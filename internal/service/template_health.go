@@ -200,7 +200,13 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 	if timeout <= 0 {
 		timeout = defaultTemplateBuildTimeout
 	}
+	// Track the goroutine so callers can join it. A rebuild writes into the
+	// templates directory, and an untracked one outlives whoever owns that
+	// directory: tests saw TempDir cleanup race a still-writing rebuild
+	// ("directory not empty"), and a daemon shutdown has the same shape.
+	s.templateRebuildWG.Add(1)
 	go func() {
+		defer s.templateRebuildWG.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		if err := s.RebuildTemplateSnapshot(ctx, templateID); err != nil {
@@ -208,6 +214,26 @@ func (s *Service) kickSnapshotRebuild(templateID string) {
 				"template_id", templateID, "error", err)
 		}
 	}()
+}
+
+// WaitForTemplateRebuilds blocks until every in-flight snapshot rebuild has
+// finished, or until the deadline elapses. Returns false on timeout so a
+// caller can report a stuck rebuild rather than hang.
+func (s *Service) WaitForTemplateRebuilds(timeout time.Duration) bool {
+	if s == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		s.templateRebuildWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 // RebuildTemplateSnapshot reruns the snapshot phase against an
@@ -258,7 +284,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 		// keeps working until an operator intervenes.
 		snapErrMsg := fmt.Sprintf("rebuild: cid allocate: %s", err.Error())
 		_ = s.store.UpdateTemplateSnapshotFailed(ctx, templateID, snapErrMsg)
-		_ = s.store.UpdateTemplateStatus(ctx, templateID,
+		_ = s.setTemplateStatus(ctx, templateID,
 			models.TemplateStatusReadyNoSnapshot, template.RootfsPath, "",
 			template.RootfsSizeBytes)
 		return fmt.Errorf("cid allocate: %w", err)
@@ -268,7 +294,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 	memOut := filepath.Join(dir, snapshotMemoryFilename)
 	stateOut := filepath.Join(dir, snapshotStateFilename)
 
-	if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+	if uerr := s.setTemplateStatus(ctx, templateID,
 		models.TemplateStatusSnapshotting, template.RootfsPath, "",
 		template.RootfsSizeBytes); uerr != nil {
 		s.logger.Warn("snapshot rebuild: status update to snapshotting failed",
@@ -297,7 +323,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 			s.logger.Warn("snapshot rebuild: snapshot_error update failed",
 				"template_id", templateID, "error", uerr)
 		}
-		if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+		if uerr := s.setTemplateStatus(ctx, templateID,
 			models.TemplateStatusReadyNoSnapshot, template.RootfsPath, "",
 			template.RootfsSizeBytes); uerr != nil {
 			s.logger.Warn("snapshot rebuild: status update to ready_no_snapshot failed",
@@ -322,7 +348,7 @@ func (s *Service) RebuildTemplateSnapshot(ctx context.Context, templateID string
 			"template_id", templateID, "error", uerr)
 		return fmt.Errorf("snapshot ready update: %w", uerr)
 	}
-	if uerr := s.store.UpdateTemplateStatus(ctx, templateID,
+	if uerr := s.setTemplateStatus(ctx, templateID,
 		models.TemplateStatusReady, template.RootfsPath, "",
 		template.RootfsSizeBytes); uerr != nil {
 		s.logger.Warn("snapshot rebuild: final status update failed",

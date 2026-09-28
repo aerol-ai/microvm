@@ -18,21 +18,23 @@ func fillFSMWithPlacements(t testing.TB, fsm *placementFSM, n int) {
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("scale-%07d", i)
 		place, _ := encodeCommand(command{
-			Op:          opPlace,
-			SandboxID:   id,
-			OwnerNodeID: fmt.Sprintf("node-%03d", i%32),
-			OwnerAPIURL: fmt.Sprintf("http://10.0.%d.%d:21212", (i/256)%256, i%256),
-			Spec:        &models.CreateSandboxRequest{Image: "img"},
+			Op:            opPlace,
+			SandboxID:     id,
+			OwnerNodeID:   fmt.Sprintf("node-%03d", i%32),
+			OwnerAPIURL:   fmt.Sprintf("http://10.0.%d.%d:21212", (i/256)%256, i%256),
+			Spec:          &models.CreateSandboxRequest{Image: "img"},
+			IncarnationID: "inc-" + id,
 		})
 		if got := fsm.Apply(&raft.Log{Index: uint64(i + 1), Data: place}); got != nil {
 			t.Fatalf("seed place %d: %v", i, got)
 		}
 		add, _ := encodeCommand(command{
-			Op:        opAddExposedPort,
-			SandboxID: id,
-			Port:      22000 + i,
-			Protocol:  models.ExposedPortProtocolTCP,
-			HostPort:  40000 + i,
+			Op:                    opAddExposedPort,
+			SandboxID:             id,
+			ExpectedIncarnationID: "inc-" + id,
+			Port:                  22000 + i,
+			Protocol:              models.ExposedPortProtocolTCP,
+			HostPort:              40000 + i,
 		})
 		if got := fsm.Apply(&raft.Log{Index: uint64(n + i + 1), Data: add}); got != nil {
 			t.Fatalf("seed expose %d: %v", i, got)
@@ -57,11 +59,12 @@ func TestFSMValidateHostPortAt10K(t *testing.T) {
 	// Place a fresh sandbox we'll mutate with new port adds.
 	newID := "scale-target"
 	place, _ := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   newID,
-		OwnerNodeID: "node-target",
-		OwnerAPIURL: "http://10.99.0.1:21212",
-		Spec:        &models.CreateSandboxRequest{Image: "img"},
+		Op:            opPlace,
+		SandboxID:     newID,
+		OwnerNodeID:   "node-target",
+		OwnerAPIURL:   "http://10.99.0.1:21212",
+		Spec:          &models.CreateSandboxRequest{Image: "img"},
+		IncarnationID: "inc-" + newID,
 	})
 	if got := fsm.Apply(&raft.Log{Index: uint64(2*n + 1), Data: place}); got != nil {
 		t.Fatalf("place target: %v", got)
@@ -71,11 +74,12 @@ func TestFSMValidateHostPortAt10K(t *testing.T) {
 	// succeed and walk the entire placement map without false-positive.
 	t0 := time.Now()
 	okAdd, _ := encodeCommand(command{
-		Op:        opAddExposedPort,
-		SandboxID: newID,
-		Port:      55555,
-		Protocol:  models.ExposedPortProtocolTCP,
-		HostPort:  60000,
+		Op:                    opAddExposedPort,
+		SandboxID:             newID,
+		ExpectedIncarnationID: "inc-" + newID,
+		Port:                  55555,
+		Protocol:              models.ExposedPortProtocolTCP,
+		HostPort:              60000,
 	})
 	if got := fsm.Apply(&raft.Log{Index: uint64(2*n + 2), Data: okAdd}); got != nil {
 		t.Fatalf("expose-non-conflicting after %d placements returned %v", n, got)
@@ -89,11 +93,12 @@ func TestFSMValidateHostPortAt10K(t *testing.T) {
 	t1 := time.Now()
 	dupHostPort := 40000 + (n / 2) // owned by scale-{n/2}
 	dupAdd, _ := encodeCommand(command{
-		Op:        opAddExposedPort,
-		SandboxID: newID,
-		Port:      55556,
-		Protocol:  models.ExposedPortProtocolTCP,
-		HostPort:  dupHostPort,
+		Op:                    opAddExposedPort,
+		SandboxID:             newID,
+		ExpectedIncarnationID: "inc-" + newID,
+		Port:                  55556,
+		Protocol:              models.ExposedPortProtocolTCP,
+		HostPort:              dupHostPort,
 	})
 	got := fsm.Apply(&raft.Log{Index: uint64(2*n + 3), Data: dupAdd})
 	conflictElapsed := time.Since(t1)
@@ -109,43 +114,46 @@ func TestFSMHostPortIndexReleasesOnRemoveAndDelete(t *testing.T) {
 	fsm := newPlacementFSM()
 	for _, id := range []string{"owner", "next"} {
 		place, _ := encodeCommand(command{
-			Op:          opPlace,
-			SandboxID:   id,
-			OwnerNodeID: "node-a",
-			Spec:        &models.CreateSandboxRequest{Image: "img"},
+			Op:            opPlace,
+			SandboxID:     id,
+			OwnerNodeID:   "node-a",
+			IncarnationID: "inc-" + id,
+			Spec:          &models.CreateSandboxRequest{Image: "img"},
 		})
 		if got := fsm.Apply(&raft.Log{Index: uint64(len(id)), Data: place}); got != nil {
 			t.Fatalf("place %s: %v", id, got)
 		}
 	}
 	add, _ := encodeCommand(command{
-		Op:        opAddExposedPort,
-		SandboxID: "owner",
-		Port:      5432,
-		Protocol:  models.ExposedPortProtocolTCP,
-		HostPort:  45432,
+		Op:                    opAddExposedPort,
+		SandboxID:             "owner",
+		ExpectedIncarnationID: "inc-owner",
+		Port:                  5432,
+		Protocol:              models.ExposedPortProtocolTCP,
+		HostPort:              45432,
 	})
 	if got := fsm.Apply(&raft.Log{Index: 10, Data: add}); got != nil {
 		t.Fatalf("add owner tcp: %v", got)
 	}
 	dup, _ := encodeCommand(command{
-		Op:        opAddExposedPort,
-		SandboxID: "next",
-		Port:      5432,
-		Protocol:  models.ExposedPortProtocolTCP,
-		HostPort:  45432,
+		Op:                    opAddExposedPort,
+		SandboxID:             "next",
+		ExpectedIncarnationID: "inc-next",
+		Port:                  5432,
+		Protocol:              models.ExposedPortProtocolTCP,
+		HostPort:              45432,
 	})
 	if got := fsm.Apply(&raft.Log{Index: 11, Data: dup}); !errors.Is(got.(error), ErrHostPortReserved) {
 		t.Fatalf("duplicate host port = %v, want ErrHostPortReserved", got)
 	}
-	remove, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "owner", Port: 5432})
+	remove, _ := encodeCommand(command{Op: opRemoveExposedPort, SandboxID: "owner", ExpectedIncarnationID: "inc-owner", Port: 5432})
 	if got := fsm.Apply(&raft.Log{Index: 12, Data: remove}); got != nil {
 		t.Fatalf("remove owner tcp: %v", got)
 	}
 	if got := fsm.Apply(&raft.Log{Index: 13, Data: dup}); got != nil {
 		t.Fatalf("host port not released after remove: %v", got)
 	}
-	del, _ := encodeCommand(command{Op: opDelete, SandboxID: "next"})
+	del, _ := encodeCommand(command{Op: opDelete, SandboxID: "next", ExpectedIncarnationID: "inc-next"})
 	if got := fsm.Apply(&raft.Log{Index: 14, Data: del}); got != nil {
 		t.Fatalf("delete next: %v", got)
 	}

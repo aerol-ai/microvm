@@ -61,11 +61,11 @@ func TestListOrphanedWasmCheckpointPushes(t *testing.T) {
 	if err := st.Create(ctx, live); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-live", "aocr://sb-live:x", "d1"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-live", "", "aocr://sb-live:x", "d1"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush(live): %v", err)
 	}
 	// Push row for a sandbox that was never created / already destroyed.
-	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-gone", "aocr://sb-gone:y", "d2"); err != nil {
+	if _, err := st.InsertWasmCheckpointPush(ctx, "sb-gone", "", "aocr://sb-gone:y", "d2"); err != nil {
 		t.Fatalf("InsertWasmCheckpointPush(gone): %v", err)
 	}
 
@@ -84,6 +84,39 @@ func TestListByRuntime_QueryErrorOnClosedDB(t *testing.T) {
 	_ = st.Close()
 	if _, err := st.ListByRuntime(context.Background(), models.RuntimeWasm); err == nil {
 		t.Fatal("ListByRuntime on a closed DB must return an error")
+	}
+}
+
+func TestDeleteOrphanedWasmStateKV(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	live := sampleSandbox("sb-live-kv")
+	live.Runtime = models.RuntimeWasm
+	if err := st.Create(ctx, live); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := st.PutWasmStateKV(ctx, "sb-live-kv", "counter", []byte("1")); err != nil {
+		t.Fatalf("PutWasmStateKV(live): %v", err)
+	}
+	if err := st.PutWasmStateKV(ctx, "sb-gone-kv", "counter", []byte("2")); err != nil {
+		t.Fatalf("PutWasmStateKV(gone): %v", err)
+	}
+
+	n, err := st.DeleteOrphanedWasmStateKV(ctx, 0)
+	if err != nil {
+		t.Fatalf("DeleteOrphanedWasmStateKV: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("deleted = %d, want 1", n)
+	}
+	keys, err := st.ListWasmStateKVKeys(ctx, "sb-live-kv")
+	if err != nil || len(keys) != 1 || keys[0] != "counter" {
+		t.Fatalf("live keys = %v err=%v, want [counter]", keys, err)
+	}
+	gone, err := st.ListWasmStateKVKeys(ctx, "sb-gone-kv")
+	if err != nil || len(gone) != 0 {
+		t.Fatalf("gone keys = %v err=%v, want empty", gone, err)
 	}
 }
 

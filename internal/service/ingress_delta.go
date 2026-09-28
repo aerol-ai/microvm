@@ -32,11 +32,26 @@ type ingressRouteIntent struct {
 	delete      func(context.Context) error
 }
 
-func clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementShardFilter {
+func (s *Service) clusterIngressShardFilter(c cluster.Client, self string) cluster.PlacementShardFilter {
 	if c == nil || self == "" {
-		return cluster.PlacementShardFilter{}
+		return cluster.NoPlacementShards()
 	}
-	return cluster.IngressShardFilterForNode(c.Members(), self)
+	// One accessor for both halves of the ingress ring: installation (here)
+	// and lookup (/v1/cluster/ingress-route/{id}). Hashing different views
+	// sends the upstream to a node that never installed the shard.
+	//
+	// The role is passed in so a node that serves no ingress asks for NO
+	// shards. Previously it was absent from the ingress id list and the helper
+	// synthesized a membership for it, which gave a dedicated worker a slice
+	// of unrelated shards at 100 ingress nodes and the entire placement map at
+	// small ingress counts.
+	return s.ingressShardFilterCache.ForNode(cluster.IngressRingMembers(c), self, s.cfg.NodeRole)
+}
+
+// servesClusterIngress reports whether this node installs peer-forwarding
+// public routes at all. A dedicated worker or server does not.
+func (s *Service) servesClusterIngress() bool {
+	return s != nil && s.cfg.IsIngress()
 }
 
 func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, self string) (map[string]ingressRouteIntent, bool) {
@@ -70,10 +85,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 					routeID:     routeID,
 					fingerprint: ingressFingerprint("live-sni-sandbox", p.SandboxID, ownerHost, sni, strconv.Itoa(tlsPeerPort), strconv.FormatUint(p.Version, 10)),
 					apply: func(ctx context.Context) error {
-						return s.caddy.UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
+						return s.publicRoutes().UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
 					},
 					delete: func(ctx context.Context) error {
-						return s.caddy.DeleteRouteByID(ctx, routeID)
+						return s.publicRoutes().DeleteRouteByID(ctx, routeID)
 					},
 				}
 				// Per-custom-hostname SNI passthrough so cluster ingress on a
@@ -92,10 +107,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 						routeID:     customRouteID,
 						fingerprint: ingressFingerprint("live-sni-custom", p.SandboxID, ownerHost, hostname, strconv.Itoa(tlsPeerPort), strconv.FormatUint(p.Version, 10)),
 						apply: func(ctx context.Context) error {
-							return s.caddy.UpsertSNIPassthroughRoute(ctx, customRouteID, hostname, ownerHost, tlsPeerPort)
+							return s.publicRoutes().UpsertSNIPassthroughRoute(ctx, customRouteID, hostname, ownerHost, tlsPeerPort)
 						},
 						delete: func(ctx context.Context) error {
-							return s.caddy.DeleteRouteByID(ctx, customRouteID)
+							return s.publicRoutes().DeleteRouteByID(ctx, customRouteID)
 						},
 					}
 				}
@@ -113,10 +128,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 				routeID:     routeID,
 				fingerprint: ingressFingerprint("live-http-sandbox", p.SandboxID, ownerHost, strings.Join(customHostnames, ","), strconv.FormatUint(p.Version, 10)),
 				apply: func(ctx context.Context) error {
-					return s.caddy.UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost, customHostnames)
+					return s.publicRoutes().UpsertSandboxRouteToPeer(ctx, p.SandboxID, ownerHost, customHostnames)
 				},
 				delete: func(ctx context.Context) error {
-					return s.caddy.DeleteSandboxRoute(ctx, p.SandboxID)
+					return s.publicRoutes().DeleteSandboxRoute(ctx, p.SandboxID)
 				},
 			}
 		}
@@ -143,10 +158,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 						routeID:     routeID,
 						fingerprint: ingressFingerprint("live-sni-port", p.SandboxID, strconv.Itoa(port), ownerHost, sni, strconv.Itoa(tlsPeerPort), strconv.FormatUint(p.Version, 10)),
 						apply: func(ctx context.Context) error {
-							return s.caddy.UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
+							return s.publicRoutes().UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
 						},
 						delete: func(ctx context.Context) error {
-							return s.caddy.DeleteRouteByID(ctx, routeID)
+							return s.publicRoutes().DeleteRouteByID(ctx, routeID)
 						},
 					}
 				} else {
@@ -157,10 +172,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 						routeID:     routeID,
 						fingerprint: ingressFingerprint("live-http-port", p.SandboxID, strconv.Itoa(port), ownerHost, strconv.FormatUint(p.Version, 10)),
 						apply: func(ctx context.Context) error {
-							return s.caddy.UpsertPortRouteToPeer(ctx, p.SandboxID, port, ownerHost)
+							return s.publicRoutes().UpsertPortRouteToPeer(ctx, p.SandboxID, port, ownerHost)
 						},
 						delete: func(ctx context.Context) error {
-							return s.caddy.DeletePortRoute(ctx, p.SandboxID, port)
+							return s.publicRoutes().DeletePortRoute(ctx, p.SandboxID, port)
 						},
 					}
 				}
@@ -179,10 +194,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 					routeID:     routeID,
 					fingerprint: ingressFingerprint("live-tcp-port", p.SandboxID, strconv.Itoa(port), ownerHost, strconv.Itoa(hostPort), strconv.FormatUint(p.Version, 10)),
 					apply: func(ctx context.Context) error {
-						return s.caddy.UpsertTCPProxyRoute(ctx, p.SandboxID, port, hostPort, ownerHost, hostPort)
+						return s.publicRoutes().UpsertTCPProxyRoute(ctx, p.SandboxID, port, hostPort, ownerHost, hostPort)
 					},
 					delete: func(ctx context.Context) error {
-						return s.caddy.DeleteTCPRoute(ctx, hostPort)
+						return s.publicRoutes().DeleteTCPRoute(ctx, hostPort)
 					},
 				}
 			case models.ExposedPortProtocolTLS:
@@ -198,10 +213,10 @@ func (s *Service) buildClusterIngressIntents(placements []cluster.Placement, sel
 					routeID:     routeID,
 					fingerprint: ingressFingerprint("live-tls-port", p.SandboxID, strconv.Itoa(port), ownerHost, sni, strconv.Itoa(tlsPeerPort), strconv.FormatUint(p.Version, 10)),
 					apply: func(ctx context.Context) error {
-						return s.caddy.UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
+						return s.publicRoutes().UpsertSNIPassthroughRoute(ctx, routeID, sni, ownerHost, tlsPeerPort)
 					},
 					delete: func(ctx context.Context) error {
-						return s.caddy.DeleteRouteByID(ctx, routeID)
+						return s.publicRoutes().DeleteRouteByID(ctx, routeID)
 					},
 				}
 			}
@@ -223,7 +238,7 @@ func (s *Service) addClusterIngressInFluxIntents(intents map[string]ingressRoute
 			return s.applyInFluxSandboxRoute(ctx, pCopy)
 		},
 		delete: func(ctx context.Context) error {
-			return s.caddy.DeleteInFluxSandboxRoute(ctx, pCopy.SandboxID)
+			return s.publicRoutes().DeleteInFluxSandboxRoute(ctx, pCopy.SandboxID)
 		},
 	}
 
@@ -244,7 +259,7 @@ func (s *Service) addClusterIngressInFluxIntents(intents map[string]ingressRoute
 				return s.applyInFluxPortRoute(ctx, pCopy, port)
 			},
 			delete: func(ctx context.Context) error {
-				return s.caddy.DeleteInFluxPortRoute(ctx, pCopy.SandboxID, port)
+				return s.publicRoutes().DeleteInFluxPortRoute(ctx, pCopy.SandboxID, port)
 			},
 		}
 	}
@@ -362,7 +377,7 @@ func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired 
 		if _, ok := expectedHTTP[id]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil && firstErr == nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -370,7 +385,7 @@ func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired 
 		if _, ok := expectedTCPServers[sid]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteTCPServer(ctx, sid); err != nil && firstErr == nil {
+		if err := s.publicRoutes().DeleteTCPServer(ctx, sid); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -378,7 +393,7 @@ func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired 
 		if _, ok := expectedTLSRoutes[id]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil && firstErr == nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -388,15 +403,15 @@ func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired 
 func (s *Service) applyInFluxSandboxRoute(ctx context.Context, p cluster.Placement) error {
 	var firstErr error
 	if s.cfg.Domain == "" {
-		if err := s.caddy.DeleteSandboxRoute(ctx, p.SandboxID); err != nil {
+		if err := s.publicRoutes().DeleteSandboxRoute(ctx, p.SandboxID); err != nil {
 			firstErr = err
 		}
 	} else {
-		if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID)); err != nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID)); err != nil {
 			firstErr = err
 		}
 	}
-	if err := s.caddy.UpsertInFluxSandboxRoute(ctx, p.SandboxID); err != nil && firstErr == nil {
+	if err := s.publicRoutes().UpsertInFluxSandboxRoute(ctx, p.SandboxID); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr
@@ -405,15 +420,15 @@ func (s *Service) applyInFluxSandboxRoute(ctx context.Context, p cluster.Placeme
 func (s *Service) applyInFluxPortRoute(ctx context.Context, p cluster.Placement, port int) error {
 	var firstErr error
 	if s.cfg.Domain == "" {
-		if err := s.caddy.DeletePortRoute(ctx, p.SandboxID, port); err != nil {
+		if err := s.publicRoutes().DeletePortRoute(ctx, p.SandboxID, port); err != nil {
 			firstErr = err
 		}
 	} else {
-		if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port)); err != nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port)); err != nil {
 			firstErr = err
 		}
 	}
-	if err := s.caddy.UpsertInFluxPortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
+	if err := s.publicRoutes().UpsertInFluxPortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	return firstErr

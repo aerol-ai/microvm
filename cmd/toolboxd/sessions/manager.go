@@ -274,6 +274,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 
 	go func() {
 		s.waitAndFinish()
+		exitCode, exitSignal := s.ExitInfo()
 		// Drop the byName entry so a future GetOrCreate(name) starts a fresh
 		// session rather than returning the dead one.
 		m.mu.Lock()
@@ -284,8 +285,8 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		m.logger.Info("session ended",
 			"session_id", id,
 			"name", name,
-			"exit_code", s.exitCode,
-			"signal", s.exitSignal,
+			"exit_code", exitCode,
+			"signal", exitSignal,
 		)
 	}()
 

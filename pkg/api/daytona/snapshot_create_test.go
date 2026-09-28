@@ -85,7 +85,7 @@ func newSnapshotCreateTestEnv(t *testing.T, builder *fakeImageBuilder) *snapshot
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rt := &fakeDaytonaSnapshotRuntime{}
-	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, nil, nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), nil, nil)
 	if builder == nil {
 		builder = &fakeImageBuilder{}
 	}

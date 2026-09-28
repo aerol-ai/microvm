@@ -50,6 +50,39 @@ func (f *fakeCheckpointDrainRuntime) ListManaged(context.Context) (map[string]*m
 	return f.fakeCheckpointRuntime.ListManaged(context.Background())
 }
 
+func TestRunWasmCheckpointPoolReturnsCancellationAfterInFlightWork(t *testing.T) {
+	svc := &Service{cfg: config.Config{WasmCheckpointMaxParallel: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	result := make(chan error, 1)
+
+	go func() {
+		result <- svc.runWasmCheckpointPool(ctx, []*models.Sandbox{{ID: "sb-1"}}, func(*models.Sandbox) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint worker did not start")
+	}
+	cancel()
+	close(release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runWasmCheckpointPool = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("checkpoint pool did not return after cancellation")
+	}
+}
+
 func TestDrainWasmSandboxes(t *testing.T) {
 	ctx := context.Background()
 	rt := &fakeCheckpointRuntime{
@@ -279,10 +312,10 @@ func (s *wasmCheckpointPusherStub) DestRefFor(sandboxID string) string { return 
 func (s *wasmCheckpointPusherStub) DestRefTagged(sandboxID, tag string) string {
 	return "test://sb:" + tag
 }
-func (s *wasmCheckpointPusherStub) PushOnceTo(ctx context.Context, sandboxID, memSnapDir, destRef string) (WasmCheckpointPushResult, error) {
+func (s *wasmCheckpointPusherStub) PushOnceTo(ctx context.Context, sandboxID, _, memSnapDir, destRef string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{RegistryRef: destRef, Digest: "sha256:123"}, nil
 }
-func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, destDir string) error {
+func (s *wasmCheckpointPusherStub) PullOnce(ctx context.Context, registryRef, _, destDir string) error {
 	return nil
 }
 func (s *wasmCheckpointPusherStub) DeleteRef(ctx context.Context, registryRef string) error {
@@ -295,11 +328,13 @@ func (f failingWasmCheckpointPusher) DestRefFor(string) string { return "test://
 func (f failingWasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	return "test://" + sandboxID + ":" + tag
 }
-func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string) (WasmCheckpointPushResult, error) {
+func (f failingWasmCheckpointPusher) PushOnceTo(context.Context, string, string, string, string) (WasmCheckpointPushResult, error) {
 	return WasmCheckpointPushResult{}, errors.New("push failed")
 }
-func (f failingWasmCheckpointPusher) PullOnce(context.Context, string, string) error { return nil }
-func (f failingWasmCheckpointPusher) DeleteRef(context.Context, string) error        { return nil }
+func (f failingWasmCheckpointPusher) PullOnce(context.Context, string, string, string) error {
+	return nil
+}
+func (f failingWasmCheckpointPusher) DeleteRef(context.Context, string) error { return nil }
 
 func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	ctx := context.Background()
@@ -324,7 +359,7 @@ func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	}
 
 	// pushWasmCheckpointBestEffort should swallow the push error and return.
-	svc.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
+	svc.pushWasmCheckpointBestEffort("sb-wasm-push", "", "/tmp/checkpoint")
 
 	// Reopen a fresh store so we can exercise the success/prune path.
 	svc2, st2, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
@@ -333,26 +368,38 @@ func TestWasmCheckpointPushAndPruneBranches(t *testing.T) {
 	pusher := &recordingCheckpointStore{destRef: "test://sb-wasm-push:latest"}
 	svc2.wasmCheckpointPusher = pusher
 	if err := st2.Create(ctx, &models.Sandbox{
-		ID:              "sb-wasm-push",
-		Runtime:         models.RuntimeWasm,
-		Status:          models.SandboxStatusPassivated,
-		Durability:      models.DurabilityDurable,
-		CheckpointPath:  "/tmp/checkpoint",
-		CloneGeneration: "gen-1",
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		LastActiveAt:    now,
+		ID:                 "sb-wasm-push",
+		Runtime:            models.RuntimeWasm,
+		Status:             models.SandboxStatusPassivated,
+		Durability:         models.DurabilityDurable,
+		CheckpointPath:     "/tmp/checkpoint",
+		CloneGeneration:    "gen-1",
+		AuditIncarnationID: "inc-push",
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
-	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "/tmp/checkpoint")
-	if len(pusher.deleteCalls) == 0 {
-		t.Fatal("expected prune to delete an older checkpoint ref")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "inc-push", "/tmp/checkpoint")
+	svc2.pushWasmCheckpointBestEffort("sb-wasm-push", "inc-push", "/tmp/checkpoint")
+	recs, err := st2.ListWasmCheckpointPushes(ctx, "sb-wasm-push")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("keep-last-1 retained %d rows", len(recs))
+	}
+	// This fake returns the SAME digest for every push, so the pruned row and
+	// the live row name one manifest. Deleting a checkpoint ref deletes its
+	// manifest, so retention must drop the row and keep the artifact the live
+	// sandbox still points at.
+	if len(pusher.deleteCalls) != 0 {
+		t.Fatalf("retention deleted %v, the manifest the live row still points at", pusher.deleteCalls)
 	}
 
 	if err := st2.Close(); err != nil {
 		t.Fatalf("store.Close: %v", err)
 	}
-	svc2.pruneWasmCheckpointPushes(ctx, "sb-wasm-push")
+	svc2.pruneWasmCheckpointPushes(ctx, "sb-wasm-push", "inc-push")
 }

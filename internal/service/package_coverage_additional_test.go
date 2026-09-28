@@ -171,16 +171,16 @@ func TestServiceCoordinatorHelperCoverage(t *testing.T) {
 }
 
 func TestServiceBackgroundLoopCoverage(t *testing.T) {
-	svc := &Service{
-		cfg: config.Config{
-			ReconcileInterval:       time.Millisecond,
-			ImageBuildGCEnabled:     true,
-			ImageBuildGCInterval:    time.Millisecond,
-			IdleTimeoutMinutes:      1,
-			FleetLiveSampleInterval: time.Millisecond,
-		},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
+	// A real store, not a bare &Service{}: these loops sweep through
+	// s.store, and a 1ms ticker that wins the race against cancel() would
+	// dereference a nil one. startPeriodic re-checks ctx before each sweep,
+	// but a sweep already past that check must still land somewhere real.
+	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.ReconcileInterval = time.Millisecond
+	svc.cfg.ImageBuildGCEnabled = true
+	svc.cfg.ImageBuildGCInterval = time.Millisecond
+	svc.cfg.IdleTimeoutMinutes = 1
+	svc.cfg.FleetLiveSampleInterval = time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	svc.StartLifecycleSweep(ctx)

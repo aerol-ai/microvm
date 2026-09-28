@@ -85,6 +85,7 @@ const (
 
 type HealthStatus = models.HealthStatus
 type Sandbox = models.Sandbox
+type RegistryAuth = models.RegistryAuth
 type MountSpec = models.MountSpec
 type MountSpecRedacted = models.MountSpecRedacted
 type PlatformVolumeMount = models.PlatformVolumeMount

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -11,11 +12,14 @@ import (
 )
 
 type fakeReclaimer struct {
+	mu    sync.Mutex
 	calls []struct{ backend, source string }
 	fail  map[string]error
 }
 
 func (f *fakeReclaimer) Reclaim(_ context.Context, backend, source string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, struct{ backend, source string }{backend, source})
 	if f.fail != nil {
 		if err, ok := f.fail[source]; ok {

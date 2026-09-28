@@ -270,7 +270,7 @@ func TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rt := &fakeDaytonaSnapshotRuntime{createErr: errors.New("simulated docker failure")}
-	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, newMountsManagerForTest(t), nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), newMountsManagerForTest(t), nil)
 
 	builder := &fakeImageBuilder{}
 	mux := http.NewServeMux()
@@ -312,7 +312,7 @@ func TestCreateSandboxNoRollbackOnCacheHit(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rt := &fakeDaytonaSnapshotRuntime{createErr: errors.New("simulated docker failure")}
-	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, newMountsManagerForTest(t), nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), newMountsManagerForTest(t), nil)
 
 	dockerfile := "FROM alpine\nRUN echo cached"
 	cachedTag := docker.BuildTagFor(dockerfile, nil)
@@ -569,7 +569,7 @@ func newSnapshotHandlerTestEnv(t *testing.T) (*service.Service, *store.Store, *f
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rt := &fakeDaytonaSnapshotRuntime{}
-	svc := service.New(config.Config{}, logger, st, rt, nil, nil, nil, nil, nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), nil, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
 		Service: svc,

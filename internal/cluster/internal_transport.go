@@ -21,16 +21,3 @@ func newInternalTransport(tlsCfg *tls.Config) *http.Transport {
 		IdleConnTimeout:     90 * time.Second,
 	}
 }
-
-// newMTLSProxyTransport backs the owner API forwards (ReverseProxy). Same TLS
-// config as the commit channel but a higher per-host idle pool — forwards are
-// the steady-state hot path across cluster-internal hops, not the bursty raft
-// leader-forward.
-func newMTLSProxyTransport(tlsCfg *tls.Config) *http.Transport {
-	return &http.Transport{
-		TLSClientConfig:     tlsCfg,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-	}
-}

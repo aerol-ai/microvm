@@ -1,16 +1,19 @@
 # B7 — Local-only built images can't be placed in a cluster (UC-74)
 
-Status: **implemented (Option A fanout)** in PR [#253](https://github.com/aerol-ai/microvm/pull/253)
+Status: **implemented (single-worker placement + node-bound tag)**; the original
+replicate-to-all implementation from PR [#253](https://github.com/aerol-ai/microvm/pull/253)
+was removed during the 2,000-node enterprise review
 (`self-node-placement`) · documented in [`pr-review.md` §7.1](../pr-review.md) ·
 Severity: P2 (feature broken in cluster mode, no data risk) ·
 Area: `internal/cluster` placement + `internal/service` image distribution +
 `pkg/api/v1` build · Source: cluster-hetero integration scenario, UC-74
 ("Create with built image graph"). Parent: `plans/cluster-hetero-failures-fix.md`.
 
-> **Shipped vs recommended:** Option B (AOCR distribution) remains the long-term
-> recommendation below. PR #253 shipped Option A extended with
-> replicate-to-all-Docker-workers build fanout plus placement-forward create —
-> see `pr-review.md` §7.1 for rationale.
+> **Current design:** the build router selects exactly one Docker worker, that
+> worker returns `aerolvm-build/node-<base32-node-id>/<digest>:latest`, and every
+> create decoder extracts that affinity into `capacity.Request.RequiredNodeID`.
+> Build and create are therefore O(1) network work. AOCR remains the option for
+> durable/cross-worker reuse, but is not required for this local-image contract.
 
 ## 1. Symptom
 
@@ -88,6 +91,23 @@ worker; role-separated clusters (the production topology) are where it breaks.
 
 ## 4. Fix options
 
+### Implemented resolution — worker placement with an encoded affinity
+
+This is Option A with the missing cross-call affinity made structural. The
+existing `image` response field carries a Docker-valid node-bound repository,
+so no SDK response field or compatibility branch is required. A fabricated or
+malformed affinity cannot broaden placement: it either decodes to one exact
+node or is treated as an ordinary local-only image and fails when unavailable.
+
+- One placement decision and at most one peer build request.
+- The follow-up create is constrained to the same live, non-drained worker.
+- The receiver verifies that the returned image tag names the selected worker.
+- Cluster-control routing headers are accepted only from an authenticated live
+  mTLS peer.
+- Cluster-disabled/single-node builds retain `aerolvm-build/<digest>:latest`.
+- A dead/full/drained build owner returns a retryable placement failure; the
+  local image is intentionally not advertised as portable.
+
 ### Option A — Build on a worker (route the build through placement)
 
 `buildImage` selects a worker via placement and builds there (locally or by
@@ -138,11 +158,10 @@ on the chosen target, then create. Requires a new combined endpoint.
 
 ## 5. Recommendation
 
-**Option B (AOCR distribution).** It reuses the existing AOCR + pusher + puller
-path that template and snapshot creates already depend on, keeps the two-call
-build/create contract, and makes built images durable and reusable. Option A is
-the fallback if AOCR can't be assumed; ship the clear-error improvement (below)
-regardless of which option lands.
+**Keep the implemented node-bound Option A for local builds.** It satisfies the
+two-call SDK contract without O(workers) amplification. Use Option B only when
+the product explicitly promises durable or cross-worker reuse; adding AOCR to
+every local build speculatively would increase latency and configuration surface.
 
 ### Independent quick win (do first, ~30 min)
 
@@ -157,17 +176,18 @@ branch) — detect `!CanOwnSandboxRole(self.Role)` and return the specific messa
 ## 6. Test plan
 
 Unit:
-- `image_distribution_test.go` — a pushed built image classifies as
-  `ImageDistributionAOCR` (Option B), so `ImageRequiresLocalPlacement` is false.
-- `clustercreate_test.go` — local-only image + non-worker self → the new
-  actionable error (the quick win), not `ErrNoPlacementTarget`.
-- placement test — a create for an AOCR-distributed built image selects a worker.
+- `pkg/docker/build_test.go` — node affinity round-trips and malformed tags fail
+  closed.
+- `pkg/api/v1/build_test.go` — one selected worker builds and an unbound/wrong
+  response is rejected.
+- v1/shared facade placement tests — `RequiredNodeID` survives normalization and
+  forces the create back to the build worker.
+- cluster-off tests — the historical local tag and local build path are unchanged.
 
 Integration (cluster-hetero, UC-74 already exists):
 - UC-74 goes green once the image is distributable/placeable.
-- Add UC-74b: build an image, then create TWO sandboxes from the same tag on
-  different workers (proves distribution, not just co-location). Register in
-  `harness/usecases.go` with `CapCluster`.
+- Add UC-74b: build an image, then create two sandboxes from the same tag and
+  assert both are pinned to the encoded worker (local reuse, not distribution).
 
 ## 7. Risks / call-outs (per CLAUDE.md + pr-review.md)
 

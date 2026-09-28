@@ -58,6 +58,7 @@ func rtRows() []CatalogueRow {
 		row("RT-09", "Does Firecracker cold-boot from a plain OCI image?", catRT(), "", "boots", scnHetero(), RTFirecracker, "UC-88"),
 		row("RT-10", "Do Firecracker template clones have distinct kernel entropy?", catRT(), "", "unique entropy", scnHetero(), RTFirecracker, "UC-80"),
 		row("RT-11", "Does isolate serve a fetch handler from an uploaded bundle?", catRT(), "", "body matches", scnBoth(), RTIsolate, "UC-103"),
+		row("RT-12", "Is the workerd group process jailed (non-root, chroot, seccomp, cgroup) while serving?", catRT(), "", "confined + serves", scnBoth(), RTIsolate, "UC-109"),
 	}
 }
 
@@ -264,6 +265,7 @@ func haRows() []CatalogueRow {
 		row("HA-05", "Uncordon restores schedulability", catHA(), "", "schedulable", scnHetero(), RTContainerd, "UC-57"),
 		row("HA-06", "Owner failover → replica serves", catHA(), "", "replica serves", scnHetero(), RTContainerd, "UC-58"),
 		row("HA-07", "Recreate-via-failover preserves identity", catHA(), "", "same id", scnHetero(), RTContainerd, "UC-58b"),
+		row("HA-07b", "Kill owner mid secret fan-out (GAP-1)", catHA(), "", "recover or clean fail", scnHetero(), RTContainerd, "UC-58c"),
 		row("HA-08", "WASM live-migrate across nodes", catHA(), "", "migrated", scnHetero(), RTWasm, "UC-59"),
 		row("HA-09", "WASM export/import round-trip", catHA(), "", "state restored", scnHetero(), RTWasm, ""),
 		row("HA-10", "Orphan reclaim-local", catHA(), "", "reclaimed", scnHetero(), RTContainerd, "UC-60"),

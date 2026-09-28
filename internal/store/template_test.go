@@ -638,6 +638,10 @@ func TestListTemplatesPendingPush_FiltersStates(t *testing.T) {
 	want := map[string]bool{
 		"tpl-ready-pending": true,
 		"tpl-ready-error":   true,
+		// 'pushing' with no claim stamp is an abandoned claim — a row written
+		// before the lease column existed, or one whose pusher died. It is
+		// reclaimable; see TestTemplatePushClaimLease for the live-claim case.
+		"tpl-ready-pushing": true,
 	}
 	if len(gotIDs) != len(want) {
 		t.Fatalf("ListTemplatesPendingPush returned %v, want exactly %v", gotIDs, want)
@@ -960,5 +964,61 @@ func TestListTemplatesReadyBefore_EmptyStore(t *testing.T) {
 	}
 	if len(rows) != 0 {
 		t.Errorf("got %d rows on empty store, want 0", len(rows))
+	}
+}
+
+// TestTemplatePushClaimLease pins the 'pushing' lease. Excluding claimed rows
+// keeps two reconciler ticks from pushing the same artifact; without an
+// expiring claim, a crash or cancellation after the claim left the row
+// permanently invisible and the template permanently undistributed.
+func TestTemplatePushClaimLease(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC().Round(time.Second)
+
+	tpl := &models.Template{
+		ID: "tpl-lease", Image: "docker://alpine:3.19",
+		Status: models.TemplateStatusReady, CreatedAt: now, UpdatedAt: now,
+		PushState: models.TemplatePushStatePending,
+	}
+	if err := st.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatalf("CreateTemplate: %v", err)
+	}
+
+	// A live claim hides the row from the retry queue.
+	if err := st.SetTemplatePushState(ctx, tpl.ID, models.TemplatePushStatePushing, ""); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	rows, err := st.ListTemplatesPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplatesPendingPush: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("live claim listed %d rows, want 0", len(rows))
+	}
+
+	// An expired claim is reclaimable.
+	expired := time.Now().UTC().Add(-PushClaimLease - time.Minute)
+	if _, err := st.db.ExecContext(ctx, `UPDATE firecracker_templates SET push_claimed_at = ? WHERE id = ?`, expired, tpl.ID); err != nil {
+		t.Fatalf("age the claim: %v", err)
+	}
+	rows, err = st.ListTemplatesPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplatesPendingPush after expiry: %v", err)
+	}
+	if len(rows) != 1 || rows[0].ID != tpl.ID {
+		t.Fatalf("expired claim listed %v, want the row back", rows)
+	}
+
+	// A terminal state clears the claim entirely.
+	if err := st.SetTemplatePushState(ctx, tpl.ID, models.TemplatePushStateActive, ""); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	rows, err = st.ListTemplatesPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplatesPendingPush after finish: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("finished template listed %v, want none", rows)
 	}
 }

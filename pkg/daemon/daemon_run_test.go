@@ -2,8 +2,13 @@ package daemon
 
 import (
 	"context"
-	"fmt"
-	"net"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,6 +37,49 @@ type runTestPaths struct {
 	bypassMarkerPath  string
 	internalL4WakeDir string
 	toolboxMountPath  string
+	clusterTLSDir     string
+}
+
+func writeTestClusterTLS(t *testing.T, rootDir string) string {
+	t.Helper()
+	dir := filepath.Join(rootDir, "cluster-tls")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir cluster tls: %v", err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate cluster tls key: %v", err)
+	}
+	now := time.Now()
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "aerolvm-test-cluster"},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"aerolvm-cluster-node", "node:aerolvm-test-cluster"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cluster tls cert: %v", err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal cluster tls key: %v", err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	for name, data := range map[string][]byte{
+		"ca.crt": certPEM, "node.crt": certPEM, "node.key": keyPEM,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return dir
 }
 
 func setBaseRunEnv(t *testing.T) runTestPaths {
@@ -57,6 +105,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 		internalL4WakeDir: filepath.Join(rootDir, "l4wake"),
 		toolboxMountPath:  "/usr/local/bin/toolboxd",
 	}
+	paths.clusterTLSDir = writeTestClusterTLS(t, rootDir)
 	paths.bypassMarkerPath = filepath.Join(filepath.Dir(paths.dbPath), "bypass_last_enabled")
 
 	if err := os.WriteFile(paths.clusterPATPath, []byte("cluster-pat-token\n"), 0o600); err != nil {
@@ -67,6 +116,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	}
 
 	t.Setenv("SB_PAT_TOKEN", "test-token")
+	t.Setenv("SB_NODE_ID", "aerolvm-test-cluster")
 	t.Setenv("SB_PUBLIC_HOST", "127.0.0.1")
 	t.Setenv("SB_API_HOST", "127.0.0.1")
 	t.Setenv("SB_API_PORT", "0")
@@ -74,6 +124,7 @@ func setBaseRunEnv(t *testing.T) runTestPaths {
 	t.Setenv("SB_TOOLBOX_BINARY_PATH", "/bin/true")
 	t.Setenv("SB_TOOLBOX_MOUNT_PATH", paths.toolboxMountPath)
 	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", paths.keyPath)
+	t.Setenv("SB_CLUSTER_TLS_DIR", paths.clusterTLSDir)
 	t.Setenv("SB_MOUNTS_ROOT", paths.mountsRoot)
 	t.Setenv("SB_MOUNTS_CRED_DIR", paths.mountCredDir)
 	t.Setenv("SB_HTTP_CLIENT_TIMEOUT", "200ms")
@@ -260,16 +311,6 @@ func TestRun_MountManagerErrorReturnsWrappedError(t *testing.T) {
 	}
 }
 
-func pickFreeTCPPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("pickFreeTCPPort: %v", err)
-	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port
-}
-
 func TestRun_GracefulShutdownWithFleetEnabled(t *testing.T) {
 	setBaseRunEnv(t)
 	t.Setenv("SB_FLEET_ENABLED", "true")
@@ -293,20 +334,21 @@ func TestRun_GracefulShutdownWithFleetEnabled(t *testing.T) {
 
 func TestRun_GracefulShutdownClusterServerIngress(t *testing.T) {
 	setBaseRunEnv(t)
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
 
 	t.Setenv("SB_NODE_ROLE", "server,ingress")
 	t.Setenv("SB_ENABLE_CLUSTER", "true")
 	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
-	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
-	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
-	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", fmt.Sprintf("127.0.0.1:%d", pickFreeTCPPort(t)))
-	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", fmt.Sprintf("http://127.0.0.1:%d", pickFreeTCPPort(t)))
+	t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
+	// Let the kernel allocate the internal-listener port atomically. Picking a
+	// free port and closing the probe socket creates a TOCTOU race with other CI
+	// jobs and was intermittently colliding before Run could bind it.
+	t.Setenv("SB_CLUSTER_INTERNAL_LISTEN", "127.0.0.1:0")
+	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", "https://127.0.0.1:21443")
 
 	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -328,18 +370,16 @@ func TestRun_GracefulShutdownWithHostCapacityOverrides(t *testing.T) {
 
 func TestRun_GracefulShutdownWithClusterBootstrap(t *testing.T) {
 	paths := setBaseRunEnv(t)
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
 
 	t.Setenv("SB_ENABLE_CLUSTER", "true")
 	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
-	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
-	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
-	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
 
 	if err := runWithAutoCancel(t, 250*time.Millisecond, nil); err != nil {
@@ -396,19 +436,17 @@ func TestRun_NetstatsBootstrapErrorIsNonFatal(t *testing.T) {
 
 func TestRun_SSHGatewayWithCluster(t *testing.T) {
 	paths := setBaseRunEnv(t)
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
 
 	t.Setenv("SB_ENABLE_SSH_GATEWAY", "true")
 	t.Setenv("SB_ENABLE_CLUSTER", "true")
 	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
-	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
-	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
-	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
 
 	if err := runWithAutoCancel(t, 200*time.Millisecond, nil); err != nil {
@@ -418,18 +456,16 @@ func TestRun_SSHGatewayWithCluster(t *testing.T) {
 
 func TestRun_ClusterWorkerWithFirecracker(t *testing.T) {
 	paths := setBaseRunEnv(t)
-	raftPort := pickFreeTCPPort(t)
-	gossipPort := pickFreeTCPPort(t)
 
 	t.Setenv("SB_ENABLE_CLUSTER", "true")
 	t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 	t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
-	t.Setenv("SB_RAFT_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
-	t.Setenv("SB_RAFT_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", raftPort))
+	t.Setenv("SB_RAFT_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_RAFT_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_RAFT_DATA_DIR", filepath.Join(paths.rootDir, "raft"))
-	t.Setenv("SB_GOSSIP_BIND_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
-	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", fmt.Sprintf("127.0.0.1:%d", gossipPort))
+	t.Setenv("SB_GOSSIP_BIND_ADDR", "127.0.0.1:0")
+	t.Setenv("SB_GOSSIP_ADVERTISE_ADDR", "127.0.0.1:0")
 	t.Setenv("SB_SELF_API_ADVERTISE_URL", "http://127.0.0.1:8080")
 	t.Setenv("SB_ENABLE_FIRECRACKER", "true")
 	t.Setenv("SB_FIRECRACKER_BINARY", "/bin/true")

@@ -39,9 +39,12 @@ func TestClusterVolumeClientRoundTrip(t *testing.T) {
 	if exists, err := c.VolumeExistsForSource(ctx, "bucket/t-a/data"); err != nil || !exists {
 		t.Fatalf("VolumeExistsForSource = %v, %v", exists, err)
 	}
+	if err := c.RecordPlacement(ctx, "sb-1", nil, PlacementSecrets{IncarnationID: "inc-sb-1"}); err != nil {
+		t.Fatalf("RecordPlacement: %v", err)
+	}
 
 	attach := models.VolumeAttachment{
-		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "bucket/t-a/data",
 	}
 	if err := c.PutVolumeAttachments(ctx, []models.VolumeAttachment{attach}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
@@ -53,7 +56,7 @@ func TestClusterVolumeClientRoundTrip(t *testing.T) {
 	if err := c.VolumeDelete(ctx, "t-a", "vol-1"); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("VolumeDelete attached = %v, want ErrVolumeInUse", err)
 	}
-	if err := c.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+	if err := c.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("DeleteVolumeAttachmentsForSandbox: %v", err)
 	}
 	if err := c.VolumeDelete(ctx, "t-a", "vol-1"); err != nil {
@@ -119,7 +122,7 @@ func TestClusterVolumeClientValidation(t *testing.T) {
 	if err := c.PutVolumeAttachments(ctx, nil); err != nil {
 		t.Fatalf("PutVolumeAttachments empty: %v", err)
 	}
-	if err := c.DeleteVolumeAttachmentsForSandbox(ctx, "  "); err != nil {
+	if err := c.DeleteVolumeAttachmentsForSandbox(ctx, "  ", ""); err != nil {
 		t.Fatalf("DeleteVolumeAttachmentsForSandbox whitespace: %v", err)
 	}
 }

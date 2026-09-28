@@ -79,7 +79,7 @@ The same word is used the same way everywhere in the codebase and these docs.
 | **Gossip** | A SWIM-protocol membership and capacity broadcast layer using [HashiCorp memberlist](https://github.com/hashicorp/memberlist). Every node tells every other node "I'm alive" and "here's my free CPU/mem". | Lightweight liveness signal; raft is too heavy for per-second pings. |
 | **Gossip secret key** | A 32-byte symmetric key shared by all nodes; signs and authenticates gossip packets. `SB_GOSSIP_SECRET_KEY`. | Without it any host that can reach the gossip port could join the membership view. |
 | **Cluster TLS** | mTLS on the cluster-internal RPC port (`:7002`). All nodes share a CA-signed cert. | Ensures only authorized nodes can talk Raft / inter-node RPCs. |
-| **TLS bundle** | The `aerolvm-tls-bundle.tar.gz` produced by `cluster-init.sh`. Contains `ca.crt`, `ca.key`, and `credential_encryption.key`. Joiners extract it on install. | Single artifact, single scp, complete trust setup. |
+| **TLS trust bundle** | The `aerolvm-tls-bundle.tar.gz` produced by `cluster-init.sh`. Contains only public `ca.crt`; joiners create their node key locally and submit a CSR for signing. Credential encryption material uses a separate 0600 bundle. | Separates public trust, cluster credential encryption, and the non-distributed CA signing key. |
 | **Owner watcher** | A goroutine on each node that watches placement changes; when this node becomes a new owner of a sandbox it doesn't yet have, it pulls the spec from the FSM and recreates the container. | Drives failover. |
 | **Dead-owner reconciler** | A periodic loop that, when an owner has been gossip-down longer than `SB_DEAD_OWNER_GRACE`, proposes a `placement.move` Raft entry to a healthy node. | Turns "node missing for N minutes" into "sandbox is now owned by someone else." |
 | **Admission** | The `/v1/admission` endpoint and underlying scheduler that picks an owner for a new sandbox based on per-node capacity (CPU/mem) advertised in gossip. | Decentralized scheduling - no central scheduler service. |
@@ -362,11 +362,13 @@ sequenceDiagram
     participant Seed as Seed node
     participant New as New node
 
-    Op->>Seed: scp aerolvm-tls-bundle.tar.gz
-    Note over Seed: bundle = ca.crt + ca.key + credential_encryption.key
+    Op->>Seed: retrieve public CA trust bundle
+    Note over Seed: ca.key remains with offline signer/HSM
     Op->>New: install.sh
-    Op->>New: cluster-join.sh --tls-bundle ... --seed ...
-    New->>New: extract bundle, write keys, write cluster.env
+    Op->>New: cluster-join.sh --tls-bundle ... --cred-bundle ...
+    New->>New: generate node.key + CSR locally
+    Op->>Seed: sign CSR with cluster-sign-node.sh
+    Op->>New: install signed node.crt; write cluster.env
     New->>Seed: gossip handshake (signed with shared key)
     Seed-->>New: welcome (membership view)
     New->>Seed: request raft join (mTLS via :7002)

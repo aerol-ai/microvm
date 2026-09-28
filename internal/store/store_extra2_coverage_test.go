@@ -24,7 +24,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = st.UpsertCompatState(ctx, "sb-list", "key1", "val1")
 	_ = st.AddCustomDomain(ctx, "sb-list", "domain.com", 80)
 	_ = st.PutMounts(ctx, "sb-list", []byte("a"))
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{SandboxID: "sb-list"})
 
 	// Run List to hit Scan rows
 	_, _ = st.List(ctx)
@@ -44,7 +44,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	cancel()
 	_ = st.SetFleetSuspended(ctxCancel, "tpl", true)
 	_, _ = st.RefreshPendingImageGCIfExists(ctxCancel, "tpl", time.Now())
-	_, _ = st.DeletePendingImageGCIfScheduledAt(ctxCancel, "tpl", time.Now())
+	_, _ = st.DeletePendingImageGCIfScheduledAt(ctxCancel, "", "tpl", time.Now())
 
 	_, _ = Open("invalid-dsn:::")
 	_, _ = Open("file::memory:?cache=shared")
@@ -137,7 +137,7 @@ func TestStoreMiscHelpers(t *testing.T) {
 	_ = sandboxFailoverPolicy(&models.Sandbox{})
 
 	_ = st.DeleteMounts(ctx, "sb-list")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb-list")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb-list", "inc-list")
 	_ = st.DeleteSnapshotAlias(ctx, "alias-list")
 	_ = st.DeleteSnapshot(ctx, "snap-list")
 	_ = st.DeleteTemplate(ctx, "tpl-list")
@@ -172,7 +172,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListCustomDomains(ctx, "sb")
 	_, _ = st.ListAllCustomDomains(ctx)
 	_ = st.SetCustomDomainStatus(ctx, "sb", models.CustomDomainStatus("active"), "err")
-	_ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
+	_, _ = st.PutClusterSecret(ctx, ClusterSecretRecord{})
 	_, _ = st.AllocateFirecrackerTapSlot(ctx, "sb", time.Now())
 	_ = st.ReleaseFirecrackerTapSlot(ctx, "sb")
 	_ = st.MarkFirecrackerVMMSlotLoaded(ctx, "id", "sb", "tap", 1, time.Now())
@@ -186,7 +186,7 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.GetFirecrackerVMMPoolStats(ctx, "tpl")
 	_ = st.SetFleetSuspended(ctx, "tpl", true)
 	_, _ = st.RefreshPendingImageGCIfExists(ctx, "tpl", time.Now())
-	_, _ = st.DeletePendingImageGCIfScheduledAt(ctx, "tpl", time.Now())
+	_, _ = st.DeletePendingImageGCIfScheduledAt(ctx, "", "tpl", time.Now())
 
 	_ = st.AddCustomDomain(ctx, "sb", "dom", 80)
 	_ = st.RemoveCustomDomain(ctx, "sb", "dom")
@@ -238,14 +238,14 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_ = st.SetNetworkLimits(ctx, "sb", 1, 1)
 	_ = st.ClearNetworkQuotaExceeded(ctx, "sb")
 	_, _ = st.GetClusterSecret(ctx, "sb")
-	_ = st.DeleteClusterSecretsForSandbox(ctx, "sb")
+	_ = st.DeleteClusterSecretRowsForIncarnation(ctx, "sb", "inc")
 	_, _ = st.GetMounts(ctx, "sb")
 
 	_ = st.DeleteAllWasmStateKV(ctx, "sb")
 	_, _ = st.ListWasmCheckpointPushes(ctx, "sb")
 	_ = st.DeleteWasmCheckpointPush(ctx, 1)
 	_ = st.DeleteAllWasmCheckpointPushes(ctx, "sb")
-	_ = st.UpdateWasmRegistryPush(ctx, "sb", "ref", "dig")
+	_, _ = st.UpdateWasmRegistryPush(ctx, "sb", "", "ref", "dig")
 	_, _ = st.ListReadyWasmModuleRefs(ctx)
 	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
 	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")

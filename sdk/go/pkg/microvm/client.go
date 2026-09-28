@@ -160,7 +160,8 @@ func (c *Client) CreateWithImage(ctx context.Context, image *Image, opts sdktype
 type ListOption func(*listOptions)
 
 type listOptions struct {
-	tags map[string]string
+	tags       map[string]string
+	includeEnv bool
 }
 
 // WithTags filters the result to sandboxes whose Tags map contains every
@@ -171,12 +172,18 @@ func WithTags(tags map[string]string) ListOption {
 	return func(o *listOptions) { o.tags = tags }
 }
 
+// WithIncludeEnv requests sandbox env vars on List/Get (`?include_env=true`).
+// Env is omitted by default; opt-in reads are audited server-side.
+func WithIncludeEnv() ListOption {
+	return func(o *listOptions) { o.includeEnv = true }
+}
+
 func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, error) {
 	var cfg listOptions
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, err := c.inner.List(ctx, cfg.tags)
+	items, err := c.inner.ListWithOptions(ctx, cfg.tags, cfg.includeEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -187,8 +194,43 @@ func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, erro
 	return wrapped, nil
 }
 
-func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
-	item, err := c.inner.Get(ctx, id)
+// ListPage fetches one bounded page and returns the server's opaque token for
+// the next page. Callers inventorying large fleets should loop until the token
+// is empty instead of materializing every sandbox in one slice.
+func (c *Client) ListPage(ctx context.Context, pageToken string, opts ...ListOption) ([]*Sandbox, string, error) {
+	var cfg listOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	items, next, err := c.inner.ListPageWithOptions(ctx, cfg.tags, cfg.includeEnv, pageToken)
+	if err != nil {
+		return nil, "", err
+	}
+	wrapped := make([]*Sandbox, 0, len(items))
+	for _, item := range items {
+		wrapped = append(wrapped, wrapSandbox(c, item))
+	}
+	return wrapped, next, nil
+}
+
+// GetOption customizes a Get call.
+type GetOption func(*getOptions)
+
+type getOptions struct {
+	includeEnv bool
+}
+
+// WithGetIncludeEnv requests env on Get (`?include_env=true`).
+func WithGetIncludeEnv() GetOption {
+	return func(o *getOptions) { o.includeEnv = true }
+}
+
+func (c *Client) Get(ctx context.Context, id string, opts ...GetOption) (*Sandbox, error) {
+	var cfg getOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	item, err := c.inner.GetWithOptions(ctx, id, cfg.includeEnv)
 	if err != nil {
 		return nil, err
 	}

@@ -22,6 +22,11 @@ CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
 RUNSC_PATH=""
 WITH_ISOLATE="false"
+# Routing without per-sandbox Caddy writes (plans/ingress-proxy-routing.md).
+# Sets SB_INGRESS_PROXY_ROUTING and routes *.rt.internal to the sandboxd
+# route responder via systemd-resolved.
+INGRESS_PROXY_ROUTING="false"
+ROUTE_DNS_ADDR="127.0.0.1:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -120,6 +125,10 @@ Options:
                                Skips the download step and registers this
                                binary instead. Only consulted with
                                --with-gvisor.
+  --ingress-proxy-routing      Route sandboxes without per-sandbox Caddy
+                               writes (static routes + sandboxd route
+                               responder; configures systemd-resolved for
+                               *.rt.internal). Off by default.
   --with-isolate               Install Cloudflare's workerd (version-pinned,
                                SHA-256 verified against hashes embedded in
                                this script) to /usr/local/bin/workerd and
@@ -290,25 +299,30 @@ curl_download() {
 
 verify_downloads() {
 	local tmp_dir="$1"
-	local sandboxd_asset="$2"
-	local toolboxd_asset="$3"
+	shift
 
 	if [[ -z "$CHECKSUMS_URL" ]]; then
-		return 0
+		echo "Checksum URL is required for prebuilt release installation" >&2
+		return 1
 	fi
 
 	if ! download_asset "$CHECKSUMS_URL" "$tmp_dir/checksums.txt"; then
-		echo "Warning: failed to download checksums; skipping verification" >&2
-		return 0
+		echo "Failed to download release checksums; refusing unverified installation" >&2
+		return 1
 	fi
 
 	(
 		cd "$tmp_dir"
-		grep -E "[[:space:]](${sandboxd_asset}|${toolboxd_asset})$" checksums.txt > selected-checksums.txt || true
-		if [[ ! -s selected-checksums.txt ]]; then
-			echo "Warning: no checksum entries found for downloaded assets; skipping verification" >&2
-			exit 0
-		fi
+		: > selected-checksums.txt
+		local asset
+		for asset in "$@"; do
+			if ! awk -v name="$asset" '$2 == name { print }' checksums.txt > "checksum-${asset}.txt" \
+				|| [[ "$(wc -l < "checksum-${asset}.txt")" -ne 1 ]]; then
+				echo "Missing or ambiguous checksum for release asset: $asset" >&2
+				exit 1
+			fi
+			cat "checksum-${asset}.txt" >> selected-checksums.txt
+		done
 		sha256sum -c selected-checksums.txt
 	)
 }
@@ -393,6 +407,10 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--with-isolate)
 			WITH_ISOLATE="true"
+			shift
+			;;
+		--ingress-proxy-routing)
+			INGRESS_PROXY_ROUTING="true"
 			shift
 			;;
 		--workerd-path)
@@ -709,16 +727,29 @@ install_custom_caddy() {
 
 	local tmp_binary
 	if [[ -n "$CADDY_BINARY_URL" ]]; then
-		tmp_binary="$(mktemp)"
+		local prebuilt_dir
+		local prebuilt_asset
+		prebuilt_dir="$(mktemp -d)"
+		prebuilt_asset="$(basename "${CADDY_BINARY_URL%%\?*}")"
+		tmp_binary="$prebuilt_dir/$prebuilt_asset"
 		echo "Downloading prebuilt custom Caddy from ${CADDY_BINARY_URL}"
-		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary" \
-			&& verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+		if curl_download "$CADDY_BINARY_URL" -o "$tmp_binary"; then
+			if [[ "$CADDY_BINARY_URL_EXPLICIT" != "true" ]] \
+				&& ! verify_downloads "$prebuilt_dir" "$prebuilt_asset"; then
+				rm -rf "$prebuilt_dir"
+				echo "Prebuilt custom Caddy checksum verification failed" >&2
+				exit 1
+			fi
+			if ! verify_custom_caddy_binary "$tmp_binary" "Prebuilt custom Caddy binary" "${required_modules[@]}"; then
+				rm -rf "$prebuilt_dir"
+				exit 1
+			fi
 			systemctl stop caddy >/dev/null 2>&1 || true
 			install -m 0755 "$tmp_binary" "$caddy_path"
-			rm -f "$tmp_binary"
+			rm -rf "$prebuilt_dir"
 			return
 		fi
-		rm -f "$tmp_binary"
+		rm -rf "$prebuilt_dir"
 		if [[ "$CADDY_BINARY_URL_EXPLICIT" == "true" ]]; then
 			echo "Failed to install custom Caddy from explicit --caddy-binary-url: ${CADDY_BINARY_URL}" >&2
 			exit 1
@@ -816,6 +847,8 @@ SB_L4_PORT_RANGE_END=23000
 # isn't needed for issuance. In IP/path mode (no --domain) this stays
 # empty and the layer4 multiplexer is never started.
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
+SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
+SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
@@ -838,6 +871,22 @@ EOF
 		if [[ -n "${WORKERD_BIN_RESOLVED:-}" && "$WORKERD_BIN_RESOLVED" != "/usr/local/bin/workerd" ]]; then
 			echo "SB_ISOLATE_WORKERD_PATH=$WORKERD_BIN_RESOLVED" >> /etc/sandboxd/sandboxd.env
 		fi
+		# The jail drops each workerd group process to a dedicated system
+		# user. The daemon's default (uid/gid 1000) is the first login user on
+		# most images — on AWS Ubuntu that is `ubuntu`, with sudo — so give the
+		# jail an identity that owns nothing and can log in nowhere.
+		if ! getent passwd sandboxd-isolate >/dev/null 2>&1; then
+			useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-isolate
+		fi
+		ISOLATE_JAIL_UID="$(id -u sandboxd-isolate)"
+		ISOLATE_JAIL_GID="$(id -g sandboxd-isolate)"
+		{
+			echo "SB_ISOLATE_JAIL_UID=${ISOLATE_JAIL_UID}"
+			echo "SB_ISOLATE_JAIL_GID=${ISOLATE_JAIL_GID}"
+			echo "SB_ISOLATE_JAIL_CHROOT_BASE=/srv/isolate-jail"
+			echo "SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate"
+		} >> /etc/sandboxd/sandboxd.env
+		install -d -m 0755 /srv/isolate-jail
 	fi
 	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
 	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
@@ -1000,6 +1049,70 @@ write_caddy_env() {
 	} > /etc/default/caddy
 	chmod 0600 /etc/default/caddy
 	chown root:root /etc/default/caddy
+}
+
+# write_route_dns_resolver routes the ingress zone (and ONLY that zone) to the
+# sandboxd route responder. caddy-l4 dials "{sni}.rt.internal" through the
+# system resolver; sandboxd refuses SB_INGRESS_PROXY_ROUTING at boot if this
+# routing is missing (routedns.ProbeName), so a half-configured node stays on
+# the per-sandbox route path.
+#
+# WHY a dedicated dummy link, not a resolved.conf.d drop-in: DNS servers in
+# resolved's GLOBAL section serve every name, and Domains=~rt.internal there
+# does not restrict them. The responder then answered general lookups, and
+# Caddy's ACME zone detection broke ("expected 1 zone, got 0"), so no cert
+# issued (found live on cluster-3-mixed-routing). Per-link DNS with
+# DNSDefaultRoute=false is used ONLY for the link's routing domains.
+#
+# The link needs an address and no IPv6 autoconf, or networkd leaves it in
+# "configuring" and resolved ignores its DNS settings. Requires
+# systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+write_route_dns_resolver() {
+	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
+		return
+	fi
+	# An earlier build wrote a global drop-in; it must go (see above).
+	if [[ -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf ]]; then
+		rm -f /etc/systemd/resolved.conf.d/aerolvm-route-dns.conf
+	fi
+	if ! systemctl is-active --quiet systemd-networkd || ! systemctl is-active --quiet systemd-resolved; then
+		echo "WARNING: --ingress-proxy-routing needs systemd-networkd + systemd-resolved to scope *.rt.internal;" >&2
+		echo "         not configuring it. sandboxd will refuse the flag at boot and keep per-sandbox Caddy routes." >&2
+		return
+	fi
+	mkdir -p /etc/systemd/network
+	cat > /etc/systemd/network/10-aerolvm-rt.netdev <<'EOF'
+[NetDev]
+Name=aerolvm-rt
+Kind=dummy
+EOF
+	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=169.254.53.53/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+	systemctl restart systemd-networkd
+	systemctl restart systemd-resolved
+	local i
+	for i in $(seq 1 30); do
+		if resolvectl status aerolvm-rt 2>/dev/null | grep -q "Current Scopes: DNS"; then
+			return
+		fi
+		sleep 1
+	done
+	echo "WARNING: aerolvm-rt never got a DNS scope; sandboxd will refuse --ingress-proxy-routing at boot." >&2
 }
 
 write_caddy_systemd_dropin() {
@@ -1202,19 +1315,43 @@ install_amd_gpu() {
 	echo "Verify with: rocm-smi"
 }
 
-install_runsc_binary() {
-	# Download the latest runsc release from gVisor's official storage bucket
-	# and install it to /usr/local/bin. The bucket layout is:
-	#   storage.googleapis.com/gvisor/releases/release/latest/<arch>/{runsc,runsc.sha512}
-	# where <arch> is x86_64 or aarch64. We verify the SHA-512 published next
-	# to the binary before installing — the upstream-recommended pattern from
-	# https://gvisor.dev/docs/user_guide/install/.
+# gvisor_fetch_release downloads and verifies the gVisor release tarball ONCE
+# per install, extracting it into a shared directory both installers read.
+#
+# Upstream changed its release layout: the bucket no longer publishes bare
+# runsc / containerd-shim-runsc-v1 objects, only
+#   releases/release/latest/<arch>/gvisor.tar.{bz2,zstd}(.sha512)
+# so every `--with-gvisor` install failed at download with a plain 404:
+#
+#   curl: (22) The requested URL returned error: 404
+#   --with-gvisor: failed to download runsc from .../latest/x86_64/runsc
+#
+# install.sh exits on that, so sandboxd was never installed at all on a
+# gvisor node. It took out all four workers of an 8-node scenario while the
+# servers — which do not set with_gvisor — came up fine, so the cluster
+# reported "expected 8 members, never reached (last 4)" and looked like a
+# membership bug.
+GVISOR_RELEASE_DIR=""
+GVISOR_TMP_DIRS=()
+gvisor_cleanup_tmp() {
+	local d
+	for d in ${GVISOR_TMP_DIRS+"${GVISOR_TMP_DIRS[@]}"}; do
+		[[ -n "$d" ]] && rm -rf "$d"
+	done
+	GVISOR_TMP_DIRS=()
+}
+trap gvisor_cleanup_tmp EXIT
+
+gvisor_fetch_release() {
+	if [[ -n "$GVISOR_RELEASE_DIR" && -x "${GVISOR_RELEASE_DIR}/runsc" ]]; then
+		return 0
+	fi
 	local arch
 	case "$(uname -m)" in
 		x86_64|amd64)   arch="x86_64" ;;
 		aarch64|arm64)  arch="aarch64" ;;
 		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for runsc" >&2
+			echo "--with-gvisor: unsupported architecture $(uname -m) for gVisor" >&2
 			exit 1
 			;;
 	esac
@@ -1222,32 +1359,58 @@ install_runsc_binary() {
 	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
 	local tmp_dir
 	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
+	# Cleaned on exit rather than on RETURN: the extracted tree is shared by
+	# install_runsc_binary and install_runsc_shim, so a RETURN trap would
+	# delete it out from under the second caller. It is ~500MB extracted, on
+	# a 20GB root volume, so leaving it behind is not an option either.
+	GVISOR_TMP_DIRS+=("$tmp_dir")
 
-	echo "Downloading runsc for ${arch} from ${base}"
-	if ! curl_download "${base}/runsc" -o "${tmp_dir}/runsc"; then
-		echo "--with-gvisor: failed to download runsc from ${base}/runsc" >&2
+	echo "Downloading gVisor release for ${arch} from ${base}"
+	if ! curl_download "${base}/gvisor.tar.bz2" -o "${tmp_dir}/gvisor.tar.bz2"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2 from ${base}/gvisor.tar.bz2" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/runsc.sha512" -o "${tmp_dir}/runsc.sha512"; then
-		echo "--with-gvisor: failed to download runsc.sha512 from ${base}/runsc.sha512" >&2
+	if ! curl_download "${base}/gvisor.tar.bz2.sha512" -o "${tmp_dir}/gvisor.tar.bz2.sha512"; then
+		echo "--with-gvisor: failed to download gvisor.tar.bz2.sha512" >&2
 		exit 1
 	fi
 
-	# gVisor's published checksum file uses the binary path under the bucket,
-	# not just the basename. Rewrite it to match what we have on disk so
-	# sha512sum -c finds the file. Format is "<hash>  <path>".
+	# The published checksum names the file as "gvisor.tar.bz2", which is what
+	# we wrote, but rewrite it anyway so a future rename upstream cannot turn
+	# verification into a silent no-op.
 	(
 		cd "$tmp_dir"
-		awk '{print $1"  runsc"}' runsc.sha512 > runsc.sha512.local
-		if ! sha512sum -c runsc.sha512.local; then
-			echo "--with-gvisor: runsc checksum verification failed" >&2
+		awk '{print $1"  gvisor.tar.bz2"}' gvisor.tar.bz2.sha512 > gvisor.sha512.local
+		if ! sha512sum -c gvisor.sha512.local; then
+			echo "--with-gvisor: gvisor.tar.bz2 checksum verification failed" >&2
 			exit 1
 		fi
 	)
 
-	install -m 0755 "${tmp_dir}/runsc" /usr/local/bin/runsc
+	if ! tar xjf "${tmp_dir}/gvisor.tar.bz2" -C "$tmp_dir"; then
+		echo "--with-gvisor: failed to extract gvisor.tar.bz2" >&2
+		exit 1
+	fi
+	# runsc now ships with a gvisor-bin/ payload beside it (gvisor_sentry,
+	# checkpointgofer, the metric server…). Installing the single binary and
+	# dropping the rest would produce a runsc that fails at first container
+	# start rather than at install time.
+	if [[ ! -x "${tmp_dir}/runsc" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain runsc (upstream layout changed again?)" >&2
+		exit 1
+	fi
+	GVISOR_RELEASE_DIR="$tmp_dir"
+}
+
+install_runsc_binary() {
+	gvisor_fetch_release
+	install -m 0755 "${GVISOR_RELEASE_DIR}/runsc" /usr/local/bin/runsc
+	if [[ -d "${GVISOR_RELEASE_DIR}/gvisor-bin" ]]; then
+		install -d -m 0755 /usr/local/bin/gvisor-bin
+		find "${GVISOR_RELEASE_DIR}/gvisor-bin" -maxdepth 1 -type f -exec \
+			install -m 0755 {} /usr/local/bin/gvisor-bin/ \;
+		echo "Installed gVisor support binaries to /usr/local/bin/gvisor-bin"
+	fi
 	echo "Installed runsc to /usr/local/bin/runsc"
 }
 
@@ -1262,43 +1425,12 @@ install_runsc_shim() {
 		echo "containerd-shim-runsc-v1 already installed"
 		return 0
 	fi
-
-	local arch
-	case "$(uname -m)" in
-		x86_64|amd64)   arch="x86_64" ;;
-		aarch64|arm64)  arch="aarch64" ;;
-		*)
-			echo "--with-gvisor: unsupported architecture $(uname -m) for containerd-shim-runsc-v1" >&2
-			exit 1
-			;;
-	esac
-
-	local base="https://storage.googleapis.com/gvisor/releases/release/latest/${arch}"
-	local tmp_dir
-	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at exit
-	trap "rm -rf '$tmp_dir'" RETURN
-
-	echo "Downloading containerd-shim-runsc-v1 for ${arch} from ${base}"
-	if ! curl_download "${base}/containerd-shim-runsc-v1" -o "${tmp_dir}/containerd-shim-runsc-v1"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1 from ${base}/containerd-shim-runsc-v1" >&2
+	gvisor_fetch_release
+	if [[ ! -x "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" ]]; then
+		echo "--with-gvisor: gvisor.tar.bz2 did not contain containerd-shim-runsc-v1" >&2
 		exit 1
 	fi
-	if ! curl_download "${base}/containerd-shim-runsc-v1.sha512" -o "${tmp_dir}/containerd-shim-runsc-v1.sha512"; then
-		echo "--with-gvisor: failed to download containerd-shim-runsc-v1.sha512" >&2
-		exit 1
-	fi
-
-	(
-		cd "$tmp_dir"
-		awk '{print $1"  containerd-shim-runsc-v1"}' containerd-shim-runsc-v1.sha512 > shim.sha512.local
-		if ! sha512sum -c shim.sha512.local; then
-			echo "--with-gvisor: containerd-shim-runsc-v1 checksum verification failed" >&2
-			exit 1
-		fi
-	)
-
-	install -m 0755 "${tmp_dir}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
+	install -m 0755 "${GVISOR_RELEASE_DIR}/containerd-shim-runsc-v1" /usr/local/bin/containerd-shim-runsc-v1
 	echo "Installed containerd-shim-runsc-v1 to /usr/local/bin/containerd-shim-runsc-v1"
 }
 
@@ -1652,6 +1784,7 @@ install_binaries
 write_environment
 write_caddy_env
 write_caddy_systemd_dropin
+write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
 write_healthcheck_script

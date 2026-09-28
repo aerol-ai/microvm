@@ -168,15 +168,16 @@ func TestVolumeAttachmentsBlockDeleteAndPendingLedger(t *testing.T) {
 	if err := st.CreateVolume(ctx, vol); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := st.Create(ctx, sampleSandbox("sb-attach")); err != nil {
+	if err := st.Create(ctx, sampleVolumeSandbox("sb-attach")); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
 	attachment := models.VolumeAttachment{
-		Tenant:    "t-a",
-		VolumeID:  "v1",
-		SandboxID: "sb-attach",
-		Target:    "/data",
-		Source:    "bucket/prefix/t-a/data",
+		Tenant:        "t-a",
+		VolumeID:      "v1",
+		SandboxID:     "sb-attach",
+		IncarnationID: "inc-sb-attach",
+		Target:        "/data",
+		Source:        "bucket/prefix/t-a/data",
 	}
 	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{attachment}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
@@ -329,23 +330,80 @@ func TestDeleteVolumeAttachmentsForSandbox(t *testing.T) {
 	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "bucket/t-a/data"}); err != nil {
 		t.Fatalf("CreateVolume: %v", err)
 	}
-	if err := st.Create(ctx, sampleSandbox("sb-1")); err != nil {
+	if err := st.Create(ctx, sampleVolumeSandbox("sb-1")); err != nil {
 		t.Fatalf("Create sandbox: %v", err)
 	}
 	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+		Tenant: "t-a", VolumeID: "v1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "bucket/t-a/data",
 	}}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
 	}
-	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("DeleteVolumeAttachmentsForSandbox: %v", err)
 	}
 	count, err := st.CountVolumeAttachments(ctx, "t-a", "v1")
 	if err != nil || count != 0 {
 		t.Fatalf("CountVolumeAttachments after explicit delete = %d, %v", count, err)
 	}
-	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("idempotent delete: %v", err)
+	}
+}
+
+func sampleVolumeSandbox(id string) *models.Sandbox {
+	sandbox := sampleSandbox(id)
+	sandbox.AuditIncarnationID = "inc-" + id
+	return sandbox
+}
+
+func TestVolumeAttachmentsAreIncarnationFencedAcrossIDReuse(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	if err := st.CreateVolume(ctx, &models.Volume{ID: "v1", Tenant: "t-a", Name: "data", Backend: "s3"}); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	if err := st.Create(ctx, sampleVolumeSandbox("reused")); err != nil {
+		t.Fatalf("create old sandbox: %v", err)
+	}
+	oldAttachment := models.VolumeAttachment{
+		Tenant: "t-a", VolumeID: "v1", SandboxID: "reused", IncarnationID: "inc-reused", Target: "/data", Source: "s/old",
+	}
+	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{oldAttachment}); err != nil {
+		t.Fatalf("attach old: %v", err)
+	}
+	if err := st.Delete(ctx, "reused"); err != nil {
+		t.Fatalf("delete old sandbox: %v", err)
+	}
+	replacement := sampleSandbox("reused")
+	replacement.AuditIncarnationID = "inc-new"
+	if err := st.Create(ctx, replacement); err != nil {
+		t.Fatalf("create replacement sandbox: %v", err)
+	}
+	newAttachment := oldAttachment
+	newAttachment.IncarnationID = "inc-new"
+	newAttachment.Source = "s/new"
+	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{newAttachment}); err != nil {
+		t.Fatalf("attach replacement: %v", err)
+	}
+
+	if err := st.PutVolumeAttachments(ctx, []models.VolumeAttachment{oldAttachment}); err == nil {
+		t.Fatal("stale attachment put succeeded")
+	}
+	if err := st.DeleteVolumeAttachmentsForSandbox(ctx, "reused", "inc-reused"); err != nil {
+		t.Fatalf("stale delete: %v", err)
+	}
+	if count, err := st.CountVolumeAttachments(ctx, "t-a", "v1"); err != nil || count != 1 {
+		t.Fatalf("replacement attachment count = %d, err = %v", count, err)
+	}
+	var incarnationID, source string
+	if err := st.db.QueryRowContext(ctx, `
+		SELECT incarnation_id, source FROM volume_attachments
+		WHERE tenant = ? AND volume_id = ? AND sandbox_id = ? AND target = ?
+	`, "t-a", "v1", "reused", "/data").Scan(&incarnationID, &source); err != nil {
+		t.Fatalf("read replacement attachment: %v", err)
+	}
+	if incarnationID != "inc-new" || source != "s/new" {
+		t.Fatalf("replacement attachment mutated by stale operation: incarnation=%q source=%q", incarnationID, source)
 	}
 }
 

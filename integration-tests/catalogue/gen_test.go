@@ -24,11 +24,20 @@ func TestRenderCatalogueMarkdown(t *testing.T) {
 	}
 }
 
+// The registry's exact row count is asserted in ONE place —
+// harness/catalogue_test.go's `want`. This test used to carry a second,
+// approximate count (287 ±15) for the same number, which meant every block of
+// new rows had to remember to update two guards, and the approximate one
+// failed with "want ≈287" long after that number stopped meaning anything.
+// The 61-row security block made it fail for exactly that reason.
+//
+// What this test can assert that the other cannot is the relationship between
+// the registry and its expansion, plus the cross-package invariant that every
+// UCRef resolves. Those are kept; the duplicate count is not.
 func TestCatalogueRegistryMatchesPlan(t *testing.T) {
-	const approx = 287
 	n := len(harness.CatalogueRegistry)
-	if n < approx || n > approx+15 {
-		t.Fatalf("catalogue registry = %d, want ≈%d", n, approx)
+	if n == 0 {
+		t.Fatal("the catalogue registry is empty")
 	}
 	seen := map[string]bool{}
 	for _, row := range harness.CatalogueRegistry {

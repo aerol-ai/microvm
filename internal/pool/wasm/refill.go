@@ -23,7 +23,15 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner) {
 	if cfg.SpawnTimeout <= 0 {
 		cfg.SpawnTimeout = 30 * time.Second
 	}
-	p.SetSpawner(spawner)
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.spawner = spawner
+	p.runWG.Add(1)
+	p.mu.Unlock()
+	defer p.runWG.Done()
 
 	ticker := time.NewTicker(cfg.RefillInterval)
 	defer ticker.Stop()
@@ -31,6 +39,8 @@ func (p *Pool) Run(ctx context.Context, cfg RefillConfig, spawner Spawner) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-p.closeCh:
 			return
 		case <-ticker.C:
 			p.refillTick(ctx, cfg.SpawnTimeout)
@@ -47,7 +57,9 @@ func (p *Pool) refillTick(parent context.Context, spawnTimeout time.Duration) {
 		for i := 0; i < budget; i++ {
 			p.MarkSpawning(t.Digest)
 			ctx, cancel := context.WithTimeout(parent, spawnTimeout)
+			stopCloseCancel := context.AfterFunc(p.closeCtx, cancel)
 			slot, err := p.WarmOne(ctx, t.Digest, t.Path)
+			stopCloseCancel()
 			cancel()
 			if err != nil {
 				p.UnmarkSpawning(t.Digest)

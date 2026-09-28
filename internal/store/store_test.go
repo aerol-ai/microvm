@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -134,8 +133,8 @@ func TestStoreCases(t *testing.T) {
 				if got.ID != sandbox.ID || got.Image != sandbox.Image || got.PublicURL != sandbox.PublicURL {
 					t.Fatalf("unexpected sandbox: %+v", got)
 				}
-				if !reflect.DeepEqual(got.Env, sandbox.Env) || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
-					t.Fatalf("unexpected env/command: %+v", got)
+				if len(got.Env) != 0 || !reflect.DeepEqual(got.ContainerCommand, sandbox.ContainerCommand) {
+					t.Fatalf("unexpected sandbox-row env/command: %+v", got)
 				}
 				if got.Runtime != sandbox.Runtime {
 					t.Fatalf("unexpected runtime: got %q, want %q", got.Runtime, sandbox.Runtime)
@@ -1447,10 +1446,10 @@ func TestStoreCases(t *testing.T) {
 				early := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 				later := early.Add(2 * time.Hour)
 
-				if err := st.SchedulePendingImageGC(ctx, "img:1", early); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", early); err != nil {
 					t.Fatalf("schedule early: %v", err)
 				}
-				if err := st.SchedulePendingImageGC(ctx, "img:1", later); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", later); err != nil {
 					t.Fatalf("schedule later: %v", err)
 				}
 
@@ -1499,7 +1498,7 @@ func TestStoreCases(t *testing.T) {
 					{"img:future", base.Add(2 * time.Hour)},
 				}
 				for _, r := range rows {
-					if err := st.SchedulePendingImageGC(ctx, r.image, r.at); err != nil {
+					if err := st.SchedulePendingImageGC(ctx, "", r.image, r.at); err != nil {
 						t.Fatalf("schedule %s: %v", r.image, err)
 					}
 				}
@@ -1530,19 +1529,19 @@ func TestStoreCases(t *testing.T) {
 				defer st.Close()
 
 				when := time.Date(2026, 5, 25, 0, 0, 0, 0, time.UTC)
-				if err := st.SchedulePendingImageGC(ctx, "img:1", when); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", when); err != nil {
 					t.Fatalf("schedule: %v", err)
 				}
-				if err := st.DeletePendingImageGC(ctx, "img:1"); err != nil {
+				if err := st.DeletePendingImageGC(ctx, "", "img:1"); err != nil {
 					t.Fatalf("first delete: %v", err)
 				}
-				if err := st.DeletePendingImageGC(ctx, "img:1"); err != nil {
+				if err := st.DeletePendingImageGC(ctx, "", "img:1"); err != nil {
 					t.Fatalf("second delete: %v", err)
 				}
-				if err := st.DeletePendingImageGC(ctx, "img:never-scheduled"); err != nil {
+				if err := st.DeletePendingImageGC(ctx, "", "img:never-scheduled"); err != nil {
 					t.Fatalf("delete missing: %v", err)
 				}
-				if err := st.DeletePendingImageGC(ctx, ""); err != nil {
+				if err := st.DeletePendingImageGC(ctx, "", ""); err != nil {
 					t.Fatalf("delete empty: %v", err)
 				}
 
@@ -1571,7 +1570,7 @@ func TestStoreCases(t *testing.T) {
 				base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 				for i := 0; i < 10; i++ {
 					img := fmt.Sprintf("img:%02d", i)
-					if err := st.SchedulePendingImageGC(ctx, img, base.Add(time.Duration(i)*time.Minute)); err != nil {
+					if err := st.SchedulePendingImageGC(ctx, "", img, base.Add(time.Duration(i)*time.Minute)); err != nil {
 						t.Fatalf("schedule %s: %v", img, err)
 					}
 				}
@@ -1616,13 +1615,13 @@ func TestStoreCases(t *testing.T) {
 
 				orig := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 				refreshed := orig.Add(time.Hour)
-				if err := st.SchedulePendingImageGC(ctx, "img:1", orig); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", orig); err != nil {
 					t.Fatalf("schedule orig: %v", err)
 				}
 
 				// No refresh yet — conditional delete on the observed
 				// timestamp must succeed.
-				ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "img:1", orig)
+				ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "img:1", orig)
 				if err != nil {
 					t.Fatalf("conditional delete: %v", err)
 				}
@@ -1633,13 +1632,13 @@ func TestStoreCases(t *testing.T) {
 				// Re-seed and simulate a destroy that refreshed the row
 				// after we read it. Conditional delete on the stale
 				// timestamp must NOT remove the freshly-extended row.
-				if err := st.SchedulePendingImageGC(ctx, "img:1", orig); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", orig); err != nil {
 					t.Fatalf("re-schedule orig: %v", err)
 				}
-				if err := st.SchedulePendingImageGC(ctx, "img:1", refreshed); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", refreshed); err != nil {
 					t.Fatalf("refresh: %v", err)
 				}
-				ok, err = st.DeletePendingImageGCIfScheduledAt(ctx, "img:1", orig)
+				ok, err = st.DeletePendingImageGCIfScheduledAt(ctx, "", "img:1", orig)
 				if err != nil {
 					t.Fatalf("conditional delete after refresh: %v", err)
 				}
@@ -1656,10 +1655,10 @@ func TestStoreCases(t *testing.T) {
 				}
 
 				// Empty image and missing image are no-ops.
-				if ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", orig); err != nil || ok {
+				if ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "", orig); err != nil || ok {
 					t.Fatalf("empty image: ok=%v err=%v", ok, err)
 				}
-				if ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "img:never", orig); err != nil || ok {
+				if ok, err := st.DeletePendingImageGCIfScheduledAt(ctx, "", "img:never", orig); err != nil || ok {
 					t.Fatalf("missing image: ok=%v err=%v", ok, err)
 				}
 			},
@@ -1698,7 +1697,7 @@ func TestStoreCases(t *testing.T) {
 				// Seed an old row; refresh moves scheduled_at forward.
 				orig := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
 				pushed := orig.Add(2 * time.Hour)
-				if err := st.SchedulePendingImageGC(ctx, "img:1", orig); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "img:1", orig); err != nil {
 					t.Fatalf("seed: %v", err)
 				}
 				ok, err = st.RefreshPendingImageGCIfExists(ctx, "img:1", pushed)
@@ -1732,7 +1731,7 @@ func TestStoreCases(t *testing.T) {
 				}
 				defer st.Close()
 
-				if err := st.SchedulePendingImageGC(ctx, "", time.Now().UTC()); err != nil {
+				if err := st.SchedulePendingImageGC(ctx, "", "", time.Now().UTC()); err != nil {
 					t.Fatalf("schedule empty: %v", err)
 				}
 				due, err := st.ListPendingImageGCDue(ctx, time.Now().UTC().Add(time.Hour), 0)
@@ -2126,61 +2125,6 @@ func TestStoreHelperCases(t *testing.T) {
 		}
 	})
 
-	t.Run("scan_sandbox_invalid_env_json_returns_error", func(t *testing.T) {
-		now := time.Now()
-		row := sqlRowStub{values: []any{
-			"sb-bad",                    // id
-			"image",                     // image
-			models.SandboxStatusStarted, // status
-			"https://example.com",       // public_url
-			"container",                 // container_id
-			"10.0.0.1",                  // container_ip
-			float64(1),                  // cpu
-			1024,                        // memory_mb
-			10,                          // disk_gb
-			"root",                      // os_user
-			"{bad json",                 // env_json — triggers the failure
-			0,                           // network_blocked
-			"[]",                        // network_allow_out_json
-			"[]",                        // network_deny_out_json
-			1,                           // allow_public_traffic
-			"",                          // mask_request_host
-			1,                           // toolbox_enabled
-			"",                          // toolbox_token
-			"",                          // ssh_public_key
-			"",                          // last_error
-			"[]",                        // container_command_json
-			"",                          // name
-			"{}",                        // tags_json
-			now, now, now,               // created_at, updated_at, last_active_at
-			int64(0), int64(0), int64(0), int64(0), // lifecycle ns columns
-			"",                 // failover_policy
-			"",                 // runtime
-			"docker",           // engine
-			"",                 // gpus_json
-			int64(0), int64(0), // net_bytes_in, net_bytes_out
-			int64(0), int64(0), // net_bytes_in_limit, net_bytes_out_limit
-			0,              // net_quota_exceeded
-			sql.NullTime{}, // net_quota_exceeded_at
-			[]byte(nil),    // registry_auth_sealed
-			0,              // auto_import_pending
-			0,              // serverless
-			0,              // wake_armed
-			"",             // template_id
-			0,              // overlay_size_gb
-			"passivatable", // durability
-			"", "",         // module_ref, module_digest
-			"", "", // checkpoint_path, clone_generation
-			"", "", // wasm_registry_ref, wasm_registry_digest
-			"", // owner_ref
-			0,  // fleet_suspended
-			"", // tenant_id
-		}}
-		_, err := scanSandbox(row)
-		if err == nil {
-			t.Fatalf("expected scanSandbox() error")
-		}
-	})
 }
 
 type sqlRowStub struct {
@@ -2199,13 +2143,14 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 	st := newTestStore(t)
 
 	rec := ClusterSecretRecord{
-		Ref:           "cluster-secret://sandbox/sb-store/v1",
-		SandboxID:     "sb-store",
-		Version:       1,
-		Recipients:    []string{"node-a"},
-		SealedPayload: []byte("opaque-ciphertext"),
+		Ref:            "cluster-secret://sandbox/sb-store/i/inc-store/v1",
+		SandboxID:      "sb-store",
+		Version:        1,
+		Recipients:     []string{"node-a"},
+		SealedPayload:  []byte("opaque-ciphertext"),
+		SealGeneration: 1,
 	}
-	if err := st.PutClusterSecret(ctx, rec); err != nil {
+	if _, err := st.PutClusterSecret(ctx, rec); err != nil {
 		t.Fatalf("PutClusterSecret: %v", err)
 	}
 	got, err := st.GetClusterSecret(ctx, rec.Ref)
@@ -2222,11 +2167,82 @@ func TestClusterSecretsStoreRoundTripAndDelete(t *testing.T) {
 		t.Fatalf("sealed payload = %q", string(got.SealedPayload))
 	}
 
-	if err := st.DeleteClusterSecretsForSandbox(ctx, rec.SandboxID); err != nil {
-		t.Fatalf("DeleteClusterSecretsForSandbox: %v", err)
+	if _, err := st.DeleteClusterSecretsOriginatorWithOutbox(ctx, rec.SandboxID, "inc-store", []string{"node-a"}); err != nil {
+		t.Fatalf("DeleteClusterSecretsOriginatorWithOutbox: %v", err)
 	}
 	if _, err := st.GetClusterSecret(ctx, rec.Ref); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetClusterSecret after delete = %v, want ErrNotFound", err)
+	}
+	tombGeneration, err := st.ClusterSecretTombGenerationForIncarnation(ctx, rec.SandboxID, "inc-store")
+	if err != nil || tombGeneration == 0 {
+		t.Fatalf("ClusterSecretTombGenerationForIncarnation = %d %v, want non-zero", tombGeneration, err)
+	}
+	if err := st.ClearClusterSecretTombForIncarnation(ctx, rec.SandboxID, "inc-store"); err != nil {
+		t.Fatalf("ClearClusterSecretTomb: %v", err)
+	}
+	tombGeneration, err = st.ClusterSecretTombGenerationForIncarnation(ctx, rec.SandboxID, "inc-store")
+	if err != nil || tombGeneration != 0 {
+		t.Fatalf("ClusterSecretTombGenerationForIncarnation after clear = %d %v, want zero", tombGeneration, err)
+	}
+}
+
+func TestListClusterSecretsBatch(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	empty, err := st.ListClusterSecretsBatch(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("ListClusterSecrets empty: %v", err)
+	}
+	if len(empty) != 0 {
+		t.Fatalf("ListClusterSecrets empty = %d, want 0", len(empty))
+	}
+
+	a := ClusterSecretRecord{
+		Ref:            "cluster-secret://sandbox/sb-a/i/inc-a/v1",
+		SandboxID:      "sb-a",
+		Version:        1,
+		Recipients:     []string{"node-a", "node-b"},
+		SealedPayload:  []byte("cipher-a"),
+		SealGeneration: 1,
+	}
+	b := ClusterSecretRecord{
+		Ref:            "cluster-secret://sandbox/sb-b/i/inc-b/v1",
+		SandboxID:      "sb-b",
+		Version:        1,
+		Recipients:     []string{"node-a"},
+		SealedPayload:  []byte("cipher-b"),
+		SealGeneration: 1,
+	}
+	if _, err := st.PutClusterSecret(ctx, a); err != nil {
+		t.Fatalf("PutClusterSecret a: %v", err)
+	}
+	if _, err := st.PutClusterSecret(ctx, b); err != nil {
+		t.Fatalf("PutClusterSecret b: %v", err)
+	}
+
+	first, err := st.ListClusterSecretsBatch(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("ListClusterSecretsBatch first: %v", err)
+	}
+	if len(first) != 1 {
+		t.Fatalf("ListClusterSecretsBatch first len = %d, want 1", len(first))
+	}
+	second, err := st.ListClusterSecretsBatch(ctx, first[0].Ref, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("ListClusterSecretsBatch second = %+v, %v", second, err)
+	}
+	if first[0].SandboxID != "sb-a" || second[0].SandboxID != "sb-b" {
+		t.Fatalf("order = %q,%q want sb-a,sb-b", first[0].SandboxID, second[0].SandboxID)
+	}
+	if len(first[0].Recipients) != 2 || string(first[0].SealedPayload) != "cipher-a" {
+		t.Fatalf("row a = %+v", first[0])
+	}
+	if len(second[0].Recipients) != 1 || string(second[0].SealedPayload) != "cipher-b" {
+		t.Fatalf("row b = %+v", second[0])
+	}
+	if tail, err := st.ListClusterSecretsBatch(ctx, second[0].Ref, 1); err != nil || len(tail) != 0 {
+		t.Fatalf("ListClusterSecretsBatch tail = %+v, %v", tail, err)
 	}
 }
 
@@ -2463,7 +2479,7 @@ func TestWasmCheckpointColumnsRoundTrip(t *testing.T) {
 	if got.CheckpointPath != sb.CheckpointPath || got.CloneGeneration != sb.CloneGeneration {
 		t.Fatalf("checkpoint fields = %+v, want path=%q gen=%q", got, sb.CheckpointPath, sb.CloneGeneration)
 	}
-	if err := st.UpdateWasmCheckpoint(ctx, sb.ID, string(models.SandboxStatusPassivated), "/new/path", "gen-2", ""); err != nil {
+	if err := st.UpdateWasmCheckpoint(ctx, sb.ID, "", string(models.SandboxStatusPassivated), "/new/path", "gen-2", ""); err != nil {
 		t.Fatalf("UpdateWasmCheckpoint: %v", err)
 	}
 	got, err = st.Get(ctx, sb.ID)
@@ -2631,5 +2647,60 @@ func TestWasmStateKVCRUD(t *testing.T) {
 	_, ok, err = st.GetWasmStateKV(ctx, sandboxID, "counter")
 	if err != nil || ok {
 		t.Fatalf("GetWasmStateKV after delete = ok=%v err=%v", ok, err)
+	}
+}
+
+// TestSnapshotPushClaimLease mirrors TestTemplatePushClaimLease for the
+// snapshot ledger: 'pushing' hides a row from the retry queue only for as long
+// as the claim is live, so a pusher that dies mid-push cannot strand the
+// snapshot in a state no reconciler will ever revisit.
+func TestSnapshotPushClaimLease(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	snap := &models.SandboxSnapshot{
+		Name:                  "snap-lease",
+		Image:                 "alpine:3.19",
+		ImageID:               "sha256:abc",
+		CreatedAt:             time.Now().UTC(),
+		ImageDistributionMode: models.ImageDistributionLocalOnly,
+		PushState:             models.SnapshotPushStatePending,
+	}
+	if err := st.CreateSnapshot(ctx, snap); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+
+	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStatePushing, ""); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	rows, err := st.ListSnapshotsPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshotsPendingPush: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("live claim listed %d rows, want 0", len(rows))
+	}
+
+	expired := time.Now().UTC().Add(-PushClaimLease - time.Minute)
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET push_claimed_at = ? WHERE name = ?`, expired, snap.Name); err != nil {
+		t.Fatalf("age the claim: %v", err)
+	}
+	rows, err = st.ListSnapshotsPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshotsPendingPush after expiry: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Name != snap.Name {
+		t.Fatalf("expired claim listed %v, want the row back", rows)
+	}
+
+	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStateActive, ""); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+	rows, err = st.ListSnapshotsPendingPush(ctx)
+	if err != nil {
+		t.Fatalf("ListSnapshotsPendingPush after finish: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("finished snapshot listed %v, want none", rows)
 	}
 }

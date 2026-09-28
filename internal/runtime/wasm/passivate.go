@@ -97,6 +97,9 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 		Preopens:       preopensFromBinds(workDir, hostMounts),
 		WASIListenPort: wasmengine.WASIListenPortDisabled,
 	}, memoryMB, d.cfg.DefaultWallTimeout)
+	if err := d.bindAuditCapability(sandbox.ID, &caps); err != nil {
+		return nil, err
+	}
 
 	if err := client.Restore(sandbox.ID, checkpointPath, caps); err != nil {
 		if errors.Is(err, models.ErrSnapshotCorrupt) || errors.Is(err, models.ErrSnapshotFenced) {

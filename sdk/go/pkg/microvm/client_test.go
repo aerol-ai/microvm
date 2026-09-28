@@ -696,6 +696,37 @@ func TestListWithTagsOptionRendersWireFormat(t *testing.T) {
 	}
 }
 
+func TestGetAndListIncludeEnv(t *testing.T) {
+	ctx := context.Background()
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.URL.String())
+		if strings.Contains(r.URL.Path, "/sandboxes/") {
+			_, _ = w.Write([]byte(`{"id":"sb-1"}`))
+			return
+		}
+		_, _ = w.Write([]byte("[]"))
+	}))
+	defer server.Close()
+
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig() error = %v", err)
+	}
+	if _, err := client.Get(ctx, "sb-1", WithGetIncludeEnv()); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, err := client.List(ctx, WithTags(map[string]string{"team": "a"}), WithIncludeEnv()); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(seen) != 2 || !strings.Contains(seen[0], "include_env=true") || !strings.Contains(seen[1], "include_env=true") {
+		t.Fatalf("seen URLs = %v", seen)
+	}
+	if !strings.Contains(seen[1], "tag.team=a") {
+		t.Fatalf("list URL missing tag: %q", seen[1])
+	}
+}
+
 // TestTemplateLifecycle covers the public CreateTemplate / GetTemplate /
 // ListTemplates / DeleteTemplate / RebuildTemplate methods. The server
 // shape is stubbed via httptest so we can assert method+path+JSON shape

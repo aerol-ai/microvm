@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -143,7 +145,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}()
 	}
 
-	db, err := store.Open(cfg.DBPath)
+	// Initialize the cipher before opening the database. Store startup may need
+	// it to transactionally seal plaintext env/toolbox values left by a
+	// pre-hardening release before any service begins reading the database.
+	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	if err != nil {
+		return fmt.Errorf("initialize credential cipher: %w", err)
+	}
+
+	db, err := store.OpenWithSecretCipher(cfg.DBPath, cipher)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -180,11 +190,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	configureAOCRPullAuth(logger, cfg, dockerClient)
 
 	caddyClient := caddy.New(cfg)
-
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
-	if err != nil {
-		return fmt.Errorf("initialize credential cipher: %w", err)
-	}
 
 	mountManager, err := mounts.New(logger, mounts.Config{
 		RootDir:     cfg.MountsRootPath,
@@ -276,6 +281,22 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// same instance today; the split exists so a future non-Docker runtime
 	// can replace the first without touching the second.
 	svc := service.New(cfg, logger, db, dockerClient, dockerClient, caddyClient, cipher, mountManager, admitter)
+	// Close the audit sink on any return path (boot failure after New, or
+	// graceful shutdown) so the writer goroutine and witness loop do not leak.
+	defer svc.CloseSecretAuditSink()
+	if err := svc.ValidateSecretAuditSink(); err != nil {
+		return err
+	}
+	if err := svc.StartAuditIngestServer(ctx); err != nil {
+		return fmt.Errorf("start audit ingest: %w", err)
+	}
+	defer svc.StopAuditIngestServer()
+	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
+		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
+	}
+	if err := svc.ConfigureSecretProvider(ctx); err != nil {
+		return fmt.Errorf("configure secret provider: %w", err)
+	}
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -289,6 +310,27 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// controlplane.Noop() this is the no-op reporter, so the open-source build
 	// emits nothing and pays no cost.
 	svc.SetUsageReporter(cp.Reporter)
+	svc.SetWitness(cp.Witness)
+	// Audit export connectors (plans/audit-export-connectors.md): a managed
+	// build's injected exporter wins; otherwise SB_AUDIT_EXPORT_BACKEND selects
+	// a connector behind the same tailer. Raft never carries this history.
+	if cp.HasAuditExporter() {
+		svc.SetAuditExporter(cp.AuditExporter)
+	} else if err := svc.ConfigureAuditExporter(); err != nil {
+		return fmt.Errorf("configure audit export connector: %w", err)
+	}
+	// "Enabled" is not the bar: stdout and file are enabled backends that
+	// never leave the node, so disk loss still takes the reconstructable
+	// history with it. Require a backend that ships somewhere this node
+	// cannot silently rewrite, or a programmatic exporter.
+	if cfg.EnterpriseMode && !cp.HasAuditExporter() && !auditexport.IsOffNodeBackend(cfg.ResolvedAuditExportBackend()) {
+		return fmt.Errorf("enterprise mode requires an off-node audit exporter: SB_AUDIT_EXPORT_BACKEND=%q keeps evidence on this node; set webhook|s3|bus (or SB_SECRET_AUDIT_EXPORT_URL) or wire controlplane.AuditExporter", cfg.ResolvedAuditExportBackend())
+	}
+	// Witness is installed after the sink opens; re-validate so enterprise +
+	// external witness fail closed at boot when the chain/receipts disagree.
+	if err := svc.ValidateSecretAuditWitness(); err != nil {
+		return err
+	}
 	// Wire the managed create-gate. Under Noop() this is the allow-all admitter,
 	// so the open-source build never gates a create.
 	svc.SetFleetAdmitter(cp.Admitter)
@@ -501,26 +543,35 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}
 		}()
 		svc.AttachCluster(clusterClient)
+		// Fail closed on oversized ingress tiers without an explicit
+		// shard-aware router opt-in. Enterprise boots refuse to start;
+		// open-source warns and skips marking ingress reconcile ready.
+		if topoErr := svc.ClusterTopologyError(); topoErr != nil {
+			if cfg.EnterpriseMode {
+				return fmt.Errorf("cluster topology: %w (set SB_CLUSTER_SHARD_AWARE_INGRESS=true only when the upstream router shards via /v1/cluster/ingress-route/{id})", topoErr)
+			}
+			logger.Error("cluster topology violation; refusing to mark ingress ready",
+				"error", topoErr,
+				"hint", "set SB_CLUSTER_SHARD_AWARE_INGRESS=true when the upstream router is shard-aware",
+			)
+		}
 		// The owner watcher needs a hook back into the service to recreate
 		// sandboxes whose placements were reassigned to this node after a
 		// dead-owner eviction. Wired here (after both objects exist) to keep
 		// the cluster→service direction one-way through the SandboxRecreator
 		// interface, avoiding an import cycle.
+		//
+		// Both *Cluster and *Agent implement it: a dedicated worker owns
+		// sandboxes too, and when only *Cluster did, this probe silently
+		// skipped every worker-role node and its reassigned placements were
+		// never materialized. A miss is now loud rather than invisible.
 		if withRecreator, ok := clusterClient.(interface {
 			AttachRecreator(cluster.SandboxRecreator)
 		}); ok {
 			withRecreator.AttachRecreator(svc)
-		}
-		// Isolate's JS-bundle store is per-node, so an uploaded bundle must be
-		// fanned out to peers or an isolate create placed on another node fails
-		// "bundle not found". Wire the fan-out only in cluster mode (both
-		// *Cluster and *Agent implement ReplicateJSBundle); single-node leaves
-		// the replicator nil (no-op). Harmless when isolate is off — no bundles
-		// are ever uploaded.
-		if withRep, ok := clusterClient.(interface {
-			ReplicateJSBundle(context.Context, string, models.CreateJSBundleRequest) error
-		}); ok {
-			svc.SetJSBundleReplicator(withRep.ReplicateJSBundle)
+		} else {
+			logger.Error("cluster: client exposes no AttachRecreator; failover recreation is disabled on this node",
+				"node_role", cfg.NodeRole)
 		}
 		// Phase 6 PR-D: template-aware placement. The capacity lease
 		// cache asks the service for the local "ready" template
@@ -539,6 +590,13 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			}); ok {
 				withTemplates.SetLocalTemplateIDsProvider(func() ([]string, bool) {
 					return svc.LocalReadyTemplateInventory(context.Background())
+				})
+			}
+			if withTemplateCatalog, ok := clusterClient.(interface {
+				SetLocalTemplateCatalogProvider(func() ([]string, bool))
+			}); ok {
+				withTemplateCatalog.SetLocalTemplateCatalogProvider(func() ([]string, bool) {
+					return svc.LocalTemplateCatalogInventory(context.Background())
 				})
 			}
 		}
@@ -577,6 +635,17 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			logger.Warn("failed to ensure caddy layer4 app at startup; will retry on first L4 exposure", "error", err)
 		}
 	}
+
+	// Ingress proxy routing (plans/ingress-proxy-routing.md §5): engage (or
+	// roll back) BEFORE the boot reconciles below, so they fill the
+	// in-memory route tables instead of writing Caddy. The Caddy side (one
+	// load) is committed once the router is serving.
+	var hostPortForwarder service.HostPortForwarder
+	if cfg.IngressProxyRouting || readBypassMarker(ingressRoutingMarkerPath(cfg)) {
+		hostPortForwarder = newHostPortForwarder(logger)
+	}
+	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
+	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means
 	// counters stay at zero until the next attempt at lazy bootstrap.
@@ -599,10 +668,68 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			if !replayClusterOwnership(ctx, svc, logger) {
 				startClusterOwnershipReplayRetry(ctx, svc, logger)
 			}
+			// Rebuild secret holder counts + re-push multi-recipient blobs so
+			// failover_ready is not stuck false after a restart (holders are
+			// in-memory only). Best-effort; fan-out continues async.
+			if err := svc.ReFanoutClusterSecrets(ctx); err != nil {
+				switch bootRefanoutDisposition(err, cfg.EnterpriseMode) {
+				// Leadership being momentarily unsettled is the normal state
+				// of a cluster that is starting up, and says nothing about
+				// whether the durable secrets are valid. Exiting on it turned
+				// a routine election into a node that never came back: the
+				// re-fanout needs one leader RPC, a restarting node found no
+				// leader seated, and enterprise mode made that fatal —
+				// whereupon systemd's restart limit made it permanent.
+				//
+				//   cluster: validate/re-fanout durable secrets at boot:
+				//     authoritative cluster placement snapshot during secret
+				//     re-fanout: cluster: not raft leader
+				//   sandboxd.service: Start request repeated too quickly.
+				//
+				// Observed on a live 3-node enterprise cluster (S4): the seed
+				// stayed down for the rest of the run. Retry it in the
+				// background, exactly as ownership replay directly above
+				// already does for the same condition.
+				case refanoutRetry:
+					logger.Warn("cluster: secret re-fanout at boot deferred, no leader yet", "error", err)
+					startClusterSecretRefanoutRetry(ctx, svc, logger)
+				case refanoutFatal:
+					// Anything else still fails closed: under enterprise a
+					// node that cannot validate its durable secrets must not
+					// serve.
+					return fmt.Errorf("cluster: validate/re-fanout durable secrets at boot: %w", err)
+				default:
+					logger.Warn("cluster: secret re-fanout at boot failed", "error", err)
+				}
+			}
+			if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret delete-outbox reconcile at boot failed", "error", err)
+			}
+			if err := svc.ReconcileSecretPutOutbox(ctx); err != nil {
+				logger.Warn("cluster: secret put-outbox reconcile at boot failed", "error", err)
+			}
+			svc.StartSecretDeleteOutboxReconcile(ctx)
 		}
 		if cfg.IsIngress() {
-			svc.StartClusterIngressReconcile(ctx)
+			if topoErr := svc.ClusterTopologyError(); topoErr != nil && !cfg.ClusterShardAwareIngress {
+				logger.Error("skipping cluster ingress reconcile until shard-aware ingress is configured",
+					"error", topoErr)
+			} else {
+				svc.StartClusterIngressReconcile(ctx)
+			}
 		}
+	} else {
+		// Standalone. The secret-lifecycle tables (sealed rows, tombstones,
+		// both peer outboxes) exist regardless of mode, and a node that left a
+		// cluster still holds rows it can never act on — peer PUTs and DELETEs
+		// with no transport, ciphertext for sandboxes that are not here. The
+		// same reconciler runs here; with no peers it retires those after
+		// SB_SECRET_OUTBOX_STANDALONE_GRACE and prunes tombstones on retention,
+		// so a cluster→single-node downgrade does not leak them forever.
+		if err := svc.ReconcileSecretDeleteOutbox(ctx); err != nil {
+			logger.Warn("standalone: secret lifecycle reconcile at boot failed", "error", err)
+		}
+		svc.StartSecretDeleteOutboxReconcile(ctx)
 	}
 
 	// Bypass-flip rollback marker (D5 of plans/warm-direct-route-bypass.md).
@@ -650,6 +777,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if cfg.AutoReconcile {
 			if err := svc.Reconcile(ctx); err != nil {
 				logger.Warn("initial reconcile failed", "error", err)
+			} else {
+				ownerReasserted = true
 			}
 			svc.StartReconcileLoop(ctx)
 		}
@@ -816,9 +945,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// without Caddy nothing routes to this listener). Both features
 	// share the same mux so they share one loopback listener.
 	var ingressServer *http.Server
-	if (cfg.EnableServerless || cfg.EnableCustomDomains) && cfg.EnableCaddy {
+	if (cfg.EnableServerless || cfg.EnableCustomDomains || routingBoot.engaged()) && cfg.EnableCaddy {
 		ingressMux := http.NewServeMux()
-		if cfg.EnableServerless {
+		if cfg.EnableServerless || routingBoot.engaged() {
 			ingressproxy.RegisterRoutes(ingressMux, ingressproxy.Deps{
 				Resolver:             svc,
 				Logger:               logger,
@@ -827,6 +956,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				MaxPendingPerSandbox: cfg.HTTPWakeMaxPendingPerSandbox,
 				MaxPendingGlobal:     cfg.HTTPWakeMaxPendingGlobal,
 				MaxBufferBytesGlobal: cfg.HTTPWakeMaxBufferBytesGlobal,
+				// The static routes' fallback (NXDOMAIN): wake, 503, 421,
+				// mediators. nil unless ingress proxy routing is engaged.
+				Hosts: routingBoot.hostRoutes(),
 			})
 		}
 		// Caddy on-demand TLS ask callback (plans/custom-domains.md).
@@ -869,7 +1001,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			ingressproxy.RegisterTLSAsk(ingressMux, askHandler)
 			svc.AttachCustomDomainCacheEvicter(askHandler)
 			askURL := "http://" + cfg.InternalIngressAddr + ingressproxy.TLSAskPath
-			if err := caddyClient.EnsureOnDemandTLS(ctx, askURL, cfg.TLSOnDemandBurst, cfg.TLSOnDemandInterval); err != nil {
+			if !onDemandTLSOnThisNode(cfg) {
+				logger.Info("caddy on-demand TLS policy skipped: ingress-only node under SB_INGRESS_PROXY_ROUTING (owners terminate custom domains)")
+			} else if err := caddyClient.EnsureOnDemandTLS(ctx, askURL, cfg.TLSOnDemandBurst, cfg.TLSOnDemandInterval); err != nil {
 				logger.Warn("failed to install caddy on-demand TLS policy; will retry on next reconcile",
 					"error", err, "ask_url", askURL)
 			} else {
@@ -885,13 +1019,23 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		logger.Info("ingress proxy listening",
 			"addr", cfg.InternalIngressAddr,
 			"serverless", cfg.EnableServerless,
-			"custom_domains", cfg.EnableCustomDomains)
-		go func() {
-			if err := ingressServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				logger.Error("ingress proxy stopped unexpectedly", "error", err)
-				cancel()
-			}
-		}()
+			"custom_domains", cfg.EnableCustomDomains,
+			"ingress_proxy_routing", routingBoot.engaged())
+		ingressLn, err := net.Listen("tcp", cfg.InternalIngressAddr)
+		if err != nil {
+			logger.Error("ingress proxy failed to listen", "addr", cfg.InternalIngressAddr, "error", err)
+			cancel()
+		} else {
+			go func() {
+				if err := ingressServer.Serve(ingressLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					logger.Error("ingress proxy stopped unexpectedly", "error", err)
+					cancel()
+				}
+			}()
+			// The router is accepting now (listen succeeded), so the static
+			// routes' fallback is live before the per-sandbox routes go.
+			routingBoot.commit(ctx, svc, ownerReasserted)
+		}
 		if cfg.EnableServerless {
 			if err := svc.StartL4WakeProxy(ctx); err != nil {
 				logger.Error("l4 wake proxy failed to start", "error", err)
@@ -924,6 +1068,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.
 	svc.StopCaddyCoalescer()
+	// Flush/stop the secret-audit writer after HTTP is down so in-flight
+	// request Emits have finished. Idempotent with the deferred close.
+	svc.CloseSecretAuditSink()
 	return nil
 }
 
@@ -945,8 +1092,9 @@ var clusterOwnershipReplayTick = 10 * time.Second
 
 func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
 	logger.Warn("cluster: scheduling ownership replay retry")
+	interval := clusterOwnershipReplayTick
 	go func() {
-		t := time.NewTicker(clusterOwnershipReplayTick)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
@@ -958,6 +1106,79 @@ func startClusterOwnershipReplayRetry(ctx context.Context, svc *service.Service,
 				cancel()
 				if ok {
 					return
+				}
+			}
+		}
+	}()
+}
+
+// bootRefanoutOutcome is what the daemon does about a failed boot re-fanout.
+type bootRefanoutOutcome int
+
+const (
+	// refanoutWarn: log and carry on. The non-enterprise default.
+	refanoutWarn bootRefanoutOutcome = iota
+	// refanoutRetry: defer to a background retry. Leadership was not
+	// reachable, which says nothing about the secrets.
+	refanoutRetry
+	// refanoutFatal: refuse to serve. Enterprise, and a real failure.
+	refanoutFatal
+)
+
+// bootRefanoutDisposition decides whether a boot re-fanout failure should
+// end the process.
+//
+// Control-plane-unavailable (no leader, or the server not yet seeing this
+// node in gossip) is checked BEFORE the enterprise branch, and that order
+// is the entire fix. Enterprise mode is meant to fail closed on secrets it
+// cannot validate; it is not meant to fail closed because an election was in
+// flight. Getting that backwards took a live 3-node cluster's seed down
+// permanently — one leader RPC found no leader, enterprise made it fatal,
+// and systemd's restart limit made it final.
+func bootRefanoutDisposition(err error, enterprise bool) bootRefanoutOutcome {
+	switch {
+	case err == nil:
+		return refanoutWarn
+	case cluster.IsControlPlaneUnavailable(err):
+		return refanoutRetry
+	case enterprise:
+		return refanoutFatal
+	default:
+		return refanoutWarn
+	}
+}
+
+// startClusterSecretRefanoutRetry re-runs the boot secret re-fanout until it
+// succeeds, for the case where it failed only because the control plane could
+// not serve this node yet (no leader seated, or its rejoin not yet gossiped).
+//
+// Mirrors startClusterOwnershipReplayRetry: same tick, same ctx-cancellation,
+// same "stop on first success". Under enterprise the node is serving while
+// this is outstanding, which is the deliberate trade — the alternative it
+// replaces was not serving AT ALL, permanently, over a condition that clears
+// itself in seconds.
+func startClusterSecretRefanoutRetry(ctx context.Context, svc *service.Service, logger *slog.Logger) {
+	logger.Warn("cluster: scheduling secret re-fanout retry")
+	go func() {
+		t := time.NewTicker(clusterOwnershipReplayTick)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				retryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				err := svc.ReFanoutClusterSecrets(retryCtx)
+				cancel()
+				if err == nil {
+					logger.Info("cluster: secret re-fanout completed on retry")
+					return
+				}
+				if !cluster.IsLeaderUnavailable(err) {
+					// A real failure, not a missing leader. Keep saying so
+					// rather than looping silently on a condition that will
+					// not clear by waiting.
+					logger.Warn("cluster: secret re-fanout retry failed", "error", err)
 				}
 			}
 		}
@@ -1371,7 +1592,9 @@ func startTemplateArtifactPushReconciler(ctx context.Context, logger *slog.Logge
 			"error", err)
 		return
 	}
-	r := service.NewTemplateArtifactPushReconciler(pusher, db, logger, cfg.SnapshotPushMaxInFlight)
+	// Through the service's seam, so a push that changes the row's registry
+	// ref or push state also invalidates the replicated artifact catalogue.
+	r := service.NewTemplateArtifactPushReconciler(pusher, svc.TemplatePushStore(db), logger, cfg.SnapshotPushMaxInFlight)
 	if r == nil {
 		return
 	}

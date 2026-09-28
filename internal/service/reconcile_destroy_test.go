@@ -376,17 +376,18 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	// re-Inspect returns "container not found" → durably gone → reaped.
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           sandboxID,
-		Image:        image,
-		Status:       models.SandboxStatusStarted,
-		ContainerID:  "ctr-doomed",
-		ContainerIP:  "10.0.0.42",
-		CPU:          1,
-		MemoryMB:     512,
-		Runtime:      models.RuntimeDocker,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 sandboxID,
+		Image:              image,
+		Status:             models.SandboxStatusStarted,
+		ContainerID:        "ctr-doomed",
+		ContainerIP:        "10.0.0.42",
+		CPU:                1,
+		MemoryMB:           512,
+		Runtime:            models.RuntimeDocker,
+		AuditIncarnationID: "inc-" + sandboxID,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
@@ -416,13 +417,14 @@ func TestReconcileDestroyedRowFreesHostPort(t *testing.T) {
 	// would never be tried because the original sandbox still owned it).
 	const successorID = "sb-successor"
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           successorID,
-		Image:        image,
-		Status:       models.SandboxStatusStarted,
-		Runtime:      models.RuntimeDocker,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
-		LastActiveAt: time.Now().UTC(),
+		ID:                 successorID,
+		Image:              image,
+		Status:             models.SandboxStatusStarted,
+		Runtime:            models.RuntimeDocker,
+		AuditIncarnationID: "inc-" + successorID,
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
+		LastActiveAt:       time.Now().UTC(),
 	}); err != nil {
 		t.Fatalf("create successor sandbox: %v", err)
 	}
@@ -518,17 +520,18 @@ func TestDestroyEventFreesHostPort(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.Create(ctx, &models.Sandbox{
-		ID:           sandboxID,
-		Image:        image,
-		Status:       models.SandboxStatusStarted,
-		ContainerID:  "ctr-event-doomed",
-		ContainerIP:  "10.0.0.99",
-		CPU:          1,
-		MemoryMB:     512,
-		Runtime:      models.RuntimeDocker,
-		CreatedAt:    now,
-		UpdatedAt:    now,
-		LastActiveAt: now,
+		ID:                 sandboxID,
+		Image:              image,
+		Status:             models.SandboxStatusStarted,
+		ContainerID:        "ctr-event-doomed",
+		ContainerIP:        "10.0.0.99",
+		CPU:                1,
+		MemoryMB:           512,
+		Runtime:            models.RuntimeDocker,
+		AuditIncarnationID: "inc-" + sandboxID,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		LastActiveAt:       now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
@@ -720,15 +723,16 @@ func TestReconcileReInspectsBeforeReap(t *testing.T) {
 	seed := func(st *store.Store, id string) {
 		now := time.Now().UTC()
 		if err := st.Create(context.Background(), &models.Sandbox{
-			ID:           id,
-			Image:        "ubuntu:22.04",
-			Status:       models.SandboxStatusStarted,
-			ContainerID:  "ctr-" + id,
-			ContainerIP:  "10.0.0.5",
-			Runtime:      models.RuntimeDocker,
-			CreatedAt:    now,
-			UpdatedAt:    now,
-			LastActiveAt: now,
+			ID:                 id,
+			Image:              "ubuntu:22.04",
+			Status:             models.SandboxStatusStarted,
+			ContainerID:        "ctr-" + id,
+			ContainerIP:        "10.0.0.5",
+			Runtime:            models.RuntimeDocker,
+			AuditIncarnationID: "inc-" + id,
+			CreatedAt:          now,
+			UpdatedAt:          now,
+			LastActiveAt:       now,
 		}); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}

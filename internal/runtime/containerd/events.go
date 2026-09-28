@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/runtime"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
+	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -23,7 +23,13 @@ func (d *Driver) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent
 	if err != nil {
 		return err
 	}
-	envelopes, errs := client.SubscribeEvents(ctx, `topic~="/tasks/"`)
+	// Two filters (OR'd by containerd). Task topics carry start/exit/oom, but
+	// they cannot tell "the process ended" from "the container was removed":
+	// /tasks/delete fires on BOTH, because the task is the process and it is
+	// reaped either way. Only /containers/delete means the container object is
+	// gone, which is what Docker's "destroy" denotes and what the service
+	// consumer acts on by deleting the sandbox row.
+	envelopes, errs := client.SubscribeEvents(ctx, `topic~="/tasks/"`, `topic=="`+containerDeleteEventTopic+`"`)
 	for {
 		select {
 		case <-ctx.Done():
@@ -57,6 +63,12 @@ func (d *Driver) StreamEvents(ctx context.Context, out chan<- docker.DockerEvent
 	}
 }
 
+// containerDeleteEventTopic is containerd's CONTAINER-level delete topic. The
+// core/runtime package only exports /tasks/* constants, so this one is spelled
+// out here; it is published by plugins/services/containers as
+// "/containers/delete" and carries an apievents.ContainerDelete payload.
+const containerDeleteEventTopic = "/containers/delete"
+
 // normalizeContainerdEvent maps a containerd task-lifecycle envelope onto the
 // docker.DockerEvent the service monitor consumes. Topics are matched against
 // the canonical containerd constants (real topics are "/tasks/exit" etc., NOT
@@ -74,9 +86,19 @@ func normalizeContainerdEvent(ev *events.Envelope) (docker.DockerEvent, bool) {
 		action = "die"
 	case runtime.TaskOOMEventTopic:
 		action = "oom"
-	case runtime.TaskDeleteEventTopic:
+	case containerDeleteEventTopic:
 		action = "destroy"
 	default:
+		// TaskDelete is deliberately NOT mapped to "destroy". It is
+		// /tasks/delete — the TASK (the process) being reaped — which happens
+		// on every ordinary stop while the container object survives and stays
+		// restartable. Mapping it to "destroy" made handleDestroyEvent delete
+		// the sandbox row on a manual stop, so a stopped sandbox vanished and
+		// UC-14/UC-15 (stop, then start again) broke on the containerd engine —
+		// the default engine for every non-local deployment. Observed live on
+		// single-node 2026-09-23, intermittently: die(stop_mode=manual) ->
+		// POST /stop 200 -> "destroyed via docker event" 2ms later -> GET 404.
+		// Same failure shape as the TaskPaused case below, one topic over.
 		// TaskPaused/TaskResumed are deliberately NOT mapped. The service
 		// consumer folds "stop" into markSandboxStopped (route + netrules +
 		// admitter teardown), so mapping TaskPaused→"stop" made an internal
@@ -117,6 +139,15 @@ func containerIDAndExitFromEvent(ev *events.Envelope) (string, int) {
 	id := ""
 	if g, ok := decoded.(interface{ GetContainerID() string }); ok {
 		id = g.GetContainerID()
+	}
+	// ContainerDelete names the container with GetID(), not GetContainerID().
+	// Order matters: task events ALSO have GetID(), where it is the EXEC id
+	// ("" for the init process), so GetContainerID must win whenever present or
+	// an exec's exit would be attributed to a container named after the exec.
+	if id == "" {
+		if g, ok := decoded.(interface{ GetID() string }); ok {
+			id = g.GetID()
+		}
 	}
 	exitCode := 0
 	if g, ok := decoded.(interface{ GetExitStatus() uint32 }); ok {

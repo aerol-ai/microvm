@@ -138,7 +138,7 @@ func TestL4ActivityTracking(t *testing.T) {
 	if !ok || releaseActive == nil {
 		t.Fatal("expected active acquire")
 	}
-	gen := svc.l4ActivityGenerations["sb"]
+	gen := svc.l4ActivityGeneration("sb")
 	if !svc.l4ActivityStillActive("sb", gen) {
 		t.Fatal("activity should be active for current generation")
 	}

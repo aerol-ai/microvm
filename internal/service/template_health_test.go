@@ -56,6 +56,14 @@ func newHealthHarness(t *testing.T) (*Service, *store.Store, string) {
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		store:  st,
 	}
+	// Registered after t.TempDir(), so LIFO cleanup joins in-flight rebuilds
+	// BEFORE the directory they write into is removed. Without this, a rebuild
+	// still running at test exit raced RemoveAll ("directory not empty").
+	t.Cleanup(func() {
+		if !svc.WaitForTemplateRebuilds(10 * time.Second) {
+			t.Error("a template rebuild was still running at test exit")
+		}
+	})
 	return svc, st, templatesDir
 }
 

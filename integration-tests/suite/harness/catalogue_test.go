@@ -3,7 +3,9 @@ package harness
 import "testing"
 
 func TestCatalogueRegistryWellFormed(t *testing.T) {
-	const want = 297 // category table sums (plan TOTAL 287 is off by 10)
+	// 299 before the security programme; +61 SEC rows (UC-110..169 plus
+	// UC-145b). Bumped in the same commit that adds them, per §7.
+	const want = 360
 	if len(CatalogueRegistry) != want {
 		t.Fatalf("catalogue rows = %d, want %d", len(CatalogueRegistry), want)
 	}

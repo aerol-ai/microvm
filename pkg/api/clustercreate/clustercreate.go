@@ -1,8 +1,11 @@
 package clustercreate
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -11,7 +14,9 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -30,6 +35,35 @@ type Decision struct {
 
 type PrepareOptions struct {
 	PreferredSandboxID string
+	// Normalize runs after the shared create normalizations and before
+	// placement. v1 uses it to settle runtime/template_id, which decides
+	// which workers are even eligible. Facades translate their own wire
+	// shape first and pass nil.
+	Normalize func(*models.CreateSandboxRequest) error
+	// OwnerRef is the tenant account recorded on the reservation's secret
+	// handle. Empty leaves the handle untenanted.
+	OwnerRef string
+	// SyncBody re-marshals the normalized request into r.Body so a forwarded
+	// create carries the normalizations the router applied. Native v1 sets
+	// this because the peer re-decodes the same CreateSandboxRequest shape;
+	// facades must NOT, because they forward their own wire body and
+	// re-translate it on the target.
+	SyncBody bool
+	// MetricPrefix labels idempotency-conflict metrics. Defaults to
+	// "cluster.create" when empty.
+	MetricPrefix string
+	// OnForwardStale fires when a forwarded create lands on the wrong node.
+	OnForwardStale func()
+	// Logger, when set, records placement decisions worth tracing.
+	Logger *slog.Logger
+}
+
+func (o PrepareOptions) metric(suffix string) string {
+	prefix := strings.TrimSpace(o.MetricPrefix)
+	if prefix == "" {
+		prefix = "cluster.create"
+	}
+	return prefix + "." + suffix
 }
 
 func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req models.CreateSandboxRequest, writeError ErrorWriter, opts PrepareOptions) (Decision, bool) {
@@ -48,7 +82,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 
 	if targetNodeID := strings.TrimSpace(r.Header.Get(HeaderTarget)); targetNodeID != "" {
 		if targetNodeID != c.SelfNodeID() {
-			service.RecordFacadeIdempotencyConflict("cluster.create.forward")
+			if opts.OnForwardStale != nil {
+				opts.OnForwardStale()
+			}
+			service.RecordFacadeIdempotencyConflict(opts.metric("forward"))
 			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
@@ -71,8 +108,32 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
+	if opts.Normalize != nil {
+		if err := opts.Normalize(&req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
+	if svc.ClusterEnabled() {
+		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return Decision{}, false
+		}
+	}
+	// Publish the normalized spec on the wire before any forward so the
+	// target acts on the same request the router placed.
+	if opts.SyncBody {
+		normalized, err := json.Marshal(req)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
+			return Decision{}, false
+		}
+		r.Body = io.NopCloser(bytes.NewReader(normalized))
+		r.ContentLength = int64(len(normalized))
+	}
 	if service.ImageRequiresLocalPlacement(req) {
-		if clusterCreateSelfCanOwnSandbox(c) {
+		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
+		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
 				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
@@ -81,6 +142,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 		if err != nil {
+			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+				// The artifact went with its node; no Retry-After, the client
+				// must re-create it (re-upload the bundle / rebuild the image).
+				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+				return Decision{}, false
+			}
 			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 				if errors.Is(err, cluster.ErrInvalidTopology) {
 					w.Header().Set("Retry-After", "300")
@@ -104,14 +171,40 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
+		if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
+			opts.Logger.Info("cluster create: forwarding built local image to selected worker",
+				"image", req.Image, "target", target.NodeID)
+		}
 		r.Header.Set(HeaderTarget, target.NodeID)
 		r.Header.Del(HeaderID)
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 		return Decision{}, false
 	}
 
-	target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
+	// Resolve the id before placement: the control plane needs it to pick the
+	// seal recipients on its side, which is what keeps a create's answer
+	// bounded instead of O(fleet) (one Member per eligible worker).
+	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
+	if sandboxID == "" {
+		generated, genErr := service.GenerateSandboxID()
+		if genErr != nil {
+			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
+			return Decision{}, false
+		}
+		sandboxID = generated
+	}
+	recipientBackups := 0
+	if svc.WantsSecretRecipientFanout(req) {
+		recipientBackups = svc.SecretRecipientBackupCount()
+	}
+	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
+		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
+			// A node-bound js-bundle whose worker is gone: the client must
+			// re-upload, so no Retry-After — waiting changes nothing.
+			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+			return Decision{}, false
+		}
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
 			if errors.Is(err, cluster.ErrInvalidTopology) {
 				w.Header().Set("Retry-After", "300")
@@ -124,22 +217,14 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
-	sandboxID := strings.TrimSpace(opts.PreferredSandboxID)
-	if sandboxID == "" {
-		var err error
-		sandboxID, err = service.GenerateSandboxID()
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+err.Error())
-			return Decision{}, false
-		}
-	}
 	redacted := service.RedactClusterSecrets(req)
+	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, cluster.PlacementSecrets{}, ReservationTTL)
+	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)
 	cancel()
 	if err != nil {
 		if opts.PreferredSandboxID != "" && errors.Is(err, cluster.ErrReservationConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
+			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			handled, local := routeExistingPlacement(w, r, c, sandboxID, writeError)
 			if local {
 				return Decision{ReservationID: sandboxID}, true
@@ -149,12 +234,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			}
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.name")
+			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
 			writeError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
-			service.RecordFacadeIdempotencyConflict("cluster.create.reservation")
+			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
 			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}
@@ -185,7 +270,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
 	return Decision{}, false
 }
 
@@ -204,7 +289,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
-	c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	return true, false
 }
 
@@ -245,38 +330,27 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		return nil, err
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, err
 	}
 
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	secrets, sealErr := svc.PutClusterSecretsForRecipient(commitCtx, resp.Sandbox.ID, req, c.SelfNodeID())
+	secrets, sealErr := svc.SealAndDistribute(commitCtx, resp.Sandbox.ID, req, svc.SecretRecipientsForSeal(resp.Sandbox.ID))
 	if sealErr != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, sealErr
 	}
+	if secrets.IncarnationID == "" {
+		secrets.IncarnationID = resp.Sandbox.AuditIncarnationID
+	}
+	secrets.OwnerRef = resp.Sandbox.OwnerRef
 	redacted := service.RedactClusterSecrets(req)
 	if promoteErr := c.RecordPlacement(commitCtx, resp.Sandbox.ID, &redacted, secrets); promoteErr != nil {
-		rollbackCreate(context.Background(), svc, c, logger, resp.Sandbox.ID, reservationID)
+		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
 		return nil, promoteErr
 	}
 	return resp, nil
-}
-
-func DeletePlacementBestEffort(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
-	if svc == nil || sandboxID == "" {
-		return
-	}
-	c := svc.Cluster()
-	if c == nil {
-		return
-	}
-	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if err := c.DeletePlacement(commitCtx, sandboxID); err != nil && logger != nil {
-		logger.Warn("cluster: delete placement after facade rollback failed", "sandbox_id", sandboxID, "err", err)
-	}
 }
 
 func CancelReservationBestEffort(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
@@ -319,6 +393,14 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		TemplateID: templateID,
 		ModuleRef:  models.ModuleRefForCreate(req),
 	}
+	if nodeID, ok := docker.BuiltImagePlacementNode(req.Image); ok {
+		out.RequiredNodeID = nodeID
+	}
+	if runtimeName == models.RuntimeIsolate {
+		if nodeID, _, ok := models.ParseJSBundleNodeRef(out.ModuleRef); ok {
+			out.RequiredNodeID = nodeID
+		}
+	}
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
@@ -353,14 +435,23 @@ func clusterCreateSelfCanOwnSandbox(c cluster.Client) bool {
 	return true
 }
 
-func rollbackCreate(ctx context.Context, svc *service.Service, c cluster.Client, logger *slog.Logger, sandboxID, reservationID string) {
-	if err := svc.DestroySandbox(ctx, sandboxID); err != nil && logger != nil {
-		logger.Error("cluster: rollback destroy failed", "sandbox_id", sandboxID, "err", err)
+// RollbackLocalCreate retracts a non-reserved local create. Placement release
+// is conditional on complete local destruction: retaining the row and its
+// lifecycle identity is safer than creating an untracked live runtime when a
+// runtime, secret, or store finalizer fails.
+func RollbackLocalCreate(ctx context.Context, svc *service.Service, logger *slog.Logger, sandboxID string) {
+	if svc == nil || strings.TrimSpace(sandboxID) == "" {
+		return
 	}
-	if reservationID != "" && c != nil {
-		cancelReservation(ctx, c, logger, reservationID)
+	rbCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := svc.DestroySandbox(rbCtx, sandboxID); err != nil {
+		if logger != nil {
+			logger.Error("cluster: rollback destroy failed; retaining placement for reconciliation",
+				"sandbox_id", sandboxID, "err", err)
+		}
+		return
 	}
-	DeletePlacementBestEffort(ctx, svc, logger, sandboxID)
 }
 
 func cancelReservation(ctx context.Context, c cluster.Client, logger *slog.Logger, sandboxID string) {

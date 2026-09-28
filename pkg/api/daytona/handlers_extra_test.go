@@ -102,7 +102,7 @@ func newHandlerExtraTestEnv(t *testing.T) (*service.Service, *store.Store, *fake
 
 	caddyClient := caddy.New(config.Config{EnableCaddy: false})
 
-	svc := service.New(config.Config{}, logger, st, rt, nil, caddyClient, nil, mgr, nil)
+	svc := service.New(config.Config{}, logger, st, rt, nil, caddyClient, newDaytonaTestCipher(t), mgr, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
 		Service: svc,
@@ -200,15 +200,16 @@ func TestSandboxLifecycleHandlers(t *testing.T) {
 
 	now := time.Now().UTC()
 	sb := &models.Sandbox{
-		ID:             "sb-123",
-		Name:           "test-sb",
-		Status:         models.SandboxStatusStopped,
-		ToolboxEnabled: true,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		ID:                 "sb-123",
+		Name:               "test-sb",
+		Status:             models.SandboxStatusStopped,
+		AuditIncarnationID: "inc-sb-123",
+		ToolboxEnabled:     true,
+		CreatedAt:          now,
+		UpdatedAt:          now,
 	}
-	if err := st.Upsert(context.Background(), sb); err != nil {
-		t.Fatalf("Upsert: %v", err)
+	if err := st.Create(context.Background(), sb); err != nil {
+		t.Fatalf("Create: %v", err)
 	}
 
 	t.Run("get_sandbox", func(t *testing.T) {
@@ -1445,6 +1446,34 @@ func TestDirectHelperMethodErrors(t *testing.T) {
 	_, err = h.listSandboxMeta(context.Background())
 	if err == nil {
 		t.Fatal("expected error from listSandboxMeta with closed database")
+	}
+}
+
+func TestForwardedListAppliesExactPlacementIDsBeforeSerialization(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/daytona/sandbox?ids=sb-keep", nil)
+	req.Header.Set("X-Cluster-Forwarded", "1")
+	filters, err := parseListFilters(req)
+	if err != nil {
+		t.Fatalf("parseListFilters() error = %v", err)
+	}
+	now := time.Now().UTC()
+	sandboxes := []*models.Sandbox{
+		{ID: "sb-keep", Name: "keep", Status: models.SandboxStatusStarted, CreatedAt: now},
+		{ID: "sb-drop", Name: "drop", Status: models.SandboxStatusStarted, CreatedAt: now.Add(time.Second)},
+	}
+	items := newHandlers(Deps{}).filteredSandboxes(req, sandboxes, nil, filters)
+	if len(items) != 1 || items[0].ID != "sb-keep" {
+		t.Fatalf("filtered items = %+v, want only sb-keep", items)
+	}
+
+	public := httptest.NewRequest(http.MethodGet, "/daytona/sandbox?ids=sb-keep", nil)
+	publicFilters, err := parseListFilters(public)
+	if err != nil {
+		t.Fatalf("public parseListFilters() error = %v", err)
+	}
+	items = newHandlers(Deps{}).filteredSandboxes(public, sandboxes, nil, publicFilters)
+	if len(items) != 2 {
+		t.Fatalf("public ids query unexpectedly changed API behavior: %+v", items)
 	}
 }
 

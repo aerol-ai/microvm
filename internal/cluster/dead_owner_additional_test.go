@@ -46,7 +46,7 @@ func TestCancelDeadOwnerWatch(t *testing.T) {
 	c.cancelDeadOwnerWatch("peer")
 }
 
-func TestPickRecreationTarget(t *testing.T) {
+func TestSelectRecreationTargetRejectsMissingAndLocalOnlySpecs(t *testing.T) {
 	c := &Cluster{
 		nodeID: "self",
 		apiURL: "http://self",
@@ -54,17 +54,14 @@ func TestPickRecreationTarget(t *testing.T) {
 		gossip: &gossipNode{memberIndex: newGossipMemberIndex()},
 	}
 
-	// nil spec
-	id, url, dp := c.pickRecreationTarget(nil)
-	if id != "" || url != "" || dp != "" {
+	if _, ok := c.selectRecreationTarget(Placement{}); ok {
 		t.Errorf("expected empty returns")
 	}
 
 	// local only mode
-	id, url, dp = c.pickRecreationTarget(&models.CreateSandboxRequest{
+	if _, ok := c.selectRecreationTarget(Placement{Spec: &models.CreateSandboxRequest{
 		ImageDistributionMode: models.ImageDistributionLocalOnly,
-	})
-	if id != "" || url != "" || dp != "" {
+	}}); ok {
 		t.Errorf("expected empty returns for local only")
 	}
 }

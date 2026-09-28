@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"encoding/json"
+
 	"context"
 	"errors"
 	"io"
@@ -458,4 +460,194 @@ func TestHandlers_ListCustomDomains_StoreError(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 	}
+}
+
+// TestParseSandboxIDsFilterBranches pins the forwarded-only ids= filter used
+// so cluster list peers return just the placement-page subset.
+// TestParseSandboxIDsFilterBranches pins the forwarded-only ids= filter used
+// so cluster list peers return just the placement-page subset.
+func TestParseSandboxIDsFilterBranches(t *testing.T) {
+	if got := parseSandboxIDsFilter(nil); got != nil {
+		t.Fatalf("nil request = %v", got)
+	}
+	plain := httptest.NewRequest(http.MethodGet, "/v1/sandboxes?ids=a,b", nil)
+	if got := parseSandboxIDsFilter(plain); got != nil {
+		t.Fatalf("unforwarded request must ignore ids: %v", got)
+	}
+	empty := httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil)
+	empty.Header.Set("X-Cluster-Forwarded", "1")
+	if got := parseSandboxIDsFilter(empty); got != nil {
+		t.Fatalf("forwarded without ids = %v", got)
+	}
+	commas := httptest.NewRequest(http.MethodGet, "/v1/sandboxes?ids=,%20,", nil)
+	commas.Header.Set("X-Cluster-Forwarded", "1")
+	if got := parseSandboxIDsFilter(commas); got != nil {
+		t.Fatalf("only-empty parts = %v", got)
+	}
+	ok := httptest.NewRequest(http.MethodGet, "/v1/sandboxes?ids=sb-a,%20sb-b,", nil)
+	ok.Header.Set("X-Cluster-Forwarded", "1")
+	got := parseSandboxIDsFilter(ok)
+	if _, a := got["sb-a"]; !a {
+		t.Fatalf("missing sb-a: %v", got)
+	}
+	if _, b := got["sb-b"]; !b {
+		t.Fatalf("missing sb-b: %v", got)
+	}
+}
+
+func liftV1Handler(t *testing.T) (*handlers, *store.Store) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
+	return &handlers{deps: Deps{Service: svc, Logger: logger}}, st
+}
+
+func TestListSandboxesFilterAndStoreError(t *testing.T) {
+	h, st := liftV1Handler(t)
+	now := time.Now().UTC()
+	for _, id := range []string{"sb-keep", "sb-drop"} {
+		if err := st.Create(context.Background(), &models.Sandbox{
+			ID: id, Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+			CPU: 1, MemoryMB: 256, DiskGB: 1, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		}); err != nil {
+			t.Fatalf("Create %s: %v", id, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/sandboxes?ids=sb-keep,missing", nil)
+	req.Header.Set("X-Cluster-Forwarded", "1")
+	rr := httptest.NewRecorder()
+	h.listSandboxes(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	var listed []*models.Sandbox
+	if err := json.Unmarshal(rr.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(listed) != 1 || listed[0].ID != "sb-keep" {
+		t.Fatalf("listed = %+v, want only sb-keep", listed)
+	}
+
+	_ = st.Close()
+	errRR := httptest.NewRecorder()
+	h.listSandboxes(errRR, httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil))
+	if errRR.Code != http.StatusInternalServerError {
+		t.Fatalf("closed store status = %d", errRR.Code)
+	}
+}
+
+func TestHandlerStoreErrorBranches(t *testing.T) {
+	h, st := liftV1Handler(t)
+	_ = st.Close()
+
+	resize := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb/resize", strings.NewReader(`{"cpu":2}`))
+	req.SetPathValue("id", "sb")
+	h.resizeSandbox(resize, req)
+	if resize.Code == http.StatusOK {
+		t.Fatal("expected resize store error")
+	}
+
+	life := httptest.NewRecorder()
+	lreq := httptest.NewRequest(http.MethodPatch, "/v1/sandboxes/sb/lifecycle", strings.NewReader(`{"lifecycle":{}}`))
+	lreq.SetPathValue("id", "sb")
+	h.updateLifecycle(life, lreq)
+	if life.Code == http.StatusOK {
+		t.Fatal("expected lifecycle store error")
+	}
+
+	net := httptest.NewRecorder()
+	nreq := httptest.NewRequest(http.MethodPut, "/v1/sandboxes/sb/network-limits", strings.NewReader(`{"network_bytes_in_limit":1}`))
+	nreq.SetPathValue("id", "sb")
+	h.updateNetworkLimits(net, nreq)
+	if net.Code == http.StatusOK {
+		t.Fatal("expected network-limits store error")
+	}
+
+	dom := httptest.NewRecorder()
+	dreq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb/custom-domains", strings.NewReader(`{"hostname":"ex.test"}`))
+	dreq.SetPathValue("id", "sb")
+	h.addCustomDomain(dom, dreq)
+	if dom.Code == http.StatusCreated {
+		t.Fatal("expected custom-domain store error")
+	}
+}
+
+type resizeOKRuntime struct{ noopRuntime }
+
+func (resizeOKRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
+	return nil
+}
+
+func TestResizeAndLifecycleSuccess(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, logger, st, resizeOKRuntime{}, nil, nil, nil, nil, nil)
+	h := &handlers{deps: Deps{Service: svc, Logger: logger}}
+	now := time.Now().UTC()
+	if err := st.Create(context.Background(), &models.Sandbox{
+		ID: "sb-ok", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
+		CPU: 1, MemoryMB: 256, DiskGB: 1, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	resize := httptest.NewRecorder()
+	rreq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb-ok/resize", strings.NewReader(`{"cpu":2}`))
+	rreq.SetPathValue("id", "sb-ok")
+	h.resizeSandbox(resize, rreq)
+	if resize.Code != http.StatusOK {
+		t.Fatalf("resize status = %d body=%s", resize.Code, resize.Body.String())
+	}
+
+	life := httptest.NewRecorder()
+	lreq := httptest.NewRequest(http.MethodPatch, "/v1/sandboxes/sb-ok/lifecycle",
+		strings.NewReader(`{"lifecycle":{}}`))
+	lreq.SetPathValue("id", "sb-ok")
+	h.updateLifecycle(life, lreq)
+	if life.Code != http.StatusOK {
+		t.Fatalf("lifecycle status = %d body=%s", life.Code, life.Body.String())
+	}
+}
+
+func TestHandlers_CreateSandboxContextErrors(t *testing.T) {
+	t.Run("canceled", func(t *testing.T) {
+		rt := &apiRecordingRuntime{createDelay: time.Second}
+		h, _ := newClusterCreateHarness(t, rt, cluster.NewNoop("node-a", "http://node-a", ""))
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine:3.20"}`)).WithContext(ctx)
+		h.createSandbox(rr, req)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("deadline_exceeded", func(t *testing.T) {
+		rt := &apiRecordingRuntime{createDelay: 2 * time.Second}
+		h, _ := newClusterCreateHarness(t, rt, cluster.NewNoop("node-a", "http://node-a", ""))
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine:3.20"}`)).WithContext(ctx)
+		h.createSandbox(rr, req)
+		if rr.Code != http.StatusGatewayTimeout {
+			t.Fatalf("status = %d, want 504; body=%s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+func TestHandlersReconcileSuccess(t *testing.T) {
+	t.Skip("reconcile needs a fully wired Service (runtime/docker); covered elsewhere")
 }

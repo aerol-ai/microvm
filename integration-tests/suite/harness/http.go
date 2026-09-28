@@ -3,10 +3,13 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // rawGet issues an authenticated GET against the scenario's control-plane API
@@ -68,11 +71,42 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 	return nil
 }
 
+// transientGatewayStatuses are the edge failing to reach the daemon, not the
+// daemon answering. Caddy fronts the API, and a sandboxd restart — which
+// several security use cases perform deliberately — leaves a window where it
+// answers 502. Recording that as a use case's verdict attributes a gateway
+// hiccup to the product: the live gate lost UC-136 twice to exactly this.
+var transientGatewayStatuses = map[int]bool{502: true, 503: true, 504: true}
+
+// gatewayRetries and gatewayRetryDelay bound the wait. Short and few: this
+// is for a restart window, not for a node that is down — a genuinely dead
+// daemon must still fail the case promptly rather than after minutes.
+// Deliberately small. Retries MULTIPLY across pagination: AllAuditPages
+// walks up to maxPages requests, so 4 attempts at 3s turned one history read
+// into eight minutes and hung UC-149 past the suite's own 60m timeout. This
+// covers a restart window of a few seconds, not an outage to ride out;
+// anything longer belongs to the caller's own deadline.
+const gatewayRetries = 2
+
+// gatewayRetryDelay is a var so the offline tests can collapse it; nothing
+// else reassigns it.
+var gatewayRetryDelay = 2 * time.Second
+
+// gatewayRetryDelayForTest shortens the delay and returns a restore func.
+func gatewayRetryDelayForTest(d time.Duration) func() {
+	prev := gatewayRetryDelay
+	gatewayRetryDelay = d
+	return func() { gatewayRetryDelay = prev }
+}
+
 // GetJSON GETs path and decodes a 2xx JSON body into out. Any non-2xx is an
 // error carrying the status and a snippet of the body, so a failing use case
 // reports what the server actually said.
+//
+// A transient gateway status is retried rather than returned; see
+// transientGatewayStatuses.
 func (c *Client) GetJSON(ctx context.Context, path string, out any) error {
-	resp, err := c.rawGet(ctx, path)
+	resp, err := c.getWithGatewayRetry(ctx, path)
 	if err != nil {
 		return err
 	}
@@ -130,4 +164,58 @@ func snippet(b []byte) string {
 		return string(b[:max]) + "..."
 	}
 	return string(b)
+}
+
+// getWithGatewayRetry issues the GET, retrying only while the EDGE is
+// failing. Any response the daemon itself produced — including a 4xx or a
+// 500 — is returned immediately, because those are answers and a use case
+// must assert on them.
+func (c *Client) getWithGatewayRetry(ctx context.Context, path string) (*http.Response, error) {
+	var resp *http.Response
+	var err error
+	for attempt := 0; ; attempt++ {
+		resp, err = c.rawGet(ctx, path)
+		// A dropped connection is the same class as a 502: the edge went
+		// away mid-request. UC-147 failed on a bare
+		// "read tcp ...: connection reset" while a node was restarting, and
+		// only HTTP statuses were being retried.
+		if err != nil {
+			if attempt >= gatewayRetries || ctx.Err() != nil || !isRetriableTransportErr(err) {
+				return nil, err
+			}
+		} else if !transientGatewayStatuses[resp.StatusCode] || attempt >= gatewayRetries {
+			return resp, err
+		} else {
+			// Drain and close so the connection can be reused for the retry.
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(gatewayRetryDelay):
+		}
+	}
+}
+
+// isRetriableTransportErr reports whether an error is the connection failing
+// rather than the server answering. Only the shapes a restarting edge
+// produces — a refused dial, a reset or a half-closed read — so a genuine
+// client bug (a bad URL, a TLS trust failure) still fails immediately.
+func isRetriableTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	msg := err.Error()
+	for _, s := range []string{"connection reset", "connection refused", "unexpected EOF", "server closed idle connection", "broken pipe"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

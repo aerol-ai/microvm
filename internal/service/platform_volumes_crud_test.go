@@ -134,16 +134,17 @@ func TestPlatformVolumeDeleteWhileAttached(t *testing.T) {
 	now := time.Now().UTC()
 	if err := s.store.Create(ctx, &models.Sandbox{
 		ID: "sb-attached", Image: "alpine:3.20", Status: models.SandboxStatusStarted,
-		Runtime: models.RuntimeDocker, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+		Runtime: models.RuntimeDocker, AuditIncarnationID: "inc-sb-attached", CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
 	}); err != nil {
 		t.Fatalf("seed sandbox: %v", err)
 	}
 	if err := s.store.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
-		Tenant:    tenant,
-		VolumeID:  v.ID,
-		SandboxID: "sb-attached",
-		Target:    spec.Target,
-		Source:    spec.Source,
+		Tenant:        tenant,
+		VolumeID:      v.ID,
+		SandboxID:     "sb-attached",
+		IncarnationID: "inc-sb-attached",
+		Target:        spec.Target,
+		Source:        spec.Source,
 	}}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
 	}

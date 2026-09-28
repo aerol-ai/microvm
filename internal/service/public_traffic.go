@@ -10,16 +10,23 @@ import (
 )
 
 func allowPublicTrafficEnabled(v *bool) bool {
-	return v == nil || *v
+	return v != nil && *v
 }
 
 func sandboxAllowsPublicTraffic(sandbox *models.Sandbox) bool {
-	return sandbox == nil || allowPublicTrafficEnabled(sandbox.AllowPublicTraffic)
+	return sandbox != nil && allowPublicTrafficEnabled(sandbox.AllowPublicTraffic)
 }
 
+// placementAllowsPublicTraffic reads the hot-row flag first: an ingress-only
+// node only ever sees redacted placements with no Spec (see
+// cluster.Placement.PublicTraffic). Spec still decides when present, which
+// keeps rows written by older builds behaving as they did.
 func placementAllowsPublicTraffic(p cluster.Placement) bool {
-	if p.Spec == nil {
+	if p.PublicTraffic {
 		return true
+	}
+	if p.Spec == nil {
+		return false
 	}
 	return allowPublicTrafficEnabled(p.Spec.AllowPublicTraffic)
 }
@@ -38,7 +45,7 @@ func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sa
 	if !sandboxAllowsPublicTraffic(sandbox) {
 		return s.deleteSandboxPublicRoutes(ctx, sandbox)
 	}
-	return s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
+	return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
 }
 
 // enableSandboxPublicTraffic flips a private sandbox to public in place:
@@ -87,14 +94,14 @@ func (s *Service) deleteSandboxPublicRoutes(ctx context.Context, sandbox *models
 		return nil
 	}
 	var firstErr error
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+	if err := s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		firstErr = err
 	}
 	for _, cd := range sandbox.CustomDomains {
 		if cd.Hostname == "" {
 			continue
 		}
-		if err := s.caddy.DeleteCustomDomainHTTPRoute(ctx, sandbox.ID, cd.Hostname); err != nil && firstErr == nil {
+		if err := s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, sandbox.ID, cd.Hostname); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

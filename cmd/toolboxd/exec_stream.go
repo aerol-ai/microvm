@@ -113,7 +113,12 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 		rows = 24
 	}
 
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+	var ptmx *os.File
+	child, err := execChildren.start(cmd, func() error {
+		var startErr error
+		ptmx, startErr = pty.StartWithSize(cmd, &pty.Winsize{Cols: cols, Rows: rows})
+		return startErr
+	})
 	if err != nil {
 		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: "start pty: " + err.Error()})
 		return
@@ -150,7 +155,7 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 		s.logger.Debug("pty read ended", "error", err)
 	}
 
-	exitCode, exitSignal := waitForCommand(cmd)
+	exitCode, exitSignal := interpretWaitResult(child.wait())
 	close(done)
 	writeStreamControl(conn, execStreamControlOut{Type: "exit", Code: exitCode, Signal: exitSignal})
 }
@@ -172,7 +177,8 @@ func (s *server) runWithPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 		return
 	}
 
-	if err := cmd.Start(); err != nil {
+	child, err := startTracked(cmd)
+	if err != nil {
 		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: "start: " + err.Error()})
 		return
 	}
@@ -224,7 +230,7 @@ func (s *server) runWithPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 	<-stdoutDone
 	<-stderrDone
 
-	exitCode, exitSignal := waitForCommand(cmd)
+	exitCode, exitSignal := interpretWaitResult(child.wait())
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	_ = conn.WriteJSON(execStreamControlOut{Type: "exit", Code: exitCode, Signal: exitSignal})
@@ -303,10 +309,6 @@ func writeStreamControl(conn *websocket.Conn, msg execStreamControlOut) {
 	_ = conn.WriteJSON(msg)
 }
 
-func waitForCommand(cmd *exec.Cmd) (int, string) {
-	return interpretWaitResult(cmd.Wait())
-}
-
 func interpretWaitResult(err error) (int, string) {
 	if err == nil {
 		return 0, ""
@@ -321,14 +323,17 @@ func interpretWaitResult(err error) (int, string) {
 		}
 		return ee.ExitCode(), ""
 	}
-	// toolboxd runs as PID 1 in the container. Orphaned grandchildren (e.g.
-	// npm lifecycle scripts) are reparented to it and exit with SIGCHLD. In
-	// rare races this can cause the kernel to return ECHILD for our direct
-	// child before cmd.Wait() gets there. Since we only call this after all
-	// pipe I/O has completed (process definitely exited), treat ECHILD as 0.
-	if errors.Is(err, syscall.ECHILD) {
-		return 0, ""
+	var re *reapedExit
+	if errors.As(err, &re) {
+		if re.status.Signaled() {
+			return -1, re.status.Signal().String()
+		}
+		return re.status.ExitStatus(), ""
 	}
+	// An exec child started through execChildren never loses its status to
+	// the reaper. So ECHILD here means the status is really gone. This path
+	// used to report it as exit 0, which made a failed command look like a
+	// success (UC-84). Report it as unknown instead.
 	return -1, err.Error()
 }
 

@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	apiclient "github.com/daytonaio/daytona/libs/api-client-go"
 	daytonasdk "github.com/daytonaio/daytona/libs/sdk-go/pkg/daytona"
 	sdktypes "github.com/daytonaio/daytona/libs/sdk-go/pkg/types"
@@ -32,6 +33,15 @@ const (
 	contractOrgID      = "org-contract"
 	contractPublicHost = "sandbox.test"
 )
+
+func newDaytonaTestCipher(t *testing.T) *secrets.Cipher {
+	t.Helper()
+	cipher, err := secrets.NewCipher("", filepath.Join(t.TempDir(), "credential.key"))
+	if err != nil {
+		t.Fatalf("secrets.NewCipher() error = %v", err)
+	}
+	return cipher
+}
 
 var _ internalruntime.Runtime = (*fakeDaytonaContractRuntime)(nil)
 
@@ -314,7 +324,8 @@ func newDaytonaContractEnv(t *testing.T) *daytonaContractEnv {
 	}
 
 	runtimeDriver := newFakeDaytonaContractRuntime()
-	svc := service.New(cfg, logger, st, runtimeDriver, nil, caddy.New(cfg), nil, mountManager, nil)
+	cipher := newDaytonaTestCipher(t)
+	svc := service.New(cfg, logger, st, runtimeDriver, nil, caddy.New(cfg), cipher, mountManager, nil)
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
 		Service: svc,
@@ -436,31 +447,32 @@ func (e *daytonaContractEnv) seedSandbox(seed contractSandboxSeed) *models.Sandb
 	}
 
 	sandbox := &models.Sandbox{
-		ID:               id,
-		Name:             name,
-		Image:            image,
-		Status:           status,
-		PublicURL:        publicURL,
-		ContainerID:      containerID,
-		ContainerIP:      containerIP,
-		CPU:              firstNonZeroFloat64(seed.CPU, 2),
-		MemoryMB:         firstNonZeroInt(seed.MemoryMB, 2048),
-		DiskGB:           firstNonZeroInt(seed.DiskGB, 10),
-		OSUser:           osUser,
-		Env:              maps.Clone(seed.Env),
-		Tags:             maps.Clone(seed.Labels),
-		NetworkBlockAll:  seed.NetworkBlockAll,
-		ToolboxEnabled:   toolboxEnabled,
-		ToolboxToken:     toolboxToken,
-		SSHPublicKey:     seed.SSHPublicKey,
-		ExposedPorts:     exposedPorts,
-		CreatedAt:        createdAt,
-		UpdatedAt:        updatedAt,
-		LastActiveAt:     lastActiveAt,
-		LastError:        seed.LastError,
-		ContainerCommand: slices.Clone(seed.ContainerCommand),
-		Lifecycle:        lifecycle,
-		Runtime:          runtimeName,
+		ID:                 id,
+		AuditIncarnationID: "inc-" + id,
+		Name:               name,
+		Image:              image,
+		Status:             status,
+		PublicURL:          publicURL,
+		ContainerID:        containerID,
+		ContainerIP:        containerIP,
+		CPU:                firstNonZeroFloat64(seed.CPU, 2),
+		MemoryMB:           firstNonZeroInt(seed.MemoryMB, 2048),
+		DiskGB:             firstNonZeroInt(seed.DiskGB, 10),
+		OSUser:             osUser,
+		Env:                maps.Clone(seed.Env),
+		Tags:               maps.Clone(seed.Labels),
+		NetworkBlockAll:    seed.NetworkBlockAll,
+		ToolboxEnabled:     toolboxEnabled,
+		ToolboxToken:       toolboxToken,
+		SSHPublicKey:       seed.SSHPublicKey,
+		ExposedPorts:       exposedPorts,
+		CreatedAt:          createdAt,
+		UpdatedAt:          updatedAt,
+		LastActiveAt:       lastActiveAt,
+		LastError:          seed.LastError,
+		ContainerCommand:   slices.Clone(seed.ContainerCommand),
+		Lifecycle:          lifecycle,
+		Runtime:            runtimeName,
 	}
 	if err := e.store.Upsert(e.ctx, sandbox); err != nil {
 		e.t.Fatalf("store.Upsert(%s) error = %v", sandbox.ID, err)

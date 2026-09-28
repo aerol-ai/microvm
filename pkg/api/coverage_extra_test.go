@@ -124,7 +124,7 @@ func TestLoggingMiddlewareHijackedAndUpgrade(t *testing.T) {
 }
 
 func TestPrometheusCollectNestedMapAndInt(t *testing.T) {
-	root := expvar.NewMap("aerolvm_nested_test")
+	root := ensureExpvarMap("aerolvm_nested_test")
 	child := new(expvar.Map).Init()
 	child.Add("inner", 3)
 	root.Set("child", child)
@@ -139,7 +139,9 @@ func TestPrometheusCollectNestedMapAndInt(t *testing.T) {
 		t.Fatalf("missing nested metric:\n%s", body)
 	}
 
-	if val, ok := prometheusValue(expvar.NewInt("aerolvm_int_probe")); !ok || val != "0" {
+	probe := ensureExpvarInt("aerolvm_int_probe")
+	probe.Set(0)
+	if val, ok := prometheusValue(probe); !ok || val != "0" {
 		t.Fatalf("prometheusValue int: ok=%v val=%q", ok, val)
 	}
 
@@ -163,7 +165,7 @@ type errWriter struct{}
 func (errWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
 func TestWritePrometheusExpvarsWriteError(t *testing.T) {
-	expvar.NewInt("aerolvm_write_err_probe").Set(1)
+	ensureExpvarInt("aerolvm_write_err_probe").Set(1)
 	if err := writePrometheusExpvars(errWriter{}); err == nil {
 		t.Fatal("expected write error")
 	}

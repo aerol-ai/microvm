@@ -172,6 +172,18 @@ func (f *placementFSM) releaseVolumeAttachmentKeyLocked(key string, a models.Vol
 }
 
 func (f *placementFSM) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
+	f.releaseVolumeAttachmentsLocked(sandboxID, "")
+}
+
+func (f *placementFSM) releaseVolumeAttachmentsForIncarnationLocked(sandboxID, incarnationID string) {
+	incarnationID = strings.TrimSpace(incarnationID)
+	if incarnationID == "" {
+		return
+	}
+	f.releaseVolumeAttachmentsLocked(sandboxID, incarnationID)
+}
+
+func (f *placementFSM) releaseVolumeAttachmentsLocked(sandboxID, incarnationID string) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {
 		return
@@ -179,6 +191,9 @@ func (f *placementFSM) releaseVolumeAttachmentsForSandboxLocked(sandboxID string
 	refs := f.volumeAttachmentsBySandbox[sandboxID]
 	for key := range refs {
 		if a, ok := f.volumeAttachments[key]; ok {
+			if incarnationID != "" && strings.TrimSpace(a.IncarnationID) != incarnationID {
+				continue
+			}
 			f.releaseVolumeAttachmentKeyLocked(key, a)
 		}
 	}

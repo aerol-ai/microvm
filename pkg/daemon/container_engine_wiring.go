@@ -85,8 +85,9 @@ func startChainReassert(ctx context.Context, rules *netrules.Manager, logger *sl
 		return func() {}
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	interval := chainReassertInterval
 	go func() {
-		t := time.NewTicker(chainReassertInterval)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {

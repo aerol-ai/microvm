@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type hostPortReserveCluster struct {
@@ -181,8 +182,10 @@ func TestRecreateSandboxFailsWhenClusterSecretRefMissing(t *testing.T) {
 	svc, st, _ := newServiceRuntimeHarness(t, rt)
 
 	err := svc.RecreateSandbox(ctx, "sb-recreate-missing-secret", models.CreateSandboxRequest{Image: "alpine:3.20"}, cluster.PlacementSecrets{
-		Ref:     "cluster-secret:missing",
-		Version: 1,
+		Ref:            secrets.FormatRef("sb-recreate-missing-secret", "inc-missing", secrets.RefVersion),
+		Version:        secrets.RefVersion,
+		IncarnationID:  "inc-missing",
+		SealGeneration: 1,
 	}, nil)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("RecreateSandbox() error = %v, want missing secret ref", err)

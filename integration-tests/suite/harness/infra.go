@@ -46,6 +46,27 @@ func LoadIntegrationTargets() *IntegrationTargets {
 	return &t
 }
 
+// IntegrationNodeForClusterID maps a cluster node ID (what placements report,
+// e.g. "aerolvm-itest-cluster-3-mixed-routing-node3") to the provisioned
+// node. Terraform prefixes the node's map key ("node3") with the cluster
+// name, so an exact match is tried first, then the longest name the ID ends
+// with after a "-". Longest wins, so "node13" never matches "node3".
+func IntegrationNodeForClusterID(targets *IntegrationTargets, id string) (IntegrationNode, bool) {
+	if n, ok := LookupIntegrationNode(targets, id); ok {
+		return n, true
+	}
+	var best IntegrationNode
+	if targets == nil {
+		return best, false
+	}
+	for _, n := range targets.Nodes {
+		if n.Name != "" && strings.HasSuffix(id, "-"+n.Name) && len(n.Name) > len(best.Name) {
+			best = n
+		}
+	}
+	return best, best.Name != ""
+}
+
 // LookupIntegrationNode finds a provisioned node by terraform name (node_id).
 func LookupIntegrationNode(targets *IntegrationTargets, name string) (IntegrationNode, bool) {
 	if targets == nil {

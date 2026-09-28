@@ -16,7 +16,7 @@ func TestNoopVolumeAttachmentsRoundTrip(t *testing.T) {
 		t.Fatalf("VolumeUpsert: %v", err)
 	}
 	attach := models.VolumeAttachment{
-		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "bucket/t-a/data",
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "bucket/t-a/data",
 	}
 	if err := n.PutVolumeAttachments(ctx, []models.VolumeAttachment{attach}); err != nil {
 		t.Fatalf("PutVolumeAttachments: %v", err)
@@ -28,7 +28,7 @@ func TestNoopVolumeAttachmentsRoundTrip(t *testing.T) {
 	if err := n.VolumeDelete(ctx, "t-a", "vol-1"); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("VolumeDelete attached = %v, want ErrVolumeInUse", err)
 	}
-	if err := n.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1"); err != nil {
+	if err := n.DeleteVolumeAttachmentsForSandbox(ctx, "sb-1", "inc-sb-1"); err != nil {
 		t.Fatalf("DeleteVolumeAttachmentsForSandbox: %v", err)
 	}
 	if err := n.VolumeDelete(ctx, "t-a", "vol-1"); err != nil {
@@ -39,10 +39,33 @@ func TestNoopVolumeAttachmentsRoundTrip(t *testing.T) {
 func TestNoopPutVolumeAttachmentsRequiresKnownVolume(t *testing.T) {
 	n := NewNoop("standalone", "http://self", "")
 	err := n.PutVolumeAttachments(context.Background(), []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", Target: "/data", Source: "s/x",
+		Tenant: "t-a", VolumeID: "missing", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/x",
 	}})
 	if !errors.Is(err, ErrUnknownVolume) {
 		t.Fatalf("PutVolumeAttachments unknown volume = %v, want ErrUnknownVolume", err)
+	}
+}
+
+func TestNoopExactPlacementDeleteReleasesOnlyMatchingLifecycleAttachments(t *testing.T) {
+	ctx := context.Background()
+	n := NewNoop("node-a", "http://node-a", "")
+	volume := models.Volume{Tenant: "tenant-a", ID: "vol-a", Name: "data", Backend: "s3", Source: "s3://bucket/data"}
+	if _, _, err := n.VolumeUpsert(ctx, volume, 10); err != nil {
+		t.Fatal(err)
+	}
+	for _, incarnationID := range []string{"inc-old", "inc-new"} {
+		if err := n.PutVolumeAttachments(ctx, []models.VolumeAttachment{{
+			Tenant: volume.Tenant, VolumeID: volume.ID, SandboxID: "sb-reused", IncarnationID: incarnationID,
+			Target: "/" + incarnationID, Source: volume.Source,
+		}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := n.DeletePlacementExact(ctx, "sb-reused", "node-a", "inc-old"); err != nil {
+		t.Fatal(err)
+	}
+	if count, err := n.VolumeAttachmentCount(ctx, volume.Tenant, volume.ID); err != nil || count != 1 {
+		t.Fatalf("attachment count after exact delete = %d, %v; want current lifecycle retained", count, err)
 	}
 }
 

@@ -28,6 +28,46 @@ with Deno Sandbox (microVMs).
 
 ## 0. Review history
 
+- **2026-09-12 — Jail realized end to end.** The §2.1 jail was a spec with a
+  uid drop: `applyJail` set credentials and, if asked, an *unpopulated*
+  chroot, so every live run set `SB_ISOLATE_USE_JAIL=false`. Now realized
+  (`pkg/isolate`): the daemon builds a chroot base at boot (workerd + `ldd`
+  libraries + `/dev` nodes; boot fails if it cannot) and hard-links a root
+  per group; the process is cloned into its own cgroup v2 (`cpu.max` /
+  `memory.max` from the group's caps, applied live when a warm blank is
+  claimed); the daemon re-execs itself as a shim that chroots, drops to the
+  jail uid, sets `no_new_privs`, installs the classic-BPF seccomp allowlist
+  (built in Go from the §2.1 names, per-arch tables, `TSYNC`) and execs
+  `/workerd`. The allowlist grew to what a glibc-linked V8 host needs with
+  the filter installed before `execve` (loader RELRO `mprotect`,
+  `set_tid_address`, `clone3`, legacy x86-64 names skipped on arm64);
+  `--jitless` now keeps `mprotect`/`mmap` by name and refuses `PROT_EXEC` by
+  argument rule. `SB_ISOLATE_SECCOMP_MODE=audit` (kernel logs, allows) is the
+  bring-up path for a new workerd build. `install.sh --with-isolate` creates
+  the `sandboxd-isolate` system user (the old default uid 1000 is the login
+  user on AWS images). Enterprise mode now *requires* the jail with an
+  enforcing filter instead of forbidding isolate. **Real-host proof pending:**
+  `make integration-single-isolate-jail` (UC-109) inspects the workerd
+  process for uid / `NoNewPrivs` / `Seccomp: 2` / chroot / cgroup; it has not
+  yet been run — until it passes on a Linux box, the jail is verified
+  piecewise (offline: program shape, chroot tree, cgroup layout, shim spec,
+  path mapping; cross-compiled for linux/amd64 and arm64) not as a whole.
+  Not done: PID/network namespaces; per-isolate CPU caps (Phase 4).
+- **2026-09-12 — Cluster catalogue + bundle durability follow-up.** The
+  node-bound `module_ref` (O(1) create placement, no per-upload fan-out) shipped
+  with the secrets-hardening PR and deleted the fleet-wide replication; two
+  gaps came with it and are now closed on a stacked PR: `GET /v1/js-bundles`
+  returned only the receiving node's bundles in cluster mode (empty from
+  ingress) — it is now the shared per-worker catalogue list (leader-coalesced,
+  cached, bounded fan-out to isolate workers, digest-deduped, partial coverage
+  in headers; the same shape as templates); and a bundle whose worker is gone
+  failed as a generic no-placement 503 — it is now `503` +
+  `code: artifact_node_unavailable`, no `Retry-After`, so SDKs re-upload.
+  **Bundle durability** (registry-backed bundles: upload pushes to AOCR, any
+  worker pulls, placement unpinned, node loss becomes a cache miss — the same
+  mechanism `.wasm` modules already use) is the GA-tier fix and is recorded as
+  a Phase 5 prerequisite below. Not re-adding K-copy fan-out: that would be a
+  third replication mechanism next to secrets and images.
 - **2026-07-18 — Live integration + UC-94 bench.** `single-node-isolate`
   scenario (`make integration-single-isolate`): UC-103 (runs), UC-104
   (per-sandbox egress allowlist in one tenant group), UC-105 (js-bundle
@@ -198,6 +238,8 @@ The chosen posture (amended per review):
   tenant invariant the security posture is stated in terms of. **Regression
   test required (§11).**
 - **Jail the `workerd` process — as a first-class Phase-1 deliverable.**
+  *(Realized 2026-09-12; see the status entry. What follows is the original
+  design, which the realization follows.)*
   Reuses the Firecracker jailer's chroot + cgroups + drop-priv pattern; the
   new work is a seccomp allowlist for a JIT-heavy V8 process (W^X pages,
   memfd, thread spawn) — a known subproject, budgeted as such. The jail spike
@@ -597,7 +639,11 @@ Every new package ships with `_test.go` next to it at the ~85% bar (§11).
   packing beyond per-tenant granularity where trust allows; CPU/mem limit
   mapping; single-node admission footprint + density bench; per-invocation
   billing export; snapshot spike only if warm-pool numbers justify it.
-- **Phase 5 — Durability + cluster + facades.** `durable`
+- **Phase 5 — Durability + cluster + facades.** **Bundle durability first:**
+  bundles are single-copy on the receiving worker today (see 2026-09-12 entry);
+  before any cross-worker failover promise, uploads must push to the AOCR
+  registry and workers pull on demand, so `module_ref` becomes a plain digest
+  and placement is unpinned. `durable`
   enablement (statekv reattach + `NormalizeCreateDurability`); cluster
   placement with tenant-affinity / forwarding / failover parity (no-op when
   `EnableCluster` false; group failover rehydrates from bundles + statekv);

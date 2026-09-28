@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/errdefs"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )

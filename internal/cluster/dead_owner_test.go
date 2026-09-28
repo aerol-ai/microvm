@@ -2,12 +2,14 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // TestDeadOwnerTrackerMarkAndClear verifies the tiny piece of state the
@@ -132,6 +134,7 @@ func TestEvictDeadOwnerReassignsWhenSpecOptsIn(t *testing.T) {
 	// Placement with a non-nil spec belongs to a phantom dead node.
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-reassign", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
+		IncarnationID: "inc-reassign",
 		Spec: &models.CreateSandboxRequest{
 			Image:    "alpine",
 			CPU:      0.5,
@@ -157,6 +160,104 @@ func TestEvictDeadOwnerReassignsWhenSpecOptsIn(t *testing.T) {
 	}
 }
 
+// TestSelectRecreationTargetRestrictsSecretPlacementToRecipients is the
+// 2,000-node regression for the local-provider failure mode: only the owner
+// and its selected backups receive the ciphertext row, so failover must never
+// hand the sandbox to a higher-capacity non-recipient.
+func TestSelectRecreationTargetRestrictsSecretPlacementToRecipients(t *testing.T) {
+	index := newGossipMemberIndex()
+	for i := 0; i < 2000; i++ {
+		id := fmt.Sprintf("worker-%04d", i)
+		freeCPU := 64.0
+		if id == "worker-0100" {
+			freeCPU = 4
+		}
+		if id == "worker-0200" {
+			freeCPU = 8
+		}
+		index.upsert(Member{
+			NodeID: id,
+			APIURL: "http://" + id,
+			Alive:  true,
+			Role:   config.NodeRoleWorker,
+			Capacity: capacity.Snapshot{
+				HostCPUCores:      64,
+				HostMemoryTotalMB: 65536,
+				CPUBudget:         64,
+				MemoryBudgetMB:    65536,
+				ReservedCPU:       64 - freeCPU,
+				AvailableCPU:      freeCPU,
+				AvailableMemoryMB: 65536,
+				CanAdmit:          true,
+			},
+		})
+	}
+	c := &Cluster{
+		nodeID: "leader",
+		fsm:    newPlacementFSM(),
+		gossip: &gossipNode{memberIndex: index},
+	}
+	p := Placement{
+		Spec:                 &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		SecretRef:            "present",
+		SecretVersion:        secrets.RefVersion,
+		SecretSealGeneration: 1,
+		SecretRecipients:     []string{"dead-owner", "worker-0100", "worker-0200"},
+	}
+	if candidates := c.recreationCandidates(p); len(candidates) != 2 {
+		t.Fatalf("recipient candidate count = %d, want 2 from 2,000 live workers", len(candidates))
+	}
+	target, ok := c.selectRecreationTarget(p)
+	if !ok {
+		t.Fatal("expected an alive recipient target")
+	}
+	if target.NodeID != "worker-0200" {
+		t.Fatalf("target = %q, want best eligible recipient worker-0200", target.NodeID)
+	}
+}
+
+func TestEvictDeadOwnerOrphansWhenNoSecretRecipientIsAlive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+	seedSelfFailoverCapacity(c)
+
+	const sandboxID = "sb-no-live-recipient"
+	const incarnationID = "inc-no-live-recipient"
+	cmd := command{
+		Op:                   opPlace,
+		SandboxID:            sandboxID,
+		OwnerNodeID:          "dead-node",
+		OwnerAPIURL:          "http://gone",
+		IncarnationID:        incarnationID,
+		SecretRef:            secrets.FormatRef(sandboxID, incarnationID, secrets.RefVersion),
+		SecretVersion:        secrets.RefVersion,
+		SecretSealGeneration: 1,
+		SecretRecipients:     []string{"dead-node", "dead-backup"},
+		Spec: &models.CreateSandboxRequest{
+			Image:    "alpine",
+			CPU:      0.5,
+			MemoryMB: 256,
+			Failover: &models.Failover{Policy: models.FailoverPolicyRecreate},
+		},
+	}
+	payload, err := encodeCommand(cmd)
+	if err != nil {
+		t.Fatalf("encodeCommand: %v", err)
+	}
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("raft Apply: %v", err)
+	}
+
+	c.evictDeadOwner(context.Background(), "dead-node")
+	if _, err := c.OwnerOf(sandboxID); err != ErrOrphaned {
+		t.Fatalf("OwnerOf after eviction = %v, want ErrOrphaned", err)
+	}
+}
+
 func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
@@ -167,7 +268,8 @@ func TestEvictDeadOwnerOrphansSpecWithoutFailoverOptIn(t *testing.T) {
 
 	cmd := command{
 		Op: opPlace, SandboxID: "sb-no-ha", OwnerNodeID: "dead-node", OwnerAPIURL: "http://gone",
-		Spec: &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
+		IncarnationID: "inc-no-ha",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine", CPU: 0.5, MemoryMB: 256},
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {

@@ -20,14 +20,23 @@ import (
 )
 
 func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
+	return generateTestCertForNode("")
+}
+
+func generateTestCertForNode(nodeID string) (*x509.CertPool, tls.Certificate, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, tls.Certificate{}, err
+	}
+	dns := []string{"aerolvm-cluster-node", "localhost"}
+	if nodeID != "" {
+		dns = append(dns, "node:"+nodeID)
 	}
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject: pkix.Name{
 			Organization: []string{"Acme Co"},
+			CommonName:   nodeID,
 		},
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().Add(time.Hour * 24 * 180),
@@ -35,7 +44,7 @@ func generateTestCert() (*x509.CertPool, tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		DNSNames:              []string{"aerolvm-cluster-node", "localhost"},
+		DNSNames:              dns,
 		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
 	}
 
@@ -66,7 +75,7 @@ func TestInternalServerSetup(t *testing.T) {
 }
 
 func TestInternalServerHandlers(t *testing.T) {
-	pool, tlsCert, err := generateTestCert()
+	pool, tlsCert, err := generateTestCertForNode("node-test")
 	if err != nil {
 		t.Fatalf("cert gen: %v", err)
 	}
@@ -86,6 +95,10 @@ func TestInternalServerHandlers(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 	defer srv.Close()
+
+	// Membership authorization is enforced in every mode, so this test needs
+	// an installed authorizer before any request can reach the apply handler.
+	srv.SetPeerAuthorizer(func(string) bool { return true })
 
 	if srv.Addr() == "" {
 		t.Errorf("expected bound address")
@@ -171,5 +184,96 @@ func TestInternalServerHandlers(t *testing.T) {
 func TestInternalServerNilCheck(t *testing.T) {
 	var s *internalServer
 	s.SetExtraHandler(nil)
+	s.SetPeerAuthorizer(nil)
 	s.Close()
+}
+
+// TestInternalServerApplyRequiresLiveCertIdentity pins the revocation
+// boundary: a cluster-CA leaf alone never authorizes a raft apply, in ANY
+// cluster mode (enterprise used to be the only mode that checked). The boot
+// window — listener bound, gossip not yet constructed — must refuse as a
+// retryable 503, and a peer that is no longer in the live membership must get
+// a permanent 403.
+func TestInternalServerApplyRequiresLiveCertIdentity(t *testing.T) {
+	pool, tlsCert, err := generateTestCertForNode("worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := &ClusterTLS{nodeCert: tlsCert, caPool: pool}
+	var calls int
+	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error {
+		calls++
+		return nil
+	}, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: ct.clientConfig()}}
+	post := func(claim string, body []byte) int {
+		req, reqErr := http.NewRequest(http.MethodPost, "https://"+srv.Addr()+InternalAPIPath, bytes.NewReader(body))
+		if reqErr != nil {
+			t.Fatal(reqErr)
+		}
+		if claim != "" {
+			req.Header.Set(PeerNodeIDHeader, claim)
+		}
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+	// Boot window: no membership view yet. Retryable, never served.
+	if got := post("worker-1", []byte("ok")); got != http.StatusServiceUnavailable {
+		t.Fatalf("boot-window status=%d, want 503", got)
+	}
+	live := map[string]bool{"worker-1": true}
+	srv.SetPeerAuthorizer(func(id string) bool { return live[id] })
+	if got := post("worker-2", []byte("ok")); got != http.StatusForbidden {
+		t.Fatalf("mismatched identity status=%d, want 403", got)
+	}
+	if got := post("worker-1", []byte("ok")); got != http.StatusNoContent {
+		t.Fatalf("authorized identity status=%d, want 204", got)
+	}
+	// Decommission worker-1: its certificate is still valid and unexpired,
+	// but it has left the live membership and must lose apply authority.
+	delete(live, "worker-1")
+	if got := post("worker-1", []byte("ok")); got != http.StatusForbidden {
+		t.Fatalf("removed-member status=%d, want 403", got)
+	}
+	live["worker-1"] = true
+	if got := post("worker-1", bytes.Repeat([]byte{'x'}, (1<<20)+1)); got != http.StatusBadRequest {
+		t.Fatalf("oversized apply status=%d, want 400", got)
+	}
+	if calls != 1 {
+		t.Fatalf("apply calls=%d, want only the authorized bounded request", calls)
+	}
+}
+
+func TestInternalServerDoesNotBoundStreamingBodies(t *testing.T) {
+	// Forwarded exec/log/upload/websocket hitch a ride on this listener.
+	// ReadTimeout/WriteTimeout would cut those the way the public API
+	// deliberately does not (pkg/daemon/daemon.go).
+	pool, cert, err := generateTestCertForNode("worker-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := &ClusterTLS{caPool: pool, nodeCert: cert}
+	srv, err := startInternalServer("127.0.0.1:0", ct, func(context.Context, []byte) error { return nil }, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	if srv.srv.ReadTimeout != 0 {
+		t.Fatalf("ReadTimeout = %s, want 0 (streaming)", srv.srv.ReadTimeout)
+	}
+	if srv.srv.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout = %s, want 0 (streaming)", srv.srv.WriteTimeout)
+	}
+	if srv.srv.ReadHeaderTimeout != 10*time.Second {
+		t.Fatalf("ReadHeaderTimeout = %s, want 10s", srv.srv.ReadHeaderTimeout)
+	}
 }

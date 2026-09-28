@@ -57,7 +57,27 @@ func (n *Noop) OwnerOfName(name string) (string, OwnerInfo, error) {
 }
 
 func (n *Noop) SelectPlacement(req capacity.Request) (PlacementTarget, error) {
-	return PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
+	target, _, err := n.SelectPlacementWithCandidates(req)
+	return target, err
+}
+
+func (n *Noop) SelectPlacementWithCandidates(req capacity.Request) (PlacementTarget, []Member, error) {
+	if req.RequiredNodeID != "" && req.RequiredNodeID != n.nodeID {
+		return PlacementTarget{}, nil, ErrNoPlacementTarget
+	}
+	self := PlacementTarget{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}
+	return self, []Member{{NodeID: n.nodeID, APIURL: n.apiURL, Alive: true}}, nil
+}
+
+func (n *Noop) SelectPlacementForCreate(req capacity.Request, sandboxID string, recipientBackups int) (PlacementTarget, []string, error) {
+	target, candidates, err := n.SelectPlacementWithCandidates(req)
+	if err != nil {
+		return PlacementTarget{}, nil, err
+	}
+	if recipientBackups <= 0 {
+		return target, nil, nil
+	}
+	return target, SelectSecretRecipients(sandboxID, candidates, target.NodeID, recipientBackups), nil
 }
 
 func (n *Noop) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
@@ -67,6 +87,9 @@ func (n *Noop) ClaimOrphan(ctx context.Context, sandboxID string, spec *models.C
 	return nil
 }
 func (n *Noop) UpsertSpec(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, secrets PlacementSecrets) error {
+	return nil
+}
+func (n *Noop) UpdatePlacementSecretRecipients(ctx context.Context, sandboxID string, recipients []string, secrets PlacementSecrets, expectedIncarnationID, expectedOwnerNodeID string, expectedSealGeneration int64) error {
 	return nil
 }
 func (n *Noop) SpecOf(sandboxID string) *models.CreateSandboxRequest { return nil }
@@ -82,9 +105,34 @@ func (n *Noop) AddCustomDomain(ctx context.Context, sandboxID, hostname string) 
 func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname string) error {
 	return nil
 }
-func (n *Noop) CustomDomainsOf(sandboxID string) []string                   { return nil }
-func (n *Noop) ResolveCustomDomain(hostname string) (string, bool)          { return "", false }
-func (n *Noop) DeletePlacement(ctx context.Context, sandboxID string) error { return nil }
+func (n *Noop) CustomDomainsOf(sandboxID string) []string          { return nil }
+func (n *Noop) ResolveCustomDomain(hostname string) (string, bool) { return "", false }
+
+func (n *Noop) DeletePlacement(_ context.Context, sandboxID string) error {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.releaseVolumeAttachmentsForSandboxLocked(strings.TrimSpace(sandboxID))
+	return nil
+}
+
+func (n *Noop) DeletePlacementExact(_ context.Context, sandboxID, _, incarnationID string) error {
+	n.volMu.Lock()
+	defer n.volMu.Unlock()
+	n.releaseVolumeAttachmentsForIncarnationLocked(strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
+	return nil
+}
+
+func (n *Noop) BeginDeletePlacementExact(context.Context, string, string, string) error { return nil }
+
+func (n *Noop) AuditOwnerRef(context.Context, string) (string, bool, error) {
+	return "", false, nil
+}
+
+func (n *Noop) AuditACLForSandbox(context.Context, string, string) (AuditACL, bool, error) {
+	return AuditACL{}, false, nil
+}
+
+func (n *Noop) PruneAuditACL(context.Context, time.Time) error { return nil }
 func (n *Noop) ReserveOnTarget(ctx context.Context, sandboxID string, target PlacementTarget, redacted *models.CreateSandboxRequest, secrets PlacementSecrets, ttl time.Duration) error {
 	return nil
 }
@@ -210,15 +258,16 @@ func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.Volu
 		tenant := strings.TrimSpace(a.Tenant)
 		volumeID := strings.TrimSpace(a.VolumeID)
 		sandboxID := strings.TrimSpace(a.SandboxID)
+		incarnationID := strings.TrimSpace(a.IncarnationID)
 		target := strings.TrimSpace(a.Target)
 		source := strings.TrimSpace(a.Source)
-		if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
+		if tenant == "" || volumeID == "" || sandboxID == "" || incarnationID == "" || target == "" || source == "" {
 			return ErrUnknownVolume
 		}
 		if _, ok := n.volumes[volumeKey(tenant, volumeID)]; !ok {
 			return ErrUnknownVolume
 		}
-		a.Tenant, a.VolumeID, a.SandboxID, a.Target, a.Source = tenant, volumeID, sandboxID, target, source
+		a.Tenant, a.VolumeID, a.SandboxID, a.IncarnationID, a.Target, a.Source = tenant, volumeID, sandboxID, incarnationID, target, source
 		if a.CreatedAt.IsZero() {
 			a.CreatedAt = time.Now().UTC()
 		}
@@ -227,10 +276,10 @@ func (n *Noop) PutVolumeAttachments(_ context.Context, attachments []models.Volu
 	return nil
 }
 
-func (n *Noop) DeleteVolumeAttachmentsForSandbox(_ context.Context, sandboxID string) error {
+func (n *Noop) DeleteVolumeAttachmentsForSandbox(_ context.Context, sandboxID, incarnationID string) error {
 	n.volMu.Lock()
 	defer n.volMu.Unlock()
-	n.releaseVolumeAttachmentsForSandboxLocked(strings.TrimSpace(sandboxID))
+	n.releaseVolumeAttachmentsForIncarnationLocked(strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
 	return nil
 }
 
@@ -285,11 +334,25 @@ func (n *Noop) releaseVolumeAttachmentKeyLocked(key string, a models.VolumeAttac
 }
 
 func (n *Noop) releaseVolumeAttachmentsForSandboxLocked(sandboxID string) {
+	n.releaseVolumeAttachmentsLocked(sandboxID, "")
+}
+
+func (n *Noop) releaseVolumeAttachmentsForIncarnationLocked(sandboxID, incarnationID string) {
+	if incarnationID == "" {
+		return
+	}
+	n.releaseVolumeAttachmentsLocked(sandboxID, incarnationID)
+}
+
+func (n *Noop) releaseVolumeAttachmentsLocked(sandboxID, incarnationID string) {
 	if sandboxID == "" {
 		return
 	}
 	for key := range n.volAttachmentsBySandbox[sandboxID] {
 		if a, ok := n.volAttachments[key]; ok {
+			if incarnationID != "" && strings.TrimSpace(a.IncarnationID) != incarnationID {
+				continue
+			}
 			n.releaseVolumeAttachmentKeyLocked(key, a)
 		}
 	}
@@ -316,6 +379,19 @@ func (n *Noop) Members() []Member {
 	return []Member{{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}}
 }
 
+// LocalMembers mirrors Members in single-node mode.
+func (n *Noop) LocalMembers() []Member { return n.Members() }
+
+// LookupMember resolves the single Noop member when id matches.
+func (n *Noop) LookupMember(id string) (Member, bool) {
+	if n == nil || id == "" || id != n.nodeID {
+		return Member{}, false
+	}
+	return Member{NodeID: n.nodeID, APIURL: n.apiURL, PublicHost: n.publicHost, Alive: true}, true
+}
+
+func (n *Noop) PeerInternalHTTPClient() *http.Client { return nil }
+
 // IngressTargets reports the single-node deployment's public address as the
 // DNS target. Empty publicHost (IP-only mode) returns the Unknown source so
 // the service layer can surface a clean 412 rather than fake records.
@@ -331,12 +407,23 @@ func (n *Noop) Placements() []Placement { return nil }
 func (n *Noop) PlacementsForShards(PlacementShardFilter) []Placement { return nil }
 
 func (n *Noop) PlacementPage(PlacementPageRequest) PlacementPageResponse {
+	// Not authoritative: single-node Noop has no placement index. List paths
+	// treat this as cold-start (keep local rows) rather than an empty tenant.
 	return PlacementPageResponse{}
 }
 
 // PlacementOf has no record in single-node mode — there's no FSM. Returns
 // the zero Placement and false so callers fall back to the local sandbox row.
 func (n *Noop) PlacementOf(sandboxID string) (Placement, bool) { return Placement{}, false }
+
+// PlacementsByIDs is empty in single-node mode (no FSM).
+func (n *Noop) PlacementsByIDs(ids []string) map[string]Placement {
+	return map[string]Placement{}
+}
+
+func (n *Noop) AuthoritativePlacementsByIDs(context.Context, []string) (map[string]Placement, error) {
+	return map[string]Placement{}, nil
+}
 
 // PlacementVersion always returns 0 in single-node mode — there's no FSM and
 // no need to wake an ingress reconciler that isn't running.

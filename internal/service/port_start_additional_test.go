@@ -24,6 +24,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 type pushErrorRuntime struct {
@@ -205,6 +206,8 @@ func newServiceRuntimeHarnessAtPath(t *testing.T, dbPath string, driver runtime.
 	t.Cleanup(func() {
 		_ = st.Close()
 	})
+	cipher := newTestCipher(t)
+	st.SetSecretCipher(cipher)
 
 	mgr, err := mounts.New(slog.New(slog.NewTextHandler(io.Discard, nil)), mounts.Config{
 		RootDir:     filepath.Join(t.TempDir(), "mounts"),
@@ -229,13 +232,15 @@ func newServiceRuntimeHarnessAtPath(t *testing.T, dbPath string, driver runtime.
 			EnableCaddy:       false,
 			HTTPClientTimeout: time.Second,
 		},
-		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
-		store:    st,
-		docker:   driver,
-		caddy:    caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
-		mounts:   mgr,
-		admitter: admitter,
-		images:   newDefaultImageDistributionProvider(""),
+		logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:          st,
+		docker:         driver,
+		caddy:          caddy.New(config.Config{EnableCaddy: false, HTTPClientTimeout: time.Second}),
+		mounts:         mgr,
+		admitter:       admitter,
+		images:         newDefaultImageDistributionProvider(""),
+		cipher:         cipher,
+		secretProvider: secrets.NewLocalProvider(cipher, newSecretBlobStore(st)),
 	}
 	return svc, st, admitter
 }

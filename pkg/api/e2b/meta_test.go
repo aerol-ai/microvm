@@ -249,7 +249,7 @@ func TestMetaSnapshotNameFromID(t *testing.T) {
 }
 
 func TestCreateRequestFingerprint(t *testing.T) {
-	f, err := createRequestFingerprint("tid", models.CreateSandboxRequest{NetworkBlockAll: true}, sandboxMeta{TimeoutSeconds: 10})
+	f, err := createRequestFingerprint("", "tid", models.CreateSandboxRequest{NetworkBlockAll: true}, sandboxMeta{TimeoutSeconds: 10})
 	if err != nil {
 		t.Fatal(err)
 	}

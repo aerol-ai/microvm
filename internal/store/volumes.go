@@ -260,27 +260,50 @@ func (s *Store) PutVolumeAttachments(ctx context.Context, attachments []models.V
 	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().UTC()
+	currentIncarnations := make(map[string]string)
 	for i := range attachments {
 		a := attachments[i]
 		tenant := strings.TrimSpace(a.Tenant)
 		volumeID := strings.TrimSpace(a.VolumeID)
 		sandboxID := strings.TrimSpace(a.SandboxID)
+		incarnationID := strings.TrimSpace(a.IncarnationID)
 		target := strings.TrimSpace(a.Target)
 		source := strings.TrimSpace(a.Source)
-		if tenant == "" || volumeID == "" || sandboxID == "" || target == "" || source == "" {
-			return fmt.Errorf("put volume attachment: tenant, volume_id, sandbox_id, target, and source are required")
+		if tenant == "" || volumeID == "" || sandboxID == "" || incarnationID == "" || target == "" || source == "" {
+			return fmt.Errorf("put volume attachment: tenant, volume_id, sandbox_id, incarnation_id, target, and source are required")
+		}
+		currentIncarnationID, ok := currentIncarnations[sandboxID]
+		if !ok {
+			if err := tx.QueryRowContext(ctx, `
+				SELECT acl.incarnation_id
+				FROM sandboxes AS sandbox
+				JOIN sandbox_audit_acl AS acl ON acl.sandbox_id = sandbox.id
+				WHERE sandbox.id = ? AND acl.incarnation_id <> ''
+				ORDER BY acl.updated_at DESC, acl.incarnation_id DESC
+				LIMIT 1
+			`, sandboxID).Scan(&currentIncarnationID); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("put volume attachment: live sandbox incarnation is required")
+				}
+				return fmt.Errorf("put volume attachment: resolve sandbox incarnation: %w", err)
+			}
+			currentIncarnations[sandboxID] = currentIncarnationID
+		}
+		if strings.TrimSpace(currentIncarnationID) != incarnationID {
+			return fmt.Errorf("put volume attachment: sandbox incarnation conflict")
 		}
 		created := a.CreatedAt
 		if created.IsZero() {
 			created = now
 		}
 		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO volume_attachments (tenant, volume_id, sandbox_id, target, source, created_at)
-			VALUES (?, ?, ?, ?, ?, ?)
+			INSERT INTO volume_attachments (tenant, volume_id, sandbox_id, incarnation_id, target, source, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(tenant, volume_id, sandbox_id, target) DO UPDATE SET
+				incarnation_id = excluded.incarnation_id,
 				source = excluded.source,
 				created_at = excluded.created_at
-		`, tenant, volumeID, sandboxID, target, source, created.UTC()); err != nil {
+		`, tenant, volumeID, sandboxID, incarnationID, target, source, created.UTC()); err != nil {
 			return fmt.Errorf("put volume attachment: %w", err)
 		}
 	}
@@ -309,10 +332,10 @@ func (s *Store) CountVolumeAttachments(ctx context.Context, tenant, volumeID str
 // references for sandboxID. SQLite normally reaches this through the sandbox FK
 // cascade, but the explicit method lets service code share the cluster-mode
 // cleanup path and is idempotent for rollback.
-func (s *Store) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID string) error {
+func (s *Store) DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error {
 	_, err := s.db.ExecContext(ctx, `
-		DELETE FROM volume_attachments WHERE sandbox_id = ?
-	`, strings.TrimSpace(sandboxID))
+		DELETE FROM volume_attachments WHERE sandbox_id = ? AND incarnation_id = ?
+	`, strings.TrimSpace(sandboxID), strings.TrimSpace(incarnationID))
 	if err != nil {
 		return fmt.Errorf("delete volume attachments for sandbox: %w", err)
 	}

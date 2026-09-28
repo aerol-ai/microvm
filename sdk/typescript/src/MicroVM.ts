@@ -16,6 +16,7 @@ import type {
   HealthStatus,
   IngressTarget,
   Lifecycle,
+  GetOptions,
   ListOptions,
   MountSpecRedacted,
   RegisterSnapshotOptions,
@@ -47,7 +48,7 @@ export interface MicroVMConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (429, 502, 503, 504). The SDK
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). The SDK
    * retries up to 3 times with exponential backoff by default. Pass
    * `{ maxRetries: 0 }` to disable.
    */
@@ -89,8 +90,18 @@ export class MicroVM {
     return sandboxes.map((sandbox) => this.wrap(sandbox.toJSON()));
   }
 
-  async get(id: string): Promise<Sandbox> {
-    const sandbox = await this.client.get(id);
+  /**
+   * Iterates one server page at a time. Use this for large fleet inventories so
+   * the SDK does not retain every sandbox in memory.
+   */
+  async *listPages(options?: ListOptions): AsyncGenerator<Sandbox[]> {
+    for await (const page of this.client.listPages(options)) {
+      yield page.map((sandbox) => this.wrap(sandbox.toJSON()));
+    }
+  }
+
+  async get(id: string, options?: GetOptions): Promise<Sandbox> {
+    const sandbox = await this.client.get(id, options);
     return this.wrap(sandbox.toJSON());
   }
 

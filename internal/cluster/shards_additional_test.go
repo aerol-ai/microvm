@@ -3,6 +3,8 @@ package cluster
 import (
 	"reflect"
 	"testing"
+
+	"github.com/aerol-ai/microvm/internal/config"
 )
 
 func TestPlacementPageRequestNormalize(t *testing.T) {
@@ -64,7 +66,7 @@ func TestPlacementShardForSandbox(t *testing.T) {
 
 func TestIngressShardFilterForNodeEdgeCases(t *testing.T) {
 	// Empty node ID
-	f := IngressShardFilterForNode([]Member{}, "")
+	f := IngressShardFilterForNode([]Member{}, "", config.NodeRoleIngress)
 	if f.ShardCount != 0 {
 		t.Errorf("expected empty filter for empty nodeID, got %+v", f)
 	}

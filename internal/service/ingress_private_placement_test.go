@@ -71,14 +71,13 @@ func TestClusterIngressSkipsPrivatePlacements(t *testing.T) {
 		t.Fatal("public placement with tcp/tls exposure should need L4")
 	}
 
-	// Legacy compat: a nil replicated spec (pre-private-by-default failover
-	// replay) must keep meaning PUBLIC — flipping that default would break
-	// failover for sandboxes created before the flag existed.
-	legacy := publicishPlacement("sb-legacy", nil)
-	legacy.Spec = nil
-	intents, _ = svc.buildClusterIngressIntents([]cluster.Placement{legacy}, "self")
-	if len(intents) == 0 {
-		t.Fatal("legacy nil-spec placement produced no intents, want public routes")
+	// Missing replicated policy fails private; incomplete state must never
+	// synthesize public ingress.
+	missing := publicishPlacement("sb-missing-policy", nil)
+	missing.Spec = nil
+	intents, _ = svc.buildClusterIngressIntents([]cluster.Placement{missing}, "self")
+	if len(intents) != 0 {
+		t.Fatalf("missing-policy placement produced %d intents, want zero", len(intents))
 	}
 }
 

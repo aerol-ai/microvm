@@ -177,17 +177,49 @@ open egress.
 Public HTTP ingress is opt-in with `exposePort` (HTTP only — the TCP host-port
 pool is never walked for isolates).
 
+## Cluster mode
+
+A bundle is stored on **one** isolate-capable worker: the one placement chose
+for the upload. Its `module_ref` carries that worker's identity, so a create
+that references it is placed on that worker in O(1), with no fleet probe and
+no replication. Two consequences follow:
+
+- **Listing is cluster-wide.** `GET /v1/js-bundles` from any node returns the
+  union of every isolate worker's catalogue (deduplicated by digest, scoped to
+  the caller's tenant). The list is coalesced on the Raft leader and cached for
+  two seconds. When a worker that may hold bundles did not answer, the response
+  carries `X-Aerol-Partial: true` and `X-Aerol-Missing-JSBundle-Peers: <n>`
+  rather than silently omitting its bundles.
+- **Bundles are single-copy.** If the worker holding a bundle leaves the
+  cluster, every create, get, or delete referencing that `module_ref` returns
+  `503` with `"code": "artifact_node_unavailable"`. Waiting will not bring it
+  back: the client keeps the source, and the recovery is to upload the bundle
+  again and use the new `module_ref`. SDKs should treat that code as
+  "re-upload, then retry", not as a transient error.
+
+Registry-backed durable bundles (upload once, pull on any worker, unpinned
+placement) are the planned follow-up for the GA tier; see
+`plans/isolate-runtime.md`, "Bundle durability".
+
 ## Residual limits
 
 Isolates have **no shell, no filesystem, and no arbitrary binary**. Toolbox
 `exec` invokes the `fetch` handler; other toolbox verbs return 501. Platform
 volumes and OCI images are rejected. SSH is not available.
 
-The outer jail (chroot + seccomp) defaults on in config; full chroot populate
-with the workerd binary is still landing — deploy with
-`SB_ISOLATE_USE_JAIL=false` until that follow-up ships (the live integration
-scenario does this today). Cross-tenant isolation remains one OS process per
-tenant group regardless.
+## The jail
+
+Isolates share one `workerd` process per tenant group, so that process
+boundary is the cross-tenant boundary. With `SB_ISOLATE_USE_JAIL=true` (the
+default) each group process runs as a dedicated non-root user, inside a chroot
+holding only workerd, its libraries, a few `/dev` nodes and its own socket
+directory, in its own cgroup v2 with the group's CPU and memory caps, with
+`no_new_privs` set and an enforcing seccomp allowlist installed before workerd
+starts. The daemon builds the chroot base at boot and refuses to start if it
+cannot, so a jail that cannot be realized is never discovered by a tenant's
+create. Enterprise mode requires the jail with `SB_ISOLATE_SECCOMP_MODE=enforce`.
+Operator details, the audit-mode procedure for new workerd builds, and the
+list of what the jail does not do are in `setup/runbooks/isolate-jail.md`.
 
 ## Operator setup
 
@@ -197,11 +229,17 @@ tenant group regardless.
 | `SB_ISOLATE_WORKERD_PATH` | install path | Pinned workerd binary |
 | `SB_ISOLATE_GROUP_GRANULARITY` | `per-tenant` | Or `per-sandbox` for stronger isolation / lower density |
 | `SB_ISOLATE_EGRESS_POOL_SIZE` | `64` | Concurrent egress slots per group |
-| `SB_ISOLATE_USE_JAIL` | `true` | Outer jail; set `false` until chroot-populate lands |
+| `SB_ISOLATE_USE_JAIL` | `true` | Jail every group process (chroot + cgroup + privilege drop + seccomp). `false` runs workerd unconfined as the daemon user — never in enterprise mode |
+| `SB_ISOLATE_SECCOMP_MODE` | `enforce` | `audit` logs unlisted syscalls instead of killing (bring-up for a new workerd build); `off` installs no filter (diagnosis only) |
+| `SB_ISOLATE_JAIL_UID` / `_GID` | installer-set | The `sandboxd-isolate` system user `install.sh --with-isolate` creates; the code default `1000` is the first login user on most images, so set these |
+| `SB_ISOLATE_JAIL_CHROOT_BASE` | `/srv/isolate-jail` | Parent of the shared base tree and the per-group roots |
+| `SB_ISOLATE_JAIL_CGROUP_ROOT` | `/sys/fs/cgroup/aerolvm-isolate` | Parent cgroup (v2) for the per-group cgroups |
 
 Installer: `install.sh --with-isolate`. Cluster Terraform:
 `with_isolate = true` on workers (or `default_with_isolate`). Operators upgrade
 the pinned workerd via `setup/runbooks/isolate-workerd-upgrade.md`.
 
-Live coverage: `make integration-single-isolate` (UC-103/104/105) and
+Live coverage: `make integration-single-isolate-jail` (UC-103/104/105 against
+jailed groups, plus UC-109 inspecting the confined workerd process),
+`make integration-single-isolate` (UC-103/104/105, jail off) and
 `make integration-benchmark-isolate` (UC-94 create latency).

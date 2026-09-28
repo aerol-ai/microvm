@@ -31,6 +31,7 @@ __pycache__/
 sdk/rust/target/
 **/target/
 Cargo.lock
+!sdk/rust/Cargo.lock
 .gstack/
 
 # Terraform artifacts
@@ -95,6 +96,8 @@ internal/store/invalid-dsn:::-shm
 internal/store/invalid-dsn:::-wal
 # Integration test harness (plans/integration-tests.md)
 integration-tests/.tf/                       
+# Locally cross-compiled daemon artifacts (plans/integration-test-security.md §4)
+integration-tests/.build/
 integration-tests/reports/*                  
 !integration-tests/reports/.gitignore
 integration-tests/scenarios/domains.yml

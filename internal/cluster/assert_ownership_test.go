@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // TestAssertOwnershipBackfillsFreshPlacement covers the boot scenario where the
@@ -27,6 +28,10 @@ func TestAssertOwnershipBackfillsFreshPlacement(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:   "sb-fresh",
 		Spec: spec,
+		Secrets: PlacementSecrets{
+			Ref: secretspkg.FormatRef("sb-fresh", "inc-fresh", secretspkg.RefVersion), Version: secretspkg.RefVersion,
+			Recipients: []string{"leader", "backup-a", "backup-b"}, IncarnationID: "inc-fresh", SealGeneration: 1,
+		},
 		ExposedPorts: map[int]ExposedPortRoute{
 			80:   {Protocol: "http"},
 			5432: {Protocol: "tcp", HostPort: 22432},
@@ -45,6 +50,9 @@ func TestAssertOwnershipBackfillsFreshPlacement(t *testing.T) {
 	}
 	if got.Spec == nil || got.Spec.Image != "alpine" {
 		t.Fatalf("spec not backfilled: %+v", got.Spec)
+	}
+	if len(got.SecretRecipients) != 3 || got.SecretRecipients[0] != "leader" || got.SecretRecipients[1] != "backup-a" || got.SecretRecipients[2] != "backup-b" {
+		t.Fatalf("ownership replay recipient set = %v, want all HA recipients", got.SecretRecipients)
 	}
 	if got.ExposedPorts[80] != "http" || got.ExposedPorts[5432] != "tcp" {
 		t.Fatalf("exposed ports not backfilled: %+v", got.ExposedPorts)
@@ -65,7 +73,7 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 
 	// Plant a spec-less placement via raw raft Apply so we hit the
 	// "placement exists, spec missing" branch deterministically.
-	cmd := command{Op: opPlace, SandboxID: "sb-legacy", OwnerNodeID: "leader"}
+	cmd := command{Op: opPlace, SandboxID: "sb-legacy", OwnerNodeID: "leader", IncarnationID: "inc-legacy"}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
 		t.Fatalf("seed opPlace: %v", err)
@@ -77,6 +85,7 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-legacy",
 		Spec:         spec,
+		Secrets:      PlacementSecrets{IncarnationID: "inc-legacy"},
 		ExposedPorts: map[int]ExposedPortRoute{443: {Protocol: "tls"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -95,6 +104,42 @@ func TestAssertOwnershipBackfillsMissingSpec(t *testing.T) {
 	}
 }
 
+func TestAssertOwnershipPromotesWidenedReplaySecretRecipients(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newTestCluster(t, "leader", true, nil)
+	defer cleanup()
+	waitForLeader(t, c, 10*time.Second)
+
+	cmd := command{
+		Op: opPlace, SandboxID: "sb-replay-widen", OwnerNodeID: "leader", IncarnationID: "inc-replay-widen",
+		Spec:      &models.CreateSandboxRequest{Image: "alpine", Failover: &models.Failover{Policy: models.FailoverPolicyRecreate}},
+		SecretRef: secretspkg.FormatRef("sb-replay-widen", "inc-replay-widen", secretspkg.RefVersion), SecretVersion: secretspkg.RefVersion,
+		SecretRecipients: []string{"leader"}, SecretSealGeneration: 1,
+	}
+	payload, _ := encodeCommand(cmd)
+	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
+		t.Fatalf("seed placement: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.AssertOwnership(ctx, []LocalSandboxState{{
+		ID: "sb-replay-widen", Spec: cmd.Spec,
+		Secrets: PlacementSecrets{
+			Ref: cmd.SecretRef, Version: cmd.SecretVersion, Recipients: []string{"leader", "backup-a"},
+			IncarnationID: cmd.IncarnationID, SealGeneration: 2,
+		},
+	}}); err != nil {
+		t.Fatalf("AssertOwnership: %v", err)
+	}
+	got, ok := c.fsm.get("sb-replay-widen")
+	if !ok || got.SecretSealGeneration != 2 || !sameSecretRecipientSet(got.SecretRecipients, []string{"leader", "backup-a"}) {
+		t.Fatalf("promoted replay secret state = %+v", got)
+	}
+}
+
 func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test: requires real raft socket")
@@ -104,11 +149,12 @@ func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	cmd := command{
-		Op:          opReserve,
-		SandboxID:   "sb-reserved-local",
-		OwnerNodeID: "leader",
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
-		ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		Op:            opReserve,
+		SandboxID:     "sb-reserved-local",
+		OwnerNodeID:   "leader",
+		IncarnationID: "inc-reserved-local",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		ExpiresUnix:   time.Now().Add(time.Minute).Unix(),
 	}
 	payload, _ := encodeCommand(cmd)
 	if err := c.raft.raft.Apply(payload, 2*time.Second).Error(); err != nil {
@@ -124,6 +170,7 @@ func TestAssertOwnershipPromotesSelfReservation(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-reserved-local",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:reserved", CPU: 1},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-reserved-local"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -228,11 +275,12 @@ func TestAssertOwnershipClaimsOwnOrphanedPlacement(t *testing.T) {
 	waitForLeader(t, c, 10*time.Second)
 
 	place, _ := encodeCommand(command{
-		Op:          opPlace,
-		SandboxID:   "sb-orphaned-self",
-		OwnerNodeID: "leader",
-		OwnerAPIURL: "http://old-leader",
-		Spec:        &models.CreateSandboxRequest{Image: "alpine:old", CPU: 1},
+		Op:            opPlace,
+		SandboxID:     "sb-orphaned-self",
+		OwnerNodeID:   "leader",
+		IncarnationID: "inc-orphaned-self",
+		OwnerAPIURL:   "http://old-leader",
+		Spec:          &models.CreateSandboxRequest{Image: "alpine:old", CPU: 1},
 	})
 	if err := c.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
 		t.Fatalf("seed opPlace: %v", err)
@@ -250,6 +298,7 @@ func TestAssertOwnershipClaimsOwnOrphanedPlacement(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-orphaned-self",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine:new", CPU: 2, MemoryMB: 512},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-orphaned-self"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {
@@ -333,6 +382,7 @@ func TestAssertOwnershipIsIdempotent(t *testing.T) {
 	local := []LocalSandboxState{{
 		ID:           "sb-twice",
 		Spec:         &models.CreateSandboxRequest{Image: "alpine", CPU: 1, MemoryMB: 256},
+		Secrets:      PlacementSecrets{IncarnationID: "inc-twice"},
 		ExposedPorts: map[int]ExposedPortRoute{8080: {Protocol: "http"}},
 	}}
 	if err := c.AssertOwnership(ctx, local); err != nil {

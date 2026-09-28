@@ -88,6 +88,38 @@ func TestDestroyNilSandboxIsNoop(t *testing.T) {
 	}
 }
 
+func TestAuditCapabilityBindingIsScopedAndFailClosed(t *testing.T) {
+	var nilDriver *Driver
+	if err := nilDriver.bindAuditCapability("sb", &wasmengine.Capabilities{}); err != nil {
+		t.Fatalf("nil driver binding = %v", err)
+	}
+	d := New(Config{ModulesDir: t.TempDir()}, nil)
+	if err := d.bindAuditCapability("sb", nil); err != nil {
+		t.Fatalf("nil capabilities binding = %v", err)
+	}
+	caps := &wasmengine.Capabilities{}
+	if err := d.bindAuditCapability("sb", caps); err != nil || caps.AuditCapability != "" {
+		t.Fatalf("unconfigured issuer binding = %+v err=%v", caps, err)
+	}
+	d.SetAuditCapabilityIssuer(func(id string) (string, string, error) {
+		if id != "sb-a" {
+			t.Fatalf("issuer sandbox id = %q", id)
+		}
+		return "cap-a", "inc-a", nil
+	})
+	if err := d.bindAuditCapability("sb-a", caps); err != nil {
+		t.Fatalf("capability binding: %v", err)
+	}
+	if caps.AuditCapability != "cap-a" || caps.AuditIncarnation != "inc-a" {
+		t.Fatalf("bound audit capability = %+v", caps)
+	}
+	issuerErr := errors.New("audit key unavailable")
+	d.SetAuditCapabilityIssuer(func(string) (string, string, error) { return "", "", issuerErr })
+	if err := d.bindAuditCapability("sb-b", &wasmengine.Capabilities{}); !errors.Is(err, issuerErr) {
+		t.Fatalf("issuer failure = %v, want %v", err, issuerErr)
+	}
+}
+
 func TestListManagedEmptyOK(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
 	got, err := d.ListManaged(context.Background())

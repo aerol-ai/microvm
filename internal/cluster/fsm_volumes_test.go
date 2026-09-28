@@ -101,7 +101,8 @@ func TestFSMVolumeDelete(t *testing.T) {
 func TestFSMVolumeAttachmentsBlockDeleteUntilSandboxReleased(t *testing.T) {
 	fsm := newPlacementFSM()
 	fsm.Apply(&raft.Log{Index: 1, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
-	attach := models.VolumeAttachment{Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d"}
+	fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "node-a", IncarnationID: "inc-sb-1"})})
+	attach := models.VolumeAttachment{Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d"}
 	if got := fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{attach}})}); got != nil {
 		t.Fatalf("put attachment returned %v", got)
 	}
@@ -112,7 +113,7 @@ func TestFSMVolumeAttachmentsBlockDeleteUntilSandboxReleased(t *testing.T) {
 	if err, _ := got.(error); !errors.Is(err, ErrVolumeInUse) {
 		t.Fatalf("delete attached volume = %v, want ErrVolumeInUse", got)
 	}
-	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opDeleteVolumeAttach, VolumeSandboxID: "sb-1"})}); got != nil {
+	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opDeleteVolumeAttach, VolumeSandboxID: "sb-1", ExpectedIncarnationID: "inc-sb-1"})}); got != nil {
 		t.Fatalf("delete attachments returned %v", got)
 	}
 	if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
@@ -131,23 +132,24 @@ func TestFSMPutVolumeAttachValidationAndUpsert(t *testing.T) {
 	got := fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{
 		Op: opPutVolumeAttach,
 		VolumeAttachments: []models.VolumeAttachment{{
-			Tenant: "t-a", VolumeID: "vol-1", SandboxID: "", Target: "/data", Source: "s/d",
+			Tenant: "t-a", VolumeID: "vol-1", SandboxID: "", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d",
 		}},
 	})})
 	if got == nil {
 		t.Fatal("expected validation error for missing sandbox_id")
 	}
 	fsm.Apply(&raft.Log{Index: 3, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
+	fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "node-a", IncarnationID: "inc-sb-1"})})
 	got = fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{
 		Op: opPutVolumeAttach,
 		VolumeAttachments: []models.VolumeAttachment{{
-			Tenant: "t-a", VolumeID: "vol-missing", SandboxID: "sb-1", Target: "/data", Source: "s/d",
+			Tenant: "t-a", VolumeID: "vol-missing", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d",
 		}},
 	})})
 	if err, _ := got.(error); !errors.Is(err, ErrUnknownVolume) {
 		t.Fatalf("unknown volume attach = %v, want ErrUnknownVolume", got)
 	}
-	attach := models.VolumeAttachment{Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d"}
+	attach := models.VolumeAttachment{Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d"}
 	fsm.Apply(&raft.Log{Index: 5, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{attach}})})
 	attach.Source = "s/d-updated"
 	fsm.Apply(&raft.Log{Index: 6, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{attach}})})
@@ -159,21 +161,82 @@ func TestFSMPutVolumeAttachValidationAndUpsert(t *testing.T) {
 func TestFSMDeletePlacementReleasesVolumeAttachments(t *testing.T) {
 	fsm := newPlacementFSM()
 	fsm.Apply(&raft.Log{Index: 1, Data: mustEncode(t, command{
-		Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "node-a",
+		Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "node-a", IncarnationID: "inc-sb-1",
 	})})
 	fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
 	fsm.Apply(&raft.Log{Index: 3, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d",
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d",
 	}}})})
 	if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 1 {
 		t.Fatalf("attachment count = %d, want 1", n)
 	}
-	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opDelete, SandboxID: "sb-1"})}); got != nil {
+	if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{Op: opDelete, SandboxID: "sb-1", ExpectedIncarnationID: "inc-sb-1"})}); got != nil {
 		t.Fatalf("opDelete returned %v", got)
 	}
 	if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
 		t.Fatalf("attachments not released on placement delete: %d", n)
 	}
+}
+
+func TestFSMReservationRemovalPathsReleaseVolumeAttachments(t *testing.T) {
+	seed := func(t *testing.T, owner, incarnation string, expires time.Time) *placementFSM {
+		t.Helper()
+		fsm := newPlacementFSM()
+		fsm.Apply(&raft.Log{Index: 1, Data: mustEncode(t, volCmd(models.Volume{
+			ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d",
+		}, 0))})
+		fsm.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{
+			Op: opReserve, SandboxID: "sb-1", OwnerNodeID: owner,
+			IncarnationID: incarnation, ExpiresUnix: expires.Unix(),
+		})})
+		fsm.Apply(&raft.Log{Index: 3, Data: mustEncode(t, command{
+			Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{{
+				Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1",
+				IncarnationID: incarnation, Target: "/data", Source: "s/d",
+			}},
+		})})
+		if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 1 {
+			t.Fatalf("seed attachment count = %d, want 1", n)
+		}
+		return fsm
+	}
+
+	t.Run("cancel", func(t *testing.T) {
+		fsm := seed(t, "node-a", "inc-old", time.Now().Add(time.Minute))
+		if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{
+			Op: opCancelReserve, SandboxID: "sb-1", ExpectedIncarnationID: "inc-old",
+		})}); got != nil {
+			t.Fatalf("cancel reservation returned %v", got)
+		}
+		if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
+			t.Fatalf("attachments after cancel = %d, want 0", n)
+		}
+	})
+
+	t.Run("owner_eviction", func(t *testing.T) {
+		fsm := seed(t, "node-a", "inc-old", time.Now().Add(time.Minute))
+		if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{
+			Op: opOrphanOwner, NodeID: "node-a",
+		})}); got != nil {
+			t.Fatalf("orphan owner returned %v", got)
+		}
+		if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
+			t.Fatalf("attachments after owner eviction = %d, want 0", n)
+		}
+	})
+
+	t.Run("expired_overwrite", func(t *testing.T) {
+		fsm := seed(t, "node-a", "inc-old", time.Now().Add(-time.Minute))
+		if got := fsm.Apply(&raft.Log{Index: 4, Data: mustEncode(t, command{
+			Op: opReserve, SandboxID: "sb-1", OwnerNodeID: "node-b",
+			IncarnationID: "inc-new", ExpiresUnix: time.Now().Add(time.Minute).Unix(),
+		})}); got != nil {
+			t.Fatalf("replace expired reservation returned %v", got)
+		}
+		if n := fsm.VolumeAttachmentCount("t-a", "vol-1"); n != 0 {
+			t.Fatalf("attachments after expired overwrite = %d, want 0", n)
+		}
+	})
 }
 
 func TestFSMDeleteVolumeAttachRequiresSandboxID(t *testing.T) {
@@ -184,11 +247,57 @@ func TestFSMDeleteVolumeAttachRequiresSandboxID(t *testing.T) {
 	}
 }
 
+func TestFSMVolumeAttachmentsAreIncarnationFencedAcrossIDReuse(t *testing.T) {
+	fsm := newPlacementFSM()
+	apply := func(index uint64, cmd command) any {
+		return fsm.Apply(&raft.Log{Index: index, Data: mustEncode(t, cmd)})
+	}
+	if got := apply(1, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0)); got != nil {
+		t.Fatalf("put volume: %v", got)
+	}
+	if got := apply(2, command{Op: opPlace, SandboxID: "sb-reused", OwnerNodeID: "node-a", IncarnationID: "inc-old"}); got != nil {
+		t.Fatalf("place old: %v", got)
+	}
+	oldAttachment := models.VolumeAttachment{
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-reused", IncarnationID: "inc-old", Target: "/data", Source: "s/old",
+	}
+	if got := apply(3, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{oldAttachment}}); got != nil {
+		t.Fatalf("attach old: %v", got)
+	}
+	if got := apply(4, command{Op: opDelete, SandboxID: "sb-reused", ExpectedIncarnationID: "inc-old"}); got != nil {
+		t.Fatalf("delete old: %v", got)
+	}
+	if got := apply(5, command{Op: opPlace, SandboxID: "sb-reused", OwnerNodeID: "node-b", IncarnationID: "inc-new"}); got != nil {
+		t.Fatalf("place replacement: %v", got)
+	}
+	newAttachment := oldAttachment
+	newAttachment.IncarnationID = "inc-new"
+	newAttachment.Source = "s/new"
+	if got := apply(6, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{newAttachment}}); got != nil {
+		t.Fatalf("attach replacement: %v", got)
+	}
+
+	if got := apply(7, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{oldAttachment}}); !errors.Is(got.(error), ErrIncarnationConflict) {
+		t.Fatalf("stale put = %v, want ErrIncarnationConflict", got)
+	}
+	if got := apply(8, command{Op: opDeleteVolumeAttach, VolumeSandboxID: "sb-reused", ExpectedIncarnationID: "inc-old"}); !errors.Is(got.(error), ErrIncarnationConflict) {
+		t.Fatalf("stale delete = %v, want ErrIncarnationConflict", got)
+	}
+	if count := fsm.VolumeAttachmentCount("t-a", "vol-1"); count != 1 {
+		t.Fatalf("replacement attachment count = %d, want 1", count)
+	}
+	key := volumeAttachmentKey("t-a", "vol-1", "sb-reused", "/data")
+	if got := fsm.volumeAttachments[key]; got.IncarnationID != "inc-new" || got.Source != "s/new" {
+		t.Fatalf("replacement attachment mutated by stale operation: %+v", got)
+	}
+}
+
 func TestFSMVolumeAttachmentsSurviveSnapshotRoundtrip(t *testing.T) {
 	src := newPlacementFSM()
 	src.Apply(&raft.Log{Index: 1, Data: mustEncode(t, volCmd(models.Volume{ID: "vol-1", Tenant: "t-a", Name: "data", Backend: "s3", Source: "s/d"}, 0))})
+	src.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPlace, SandboxID: "sb-1", OwnerNodeID: "node-a", IncarnationID: "inc-sb-1"})})
 	src.Apply(&raft.Log{Index: 2, Data: mustEncode(t, command{Op: opPutVolumeAttach, VolumeAttachments: []models.VolumeAttachment{{
-		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", Target: "/data", Source: "s/d",
+		Tenant: "t-a", VolumeID: "vol-1", SandboxID: "sb-1", IncarnationID: "inc-sb-1", Target: "/data", Source: "s/d",
 	}}})})
 
 	snap, err := src.Snapshot()

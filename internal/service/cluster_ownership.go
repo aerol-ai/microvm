@@ -2,9 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	secretspkg "github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // ReplayClusterOwnership pushes local sandbox truth into the cluster placement
@@ -40,6 +45,7 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 		return 0, nil
 	}
 	states := make([]cluster.LocalSandboxState, 0)
+	var firstErr error
 	for _, sb := range sandboxes {
 		if sb == nil || sb.ID == "" || sb.Status == models.SandboxStatusDestroyed {
 			continue
@@ -54,12 +60,22 @@ func (s *Service) assertClusterOwnership(ctx context.Context, sandboxes []*model
 		if !s.clusterOwnershipNeedsReplay(c, sb) {
 			continue
 		}
-		states = append(states, s.localSandboxStateForCluster(ctx, c, sb))
+		state, stateErr := s.localSandboxStateForCluster(ctx, c, sb)
+		if stateErr != nil {
+			// One corrupt or temporarily unreadable local row must not starve
+			// ownership repair for every other sandbox on the node. Keep that row
+			// out of Raft, reconcile the safe rows, and report the failure for retry.
+			if firstErr == nil {
+				firstErr = stateErr
+			}
+			continue
+		}
+		states = append(states, state)
 	}
 	if len(states) == 0 {
-		return 0, nil
+		return 0, firstErr
 	}
-	return len(states), c.AssertOwnership(ctx, states)
+	return len(states), errors.Join(firstErr, c.AssertOwnership(ctx, states))
 }
 
 func (s *Service) clusterOwnershipNeedsReplay(c cluster.Client, sb *models.Sandbox) bool {
@@ -142,34 +158,99 @@ func placementMissingLocalPorts(p cluster.Placement, sb *models.Sandbox) bool {
 	return false
 }
 
-func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Client, sb *models.Sandbox) cluster.LocalSandboxState {
-	spec := s.specFromSandbox(ctx, sb)
+func (s *Service) localSandboxStateForCluster(ctx context.Context, c cluster.Client, sb *models.Sandbox) (cluster.LocalSandboxState, error) {
+	spec, err := s.specFromSandbox(ctx, sb)
+	if err != nil {
+		return cluster.LocalSandboxState{}, err
+	}
 	var secrets cluster.PlacementSecrets
 	if spec != nil {
-		handle, err := s.PutClusterSecretsForRecipient(ctx, sb.ID, *spec, c.SelfNodeID())
-		if err != nil {
-			if s.logger != nil {
-				s.logger.Warn("cluster: store secret ref during ownership replay failed; placement will ship without secret ref",
-					"sandbox_id", sb.ID, "err", err)
-			}
-		} else {
+		// Reuse the exact durable seal when possible and otherwise preserve (or
+		// restore) the HA recipient width. Boot replay has no reservation from
+		// which RecordPlacement could recover that set. Never put the unredacted
+		// recovery spec into Raft: a sealing failure leaves this row pending for
+		// the next reconciliation pass instead of leaking credentials.
+		handle, sealErr := s.secretHandleForOwnershipReplay(ctx, c, sb, *spec)
+		if sealErr != nil {
+			return cluster.LocalSandboxState{}, fmt.Errorf("seal sandbox %s for ownership replay: %w", sb.ID, sealErr)
+		}
+		if handle.Ref != "" {
 			secrets = handle
-			redacted := RedactClusterSecrets(*spec)
-			spec = &redacted
+		}
+		redacted := RedactClusterSecrets(*spec)
+		spec = &redacted
+	}
+	// A sandbox without credentials still has a lifecycle. Carry the durable
+	// audit incarnation into Raft so a later credential rotation and audit
+	// authorization cannot attach to two different lifetimes.
+	if secrets.IncarnationID == "" {
+		var err error
+		secrets.IncarnationID, err = s.localSandboxAuditIncarnation(ctx, sb)
+		if err != nil {
+			return cluster.LocalSandboxState{}, err
 		}
 	}
+	secrets.OwnerRef = sb.OwnerRef
 	return cluster.LocalSandboxState{
 		ID:              sb.ID,
 		Spec:            spec,
 		Secrets:         secrets,
 		ExposedPorts:    clusterPortsFromSandbox(sb),
 		CustomHostnames: sandboxCustomHostnamesList(sb),
-	}
+	}, nil
 }
 
-func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) *models.CreateSandboxRequest {
+func (s *Service) secretHandleForOwnershipReplay(ctx context.Context, c cluster.Client, sb *models.Sandbox, spec models.CreateSandboxRequest) (cluster.PlacementSecrets, error) {
+	if secretsFromRequest(spec).IsEmpty() {
+		return cluster.PlacementSecrets{}, nil
+	}
+	selfID := strings.TrimSpace(c.SelfNodeID())
+	placement, placed := c.PlacementOf(sb.ID)
+	incarnationID := strings.TrimSpace(sb.AuditIncarnationID)
+	if placed && strings.TrimSpace(placement.IncarnationID) != "" {
+		incarnationID = strings.TrimSpace(placement.IncarnationID)
+	}
+
+	var local *store.ClusterSecretRecord
+	if s.store != nil && incarnationID != "" {
+		rec, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sb.ID, incarnationID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return cluster.PlacementSecrets{}, fmt.Errorf("load durable secret for ownership replay: %w", err)
+		}
+		local = rec
+	}
+
+	recipients := secretspkg.NormalizeRecipients(placement.SecretRecipients)
+	if local != nil && (len(recipients) == 0 || local.SealGeneration > placement.SecretSealGeneration) {
+		recipients = secretspkg.NormalizeRecipients(local.Recipients)
+	}
+	if len(recipients) == 0 {
+		recipients = []string{selfID}
+	}
+
+	// A previously buggy replay may have published only self. Widen active or
+	// missing placements immediately; an orphan is first reclaimed with its
+	// existing valid seal and the periodic recipient reconciler widens it once
+	// peers will accept owner-authorized PUTs again.
+	if spec.ShouldRecreateOnFailover() && (!placed || !placement.IsOrphaned()) &&
+		len(nonSelfRecipients(recipients, selfID)) < s.SecretRecipientBackupCount() {
+		if replacements := s.selectReplacementRecipients(sb.ID, selfID, s.SecretRecipientBackupCount()); len(nonSelfRecipients(replacements, selfID)) > len(nonSelfRecipients(recipients, selfID)) {
+			recipients = replacements
+		}
+	}
+
+	if local != nil && sameStringSlice(secretspkg.NormalizeRecipients(local.Recipients), secretspkg.NormalizeRecipients(recipients)) {
+		return cluster.PlacementSecrets{
+			Ref: local.Ref, Version: local.Version, Recipients: append([]string(nil), local.Recipients...),
+			IncarnationID: incarnationID, SealGeneration: local.SealGeneration,
+		}, nil
+	}
+	return s.sealAndDistributeForIncarnation(ctx, sb.ID, spec, recipients, incarnationID)
+}
+
+func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*models.CreateSandboxRequest, error) {
 	if sb == nil {
-		return nil
+		return nil, nil
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -198,27 +279,25 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) *mode
 		spec.Failover = nil
 	}
 
-	auth, err := s.UnsealRegistry(sb.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(sb.ID, sb.RegistryAuthSealed)
 	if err != nil {
-		if s.logger != nil {
-			s.logger.Warn("cluster: unseal registry auth failed; spec backfill will omit credentials",
-				"sandbox_id", sb.ID, "err", err)
-		}
-	} else {
-		spec.Registry = auth
+		return nil, fmt.Errorf("unseal registry auth for ownership replay %s: %w", sb.ID, err)
 	}
+	spec.Registry = auth
 	if s.store != nil && s.cipher != nil {
 		mounts, err := s.loadMounts(ctx, sb.ID)
 		if err != nil {
-			if s.logger != nil {
-				s.logger.Warn("cluster: load sandbox mounts failed; spec backfill will omit mounts",
-					"sandbox_id", sb.ID, "err", err)
-			}
+			return nil, fmt.Errorf("load mounts for ownership replay %s: %w", sb.ID, err)
 		} else if len(mounts) > 0 {
 			spec.Mounts = mounts
 		}
+		if env, envErr := s.loadEnv(ctx, sb.ID, sb.AuditIncarnationID); envErr != nil {
+			return nil, fmt.Errorf("load environment for ownership replay %s: %w", sb.ID, envErr)
+		} else if len(env) > 0 {
+			spec.Env = env
+		}
 	}
-	return spec
+	return spec, nil
 }
 
 func isStoppedFirecrackerSnapshotRow(sb *models.Sandbox) bool {

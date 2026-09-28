@@ -23,7 +23,7 @@ func TestFSMSnapshotJoinFetchOnMiss(t *testing.T) {
 	spec := &models.CreateSandboxRequest{Image: "alpine:3.20", Name: "join-me", CPU: 1, MemoryMB: 512}
 	if res := applyOp(t, src, command{
 		Op: opPlace, SandboxID: "sb-join", OwnerNodeID: "A", OwnerAPIURL: "http://a",
-		Spec: spec, SecretRef: "cluster-secret://sandbox/sb-join/v1", SecretVersion: 1,
+		Spec: spec, IncarnationID: "inc-join", SecretRef: testSecretRef("sb-join", "inc-join"), SecretVersion: 1, SecretSealGeneration: 1,
 	}); res != nil {
 		t.Fatalf("place: %v", res)
 	}
@@ -61,7 +61,7 @@ func TestFSMSnapshotJoinFetchOnMiss(t *testing.T) {
 	if got.Spec == nil || got.Spec.Image != "alpine:3.20" {
 		t.Fatalf("Spec after snapshot join = %+v, want fetch-on-miss hydrated alpine:3.20", got.Spec)
 	}
-	if got.SecretRef != "cluster-secret://sandbox/sb-join/v1" || got.SecretVersion != 1 {
+	if got.SecretRef != testSecretRef("sb-join", "inc-join") || got.SecretVersion != 1 {
 		t.Fatalf("secret handle after snapshot join = (%q, %d), want original", got.SecretRef, got.SecretVersion)
 	}
 	if fetches == 0 {

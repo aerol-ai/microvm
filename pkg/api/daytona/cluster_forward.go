@@ -52,6 +52,6 @@ func (h *handlers) clusterForwardWrap(pathKey string, local http.Handler) http.H
 			apihttp.WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarding loop detected")
 			return
 		}
-		c.ForwardHTTP(cluster.Endpoint{InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
+		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
 }

@@ -109,6 +109,16 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "invalid SB_L4_PORT_RANGE_START/END",
 		},
 		{
+			name: "hostport redirect port inside the l4 pool",
+			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "22500"},
+			want: "invalid SB_HOSTPORT_REDIRECT_PORT 22500",
+		},
+		{
+			name: "hostport redirect port out of range",
+			env:  map[string]string{"SB_INGRESS_PROXY_ROUTING": "true", "SB_HOSTPORT_REDIRECT_PORT": "0"},
+			want: "invalid SB_HOSTPORT_REDIRECT_PORT 0",
+		},
+		{
 			name: "node role without cluster",
 			env:  map[string]string{"SB_NODE_ROLE": "worker"},
 			want: "requires SB_ENABLE_CLUSTER=true",
@@ -416,6 +426,7 @@ func TestConfigHelperCoverage(t *testing.T) {
 		t.Setenv("SB_CLUSTER_BOOTSTRAP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_GOSSIP", "true")
 		t.Setenv("SB_CLUSTER_INSECURE_CREDENTIALS", "true")
+		t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 		t.Setenv("SB_NODE_ROLE", "server,worker")
 		t.Setenv("SB_DATA_PLANE_ADVERTISE_HOST", (&url.URL{Scheme: "https", Host: "edge.example:443"}).String())
 		t.Setenv("SB_IDLE_TIMEOUT_MIN", "17")
@@ -450,6 +461,7 @@ func TestLoad_ComprehensiveEnabledConfig(t *testing.T) {
 	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", keyPath)
 	t.Setenv("SB_API_ADVERTISE_URL", "http://api.example.test:21212")
 	t.Setenv("SB_CLUSTER_INTERNAL_ADVERTISE", "https://cluster.example.test:7002")
+	t.Setenv("SB_CLUSTER_TLS_DIR", t.TempDir())
 	t.Setenv("SB_ENABLE_CUSTOM_DOMAINS", "true")
 	t.Setenv("SB_DOMAIN", "example.test")
 	t.Setenv("SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX", "3")

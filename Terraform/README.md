@@ -111,11 +111,21 @@ Per-node fields:
 | `ami_id`            | latest Ubuntu 22.04 LTS amd64    |                                                  |
 | `with_firecracker`  | `var.default_with_firecracker`   | worker-capable nodes only; writes `SB_ENABLE_FIRECRACKER` and optional host downloads |
 | `with_gvisor`       | `var.default_with_gvisor`        | adds `--with-gvisor` to install.sh               |
+| `ingress_proxy_routing` | `var.default_ingress_proxy_routing` | adds `--ingress-proxy-routing` to install.sh |
 | `with_nvidia_gpu`   | `var.default_with_nvidia_gpu`    | adds `--with-nvidia-gpu` (driver must be loaded) |
 | `with_amd_gpu`      | `var.default_with_amd_gpu`       | adds `--with-amd-gpu` (x86_64 only)              |
 | `idle_timeout_min`  | `var.default_idle_timeout_min`   | sandbox auto-stop minutes; 0 disables            |
 | `extra_user_data`   | `""`                             | shell, appended to bootstrap                     |
 | `tags`              | `{}`                             |                                                  |
+
+**Ingress tier size.** Up to 10 ingress-capable nodes (`ingress`, any hybrid
+containing it, or `mixed`) work behind the Cloudflare records this module
+creates. More than 10 requires a shard-aware router that resolves owners
+through `GET /v1/cluster/ingress-route/{id}`, declared with
+`shard_aware_ingress = true` (writes `SB_CLUSTER_SHARD_AWARE_INGRESS` on every
+node); `terraform plan` refuses a larger tier without it because the daemon
+would refuse to boot it. Do not set it with a plain LB in front - see
+`setup/runbooks/cluster-ingress-topology.md`.
 
 ### Role rules (validated at plan time, mirrors `cluster-init.sh` / `cluster-join.sh`)
 

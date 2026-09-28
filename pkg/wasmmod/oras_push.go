@@ -3,10 +3,14 @@ package wasmmod
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
@@ -61,6 +65,47 @@ func WasmCheckpointRefTagged(host, clusterID, sandboxID, tag string) string {
 	return fmt.Sprintf("%s/cluster/%s/wasm-checkpoints/%s:%s", host, clusterID, sandboxID, tag)
 }
 
+// WasmCheckpointIncarnationAnnotation carries, on every checkpoint manifest,
+// the sandbox LIFETIME that published it. It is the artifact's identity: a pull
+// verifies it against the lifetime it expects, and because it differs per
+// lifetime it also makes every lifetime's manifests distinct, so deleting one
+// lifetime's manifest can never take another lifetime's tag with it.
+const WasmCheckpointIncarnationAnnotation = "com.aerol.wasm-checkpoint.incarnation"
+
+// ErrCheckpointLifetimeMismatch reports a checkpoint published by a different
+// sandbox lifetime than the one restoring it. Restoring it would hand the
+// current sandbox another lifetime's memory.
+var ErrCheckpointLifetimeMismatch = errors.New("wasm checkpoint belongs to a different sandbox lifetime")
+
+// WasmCheckpointLifetimeKey is the tag-safe name for one sandbox lifetime.
+//
+// Checkpoint tags used to be keyed by sandbox ID alone, and every push wrote the
+// shared :latest. A sandbox ID outlives its lifetimes — destroy and re-create
+// keeps it — while a checkpoint push runs detached for minutes, so a dead
+// lifetime's late push re-pointed the tag the live one depended on. A fenced
+// metadata write afterwards cannot undo a registry write. Scoping every tag to
+// the lifetime means no other lifetime can ever move a tag this one resolves.
+//
+// A hash rather than the raw id: incarnation ids are 64 hex characters, and an
+// OCI tag allows 128, which a digest suffix alone nearly fills. 128 bits of
+// sha256 cannot collide between lifetimes of one sandbox.
+func WasmCheckpointLifetimeKey(incarnationID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(incarnationID)))
+	return hex.EncodeToString(sum[:16])
+}
+
+// WasmCheckpointLatestTag is one lifetime's rolling pointer to its most recent
+// checkpoint. Only that lifetime's pushes ever write it.
+func WasmCheckpointLatestTag(incarnationID string) string {
+	return WasmCheckpointLifetimeKey(incarnationID) + "-latest"
+}
+
+// WasmCheckpointLifetimeDigestTag is one lifetime's immutable, content-addressed
+// tag for a single checkpoint.
+func WasmCheckpointLifetimeDigestTag(incarnationID, digest string) string {
+	return WasmCheckpointLifetimeKey(incarnationID) + "-" + WasmCheckpointDigestTag(digest)
+}
+
 // WasmCheckpointDigestTag normalizes a manifest digest for use as an OCI tag.
 func WasmCheckpointDigestTag(digest string) string {
 	digest = strings.TrimSpace(digest)
@@ -74,12 +119,19 @@ func WasmCheckpointDigestTag(digest string) string {
 	return digest
 }
 
-// PushSnapshotArtifact uploads a local mem.snap directory to an OCI registry.
-func PushSnapshotArtifact(ctx context.Context, cfg ORASPushConfig, memSnapDir, registryRef string) (digest string, err error) {
+// PushSnapshotArtifact uploads a local mem.snap directory to an OCI registry,
+// as a manifest bound to the sandbox lifetime that produced it.
+func PushSnapshotArtifact(ctx context.Context, cfg ORASPushConfig, memSnapDir, registryRef, incarnationID string) (digest string, err error) {
 	memSnapDir = strings.TrimSpace(memSnapDir)
 	registryRef = strings.TrimSpace(registryRef)
+	incarnationID = strings.TrimSpace(incarnationID)
 	if memSnapDir == "" || registryRef == "" {
 		return "", fmt.Errorf("oras push: mem.snap dir and registry ref required")
+	}
+	if incarnationID == "" {
+		// An unbound checkpoint could be restored into any lifetime of this
+		// sandbox id, which is exactly what the binding exists to prevent.
+		return "", fmt.Errorf("oras push: sandbox lifetime (incarnation) required")
 	}
 	if err := cfg.Validate(); err != nil {
 		return "", err
@@ -124,6 +176,14 @@ func PushSnapshotArtifact(ctx context.Context, cfg ORASPushConfig, memSnapDir, r
 	manifestDesc, err := oras.PackManifest(ctx, fs, oras.PackManifestVersion1_1, wasmSnapshotArtifactType, oras.PackManifestOptions{
 		ConfigDescriptor: &configDesc,
 		Layers:           layers,
+		ManifestAnnotations: map[string]string{
+			WasmCheckpointIncarnationAnnotation: incarnationID,
+			// Nanosecond creation stamp: oras would stamp whole seconds, and two
+			// identical snapshots pushed in the same second would then share a
+			// manifest — deleting one push's tag would delete the other's.
+			// Every push gets a manifest of its own.
+			ocispec.AnnotationCreated: time.Now().UTC().Format(time.RFC3339Nano),
+		},
 	})
 	if err != nil {
 		return "", fmt.Errorf("oras push: pack manifest: %w", err)

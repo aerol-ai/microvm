@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 var (
@@ -46,7 +47,28 @@ var (
 	clusterSecretLastOpenNanos   = expvar.NewInt("aerolvm_secret_decrypt_last_nanos")
 	clusterSecretOpenLatency     = scaleobs.NewDurationBuckets("aerolvm_secret_decrypt_latency_seconds_bucket")
 	clusterSecretRecipientDenies = expvar.NewInt("aerolvm_secret_recipient_denied_total")
-
+	// Peer fan-out failures (push or delete). HA create fails when its bounded
+	// first-ACK window gets no backup; remaining replicas may still be converging
+	// while failover_ready is false.
+	secretFanoutFailuresTotal = expvar.NewInt("aerolvm_secret_fanout_failures_total")
+	// Durable cleanup health. Gauges are refreshed by the boot/periodic
+	// reconciler and remain cardinality-free at 100k+ concurrent sandboxes.
+	secretDeleteOutboxPending          = expvar.NewInt("aerolvm_secret_delete_outbox_pending")
+	secretDeleteOutboxOldestAgeSeconds = expvar.NewInt("aerolvm_secret_delete_outbox_oldest_age_seconds")
+	secretPutOutboxPending             = expvar.NewInt("aerolvm_secret_put_outbox_pending")
+	secretPutOutboxOldestAgeSeconds    = expvar.NewInt("aerolvm_secret_put_outbox_oldest_age_seconds")
+	secretPutOutboxFailuresTotal       = expvar.NewInt("aerolvm_secret_put_outbox_failures_total")
+	secretTombstones                   = expvar.NewInt("aerolvm_secret_tombstones")
+	// Retirement counters. Standalone retirement is a node without cluster
+	// mode giving up peer obligations it can never discharge (after
+	// SB_SECRET_OUTBOX_STANDALONE_GRACE); ciphertext retirement is either
+	// mode tombing a sealed row whose lifecycle no longer exists.
+	secretDeleteOutboxRetiredStandalone = expvar.NewInt("aerolvm_secret_delete_outbox_retired_standalone_total")
+	secretPutOutboxRetiredStandalone    = expvar.NewInt("aerolvm_secret_put_outbox_retired_standalone_total")
+	secretCiphertextRetiredTotal        = expvar.NewInt("aerolvm_secret_ciphertext_retired_total")
+	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
+	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
+	// Best-effort local seal failures (ownership replay backfill).
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
 	// result so a DeletePlacement failure is visible without relying on logs.
@@ -172,6 +194,22 @@ func recordClusterSecretKeyMismatch() {
 	clusterSecretKeyMismatches.Add(1)
 }
 
+func recordSecretFanoutFailure() {
+	secretFanoutFailuresTotal.Add(1)
+}
+
+func recordSecretPutOutboxFailure() {
+	secretPutOutboxFailuresTotal.Add(1)
+}
+
+func recordSecretProviderCanary(ok bool) {
+	if ok {
+		secretProviderCanaryOK.Set(1)
+		return
+	}
+	secretProviderCanaryOK.Set(0)
+}
+
 // reapplyNetworkBlockAll heals the per-IP isolation rule and reports whether
 // it was actually missing. Drivers that can't answer (anything not backed by
 // netrules) still get healed — they just report inserted=false, so the drift
@@ -264,6 +302,22 @@ func classifySecretMetricError(err error) string {
 	if err == nil {
 		return ""
 	}
+	switch {
+	case errors.Is(err, secrets.ErrVersionMismatch):
+		return "key_version_mismatch"
+	case errors.Is(err, secrets.ErrRecipientDenied):
+		return "recipient_denied"
+	case errors.Is(err, secrets.ErrNotFound):
+		return "ref_not_found"
+	case errors.Is(err, secrets.ErrDecryptFailed):
+		return "decrypt_failed"
+	case errors.Is(err, secrets.ErrProviderUnavailable):
+		return "provider_unavailable"
+	case errors.Is(err, secrets.ErrProviderThrottled):
+		return "provider_throttled"
+	case errors.Is(err, secrets.ErrProviderDenied):
+		return "provider_denied"
+	}
 	msg := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(msg, "version mismatch"):
@@ -304,3 +358,14 @@ func idempotencyState(record *models.IdempotentRequestRecord) string {
 		return "unknown"
 	}
 }
+
+// clusterTopologyOK is 1 while the live membership satisfies the production
+// topology contract and 0 while it does not — in practice an ingress tier past
+// cluster.MaxReplicatedIngressRouteNodes without SB_CLUSTER_SHARD_AWARE_INGRESS,
+// the state in which open-source boots never mark ingress ready. /health and a
+// reconcile log line already say so; this makes it alertable without scraping
+// either. Standalone nodes never evaluate the contract, so the gauge starts at
+// 1 and stays there for them.
+var clusterTopologyOK = expvar.NewInt("aerolvm_cluster_topology_ok")
+
+func init() { clusterTopologyOK.Set(1) }

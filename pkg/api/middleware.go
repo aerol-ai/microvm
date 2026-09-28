@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -19,6 +20,41 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
+
+const clusterControlHeaderPrefix = "X-Cluster-"
+
+// clusterControlHeaderGuard makes every internal routing marker a consequence
+// of node-authenticated transport, never a credential supplied by a public API
+// caller. This single guard covers v1 and all compatibility facades, including
+// create-target, fan-out loop, peer-node, and artifact-replication headers.
+func (s *Server) clusterControlHeaderGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.clusterEnabled || !hasClusterControlHeader(r.Header) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		peerID, err := cluster.AuthenticatedPeerNodeID(r)
+		if err != nil {
+			apihttp.WriteError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		if s.service == nil || !cluster.IsLivePeer(s.service.Cluster(), peerID) {
+			cluster.RecordMTLSUnknownPeer()
+			apihttp.WriteError(w, http.StatusForbidden, "cluster peer not in membership")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func hasClusterControlHeader(header http.Header) bool {
+	for name := range header {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), clusterControlHeaderPrefix) {
+			return true
+		}
+	}
+	return false
+}
 
 // extractBearerToken returns the caller's bearer token from either:
 //  1. the Authorization header, or

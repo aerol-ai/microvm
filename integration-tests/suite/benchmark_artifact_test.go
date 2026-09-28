@@ -31,18 +31,7 @@ func TestMergeBenchReportsPreservesLatencyWhenDensityArrives(t *testing.T) {
 
 func TestMissingBenchRuntimeTargetsDockerColdUsesDockerGossip(t *testing.T) {
 	members := capacityView{}
-	members.Members = append(members.Members, struct {
-		NodeID        string `json:"node_id"`
-		NodeName      string `json:"node_name"`
-		Role          string `json:"role"`
-		Alive         bool   `json:"alive"`
-		Drained       bool   `json:"drained"`
-		CapacityStale bool   `json:"capacity_stale"`
-		Capacity      struct {
-			CanAdmit          bool     `json:"can_admit"`
-			SupportedRuntimes []string `json:"supported_runtimes"`
-		} `json:"capacity"`
-	}{
+	members.Members = append(members.Members, capacityMember{
 		Role:  "mixed",
 		Alive: true,
 		Capacity: struct {

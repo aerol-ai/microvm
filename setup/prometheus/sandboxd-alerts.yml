@@ -370,3 +370,256 @@ groups:
           summary: "Firecracker template artifact pulls are failing"
           description: "Peer-side template fetches have been failing for 5 minutes. Sandbox creates that resolve to a remote-built template will block on the pull retry on the affected nodes until the pull path recovers."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/firecracker-template-health.md"
+
+  - name: sandboxd.secrets-audit
+    interval: 30s
+    rules:
+      # The writer failed to initialize or encountered persistent I/O errors.
+      - alert: SandboxdSecretAuditSinkUnavailable
+        expr: aerolvm_secret_audit_sink_healthy == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret audit sink is unavailable"
+          description: "The local evidence writer is unavailable. Strict-boot nodes refuse startup; an explicitly non-strict node counts every attempted event as dropped until recovery."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Buffer overflow on the async audit writer. Gap markers are written so
+      # the JSONL stays honest, but dropped events are gone on that node.
+      - alert: SandboxdAuditEventsDropped
+        expr: increase(aerolvm_audit_events_dropped_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret audit events are being dropped"
+          description: "aerolvm_audit_events_dropped_total increased in the last 5 minutes. The local audit stream has gap markers; history on this node is incomplete."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # One sandbox is over its per-sandbox egress evidence budget. Not data
+      # loss in the gap sense — the refusals are recorded as that sandbox's own
+      # rate_limited record — but sustained firing means a tenant is flooding
+      # (or the budget is too small for a legitimate workload).
+      - alert: SandboxdAuditEgressBudgetExceeded
+        expr: increase(aerolvm_audit_egress_rate_limited_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "a sandbox on this node is over its egress audit budget"
+          description: "aerolvm_audit_egress_rate_limited_total has kept increasing for 10 minutes. Find the sandbox by the rate_limited records in its audit history; raise SB_AUDIT_EGRESS_SANDBOX_RATE/BURST only for a legitimate workload."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # A crash mid-append left an unterminated partial record; the sink cut it
+      # at boot and chained a torn_tail gap marker. Evidence before the tear is
+      # intact, but whatever was still in the page cache at the crash is gone.
+      - alert: SandboxdAuditTornTailRepaired
+        expr: increase(aerolvm_audit_torn_tail_repairs_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd repaired a torn secret audit tail at boot"
+          description: "aerolvm_audit_torn_tail_repairs_total increased: the node restarted after an unclean shutdown and cut an unterminated partial record from secrets.jsonl. A gap marker (reason=torn_tail) is in the chain; its dropped count is a floor. Repeated firing means the node is crashing — find that cause, the audit sink is behaving as designed."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The export tailer is falling behind its backend. Evidence is not lost
+      # (retention refuses to rotate unexported bytes) but disk grows and the
+      # off-node copy is stale. Usually the receiver, not the daemon.
+      - alert: SandboxdAuditExportLagging
+        expr: aerolvm_audit_export_lag_bytes > 67108864
+        for: 15m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit export is lagging its backend"
+          description: "aerolvm_audit_export_lag_bytes has exceeded 64 MiB for 15 minutes. The local JSONL is retaining evidence the backend has not acknowledged; check the receiver and aerolvm_audit_export_backend_healthy. Do not shrink retention to reclaim disk."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The configured connector's last export failed and has kept failing.
+      # Evidence is retained locally; this names the backend so the receiver
+      # (webhook / bucket / broker) is the first place to look.
+      - alert: SandboxdAuditExportBackendUnhealthy
+        expr: aerolvm_audit_export_backend_healthy{key!="noop"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit export backend {{ $labels.key }} is unhealthy"
+          description: "aerolvm_audit_export_backend_healthy{key={{ $labels.key }}} has been 0 for 10 minutes: the last export to this backend failed and the tailer is backing off (aerolvm_audit_export_failures_total{key={{ $labels.key }}}). Local evidence is retained and export lag is growing."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The per-sandbox audit read index is not serving: pages scan the whole
+      # local log instead (correct, O(retained events) per page). Expected for
+      # minutes after a first boot on a large log or a rebuild; persistent
+      # means the store is refusing the index's writes.
+      - alert: SandboxdAuditIndexNotReady
+        expr: aerolvm_audit_index_ready == 0
+        for: 30m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd audit read index has been down for 30 minutes"
+          description: "aerolvm_audit_index_ready is 0: GET /v1/sandboxes/{id}/audit is served by scanning secrets.jsonl. Check aerolvm_audit_index_write_failures_total and the daemon log for 'building secret audit index'. If the log is large a rebuild takes minutes; if writes are failing, fix the store (disk, locks)."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # While indexing, a record did not link to its predecessor: the local
+      # chain is broken. The node withholds audit reads until restart.
+      - alert: SandboxdAuditChainBroken
+        expr: increase(aerolvm_audit_index_chain_breaks_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd detected a break in its local audit hash chain"
+          description: "aerolvm_audit_index_chain_breaks_total increased: a record in secrets.jsonl does not link to the one before it — seen while indexing, or by the background full verification after a checkpoint boot (SB_SECRET_AUDIT_BOOT_VERIFY=checkpoint). This is corruption or tampering, not a crash (torn tails are repaired at boot). Local audit reads answer 503 and the index stays off until restart. Capture the file before touching it; POST /v1/audit/verify names the offset."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # An operator-triggered full verification (POST /v1/audit/verify)
+      # failed most recently.
+      - alert: SandboxdAuditChainVerifyFailed
+        expr: aerolvm_audit_chain_verify_ok == 0 and aerolvm_audit_chain_verified_unix > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd's last on-demand audit chain verification failed"
+          description: "The last POST /v1/audit/verify on this node reported ok=false. The response body carries the failing offset and reason. Treat the local log as untrusted evidence until reconciled with the export backend or witness."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Audit reads are being refused for lack of read slots. With the index
+      # ready a slot is held for milliseconds; sustained busy rejections mean
+      # the node is saturated or the index is off.
+      - alert: SandboxdAuditReadsBusy
+        expr: increase(aerolvm_audit_query_busy_total[10m]) > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd is rejecting audit reads as busy (429)"
+          description: "aerolvm_audit_query_busy_total is rising: audit reads on this node could not get one of its 8 read slots within 50ms and were answered 429 + Retry-After. Check aerolvm_audit_index_ready (scanning pages hold slots far longer) and aerolvm_audit_query_scan_fallback_total."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Async sealed-blob peer push/delete failures. Creates do not wait on
+      # fan-out; failover_ready stays false until copies land.
+      - alert: SandboxdSecretFanoutFailures
+        expr: increase(aerolvm_secret_fanout_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret peer fan-out is failing"
+          description: "aerolvm_secret_fanout_failures_total increased in the last 10 minutes. HA sandboxes may remain failover_ready=false; check peer health and credentials."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretDeleteOutboxStalled
+        expr: aerolvm_secret_delete_outbox_pending > 0 and aerolvm_secret_delete_outbox_oldest_age_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-delete reconciliation is stalled"
+          description: "At least one durable peer-delete job has remained pending for more than 15 minutes. Deleted credentials may still exist on an unavailable recipient."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretDeleteOutboxBacklogHigh
+        expr: aerolvm_secret_delete_outbox_pending > 10000
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-delete backlog is high"
+          description: "More than 10,000 durable peer-delete jobs are pending on this node. Check recipient reachability before the backlog threatens retention objectives."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretPutOutboxBacklogHigh
+        expr: aerolvm_secret_put_outbox_pending > 10000
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-put backlog is high"
+          description: "More than 10,000 durable secret PUT deliveries are pending. HA sandboxes may remain failover_ready=false until recipients recover."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretPutOutboxFailures
+        expr: increase(aerolvm_secret_put_outbox_failures_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret-put reconciliation is failing"
+          description: "The durable secret PUT outbox reported failures. Check SQLite health, mTLS identity, and recipient reachability."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdSecretAuditExportFailing
+        expr: increase(aerolvm_secret_audit_export_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd off-node audit export is failing"
+          description: "Audit batches are not reaching the configured off-node receiver. Local evidence continues to grow but disk loss can exceed the recovery objective."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      - alert: SandboxdClusterCertExpiring
+        expr: ((aerolvm_cluster_mtls_cert_not_after_unix - time()) < 1209600 and aerolvm_cluster_mtls_cert_not_after_unix > time()) or ((aerolvm_cluster_mtls_ca_not_after_unix - time()) < 2592000 and aerolvm_cluster_mtls_ca_not_after_unix > time())
+        for: 5m
+        labels:
+          severity: warning
+          component: cluster-mtls
+        annotations:
+          summary: "sandboxd cluster mTLS certificate is nearing expiry"
+          description: "A node leaf has less than 14 days or the cluster CA less than 30 days remaining. Rotate node.crt/node.key atomically; new handshakes hot-reload the pair."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # Provider boot/runtime canary (local always ok; awskms wrap/unwrap).
+      - alert: SandboxdSecretProviderCanaryFailing
+        expr: aerolvm_secret_provider_canary_ok == 0
+        for: 10m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd secret provider canary is failing"
+          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail; for awskms check IAM/KMS reachability."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+  - name: sandboxd.cluster-topology
+    interval: 30s
+    rules:
+      # The live membership violates the production topology contract. The
+      # common case is an ingress tier past 10 nodes without
+      # SB_CLUSTER_SHARD_AWARE_INGRESS: enterprise boots refuse outright, an
+      # open-source node boots but never starts its ingress reconciler and
+      # reports degraded on /health. Do NOT clear this by setting the flag
+      # unless a shard-aware router (GET /v1/cluster/ingress-route/{id}) is
+      # actually in front of the tier — with a plain LB that silences the
+      # check and black-holes most public sandbox traffic.
+      - alert: SandboxdClusterTopologyViolation
+        expr: aerolvm_cluster_topology_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+          component: cluster-ingress
+        annotations:
+          summary: "sandboxd cluster topology violation; ingress may not be serving"
+          description: "aerolvm_cluster_topology_ok has been 0 for 5 minutes on {{ $labels.instance }}. Either more than 10 live ingress nodes without a declared shard-aware router, or mixed/hybrid roles above 10 live nodes. See /health cluster_topology for the exact reason."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md"

@@ -18,6 +18,24 @@ func (s *Service) isIsolateSandbox(sandbox *models.Sandbox) bool {
 	return sandbox != nil && sandbox.Runtime == models.RuntimeIsolate
 }
 
+// ValidateClusterIsolateBundleRef enforces the cluster-wide placement contract
+// for isolate bundles. Uploaded bundles are worker-local, so cluster callers
+// must use the node-bound reference returned by POST /v1/js-bundles. Keep this
+// policy here so every API facade applies the same rule before placement.
+func ValidateClusterIsolateBundleRef(req models.CreateSandboxRequest) error {
+	if strings.TrimSpace(req.Runtime) != models.RuntimeIsolate {
+		return nil
+	}
+	ref := models.ModuleRefForCreate(req)
+	if ref == "" {
+		return nil // createIsolateSandbox returns the required-field error
+	}
+	if _, _, ok := models.ParseJSBundleNodeRef(ref); !ok {
+		return errors.New("cluster isolate create requires the node-bound module_ref returned by POST /v1/js-bundles")
+	}
+	return nil
+}
+
 // createIsolateSandbox is the V8-isolate runtime create path
 // (plans/isolate-runtime.md): validate unsupported options, authorize the
 // tenant group key, resolve+pin the bundle, admit, driver.Create (group
@@ -43,6 +61,16 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	bundleRef := models.ModuleRefForCreate(req)
 	if bundleRef == "" {
 		return nil, errors.New("module_ref or image is required for isolate runtime (the JS/TS bundle reference)")
+	}
+	boundNodeID, localBundleRef, nodeBound := models.ParseJSBundleNodeRef(bundleRef)
+	if s.ClusterEnabled() && !nodeBound {
+		return nil, errors.New("cluster isolate create requires the node-bound module_ref returned by POST /v1/js-bundles")
+	}
+	if nodeBound {
+		if c := s.Cluster(); s.ClusterEnabled() && c != nil && c.SelfNodeID() != boundNodeID {
+			return nil, fmt.Errorf("isolate bundle is bound to worker %q", boundNodeID)
+		}
+		bundleRef = localBundleRef
 	}
 	req.ModuleRef = bundleRef
 
@@ -150,9 +178,13 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	}
 
 	now := time.Now().UTC()
+	persistedModuleRef := req.ModuleRef
+	if nodeBound {
+		persistedModuleRef = models.JSBundleRefForNode(persistedModuleRef, boundNodeID)
+	}
 	sandbox := &models.Sandbox{
 		ID:                   state.SandboxID,
-		Image:                req.ModuleRef,
+		Image:                persistedModuleRef,
 		Status:               state.Status,
 		CPU:                  req.CPU,
 		MemoryMB:             req.MemoryMB,
@@ -172,17 +204,16 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		NetworkBytesInLimit:  req.NetworkBytesInLimit,
 		NetworkBytesOutLimit: req.NetworkBytesOutLimit,
 		Durability:           req.Durability,
-		ModuleRef:            req.ModuleRef,
+		ModuleRef:            persistedModuleRef,
 		ModuleDigest:         state.ModuleDigest,
 		TenantID:             req.TenantID,
 	}
-	sandbox.OwnerRef = ownerRefForCreate(ctx)
-
+	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, sandbox.ID)
 	// Loopback IP so syncAllowedPorts / expose_port probe gating treat the
 	// sandbox as host-mediated (same posture as WASM). Public L7 routing is
 	// opt-in via expose_port — creates stay private-by-default.
 	sandbox.ContainerIP = "127.0.0.1"
-	if err := s.store.Create(ctx, sandbox); err != nil {
+	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		if errors.Is(err, models.ErrSandboxExists) {
 			// A concurrent create with the same id won the INSERT. Both callers
 			// ran the full driver create for the SAME id — host.Load, the group

@@ -8,8 +8,8 @@ import (
 	"time"
 
 	apievents "github.com/containerd/containerd/api/events"
-	"github.com/containerd/containerd/events"
-	"github.com/containerd/containerd/runtime"
+	"github.com/containerd/containerd/v2/core/events"
+	"github.com/containerd/containerd/v2/core/runtime"
 	"github.com/containerd/typeurl/v2"
 
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -63,11 +63,38 @@ func TestNormalizeContainerdEvent(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:       "task delete maps to destroy",
-			env:        mkEnvelope(t, runtime.TaskDeleteEventTopic, &apievents.TaskDelete{ContainerID: "sb-3"}),
+			// Regression: /tasks/delete must be IGNORED, not mapped to
+			// "destroy". It is the TASK (the process) being reaped, which
+			// happens on every ordinary stop while the container object
+			// survives and stays restartable. Mapping it to destroy made the
+			// service consumer delete the sandbox row on a manual stop, so a
+			// stopped sandbox vanished and UC-14/UC-15 broke on containerd —
+			// the default engine for non-local deployments. Seen live on
+			// single-node 2026-09-23: die(stop_mode=manual) -> POST /stop 200
+			// -> "destroyed via docker event" 2ms later -> GET 404.
+			name:   "task delete is ignored (a stop reaps the task, not the container)",
+			env:    mkEnvelope(t, runtime.TaskDeleteEventTopic, &apievents.TaskDelete{ContainerID: "sb-3"}),
+			wantOK: false,
+		},
+		{
+			// /containers/delete is the real analogue of Docker's "destroy":
+			// the container object is gone. Note it names the container with
+			// ID, not ContainerID.
+			name:       "container delete maps to destroy",
+			env:        mkEnvelope(t, containerDeleteEventTopic, &apievents.ContainerDelete{ID: "sb-3"}),
 			wantOK:     true,
 			wantAction: "destroy",
 			wantID:     "sb-3",
+		},
+		{
+			// GetContainerID must win over GetID. Task events carry BOTH: ID is
+			// the EXEC id there, so preferring it would attribute an exec's exit
+			// to a container named after the exec and destroy the wrong row.
+			name:       "exec exit is attributed to the container, not the exec id",
+			env:        mkEnvelope(t, runtime.TaskExitEventTopic, &apievents.TaskExit{ContainerID: "sb-exec-owner", ID: "exec-42"}),
+			wantOK:     true,
+			wantAction: "die",
+			wantID:     "sb-exec-owner",
 		},
 		{
 			name:       "task oom maps to oom",
@@ -195,7 +222,7 @@ func TestStreamEventsClosedChannel(t *testing.T) {
 
 type closedSubscribeTransport struct{ fakeTransport }
 
-func (closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+func (*closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
 	ch := make(chan *events.Envelope)
 	close(ch)
 	return ch, make(chan error)
@@ -203,7 +230,7 @@ func (closedSubscribeTransport) subscribe(context.Context, ...string) (<-chan *e
 
 type errorSubscribeTransport struct{ fakeTransport }
 
-func (errorSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+func (*errorSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
 	errCh := make(chan error, 1)
 	errCh <- errors.New("subscribe failed")
 	return make(chan *events.Envelope), errCh

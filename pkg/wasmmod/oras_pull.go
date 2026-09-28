@@ -2,10 +2,12 @@ package wasmmod
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/content/file"
 )
@@ -31,9 +33,17 @@ func (c ORASPullConfig) Validate() error {
 	return nil
 }
 
-// PullSnapshotArtifact downloads a §4.8.1 mem.snap directory from AOCR into dstDir.
-func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, dstDir string) error {
+// PullSnapshotArtifact downloads a §4.8.1 mem.snap directory from AOCR into
+// dstDir, refusing a checkpoint that another sandbox lifetime published.
+//
+// incarnationID is the lifetime the caller is restoring. A manifest that names
+// a different lifetime is rejected with ErrCheckpointLifetimeMismatch. One that
+// names none predates the binding and is accepted: it can only be reached
+// through a ref the lifetime's own row recorded, because every fallback now
+// resolves a lifetime-scoped tag that only annotated pushes write.
+func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, incarnationID, dstDir string) error {
 	registryRef = strings.TrimSpace(registryRef)
+	incarnationID = strings.TrimSpace(incarnationID)
 	dstDir = strings.TrimSpace(dstDir)
 	if registryRef == "" || dstDir == "" {
 		return fmt.Errorf("oras pull: registry ref and destination dir required")
@@ -63,11 +73,23 @@ func PullSnapshotArtifact(ctx context.Context, cfg ORASPullConfig, registryRef, 
 	}
 
 	tag := registryTag(registryRef)
-	if _, err := repo.Resolve(ctx, tag); err != nil {
+	desc, manifestBytes, err := oras.FetchBytes(ctx, repo, tag, oras.DefaultFetchBytesOptions)
+	if err != nil {
 		return fmt.Errorf("oras pull resolve %s: %w", registryRef, err)
 	}
+	var manifest ocispec.Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return fmt.Errorf("oras pull decode manifest %s: %w", registryRef, err)
+	}
+	if owner := strings.TrimSpace(manifest.Annotations[WasmCheckpointIncarnationAnnotation]); owner != "" && owner != incarnationID {
+		return fmt.Errorf("%w: %s was published by lifetime %s, restoring %s",
+			ErrCheckpointLifetimeMismatch, registryRef, owner, incarnationID)
+	}
 
-	if _, err := oras.Copy(ctx, repo, tag, fs, tag, oras.DefaultCopyOptions); err != nil {
+	// Copy the manifest that was just VERIFIED, by digest. Copying by tag would
+	// resolve it a second time, and a tag that moved in between would restore
+	// a checkpoint nobody checked.
+	if _, err := oras.Copy(ctx, repo, desc.Digest.String(), fs, tag, oras.DefaultCopyOptions); err != nil {
 		return fmt.Errorf("oras pull copy from %s: %w", registryRef, err)
 	}
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -290,6 +291,25 @@ func (s *Store) ListDigests(tenant string) []string {
 	defer s.mu.Unlock()
 	out := make([]string, len(s.byTenant[tenant]))
 	copy(out, s.byTenant[tenant])
+	return out
+}
+
+// Tenants returns every tenant with at least one bundle on this node, sorted.
+// The replicated artifact catalogue publishes one node's WHOLE inventory of a
+// kind, so it has to enumerate the tenants rather than be asked per tenant —
+// a tenant this node holds nothing for is an answer the catalogue must be
+// able to give.
+func (s *Store) Tenants() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.byTenant))
+	for tenant, digests := range s.byTenant {
+		if len(digests) == 0 {
+			continue
+		}
+		out = append(out, tenant)
+	}
+	sort.Strings(out)
 	return out
 }
 

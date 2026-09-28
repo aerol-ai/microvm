@@ -29,6 +29,11 @@ const (
 	mediaWASIState = "application/vnd.aerolvm.wasm-snapshot.v1.wasi-state.cbor"
 	engineWazero   = "wazero"
 	wasiPreview1   = "preview1"
+
+	// A snapshot is fully materialized before engine restore. Bound hostile or
+	// corrupt zstd frames so an internal migration/AOCR artifact cannot request
+	// the decoder's 64 GiB default allocation and exhaust a worker.
+	maxSnapshotMemoryBytes = 1 << 30
 )
 
 // SnapshotConfig is the v1 config descriptor (§4.8.1).
@@ -220,10 +225,14 @@ func zstdCompress(src []byte) ([]byte, error) {
 }
 
 func zstdDecompress(src []byte) ([]byte, error) {
+	return zstdDecompressMax(src, maxSnapshotMemoryBytes)
+}
+
+func zstdDecompressMax(src []byte, maxBytes uint64) ([]byte, error) {
 	if len(src) == 0 {
 		return []byte{}, nil
 	}
-	dec, err := zstd.NewReader(nil)
+	dec, err := zstd.NewReader(nil, zstd.WithDecoderMaxMemory(maxBytes))
 	if err != nil {
 		return nil, err
 	}

@@ -104,6 +104,35 @@ func TestWasmCheckpointTarHelperBranches(t *testing.T) {
 		}
 	})
 
+	t.Run("oversized tar member", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		if err := tw.WriteHeader(&tar.Header{
+			Name: "config.json", Mode: 0o600, Typeflag: tar.TypeReg,
+			Size: int64(wasmSnapshotMetadataMax) + 1,
+		}); err != nil {
+			t.Fatalf("write header: %v", err)
+		}
+		if err := extractWasmCheckpointTar(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected oversized tar member rejection")
+		}
+	})
+
+	t.Run("duplicate tar member", func(t *testing.T) {
+		var buf bytes.Buffer
+		tw := tar.NewWriter(&buf)
+		for range 2 {
+			if err := tw.WriteHeader(&tar.Header{Name: "config.json", Mode: 0o600, Typeflag: tar.TypeReg, Size: 2}); err != nil {
+				t.Fatalf("write header: %v", err)
+			}
+			_, _ = tw.Write([]byte("{}"))
+		}
+		_ = tw.Close()
+		if err := extractWasmCheckpointTar(bytes.NewReader(buf.Bytes()), filepath.Join(t.TempDir(), "dst")); err == nil {
+			t.Fatal("expected duplicate tar member rejection")
+		}
+	})
+
 	t.Run("skip non-regular tar entry", func(t *testing.T) {
 		src := filepath.Join(t.TempDir(), "mem.snap")
 		cap := wasmengine.SnapshotCapture{

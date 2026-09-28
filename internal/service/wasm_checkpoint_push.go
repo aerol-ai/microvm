@@ -33,11 +33,6 @@ func NewWasmCheckpointPusher(cfg SnapshotPushConfig, logger *slog.Logger) (*Wasm
 	return &WasmCheckpointPusher{cfg: cfg, logger: logger}, nil
 }
 
-// DestRefFor returns the AOCR :latest ref for sandboxID without pushing.
-func (p *WasmCheckpointPusher) DestRefFor(sandboxID string) string {
-	return p.DestRefTagged(sandboxID, "latest")
-}
-
 // DestRefTagged returns an AOCR ref with an explicit tag.
 func (p *WasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	if p == nil {
@@ -50,13 +45,9 @@ func (p *WasmCheckpointPusher) DestRefTagged(sandboxID, tag string) string {
 	return wasmmod.WasmCheckpointRefTagged(p.cfg.Host, p.cfg.ClusterID, sandboxID, tag)
 }
 
-// PushOnce uploads memSnapDir to AOCR :latest for sandboxID.
-func (p *WasmCheckpointPusher) PushOnce(ctx context.Context, sandboxID, memSnapDir string) (WasmCheckpointPushResult, error) {
-	return p.PushOnceTo(ctx, sandboxID, memSnapDir, p.DestRefFor(sandboxID))
-}
-
-// PushOnceTo uploads memSnapDir to an explicit AOCR ref.
-func (p *WasmCheckpointPusher) PushOnceTo(ctx context.Context, sandboxID, memSnapDir, dest string) (WasmCheckpointPushResult, error) {
+// PushOnceTo uploads memSnapDir to an explicit AOCR ref, as an artifact bound
+// to the sandbox lifetime incarnationID.
+func (p *WasmCheckpointPusher) PushOnceTo(ctx context.Context, sandboxID, incarnationID, memSnapDir, dest string) (WasmCheckpointPushResult, error) {
 	if p == nil {
 		return WasmCheckpointPushResult{}, errors.New("wasm checkpoint push disabled (pusher is nil)")
 	}
@@ -74,7 +65,7 @@ func (p *WasmCheckpointPusher) PushOnceTo(ctx context.Context, sandboxID, memSna
 		ClusterID: p.cfg.ClusterID,
 		PATPath:   p.cfg.PATPath,
 	}
-	digest, err := wasmmod.PushSnapshotArtifact(ctx, orasCfg, memSnapDir, dest)
+	digest, err := wasmmod.PushSnapshotArtifact(ctx, orasCfg, memSnapDir, dest, incarnationID)
 	if err != nil {
 		return WasmCheckpointPushResult{}, fmt.Errorf("wasm checkpoint push %s -> %s: %w", sandboxID, dest, err)
 	}
@@ -88,8 +79,9 @@ func (p *WasmCheckpointPusher) PushOnceTo(ctx context.Context, sandboxID, memSna
 	return WasmCheckpointPushResult{RegistryRef: dest, Digest: digest}, nil
 }
 
-// PullOnce downloads a durable checkpoint from AOCR into dstDir (§4.8 failover).
-func (p *WasmCheckpointPusher) PullOnce(ctx context.Context, registryRef, dstDir string) error {
+// PullOnce downloads a durable checkpoint from AOCR into dstDir (§4.8
+// failover), refusing one another lifetime than incarnationID published.
+func (p *WasmCheckpointPusher) PullOnce(ctx context.Context, registryRef, incarnationID, dstDir string) error {
 	if p == nil {
 		return errors.New("wasm checkpoint pull disabled (pusher is nil)")
 	}
@@ -98,7 +90,7 @@ func (p *WasmCheckpointPusher) PullOnce(ctx context.Context, registryRef, dstDir
 	if registryRef == "" || dstDir == "" {
 		return fmt.Errorf("wasm checkpoint pull: registry ref and destination dir required")
 	}
-	return wasmmod.PullSnapshotArtifact(ctx, p.orasPullConfig(), registryRef, dstDir)
+	return wasmmod.PullSnapshotArtifact(ctx, p.orasPullConfig(), registryRef, incarnationID, dstDir)
 }
 
 func (p *WasmCheckpointPusher) orasPullConfig() wasmmod.ORASPullConfig {

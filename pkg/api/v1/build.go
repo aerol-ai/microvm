@@ -14,11 +14,12 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-const clusterImageBuildFanoutHeader = "X-Cluster-Image-Build-Fanout"
+const clusterImageBuildRoutedHeader = "X-Cluster-Image-Build-Routed"
 
 // buildContextWithTimeout returns a child context with the configured build
 // timeout. A timeout of zero falls back to plain cancel — the parent's
@@ -54,7 +55,7 @@ type buildImageResponse struct {
 }
 
 func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get(clusterImageBuildFanoutHeader) == "1" {
+	if r.Header.Get(clusterImageBuildRoutedHeader) == "1" {
 		h.buildImage(w, r)
 		return
 	}
@@ -63,12 +64,12 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	c := h.deps.Service.Cluster()
-	if c == nil {
+	if c == nil || !h.deps.Service.ClusterEnabled() {
 		h.buildImage(w, r)
 		return
 	}
 
-	raw, err := io.ReadAll(r.Body)
+	raw, err := apihttp.ReadJSONBody(w, r)
 	_ = r.Body.Close()
 	if err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "read body: "+err.Error())
@@ -84,93 +85,83 @@ func (h *handlers) clusterBuildImageWrap(w http.ResponseWriter, r *http.Request)
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
 
-	// Explicit push/context builds have their own distribution semantics. The
-	// fanout is for the SDK CreateWithImage path, which returns a local-only
-	// aerolvm-build/* tag and immediately creates a Docker sandbox from it.
-	if parsed.Push != nil || len(parsed.ContextHashes) > 0 {
+	// A built image is local to one worker. Select that worker once and encode
+	// its identity in the returned tag; the follow-up create request decodes the
+	// affinity and routes back to the same worker. This keeps one SDK build at
+	// O(1) work instead of broadcasting it to every Docker worker.
+	target, err := c.SelectPlacement(capacity.Request{
+		CPU: models.DefaultCPU, MemoryMB: models.DefaultMemoryMB,
+		DiskGB: models.DefaultDiskGB, Runtime: models.RuntimeDocker,
+	})
+	if err != nil || target.NodeID == "" {
+		if err == nil {
+			err = cluster.ErrNoPlacementTarget
+		}
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster image build placement: "+err.Error())
+		return
+	}
+	if target.IsSelf {
 		h.buildImage(w, r)
 		return
 	}
-	if clusterSelfCanOwnSandbox(c) {
-		h.buildImage(w, r)
+	member := cluster.Member{
+		NodeID: target.NodeID, APIURL: target.APIURL, InternalURL: target.InternalURL,
+	}
+	status, header, body, err := h.runImageBuildOnTarget(c, r, raw, member, false)
+	if err != nil {
+		if h.deps.Logger != nil {
+			h.deps.Logger.Warn("cluster image build failed", "node", target.NodeID, "err", err)
+		}
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+target.NodeID+": "+err.Error())
 		return
 	}
-
-	type target struct {
-		member cluster.Member
-		self   bool
-	}
-	selfID := c.SelfNodeID()
-	targets := make([]target, 0)
-	for _, m := range c.Members() {
-		if !m.Alive || m.NodeID == "" || c.IsNodeDrained(m.NodeID) {
-			continue
-		}
-		if !clusterMemberCanOwnSandbox(m.Role) || !clusterMemberSupportsRuntime(m, models.RuntimeDocker) {
-			continue
-		}
-		isSelf := m.NodeID == selfID
-		if !isSelf && m.APIURL == "" {
-			continue
-		}
-		targets = append(targets, target{member: m, self: isSelf})
-	}
-	if len(targets) == 0 || (len(targets) == 1 && targets[0].self) {
-		h.buildImage(w, r)
+	if status != http.StatusOK {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+target.NodeID+": "+strings.TrimSpace(string(body)))
 		return
 	}
-
-	var firstStatus int
-	var firstHeader http.Header
-	var firstBody []byte
-	for _, t := range targets {
-		status, header, body, err := h.runImageBuildOnTarget(r, raw, t.member, t.self)
-		if err != nil {
-			if h.deps.Logger != nil {
-				h.deps.Logger.Warn("cluster image build fanout failed", "node", t.member.NodeID, "err", err)
-			}
-			apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+t.member.NodeID+": "+err.Error())
-			return
-		}
-		if status != http.StatusOK {
-			apihttp.WriteError(w, http.StatusBadGateway, "cluster image build failed on "+t.member.NodeID+": "+strings.TrimSpace(string(body)))
-			return
-		}
-		if firstStatus == 0 {
-			firstStatus = status
-			firstHeader = header
-			firstBody = body
-		}
+	var built buildImageResponse
+	if err := json.Unmarshal(body, &built); err != nil {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build returned an invalid response")
+		return
 	}
-	copyHeaderValues(w.Header(), firstHeader)
-	w.WriteHeader(firstStatus)
-	_, _ = w.Write(firstBody)
+	if owner, ok := docker.BuiltImagePlacementNode(built.Image); !ok || owner != target.NodeID {
+		apihttp.WriteError(w, http.StatusBadGateway, "cluster image build returned an unbound image tag")
+		return
+	}
+	copyHeaderValues(w.Header(), header)
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }
 
-func (h *handlers) runImageBuildOnTarget(parent *http.Request, raw []byte, m cluster.Member, self bool) (int, http.Header, []byte, error) {
+func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request, raw []byte, m cluster.Member, self bool) (int, http.Header, []byte, error) {
 	if self {
 		req := parent.Clone(parent.Context())
 		req.Body = io.NopCloser(bytes.NewReader(raw))
 		req.ContentLength = int64(len(raw))
 		req.Header = parent.Header.Clone()
-		req.Header.Set(clusterImageBuildFanoutHeader, "1")
+		req.Header.Set(clusterImageBuildRoutedHeader, "1")
 		rr := httptest.NewRecorder()
 		h.buildImage(rr, req)
 		return rr.Code, rr.Header(), rr.Body.Bytes(), nil
 	}
-	req, err := http.NewRequestWithContext(parent.Context(), http.MethodPost,
-		clusterPeerURL(m.APIURL, PathPrefix+"/images/build"), bytes.NewReader(raw))
+	client, base, err := dialClusterPeer(c, m)
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	req.Header.Set(clusterImageBuildFanoutHeader, "1")
+	req, err := http.NewRequestWithContext(parent.Context(), http.MethodPost,
+		base+PathPrefix+"/images/build", bytes.NewReader(raw))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req.Header.Set(clusterImageBuildRoutedHeader, "1")
+	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)
 	}
 	if ct := parent.Header.Get("Content-Type"); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -218,6 +209,11 @@ func (h *handlers) buildImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tag := docker.BuildTagFor(dockerfile, req.ContextHashes)
+	if h.deps.Service != nil && h.deps.Service.ClusterEnabled() {
+		if c := h.deps.Service.Cluster(); c != nil {
+			tag = docker.BuildTagForNode(dockerfile, req.ContextHashes, c.SelfNodeID())
+		}
+	}
 	exists, err := h.deps.Builder.ImageExists(r.Context(), tag)
 	if err != nil {
 		apihttp.WriteError(w, http.StatusInternalServerError, fmt.Sprintf("check built image cache: %v", err))

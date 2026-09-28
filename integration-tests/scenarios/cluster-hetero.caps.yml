@@ -28,3 +28,8 @@ capabilities:
   # be a no-op on a containerd host.
 
 expected_members: 8
+
+# Node-kill / failover fault injection. Previously implied by this scenario's
+# NAME in run.sh; now declared here, because a name match meant every other
+# scenario silently skipped its D-tagged cases instead of running them.
+disruptive: true

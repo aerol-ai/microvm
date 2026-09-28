@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/events"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/events"
 )
 
 // clientTransport is the containerd API subset the driver exercises. Production

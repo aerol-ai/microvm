@@ -124,8 +124,14 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 			return
 		}
 		started = true
-		g.logger.Info("ssh remote session start", "sandbox_id", sandboxID, "forward_id", forwardID, "session", sessionName, "exec", state.execCommand != "")
-		go func() { done <- g.attachToSession(ctx, channel, ep, sessionName, state, resize) }()
+		// The request loop continues accepting window-change messages while the
+		// attach runs. Give the goroutine an immutable launch snapshot so a late
+		// SSH request cannot race session creation parameters.
+		launchState := *state
+		launchState.envVars = append([]string(nil), state.envVars...)
+		launchName := sessionName
+		g.logger.Info("ssh remote session start", "sandbox_id", sandboxID, "forward_id", forwardID, "session", launchName, "exec", launchState.execCommand != "")
+		go func() { done <- g.attachToSession(ctx, channel, ep, launchName, &launchState, resize) }()
 	}
 	finish := func(code int) {
 		_ = sendExitStatus(channel, uint32(code))
@@ -151,6 +157,10 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 			}
 			switch req.Type {
 			case "pty-req":
+				if started {
+					replyRequest(req, false)
+					continue
+				}
 				term, rows, cols, ok := parsePTYRequest(req.Payload)
 				if !ok {
 					replyRequest(req, false)
@@ -165,6 +175,10 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 				replyRequest(req, true)
 
 			case "env":
+				if started {
+					replyRequest(req, false)
+					continue
+				}
 				name, value, ok := parseEnvRequest(req.Payload)
 				if ok && allowEnvVar(name) {
 					state.envVars = append(state.envVars, name+"="+value)
@@ -172,10 +186,18 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 				replyRequest(req, true)
 
 			case "shell":
+				if started {
+					replyRequest(req, false)
+					continue
+				}
 				replyRequest(req, true)
 				start()
 
 			case "exec":
+				if started {
+					replyRequest(req, false)
+					continue
+				}
 				command, ok := parseExecRequest(req.Payload)
 				if !ok || strings.TrimSpace(command) == "" {
 					replyRequest(req, false)
@@ -193,13 +215,14 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 				if !ok {
 					continue
 				}
-				state.ptyRows = rows
-				state.ptyCols = cols
 				if started {
 					select {
 					case resize <- [2]uint32{cols, rows}:
 					default:
 					}
+				} else {
+					state.ptyRows = rows
+					state.ptyCols = cols
 				}
 
 			default:

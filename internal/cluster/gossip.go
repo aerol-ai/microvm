@@ -8,6 +8,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -31,10 +32,7 @@ type nodeMeta struct {
 	APIURL        string `json:"api_url"`
 	DataPlaneHost string `json:"data_plane_host,omitempty"`
 	RaftAddr      string `json:"raft_addr,omitempty"`
-	// InternalURL is this node's cluster-internal mTLS endpoint (e.g.
-	// https://10.0.0.5:7002). Set only when the node was started with cluster
-	// TLS material — peers receiving an empty value know to fall back to the
-	// public APIURL with PAT-only auth.
+	// InternalURL is this node's required cluster-internal mTLS endpoint.
 	InternalURL string `json:"internal_url,omitempty"`
 	// Role is the gossiped SB_NODE_ROLE — the leader's voter-promotion code
 	// uses this to decline to AddVoter a peer that announced itself as
@@ -87,7 +85,10 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 // refreshMeta rebuilds the encoded metadata blob. memberlist's NodeMeta()
 // must return a stable byte slice, so we double-buffer.
 func (d *gossipDelegate) refreshMeta() {
-	meta := nodeMeta{NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost}
+	meta := nodeMeta{
+		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
+		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
+	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
 		// nodeMeta has only string fields; json.Marshal cannot fail. Keep the
@@ -146,20 +147,65 @@ type gossipNode struct {
 	ml                 *memberlist.Memberlist
 	delegate           *gossipDelegate
 	memberIndex        *gossipMemberIndex
+	memberIndexMu      sync.RWMutex
 	stopRefresh        context.CancelFunc
 	logger             *slog.Logger
 	bootstrapPeers     []string
 	joinBootstrapPeers func([]string) (int, error)
+	// peerCache remembers live control-plane peers across restarts; nil when
+	// no directory was configured. See gossip_peer_cache.go for why.
+	peerCache *gossipPeerCache
+	// selfGossipAddr is excluded from every rejoin list.
+	selfGossipAddr string
+	// rejoinInFlight keeps a slow rejoin (serial dials, TCP timeouts to a
+	// vanished host) off the refresh loop and stops attempts from stacking.
+	rejoinInFlight atomic.Bool
 }
 
 type gossipMemberIndex struct {
 	mu      sync.RWMutex
 	members map[string]Member
 	seen    map[string]int64
+	// controlPlane is the maintained subset of members that can answer a
+	// control-plane request: alive, control-plane-capable role, non-empty
+	// InternalURL, not self-filtered (callers still drop themselves).
+	//
+	// Every Agent RPC has to pick a server, and doing that by snapshotting the
+	// whole membership first allocates the entire fleet — roughly 1.16 MB per
+	// discovery at 2,000 nodes — to choose from a handful of candidates. The
+	// subset is small and changes only on membership churn, so it is kept
+	// alongside the map instead of being re-derived per call.
+	controlPlane []Member
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
 	return &gossipMemberIndex{members: make(map[string]Member), seen: make(map[string]int64)}
+}
+
+// rebuildControlPlaneLocked refreshes the server-role index. Caller holds the
+// write lock.
+func (i *gossipMemberIndex) rebuildControlPlaneLocked() {
+	out := make([]Member, 0, len(i.controlPlane))
+	for _, m := range i.members {
+		if m.NodeID == "" || !m.Alive || m.InternalURL == "" {
+			continue
+		}
+		if !CanServeControlPlaneRole(m.Role) {
+			continue
+		}
+		out = append(out, m)
+	}
+	i.controlPlane = out
+}
+
+// controlPlaneSnapshot returns a copy of the maintained server subset.
+func (i *gossipMemberIndex) controlPlaneSnapshot() []Member {
+	if i == nil {
+		return nil
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return append([]Member(nil), i.controlPlane...)
 }
 
 func (i *gossipMemberIndex) upsert(m Member) {
@@ -175,6 +221,7 @@ func (i *gossipMemberIndex) upsert(m Member) {
 		i.seen[m.NodeID] = now
 	}
 	i.members[m.NodeID] = m
+	i.rebuildControlPlaneLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }
@@ -207,8 +254,19 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	}
 	i.recordLeaseLossesLocked(next)
 	i.members = next
+	i.rebuildControlPlaneLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
+}
+
+func (i *gossipMemberIndex) get(id string) (Member, bool) {
+	if i == nil || id == "" {
+		return Member{}, false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	m, ok := i.members[id]
+	return m, ok
 }
 
 func (i *gossipMemberIndex) snapshot() []Member {
@@ -222,6 +280,13 @@ func (i *gossipMemberIndex) snapshot() []Member {
 		out = append(out, m)
 	}
 	return out
+}
+
+func (g *gossipNode) lookupMember(id string) (Member, bool) {
+	if g == nil {
+		return Member{}, false
+	}
+	return g.currentMemberIndex().get(id)
 }
 
 func (i *gossipMemberIndex) recordLeaseLossesLocked(next map[string]Member) {
@@ -274,9 +339,10 @@ func (i *gossipMemberIndex) recordMetricsLocked(now int64) {
 }
 
 type indexedEventDelegate struct {
-	index  *gossipMemberIndex
-	logger *slog.Logger
-	next   memberlist.EventDelegate
+	index   *gossipMemberIndex
+	logger  *slog.Logger
+	next    memberlist.EventDelegate
+	onLeave func(nodeID string)
 }
 
 func (d *indexedEventDelegate) NotifyJoin(n *memberlist.Node) {
@@ -317,6 +383,9 @@ func (d *indexedEventDelegate) NotifyLeave(n *memberlist.Node) {
 			"memberlist_name", n.Name,
 			"memberlist_addr", n.Address(),
 		)
+	}
+	if d.onLeave != nil && m.NodeID != "" {
+		d.onLeave(m.NodeID)
 	}
 	if d.next != nil {
 		d.next.NotifyLeave(n)
@@ -375,6 +444,13 @@ type gossipSetupConfig struct {
 	// Events, if non-nil, receives memberlist join/leave/update notifications.
 	// Auto-voter promotion in Phase 2 plugs in here.
 	Events memberlist.EventDelegate
+	// OnLeave is invoked after the local membership index marks a peer left.
+	// Used to drop cached per-peer mTLS HTTP clients.
+	OnLeave func(nodeID string)
+	// PeerCacheDir, when set, is where live control-plane peers are
+	// remembered so a restart can rejoin without SB_CLUSTER_PEERS. Empty
+	// disables the cache (tests, and any caller without durable state).
+	PeerCacheDir string
 }
 
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
@@ -398,7 +474,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, cfg.PublicHost, admitter)
 	memberIndex := newGossipMemberIndex()
 	mlCfg.Delegate = delegate
-	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events}
+	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
 		// memberlist accepts 16/24/32-byte keys for AES-128/192/256-GCM. Anything
 		// else is rejected at construction so we surface a clear error rather
@@ -476,6 +552,14 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		logger:             logger,
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
+		peerCache:          newGossipPeerCache(cfg.PeerCacheDir),
+		selfGossipAddr:     ml.LocalNode().Address(),
+	}
+	// Loaded but deliberately not dialled here: setupGossip is on the boot
+	// path, and a stale entry whose host is gone costs a full TCP timeout.
+	// The refresh loop's first tick rejoins through them in the background.
+	if cached := gn.peerCache.load(); len(cached) > 0 && logger != nil {
+		logger.Info("cluster gossip remembered peers loaded", "peers", cached)
 	}
 	gn.refreshMemberIndex()
 	go gn.runRefreshLoop(refreshCtx, interval)
@@ -497,9 +581,42 @@ func (g *gossipNode) runRefreshLoop(ctx context.Context, interval time.Duration)
 			return
 		case <-t.C:
 			g.refreshMemberIndex()
-			g.maybeRejoinBootstrapPeers(g.memberlistNodes())
+			nodes := g.memberlistNodes()
+			g.rememberLivePeers(nodes)
+			if g.rejoinInFlight.CompareAndSwap(false, true) {
+				go func() {
+					defer g.rejoinInFlight.Store(false)
+					g.maybeRejoinBootstrapPeers(nodes)
+				}()
+			}
 		}
 	}
+}
+
+// rememberLivePeers persists the currently-alive control-plane peers. A write
+// failure only costs the next restart its fallback, so it is logged, not fatal.
+func (g *gossipNode) rememberLivePeers(nodes []*memberlist.Node) {
+	if g == nil || g.peerCache == nil {
+		return
+	}
+	selfNodeID := ""
+	if g.delegate != nil {
+		selfNodeID = g.delegate.nodeID
+	}
+	if err := g.peerCache.remember(liveControlPlanePeerAddrs(nodes, selfNodeID)); err != nil && g.logger != nil {
+		g.logger.Warn("cluster gossip could not persist remembered peers", "path", g.peerCache.path, "error", err)
+	}
+}
+
+// rejoinPeers is configured peers plus remembered ones, minus self.
+func (g *gossipNode) rejoinPeers() []string {
+	var cached []string
+	if g.peerCache != nil {
+		g.peerCache.mu.Lock()
+		cached = append([]string(nil), g.peerCache.last...)
+		g.peerCache.mu.Unlock()
+	}
+	return mergeRejoinPeers(g.bootstrapPeers, cached, g.selfGossipAddr)
 }
 
 func (g *gossipNode) memberlistNodes() []*memberlist.Node {
@@ -510,7 +627,11 @@ func (g *gossipNode) memberlistNodes() []*memberlist.Node {
 }
 
 func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
-	if g == nil || len(g.bootstrapPeers) == 0 || g.joinBootstrapPeers == nil {
+	if g == nil || g.joinBootstrapPeers == nil {
+		return
+	}
+	peers := g.rejoinPeers()
+	if len(peers) == 0 {
 		return
 	}
 	selfNodeID := ""
@@ -520,15 +641,15 @@ func (g *gossipNode) maybeRejoinBootstrapPeers(nodes []*memberlist.Node) {
 	if hasLiveControlPlaneMember(nodes, selfNodeID) {
 		return
 	}
-	joined, err := g.joinBootstrapPeers(g.bootstrapPeers)
+	joined, err := g.joinBootstrapPeers(peers)
 	if err != nil {
 		if g.logger != nil {
-			g.logger.Warn("cluster gossip bootstrap rejoin failed", "peers", g.bootstrapPeers, "error", err)
+			g.logger.Warn("cluster gossip bootstrap rejoin failed", "peers", peers, "error", err)
 		}
 		return
 	}
 	if joined > 0 && g.logger != nil {
-		g.logger.Info("cluster gossip bootstrap rejoined peers", "joined", joined, "peers", g.bootstrapPeers)
+		g.logger.Info("cluster gossip bootstrap rejoined peers", "joined", joined, "peers", peers)
 	}
 }
 
@@ -544,7 +665,7 @@ func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool
 		if selfNodeID != "" && m.NodeID == selfNodeID {
 			continue
 		}
-		if m.NodeID != "" && CanServeControlPlaneRole(m.Role) && (m.APIURL != "" || m.InternalURL != "") {
+		if m.NodeID != "" && CanServeControlPlaneRole(m.Role) && m.InternalURL != "" {
 			return true
 		}
 	}
@@ -558,17 +679,36 @@ func hasLiveControlPlaneMember(nodes []*memberlist.Node, selfNodeID string) bool
 // calls UpdateNode, which races with members() reads. memberlist exposes no
 // safe accessor for self's Meta, so we substitute self ourselves.
 func (g *gossipNode) members() []Member {
-	if g.memberIndex != nil {
-		return g.memberIndex.snapshot()
+	if index := g.currentMemberIndex(); index != nil {
+		return index.snapshot()
 	}
 	return g.scanMembers()
 }
 
 func (g *gossipNode) refreshMemberIndex() {
-	if g.memberIndex == nil {
+	index := g.currentMemberIndex()
+	if index == nil {
 		return
 	}
-	g.memberIndex.replace(g.scanMembers())
+	index.replace(g.scanMembers())
+}
+
+func (g *gossipNode) currentMemberIndex() *gossipMemberIndex {
+	if g == nil {
+		return nil
+	}
+	g.memberIndexMu.RLock()
+	defer g.memberIndexMu.RUnlock()
+	return g.memberIndex
+}
+
+func (g *gossipNode) setMemberIndex(index *gossipMemberIndex) {
+	if g == nil {
+		return
+	}
+	g.memberIndexMu.Lock()
+	g.memberIndex = index
+	g.memberIndexMu.Unlock()
 }
 
 func (g *gossipNode) scanMembers() []Member {
@@ -659,8 +799,8 @@ func (g *gossipNode) peerDataPlaneHost(nodeID string) string {
 }
 
 // peerInternalURL returns the gossiped cluster-internal mTLS endpoint for
-// nodeID, or "" if the peer hasn't advertised one (it's running without
-// SB_CLUSTER_TLS_DIR). Callers fall back to peerAPIURL + PAT-only auth.
+// nodeID, or "" if the peer has not advertised one. Peer RPC callers treat an
+// empty value as unavailable and never downgrade to the public API.
 func (g *gossipNode) peerInternalURL(nodeID string) string {
 	for _, m := range g.members() {
 		if m.NodeID == nodeID {

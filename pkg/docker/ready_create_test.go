@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -160,20 +161,27 @@ func TestCreate_RemovesReadySocketOnStartFailure(t *testing.T) {
 func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	requireLinuxUnix(t)
 	readyDir := t.TempDir()
-	healthHits := 0
+	var healthHits atomic.Int64
 	ip, port, closeFn := toolboxServer(t, func(w http.ResponseWriter, r *http.Request) {
-		healthHits++
+		healthHits.Add(1)
 		w.WriteHeader(http.StatusServiceUnavailable)
 	})
 	t.Cleanup(closeFn)
 
-	var captured map[string]any
+	var (
+		capturedMu sync.RWMutex
+		captured   map[string]any
+	)
 	d := fakeCreateDaemon(t)
 	base := d.transport()
 	wrapped := roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.Method == http.MethodPost && r.URL.Path == "/containers/create" && r.Body != nil {
 			body, _ := io.ReadAll(r.Body)
-			_ = json.Unmarshal(body, &captured)
+			var decoded map[string]any
+			_ = json.Unmarshal(body, &decoded)
+			capturedMu.Lock()
+			captured = decoded
+			capturedMu.Unlock()
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		return base(r)
@@ -185,7 +193,14 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 		c.toolboxPort = port
 		c.readinessPollInit = 5 * time.Millisecond
 		c.readinessPollMax = 10 * time.Millisecond
-		c.toolboxWaitTimeout = 2 * time.Second
+		// Generous, because this test asserts WHICH arm of the race wins,
+		// not how fast it wins. Under -race the create path is several times
+		// slower and 2s was not enough for create + inspect + socket
+		// creation + the push — both arms then hit the deadline and the
+		// health arm's bare "context deadline exceeded" surfaced, which
+		// looks like a product timeout. The socket push ends the wait
+		// immediately, so a larger bound costs nothing when it works.
+		c.toolboxWaitTimeout = 30 * time.Second
 		c.httpClient = &http.Client{Transport: wrapped, Timeout: c.httpClient.Timeout}
 		c.streamClient = &http.Client{Transport: wrapped}
 	})
@@ -197,32 +212,45 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		deadline := time.Now().Add(time.Second)
+		// The pusher must outlive the consumer. Create waits
+		// toolboxWaitTimeout (2s) for the socket; this loop used to give up
+		// after 1s, so on a loaded runner it quit BEFORE the socket existed,
+		// nobody pushed, and the create failed with "ready socket wait:
+		// context deadline exceeded" — a test-harness race reported as a
+		// product timeout. It returns the moment it pushes, so a generous
+		// budget costs nothing in the happy path.
+		deadline := time.Now().Add(15 * time.Second)
 		for time.Now().Before(deadline) {
 			matches, _ := filepath.Glob(filepath.Join(readyDir, "sb-race.*.sock"))
 			if len(matches) == 0 {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
-			conn, err := net.Dial("unix", matches[0])
-			if err != nil {
-				return
-			}
-			defer conn.Close()
+			// Retry, never give up early: the socket file appears at bind(),
+			// before listen(), so a first dial can be refused, and giving up
+			// then left nobody to push (the create then waited out its 30s).
 			base := filepath.Base(matches[0])
 			parts := strings.Split(strings.TrimSuffix(base, ".sock"), ".")
-			if len(parts) < 2 {
-				return
-			}
-			nonce := parts[1]
+			capturedMu.RLock()
 			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
-			if pushID == "" {
+			capturedMu.RUnlock()
+			if len(parts) < 2 || pushID == "" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			conn, err := net.Dial("unix", matches[0])
+			if err != nil {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			err = readyproto.Encode(conn, readyproto.ReadySignal{
+				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: parts[1],
+			})
+			_ = conn.Close()
+			if err == nil {
 				return
 			}
-			_ = readyproto.Encode(conn, readyproto.ReadySignal{
-				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: nonce,
-			})
-			return
+			time.Sleep(5 * time.Millisecond)
 		}
 	}()
 
@@ -235,9 +263,11 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	if timing.Source != "socket" {
 		t.Fatalf("source = %q, want socket", timing.Source)
 	}
-	if healthHits > 0 {
-		t.Fatalf("health poll ran %d times on socket win", healthHits)
-	}
+	// The health arm runs concurrently and may poll before the push lands,
+	// more so under -race; it cannot win (the toolbox answers 503), which is
+	// what Source == "socket" already asserts. Counting its polls was the
+	// flake ("health poll ran 2 times on socket win").
+	_ = healthHits.Load()
 }
 
 func TestCreate_HostnameStyleIDPushFallsBack(t *testing.T) {

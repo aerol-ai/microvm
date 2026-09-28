@@ -118,7 +118,8 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := cmd.Start(); err != nil {
+	child, err := startTracked(cmd)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -135,7 +136,7 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 		stderrBytes, _ = io.ReadAll(stderr)
 	}()
 	readWG.Wait()
-	waitErr := cmd.Wait()
+	waitErr := child.wait()
 
 	exitCode, _ := interpretWaitResult(waitErr)
 	// The SDK exposes only `result` (stdout) and `exitCode`. Merge stderr in

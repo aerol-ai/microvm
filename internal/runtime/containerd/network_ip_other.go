@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 
-	cntr "github.com/containerd/containerd"
+	cntr "github.com/containerd/containerd/v2/client"
 )
 
 func containerIPv4FromTask(ctx context.Context, task cntr.Task) (string, error) {

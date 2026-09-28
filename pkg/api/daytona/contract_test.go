@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 	apiclient "github.com/daytonaio/daytona/libs/api-client-go"
@@ -216,15 +217,19 @@ func TestDaytonaGeneratedSandboxContracts(t *testing.T) {
 					Execute()
 				mustGeneratedSandboxSuccess(t, resp, httpResp, err)
 
-				stored, err := env.store.Get(env.ctx, resp.GetId())
+				sealedEnv, err := env.store.GetEnv(env.ctx, resp.GetId())
+				if err != nil || len(sealedEnv) == 0 {
+					t.Fatalf("store.GetEnv(%s) = %d bytes, %v", resp.GetId(), len(sealedEnv), err)
+				}
+				stored, err := env.service.GetSandboxWithOptions(env.ctx, resp.GetId(), service.GetSandboxOptions{IncludeEnv: true})
 				if err != nil {
-					t.Fatalf("store.Get(%s) error = %v", resp.GetId(), err)
+					t.Fatalf("GetSandboxWithOptions(%s) error = %v", resp.GetId(), err)
 				}
 				if stored.Env["APP_ENV"] != "contract" {
 					t.Fatalf("stored.Env = %+v", stored.Env)
 				}
-				if resp.GetEnv()["LANG"] != "en_US.UTF-8" {
-					t.Fatalf("resp.Env = %+v", resp.GetEnv())
+				if len(resp.GetEnv()) != 0 {
+					t.Fatalf("create response leaked env: %+v", resp.GetEnv())
 				}
 			},
 		},

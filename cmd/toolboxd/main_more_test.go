@@ -149,8 +149,23 @@ func TestMainStartupBranchesWithStubs(t *testing.T) {
 		}
 	}
 	forwardShutdownSignalsFn = func(*slog.Logger, *http.Server) {}
-	netListenFn = func(network, addr string) (net.Listener, error) {
-		return net.Listen(network, addr)
+	// Ephemeral loopback, and closed when the test ends. This stub used to
+	// pass addr straight through, which binds the real, fixed, all-interfaces
+	// :2280 (SB_TOOLBOX_PORT's default) and never closes it — so the listener
+	// leaked for the rest of the package run and any later bind of that port
+	// failed with "address already in use". It did, intermittently, in CI.
+	// Nothing here asserts on the address; the assertions are on the vsock
+	// stub below.
+	var stubListener net.Listener
+	t.Cleanup(func() {
+		if stubListener != nil {
+			_ = stubListener.Close()
+		}
+	})
+	netListenFn = func(string, string) (net.Listener, error) {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		stubListener = ln
+		return ln, err
 	}
 	serveHTTPFn = func(*http.Server, net.Listener) error { return http.ErrServerClosed }
 	fakeVsock := &fakeVsockServer{served: make(chan struct{}), closed: make(chan struct{})}

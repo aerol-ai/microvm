@@ -90,7 +90,7 @@ func newToolboxExecEnv(t *testing.T) (facadeURL, sandboxID string) {
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
 	}
-	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 
 	sandboxID = "sb-exec"
 	now := time.Now().UTC().Round(time.Second)
@@ -214,7 +214,7 @@ func newToolboxExecEnvWithHandler(t *testing.T, executeFn http.HandlerFunc) (fac
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
 	}
-	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 
 	sandboxID = "sb-exec-stderr"
 	now := time.Now().UTC().Round(time.Second)
@@ -715,7 +715,7 @@ func newToolboxErrorEnv(t *testing.T) (facadeURL, sandboxID string) {
 		EnableCaddy:       false,
 		HTTPClientTimeout: 5 * time.Second,
 	}
-	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, mountManager, nil)
+	svc := service.New(cfg, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), mountManager, nil)
 
 	sandboxID = "sb-exec-err"
 	now := time.Now().UTC()
@@ -750,7 +750,7 @@ func TestToolboxDirectCoverage(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	svc := service.New(config.Config{}, logger, st, fakeToolboxRouteRuntime{}, nil, nil, nil, nil, nil)
+	svc := service.New(config.Config{}, logger, st, fakeToolboxRouteRuntime{}, nil, nil, newDaytonaTestCipher(t), nil, nil)
 	h := newHandlers(Deps{
 		Service: svc,
 		Logger:  logger,

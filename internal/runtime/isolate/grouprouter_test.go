@@ -32,6 +32,21 @@ func TestSpawnGroupWarmPool(t *testing.T) {
 	if err != nil || host != warm {
 		t.Fatalf("spawnGroup warm = %v err=%v", host, err)
 	}
+	// A blank was jailed with unlimited caps; the claiming tenant's caps are
+	// applied to it, so the pool never hands out an uncapped process.
+	if warm.capsHits != 1 || warm.capsCPU != 1 || warm.capsMem != 128 {
+		t.Fatalf("warm host caps = hits %d cpu %v mem %d, want 1/1/128", warm.capsHits, warm.capsCPU, warm.capsMem)
+	}
+	// A host whose caps cannot be applied is not handed to the tenant.
+	broken := newFakeGroupHost()
+	broken.capsErr = errors.New("cgroup write failed")
+	d.SetWarmPool(warmPoolHost{host: broken, ok: true})
+	if _, err := d.spawnGroup(context.Background(), "acme", 1, 128); err == nil || !strings.Contains(err.Error(), "apply caps") {
+		t.Fatalf("uncappable warm host err = %v", err)
+	}
+	if !broken.stopped {
+		t.Fatal("uncappable warm host was not stopped")
+	}
 }
 
 func TestAcquireGroupSpawnError(t *testing.T) {

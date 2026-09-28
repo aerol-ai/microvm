@@ -254,6 +254,7 @@
         - "../../setup/runbooks/image-pull-storm.md"
         - "../../setup/runbooks/slo-breach.md"
         - "../../setup/runbooks/containerd-engine-coexistence.md"
+        - "../../setup/runbooks/cluster-ingress-topology.md"
 
     - name: Ensure sandboxd secrets directory exists
       when: >-

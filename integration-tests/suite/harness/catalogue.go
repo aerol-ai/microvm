@@ -128,6 +128,7 @@ func buildCatalogueRegistry() []CatalogueRow {
 	rows = append(rows, gpuRows()...)
 	rows = append(rows, obsRows()...)
 	rows = append(rows, idemRows()...)
+	rows = append(rows, secRows()...)
 	return rows
 }
 

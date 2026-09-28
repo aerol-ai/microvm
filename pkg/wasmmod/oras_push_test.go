@@ -15,7 +15,7 @@ func TestWasmCheckpointRef(t *testing.T) {
 }
 
 func TestPushSnapshotArtifactRequiresInputs(t *testing.T) {
-	_, err := PushSnapshotArtifact(t.Context(), ORASPushConfig{}, "", "")
+	_, err := PushSnapshotArtifact(t.Context(), ORASPushConfig{}, "", "", "inc-test")
 	if err == nil {
 		t.Fatal("expected error for empty inputs")
 	}
@@ -27,7 +27,7 @@ func TestPushSnapshotArtifactRequiresInputs(t *testing.T) {
 		Host:      "aocr.example.com",
 		ClusterID: "c1",
 		PATPath:   t.TempDir() + "/missing",
-	}, dir, WasmCheckpointRef("aocr.example.com", "c1", "sb-1"))
+	}, dir, WasmCheckpointRef("aocr.example.com", "c1", "sb-1"), "inc-test")
 	if err == nil {
 		t.Fatal("expected error without PAT")
 	}
@@ -39,7 +39,7 @@ func TestPushSnapshotArtifactRequiresInputs(t *testing.T) {
 	// Missing directory
 	_, err = PushSnapshotArtifact(t.Context(), ORASPushConfig{
 		Host: "h", ClusterID: "c", PATPath: patFile,
-	}, t.TempDir()+"/missing_dir", "reg/ref:tag")
+	}, t.TempDir()+"/missing_dir", "reg/ref:tag", "inc-test")
 	if err == nil {
 		t.Fatal("expected err for missing dir")
 	}
@@ -48,7 +48,7 @@ func TestPushSnapshotArtifactRequiresInputs(t *testing.T) {
 	emptyDir := t.TempDir()
 	_, err = PushSnapshotArtifact(t.Context(), ORASPushConfig{
 		Host: "h", ClusterID: "c", PATPath: patFile,
-	}, emptyDir, "reg/ref:tag")
+	}, emptyDir, "reg/ref:tag", "inc-test")
 	if err == nil {
 		t.Fatal("expected err for missing config.json")
 	}
@@ -56,7 +56,7 @@ func TestPushSnapshotArtifactRequiresInputs(t *testing.T) {
 	// Bad registry ref
 	_, err = PushSnapshotArtifact(t.Context(), ORASPushConfig{
 		Host: "h", ClusterID: "c", PATPath: patFile,
-	}, dir, "http://\x00invalid")
+	}, dir, "http://\x00invalid", "inc-test")
 	if err == nil {
 		t.Fatal("expected err for bad registry ref")
 	}

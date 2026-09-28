@@ -20,6 +20,9 @@ exercised by `make integration-single-isolate` (UC-103/104/105) and
 ## Prerequisites
 
 - `terraform`, `go`, `awscli`, `jq`, `yq`, `curl`, `openssl`, `ssh`
+- `zig` (`brew install zig`) — the cross-compiling C toolchain the local
+  artifact build needs; `sandboxd` links CGO sqlite, so a pure-Go cross-compile
+  is not an option. `xcaddy` only for `--with-caddy`.
 - AWS credentials with permission to create EC2/VPC/etc.
 - `config/secrets.yml` populated (PAT, Cloudflare token) — see `config/secrets.example.yml`
 - `integration-tests/scenarios/domains.yml` — copy from `domains.example.yml`, fill in
@@ -46,6 +49,48 @@ make integration-reap                   # terminate any leaked itest instances p
 
 Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`,
 `index.md` matrix). Legend: ✅ pass · ❌ fail · ⚪ skip(n/a) · 🟡 pending · 🟤 inconclusive.
+
+## Where the binaries come from
+
+**Scenarios build the daemon locally by default.** Every run cross-compiles the
+current working tree, uploads it to a per-account artifacts bucket, and hands
+the nodes presigned URLs. This is what lets the harness test an **unmerged
+branch** — before this, a scenario could only provision from `releases/latest`,
+so a branch was testable only after it merged and released.
+
+One-time per operator/account:
+
+```bash
+make itest-artifacts-init     # creates s3://aerol-itest-artifacts-<account>
+```
+
+Then the default path needs nothing extra:
+
+```bash
+make integration-single                      # builds HEAD, publishes, provisions from it
+make integration-single released             # old behaviour: releases/latest
+make integration-single no-build             # reuse the last published build (fast re-provision)
+make integration-single FLAGS=--version=v0.7.21   # pin a released tag (A/B vs known-good)
+```
+
+The build id is **content-addressed** —
+`AEROL_BUILD_ID = <short-sha>[-dirty-<tree-hash>]` — so an unchanged tree skips
+both the compile and the upload. That is what makes iterating against a
+`--keep` cluster free. A tree with uncommitted or untracked changes gets a
+`-dirty-` id, and the report says so: those numbers are not reproducible from
+git.
+
+Working on the build itself:
+
+```bash
+make itest-build                             # build only
+make itest-build BUILD_FLAGS="--ref main"    # build another commit (detached worktree)
+make itest-publish                           # upload + print presigned tfvars on stdout
+```
+
+Artifacts expire from the bucket after 7 days; presigned URLs default to 12h,
+which covers a slow `*.metal` provision. `reports/<scenario>.json` carries a
+`build` block naming the tree that produced its numbers.
 
 ## Container engine
 

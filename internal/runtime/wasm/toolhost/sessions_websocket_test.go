@@ -363,25 +363,7 @@ func TestSessionsEdgeCases(t *testing.T) {
 	}
 	defer func() { _ = mgr.Delete(sess.ID()) }()
 
-	// 3. Signal REST API success
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"INT"}`))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("signal success got %d", rec.Code)
-	}
-
-	// Signal REST API error (invalid signal)
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"SIGINVALID"}`))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("signal error got %d", rec.Code)
-	}
-
-	// 4. Resize REST API success
+	// Resize before signal so finish cannot race Setsize under -race.
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/resize", strings.NewReader(`{"cols":120,"rows":40}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -397,6 +379,24 @@ func TestSessionsEdgeCases(t *testing.T) {
 	h.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("resize error got %d", rec.Code)
+	}
+
+	// Signal REST API success
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"INT"}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("signal success got %d", rec.Code)
+	}
+
+	// Signal REST API error (invalid signal)
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/sessions/"+sess.ID()+"/signal", strings.NewReader(`{"signal":"SIGINVALID"}`))
+	req.Header.Set("Content-Type", "application/json")
+	h.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("signal error got %d", rec.Code)
 	}
 
 	// 5. Session recording empty when recorder fails to initialize (blocked by file)

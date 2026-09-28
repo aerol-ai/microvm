@@ -129,10 +129,16 @@ func TestClusterTopologyRequiresShardAwareIngressForLargeIngressTier(t *testing.
 	if !errors.Is(err, cluster.ErrInvalidTopology) {
 		t.Fatalf("ClusterTopologyError = %v, want ErrInvalidTopology", err)
 	}
+	if clusterTopologyOK.Value() != 0 {
+		t.Fatalf("aerolvm_cluster_topology_ok = %d during a violation, want 0 (the alert reads this)", clusterTopologyOK.Value())
+	}
 
 	svc.cfg.ClusterShardAwareIngress = true
 	if err := svc.ClusterTopologyError(); err != nil {
 		t.Fatalf("ClusterTopologyError with shard-aware ingress = %v, want nil", err)
+	}
+	if clusterTopologyOK.Value() != 1 {
+		t.Fatalf("aerolvm_cluster_topology_ok = %d once the opt-in is set, want 1", clusterTopologyOK.Value())
 	}
 }
 
@@ -144,3 +150,5 @@ type topologyCluster struct {
 func (c *topologyCluster) Members() []cluster.Member {
 	return c.members
 }
+
+func (c *topologyCluster) LocalMembers() []cluster.Member { return c.Members() }

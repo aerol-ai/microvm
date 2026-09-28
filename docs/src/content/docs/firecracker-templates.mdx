@@ -15,17 +15,24 @@ Firecracker templates let one OCI image power many sandboxes with sub-100ms cold
 
 Templates are an opt-in alternative to the Docker runtime - your existing sandboxes are unaffected. Use the template lifecycle on this page when you want predictable, fast cold starts (CI runners, REPLs, agent workloads) and accept the up-front build cost.
 
+:::caution[Operator-only control plane]
+Template create, list, inspect, delete, and rebuild endpoints administer global
+worker artifacts. They require operator credentials; managed tenant credentials
+cannot use them. In cluster mode, an ingress routes each operation to the owning
+Firecracker worker and coalesces list aggregation on the Raft leader.
+:::
+
 ## When you want this
 
 - **Fast cold starts.** Once a template is `ready`, new sandboxes boot from a memory snapshot, not from kernel init.
 - **Predictable image content.** A template is built once and reused; you control when it gets rebuilt.
-- **Cluster replication.** Templates with a registry destination ship their artifacts to all peers automatically (see [Cluster Setup](/cluster-setup/)).
+- **Cluster distribution.** Templates with a registry destination publish once to AOCR; peer workers pull artifacts lazily when placement needs them (see [Cluster Setup](/cluster-setup/)).
 
 If you only need one-off sandboxes from arbitrary images, stick with the default Docker runtime - templates are not required.
 
 ## Register a template
 
-Pass an explicit `id` so retried CI steps are idempotent - the daemon rejects a duplicate id with `409 Conflict` rather than creating a second row. The build runs asynchronously; the call returns immediately with `status: "pending"`.
+Pass an explicit `id` so retried CI steps are idempotent - the daemon rejects a duplicate id with `409 Conflict` rather than creating a second row. IDs must start with an alphanumeric character, use only alphanumerics, `.`, `_`, or `-`, and be at most 128 characters. The build runs asynchronously; the call returns immediately with `status: "pending"`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

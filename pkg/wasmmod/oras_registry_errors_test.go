@@ -42,7 +42,7 @@ func TestPullSnapshotArtifactRegistryAuthFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ORASPullConfig{Host: "h", ClusterID: "c", PATPath: patFile}
-	err := PullSnapshotArtifact(context.Background(), cfg, ref, t.TempDir())
+	err := PullSnapshotArtifact(context.Background(), cfg, ref, "inc-test", t.TempDir())
 	if err == nil {
 		t.Fatal("expected pull failure")
 	}

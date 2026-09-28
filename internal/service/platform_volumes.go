@@ -204,14 +204,15 @@ func (s *Service) cleanupPlatformVolumeAttachments(ctx context.Context, attachme
 	}
 	seen := map[string]struct{}{}
 	for _, a := range attachments {
-		if a.SandboxID == "" {
+		if a.SandboxID == "" || a.IncarnationID == "" {
 			continue
 		}
-		if _, ok := seen[a.SandboxID]; ok {
+		key := a.SandboxID + "\x00" + a.IncarnationID
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		seen[a.SandboxID] = struct{}{}
-		if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, a.SandboxID); err != nil && s.logger != nil {
+		seen[key] = struct{}{}
+		if err := s.volumeMeta().DeleteAttachmentsForSandbox(ctx, a.SandboxID, a.IncarnationID); err != nil && s.logger != nil {
 			s.logger.Warn("cleanup platform volume attachments failed",
 				"sandbox_id", a.SandboxID, "err", err)
 		}

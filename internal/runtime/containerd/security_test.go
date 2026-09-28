@@ -5,7 +5,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/v2/pkg/oci"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/pkg/models"

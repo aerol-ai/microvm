@@ -7,10 +7,10 @@ import (
 	"testing"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	runtimeoptions "github.com/containerd/containerd/pkg/runtimeoptions/v1"
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 

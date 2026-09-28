@@ -57,7 +57,30 @@ func sshBaseArgs() []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "UserKnownHostsFile=/dev/null",
 		"-o", "ConnectTimeout=10",
+		// ConnectTimeout only bounds the handshake. Without keepalives an
+		// established session whose TCP path dies (the operator's laptop
+		// slept mid-T18) blocks forever: one `systemctl is-active` hung for
+		// 85 minutes and froze the whole suite. 15s x 4 turns that into a
+		// one-minute error the caller already handles.
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=4",
 		"-o", "BatchMode=yes",
+		// SSHRun merges stderr into stdout, and with UserKnownHostsFile=/dev/null
+		// every single connection emits
+		//   Warning: Permanently added '<ip>' (ED25519) to the list of known hosts.
+		// on stderr. That line then IS the command's output as far as any
+		// caller parsing it is concerned.
+		//
+		// It broke three things on the first run where SSH actually worked:
+		// awaitUnitActive never matched "active" (so WithNodeEnv waited out
+		// its full timeout and reported the node as failed to start), and —
+		// far worse — the UC-169 leak sweep saw a non-empty, non-"NOHITS"
+		// result and reported the canary as FOUND ON DISK in all five
+		// encodings. A false-positive secret leak is the worst possible
+		// output from a security suite.
+		//
+		// LogLevel=ERROR suppresses the warning and keeps real errors.
+		"-o", "LogLevel=ERROR",
 	}
 	if key := strings.TrimSpace(os.Getenv("AEROL_SSH_IDENTITY_FILE")); key != "" {
 		args = append(args, "-i", key)
@@ -65,8 +88,45 @@ func sshBaseArgs() []string {
 	return args
 }
 
+// sshRunner is the seam every SSH call goes through. It is a package var so
+// the offline tests can prove WithNodeEnv's restore contract — that a node is
+// never left down by a failing use case — without a host to SSH into. Nothing
+// but a test ever reassigns it.
+var sshRunner = execSSHRun
+
 // SSHRun runs a remote shell command via SSH. Returns combined stdout/stderr.
 func SSHRun(t *testing.T, target, script string) (string, error) {
+	t.Helper()
+	return sshRunner(t, target, script)
+}
+
+// SSHRunStdin runs a remote command with stdin supplied locally.
+//
+// It exists so a secret never reaches the remote argv. sudo logs the FULL
+// command line to /var/log/auth.log and the journal, so a canary passed as a
+// grep argument is written into the very files the sweep then searches —
+// UC-169 reported itself as a leak in all five encodings because of exactly
+// that. Feeding the pattern on stdin leaves no trace.
+func SSHRunStdin(t *testing.T, target, script, stdin string) (string, error) {
+	t.Helper()
+	return sshRunnerStdin(t, target, script, stdin)
+}
+
+var sshRunnerStdin = execSSHRunStdin
+
+func execSSHRunStdin(t *testing.T, target, script, stdin string) (string, error) {
+	t.Helper()
+	args := append(sshBaseArgs(), target, script)
+	cmd := exec.Command("ssh", args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	return buf.String(), err
+}
+
+func execSSHRun(t *testing.T, target, script string) (string, error) {
 	t.Helper()
 	args := append(sshBaseArgs(), target, script)
 	cmd := exec.Command("ssh", args...)

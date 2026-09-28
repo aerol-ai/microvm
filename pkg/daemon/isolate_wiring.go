@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 
@@ -21,6 +22,23 @@ import (
 // (plans/isolate-runtime.md Phase 2 leftovers + Phase 3).
 func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger, svc *service.Service) (*isolateruntime.Driver, error) {
 	isoCfg := isolateruntime.FromDaemonConfig(cfg)
+	if cfg.IsolateUseJail {
+		// Bootstrap belongs at daemon start: a jail that cannot be realized
+		// here must fail boot, not the first tenant's create. The base tree
+		// (workerd + its shared libraries + /dev nodes) is built once and
+		// every group chroot is hard-linked from it.
+		shim, err := isolateShimPath()
+		if err != nil {
+			return nil, fmt.Errorf("isolate jail: locate daemon binary for the jail shim: %w", err)
+		}
+		isoCfg.ShimPath = shim
+		if !pkgisolate.JailRealizable() {
+			return nil, fmt.Errorf("isolate jail: SB_ISOLATE_USE_JAIL=true but this host cannot realize a jail (Linux root required); set SB_ISOLATE_USE_JAIL=false to run unconfined, accepting the risk")
+		}
+		if err := pkgisolate.PrepareJailBase(cfg.IsolateJailChrootBase, cfg.IsolateWorkerdPath); err != nil {
+			return nil, fmt.Errorf("isolate jail: prepare chroot base: %w", err)
+		}
+	}
 	driver := isolateruntime.New(isoCfg, logger)
 
 	store, err := jsbundle.NewStore(jsbundle.StoreConfig{
@@ -31,12 +49,20 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 	}
 	driver.SetBundleResolver(isolateruntime.NewBundleResolver(jsbundle.NewResolver(store)))
 	supervisor := isolateruntime.NewHostSupervisor(isoCfg)
+	// E3a: host-mediated egress destinations → audit JSONL (async, dial path).
+	if cfg.EgressAttributionEnabled {
+		if setter, ok := supervisor.(interface {
+			SetEgressObserver(pkgisolate.EgressObserver)
+		}); ok {
+			setter.SetEgressObserver(svc.EgressAuditObserver())
+		}
+	}
 	driver.SetHostSupervisor(supervisor)
 
 	if cfg.IsolatePoolEnabled {
 		pool := isolatepool.New(logger)
 		pool.SetDepth(cfg.IsolatePoolDepthDefault)
-		pool.SetSpawner(&poolSpawner{supervisor: supervisor})
+		pool.SetSpawner(&poolSpawner{supervisor: supervisor, cfg: isoCfg})
 		driver.SetWarmPool(pool)
 		// Boot prewarm + refill: fill blank hosts before the first create
 		// (the wasm prewarm lesson — ticker-only leaves the first creates cold).
@@ -75,6 +101,9 @@ func wireIsolateRuntime(ctx context.Context, cfg config.Config, logger *slog.Log
 		"group_granularity", cfg.IsolateGroupGranularity,
 		"jail_requested", cfg.IsolateUseJail,
 		"jail_realizable", jailRealizable,
+		"jail_chroot_base", cfg.IsolateJailChrootBase,
+		"jail_cgroup_root", cfg.IsolateJailCgroupRoot,
+		"seccomp_mode", cfg.IsolateSeccompMode,
 		"jitless", cfg.IsolateJitless,
 		"idle_ttl", cfg.IsolateGroupIdleTTL,
 		"pool", cfg.IsolatePoolEnabled,
@@ -96,13 +125,31 @@ func startIsolateBackground(ctx context.Context, cfg config.Config, driver *isol
 // warm slot is a real blank group host under a synthetic pool key.
 type poolSpawner struct {
 	supervisor isolateruntime.HostSupervisor
+	cfg        isolateruntime.Config
 	n          atomic.Int64
 }
 
 func (s *poolSpawner) Spawn(ctx context.Context) (isolateruntime.GroupHost, error) {
 	n := s.n.Add(1)
 	key := fmt.Sprintf("warm-%d", n)
-	// Warm slots are blank group hosts — jail realization is best-effort for
-	// the pool (the supervisor only needs GroupKey for the run-dir path).
-	return s.supervisor.SpawnGroup(ctx, isolateruntime.JailSpec{GroupKey: key})
+	// A warm blank is jailed exactly like a tenant group — same chroot shape,
+	// same uid, same filter — with unlimited caps until a tenant claims it
+	// (the router then applies theirs). Anything less would hand a tenant an
+	// unconfined process whenever the pool had one ready.
+	spec, err := isolateruntime.BuildJailSpec(s.cfg, key, 0, 0)
+	if err != nil {
+		if !s.cfg.UseJail {
+			// Unjailed pools never needed a valid jail identity; keep the
+			// run-dir-only spec they always had.
+			return s.supervisor.SpawnGroup(ctx, isolateruntime.JailSpec{GroupKey: key})
+		}
+		return nil, fmt.Errorf("isolate warm pool: jail spec for %s: %w", key, err)
+	}
+	return s.supervisor.SpawnGroup(ctx, spec)
+}
+
+// isolateShimPath is the daemon binary re-exec'd as the jail shim; tests
+// replace it.
+var isolateShimPath = func() (string, error) {
+	return os.Executable()
 }

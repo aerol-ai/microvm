@@ -97,6 +97,7 @@ type VolumeAttachment struct {
 	Tenant        string    `json:"tenant"`
 	VolumeID      string    `json:"volume_id"`
 	SandboxID     string    `json:"sandbox_id"`
+	IncarnationID string    `json:"incarnation_id"`
 	Target        string    `json:"target"`
 	Source        string    `json:"source"`
 	CreatedAt     time.Time `json:"created_at"`
@@ -246,6 +247,113 @@ func validateSource(t MountType, source string) error {
 		}
 	}
 	return nil
+}
+
+// Mount secrets belong in Credentials and nowhere else. Source and Options
+// are not secrets by contract: the read API returns them, and in cluster mode
+// they are replicated in the clear into the Raft placement spec and the
+// recovery store so another node can re-run the mount (the service's
+// RedactClusterSecrets keeps them and strips only Credentials). A credential
+// smuggled into either — an rclone connection-string parameter in source, a
+// mount-tool flag in options.extra_args, an NFS option, an invented options
+// key — would therefore be replicated unsealed. mountCredentialNameMarkers
+// are the substrings that mean "credential" in every tool this daemon drives
+// (the AWS chain behind mount-s3, rclone backends, ssh); ValidateSecretsPlacement
+// refuses such a name with a pointer to the right field. It is separate from
+// Validate because it is an intake rule for new requests: a stored spec being
+// replayed for a failover recreate is already replicated, and refusing it
+// there would only lose the sandbox. This is hygiene at the edge, not the
+// boundary: the boundary is that only Credentials is sealed.
+var mountCredentialNameMarkers = []string{
+	"secret", "password", "passwd", "token", "access_key", "private_key",
+	"api_key", "customer_key", "client_secret", "sas_url",
+}
+
+// isMountCredentialName reports whether a flag, option, or parameter name
+// names a credential. Leading dashes are dropped, case is ignored, and '-'
+// and '_' are equivalent, so --s3-secret-access-key, secret_access_key and
+// SECRET-ACCESS-KEY are one name. A bare "pass" (rclone's sftp/ftp/webdav
+// parameter) and any name ending in _pass count too.
+func isMountCredentialName(name string) bool {
+	name = strings.ToLower(strings.TrimLeft(strings.TrimSpace(name), "-"))
+	name = strings.ReplaceAll(name, "-", "_")
+	if name == "" {
+		return false
+	}
+	if name == "pass" || strings.HasSuffix(name, "_pass") {
+		return true
+	}
+	for _, marker := range mountCredentialNameMarkers {
+		if strings.Contains(name, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func mountCredentialInClearError(where, name string) error {
+	return fmt.Errorf("%s %q names a credential: put it in credentials, which is sealed; source and options are stored and replicated in the clear", where, name)
+}
+
+// ValidateSecretsPlacement refuses credential-shaped names in the fields that
+// are stored and replicated unsealed. See mountCredentialNameMarkers.
+func (m *MountSpec) ValidateSecretsPlacement() error {
+	if m == nil {
+		return errors.New("mount is nil")
+	}
+	for k := range m.Options {
+		if isMountCredentialName(k) {
+			return mountCredentialInClearError("options key", k)
+		}
+	}
+	// options.extra_args is whitespace-split into argv by the S3 adapter;
+	// check every flag name, in both --flag=value and --flag value forms.
+	for _, tok := range strings.Fields(m.Options["extra_args"]) {
+		if !strings.HasPrefix(tok, "-") {
+			continue
+		}
+		name, _, _ := strings.Cut(tok, "=")
+		if isMountCredentialName(name) {
+			return mountCredentialInClearError("options.extra_args flag", name)
+		}
+	}
+	// options.opts is the NFS -o list: name or name=value, comma-separated.
+	if opts := strings.TrimSpace(m.Options["opts"]); opts != "" {
+		for _, kv := range strings.Split(opts, ",") {
+			name, _, _ := strings.Cut(kv, "=")
+			if isMountCredentialName(name) {
+				return mountCredentialInClearError("options.opts entry", name)
+			}
+		}
+	}
+	if m.Type == MountTypeRclone {
+		if name, found := rcloneConnectionStringCredential(m.Source); found {
+			return mountCredentialInClearError("rclone source parameter", name)
+		}
+	}
+	return nil
+}
+
+// rcloneConnectionStringCredential scans rclone's remote,param=value:path and
+// :backend,param=value:path connection-string syntax — which needs no
+// rclone.conf and so can carry a whole credential in the source string — and
+// returns the first parameter that names one. Best effort by design: a quoted
+// value containing a colon ends the scan early and the parameters before it
+// are still checked.
+func rcloneConnectionStringCredential(source string) (string, bool) {
+	source = strings.TrimPrefix(strings.TrimSpace(source), ":")
+	remote, _, ok := strings.Cut(source, ":")
+	if !ok {
+		return "", false
+	}
+	params := strings.Split(remote, ",")
+	for _, p := range params[1:] {
+		name, _, _ := strings.Cut(p, "=")
+		if isMountCredentialName(name) {
+			return strings.TrimSpace(name), true
+		}
+	}
+	return "", false
 }
 
 // Redact strips credentials, returning the user-safe view.

@@ -281,6 +281,19 @@ export interface ListOptions {
    * or pass an empty map to list every sandbox visible to the PAT.
    */
   tags?: Record<string, string>;
+  /**
+   * When true, include sandbox env vars in the response (`?include_env=true`).
+   * Env is omitted by default — opt-in reads are audited server-side.
+   */
+  includeEnv?: boolean;
+}
+
+export interface GetOptions {
+  /**
+   * When true, include sandbox env vars in the response (`?include_env=true`).
+   * Env is omitted by default — opt-in reads are audited server-side.
+   */
+  includeEnv?: boolean;
 }
 
 export interface CreateSessionOptions {

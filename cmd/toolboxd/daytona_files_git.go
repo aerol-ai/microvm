@@ -624,7 +624,7 @@ func runGitNoRepoWithEnv(extraEnv []string, args ...string) (string, error) {
 	if len(extraEnv) > 0 {
 		cmd.Env = append(os.Environ(), extraEnv...)
 	}
-	output, err := cmd.CombinedOutput()
+	output, err := trackedCombinedOutput(cmd)
 	if err != nil {
 		message := strings.TrimSpace(string(output))
 		if message == "" {

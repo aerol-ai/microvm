@@ -28,6 +28,11 @@ func TestMain(m *testing.M) {
 		os.Exit(2)
 	}
 	sc = loaded
+	// Any helper that restarts a node must wait for it to be back IN THE
+	// CLUSTER, not merely for its unit to be active. See
+	// harness.NodeRejoinCheck — a live run lost 79 cases to the gap between
+	// the two.
+	harness.NodeRejoinCheck = waitNodeRejoined
 	os.Exit(m.Run())
 }
 

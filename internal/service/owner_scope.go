@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"strings"
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -64,6 +65,35 @@ func ownerRefForCreate(ctx context.Context) string {
 		return ""
 	}
 	return owner
+}
+
+// OwnerRefForCreate is the exported form of ownerRefForCreate for API layers
+// that need to stamp PlacementSecrets.OwnerRef at reserve time.
+func OwnerRefForCreate(ctx context.Context) string {
+	return ownerRefForCreate(ctx)
+}
+
+// tenantOwnerRefForRecreate prefers the replicated Placement.OwnerRef so
+// owner-watcher recreates (unscoped context) keep the original tenant.
+func (s *Service) tenantOwnerRefForRecreate(ctx context.Context, sandboxID string) string {
+	if c := s.Cluster(); c != nil {
+		if p, ok := c.PlacementOf(sandboxID); ok {
+			if ref := strings.TrimSpace(p.OwnerRef); ref != "" {
+				return ref
+			}
+		}
+	}
+	return ownerRefForCreate(ctx)
+}
+
+// ownerRefForCreateOrRecreate uses the request Access when present; on failover
+// recreate (empty Access + known id) falls back to Placement.OwnerRef.
+func (s *Service) ownerRefForCreateOrRecreate(ctx context.Context, idOverride string) string {
+	ownerRef := ownerRefForCreate(ctx)
+	if ownerRef == "" && strings.TrimSpace(idOverride) != "" {
+		return s.tenantOwnerRefForRecreate(ctx, idOverride)
+	}
+	return ownerRef
 }
 
 // filterByOwnerScope narrows a sandbox slice to the caller's account when the

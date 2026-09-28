@@ -55,8 +55,16 @@ func TestStartOTELEnabledPaths(t *testing.T) {
 	defer server.Close()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	expvarName := "aerolvm_otel_test_metric"
-	expvar.NewInt(expvarName).Set(3)
-	expvar.NewFloat("aerolvm_otel_test_float").Set(1.5)
+	if v := expvar.Get(expvarName); v != nil {
+		v.(*expvar.Int).Set(3)
+	} else {
+		expvar.NewInt(expvarName).Set(3)
+	}
+	if v := expvar.Get("aerolvm_otel_test_float"); v != nil {
+		v.(*expvar.Float).Set(1.5)
+	} else {
+		expvar.NewFloat("aerolvm_otel_test_float").Set(1.5)
+	}
 
 	metricsShutdown, err := StartOTELMetrics(context.Background(), logger, OTELMetricsConfig{
 		Enabled:     true,

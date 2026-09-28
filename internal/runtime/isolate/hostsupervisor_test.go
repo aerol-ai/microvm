@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -62,5 +63,30 @@ func TestHostSupervisorSpawnNewHostFailure(t *testing.T) {
 	}
 	if _, err := sup.SpawnGroup(context.Background(), spec); err == nil {
 		t.Fatal("SpawnGroup should fail with empty RunDir")
+	}
+}
+
+// A jailed group's run dir must sit inside its chroot (pkg/isolate maps the
+// paths for workerd); a spec without a chroot cannot be jailed at all.
+func TestHostSupervisorJailedRunDirLivesInsideChroot(t *testing.T) {
+	sup := NewHostSupervisor(Config{WorkerdPath: "/nonexistent-workerd", RunDir: t.TempDir(), UseJail: true})
+	if _, err := sup.SpawnGroup(context.Background(), JailSpec{GroupKey: "acme"}); err == nil || !strings.Contains(err.Error(), "no chroot dir") {
+		t.Fatalf("jailed spawn without chroot err = %v", err)
+	}
+	spec, err := BuildJailSpec(Config{JailChrootBase: "/srv/jail", JailUID: 1000, JailGID: 1000, UseJail: true, SeccompMode: "enforce", ShimPath: "/sandboxd"}, "acme", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Realization fails on this host (no root / not linux) — but only after
+	// NewHost accepted the chroot-relative run dir, which is what we assert:
+	// the error is the jail's fail-closed refusal, not a run-dir mismatch.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err = sup.SpawnGroup(ctx, spec)
+	if err == nil {
+		t.Fatal("jailed spawn succeeded without a realizable jail")
+	}
+	if strings.Contains(err.Error(), "jailed run dir") {
+		t.Fatalf("run dir contract not applied by the supervisor: %v", err)
 	}
 }

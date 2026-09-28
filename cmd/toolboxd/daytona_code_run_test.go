@@ -115,6 +115,26 @@ func TestHandleDaytonaCodeRunRejectsInvalidPayloads(t *testing.T) {
 	}
 }
 
+func TestHandleDaytonaCodeRunStartFailure(t *testing.T) {
+	// LookPath accepts an executable file; the kernel rejects it at Start,
+	// which is the startTracked error branch.
+	bad := filepath.Join(t.TempDir(), "not-a-binary")
+	if err := os.WriteFile(bad, []byte("not elf"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	codeRunSpecs["notelf"] = codeRunSpec{suffix: ".sh", cmd: bad}
+	t.Cleanup(func() { delete(codeRunSpecs, "notelf") })
+
+	srv := newDaytonaTestServer(t)
+	body := bytes.NewBufferString(`{"code":"echo hi","language":"notelf"}`)
+	req := httptest.NewRequest(http.MethodPost, "/process/code-run", body)
+	rec := httptest.NewRecorder()
+	srv.handleDaytonaCodeRun(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s, want 500", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleDaytonaCodeRunUsesStderrFallbackAndWriteScriptCleanup(t *testing.T) {
 	srv := newDaytonaTestServer(t)
 

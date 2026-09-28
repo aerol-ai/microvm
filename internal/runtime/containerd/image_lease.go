@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	cntr "github.com/containerd/containerd"
-	"github.com/containerd/containerd/leases"
+	cntr "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/leases"
 )
 
 const (

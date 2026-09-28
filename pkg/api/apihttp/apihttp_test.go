@@ -3,6 +3,7 @@ package apihttp
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -53,6 +54,43 @@ func TestWriteError(t *testing.T) {
 	}
 	if body.Error != "something went wrong" {
 		t.Errorf("body.Error = %q, want %q", body.Error, "something went wrong")
+	}
+}
+
+func TestReadJSONBodyEnforcesSharedLimit(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(strings.Repeat("x", MaxJSONBodyBytes+1)))
+	if _, err := ReadJSONBody(rr, req); err == nil {
+		t.Fatal("expected oversized JSON body rejection")
+	}
+}
+
+func TestDecodeJSONLimitUsesEndpointLimit(t *testing.T) {
+	const endpointLimit = MaxJSONBodyBytes + 128
+	body := `{"value":"` + strings.Repeat("x", MaxJSONBodyBytes) + `"}`
+	var decoded struct {
+		Value string `json:"value"`
+	}
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	if err := DecodeJSONLimit(httptest.NewRecorder(), req, &decoded, endpointLimit); err != nil {
+		t.Fatalf("DecodeJSONLimit() = %v", err)
+	}
+	if len(decoded.Value) != MaxJSONBodyBytes {
+		t.Fatalf("decoded value length = %d, want %d", len(decoded.Value), MaxJSONBodyBytes)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	if err := DecodeJSON(httptest.NewRecorder(), req, &decoded); err == nil {
+		t.Fatal("DecodeJSON accepted body above shared default")
+	}
+}
+
+func TestDecodeJSONRejectsTrailingValue(t *testing.T) {
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"value":1}{"value":2}`))
+	var dst map[string]int
+	if err := DecodeJSON(rr, req, &dst); err == nil {
+		t.Fatal("DecodeJSON accepted multiple JSON values")
 	}
 }
 
@@ -116,6 +154,17 @@ func TestWriteStoreAwareError_WakeCircuitOpen(t *testing.T) {
 	}
 	if rr.Header().Get("Retry-After") != "60" {
 		t.Errorf("Retry-After = %q, want 60", rr.Header().Get("Retry-After"))
+	}
+}
+
+func TestWriteStoreAwareError_ClusterFinalizationUnavailable(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("destroy: %w", service.ErrClusterFinalizationUnavailable))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") != "5" {
+		t.Errorf("Retry-After = %q, want 5", rr.Header().Get("Retry-After"))
 	}
 }
 

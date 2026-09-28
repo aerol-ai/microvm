@@ -202,6 +202,7 @@ func TestFleetControllerErrorBranches(t *testing.T) {
 		if err != nil {
 			t.Fatalf("store.Open: %v", err)
 		}
+		st2.SetSecretCipher(svc.cipher)
 		svc.store = st2
 		createOwned(t, svc, "acme", "sb-owner-list")
 		if err := st2.Close(); err != nil {

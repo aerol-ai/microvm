@@ -190,6 +190,10 @@ type fakeGroupHost struct {
 	mu       sync.Mutex
 	loaded   map[string]bool
 	stopped  bool
+	capsCPU  float64 // last ApplyCaps
+	capsMem  int
+	capsErr  error
+	capsHits int
 	loadErr  error
 	loadGate chan struct{} // if non-nil, Load blocks on it (teardown-race test)
 	inLoad   chan struct{} // if non-nil, closed once Load is entered
@@ -198,6 +202,14 @@ type fakeGroupHost struct {
 }
 
 func newFakeGroupHost() *fakeGroupHost { return &fakeGroupHost{loaded: map[string]bool{}} }
+
+func (h *fakeGroupHost) ApplyCaps(cpu float64, memMB int, pidsMax int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.capsHits++
+	h.capsCPU, h.capsMem = cpu, memMB
+	return h.capsErr
+}
 
 func (h *fakeGroupHost) Load(id string, b *jsbundle.Bundle) error {
 	if h.loadErr != nil {

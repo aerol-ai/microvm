@@ -29,8 +29,8 @@ func TestFSMInlinePlaceSplitsPayloadToLocalStore(t *testing.T) {
 		OwnerNodeID:   "node-a",
 		OwnerAPIURL:   "http://a",
 		Spec:          &models.CreateSandboxRequest{Name: "split", Image: "alpine:3.20"},
-		SecretRef:     "provider-ref",
-		SecretVersion: 2,
+		IncarnationID: "inc-split", SecretRef: testSecretRef("sb-split", "inc-split"),
+		SecretVersion: 1, SecretSealGeneration: 1,
 	}); got != nil {
 		t.Fatalf("apply: %v", got)
 	}
@@ -45,7 +45,7 @@ func TestFSMInlinePlaceSplitsPayloadToLocalStore(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("recovery payload missing locally after inline apply: ok=%v err=%v", ok, err)
 	}
-	if rec.Spec == nil || rec.Spec.Image != "alpine:3.20" || rec.SecretRef != "provider-ref" || rec.SecretVersion != 2 {
+	if rec.Spec == nil || rec.Spec.Image != "alpine:3.20" || rec.SecretRef != testSecretRef("sb-split", "inc-split") || rec.SecretVersion != 1 {
 		t.Fatalf("stored recovery payload diverged from the command: %+v", rec)
 	}
 }
@@ -81,14 +81,14 @@ func TestFSMReplayInlineEntries(t *testing.T) {
 	entries := []command{
 		{
 			Op: opReserve, SandboxID: "sb-a", OwnerNodeID: "node-a", ExpiresUnix: expiry,
-			Spec: &models.CreateSandboxRequest{Name: "a", Image: "alpine:3.20"}, SecretRef: "ra", SecretVersion: 1,
+			Spec: &models.CreateSandboxRequest{Name: "a", Image: "alpine:3.20"}, IncarnationID: "inc-a", SecretRef: testSecretRef("sb-a", "inc-a"), SecretVersion: 1, SecretSealGeneration: 1,
 		},
 		{
 			Op: opReserve, SandboxID: "sb-b", OwnerNodeID: "node-b", ExpiresUnix: expiry,
-			Spec: &models.CreateSandboxRequest{Name: "b", Image: "debian:12"},
+			Spec: &models.CreateSandboxRequest{Name: "b", Image: "debian:12"}, IncarnationID: "inc-b",
 		},
-		{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-a"},
-		{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-b"},
+		{Op: opPlace, SandboxID: "sb-a", OwnerNodeID: "node-a", IncarnationID: "inc-a", ExpectedIncarnationID: "inc-a"},
+		{Op: opPlace, SandboxID: "sb-b", OwnerNodeID: "node-b", IncarnationID: "inc-b", ExpectedIncarnationID: "inc-b"},
 	}
 
 	replay := func() (Placement, Placement) {
@@ -121,7 +121,7 @@ func TestFSMReplayInlineEntries(t *testing.T) {
 	if a1.State != PlacementStatePlaced || a1.Spec == nil || a1.Spec.Image != "alpine:3.20" {
 		t.Fatalf("inline-reserved spec not preserved through promote: %+v", a1)
 	}
-	if a1.SecretRef != "ra" || a1.SecretVersion != 1 {
+	if a1.SecretRef != testSecretRef("sb-a", "inc-a") || a1.SecretVersion != 1 || a1.SecretSealGeneration != 1 {
 		t.Fatalf("secret handle not preserved through promote: %+v", a1)
 	}
 	if b1.State != PlacementStatePlaced || b1.Spec == nil || b1.Spec.Image != "debian:12" {
