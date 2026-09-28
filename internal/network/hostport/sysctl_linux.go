@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
+var ipForwardPath = "/proc/sys/net/ipv4/ip_forward"
 
 // platformEnableIPForward sets net.ipv4.ip_forward=1, writing only when it
 // is not already on.

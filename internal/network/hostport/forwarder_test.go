@@ -438,3 +438,92 @@ func TestForwarderEnablesForwardingAndAcceptsBothDirections(t *testing.T) {
 		t.Fatal("a host where forwarding cannot be enabled must fail the expose loudly")
 	}
 }
+
+// ruleMatches reads rules semantically, per chain. Every mismatch must say
+// "stale", or Reconcile would keep a rule that forwards somewhere else.
+func TestRuleMatchesPerChain(t *testing.T) {
+	d := dnat("10.0.0.5:5432", true)
+	r := Target{Kind: Redirect, RedirectPort: 21215}
+	nat := func(tgt Target) []string { return natSpec(22000, tgt) }
+	cases := []struct {
+		name  string
+		chain string
+		spec  []string
+		hp    int
+		t     Target
+		want  bool
+	}{
+		{"nat dnat match", ChainNAT, nat(d), 22000, d, true},
+		{"nat dnat other target", ChainNAT, nat(dnat("10.0.0.6:5432", true)), 22000, d, false},
+		{"nat redirect match", ChainNAT, nat(r), 22000, r, true},
+		{"nat redirect other port", ChainNAT, nat(Target{Kind: Redirect, RedirectPort: 1}), 22000, r, false},
+		{"nat dnat vs redirect", ChainNAT, nat(r), 22000, d, false},
+		{"fwd match", ChainFwd, fwdSpec(22000, d), 22000, d, true},
+		{"fwd other host port", ChainFwd, fwdSpec(22001, d), 22000, d, false},
+		{"fwd for a redirect is stale", ChainFwd, fwdSpec(22000, d), 22000, r, false},
+		{"post match", ChainPost, postSpec(22000, d), 22000, d, true},
+		{"post without masquerade is stale", ChainPost, postSpec(22000, d), 22000, dnat("10.0.0.5:5432", false), false},
+		{"post other target", ChainPost, postSpec(22000, dnat("10.0.0.9:1", true)), 22000, d, false},
+		{"unknown chain", "OTHER", nat(d), 22000, d, false},
+	}
+	for _, tc := range cases {
+		if got := ruleMatches(tc.chain, tc.spec, tc.hp, tc.t); got != tc.want {
+			t.Errorf("%s: ruleMatches = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestForwarderRemoveSurfacesDeleteErrors(t *testing.T) {
+	for _, op := range []string{"Exists", "Delete"} {
+		m := newMem()
+		f := New(m, nil)
+		if err := f.Ensure(22200, dnat("10.1.0.9:22200", true)); err != nil {
+			t.Fatal(err)
+		}
+		m.failOn = op
+		if err := f.Remove(22200); err == nil {
+			t.Fatalf("%s failure on remove: want error", op)
+		}
+	}
+}
+
+// Every backend failure while changing rules surfaces; none is swallowed
+// into a silently half-forwarded port.
+func TestForwarderSurfacesChangeAndReconcileErrors(t *testing.T) {
+	for _, op := range []string{"Exists", "Append"} {
+		m := newMem()
+		f := New(m, nil)
+		if err := f.Ensure(22400, dnat("10.1.0.9:1", true)); err != nil { // chains up
+			t.Fatal(err)
+		}
+		m.failOn = op
+		if err := f.Ensure(22401, dnat("10.1.0.9:2", true)); err == nil {
+			t.Fatalf("%s failure on ensure: want error", op)
+		}
+		// A target change deletes the old rules first.
+		if err := f.Ensure(22400, dnat("10.1.0.9:3", true)); err == nil {
+			t.Fatalf("%s failure on a target change: want error", op)
+		}
+	}
+	for _, op := range []string{"List", "Delete", "Append"} {
+		m := newMem()
+		old := New(m, nil)
+		_ = old.Ensure(22410, dnat("10.1.0.9:1", true))
+		m.failOn = op
+		if err := New(m, nil).Reconcile(map[int]Target{22411: dnat("10.1.0.9:2", false)}); err == nil {
+			t.Fatalf("%s failure on reconcile: want error", op)
+		}
+	}
+	m := newMem()
+	_ = New(m, nil).Ensure(22420, dnat("10.1.0.9:1", true))
+	boom := func(int) error { return errors.New("netlink") }
+	if err := New(m, boom).Reconcile(map[int]Target{}); err == nil {
+		t.Fatal("conntrack flush failure on reconcile: want error")
+	}
+	if err := New(m, nil).Reconcile(map[int]Target{0: dnat("10.1.0.9:1", false)}); err == nil {
+		t.Fatal("invalid host port on reconcile: want error")
+	}
+	if err := New(m, nil).Reconcile(map[int]Target{22421: {Kind: DNAT}}); err == nil {
+		t.Fatal("invalid target on reconcile: want error")
+	}
+}
