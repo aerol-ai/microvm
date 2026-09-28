@@ -136,7 +136,38 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Code:** `internal/cluster/storage_obligations.go`,
   `internal/service/storage_obligations.go`,
   `internal/store` `SecretDeleteOwedByRecipient`.
-- **Next:** run UC-160 live (T19, or a hetero-lite run).
+- **Status:** passed live on hetero-lite (`e65c9cbc`) and on both T19
+  metal scenarios (2026-09-28).
+
+## Ingress route changes reset in-flight TLS connections on :443
+
+- **What:** Stop an unrelated sandbox's route add/delete from resetting
+  client connections that are mid-handshake through the ingress.
+- **Why:** Seen in T19 S6 (UC-09). The test's TLS dial to the apex was
+  reset 0.5s in; 0.41s in, `DELETE /id/sandbox-…-ingress-sni` for another
+  test's sandbox had made Caddy reload. Every route change reloads the
+  config, including the layer-4 `tls-mux` server that fronts :443. At
+  cluster scale (100k sandboxes, constant expose/unexpose churn) that is a
+  steady rate of dropped client connections, not a test flake.
+- **Evidence:** 153 reloads/admin writes in ~20 min on one ingress during
+  S6; the correlation is in the T19 notes (plans/integration-test-security.md §7.12).
+- **Start:** `pkg/caddy/client.go` (route PATCH/DELETE against `/id/…`);
+  check whether caddy-l4 re-binds listeners on reload, and whether SNI routes
+  can move to a dynamic source that doesn't need a config reload.
+  Related, and possibly the same mechanism: the admin-side EOF entry below.
+
+## First boot Caddy config lacks S3 certificate storage
+
+- **What:** Make the first Caddy config an ingress loads already carry the
+  S3 certificate storage, not a later reload.
+- **Why:** T19 S6's first config (06:28:50) had no S3 storage. The cert jobs
+  failed with "failed storage check: context canceled" and were not retried
+  until Caddy reloaded with S3 storage at 06:33:35. HTTPS was down for ~5 min
+  after boot. At the same boundary `sandboxd` got a 500 installing the
+  on-demand TLS policy ("on-demand TLS cannot be enabled without a
+  permission module"); it retried on reconcile.
+- **Start:** the ingress Caddyfile / bootstrap in `packaging/` and the
+  on-demand policy install in `pkg/caddy`.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 

@@ -207,6 +207,9 @@ func (h *handlers) clusterTemplateItemWrap(local http.Handler) http.HandlerFunc 
 
 		peer, inventoryUnknown, ok := templateOwnerFromInventory(c, r.PathValue("id"))
 		if !ok {
+			peer, ok = templateOwnerFromCatalog(c, r.PathValue("id"))
+		}
+		if !ok {
 			if inventoryUnknown {
 				apihttp.WriteError(w, http.StatusServiceUnavailable, "template inventory has not converged")
 				return
@@ -255,6 +258,43 @@ func templateOwnerFromInventory(c cluster.Client, templateID string) (cluster.Me
 		}
 	}
 	return owner, unknown, owner.NodeID != ""
+}
+
+// artifactCatalogHolderReader is the point lookup a control-plane node can
+// answer from the replicated artifact catalogue. Asserted rather than added
+// to cluster.Client: only nodes holding the FSM implement it, and this route
+// already runs on the leader.
+type artifactCatalogHolderReader interface {
+	ArtifactCatalogHolders(kind, tenant, id string) []string
+}
+
+// templateOwnerFromCatalog routes a template the gossip inventory does not
+// list yet. Capacity heartbeats trail a create, but CreateTemplate publishes
+// to the catalogue before it answers, so without this a read straight after
+// create 404'd ("sandbox not found": UC-47..50, UC-80, UC-93 on T19).
+func templateOwnerFromCatalog(c cluster.Client, templateID string) (cluster.Member, bool) {
+	reader, ok := c.(artifactCatalogHolderReader)
+	if !ok {
+		return cluster.Member{}, false
+	}
+	holders := reader.ArtifactCatalogHolders(cluster.ArtifactKindTemplate, "", templateID)
+	if len(holders) == 0 {
+		return cluster.Member{}, false
+	}
+	byID := make(map[string]cluster.Member)
+	for _, member := range c.Members() {
+		if clusterTemplateMemberEligible(c, member) {
+			byID[member.NodeID] = member
+		}
+	}
+	// Holders are sorted, so the first live one matches the inventory
+	// path's lowest-node-id choice.
+	for _, nodeID := range holders {
+		if member, found := byID[nodeID]; found && member.Alive {
+			return member, true
+		}
+	}
+	return cluster.Member{}, false
 }
 
 // clusterTemplateMemberEligible identifies workers whose template inventory

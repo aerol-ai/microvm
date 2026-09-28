@@ -354,6 +354,18 @@ func (c *Cluster) ArtifactCatalog(_ context.Context, req ArtifactCatalogRequest)
 	return c.fsm.artifactCatalogPage(req), nil
 }
 
+// ArtifactCatalogHolders returns the nodes whose committed inventory of kind
+// holds (tenant, id), sorted. A point read for routing one artifact request:
+// the gossip inventory that item routes use first trails a create by a
+// capacity heartbeat, while a creator publishes here before it answers, so
+// "created, then read at once" must fall back to this or 404.
+func (c *Cluster) ArtifactCatalogHolders(kind, tenant, id string) []string {
+	if c == nil || c.fsm == nil {
+		return nil
+	}
+	return c.fsm.artifactCatalogHolders(kind, tenant, id)
+}
+
 // ArtifactCatalogForPeer answers the agent-facing read.
 func (c *Cluster) ArtifactCatalogForPeer(req ArtifactCatalogRequest) ArtifactCatalogPage {
 	if c == nil || c.fsm == nil {
@@ -616,6 +628,28 @@ func (f *placementFSM) artifactCatalogPublisherEpoch(kind, nodeID string) int64 
 		epoch = pending
 	}
 	return epoch
+}
+
+func (f *placementFSM) artifactCatalogHolders(kind, tenant, id string) []string {
+	key := artifactCatalogRowKey(tenant, id)
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	state := f.artifactCatalog[artifactCatalogKindKey(kind)]
+	if state == nil {
+		return nil
+	}
+	var holders []string
+	for nodeID, entry := range state.Committed {
+		// A withdrawn node has no coverage; its rows are not a claim.
+		if entry.Withdrawn {
+			continue
+		}
+		if _, ok := entry.Rows[key]; ok {
+			holders = append(holders, nodeID)
+		}
+	}
+	sort.Strings(holders)
+	return holders
 }
 
 func (f *placementFSM) artifactCatalogPage(req ArtifactCatalogRequest) ArtifactCatalogPage {
