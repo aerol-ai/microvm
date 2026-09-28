@@ -1529,6 +1529,17 @@ carried #496 and #497. That turned it into a live check of both.
 | UC-09: `connection reset` on the TLS dial | S6 | Real, pre-existing. Another test's ingress route DELETE triggered a Caddy reload 0.41s into the handshake. | TODOS: ingress reload resets in-flight :443 |
 | S6 start was delayed ~5 min before HTTPS came up | S6 | The first boot Caddy config lacked S3 cert storage. Cert jobs were cancelled ("failed storage check") until Caddy reloaded with S3 storage. | TODOS |
 
+**Post-fix validation (2026-09-28, hetero-lite, build `924a9b8e` =
+`9a97d925` + harness-only #499 commits):** **120 pass / 2 fail / 53 skip**,
+torn down clean. UC-84 passed with #497. The template UCs (47–50, 80, 93)
+**skip on hetero-lite** because they need a Firecracker worker, so
+**#496/#498 are still unproven live** and need a metal run. The 2 fails are
+non-product: UC-29 was a stale public-resolver NXDOMAIN (harness, fixed by
+authoritative-NS `wait_for_dns`), and UC-31 was an EOF from the Caddy
+reload connection loss (TODOS, design pending). Two earlier attempts were
+marked inconclusive by the same harness DNS bug while the clusters were
+healthy.
+
 ### T18 / T19 — the split
 
 The old T18 ("flagship S5 + S6") bundled two questions with a 40x cost gap:
