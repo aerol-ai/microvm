@@ -329,6 +329,10 @@ type Service struct {
 	// both lets cold-start bursts shed excess work without blocking
 	// unrelated warm traffic accounting. See l4Limiters (lazy) and
 	// connLimiter (l4proxy.go).
+	// routeWriter, when set, replaces s.caddy for every per-sandbox route
+	// write (publicRoutes, eng review 4A). nil means the concrete client.
+	routeWriter publicRouteWriter
+
 	l4LimitersOnce sync.Once
 	l4Pending      *connLimiter
 	l4Active       *connLimiter
@@ -3633,7 +3637,7 @@ func (s *Service) exposePort(ctx context.Context, id string, port int, protocol 
 			return models.ExposePortResponse{}, err
 		}
 		if err := s.recordClusterExposedPort(ctx, id, port, cluster.ExposedPortRoute{Protocol: canonicalProto, HostPort: hostPort, PublicURL: publicURL}); err != nil {
-			_ = s.caddy.DeleteTCPRoute(ctx, hostPort)
+			_ = s.publicRoutes().DeleteTCPRoute(ctx, hostPort)
 			if !reused {
 				_ = s.store.DeletePort(ctx, id, port)
 				if preferredHostPort == 0 {
@@ -3885,7 +3889,7 @@ func (s *Service) UnexposePort(ctx context.Context, id string, port int) error {
 	// back to the legacy HTTP path so old rows that pre-date the protocol
 	// column are still cleaned up correctly.
 	if exposure == nil {
-		_ = s.caddy.DeletePortRoute(ctx, id, port)
+		_ = s.publicRoutes().DeletePortRoute(ctx, id, port)
 	} else {
 		if err := s.deleteExposedPortRoute(ctx, sandbox, *exposure); err != nil {
 			return err
@@ -3951,7 +3955,7 @@ func (s *Service) deleteExposedPortRoute(ctx context.Context, sandbox *models.Sa
 	case "", models.ExposedPortProtocolHTTP:
 		return s.removeHTTPPortRoute(ctx, sandbox.ID, port.Port)
 	case models.ExposedPortProtocolTCP:
-		return s.caddy.DeleteTCPRoute(ctx, port.HostPort)
+		return s.publicRoutes().DeleteTCPRoute(ctx, port.HostPort)
 	case models.ExposedPortProtocolTLS:
 		return s.deleteTLSPortRoute(ctx, sandbox.ID, port.Port)
 	default:
@@ -4010,11 +4014,11 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 		// headers block), so the non-serverless JSON regression test stays
 		// valid. Only the warm-bypass path adopts the retry window.
 		if s.serverlessWakeEnabled(sandbox) && s.cfg.HTTPWakeDirectBypassEnabled {
-			if err := s.caddy.UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration, routeOpts); err != nil {
+			if err := s.publicRoutes().UpsertPortRouteWithRetry(ctx, sandbox.ID, sandbox.ContainerIP, port, s.cfg.HTTPWakeDirectRouteRetryDuration, routeOpts); err != nil {
 				return err
 			}
 		} else {
-			if err := s.caddy.UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, routeOpts); err != nil {
+			if err := s.publicRoutes().UpsertPortRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, routeOpts); err != nil {
 				return err
 			}
 		}
@@ -4022,20 +4026,20 @@ func (s *Service) applyHTTPPortRoute(ctx context.Context, sandbox *models.Sandbo
 		// Stopped+armed state (or a flag flip back to bypass-on) must
 		// go so Caddy doesn't keep two routes matching the same host.
 		// DeleteWakeHTTPPortRoute treats 404 as success.
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
 		return nil
 	case RouteShapeWake:
-		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
+		if err := s.publicRoutes().UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, port); err != nil {
 			return err
 		}
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, port)
 		return nil
 	case RouteShapeNone:
 		// Destroyed sandboxes or stopped-unarmed serverless sandboxes
 		// publish neither route. Idempotent deletes; either or both
 		// may already be absent.
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, port)
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, port)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, port)
 		return nil
 	}
 	return nil
@@ -4054,11 +4058,11 @@ func (s *Service) installTCPPortRoute(ctx context.Context, sandbox *models.Sandb
 	}
 	switch s.chooseRouteShape(sandbox, RouteKindL4) {
 	case RouteShapeDirect:
-		return s.caddy.UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
+		return s.publicRoutes().UpsertTCPRoute(ctx, sandbox.ID, sandbox.ContainerIP, port, hostPort)
 	case RouteShapeWake:
-		return s.caddy.UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
+		return s.publicRoutes().UpsertWakeTCPRoute(ctx, sandbox.ID, port, hostPort, s.cfg.InternalL4WakeAddr)
 	case RouteShapeNone:
-		return s.caddy.DeleteTCPRoute(ctx, hostPort)
+		return s.publicRoutes().DeleteTCPRoute(ctx, hostPort)
 	}
 	return nil
 }
@@ -4127,10 +4131,10 @@ func (s *Service) serverlessWakeEnabled(sandbox *models.Sandbox) bool {
 func (s *Service) removeHTTPPortRoute(ctx context.Context, id string, port int) error {
 	s.releaseWasmHTTPListener(id, port)
 	s.releaseIsolateHTTPListener(id, port)
-	if err := s.caddy.DeletePortRoute(ctx, id, port); err != nil {
+	if err := s.publicRoutes().DeletePortRoute(ctx, id, port); err != nil {
 		return err
 	}
-	if err := s.caddy.DeleteWakeHTTPPortRoute(ctx, id, port); err != nil {
+	if err := s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, id, port); err != nil {
 		return err
 	}
 	return nil
@@ -4833,7 +4837,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					if s.admitter != nil {
 						s.admitter.Release(sandbox.ID)
 					}
-					_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+					_ = s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID)
 					if sandbox.WakeArmed {
 						s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
 					} else {
@@ -4848,7 +4852,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				if s.admitter != nil {
 					s.admitter.Release(sandbox.ID)
 				}
-				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+				_ = s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID)
 				if sandbox.WakeArmed {
 					s.ReconstructWakeArmedIfNeeded(ctx, sandbox)
 				} else {
@@ -4886,7 +4890,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// order; failures here are picked up by gcZombieCaddyEntries on
 			// a later pass and by the mounts.Sweep at the end of Reconcile.
 			if s.caddy != nil {
-				_ = s.caddy.DeleteSandboxRoute(ctx, sandbox.ID)
+				_ = s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID)
 			}
 			for _, port := range sandbox.ExposedPorts {
 				_ = s.deleteExposedPortRoute(ctx, sandbox, port)
@@ -5122,7 +5126,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				)
 			}
 			if s.caddy != nil {
-				_ = s.caddy.DeleteSandboxRoute(ctx, sandboxID)
+				_ = s.publicRoutes().DeleteSandboxRoute(ctx, sandboxID)
 			}
 			if s.mounts != nil {
 				_ = s.mounts.UnmountAll(sandboxID)
@@ -5618,7 +5622,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if _, ok := expectedHTTP[id]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil {
 			s.logger.Warn("zombie http route delete failed", "route_id", id, "error", err)
 			continue
 		}
@@ -5628,7 +5632,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if _, ok := expectedTCPServers[sid]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteTCPServer(ctx, sid); err != nil {
+		if err := s.publicRoutes().DeleteTCPServer(ctx, sid); err != nil {
 			s.logger.Warn("zombie tcp server delete failed", "server_id", sid, "error", err)
 			continue
 		}
@@ -5638,7 +5642,7 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if _, ok := expectedTLSRoutes[id]; ok {
 			continue
 		}
-		if err := s.caddy.DeleteRouteByID(ctx, id); err != nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil {
 			s.logger.Warn("zombie tls route delete failed", "route_id", id, "error", err)
 			continue
 		}
@@ -6041,15 +6045,15 @@ func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) err
 	var firstErr error
 	// Drop live HTTP / SNI routes (whichever mode wired them).
 	if s.cfg.Domain == "" {
-		if err := s.caddy.DeleteSandboxRoute(ctx, p.SandboxID); err != nil {
+		if err := s.publicRoutes().DeleteSandboxRoute(ctx, p.SandboxID); err != nil {
 			firstErr = err
 		}
 	} else {
-		if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID)); err != nil {
+		if err := s.publicRoutes().DeleteRouteByID(ctx, caddy.IngressSandboxSNIRouteID(p.SandboxID)); err != nil {
 			firstErr = err
 		}
 	}
-	if err := s.caddy.UpsertInFluxSandboxRoute(ctx, p.SandboxID); err != nil && firstErr == nil {
+	if err := s.publicRoutes().UpsertInFluxSandboxRoute(ctx, p.SandboxID); err != nil && firstErr == nil {
 		firstErr = err
 	}
 	// Per-port: same idea. We only mirror HTTP/TLS in-flux into Caddy; raw
@@ -6060,15 +6064,15 @@ func (s *Service) applyInFluxRoute(ctx context.Context, p cluster.Placement) err
 			continue
 		}
 		if s.cfg.Domain == "" {
-			if err := s.caddy.DeleteRouteByID(ctx, caddy.PortRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
+			if err := s.publicRoutes().DeleteRouteByID(ctx, caddy.PortRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		} else {
-			if err := s.caddy.DeleteRouteByID(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
+			if err := s.publicRoutes().DeleteRouteByID(ctx, caddy.IngressPortSNIRouteID(p.SandboxID, port)); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}
-		if err := s.caddy.UpsertInFluxPortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
+		if err := s.publicRoutes().UpsertInFluxPortRoute(ctx, p.SandboxID, port); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}

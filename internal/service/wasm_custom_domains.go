@@ -67,7 +67,7 @@ func (s *Service) installWasmCustomDomainHTTPRoute(ctx context.Context, sandbox 
 	if targetPort > 0 {
 		routeOpts.MaskRequestHost = sandbox.MaskRequestHost
 	}
-	return s.caddy.UpsertCustomDomainHTTPRouteWithDial(ctx, sandbox.ID, hostname, dial, routeOpts)
+	return s.publicRoutes().UpsertCustomDomainHTTPRouteWithDial(ctx, sandbox.ID, hostname, dial, routeOpts)
 }
 
 // syncWasmCustomDomainRoutes re-PATCHes every attached custom hostname so WASM
