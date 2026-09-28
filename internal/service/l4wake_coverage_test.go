@@ -138,9 +138,7 @@ func TestL4WakeAcceptAndProxyBranchesWave13(t *testing.T) {
 	svc.testL4ActivityInterval = time.Millisecond
 	release2, ok := svc.tryAcquireL4Active("sb-l4w")
 	if ok {
-		svc.l4LimitMu.Lock()
-		gen := svc.l4ActivityGenerations["sb-l4w"]
-		svc.l4LimitMu.Unlock()
+		gen := svc.l4ActivityGeneration("sb-l4w")
 		done := make(chan struct{})
 		go func() {
 			svc.touchDuringL4Activity("sb-l4w", gen)
@@ -483,14 +481,25 @@ func TestL4WakeLimitHelpersWave3(t *testing.T) {
 		t.Fatal("per-sandbox pending cap should reject second acquire")
 	}
 	release()
-	svc.releaseL4Pending("sb-l4") // idempotent when already zero
+	release() // a double release must not free another connection's slot
+	held, ok := svc.tryAcquireL4Pending("sb-l4")
+	if !ok {
+		t.Fatal("pending slot should be free after release")
+	}
+	if _, ok := svc.tryAcquireL4Pending("sb-l4"); ok {
+		t.Fatal("double release freed an extra slot: per-sandbox cap bypassed")
+	}
+	held()
 
 	activeRelease, ok := svc.tryAcquireL4Active("sb-active")
 	if !ok || activeRelease == nil {
 		t.Fatal("active acquire should succeed")
 	}
 	activeRelease()
-	svc.releaseL4Active("sb-active")
+	activeRelease()
+	if gen := svc.l4ActivityGeneration("sb-active"); gen != 0 {
+		t.Fatalf("activity generation survived the last release: %d", gen)
+	}
 }
 
 func TestStartL4WakeProxyAddrWave8(t *testing.T) {

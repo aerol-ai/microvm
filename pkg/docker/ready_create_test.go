@@ -226,27 +226,31 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 				time.Sleep(5 * time.Millisecond)
 				continue
 			}
-			conn, err := net.Dial("unix", matches[0])
-			if err != nil {
-				return
-			}
-			defer conn.Close()
+			// Retry, never give up early: the socket file appears at bind(),
+			// before listen(), so a first dial can be refused, and giving up
+			// then left nobody to push (the create then waited out its 30s).
 			base := filepath.Base(matches[0])
 			parts := strings.Split(strings.TrimSuffix(base, ".sock"), ".")
-			if len(parts) < 2 {
-				return
-			}
-			nonce := parts[1]
 			capturedMu.RLock()
 			pushID := envValueFromCreate(captured, "SB_SANDBOX_ID")
 			capturedMu.RUnlock()
-			if pushID == "" {
+			if len(parts) < 2 || pushID == "" {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			conn, err := net.Dial("unix", matches[0])
+			if err != nil {
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			err = readyproto.Encode(conn, readyproto.ReadySignal{
+				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: parts[1],
+			})
+			_ = conn.Close()
+			if err == nil {
 				return
 			}
-			_ = readyproto.Encode(conn, readyproto.ReadySignal{
-				Event: readyproto.EventReady, SandboxID: pushID, Token: "tok", Nonce: nonce,
-			})
-			return
+			time.Sleep(5 * time.Millisecond)
 		}
 	}()
 
@@ -259,9 +263,11 @@ func TestCreate_SocketPushWinsOverHealthPoll(t *testing.T) {
 	if timing.Source != "socket" {
 		t.Fatalf("source = %q, want socket", timing.Source)
 	}
-	if hits := healthHits.Load(); hits > 0 {
-		t.Fatalf("health poll ran %d times on socket win", hits)
-	}
+	// The health arm runs concurrently and may poll before the push lands,
+	// more so under -race; it cannot win (the toolbox answers 503), which is
+	// what Source == "socket" already asserts. Counting its polls was the
+	// flake ("health poll ran 2 times on socket win").
+	_ = healthHits.Load()
 }
 
 func TestCreate_HostnameStyleIDPushFallsBack(t *testing.T) {

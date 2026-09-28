@@ -324,15 +324,16 @@ type Service struct {
 	// rapid cold→warm→cold flip doesn't tear down a socket that the new
 	// wake route depends on.
 	pendingTLSClose map[string]*time.Timer
-	l4LimitMu       sync.Mutex
-	// pending counts L4 connections waiting for wake/target resolution.
-	// active counts connections already admitted to proxy bytes. Keeping both
-	// lets cold-start bursts shed excess work without blocking unrelated warm
-	// traffic accounting.
-	l4PendingGlobal       int
-	l4PendingBySandbox    map[string]int
-	l4ActiveGlobal        int
-	l4ActiveBySandbox     map[string]int
+	// l4Pending counts L4 connections waiting for wake/target resolution;
+	// l4Active counts connections already admitted to proxy bytes. Keeping
+	// both lets cold-start bursts shed excess work without blocking
+	// unrelated warm traffic accounting. See l4Limiters (lazy) and
+	// connLimiter (l4proxy.go).
+	l4LimitersOnce sync.Once
+	l4Pending      *connLimiter
+	l4Active       *connLimiter
+	// l4ActivityGenerations / l4ActivitySeq are guarded by l4Active's lock
+	// (connLimiter hooks), so a generation changes atomically with the count.
 	l4ActivityGenerations map[string]uint64
 	l4ActivitySeq         uint64
 
