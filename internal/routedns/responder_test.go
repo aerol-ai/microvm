@@ -109,8 +109,12 @@ func TestResponderOwnerAnswers(t *testing.T) {
 			if !in.Authoritative || in.RecursionAvailable {
 				t.Fatalf("answer must be authoritative and non-recursive: aa=%v ra=%v", in.Authoritative, in.RecursionAvailable)
 			}
-			if tc.wantA == "" && (len(in.Ns) == 0 || in.Ns[0].(*dns.SOA).Minttl != answerTTL) {
-				t.Fatalf("negative answer needs an SOA with minttl=%d so resolvers don't cache it long: %v", answerTTL, in.Ns)
+			// Regression (live cluster-3-mixed-routing): an owner negative
+			// must NOT claim the platform domain's SOA. A mis-scoped system
+			// resolver once fed that SOA to Caddy's ACME zone lookup and
+			// no cert issued.
+			if len(in.Ns) != 0 {
+				t.Fatalf("owner negative carries an authority record (would claim a zone it doesn't own): %v", in.Ns)
 			}
 		})
 	}
@@ -155,6 +159,20 @@ func TestResponderIngressAnswers(t *testing.T) {
 			in := query(t, addr, tc.sni+"."+IngressZone, dns.TypeA)
 			if in.Rcode != tc.wantRcode || aOf(in) != tc.want {
 				t.Fatalf("rcode=%s answer=%q, want %s %q", dns.RcodeToString[in.Rcode], aOf(in), dns.RcodeToString[tc.wantRcode], tc.want)
+			}
+			// Negatives in the zone this responder owns keep an SOA whose
+			// minimum is the 1s TTL, so the system resolver re-asks quickly.
+			if tc.want == "" {
+				soa, ok := func() (*dns.SOA, bool) {
+					if len(in.Ns) == 0 {
+						return nil, false
+					}
+					s, ok := in.Ns[0].(*dns.SOA)
+					return s, ok
+				}()
+				if !ok || soa.Hdr.Name != dns.Fqdn(IngressZone) || soa.Minttl != answerTTL {
+					t.Fatalf("ingress negative needs an %s SOA with minttl=%d: %v", IngressZone, answerTTL, in.Ns)
+				}
 			}
 		})
 	}

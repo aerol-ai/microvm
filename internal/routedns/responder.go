@@ -105,8 +105,14 @@ func (r *Responder) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if rr != nil {
 		m.Answer = append(m.Answer, rr)
 	}
-	if len(m.Answer) == 0 {
-		m.Ns = append(m.Ns, r.soa(name))
+	// An SOA only for the zone this responder really owns. Owner lookups
+	// (platform and tenant hosts) come straight from Caddy, which caches
+	// nothing, so they need no negative TTL. Claiming the platform domain's
+	// SOA is a lie that poisons anything that ever reaches this server by
+	// mistake: a mis-scoped system resolver fed it to Caddy's ACME zone
+	// lookup ("expected 1 zone, got 0 for <domain>"), and no cert issued.
+	if len(m.Answer) == 0 && strings.HasSuffix(name, "."+IngressZone) {
+		m.Ns = append(m.Ns, r.soa())
 	}
 	_ = w.WriteMsg(m)
 }
@@ -253,11 +259,8 @@ func (r *Responder) rememberNegative(host string) {
 // soa is the authority record on NXDOMAIN/NODATA. Its minimum (the negative
 // TTL) matches answerTTL, so a miss is re-asked within a second, never
 // cached for the 30 minutes a public zone would impose.
-func (r *Responder) soa(name string) dns.RR {
+func (r *Responder) soa() dns.RR {
 	zone := IngressZone
-	if !strings.HasSuffix(name, "."+IngressZone) && normHost(r.Domain) != "" {
-		zone = normHost(r.Domain)
-	}
 	return &dns.SOA{
 		Hdr:     dns.RR_Header{Name: dns.Fqdn(zone), Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: answerTTL},
 		Ns:      "ns." + dns.Fqdn(zone),

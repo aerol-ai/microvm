@@ -93,12 +93,9 @@ func TestResponderMalformedAndNilTables(t *testing.T) {
 	if got := query(t, addr, "sb.sandbox.test."+IngressZone, dns.TypeA); got.Rcode != dns.RcodeNameError {
 		t.Fatalf("nil ingress index without LocalIP: %s", dns.RcodeToString[got.Rcode])
 	}
-	// The SOA zone follows the query: ingress zone vs platform domain.
-	if soa := r.soa("x." + IngressZone).(*dns.SOA); soa.Hdr.Name != IngressZone+"." {
-		t.Fatalf("ingress SOA zone = %s", soa.Hdr.Name)
-	}
-	if soa := r.soa("x." + testDomain).(*dns.SOA); soa.Hdr.Name != testDomain+"." {
-		t.Fatalf("owner SOA zone = %s", soa.Hdr.Name)
+	// The only zone the responder ever claims is the ingress zone.
+	if soa := r.soa().(*dns.SOA); soa.Hdr.Name != IngressZone+"." {
+		t.Fatalf("SOA zone = %s", soa.Hdr.Name)
 	}
 }
 
