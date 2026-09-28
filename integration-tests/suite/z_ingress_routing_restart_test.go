@@ -78,7 +78,7 @@ func TestIngressRoutingSessionsSurviveSandboxdRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("owner of %s: %v", target.sb.ID, err)
 	}
-	owner, ok := harness.LookupIntegrationNode(targets, ownerID)
+	owner, ok := harness.IntegrationNodeForClusterID(targets, ownerID)
 	if !ok {
 		t.Fatalf("owner node %q not in the integration targets", ownerID)
 	}
