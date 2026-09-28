@@ -389,7 +389,7 @@ func (s *Service) RemoveCustomDomain(ctx context.Context, sandboxID, hostname st
 	// UpsertSandboxRoute only writes; it does not GC the per-hostname route
 	// for the detached domain. Drop it explicitly so the dial target stops
 	// answering immediately rather than waiting on a reconcile sweep.
-	if err := s.caddy.DeleteCustomDomainHTTPRoute(ctx, refreshed.ID, canonical); err != nil {
+	if err := s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, refreshed.ID, canonical); err != nil {
 		return fmt.Errorf("delete caddy per-hostname route for %q: %w", canonical, err)
 	}
 	return nil

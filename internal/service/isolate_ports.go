@@ -68,32 +68,32 @@ func (s *Service) installIsolateHTTPPortRoute(ctx context.Context, sandbox *mode
 	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
-		if err := s.caddy.UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial, routeOpts); err != nil {
+		if err := s.publicRoutes().UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial, routeOpts); err != nil {
 			// isolateHTTPDial opened the loopback listener above; a failed caddy
 			// upsert leaves no route pointing at it, so release it rather than
 			// orphan the listener + goroutine (pr-review.md §4).
 			s.releaseIsolateHTTPListener(sandbox.ID, guestPort)
 			return err
 		}
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	case RouteShapeWake:
-		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, guestPort); err != nil {
+		if err := s.publicRoutes().UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, guestPort); err != nil {
 			s.releaseIsolateHTTPListener(sandbox.ID, guestPort)
 			return err
 		}
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	case RouteShapeNone:
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, guestPort)
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	}
 	return nil
 }
 
 func (s *Service) isolateHTTPPortRouteCleanup(ctx context.Context, sandboxID string, guestPort int) {
-	_ = s.caddy.DeletePortRoute(ctx, sandboxID, guestPort)
-	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandboxID, guestPort)
+	_ = s.publicRoutes().DeletePortRoute(ctx, sandboxID, guestPort)
+	_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandboxID, guestPort)
 	s.releaseIsolateHTTPListener(sandboxID, guestPort)
 }

@@ -76,20 +76,20 @@ func (s *Service) installWasmHTTPPortRoute(ctx context.Context, sandbox *models.
 	routeOpts := caddy.HTTPRouteOptions{MaskRequestHost: sandbox.MaskRequestHost}
 	switch s.chooseRouteShape(sandbox, RouteKindHTTP) {
 	case RouteShapeDirect:
-		if err := s.caddy.UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial, routeOpts); err != nil {
+		if err := s.publicRoutes().UpsertPortRouteWithDial(ctx, sandbox.ID, guestPort, dial, routeOpts); err != nil {
 			return err
 		}
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	case RouteShapeWake:
-		if err := s.caddy.UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, guestPort); err != nil {
+		if err := s.publicRoutes().UpsertWakeHTTPPortRoute(ctx, sandbox.ID, s.cfg.InternalIngressAddr, guestPort); err != nil {
 			return err
 		}
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	case RouteShapeNone:
-		_ = s.caddy.DeletePortRoute(ctx, sandbox.ID, guestPort)
-		_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeletePortRoute(ctx, sandbox.ID, guestPort)
+		_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandbox.ID, guestPort)
 		return nil
 	}
 	return nil
@@ -97,7 +97,7 @@ func (s *Service) installWasmHTTPPortRoute(ctx context.Context, sandbox *models.
 
 // wasmHTTPPortRouteCleanup drops caddy routes and the host listener for one port.
 func (s *Service) wasmHTTPPortRouteCleanup(ctx context.Context, sandboxID string, guestPort int) {
-	_ = s.caddy.DeletePortRoute(ctx, sandboxID, guestPort)
-	_ = s.caddy.DeleteWakeHTTPPortRoute(ctx, sandboxID, guestPort)
+	_ = s.publicRoutes().DeletePortRoute(ctx, sandboxID, guestPort)
+	_ = s.publicRoutes().DeleteWakeHTTPPortRoute(ctx, sandboxID, guestPort)
 	s.releaseWasmHTTPListener(sandboxID, guestPort)
 }

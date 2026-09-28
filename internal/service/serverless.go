@@ -197,7 +197,7 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	// the wake-aware shape live for HTTP ports on an arming stop) and
 	// returns the demoted arm value if every wake route upsert failed.
 	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+	if err := s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		s.logger.Warn("caddy route cleanup on stop failed", "sandbox_id", id, "error", err)
 	}
 

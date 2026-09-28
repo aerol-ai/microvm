@@ -180,7 +180,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// demotes arm to false if every wake-route install attempt failed.
 	arm = s.tearDownPortRoutesForStop(ctx, sandbox, arm)
 	if s.caddy != nil {
-		if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+		if err := s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 			s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 		}
 	}
@@ -244,7 +244,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	// is skipped because the event itself means the container is already
 	// gone. Failures here are picked up by gcZombieCaddyEntries /
 	// mounts.Sweep on the next reconcile pass.
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+	if err := s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		s.logger.Warn("delete sandbox route failed", "sandbox_id", sandbox.ID, "error", err)
 	}
 	for _, port := range sandbox.ExposedPorts {

@@ -45,7 +45,7 @@ func (s *Service) syncSandboxPublicRoute(ctx context.Context, sandbox *models.Sa
 	if !sandboxAllowsPublicTraffic(sandbox) {
 		return s.deleteSandboxPublicRoutes(ctx, sandbox)
 	}
-	return s.caddy.UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
+	return s.publicRoutes().UpsertSandboxRoute(ctx, sandbox.ID, sandbox.ContainerIP, s.cfg.ToolboxPort, sandboxCustomHostnames(sandbox))
 }
 
 // enableSandboxPublicTraffic flips a private sandbox to public in place:
@@ -94,14 +94,14 @@ func (s *Service) deleteSandboxPublicRoutes(ctx context.Context, sandbox *models
 		return nil
 	}
 	var firstErr error
-	if err := s.caddy.DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
+	if err := s.publicRoutes().DeleteSandboxRoute(ctx, sandbox.ID); err != nil {
 		firstErr = err
 	}
 	for _, cd := range sandbox.CustomDomains {
 		if cd.Hostname == "" {
 			continue
 		}
-		if err := s.caddy.DeleteCustomDomainHTTPRoute(ctx, sandbox.ID, cd.Hostname); err != nil && firstErr == nil {
+		if err := s.publicRoutes().DeleteCustomDomainHTTPRoute(ctx, sandbox.ID, cd.Hostname); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
