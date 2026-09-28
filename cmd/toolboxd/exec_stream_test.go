@@ -17,7 +17,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func TestInterpretWaitResultTreatsWrappedECHILDAsSuccess(t *testing.T) {
+// ECHILD used to be reported as exit 0, which turned a reaper-raced failing
+// command into a false success (UC-84). A lost status is now -1 with a reason,
+// and child_table_test.go proves tracked children never lose it.
+func TestInterpretWaitResultReportsWrappedECHILDAsUnknown(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
@@ -39,8 +42,8 @@ func TestInterpretWaitResultTreatsWrappedECHILDAsSuccess(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			code, signal := interpretWaitResult(tc.err)
-			if code != 0 || signal != "" {
-				t.Fatalf("interpretWaitResult(%v) = (%d, %q), want (0, \"\")", tc.err, code, signal)
+			if code != -1 || signal == "" {
+				t.Fatalf("interpretWaitResult(%v) = (%d, %q), want (-1, <reason>)", tc.err, code, signal)
 			}
 		})
 	}
