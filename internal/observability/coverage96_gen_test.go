@@ -78,7 +78,8 @@ func fill96(v reflect.Value, depth int) {
 }
 
 func cover96Ctx() context.Context {
-	ctx, _ := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	time.AfterFunc(30*time.Millisecond, cancel)
 	return ctx
 }
 
