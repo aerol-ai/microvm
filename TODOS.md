@@ -705,6 +705,27 @@ the skip.
 
 ---
 
+
+## Propose a controller-class field upstream in agent-sandbox (Kubernetes, P2)
+
+- **What:** open an issue/KEP in `kubernetes-sigs/agent-sandbox` for a
+  `spec.controllerName` class field (precedent: IngressClass, GatewayClass) so
+  several backends can serve `agents.x-k8s.io` objects in one cluster.
+- **Why:** `plans/kubernetes-deployment.md` D5 makes `aerolvm-controller`
+  replace the upstream controller, and the chart refuses to install next to it.
+  A customer therefore cannot run upstream gVisor sandboxes and AerolVM
+  sandboxes side by side. A class field removes that for every backend (Mitos
+  included) and puts AerolVM in the upstream conversation.
+- **Pros:** removes the main adoption caveat of the facade; SIG Apps visibility.
+- **Cons:** the upstream timeline is out of our control; design discussion, not code.
+- **Effort:** human S / CC S. **Priority:** P2.
+- **Depends on:** the Phase 3 facade existing, so the proposal can cite a real
+  second backend.
+- **Start:** the agent-sandbox issue tracker; cite GatewayClass
+  `controllerName` semantics.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
