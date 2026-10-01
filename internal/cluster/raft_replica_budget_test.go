@@ -10,9 +10,6 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// seedGossipView installs a deterministic membership view on a real cluster so
-// the test controls the topology regime without standing up N memberlist
-// processes.
 // newReplicaBudgetCluster is a real single-voter raft leader. The voter cap is
 // pinned to 1 so every admitted peer joins as a NON-VOTER: a non-voter still
 // receives the full log and FSM (the thing the budget exists to bound) but
@@ -26,8 +23,27 @@ func newReplicaBudgetCluster(t *testing.T, nodeID string) (*Cluster, func()) {
 	return c, cleanup
 }
 
+// seedGossipView installs a deterministic membership view on a real cluster so
+// the test controls the topology regime without standing up N memberlist
+// processes.
+//
+// The real gossip refresh loop must be stopped first: every
+// ClusterCapacityGossipInterval (1s here) it rewrites the current index from
+// memberlist, which knows only this node. A tick landing between the seed and
+// handleMemberJoin made peerRaftAddr return "" for every joiner, so none was
+// admitted — a flake that only needed a slow runner to widen the window.
 func seedGossipView(t *testing.T, c *Cluster, members []Member) {
 	t.Helper()
+	if c.gossip.stopRefresh != nil {
+		c.gossip.stopRefresh()
+	}
+	if c.gossip.refreshDone != nil {
+		select {
+		case <-c.gossip.refreshDone:
+		case <-time.After(10 * time.Second):
+			t.Fatal("gossip refresh loop did not stop; it would overwrite the seeded view")
+		}
+	}
 	index := newGossipMemberIndex()
 	for _, m := range members {
 		index.upsert(m)
