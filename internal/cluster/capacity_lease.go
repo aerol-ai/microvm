@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -323,9 +322,10 @@ func (c *capacityLeaseCache) recordFetchResult(nodeID string, now time.Time, err
 	c.nextAttempt[nodeID] = now.Add(backoff)
 }
 
-// recordAttempt stamps the fairness clock. Called when a peer is dispatched,
-// whatever the outcome: an attempt that timed out still used a slot, and the
-// peers that did not get one are the ones owed the next sweep.
+// recordAttempt stamps the fairness clock. Called for an attempt that
+// resolved on the peer's terms. A request the sweep cut short does not
+// count: advancing the clock would send that peer to the back of the next
+// sweep, where it would be cut short again.
 func (c *capacityLeaseCache) recordAttempt(nodeID string, now time.Time) {
 	if c == nil || nodeID == "" {
 		return
@@ -835,14 +835,16 @@ func hasCapacitySnapshot(s capacity.Snapshot) bool {
 // curtailedByPhase reports whether a failed attempt was ended by the sweep
 // rather than by the peer. A phase gives each request its own timeout, but a
 // request dispatched near the end of the phase inherits only the phase's
-// remaining time — so a cancellation while the phase itself is over is the
+// remaining time — so a failure while the phase itself is over is the
 // coordinator's budget running out, not evidence about the peer, and must not
-// feed the failure backoff.
+// feed the failure backoff or the fairness clock.
+//
+// The error is often not context.Canceled. Once the phase deadline fires, the
+// client's select between ctx.Done and the response is random: the handler
+// returns without writing, and the transport reports EOF or a connection
+// reset instead of the context error. Those still belong to the sweep.
 func curtailedByPhase(phaseCtx context.Context, err error) bool {
 	if err == nil || phaseCtx == nil {
-		return false
-	}
-	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
 		return false
 	}
 	return phaseCtx.Err() != nil
