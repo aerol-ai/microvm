@@ -501,7 +501,9 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
+	# macOS hostname has no -I; under pipefail the failed pipeline would
+	# exit the script silently, so fall through to the default instead.
+	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
 fi
 
