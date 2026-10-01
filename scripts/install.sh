@@ -40,15 +40,14 @@ WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
 LOCAL_MODE="false"
 NODE_NAME=""
-# macOS --local: sandbox containers run in Docker's Linux VM (OrbStack /
-# Docker Desktop), which only sees the host paths it shares (/Users,
-# /private, /tmp, /Volumes). A toolboxd under /usr/local/bin bind-mounts as
-# an empty directory, so the Linux toolboxd lives under /private instead —
-# world-readable, because the VM's file sharing reads as the console user.
-# /run does not exist on macOS (sealed system volume); /private/var/run is
-# its writable counterpart.
-DARWIN_TOOLBOX_DIR="/private/var/lib/sandboxd-toolbox"
-DARWIN_RUN_DIR="/private/var/run/sandboxd"
+PAT_TOKEN_EXPLICIT="false"
+# macOS --local installs for the current user only — no sudo, nothing outside
+# $HOME. Everything lives under one directory inside /Users, which Docker's
+# Linux VM (OrbStack / Docker Desktop) shares with containers, so the Linux
+# toolboxd bind-mounts into sandboxes from here (a /usr/local/bin path would
+# arrive as an empty directory). sandboxd runs as a LaunchAgent.
+DARWIN_HOME="$HOME/.aerolvm"
+DARWIN_LAUNCH_AGENT="$HOME/Library/LaunchAgents/com.aerol.sandboxd.plist"
 
 # Bound every bootstrap download. Without low-speed and total timeouts, a dead
 # CDN/GitHub connection can sit at 0 bytes forever and leave cloud-init running
@@ -207,11 +206,15 @@ Options:
                                renders stored certs unrecoverable.
   --local                      Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
-                               on both macOS and Linux. Docker Desktop (macOS)
-                               or Docker Engine (Linux) must already be running.
-                               No domain name required. On macOS a launchd
-                               daemon is registered; on Linux a systemd unit
-                               without a Caddy dependency is used.
+                               on both macOS and Linux. No domain name required.
+                               Linux: run with sudo; Docker Engine is installed
+                               if missing and a systemd unit without a Caddy
+                               dependency is used.
+                               macOS: run WITHOUT sudo. Installs for the current
+                               user into ~/.aerolvm and registers a LaunchAgent;
+                               OrbStack or Docker Desktop must be running. Each
+                               sandbox publishes only its toolbox port, on
+                               127.0.0.1; every listener stays on 127.0.0.1.
   --help                       Show this help
 
 Examples:
@@ -353,6 +356,7 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--pat-token)
 			PAT_TOKEN="$2"
+			PAT_TOKEN_EXPLICIT="true"
 			shift 2
 			;;
 		--github-repo)
@@ -501,14 +505,19 @@ if [[ -z "$PAT_TOKEN" ]]; then
 fi
 
 if [[ -z "$PUBLIC_HOST" ]]; then
-	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
+	# macOS hostname has no -I; under pipefail the failed pipeline would
+	# exit the script silently, so fall through to the default instead.
+	PUBLIC_HOST="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 	PUBLIC_HOST="${PUBLIC_HOST:-127.0.0.1}"
 fi
 
 # Host path of the toolboxd binary bind-mounted into every sandbox.
 TOOLBOX_BINARY_PATH="$INSTALL_PREFIX/toolboxd"
 if [[ "$(uname -s)" == "Darwin" ]]; then
-	TOOLBOX_BINARY_PATH="$DARWIN_TOOLBOX_DIR/toolboxd"
+	if [[ "$INSTALL_PREFIX" == "/usr/local/bin" ]]; then
+		INSTALL_PREFIX="$DARWIN_HOME/bin"
+	fi
+	TOOLBOX_BINARY_PATH="$DARWIN_HOME/toolbox/toolboxd"
 fi
 
 if [[ -n "$DNS_PROVIDER" ]]; then
@@ -809,26 +818,15 @@ install_custom_caddy() {
 }
 
 install_binaries() {
-	mkdir -p "$INSTALL_PREFIX"
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		mkdir -p "$DARWIN_TOOLBOX_DIR"
-		chmod 0755 "$DARWIN_TOOLBOX_DIR"
-	fi
+	mkdir -p "$INSTALL_PREFIX" "$(dirname "$TOOLBOX_BINARY_PATH")"
 	if [[ "$BUILD_FROM_SOURCE" == "true" ]]; then
 		if [[ "$(uname -s)" == "Darwin" ]]; then
 			# sandboxd runs on the Mac; toolboxd runs in Linux containers.
-			# Build as the invoking user: macOS sudo can keep HOME, and a
-			# root build would leave root-owned dirs in their Go caches.
 			local goarch
 			goarch="$(detect_platform)"
 			goarch="${goarch#*_}"
-			if [[ -n "${SUDO_USER:-}" ]]; then
-				sudo -H -u "$SUDO_USER" make build-sandboxd
-				sudo -H -u "$SUDO_USER" env GOOS=linux GOARCH="$goarch" make build-toolboxd
-			else
-				make build-sandboxd
-				GOOS=linux GOARCH="$goarch" make build-toolboxd
-			fi
+			make build-sandboxd
+			GOOS=linux GOARCH="$goarch" make build-toolboxd
 		else
 			make build
 		fi
@@ -1631,12 +1629,8 @@ PY
 }
 
 write_local_environment() {
-	local run_dir="/run/sandboxd"
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		run_dir="$DARWIN_RUN_DIR"
-	fi
-	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts "$run_dir"
-	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts "$run_dir"
+	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_NODE_NAME=$NODE_NAME
@@ -1652,7 +1646,7 @@ SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=false
 SB_ENABLE_NETWORK_RULES=false
 SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
-SB_MOUNTS_CRED_DIR=$run_dir
+SB_MOUNTS_CRED_DIR=/run/sandboxd
 SB_MOUNT_WAIT_TIMEOUT=30s
 SB_RECORDING_DIR=/var/lib/toolboxd/recordings
 SB_RECORDING_RETENTION=168h
@@ -1694,19 +1688,18 @@ WantedBy=multi-user.target
 EOF
 }
 
-# detect_darwin_docker_host prints the unix:// endpoint of the Docker engine
-# the installing user runs. launchd starts sandboxd as root with an empty
-# environment, and OrbStack / Docker Desktop serve the engine from a socket
-# under the user's home (~/.orbstack/run/docker.sock,
-# ~/.docker/run/docker.sock); /var/run/docker.sock exists only when Docker
-# Desktop's default-socket option is on. sudo drops DOCKER_HOST, so read the
-# user's active docker context.
+# detect_darwin_docker_host prints the unix:// endpoint of the current user's
+# Docker engine. launchd starts the agent with an empty environment, and
+# OrbStack / Docker Desktop serve the engine from a socket under $HOME
+# (~/.orbstack/run/docker.sock, ~/.docker/run/docker.sock);
+# /var/run/docker.sock exists only when Docker Desktop's default-socket option
+# is on. Order: DOCKER_HOST, the active docker context, /var/run/docker.sock.
 detect_darwin_docker_host() {
 	local host=""
 	if [[ "${DOCKER_HOST:-}" == unix://* ]]; then
 		host="$DOCKER_HOST"
-	elif [[ -n "${SUDO_USER:-}" ]] && command -v docker >/dev/null 2>&1; then
-		host="$(sudo -H -u "$SUDO_USER" docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
+	elif command -v docker >/dev/null 2>&1; then
+		host="$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)"
 	fi
 	if [[ "$host" != unix://* || ! -S "${host#unix://}" ]]; then
 		host=""
@@ -1718,16 +1711,41 @@ detect_darwin_docker_host() {
 	echo "$host"
 }
 
-# SB_RESOURCE_LIMITS_DISABLED: every create carries a disk quota
-# (StorageOpt size), which dockerd only honours on overlay over xfs+pquota.
-# The Linux VMs behind OrbStack and Docker Desktop do not run that, so with
-# limits on, every sandbox create fails with a 500 from dockerd.
-write_launchd_plist() {
+# reuse_darwin_pat_token keeps an existing install's token so re-running the
+# installer (the upgrade path) does not lock out clients already holding it.
+reuse_darwin_pat_token() {
+	if [[ "$PAT_TOKEN_EXPLICIT" == "true" || ! -f "$DARWIN_LAUNCH_AGENT" ]]; then
+		return
+	fi
+	local existing
+	existing="$(plutil -extract EnvironmentVariables.SB_PAT_TOKEN raw -o - "$DARWIN_LAUNCH_AGENT" 2>/dev/null || true)"
+	if [[ -n "$existing" ]]; then
+		PAT_TOKEN="$existing"
+	fi
+}
+
+# write_launch_agent_plist registers sandboxd as a per-user LaunchAgent: every
+# path is under $DARWIN_HOME and every listener is bound to 127.0.0.1.
+#   SB_DOCKER_TOOLBOX_LOOPBACK  each sandbox publishes only its toolbox port,
+#                               on 127.0.0.1; macOS Local Network privacy
+#                               blocks a user process from dialing the Docker
+#                               VM's container IPs, but not loopback.
+#   SB_SSH_LISTEN_ADDR          the SSH gateway otherwise binds 0.0.0.0:2220.
+#   SB_RESOURCE_LIMITS_DISABLED every create carries a disk quota (StorageOpt
+#                               size), which dockerd only honours on overlay
+#                               over xfs+pquota; the OrbStack / Docker Desktop
+#                               VMs reject it with a 500.
+# The plist carries the PAT token, so it is created under umask 077.
+write_launch_agent_plist() {
 	local docker_host="$1"
-	mkdir -p /var/lib/sandboxd /var/lib/sandboxd/mounts /var/log/sandboxd
-	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts
-	local plist_path="/Library/LaunchDaemons/com.aerol.sandboxd.plist"
-	cat > "$plist_path" <<EOF
+	local state="$DARWIN_HOME/state"
+	local run="$DARWIN_HOME/run"
+	mkdir -p "$state" "$DARWIN_HOME/mounts" "$run" "$DARWIN_HOME/logs" "$(dirname "$DARWIN_LAUNCH_AGENT")"
+	chmod 0700 "$state" "$DARWIN_HOME/mounts" "$run"
+	local old_umask
+	old_umask="$(umask)"
+	umask 077
+	cat > "$DARWIN_LAUNCH_AGENT" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1744,16 +1762,32 @@ write_launchd_plist() {
 		<string>$docker_host</string>
 		<key>SB_PAT_TOKEN</key>
 		<string>$PAT_TOKEN</string>
+		<key>SB_NODE_NAME</key>
+		<string>$NODE_NAME</string>
 		<key>SB_API_HOST</key>
 		<string>127.0.0.1</string>
 		<key>SB_API_PORT</key>
 		<string>21212</string>
 		<key>SB_PUBLIC_HOST</key>
 		<string>127.0.0.1</string>
+		<key>SB_SSH_LISTEN_ADDR</key>
+		<string>127.0.0.1:2220</string>
 		<key>SB_DB_PATH</key>
-		<string>/var/lib/sandboxd/state.db</string>
+		<string>$state/state.db</string>
+		<key>SB_CREDENTIAL_ENCRYPTION_KEY_PATH</key>
+		<string>$state/credential_encryption.key</string>
+		<key>SB_SSH_HOST_KEY_PATH</key>
+		<string>$state/ssh_host_ed25519_key</string>
+		<key>SB_WASM_MODULES_DIR</key>
+		<string>$state/wasm/modules</string>
+		<key>SB_FIRECRACKER_TEMPLATES_DIR</key>
+		<string>$state/firecracker/templates</string>
+		<key>SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT</key>
+		<string>$state/volume-reclaim</string>
 		<key>SB_DOCKER_NETWORK</key>
 		<string>bridge</string>
+		<key>SB_DOCKER_TOOLBOX_LOOPBACK</key>
+		<string>true</string>
 		<key>SB_TOOLBOX_BINARY_PATH</key>
 		<string>$TOOLBOX_BINARY_PATH</string>
 		<key>SB_TOOLBOX_MOUNT_PATH</key>
@@ -1769,9 +1803,11 @@ write_launchd_plist() {
 		<key>SB_RESOURCE_LIMITS_DISABLED</key>
 		<string>true</string>
 		<key>SB_MOUNTS_ROOT</key>
-		<string>/var/lib/sandboxd/mounts</string>
+		<string>$DARWIN_HOME/mounts</string>
 		<key>SB_MOUNTS_CRED_DIR</key>
-		<string>$DARWIN_RUN_DIR</string>
+		<string>$run</string>
+		<key>SB_INTERNAL_L4_WAKE_DIR</key>
+		<string>$run/l4wake</string>
 		<key>SB_RECORDING_DIR</key>
 		<string>/var/lib/toolboxd/recordings</string>
 		<key>SB_RECORDING_RETENTION</key>
@@ -1784,12 +1820,58 @@ write_launchd_plist() {
 	<key>KeepAlive</key>
 	<true/>
 	<key>StandardOutPath</key>
-	<string>/var/log/sandboxd/sandboxd.log</string>
+	<string>$DARWIN_HOME/logs/sandboxd.log</string>
 	<key>StandardErrorPath</key>
-	<string>/var/log/sandboxd/sandboxd.err</string>
+	<string>$DARWIN_HOME/logs/sandboxd.err</string>
 </dict>
 </plist>
 EOF
+	umask "$old_umask"
+}
+
+# install_darwin_local is --local on macOS: a per-user install, no root.
+install_darwin_local() {
+	if [[ $EUID -eq 0 ]]; then
+		echo "On macOS, run install.sh --local without sudo: it installs into ~/.aerolvm for the current user." >&2
+		exit 1
+	fi
+	local docker_host
+	if ! docker_host="$(detect_darwin_docker_host)"; then
+		echo "No running Docker engine socket found. Start OrbStack or Docker Desktop and re-run," >&2
+		echo "or name it: DOCKER_HOST=unix:///path/to/docker.sock ./install.sh --local" >&2
+		exit 1
+	fi
+	reuse_darwin_pat_token
+	install_binaries
+	write_launch_agent_plist "$docker_host"
+	local domain
+	domain="gui/$(id -u)"
+	launchctl bootout "$domain/com.aerol.sandboxd" >/dev/null 2>&1 || true
+	launchctl bootstrap "$domain" "$DARWIN_LAUNCH_AGENT"
+
+	local healthy="false"
+	local _
+	for _ in $(seq 1 30); do
+		if curl -fsS -o /dev/null http://127.0.0.1:21212/health 2>/dev/null; then
+			healthy="true"
+			break
+		fi
+		sleep 1
+	done
+	if [[ "$healthy" != "true" ]]; then
+		echo "sandboxd did not become healthy within 30s; see $DARWIN_HOME/logs/sandboxd.err" >&2
+		exit 1
+	fi
+
+	echo "AerolVM installed (local mode, current user)"
+	echo "PAT token: $PAT_TOKEN"
+	echo "Use header: Authorization: Bearer <PAT token>"
+	echo "API URL: http://127.0.0.1:21212"
+	echo "Health URL: http://127.0.0.1:21212/health"
+	echo "Docker engine: $docker_host"
+	echo "Service: LaunchAgent com.aerol.sandboxd (starts at login)"
+	echo "Files: $DARWIN_HOME (logs in $DARWIN_HOME/logs)"
+	echo "Stop: launchctl bootout $domain/com.aerol.sandboxd"
 }
 
 if [[ "$LOCAL_MODE" == "true" ]]; then
@@ -1797,46 +1879,31 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		echo "--local is incompatible with --domain and --dns-provider" >&2
 		exit 1
 	fi
+	if [[ "$(uname -s)" == "Darwin" ]]; then
+		install_darwin_local
+		exit 0
+	fi
 	if [[ $EUID -ne 0 ]]; then
 		echo "install.sh must run as root (use sudo)" >&2
 		exit 1
 	fi
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		if ! darwin_docker_host="$(detect_darwin_docker_host)"; then
-			echo "No running Docker engine socket found. Start OrbStack or Docker Desktop and re-run," >&2
-			echo "or name it: sudo DOCKER_HOST=unix:///path/to/docker.sock ./install.sh --local" >&2
-			exit 1
-		fi
-	fi
 	install_binaries
 	write_local_environment
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		write_launchd_plist "$darwin_docker_host"
-		launchctl load /Library/LaunchDaemons/com.aerol.sandboxd.plist
-	else
-		# The local unit hard-Requires docker.service; on Linux we must install
-		# the engine here since this branch skips install_packages. (macOS local
-		# mode assumes Docker Desktop is already running.)
-		ensure_docker
-		write_local_systemd_unit
-		write_healthcheck_script
-		write_healthcheck_units
-		systemctl daemon-reload
-		systemctl enable --now sandboxd sandboxd-healthcheck.timer
-	fi
+	# The local unit hard-Requires docker.service; on Linux we must install
+	# the engine here since this branch skips install_packages.
+	ensure_docker
+	write_local_systemd_unit
+	write_healthcheck_script
+	write_healthcheck_units
+	systemctl daemon-reload
+	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
 	echo "PAT token: $PAT_TOKEN"
 	echo "Use header: Authorization: Bearer <PAT token>"
 	echo "API URL: http://127.0.0.1:21212"
 	echo "Health URL: http://127.0.0.1:21212/health"
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		echo "Service: launchd daemon com.aerol.sandboxd (auto-starts on boot)"
-		echo "Logs: /var/log/sandboxd/sandboxd.log"
-		echo "Stop: sudo launchctl unload /Library/LaunchDaemons/com.aerol.sandboxd.plist"
-	else
-		echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
-		echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
-	fi
+	echo "systemd restart policy: always (5 second backoff, 10 restarts per 5 minutes)"
+	echo "Health watchdog: sandboxd-healthcheck.timer probes /health every 30 seconds"
 	exit 0
 fi
 

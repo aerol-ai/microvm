@@ -64,12 +64,37 @@ func (ep sessionEndpoint) applyHeaders(h http.Header) {
 // single-node / self-owned path and must stay byte-for-byte identical to the
 // pre-cluster behaviour.
 func localSessionEndpoint(containerIP string, toolboxPort int, toolboxToken string) sessionEndpoint {
-	root := fmt.Sprintf("%s:%d/sessions", containerIP, toolboxPort)
+	return localSessionEndpointAt(fmt.Sprintf("%s:%d", containerIP, toolboxPort), toolboxToken)
+}
+
+// localSessionEndpointAt is localSessionEndpoint for an already-resolved
+// toolbox host:port (see Gateway.sessionToolboxAddr).
+func localSessionEndpointAt(toolboxAddr, toolboxToken string) sessionEndpoint {
+	root := toolboxAddr + "/sessions"
 	return sessionEndpoint{
 		baseURL: "http://" + root,
 		wsURL:   "ws://" + root,
 		auth:    bearer(toolboxToken),
 	}
+}
+
+// toolboxAddresser is the optional slice of *docker.Client that says where a
+// sandbox's toolboxd listens when it is not ContainerIP:toolboxPort
+// (SB_DOCKER_TOOLBOX_LOOPBACK publishes it on a per-start 127.0.0.1 port).
+type toolboxAddresser interface {
+	ToolboxAddress(ctx context.Context, sandbox *models.Sandbox) (string, error)
+}
+
+// sessionToolboxAddr resolves the toolbox host:port for the local session
+// path. Only Docker sandboxes ask the Docker client; containerd tasks and
+// test fakes keep ContainerIP:toolboxPort.
+func (g *Gateway) sessionToolboxAddr(ctx context.Context, sandbox *models.Sandbox) (string, error) {
+	if g.containerEngine != models.ContainerEngineContainerd {
+		if a, ok := g.dockerCli.(toolboxAddresser); ok {
+			return a.ToolboxAddress(ctx, sandbox)
+		}
+	}
+	return fmt.Sprintf("%s:%d", sandbox.ContainerIP, g.toolboxPort), nil
 }
 
 func bearer(token string) string {

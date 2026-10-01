@@ -359,7 +359,13 @@ func (g *Gateway) handleSession(ctx context.Context, sandboxID, mode, sessionNam
 		case "shell":
 			replyRequest(req, true)
 			if mode == "session" && g.toolboxPort > 0 && sandbox.ContainerIP != "" {
-				ep := localSessionEndpoint(sandbox.ContainerIP, g.toolboxPort, sandbox.ToolboxToken)
+				addr, err := g.sessionToolboxAddr(ctx, sandbox)
+				if err != nil {
+					g.writeStderr(channel, fmt.Sprintf("toolbox unavailable: %v\r\n", err))
+					_ = sendExitStatus(channel, 1)
+					return
+				}
+				ep := localSessionEndpointAt(addr, sandbox.ToolboxToken)
 				// Local session-attach does not forward mid-session resize
 				// (unchanged pre-cluster behaviour); pass nil.
 				exitCode := g.attachToSession(ctx, channel, ep, sessionName, state, nil)
