@@ -123,7 +123,10 @@ jobs:
             apt_pkgs: ""
             goarm: ""
 
-          # macOS — toolboxd only
+          # macOS — sandboxd (native CGO, for install.sh --local) + toolboxd.
+          # The in-sandbox agent install.sh mounts on macOS is the Linux
+          # toolboxd (containers run in Docker's Linux VM); toolboxd_darwin_*
+          # is still published for direct use.
           # - name: MacOS x86_64
           #   runner: macos-13
           #   goos: darwin
@@ -160,8 +163,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
-      - name: Build sandboxd (Linux only, CGO enabled)
-        if: matrix.goos == 'linux'
+      - name: Build sandboxd (Linux + macOS, CGO enabled)
+        if: matrix.goos == 'linux' || matrix.goos == 'darwin'
         shell: bash
         env:
           CGO_ENABLED: "1"
