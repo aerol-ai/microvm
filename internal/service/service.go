@@ -4171,10 +4171,28 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if sandbox.ContainerIP == "" {
 		return ToolboxEndpoint{}, errors.New("sandbox container IP is not available")
 	}
+	addr, err := s.toolboxAddress(ctx, sandbox)
+	if err != nil {
+		return ToolboxEndpoint{}, err
+	}
 	return ToolboxEndpoint{
-		URL:   fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort),
+		URL:   "http://" + addr,
 		Token: sandbox.ToolboxToken,
 	}, nil
+}
+
+// toolboxAddress is the host:port sandboxd dials for the sandbox's toolboxd:
+// the runtime's answer when it has one (Docker under
+// SB_DOCKER_TOOLBOX_LOOPBACK reads the live 127.0.0.1 binding — one inspect
+// per call, since the port changes on every start), else
+// ContainerIP:ToolboxPort.
+func (s *Service) toolboxAddress(ctx context.Context, sandbox *models.Sandbox) (string, error) {
+	if rt, err := s.runtimeForSandbox(sandbox); err == nil {
+		if a, ok := runtime.AsToolboxAddresser(rt); ok {
+			return a.ToolboxAddress(ctx, sandbox)
+		}
+	}
+	return fmt.Sprintf("%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort), nil
 }
 
 // WakeAwareToolboxTarget is the entry point every control-plane HTTP

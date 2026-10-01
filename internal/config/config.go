@@ -427,9 +427,17 @@ type Config struct {
 	// DockerNetnsPoolRefillInterval drives the refill/reap loop.
 	// SB_DOCKER_NETNS_POOL_REFILL_INTERVAL.
 	DockerNetnsPoolRefillInterval time.Duration
-	ReconcileInterval             time.Duration
-	NetstatsPollInterval          time.Duration
-	UploadMaxBytes                int64
+	// DockerToolboxLoopback publishes each Docker sandbox's toolbox port on
+	// 127.0.0.1 (a Docker-assigned host port, nothing else published) and has
+	// sandboxd reach toolboxd there instead of at ContainerIP:ToolboxPort.
+	// For hosts where sandboxd cannot dial container IPs: on macOS the
+	// engine runs in a Linux VM and Local Network privacy blocks a user
+	// process from its addresses, but not from loopback. Single-node only.
+	// Default off. SB_DOCKER_TOOLBOX_LOOPBACK.
+	DockerToolboxLoopback bool
+	ReconcileInterval     time.Duration
+	NetstatsPollInterval  time.Duration
+	UploadMaxBytes        int64
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1708,6 +1716,7 @@ func Load() (Config, error) {
 		DockerNetnsPoolDepth:          getEnvInt("SB_DOCKER_NETNS_POOL_DEPTH", 4),
 		DockerNetnsPoolPauseImage:     getEnv("SB_DOCKER_NETNS_POOL_PAUSE_IMAGE", "registry.k8s.io/pause:3.10"),
 		DockerNetnsPoolRefillInterval: getEnvDuration("SB_DOCKER_NETNS_POOL_REFILL_INTERVAL", 2*time.Second),
+		DockerToolboxLoopback:         getEnvBool("SB_DOCKER_TOOLBOX_LOOPBACK", false),
 		ReconcileInterval:             getEnvDuration("SB_RECONCILE_INTERVAL", 5*time.Minute),
 		NetstatsPollInterval:          getEnvDuration("SB_NETSTATS_POLL_INTERVAL", 10*time.Second),
 		UploadMaxBytes:                int64(getEnvInt("SB_UPLOAD_MAX_BYTES", 256*1024*1024)),
@@ -2049,6 +2058,9 @@ func Load() (Config, error) {
 	}
 	if cfg.DockerReadinessPollMax < cfg.DockerReadinessPollInitial {
 		return Config{}, errors.New("SB_DOCKER_READINESS_POLL_MAX must be >= SB_DOCKER_READINESS_POLL_INITIAL")
+	}
+	if err := validateDockerToolboxLoopback(cfg); err != nil {
+		return Config{}, err
 	}
 
 	if cfg.Domain == "" && cfg.PublicHost == "" {
@@ -2674,6 +2686,31 @@ func (c Config) CreateSandboxTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(c.CreateSandboxTimeoutSeconds) * time.Second
+}
+
+// validateDockerToolboxLoopback rejects the shapes a loopback-published
+// toolbox cannot serve: Docker cannot publish ports on a container that joins
+// another's netns (the warm pool's parked containers, the pause-netns pool)
+// or on host networking, and cluster peers would have to reach a port bound
+// to this node's 127.0.0.1.
+func validateDockerToolboxLoopback(cfg Config) error {
+	if !cfg.DockerToolboxLoopback {
+		return nil
+	}
+	for _, conflict := range []struct {
+		on   bool
+		knob string
+	}{
+		{cfg.EnableCluster, "SB_ENABLE_CLUSTER"},
+		{cfg.DockerPoolEnabled, "SB_DOCKER_POOL_ENABLED"},
+		{cfg.DockerNetnsPoolEnabled, "SB_DOCKER_NETNS_POOL_ENABLED"},
+		{cfg.DockerNetwork == "host", "SB_DOCKER_NETWORK=host"},
+	} {
+		if conflict.on {
+			return fmt.Errorf("SB_DOCKER_TOOLBOX_LOOPBACK cannot be combined with %s", conflict.knob)
+		}
+	}
+	return nil
 }
 
 // DockerReadySocketEffective is true when push-based readiness is active.

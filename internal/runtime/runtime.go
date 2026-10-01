@@ -151,3 +151,19 @@ func AsNetworkBlockReporter(cr ContainerRuntime) (NetworkBlockReporter, bool) {
 	r, ok := cr.(NetworkBlockReporter)
 	return r, ok
 }
+
+// ToolboxAddresser reports the host:port at which sandboxd reaches a
+// sandbox's toolboxd when that is not ContainerIP:ToolboxPort — Docker with
+// SB_DOCKER_TOOLBOX_LOOPBACK publishes it on a 127.0.0.1 port that changes
+// on every start. Optional so drivers whose toolbox sits at the guest IP
+// (Firecracker, containerd) stay untouched.
+type ToolboxAddresser interface {
+	ToolboxAddress(ctx context.Context, sandbox *models.Sandbox) (string, error)
+}
+
+// AsToolboxAddresser returns the addressing surface when rt implements it.
+// Callers fall back to ContainerIP:ToolboxPort when this returns false.
+func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
+	a, ok := rt.(ToolboxAddresser)
+	return a, ok
+}
