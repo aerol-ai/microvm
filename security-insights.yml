@@ -1,0 +1,152 @@
+header:
+  schema-version: "2.2.0"
+  last-updated: "2026-10-03"
+  last-reviewed: "2026-10-03"
+  url: https://raw.githubusercontent.com/aerol-ai/microvm/main/security-insights.yml
+  comment: |
+    Single-repository Security Insights file for AerolVM.
+    Vulnerability statements that do not affect a release are recorded in security/vex/openvex.json.
+
+project:
+  name: AerolVM
+  homepage: https://microvm.aerol.ai
+  administrators:
+    - name: Suman Saurabh
+      affiliation: Aerol
+      email: security@aerol.ai
+      social: https://github.com/sumansaurabh
+      primary: true
+    - name: akanshasinha19
+      affiliation: Aerol
+      social: https://github.com/akanshasinha19
+      primary: false
+  documentation:
+    quickstart-guide: https://microvm.aerol.ai/getting-started
+    detailed-guide: https://microvm.aerol.ai
+    release-process: https://github.com/aerol-ai/microvm/blob/main/.github/workflows/release.yml
+    support-policy: https://github.com/aerol-ai/microvm/blob/main/SUPPORT.md
+    signature-verification: https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md
+  repositories:
+    - name: microvm
+      url: https://github.com/aerol-ai/microvm
+      comment: |
+        The AerolVM daemon, toolboxd, SDKs, and docs. This is the only repository in the project.
+  vulnerability-reporting:
+    reports-accepted: true
+    bug-bounty-available: false
+    contact:
+      name: AerolVM security
+      email: security@aerol.ai
+      primary: true
+    policy: https://github.com/aerol-ai/microvm/blob/main/SECURITY.md
+    comment: |
+      Private reports go to a GitHub Security Advisory or security@aerol.ai.
+      Response targets are in SECURITY.md.
+
+repository:
+  url: https://github.com/aerol-ai/microvm
+  status: active
+  accepts-change-request: true
+  accepts-automated-change-request: true
+  bug-fixes-only: false
+  no-third-party-packages: false
+  core-team:
+    - name: Suman Saurabh
+      affiliation: Aerol
+      email: security@aerol.ai
+      social: https://github.com/sumansaurabh
+      primary: true
+    - name: akanshasinha19
+      affiliation: Aerol
+      social: https://github.com/akanshasinha19
+      primary: false
+  license:
+    url: https://github.com/aerol-ai/microvm/blob/main/LICENSE
+    expression: MIT
+  documentation:
+    contributing-guide: https://github.com/aerol-ai/microvm/blob/main/CONTRIBUTING.md
+    review-policy: https://github.com/aerol-ai/microvm/blob/main/CONTRIBUTING.md
+    security-policy: https://github.com/aerol-ai/microvm/blob/main/SECURITY.md
+    governance: https://github.com/aerol-ai/microvm/blob/main/GOVERNANCE.md
+    dependency-management-policy: https://github.com/aerol-ai/microvm/blob/main/SUPPLY-CHAIN.md
+  release:
+    automated-pipeline: true
+    changelog: https://github.com/aerol-ai/microvm/blob/main/CHANGELOG.md
+    distribution-points:
+      - uri: https://github.com/aerol-ai/microvm/releases
+        comment: GitHub Releases. Each asset URL contains the release tag.
+      - uri: pkg:golang/github.com/aerol-ai/microvm
+        comment: Go module.
+    attestations:
+      - name: CycloneDX SBOM
+        predicate-uri: https://cyclonedx.org/specification/overview/
+        location: https://github.com/aerol-ai/microvm/releases/download/{version}/sbom.cdx.json
+        comment: Replace {version} with the release tag, for example v0.6.3.
+      - name: SLSA build provenance
+        predicate-uri: https://slsa.dev/provenance/v1
+        location: https://github.com/aerol-ai/microvm/releases/download/{version}/{version}.intoto.jsonl
+        comment: Replace {version} with the release tag.
+      - name: OpenVEX
+        predicate-uri: https://openvex.dev/ns/v0.2.0
+        location: https://github.com/aerol-ai/microvm/blob/main/security/vex/openvex.json
+        comment: Statements for dependency vulnerabilities that do not affect the project.
+  security:
+    assessments:
+      self:
+        name: AerolVM threat model and attack surface analysis
+        date: "2026-10-03"
+        evidence: https://github.com/aerol-ai/microvm/blob/main/THREAT-MODEL.md
+        comment: |
+          Threat model and attack surface analysis of the daemon, the runtimes,
+          and the release path, reviewed with the 0.6.3 security assessment.
+    tools:
+      - name: actions/dependency-review-action
+        type: SCA
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: true
+        results: {}
+        comment: |
+          Pull requests are blocked when dependency review reports a high or critical
+          known vulnerability or a malicious package.
+      - name: govulncheck
+        type: SCA
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: true
+        results: {}
+      - name: gosec
+        type: SAST
+        rulesets:
+          - default
+        integration:
+          adhoc: false
+          ci: true
+          release: false
+        results: {}
+        comment: |
+          High-severity gosec findings block merge unless a not-exploitable exception is declared.
+      - name: CodeQL
+        type: SAST
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results: {}
+      - name: GitHub secret scanning
+        type: secret
+        rulesets:
+          - default
+        integration:
+          adhoc: true
+          ci: true
+          release: false
+        results: {}

@@ -1,0 +1,9 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/aerol-ai/microvm/blob/main/security/vex/openvex.json",
+  "author": "AerolVM maintainers",
+  "role": "Project maintainers",
+  "timestamp": "2026-10-03T00:00:00Z",
+  "version": 1,
+  "statements": []
+}
