@@ -294,6 +294,18 @@ A released version's dependencies are the ones recorded in the committed manifes
 
 [Dependabot](.github/dependabot.yml) opens a weekly pull request for Go modules, GitHub Actions, npm (the docs site and the TypeScript SDK), pip, Maven, and Cargo. Dependabot security updates are enabled on the repository. The pinned npm CLI under `.github/npm-cli` is outside that schedule; it changes only when its lockfile is updated in a pull request. The Go CI job also runs `govulncheck` against the module graph.
 
+## Access to sensitive resources
+
+These GitHub accounts can reach the repository's sensitive resources. Registry publish tokens (npm, PyPI, Maven, crates.io) are GitHub Actions secrets. They are not in the git tree. The release workflow and the SDK publish workflow are what read them.
+
+| GitHub account | Access |
+| :--- | :--- |
+| [`sumansaurabh`](https://github.com/sumansaurabh) | Organization owner and repository admin. Can change branch rules, Actions secrets, security settings, and publish a release. |
+| [`akanshasinha19`](https://github.com/akanshasinha19) | Write. Can push branches, open pull requests, publish a GitHub release, and dispatch the SDK publish workflow. |
+| [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Write. Same as above. |
+
+Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list.
+
 ## Contributing
 
 AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
