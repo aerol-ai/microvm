@@ -260,9 +260,17 @@ jobs:
           sha256sum * > checksums.txt
 
       - name: Attest release artifacts
+        id: attest
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: dist/*
+
+      # Publish the SLSA provenance bundle AS a release asset (in addition to the
+      # attestation stored in GitHub's attestation API) so consumers — and the
+      # OpenSSF Scorecard Signed-Releases check — can verify the artifacts from
+      # the release page. Copied in after attestation so it is not its own subject.
+      - name: Attach provenance to release assets
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "dist/${VERSION}.intoto.jsonl"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
