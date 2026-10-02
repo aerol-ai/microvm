@@ -26,6 +26,7 @@
   <a href="https://github.com/aerol-ai/microvm/actions/workflows/release.yml"><img src="https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release" alt="Release"></a>
   <a href="https://github.com/aerol-ai/microvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/aerol-ai/microvm"><img src="https://api.securityscorecards.dev/projects/github.com/aerol-ai/microvm/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://www.bestpractices.dev/projects/15170"><img src="https://www.bestpractices.dev/projects/15170/baseline" alt="OpenSSF Baseline"></a>
 </p>
 
 &nbsp;
@@ -277,6 +278,8 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Snapshots](https://microvm.aerol.ai/snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
 | [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
 | [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
+| [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
+| [Security assessment](SECURITY-ASSESSMENT.md) | The most likely and most severe problems for a released node, and where the 0.6.3 review left each one. |
 
 ## Dependencies
 
