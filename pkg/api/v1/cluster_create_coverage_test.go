@@ -241,33 +241,46 @@ func TestCreateSandboxOnSelectedNode_PromoteSuccess(t *testing.T) {
 	}
 }
 
-// Overlap wall clock should be ~max(create, promote), not sum — create is
-// delayed past promote so handler duration stays near createDelay, not
-// createDelay+promote.
+// Seal overlaps the local create; promote stays sequential and is instant in
+// this stub. Wall clock should grow by about createDelay, not by another copy
+// of the handler. A same-test baseline subtracts sqlite, keygen, and scheduler
+// delay — a saturated `go test -race ./...` run has measured ~180ms here with
+// the overlap intact, which blows a fixed "50ms + 80ms" budget.
 func TestCreateSandboxOnSelectedNode_OverlapWallClockNearMax(t *testing.T) {
-	const createDelay = 50 * time.Millisecond
-	rt := &apiRecordingRuntime{createDelay: createDelay}
-	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
-	h, _ := newClusterCreateHarness(t, rt, stub)
-
-	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
-	rr := httptest.NewRecorder()
-	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
-	start := time.Now()
-	h.createSandboxOnSelectedNode(rr, httpReq, req, "sb-overlap-wall")
-	elapsed := time.Since(start)
-
-	if rr.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
-	}
-	// Sequential would be ≥ createDelay + promote; overlapped should finish
-	// shortly after createDelay. Allow generous slack for CI noise.
-	if elapsed > createDelay+80*time.Millisecond {
-		t.Fatalf("elapsed = %v, want near createDelay=%v (overlap), not sum", elapsed, createDelay)
+	const createDelay = 200 * time.Millisecond
+	baseline := measureSelectedNodeCreate(t, 0, "sb-overlap-base")
+	elapsed := measureSelectedNodeCreate(t, createDelay, "sb-overlap-wall")
+	extra := elapsed - baseline
+	// Slack covers the two runs seeing different CPU contention. It stays
+	// below createDelay so paying the stub sleep twice still fails.
+	const slack = 150 * time.Millisecond
+	if extra > createDelay+slack {
+		t.Fatalf("extra = %v (elapsed=%v baseline=%v), want ≤ %v; create delay should be paid once while seal overlaps",
+			extra, elapsed, baseline, createDelay+slack)
 	}
 	if elapsed < createDelay {
 		t.Fatalf("elapsed = %v, want ≥ createDelay=%v", elapsed, createDelay)
 	}
+}
+
+func measureSelectedNodeCreate(t *testing.T, createDelay time.Duration, id string) time.Duration {
+	t.Helper()
+	rt := &apiRecordingRuntime{createDelay: createDelay}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	h, _ := newClusterCreateHarness(t, rt, stub)
+
+	rr := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+	start := time.Now()
+	h.createSandboxOnSelectedNode(rr, httpReq, models.CreateSandboxRequest{Image: "alpine:3.20"}, id)
+	elapsed := time.Since(start)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Header().Get("Server-Timing"), "cluster_seal;dur=") {
+		t.Fatalf("Server-Timing = %q, want cluster_seal stage", rr.Header().Get("Server-Timing"))
+	}
+	return elapsed
 }
 
 func TestCreateSandboxOnSelectedNode_CreateFailureCancelsReservation(t *testing.T) {
