@@ -317,7 +317,7 @@ Merges to the default branch still require a reviewed pull request. [Code owners
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
+AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change.
 
 ```bash
 make fmt      # format Go code
