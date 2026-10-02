@@ -1,0 +1,6 @@
+# CI and publish install set. Hash-pinned output is requirements-ci.txt.
+websocket-client>=1.8.0,<2
+build>=1.2
+twine>=6
+setuptools>=61
+wheel

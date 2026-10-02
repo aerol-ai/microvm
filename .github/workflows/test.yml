@@ -222,10 +222,16 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: sdk/python/pyproject.toml
+          cache-dependency-path: |
+            sdk/python/pyproject.toml
+            sdk/python/requirements-ci.txt
 
       - name: Install Python SDK dependencies
-        run: python -m pip install .
+        run: |
+          # Hash-pin third-party packages. Install this repo with --no-deps so
+          # pip does not fetch an unpinned dependency tree for the local package.
+          python -m pip install --require-hashes -r requirements-ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
 
       - name: Run Python SDK tests
         run: python -m unittest discover -s tests -v
