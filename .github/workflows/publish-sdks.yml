@@ -15,8 +15,24 @@ env:
   SDK_VERSION: ${{ github.event.inputs.sdk_version }}
 
 jobs:
+  validate:
+    name: Validate SDK version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject an SDK version that is not a version
+        env:
+          SDK_VERSION: ${{ github.event.inputs.sdk_version }}
+        run: |
+          # workflow_dispatch input is metadata from outside this file.
+          # Refuse anything that is not a version before a publish script uses it.
+          if [[ ! "$SDK_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::sdk_version must look like 0.1.0 or v0.1.0"
+            exit 1
+          fi
+
   java:
     name: Publish Java SDK to GitHub Packages
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -107,6 +123,7 @@ jobs:
 
   npm:
     name: Publish TypeScript SDK to npm
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -241,6 +258,7 @@ jobs:
 
   pypi:
     name: Publish Python SDK to PyPI
+    needs: validate
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -302,6 +320,7 @@ jobs:
 
   crates:
     name: Publish Rust SDK to crates.io
+    needs: validate
     runs-on: ubuntu-latest
     defaults:
       run:
