@@ -1,0 +1,8 @@
+{
+  "name": "npm-cli-pin",
+  "private": true,
+  "description": "Hash-pinned npm CLI for sdk publish. Node 22 ships npm older than 11.5.1, the first release that can do GitHub OIDC trusted publishing.",
+  "dependencies": {
+    "npm": "11.21.0"
+  }
+}
