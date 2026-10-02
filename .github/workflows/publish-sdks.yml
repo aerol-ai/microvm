@@ -108,6 +108,9 @@ jobs:
   npm:
     name: Publish TypeScript SDK to npm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: sdk/typescript
@@ -205,9 +208,15 @@ jobs:
 
       - name: Publish package
         if: steps.npm_publish_state.outputs.already_published != 'true'
-        run: npm publish --access public
+        run: |
+          # Node 22's bundled npm ignores Actions OIDC and falls through to
+          # NPM_TOKEN. That token cannot bypass 2FA, so the registry answers
+          # EOTP and the job cannot enter an authenticator code.
+          npm install -g npm@11
+          npm config delete "//registry.npmjs.org/:_authToken" --location=user || true
+          npm publish --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ""
 
   pypi:
     name: Publish Python SDK to PyPI
