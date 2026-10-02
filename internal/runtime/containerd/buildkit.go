@@ -154,8 +154,19 @@ func (w logLineWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// Bounds on an extracted build context, capping host disk and inode use from a
+// crafted context tar (many entries, or entries that extract to far more than
+// the tar's own size). Generous ceilings — real build contexts are far smaller;
+// these only stop abuse. Vars, not consts, so tests can lower them.
+var (
+	maxContextEntries          = 100_000
+	maxContextTotalBytes int64 = 2 << 30 // 2 GiB extracted
+)
+
 func extractTar(data []byte, dir string) error {
 	tr := tar.NewReader(bytes.NewReader(data))
+	entries := 0
+	var total int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -163,6 +174,10 @@ func extractTar(data []byte, dir string) error {
 		}
 		if err != nil {
 			return err
+		}
+		entries++
+		if entries > maxContextEntries {
+			return fmt.Errorf("build context has too many entries (max %d)", maxContextEntries)
 		}
 		// Reject path traversal: an entry whose joined path lands outside dir
 		// (e.g. "../escape") must not be written. filepath.Join cleans the
@@ -186,9 +201,19 @@ func extractTar(data []byte, dir string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(f, tr); err != nil { //nolint:gosec // bounded by build context size
+			// Bound the running total; CopyN of remaining+1 lets us detect an
+			// entry that would push the extraction past the ceiling (io.CopyN,
+			// not io.Copy, so a lying/oversized entry cannot write unbounded).
+			remaining := maxContextTotalBytes - total
+			n, cErr := io.CopyN(f, tr, remaining+1)
+			total += n
+			if cErr != nil && cErr != io.EOF {
 				_ = f.Close()
-				return err
+				return cErr
+			}
+			if n > remaining {
+				_ = f.Close()
+				return fmt.Errorf("build context exceeds %d bytes", maxContextTotalBytes)
 			}
 			if err := f.Close(); err != nil {
 				return err
