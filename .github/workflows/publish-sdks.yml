@@ -216,7 +216,9 @@ jobs:
           # Two things otherwise keep the CLI on that token path:
           # - Node 22 ships npm older than 11.5.1, the first release that
           #   exchanges ACTIONS_ID_TOKEN_REQUEST_*. Install 11.21.0 from the
-          #   lockfile in .github/npm-cli. `npm ci` checks those integrity hashes.
+          #   lockfile in .github/npm-cli. `npm ci` checks those integrity hashes
+          #   and its postinstall replaces the vulnerable bundled copies of
+          #   brace-expansion, ip-address, and undici.
           # - setup-node's registry-url writes
           #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
           #   into $NPM_CONFIG_USERCONFIG. Any _authToken entry, including
