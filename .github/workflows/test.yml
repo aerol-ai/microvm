@@ -14,7 +14,7 @@ permissions:
   contents: read
 
 jobs:
-  changes:
+  paths:
     runs-on: ubuntu-latest
     outputs:
       docs: ${{ steps.filter.outputs.docs }}
@@ -30,8 +30,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The ruleset requires this job. A missing trailer fails the job, so a
-      # commit cannot reach the default branch without the assertion.
+      # A missing trailer fails this job. The required `changes` job below
+      # depends on it, so a commit cannot reach the default branch without
+      # the assertion.
       - name: Require DCO sign-off on every commit
         if: github.event_name != 'push'
         env:
@@ -83,8 +84,8 @@ jobs:
               - 'sdk/rust/**'
 
   go-tests:
-    needs: changes
-    if: needs.changes.outputs.go_main == 'true'
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -122,8 +123,8 @@ jobs:
           fail_ci_if_error: false
 
   go-race:
-    needs: changes
-    if: needs.changes.outputs.go_main == 'true'
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -145,8 +146,8 @@ jobs:
         run: go test -race -count=1 -timeout 25m ./cmd/... ./internal/... ./pkg/...
 
   go-security:
-    needs: changes
-    if: needs.changes.outputs.go_main == 'true'
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -170,8 +171,8 @@ jobs:
     # behind the `integration` build tag AND the presence of AOCR creds — the
     # test self-skips when AEROL_WASM_IT_* are unset, so forks and credential-less
     # PRs stay green. Runs only when daemon Go code changed.
-    needs: changes
-    if: needs.changes.outputs.go_main == 'true'
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -191,8 +192,8 @@ jobs:
         run: go test -count=1 -tags integration -run TestIntegrationModulePushPullRoundTrip ./pkg/wasmmod/...
 
   go-sdk-tests:
-    needs: changes
-    if: needs.changes.outputs.go_sdk == 'true'
+    needs: paths
+    if: needs.paths.outputs.go_sdk == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -208,8 +209,8 @@ jobs:
         run: go test -count=1 ./sdk/go/...
 
   java-sdk-tests:
-    needs: changes
-    if: needs.changes.outputs.java_sdk == 'true'
+    needs: paths
+    if: needs.paths.outputs.java_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -230,8 +231,8 @@ jobs:
         run: mvn -B -ntp test
 
   python-sdk-tests:
-    needs: changes
-    if: needs.changes.outputs.python_sdk == 'true'
+    needs: paths
+    if: needs.paths.outputs.python_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -260,8 +261,8 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   typescript-sdk-tests:
-    needs: changes
-    if: needs.changes.outputs.typescript_sdk == 'true'
+    needs: paths
+    if: needs.paths.outputs.typescript_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -287,8 +288,8 @@ jobs:
         run: npm test
 
   rust-sdk-tests:
-    needs: changes
-    if: needs.changes.outputs.rust_sdk == 'true'
+    needs: paths
+    if: needs.paths.outputs.rust_sdk == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -309,3 +310,85 @@ jobs:
 
       - name: Run Rust SDK tests
         run: cargo test --locked
+
+  # Runs on every pull request, including docs-only changes, so a commit is
+  # never accepted without at least one test suite having run.
+  baseline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run the Go SDK test suite
+        run: go test -count=1 ./sdk/go/...
+
+  # Job id stays `changes` because ruleset 16186085 requires that check.
+  # It runs even when a suite fails (if: always); a skipped required check
+  # would otherwise let the pull request merge.
+  changes:
+    needs:
+      - paths
+      - baseline-tests
+      - go-tests
+      - go-race
+      - go-security
+      - wasm-integration
+      - go-sdk-tests
+      - java-sdk-tests
+      - python-sdk-tests
+      - typescript-sdk-tests
+      - rust-sdk-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every applicable test suite passed
+        env:
+          PATHS: ${{ needs.paths.result }}
+          BASELINE: ${{ needs.baseline-tests.result }}
+          GO_MAIN: ${{ needs.paths.outputs.go_main }}
+          GO_SDK: ${{ needs.paths.outputs.go_sdk }}
+          JAVA_SDK: ${{ needs.paths.outputs.java_sdk }}
+          PYTHON_SDK: ${{ needs.paths.outputs.python_sdk }}
+          TYPESCRIPT_SDK: ${{ needs.paths.outputs.typescript_sdk }}
+          RUST_SDK: ${{ needs.paths.outputs.rust_sdk }}
+          GO_TESTS: ${{ needs.go-tests.result }}
+          GO_RACE: ${{ needs.go-race.result }}
+          GO_SECURITY: ${{ needs.go-security.result }}
+          WASM_INTEGRATION: ${{ needs.wasm-integration.result }}
+          GO_SDK_TESTS: ${{ needs.go-sdk-tests.result }}
+          JAVA_SDK_TESTS: ${{ needs.java-sdk-tests.result }}
+          PYTHON_SDK_TESTS: ${{ needs.python-sdk-tests.result }}
+          TYPESCRIPT_SDK_TESTS: ${{ needs.typescript-sdk-tests.result }}
+          RUST_SDK_TESTS: ${{ needs.rust-sdk-tests.result }}
+        run: |
+          fail=0
+          require_success() {
+            if [[ "$2" != "success" ]]; then
+              echo "::error::$1 is $2"
+              fail=1
+            fi
+          }
+          require_if_selected() {
+            if [[ "$1" == "true" && "$3" != "success" ]]; then
+              echo "::error::$2 is $3"
+              fail=1
+            fi
+          }
+          require_success paths "$PATHS"
+          require_success baseline-tests "$BASELINE"
+          require_if_selected "$GO_MAIN" go-tests "$GO_TESTS"
+          require_if_selected "$GO_MAIN" go-race "$GO_RACE"
+          require_if_selected "$GO_MAIN" go-security "$GO_SECURITY"
+          require_if_selected "$GO_MAIN" wasm-integration "$WASM_INTEGRATION"
+          require_if_selected "$GO_SDK" go-sdk-tests "$GO_SDK_TESTS"
+          require_if_selected "$JAVA_SDK" java-sdk-tests "$JAVA_SDK_TESTS"
+          require_if_selected "$PYTHON_SDK" python-sdk-tests "$PYTHON_SDK_TESTS"
+          require_if_selected "$TYPESCRIPT_SDK" typescript-sdk-tests "$TYPESCRIPT_SDK_TESTS"
+          require_if_selected "$RUST_SDK" rust-sdk-tests "$RUST_SDK_TESTS"
+          exit "$fail"
