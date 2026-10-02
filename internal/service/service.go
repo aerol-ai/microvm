@@ -1515,6 +1515,16 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	// A caller-supplied id (CreateSandboxWithID / the X-Cluster-Create-ID
+	// forward header) becomes a host path component in the mount manager and the
+	// per-sandbox state dirs, so it must be delimiter-safe before any runtime
+	// dispatch. An empty id is generated downstream and is always safe. This is
+	// a pure in-memory check: no effect on boot latency or the generated-id path.
+	if idOverride != "" {
+		if err := models.ValidateSandboxID(idOverride); err != nil {
+			return nil, err
+		}
+	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
 	if t := s.cfg.CreateSandboxTimeout(); t > 0 {
