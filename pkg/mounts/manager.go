@@ -108,6 +108,13 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 	if len(mounts) == 0 {
 		return nil, nil
 	}
+	// sandboxID is a path component for every host dir and bind below. Validate
+	// it here as well as at the create entry: the mount manager must be
+	// self-protecting so a '..' id can never escape rootDir (host-dir creation,
+	// bind source, or the rollback RemoveAll).
+	if err := models.ValidateSandboxID(sandboxID); err != nil {
+		return nil, fmt.Errorf("mount: %w", err)
+	}
 	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}

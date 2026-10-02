@@ -1346,6 +1346,34 @@ func ValidTemplateID(templateID string) bool {
 	return templateIDPattern.MatchString(templateID)
 }
 
+// sandboxIDPattern is the delimiter-safe grammar for a sandbox ID. It matches
+// what generateSandboxID produces ("sb-" + hex) and the warm-slot / facade IDs
+// (fc-*, wasm-*, iso-*), and it is the grammar the firecracker and containerd
+// drivers already enforce. Disallowing '.', '/', and every other separator is
+// what makes an ID safe to use as a filesystem path component, a URL segment,
+// and a SQL key: '..' and './' cannot be expressed.
+var sandboxIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// ValidateSandboxID rejects any ID that is empty, over 128 bytes, or carries a
+// character outside [A-Za-z0-9_-]. It is the single guard every path that uses
+// a sandbox ID as a host path component relies on (the mount manager, per-
+// sandbox state dirs). A sandbox ID can originate from a caller-influenced
+// source — the X-Cluster-Create-ID forward header — so it must be validated at
+// the create entry and at the point of use, never trusted because "IDs are
+// generated".
+func ValidateSandboxID(id string) error {
+	if id == "" {
+		return errors.New("sandbox ID is required")
+	}
+	if len(id) > 128 {
+		return fmt.Errorf("sandbox ID exceeds 128 chars (%d)", len(id))
+	}
+	if !sandboxIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid sandbox ID %q: only letters, digits, '-' and '_' are allowed", id)
+	}
+	return nil
+}
+
 // EncodeNodeAffinity returns the URL/tag-safe encoding shared by node-bound
 // artifacts. Invalid node IDs are rejected at this boundary as well as config.
 func EncodeNodeAffinity(nodeID string) (string, bool) {

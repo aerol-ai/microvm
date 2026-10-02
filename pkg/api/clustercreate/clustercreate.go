@@ -97,6 +97,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			writeError(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
 			return Decision{}, false
 		}
+		// The forward header is honored on the same handler the public listener
+		// serves (daemon mounts it on both), so reject a non-delimiter-safe id
+		// here rather than let it reach the mount manager as a host path.
+		if err := models.ValidateSandboxID(sandboxID); err != nil {
+			writeError(w, http.StatusBadRequest, "cluster: "+err.Error())
+			return Decision{}, false
+		}
 		return Decision{ReservationID: sandboxID}, true
 	}
 
