@@ -278,6 +278,22 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
 | [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
 
+## Dependencies
+
+A released version's dependencies are the ones recorded in the committed manifests and lockfiles. A new dependency is added only in a reviewed pull request that names the package, the version, and why it is needed. Builds obtain those dependencies with the standard tool for that language, from the lockfile, so a release does not resolve an unpinned range.
+
+| Component | Recorded in | Obtained with |
+| :--- | :--- | :--- |
+| Go daemon and Go SDK | `go.mod`, `go.sum` | Go modules (`go build`, `go test`) |
+| TypeScript SDK | `sdk/typescript/package-lock.json` | `npm ci` |
+| Docs site | `docs/package-lock.json` | `npm ci` |
+| Release npm CLI | `.github/npm-cli/package-lock.json` | `npm ci` |
+| Python SDK | `sdk/python/pyproject.toml`, `sdk/python/requirements-ci.txt` | `pip install --require-hashes` |
+| Java SDK | `sdk/java/pom.xml` | Maven (`mvn`) |
+| Rust SDK | `sdk/rust/Cargo.lock` | `cargo test --locked` / `cargo publish` |
+
+[Dependabot](.github/dependabot.yml) opens a weekly pull request for Go modules, GitHub Actions, npm (the docs site and the TypeScript SDK), pip, Maven, and Cargo. Dependabot security updates are enabled on the repository. The pinned npm CLI under `.github/npm-cli` is outside that schedule; it changes only when its lockfile is updated in a pull request. The Go CI job also runs `govulncheck` against the module graph.
+
 ## Contributing
 
 AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
