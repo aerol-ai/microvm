@@ -198,8 +198,15 @@ func TestSSHFSBuild(t *testing.T) {
 	if !contains(plan.Argv, "sshfs") || !contains(plan.Argv, "/mnt/ssh") {
 		t.Fatalf("argv missing sshfs pieces: %v", plan.Argv)
 	}
-	if !strings.Contains(plan.Argv[2], "IdentityFile=/creds/sb-1-1.id") || !strings.Contains(plan.Argv[2], "ro") {
-		t.Fatalf("sshfs opts missing identity or ro: %q", plan.Argv[2])
+	// sshfs 3.x rejects "-o foreground"; foreground mode must be the -f flag.
+	if plan.Argv[1] != "-f" || plan.Argv[2] != "-o" {
+		t.Fatalf("sshfs argv must start [sshfs -f -o ...]: %v", plan.Argv)
+	}
+	if !strings.Contains(plan.Argv[3], "IdentityFile=/creds/sb-1-1.id") || !strings.Contains(plan.Argv[3], "ro") {
+		t.Fatalf("sshfs opts missing identity or ro: %q", plan.Argv[3])
+	}
+	if strings.Contains(plan.Argv[3], "foreground") {
+		t.Fatalf("sshfs -o list must not carry foreground (unknown to sshfs 3.x): %q", plan.Argv[3])
 	}
 	assertPositionalTail(t, plan.Argv, "user@example.com:/home/user", "/mnt/ssh")
 
