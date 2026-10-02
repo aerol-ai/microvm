@@ -17,7 +17,8 @@
   <a href="https://microvm.aerol.ai">Documentation</a> ·
   <a href="https://microvm.aerol.ai/getting-started">Quick Start</a> ·
   <a href="https://github.com/aerol-ai/microvm/issues/new?labels=bug&template=bug_report.md">Report Bug</a> ·
-  <a href="https://github.com/aerol-ai/microvm/issues/new?labels=enhancement&template=feature_request.md">Request Feature</a>
+  <a href="https://github.com/aerol-ai/microvm/issues/new?labels=enhancement&template=feature_request.md">Request Feature</a> ·
+  <a href="https://github.com/sponsors/aerol-ai">Sponsor</a>
 </p>
 
 <p align="center">
