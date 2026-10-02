@@ -157,6 +157,7 @@ class ExecStreamHandle:
             try:
                 self._ws.close()
             except Exception:
+                # The peer may already have closed the socket.
                 pass
 
     def _handle_text_frame(self, payload: str) -> None:
@@ -255,6 +256,7 @@ class SessionAttachHandle:
             try:
                 self._ws.close()
             except Exception:
+                # The peer may already have closed the socket.
                 pass
 
     def _handle_text_frame(self, payload: str) -> None:
@@ -1103,6 +1105,10 @@ def _to_websocket_url(base_url: str, path: str) -> str:
 
 def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
+        # Callers pass string field names. Skip anything else so a dict
+        # never reaches the subscript, which would raise TypeError.
+        if not isinstance(key, str):
+            continue
         if key in mapping and mapping[key] is not None:
             return mapping[key]
     return None

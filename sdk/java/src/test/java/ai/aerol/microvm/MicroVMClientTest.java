@@ -1638,8 +1638,11 @@ class MicroVMClientTest {
     }
 
     private static Map<String, Object> mapOf(Object... entries) {
+        if ((entries.length & 1) != 0) {
+            throw new IllegalArgumentException("mapOf requires key/value pairs");
+        }
         Map<String, Object> map = new HashMap<>();
-        for (int i = 0; i < entries.length; i += 2) {
+        for (int i = 0; i + 1 < entries.length; i += 2) {
             map.put((String) entries[i], entries[i + 1]);
         }
         return map;

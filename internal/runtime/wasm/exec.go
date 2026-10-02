@@ -27,13 +27,9 @@ func (d *Driver) execSandbox(ctx context.Context, sandboxID string, req models.E
 	if inst == nil {
 		return models.ExecResult{}, fmt.Errorf("wasm sandbox %q not found", sandboxID)
 	}
-
-	timeout := time.Duration(req.TimeoutSeconds) * time.Second
-	if timeout <= 0 {
-		timeout = 5 * time.Minute
+	if err := ctx.Err(); err != nil {
+		return models.ExecResult{}, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	args := wasmExecArgs(req.Command, inst.baseArgs)
 	env := mergeEnv(inst.baseEnv, req.Env)

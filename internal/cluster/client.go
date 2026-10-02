@@ -1442,7 +1442,6 @@ func (c *Cluster) applyEncodedLocalResult(ctx context.Context, payload []byte) (
 	f := c.raft.raft.Apply(payload, timeout)
 	if applyErr := f.Error(); applyErr != nil {
 		if errors.Is(applyErr, raft.ErrNotLeader) || errors.Is(applyErr, raft.ErrLeadershipLost) {
-			err = ErrNotLeader
 			return nil, ErrNotLeader
 		}
 		err = fmt.Errorf("cluster: raft apply: %w", applyErr)
