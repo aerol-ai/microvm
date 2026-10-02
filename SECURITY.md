@@ -14,6 +14,8 @@ receive backports — upgrade to the latest release.
 | Older `0.6.x`    | upgrade to latest  |
 | `< 0.6`          | :x:                |
 
+Which releases still receive security fixes, and when a line stops, is stated in [SUPPORT.md](SUPPORT.md).
+
 ## Reporting a vulnerability
 
 Please report privately — do **not** open a public issue, pull request, or
@@ -70,6 +72,10 @@ Out of scope:
 - Findings that require an already-compromised operator credential (the PAT) —
   in the open-source build the PAT holder is trusted as a host operator.
 - Reports from automated scanners with no demonstrated impact.
+
+## Secrets and credentials
+
+Operator tokens, registry credentials, and CI secrets are stored in GitHub Actions secrets or in a root-owned file on the host. They are not committed to the repository. Access is limited to repository administrators and to the workflow job that needs that credential. Rotation is required after a suspected exposure and when a person who could read the credential leaves the project. GitHub secret scanning and push protection reject a push that contains a credential.
 
 ## Safe harbor
 
