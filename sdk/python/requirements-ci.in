@@ -1,6 +1,11 @@
 # CI and publish install set. Hash-pinned output is requirements-ci.txt.
+# secretstorage, jeepney, and cryptography are keyring's Linux dependencies.
+# They are listed directly so the hash file includes them when compiled off Linux.
 websocket-client>=1.8.0,<2
 build>=1.2
 twine>=6
 setuptools>=61
 wheel
+secretstorage>=3.2
+jeepney>=0.6
+cryptography>=2.0
