@@ -5,6 +5,10 @@ on:
     branches:
       - main
   pull_request:
+  # The merge queue re-runs the required `changes` check on a temporary
+  # merge commit. That event is merge_group, not pull_request, so without
+  # this trigger the queue waits until check_response_timeout and fails.
+  merge_group:
 
 permissions:
   contents: read
