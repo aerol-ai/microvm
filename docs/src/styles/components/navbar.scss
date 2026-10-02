@@ -106,7 +106,8 @@
   }
 
   .version-pill,
-  .github-link {
+  .github-link,
+  .sponsor-link {
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -124,7 +125,8 @@
     border-color: rgba(58, 161, 255, 0.25);
   }
 
-  .github-link {
+  .github-link,
+  .sponsor-link {
     gap: 6px;
 
     &:hover {
