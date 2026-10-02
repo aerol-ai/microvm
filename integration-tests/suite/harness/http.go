@@ -49,6 +49,19 @@ func (c *Client) rawPost(ctx context.Context, path string, body any) (*http.Resp
 	return http.DefaultClient.Do(req)
 }
 
+// PostStatus issues an authenticated POST and returns the status code and body
+// without treating non-2xx as an error, for UCs that assert a request is
+// refused (and how).
+func (c *Client) PostStatus(ctx context.Context, path string, body any) (int, []byte, error) {
+	resp, err := c.rawPost(ctx, path, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	return resp.StatusCode, b, err
+}
+
 // Delete issues an authenticated DELETE and returns an error on any non-2xx.
 // Used by the isolate js-bundle catalogue UC, whose delete verb the Go SDK does
 // not wrap. 204 No Content (the catalogue's success status) and any 2xx count as

@@ -569,6 +569,8 @@ var Registry = []UseCase{
 	{ID: "UC-171", Title: "Churn gate: fresh HTTP and raw-TCP connections to a stable sandbox never fail while other sandboxes are created, exposed and destroyed", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
 	{ID: "UC-172", Title: "Established raw-TCP and HTTP keep-alive sessions survive a sandboxd restart on the owner and the ingress", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
 	{ID: "UC-173", Title: "A live public sandbox has no per-sandbox Caddy route on any node: routing is static routes plus the responder", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	{ID: "UC-174", Title: "Option-shaped mount sources (leading '-') are refused at create; no sandbox is made", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-175", Title: "WASM create validates mounts: option-shaped sources are refused", Requires: []Capability{CapWasm}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
