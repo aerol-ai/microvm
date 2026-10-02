@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // MountType identifies the storage backend the user wants mounted inside their
@@ -221,8 +222,22 @@ func (m *MountSpec) Validate(toolboxMountPath string) error {
 	return nil
 }
 
+// validateSource is the one guard every host-side mount argv relies on: each
+// adapter places source (or a component of it) as a positional argument to a
+// tool running on the host as the daemon user (pr-review.md §5). A value that
+// starts with '-' would be parsed as a tool option instead — e.g. an sshfs
+// source of "-oProxyCommand=… @h:/" makes ssh run a shell command on the host —
+// so every positional component is refused a leading dash here, and control
+// characters are refused outright. The adapters also terminate options with
+// "--" as defense in depth, but this check is what callers can rely on.
 func validateSource(t MountType, source string) error {
 	source = strings.TrimSpace(source)
+	if strings.IndexFunc(source, unicode.IsControl) >= 0 {
+		return fmt.Errorf("%s source must not contain control characters", t)
+	}
+	if strings.HasPrefix(source, "-") {
+		return fmt.Errorf("%s source must not start with '-': %q", t, source)
+	}
 	switch t {
 	case MountTypeS3:
 		// Accept either a bare bucket name or s3://bucket[/prefix]. Reject
@@ -230,15 +245,33 @@ func validateSource(t MountType, source string) error {
 		if strings.HasPrefix(source, "/") || strings.HasPrefix(source, "./") || strings.HasPrefix(source, "../") {
 			return fmt.Errorf("s3 source must not be a filesystem path: %q", source)
 		}
+		// The adapter strips s3:// and passes the bucket positionally, so the
+		// bucket itself must not read as a flag either.
+		if strings.HasPrefix(strings.TrimPrefix(source, "s3://"), "-") {
+			return fmt.Errorf("s3 bucket must not start with '-': %q", source)
+		}
 	case MountTypeNFS:
 		// Format: host:/path
 		if !strings.Contains(source, ":/") || strings.HasPrefix(source, "/") {
 			return fmt.Errorf("nfs source must look like host:/path: %q", source)
 		}
 	case MountTypeSSHFS:
-		// Format: user@host:/path
-		if !strings.Contains(source, "@") || !strings.Contains(source, ":") {
+		// Format: user@host:path. sshfs hands user and host to ssh, so neither
+		// may be empty, carry whitespace, or begin with '-'.
+		at := strings.Index(source, "@")
+		if at <= 0 {
 			return fmt.Errorf("sshfs source must look like user@host:/path: %q", source)
+		}
+		user, rest := source[:at], source[at+1:]
+		colon := strings.Index(rest, ":")
+		if colon <= 0 {
+			return fmt.Errorf("sshfs source must look like user@host:/path: %q", source)
+		}
+		host := rest[:colon]
+		for _, part := range []string{user, host} {
+			if strings.HasPrefix(part, "-") || strings.ContainsFunc(part, unicode.IsSpace) {
+				return fmt.Errorf("sshfs source user and host must not start with '-' or contain whitespace: %q", source)
+			}
 		}
 	case MountTypeRclone:
 		// Format: remote:path (rclone's own syntax). Refuse a bare local path.

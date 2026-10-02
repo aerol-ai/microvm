@@ -21,15 +21,17 @@ func (Rclone) Build(sandboxID string, index int, spec models.MountSpec, hostTarg
 
 	credFile := filepath.Join(credDir, fmt.Sprintf("%s-%d.rclone.conf", sandboxID, index))
 
+	// The flag=value form binds the option value so it cannot become its own
+	// flag, and every flag precedes "--" so source stays positional.
 	argv := []string{
 		"rclone", "mount",
 		"--config", credFile,
-		"--vfs-cache-mode", valueOr(spec.Options["vfs_cache_mode"], "writes"),
-		spec.Source, hostTarget,
+		"--vfs-cache-mode=" + valueOr(spec.Options["vfs_cache_mode"], "writes"),
 	}
 	if spec.ReadOnly {
 		argv = append(argv, "--read-only")
 	}
+	argv = append(argv, "--", spec.Source, hostTarget)
 
 	return Plan{
 		Argv:       argv,
