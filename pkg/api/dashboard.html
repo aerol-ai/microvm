@@ -373,7 +373,7 @@ function fmtPct(n) {
 
 function fmtUnix(u) {
   if (!u) { return "—"; }
-  try { return new Date(Number(u) * 1000).toISOString().replace("T", " ").replace("Z", "Z"); }
+  try { return new Date(Number(u) * 1000).toISOString().replace("T", " "); }
   catch (e) { return String(u); }
 }
 
