@@ -210,66 +210,6 @@ func TestHostExecError(t *testing.T) {
 
 // ─── Code-run interpreter routes ─────────────────────────────────────────────
 
-func TestHostCodeRunBadJSON(t *testing.T) {
-	h := newHost(t)
-	rec := serve(h, http.MethodPost, "/process/code-run", []byte("notjson"), map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("bad json status = %d", rec.Code)
-	}
-}
-
-func TestHostCodeRunMissingCode(t *testing.T) {
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"language": "python"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("missing code status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunUnsupportedLanguage(t *testing.T) {
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"code": "x", "language": "cobol"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("unsupported language status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunInterpreterNotInstalled(t *testing.T) {
-	h := newHost(t)
-	// ts-node is unlikely to be installed in test environment
-	payload, _ := json.Marshal(map[string]string{"code": "console.log(1)", "language": "typescript"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	// 400 if ts-node not found, 200 if it is — either is valid
-	if rec.Code != http.StatusBadRequest && rec.Code != http.StatusOK {
-		t.Fatalf("ts-node status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHostCodeRunBash(t *testing.T) {
-	h := newHost(t)
-	payload, _ := json.Marshal(map[string]string{"code": "echo hello", "language": "bash"})
-	rec := serve(h, http.MethodPost, "/process/code-run", payload, map[string]string{
-		"Content-Type": "application/json",
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("bash status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("bash json: %v", err)
-	}
-}
-
 func TestHostCodeInterpreterNotImplemented(t *testing.T) {
 	h := newHost(t)
 	rec := serve(h, http.MethodPost, "/process/interpreter/python", nil, nil)

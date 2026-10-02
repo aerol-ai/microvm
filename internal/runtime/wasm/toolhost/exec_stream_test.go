@@ -40,3 +40,19 @@ func TestExecStreamRouteReturns501(t *testing.T) {
 		t.Fatalf("route status = %d, want 501 (body %q)", rec.Code, rec.Body.String())
 	}
 }
+
+// Code-run must also fail closed on the wasm toolhost: it previously ran caller
+// code through a host interpreter in-process in sandboxd. 501, no host process.
+func TestHandleCodeRunDisabled(t *testing.T) {
+	h := New(Config{SandboxID: "sb-test", WorkDir: t.TempDir(), AuthToken: "tok"})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/process/code-run",
+		strings.NewReader(`{"language":"python","code":"import os;os.system('id')"}`))
+	req.Header.Set("Authorization", "Bearer tok")
+	h.serveHTTP(rec, req)
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("code-run status = %d, want 501 (body %q)", rec.Code, rec.Body.String())
+	}
+}

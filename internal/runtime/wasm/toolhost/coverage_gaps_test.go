@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -23,85 +22,6 @@ import (
 )
 
 // ─── coderun.go ──────────────────────────────────────────────────────────────
-
-func TestWriteCodeRunScriptErrors(t *testing.T) {
-	// workDir is a regular file → MkdirAll(".coderun") fails
-	fileAsDir := filepath.Join(t.TempDir(), "blocked")
-	if err := os.WriteFile(fileAsDir, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(fileAsDir, "code", ".sh"); err == nil {
-		t.Fatal("expected MkdirAll error")
-	}
-
-	// Read-only workDir prevents writing the script file.
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("chmod not supported")
-	}
-	if _, _, err := writeCodeRunScript(dir, "code", ".sh"); err == nil {
-		t.Fatal("expected WriteFile error")
-	}
-}
-
-func TestHandleCodeRunSuccessAndWaitError(t *testing.T) {
-	dir := t.TempDir()
-	h := New(Config{SandboxID: "sb", WorkDir: dir})
-
-	// Happy path with env + argv exercises the full handler body.
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "echo coded",
-		"language": "bash",
-		"argv":     []string{},
-		"envs":     map[string]string{"CODE_RUN_TEST": "1"},
-		"timeout":  30,
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code-run status = %d body=%s", rec.Code, rec.Body.String())
-	}
-
-	// Force a non-ExitError wait path by running a command that cannot start.
-	badPayload, _ := json.Marshal(map[string]string{
-		"code":     "exit 0",
-		"language": "bash",
-	})
-	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(badPayload))
-	req.Header.Set("Content-Type", "application/json")
-	// Shadow PATH so bash lookup fails after writeCodeRunScript succeeds.
-	req = req.WithContext(context.Background())
-	h2 := New(Config{SandboxID: "sb", WorkDir: dir})
-	// Use an invalid interpreter by temporarily breaking PATH via env in request is not possible;
-	// instead rely on writeCodeRunScript failure already tested above.
-	_ = h2
-}
-
-func TestHandleCodeRunContextTimeoutAppendsError(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "sleep 10",
-		"language": "bash",
-		"timeout":  1,
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("timeout status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if resp.ExitCode == 0 {
-		t.Fatalf("expected non-zero exit on timeout, got %d", resp.ExitCode)
-	}
-}
 
 func TestPumpWasmSessionStderrFrames(t *testing.T) {
 	h, mgr := newHostWithRealSessions(t)
@@ -131,60 +51,12 @@ func TestPumpWasmSessionStderrFrames(t *testing.T) {
 	conn.Close()
 }
 
-func TestHandleCodeRunStderrOnlyResult(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]string{
-		"code":     "echo oops 1>&2",
-		"language": "bash",
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if !strings.Contains(resp.Result, "oops") {
-		t.Fatalf("expected stderr in result, got %q", resp.Result)
-	}
-}
-
 func TestStripSandboxPrefixEmptyRemainder(t *testing.T) {
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	req := httptest.NewRequest(http.MethodGet, "/sb/", nil)
 	_ = h.stripSandboxPrefix(req)
 	if req.URL.Path != "/" {
 		t.Fatalf("path = %q", req.URL.Path)
-	}
-}
-
-func TestHandleCodeRunScriptWriteErrorHTTP(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Skip("chmod not supported")
-	}
-	h := New(Config{SandboxID: "sb", WorkDir: dir})
-	payload, _ := json.Marshal(map[string]string{"code": "echo x", "language": "bash"})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("write script error status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestWriteCodeRunScriptMkdirTempParentIsFile(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".coderun"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(dir, "x", ".sh"); err == nil {
-		t.Fatal("expected MkdirAll error when .coderun is a file")
 	}
 }
 
@@ -289,23 +161,6 @@ func TestDaytonaSessionEntrypointLogsNotImplemented(t *testing.T) {
 	}
 }
 
-func TestHandleCodeRunWithArgvAndEnv(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]interface{}{
-		"code":     "echo $1 $CODE_RUN_ARG",
-		"language": "bash",
-		"argv":     []string{"from-argv"},
-		"envs":     map[string]string{"CODE_RUN_ARG": "from-env"},
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code-run status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
 func TestHandleSessionsRouteNotFound(t *testing.T) {
 	h, _ := newHostWithRealSessions(t)
 	rec := httptest.NewRecorder()
@@ -335,26 +190,6 @@ func TestHandleUploadAtomicWriteError(t *testing.T) {
 	h.Handler().ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("atomic write onto directory status = %d body=%s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestWriteCodeRunScriptMkdirTempError(t *testing.T) {
-	dir := t.TempDir()
-	base := filepath.Join(dir, ".coderun")
-	if err := os.MkdirAll(base, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	// Fill the parent with enough entries that MkdirTemp may fail on some systems;
-	// also replace base with a file after creating many dirs to force MkdirTemp failure.
-	for i := 0; i < 50; i++ {
-		_ = os.Mkdir(filepath.Join(base, "run-fill-"+strconv.Itoa(i)), 0o700)
-	}
-	_ = os.RemoveAll(base)
-	if err := os.WriteFile(base, []byte("not-a-dir"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := writeCodeRunScript(dir, "x", ".sh"); err == nil {
-		t.Fatal("expected writeCodeRunScript error when .coderun is a file")
 	}
 }
 
@@ -1170,45 +1005,6 @@ func TestPumpWasmSessionStdinWriteError(t *testing.T) {
 	defer conn.Close()
 	_ = conn.WriteMessage(websocket.BinaryMessage, []byte("data"))
 	time.Sleep(50 * time.Millisecond)
-}
-
-func TestWriteCodeRunScriptCoderunNotDirectory(t *testing.T) {
-	workDir := t.TempDir()
-	if _, err := os.Stat("/dev/null"); err != nil {
-		t.Skip("/dev/null not available")
-	}
-	if err := os.Symlink("/dev/null", filepath.Join(workDir, ".coderun")); err != nil {
-		t.Fatalf("symlink: %v", err)
-	}
-	_, _, err := writeCodeRunScript(workDir, "echo hi", ".sh")
-	if err == nil {
-		t.Fatal("expected error when .coderun is not a writable directory")
-	}
-}
-
-func TestHandleCodeRunNonZeroExitWithStderr(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	payload, _ := json.Marshal(map[string]string{
-		"code":     "echo failed 1>&2; exit 7",
-		"language": "bash",
-	})
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/process/code-run", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	h.Handler().ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
-	}
-	var resp codeRunResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("json: %v", err)
-	}
-	if resp.ExitCode != 7 {
-		t.Fatalf("exit code = %d, want 7", resp.ExitCode)
-	}
-	if !strings.Contains(resp.Result, "failed") {
-		t.Fatalf("result = %q", resp.Result)
-	}
 }
 
 func TestStreamDaytonaLogsInitialWriteAndClientDone(t *testing.T) {
