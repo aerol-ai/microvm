@@ -306,6 +306,15 @@ These GitHub accounts can reach the repository's sensitive resources. Registry p
 
 Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list.
 
+## Roles and responsibilities
+
+| Role | Members | Responsibilities |
+| :--- | :--- | :--- |
+| Maintainer | [`sumansaurabh`](https://github.com/sumansaurabh) | Approve pull requests. Publish official releases and the SDK packages. Change branch rules, Actions secrets, and security settings. Triage reports sent to [security@aerol.ai](mailto:security@aerol.ai) and [GitHub private advisories](https://github.com/aerol-ai/microvm/security/advisories/new). |
+| Code owner | [`sumansaurabh`](https://github.com/sumansaurabh), [`akanshasinha19`](https://github.com/akanshasinha19) | Review pull requests. A code owner other than the pull request author approves changes to the default branch. |
+| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19), [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Push branches and open pull requests. Official releases stay with the maintainer. |
+| Contributor | Anyone else | Open issues and pull requests. No access to Actions secrets, branch rules, or release publishing. |
+
 ## Contributing
 
 AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
