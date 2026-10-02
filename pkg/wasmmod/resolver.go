@@ -3,6 +3,7 @@ package wasmmod
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -72,7 +73,16 @@ func (r *Resolver) resolvePath(ref string) (string, error) {
 	if r.ModulesDir == "" {
 		return "", fmt.Errorf("relative module ref %q requires modules dir", ref)
 	}
-	return filepath.Join(r.ModulesDir, ref), nil
+	// A relative ref must stay under ModulesDir: a module lives there, so "../"
+	// traversal is never legitimate. (Absolute paths remain the explicit
+	// operator escape hatch handled above.) filepath.Join cleans the result, so
+	// a traversing ref resolves above ModulesDir and fails the prefix check.
+	cleaned := filepath.Join(r.ModulesDir, ref)
+	base := filepath.Clean(r.ModulesDir)
+	if cleaned != base && !strings.HasPrefix(cleaned, base+string(os.PathSeparator)) {
+		return "", fmt.Errorf("module ref %q escapes modules dir", ref)
+	}
+	return cleaned, nil
 }
 
 func (r *Resolver) digestFor(path string) (hexDigest string, size int64, err error) {
