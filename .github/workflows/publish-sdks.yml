@@ -209,14 +209,32 @@ jobs:
       - name: Publish package
         if: steps.npm_publish_state.outputs.already_published != 'true'
         run: |
-          # Node 22's bundled npm ignores Actions OIDC and falls through to
-          # NPM_TOKEN. That token cannot bypass 2FA, so the registry answers
-          # EOTP and the job cannot enter an authenticator code.
-          npm install -g npm@11
-          npm config delete "//registry.npmjs.org/:_authToken" --location=user || true
+          # Publish through GitHub OIDC trusted publishing. NPM_TOKEN is a
+          # classic credential, and npm publish 2FA rejects it with EOTP
+          # because the job cannot enter an authenticator code.
+          #
+          # Two things otherwise keep the CLI on that token path:
+          # - Node 22 ships npm older than 11.5.1, the first release that
+          #   exchanges ACTIONS_ID_TOKEN_REQUEST_*.
+          # - setup-node's registry-url writes
+          #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+          #   into $NPM_CONFIG_USERCONFIG. Any _authToken entry, including
+          #   one that expands empty, makes npm skip OIDC and send the
+          #   classic token (actions/setup-node#1551).
+          npm install -g 'npm@>=11.5.1'
+          hash -r
+          npmrc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          if [[ -f "$npmrc" ]]; then
+            sed -i -E '/_authToken/d' "$npmrc"
+          fi
+          unset NODE_AUTH_TOKEN
+          if [[ -n "${NODE_AUTH_TOKEN:-}" ]] || { [[ -f "$npmrc" ]] && grep -q '_authToken' "$npmrc"; }; then
+            echo "::error::classic npm auth is still configured; refusing to publish with a 2FA token"
+            exit 1
+          fi
+          echo "publishing with npm $(npm -v)"
+          node -e 'const [maj,min,pat]=process.argv[1].split(".").map(Number); if (maj<11 || (maj===11 && (min<5 || (min===5 && pat<1)))) { console.error("npm "+process.argv[1]+" cannot do trusted publishing; need >= 11.5.1"); process.exit(1); }' "$(npm -v)"
           npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ""
 
   pypi:
     name: Publish Python SDK to PyPI
