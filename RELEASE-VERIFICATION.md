@@ -1,6 +1,6 @@
 # Verifying a release
 
-Official builds are GitHub Releases. Each asset is attached to the release whose tag is the version, so the download URL contains that tag (`/releases/download/vX.Y.Z/<asset>`). `checksums.txt` lists a SHA-256 for every file in the release. `sbom.cdx.json` is the CycloneDX bill of materials for the Go module at that tag. `<version>.intoto.jsonl` is the SLSA build provenance.
+Official builds are GitHub Releases. Each asset is attached to the release whose tag is the version, so the download URL contains that tag (`/releases/download/vX.Y.Z/<asset>`). The release workflow also publishes a second copy of each binary and script whose file name starts with that tag (`vX.Y.Z_sandboxd_linux_amd64`). The unversioned name remains so existing download URLs keep working. `checksums.txt` lists a SHA-256 for every file in the release. `sbom.cdx.json` is the CycloneDX bill of materials for the Go module at that tag. `<version>.intoto.jsonl` is the SLSA build provenance.
 
 ## Integrity of the assets
 
