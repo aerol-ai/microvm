@@ -179,10 +179,14 @@ func extractTar(data []byte, dir string) error {
 		if entries > maxContextEntries {
 			return fmt.Errorf("build context has too many entries (max %d)", maxContextEntries)
 		}
-		// Reject path traversal: an entry whose joined path lands outside dir
-		// (e.g. "../escape") must not be written. filepath.Join cleans the
-		// result, so a traversing name resolves above dir and fails the prefix
-		// check rather than being silently written elsewhere.
+		// Reject path traversal before any filesystem call. filepath.IsLocal is
+		// the lexical check CodeQL's zip-slip query models as a sanitizer: it
+		// rejects empty, absolute, and ".." names. The prefix check stays as
+		// a backstop because filepath.Join drops the base when a later element
+		// is absolute, so a name that slipped past IsLocal still fails closed.
+		if !filepath.IsLocal(hdr.Name) {
+			return fmt.Errorf("tar entry escapes context dir: %q", hdr.Name)
+		}
 		target := filepath.Join(dir, hdr.Name)
 		cleanDir := filepath.Clean(dir)
 		if target != cleanDir && !strings.HasPrefix(target, cleanDir+string(os.PathSeparator)) {
