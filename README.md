@@ -277,6 +277,7 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Snapshots](https://microvm.aerol.ai/snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
 | [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
 | [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
+| [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
 
 ## Dependencies
 
