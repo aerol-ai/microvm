@@ -142,6 +142,15 @@ func TestExtractTarRejectsTraversal(t *testing.T) {
 	if err := extractTar(buf.Bytes(), t.TempDir()); err == nil {
 		t.Fatal("path traversal entry must be rejected")
 	}
+
+	buf.Reset()
+	tw = tar.NewWriter(&buf)
+	_ = tw.WriteHeader(&tar.Header{Name: "/etc/passwd", Mode: 0o644, Size: 1, Typeflag: tar.TypeReg})
+	_, _ = tw.Write([]byte("x"))
+	_ = tw.Close()
+	if err := extractTar(buf.Bytes(), t.TempDir()); err == nil {
+		t.Fatal("absolute tar entry must be rejected")
+	}
 }
 
 func TestLogLineWriter(t *testing.T) {
