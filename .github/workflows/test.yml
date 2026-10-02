@@ -30,6 +30,29 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The ruleset requires this job. A missing trailer fails the job, so a
+      # commit cannot reach the default branch without the assertion.
+      - name: Require DCO sign-off on every commit
+        if: github.event_name != 'push'
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::refusing to check DCO without a commit SHA"
+            exit 1
+          fi
+          missing=0
+          while IFS= read -r sha; do
+            [[ -z "$sha" ]] && continue
+            trailer="$(git log -1 --format='%(trailers:key=Signed-off-by,valueonly)' "$sha")"
+            if ! grep -Eq '<[^>@[:space:]]+@[^>[:space:]]+>' <<<"$trailer"; then
+              echo "::error::commit ${sha} has no Signed-off-by trailer. Use git commit -s."
+              git log -1 --format='%h %s' "$sha"
+              missing=1
+            fi
+          done < <(git rev-list --no-merges "${BASE_SHA}..HEAD")
+          exit "$missing"
+
       - name: Detect changed paths
         id: filter
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
