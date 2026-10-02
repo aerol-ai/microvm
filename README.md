@@ -25,6 +25,7 @@
   <a href="https://codecov.io/gh/aerol-ai/microvm"><img src="https://codecov.io/gh/aerol-ai/microvm/branch/main/graph/badge.svg" alt="Coverage"></a>
   <a href="https://github.com/aerol-ai/microvm/actions/workflows/release.yml"><img src="https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release" alt="Release"></a>
   <a href="https://github.com/aerol-ai/microvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/aerol-ai/microvm"><img src="https://api.securityscorecards.dev/projects/github.com/aerol-ai/microvm/badge" alt="OpenSSF Scorecard"></a>
 </p>
 
 &nbsp;

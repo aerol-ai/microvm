@@ -1,0 +1,48 @@
+---
+# OpenSSF Scorecard: supply-chain security posture, published so the README
+# badge and https://scorecard.dev/viewer/?uri=github.com/aerol-ai/microvm stay
+# current. Results also upload to the repo's code-scanning tab.
+name: Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: "41 6 * * 1" # weekly, Monday 06:41 UTC
+  push:
+    branches: [main]
+
+# Top-level least privilege; the analysis job widens only what it needs.
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload the SARIF to code scanning
+      id-token: write # publish results to the OpenSSF API (badge)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # publish_results feeds the public badge + scorecard.dev viewer.
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code scanning
+        uses: github/codeql-action/upload-sarif@416ff0dea110f80f0f56f0046500dbf7420e4bb0 # codeql-bundle-v2.27.1
+        with:
+          sarif_file: results.sarif
