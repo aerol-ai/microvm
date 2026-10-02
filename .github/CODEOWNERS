@@ -1,0 +1,4 @@
+# Branch protection on main requires a code-owner review. These accounts
+# have write access, so a pull request author is not the only person who
+# can satisfy it.
+* @sumansaurabh @akanshasinha19
