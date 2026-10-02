@@ -11,7 +11,10 @@ func TestMountSpecValidate(t *testing.T) {
 		{Type: MountTypeS3, Source: "bare-bucket-name", Target: "/data"},
 		{Type: MountTypeNFS, Source: "nfs.internal:/exports/work", Target: "/mnt/nfs"},
 		{Type: MountTypeSSHFS, Source: "ubuntu@build-host:/home/ubuntu", Target: "/home/dev"},
+		// Relative remote paths and dashes inside the path stay legal.
+		{Type: MountTypeSSHFS, Source: "deploy@10.0.0.5:data/-cache", Target: "/home/dev"},
 		{Type: MountTypeRclone, Source: "myremote:bucket/prefix", Target: "/workspace"},
+		{Type: MountTypeS3, Source: "s3://my-bucket/-odd-prefix", Target: "/workspace"},
 	}
 	for _, m := range good {
 		if err := m.Validate("/usr/local/bin/toolboxd"); err != nil {
@@ -37,6 +40,21 @@ func TestMountSpecValidate(t *testing.T) {
 		{"nfs malformed", MountSpec{Type: MountTypeNFS, Source: "no-colon-slash", Target: "/mnt"}},
 		{"sshfs malformed", MountSpec{Type: MountTypeSSHFS, Source: "no-at-sign", Target: "/mnt"}},
 		{"rclone local path", MountSpec{Type: MountTypeRclone, Source: "/var/data", Target: "/workspace"}},
+		// Argv-injection regression guards: each adapter passes source (or its
+		// bucket) positionally to a host-side tool, so a leading '-' would be
+		// parsed as an option. The sshfs case is the host-RCE shape: it carries
+		// '@' and ':' and passed the old check.
+		{"sshfs ProxyCommand injection", MountSpec{Type: MountTypeSSHFS, Source: "-oProxyCommand=touch /tmp/pwned @h:/x", Target: "/mnt"}},
+		{"sshfs leading dash after space", MountSpec{Type: MountTypeSSHFS, Source: "  -oProxyCommand=x @h:/x", Target: "/mnt"}},
+		{"sshfs dash host", MountSpec{Type: MountTypeSSHFS, Source: "u@-oProxyCommand=x:/x", Target: "/mnt"}},
+		{"sshfs empty user", MountSpec{Type: MountTypeSSHFS, Source: "@host:/x", Target: "/mnt"}},
+		{"sshfs empty host", MountSpec{Type: MountTypeSSHFS, Source: "u@:/x", Target: "/mnt"}},
+		{"sshfs whitespace in host", MountSpec{Type: MountTypeSSHFS, Source: "u@h -oX:/x", Target: "/mnt"}},
+		{"rclone flag source", MountSpec{Type: MountTypeRclone, Source: "--rc-no-auth", Target: "/mnt"}},
+		{"nfs flag source", MountSpec{Type: MountTypeNFS, Source: "-oremount:/x", Target: "/mnt"}},
+		{"s3 flag source", MountSpec{Type: MountTypeS3, Source: "--endpoint-url=http://x", Target: "/mnt"}},
+		{"s3 flag bucket after scheme", MountSpec{Type: MountTypeS3, Source: "s3://-oProxyCommand=x/p", Target: "/mnt"}},
+		{"control character in source", MountSpec{Type: MountTypeSSHFS, Source: "u@h:/x\n-oProxyCommand=x", Target: "/mnt"}},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {

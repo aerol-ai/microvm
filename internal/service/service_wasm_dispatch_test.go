@@ -313,6 +313,24 @@ func TestWasmCreateSandboxValidation(t *testing.T) {
 			req:  models.CreateSandboxRequest{ModuleRef: "a", Runtime: models.RuntimeWasm, Lifecycle: &models.Lifecycle{StopIfIdleFor: -time.Second}},
 			want: "invalid lifecycle",
 		},
+		// The WASM path used to hand mounts straight to MountAll (host-side
+		// mount tools) without MountSpec.Validate; these must now be refused
+		// before any host process could be spawned.
+		{
+			name: "mount source argv injection",
+			req: models.CreateSandboxRequest{ModuleRef: "a", Runtime: models.RuntimeWasm, Mounts: []models.MountSpec{{
+				Type: models.MountTypeSSHFS, Source: "-oProxyCommand=touch /tmp/pwned @h:/x", Target: "/mnt/x",
+				Credentials: map[string]string{"private_key_pem": "k"},
+			}}},
+			want: "must not start with '-'",
+		},
+		{
+			name: "mount reserved target",
+			req: models.CreateSandboxRequest{ModuleRef: "a", Runtime: models.RuntimeWasm, Mounts: []models.MountSpec{{
+				Type: models.MountTypeS3, Source: "s3://b", Target: "/etc",
+			}}},
+			want: "is reserved",
+		},
 	}
 
 	for _, tc := range cases {

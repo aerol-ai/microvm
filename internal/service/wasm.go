@@ -53,6 +53,13 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		}
 	}
 
+	// The shared create path validates mounts only after runtime dispatch, so
+	// WASM must do it here: MountAll below runs each spec's tool on the host,
+	// and source/target/credential checks are the only guard on those argv.
+	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
+		return nil, err
+	}
+
 	var lifecycle models.Lifecycle
 	if req.Lifecycle != nil {
 		if err := s.validateLifecycle(*req.Lifecycle); err != nil {

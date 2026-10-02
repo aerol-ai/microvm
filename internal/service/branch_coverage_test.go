@@ -414,10 +414,13 @@ func TestCreateWasmSandboxBranchCoverage(t *testing.T) {
 		_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 			ModuleRef: "hello.wasm",
 			Runtime:   models.RuntimeWasm,
+			// A spec that passes MountSpec.Validate (now enforced on the WASM
+			// path) but fails inside MountAll: the sshfs adapter refuses to
+			// build a plan without credentials.private_key_pem.
 			Mounts: []models.MountSpec{{
-				Type:   "bogus",
+				Type:   models.MountTypeSSHFS,
 				Target: "/data",
-				Source: "bucket",
+				Source: "user@host:/data",
 			}},
 		})
 		if err == nil || !strings.Contains(err.Error(), "mount external storage") {

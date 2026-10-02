@@ -29,7 +29,9 @@ func (SSHFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarge
 		opts += ",ro"
 	}
 
-	argv := []string{"sshfs", "-o", opts, spec.Source, hostTarget}
+	// "--" ends option parsing so source can never be read as an sshfs/ssh
+	// option; models.validateSource is the primary guard.
+	argv := []string{"sshfs", "-o", opts, "--", spec.Source, hostTarget}
 
 	return Plan{
 		Argv:       argv,

@@ -26,7 +26,9 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 	// profile at all and let mount-s3 resolve credentials from the environment.
 	useStaticCreds := hasS3Credentials(spec.Credentials)
 
-	argv := []string{"mount-s3", bucket, hostTarget, "--foreground"}
+	// Flags first; the bucket and target are appended after "--" at the end
+	// so neither can be parsed as a mount-s3 option.
+	argv := []string{"mount-s3", "--foreground"}
 	if useStaticCreds {
 		argv = append(argv, "--profile", "sandbox")
 	}
@@ -55,6 +57,7 @@ func (S3) Build(sandboxID string, index int, spec models.MountSpec, hostTarget, 
 		// token becomes its own argv entry to avoid shell interpretation.
 		argv = append(argv, strings.Fields(extra)...)
 	}
+	argv = append(argv, "--", bucket, hostTarget)
 
 	if !useStaticCreds {
 		// No profile file; ambient instance-role credentials are used.
