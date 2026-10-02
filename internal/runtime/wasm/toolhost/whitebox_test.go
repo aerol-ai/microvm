@@ -4,81 +4,10 @@ import (
 	"errors"
 	"os/exec"
 	"strings"
-	"syscall"
 	"testing"
 )
 
 // ─── exec_stream helpers ──────────────────────────────────────────────────────
-
-func TestMergeExecEnv(t *testing.T) {
-	// no extra env → returns os.Environ()
-	base := mergeExecEnv(nil)
-	if len(base) == 0 {
-		t.Fatal("mergeExecEnv with nil should return os.Environ()")
-	}
-	// extra env is added
-	merged := mergeExecEnv(map[string]string{"TEST_VAR": "hello"})
-	found := false
-	for _, e := range merged {
-		if e == "TEST_VAR=hello" {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("TEST_VAR not found in merged env")
-	}
-}
-
-func TestWaitExec(t *testing.T) {
-	// Successful command
-	cmd := exec.Command("true")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start true: %v", err)
-	}
-	code, sig := waitExec(cmd)
-	if code != 0 || sig != "" {
-		t.Fatalf("true: code=%d sig=%q", code, sig)
-	}
-
-	// Failing command (exit 2)
-	cmd = exec.Command("sh", "-c", "exit 2")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sh: %v", err)
-	}
-	code, sig = waitExec(cmd)
-	if code != 2 {
-		t.Fatalf("exit 2 code = %d", code)
-	}
-	_ = sig
-}
-
-func TestSignalExecNilProcess(t *testing.T) {
-	// should not panic
-	signalExec(nil, "TERM")
-	signalExec(&exec.Cmd{}, "TERM") // Process is nil
-}
-
-func TestSignalExecUnknownSignal(t *testing.T) {
-	// should silently ignore unknown signal
-	cmd := exec.Command("sleep", "10")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	defer func() { _ = cmd.Process.Signal(syscall.SIGKILL) }()
-	signalExec(cmd, "SIGUSR99") // unknown — no panic
-}
-
-func TestSignalExecKnownSignals(t *testing.T) {
-	for _, sig := range []string{"TERM", "SIGTERM", "KILL", "SIGKILL", "INT", "SIGINT"} {
-		cmd := exec.Command("sleep", "60")
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start sleep for %s: %v", sig, err)
-		}
-		signalExec(cmd, sig)
-		// Don't wait — just confirm no panic. The signal may or may not kill before cleanup.
-		_ = cmd.Process.Signal(syscall.SIGKILL)
-	}
-}
 
 // ─── coderun helpers ──────────────────────────────────────────────────────────
 

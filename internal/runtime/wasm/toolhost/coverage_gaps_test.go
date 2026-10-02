@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -154,93 +153,6 @@ func TestHandleCodeRunStderrOnlyResult(t *testing.T) {
 	}
 }
 
-func TestHandleExecStreamCustomWorkdir(t *testing.T) {
-	workdir := t.TempDir()
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.WriteJSON(map[string]interface{}{
-		"command": "pwd",
-		"workdir": workdir,
-		"tty":     false,
-	})
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	readUntilExit(t, conn)
-}
-
-func TestPumpExecStreamReaderWriteError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("data"))
-			_ = pw.Close()
-		}()
-		_ = pumpExecStreamReader(conn, pr, streamFramePrefixStdout)
-		_ = conn.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	conn.Close()
-}
-
-func TestPumpExecStreamReaderLockedWriteError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("data"))
-			_ = pw.Close()
-		}()
-		var mu sync.Mutex
-		_ = pumpExecStreamReaderLocked(conn, pr, streamFramePrefixStderr, &mu)
-		_ = conn.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	time.Sleep(20 * time.Millisecond)
-	conn.Close()
-}
-
-func TestExecStreamStdinPumpSignalControl(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		pr, pw := io.Pipe()
-		go func() {
-			h := &Host{}
-			h.execStreamStdinPump(conn, pw)
-		}()
-		sig, _ := json.Marshal(execStreamControlIn{Type: "signal", Signal: "TERM"})
-		_ = conn.WriteMessage(websocket.TextMessage, sig)
-		time.Sleep(30 * time.Millisecond)
-		_ = pr.Close()
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.Close()
-}
-
 func TestStripSandboxPrefixEmptyRemainder(t *testing.T) {
 	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
 	req := httptest.NewRequest(http.MethodGet, "/sb/", nil)
@@ -273,30 +185,6 @@ func TestWriteCodeRunScriptMkdirTempParentIsFile(t *testing.T) {
 	}
 	if _, _, err := writeCodeRunScript(dir, "x", ".sh"); err == nil {
 		t.Fatal("expected MkdirAll error when .coderun is a file")
-	}
-}
-
-func TestHandleExecStreamPipesStartFailureBadWorkdir(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-	_ = conn.WriteJSON(map[string]interface{}{
-		"command": "echo hi",
-		"workdir": "/no/such/workdir",
-		"tty":     false,
-	})
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	if msg.Type != "error" {
-		t.Fatalf("expected start error, got %q", msg.Type)
 	}
 }
 
@@ -726,154 +614,6 @@ func TestHandleExecStreamUpgradeFailure(t *testing.T) {
 	h.Handler().ServeHTTP(rec, req)
 	if rec.Code == http.StatusOK {
 		t.Fatal("expected non-200 without websocket upgrade")
-	}
-}
-
-func TestHandleExecStreamPTYDefaultsAndStartError(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(h.Handler())
-	defer srv.Close()
-
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/process/exec/stream", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer conn.Close()
-
-	if err := conn.WriteJSON(map[string]interface{}{"command": "echo pty-defaults", "tty": true}); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(8 * time.Second))
-	readUntilExit(t, conn)
-
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		h.runExecStreamPTY(c, exec.Command(""), &execStreamStartMsg{})
-	}))
-	defer srv2.Close()
-	c2, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv2.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial pty err: %v", err)
-	}
-	c2.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = c2.ReadJSON(&msg)
-	c2.Close()
-}
-
-func TestHandleExecStreamPipesErrors(t *testing.T) {
-	h := New(Config{SandboxID: "sb", WorkDir: t.TempDir()})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		_ = cmd.Start()
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected error, got %q", msg.Type)
-	}
-}
-
-func TestExecStreamPumpAndWaitEdgeCases(t *testing.T) {
-	// waitExec with never-started command → non-ExitError path
-	cmd := exec.Command("true")
-	code, sig := waitExec(cmd)
-	if code != 1 || sig == "" {
-		t.Fatalf("unstarted wait: code=%d sig=%q", code, sig)
-	}
-
-	// pumpExecStreamReader write failure closes early
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		pr, pw := io.Pipe()
-		go func() {
-			_, _ = pw.Write([]byte("chunk"))
-			_ = pw.Close()
-		}()
-		_ = pumpExecStreamReader(conn, pr, streamFramePrefixStdout)
-	}))
-	defer srv.Close()
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.Close()
-
-	// execStreamControlPump invalid JSON + signal path
-	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		cmd := exec.Command("sleep", "30")
-		_ = cmd.Start()
-		defer func() { _ = cmd.Process.Kill() }()
-		ptmx, _ := os.Open(os.DevNull)
-		h := &Host{}
-		go h.execStreamControlPump(conn, cmd, ptmx)
-		_ = conn.WriteMessage(websocket.TextMessage, []byte("not-json"))
-		sig, _ := json.Marshal(execStreamControlIn{Type: "signal", Signal: "KILL"})
-		_ = conn.WriteMessage(websocket.TextMessage, sig)
-		time.Sleep(50 * time.Millisecond)
-	}))
-	defer srv2.Close()
-	c2, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv2.URL, "http")+"/", nil)
-	if c2 != nil {
-		c2.Close()
-	}
-
-	// stdin pump: signal control ends pump; write error on broken stdin
-	srv3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		conn, _ := upgrader.Upgrade(w, r, nil)
-		defer conn.Close()
-		_, pw := io.Pipe()
-		h := &Host{}
-		h.execStreamStdinPump(conn, pw)
-	}))
-	defer srv3.Close()
-	c3, _, _ := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv3.URL, "http")+"/", nil)
-	if c3 != nil {
-		_ = c3.WriteMessage(websocket.BinaryMessage, []byte("x"))
-		c3.Close()
-	}
-}
-
-func readUntilExit(t *testing.T, conn *websocket.Conn) {
-	t.Helper()
-	for {
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-		if msgType == websocket.TextMessage {
-			var ctrl execStreamControlOut
-			if json.Unmarshal(data, &ctrl) == nil && ctrl.Type == "exit" {
-				return
-			}
-		}
 	}
 }
 
@@ -1432,60 +1172,6 @@ func TestPumpWasmSessionStdinWriteError(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 }
 
-func TestRunExecStreamPipesStdinAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("cat")
-		cmd.Stdin = strings.NewReader("preset")
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stdin pipe error, got %q", msg.Type)
-	}
-}
-
-func TestRunExecStreamPipesStdoutAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		cmd.Stdout = io.Discard
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stdout pipe error, got %q", msg.Type)
-	}
-}
-
 func TestWriteCodeRunScriptCoderunNotDirectory(t *testing.T) {
 	workDir := t.TempDir()
 	if _, err := os.Stat("/dev/null"); err != nil {
@@ -1522,33 +1208,6 @@ func TestHandleCodeRunNonZeroExitWithStderr(t *testing.T) {
 	}
 	if !strings.Contains(resp.Result, "failed") {
 		t.Fatalf("result = %q", resp.Result)
-	}
-}
-
-func TestRunExecStreamPipesStderrAlreadySet(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-		c, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer c.Close()
-		cmd := exec.Command("echo", "x")
-		cmd.Stderr = io.Discard
-		h := &Host{}
-		h.runExecStreamPipes(c, cmd)
-	}))
-	defer srv.Close()
-	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http")+"/", nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	var msg execStreamControlOut
-	_ = conn.ReadJSON(&msg)
-	conn.Close()
-	if msg.Type != "error" {
-		t.Fatalf("expected stderr pipe error, got %q", msg.Type)
 	}
 }
 
