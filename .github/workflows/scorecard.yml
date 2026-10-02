@@ -11,14 +11,18 @@ on:
   push:
     branches: [main]
 
-# Top-level least privilege; the analysis job widens only what it needs.
-permissions: read-all
+# Top-level least privilege. The analysis job replaces this set with the
+# scopes that job actually uses: read the repo, upload SARIF, and mint the
+# OIDC token the scorecard API expects.
+permissions:
+  contents: read
 
 jobs:
   analysis:
     name: Scorecard analysis
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       security-events: write # upload the SARIF to code scanning
       id-token: write # publish results to the OpenSSF API (badge)
     steps:

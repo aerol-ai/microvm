@@ -1,0 +1,62 @@
+# Dependency review and gosec run on every pull request and on the merge
+# queue. They are required checks: a high-severity finding fails the job,
+# and the default-branch ruleset rejects the merge.
+#
+# No `push` trigger and no `if:` on the jobs. Dependency review has no pull
+# request to diff on a branch push, and a conditional job is not a gate.
+# Direct pushes to the default branch are already rejected by the ruleset.
+name: Supply chain
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    name: dependency-review
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          comment-summary-in-pr: never
+          # pull_request has defaults. merge_group does not, and the merge
+          # queue re-runs this required check on the temporary merge commit.
+          base-ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
+          head-ref: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.head.sha }}
+
+  gosec:
+    name: gosec
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+          export PATH="$(go env GOPATH)/bin:${PATH}"
+          # The executable name is the gate the supply-chain policy requires.
+          gosec -fmt text -severity high -confidence high -quiet ./cmd/... ./internal/... ./pkg/...

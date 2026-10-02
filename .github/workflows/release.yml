@@ -279,6 +279,19 @@ jobs:
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
 
+      # The unversioned name is what install.sh and the cluster docs download
+      # from /releases/latest/download/. The copy prefixed with the tag is the
+      # same bytes under a name that carries the release identifier.
+      - name: Copy each asset under a name that includes the release tag
+        run: |
+          cd dist
+          for asset in *; do
+            case "$asset" in
+              checksums.txt|sbom.cdx.json|*.intoto.jsonl) continue ;;
+            esac
+            cp "$asset" "${VERSION}_${asset}"
+          done
+
       - name: Generate checksums
         run: |
           cd dist
