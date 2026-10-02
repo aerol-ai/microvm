@@ -726,11 +726,11 @@ func parseAheadBehind(raw string, response *daytonaGitStatusResponse) {
 		trimmed := strings.TrimSpace(item)
 		switch {
 		case strings.HasPrefix(trimmed, "ahead "):
-			if value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(trimmed, "ahead "))); err == nil {
+			if value, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(trimmed, "ahead ")), 10, 32); err == nil {
 				response.Ahead = int32Ptr(int32(value))
 			}
 		case strings.HasPrefix(trimmed, "behind "):
-			if value, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(trimmed, "behind "))); err == nil {
+			if value, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(trimmed, "behind ")), 10, 32); err == nil {
 				response.Behind = int32Ptr(int32(value))
 			}
 		}

@@ -757,9 +757,9 @@ func (h *Host) runDaytonaSessionCommand(sess *sessions.Session, state *daytonaSe
 			if lineEnd < 0 {
 				continue
 			}
-			exitCode, err := strconv.Atoi(strings.TrimSpace(rest[:lineEnd]))
-			if err != nil {
-				exitCode = 1
+			var exitCode int32 = 1
+			if parsed, perr := strconv.ParseInt(strings.TrimSpace(rest[:lineEnd]), 10, 32); perr == nil {
+				exitCode = int32(parsed)
 			}
 			stdoutText := captured[:index]
 			stderrText := stderr.String()
