@@ -40,7 +40,7 @@ func copyDir(src, dst string) error {
 	return nil
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string) (rerr error) {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -50,9 +50,15 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	// The writable close flushes the copy. A deferred Close that drops its
+	// error would report success after a failed flush.
+	defer func() {
+		if cerr := out.Close(); rerr == nil {
+			rerr = cerr
+		}
+	}()
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
-	return out.Close()
+	return nil
 }

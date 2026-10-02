@@ -59,11 +59,13 @@ def main() -> int:
             try:
                 Sandbox.delete_snapshot(snapshot.snapshot_id)
             except Exception:
+                # Cleanup is best-effort. A failed delete must not hide the smoke result.
                 pass
         if sandbox is not None:
             try:
                 sandbox.kill()
             except Exception:
+                # Cleanup is best-effort. A failed kill must not hide the smoke result.
                 pass
 
 
