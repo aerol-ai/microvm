@@ -58,11 +58,13 @@ jobs:
       # automationDetails.id. Code scanning rejects that file. Collapse
       # those runs and stamp a unique category before upload.
       # https://github.blog/changelog/2025-07-21-code-scanning-will-stop-combining-multiple-sarif-runs-uploaded-in-the-same-sarif-file/
+      # results.sarif is owned by root (the Codacy container). Write the
+      # rewritten file beside it so the runner user can create it.
       - name: Give each Codacy tool a unique SARIF category
-        run: python3 .github/scripts/codacy_sarif_categories.py results.sarif
+        run: python3 .github/scripts/codacy_sarif_categories.py results.sarif results.categorized.sarif
 
       # Upload the SARIF file generated in the previous step
       - name: Upload SARIF results file
         uses: github/codeql-action/upload-sarif@88585263c0627ee42c0e1c5143a112c8d6f4aa18 # v4.38.2
         with:
-          sarif_file: results.sarif
+          sarif_file: results.categorized.sarif

@@ -8,15 +8,19 @@ runs of the same tool and category and rejects the upload:
 
 https://github.blog/changelog/2025-07-21-code-scanning-will-stop-combining-multiple-sarif-runs-uploaded-in-the-same-sarif-file/
 
-This rewrites the file in place: runs that share a driver name and version
+This writes a new SARIF file: runs that share a driver name and version
 are merged (rules and artifact indexes remapped), and each remaining run
 gets a distinct automationDetails.id. upload-sarif leaves an existing id
 alone, so the id is the category GitHub records.
+
+The Codacy CLI runs in Docker and leaves results.sarif owned by root, so
+the output path must be a different file the runner user can create.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from typing import Any
@@ -162,20 +166,23 @@ def assign_categories(doc: dict[str, Any]) -> tuple[int, int]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(f"usage: {argv[0]} results.sarif", file=sys.stderr)
+    if len(argv) != 3:
+        print(f"usage: {argv[0]} results.sarif results.categorized.sarif", file=sys.stderr)
         return 2
-    path = argv[1]
-    with open(path, encoding="utf-8") as fh:
+    src, dst = argv[1], argv[2]
+    if os.path.abspath(src) == os.path.abspath(dst):
+        print(f"{dst}: refusing to overwrite the Codacy output; pass a new path", file=sys.stderr)
+        return 2
+    with open(src, encoding="utf-8") as fh:
         doc = json.load(fh)
     if not isinstance(doc, dict):
-        print(f"{path}: SARIF root must be an object", file=sys.stderr)
+        print(f"{src}: SARIF root must be an object", file=sys.stderr)
         return 1
     before, after = assign_categories(doc)
-    with open(path, "w", encoding="utf-8") as fh:
+    with open(dst, "w", encoding="utf-8") as fh:
         json.dump(doc, fh, separators=(",", ":"))
         fh.write("\n")
-    print(f"codacy sarif: {before} runs -> {after} runs with unique categories")
+    print(f"codacy sarif: {before} runs -> {after} runs with unique categories ({dst})")
     return 0
 
 
