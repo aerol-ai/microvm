@@ -1,0 +1,9 @@
+# Scorecard runs osv-scanner on this tree. GO-2026-5932 marks every version of
+# golang.org/x/crypto because golang.org/x/crypto/openpgp is unmaintained, and
+# the advisory has no fixed release. This module imports golang.org/x/crypto/ssh
+# only. govulncheck reports the advisory as present in a required module and not
+# called. grpc, containerd, and x/net also require the module, so it cannot be
+# removed.
+[[IgnoredVulns]]
+id = "GO-2026-5932"
+reason = "No import of golang.org/x/crypto/openpgp. govulncheck reports the advisory as not called. The module stays for golang.org/x/crypto/ssh and for dependencies that require it."

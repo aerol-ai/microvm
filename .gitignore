@@ -106,3 +106,6 @@ integration-tests/scenarios/domains.yml
 integration-tests/fixtures/wasm/*.wasm
 # Go coverage profiles
 *.out
+
+# Local build/debug binary; never commit
+/report

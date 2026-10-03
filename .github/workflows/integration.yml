@@ -83,11 +83,39 @@ jobs:
           printf '%s' "$AEROL_DOMAINS_YML" > integration-tests/scenarios/domains.yml
 
       - name: Run scenario
+        env:
+          # workflow_dispatch values are collaborator input. Bind them to the
+          # environment and accept only the values the workflow declares before
+          # a script interpolates them.
+          SCENARIO: ${{ inputs.scenario }}
+          PROD_TLS: ${{ inputs.prod_tls }}
+          METAL_ON_DEMAND: ${{ inputs.metal_on_demand }}
         run: |
+          case "$SCENARIO" in
+            local-mode|single-node|cluster-3-mixed|cluster-hetero) ;;
+            *)
+              echo "::error::refusing scenario that is not one of the declared choices"
+              exit 1
+              ;;
+          esac
+          case "$PROD_TLS" in
+            true|false) ;;
+            *)
+              echo "::error::prod_tls must be true or false"
+              exit 1
+              ;;
+          esac
+          case "$METAL_ON_DEMAND" in
+            true|false) ;;
+            *)
+              echo "::error::metal_on_demand must be true or false"
+              exit 1
+              ;;
+          esac
           FLAGS=""
-          [ "${{ inputs.prod_tls }}" = "true" ] && FLAGS="$FLAGS --prod-tls"
-          [ "${{ inputs.metal_on_demand }}" = "true" ] && FLAGS="$FLAGS --metal-on-demand"
-          integration-tests/run.sh "${{ inputs.scenario }}" $FLAGS
+          [ "$PROD_TLS" = "true" ] && FLAGS="$FLAGS --prod-tls"
+          [ "$METAL_ON_DEMAND" = "true" ] && FLAGS="$FLAGS --metal-on-demand"
+          integration-tests/run.sh "$SCENARIO" $FLAGS
 
       - name: Upload coverage report
         if: always()

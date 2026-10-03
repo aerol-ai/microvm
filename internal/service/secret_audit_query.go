@@ -665,8 +665,8 @@ func (s *Service) VerifySecretAuditChain(ctx context.Context) (SecretAuditVerifi
 	if s == nil {
 		return SecretAuditVerification{}, errors.New("service unavailable")
 	}
-	if ctx == nil {
-		ctx = context.Background()
+	if ctx != nil && ctx.Err() != nil {
+		return SecretAuditVerification{}, ctx.Err()
 	}
 	if !secretAuditVerifyMu.TryLock() {
 		secretAuditQueryBusyTotal.Add(1)

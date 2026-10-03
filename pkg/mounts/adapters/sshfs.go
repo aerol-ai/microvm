@@ -24,12 +24,17 @@ func (SSHFS) Build(sandboxID string, index int, spec models.MountSpec, hostTarge
 	opts := "IdentityFile=" + credFile +
 		",StrictHostKeyChecking=accept-new" +
 		",ServerAliveInterval=15,ServerAliveCountMax=3" +
-		",reconnect,allow_other,foreground"
+		",reconnect,allow_other"
 	if spec.ReadOnly {
 		opts += ",ro"
 	}
 
-	argv := []string{"sshfs", "-o", opts, spec.Source, hostTarget}
+	// -f keeps sshfs in the foreground so the manager can supervise it.
+	// "foreground" is not a valid -o option: sshfs 3.x (the Ubuntu 22.04+
+	// package) rejects it with "fuse: unknown option(s)" and never mounts.
+	// "--" ends option parsing so source can never be read as an sshfs/ssh
+	// option; models.validateSource is the primary guard.
+	argv := []string{"sshfs", "-f", "-o", opts, "--", spec.Source, hostTarget}
 
 	return Plan{
 		Argv:       argv,

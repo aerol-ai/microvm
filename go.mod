@@ -1,6 +1,6 @@
 module github.com/aerol-ai/microvm
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/bytecodealliance/wasmtime-go/v37 v37.0.0
@@ -28,7 +28,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.35
 	github.com/aws/aws-sdk-go-v2/service/kms v1.55.4
 	github.com/containerd/containerd/api v1.11.1
-	github.com/containerd/containerd/v2 v2.3.5
+	github.com/containerd/containerd/v2 v2.3.6
 	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/platforms v1.0.0-rc.5
 	github.com/containerd/typeurl/v2 v2.3.0

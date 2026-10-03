@@ -84,7 +84,18 @@ func cover96Ctx() context.Context {
 }
 
 func cover96_funcs() {
-	cover96Call(func() { StartOTELMetrics(cover96Ctx(), zero96[*slog.Logger](), zero96[OTELMetricsConfig]()) }) // otel.go:55
+	// zero96 sets Interval to 1ns. PeriodicReader starts collecting before
+	// NewPeriodicReader finishes writing its instrumentation field, which
+	// the race detector reports. Park the loop on a long interval and shut
+	// it down before the call returns.
+	cover96Call(func() {
+		cfg := zero96[OTELMetricsConfig]()
+		cfg.Interval = time.Hour
+		shutdown, _ := StartOTELMetrics(cover96Ctx(), zero96[*slog.Logger](), cfg)
+		if shutdown != nil {
+			_ = shutdown(context.Background())
+		}
+	}) // otel.go:55
 	cover96Call(func() {
 		observeAerolVMExpvars(cover96Ctx(), zero96[otelmetric.Observer](), zero96[otelmetric.Int64Observable](), zero96[otelmetric.Float64Observable]())
 	}) // otel.go:109

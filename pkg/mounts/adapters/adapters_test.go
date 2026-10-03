@@ -46,7 +46,7 @@ func TestS3Build(t *testing.T) {
 		t.Fatalf("S3.Build: %v", err)
 	}
 	// mountpoint-s3 requires --prefix to end in '/', so the adapter appends one.
-	wantPrefix := []string{"mount-s3", "bucket", "/mnt/target", "--foreground", "--profile", "sandbox", "--prefix", "prefix/sub/"}
+	wantPrefix := []string{"mount-s3", "--foreground", "--profile", "sandbox", "--prefix", "prefix/sub/"}
 	if !reflect.DeepEqual(plan.Argv[:len(wantPrefix)], wantPrefix) {
 		t.Fatalf("argv prefix mismatch: got=%v want=%v", plan.Argv[:len(wantPrefix)], wantPrefix)
 	}
@@ -59,6 +59,7 @@ func TestS3Build(t *testing.T) {
 	if !contains(plan.Argv, "--read-only") || !contains(plan.Argv, "--allow-delete") || !contains(plan.Argv, "--uid") || !contains(plan.Argv, "1000") {
 		t.Fatalf("argv missing readonly/extra args: %v", plan.Argv)
 	}
+	assertPositionalTail(t, plan.Argv, "bucket", "/mnt/target")
 	if plan.CredFile != "/creds/sb-1-3.aws" {
 		t.Fatalf("CredFile = %q, want /creds/sb-1-3.aws", plan.CredFile)
 	}
@@ -160,7 +161,7 @@ func TestNFSBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NFS.Build: %v", err)
 	}
-	want := []string{"mount", "-t", "nfs", "-o", "ro", "10.0.0.2:/exports/data", "/mnt/nfs"}
+	want := []string{"mount", "-t", "nfs", "-o", "ro", "--", "10.0.0.2:/exports/data", "/mnt/nfs"}
 	if !reflect.DeepEqual(plan.Argv, want) {
 		t.Fatalf("NFS argv mismatch: got=%v want=%v", plan.Argv, want)
 	}
@@ -197,9 +198,17 @@ func TestSSHFSBuild(t *testing.T) {
 	if !contains(plan.Argv, "sshfs") || !contains(plan.Argv, "/mnt/ssh") {
 		t.Fatalf("argv missing sshfs pieces: %v", plan.Argv)
 	}
-	if !strings.Contains(plan.Argv[2], "IdentityFile=/creds/sb-1-1.id") || !strings.Contains(plan.Argv[2], "ro") {
-		t.Fatalf("sshfs opts missing identity or ro: %q", plan.Argv[2])
+	// sshfs 3.x rejects "-o foreground"; foreground mode must be the -f flag.
+	if plan.Argv[1] != "-f" || plan.Argv[2] != "-o" {
+		t.Fatalf("sshfs argv must start [sshfs -f -o ...]: %v", plan.Argv)
 	}
+	if !strings.Contains(plan.Argv[3], "IdentityFile=/creds/sb-1-1.id") || !strings.Contains(plan.Argv[3], "ro") {
+		t.Fatalf("sshfs opts missing identity or ro: %q", plan.Argv[3])
+	}
+	if strings.Contains(plan.Argv[3], "foreground") {
+		t.Fatalf("sshfs -o list must not carry foreground (unknown to sshfs 3.x): %q", plan.Argv[3])
+	}
+	assertPositionalTail(t, plan.Argv, "user@example.com:/home/user", "/mnt/ssh")
 
 	if _, err := (SSHFS{}).Build("sb", 0, models.MountSpec{Source: "x"}, "/mnt", "/creds"); err == nil {
 		t.Fatal("expected missing key error")
@@ -224,9 +233,10 @@ func TestRcloneBuild(t *testing.T) {
 	if !plan.UnlinkCred {
 		t.Fatal("UnlinkCred = false, want true")
 	}
-	if !contains(plan.Argv, "--vfs-cache-mode") || !contains(plan.Argv, "full") || !contains(plan.Argv, "--read-only") {
+	if !contains(plan.Argv, "--vfs-cache-mode=full") || !contains(plan.Argv, "--read-only") {
 		t.Fatalf("argv missing rclone options: %v", plan.Argv)
 	}
+	assertPositionalTail(t, plan.Argv, "remote:bucket/path", "/mnt/rclone")
 
 	plan, err = (Rclone{}).Build("sb-9", 2, models.MountSpec{
 		Source:      "remote:bucket/path",
@@ -235,7 +245,7 @@ func TestRcloneBuild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Rclone.Build default cache mode: %v", err)
 	}
-	if !contains(plan.Argv, "writes") {
+	if !contains(plan.Argv, "--vfs-cache-mode=writes") {
 		t.Fatalf("argv missing default vfs cache mode: %v", plan.Argv)
 	}
 
@@ -251,4 +261,53 @@ func contains(items []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// assertPositionalTail pins the argv shape every adapter must keep: all flags
+// come first and the attacker-influenced source plus the host target follow a
+// "--" terminator, so neither can be parsed as a mount-tool option on the host.
+func assertPositionalTail(t *testing.T, argv []string, source, target string) {
+	t.Helper()
+	n := len(argv)
+	if n < 3 || argv[n-3] != "--" || argv[n-2] != source || argv[n-1] != target {
+		t.Fatalf("argv must end with [-- %s %s]: %v", source, target, argv)
+	}
+}
+
+// TestAdaptersTerminateOptionsBeforeSource is the defense-in-depth regression
+// guard for the mount-source argv injection: even a source that slipped past
+// models.validateSource and starts with '-' must land after "--", never in
+// option position, for every adapter.
+func TestAdaptersTerminateOptionsBeforeSource(t *testing.T) {
+	const evil = "-oProxyCommand=touch /tmp/pwned @h:/x"
+	creds := map[string]string{
+		"private_key_pem": "key",
+		"rclone_conf":     "[r]\ntype = s3\n",
+	}
+	for typ, adapter := range Adapters() {
+		source := evil
+		if typ == models.MountTypeS3 {
+			// The S3 adapter splits off the bucket; keep the injected token in it.
+			source = "s3://-oProxyCommand=x"
+		}
+		plan, err := adapter.Build("sb", 0, models.MountSpec{Type: typ, Source: source, Credentials: creds}, "/mnt/t", "/creds")
+		if err != nil {
+			t.Fatalf("%s Build: %v", typ, err)
+		}
+		dash := -1
+		for i, a := range plan.Argv {
+			if a == "--" {
+				dash = i
+				break
+			}
+		}
+		if dash < 0 {
+			t.Fatalf("%s argv has no -- terminator: %v", typ, plan.Argv)
+		}
+		for i, a := range plan.Argv[:dash] {
+			if strings.Contains(a, "ProxyCommand") {
+				t.Fatalf("%s argv[%d]=%q: source reached option position: %v", typ, i, a, plan.Argv)
+			}
+		}
+	}
 }

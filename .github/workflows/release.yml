@@ -15,6 +15,14 @@ jobs:
     env:
       VERSION: ${{ github.event.release.tag_name }}
     steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # A release tag is metadata from outside this file. Refuse anything
+          # that is not a version before checkout or a script can use it.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -123,7 +131,10 @@ jobs:
             apt_pkgs: ""
             goarm: ""
 
-          # macOS — toolboxd only
+          # macOS — sandboxd (native CGO, for install.sh --local) + toolboxd.
+          # The in-sandbox agent install.sh mounts on macOS is the Linux
+          # toolboxd (containers run in Docker's Linux VM); toolboxd_darwin_*
+          # is still published for direct use.
           # - name: MacOS x86_64
           #   runner: macos-13
           #   goos: darwin
@@ -143,6 +154,15 @@ jobs:
             goarm: ""
 
     steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag is copied into ldflags, so a
+          # value that is not a version must not reach the compiler.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -160,8 +180,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_pkgs }}
 
-      - name: Build sandboxd (Linux only, CGO enabled)
-        if: matrix.goos == 'linux'
+      - name: Build sandboxd (Linux + macOS, CGO enabled)
+        if: matrix.goos == 'linux' || matrix.goos == 'darwin'
         shell: bash
         env:
           CGO_ENABLED: "1"
@@ -223,6 +243,14 @@ jobs:
     env:
       VERSION: ${{ github.event.release.tag_name }}
     steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag becomes a release asset name.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -251,15 +279,38 @@ jobs:
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json
 
+      # The unversioned name is what install.sh and the cluster docs download
+      # from /releases/latest/download/. The copy prefixed with the tag is the
+      # same bytes under a name that carries the release identifier.
+      - name: Copy each asset under a name that includes the release tag
+        run: |
+          cd dist
+          for asset in *; do
+            case "$asset" in
+              checksums.txt|sbom.cdx.json|*.intoto.jsonl) continue ;;
+            esac
+            cp "$asset" "${VERSION}_${asset}"
+          done
+
       - name: Generate checksums
         run: |
           cd dist
           sha256sum * > checksums.txt
 
       - name: Attest release artifacts
+        id: attest
         uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
         with:
           subject-path: dist/*
+
+      # Publish the SLSA provenance bundle AS a release asset (in addition to the
+      # attestation stored in GitHub's attestation API) so consumers — and the
+      # OpenSSF Scorecard Signed-Releases check — can verify the artifacts from
+      # the release page. Copied in after attestation so it is not its own subject.
+      - name: Attach provenance to release assets
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE_PATH" "dist/${VERSION}.intoto.jsonl"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3

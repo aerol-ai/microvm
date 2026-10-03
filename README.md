@@ -17,7 +17,8 @@
   <a href="https://microvm.aerol.ai">Documentation</a> ·
   <a href="https://microvm.aerol.ai/getting-started">Quick Start</a> ·
   <a href="https://github.com/aerol-ai/microvm/issues/new?labels=bug&template=bug_report.md">Report Bug</a> ·
-  <a href="https://github.com/aerol-ai/microvm/issues/new?labels=enhancement&template=feature_request.md">Request Feature</a>
+  <a href="https://github.com/aerol-ai/microvm/issues/new?labels=enhancement&template=feature_request.md">Request Feature</a> ·
+  <a href="https://github.com/sponsors/aerol-ai">Sponsor</a>
 </p>
 
 <p align="center">
@@ -25,11 +26,15 @@
   <a href="https://codecov.io/gh/aerol-ai/microvm"><img src="https://codecov.io/gh/aerol-ai/microvm/branch/main/graph/badge.svg" alt="Coverage"></a>
   <a href="https://github.com/aerol-ai/microvm/actions/workflows/release.yml"><img src="https://github.com/aerol-ai/microvm/actions/workflows/release.yml/badge.svg?event=release" alt="Release"></a>
   <a href="https://github.com/aerol-ai/microvm/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/aerol-ai/microvm"><img src="https://api.securityscorecards.dev/projects/github.com/aerol-ai/microvm/badge" alt="OpenSSF Scorecard"></a>
+  <a href="https://www.bestpractices.dev/projects/15170"><img src="https://www.bestpractices.dev/projects/15170/badge" alt="OpenSSF Best Practices"></a>
 </p>
 
 &nbsp;
 
 AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting OCI containers on **containerd** (default), gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
+
+What the project intends to do, and not do, through October 2027 is in [ROADMAP.md](ROADMAP.md).
 
 ## Features
 
@@ -276,10 +281,51 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Snapshots](https://microvm.aerol.ai/snapshots) | Stop a sandbox, snapshot its state, restart it later exactly where it left off. |
 | [Cluster Setup](https://microvm.aerol.ai/cluster-setup) | Multi-node deployment with Raft placement and SWIM gossip. |
 | [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
+| [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
+| [Security assessment](SECURITY-ASSESSMENT.md) | The most likely and most severe problems for a released node, and where the 0.6.3 review left each one. |
+
+## Dependencies
+
+A released version's dependencies are the ones recorded in the committed manifests and lockfiles. A new dependency is added only in a reviewed pull request that names the package, the version, and why it is needed. Builds obtain those dependencies with the standard tool for that language, from the lockfile, so a release does not resolve an unpinned range.
+
+| Component | Recorded in | Obtained with |
+| :--- | :--- | :--- |
+| Go daemon and Go SDK | `go.mod`, `go.sum` | Go modules (`go build`, `go test`) |
+| TypeScript SDK | `sdk/typescript/package-lock.json` | `npm ci` |
+| Docs site | `docs/package-lock.json` | `npm ci` |
+| Release npm CLI | `.github/npm-cli/package-lock.json` | `npm ci` |
+| Python SDK | `sdk/python/pyproject.toml`, `sdk/python/requirements-ci.txt` | `pip install --require-hashes` |
+| Java SDK | `sdk/java/pom.xml` | Maven (`mvn`) |
+| Rust SDK | `sdk/rust/Cargo.lock` | `cargo test --locked` / `cargo publish` |
+
+[Dependabot](.github/dependabot.yml) opens a weekly pull request for Go modules, GitHub Actions, npm (the docs site and the TypeScript SDK), pip, Maven, and Cargo. Dependabot security updates are enabled on the repository. The pinned npm CLI under `.github/npm-cli` is outside that schedule; it changes only when its lockfile is updated in a pull request. The Go CI job also runs `govulncheck` against the module graph.
+
+## Access to sensitive resources
+
+These GitHub accounts can reach the repository's sensitive resources. Registry publish tokens (npm, PyPI, Maven, crates.io) are GitHub Actions secrets. They are not in the git tree. The release workflow and the SDK publish workflow are what read them.
+
+| GitHub account | Access |
+| :--- | :--- |
+| [`sumansaurabh`](https://github.com/sumansaurabh) | Organization owner and repository admin. Can change branch rules, Actions secrets, security settings, and publish a release. |
+| [`akanshasinha19`](https://github.com/akanshasinha19) | Write. Can push branches, open pull requests, publish a GitHub release, and dispatch the SDK publish workflow. |
+| [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Write. Same as above. |
+
+Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list. How the project keeps creating issues, accepting changes, and publishing releases if one person is unavailable, and why the bus factor is 2, is in [CONTINUITY.md](CONTINUITY.md).
+
+## Roles and responsibilities
+
+How these roles make decisions is in [GOVERNANCE.md](GOVERNANCE.md).
+
+| Role | Members | Responsibilities |
+| :--- | :--- | :--- |
+| Maintainer | [`sumansaurabh`](https://github.com/sumansaurabh) | Approve pull requests. Publish official releases and the SDK packages. Change branch rules, Actions secrets, and security settings. Triage reports sent to [security@aerol.ai](mailto:security@aerol.ai) and [GitHub private advisories](https://github.com/aerol-ai/microvm/security/advisories/new). |
+| Code owner | [`sumansaurabh`](https://github.com/sumansaurabh), [`akanshasinha19`](https://github.com/akanshasinha19) | Review pull requests. A code owner other than the pull request author approves changes to the default branch. |
+| Write collaborator | [`akanshasinha19`](https://github.com/akanshasinha19), [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Push branches and open pull requests. Official releases stay with the maintainer. |
+| Contributor | Anyone else | Open issues and pull requests. No access to Actions secrets, branch rules, or release publishing. |
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). Contributions are welcome - open an issue first for non-trivial changes so we can align on the approach before you invest time in an implementation.
+AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change. Community spaces follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ```bash
 make fmt      # format Go code

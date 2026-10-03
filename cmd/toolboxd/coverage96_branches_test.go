@@ -463,8 +463,13 @@ func TestRunDaytonaSessionCommandMarkerParsing(t *testing.T) {
 		return *s
 	}
 
+	// /bin/echo is external on purpose. Dash (Ubuntu /bin/sh) runs echo as a
+	// builtin whose output goes through the shell stdout buffer, so
+	// `echo oops >&2` is written to stdout and this case never sees stderr.
+	// The sleep gives the runner time to observe the start marker before
+	// the stderr frame arrives.
 	t.Run("stderr-after-start", func(t *testing.T) {
-		resp := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "err1", "sleep 0.2; echo oops >&2")
+		resp := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "err1", "sleep 0.2; /bin/echo oops >&2")
 		if !strings.Contains(deref(resp.Stderr), "oops") || *resp.ExitCode != 0 {
 			t.Fatalf("resp stderr=%q exit=%d", deref(resp.Stderr), *resp.ExitCode)
 		}

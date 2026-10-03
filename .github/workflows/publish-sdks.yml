@@ -15,8 +15,24 @@ env:
   SDK_VERSION: ${{ github.event.inputs.sdk_version }}
 
 jobs:
+  validate:
+    name: Validate SDK version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject an SDK version that is not a version
+        env:
+          SDK_VERSION: ${{ github.event.inputs.sdk_version }}
+        run: |
+          # workflow_dispatch input is metadata from outside this file.
+          # Refuse anything that is not a version before a publish script uses it.
+          if [[ ! "$SDK_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::sdk_version must look like 0.1.0 or v0.1.0"
+            exit 1
+          fi
+
   java:
     name: Publish Java SDK to GitHub Packages
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -107,7 +123,11 @@ jobs:
 
   npm:
     name: Publish TypeScript SDK to npm
+    needs: validate
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     defaults:
       run:
         working-directory: sdk/typescript
@@ -205,12 +225,40 @@ jobs:
 
       - name: Publish package
         if: steps.npm_publish_state.outputs.already_published != 'true'
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Publish through GitHub OIDC trusted publishing. NPM_TOKEN is a
+          # classic credential, and npm publish 2FA rejects it with EOTP
+          # because the job cannot enter an authenticator code.
+          #
+          # Two things otherwise keep the CLI on that token path:
+          # - Node 22 ships npm older than 11.5.1, the first release that
+          #   exchanges ACTIONS_ID_TOKEN_REQUEST_*. Install 11.21.0 from the
+          #   lockfile in .github/npm-cli. `npm ci` checks those integrity hashes
+          #   and its postinstall replaces the vulnerable bundled copies of
+          #   brace-expansion, ip-address, and undici.
+          # - setup-node's registry-url writes
+          #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
+          #   into $NPM_CONFIG_USERCONFIG. Any _authToken entry, including
+          #   one that expands empty, makes npm skip OIDC and send the
+          #   classic token (actions/setup-node#1551).
+          npm ci --prefix "$GITHUB_WORKSPACE/.github/npm-cli"
+          npm_bin="$GITHUB_WORKSPACE/.github/npm-cli/node_modules/.bin/npm"
+          npmrc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
+          if [[ -f "$npmrc" ]]; then
+            sed -i -E '/_authToken/d' "$npmrc"
+          fi
+          unset NODE_AUTH_TOKEN
+          if [[ -n "${NODE_AUTH_TOKEN:-}" ]] || { [[ -f "$npmrc" ]] && grep -q '_authToken' "$npmrc"; }; then
+            echo "::error::classic npm auth is still configured; refusing to publish with a 2FA token"
+            exit 1
+          fi
+          echo "publishing with npm $("$npm_bin" -v)"
+          node -e 'const [maj,min,pat]=process.argv[1].split(".").map(Number); if (maj<11 || (maj===11 && (min<5 || (min===5 && pat<1)))) { console.error("npm "+process.argv[1]+" cannot do trusted publishing; need >= 11.5.1"); process.exit(1); }' "$("$npm_bin" -v)"
+          "$npm_bin" publish --access public
 
   pypi:
     name: Publish Python SDK to PyPI
+    needs: validate
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -226,7 +274,9 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: sdk/python/pyproject.toml
+          cache-dependency-path: |
+            sdk/python/pyproject.toml
+            sdk/python/requirements-ci.txt
 
       - name: Verify PyPI token is configured
         run: |
@@ -248,14 +298,16 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install . build twine
+          # Hash-pin third-party packages. Install this repo with --no-deps so
+          # pip does not fetch an unpinned dependency tree for the local package.
+          python -m pip install --require-hashes -r requirements-ci.txt
+          python -m pip install --no-deps --no-build-isolation -e .
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
 
       - name: Build distributions
-        run: python -m build
+        run: python -m build --no-isolation
 
       - name: Validate distributions
         run: python -m twine check dist/*
@@ -268,6 +320,7 @@ jobs:
 
   crates:
     name: Publish Rust SDK to crates.io
+    needs: validate
     runs-on: ubuntu-latest
     defaults:
       run:

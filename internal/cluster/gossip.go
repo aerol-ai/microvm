@@ -160,6 +160,10 @@ type gossipNode struct {
 	// rejoinInFlight keeps a slow rejoin (serial dials, TCP timeouts to a
 	// vanished host) off the refresh loop and stops attempts from stacking.
 	rejoinInFlight atomic.Bool
+	// refreshDone closes once the refresh loop has returned. Cancelling
+	// stopRefresh alone does not prove the loop is idle: a tick already
+	// selected can still rewrite the index afterwards. Nil when no loop runs.
+	refreshDone chan struct{}
 }
 
 type gossipMemberIndex struct {
@@ -549,6 +553,7 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		delegate:           delegate,
 		memberIndex:        memberIndex,
 		stopRefresh:        cancel,
+		refreshDone:        make(chan struct{}),
 		logger:             logger,
 		bootstrapPeers:     append([]string(nil), cfg.BootstrapPeers...),
 		joinBootstrapPeers: ml.Join,
@@ -562,7 +567,10 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 		logger.Info("cluster gossip remembered peers loaded", "peers", cached)
 	}
 	gn.refreshMemberIndex()
-	go gn.runRefreshLoop(refreshCtx, interval)
+	go func() {
+		defer close(gn.refreshDone)
+		gn.runRefreshLoop(refreshCtx, interval)
+	}()
 	return gn, nil
 }
 

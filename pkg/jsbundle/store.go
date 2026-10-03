@@ -172,6 +172,12 @@ func (s *Store) Put(tenant, name string, b *Bundle) (string, error) {
 
 // GetByDigest loads a bundle by its content digest.
 func (s *Store) GetByDigest(digest string) (*Bundle, error) {
+	// A digest is the content-address key and becomes a path component in
+	// blobPath, so reject anything that is not a 64-char hex sha256 before it
+	// can reach the filesystem (a non-hex value like "../x" would traverse).
+	if !isHex64(digest) {
+		return nil, fmt.Errorf("%w: digest %q", ErrBundleNotFound, digest)
+	}
 	raw, err := os.ReadFile(s.blobPath(digest))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -251,6 +257,9 @@ func (s *Store) GCUnreferenced(pinned map[string]struct{}) ([]string, error) {
 // DELETE /v1/js-bundles/{digest} 404s (matching /v1/wasm-modules) instead of
 // silently succeeding on an unknown or unowned id.
 func (s *Store) Delete(tenant, digest string) error {
+	if !isHex64(digest) {
+		return ErrBundleNotFound
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !slices.Contains(s.byTenant[tenant], digest) {

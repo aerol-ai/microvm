@@ -184,9 +184,9 @@ class RecordingMicroVM(MicroVM):
             }
         raise AssertionError(f"unexpected call: {method} {path} {payload}")
 
-    def _request(self, method, url, body=None, content_type=None):  # type: ignore[override]
+    def _request(self, method, url, body=None, content_type=None, extra_headers=None):  # type: ignore[override]
         path = url.replace(self.api_url, "")
-        self.raw_calls.append((method, path, body, content_type))
+        self.raw_calls.append((method, path, body, content_type, extra_headers))
         if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/log":
             return b"session log"
         if method == "GET" and path == "/v1/sandboxes/sb-1/sessions/ses-1/recording":

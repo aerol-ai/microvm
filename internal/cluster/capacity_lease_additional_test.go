@@ -237,6 +237,26 @@ func TestCapacityPhaseDeadlineIsNotChargedToThePeer(t *testing.T) {
 	}
 }
 
+func TestCurtailedByPhaseCountsTransportErrorsOnceTheSweepIsOver(t *testing.T) {
+	over, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !curtailedByPhase(over, io.EOF) {
+		t.Fatal("EOF after the phase ended was treated as the peer's failure")
+	}
+	if !curtailedByPhase(over, errors.New("read: connection reset by peer")) {
+		t.Fatal("a connection reset after the phase ended was treated as the peer's failure")
+	}
+	if curtailedByPhase(over, nil) {
+		t.Fatal("a successful fetch was discarded because the phase had already ended")
+	}
+	if curtailedByPhase(context.Background(), io.EOF) {
+		t.Fatal("a peer error while the phase was still running was treated as curtailment")
+	}
+	if curtailedByPhase(nil, io.EOF) {
+		t.Fatal("a nil phase context was treated as curtailment")
+	}
+}
+
 // A request the sweep cut short must not cost the peer its PLACE either. The
 // fairness clock orders the next sweep by when each peer was last attempted;
 // advancing it at dispatch meant a curtailed peer sorted LAST next time, was

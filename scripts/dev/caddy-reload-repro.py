@@ -20,7 +20,13 @@ def admin(method, path, body=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as r: return r.status
     except urllib.error.HTTPError as e: return e.code
-ctx = ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+ctx = ssl.create_default_context()
+# Loopback-only dev repro against a local Caddy: pin the TLS floor to 1.2 (the
+# modern, non-deprecated way — OP_NO_TLSv1* are deprecated). check_hostname /
+# CERT_NONE stay off on purpose for the self-signed local cert.
+ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
 def one():
     s = socket.create_connection(("127.0.0.1",19443), timeout=5)
     t = ctx.wrap_socket(s, server_hostname="repro.localhost")

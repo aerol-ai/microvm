@@ -1515,6 +1515,16 @@ func gpuVendorForCapacity(req *models.GPURequest) string {
 func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxRequest, idOverride string) (resp *models.CreateSandboxResponse, err error) {
 	done := beginSandboxCreateMetric()
 	defer func() { done(err) }()
+	// A caller-supplied id (CreateSandboxWithID / the X-Cluster-Create-ID
+	// forward header) becomes a host path component in the mount manager and the
+	// per-sandbox state dirs, so it must be delimiter-safe before any runtime
+	// dispatch. An empty id is generated downstream and is always safe. This is
+	// a pure in-memory check: no effect on boot latency or the generated-id path.
+	if idOverride != "" {
+		if err := models.ValidateSandboxID(idOverride); err != nil {
+			return nil, err
+		}
+	}
 	// Bound the entire create operation so a stalled image pull or a slow
 	// registry cannot block a goroutine forever. 0 disables the guard.
 	if t := s.cfg.CreateSandboxTimeout(); t > 0 {
@@ -4171,10 +4181,28 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if sandbox.ContainerIP == "" {
 		return ToolboxEndpoint{}, errors.New("sandbox container IP is not available")
 	}
+	addr, err := s.toolboxAddress(ctx, sandbox)
+	if err != nil {
+		return ToolboxEndpoint{}, err
+	}
 	return ToolboxEndpoint{
-		URL:   fmt.Sprintf("http://%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort),
+		URL:   "http://" + addr,
 		Token: sandbox.ToolboxToken,
 	}, nil
+}
+
+// toolboxAddress is the host:port sandboxd dials for the sandbox's toolboxd:
+// the runtime's answer when it has one (Docker under
+// SB_DOCKER_TOOLBOX_LOOPBACK reads the live 127.0.0.1 binding — one inspect
+// per call, since the port changes on every start), else
+// ContainerIP:ToolboxPort.
+func (s *Service) toolboxAddress(ctx context.Context, sandbox *models.Sandbox) (string, error) {
+	if rt, err := s.runtimeForSandbox(sandbox); err == nil {
+		if a, ok := runtime.AsToolboxAddresser(rt); ok {
+			return a.ToolboxAddress(ctx, sandbox)
+		}
+	}
+	return fmt.Sprintf("%s:%d", sandbox.ContainerIP, s.cfg.ToolboxPort), nil
 }
 
 // WakeAwareToolboxTarget is the entry point every control-plane HTTP
