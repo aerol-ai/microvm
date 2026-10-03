@@ -34,6 +34,8 @@
 
 AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting OCI containers on **containerd** (default), gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
 
+What the project intends to do, and not do, through October 2027 is in [ROADMAP.md](ROADMAP.md).
+
 ## Features
 
 AerolVM provides a complete surface for building sandbox-backed products and agent workflows.
@@ -308,7 +310,7 @@ These GitHub accounts can reach the repository's sensitive resources. Registry p
 | [`akanshasinha19`](https://github.com/akanshasinha19) | Write. Can push branches, open pull requests, publish a GitHub release, and dispatch the SDK publish workflow. |
 | [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Write. Same as above. |
 
-Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list.
+Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list. How the project keeps creating issues, accepting changes, and publishing releases if one person is unavailable, and why the bus factor is 2, is in [CONTINUITY.md](CONTINUITY.md).
 
 ## Roles and responsibilities
 
@@ -323,7 +325,7 @@ How these roles make decisions is in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change.
+AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change. Community spaces follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ```bash
 make fmt      # format Go code
