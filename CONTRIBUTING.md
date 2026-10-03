@@ -4,6 +4,8 @@ AerolVM is open source under the [MIT License](LICENSE). Contributions are accep
 
 Report suspected vulnerabilities through [SECURITY.md](SECURITY.md). Use a private advisory or security@aerol.ai. A public issue or pull request is the wrong channel for a vulnerability.
 
+Expected behavior in issues, pull requests, and other project spaces is in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## Acceptable contributions
 
 A change is acceptable when all of the following are true:

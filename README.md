@@ -323,7 +323,7 @@ How these roles make decisions is in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Contributing
 
-AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change.
+AerolVM is open source under the [MIT License](LICENSE). The [contributor guide](CONTRIBUTING.md) states what an acceptable change must include: a reviewed pull request, a filled pull request description, tests, and no secrets in the diff. Open an issue first for a non-trivial change. Community spaces follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ```bash
 make fmt      # format Go code
