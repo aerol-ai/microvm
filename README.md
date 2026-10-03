@@ -308,7 +308,7 @@ These GitHub accounts can reach the repository's sensitive resources. Registry p
 | [`akanshasinha19`](https://github.com/akanshasinha19) | Write. Can push branches, open pull requests, publish a GitHub release, and dispatch the SDK publish workflow. |
 | [`sumansaurabh-slice`](https://github.com/sumansaurabh-slice) | Write. Same as above. |
 
-Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list.
+Merges to the default branch still require a reviewed pull request. [Code owners](.github/CODEOWNERS) are the review list, separate from this access list. How the project keeps creating issues, accepting changes, and publishing releases if one person is unavailable, and why the bus factor is 2, is in [CONTINUITY.md](CONTINUITY.md).
 
 ## Roles and responsibilities
 
