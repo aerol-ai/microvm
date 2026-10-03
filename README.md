@@ -34,6 +34,8 @@
 
 AerolVM is open-source sandbox infrastructure for running isolated code environments - self-host it on your own Linux host, or run it as a managed, multi-tenant service. Each sandbox is a fully isolated compute unit with its own filesystem, network stack, and allocated resources - create latency as low as **4ms server-side** (V8 isolate warm path) and supporting OCI containers on **containerd** (default), gVisor, Firecracker, WASM, and V8-isolate runtimes. Built for AI agent pipelines and ephemeral CI, it ships as a single Go binary backed by Caddy for TLS routing and SQLite for state, with no external dependencies and a one-line installer.
 
+What the project intends to do, and not do, through October 2027 is in [ROADMAP.md](ROADMAP.md).
+
 ## Features
 
 AerolVM provides a complete surface for building sandbox-backed products and agent workflows.
