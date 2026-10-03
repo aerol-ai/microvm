@@ -20,7 +20,8 @@
     "mermaid": "^11.17.2",
     "sass": "^1.104.1",
     "tailwindcss": "^4.3.3",
-    "typescript": "^7.0.2"
+    "typescript": "^7.0.2",
+    "http-cache-semantics": "file:../third_party/http-cache-semantics"
   },
   "devDependencies": {
     "prettier": "^3.9.9",
@@ -30,6 +31,9 @@
   "optionalDependencies": {
     "@emnapi/core": "1.11.3",
     "@emnapi/runtime": "1.11.3"
+  },
+  "overrides": {
+    "http-cache-semantics": "$http-cache-semantics"
   },
   "engines": {
     "node": ">=22.12.0"

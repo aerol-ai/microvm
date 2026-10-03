@@ -1,0 +1,16 @@
+# Scorecard's Vulnerabilities check runs osv-scanner per lockfile directory.
+# This ignore does not propagate from the repo root.
+#
+# npm 11.21.0 bundles http-cache-semantics 4.2.0. No newer release is published,
+# and npm ci rejects any other version on that inBundle entry because
+# make-fetch-happen still depends on ^4.1.1, which resolves to 4.2.0.
+# patch-bundled-deps.js overwrites the bundled copy with
+# third_party/http-cache-semantics (4.2.1-aerol.1), which refuses max-stale
+# reuse of security-zeroed cache entries. npm's own cache also constructs
+# CachePolicy with shared:false, so the cross-user Set-Cookie bug does not
+# apply to this CLI. Delete this ignore when a release newer than 4.2.0 is on
+# npm and the bundled pin moves to that version.
+[[IgnoredVulns]]
+id = "GHSA-ch52-4w7c-c8xp"
+ignoreUntil = "2027-01-15T00:00:00Z"
+reason = "Bundled 4.2.0 is overwritten at postinstall by third_party/http-cache-semantics. npm ci cannot record that patch as the lockfile version, and npm's cache is not shared."
