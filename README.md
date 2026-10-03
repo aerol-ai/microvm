@@ -314,6 +314,8 @@ Merges to the default branch still require a reviewed pull request. [Code owners
 
 ## Roles and responsibilities
 
+How these roles make decisions is in [GOVERNANCE.md](GOVERNANCE.md).
+
 | Role | Members | Responsibilities |
 | :--- | :--- | :--- |
 | Maintainer | [`sumansaurabh`](https://github.com/sumansaurabh) | Approve pull requests. Publish official releases and the SDK packages. Change branch rules, Actions secrets, and security settings. Triage reports sent to [security@aerol.ai](mailto:security@aerol.ai) and [GitHub private advisories](https://github.com/aerol-ai/microvm/security/advisories/new). |
