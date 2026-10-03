@@ -103,6 +103,12 @@ function toNumberOrZero(s) {
     return isFinite(n) ? n : 0;
 }
 
+// \s*,\s* is polynomial on a long run of spaces. Header lists are
+// comma-separated fields with optional whitespace around each comma.
+function splitHeaderList(value) {
+    return value.split(',').map(part => part.trim());
+}
+
 /**
  * Determines if the given response is an error response.
  * Implements RFC 5861 behavior.
@@ -492,10 +498,7 @@ module.exports = class CachePolicy {
             return false;
         }
 
-        const fields = this._resHeaders.vary
-            .trim()
-            .toLowerCase()
-            .split(/\s*,\s*/);
+        const fields = splitHeaderList(this._resHeaders.vary.trim().toLowerCase());
         for (const name of fields) {
             if (req.headers[name] !== this._reqHeaders[name]) return false;
         }
@@ -516,7 +519,7 @@ module.exports = class CachePolicy {
         }
         // 9.1.  Connection
         if (inHeaders.connection) {
-            const tokens = inHeaders.connection.trim().split(/\s*,\s*/);
+            const tokens = splitHeaderList(inHeaders.connection.trim());
             for (const name of tokens) {
                 delete headers[name];
             }

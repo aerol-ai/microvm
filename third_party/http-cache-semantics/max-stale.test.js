@@ -88,3 +88,37 @@ test('a fresh ordinary response is reusable without max-stale', () => {
     const policy = policyFor({ 'cache-control': 'max-age=60' }, { ageMs: 1000 });
     assert.equal(policy.satisfiesWithoutRevalidation(request('')), true);
 });
+
+test('Connection lists with long runs of spaces still name hop-by-hop headers', () => {
+    const spaces = ' '.repeat(20000);
+    const policy = policyFor({
+        'cache-control': 'max-age=60',
+        connection: `x-hop${spaces},${spaces}close`,
+        'x-hop': '1',
+    }, { ageMs: 0 });
+    const headers = policy.responseHeaders();
+    assert.equal(headers['x-hop'], undefined);
+});
+
+test('Vary lists with long runs of spaces still match field names', () => {
+    const spaces = ' '.repeat(20000);
+    const policy = new CachePolicy(
+        { headers: { host: 'example.test', accept: 'text/plain' } },
+        {
+            status: 200,
+            headers: {
+                date: new Date(now).toUTCString(),
+                'cache-control': 'max-age=60',
+                vary: `accept${spaces},${spaces}accept-language`,
+            },
+        },
+        { shared: true },
+    );
+    policy.now = () => now + 1000;
+    assert.equal(
+        policy.satisfiesWithoutRevalidation({
+            headers: { host: 'example.test', accept: 'text/html' },
+        }),
+        false,
+    );
+});
