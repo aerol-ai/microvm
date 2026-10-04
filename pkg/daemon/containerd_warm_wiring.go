@@ -67,10 +67,12 @@ func wireContainerdWarmPool(ctx context.Context, cfg config.Config, logger *slog
 		},
 	}
 	pool.SetParkReleaser(gate.ReleasePark)
-	// Parked slots are speculative: a real create that does not fit may
-	// reclaim them, so a pool that filled the node never refuses real work.
+	// A ready parked slot is speculative: a real create that does not fit only
+	// because of parked slots reclaims them, so a pool that filled the node
+	// does not refuse that create on the CPU/memory/disk budget.
+	pool.SetParkReadyNotifier(gate.MarkParkReady)
 	if admitter != nil {
-		admitter.SetParkReclaimer(pool.Reclaim)
+		admitter.AddParkReclaimer(pool.Reclaim)
 	}
 	driver.SetWarmPool(pool)
 

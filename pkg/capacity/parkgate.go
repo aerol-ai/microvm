@@ -61,6 +61,15 @@ func (g *ParkGate) ParkReservation(slotID string, shape dockerpool.ParkShape) er
 	})
 }
 
+// MarkParkReady tells the admitter whether a parked slot sits ready in its
+// pool, and so whether a real create may reclaim it.
+func (g *ParkGate) MarkParkReady(slotID string, ready bool) {
+	if g == nil || g.Admitter == nil {
+		return
+	}
+	g.Admitter.SetParkReclaimable(ParkReservationID(slotID), ready)
+}
+
 // ReleasePark frees a park reservation.
 func (g *ParkGate) ReleasePark(slotID string) {
 	if g == nil || g.Admitter == nil {

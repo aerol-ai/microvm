@@ -273,14 +273,18 @@ type Admitter struct {
 	totalMemMB   int
 	totalDiskGB  int
 	totalGPUs    int
-	// The park:* share of the totals above. A warm slot reserves a full
-	// sandbox shape so the pool cannot overfill the host, but it is
-	// speculative: a real create that does not fit may reclaim it.
+	// The reclaimable share of the totals above: park:* reservations whose
+	// slot is ready in its pool. A warm slot reserves a full sandbox shape so
+	// the pool cannot overfill the host, but a ready one is speculative and a
+	// real create that does not fit may reclaim it. A slot still spawning, or
+	// acquired by a create that is adopting it, is not in its pool's ready
+	// queue, so it is neither counted here nor reported to placement as free.
+	reclaimable  map[string]struct{}
 	parkedCPU    float64
 	parkedMemMB  int
 	parkedDiskGB int
 	parkedSlots  int
-	reclaim      ParkReclaimer
+	reclaimers   []ParkReclaimer
 }
 
 // ParkReclaimer gives up to slots warm-pool slots back to the admitter and
@@ -289,12 +293,41 @@ type Admitter struct {
 // is called without the admitter lock held, so it may call Release.
 type ParkReclaimer func(slots int) int
 
-// SetParkReclaimer wires the warm pool that admission may reclaim parked
-// slots from. nil disables reclaim.
-func (a *Admitter) SetParkReclaimer(fn ParkReclaimer) {
+// AddParkReclaimer registers a warm pool that admission may reclaim parked
+// slots from. A host can run more than one pool against this admitter (the
+// docker pool is not gated on the engine), so each is asked in turn.
+func (a *Admitter) AddParkReclaimer(fn ParkReclaimer) {
+	if fn == nil {
+		return
+	}
 	a.mu.Lock()
-	a.reclaim = fn
+	a.reclaimers = append(a.reclaimers, fn)
 	a.mu.Unlock()
+}
+
+// SetParkReclaimable marks a park:<slot-id> reservation as reclaimable (its
+// slot sits ready in a pool) or not (spawning, or acquired for adoption).
+// Pools call it through ParkGate.MarkParkReady; unknown or non-park IDs are
+// ignored, so a notice that races a Release is harmless.
+func (a *Admitter) SetParkReclaimable(id string, ready bool) {
+	if !isParkReservation(id) {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	req, exists := a.reservations[id]
+	_, was := a.reclaimable[id]
+	switch {
+	case ready && !was && exists:
+		if a.reclaimable == nil {
+			a.reclaimable = make(map[string]struct{})
+		}
+		a.reclaimable[id] = struct{}{}
+		a.addParkedLocked(req)
+	case !ready && was:
+		delete(a.reclaimable, id)
+		a.subtractParkedLocked(req)
+	}
 }
 
 // isParkReservation reports whether id is a warm-pool slot reservation.
@@ -302,17 +335,15 @@ func isParkReservation(id string) bool {
 	return strings.HasPrefix(id, parkReservationPrefix)
 }
 
-// addLocked and subtractLocked keep the totals and their parked share in step.
+// addLocked and subtractLocked keep the totals and their reclaimable share in
+// step; a reservation re-admitted under the same ID keeps its ready state.
 func (a *Admitter) addLocked(id string, req Request) {
 	a.totalCPU += req.CPU
 	a.totalMemMB += req.MemoryMB
 	a.totalDiskGB += req.DiskGB
 	a.totalGPUs += req.GPUs
-	if isParkReservation(id) {
-		a.parkedCPU += req.CPU
-		a.parkedMemMB += req.MemoryMB
-		a.parkedDiskGB += req.DiskGB
-		a.parkedSlots++
+	if _, ok := a.reclaimable[id]; ok {
+		a.addParkedLocked(req)
 	}
 }
 
@@ -321,12 +352,23 @@ func (a *Admitter) subtractLocked(id string, req Request) {
 	a.totalMemMB -= req.MemoryMB
 	a.totalDiskGB -= req.DiskGB
 	a.totalGPUs -= req.GPUs
-	if isParkReservation(id) {
-		a.parkedCPU -= req.CPU
-		a.parkedMemMB -= req.MemoryMB
-		a.parkedDiskGB -= req.DiskGB
-		a.parkedSlots--
+	if _, ok := a.reclaimable[id]; ok {
+		a.subtractParkedLocked(req)
 	}
+}
+
+func (a *Admitter) addParkedLocked(req Request) {
+	a.parkedCPU += req.CPU
+	a.parkedMemMB += req.MemoryMB
+	a.parkedDiskGB += req.DiskGB
+	a.parkedSlots++
+}
+
+func (a *Admitter) subtractParkedLocked(req Request) {
+	a.parkedCPU -= req.CPU
+	a.parkedMemMB -= req.MemoryMB
+	a.parkedDiskGB -= req.DiskGB
+	a.parkedSlots--
 }
 
 // New builds an admitter. host should reflect the machine's total capacity;
@@ -397,9 +439,16 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	slots, err := a.admitOnce(sandboxID, req)
 	for round := 0; err != nil && slots > 0 && round < 2; round++ {
 		a.mu.Lock()
-		reclaim := a.reclaim
+		reclaimers := append([]ParkReclaimer(nil), a.reclaimers...)
 		a.mu.Unlock()
-		if reclaim == nil || reclaim(slots) == 0 {
+		freed := 0
+		for _, reclaim := range reclaimers {
+			if freed >= slots {
+				break
+			}
+			freed += reclaim(slots - freed)
+		}
+		if freed == 0 {
 			return err
 		}
 		slots, err = a.admitOnce(sandboxID, req)
@@ -546,10 +595,8 @@ func (a *Admitter) parkedSlotsCoveringLocked(over Request) int {
 	}
 	var freed Request
 	slots := 0
-	for id, r := range a.reservations {
-		if !isParkReservation(id) {
-			continue
-		}
+	for id := range a.reclaimable {
+		r := a.reservations[id]
 		freed.CPU += r.CPU
 		freed.MemoryMB += r.MemoryMB
 		freed.DiskGB += r.DiskGB
@@ -571,6 +618,7 @@ func (a *Admitter) Release(sandboxID string) {
 	}
 	delete(a.reservations, sandboxID)
 	a.subtractLocked(sandboxID, prior)
+	delete(a.reclaimable, sandboxID)
 }
 
 // Reserve records a reservation without running admission checks. Use this on

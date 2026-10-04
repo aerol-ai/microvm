@@ -117,3 +117,44 @@ func TestReclaimNoop(t *testing.T) {
 		t.Fatal("Reclaim(0) took a slot")
 	}
 }
+
+// The ready notifier is what keeps the admitter from treating a slot it
+// cannot reclaim as free: a slot is reported ready when it enters the queue
+// (parked or returned) and not ready when a create acquires it.
+func TestParkReadyNotifierTracksTheReadyQueue(t *testing.T) {
+	p := New(nil)
+	key := testKey()
+	p.NoteTarget(key)
+	var events []string
+	p.SetParkReadyNotifier(func(id string, ready bool) {
+		state := "busy"
+		if ready {
+			state = "ready"
+		}
+		events = append(events, id+"="+state)
+	})
+
+	parkSlots(p, key, "s1")
+	slot, err := p.Acquire(context.Background(), key, "")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	p.ReturnSlot(slot)
+
+	want := []string{"s1=ready", "s1=busy", "s1=ready"}
+	if len(events) != len(want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	for i := range want {
+		if events[i] != want[i] {
+			t.Fatalf("events = %v, want %v", events, want)
+		}
+	}
+	// A miss notifies nothing.
+	if _, err := p.Acquire(context.Background(), Key{Image: "absent:1", Runtime: models.RuntimeDocker}, ""); !errors.Is(err, ErrNoSlot) {
+		t.Fatalf("acquire miss = %v", err)
+	}
+	if len(events) != len(want) {
+		t.Fatalf("a miss produced events: %v", events[len(want):])
+	}
+}
