@@ -1,0 +1,341 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Run command"
+    },
+    "description": "Run a shell command line in the sandbox (/bin/sh -c) and wait for it to exit. Returns exit_code, stdout and stderr; a non-zero exit_code is a normal result. Long output keeps its first 4 KiB and last 12 KiB per stream. Times out after timeout_seconds (default 300) with exit_code 124. Not for servers or watchers that never exit; use start_process for those.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "shell command line, run with /bin/sh -c",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "working directory",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "extra environment variables",
+          "type": "object"
+        },
+        "timeout_seconds": {
+          "description": "kill the command after this many seconds (default 300, max 3600)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "exec",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "type": "integer"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "signal": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "stderr_dropped_bytes": {
+          "type": "integer"
+        },
+        "stderr_truncated": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stdout_dropped_bytes": {
+          "type": "integer"
+        },
+        "stdout_truncated": {
+          "type": "boolean"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exit_code",
+        "stdout",
+        "stderr",
+        "duration_ms"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Expose port"
+    },
+    "description": "Publish a port the sandbox listens on and return its public URL, e.g. to preview a dev server. Calling it again returns the same URL. Start the server first (start_process, or exec with nohup ... \u0026).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "description": "port the sandbox listens on (1-65535)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "type": "object"
+    },
+    "name": "expose_port",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "notice": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "port",
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "List files"
+    },
+    "description": "List one directory in the sandbox (default: the working directory). Directories have is_dir true.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "directory (default: the working directory)",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_files",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "is_dir": {
+                "type": "boolean"
+              },
+              "mod_time": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "is_dir"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "entries"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Read file"
+    },
+    "description": "Read a text file from the sandbox: up to 2,000 lines or 256 KiB per call, starting at offset_line (1-based). If next_offset is set, call again with offset_line=next_offset for the rest. Binary files are refused; inspect them with exec.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit_lines": {
+          "description": "maximum lines to return (default and maximum 2000)",
+          "type": "integer"
+        },
+        "offset_line": {
+          "description": "first line to return, 1-based (default 1)",
+          "type": "integer"
+        },
+        "path": {
+          "description": "file path in the sandbox",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "read_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "line_truncated": {
+          "type": "boolean"
+        },
+        "next_offset": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "start_line": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "content",
+        "start_line",
+        "end_line"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Write file"
+    },
+    "description": "Write a file in the sandbox, replacing it if it exists and creating parent directories. Use it to create files; to change part of a file use edit_file if it is available.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "the whole new file content",
+          "type": "string"
+        },
+        "path": {
+          "description": "file path in the sandbox",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "write_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "bytes"
+      ],
+      "type": "object"
+    }
+  }
+]

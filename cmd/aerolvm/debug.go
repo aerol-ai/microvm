@@ -10,6 +10,11 @@ import (
 	"time"
 )
 
+// debugHTTPClient is the --debug HTTP client: requests logged to out.
+func debugHTTPClient(out io.Writer) *http.Client {
+	return &http.Client{Transport: &debugTransport{base: http.DefaultTransport, out: out}}
+}
+
 // debugTransport logs each API request and response line to stderr for
 // --debug. The Authorization header is printed as [REDACTED]: debug output
 // gets pasted into issues and chat, and the token must never land there.

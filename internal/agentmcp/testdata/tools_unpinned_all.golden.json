@@ -1,0 +1,984 @@
+[
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Edit file"
+    },
+    "description": "Replace one exact occurrence of old_string with new_string in a sandbox file. Fails if old_string is missing or appears more than once; include enough surrounding lines to make it unique. Read the file first to copy the text exactly, whitespace included.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "new_string": {
+          "description": "replacement text",
+          "type": "string"
+        },
+        "old_string": {
+          "description": "exact text to replace; must occur exactly once",
+          "type": "string"
+        },
+        "path": {
+          "description": "file path in the sandbox",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "path",
+        "old_string",
+        "new_string"
+      ],
+      "type": "object"
+    },
+    "name": "edit_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "replaced": {
+          "type": "integer"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "replaced"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Run command"
+    },
+    "description": "Run a shell command line in the sandbox (/bin/sh -c) and wait for it to exit. Returns exit_code, stdout and stderr; a non-zero exit_code is a normal result. Long output keeps its first 4 KiB and last 12 KiB per stream. Times out after timeout_seconds (default 300) with exit_code 124. Not for servers or watchers that never exit; use start_process for those.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "shell command line, run with /bin/sh -c",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "working directory",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "extra environment variables",
+          "type": "object"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "description": "kill the command after this many seconds (default 300, max 3600)",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sandbox",
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "exec",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "type": "integer"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "signal": {
+          "type": "string"
+        },
+        "stderr": {
+          "type": "string"
+        },
+        "stderr_dropped_bytes": {
+          "type": "integer"
+        },
+        "stderr_truncated": {
+          "type": "boolean"
+        },
+        "stdout": {
+          "type": "string"
+        },
+        "stdout_dropped_bytes": {
+          "type": "integer"
+        },
+        "stdout_truncated": {
+          "type": "boolean"
+        },
+        "timed_out": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exit_code",
+        "stdout",
+        "stderr",
+        "duration_ms"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Expose port"
+    },
+    "description": "Publish a port the sandbox listens on and return its public URL, e.g. to preview a dev server. Calling it again returns the same URL. Start the server first (start_process, or exec with nohup ... \u0026).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "description": "port the sandbox listens on (1-65535)",
+          "type": "integer"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "port"
+      ],
+      "type": "object"
+    },
+    "name": "expose_port",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "notice": {
+          "type": "string"
+        },
+        "port": {
+          "type": "integer"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "port",
+        "url"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Search file contents"
+    },
+    "description": "Find lines containing pattern (plain text, not a regex) in files under path. Returns up to 200 matches as {file, line, content}.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "directory to search (default: the working directory)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "text to find (plain text, not a regex)",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "grep_files",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "matches": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "content": {
+                "type": "string"
+              },
+              "file": {
+                "type": "string"
+              },
+              "line": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "file",
+              "line",
+              "content"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "matches"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "List files"
+    },
+    "description": "List one directory in the sandbox (default: the working directory). Directories have is_dir true.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "directory (default: the working directory)",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox"
+      ],
+      "type": "object"
+    },
+    "name": "list_files",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "entries": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "is_dir": {
+                "type": "boolean"
+              },
+              "mod_time": {
+                "type": "string"
+              },
+              "mode": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "size": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "name",
+              "is_dir"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "entries"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Background process output"
+    },
+    "description": "Show a background process's status and output (first 4 KiB and last 12 KiB).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "session_id from start_process",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "process_logs",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "dropped_bytes": {
+          "type": "integer"
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "exit_signal": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "name",
+        "status",
+        "output"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Read file"
+    },
+    "description": "Read a text file from the sandbox: up to 2,000 lines or 256 KiB per call, starting at offset_line (1-based). If next_offset is set, call again with offset_line=next_offset for the rest. Binary files are refused; inspect them with exec.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit_lines": {
+          "description": "maximum lines to return (default and maximum 2000)",
+          "type": "integer"
+        },
+        "offset_line": {
+          "description": "first line to return, 1-based (default 1)",
+          "type": "integer"
+        },
+        "path": {
+          "description": "file path in the sandbox",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "path"
+      ],
+      "type": "object"
+    },
+    "name": "read_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "end_line": {
+          "type": "integer"
+        },
+        "line_truncated": {
+          "type": "boolean"
+        },
+        "next_offset": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "start_line": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "path",
+        "content",
+        "start_line",
+        "end_line"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Create sandbox"
+    },
+    "description": "Create a sandbox (an isolated Linux machine), or return the existing one with the same name. Safe to retry. Without a name, one is generated. Returns its id and name; pass either as `sandbox` to the other tools. New sandboxes stop after 30 minutes idle and are destroyed after 24 hours idle.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "description": "CPU cores",
+          "type": "number"
+        },
+        "destroy_if_idle_minutes": {
+          "description": "destroy after this many idle minutes (default 1440)",
+          "type": "integer"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "environment variables",
+          "type": "object"
+        },
+        "image": {
+          "description": "container image such as python:3.12 or node:22; for runtime wasm, the module",
+          "type": "string"
+        },
+        "memory_mb": {
+          "description": "memory in MiB",
+          "type": "integer"
+        },
+        "name": {
+          "description": "sandbox name, unique among your sandboxes; omit to generate one",
+          "type": "string"
+        },
+        "runtime": {
+          "description": "isolation runtime; omit for the server default",
+          "enum": [
+            "docker",
+            "gvisor",
+            "firecracker",
+            "wasm"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "sandbox_create",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "created": {
+          "type": "boolean"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "runtime": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "status",
+        "created_at",
+        "created"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Destroy sandbox"
+    },
+    "description": "Destroy a sandbox and everything in it. Cannot be undone. Destroying one that is already gone succeeds.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox"
+      ],
+      "type": "object"
+    },
+    "name": "sandbox_destroy",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "already_gone": {
+          "type": "boolean"
+        },
+        "destroyed": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "destroyed"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "List sandboxes"
+    },
+    "description": "List your sandboxes, 20 per page, as {id, name, status, runtime, created_at, tags}. Pass next_page_token back as page_token for the next page. Filter with tags.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "page_token": {
+          "description": "next_page_token from the previous page",
+          "type": "string"
+        },
+        "tags": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "only sandboxes with all these labels",
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "name": "sandbox_list",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "next_page_token": {
+          "type": "string"
+        },
+        "sandboxes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "created_at": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "runtime": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "tags": {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "id",
+              "status",
+              "created_at"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        }
+      },
+      "required": [
+        "sandboxes"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "Search file names"
+    },
+    "description": "Find files under path whose names match a glob pattern such as *.go. Returns up to 500 paths.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "directory to search (default: the working directory)",
+          "type": "string"
+        },
+        "pattern": {
+          "description": "file name glob, e.g. *.py",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "pattern"
+      ],
+      "type": "object"
+    },
+    "name": "search_files",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "files"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false,
+      "title": "Start background process"
+    },
+    "description": "Start a long-running command (dev server, watcher, worker) in the background and return its session_id at once. Read its output with process_logs and stop it with stop_process.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "shell command line to run in the background",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "working directory",
+          "type": "string"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "extra environment variables",
+          "type": "object"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "command"
+      ],
+      "type": "object"
+    },
+    "name": "start_process",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "exit_code": {
+          "type": "integer"
+        },
+        "exit_signal": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "name",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Stop background process"
+    },
+    "description": "Stop a background process started with start_process. Stopping one that is already gone succeeds.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        },
+        "session_id": {
+          "description": "session_id from start_process",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "stop_process",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "notice": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "stopped": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id",
+        "stopped"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false,
+      "title": "Write file"
+    },
+    "description": "Write a file in the sandbox, replacing it if it exists and creating parent directories. Use it to create files; to change part of a file use edit_file if it is available.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "the whole new file content",
+          "type": "string"
+        },
+        "path": {
+          "description": "file path in the sandbox",
+          "type": "string"
+        },
+        "sandbox": {
+          "description": "the sandbox's ID or name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sandbox",
+        "path",
+        "content"
+      ],
+      "type": "object"
+    },
+    "name": "write_file",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "type": "integer"
+        },
+        "notice": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "sandbox_created": {
+          "type": "boolean"
+        },
+        "sandbox_recreated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "bytes"
+      ],
+      "type": "object"
+    }
+  }
+]
