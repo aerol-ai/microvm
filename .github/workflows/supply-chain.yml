@@ -1,6 +1,6 @@
-# Dependency review and gosec run on every pull request and on the merge
-# queue. They are required checks: a high-severity finding fails the job,
-# and the default-branch ruleset rejects the merge.
+# Dependency review and gosec run on every pull request into main and on
+# the merge queue. They are required checks: a high-severity finding fails
+# the job, and the default-branch ruleset rejects the merge.
 #
 # No `push` trigger and no `if:` on the jobs. Dependency review has no pull
 # request to diff on a branch push, and a conditional job is not a gate.
@@ -8,7 +8,15 @@
 name: Supply chain
 
 on:
+  # Only pull requests into main. A stacked pull request whose base is
+  # another feature branch runs nothing; when GitHub retargets it to main
+  # after its base merges, that fires `edited`, which is listed so the
+  # pull request gets its required checks without a new push. A title or
+  # body edit also fires `edited` and re-runs these jobs.
   pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited]
   merge_group:
 
 permissions:

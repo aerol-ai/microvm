@@ -4,7 +4,15 @@ on:
   push:
     branches:
       - main
+  # Only pull requests into main. A stacked pull request whose base is
+  # another feature branch runs nothing; when GitHub retargets it to main
+  # after its base merges, that fires `edited`, which is listed so the
+  # pull request gets its required checks without a new push. A title or
+  # body edit also fires `edited` and re-runs the workflow.
   pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, edited]
   # The merge queue re-runs the required `changes` check on a temporary
   # merge commit. That event is merge_group, not pull_request, so without
   # this trigger the queue waits until check_response_timeout and fails.
