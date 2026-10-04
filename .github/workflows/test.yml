@@ -4,11 +4,13 @@ on:
   push:
     branches:
       - main
-  # Only pull requests into main. A stacked pull request whose base is
-  # another feature branch runs nothing; when GitHub retargets it to main
-  # after its base merges, that fires `edited`, which is listed so the
-  # pull request gets its required checks without a new push. A title or
-  # body edit also fires `edited` and re-runs the workflow.
+  # Only pull requests into main. A plain pull request into a feature
+  # branch runs nothing. A GitHub native stacked pull request still runs:
+  # GitHub builds its merge ref against main and merges the whole stack
+  # under main's ruleset, so every layer must post the required `changes`
+  # check. On those layers `paths` turns every suite off, and only the
+  # gate jobs run. `edited` is listed so a pull request retargeted to main
+  # gets its checks without a new push; a title or body edit also fires it.
   pull_request:
     branches:
       - main
@@ -18,20 +20,31 @@ on:
   # this trigger the queue waits until check_response_timeout and fails.
   merge_group:
 
+# A new push to a pull request cancels that pull request's older run, so
+# a rebased stack doesn't queue a stale run per layer ahead of the current
+# one. Pushes to main and merge-queue runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   paths:
     runs-on: ubuntu-latest
+    # A stacked layer (base is another branch) reports every suite as
+    # unselected, so it runs only DCO, baseline-tests and the gate. The
+    # suites are advisory, and they run on the stack's root pull request
+    # and on the push to main once the stack lands.
     outputs:
-      docs: ${{ steps.filter.outputs.docs }}
-      go_main: ${{ steps.filter.outputs.go_main }}
-      go_sdk: ${{ steps.filter.outputs.go_sdk }}
-      java_sdk: ${{ steps.filter.outputs.java_sdk }}
-      python_sdk: ${{ steps.filter.outputs.python_sdk }}
-      typescript_sdk: ${{ steps.filter.outputs.typescript_sdk }}
-      rust_sdk: ${{ steps.filter.outputs.rust_sdk }}
+      docs: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.docs || 'false' }}
+      go_main: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_main || 'false' }}
+      go_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.go_sdk || 'false' }}
+      java_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.java_sdk || 'false' }}
+      python_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.python_sdk || 'false' }}
+      typescript_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.typescript_sdk || 'false' }}
+      rust_sdk: ${{ (github.event_name != 'pull_request' || github.base_ref == 'main') && steps.filter.outputs.rust_sdk || 'false' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
