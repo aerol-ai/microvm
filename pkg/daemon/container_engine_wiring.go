@@ -51,6 +51,10 @@ func wireContainerEngine(ctx context.Context, cfg config.Config, logger *slog.Lo
 	}
 	reassertStop := startChainReassert(ctx, ctdRules, logger)
 	driver := cntr.New(cntr.FromDaemonConfig(cfg), ctdRules, logger)
+	// Same cluster-PAT pull credential the docker client got in Run (see
+	// configureAOCRPullAuth in daemon.go). Installed here, before the warm pool
+	// starts refilling, because ensureImage reads it without a lock.
+	configureAOCRPullAuth(logger, cfg, models.ContainerEngineContainerd, driver)
 	netnsPool, err := wireContainerdNativeNetnsPool(ctx, cfg, logger, st, driver)
 	if err != nil {
 		return nil, err

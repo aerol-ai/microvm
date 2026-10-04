@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,4 +144,53 @@ func TestWireContainerEngineContainerdPathWithoutDockerClient(t *testing.T) {
 		t.Fatal("expected reassert stop func")
 	}
 	w.Stop()
+}
+
+// TestWireContainerEngineConfiguresContainerdAOCRPullAuth is the wiring half of
+// the containerd cross-node snapshot 401 fix: on a containerd node with cluster
+// AOCR config, wireContainerEngine must hand the driver the cluster PAT (the
+// docker client alone was configured before). The resolver behaviour itself is
+// covered next to the driver in internal/runtime/containerd.
+func TestWireContainerEngineConfiguresContainerdAOCRPullAuth(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/state.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	base := config.Config{
+		EnableNetworkRules:        false,
+		NetrulesBackend:           "exec",
+		AutoImportClusterID:       "prod-aerolvm-us-east-1",
+		AutoImportClusterPATPath:  t.TempDir() + "/cluster-pat",
+		ImageDistributionAOCRHost: "aocr.aerol.ai",
+	}
+	cases := []struct {
+		name   string
+		engine string
+		want   bool
+	}{
+		{"containerd engine configures the driver", models.ContainerEngineContainerd, true},
+		{"docker engine leaves containerd unwired", models.ContainerEngineDocker, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			cfg := base
+			cfg.ContainerEngine = tc.engine
+			w, err := wireContainerEngine(context.Background(), cfg, logger, &service.Service{}, st, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("wireContainerEngine: %v", err)
+			}
+			if w != nil {
+				w.Stop()
+			}
+			logs := buf.String()
+			got := strings.Contains(logs, "aocr pull auth configured") && strings.Contains(logs, "engine=containerd")
+			if got != tc.want {
+				t.Fatalf("containerd aocr pull auth configured = %v, want %v; logs:\n%s", got, tc.want, logs)
+			}
+		})
+	}
 }

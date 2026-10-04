@@ -9,6 +9,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 )
 
@@ -92,6 +93,13 @@ type Driver struct {
 	pullSem       chan struct{}
 	pullFailMu    sync.Mutex
 	pullFailUntil map[string]time.Time
+
+	// aocrPullAuth is the node-local cluster PAT presented on a cache-miss pull
+	// of an AOCR `cluster/...` ref when the caller supplied no credential (the
+	// cross-node create-from-snapshot shape). nil = anonymous pulls. Set once
+	// at boot via ConfigureAOCRPullAuth, before any create or warm-pool refill
+	// can read it, so it needs no lock. See aocr_pull_auth.go.
+	aocrPullAuth *dockerpkg.AOCRPullAuth
 
 	warmPool WarmPool
 	netns    NetnsHandoff

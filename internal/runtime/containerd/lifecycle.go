@@ -691,7 +691,11 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 		// WithPullUnpack is mandatory: cntr.WithNewSnapshot expects the image
 		// layers unpacked into the snapshotter, and a bare Pull does not unpack.
 		opts := []cntr.RemoteOpt{cntr.WithPullUnpack}
-		if a := auth; a != nil && a.Username != "" {
+		// Resolved inside the flight, after the local re-check, so a warm
+		// image never reads the PAT file and N concurrent cold creates of
+		// one cross-node snapshot read it once.
+		pullAuth, patErr := d.pullAuthFor(ref, auth)
+		if a := pullAuth; a != nil && a.Username != "" {
 			refHost := registryHost(ref)
 			opts = append(opts, cntr.WithResolver(docker.NewResolver(docker.ResolverOptions{
 				// Scope creds to the ref's own registry host. Returning creds
@@ -705,7 +709,14 @@ func (d *Driver) ensureImage(ctx context.Context, client *Client, ref string, au
 				})),
 			})))
 		}
-		return client.PullImage(ctx, ref, opts...)
+		image, pullErr := client.PullImage(ctx, ref, opts...)
+		if pullErr != nil && patErr != nil {
+			// The anonymous fallback against a `cluster/` ref fails with an
+			// opaque "failed to fetch anonymous token: 401"; name the real
+			// cause (the unreadable PAT file) in the error the create returns.
+			return nil, fmt.Errorf("%w (AOCR cluster pull auth unavailable, pulled anonymously: %w)", pullErr, patErr)
+		}
+		return image, pullErr
 	})
 	if err != nil {
 		if backoff := d.cfg.PullFailureBackoff; backoff > 0 {

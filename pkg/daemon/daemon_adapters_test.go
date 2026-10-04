@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
 	logger := testLogger()
 
 	// Empty config: must short-circuit before touching the client.
-	configureAOCRPullAuth(logger, config.Config{}, &docker.Client{})
+	configureAOCRPullAuth(logger, config.Config{}, models.ContainerEngineDocker, &docker.Client{})
 
 	// Fully configured: writes node-local pull auth onto the client. The
 	// behavior of the resolver itself is covered in pkg/docker; here we only
@@ -81,7 +82,65 @@ func TestConfigureAOCRPullAuthGuard_NoPanic(t *testing.T) {
 		AutoImportClusterPATPath:  patPath,
 		MirrorPushHost:            "aocr.aerol.ai",
 		ImageDistributionAOCRHost: "aocr.aerol.ai",
-	}, &docker.Client{})
+	}, models.ContainerEngineDocker, &docker.Client{})
+}
+
+// recordingAOCRConfigurer captures what configureAOCRPullAuth hands an engine,
+// so the test can pin the shared host/cluster/PAT inputs without reaching into
+// either engine's unexported state.
+type recordingAOCRConfigurer struct {
+	calls     int
+	hosts     []string
+	clusterID string
+	patPath   string
+}
+
+func (r *recordingAOCRConfigurer) ConfigureAOCRPullAuth(hosts []string, clusterID, patPath string) {
+	r.calls++
+	r.hosts = append([]string(nil), hosts...)
+	r.clusterID = clusterID
+	r.patPath = patPath
+}
+
+func TestConfigureAOCRPullAuth_EngineInputs(t *testing.T) {
+	cases := []struct {
+		name      string
+		cfg       config.Config
+		wantCalls int
+		wantHosts []string
+	}{
+		{"empty config is a no-op", config.Config{}, 0, nil},
+		{"cluster id without PAT path is a no-op", config.Config{AutoImportClusterID: "c1"}, 0, nil},
+		{"PAT path without cluster id is a no-op", config.Config{AutoImportClusterPATPath: "/etc/pat"}, 0, nil},
+		{
+			"push host and distribution host both passed, trimmed ids",
+			config.Config{
+				AutoImportClusterID:       "  prod-aerolvm-us-east-1 ",
+				AutoImportClusterPATPath:  " /etc/sandboxd/cluster-pat ",
+				MirrorPushHost:            "push.aocr.aerol.ai",
+				ImageDistributionAOCRHost: "aocr.aerol.ai",
+			},
+			1, []string{"push.aocr.aerol.ai", "aocr.aerol.ai"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &recordingAOCRConfigurer{}
+			configureAOCRPullAuth(testLogger(), tc.cfg, models.ContainerEngineContainerd, r)
+			if r.calls != tc.wantCalls {
+				t.Fatalf("calls = %d, want %d", r.calls, tc.wantCalls)
+			}
+			if tc.wantCalls == 0 {
+				return
+			}
+			if strings.Join(r.hosts, ",") != strings.Join(tc.wantHosts, ",") {
+				t.Fatalf("hosts = %v, want %v", r.hosts, tc.wantHosts)
+			}
+			if r.clusterID != "prod-aerolvm-us-east-1" || r.patPath != "/etc/sandboxd/cluster-pat" {
+				t.Fatalf("clusterID=%q patPath=%q, want trimmed values", r.clusterID, r.patPath)
+			}
+		})
+	}
 }
 
 func TestWireDockerNetnsPool_Enabled(t *testing.T) {
