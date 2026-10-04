@@ -17,7 +17,10 @@ Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the ser
   page. Register it in the sidebar at `docs/src/content.config.ts` (note: file
   is `content.config.ts`, not `content/config.ts`).
 - Every new docs page must cover all five SDK languages with matching
-  `syncKey="lang"` tab order.
+  `syncKey="lang"` tab order. The one exception is `cli.mdx` and `mcp.mdx`:
+  their examples are shell commands and MCP client config, in tabs keyed
+  `syncKey="mcp-client"`, and each still ends with a "Same thing from the
+  SDK" section in the five `syncKey="lang"` tabs.
 
 ### API & server changes
 
