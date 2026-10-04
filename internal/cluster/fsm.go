@@ -3693,9 +3693,16 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 // signal collapses into the next one (the watcher only needs "something
 // changed", not the count of changes). Returns a cancel func that removes the
 // subscriber and is safe to call multiple times.
+// subscribe and its cancel replace f.subscribers with a new slice instead of
+// editing it in place: notifySubscribers walks the slice it read under
+// subMu after releasing the lock, so an in-place append or removal would
+// write into the array a fan-out is reading. Subscribing is rare; the
+// fan-out runs on every Apply, so the copy belongs here.
 func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 	f.subMu.Lock()
-	f.subscribers = append(f.subscribers, ch)
+	next := make([]chan<- struct{}, len(f.subscribers), len(f.subscribers)+1)
+	copy(next, f.subscribers)
+	f.subscribers = append(next, ch)
 	f.subMu.Unlock()
 	var once sync.Once
 	return func() {
@@ -3704,7 +3711,9 @@ func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 			defer f.subMu.Unlock()
 			for i, c := range f.subscribers {
 				if c == ch {
-					f.subscribers = append(f.subscribers[:i], f.subscribers[i+1:]...)
+					next := make([]chan<- struct{}, 0, len(f.subscribers)-1)
+					next = append(next, f.subscribers[:i]...)
+					f.subscribers = append(next, f.subscribers[i+1:]...)
 					return
 				}
 			}
@@ -3718,7 +3727,7 @@ func (f *placementFSM) subscribe(ch chan<- struct{}) (cancel func()) {
 // just "wake up and reconcile."
 func (f *placementFSM) notifySubscribers() {
 	f.subMu.Lock()
-	subs := f.subscribers
+	subs := f.subscribers // never mutated in place; see subscribe
 	f.subMu.Unlock()
 	for _, ch := range subs {
 		select {
