@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -67,7 +68,10 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(hostPath)
+	// Stream from the file: this handler runs inside sandboxd, so reading a
+	// large guest file whole would land it in daemon memory, even when the
+	// client only wants its first window (the agent read_file tool).
+	f, err := os.Open(hostPath)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
@@ -76,11 +80,25 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if info.IsDir() {
+		// Same status and text os.ReadFile produced for a directory.
+		writeError(w, http.StatusInternalServerError, "read "+hostPath+": is a directory")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "attachment; filename="+strconvQuote(filepath.Base(hostPath)))
+	if info.Mode().IsRegular() {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, f)
 }
 
 func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
