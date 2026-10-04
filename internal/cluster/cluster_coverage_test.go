@@ -653,7 +653,7 @@ func TestNoopExtraBranches(t *testing.T) {
 	if row, created, err := n.VolumeUpsert(ctx, models.Volume{Tenant: "t", Name: "n", ID: "id-1"}, 0); err != nil || !created || row.ID != "id-1" {
 		t.Fatalf("VolumeUpsert row=%+v created=%v err=%v", row, created, err)
 	}
-	if _, _, err := n.OwnerOfName("missing"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := n.OwnerOfName("", "missing"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName error=%v", err)
 	}
 	if _, err := n.SelectPlacement(capacity.Request{CPU: 1, MemoryMB: 1}); err != nil {

@@ -121,6 +121,12 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			return Decision{}, false
 		}
 	}
+	// Reject reserved names before the reservation claims the name in Raft;
+	// the target node's create applies the same rule again.
+	if err := models.ValidateSandboxName(req.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
 	if svc.ClusterEnabled() {
 		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -224,7 +230,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
+	// Names are unique per owner: the reservation claims the caller's
+	// owner-qualified key (internal/cluster/name_key.go). The owner comes
+	// from the request rather than opts.OwnerRef because the facades leave
+	// the reservation's secret handle untenanted but still need their names
+	// in the caller's namespace. The promote re-qualifies idempotently.
 	redacted := service.RedactClusterSecrets(req)
+	redacted.Name = cluster.QualifiedSandboxName(service.OwnerRefForCreate(r.Context()), redacted.Name)
 	reserveSecrets := cluster.PlacementSecrets{Recipients: recipients, OwnerRef: strings.TrimSpace(opts.OwnerRef)}
 	commitCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	err = c.ReserveOnTarget(commitCtx, sandboxID, target, &redacted, reserveSecrets, ReservationTTL)

@@ -24,7 +24,9 @@ func (h *handlers) clusterForwardWrap(pathKey string, local http.Handler) http.H
 
 		owner, err := c.OwnerOf(strings.TrimSpace(r.PathValue(pathKey)))
 		if errors.Is(err, cluster.ErrUnknownSandbox) && pathKey == "idOrName" {
-			_, owner, err = c.OwnerOfName(r.PathValue(pathKey))
+			// Names are unique per owner: resolve in the caller's namespace,
+			// the same one resolveSandbox uses on the owner node.
+			_, owner, err = c.OwnerOfName(service.OwnerRefForCreate(r.Context()), r.PathValue(pathKey))
 		}
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
 			local.ServeHTTP(w, r)

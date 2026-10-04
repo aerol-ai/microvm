@@ -1109,7 +1109,9 @@ func (h *handlers) clusterInternalPlacementByName(w http.ResponseWriter, r *http
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
 		return
 	}
-	id, owner, err := c.OwnerOfName(string(decoded))
+	// Raw-key contract: the path carries one nameIndex key, and the worker
+	// agent applies the per-owner rules itself (cluster.Agent.OwnerOfName).
+	id, owner, err := c.OwnerOfNameKey(string(decoded))
 	if err != nil {
 		if errors.Is(err, cluster.ErrUnknownSandbox) {
 			apihttp.WriteError(w, http.StatusNotFound, "no placement record")

@@ -24,10 +24,14 @@ func (s *Service) ListCompatState(ctx context.Context, facade string) (map[strin
 	return s.store.ListCompatState(ctx, facade)
 }
 
-// ResolveSandboxIDByName looks up the sandbox owning the given unique
-// name. Empty name returns ErrNotFound (handled inside the store).
+// ResolveSandboxIDByName looks up the caller's sandbox with the given name.
+// Names are unique per owner, so the lookup runs in the namespace a create by
+// this caller would use: a user token's account, or "" for operator/PAT and
+// internal callers. Another owner's name reads as ErrNotFound, never as a
+// conflict, so a user token cannot learn which names other tenants hold.
+// Empty name returns ErrNotFound (handled inside the store).
 func (s *Service) ResolveSandboxIDByName(ctx context.Context, name string) (string, error) {
-	return s.store.ResolveSandboxIDByName(ctx, name)
+	return s.store.ResolveSandboxIDByName(ctx, ownerRefForCreate(ctx), name)
 }
 
 // UpdateTags replaces sandboxes.tags_json for the given sandbox. Tags are

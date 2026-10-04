@@ -74,7 +74,7 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 		t.Fatal("AttachInternalHandler() did not install the extra handler")
 	}
 
-	sandboxID, owner, err := c.OwnerOfName("demo")
+	sandboxID, owner, err := c.OwnerOfName("", "demo")
 	if err != nil {
 		t.Fatalf("OwnerOfName() error = %v", err)
 	}
@@ -84,7 +84,7 @@ func TestClusterLocalClientReadWrappers(t *testing.T) {
 	if owner.NodeID != "owner-node" || owner.APIURL != "http://owner-node" || owner.InternalURL != "https://owner-node.internal" || owner.IsSelf {
 		t.Fatalf("OwnerOfName() owner = %+v, want gossip-enriched remote owner", owner)
 	}
-	if _, _, err := c.OwnerOfName("missing"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := c.OwnerOfName("", "missing"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName(missing) error = %v, want ErrUnknownSandbox", err)
 	}
 
