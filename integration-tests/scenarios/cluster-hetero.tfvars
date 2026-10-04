@@ -36,6 +36,13 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# Serve the remote MCP endpoint at /mcp on every node (UC-178, capability
+# remote-mcp). Here the API domain lands on ingress-1, which can never own a
+# sandbox, so every remote tool call is forwarded to its owning worker.
+extra_sandboxd_env = {
+  SB_MCP_ENABLED = "true"
+}
+
 nodes = {
   server-1  = { role = "server", seed = true, instance_type = "t3.medium", volume_size_gb = 20, spot = false }
   server-2  = { role = "server", instance_type = "t3.medium", volume_size_gb = 20, spot = false }
