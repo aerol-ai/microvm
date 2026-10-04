@@ -374,6 +374,12 @@ func (s *Server) sandboxRoute(w http.ResponseWriter, r *http.Request, id, sub st
 	case strings.HasPrefix(sub, "ports/") && r.Method == http.MethodPost:
 		port, _ := strconv.Atoi(strings.TrimPrefix(sub, "ports/"))
 		writeJSON(w, http.StatusOK, models.ExposePortResponse{Protocol: "http", PublicURL: fmt.Sprintf("https://%d-%s.example.test", port, id)})
+	case sub == "snapshot" && r.Method == http.MethodPost:
+		var req models.CreateSandboxSnapshotRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		writeJSON(w, http.StatusCreated, models.SandboxSnapshot{Name: req.Name, Image: "snapshots/" + req.Name, SourceSandboxID: id})
+	case strings.HasPrefix(sub, "sessions/") && strings.HasSuffix(sub, "/attach") && r.Method == http.MethodGet:
+		s.attachSession(w, r, sb, strings.TrimSuffix(strings.TrimPrefix(sub, "sessions/"), "/attach"))
 	case strings.HasPrefix(sub, "sessions"):
 		s.sessions(w, r, sb, strings.TrimPrefix(sub, "sessions"))
 	case strings.HasPrefix(sub, "toolbox/"):
@@ -728,6 +734,29 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request, sb *Sandbox, r
 	default:
 		writeErr(w, http.StatusNotFound, "no session route")
 	}
+}
+
+// attachSession replays a session's log and reports exit code 0, like
+// attaching to a command that has just finished.
+func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sb *Sandbox, sessionID string) {
+	s.mu.Lock()
+	session, ok := sb.Sessions[sessionID]
+	var logCopy []byte
+	if ok {
+		logCopy = append([]byte(nil), session.Log...)
+	}
+	s.mu.Unlock()
+	if !ok {
+		writeErr(w, http.StatusNotFound, "session not found")
+		return
+	}
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{1}, logCopy...))
+	_ = conn.WriteJSON(map[string]any{"type": "exit", "code": 0})
 }
 
 // AppendSessionLog adds output to a fake session's log.
