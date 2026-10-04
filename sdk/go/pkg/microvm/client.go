@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -547,6 +548,16 @@ func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.
 // reading only the head of a large file costs only the head.
 func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
 	return s.client.inner.DownloadFileStream(ctx, s.ID, targetPath)
+}
+
+// ToolboxRequest sends one raw request to this sandbox's toolbox (path such
+// as "/files" or "/process/execute") and returns the response for the caller
+// to read and close. Use it for toolbox endpoints without a typed method, or
+// to bound how much of a response you read. A 4xx/5xx returns an *APIError.
+// Reads (GET/HEAD) retry on transient statuses; requests with a body are
+// sent once.
+func (s *Sandbox) ToolboxRequest(ctx context.Context, method, path string, query url.Values, body []byte, contentType string) (*http.Response, error) {
+	return s.client.inner.ToolboxRequest(ctx, s.ID, method, path, query, body, contentType)
 }
 
 // ExposeOption customizes an ExposePort call. Build values with WithProtocol;
