@@ -1044,6 +1044,58 @@ class MicroVMClientTest {
         }
     }
 
+    // Names are unique per owner and looked up with ?name=. getByName must
+    // trust the reply only when it holds at most one sandbox carrying that
+    // name: an old server ignores the filter and returns a normal list page.
+    @Test
+    void getByNameSendsNameQueryAndVerifiesReply() throws Exception {
+        Map<String, Object> agent = new java.util.LinkedHashMap<>();
+        agent.put("id", "sb-1");
+        agent.put("name", "agent");
+        agent.put("tags", mapOf("team", "x"));
+        Map<String, List<Object>> replies = new HashMap<>();
+        replies.put("agent", List.of(agent));
+        replies.put("missing", List.of());
+        replies.put("old", List.of(mapOf("id", "sb-1", "name", "a"), mapOf("id", "sb-2", "name", "b")));
+        replies.put("mismatch", List.of(mapOf("id", "sb-3", "name", "someone-else")));
+        List<String> queries = new ArrayList<>();
+        HttpServer server = startServer(exchange -> {
+            String q = exchange.getRequestURI().getQuery();
+            queries.add(q);
+            writeJson(exchange, 200, replies.get(q.substring("name=".length())));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            Sandbox found = client.getByName(" agent ").orElseThrow();
+            assertEquals("sb-1", found.toData().id);
+            assertEquals("agent", found.toData().name);
+            assertEquals("x", found.toData().tags.get("team"));
+            assertEquals("name=agent", queries.get(0));
+            assertTrue(client.getByName("missing").isEmpty());
+            for (String name : List.of("old", "mismatch")) {
+                MicroVMException err = assertThrows(MicroVMException.class, () -> client.getByName(name));
+                assertTrue(err.getMessage().contains("does not support sandbox name lookup"), err.getMessage());
+            }
+            assertThrows(IllegalArgumentException.class, () -> client.getByName("  "));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void createOptionsSerializeNameAndTags() throws Exception {
+        CreateOptions options = new CreateOptions();
+        options.image = "alpine";
+        String plain = JsonSupport.write(options);
+        assertTrue(!plain.contains("\"name\""), plain);
+        options.name = "agent";
+        options.tags = Map.of("a", "b");
+        String json = JsonSupport.write(options);
+        assertTrue(json.contains("\"name\":\"agent\""), json);
+        assertTrue(json.contains("\"tags\":{\"a\":\"b\"}"), json);
+    }
+
     // Empty filters should use the canonical collection URL without a stray
     // query delimiter.
     @Test

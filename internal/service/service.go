@@ -2708,6 +2708,34 @@ func (s *Service) applyListEnvOptions(ctx context.Context, sandboxes []*models.S
 
 // sandboxMatchesTags returns true iff every key in want is present on sb.Tags
 // with the same value. An empty want matches everything (caller short-circuits).
+// ListSandboxesByName returns the caller's sandbox called name as a list of
+// zero or one, so a lookup by name and a list share one wire shape (the v1
+// GET /sandboxes?name= filter). Names are unique per owner and the lookup runs
+// in the caller's namespace (ResolveSandboxIDByName), so another tenant's
+// name reads as an empty list rather than revealing that it exists. A tag
+// filter still applies to the one row.
+func (s *Service) ListSandboxesByName(ctx context.Context, name string, tagFilter map[string]string, opts GetSandboxOptions) ([]*models.Sandbox, error) {
+	empty := []*models.Sandbox{}
+	id, err := s.ResolveSandboxIDByName(ctx, name)
+	if errors.Is(err, store.ErrNotFound) {
+		return empty, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	sb, err := s.GetSandboxWithOptions(ctx, id, opts)
+	if errors.Is(err, store.ErrNotFound) {
+		return empty, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !sandboxMatchesTags(sb, tagFilter) {
+		return empty, nil
+	}
+	return []*models.Sandbox{sb}, nil
+}
+
 func sandboxMatchesTags(sb *models.Sandbox, want map[string]string) bool {
 	for k, v := range want {
 		if sb.Tags[k] != v {

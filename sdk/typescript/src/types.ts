@@ -161,6 +161,15 @@ import type { Image } from "./Image.js";
 
 export interface CreateOptions {
   /**
+   * Optional name, unique among the caller's sandboxes (another account may
+   * use the same name). A repeat create with a name the caller already holds
+   * returns HTTP 409. Names starting with `owner:` or shaped like a sandbox
+   * ID (`sb-` plus 16 hex) are rejected.
+   */
+  name?: string;
+  /** Free-form key/value labels; filter on them with `ListOptions.tags`. */
+  tags?: Record<string, string>;
+  /**
    * The base image for this sandbox. A bare image reference (e.g.
    * `"ubuntu:22.04"`) is pulled by the daemon as-is. An {@link Image} builder
    * is compiled to a Dockerfile and sent to the daemon's
@@ -286,6 +295,13 @@ export interface ListOptions {
    * Env is omitted by default — opt-in reads are audited server-side.
    */
   includeEnv?: boolean;
+  /**
+   * Filter to the caller's sandbox with exactly this name (`?name=<name>`);
+   * the result has zero or one entries. Names are unique per owner. Servers
+   * that predate name lookup ignore the filter and return a normal list, so
+   * prefer `MicroVM.getByName`, which checks the reply.
+   */
+  name?: string;
 }
 
 export interface GetOptions {
@@ -465,6 +481,10 @@ export type ExposeResult =
 
 export interface Sandbox {
   id: string;
+  /** Name set at create time, unique per owner. Absent for unnamed sandboxes. */
+  name?: string;
+  /** Labels set at create time. */
+  tags?: Record<string, string>;
   image: string;
   status: SandboxStatus;
   publicURL: string;
