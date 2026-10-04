@@ -300,6 +300,13 @@ func secretRecipientScore(sandboxID, nodeID string) uint64 {
 // because that's what the remote admitter will check. extraReserved is the sum
 // of in-flight reservations the cluster has against this node but the
 // heartbeat doesn't yet reflect (zero value when none).
+//
+// Parked warm-pool slots are left out of the reserved side: the worker's
+// admitter reclaims them for a real sandbox, so counting them made a node the
+// pool had filled look full to every create it could have served. A peer that
+// does not report Parked* reads as zero, which is the old accounting.
+// headroomScore still counts them, so a node with genuinely free room wins
+// before warm slots are given up.
 func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
 	cap := m.Capacity
 	if m.CapacityStale || !hasCapacitySnapshot(cap) {
@@ -308,13 +315,16 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 	if !cap.CanAdmit && len(cap.Reasons) > 0 {
 		return false
 	}
-	if cap.CPUBudget > 0 && cap.ReservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
+	reservedCPU := max(cap.ReservedCPU-cap.ParkedCPU, 0)
+	reservedMemMB := max(cap.ReservedMemoryMB-cap.ParkedMemoryMB, 0)
+	reservedDiskGB := max(cap.ReservedDiskGB-cap.ParkedDiskGB, 0)
+	if cap.CPUBudget > 0 && reservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
 		return false
 	}
-	if cap.MemoryBudgetMB > 0 && cap.ReservedMemoryMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
+	if cap.MemoryBudgetMB > 0 && reservedMemMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
 		return false
 	}
-	if cap.DiskBudgetGB > 0 && cap.ReservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
+	if cap.DiskBudgetGB > 0 && reservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
 		return false
 	}
 	// GPU and runtime are physical attributes — a peer that lacks them can

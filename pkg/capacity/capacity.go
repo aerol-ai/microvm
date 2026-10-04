@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -123,6 +124,15 @@ type Snapshot struct {
 	AvailableGPUs     int     `json:"available_gpus,omitempty"`
 	LiveMemoryFreeMB  int     `json:"live_memory_free_mb"`
 	SandboxesActive   int     `json:"sandboxes_active"`
+	// Parked* is the part of the Reserved* totals held by warm-pool slots
+	// (park:<slot-id>). Admission gives it back to a real sandbox by
+	// reclaiming slots, so placement treats it as free when deciding fit.
+	// Zero (omitted) on a peer that predates the fields, which makes
+	// placement read that peer exactly as before.
+	ParkedCPU      float64 `json:"parked_cpu,omitempty"`
+	ParkedMemoryMB int     `json:"parked_memory_mb,omitempty"`
+	ParkedDiskGB   int     `json:"parked_disk_gb,omitempty"`
+	ParkedSlots    int     `json:"parked_slots,omitempty"`
 	// SandboxesByRuntime is the live reservation count keyed by OCI runtime
 	// ("docker"/containerd, "gvisor", "wasm", "isolate", "firecracker";
 	// "unspecified" for a runtime-agnostic reservation). Lets dashboards show
@@ -263,6 +273,102 @@ type Admitter struct {
 	totalMemMB   int
 	totalDiskGB  int
 	totalGPUs    int
+	// The reclaimable share of the totals above: park:* reservations whose
+	// slot is ready in its pool. A warm slot reserves a full sandbox shape so
+	// the pool cannot overfill the host, but a ready one is speculative and a
+	// real create that does not fit may reclaim it. A slot still spawning, or
+	// acquired by a create that is adopting it, is not in its pool's ready
+	// queue, so it is neither counted here nor reported to placement as free.
+	reclaimable  map[string]struct{}
+	parkedCPU    float64
+	parkedMemMB  int
+	parkedDiskGB int
+	parkedSlots  int
+	reclaimers   []ParkReclaimer
+}
+
+// ParkReclaimer gives up to slots warm-pool slots back to the admitter and
+// returns how many it released. It must release each slot's park:<slot-id>
+// reservation before returning (container teardown may finish later), and it
+// is called without the admitter lock held, so it may call Release.
+type ParkReclaimer func(slots int) int
+
+// AddParkReclaimer registers a warm pool that admission may reclaim parked
+// slots from. A host can run more than one pool against this admitter (the
+// docker pool is not gated on the engine), so each is asked in turn.
+func (a *Admitter) AddParkReclaimer(fn ParkReclaimer) {
+	if fn == nil {
+		return
+	}
+	a.mu.Lock()
+	a.reclaimers = append(a.reclaimers, fn)
+	a.mu.Unlock()
+}
+
+// SetParkReclaimable marks a park:<slot-id> reservation as reclaimable (its
+// slot sits ready in a pool) or not (spawning, or acquired for adoption).
+// Pools call it through ParkGate.MarkParkReady; unknown or non-park IDs are
+// ignored, so a notice that races a Release is harmless.
+func (a *Admitter) SetParkReclaimable(id string, ready bool) {
+	if !isParkReservation(id) {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	req, exists := a.reservations[id]
+	_, was := a.reclaimable[id]
+	switch {
+	case ready && !was && exists:
+		if a.reclaimable == nil {
+			a.reclaimable = make(map[string]struct{})
+		}
+		a.reclaimable[id] = struct{}{}
+		a.addParkedLocked(req)
+	case !ready && was:
+		delete(a.reclaimable, id)
+		a.subtractParkedLocked(req)
+	}
+}
+
+// isParkReservation reports whether id is a warm-pool slot reservation.
+func isParkReservation(id string) bool {
+	return strings.HasPrefix(id, parkReservationPrefix)
+}
+
+// addLocked and subtractLocked keep the totals and their reclaimable share in
+// step; a reservation re-admitted under the same ID keeps its ready state.
+func (a *Admitter) addLocked(id string, req Request) {
+	a.totalCPU += req.CPU
+	a.totalMemMB += req.MemoryMB
+	a.totalDiskGB += req.DiskGB
+	a.totalGPUs += req.GPUs
+	if _, ok := a.reclaimable[id]; ok {
+		a.addParkedLocked(req)
+	}
+}
+
+func (a *Admitter) subtractLocked(id string, req Request) {
+	a.totalCPU -= req.CPU
+	a.totalMemMB -= req.MemoryMB
+	a.totalDiskGB -= req.DiskGB
+	a.totalGPUs -= req.GPUs
+	if _, ok := a.reclaimable[id]; ok {
+		a.subtractParkedLocked(req)
+	}
+}
+
+func (a *Admitter) addParkedLocked(req Request) {
+	a.parkedCPU += req.CPU
+	a.parkedMemMB += req.MemoryMB
+	a.parkedDiskGB += req.DiskGB
+	a.parkedSlots++
+}
+
+func (a *Admitter) subtractParkedLocked(req Request) {
+	a.parkedCPU -= req.CPU
+	a.parkedMemMB -= req.MemoryMB
+	a.parkedDiskGB -= req.DiskGB
+	a.parkedSlots--
 }
 
 // New builds an admitter. host should reflect the machine's total capacity;
@@ -321,7 +427,39 @@ func DetectHost() (HostInfo, error) {
 // Callers that fail downstream (e.g. docker create errors) must call Release
 // to free the reservation. Reserve is idempotent per sandboxID — re-admitting
 // the same ID overwrites the prior reservation.
+//
+// A real create (any ID but park:*) that fails only on the CPU, memory or disk
+// budget, by no more than parked warm slots hold, reclaims enough slots and is
+// admitted. Reclaim runs without the lock because the pool frees each slot
+// through Release, and it is bounded to two rounds: a refill park or another
+// admit can take the freed room before the retry, and a create must not loop
+// against a pool that keeps re-parking. It fires only when the host is
+// otherwise full, so a create that fits pays nothing for it.
 func (a *Admitter) Admit(sandboxID string, req Request) error {
+	slots, err := a.admitOnce(sandboxID, req)
+	for round := 0; err != nil && slots > 0 && round < 2; round++ {
+		a.mu.Lock()
+		reclaimers := append([]ParkReclaimer(nil), a.reclaimers...)
+		a.mu.Unlock()
+		freed := 0
+		for _, reclaim := range reclaimers {
+			if freed >= slots {
+				break
+			}
+			freed += reclaim(slots - freed)
+		}
+		if freed == 0 {
+			return err
+		}
+		slots, err = a.admitOnce(sandboxID, req)
+	}
+	return err
+}
+
+// admitOnce is one locked admission pass. On a budget-only failure it also
+// returns how many parked slots would cover the shortfall (0 when parked
+// capacity cannot, or the failure is not a budget one).
+func (a *Admitter) admitOnce(sandboxID string, req Request) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -339,10 +477,14 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	}
 
 	var reasons []string
+	// over is how far each budget would be exceeded; another reason kind
+	// (GPU, runtime, live memory) is something no reclaim can fix.
+	var over Request
 
 	if a.limits.CPUReservationRatio > 0 && a.host.CPUCores > 0 {
 		cpuBudget := a.cpuBudget()
 		if projectedCPU > cpuBudget {
+			over.CPU = projectedCPU - cpuBudget
 			reasons = append(reasons, fmt.Sprintf(
 				"cpu reservation exceeded (%.2f+%.2f > %.2f budget)",
 				a.totalCPU, req.CPU, cpuBudget,
@@ -353,6 +495,7 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	if a.limits.MemoryReservationRatio > 0 && a.host.MemoryTotalMB > 0 {
 		memBudget := a.memBudgetMB()
 		if projectedMem > memBudget {
+			over.MemoryMB = projectedMem - memBudget
 			reasons = append(reasons, fmt.Sprintf(
 				"memory reservation exceeded (%d+%d MB > %d MB budget)",
 				a.totalMemMB, req.MemoryMB, memBudget,
@@ -363,12 +506,14 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	if a.limits.DiskReservationRatio > 0 && a.host.DiskTotalGB > 0 {
 		diskBudget := a.diskBudgetGB()
 		if projectedDisk > diskBudget {
+			over.DiskGB = projectedDisk - diskBudget
 			reasons = append(reasons, fmt.Sprintf(
 				"disk reservation exceeded (%d+%d GB > %d GB budget)",
 				a.totalDiskGB, req.DiskGB, diskBudget,
 			))
 		}
 	}
+	budgetReasons := len(reasons)
 
 	// GPU and runtime are not "budgets" the operator scales — they are
 	// physical attributes of the host. We reject up front so a sandbox
@@ -426,21 +571,41 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 	}
 
 	if len(reasons) > 0 {
-		return fmt.Errorf("%w: %v", ErrCapacityExceeded, reasons)
+		err := fmt.Errorf("%w: %v", ErrCapacityExceeded, reasons)
+		if len(reasons) != budgetReasons || isParkReservation(sandboxID) {
+			return 0, err
+		}
+		return a.parkedSlotsCoveringLocked(over), err
 	}
 
 	if exists {
-		a.totalCPU -= prior.CPU
-		a.totalMemMB -= prior.MemoryMB
-		a.totalDiskGB -= prior.DiskGB
-		a.totalGPUs -= prior.GPUs
+		a.subtractLocked(sandboxID, prior)
 	}
 	a.reservations[sandboxID] = req
-	a.totalCPU += req.CPU
-	a.totalMemMB += req.MemoryMB
-	a.totalDiskGB += req.DiskGB
-	a.totalGPUs += req.GPUs
-	return nil
+	a.addLocked(sandboxID, req)
+	return 0, nil
+}
+
+// parkedSlotsCoveringLocked counts how many parked reservations free at least
+// over on every axis, or 0 when even all of them would not. Only reached when
+// a create is already refused, so the scan is off the success path.
+func (a *Admitter) parkedSlotsCoveringLocked(over Request) int {
+	if a.parkedSlots == 0 || a.parkedCPU < over.CPU || a.parkedMemMB < over.MemoryMB || a.parkedDiskGB < over.DiskGB {
+		return 0
+	}
+	var freed Request
+	slots := 0
+	for id := range a.reclaimable {
+		r := a.reservations[id]
+		freed.CPU += r.CPU
+		freed.MemoryMB += r.MemoryMB
+		freed.DiskGB += r.DiskGB
+		slots++
+		if freed.CPU >= over.CPU && freed.MemoryMB >= over.MemoryMB && freed.DiskGB >= over.DiskGB {
+			return slots
+		}
+	}
+	return 0
 }
 
 // Release frees the reservation for sandboxID. Safe to call for unknown IDs.
@@ -452,10 +617,8 @@ func (a *Admitter) Release(sandboxID string) {
 		return
 	}
 	delete(a.reservations, sandboxID)
-	a.totalCPU -= prior.CPU
-	a.totalMemMB -= prior.MemoryMB
-	a.totalDiskGB -= prior.DiskGB
-	a.totalGPUs -= prior.GPUs
+	a.subtractLocked(sandboxID, prior)
+	delete(a.reclaimable, sandboxID)
 }
 
 // Reserve records a reservation without running admission checks. Use this on
@@ -465,16 +628,10 @@ func (a *Admitter) Reserve(sandboxID string, req Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if prior, ok := a.reservations[sandboxID]; ok {
-		a.totalCPU -= prior.CPU
-		a.totalMemMB -= prior.MemoryMB
-		a.totalDiskGB -= prior.DiskGB
-		a.totalGPUs -= prior.GPUs
+		a.subtractLocked(sandboxID, prior)
 	}
 	a.reservations[sandboxID] = req
-	a.totalCPU += req.CPU
-	a.totalMemMB += req.MemoryMB
-	a.totalDiskGB += req.DiskGB
-	a.totalGPUs += req.GPUs
+	a.addLocked(sandboxID, req)
 }
 
 // Snapshot returns a point-in-time view. Includes a CanAdmit answer for a
@@ -498,6 +655,7 @@ func (a *Admitter) Snapshot() Snapshot {
 	totalMem := a.totalMemMB
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
+	parkedCPU, parkedMem, parkedDisk, parkedSlots := a.parkedCPU, a.parkedMemMB, a.parkedDiskGB, a.parkedSlots
 	a.mu.Unlock()
 
 	free := 0
@@ -536,6 +694,10 @@ func (a *Admitter) Snapshot() Snapshot {
 		AvailableGPUs:             maxInt(a.host.GPUCount-totalGPUs, 0),
 		LiveMemoryFreeMB:          free,
 		SandboxesActive:           count,
+		ParkedCPU:                 parkedCPU,
+		ParkedMemoryMB:            parkedMem,
+		ParkedDiskGB:              parkedDisk,
+		ParkedSlots:               parkedSlots,
 		SandboxesByRuntime:        byRuntime,
 		CPUReservationRatio:       a.limits.CPUReservationRatio,
 		MemoryReservationRatio:    a.limits.MemoryReservationRatio,
@@ -557,25 +719,35 @@ func (a *Admitter) Snapshot() Snapshot {
 	}
 	// Use the smallest meaningful request (1 CPU, 1 MB) as the probe ask.
 	// We don't use 0/0 because that bypasses every check and would always
-	// report CanAdmit=true even when the host is full.
-	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1})
+	// report CanAdmit=true even when the host is full. Parked slots do not
+	// count: Admit reclaims them for a real sandbox, so a host full of warm
+	// slots is still accepting, and placement must not skip it on this flag.
+	snap.CanAdmit, snap.Reasons = a.dryRun(Request{CPU: 1, MemoryMB: 1}, true)
 	recordHostPressure(snap)
 	return snap
 }
 
 // CanAdmitRequest is a non-mutating admission probe for a specific shape.
+// It counts parked slots as used, which is what the warm-pool refill gate
+// needs: a park must never take capacity a parked slot already holds.
 func (a *Admitter) CanAdmitRequest(req Request) (bool, []string) {
-	return a.dryRun(req)
+	return a.dryRun(req, false)
 }
 
 // dryRun is Admit's check-only path — it returns whether a request would be
 // admitted right now and the reasons if not, without mutating state.
-func (a *Admitter) dryRun(req Request) (bool, []string) {
+// excludeParked answers for a real sandbox, which may reclaim parked slots.
+func (a *Admitter) dryRun(req Request, excludeParked bool) (bool, []string) {
 	a.mu.Lock()
 	totalCPU := a.totalCPU
 	totalMem := a.totalMemMB
 	totalDisk := a.totalDiskGB
 	totalGPUs := a.totalGPUs
+	if excludeParked {
+		totalCPU -= a.parkedCPU
+		totalMem -= a.parkedMemMB
+		totalDisk -= a.parkedDiskGB
+	}
 	a.mu.Unlock()
 
 	var reasons []string

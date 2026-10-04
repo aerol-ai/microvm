@@ -758,3 +758,62 @@ func TestCatalogueTemplateHolderPassesTheTemplateFilter(t *testing.T) {
 		t.Fatal("no holders should return the input slice untouched")
 	}
 }
+
+// warmFilledWorker is the node cluster-mixed-benchmark-with-obs left behind:
+// an 18-CPU budget with 17 reserved, 8 of them parked warm-pool slots its
+// admitter reclaims for a real sandbox.
+func warmFilledWorker(parkedCPU float64, parkedMemMB, parkedDiskGB int) Member {
+	return Member{
+		NodeID: "w1", APIURL: "http://w1", Role: "mixed", Alive: true,
+		Capacity: capacity.Snapshot{
+			HostCPUCores: 2, HostMemoryTotalMB: 7820,
+			CPUBudget: 18, MemoryBudgetMB: 66470, DiskBudgetGB: 180,
+			ReservedCPU: 17, ReservedMemoryMB: 17408, ReservedDiskGB: 170,
+			ParkedCPU: parkedCPU, ParkedMemoryMB: parkedMemMB, ParkedDiskGB: parkedDiskGB,
+			CanAdmit: true,
+		},
+	}
+}
+
+// Parked warm slots must not make a node look full. Counting them is what
+// stopped UC-95 density at 9 sandboxes a node and sent UC-104's isolate
+// creates to "capacity exceeded" on idle nodes. A peer that predates the
+// Parked* fields reads as zero parked and keeps the old answer.
+func TestNodeFitsTreatsParkedWarmSlotsAsFree(t *testing.T) {
+	two := capacity.Request{CPU: 1, MemoryMB: 1024, DiskGB: 10}
+	cases := []struct {
+		name  string
+		node  Member
+		extra capacity.Request
+		want  bool
+	}{
+		{"parked slots leave room", warmFilledWorker(8, 8192, 80), capacity.Request{}, true},
+		{"in-flight reservations still count", warmFilledWorker(8, 8192, 80), capacity.Request{CPU: 9}, false},
+		{"legacy peer without parked fields", warmFilledWorker(0, 0, 0), capacity.Request{CPU: 1}, false},
+		{"parked larger than reserved floors at zero", warmFilledWorker(40, 8192, 80), capacity.Request{CPU: 17}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nodeFits(tc.node, two, tc.extra); got != tc.want {
+				t.Fatalf("nodeFits = %v, want %v", got, tc.want)
+			}
+		})
+	}
+
+	// The leader's reservation check (run before the Raft propose, never in
+	// FSM apply) reads the same fit, so a reservation against the node is
+	// admitted rather than refused with ErrCapacityExceeded.
+	err := admitReservationCommands([]Member{warmFilledWorker(8, 8192, 80)}, nil, nil, 0,
+		[]reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "w1"}})
+	if err != nil {
+		t.Fatalf("reservation against a warm-filled worker = %v, want admitted", err)
+	}
+
+	// Scoring still counts parked capacity: a node with genuinely free room
+	// must outscore one that would have to give up warm slots.
+	free := warmFilledWorker(0, 0, 0)
+	free.Capacity.ReservedCPU, free.Capacity.ReservedMemoryMB, free.Capacity.ReservedDiskGB = 9, 9216, 90
+	if headroomScore(free, two, capacity.Request{}) <= headroomScore(warmFilledWorker(8, 8192, 80), two, capacity.Request{}) {
+		t.Fatal("a node with free room scored no better than one full of warm slots")
+	}
+}

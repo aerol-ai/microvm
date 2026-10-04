@@ -34,7 +34,7 @@ func TestDryRunRejectsRuntimeAndGPUVendor(t *testing.T) {
 		Limits{CPUReservationRatio: 1.0, MemoryReservationRatio: 1.0},
 		nil,
 	)
-	can, reasons := a.dryRun(Request{Runtime: "wasm", GPUs: 1, GPUVendor: "amd"})
+	can, reasons := a.dryRun(Request{Runtime: "wasm", GPUs: 1, GPUVendor: "amd"}, false)
 	if can || len(reasons) < 2 {
 		t.Fatalf("dryRun = (%v, %v), want false with runtime + vendor reasons", can, reasons)
 	}
@@ -46,7 +46,7 @@ func TestDryRunMemoryFloorRejects(t *testing.T) {
 		Limits{CPUReservationRatio: 1.0, MemoryReservationRatio: 1.0, MemoryFloorRatio: 0.5},
 		fakeProbe{free: 1000},
 	)
-	can, reasons := a.dryRun(Request{CPU: 0.1, MemoryMB: 500})
+	can, reasons := a.dryRun(Request{CPU: 0.1, MemoryMB: 500}, false)
 	if can {
 		t.Fatalf("dryRun should reject when free-memory floor breached: %v", reasons)
 	}

@@ -26,6 +26,7 @@ type Pool struct {
 	spawnFails    map[string]int // keyString -> consecutive park failures
 	spawner       Spawner
 	onReleasePark func(slotID string)
+	onParkReady   func(slotID string, ready bool)
 	metrics       *Metrics
 	refillKick    chan struct{}
 }
@@ -48,9 +49,36 @@ func New(logger *slog.Logger) *Pool {
 	}
 }
 
-func (p *Pool) SetSpawner(s Spawner) { p.spawner = s }
+// SetSpawner is guarded: the refill loop sets it when it starts, while
+// Reclaim (on a create) and slot teardown may already be reading it.
+func (p *Pool) SetSpawner(s Spawner) {
+	p.mu.Lock()
+	p.spawner = s
+	p.mu.Unlock()
+}
+
+func (p *Pool) currentSpawner() Spawner {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spawner
+}
 func (p *Pool) SetParkReleaser(fn func(slotID string)) {
 	p.onReleasePark = fn
+}
+
+// SetParkReadyNotifier is told when a slot enters the ready queue (ready) and
+// when Acquire hands it to a create (not ready). Only a ready slot can be
+// reclaimed, so the admitter counts only those as reclaimable (and placement
+// as free); a slot still spawning or being adopted is neither.
+func (p *Pool) SetParkReadyNotifier(fn func(slotID string, ready bool)) {
+	p.onParkReady = fn
+}
+
+// notifyParkReady runs outside p.mu: the notifier takes the admitter lock.
+func (p *Pool) notifyParkReady(slotID string, ready bool) {
+	if p.onParkReady != nil && slotID != "" {
+		p.onParkReady(slotID, ready)
+	}
 }
 
 func (p *Pool) releasePark(slotID string) {
@@ -69,12 +97,13 @@ func (p *Pool) ReleasePark(slotID string) { p.releasePark(slotID) }
 // destroySlots tears down discarded slots outside the pool lock: the spawner
 // call talks to the Docker engine and must never run under p.mu.
 func (p *Pool) destroySlots(ctx context.Context, slots []*ParkedSlot) {
+	spawner := p.currentSpawner()
 	for _, slot := range slots {
 		if slot == nil {
 			continue
 		}
-		if p.spawner != nil {
-			_ = p.spawner.DestroyParked(ctx, slot)
+		if spawner != nil {
+			_ = spawner.DestroyParked(ctx, slot)
 		}
 		p.releasePark(slot.ID)
 	}
@@ -279,7 +308,78 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 	if picked == nil {
 		return nil, ErrNoSlot
 	}
+	p.notifyParkReady(picked.ID, false)
 	return picked, nil
+}
+
+// reclaimDestroyTimeout bounds the background teardown of each reclaimed
+// slot, so one slow destroy cannot leave the rest running.
+const reclaimDestroyTimeout = 30 * time.Second
+
+// Reclaim gives up to n parked slots back so a real sandbox can be admitted
+// on a host the pool has filled (capacity.Admitter calls it through
+// SetParkReclaimer). It takes from the least-recently-used miss-driven target
+// first and from pinned targets last, releases each slot's park reservation
+// before returning because the admitter retries straight after, and tears the
+// containers down in the background so the create that asked never waits on
+// the engine. Refill re-parks only once the capacity gate has room again.
+func (p *Pool) Reclaim(n int) int {
+	if p == nil || n <= 0 {
+		return 0
+	}
+	var taken []*ParkedSlot
+	p.mu.Lock()
+	for len(taken) < n {
+		ks := p.reclaimVictimLocked()
+		if ks == "" {
+			break
+		}
+		q := p.ready[ks]
+		taken = append(taken, q[0])
+		p.ready[ks] = q[1:]
+	}
+	if len(taken) > 0 {
+		p.publishParkedLocked()
+		if p.metrics != nil {
+			p.metrics.recordReclaim(len(taken))
+		}
+	}
+	spawner := p.spawner
+	p.mu.Unlock()
+
+	for _, slot := range taken {
+		p.releasePark(slot.ID)
+	}
+	if len(taken) > 0 && spawner != nil {
+		go func() {
+			for _, slot := range taken {
+				ctx, cancel := context.WithTimeout(context.Background(), reclaimDestroyTimeout)
+				_ = spawner.DestroyParked(ctx, slot)
+				cancel()
+			}
+		}()
+	}
+	return len(taken)
+}
+
+// reclaimVictimLocked picks the queue to take a reclaimed slot from: the
+// non-pinned target used least recently, else the least recently used pinned
+// one. Pinned targets are operator config, so they are the last to shrink.
+func (p *Pool) reclaimVictimLocked() string {
+	best := ""
+	bestPinned := false
+	var bestAt time.Time
+	for ks, q := range p.ready {
+		if len(q) == 0 {
+			continue
+		}
+		_, pinned := p.pinned[ks]
+		used := p.lastUsed[ks]
+		if best == "" || (bestPinned && !pinned) || (pinned == bestPinned && used.Before(bestAt)) {
+			best, bestPinned, bestAt = ks, pinned, used
+		}
+	}
+	return best
 }
 
 func (p *Pool) kickRefillLocked() {
@@ -306,6 +406,7 @@ func (p *Pool) ReturnSlot(slot *ParkedSlot) {
 	p.ready[ks] = append(p.ready[ks], slot)
 	p.publishParkedLocked()
 	p.mu.Unlock()
+	p.notifyParkReady(slot.ID, true)
 }
 
 // RecordLoaded pushes a freshly parked slot into the ready queue.
@@ -321,6 +422,7 @@ func (p *Pool) RecordLoaded(slot *ParkedSlot) {
 	}
 	p.publishParkedLocked()
 	p.mu.Unlock()
+	p.notifyParkReady(slot.ID, true)
 }
 
 func (p *Pool) publishParkedLocked() {
