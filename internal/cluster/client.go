@@ -35,6 +35,11 @@ type Cluster struct {
 	raft   *raftNode
 	gossip *gossipNode
 
+	// authoritativePlacementsHook stands in for AuthoritativePlacementsByIDs
+	// in tests that need a lagging local replica next to a live leader.
+	// Always nil in production.
+	authoritativePlacementsHook func(context.Context, []string) (map[string]Placement, error)
+
 	// patToken authenticates leader-forwarded raft applies. Sourced from
 	// cfg.PATToken at construction; same value every node already shares for
 	// regular API auth, so no new secret-distribution surface. With mTLS
@@ -968,6 +973,20 @@ func (c *Cluster) CancelReservation(ctx context.Context, sandboxID string) error
 		return nil
 	}
 	placement, ok := c.fsm.get(strings.TrimSpace(sandboxID))
+	if !ok {
+		// A local miss does not prove the reservation is gone. The proposer
+		// reserves through raft and forwards the create here; a create that
+		// fails within milliseconds cancels before this follower has applied
+		// the reservation, and returning nil then leaked the name until the
+		// reservation expired (every retry 409'd for two minutes in a live
+		// cluster run). Ask the leader. A row that IS present locally is
+		// conclusive either way: a replica can only lag the leader.
+		var err error
+		placement, ok, err = c.authoritativePlacement(ctx, strings.TrimSpace(sandboxID))
+		if err != nil {
+			return fmt.Errorf("cluster: cancel reservation: %w", err)
+		}
+	}
 	if !ok || !placement.IsReserved() {
 		return nil
 	}
@@ -1628,6 +1647,25 @@ func (c *Cluster) PlacementOf(sandboxID string) (Placement, bool) {
 		return Placement{}, false
 	}
 	return c.fsm.get(sandboxID)
+}
+
+// authoritativePlacement reads one placement from the leader. Without raft
+// (a single-process FSM) the local FSM is already the whole truth, so a miss
+// there stands.
+func (c *Cluster) authoritativePlacement(ctx context.Context, sandboxID string) (Placement, bool, error) {
+	lookup := c.authoritativePlacementsHook
+	if lookup == nil {
+		if c.raft == nil || c.raft.raft == nil {
+			return Placement{}, false, nil
+		}
+		lookup = c.AuthoritativePlacementsByIDs
+	}
+	got, err := lookup(ctx, []string{sandboxID})
+	if err != nil {
+		return Placement{}, false, err
+	}
+	placement, ok := got[sandboxID]
+	return placement, ok, nil
 }
 
 // PlacementsByIDs returns hot placement rows for the given IDs (point lookups).
