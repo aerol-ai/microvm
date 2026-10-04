@@ -99,7 +99,7 @@ func TestLift3AgentRemainingClientBranches(t *testing.T) {
 		}
 	}), Member{NodeID: "worker-self", Alive: true, Role: config.NodeRoleWorker})
 
-	if _, _, err := agent.OwnerOfName("named"); err == nil {
+	if _, _, err := agent.OwnerOfName("", "named"); err == nil {
 		t.Fatal("owner-of-name 500")
 	}
 	if sec := agent.SecretsOf("missing"); sec.Ref != "" {

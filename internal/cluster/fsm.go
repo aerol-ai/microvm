@@ -377,8 +377,10 @@ type placementFSM struct {
 	// tests and single-process FSM use can stay local-only.
 	recoveryResolver func(context.Context, string) (RecoveryBlob, bool, error)
 	version          uint64
-	// nameIndex maps sandbox Name → SandboxID for cluster-wide name uniqueness.
-	// Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
+	// nameIndex maps a sandbox name key → SandboxID for name uniqueness. Names
+	// are unique per owner: tenant specs carry an owner-qualified key and
+	// operator specs a plain name, both written by the proposer so apply
+	// stays byte-deterministic (name_key.go). Empty names are NOT indexed (anonymous sandboxes don't conflict, matching
 	// the local SQLite partial unique index that allows many empty names but
 	// rejects duplicate non-empty names). Updated inside Apply alongside the
 	// placement write so the index can never lag the authoritative map; rebuilt
@@ -2711,6 +2713,38 @@ func (f *placementFSM) sandboxIDByName(name string) (string, bool) {
 	defer f.mu.RUnlock()
 	id, ok := f.nameIndex[name]
 	return id, ok
+}
+
+// sandboxIDByOwnerName resolves name within ownerRef's namespace (see
+// name_key.go): the owner-qualified key first, then a legacy plain key whose
+// placement belongs to the same owner. One read lock covers both probes.
+func (f *placementFSM) sandboxIDByOwnerName(ownerRef, name string) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return resolveOwnerName(ownerRef, name, func(key string) (string, string, bool) {
+		id, ok := f.nameIndex[key]
+		if !ok {
+			return "", "", false
+		}
+		p, ok := f.placements[id]
+		if !ok {
+			return "", "", false
+		}
+		return id, p.OwnerRef, true
+	})
+}
+
+// ownerRefOf returns the replicated OwnerRef for sandboxID from the hot
+// placement row, without loading the recovery spec the way get does.
+// Proposers use it to qualify a spec name when the caller didn't pass one.
+func (f *placementFSM) ownerRefOf(sandboxID string) (string, bool) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	p, ok := f.placements[sandboxID]
+	if !ok {
+		return "", false
+	}
+	return p.OwnerRef, true
 }
 
 // idsOwnedBy returns the sandbox IDs whose current owner is nodeID. Used by

@@ -49,7 +49,7 @@ func (c *internalPlacementErrCluster) OwnerOf(string) (cluster.OwnerInfo, error)
 	return c.owner, c.ownerErr
 }
 
-func (c *internalPlacementErrCluster) OwnerOfName(name string) (string, cluster.OwnerInfo, error) {
+func (c *internalPlacementErrCluster) OwnerOfNameKey(name string) (string, cluster.OwnerInfo, error) {
 	if name != "known" {
 		return "", cluster.OwnerInfo{}, cluster.ErrUnknownSandbox
 	}

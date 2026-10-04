@@ -366,7 +366,7 @@ func TestListHelpersQueryErrorsByDroppedTables(t *testing.T) {
 			name: "ResolveSandboxIDByName",
 			drop: "sandboxes",
 			seed: func(t *testing.T, st *Store) {},
-			call: func(st *Store) error { _, err := st.ResolveSandboxIDByName(ctx, "x"); return err },
+			call: func(st *Store) error { _, err := st.ResolveSandboxIDByName(ctx, "", "x"); return err },
 		},
 		{
 			name: "IsTemplateReferenced",
@@ -978,8 +978,10 @@ func TestInsertSandboxAndUpsertRemaining(t *testing.T) {
 		t.Fatal("toolbox token without cipher")
 	}
 
+	// Names are unique per owner, so the duplicate must share the owner.
 	dupName := sampleSandbox("sb-dup-name")
 	dupName.Name = "named-full"
+	dupName.OwnerRef = "tenant-a"
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -3051,7 +3053,7 @@ func TestFleetResolveAndDomainConflictEdges(t *testing.T) {
 	if err := st.SetFleetSuspended(ctx, "missing", true); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("SetFleetSuspended missing = %v", err)
 	}
-	if _, err := st.ResolveSandboxIDByName(ctx, "   "); !errors.Is(err, ErrNotFound) {
+	if _, err := st.ResolveSandboxIDByName(ctx, "", "   "); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ResolveSandboxIDByName blank = %v", err)
 	}
 
