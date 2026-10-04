@@ -143,12 +143,17 @@ func TestExecWasmBuffered(t *testing.T) {
 	fake.AddSandbox(models.Sandbox{Name: "wasm", Runtime: models.RuntimeWasm})
 	sb := resolveTarget(t, tools, "wasm")
 
-	res, err := tools.Exec(ctx, sb, ExecRequest{Command: "echo hi", Cwd: "/work", Timeout: 1500 * time.Millisecond})
-	if err != nil || res.Stdout != "hi\n" || res.ExitCode != 0 {
-		t.Fatalf("wasm echo = (%+v, %v)", res, err)
+	var live strings.Builder
+	res, err := tools.Exec(ctx, sb, ExecRequest{Command: "echo hi", Cwd: "/work", Timeout: 1500 * time.Millisecond, OnStdout: func(b []byte) { live.Write(b) }, OnStderr: func(b []byte) { live.Write(b) }})
+	if err != nil || res.Stdout != "hi\n" || res.ExitCode != 0 || live.String() != "hi\n" {
+		t.Fatalf("wasm echo = (%+v, %v), live %q", res, err, live.String())
+	}
+	live.Reset()
+	if _, err := tools.Exec(ctx, sb, ExecRequest{Command: "stderr warn", OnStderr: func(b []byte) { live.Write(b) }}); err != nil || live.String() != "warn\n" {
+		t.Fatalf("wasm stderr live = %q, %v", live.String(), err)
 	}
 	fake.Observe(func(s *agenttoolstest.Server) {
-		if s.StreamDials != 0 || s.BufferedExecs != 1 {
+		if s.StreamDials != 0 || s.BufferedExecs != 2 {
 			t.Fatalf("stream dials %d, buffered %d", s.StreamDials, s.BufferedExecs)
 		}
 	})

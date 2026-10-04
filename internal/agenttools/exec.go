@@ -262,6 +262,14 @@ func (t *Tools) execBuffered(ctx context.Context, sb *microvm.Sandbox, req ExecR
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return ExecResult{}, &Error{Code: CodeInternal, Message: "decode exec response: " + err.Error(), cause: err}
 	}
+	// Live sinks get the whole output: the CLI prints it unbounded, as it
+	// does for a streamed exec. Only the returned result is bounded.
+	if req.OnStdout != nil && out.Stdout != "" {
+		req.OnStdout([]byte(out.Stdout))
+	}
+	if req.OnStderr != nil && out.Stderr != "" {
+		req.OnStderr([]byte(out.Stderr))
+	}
 	res := ExecResult{ExitCode: out.ExitCode, DurationMS: out.DurationMS}
 	if res.DurationMS == 0 {
 		res.DurationMS = time.Since(start).Milliseconds()
