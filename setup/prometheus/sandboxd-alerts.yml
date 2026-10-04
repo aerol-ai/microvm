@@ -623,3 +623,27 @@ groups:
           summary: "sandboxd cluster topology violation; ingress may not be serving"
           description: "aerolvm_cluster_topology_ok has been 0 for 5 minutes on {{ $labels.instance }}. Either more than 10 live ingress nodes without a declared shard-aware router, or mixed/hybrid roles above 10 live nodes. See /health cluster_topology for the exact reason."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/cluster-ingress-topology.md"
+
+  - name: sandboxd.remote-mcp
+    interval: 30s
+    rules:
+      # Remote MCP (/mcp, SB_MCP_ENABLED) tool calls failing on the platform
+      # side: 5xx, unreachable owners, timeouts. tool_error (not found, bad
+      # argument, edit conflict) is ordinary agent behaviour and is not
+      # counted. The traffic floor keeps one failed call on a quiet node
+      # from paging.
+      - alert: SandboxdRemoteMCPErrorRate
+        expr: |
+          (
+            sum(rate(aerolvm_mcp_tool_calls_total{key2="api_error"}[5m]))
+            / clamp_min(sum(rate(aerolvm_mcp_tool_calls_total[5m])), 1e-9)
+          ) > 0.2
+          and sum(rate(aerolvm_mcp_tool_calls_total[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          component: remote-mcp
+        annotations:
+          summary: "More than 20% of remote MCP tool calls are failing"
+          description: "Over 20% of /mcp tool calls have ended in api_error for 10 minutes. Agents connected over remote MCP are seeing platform failures; check the 'mcp tool call' log lines (outcome=api_error) for the tool and code."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md"

@@ -6,9 +6,12 @@
 package agentmcp
 
 import (
+	"flag"
 	"fmt"
+	"net/url"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -149,6 +152,76 @@ func (o *Options) Validate() error {
 		return optErr("destroy_if_idle", "at most %s", models.MaxLifecycleDuration)
 	}
 	return nil
+}
+
+// RemoteParams are the options the remote endpoint takes as URL query
+// parameters (CEO review CF1). The token stays in the Authorization header;
+// stdio-only options (ephemeral, max_creates, ...) are not accepted there.
+var RemoteParams = []string{"sandbox", "create_if_missing", "image", "runtime", "toolsets", "read_only"}
+
+// BindFlags registers the stdio flags on fs (query names with dashes) and
+// returns a parser that validates them. It and ParseQuery are the only two
+// ways to build Options, and both end in Validate.
+func BindFlags(fs *flag.FlagSet) func() (Options, error) {
+	var (
+		opts     Options
+		toolsets string
+	)
+	fs.StringVar(&opts.Sandbox, "sandbox", "", "")
+	fs.BoolVar(&opts.CreateIfMissing, "create-if-missing", false, "")
+	fs.StringVar(&opts.Image, "image", "", "")
+	fs.StringVar(&opts.Runtime, "runtime", "", "")
+	fs.StringVar(&toolsets, "toolsets", ToolsetCore, "")
+	fs.BoolVar(&opts.ReadOnly, "read-only", false, "")
+	fs.BoolVar(&opts.Ephemeral, "ephemeral", false, "")
+	fs.BoolVar(&opts.Keep, "keep", false, "")
+	fs.DurationVar(&opts.StopIfIdle, "stop-if-idle", DefaultStopIfIdle, "")
+	fs.DurationVar(&opts.DestroyIfIdle, "destroy-if-idle", DefaultDestroyIfIdle, "")
+	fs.IntVar(&opts.MaxCreates, "max-creates", DefaultMaxCreates, "")
+	fs.IntVar(&opts.MaxOutputBytes, "max-output-bytes", 0, "")
+	return func() (Options, error) {
+		o := opts
+		o.Toolsets = ParseToolsets(toolsets)
+		return o, o.Validate()
+	}
+}
+
+// ParseQuery builds Options for the remote endpoint from URL query
+// parameters, parsed on every request (the endpoint is stateless). An
+// unknown or stdio-only parameter is refused by name, so a typo such as
+// create-if-missing fails loudly instead of being ignored.
+func ParseQuery(q url.Values) (Options, error) {
+	opts := Options{Remote: true}
+	for key, values := range q {
+		if !slices.Contains(RemoteParams, key) {
+			return Options{}, optErr(key, "unknown parameter (remote MCP takes %s)", strings.Join(RemoteParams, ", "))
+		}
+		if len(values) != 1 {
+			return Options{}, optErr(key, "give it once")
+		}
+		value := values[0]
+		switch key {
+		case "sandbox":
+			opts.Sandbox = value
+		case "image":
+			opts.Image = value
+		case "runtime":
+			opts.Runtime = value
+		case "toolsets":
+			opts.Toolsets = ParseToolsets(value)
+		case "create_if_missing", "read_only":
+			b, err := strconv.ParseBool(value)
+			if err != nil {
+				return Options{}, optErr(key, "must be true or false, got %q", value)
+			}
+			if key == "create_if_missing" {
+				opts.CreateIfMissing = b
+			} else {
+				opts.ReadOnly = b
+			}
+		}
+	}
+	return opts, opts.Validate()
 }
 
 // ParseToolsets splits a comma-separated toolset list ("core,files", "all").
