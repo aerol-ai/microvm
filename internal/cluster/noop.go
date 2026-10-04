@@ -52,7 +52,11 @@ func (n *Noop) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	return OwnerInfo{NodeID: n.nodeID, APIURL: n.apiURL, IsSelf: true}, nil
 }
 
-func (n *Noop) OwnerOfName(name string) (string, OwnerInfo, error) {
+func (n *Noop) OwnerOfName(ownerRef, name string) (string, OwnerInfo, error) {
+	return "", OwnerInfo{}, ErrUnknownSandbox
+}
+
+func (n *Noop) OwnerOfNameKey(key string) (string, OwnerInfo, error) {
 	return "", OwnerInfo{}, ErrUnknownSandbox
 }
 

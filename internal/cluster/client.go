@@ -405,15 +405,30 @@ func (c *Cluster) OwnerOf(sandboxID string) (OwnerInfo, error) {
 	}, nil
 }
 
-// OwnerOfName resolves a replicated sandbox Name to its placement owner. This
-// is intentionally a local FSM read just like OwnerOf; the name index is
-// maintained inside the FSM apply path so it tracks the authoritative
-// placement map exactly.
-func (c *Cluster) OwnerOfName(name string) (string, OwnerInfo, error) {
-	sandboxID, ok := c.fsm.sandboxIDByName(name)
+// OwnerOfName resolves a sandbox name within ownerRef's namespace to its
+// placement owner (see name_key.go). This is intentionally a local FSM read
+// just like OwnerOf; the name index is maintained inside the FSM apply path so
+// it tracks the authoritative placement map exactly.
+func (c *Cluster) OwnerOfName(ownerRef, name string) (string, OwnerInfo, error) {
+	sandboxID, ok := c.fsm.sandboxIDByOwnerName(ownerRef, name)
 	if !ok {
 		return "", OwnerInfo{}, ErrUnknownSandbox
 	}
+	return c.ownerOfResolvedName(sandboxID)
+}
+
+// OwnerOfNameKey resolves one raw nameIndex key, with no owner filtering. It
+// backs the cluster-internal placement-by-name endpoint, which worker agents
+// call once per key (see Agent.OwnerOfName).
+func (c *Cluster) OwnerOfNameKey(key string) (string, OwnerInfo, error) {
+	sandboxID, ok := c.fsm.sandboxIDByName(key)
+	if !ok {
+		return "", OwnerInfo{}, ErrUnknownSandbox
+	}
+	return c.ownerOfResolvedName(sandboxID)
+}
+
+func (c *Cluster) ownerOfResolvedName(sandboxID string) (string, OwnerInfo, error) {
 	owner, err := c.OwnerOf(sandboxID)
 	if err != nil {
 		return sandboxID, OwnerInfo{}, err
@@ -472,7 +487,7 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		OwnerNodeID:           c.nodeID,
 		OwnerAPIURL:           c.apiURL,
 		OwnerDataPlaneHost:    c.dataPlaneHost,
-		Spec:                  spec,
+		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -482,6 +497,22 @@ func (c *Cluster) RecordPlacement(ctx context.Context, sandboxID string, spec *m
 		OwnerRef:              secrets.OwnerRef,
 	}
 	return c.applyCommand(ctx, cmd)
+}
+
+// qualifySpecForCommand writes the owner-qualified name key into spec before
+// it enters a Raft command (name_key.go). ownerRef is what the caller passed.
+// When it is empty and the spec carries a plain name, the replicated OwnerRef
+// of an existing placement is used instead (a reservation being promoted, an
+// orphan being claimed), because the FSM keeps that OwnerRef and the key has
+// to match it. The lookup reads only the hot placement row; operator creates
+// of a new name pay one map miss.
+func (c *Cluster) qualifySpecForCommand(sandboxID string, spec *models.CreateSandboxRequest, ownerRef string) *models.CreateSandboxRequest {
+	if strings.TrimSpace(ownerRef) == "" && specNeedsOwnerForName(spec) {
+		if ref, ok := c.fsm.ownerRefOf(sandboxID); ok {
+			ownerRef = ref
+		}
+	}
+	return QualifySpecName(spec, ownerRef)
 }
 
 // ClaimOrphan commits sandboxID -> self only if the existing placement is
@@ -511,7 +542,7 @@ func (c *Cluster) ClaimOrphan(ctx context.Context, sandboxID string, spec *model
 		OwnerNodeID:          c.nodeID,
 		OwnerAPIURL:          c.apiURL,
 		OwnerDataPlaneHost:   c.dataPlaneHost,
-		Spec:                 spec,
+		Spec:                 c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretRecipients:     normalizeSecretRecipientIDs(secrets.Recipients),
@@ -551,7 +582,7 @@ func (c *Cluster) UpsertSpec(ctx context.Context, sandboxID string, spec *models
 	cmd := command{
 		Op:                    opUpsertSpec,
 		SandboxID:             sandboxID,
-		Spec:                  spec,
+		Spec:                  c.qualifySpecForCommand(sandboxID, spec, secrets.OwnerRef),
 		SecretRef:             secrets.Ref,
 		SecretVersion:         secrets.Version,
 		SecretRecipients:      normalizeSecretRecipientIDs(secrets.Recipients),
@@ -901,7 +932,7 @@ func (c *Cluster) ReserveOnTarget(ctx context.Context, sandboxID string, target 
 		OwnerNodeID:          target.NodeID,
 		OwnerAPIURL:          target.APIURL,
 		OwnerDataPlaneHost:   target.DataPlaneHost,
-		Spec:                 redacted,
+		Spec:                 QualifySpecName(redacted, secrets.OwnerRef),
 		SecretRef:            secrets.Ref,
 		SecretVersion:        secrets.Version,
 		SecretSealGeneration: secrets.SealGeneration,
@@ -946,7 +977,7 @@ func (c *Cluster) ReserveBatchOnTargets(ctx context.Context, reservations []Plac
 			OwnerNodeID:          r.Target.NodeID,
 			OwnerAPIURL:          r.Target.APIURL,
 			OwnerDataPlaneHost:   r.Target.DataPlaneHost,
-			Spec:                 r.Redacted,
+			Spec:                 QualifySpecName(r.Redacted, r.Secrets.OwnerRef),
 			SecretRef:            r.Secrets.Ref,
 			SecretVersion:        r.Secrets.Version,
 			SecretSealGeneration: r.Secrets.SealGeneration,
@@ -1275,7 +1306,7 @@ func (c *Cluster) AssertOwnership(ctx context.Context, local []LocalSandboxState
 				if existing.Spec == nil {
 					spec = st.Spec
 				}
-				replaySecrets := PlacementSecrets{IncarnationID: incarnationID}
+				replaySecrets := PlacementSecrets{IncarnationID: incarnationID, OwnerRef: st.Secrets.OwnerRef}
 				if needsSecretBackfill {
 					replaySecrets = st.Secrets
 				}

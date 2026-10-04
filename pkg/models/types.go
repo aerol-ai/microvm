@@ -556,13 +556,18 @@ type CreateSandboxRequest struct {
 	Lifecycle       *Lifecycle            `json:"lifecycle,omitempty"`
 	Failover        *Failover             `json:"failover,omitempty"`
 	// Name is an optional human-readable identifier. When set, it must be
-	// unique across all sandboxes — the store enforces this with a partial
-	// unique index. Empty means no name; the sandbox can only be referenced
-	// by ID. The Daytona facade requires names; the native /v1 API and other
-	// facades may set or omit it.
+	// unique among the owner's sandboxes (a user token's account, or the
+	// operator namespace for PAT callers) — the store enforces this with a
+	// per-owner partial unique index, and cluster mode with an
+	// owner-qualified Raft name key. Two tenants may use the same name.
+	// Empty means no name; the sandbox can only be referenced by ID. The
+	// Daytona facade requires names; the native /v1 API and other facades
+	// may set or omit it.
 	//
-	// Duplicate names are rejected with HTTP 409 Conflict. Use a unique name
-	// per sandbox or omit this field to let the daemon assign an ID instead.
+	// Duplicate names within one owner are rejected with HTTP 409 Conflict.
+	// Names starting with "owner:" or shaped like a generated sandbox ID
+	// (sb- plus 16 hex) are reserved and rejected with HTTP 400 (see
+	// ValidateSandboxName).
 	Name string `json:"name,omitempty"`
 	// Tags is an optional free-form key/value map associated with the
 	// sandbox. Used by facades that expose label-style metadata (Daytona
@@ -731,8 +736,9 @@ type Sandbox struct {
 	// the secret holder count meets HA (owner + ≥1 backup) or the recipient
 	// set is single-node (len≤1). Omitted for non-recreate sandboxes.
 	FailoverReady *bool `json:"failover_ready,omitempty"`
-	// Name is the optional unique identifier set at create time. Empty when
-	// the sandbox was created without one (the common path on /v1 today).
+	// Name is the optional identifier set at create time, unique per owner
+	// (see CreateSandboxRequest.Name). Empty when the sandbox was created
+	// without one (the common path on /v1 today).
 	Name string `json:"name,omitempty"`
 	// Tags is the optional key/value bag set at create time. Facades use it
 	// for label-style metadata (Daytona labels, E2B metadata) but the field

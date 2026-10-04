@@ -598,11 +598,17 @@ type Client interface {
 	// ErrUnknownSandbox if no placement record exists.
 	OwnerOf(sandboxID string) (OwnerInfo, error)
 
-	// OwnerOfName resolves a cluster-wide sandbox name to its sandbox ID and
-	// current owner. Names are indexed from replicated specs and exist for
-	// facade APIs that accept either ID or name. Returns ErrUnknownSandbox if
-	// no placement record claims name.
-	OwnerOfName(name string) (string, OwnerInfo, error)
+	// OwnerOfName resolves a sandbox name within ownerRef's namespace to its
+	// sandbox ID and current owner. Names are unique per owner and indexed
+	// from replicated specs (see name_key.go); ownerRef "" is the operator
+	// namespace. Returns ErrUnknownSandbox if no placement in that namespace
+	// claims name.
+	OwnerOfName(ownerRef, name string) (string, OwnerInfo, error)
+
+	// OwnerOfNameKey resolves one raw nameIndex key with no owner filtering.
+	// Only the cluster-internal placement-by-name endpoint uses it; callers
+	// that act for a user go through OwnerOfName.
+	OwnerOfNameKey(key string) (string, OwnerInfo, error)
 
 	// SelectPlacement chooses a node to host a new sandbox with the given
 	// resource request. In single-node mode it always returns self.
