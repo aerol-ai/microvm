@@ -265,10 +265,15 @@ const maxClusterListPages = 100000
 // Partial coverage or an unready placement view is returned as an error rather
 // than a silent incomplete list.
 func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, includeEnv bool) ([]*Sandbox, error) {
+	return c.ListWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv})
+}
+
+// ListWithQuery is ListWithOptions with every list filter.
+func (c *Client) ListWithQuery(ctx context.Context, q ListQuery) ([]*Sandbox, error) {
 	var items []*Sandbox
 	pageToken := ""
 	for page := 0; page < maxClusterListPages; page++ {
-		response, next, err := c.ListPageWithOptions(ctx, tags, includeEnv, pageToken)
+		response, next, err := c.ListPageWithQuery(ctx, q, pageToken)
 		if err != nil {
 			return nil, err
 		}
@@ -285,7 +290,22 @@ func (c *Client) ListWithOptions(ctx context.Context, tags map[string]string, in
 // token is opaque and empty on the final page. This is the bounded-memory path
 // for fleet inventory callers; partial/unready coverage is always an error.
 func (c *Client) ListPageWithOptions(ctx context.Context, tags map[string]string, includeEnv bool, pageToken string) ([]*Sandbox, string, error) {
-	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(tags, includeEnv)
+	return c.ListPageWithQuery(ctx, ListQuery{Tags: tags, IncludeEnv: includeEnv}, pageToken)
+}
+
+// ListQuery is the full set of GET /sandboxes filters.
+type ListQuery struct {
+	Tags       map[string]string
+	IncludeEnv bool
+	// Name filters to the caller's sandbox with this name (?name=). Servers
+	// that predate name lookup ignore it; GetByName verifies the reply.
+	Name string
+}
+
+// ListPageWithQuery is ListPageWithOptions with every list filter.
+func (c *Client) ListPageWithQuery(ctx context.Context, q ListQuery, pageToken string) ([]*Sandbox, string, error) {
+	basePath := c.versionPrefix + "/sandboxes" + buildSandboxQuery(q.Tags, q.IncludeEnv)
+	basePath = appendQueryParam(basePath, "name", strings.TrimSpace(q.Name))
 	path := appendQueryParam(basePath, "page_token", pageToken)
 	var response []models.Sandbox
 	hdrs, err := c.doJSONHeaders(ctx, http.MethodGet, path, nil, &response)
@@ -325,6 +345,30 @@ func buildSandboxQuery(tags map[string]string, includeEnv bool) string {
 		return ""
 	}
 	return "?" + values.Encode()
+}
+
+// GetByName returns the caller's sandbox called name with one request, or an
+// error matching ErrNotFound. Names are unique per owner. The reply is only
+// trusted when it holds at most one sandbox carrying the requested name: a
+// server that predates ?name= ignores the filter and returns an ordinary list
+// page, and acting on its first row would target the wrong sandbox. That case
+// returns an error matching ErrNameLookupUnsupported.
+func (c *Client) GetByName(ctx context.Context, name string, includeEnv bool) (*Sandbox, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.New("sandbox name is required")
+	}
+	items, _, err := c.ListPageWithQuery(ctx, ListQuery{Name: name, IncludeEnv: includeEnv}, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("sandbox %q: %w", name, ErrNotFound)
+	}
+	if len(items) > 1 || items[0].Name != name {
+		return nil, fmt.Errorf("%s does not support sandbox name lookup; use the sandbox ID or upgrade the server: %w", c.baseURL, ErrNameLookupUnsupported)
+	}
+	return items[0], nil
 }
 
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
@@ -978,12 +1022,4 @@ func (c *Client) addAuth(request *http.Request) {
 
 func (c *Client) wrap(sandbox models.Sandbox) *Sandbox {
 	return &Sandbox{Sandbox: sandbox, client: c}
-}
-
-func decodeError(response *http.Response) error {
-	var payload models.ErrorResponse
-	if err := json.NewDecoder(response.Body).Decode(&payload); err == nil && payload.Error != "" {
-		return errors.New(payload.Error)
-	}
-	return fmt.Errorf("request failed with status %d", response.StatusCode)
 }

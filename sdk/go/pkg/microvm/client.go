@@ -11,6 +11,20 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
+// APIError is an HTTP error response from sandboxd: status, the server's
+// optional stable error code, and its message (Error() returns the message
+// unchanged). Use errors.As to read it.
+type APIError = apiclient.APIError
+
+// Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
+// ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
+// `?name=`.
+var (
+	ErrNotFound              = apiclient.ErrNotFound
+	ErrConflict              = apiclient.ErrConflict
+	ErrNameLookupUnsupported = apiclient.ErrNameLookupUnsupported
+)
+
 const defaultAPIURL = "http://127.0.0.1:21212"
 const authRequiredErrorMessage = "PAT token is required. Set PATToken or SB_PAT_TOKEN."
 
@@ -162,6 +176,19 @@ type ListOption func(*listOptions)
 type listOptions struct {
 	tags       map[string]string
 	includeEnv bool
+	name       string
+}
+
+func (o listOptions) query() apiclient.ListQuery {
+	return apiclient.ListQuery{Tags: o.tags, IncludeEnv: o.includeEnv, Name: o.name}
+}
+
+// WithName filters to the caller's sandbox with exactly this name
+// (`?name=<name>`); the result has zero or one entries. Names are unique per
+// owner. Servers that predate name lookup ignore the filter and return a
+// normal list, so prefer GetByName, which checks the reply.
+func WithName(name string) ListOption {
+	return func(o *listOptions) { o.name = strings.TrimSpace(name) }
 }
 
 // WithTags filters the result to sandboxes whose Tags map contains every
@@ -183,7 +210,7 @@ func (c *Client) List(ctx context.Context, opts ...ListOption) ([]*Sandbox, erro
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, err := c.inner.ListWithOptions(ctx, cfg.tags, cfg.includeEnv)
+	items, err := c.inner.ListWithQuery(ctx, cfg.query())
 	if err != nil {
 		return nil, err
 	}
@@ -202,7 +229,7 @@ func (c *Client) ListPage(ctx context.Context, pageToken string, opts ...ListOpt
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	items, next, err := c.inner.ListPageWithOptions(ctx, cfg.tags, cfg.includeEnv, pageToken)
+	items, next, err := c.inner.ListPageWithQuery(ctx, cfg.query(), pageToken)
 	if err != nil {
 		return nil, "", err
 	}
@@ -231,6 +258,23 @@ func (c *Client) Get(ctx context.Context, id string, opts ...GetOption) (*Sandbo
 		opt(&cfg)
 	}
 	item, err := c.inner.GetWithOptions(ctx, id, cfg.includeEnv)
+	if err != nil {
+		return nil, err
+	}
+	return wrapSandbox(c, item), nil
+}
+
+// GetByName returns the caller's sandbox called name, with one request.
+// Names are unique per owner. A missing name returns an error matching
+// ErrNotFound. A server that predates name lookup ignores `?name=` and
+// returns an unfiltered list; GetByName detects that and returns an error
+// matching ErrNameLookupUnsupported instead of picking a row.
+func (c *Client) GetByName(ctx context.Context, name string, opts ...GetOption) (*Sandbox, error) {
+	var cfg getOptions
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	item, err := c.inner.GetByName(ctx, name, cfg.includeEnv)
 	if err != nil {
 		return nil, err
 	}

@@ -144,6 +144,13 @@ class GPUOptions(TypedDict, total=False):
 
 class CreateOptions(TypedDict, total=False):
     image: Union[str, "Image"]
+    # Optional name, unique among the caller's sandboxes (another account may
+    # use the same name); a repeat create with a held name returns HTTP 409.
+    # Names starting with "owner:" or shaped like a sandbox ID ("sb-" plus 16
+    # hex) are rejected.
+    name: str
+    # Free-form key/value labels; filter on them with list(tags=...).
+    tags: Dict[str, str]
     # cpu accepts fractional cores: 0.5 = half a core, 1.5 = one and a half.
     cpu: float
     memoryMB: int
@@ -409,6 +416,9 @@ class ExposeResult:
 
 class SandboxData(TypedDict, total=False):
     id: str
+    # Name set at create time, unique per owner. Absent for unnamed sandboxes.
+    name: str
+    tags: Dict[str, str]
     image: str
     status: str
     publicURL: str

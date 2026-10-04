@@ -9,6 +9,15 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class CreateOptions {
     public String image;
+    /**
+     * Optional name, unique among the caller's sandboxes (another account may
+     * use the same name); a repeat create with a held name returns HTTP 409.
+     * Names starting with {@code owner:} or shaped like a sandbox ID
+     * ({@code sb-} plus 16 hex) are rejected.
+     */
+    public String name;
+    /** Free-form key/value labels; filter on them with {@code MicroVMClient.list(tags)}. */
+    public Map<String, String> tags;
     public Double cpu;
     @JsonProperty("memory_mb")
     public Integer memoryMb;

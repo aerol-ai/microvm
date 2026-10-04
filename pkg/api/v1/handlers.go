@@ -115,6 +115,16 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	if name, ok := parseNameFilter(r); ok {
+		sandboxes, err := h.deps.Service.ListSandboxesByName(ctx, name, parseTagFilter(r), opts)
+		if err != nil {
+			h.deps.Logger.Warn("list sandboxes by name failed", "error", err)
+			apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		apihttp.WriteJSON(w, http.StatusOK, sandboxes)
+		return
+	}
 	sandboxes, err := h.deps.Service.ListSandboxesWithOptions(ctx, parseTagFilter(r), opts)
 	if err != nil {
 		h.deps.Logger.Warn("list sandboxes failed", "error", err)
@@ -165,6 +175,13 @@ func parseSandboxIDsFilter(r *http.Request) map[string]struct{} {
 // CreateSandboxRequest.Tags — an external control plane stamps tags at create
 // time and uses the same keys here to scope its list calls. See
 // plans/multi-tenancy-via-control-plane.md.
+// parseNameFilter reads ?name=<name>. A present-but-blank value is treated as
+// absent: no sandbox can be looked up by an empty name.
+func parseNameFilter(r *http.Request) (string, bool) {
+	name := strings.TrimSpace(r.URL.Query().Get("name"))
+	return name, name != ""
+}
+
 func parseTagFilter(r *http.Request) map[string]string {
 	const prefix = "tag."
 	q := r.URL.Query()
