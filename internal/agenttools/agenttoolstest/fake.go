@@ -79,6 +79,10 @@ type Server struct {
 	// ConflictAlways makes every create fail with 409 without creating
 	// anything (a conflict on something other than the name).
 	ConflictAlways bool
+	// FailCreates makes the next N creates fail with 500.
+	FailCreates int
+	// CreateDelay holds each create this long, to widen races in tests.
+	CreateDelay time.Duration
 
 	// Observations.
 
@@ -279,6 +283,17 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		writeErr(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 		return
+	}
+	if s.FailCreates > 0 {
+		s.FailCreates--
+		s.mu.Unlock()
+		writeErr(w, http.StatusInternalServerError, "create failed")
+		return
+	}
+	if d := s.CreateDelay; d > 0 {
+		s.mu.Unlock()
+		time.Sleep(d)
+		s.mu.Lock()
 	}
 	if req.Name != "" {
 		for _, sb := range s.sandboxes {

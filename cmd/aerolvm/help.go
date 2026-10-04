@@ -41,7 +41,7 @@ that sandbox is returned and nothing is created.
 Flags:
   --name N             sandbox name, unique in your account
   --image I            container image, or the module for --runtime wasm
-  --runtime R          docker, gvisor, kata, firecracker or wasm
+  --runtime R          docker, gvisor, firecracker or wasm
   --cpu C              CPU cores (fractions allowed)
   --memory-mb M        memory in MiB
   --env K=V            environment variable (repeatable)
