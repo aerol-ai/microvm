@@ -1,0 +1,298 @@
+---
+title: MCP Server
+description: Give Claude Code, Claude Desktop, Cursor, VS Code and other MCP clients their own AerolVM sandboxes.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`aerolvm mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server for AerolVM. It gives an AI agent tools to create sandboxes, run commands in them, read and edit their files, run background processes and expose ports. The agent works in a sandbox instead of on your machine.
+
+It runs locally over stdio and is the same binary as the [aerolvm CLI](/cli). sandboxd can also serve the same tools over HTTP at `/mcp`; see [Remote endpoint](#remote-endpoint).
+
+## Set up your client
+
+Install `aerolvm` first ([Install](/cli#install)), or skip the install and let your client run it through npm: use the command `npx` with the arguments `-y @aerol-ai/aerolvm mcp` wherever the snippets below say `aerolvm mcp`. You need your server's URL and an API token, the same ones the [SDKs](/sdk-setup) use.
+
+<Tabs syncKey="mcp-client">
+  <TabItem label="Claude Code">
+    Install the AerolVM plugin. It registers the MCP server and adds a short skill that teaches Claude the CLI:
+
+    ```text
+    /plugin marketplace add aerol-ai/microvm
+    /plugin install aerolvm@aerol-ai
+    ```
+
+    Claude Code asks for your sandboxd URL and token when you enable the plugin. The token goes to your system's secure credential store, not to `settings.json`.
+
+    To register only the MCP server instead, run this in a shell where `SB_PAT_TOKEN` is set:
+
+    ```sh
+    claude mcp add aerolvm -e SB_API_URL=https://sandbox.example.com -e SB_PAT_TOKEN="$SB_PAT_TOKEN" -- aerolvm mcp
+    ```
+  </TabItem>
+  <TabItem label="Claude Desktop">
+    Add this to `claude_desktop_config.json` and replace the token placeholder:
+
+    ```json
+    {
+      "mcpServers": {
+        "aerolvm": {
+          "command": "aerolvm",
+          "args": ["mcp"],
+          "env": {
+            "SB_API_URL": "https://sandbox.example.com",
+            "SB_PAT_TOKEN": "<paste your AerolVM token>"
+          }
+        }
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Cursor">
+    Add this to `.cursor/mcp.json`. Cursor reads `SB_PAT_TOKEN` from your environment:
+
+    ```json
+    {
+      "mcpServers": {
+        "aerolvm": {
+          "command": "aerolvm",
+          "args": ["mcp"],
+          "env": {
+            "SB_API_URL": "https://sandbox.example.com",
+            "SB_PAT_TOKEN": "${env:SB_PAT_TOKEN}"
+          }
+        }
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="VS Code">
+    Add this to `.vscode/mcp.json`. VS Code asks for the token once and stores it securely:
+
+    ```json
+    {
+      "inputs": [
+        {
+          "type": "promptString",
+          "id": "aerolvm-token",
+          "description": "AerolVM API token",
+          "password": true
+        }
+      ],
+      "servers": {
+        "aerolvm": {
+          "type": "stdio",
+          "command": "aerolvm",
+          "args": ["mcp"],
+          "env": {
+            "SB_API_URL": "https://sandbox.example.com",
+            "SB_PAT_TOKEN": "${input:aerolvm-token}"
+          }
+        }
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Other clients">
+    Any MCP client that runs stdio servers can start it. Use the command `aerolvm` with the argument `mcp`, and set two environment variables:
+
+    | Variable | Value |
+    |---|---|
+    | `SB_API_URL` | Your sandboxd URL. Defaults to `http://127.0.0.1:21212`. |
+    | `SB_PAT_TOKEN` | Your API token. |
+
+    The server is also listed in the [MCP Registry](https://registry.modelcontextprotocol.io) as `io.github.aerol-ai/aerolvm`, so clients that install from the registry can find it there.
+  </TabItem>
+</Tabs>
+
+`aerolvm mcp config <claude-code|claude-desktop|cursor|vscode>` prints the snippet for your `SB_API_URL`, including any server flags you pass, such as `--sandbox`. It never prints your token.
+
+## Tools
+
+Tools come in three toolsets. The server offers `core` unless you pass `--toolsets`, with a comma list or `all`.
+
+| Toolset | Tools |
+|---|---|
+| `core` | `sandbox_create`, `sandbox_list`, `sandbox_destroy`, `exec`, `read_file`, `write_file`, `list_files`, `expose_port` |
+| `files` | `edit_file` (replace one exact match), `search_files` (by name), `grep_files` (by content) |
+| `process` | `start_process`, `process_logs`, `stop_process`, for dev servers and watchers that keep running |
+
+`--read-only` offers only the tools that change nothing: listing, reading, searching and logs.
+
+Every tool that acts on a sandbox takes a `sandbox` argument, an ID or a name. `sandbox_create` is safe to retry: asking for a name you already have returns that sandbox instead of making a second one.
+
+## Pinned mode
+
+Pinned mode gives the agent one sandbox and nothing else:
+
+```sh
+aerolvm mcp --sandbox my-agent --create-if-missing --image python:3.12
+```
+
+- The `sandbox` argument disappears from every tool, and `sandbox_create`, `sandbox_list` and `sandbox_destroy` are not offered.
+- With `--create-if-missing`, the sandbox is created on the first tool call that needs it, not when the server starts.
+- If the sandbox disappears, for example after it was destroyed for idling, the next call creates a new one. The result tells the model that files from earlier calls are gone.
+- `--ephemeral` destroys the sandbox when the server exits.
+
+Pass the same flags to `aerolvm mcp config` to get a client snippet that starts the server pinned.
+
+## Defaults that keep costs down
+
+Agents forget to clean up, so sandboxes created through MCP get an idle lifecycle:
+
+- They **stop after 30 minutes idle**. A stopped sandbox keeps its files, and the next tool call starts it again.
+- They are **destroyed after 24 hours idle**.
+
+Change these with `--stop-if-idle` and `--destroy-if-idle`, or turn them off with `--keep`. An unpinned server also allows at most 5 creates per session (`--max-creates`, `0` for no limit), so a looping agent can't fill your server.
+
+Every sandbox the MCP server creates gets the tag `aerolvm.created_by=mcp`, unless the agent sets that tag itself. `aerolvm list --tag aerolvm.created_by=mcp` finds them.
+
+## Results the model can use
+
+Tool results are sized for a model's context:
+
+- `exec` keeps 16 KiB of each stream, its first quarter and last three quarters, and says how much it cut. Change the size with `--max-output-bytes`. A command that runs past its timeout is killed and reports exit code 124.
+- `read_file` returns up to 2000 lines or 256 KiB per call and says where to continue. It refuses binary files.
+- `sandbox_list` returns 20 sandboxes per page, with a token for the next page. `search_files` and `grep_files` cap their matches and say when they cut some.
+
+Errors come back as tool results with a code the model can act on, such as `not_found`, `edit_conflict`, `binary_file` or `create_limit`, instead of protocol failures.
+
+### Runtimes
+
+- **WASM sandboxes** have no streaming exec. `exec` runs buffered there and refuses output over 4 MiB with `output_too_large`.
+- **Isolate sandboxes** have no shell or filesystem. The tools refuse them with `unsupported_runtime`, and `sandbox_create` doesn't offer `isolate` as a runtime. Use the SDK's invoke call for isolates; see [Isolate Sandbox](/isolate-sandbox).
+
+## Remote endpoint
+
+sandboxd can serve the same tools over Streamable HTTP at `/mcp`, so a client connects with only a URL and a token, and nothing to install. It is off by default. An operator turns it on with `SB_MCP_ENABLED=true`.
+
+The remote endpoint is always pinned. The query string chooses the sandbox and the options:
+
+| Parameter | Meaning |
+|---|---|
+| `sandbox` | The sandbox name or ID. Required. |
+| `create_if_missing` | `true` to create the sandbox on first use. |
+| `image`, `runtime` | What to create it from. |
+| `toolsets` | `core` (default), `files`, `process`, or `all`, as a comma list. |
+| `read_only` | `true` for the tools that change nothing. |
+
+Authenticate with your API token as a bearer token. For example, in Claude Code:
+
+```sh
+claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox=my-agent&create_if_missing=true" --header "Authorization: Bearer $SB_PAT_TOKEN"
+```
+
+The endpoint is stateless, so any node of a cluster can serve any request. Each call runs with your token's permissions, through the same checks as a direct API call. The first call that creates the sandbox says so in its result. A remote `exec` is buffered on every runtime, with the 4 MiB limit above.
+
+Operator settings:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SB_MCP_ENABLED` | `false` | Serve `/mcp`. |
+| `SB_MCP_ALLOWED_ORIGINS` | empty | Browser origins allowed to call `/mcp`, as a comma list. A request with any other `Origin` header is refused, which blocks DNS rebinding. Desktop and CLI clients send no `Origin` and are unaffected. |
+| `SB_MCP_ALLOWED_HOSTS` | empty (any) | `Host` values `/mcp` answers to, as a comma list. |
+| `SB_MCP_RATE_LIMIT` | `20` | Requests per second per token, with bursts up to twice that. `0` turns the limit off. |
+
+sandboxd counts tool calls by tool and outcome in `aerolvm_mcp_tool_calls_total`, and writes one log line per call with the tool, sandbox, owner, outcome and duration. It never logs arguments or output.
+
+## Same thing from the SDK
+
+What a pinned server does on its first `exec`: get or create `my-agent` with the MCP idle defaults, then run a command.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox =
+      (await client.getByName('my-agent')) ??
+      (await client.create({
+        name: 'my-agent',
+        image: 'python:3.12',
+        lifecycle: {
+          stopIfIdleFor: 30 * 60 * 1_000_000_000,       // 30 minutes in nanoseconds
+          destroyIfIdleFor: 24 * 60 * 60 * 1_000_000_000, // 24 hours in nanoseconds
+        },
+      }))
+
+    const result = await sandbox.exec({ command: 'python -V' })
+    console.log(result.exitCode, result.stdout)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get_by_name('my-agent') or client.create({
+        'name': 'my-agent',
+        'image': 'python:3.12',
+        'lifecycle': {
+            'stopIfIdleFor': 1_800_000_000_000,      # 30 minutes
+            'destroyIfIdleFor': 86_400_000_000_000,  # 24 hours
+        },
+    })
+
+    result = sandbox.exec_command('python -V')
+    print(result['exit_code'], result['stdout'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.GetByName(ctx, "my-agent")
+    if errors.Is(err, microvm.ErrNotFound) {
+        sandbox, err = client.Create(ctx, sdktypes.CreateSandboxOptions{
+            Name:  "my-agent",
+            Image: "python:3.12",
+            Lifecycle: &sdktypes.Lifecycle{
+                StopIfIdleFor:    30 * time.Minute,
+                DestroyIfIdleFor: 24 * time.Hour,
+            },
+        })
+    }
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    result, err := sandbox.ExecCommand(ctx, "python -V")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(result.ExitCode, result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = match client.get_by_name("my-agent")? {
+        Some(sandbox) => sandbox,
+        None => client.create(CreateOptions {
+            name: Some("my-agent".to_string()),
+            image: "python:3.12".to_string(),
+            lifecycle: Some(Lifecycle {
+                stop_if_idle_for: 1_800_000_000_000,
+                destroy_if_idle_for: 86_400_000_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })?,
+    };
+
+    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command: "python -V".to_string(),
+        ..Default::default()
+    })?;
+    println!("{} {}", result.exit_code, result.stdout);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.getByName("my-agent").orElseGet(() -> {
+        CreateOptions options = new CreateOptions()
+            .setImage("python:3.12")
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(1_800_000_000_000L)
+                .setDestroyIfIdleFor(86_400_000_000_000L));
+        options.name = "my-agent";
+        return client.create(options);
+    });
+
+    ExecResult result = sandbox.exec(new ExecOptions().setCommand("python -V"));
+    System.out.println(result.exitCode + " " + result.stdout);
+    ```
+  </TabItem>
+</Tabs>

@@ -162,6 +162,8 @@ interface ApiFailover {
 
 interface ApiSandbox {
   id: string;
+  name?: string;
+  tags?: Record<string, string>;
   image: string;
   status: Sandbox["status"];
   public_url: string;
@@ -525,6 +527,32 @@ export class APIClient {
       }
     }
     throw new Error("incomplete cluster list: exceeded max pages");
+  }
+
+  /**
+   * Looks up the caller's sandbox by name with one request. The reply is only
+   * trusted when it holds at most one sandbox and that sandbox carries the
+   * requested name: a server that predates `?name=` ignores the filter and
+   * returns an ordinary list page, and acting on its first row would target
+   * the wrong sandbox.
+   */
+  async getByName(name: string, options?: GetOptions): Promise<SandboxResource | null> {
+    const trimmed = name.trim();
+    if (trimmed === "") {
+      throw new Error("sandbox name is required");
+    }
+    const path = this.versioned("/sandboxes") + buildSandboxListQuery({ name: trimmed, includeEnv: options?.includeEnv });
+    const body = await this.doJSON<ApiSandbox[] | null>("GET", path);
+    const items = body ?? [];
+    if (items.length === 0) {
+      return null;
+    }
+    if (items.length > 1 || items[0].name !== trimmed) {
+      throw new Error(
+        `${this.baseURL} does not support sandbox name lookup; use the sandbox ID or upgrade the server`,
+      );
+    }
+    return this.wrap(items[0]);
   }
 
   async get(id: string, options?: GetOptions): Promise<SandboxResource> {
@@ -971,6 +999,8 @@ export class SandboxResource implements Sandbox {
   declare createdAt: string;
   declare updatedAt: string;
   declare lastActiveAt: string;
+  declare name?: string;
+  declare tags?: Record<string, string>;
   declare lastError?: string;
   declare containerCommand?: string[];
   declare lifecycle: Lifecycle;
@@ -1136,6 +1166,8 @@ export class SandboxResource implements Sandbox {
 
 function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
   return {
+    name: options.name,
+    tags: options.tags,
     image: options.image,
     cpu: options.cpu,
     memory_mb: options.memoryMB,
@@ -1227,6 +1259,8 @@ function toApiFailover(failover: Failover): ApiFailover {
 function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
   return {
     id: sandbox.id,
+    name: sandbox.name || undefined,
+    tags: sandbox.tags,
     image: sandbox.image,
     status: sandbox.status,
     publicURL: sandbox.public_url,
@@ -1513,14 +1547,15 @@ function buildIncludeEnvQuery(includeEnv: boolean | undefined): string {
 }
 
 function buildSandboxListQuery(options?: ListOptions): string {
-  const tags = buildTagQuery(options?.tags);
-  if (!options?.includeEnv) {
-    return tags;
+  let query = buildTagQuery(options?.tags);
+  if (options?.includeEnv) {
+    query = appendQueryParam(query, "include_env", "true");
   }
-  if (tags === "") {
-    return "?include_env=true";
+  const name = options?.name?.trim();
+  if (name) {
+    query = appendQueryParam(query, "name", name);
   }
-  return tags + "&include_env=true";
+  return query;
 }
 
 function appendQueryParam(path: string, key: string, value: string): string {
@@ -1535,6 +1570,7 @@ function cloneSandbox(sandbox: Sandbox): Sandbox {
   return {
     ...sandbox,
     env: sandbox.env ? { ...sandbox.env } : undefined,
+    tags: sandbox.tags ? { ...sandbox.tags } : undefined,
     exposedPorts: sandbox.exposedPorts?.map((port) => ({ ...port })),
     containerCommand: sandbox.containerCommand ? [...sandbox.containerCommand] : undefined,
     lifecycle: { ...sandbox.lifecycle },

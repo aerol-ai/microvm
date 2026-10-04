@@ -735,6 +735,44 @@ impl Client {
         })
     }
 
+    /// Returns the caller's sandbox with this name, or `None` if there is
+    /// none. Names are unique per owner. The reply is only trusted when it
+    /// holds at most one sandbox carrying the requested name: a server that
+    /// predates `?name=` ignores the filter and returns an ordinary list page,
+    /// and acting on its first row would target the wrong sandbox.
+    pub fn get_by_name(&self, name: &str) -> Result<Option<Sandbox>, Error> {
+        self.get_by_name_with_options(name, false)
+    }
+
+    /// [`Client::get_by_name`] with optional `include_env=true`.
+    pub fn get_by_name_with_options(
+        &self,
+        name: &str,
+        include_env: bool,
+    ) -> Result<Option<Sandbox>, Error> {
+        let wanted = name.trim();
+        if wanted.is_empty() {
+            return Err(Error::Api("sandbox name is required".into()));
+        }
+        let mut path = format!("{}/sandboxes", self.version_prefix());
+        path.push_str(&build_sandbox_query(
+            &std::collections::HashMap::new(),
+            include_env,
+        ));
+        let path = append_query_param(&path, "name", wanted);
+        let mut raw = self.do_json::<(), Vec<SandboxData>>(Method::GET, &path, None)?;
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        if raw.len() > 1 || raw[0].name.as_deref() != Some(wanted) {
+            return Err(Error::Api(format!(
+                "{} does not support sandbox name lookup; use the sandbox ID or upgrade the server",
+                self.api_url
+            )));
+        }
+        Ok(Some(Sandbox::new(self.clone(), raw.remove(0))))
+    }
+
     pub fn get(&self, id: &str) -> Result<Sandbox, Error> {
         self.get_with_options(id, false)
     }
@@ -2093,6 +2131,8 @@ mod tests {
             durability: None,
             module_ref: None,
             tenant_id: None,
+            name: None,
+            tags: None,
         }
     }
 
@@ -3281,6 +3321,87 @@ mod tests {
             "unexpected request: {}",
             request
         );
+    }
+
+    fn named_sandbox_json(id: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "tags": {"team": "x"},
+            "image": "ubuntu:22.04",
+            "status": "started",
+            "public_url": "https://sb.example.com",
+            "container_id": "c1",
+            "container_ip": "10.0.0.1",
+            "cpu": 1,
+            "memory_mb": 512,
+            "disk_gb": 5,
+            "os_user": "root",
+            "network_block_all": false,
+            "toolbox_enabled": true,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "last_active_at": "2024-01-01T00:00:00Z",
+            "lifecycle": {}
+        })
+    }
+
+    // Names are unique per owner and looked up with ?name=. get_by_name must
+    // trust the reply only when it holds at most one sandbox carrying that
+    // name: an old server ignores the filter and returns a normal list page.
+    #[test]
+    fn get_by_name_sends_name_query_and_verifies_reply() {
+        let body = serde_json::json!([named_sandbox_json("sb-1", "agent")]).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let found = client
+            .get_by_name(" agent ")
+            .expect("get_by_name should succeed")
+            .expect("sandbox should be found");
+        assert_eq!(found.data.id, "sb-1");
+        assert_eq!(found.data.name.as_deref(), Some("agent"));
+        assert_eq!(
+            found.data.tags.as_ref().and_then(|t| t.get("team")).map(String::as_str),
+            Some("x")
+        );
+        let request = request_rx.recv().expect("request");
+        assert!(
+            request.starts_with("GET /v1/sandboxes?name=agent HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+
+        let (url, _rx) = spawn_json_server("[]".to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        assert!(client.get_by_name("agent").expect("empty reply is ok").is_none());
+
+        for reply in [
+            serde_json::json!([named_sandbox_json("sb-1", "a"), named_sandbox_json("sb-2", "b")]),
+            serde_json::json!([named_sandbox_json("sb-3", "someone-else")]),
+        ] {
+            let (url, _rx) = spawn_json_server(reply.to_string());
+            let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+            match client.get_by_name("agent") {
+                Err(Error::Api(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
+                other => panic!("expected unsupported error, got {:?}", other.map(|s| s.map(|s| s.data.id))),
+            }
+        }
+
+        let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token")).expect("client should build");
+        assert!(matches!(client.get_by_name("  "), Err(Error::Api(_))));
+    }
+
+    #[test]
+    fn create_options_serializes_name_and_tags() {
+        let mut opts = minimal_create_options();
+        assert!(serde_json::to_value(&opts).expect("serialize").get("name").is_none());
+        opts.name = Some("agent".to_string());
+        let mut tags = std::collections::HashMap::new();
+        tags.insert("a".to_string(), "b".to_string());
+        opts.tags = Some(tags);
+        let value = serde_json::to_value(&opts).expect("serialize create options");
+        assert_eq!(value["name"], "agent");
+        assert_eq!(value["tags"]["a"], "b");
     }
 
     #[test]

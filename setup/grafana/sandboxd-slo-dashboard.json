@@ -275,6 +275,62 @@
       ],
       "title": "Template Pull Activity",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 55 },
+      "id": 21,
+      "panels": [],
+      "title": "Remote MCP",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 56 },
+      "id": 22,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (key2) (rate(aerolvm_mcp_tool_calls_total[5m]))", "legendFormat": "{{key2}}", "refId": "A" }
+      ],
+      "title": "MCP Tool Calls by Outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 56 },
+      "id": 23,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum(rate(aerolvm_mcp_tool_calls_total{key2=\"api_error\"}[5m])) / clamp_min(sum(rate(aerolvm_mcp_tool_calls_total[5m])), 1e-9)", "legendFormat": "api_error ratio", "refId": "A" }
+      ],
+      "title": "MCP Error Ratio (alert at 20%)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 63 },
+      "id": 24,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (key) (rate(aerolvm_mcp_tool_latency_ms_total[5m])) / clamp_min(sum by (key) (rate(aerolvm_mcp_tool_calls_total[5m])), 1e-9)", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "MCP Mean Tool Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 63 },
+      "id": 25,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } },
+      "targets": [
+        { "expr": "sum by (key) (rate(aerolvm_mcp_requests_total[5m]))", "legendFormat": "{{key}}", "refId": "A" }
+      ],
+      "title": "MCP Requests (accepted, refused, limited)",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

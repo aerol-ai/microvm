@@ -1,9 +1,10 @@
 import json
 import unittest
+import urllib.parse
 
 from microvm import Image
 from microvm import client as client_module
-from microvm.client import MicroVM
+from microvm.client import MicroVM, MicroVMError, _to_api_create_options
 
 
 class RecordingMicroVM(MicroVM):
@@ -963,6 +964,51 @@ class ListFilterTests(unittest.TestCase):
         self.assertEqual(captured["paths"][0][1], "/v1/sandboxes/sb-1?include_env=true")
         self.assertIn("tag.team=a", captured["paths"][1][1])
         self.assertIn("include_env=true", captured["paths"][1][1])
+
+    def test_list_forwards_name_filter(self):
+        client, captured = self._client_capturing()
+        client.list(name=" agent ", tags={"team": "a"})
+        _, path, _ = captured["paths"][0]
+        self.assertIn("name=agent", path)
+        self.assertIn("tag.team=a", path)
+
+    def test_get_by_name_verifies_the_reply(self):
+        replies = {
+            "agent": [{"id": "sb-1", "name": "agent", "tags": {"team": "x"}, "status": "started"}],
+            "missing": [],
+            "old": [{"id": "sb-1", "name": "a"}, {"id": "sb-2", "name": "b"}],
+            "mismatch": [{"id": "sb-3", "name": "someone-else"}],
+        }
+        seen = []
+
+        class NameClient(MicroVM):
+            def __init__(self) -> None:
+                super().__init__(api_url="https://sandbox.example.com", pat_token="pat-token")
+
+            def _do_json(self, method, path, payload):  # type: ignore[override]
+                seen.append(path)
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+                return replies[query["name"][0]]
+
+        client = NameClient()
+        found = client.get_by_name(" agent ")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.id, "sb-1")
+        self.assertEqual(found.name, "agent")
+        self.assertEqual(found.tags, {"team": "x"})
+        self.assertEqual(seen[0], "/v1/sandboxes?name=agent")
+        self.assertIsNone(client.get_by_name("missing"))
+        for name in ("old", "mismatch"):
+            with self.assertRaisesRegex(MicroVMError, "does not support sandbox name lookup"):
+                client.get_by_name(name)
+        with self.assertRaises(ValueError):
+            client.get_by_name("  ")
+
+    def test_create_sends_name_and_tags(self):
+        payload = _to_api_create_options({"image": "alpine", "name": "agent", "tags": {"a": "b"}})
+        self.assertEqual(payload["name"], "agent")
+        self.assertEqual(payload["tags"], {"a": "b"})
+        self.assertNotIn("name", _to_api_create_options({"image": "alpine"}))
 
     def test_list_drains_cluster_pages(self):
         captured = {"paths": []}

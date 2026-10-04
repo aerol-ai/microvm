@@ -71,6 +71,10 @@ type server struct {
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+
+	// execLiveness overrides the exec-stream keepalive timings; the zero value
+	// means defaultExecStreamLiveness. Only tests set it.
+	execLiveness execStreamLiveness
 }
 
 func (s *server) servingRequests() bool {
@@ -697,7 +701,10 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := os.ReadFile(targetPath)
+	// Stream from the file rather than reading it whole: a client that only
+	// wants the head of a multi-GB file (the agent read_file tool reads one
+	// window) must not make toolboxd allocate the entire file in the guest.
+	f, err := os.Open(targetPath)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
@@ -706,11 +713,25 @@ func (s *server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error())
 		return
 	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if info.IsDir() {
+		// Same status and text os.ReadFile produced for a directory.
+		writeError(w, http.StatusInternalServerError, "read "+targetPath+": is a directory")
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filepath.Base(targetPath)))
+	if info.Mode().IsRegular() {
+		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	}
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	_, _ = io.Copy(w, f)
 }
 
 func (s *server) handleSetAllowedPorts(w http.ResponseWriter, r *http.Request) {

@@ -8,6 +8,8 @@ capabilities:
   - platform-volumes
   - domain
   - cluster
+  # SB_MCP_ENABLED=true on every node (tfvars extra_sandboxd_env); gates UC-178.
+  - remote-mcp
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
 expected_members: 3

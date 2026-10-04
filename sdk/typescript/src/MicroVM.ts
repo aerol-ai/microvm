@@ -105,6 +105,16 @@ export class MicroVM {
     return this.wrap(sandbox.toJSON());
   }
 
+  /**
+   * Returns the caller's sandbox with this name, or `null` when there is none.
+   * Names are unique per owner. Throws when the server predates name lookup
+   * (it ignores `?name=`), rather than guessing from an unfiltered list.
+   */
+  async getByName(name: string, options?: GetOptions): Promise<Sandbox | null> {
+    const sandbox = await this.client.getByName(name, options);
+    return sandbox === null ? null : this.wrap(sandbox.toJSON());
+  }
+
   async start(id: string): Promise<Sandbox> {
     const sandbox = await this.client.start(id);
     return this.wrap(sandbox.toJSON());

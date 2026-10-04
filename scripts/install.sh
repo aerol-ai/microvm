@@ -6,6 +6,7 @@ DOMAIN=""
 PUBLIC_HOST=""
 PAT_TOKEN=""
 INSTALL_PREFIX="/usr/local/bin"
+INSTALL_PREFIX_EXPLICIT="false"
 BUILD_FROM_SOURCE="auto"
 GITHUB_REPO="aerol-ai/microvm"
 VERSION="latest"
@@ -39,6 +40,9 @@ WITH_NVIDIA_GPU="false"
 WITH_AMD_GPU="false"
 WITH_CONTAINERD_ENGINE="false"
 LOCAL_MODE="false"
+# --cli-only installs just the aerolvm agent CLI: no daemon, Docker or root.
+CLI_ONLY="false"
+CLI_URL=""
 NODE_NAME=""
 PAT_TOKEN_EXPLICIT="false"
 # macOS --local installs for the current user only — no sudo, nothing outside
@@ -215,12 +219,21 @@ Options:
                                OrbStack or Docker Desktop must be running. Each
                                sandbox publishes only its toolbox port, on
                                127.0.0.1; every listener stays on 127.0.0.1.
+  --cli-only                   Install only the aerolvm CLI (also an MCP
+                               server: 'aerolvm mcp') on Linux or macOS. No
+                               daemon, Docker or root needed; without root
+                               it installs to ~/.local/bin unless
+                               --install-prefix says otherwise. Ignores
+                               every server option.
+  --cli-url <url>              Download URL for the aerolvm binary
+                               (--cli-only).
   --help                       Show this help
 
 Examples:
 	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
 	./scripts/install.sh --public-host 203.0.113.42 --pat-token dev-token --build-from-source
+	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- --cli-only
 	./scripts/install.sh --domain sandbox.example.com --pat-token my-pat-token \
 	    --dns-provider cloudflare --dns-api-token cf-scoped-token
 EOF
@@ -340,8 +353,83 @@ verify_downloads() {
 			fi
 			cat "checksum-${asset}.txt" >> selected-checksums.txt
 		done
-		sha256sum -c selected-checksums.txt
+		sha256_check selected-checksums.txt
 	)
+}
+
+# sha256_check verifies a checksum file. macOS before 14 has no sha256sum,
+# only shasum, and the --cli-only path runs there.
+sha256_check() {
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum -c "$1"
+	else
+		shasum -a 256 -c "$1"
+	fi
+}
+
+# install_cli installs the aerolvm agent CLI alone
+# (plans/mcp-server-and-agent-cli.md §5.8): the path for laptops and CI
+# runners that drive a sandboxd running somewhere else.
+install_cli() {
+	local os
+	local arch
+	local dest
+	os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+	case "$os" in
+		linux|darwin) ;;
+		*)
+			echo "--cli-only supports Linux and macOS; on Windows download aerolvm_windows_<arch>.exe from the release page" >&2
+			exit 1
+			;;
+	esac
+	case "$(uname -m)" in
+		x86_64|amd64) arch="amd64" ;;
+		aarch64|arm64) arch="arm64" ;;
+		*)
+			echo "aerolvm is released for amd64 and arm64, not $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+
+	dest="$INSTALL_PREFIX"
+	if [[ "$INSTALL_PREFIX_EXPLICIT" != "true" && $EUID -ne 0 && ! -w "$dest" ]]; then
+		# One user-level binary is not worth a sudo prompt.
+		dest="$HOME/.local/bin"
+	fi
+	mkdir -p "$dest"
+
+	# Unlike the server path, "auto" builds from source only inside this
+	# repo: piping the installer into bash from some other Go project must
+	# not try to build ./cmd/aerolvm there.
+	if [[ "$BUILD_FROM_SOURCE" == "true" || ( "$BUILD_FROM_SOURCE" == "auto" && -z "$CLI_URL" && -f ./go.mod && -d ./cmd/aerolvm ) ]]; then
+		CGO_ENABLED=0 go build -trimpath -o "$dest/aerolvm" ./cmd/aerolvm
+	else
+		local release_base
+		local asset
+		local tmp_dir
+		release_base="https://github.com/${GITHUB_REPO}/releases"
+		if [[ "$VERSION" == "latest" ]]; then
+			CLI_URL="${CLI_URL:-${release_base}/latest/download/aerolvm_${os}_${arch}}"
+			CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/latest/download/checksums.txt}"
+		else
+			CLI_URL="${CLI_URL:-${release_base}/download/${VERSION}/aerolvm_${os}_${arch}}"
+			CHECKSUMS_URL="${CHECKSUMS_URL:-${release_base}/download/${VERSION}/checksums.txt}"
+		fi
+		asset="$(basename "${CLI_URL%%\?*}")"
+		tmp_dir="$(mktemp -d)"
+		download_asset "$CLI_URL" "$tmp_dir/$asset"
+		verify_downloads "$tmp_dir" "$asset"
+		install -m 0755 "$tmp_dir/$asset" "$dest/aerolvm"
+		rm -rf "$tmp_dir"
+	fi
+
+	echo "aerolvm installed: $dest/aerolvm"
+	case ":$PATH:" in
+		*":$dest:"*) ;;
+		*) echo "Add $dest to your PATH to run it as aerolvm." ;;
+	esac
+	echo "Point it at a sandboxd: export SB_API_URL=<api url> SB_PAT_TOKEN=<token>"
+	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -389,6 +477,7 @@ while [[ $# -gt 0 ]]; do
 			;;
 		--install-prefix)
 			INSTALL_PREFIX="$2"
+			INSTALL_PREFIX_EXPLICIT="true"
 			shift 2
 			;;
 		--idle-timeout-min)
@@ -447,6 +536,14 @@ while [[ $# -gt 0 ]]; do
 			LOCAL_MODE="true"
 			shift
 			;;
+		--cli-only)
+			CLI_ONLY="true"
+			shift
+			;;
+		--cli-url)
+			CLI_URL="$2"
+			shift 2
+			;;
 		--node-name)
 			NODE_NAME="$2"
 			shift 2
@@ -494,6 +591,11 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+
+if [[ "$CLI_ONLY" == "true" ]]; then
+	install_cli
+	exit 0
+fi
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -1027,7 +1129,7 @@ https://$DOMAIN:8443 {
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/*
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
 	handle @api {
 		reverse_proxy 127.0.0.1:21212
 	}

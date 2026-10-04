@@ -12,6 +12,10 @@ All AerolVM SDKs connect to the same REST API using a PAT token set during serve
 | `SB_PAT_TOKEN` | Yes | The token set with `--pat-token` during installation. |
 | `SB_API_URL` | No | Server base URL. Defaults to `http://127.0.0.1:21212` if omitted. |
 
+## CLI and MCP
+
+To drive sandboxes from a terminal, a script or an AI coding agent without writing code, use the [aerolvm CLI](/cli). The same binary is an [MCP server](/mcp) for Claude Code, Claude Desktop, Cursor, VS Code and other MCP clients. Both read the variables above.
+
 ## Compatibility SDKs
 
 ### Daytona
