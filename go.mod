@@ -41,7 +41,7 @@ require (
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
-	golang.org/x/time v0.15.0
+	golang.org/x/time v0.16.0
 )
 
 require (
