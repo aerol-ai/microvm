@@ -123,6 +123,25 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
           },
         ],
       },
+      {
+        type: 'group',
+        label: 'CLI & MCP',
+        homePageHref: '/cli',
+        entries: [
+          {
+            type: 'link',
+            href: '/cli',
+            label: 'aerolvm CLI',
+            description: 'Drive sandboxes from a shell, a script, CI, or an AI coding agent.',
+          },
+          {
+            type: 'link',
+            href: '/mcp',
+            label: 'MCP Server',
+            description: 'Give Claude Code, Claude Desktop, Cursor, VS Code and other MCP clients their own sandboxes.',
+          },
+        ],
+      },
     ],
   },
   {
