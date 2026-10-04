@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/toolhost"
@@ -648,5 +649,30 @@ func TestHostDaytonaProcessNotFound(t *testing.T) {
 	rec := serve(h, http.MethodGet, "/process/session/unknown/bogus", nil, nil)
 	if rec.Code == http.StatusOK {
 		t.Fatalf("bogus daytona route status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHostDownloadStreamsWithLength pins the streaming download (it runs in
+// sandboxd, so a whole-file read would cost daemon memory): the body is the
+// file with Content-Length set, and a directory keeps the old 500.
+func TestHostDownloadStreamsWithLength(t *testing.T) {
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("wasm-file "), 4096)
+	if err := os.WriteFile(filepath.Join(dir, "big.txt"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHost(t, func(c *toolhost.Config) { c.WorkDir = dir })
+	rec := serve(h, http.MethodGet, "/files/download?path=/big.txt", nil, nil)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
+		t.Fatalf("status %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(data)) {
+		t.Fatalf("Content-Length = %q, want %d", got, len(data))
+	}
+	if rec := serve(h, http.MethodGet, "/files/download?path=/sub", nil, nil); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("directory status = %d, want 500", rec.Code)
 	}
 }
