@@ -1,8 +1,8 @@
 {
     "name": "http-cache-semantics",
-    "version": "4.2.1-aerol.1",
+    "version": "4.2.1",
     "private": true,
-    "description": "Local patch of http-cache-semantics 4.2.0. Upstream has not published a fix for GHSA-ch52-4w7c-c8xp (max-stale serving security-zeroed shared-cache entries). Drop this pin when a release newer than 4.2.0 is on npm.",
+    "description": "Local patch of http-cache-semantics 4.2.0 for GHSA-ch52-4w7c-c8xp (max-stale serving security-zeroed shared-cache entries). Versioned 4.2.1, not a prerelease: make-fetch-happen depends on ^4.1.1, which does not match 4.2.1-aerol.1, and npm ci then rejects the bundled lockfile entry. 4.2.1 satisfies that range and is outside the advisory (<= 4.2.0). This is not an upstream release. Drop this pin when a fixed release is on npm.",
     "repository": {
         "type": "git",
         "url": "git+https://github.com/kornelski/http-cache-semantics.git"
