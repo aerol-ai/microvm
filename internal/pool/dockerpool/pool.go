@@ -282,6 +282,74 @@ func (p *Pool) Acquire(ctx context.Context, key Key, currentImageID string) (*Pa
 	return picked, nil
 }
 
+// reclaimDestroyTimeout bounds the background teardown of reclaimed slots.
+const reclaimDestroyTimeout = 30 * time.Second
+
+// Reclaim gives up to n parked slots back so a real sandbox can be admitted
+// on a host the pool has filled (capacity.Admitter calls it through
+// SetParkReclaimer). It takes from the least-recently-used miss-driven target
+// first and from pinned targets last, releases each slot's park reservation
+// before returning because the admitter retries straight after, and tears the
+// containers down in the background so the create that asked never waits on
+// the engine. Refill re-parks only once the capacity gate has room again.
+func (p *Pool) Reclaim(n int) int {
+	if p == nil || n <= 0 {
+		return 0
+	}
+	var taken []*ParkedSlot
+	p.mu.Lock()
+	for len(taken) < n {
+		ks := p.reclaimVictimLocked()
+		if ks == "" {
+			break
+		}
+		q := p.ready[ks]
+		taken = append(taken, q[0])
+		p.ready[ks] = q[1:]
+	}
+	if len(taken) > 0 {
+		p.publishParkedLocked()
+		if p.metrics != nil {
+			p.metrics.recordReclaim(len(taken))
+		}
+	}
+	p.mu.Unlock()
+
+	for _, slot := range taken {
+		p.releasePark(slot.ID)
+	}
+	if spawner := p.spawner; len(taken) > 0 && spawner != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), reclaimDestroyTimeout)
+			defer cancel()
+			for _, slot := range taken {
+				_ = spawner.DestroyParked(ctx, slot)
+			}
+		}()
+	}
+	return len(taken)
+}
+
+// reclaimVictimLocked picks the queue to take a reclaimed slot from: the
+// non-pinned target used least recently, else the least recently used pinned
+// one. Pinned targets are operator config, so they are the last to shrink.
+func (p *Pool) reclaimVictimLocked() string {
+	best := ""
+	bestPinned := false
+	var bestAt time.Time
+	for ks, q := range p.ready {
+		if len(q) == 0 {
+			continue
+		}
+		_, pinned := p.pinned[ks]
+		used := p.lastUsed[ks]
+		if best == "" || (bestPinned && !pinned) || (pinned == bestPinned && used.Before(bestAt)) {
+			best, bestPinned, bestAt = ks, pinned, used
+		}
+	}
+	return best
+}
+
 func (p *Pool) kickRefillLocked() {
 	if p.refillKick == nil {
 		return

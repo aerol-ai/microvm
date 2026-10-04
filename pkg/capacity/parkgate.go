@@ -6,9 +6,12 @@ import (
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 )
 
+// parkReservationPrefix marks a warm-pool slot reservation in the admitter.
+const parkReservationPrefix = "park:"
+
 // ParkReservationID is the admitter key for a warm-pool parked slot.
 func ParkReservationID(slotID string) string {
-	return "park:" + strings.TrimSpace(slotID)
+	return parkReservationPrefix + strings.TrimSpace(slotID)
 }
 
 // ParkGate implements warm-pool refill gating against the host admitter.

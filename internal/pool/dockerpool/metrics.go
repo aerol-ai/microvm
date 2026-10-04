@@ -18,6 +18,7 @@ var (
 	metricStaleImage  = expvar.NewInt("aerolvm_docker_pool_stale_images_total")
 	metricSpawnFail   = expvar.NewInt("aerolvm_docker_pool_spawn_fails_total")
 	metricTargetEvict = expvar.NewInt("aerolvm_docker_pool_target_evictions_total")
+	metricReclaim     = expvar.NewInt("aerolvm_docker_pool_reclaims_total")
 	adoptMS           = expvar.NewFloat("aerolvm_docker_pool_adopt_ms")
 )
 
@@ -30,6 +31,7 @@ type Metrics struct {
 	staleImage   atomic.Int64
 	spawnFail    atomic.Int64
 	targetEvicts atomic.Int64
+	reclaims     atomic.Int64
 }
 
 // Snapshot is a point-in-time view of pool counters.
@@ -41,6 +43,9 @@ type Snapshot struct {
 	StaleImages  int64
 	SpawnFail    int64
 	TargetEvicts int64
+	// Reclaims counts parked slots given back to admit a real sandbox. A
+	// steady rate means the pool is sized past what the node can spare.
+	Reclaims int64
 }
 
 func (m *Metrics) recordHit() {
@@ -78,6 +83,11 @@ func (m *Metrics) recordTargetEvict() {
 	metricTargetEvict.Add(1)
 }
 
+func (m *Metrics) recordReclaim(n int) {
+	m.reclaims.Add(int64(n))
+	metricReclaim.Add(int64(n))
+}
+
 func (m *Metrics) setParked(n int) { metricParked.Set(int64(n)) }
 
 // RecordAdoptMS publishes the latest successful adopt handshake duration.
@@ -102,5 +112,6 @@ func (m *Metrics) Stats() Snapshot {
 		StaleImages:  m.staleImage.Load(),
 		SpawnFail:    m.spawnFail.Load(),
 		TargetEvicts: m.targetEvicts.Load(),
+		Reclaims:     m.reclaims.Load(),
 	}
 }

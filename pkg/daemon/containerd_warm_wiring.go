@@ -67,6 +67,11 @@ func wireContainerdWarmPool(ctx context.Context, cfg config.Config, logger *slog
 		},
 	}
 	pool.SetParkReleaser(gate.ReleasePark)
+	// Parked slots are speculative: a real create that does not fit may
+	// reclaim them, so a pool that filled the node never refuses real work.
+	if admitter != nil {
+		admitter.SetParkReclaimer(pool.Reclaim)
+	}
 	driver.SetWarmPool(pool)
 
 	// Image-ID cache (docker StartImageIDCacheWarmer) is intentionally NOT

@@ -40,6 +40,11 @@ func wireDockerWarmPool(ctx context.Context, cfg config.Config, logger *slog.Log
 		},
 	}
 	pool.SetParkReleaser(gate.ReleasePark)
+	// Parked slots are speculative: a real create that does not fit may
+	// reclaim them, so a pool that filled the node never refuses real work.
+	if admitter != nil {
+		admitter.SetParkReclaimer(pool.Reclaim)
+	}
 	dockerClient.SetWarmPool(pool)
 
 	images := cfg.DockerPoolImages
