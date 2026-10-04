@@ -197,3 +197,40 @@ func TestClusterListByName(t *testing.T) {
 		})
 	}
 }
+
+// TestSingleNodeListHonorsLimit pins that ?limit= pages in single-node mode
+// too (it used to be a cluster-only parameter), while a request with neither
+// limit nor page_token still gets every row in one response.
+func TestSingleNodeListHonorsLimit(t *testing.T) {
+	h, st := newNameLookupEnv(t)
+	for _, id := range []string{"sb-c", "sb-a", "sb-b"} {
+		seedNamedSandbox(t, st, id, "", "", nil)
+	}
+	get := func(query string) *httptest.ResponseRecorder {
+		rr := httptest.NewRecorder()
+		h.clusterListWrap(rr, tenantRequest(httptest.NewRequest(http.MethodGet, "/v1/sandboxes"+query, nil), ""))
+		return rr
+	}
+	if all := decodeSandboxList(t, get("")); len(all) != 3 {
+		t.Fatalf("unpaged list = %d rows, want 3", len(all))
+	}
+	var ids []string
+	query := "?limit=2"
+	for i := 0; i < 5; i++ {
+		rr := get(query)
+		for _, sb := range decodeSandboxList(t, rr) {
+			ids = append(ids, sb.ID)
+		}
+		next := rr.Header().Get("X-Cluster-List-Next-Page-Token")
+		if next == "" {
+			break
+		}
+		query = "?limit=2&page_token=" + next
+	}
+	if len(ids) != 3 || ids[0] != "sb-a" || ids[1] != "sb-b" || ids[2] != "sb-c" {
+		t.Fatalf("paged ids = %v, want [sb-a sb-b sb-c]", ids)
+	}
+	if rr := get("?limit=2&page_token=not-ours"); rr.Code != http.StatusBadRequest {
+		t.Fatalf("foreign page token status = %d, want 400", rr.Code)
+	}
+}
