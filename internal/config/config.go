@@ -1276,6 +1276,23 @@ type Config struct {
 	// SB_AUDIT_INDEX_ENABLED. Default true.
 	AuditIndexEnabled bool
 
+	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
+	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
+	// public surface, and operators opt in like every other new listener
+	// (setup/config-defaults.md). SB_MCP_ENABLED.
+	MCPEnabled bool
+	// MCPAllowedOrigins lists browser origins allowed to call /mcp; a
+	// request carrying any other Origin is refused (DNS rebinding). MCP
+	// clients outside a browser send none. Comma list, default empty.
+	// SB_MCP_ALLOWED_ORIGINS.
+	MCPAllowedOrigins []string
+	// MCPAllowedHosts, when set, lists the Host values /mcp answers to.
+	// Comma list, default empty (any host). SB_MCP_ALLOWED_HOSTS.
+	MCPAllowedHosts []string
+	// MCPRateLimit is the per-token request rate (req/s) on /mcp, burst
+	// twice that. Default 20. SB_MCP_RATE_LIMIT.
+	MCPRateLimit float64
+
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
 	// that requires a client certificate signed by the cluster CA. Without TLS
@@ -1817,6 +1834,10 @@ func Load() (Config, error) {
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
 		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
+		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
+		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
+		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
+		MCPRateLimit:                  getEnvFloat("SB_MCP_RATE_LIMIT", 20),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),
@@ -2382,6 +2403,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AuditRateLimitIdentity <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_IDENTITY must be > 0")
+	}
+	if cfg.MCPRateLimit < 0 {
+		return Config{}, errors.New("SB_MCP_RATE_LIMIT must be >= 0 (0 disables the limit)")
 	}
 	if cfg.AuditRateLimitOperator <= 0 {
 		return Config{}, errors.New("SB_AUDIT_RATE_LIMIT_OPERATOR must be > 0")
@@ -2981,4 +3005,15 @@ func (c Config) ResolvedAuditExportBackend() string {
 // AuditExportEnabled reports whether a non-noop connector is configured.
 func (c Config) AuditExportEnabled() bool {
 	return c.ResolvedAuditExportBackend() != auditexport.BackendNoop
+}
+
+// splitEnvList reads a comma-separated list, dropping blanks.
+func splitEnvList(key string) []string {
+	var out []string
+	for part := range strings.SplitSeq(os.Getenv(key), ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }

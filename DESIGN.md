@@ -8,6 +8,7 @@ This is the design of a released AerolVM node: who acts, and what each actor can
 | :--- | :--- | :--- |
 | Operator | The person who installs and configures the host. | Host access, the API token, and the daemon environment. In the open-source build the token holder is trusted as the host operator. |
 | API client | An SDK or any HTTPS caller. | The API token. |
+| MCP client | An AI agent's host (Claude Code, Cursor, VS Code) speaking MCP to `aerolvm mcp` on its own machine or to `/mcp` on `sandboxd`. | The API token, from the client's MCP configuration. |
 | Sandbox guest | Code running inside one sandbox. | That sandbox's filesystem, network namespace, and resource limits. Not the host, the API token, or another tenant's sandbox. |
 | Preview or TCP client | A browser or TCP client that was given a published address. | The preview URL or the TLS address. No API token. |
 | SSH client | A client using the sandbox's Ed25519 key. | That one sandbox's key. |
@@ -24,6 +25,7 @@ This is the design of a released AerolVM node: who acts, and what each actor can
 | API client | Run a command, open a PTY session, and read or write files. | The API forwards to `toolboxd` inside the sandbox. |
 | API client | Publish an HTTP preview or a TCP/TLS port. Take and restore a snapshot. Attach external storage. | The service layer records the intent in SQLite and programs Caddy, the runtime, or the mount manager. |
 | API client | Read capacity and the secret-audit log. | `GET /v1/capacity`, `GET /v1/sandboxes/{id}/audit`. |
+| MCP client | Create sandboxes, run commands, read and write files, and publish ports, through MCP tools. A pinned server reaches only its one sandbox. | `aerolvm mcp` calls the v1 API like any SDK. With `SB_MCP_ENABLED=true`, `/mcp` on `sandboxd` serves the same tools and sends each call back into the API in-process with the caller's token, so authentication, owner scoping, and cluster forwarding are the API's own. No MCP tool reads or writes the client's machine. |
 | Sandbox guest | Compute, open outbound connections, and use the files and mounts it was given. | The runtime: containerd (default), gVisor, Firecracker, WASM, or the V8 isolate. |
 | Sandbox guest | Ask the host to run a process, touch the filesystem, or record session output. | `toolboxd`, which the daemon placed in that sandbox. The guest does not talk to Caddy's admin socket or to SQLite. |
 | Preview or TCP client | Open the published HTTP or TCP service. | Caddy routes `<sandbox-id>.<domain>` (HTTP) or `<sandbox-id>-<port>.<domain>` (TCP) to the sandbox. |
