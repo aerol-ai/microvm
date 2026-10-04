@@ -33,7 +33,7 @@ type placementByNameStubCluster struct {
 	owner     cluster.OwnerInfo
 }
 
-func (c *placementByNameStubCluster) OwnerOfName(string) (string, cluster.OwnerInfo, error) {
+func (c *placementByNameStubCluster) OwnerOfNameKey(string) (string, cluster.OwnerInfo, error) {
 	if c.ownerErr != nil {
 		return "sb-named", c.owner, c.ownerErr
 	}

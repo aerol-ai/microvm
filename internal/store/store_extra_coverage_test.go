@@ -326,7 +326,7 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 	_, _ = st.ListCompatState(ctx, "missing")
 
 	// Misc Sandbox
-	_, _ = st.ResolveSandboxIDByName(ctx, "missing")
+	_, _ = st.ResolveSandboxIDByName(ctx, "", "missing")
 	_ = st.Delete(ctx, "missing")
 
 	// Snapshots

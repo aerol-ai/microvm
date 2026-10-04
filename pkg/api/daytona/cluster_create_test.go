@@ -114,7 +114,7 @@ func (c *daytonaOwnerForwardCluster) OwnerOf(string) (cluster.OwnerInfo, error) 
 	return c.owner, nil
 }
 
-func (c *daytonaOwnerForwardCluster) OwnerOfName(string) (string, cluster.OwnerInfo, error) {
+func (c *daytonaOwnerForwardCluster) OwnerOfName(string, string) (string, cluster.OwnerInfo, error) {
 	if c.nameErr != nil {
 		return "", cluster.OwnerInfo{}, c.nameErr
 	}

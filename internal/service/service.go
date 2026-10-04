@@ -1309,6 +1309,10 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 // idempotent route replay work is already healthy. This keeps the failover
 // recreate counter from becoming a constant five-second polling rate.
 func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+	// The replicated spec holds the owner-qualified name key; the local row
+	// gets the user's name back (names are unique per owner in the store).
+	// A malformed legacy "owner:" name decodes to itself and never fails.
+	spec = cluster.DecodeSpecName(spec)
 	if strings.TrimSpace(spec.Runtime) == models.RuntimeWasm && spec.Durability == models.DurabilityDurable {
 		nodeID := ""
 		if c := s.Cluster(); c != nil {
@@ -1566,6 +1570,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if req.Image == "" && strings.TrimSpace(req.ModuleRef) == "" {
 		return nil, errors.New("image is required")
 	}
+	// Name rules are intake-only: a failover recreate replays whatever name
+	// the replicated spec holds, including legacy names that predate them.
+	if !isStoredSpecReplay(ctx) {
+		if err := models.ValidateSandboxName(req.Name); err != nil {
+			return nil, err
+		}
+	}
 
 	// Owner attribution: a validated user token stamps its account onto the
 	// new sandbox; operator/PAT and internal creates are owner-less (""). The
@@ -1775,6 +1786,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// SHA-256 of ≤4KiB (~µs), cluster mode only.
 	if s.cfg.EnableCluster {
 		redacted := RedactClusterSecrets(req)
+		// The replicated spec carries the owner-qualified name key, which is
+		// longer than the user's name; size what will actually be encoded.
+		redacted.Name = cluster.QualifiedSandboxName(ownerRef, redacted.Name)
 		incarnationID := ""
 		if c := s.Cluster(); c != nil {
 			if p, ok := c.PlacementOf(sandboxID); ok {
