@@ -100,3 +100,6 @@ aerolvm_wasm_pool_spawn_fails_total
 aerolvm_worker_lease_max_age_nanos
 aerolvm_worker_leases_alive
 aerolvm_worker_leases_total
+aerolvm_mcp_tool_calls_total
+aerolvm_mcp_tool_latency_ms_total
+aerolvm_mcp_requests_total
