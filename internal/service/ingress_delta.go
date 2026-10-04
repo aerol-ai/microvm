@@ -265,13 +265,80 @@ func (s *Service) addClusterIngressInFluxIntents(intents map[string]ingressRoute
 	}
 }
 
-func (s *Service) planClusterIngressDelta(desired map[string]ingressRouteIntent) ([]func(context.Context) error, func()) {
+// applyClusterIngress converges Caddy on desired and returns how many route
+// operations it ran.
+//
+// Without audit it trusts the route cache and applies only the delta. With
+// audit it first reads Caddy's live config: desired routes missing there are
+// re-applied even though the cache says they are installed, and routes there
+// that nothing accounts for are deleted. The snapshot is taken before any
+// write so the GC never sees a route this pass is adding.
+//
+// The cache is committed only when everything succeeded. A failed pass
+// leaves it as it was, so the next pass replays the same writes; each one
+// starts from Caddy's state (PATCH by @id first), so replaying a write that
+// did land is a no-op.
+func (s *Service) applyClusterIngress(ctx context.Context, desired map[string]ingressRouteIntent, audit bool) (int, error) {
+	var (
+		firstErr error
+		live     *caddy.Snapshot
+	)
+	if audit {
+		snap, err := s.caddy.Snapshot(ctx)
+		if err != nil {
+			firstErr = fmt.Errorf("cluster ingress caddy snapshot: %w", err)
+		} else {
+			live = &snap
+		}
+	}
+	missing := s.missingIngressRoutes(desired, live)
+	if len(missing) > 0 {
+		s.logger.Warn("cluster ingress: routes missing from Caddy's live config; re-applying",
+			"missing", len(missing), "desired", len(desired))
+	}
+	ops, commitDelta := s.planClusterIngressDelta(desired, missing)
+	if err := runIngressOpsBatched(ctx, ops, clusterIngressMaxConcurrentWrites, clusterIngressBatchSize); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if live != nil {
+		if err := s.gcUnexpectedClusterIngressRoutesIn(ctx, desired, *live); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr == nil {
+		commitDelta()
+	}
+	return len(ops), firstErr
+}
+
+// nextClusterIngressWait picks the delay before the next reconcile pass and
+// the retry delay to carry forward. A pass that could not reach Caddy's
+// admin API retries soon, backing off by doubling to the normal interval;
+// anything else (success, or Caddy answering with an error) waits the
+// normal interval and resets the backoff.
+func nextClusterIngressWait(err error, retry time.Duration) (time.Duration, time.Duration) {
+	if !caddy.IsTransientAdminError(err) {
+		return clusterIngressReconcileInterval, clusterIngressTransientRetryDelay
+	}
+	if retry <= 0 {
+		retry = clusterIngressTransientRetryDelay
+	}
+	wait := min(retry, clusterIngressReconcileInterval)
+	return wait, min(2*wait, clusterIngressReconcileInterval)
+}
+
+// planClusterIngressDelta diffs desired against the route cache: an apply for
+// every new or changed intent, a delete for every cached intent no longer
+// desired. reapply names intents to apply even though the cache says they are
+// installed, because Caddy's live config says otherwise (missingIngressRoutes).
+func (s *Service) planClusterIngressDelta(desired map[string]ingressRouteIntent, reapply map[string]struct{}) ([]func(context.Context) error, func()) {
 	s.ingressRouteMu.Lock()
 	defer s.ingressRouteMu.Unlock()
 
 	ops := make([]func(context.Context) error, 0)
 	for key, intent := range desired {
-		if previous, ok := s.ingressRouteCache[key]; ok && previous.fingerprint == intent.fingerprint {
+		_, missing := reapply[key]
+		if previous, ok := s.ingressRouteCache[key]; ok && previous.fingerprint == intent.fingerprint && !missing {
 			continue
 		}
 		ops = append(ops, intent.apply)
@@ -355,7 +422,62 @@ func (s *Service) addLocalIngressExpectedRoutes(expectedHTTP, expectedTCPServers
 	}
 }
 
+// missingIngressRoutes returns the desired intents whose route @id is absent
+// from Caddy's live config. The route cache only records what this process
+// last wrote; anything that rewrites Caddy behind it (a Caddy restart, which
+// reloads the Caddyfile without --resume and drops every dynamic route; an
+// operator /load; a write lost in flight) leaves the cache claiming routes
+// that are gone, and the fingerprint diff alone would never put them back.
+//
+// nil live (no audit this pass) and a non-Caddy route writer (proxy routing,
+// where per-sandbox routes deliberately live outside Caddy) report nothing.
+func (s *Service) missingIngressRoutes(desired map[string]ingressRouteIntent, live *caddy.Snapshot) map[string]struct{} {
+	if live == nil || !s.routesWrittenToCaddy() {
+		return nil
+	}
+	present := map[ingressRouteSurface]map[string]struct{}{
+		ingressSurfaceHTTP: idSet(live.HTTPRouteIDs),
+		ingressSurfaceTCP:  idSet(live.L4TCPServerIDs),
+		ingressSurfaceTLS:  idSet(live.L4TLSRouteIDs),
+	}
+	var missing map[string]struct{}
+	for key, intent := range desired {
+		if _, ok := present[intent.surface][intent.routeID]; ok {
+			continue
+		}
+		if missing == nil {
+			missing = make(map[string]struct{})
+		}
+		missing[key] = struct{}{}
+	}
+	return missing
+}
+
+func idSet(ids []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		out[id] = struct{}{}
+	}
+	return out
+}
+
 func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired map[string]ingressRouteIntent) error {
+	if !s.caddy.Enabled() {
+		return nil
+	}
+	snap, err := s.caddy.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("cluster ingress caddy snapshot: %w", err)
+	}
+	return s.gcUnexpectedClusterIngressRoutesIn(ctx, desired, snap)
+}
+
+// gcUnexpectedClusterIngressRoutesIn deletes the routes in snap that neither
+// desired nor a local sandbox accounts for. snap is taken BEFORE the store is
+// listed, so a sandbox whose row existed when snap was taken is in the list.
+// The old order (list, then snapshot) could also see the route of a sandbox
+// created after the list, and delete it.
+func (s *Service) gcUnexpectedClusterIngressRoutesIn(ctx context.Context, desired map[string]ingressRouteIntent, snap caddy.Snapshot) error {
 	if !s.caddy.Enabled() {
 		return nil
 	}
@@ -368,10 +490,6 @@ func (s *Service) gcUnexpectedClusterIngressRoutes(ctx context.Context, desired 
 		s.addLocalIngressExpectedRoutes(expectedHTTP, expectedTCPServers, expectedTLSRoutes, local)
 	}
 
-	snap, err := s.caddy.Snapshot(ctx)
-	if err != nil {
-		return fmt.Errorf("cluster ingress caddy snapshot: %w", err)
-	}
 	var firstErr error
 	for _, id := range snap.HTTPRouteIDs {
 		if _, ok := expectedHTTP[id]; ok {

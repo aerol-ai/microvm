@@ -105,7 +105,7 @@ func TestBuildClusterIngressIntents_CustomHostnameDeltaFiresApply(t *testing.T) 
 		CustomHostnames: []string{"api.acme.com"},
 	}
 	initial, _ := svc.buildClusterIngressIntents([]cluster.Placement{base}, "self")
-	ops, commit := svc.planClusterIngressDelta(initial)
+	ops, commit := svc.planClusterIngressDelta(initial, nil)
 	if len(ops) != len(initial) {
 		t.Fatalf("initial delta ops=%d, want %d", len(ops), len(initial))
 	}
@@ -117,7 +117,7 @@ func TestBuildClusterIngressIntents_CustomHostnameDeltaFiresApply(t *testing.T) 
 	next.Version = 2
 	next.CustomHostnames = []string{"api.acme.com", "shop.beta.io"}
 	updated, _ := svc.buildClusterIngressIntents([]cluster.Placement{next}, "self")
-	ops, _ = svc.planClusterIngressDelta(updated)
+	ops, _ = svc.planClusterIngressDelta(updated, nil)
 
 	// Two ops expected: default SNI route's fingerprint changed (version
 	// bump), and one new custom-hostname SNI route appears. The first

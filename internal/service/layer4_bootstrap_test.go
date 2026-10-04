@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -168,5 +170,66 @@ func TestRepairLayer4ReadyBypassesSuccessLatch(t *testing.T) {
 	}
 	if !svc.l4Ready.Load() {
 		t.Fatal("repair should keep the ready latch true after success")
+	}
+}
+
+// EnsureLayer4 reads the tls-mux server and, when the fallback is missing or
+// out of place, POSTs the whole server back. A route another goroutine
+// inserted between that GET and that POST used to be overwritten: the ingress
+// reconciler's repair and a lifecycle SNI write share one Caddy. The caddy
+// client now holds its admin lock across EnsureLayer4's read-modify-write, so
+// the concurrent insert waits for the POST and lands after it.
+func TestRepairLayer4ReadyKeepsAConcurrentlyInsertedSNIRoute(t *testing.T) {
+	const sniRoute = "sandbox-sb-late-ingress-sni"
+	e := newEmulatedCaddy(t, 0)
+	// tls-mux lost its fallback: the repair must rewrite the server.
+	e.outOfBand(t, http.MethodPatch, "/config/apps/layer4/servers/tls-mux/routes", `[]`)
+
+	svc := newLiveIngressService(t, e)
+	ctx := context.Background()
+
+	var (
+		hooked    atomic.Bool
+		arrived   = make(chan struct{})
+		arriveOne sync.Once
+		insertErr = make(chan error, 1)
+	)
+	e.setBefore(func(w http.ResponseWriter, r *http.Request) bool {
+		if strings.Contains(r.URL.Path, sniRoute) || r.Method == http.MethodPut {
+			arriveOne.Do(func() { close(arrived) })
+			return false
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/config/apps/layer4/servers/tls-mux" || hooked.Swap(true) {
+			return false
+		}
+		// Read the server as the repair sees it, then give a concurrent
+		// lifecycle insert every chance to land before the repair writes.
+		stale := httptest.NewRecorder()
+		e.apply(stale, r)
+		go func() {
+			insertErr <- svc.caddy.UpsertSNIPassthroughRoute(ctx, sniRoute, "sb-late.d.test", "10.42.1.108", 443)
+		}()
+		select {
+		case <-arrived:
+		case <-time.After(300 * time.Millisecond):
+		}
+		w.WriteHeader(stale.Code)
+		_, _ = w.Write(stale.Body.Bytes())
+		return true
+	})
+
+	if err := svc.RepairLayer4Ready(ctx); err != nil {
+		t.Fatalf("RepairLayer4Ready: %v", err)
+	}
+	if err := <-insertErr; err != nil {
+		t.Fatalf("concurrent SNI insert: %v", err)
+	}
+	ids := e.tlsMuxRouteIDs(t)
+	requireRouteOnce(t, ids, sniRoute)
+	if ids[len(ids)-1] != "tls-mux-fallback" {
+		t.Fatalf("repair did not put the fallback last: %v", ids)
+	}
+	if !svc.l4Ready.Load() {
+		t.Fatal("a successful repair keeps the ready latch true")
 	}
 }

@@ -1143,7 +1143,13 @@ https://*.$DOMAIN:8443 {
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
-	respond "Sandbox not found" 404
+	# close: caddy-l4 picks a backend once per TCP connection, so a client
+	# that connected before its sandbox's route existed would otherwise keep
+	# reusing a connection pinned to this 404. Closing makes its next attempt
+	# dial again and be routed afresh.
+	respond "Sandbox not found" 404 {
+		close
+	}
 }
 EOF
 }

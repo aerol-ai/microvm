@@ -33,6 +33,10 @@ type Client struct {
 	gate    sync.RWMutex
 	batch   *configEmulator
 	batchMu sync.Mutex
+
+	// adminMu serializes config mutations from every writer in the process
+	// (admin_lock.go). Lock order: adminMu before gate.
+	adminMu sync.Mutex
 }
 
 func New(cfg config.Config) *Client {
@@ -54,7 +58,7 @@ func New(cfg config.Config) *Client {
 		// them without per-call-site instrumentation drift.
 		httpClient: &http.Client{
 			Timeout:   cfg.HTTPClientTimeout,
-			Transport: wrapTransport(http.DefaultTransport),
+			Transport: wrapTransport(newAdminTransport()),
 		},
 	}
 }
@@ -579,12 +583,20 @@ func (c *Client) inFluxMatchPort(id string, port int) []map[string]any {
 // it doesn't exist yet (404), we insert it at index 0 of the server's routes
 // list with PUT so it sits ahead of the fallback "Sandbox not found" route.
 // Per-route admin calls keep this O(1) regardless of how many sandboxes exist.
+//
+// The PATCH and the PUT run under one admin lock, so no other in-process
+// writer can insert the same @id between them.
 func (c *Client) upsertRoute(ctx context.Context, routeID string, route map[string]any) error {
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("marshal caddy route: %w", err)
 	}
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.upsertRouteLocked(ctx, routeID, body)
+	})
+}
 
+func (c *Client) upsertRouteLocked(ctx context.Context, routeID string, body []byte) error {
 	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
 	status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
 	if err != nil {
@@ -891,7 +903,14 @@ func (c *Client) EnsureOnDemandTLS(ctx context.Context, askURL string, burst int
 	if burst <= 0 || interval <= 0 {
 		return errors.New("burst and interval must be > 0")
 	}
+	// The policy check and the append run under one admin lock so two
+	// callers cannot both see "no policy" and both append one.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureOnDemandTLSLocked(ctx, askURL)
+	})
+}
 
+func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) error {
 	onDemand := map[string]any{"ask": askURL}
 	onDemandBody, err := json.Marshal(onDemand)
 	if err != nil {
@@ -994,7 +1013,15 @@ func (c *Client) EnsureLayer4(ctx context.Context, tlsListen, tlsFallback string
 	if tlsListen != "" && tlsFallback == "" {
 		return errors.New("tls fallback required when tls listen is set")
 	}
+	// One admin lock across the GETs and the write: the tls-mux update below
+	// POSTs the whole server back, so a route another goroutine inserted
+	// between the GET and the POST would be dropped.
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureLayer4Locked(ctx, tlsListen, tlsFallback)
+	})
+}
 
+func (c *Client) ensureLayer4Locked(ctx context.Context, tlsListen, tlsFallback string) error {
 	// Ensure /config/apps/layer4 exists. We only PUT it if it isn't there;
 	// otherwise we'd clobber any servers added since last boot.
 	exists, err := c.pathExists(ctx, "/config/apps/layer4")
@@ -1305,28 +1332,46 @@ func (c *Client) UpsertTLSSNIRoute(ctx context.Context, id, sniHost, containerIP
 	if err != nil {
 		return fmt.Errorf("marshal tls sni route: %w", err)
 	}
+	return c.upsertTLSMuxRoute(ctx, "tls sni route", routeID, body)
+}
 
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert tls sni route failed: %d", status)
-	}
-	return nil
+// upsertTLSMuxRoute is upsertRoute for the tls-mux layer4 server: PATCH
+// /id/<routeID> in place, or insert at routes/0 (ahead of the fallback) when
+// it is absent. Both requests run under one admin lock, and a "duplicate ID"
+// answer to the insert means the route is there after all (see upsertRoute),
+// so it is PATCHed instead of failing the caller.
+func (c *Client) upsertTLSMuxRoute(ctx context.Context, what, routeID string, body []byte) error {
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
+		status, detail, err := c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if status != http.StatusNotFound {
+			return caddyErr("patch "+what+" "+routeID, status, detail)
+		}
+		insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
+		status, detail, err = c.sendJSONDetail(ctx, http.MethodPut, insertURL, body)
+		if err != nil {
+			return err
+		}
+		if status < 400 {
+			return nil
+		}
+		if isDuplicateRouteID(detail) {
+			status, detail, err = c.sendJSONDetail(ctx, http.MethodPatch, patchURL, body)
+			if err != nil {
+				return err
+			}
+			if status < 400 {
+				return nil
+			}
+		}
+		return caddyErr("insert "+what+" "+routeID, status, detail)
+	})
 }
 
 // UpsertWakeTLSSNIRoute publishes a TLS-SNI exposure in serverless mode. Caddy
@@ -1360,28 +1405,7 @@ func (c *Client) UpsertWakeTLSSNIRoute(ctx context.Context, id, sniHost, socketP
 	if err != nil {
 		return fmt.Errorf("marshal wake tls sni route: %w", err)
 	}
-
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch wake tls sni route failed: %d", status)
-	}
-
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert wake tls sni route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "wake tls sni route", routeID, body)
 }
 
 // UpsertSNIPassthroughRoute publishes a layer4 SNI route that does not
@@ -1409,26 +1433,7 @@ func (c *Client) UpsertSNIPassthroughRoute(ctx context.Context, routeID, sniHost
 	if err != nil {
 		return fmt.Errorf("marshal sni passthrough route: %w", err)
 	}
-	patchURL := fmt.Sprintf("%s/id/%s", c.baseURL, routeID)
-	status, err := c.sendJSON(ctx, http.MethodPatch, patchURL, body)
-	if err != nil {
-		return err
-	}
-	if status < 400 {
-		return nil
-	}
-	if status != http.StatusNotFound {
-		return fmt.Errorf("patch sni passthrough route failed: %d", status)
-	}
-	insertURL := fmt.Sprintf("%s/config/apps/layer4/servers/%s/routes/0", c.baseURL, tlsMuxServerID)
-	status, err = c.sendJSON(ctx, http.MethodPut, insertURL, body)
-	if err != nil {
-		return err
-	}
-	if status >= 400 {
-		return fmt.Errorf("insert sni passthrough route failed: %d", status)
-	}
-	return nil
+	return c.upsertTLSMuxRoute(ctx, "sni passthrough route", routeID, body)
 }
 
 // DeleteTLSSNIRoute removes one SNI route by @id. 404 is treated as success

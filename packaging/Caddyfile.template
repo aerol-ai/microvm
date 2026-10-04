@@ -39,5 +39,9 @@ https://{{WILDCARD_SITE_ADDRESS}} {
     tls {
         dns {{DNS_PROVIDER}} {env.SB_DNS_API_TOKEN}
     }
-    respond "Sandbox not found" 404
+    # close: caddy-l4 picks a backend once per TCP connection; a client that
+    # connected before its route existed must reconnect to be routed again.
+    respond "Sandbox not found" 404 {
+        close
+    }
 }
