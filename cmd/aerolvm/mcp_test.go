@@ -216,38 +216,60 @@ func TestMCPSpawnedBinary(t *testing.T) {
 		t.Run(how, func(t *testing.T) {
 			fake := agenttoolstest.New(t)
 			cmd := exec.Command(bin, "mcp", "--sandbox", "my-agent", "--create-if-missing", "--ephemeral")
-			cmd.Env = append(os.Environ(), "SB_API_URL="+fake.URL, "SB_PAT_TOKEN="+agenttoolstest.Token)
-			stdin, _ := cmd.StdinPipe()
-			stdout, _ := cmd.StdoutPipe()
-			cmd.Stderr = io.Discard
-			if err := cmd.Start(); err != nil {
-				t.Fatal(err)
-			}
-			rpc := &rpcSession{t: t, in: stdin, lines: bufio.NewScanner(stdout)}
-			res := rpc.handshake()
-			if res["result"].(map[string]any)["isError"] == true {
-				t.Fatalf("exec = %v", res)
-			}
-			if how == "sigterm" {
-				_ = cmd.Process.Signal(syscall.SIGTERM)
-			} else {
-				_ = stdin.Close()
-			}
-			// Drain stdout to the end, still checking every line.
-			for rpc.lines.Scan() {
-				var msg map[string]any
-				if err := json.Unmarshal(rpc.lines.Bytes(), &msg); err != nil || msg["jsonrpc"] != "2.0" {
-					t.Fatalf("stdout line is not JSON-RPC: %q", rpc.lines.Text())
-				}
-			}
-			if err := cmd.Wait(); err != nil {
-				t.Fatalf("exit: %v", err)
-			}
-			fake.Observe(func(s *agenttoolstest.Server) {
-				if s.DestroyCalls != 1 {
-					t.Fatalf("destroys = %d, want exactly 1", s.DestroyCalls)
-				}
-			})
+			checkEphemeralShutdown(t, cmd, fake, how)
 		})
 	}
+}
+
+// checkEphemeralShutdown runs cmd, a pinned --ephemeral MCP server, makes one
+// tool call, ends it by closing stdin or sending SIGTERM, and checks that
+// every stdout line was JSON-RPC and the sandbox was destroyed exactly once.
+func checkEphemeralShutdown(t *testing.T, cmd *exec.Cmd, fake *agenttoolstest.Server, how string) {
+	t.Helper()
+	cmd.Env = append(os.Environ(), "SB_API_URL="+fake.URL, "SB_PAT_TOKEN="+agenttoolstest.Token)
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	rpc := &rpcSession{t: t, in: stdin, lines: bufio.NewScanner(stdout)}
+	res := rpc.handshake()
+	if res["result"].(map[string]any)["isError"] == true {
+		t.Fatalf("exec = %v", res)
+	}
+	if how == "sigterm" {
+		_ = cmd.Process.Signal(syscall.SIGTERM)
+	} else {
+		_ = stdin.Close()
+	}
+	// Drain stdout to the end, still checking every line.
+	done := make(chan error, 1)
+	go func() {
+		for rpc.lines.Scan() {
+			var msg map[string]any
+			if err := json.Unmarshal(rpc.lines.Bytes(), &msg); err != nil || msg["jsonrpc"] != "2.0" {
+				done <- fmt.Errorf("stdout line is not JSON-RPC: %q", rpc.lines.Text())
+				return
+			}
+		}
+		done <- cmd.Wait()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("exit: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		// Closing stdin ends a server that missed the signal, so nothing
+		// outlives the test.
+		_ = stdin.Close()
+		_ = cmd.Process.Kill()
+		t.Fatalf("still running 15s after %s", how)
+	}
+	fake.Observe(func(s *agenttoolstest.Server) {
+		if s.DestroyCalls != 1 {
+			t.Fatalf("destroys = %d, want exactly 1", s.DestroyCalls)
+		}
+	})
 }
