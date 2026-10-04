@@ -16,6 +16,8 @@ capabilities:
   - wasm
   - domain
   - cluster
+  # SB_MCP_ENABLED=true on every node (tfvars extra_sandboxd_env); gates UC-178.
+  - remote-mcp
   # Opt the create-benchmark UCs (UC-94/UC-95) in on this scenario only: it is
   # the one cluster carrying docker/gvisor/wasm together, so a per-runtime
   # create-latency + density benchmark is meaningful here.
