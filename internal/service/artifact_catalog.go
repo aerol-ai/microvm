@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -179,6 +180,22 @@ func (s *Service) MarkArtifactCatalogDirty(kind string) {
 		return
 	}
 	s.artifactCatalog.markDirty(kind)
+}
+
+// artifactCatalogInlinePublishTimeout bounds the publish an API mutation runs
+// before it returns.
+const artifactCatalogInlinePublishTimeout = 5 * time.Second
+
+// publishArtifactCatalogBeforeReturning runs one bounded reconcile so a read
+// straight after a mutation sees it. In cluster mode the leader answers
+// GET /templates/{id} and GET /v1/js-bundles from the replicated catalogue for
+// every node that has published, without asking the node, and the maintenance
+// tick republishes only every 30s. A failure leaves the kind dirty for the
+// tick; the caller's mutation never fails on it. No-op outside cluster mode.
+func (s *Service) publishArtifactCatalogBeforeReturning(ctx context.Context) {
+	pctx, cancel := context.WithTimeout(ctx, artifactCatalogInlinePublishTimeout)
+	defer cancel()
+	s.ReconcileArtifactCatalog(pctx)
 }
 
 // ReconcileArtifactCatalog republishes any kind whose local inventory has

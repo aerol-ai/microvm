@@ -75,9 +75,12 @@ func (s *Service) CreateJSBundle(ctx context.Context, req models.CreateJSBundleR
 		return nil, err
 	}
 	// Keep the replicated catalogue current so a cluster list answers from
-	// the control plane instead of asking every isolate-capable worker. The
-	// reconciler publishes; marking is cheap enough for every mutation.
+	// the control plane instead of asking every isolate-capable worker, and
+	// publish before answering: the list skips a worker the catalogue already
+	// covers, so a bundle listed straight after upload was missing for up to
+	// a tick (UC-105, UC-168). Not the sandbox boot path.
 	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
+	s.publishArtifactCatalogBeforeReturning(ctx)
 	return s.jsBundleView(digest, strings.TrimSpace(req.Name), bundle), nil
 }
 
@@ -173,9 +176,10 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 		}
 		return err
 	}
-	// A publication replaces this node's whole inventory, so a removed bundle
-	// disappears from the catalogue when the reconciler next runs.
+	// A publication replaces this node's whole inventory; publish now so a
+	// list straight after the delete no longer shows the bundle.
 	s.MarkArtifactCatalogDirty(cluster.ArtifactKindJSBundle)
+	s.publishArtifactCatalogBeforeReturning(ctx)
 	return nil
 }
 

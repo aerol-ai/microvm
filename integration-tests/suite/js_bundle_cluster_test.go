@@ -6,6 +6,7 @@ package suite
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -45,14 +46,25 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
 		defer ccancel()
-		_ = c.Delete(cctx, "/v1/js-bundles/"+created.Digest)
+		_ = c.Delete(cctx, "/v1/js-bundles/"+created.ModuleRef)
 	})
 
 	// The aggregate must contain it, and must not be declaring missing peers
-	// on a healthy cluster.
-	body, headers, err := getWithHeaders(ctx, c, "/v1/js-bundles")
-	if err != nil {
-		t.Fatalf("list bundles: %v", err)
+	// on a healthy cluster. The leader caches the aggregate for two seconds,
+	// so allow one cache window before calling the list short.
+	var body string
+	var headers http.Header
+	listDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var err error
+		body, headers, err = getWithHeaders(ctx, c, "/v1/js-bundles")
+		if err != nil {
+			t.Fatalf("list bundles: %v", err)
+		}
+		if strings.Contains(body, created.Digest) || time.Now().After(listDeadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 	if !strings.Contains(body, created.Digest) {
 		t.Fatalf("the cluster-wide list does not contain the bundle just uploaded (%s)", created.Digest)
