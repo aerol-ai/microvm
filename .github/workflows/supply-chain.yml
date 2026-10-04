@@ -20,6 +20,13 @@ on:
     types: [opened, synchronize, reopened, edited]
   merge_group:
 
+# A new push to a pull request cancels that pull request's older run, so
+# a rebased stack doesn't queue a stale run per layer ahead of the current
+# one. Pushes to main and merge-queue runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
