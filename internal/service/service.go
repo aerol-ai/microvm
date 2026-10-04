@@ -74,6 +74,13 @@ var ErrClusterFinalizationUnavailable = errors.New("cluster placement finalizati
 
 const clusterIngressReconcileInterval = 5 * time.Second
 
+// clusterIngressTransientRetryDelay is the first retry delay after a pass
+// could not reach Caddy's admin API at all (EOF, refused, reset). It doubles
+// on each consecutive such failure, up to clusterIngressReconcileInterval.
+// The failed write may or may not have landed and repeating it is safe;
+// waiting a full interval left a just-exposed URL unroutable 5s longer.
+const clusterIngressTransientRetryDelay = 500 * time.Millisecond
+
 type Service struct {
 	cfg    config.Config
 	logger *slog.Logger
@@ -5966,18 +5973,26 @@ func (s *Service) StartClusterIngressReconcile(ctx context.Context) {
 	// the previous version-poll watcher imposed a 500ms floor on convergence
 	// and a constant background ticker; the push path eliminates both.
 	//
-	// In single-node mode (Noop) the channel is nil; selecting on nil is
-	// permanently un-ready, so the loop falls back to the slow timer.
+	// The channel is nil in single-node mode (Noop) AND on a dedicated
+	// ingress node (a non-Raft Agent) unless SB_INGRESS_PROXY_ROUTING runs
+	// the placement delta feed. Selecting on nil is permanently un-ready, so
+	// there the timer is the only trigger: a port exposed through another
+	// node waits up to one interval for its route here (2.3s on
+	// cluster-hetero ingress-1, 2026-10-04).
 	wake := s.Cluster().SubscribePlacement(ctx)
 	go func() {
+		retry := clusterIngressTransientRetryDelay
 		for {
 			reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			if err := s.ReconcileClusterIngress(reconcileCtx); err != nil {
+			err := s.ReconcileClusterIngress(reconcileCtx)
+			cancel()
+			if err != nil {
 				s.logger.Warn("cluster ingress reconcile failed", "error", err)
 			}
-			cancel()
+			var wait time.Duration
+			wait, retry = nextClusterIngressWait(err, retry)
 
-			t := time.NewTimer(clusterIngressReconcileInterval)
+			t := time.NewTimer(wait)
 			select {
 			case <-ctx.Done():
 				t.Stop()
@@ -6016,49 +6031,49 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	// Caddy admin. At 10K placements this drops a 2K-route-write tick to a
 	// single hash() and a few atomic loads. The hash key includes
 	// Version, so any FSM-level placement change forces a recompute.
+	//
+	// The live audit is the exception: it runs on its own cadence even over
+	// an unchanged view, because Caddy losing routes does not change the
+	// placement view.
 	start := time.Now()
 	viewHash, routeCounts, maxVersion := hashPlacementView(self, placements)
-	runFullGC := s.shouldRunClusterIngressFullGC()
-	if viewHash == s.ingressLastHash.Load() && viewHash != 0 && !runFullGC {
+	audit := s.shouldRunClusterIngressFullGC()
+	if viewHash == s.ingressLastHash.Load() && viewHash != 0 && !audit {
 		recordIngressReconcile(reconcileSkipped, time.Since(start), routeCounts, maxVersion)
 		return nil
 	}
 
-	var firstErr error
+	var (
+		firstErr error
+		ops      int
+	)
 	desired, needL4 := s.buildClusterIngressIntents(placements, self)
 	if needL4 {
-		if err := s.RepairLayer4Ready(ctx); err != nil {
-			return err
-		}
-	}
-
-	ops, commitDelta := s.planClusterIngressDelta(desired)
-	if err := runIngressOpsBatched(ctx, ops, clusterIngressMaxConcurrentWrites, clusterIngressBatchSize); err != nil {
-		firstErr = err
-	}
-	if runFullGC {
-		if err := s.gcUnexpectedClusterIngressRoutes(ctx, desired); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		firstErr = s.RepairLayer4Ready(ctx)
 	}
 	if firstErr == nil {
-		commitDelta()
+		ops, firstErr = s.applyClusterIngress(ctx, desired, audit)
 	}
 	if firstErr == nil {
 		s.logger.Debug("cluster ingress reconcile applied",
 			"placement_shards", routeShardFilterLogValue(shardFilter),
 			"routes", len(desired),
-			"ops", len(ops),
-			"full_gc", runFullGC,
+			"ops", ops,
+			"live_audit", audit,
 		)
 	}
 	// Stash the hash only on full success — partial failures must retry next
-	// tick rather than wedging the idle-skip on a stale view.
+	// tick rather than wedging the idle-skip on a stale view. An audit that
+	// did not finish is re-armed for the next pass instead of the next
+	// minute.
 	if firstErr == nil {
 		s.ingressLastHash.Store(viewHash)
 		recordIngressReconcile(reconcileApplied, time.Since(start), routeCounts, maxVersion)
 	} else {
 		s.ingressLastHash.Store(0)
+		if audit {
+			s.ingressLastFullGCUnix.Store(0)
+		}
 		recordIngressReconcile(reconcileErrored, time.Since(start), routeCounts, maxVersion)
 	}
 	// Publish lag regardless of pass outcome: even a failed tick gives the

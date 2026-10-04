@@ -74,6 +74,15 @@ func (s *Service) publicRoutes() publicRouteWriter {
 	return s.caddy
 }
 
+// routesWrittenToCaddy reports whether per-sandbox route writes land in
+// Caddy's config, so that Caddy's live config is where they can be checked.
+// Under SB_INGRESS_PROXY_ROUTING they land in the in-memory index instead.
+func (s *Service) routesWrittenToCaddy() bool {
+	s.routeWriterMu.RLock()
+	defer s.routeWriterMu.RUnlock()
+	return s.routeWriter == nil
+}
+
 func (s *Service) setRouteWriter(w publicRouteWriter) {
 	s.routeWriterMu.Lock()
 	s.routeWriter = w

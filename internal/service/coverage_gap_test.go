@@ -283,7 +283,7 @@ func TestIngressDeltaHelpersAndGC(t *testing.T) {
 	}
 
 	svc.ingressRouteCache = map[string]ingressRouteIntent{}
-	ops, commit := svc.planClusterIngressDelta(intents)
+	ops, commit := svc.planClusterIngressDelta(intents, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delta ops on cold cache")
 	}
@@ -397,7 +397,7 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	if !needL4 {
 		t.Fatal("expected L4 to be required for cluster ingress intents")
 	}
-	ops, commit := svc.planClusterIngressDelta(desired)
+	ops, commit := svc.planClusterIngressDelta(desired, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected initial delta ops")
 	}
@@ -408,11 +408,11 @@ func TestBuildClusterIngressIntentsExecutesApplyAndDeleteClosures(t *testing.T) 
 	}
 	commit()
 
-	if ops, _ = svc.planClusterIngressDelta(desired); len(ops) != 0 {
+	if ops, _ = svc.planClusterIngressDelta(desired, nil); len(ops) != 0 {
 		t.Fatalf("identical desired state produced %d ops, want 0", len(ops))
 	}
 
-	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{})
+	ops, _ = svc.planClusterIngressDelta(map[string]ingressRouteIntent{}, nil)
 	if len(ops) == 0 {
 		t.Fatal("expected delete ops when desired state is empty")
 	}

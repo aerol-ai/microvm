@@ -180,12 +180,20 @@ func (c *Client) RemoveStaticRoutes(ctx context.Context) error {
 }
 
 // ensureRouteAt PATCHes /id/{id} if present, and otherwise inserts at
-// position(pos) in the route list.
+// position(pos) in the route list. The index is computed from a GET of the
+// list, so the whole sequence holds the admin lock: an insert by another
+// writer in between would shift the list under the computed index.
 func (c *Client) ensureRouteAt(ctx context.Context, id, routesPath string, route map[string]any, position func([]map[string]any) int) error {
 	body, err := json.Marshal(route)
 	if err != nil {
 		return fmt.Errorf("marshal static route %s: %w", id, err)
 	}
+	return c.withAdminLock(ctx, func(ctx context.Context) error {
+		return c.ensureRouteAtLocked(ctx, id, routesPath, body, position)
+	})
+}
+
+func (c *Client) ensureRouteAtLocked(ctx context.Context, id, routesPath string, body []byte, position func([]map[string]any) int) error {
 	status, err := c.sendJSON(ctx, http.MethodPatch, c.baseURL+"/id/"+id, body)
 	if err != nil {
 		return err

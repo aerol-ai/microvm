@@ -15,11 +15,15 @@ import (
 )
 
 // clusterIngressMaxConcurrentWrites caps in-flight Caddy admin calls per
-// reconcile tick. Caddy's admin API is single-process; pushing too many
-// concurrent writes through it adds queueing latency without actually
-// shortening the wall clock. 8 keeps a 10K-route tick saturating the admin
-// HTTP pipeline without overrunning it.
-const clusterIngressMaxConcurrentWrites = 8
+// reconcile tick. It is 1: Caddy applies config changes one at a time and
+// restarts its admin endpoint on each, so parallel writes never shortened a
+// tick, and the caddy client now serializes them anyway (pkg/caddy
+// admin_lock.go). It used to be 8, and those 8 goroutines raced their own
+// reloads: on 2026-10-04 a pass's second write rode a connection the first
+// write's reload was closing and failed with EOF. With one worker a pass
+// also never queues more than one write ahead of a CreateSandbox route
+// write waiting on the same admin lock.
+const clusterIngressMaxConcurrentWrites = 1
 
 // clusterIngressBatchSize caps how many route mutations one reconcile pass
 // offers to the worker pool at once. Large failover or reshard events still
