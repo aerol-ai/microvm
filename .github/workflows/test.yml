@@ -70,6 +70,15 @@ jobs:
               - 'integration-tests/suite/harness/**'
               - '.github/workflows/test.yml'
               - 'scripts/scale-gates.sh'
+              # cmd/aerolvm and the MCP packages build on the Go SDK, and
+              # cmd/aerolvm/distribution_test.go checks what ships around
+              # the aerolvm binary.
+              - 'sdk/go/**'
+              - 'plugins/**'
+              - '.claude-plugin/**'
+              - 'npm/**'
+              - 'server.json'
+              - '.github/workflows/release.yml'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
