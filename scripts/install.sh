@@ -1027,7 +1027,7 @@ https://$DOMAIN:8443 {
 	tls {
 		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
 	}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/*
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
 	handle @api {
 		reverse_proxy 127.0.0.1:21212
 	}

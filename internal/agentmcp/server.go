@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -32,14 +33,34 @@ type Server struct {
 	created  int
 
 	shutdownOnce sync.Once
+
+	instrument Instrument
+}
+
+// Instrument wraps every tool call. It runs before the call with the tool
+// name and returns the context to run the call in and a func called after it
+// with the sandbox the call acted on (if known) and its error. The remote
+// endpoint uses it for metrics, a log line and a span per call; stdio has
+// none.
+type Instrument func(ctx context.Context, tool string) (context.Context, func(sandboxID string, err error))
+
+// ServerOption configures New.
+type ServerOption func(*Server)
+
+// WithInstrument sets the per-call instrumentation.
+func WithInstrument(fn Instrument) ServerOption {
+	return func(s *Server) { s.instrument = fn }
 }
 
 // New builds a server with the tools opts enable. It validates opts.
-func New(tools *agenttools.Tools, opts Options, version string) (*Server, error) {
+func New(tools *agenttools.Tools, opts Options, version string, options ...ServerOption) (*Server, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
 	s := &Server{opts: opts, tools: tools}
+	for _, o := range options {
+		o(s)
+	}
 	s.server = mcp.NewServer(&mcp.Implementation{Name: "aerolvm", Title: "AerolVM sandboxes", Version: version}, &mcp.ServerOptions{
 		Instructions: s.instructions(),
 	})
@@ -267,10 +288,7 @@ func addTool[In, Out any](s *Server, spec toolSpec, h func(context.Context, In) 
 	if !s.opts.hasToolset(spec.toolset) {
 		return
 	}
-	schema, err := jsonschema.For[In](nil)
-	if err != nil {
-		panic(fmt.Sprintf("agentmcp: schema for %s: %v", spec.tool.Name, err))
-	}
+	schema := inputSchema[In](spec.tool.Name)
 	if s.opts.pinned() {
 		delete(schema.Properties, "sandbox")
 		schema.Required = without(schema.Required, "sandbox")
@@ -282,15 +300,64 @@ func addTool[In, Out any](s *Server, spec toolSpec, h func(context.Context, In) 
 		}
 		p.Enum = enum
 	}
-	spec.tool.InputSchema = schema
-	mcp.AddTool(s.server, spec.tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+	tool := *spec.tool
+	tool.InputSchema = schema
+	mcp.AddTool(s.server, &tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+		var done func(string, error)
+		if s.instrument != nil {
+			ctx, done = s.instrument(ctx, tool.Name)
+		}
 		out, text, err := h(ctx, in)
+		if done != nil {
+			done(s.pinnedID(), err)
+		}
 		if err != nil {
 			var zero Out
 			return nil, zero, modelError(err)
 		}
 		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}, out, nil
 	})
+}
+
+// schemaCache holds the inferred input schema per input type. Inference is
+// reflection work, and the remote endpoint builds a server per request.
+var schemaCache sync.Map // reflect.Type -> *jsonschema.Schema
+
+// inputSchema returns a private copy of In's inferred schema that addTool
+// may edit: the property map, required list and runtime property are
+// copied; untouched property schemas are shared read-only.
+func inputSchema[In any](tool string) *jsonschema.Schema {
+	key := reflect.TypeFor[In]()
+	cached, ok := schemaCache.Load(key)
+	if !ok {
+		inferred, err := jsonschema.For[In](nil)
+		if err != nil {
+			panic(fmt.Sprintf("agentmcp: schema for %s: %v", tool, err))
+		}
+		cached, _ = schemaCache.LoadOrStore(key, inferred)
+	}
+	base := cached.(*jsonschema.Schema)
+	cp := *base
+	cp.Properties = make(map[string]*jsonschema.Schema, len(base.Properties))
+	for k, v := range base.Properties {
+		cp.Properties[k] = v
+	}
+	if rt, ok := cp.Properties["runtime"]; ok {
+		rtCopy := *rt
+		cp.Properties["runtime"] = &rtCopy
+	}
+	cp.Required = append([]string(nil), base.Required...)
+	return &cp
+}
+
+// pinnedID is the pinned sandbox's ID, if resolved, for instrumentation.
+func (s *Server) pinnedID() string {
+	if !s.opts.pinned() {
+		return ""
+	}
+	s.pinMu.Lock()
+	defer s.pinMu.Unlock()
+	return s.pinID
 }
 
 func without(list []string, drop string) []string {

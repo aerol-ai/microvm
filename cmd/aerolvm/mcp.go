@@ -54,37 +54,12 @@ Examples:
   aerolvm mcp config claude-code --sandbox my-agent --create-if-missing
 `
 
-// mcpFlags registers the server flags and returns a parser into Options.
-func mcpFlags(fs *flag.FlagSet) func() (agentmcp.Options, error) {
-	var (
-		opts     agentmcp.Options
-		toolsets string
-	)
-	fs.StringVar(&opts.Sandbox, "sandbox", "", "")
-	fs.BoolVar(&opts.CreateIfMissing, "create-if-missing", false, "")
-	fs.StringVar(&opts.Image, "image", "", "")
-	fs.StringVar(&opts.Runtime, "runtime", "", "")
-	fs.StringVar(&toolsets, "toolsets", agentmcp.ToolsetCore, "")
-	fs.BoolVar(&opts.ReadOnly, "read-only", false, "")
-	fs.BoolVar(&opts.Ephemeral, "ephemeral", false, "")
-	fs.BoolVar(&opts.Keep, "keep", false, "")
-	fs.DurationVar(&opts.StopIfIdle, "stop-if-idle", agentmcp.DefaultStopIfIdle, "")
-	fs.DurationVar(&opts.DestroyIfIdle, "destroy-if-idle", agentmcp.DefaultDestroyIfIdle, "")
-	fs.IntVar(&opts.MaxCreates, "max-creates", agentmcp.DefaultMaxCreates, "")
-	fs.IntVar(&opts.MaxOutputBytes, "max-output-bytes", agenttools.DefaultMaxOutputBytes, "")
-	return func() (agentmcp.Options, error) {
-		o := opts
-		o.Toolsets = agentmcp.ParseToolsets(toolsets)
-		return o, o.Validate()
-	}
-}
-
 func runMCP(ctx context.Context, a *app, args []string) int {
 	if len(args) > 0 && args[0] == "config" {
 		return runMCPConfig(a, args[1:])
 	}
 	fs, c := a.newFlagSet("mcp")
-	parse := mcpFlags(fs)
+	parse := agentmcp.BindFlags(fs)
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
 		return a.flagError(c, "mcp", err)
@@ -154,7 +129,7 @@ var mcpClients = []string{"claude-code", "claude-desktop", "cursor", "vscode"}
 // client config formats change, and the file is the user's to edit.
 func runMCPConfig(a *app, args []string) int {
 	fs, c := a.newFlagSet("mcp config")
-	parse := mcpFlags(fs)
+	parse := agentmcp.BindFlags(fs)
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
 		return a.flagError(c, "mcp", err)

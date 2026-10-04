@@ -44,6 +44,13 @@ func connect(t *testing.T, fake *agenttoolstest.Server, opts Options) *env {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	e := connectServer(t, srv)
+	e.fake = fake
+	return e
+}
+
+func connectServer(t *testing.T, srv *Server) *env {
+	t.Helper()
 	ctx := context.Background()
 	clientT, serverT := mcp.NewInMemoryTransports()
 	ss, err := srv.MCP().Connect(ctx, serverT, nil)
@@ -55,7 +62,7 @@ func connect(t *testing.T, fake *agenttoolstest.Server, opts Options) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cs.Close(); _ = ss.Close() })
-	return &env{t: t, fake: fake, server: srv, client: cs}
+	return &env{t: t, server: srv, client: cs}
 }
 
 type callResult struct {
