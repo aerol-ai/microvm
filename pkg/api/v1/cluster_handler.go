@@ -338,6 +338,10 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.listSandboxes(w, r)
 		return
 	}
+	if name, ok := parseNameFilter(r); ok {
+		h.clusterListByName(w, r, c, name)
+		return
+	}
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
@@ -389,6 +393,40 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	result.NextPageToken = next
 	clusterlist.WriteCoverageHeaders(w, result.Coverage, result.NextPageToken)
 	apihttp.WriteJSON(w, http.StatusOK, result.Sandboxes)
+}
+
+// clusterListByName serves GET /v1/sandboxes?name= in cluster mode without a
+// fan-out: the replicated name index (an FSM read on voters, one or two
+// control-plane lookups on workers) names the owner, and the request goes to
+// that one node, whose local handler answers from its store. A name the index
+// doesn't hold is answered locally, which also covers a sandbox whose
+// placement the index hasn't caught up on yet.
+func (h *handlers) clusterListByName(w http.ResponseWriter, r *http.Request, c cluster.Client, name string) {
+	_, owner, err := c.OwnerOfName(service.OwnerRefForCreate(r.Context()), name)
+	switch {
+	case errors.Is(err, cluster.ErrUnknownSandbox):
+		h.listSandboxes(w, r)
+		return
+	case errors.Is(err, cluster.ErrOrphaned):
+		// Failover is recreating it; an empty list here would invite the
+		// caller to create a duplicate that then hits the held name.
+		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "sandbox "+name+" lost its owner node; failover is in progress")
+		return
+	case err != nil:
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: resolve sandbox name: "+err.Error())
+		return
+	}
+	if owner.IsSelf {
+		h.listSandboxes(w, r)
+		return
+	}
+	if owner.APIURL == "" && owner.InternalURL == "" {
+		service.RecordRouteMiss()
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
+		return
+	}
+	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 }
 
 func clusterMemberCanOwnSandbox(role string) bool {

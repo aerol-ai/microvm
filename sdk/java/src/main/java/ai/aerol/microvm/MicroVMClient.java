@@ -318,6 +318,34 @@ public class MicroVMClient {
         return out.toString();
     }
 
+    /**
+     * Returns the caller's sandbox with this name, or empty if there is none.
+     * Names are unique per owner. The reply is only trusted when it holds at
+     * most one sandbox carrying the requested name: a server that predates
+     * {@code ?name=} ignores the filter and returns an ordinary list page, and
+     * acting on its first row would target the wrong sandbox.
+     */
+    public java.util.Optional<Sandbox> getByName(String name) {
+        return getByName(name, false);
+    }
+
+    /** {@link #getByName(String)} with optional {@code include_env=true}. */
+    public java.util.Optional<Sandbox> getByName(String name, boolean includeEnv) {
+        String wanted = name == null ? "" : name.trim();
+        if (wanted.isEmpty()) {
+            throw new IllegalArgumentException("sandbox name is required");
+        }
+        String path = appendQueryParam(versioned("/sandboxes") + buildSandboxQuery(null, includeEnv), "name", wanted);
+        SandboxData[] response = doJson("GET", path, null, SandboxData[].class);
+        if (response == null || response.length == 0) {
+            return java.util.Optional.empty();
+        }
+        if (response.length > 1 || !wanted.equals(response[0].name)) {
+            throw new MicroVMException(apiUrl + " does not support sandbox name lookup; use the sandbox ID or upgrade the server");
+        }
+        return java.util.Optional.of(wrap(response[0]));
+    }
+
     public Sandbox get(String sandboxId) {
         return get(sandboxId, false);
     }
