@@ -3,6 +3,7 @@ package harness
 import (
 	"bytes"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -193,4 +194,41 @@ func HostHasAEROLVMUserJump(t *testing.T, node IntegrationNode) bool {
 		return false
 	}
 	return strings.Contains(out, "AEROLVM-USER")
+}
+
+// SSHForward forwards a free local port to remote (an address as the node
+// sees it, such as 127.0.0.1:21212) for the rest of the test, and returns the
+// local address. Requests through it reach that node's sandboxd directly,
+// bypassing the ingress, for cases that must land on one particular node.
+func SSHForward(t *testing.T, node IntegrationNode, remote string) string {
+	t.Helper()
+	RequireNodeSSH(t, node)
+	target, _ := SSHTarget(node)
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick a local port: %v", err)
+	}
+	local := l.Addr().String()
+	_ = l.Close()
+	args := append(sshBaseArgs(), "-N", "-o", "ExitOnForwardFailure=yes", "-L", local+":"+remote, target)
+	cmd := exec.Command("ssh", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("ssh -L to %s: %v", node.Name, err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if conn, err := net.DialTimeout("tcp", local, time.Second); err == nil {
+			_ = conn.Close()
+			return local
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatalf("ssh -L %s:%s to %s never came up: %s", local, remote, node.Name, strings.TrimSpace(stderr.String()))
+	return ""
 }

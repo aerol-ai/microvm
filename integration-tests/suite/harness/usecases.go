@@ -149,6 +149,11 @@ const (
 	// lived services, and needs AEROL_SIMS=1. UC-108 must never roll up to a
 	// single "all green" — each sim records independently.
 	CapSimulations Capability = "simulations"
+	// CapRemoteMCP means every node runs SB_MCP_ENABLED=true, so sandboxd
+	// serves the remote MCP endpoint at /mcp (plans/mcp-server-and-agent-cli.md
+	// §5.7). Advertisement + provisioning only, like CapGvisor: the scenario's
+	// tfvars turn it on. Gates UC-178.
+	CapRemoteMCP Capability = "remote-mcp"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -194,6 +199,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
+	CapRemoteMCP: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -571,6 +577,11 @@ var Registry = []UseCase{
 	{ID: "UC-173", Title: "A live public sandbox has no per-sandbox Caddy route on any node: routing is static routes plus the responder", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
 	{ID: "UC-174", Title: "Option-shaped mount sources (leading '-') are refused at create; no sandbox is made", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-175", Title: "WASM create validates mounts: option-shaped sources are refused", Requires: []Capability{CapWasm}, Implemented: true},
+
+	// The aerolvm agent CLI and MCP server (plans/mcp-server-and-agent-cli.md §8).
+	{ID: "UC-176", Title: "aerolvm CLI: create, exec, cp, expose and destroy; on a cluster a non-owner node resolves the name", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-177", Title: "aerolvm mcp (stdio): the same flow through an MCP client; a pinned server creates lazily with the idle lifecycle", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-178", Title: "Remote /mcp: a pinned call creates through the API domain, then a node that doesn't own the sandbox serves it", Requires: []Capability{CapRemoteMCP, CapCluster, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

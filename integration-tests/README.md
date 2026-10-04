@@ -50,6 +50,12 @@ make integration-reap                   # terminate any leaked itest instances p
 Reports land in `integration-tests/reports/` (`<scenario>.md`, `<scenario>.json`,
 `index.md` matrix). Legend: ✅ pass · ❌ fail · ⚪ skip(n/a) · 🟡 pending · 🟤 inconclusive.
 
+## Agent eval
+
+`agenteval/` checks that Claude can use the `aerolvm mcp` tools, against a
+local sandboxd and the Anthropic API rather than AWS. Run it before changing
+tool names, descriptions or notices; see [`agenteval/README.md`](agenteval/README.md).
+
 ## Where the binaries come from
 
 **Scenarios build the daemon locally by default.** Every run cross-compiles the
