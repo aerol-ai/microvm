@@ -1,0 +1,25 @@
+# @aerol-ai/aerolvm
+
+`aerolvm` drives [AerolVM](https://github.com/aerol-ai/microvm) sandboxes from a
+shell or an AI agent. The same binary is a CLI and an MCP server.
+
+```sh
+export SB_API_URL=https://sandbox.example.com SB_PAT_TOKEN=<token>
+npx -y @aerol-ai/aerolvm create --name build-box --image python:3.12
+npx -y @aerol-ai/aerolvm exec build-box -- python -V
+```
+
+Run it as an MCP server over stdio:
+
+```sh
+npx -y @aerol-ai/aerolvm mcp
+```
+
+`aerolvm mcp config <claude-code|claude-desktop|cursor|vscode>` prints the
+setup snippet for each client. `aerolvm --help` lists every command.
+
+This package is a small Node launcher. npm installs the prebuilt binary for
+your platform from one of the `@aerol-ai/aerolvm-<platform>-<arch>` packages
+(linux, darwin and win32 on x64 and arm64). To skip Node entirely, install the
+binary with `install.sh --cli-only` or download it from the
+[releases page](https://github.com/aerol-ai/microvm/releases).

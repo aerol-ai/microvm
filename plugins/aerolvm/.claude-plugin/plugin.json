@@ -1,0 +1,38 @@
+{
+  "name": "aerolvm",
+  "displayName": "AerolVM",
+  "description": "Run commands, edit files and expose ports in AerolVM sandboxes. Registers the aerolvm MCP server and teaches the aerolvm CLI. Needs the aerolvm binary on PATH.",
+  "author": {
+    "name": "Aerol AI",
+    "url": "https://github.com/aerol-ai"
+  },
+  "homepage": "https://github.com/aerol-ai/microvm",
+  "repository": "https://github.com/aerol-ai/microvm",
+  "license": "MIT",
+  "keywords": ["sandbox", "mcp", "cli", "aerolvm"],
+  "mcpServers": {
+    "aerolvm": {
+      "command": "aerolvm",
+      "args": ["mcp"],
+      "env": {
+        "SB_API_URL": "${user_config.api_url}",
+        "SB_PAT_TOKEN": "${user_config.api_token}"
+      }
+    }
+  },
+  "userConfig": {
+    "api_url": {
+      "type": "string",
+      "title": "sandboxd URL",
+      "description": "Where your sandboxd answers, e.g. https://sandbox.example.com or http://127.0.0.1:21212",
+      "required": true
+    },
+    "api_token": {
+      "type": "string",
+      "title": "API token",
+      "description": "Your AerolVM API token (the PAT token install.sh printed, or one your operator issued)",
+      "required": true,
+      "sensitive": true
+    }
+  }
+}
