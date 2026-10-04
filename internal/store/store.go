@@ -369,12 +369,6 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
-		// Partial unique index on sandboxes.name. The default '' is allowed
-		// many times (for sandboxes created without a name); any non-empty
-		// name is unique across the table. Daytona depends on this for
-		// name-based lookup; everyone else benefits from collision-free
-		// names by default.
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name) WHERE name <> '';`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of
@@ -934,6 +928,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	// owner_ref is a compatibility column, so the per-owner name index can
+	// only be built after the ALTER loop above.
+	if err := migrateSandboxNameIndex(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	// Partial unique index on host_port (only enforced when host_port > 0).
 	// This is the load-bearing primitive of the random-first allocator: two
 	// concurrent ExposePort calls race to INSERT a host_port row, and only
@@ -1247,6 +1247,68 @@ func migratePendingImageGCKey(db *sql.DB) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit pending_image_gc key migration: %w", err)
+	}
+	return nil
+}
+
+// sandboxNameIndexDDL makes sandbox names unique per owner. The empty name
+// is allowed many times (sandboxes created without a name). An empty
+// owner_ref is the operator namespace, so operator names stay unique among
+// themselves.
+// Daytona, the v1 ?name= lookup and the aerolvm CLI resolve names through it.
+const sandboxNameIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(owner_ref, name) WHERE name <> '';`
+
+// migrateSandboxNameIndex moves idx_sandboxes_name from the old global
+// (name) form to (owner_ref, name), keeping the index NAME (CEO review CF7).
+// The name is what makes rollback safe: SQLite's CREATE ... IF NOT EXISTS
+// checks only the index name, so a rolled-back binary's global statement is
+// a no-op against the per-owner index and the old daemon still boots. The
+// rebuild only relaxes a constraint, so existing rows cannot violate it, and
+// drop + create share one transaction so no window runs without either
+// index. A warm restart pays one PRAGMA.
+func migrateSandboxNameIndex(db *sql.DB) error {
+	rows, err := db.Query(`PRAGMA index_info(idx_sandboxes_name)`)
+	if err != nil {
+		return fmt.Errorf("inspect idx_sandboxes_name: %w", err)
+	}
+	exists, perOwner := false, false
+	for rows.Next() {
+		var (
+			seqno, cid int
+			column     sql.NullString
+		)
+		if err := rows.Scan(&seqno, &cid, &column); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan idx_sandboxes_name column: %w", err)
+		}
+		exists = true
+		if column.String == "owner_ref" {
+			perOwner = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate idx_sandboxes_name columns: %w", err)
+	}
+	rows.Close()
+	if perOwner {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin sandbox name index migration: %w", err)
+	}
+	defer tx.Rollback()
+	if exists {
+		if _, err := tx.Exec(`DROP INDEX idx_sandboxes_name;`); err != nil {
+			return fmt.Errorf("drop global sandbox name index: %w", err)
+		}
+	}
+	if _, err := tx.Exec(sandboxNameIndexDDL); err != nil {
+		return fmt.Errorf("create per-owner sandbox name index: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit sandbox name index migration: %w", err)
 	}
 	return nil
 }
@@ -2818,16 +2880,17 @@ func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]
 	return items, nil
 }
 
-// ResolveSandboxIDByName returns the sandbox ID owning the given name, or
-// ErrNotFound if no row matches. Empty input is rejected so an accidental
-// "" lookup does not match a no-name sandbox via the partial unique
-// index's escape hatch.
-func (s *Store) ResolveSandboxIDByName(ctx context.Context, name string) (string, error) {
+// ResolveSandboxIDByName returns the ID of ownerRef's sandbox called name, or
+// ErrNotFound if no row matches. Names are unique per owner
+// (idx_sandboxes_name), and ownerRef "" is the operator namespace, so at most
+// one row matches. Empty input is rejected so an accidental "" lookup does
+// not match a no-name sandbox via the partial unique index's escape hatch.
+func (s *Store) ResolveSandboxIDByName(ctx context.Context, ownerRef, name string) (string, error) {
 	trimmed := strings.TrimSpace(name)
 	if trimmed == "" {
 		return "", ErrNotFound
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE name = ?`, trimmed)
+	row := s.db.QueryRowContext(ctx, `SELECT id FROM sandboxes WHERE owner_ref = ? AND name = ?`, strings.TrimSpace(ownerRef), trimmed)
 	var sandboxID string
 	if err := row.Scan(&sandboxID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -4833,9 +4896,10 @@ var afterTapAllocateSelect func(tapName string)
 var afterTapAllocateMiss func()
 
 // ErrSandboxNameConflict is returned by Create/Upsert when the sandbox's
-// name collides with an existing row's name or id. Names are unique across
-// the sandboxes table; empty names skip the name uniqueness check but ids
-// still cannot collide with existing non-empty names.
+// name collides with another row of the same owner, or with an existing id.
+// Names are unique per owner_ref (idx_sandboxes_name); empty names skip the
+// name uniqueness check but ids still cannot collide with existing non-empty
+// names.
 var ErrSandboxNameConflict = errors.New("sandbox name already in use")
 
 var ErrSnapshotNameConflict = errors.New("snapshot name already in use")

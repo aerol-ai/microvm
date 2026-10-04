@@ -171,7 +171,7 @@ func TestAgentOwnerOfNameAndSelectPlacement(t *testing.T) {
 		t.Fatalf("SelfAPIURL() = %q, want http://self", got)
 	}
 
-	id, owner, err := agent.OwnerOfName("  demo name ")
+	id, owner, err := agent.OwnerOfName("", "  demo name ")
 	if err != nil {
 		t.Fatalf("OwnerOfName() error = %v", err)
 	}
@@ -181,10 +181,10 @@ func TestAgentOwnerOfNameAndSelectPlacement(t *testing.T) {
 	if owner.NodeID != "worker-self" || !owner.IsSelf {
 		t.Fatalf("OwnerOfName() owner = %+v, want self owner", owner)
 	}
-	if _, _, err := agent.OwnerOfName("missing"); !errors.Is(err, ErrUnknownSandbox) {
+	if _, _, err := agent.OwnerOfName("", "missing"); !errors.Is(err, ErrUnknownSandbox) {
 		t.Fatalf("OwnerOfName(missing) error = %v, want ErrUnknownSandbox", err)
 	}
-	id, _, err = agent.OwnerOfName("orphan")
+	id, _, err = agent.OwnerOfName("", "orphan")
 	if !errors.Is(err, ErrOrphaned) || id != "sb-orphan" {
 		t.Fatalf("OwnerOfName(orphan) = (%q, %v), want (sb-orphan, ErrOrphaned)", id, err)
 	}

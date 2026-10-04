@@ -512,7 +512,7 @@ func TestStoreCases(t *testing.T) {
 					t.Fatalf("StopIfIdleFor = %v, want 15m", native.Lifecycle.StopIfIdleFor)
 				}
 
-				resolved, err := st.ResolveSandboxIDByName(ctx, "workspace-alpha")
+				resolved, err := st.ResolveSandboxIDByName(ctx, "", "workspace-alpha")
 				if err != nil {
 					t.Fatalf("ResolveSandboxIDByName() error = %v", err)
 				}
@@ -624,7 +624,7 @@ func TestStoreCases(t *testing.T) {
 				if _, err := st.GetCompatState(ctx, sandbox.ID, models.FacadeDaytona); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
-				if _, err := st.ResolveSandboxIDByName(ctx, "cascade-name"); !errors.Is(err, ErrNotFound) {
+				if _, err := st.ResolveSandboxIDByName(ctx, "", "cascade-name"); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound from ResolveSandboxIDByName(), got %v", err)
 				}
 			},
