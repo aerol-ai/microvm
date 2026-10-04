@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,6 +25,37 @@ const (
 	streamFramePrefixStdout byte = 0x01
 	streamFramePrefixStderr byte = 0x02
 )
+
+// Exec-stream liveness (plans/mcp-server-and-agent-cli.md, eng re-review RR1).
+// A dropped stream kills its command (execStreamKiller), so a healthy stream
+// that is merely silent must not read as dropped. toolboxd pings every
+// execStreamPingInterval, and the read deadline is execStreamPongWait,
+// extended by every pong and every client message. Proxies that close idle
+// WebSockets after about a minute see traffic every 30s, and a real drop is
+// noticed within 90s. Clients need no change: gorilla and browser WebSockets
+// answer pings on their own.
+type execStreamLiveness struct {
+	pingInterval  time.Duration
+	pongWait      time.Duration
+	pingWriteWait time.Duration
+}
+
+var defaultExecStreamLiveness = execStreamLiveness{
+	pingInterval:  30 * time.Second,
+	pongWait:      90 * time.Second,
+	pingWriteWait: 10 * time.Second,
+}
+
+func (s *server) execStreamLiveness() execStreamLiveness {
+	if s.execLiveness.pingInterval <= 0 || s.execLiveness.pongWait <= 0 {
+		return defaultExecStreamLiveness
+	}
+	cfg := s.execLiveness
+	if cfg.pingWriteWait <= 0 {
+		cfg.pingWriteWait = defaultExecStreamLiveness.pingWriteWait
+	}
+	return cfg
+}
 
 var execStreamUpgrader = websocket.Upgrader{
 	// Auth happens in the HTTP handler before upgrade. Once upgraded the
@@ -85,8 +117,6 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: "command is required"})
 		return
 	}
-	// Future reads: no deadline; the read pump uses pong handling for liveness.
-	_ = conn.SetReadDeadline(time.Time{})
 
 	cmd := exec.Command("/bin/sh", "-c", start.Command)
 	if start.Workdir != "" {
@@ -102,6 +132,70 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.runWithPipes(conn, cmd)
 	}
+}
+
+// armExecStreamLiveness starts the keepalive pinger and the pong-extended read
+// deadline. extend must be called after every client message (it runs on the
+// reader goroutine, as does the pong handler). stop ends the pinger.
+func armExecStreamLiveness(conn *websocket.Conn, cfg execStreamLiveness) (extend func(), stop func()) {
+	extend = func() { _ = conn.SetReadDeadline(time.Now().Add(cfg.pongWait)) }
+	extend()
+	conn.SetPongHandler(func(string) error {
+		extend()
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(cfg.pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				// WriteControl is safe alongside the output pumps' writes.
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(cfg.pingWriteWait)); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return extend, func() { once.Do(func() { close(done) }) }
+}
+
+// execStreamKiller kills the command's process group when the client side of
+// the stream ends before the exit message is sent (CEO review CF3): a client
+// that dies, a proxy that drops the socket, or a missed keepalive. Before
+// this, the command kept running with nobody to read its output or stop it,
+// and only killing the sandbox ended it. Sessions (/process/session) are the
+// way to run work that outlives a connection; they are unaffected.
+type execStreamKiller struct {
+	pgid   int
+	exited atomic.Bool
+}
+
+func newExecStreamKiller(cmd *exec.Cmd) *execStreamKiller {
+	k := &execStreamKiller{}
+	if cmd != nil && cmd.Process != nil {
+		// Setpgid (pipes) and Setsid (PTY) both make the child its own
+		// process-group leader, so the group ID is its PID.
+		k.pgid = cmd.Process.Pid
+	}
+	return k
+}
+
+// markExited records that the command was reaped and its exit is about to be
+// reported, so the reader's error on the normal close is not a drop.
+func (k *execStreamKiller) markExited() { k.exited.Store(true) }
+
+// streamDropped kills the whole process group unless the command already
+// exited. Negative PID targets the group so children die too.
+func (k *execStreamKiller) streamDropped() {
+	if k.exited.Load() || k.pgid <= 0 {
+		return
+	}
+	_ = syscall.Kill(-k.pgid, syscall.SIGKILL)
 }
 
 func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStreamStartMsg) {
@@ -126,15 +220,20 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 	defer ptmx.Close()
 
 	done := make(chan struct{})
+	killer := newExecStreamKiller(cmd)
+	extend, stopLiveness := armExecStreamLiveness(conn, s.execStreamLiveness())
+	defer stopLiveness()
 
 	// Goroutine: client → PTY (stdin and control messages).
 	go func() {
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
+				killer.streamDropped()
 				_ = ptmx.Close() // unblock the read pump
 				return
 			}
+			extend()
 			switch msgType {
 			case websocket.BinaryMessage:
 				if _, err := ptmx.Write(data); err != nil {
@@ -155,7 +254,9 @@ func (s *server) runWithPTY(conn *websocket.Conn, cmd *exec.Cmd, start *execStre
 		s.logger.Debug("pty read ended", "error", err)
 	}
 
-	exitCode, exitSignal := interpretWaitResult(child.wait())
+	waitErr := child.wait()
+	killer.markExited()
+	exitCode, exitSignal := interpretWaitResult(waitErr)
 	close(done)
 	writeStreamControl(conn, execStreamControlOut{Type: "exit", Code: exitCode, Signal: exitSignal})
 }
@@ -184,15 +285,20 @@ func (s *server) runWithPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 	}
 
 	var writeMu sync.Mutex
+	killer := newExecStreamKiller(cmd)
+	extend, stopLiveness := armExecStreamLiveness(conn, s.execStreamLiveness())
+	defer stopLiveness()
 
 	// Client → stdin (and control messages).
 	go func() {
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
+				killer.streamDropped()
 				_ = stdinPipe.Close()
 				return
 			}
+			extend()
 			switch msgType {
 			case websocket.BinaryMessage:
 				if _, err := stdinPipe.Write(data); err != nil {
@@ -230,7 +336,9 @@ func (s *server) runWithPipes(conn *websocket.Conn, cmd *exec.Cmd) {
 	<-stdoutDone
 	<-stderrDone
 
-	exitCode, exitSignal := interpretWaitResult(child.wait())
+	waitErr := child.wait()
+	killer.markExited()
+	exitCode, exitSignal := interpretWaitResult(waitErr)
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	_ = conn.WriteJSON(execStreamControlOut{Type: "exit", Code: exitCode, Signal: exitSignal})
