@@ -10,6 +10,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 
 public class SandboxData {
     public String id;
+    /** Name set at create time, unique per owner. Null for unnamed sandboxes. */
+    public String name;
+    public Map<String, String> tags;
     public String image;
     public String status;
     @JsonProperty("public_url")
@@ -60,6 +63,8 @@ public class SandboxData {
             return;
         }
         id = other.id;
+        name = other.name;
+        tags = other.tags == null ? null : new LinkedHashMap<>(other.tags);
         image = other.image;
         status = other.status;
         publicUrl = other.publicUrl;

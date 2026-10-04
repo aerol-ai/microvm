@@ -522,9 +522,14 @@ class MicroVM:
         *,
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
+        name: Optional[str] = None,
     ) -> List[Sandbox]:
+        """List sandboxes. ``name`` filters to the caller's sandbox with exactly
+        that name (``?name=``). Servers that predate name lookup ignore the
+        filter and return a normal list; prefer :meth:`get_by_name`, which
+        checks the reply."""
         items: List[Sandbox] = []
-        for page in self.iter_pages(tags=tags, include_env=include_env):
+        for page in self.iter_pages(tags=tags, include_env=include_env, name=name):
             items.extend(page)
         return items
 
@@ -533,9 +538,10 @@ class MicroVM:
         *,
         tags: Optional[Dict[str, str]] = None,
         include_env: bool = False,
+        name: Optional[str] = None,
     ) -> Iterator[List[Sandbox]]:
         """Yield one server page at a time for bounded-memory fleet scans."""
-        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env)
+        base_path = self._versioned("/sandboxes") + _build_sandbox_query(tags, include_env, name)
         page_token = ""
         for _ in range(100000):
             path = _append_query_param(base_path, "page_token", page_token)
@@ -549,6 +555,25 @@ class MicroVM:
             if page_token == "":
                 return
         raise MicroVMError("incomplete cluster list: exceeded max pages")
+
+    def get_by_name(self, name: str, *, include_env: bool = False) -> Optional[Sandbox]:
+        """Return the caller's sandbox with this name, or ``None`` if there is
+        none. Names are unique per owner. The reply is only trusted when it holds
+        at most one sandbox carrying the requested name: a server that predates
+        ``?name=`` ignores the filter and returns an ordinary list page, and
+        acting on its first row would target the wrong sandbox."""
+        wanted = (name or "").strip()
+        if not wanted:
+            raise ValueError("sandbox name is required")
+        path = self._versioned("/sandboxes") + _build_sandbox_query(None, include_env, wanted)
+        sandboxes = self._do_json("GET", path, None) or []
+        if not sandboxes:
+            return None
+        if len(sandboxes) > 1 or str(_first_of(sandboxes[0], "name") or "") != wanted:
+            raise MicroVMError(
+                f"{self.api_url} does not support sandbox name lookup; use the sandbox ID or upgrade the server"
+            )
+        return self._wrap_sandbox(sandboxes[0])
 
     def get(self, sandbox_id: str, *, include_env: bool = False) -> Sandbox:
         path = f"{self._version_prefix}/sandboxes/{sandbox_id}" + _build_sandbox_query(None, include_env)
@@ -1118,7 +1143,9 @@ def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in payload.items() if value is not None}
 
 
-def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = False) -> str:
+def _build_sandbox_query(
+    tags: Optional[Dict[str, str]], include_env: bool = False, name: Optional[str] = None
+) -> str:
     # Renders tag filters and optional include_env as the server's wire format.
     # The `tag.` prefix is literal — the server's parseTagFilter inspects the
     # decoded query key — so only the user-supplied key and value get
@@ -1132,6 +1159,9 @@ def _build_sandbox_query(tags: Optional[Dict[str, str]], include_env: bool = Fal
         )
     if include_env:
         parts.append("include_env=true")
+    wanted = (name or "").strip()
+    if wanted:
+        parts.append(f"name={urllib.parse.quote(wanted, safe='')}")
     if not parts:
         return ""
     return "?" + "&".join(parts)
@@ -1149,6 +1179,8 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     failover = _first_of(options, "failover")
     return _compact(
         {
+            "name": _first_of(options, "name"),
+            "tags": _first_of(options, "tags"),
             "image": _first_of(options, "image"),
             "cpu": _first_of(options, "cpu"),
             "memory_mb": _first_of(options, "memoryMB", "memory_mb"),
@@ -1590,6 +1622,12 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
         if mapped_failover:
             result["failover"] = mapped_failover
 
+    name = _first_of(sandbox, "name")
+    if name not in (None, ""):
+        result["name"] = str(name)
+    tags = _first_of(sandbox, "tags")
+    if isinstance(tags, dict) and len(tags) > 0:
+        result["tags"] = {str(key): str(value) for key, value in tags.items()}
     container_id = _first_of(sandbox, "container_id", "containerID")
     if container_id not in (None, ""):
         result["containerID"] = str(container_id)

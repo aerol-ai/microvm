@@ -159,6 +159,15 @@ pub struct GPUOptions {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct CreateOptions {
     pub image: String,
+    /// Optional name, unique among the caller's sandboxes (another account may
+    /// use the same name); a repeat create with a held name returns HTTP 409.
+    /// Names starting with `owner:` or shaped like a sandbox ID (`sb-` plus 16
+    /// hex) are rejected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Free-form key/value labels; filter on them with `Client::list_with_tags`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<u32>,
     #[serde(rename = "memory_mb", skip_serializing_if = "Option::is_none")]
@@ -509,6 +518,11 @@ pub(crate) struct ExposePortResponseWire {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Sandbox {
     pub id: String,
+    /// Name set at create time, unique per owner. `None` for unnamed sandboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<std::collections::HashMap<String, String>>,
     pub image: String,
     pub status: String,
     #[serde(rename = "public_url")]
