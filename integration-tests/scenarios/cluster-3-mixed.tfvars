@@ -21,6 +21,13 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# Serve the remote MCP endpoint at /mcp on every node (UC-178, capability
+# remote-mcp). extra_sandboxd_env lands in cluster.env before the bootstrap's
+# final sandboxd restart, so no extra restart is needed.
+extra_sandboxd_env = {
+  SB_MCP_ENABLED = "true"
+}
+
 nodes = {
   node1 = { role = "mixed", seed = true, spot = true }
   node2 = { role = "mixed", spot = true }
