@@ -4,17 +4,18 @@
 // bundled copies. Fail if the lockfile does not already record those versions:
 // scanners read the lockfile and never run this script.
 //
-// http-cache-semantics is the exception. No release after 4.2.0 exists, and
-// npm ci rejects any other version on the inBundle entry because
-// make-fetch-happen's ^4.1.1 still resolves to 4.2.0. The copy below is the
-// local patch; osv-scanner.toml ignores GHSA-ch52-4w7c-c8xp until upstream
-// publishes a fix and this pin can move to the table above.
+// http-cache-semantics 4.2.1 is not an upstream release. Nothing after 4.2.0
+// is published, and that version is the last one affected by GHSA-ch52-4w7c-c8xp.
+// A prerelease does not satisfy make-fetch-happen's ^4.1.1, so npm ci rejects
+// it on the inBundle entry. 4.2.1 satisfies the range and is outside the
+// advisory (<= 4.2.0), so scanners reading the lockfile do not see 4.2.0.
 const fs = require('fs');
 const path = require('path');
 
 const root = __dirname;
 const pins = {
   'brace-expansion': '5.0.12',
+  'http-cache-semantics': '4.2.1',
   'ip-address': '10.7.3',
   undici: '6.28.1',
 };
@@ -47,17 +48,6 @@ for (const [name, version] of Object.entries(pins)) {
   copyOverBundle(name, version);
 }
 
-const cacheKey = 'node_modules/npm/node_modules/http-cache-semantics';
-const cacheRecorded = lock.packages?.[cacheKey]?.version;
-if (cacheRecorded !== '4.2.0') {
-  console.error(
-    `${cacheKey} is ${cacheRecorded}, expected 4.2.0. ` +
-      'npm ci only accepts that bundled version until upstream publishes a release. ' +
-      'If a fixed release exists, pin it like the packages above and drop the osv-scanner ignore.',
-  );
-  process.exit(1);
-}
-copyOverBundle('http-cache-semantics', '4.2.1-aerol.1');
 const patched = fs.readFileSync(
   path.join(root, 'node_modules', 'npm', 'node_modules', 'http-cache-semantics', 'index.js'),
   'utf8',
