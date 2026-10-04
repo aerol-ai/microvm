@@ -187,7 +187,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 	configureMirror(logger, cfg, dockerClient)
-	configureAOCRPullAuth(logger, cfg, dockerClient)
+	configureAOCRPullAuth(logger, cfg, models.ContainerEngineDocker, dockerClient)
 
 	caddyClient := caddy.New(cfg)
 
@@ -1232,11 +1232,24 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 	)
 }
 
-// configureAOCRPullAuth installs the cluster-PAT credential the docker client
+// aocrPullAuthConfigurer is the one method both container engines expose for
+// the node-local AOCR pull credential: *docker.Client (dockerd) and the native
+// containerd driver. Taking the interface keeps a single wiring helper, so the
+// two engines can never be configured from different host/cluster/PAT inputs.
+type aocrPullAuthConfigurer interface {
+	ConfigureAOCRPullAuth(hosts []string, clusterID, patPath string)
+}
+
+// configureAOCRPullAuth installs the cluster-PAT credential a container engine
 // uses to pull cluster-owned artifacts (snapshots + Firecracker templates) from
 // AOCR's `cluster/<id>/*` namespace. It reuses the same host/cluster/PAT config
 // as the producer-side snapshot and template pushers, so one credential covers
-// push and pull symmetrically.
+// push and pull symmetrically. engine only labels the boot log line.
+//
+// Called twice on a containerd node: once for the docker client (it still
+// serves Firecracker template pulls and pre-flip engine=docker sandboxes) and
+// once for the containerd driver, from wireContainerEngine. Missing the second
+// call is the bug that made cross-node create-from-snapshot 401 on containerd.
 //
 // Deliberately independent of SnapshotPushEnabled: a consume-only node (one that
 // never produces artifacts but must pull snapshots/templates on failover or
@@ -1245,11 +1258,11 @@ func configureMirror(logger *slog.Logger, cfg config.Config, c *docker.Client) {
 // wiring keeps pulling anonymously exactly as before.
 //
 // This call itself runs once at boot and adds nothing to the create path. The
-// only per-create cost it introduces lands later, in resolveAOCRPullAuth: a
-// single node-local PAT file read, and only on a cache-miss pull of an AOCR
+// only per-create cost it introduces lands later, in docker.AOCRPullAuth.Resolve:
+// a single node-local PAT file read, and only on a cache-miss pull of an AOCR
 // `cluster/...` ref (warm pulls, non-AOCR refs, and caller-supplied creds all
 // skip it). The fresh read is deliberate — it makes PAT rotation a file write.
-func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Client) {
+func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, engine string, c aocrPullAuthConfigurer) {
 	clusterID := strings.TrimSpace(cfg.AutoImportClusterID)
 	patPath := strings.TrimSpace(cfg.AutoImportClusterPATPath)
 	if clusterID == "" || patPath == "" {
@@ -1262,6 +1275,7 @@ func configureAOCRPullAuth(logger *slog.Logger, cfg config.Config, c *docker.Cli
 	hosts := []string{cfg.MirrorPushHost, cfg.ImageDistributionAOCRHost}
 	c.ConfigureAOCRPullAuth(hosts, clusterID, patPath)
 	logger.Info("aocr pull auth configured",
+		"engine", engine,
 		"cluster_id", clusterID,
 		"hosts", strings.Join(nonEmptyHosts(hosts), ","),
 	)

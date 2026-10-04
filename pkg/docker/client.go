@@ -87,7 +87,7 @@ type Client struct {
 	// artifacts (snapshots + Firecracker templates) from AOCR. nil disables it
 	// (anonymous pulls). Set via ConfigureAOCRPullAuth after construction. See
 	// aocr_pull_auth.go.
-	aocrPullAuth *aocrClusterPullAuth
+	aocrPullAuth *AOCRPullAuth
 }
 
 type imagePull struct {
