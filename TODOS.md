@@ -716,3 +716,20 @@ passed, zero-deployments premise re-verified in-tree). Branch
   needs a Daytona-compatible convention, not a Go struct tag.
 - **Start:** `pkg/api/daytona/contract_test.go` is the gate any change must
   pass; `pkg/api/daytona/include_env_test.go` covers the opt-in that exists now.
+
+## SDK create retries can duplicate unnamed sandboxes (all SDKs)
+
+- **What:** the Go SDK retries `POST /v1/sandboxes` on post-send transport
+  errors ("EOF", "timeout", "connection reset", DeadlineExceeded) and on
+  502/503/504 (`sdk/go/internal/apiclient/client.go:886-946`). Without a
+  name, a lost reply creates a second sandbox. The TS, Python and Java SDKs
+  have retry code too (`sdk/typescript/src/internal/client.ts`,
+  `sdk/python/microvm/client.py`, `MicroVMConfig.java`); check them.
+- **Why:** duplicate billed sandboxes that the caller never sees. The CLI and
+  MCP avoid it with auto-generated names (`plans/mcp-server-and-agent-cli.md`
+  §5.4, eng review D5); plain SDK users don't.
+- **Start:** decide between (a) no retry for non-idempotent POSTs after the
+  request may have been sent and (b) a create idempotency key (server + 5
+  SDKs). Add a test per SDK: a fake server creates, then drops the
+  connection, and exactly one sandbox must exist.
+- **Depends on:** none.
