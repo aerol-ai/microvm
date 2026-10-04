@@ -34,10 +34,12 @@ func uploadProbeBundle(ctx *RunContext) string {
 	}, &created); err != nil {
 		t.Fatalf("upload bundle: %v", err)
 	}
-	if created.Name != "" {
-		return created.Name
+	// The node-bound module_ref is the only reference a cluster create
+	// accepts; a bare name is refused there.
+	if created.ModuleRef == "" {
+		t.Fatalf("upload bundle: response has no module_ref: %+v", created)
 	}
-	return harness.UniqueName(ctx.Scenario, t)
+	return created.ModuleRef
 }
 
 func newIsolate(ctx *RunContext, moduleRef, tenant string, opts sdktypes.CreateSandboxOptions) *microvm.Sandbox {

@@ -725,3 +725,46 @@ func TestArtifactCatalogHolderIdentityDistinguishesRetryFromReseed(t *testing.T)
 		t.Fatal("the other kind's identity moved when this kind re-seeded")
 	}
 }
+
+// A bundle listed right after it was uploaded must be in the list. In cluster
+// mode the leader answers GET /v1/js-bundles for every worker that has
+// published from the replicated catalogue, without asking the worker, and the
+// maintenance tick republishes only every 30s, so a fresh upload was missing
+// from the list (UC-105, UC-168) and a deleted one stayed in it. Upload and
+// delete now publish before they return, as CreateTemplate does (#496).
+func TestJSBundleUploadAndDeletePublishTheCatalogueBeforeReturning(t *testing.T) {
+	svc, cl := newCatalogService(t)
+	bundleStore, err := jsbundle.NewStore(jsbundle.StoreConfig{Dir: filepath.Join(t.TempDir(), "bundles")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetIsolateBundleStore(bundleStore)
+	svc.cfg.EnableIsolate = true
+	ctx := context.Background()
+	// The boot publish: from here on the aggregator answers for this node
+	// from the catalogue alone.
+	svc.ReconcileArtifactCatalog(ctx)
+
+	created, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "fresh", Source: jsBundleSrc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindJSBundle); len(got) != 1 || got[0] != created.Digest {
+		t.Fatalf("catalogue right after upload = %v, want [%s]: a list through the leader would miss it", got, created.Digest)
+	}
+
+	if err := svc.DeleteJSBundle(ctx, created.ModuleRef); err != nil {
+		t.Fatal(err)
+	}
+	if got := cl.rowIDs(cluster.ArtifactKindJSBundle); len(got) != 0 {
+		t.Fatalf("catalogue right after delete = %v, want none: a list through the leader would still show it", got)
+	}
+
+	// A publish failure must not fail the upload; the tick retries it.
+	cl.mu.Lock()
+	cl.failing = true
+	cl.mu.Unlock()
+	if _, err := svc.CreateJSBundle(ctx, models.CreateJSBundleRequest{Name: "later", Source: jsBundleSrc + "\n"}); err != nil {
+		t.Fatalf("a catalogue publish failure failed the upload: %v", err)
+	}
+}

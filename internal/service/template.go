@@ -197,16 +197,11 @@ func (s *Service) CreateTemplate(ctx context.Context, req models.CreateTemplateR
 	// failure only leaves the kind dirty for the tick — the create itself
 	// never fails on it. No-op outside cluster mode. Not the sandbox boot
 	// path: template create returns while its build runs for minutes.
-	pctx, cancel := context.WithTimeout(ctx, templateCatalogPublishTimeout)
-	s.ReconcileArtifactCatalog(pctx)
-	cancel()
+	s.publishArtifactCatalogBeforeReturning(ctx)
 
 	s.kickTemplateBuild(template)
 	return template, nil
 }
-
-// templateCatalogPublishTimeout bounds the inline catalogue publish on create.
-const templateCatalogPublishTimeout = 5 * time.Second
 
 // kickTemplateBuild spawns the per-request build goroutine. Two-phase
 // pipeline (PR-A): the rootfs phase runs the OCI→ext4 pipeline as

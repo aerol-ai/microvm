@@ -32,15 +32,19 @@ subsequent creates in that tenant inject into the resident group.
 
 ## Create an isolate sandbox
 
-Pass `runtime: "isolate"` and a `module_ref` pointing at a JS/TS bundle —
-an uploaded catalogue digest/name, or a `file://` path for operators. Isolates
-default to `durability: "ephemeral"`; `passivatable` is rejected and `durable`
-is not yet enabled.
+Pass `runtime: "isolate"` and a `module_ref` pointing at a JS/TS bundle.
+Isolates default to `durability: "ephemeral"`; `passivatable` is rejected and
+`durable` is not yet enabled.
 
 Upload the bundle once with `POST /v1/js-bundles` (experimental catalogue),
-then create with the returned digest as `module_ref`. Same-tenant sandboxes
-share one workerd group process (server-authorized `tenant_id`); the group key
-is never client-chosen for forced co-residency.
+then create with the `module_ref` field of the upload response. Use that field
+as-is: on a cluster it names the worker holding the bundle
+(`node:<worker>:sha256:…`), and a create that passes the bare digest or the
+bundle name is refused there (see [Cluster mode](#cluster-mode)). On a single
+node the same field is `sha256:<digest>`, and the bundle name and an
+operator-only `file://` path also work. Same-tenant sandboxes share one workerd
+group process (server-authorized `tenant_id`); the group key is never
+client-chosen for forced co-residency.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -53,7 +57,7 @@ is never client-chosen for forced co-residency.
     })
 
     const sandbox = await client.create({
-      moduleRef: 'sha256:…', // or an uploaded bundle name
+      moduleRef: 'sha256:…', // the module_ref from POST /v1/js-bundles
       runtime: 'isolate',
       memoryMB: 128,
       networkAllowOut: ['api.example.com'],
