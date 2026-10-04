@@ -8,11 +8,12 @@
 name: Supply chain
 
 on:
-  # Only pull requests into main. A stacked pull request whose base is
-  # another feature branch runs nothing; when GitHub retargets it to main
-  # after its base merges, that fires `edited`, which is listed so the
-  # pull request gets its required checks without a new push. A title or
-  # body edit also fires `edited` and re-runs these jobs.
+  # Only pull requests into main. A plain pull request into a feature
+  # branch runs nothing. A GitHub native stacked pull request still runs,
+  # because GitHub merges the whole stack under main's ruleset and these
+  # are required checks on every layer. `edited` is listed so a pull
+  # request retargeted to main gets its checks without a new push; a title
+  # or body edit also fires it.
   pull_request:
     branches:
       - main
