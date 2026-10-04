@@ -342,6 +342,13 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.clusterListByName(w, r, c, name)
 		return
 	}
+	// Single-node runs this wrapper with the Noop client, whose list ignores
+	// limit. Page locally when the caller asked for pages so ?limit= means the
+	// same thing in both modes.
+	if !h.deps.Service.ClusterEnabled() && clusterlist.WantsLocalPaging(r.URL) {
+		h.listSandboxesLocalPage(w, r)
+		return
+	}
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
@@ -393,6 +400,28 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 	result.NextPageToken = next
 	clusterlist.WriteCoverageHeaders(w, result.Coverage, result.NextPageToken)
 	apihttp.WriteJSON(w, http.StatusOK, result.Sandboxes)
+}
+
+// listSandboxesLocalPage serves one single-node list page in sandbox-ID order,
+// with the next-page token in the same header the cluster path uses.
+func (h *handlers) listSandboxesLocalPage(w http.ResponseWriter, r *http.Request) {
+	limit, pageToken := clusterlist.ParsePageParams(r.URL)
+	opts := service.GetSandboxOptions{IncludeEnv: parseIncludeEnv(r), CorrelationID: correlationIDFromRequest(r)}
+	local, err := h.deps.Service.ListSandboxesWithOptions(r.Context(), parseTagFilter(r), opts)
+	if err != nil {
+		h.deps.Logger.Warn("list sandboxes failed", "error", err)
+		apihttp.WriteError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	page, next, err := clusterlist.PageLocal(local, limit, pageToken)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if next != "" {
+		w.Header().Set(clusterlist.HeaderNextPageToken, next)
+	}
+	apihttp.WriteJSON(w, http.StatusOK, page)
 }
 
 // clusterListByName serves GET /v1/sandboxes?name= in cluster mode without a

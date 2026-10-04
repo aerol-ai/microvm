@@ -3,6 +3,7 @@ package microvm
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -177,10 +178,24 @@ type listOptions struct {
 	tags       map[string]string
 	includeEnv bool
 	name       string
+	limit      int
 }
 
 func (o listOptions) query() apiclient.ListQuery {
-	return apiclient.ListQuery{Tags: o.tags, IncludeEnv: o.includeEnv, Name: o.name}
+	return apiclient.ListQuery{Tags: o.tags, IncludeEnv: o.includeEnv, Name: o.name, Limit: o.limit}
+}
+
+// WithLimit asks for at most n sandboxes per page (`?limit=<n>`); with
+// ListPage that bounds one call, and List still drains every page. The
+// server clamps n to its maximum (500). Servers that predate single-node
+// paging ignore it there and return every row, so a caller that needs a hard
+// bound must also cap the slice it gets back.
+func WithLimit(n int) ListOption {
+	return func(o *listOptions) {
+		if n > 0 {
+			o.limit = n
+		}
+	}
 }
 
 // WithName filters to the caller's sandbox with exactly this name
@@ -518,6 +533,20 @@ func (s *Sandbox) UploadFile(ctx context.Context, targetPath string, data []byte
 
 func (s *Sandbox) DownloadFile(ctx context.Context, targetPath string) ([]byte, error) {
 	return s.client.inner.DownloadFile(ctx, s.ID, targetPath)
+}
+
+// UploadFileStream uploads r to targetPath without holding the file in
+// memory; use it instead of UploadFile for large or unbounded inputs. The
+// request is not retried (the reader is consumed as it is sent).
+func (s *Sandbox) UploadFileStream(ctx context.Context, targetPath string, r io.Reader) error {
+	return s.client.inner.UploadFileStream(ctx, s.ID, targetPath, r)
+}
+
+// DownloadFileStream opens targetPath for reading without buffering it. The
+// caller must Close the returned body; closing early ends the transfer, so
+// reading only the head of a large file costs only the head.
+func (s *Sandbox) DownloadFileStream(ctx context.Context, targetPath string) (io.ReadCloser, error) {
+	return s.client.inner.DownloadFileStream(ctx, s.ID, targetPath)
 }
 
 // ExposeOption customizes an ExposePort call. Build values with WithProtocol;
