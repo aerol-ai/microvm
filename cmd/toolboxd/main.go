@@ -71,6 +71,10 @@ type server struct {
 	daytona  *daytonaCompat
 	envd     *envdCompat
 	cloneGen *clonegen.Generation
+
+	// execLiveness overrides the exec-stream keepalive timings; the zero value
+	// means defaultExecStreamLiveness. Only tests set it.
+	execLiveness execStreamLiveness
 }
 
 func (s *server) servingRequests() bool {

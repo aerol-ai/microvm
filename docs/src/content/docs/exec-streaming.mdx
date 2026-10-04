@@ -304,4 +304,20 @@ In PTY mode, stdout and stderr are merged onto the terminal, so only `onStdout` 
 
 Signals target the process group, so child processes receive them too.
 
-For persistent interactive processes that survive reconnects, see [Sessions](/sessions).
+## When the connection drops
+
+An `execStream` command lives exactly as long as its connection. If the
+WebSocket closes or errors before the exit message arrives (your process
+exits, the network drops, a proxy cuts the socket), the sandbox kills the
+command's whole process group, including anything it started in the
+background. Nothing keeps running with no one to read its output or stop it.
+
+A command that prints nothing for a long time is not treated as dropped. The
+sandbox pings every open stream every 30 seconds, which also keeps load
+balancers and proxies that close idle WebSockets from cutting a quiet
+command. Every SDK answers the pings for you. If no reply or message arrives
+for 90 seconds, the connection counts as dropped.
+
+For work that must outlive the connection (a dev server, a long build you
+want to check on later), start a [session](/sessions) instead: sessions keep
+running after you disconnect and replay their logs when you reattach.
