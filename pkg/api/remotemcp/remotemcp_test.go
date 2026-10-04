@@ -230,6 +230,10 @@ func (e *endpoint) post(query string, headers map[string]string) *http.Response 
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+agenttoolstest.Token)
 	for k, v := range headers {
+		if k == "Host" {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 	resp, err := http.DefaultClient.Do(req)
@@ -322,6 +326,31 @@ func TestRemoteOriginAndHost(t *testing.T) {
 	}
 	if hostOnly("sandbox.example.com:443") != "sandbox.example.com" || hostOnly("bare") != "bare" {
 		t.Fatal("hostOnly")
+	}
+}
+
+// TestRemoteBehindLoopbackProxy: Caddy reaches sandboxd on 127.0.0.1:21212
+// and forwards the API domain as Host. The go-sdk's default rebinding guard
+// refused exactly that (a loopback socket with a non-loopback Host), so the
+// first live cluster run got 403 on initialize for every request. The test
+// server also listens on loopback, so this is the production shape.
+func TestRemoteBehindLoopbackProxy(t *testing.T) {
+	e := newEndpoint(t, Config{})
+	if resp := e.post("sandbox=a", map[string]string{"Host": "sandbox.example.com"}); resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("proxied request = %d %s, want 200", resp.StatusCode, body)
+	}
+	// Host pinning, when configured, is still enforced on that path.
+	pinned := newEndpoint(t, Config{AllowedHosts: []string{"sandbox.example.com"}})
+	if resp := pinned.post("sandbox=a", map[string]string{"Host": "sandbox.example.com"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("pinned host = %d, want 200", resp.StatusCode)
+	}
+	if resp := pinned.post("sandbox=a", map[string]string{"Host": "evil.example"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("unpinned host = %d, want 403", resp.StatusCode)
+	}
+	// So is the Origin check, the browser-side rebinding defence.
+	if resp := e.post("sandbox=a", map[string]string{"Host": "sandbox.example.com", "Origin": "https://evil.example"}); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross-origin request = %d, want 403", resp.StatusCode)
 	}
 }
 

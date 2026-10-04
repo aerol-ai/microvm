@@ -76,6 +76,13 @@ func New(cfg Config, api func() http.Handler) *Handler {
 		Stateless:    true,
 		JSONResponse: true,
 		Logger:       cfg.Logger,
+		// The SDK's own rebinding guard 403s any request that arrives on a
+		// loopback socket with a non-loopback Host. Behind Caddy that is
+		// every request: Caddy dials 127.0.0.1:21212 with Host set to the
+		// API domain. The guard exists for unauthenticated local servers;
+		// Wrap already does the real defence (Origin before auth, bearer
+		// token, optional Host pinning).
+		DisableLocalhostProtection: true,
 	})
 	return h
 }
