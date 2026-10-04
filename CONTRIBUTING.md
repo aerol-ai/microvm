@@ -38,7 +38,7 @@ make build    # build sandboxd + toolboxd into bin/
 
 ## When tests run
 
-`make test` runs the Go unit tests on the machine you are using. It does not call the network. The same suites run in GitHub Actions on every pull request and again in the merge queue. The workflow is [`.github/workflows/test.yml`](.github/workflows/test.yml). Path filters select the SDK suites. The Go SDK suite runs on every pull request, including a docs-only change. The required `changes` check stays red until every selected suite has passed, so a commit cannot reach the default branch without that run.
+`make test` runs the Go unit tests on the machine you are using. It does not call the network. The same suites run in GitHub Actions on every pull request and on every push to the default branch. The workflow is [`.github/workflows/test.yml`](.github/workflows/test.yml). Path filters select the SDK suites. The Go SDK suite runs on every pull request, including a docs-only change. The required `changes` check passes once the DCO sign-off check and the Go SDK suite pass. The other suites report their own result but do not block the merge, so look at them before you merge and fix a red one on the default branch right away.
 
 ## Tests for major changes
 

@@ -329,43 +329,25 @@ jobs:
         run: go test -count=1 ./sdk/go/...
 
   # Job id stays `changes` because ruleset 16186085 requires that check.
-  # It runs even when a suite fails (if: always); a skipped required check
-  # would otherwise let the pull request merge.
+  # It gates the merge on the DCO sign-off (checked in `paths`) and the
+  # baseline suite only. The suites above still run on every pull request
+  # and report their own result, but they don't block the merge: waiting
+  # ~25 min for go-tests and go-race, then again whenever main moved, made
+  # every merge slow. A break they would have caught shows up on the
+  # push-to-main run instead. It runs even when a dependency fails
+  # (if: always); a skipped required check would otherwise let the pull
+  # request merge.
   changes:
     needs:
       - paths
       - baseline-tests
-      - go-tests
-      - go-race
-      - go-security
-      - wasm-integration
-      - go-sdk-tests
-      - java-sdk-tests
-      - python-sdk-tests
-      - typescript-sdk-tests
-      - rust-sdk-tests
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Fail unless every applicable test suite passed
+      - name: Fail unless the DCO check and baseline suite passed
         env:
           PATHS: ${{ needs.paths.result }}
           BASELINE: ${{ needs.baseline-tests.result }}
-          GO_MAIN: ${{ needs.paths.outputs.go_main }}
-          GO_SDK: ${{ needs.paths.outputs.go_sdk }}
-          JAVA_SDK: ${{ needs.paths.outputs.java_sdk }}
-          PYTHON_SDK: ${{ needs.paths.outputs.python_sdk }}
-          TYPESCRIPT_SDK: ${{ needs.paths.outputs.typescript_sdk }}
-          RUST_SDK: ${{ needs.paths.outputs.rust_sdk }}
-          GO_TESTS: ${{ needs.go-tests.result }}
-          GO_RACE: ${{ needs.go-race.result }}
-          GO_SECURITY: ${{ needs.go-security.result }}
-          WASM_INTEGRATION: ${{ needs.wasm-integration.result }}
-          GO_SDK_TESTS: ${{ needs.go-sdk-tests.result }}
-          JAVA_SDK_TESTS: ${{ needs.java-sdk-tests.result }}
-          PYTHON_SDK_TESTS: ${{ needs.python-sdk-tests.result }}
-          TYPESCRIPT_SDK_TESTS: ${{ needs.typescript-sdk-tests.result }}
-          RUST_SDK_TESTS: ${{ needs.rust-sdk-tests.result }}
         run: |
           fail=0
           require_success() {
@@ -374,21 +356,6 @@ jobs:
               fail=1
             fi
           }
-          require_if_selected() {
-            if [[ "$1" == "true" && "$3" != "success" ]]; then
-              echo "::error::$2 is $3"
-              fail=1
-            fi
-          }
           require_success paths "$PATHS"
           require_success baseline-tests "$BASELINE"
-          require_if_selected "$GO_MAIN" go-tests "$GO_TESTS"
-          require_if_selected "$GO_MAIN" go-race "$GO_RACE"
-          require_if_selected "$GO_MAIN" go-security "$GO_SECURITY"
-          require_if_selected "$GO_MAIN" wasm-integration "$WASM_INTEGRATION"
-          require_if_selected "$GO_SDK" go-sdk-tests "$GO_SDK_TESTS"
-          require_if_selected "$JAVA_SDK" java-sdk-tests "$JAVA_SDK_TESTS"
-          require_if_selected "$PYTHON_SDK" python-sdk-tests "$PYTHON_SDK_TESTS"
-          require_if_selected "$TYPESCRIPT_SDK" typescript-sdk-tests "$TYPESCRIPT_SDK_TESTS"
-          require_if_selected "$RUST_SDK" rust-sdk-tests "$RUST_SDK_TESTS"
           exit "$fail"
