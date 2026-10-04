@@ -1,0 +1,41 @@
+{
+  "name": "@aerol-ai/aerolvm",
+  "version": "0.0.0",
+  "description": "aerolvm: drive AerolVM sandboxes from a shell or an AI agent, as a CLI or an MCP server",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aerol-ai/microvm.git",
+    "directory": "npm/aerolvm"
+  },
+  "homepage": "https://github.com/aerol-ai/microvm",
+  "keywords": [
+    "aerolvm",
+    "sandbox",
+    "mcp",
+    "mcp-server",
+    "ai-agents"
+  ],
+  "mcpName": "io.github.aerol-ai/aerolvm",
+  "bin": {
+    "aerolvm": "aerolvm.js"
+  },
+  "files": [
+    "aerolvm.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@aerol-ai/aerolvm-darwin-arm64": "0.0.0",
+    "@aerol-ai/aerolvm-darwin-x64": "0.0.0",
+    "@aerol-ai/aerolvm-linux-arm64": "0.0.0",
+    "@aerol-ai/aerolvm-linux-x64": "0.0.0",
+    "@aerol-ai/aerolvm-win32-arm64": "0.0.0",
+    "@aerol-ai/aerolvm-win32-x64": "0.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
