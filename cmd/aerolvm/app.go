@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -79,6 +78,7 @@ func (a *app) verbs() []verb {
 		{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
 		{"health", "Check that sandboxd is reachable", healthHelp, runHealth},
 		{"version", "Print the aerolvm version", versionHelp, runVersion},
+		{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
 	}
 }
 
@@ -230,7 +230,7 @@ func (a *app) tools(c *commonFlags) (*agenttools.Tools, error) {
 		Warn:   func(s string) { a.note("aerolvm: %s", s) },
 	}
 	if c != nil && c.debug {
-		cfg.HTTPClient = &http.Client{Transport: &debugTransport{base: http.DefaultTransport, out: a.stderr}}
+		cfg.HTTPClient = debugHTTPClient(a.stderr)
 	}
 	return a.newTools(cfg)
 }
