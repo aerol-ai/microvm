@@ -651,3 +651,15 @@ func TestHandlers_CreateSandboxContextErrors(t *testing.T) {
 func TestHandlersReconcileSuccess(t *testing.T) {
 	t.Skip("reconcile needs a fully wired Service (runtime/docker); covered elsewhere")
 }
+
+func TestCoverage97ListByNameOnClosedStore(t *testing.T) {
+	h, st := liftV1Handler(t)
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	h.listSandboxes(rr, httptest.NewRequest(http.MethodGet, "/v1/sandboxes?name=box", nil))
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+}

@@ -10,6 +10,12 @@ import (
 	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
+func TestAsToolboxAddresserAbsent(t *testing.T) {
+	if _, ok := runtime.AsToolboxAddresser(nil); ok {
+		t.Fatal("nil runtime has no toolbox address")
+	}
+}
+
 func TestDockerClientSatisfiesContainerRuntime(t *testing.T) {
 	var _ runtime.Runtime = (*docker.Client)(nil)
 	var _ runtime.ContainerRuntime = (*docker.Client)(nil)

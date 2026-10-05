@@ -19,8 +19,10 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"golang.org/x/time/rate"
 
 	"github.com/aerol-ai/microvm/internal/agenttools/agenttoolstest"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 )
@@ -479,6 +481,35 @@ func requestCount(outcome string) int64 {
 	}
 	return 0
 }
+
+func TestNilLoggerEvictAndFlush(t *testing.T) {
+	h := New(Config{}, func() http.Handler { return http.NotFoundHandler() })
+	if h.serverFor(httptest.NewRequest(http.MethodPost, "/mcp", nil)) != nil {
+		t.Fatal("a request without parsed options has no server")
+	}
+	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acct"},
+	})
+	_, done := h.instrument(ctx)(context.Background(), "exec")
+	done("sb", nil)
+
+	rr := httptest.NewRecorder()
+	(&statusWriter{ResponseWriter: rr}).Flush()
+	(&statusWriter{ResponseWriter: noFlush{rr}}).Flush()
+
+	l := newTokenLimiter(1)
+	l.buckets["old"] = &tokenBucket{limiter: rate.NewLimiter(1, 1), lastSeen: time.Now().Add(-time.Hour)}
+	l.buckets["new"] = &tokenBucket{limiter: rate.NewLimiter(1, 1), lastSeen: time.Now()}
+	l.evictIdleLocked(time.Now())
+	if _, ok := l.buckets["old"]; ok {
+		t.Fatal("idle bucket was kept")
+	}
+	if _, ok := l.buckets["new"]; !ok {
+		t.Fatal("fresh bucket was dropped")
+	}
+}
+
+type noFlush struct{ http.ResponseWriter }
 
 func TestBearerToken(t *testing.T) {
 	for header, want := range map[string]string{"Bearer abc": "abc", "bearer  abc ": "abc", "Basic abc": "", "": ""} {

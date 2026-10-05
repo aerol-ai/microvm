@@ -433,6 +433,40 @@ func TestWriteStoreAwareError_ComponentModelUnsupported(t *testing.T) {
 	}
 }
 
+func TestWriteErrorCodeAndRemainingStoreMappings(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteErrorCode(rr, http.StatusConflict, "name_taken", "sandbox name already in use")
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "name_taken") {
+		t.Fatalf("WriteErrorCode = %d %s", rr.Code, rr.Body.String())
+	}
+
+	cases := []struct {
+		err    error
+		status int
+		header string
+	}{
+		{service.ErrSecretAuditBusy, http.StatusTooManyRequests, "1"},
+		{service.ErrSecretAuditChainBroken, http.StatusServiceUnavailable, ""},
+		{store.ErrJSBundleInUse, http.StatusConflict, ""},
+	}
+	for _, tc := range cases {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, tc.err)
+		if rr.Code != tc.status {
+			t.Errorf("%v status = %d, want %d", tc.err, rr.Code, tc.status)
+		}
+		if tc.header != "" && rr.Header().Get("Retry-After") != tc.header {
+			t.Errorf("%v Retry-After = %q", tc.err, rr.Header().Get("Retry-After"))
+		}
+	}
+
+	var decoded struct{ OK bool }
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ok":true}`))
+	if err := DecodeJSONLimit(httptest.NewRecorder(), req, &decoded, 0); err != nil || !decoded.OK {
+		t.Fatalf("DecodeJSONLimit default cap = %v %+v", err, decoded)
+	}
+}
+
 func TestWriteStoreAwareError_RegistryUnavailable(t *testing.T) {
 	rr := httptest.NewRecorder()
 	WriteStoreAwareError(discardLogger(), rr, wasmmod.ErrRegistryUnavailable)
