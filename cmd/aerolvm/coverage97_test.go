@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
+	"github.com/aerol-ai/microvm/internal/agenttools/agenttoolstest"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -150,18 +151,24 @@ func TestCLIFollowLogsSignalAndDetach(t *testing.T) {
 	if code := h.run("logs", "--follow", "box", "missing-session"); code == 0 {
 		t.Fatal("follow of a missing session succeeded")
 	}
-	h.fake.DropAttach = true
+	h.fake.Observe(func(s *agenttoolstest.Server) { s.DropAttach = true })
 	if code := h.run("logs", "--follow", "box", sid); code == 0 {
 		t.Fatal("follow of a dropped attach succeeded")
 	}
-	h.fake.DropAttach = false
-
-	h.fake.HangAttach = true
-	h.fake.AttachReady = make(chan struct{})
+	// The attach handler reads these under the fake's mutex. A websocket
+	// close does not order that read before a bare field write, so the
+	// race detector reports it. Assign through Observe, which holds the
+	// same mutex.
+	ready := make(chan struct{})
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		s.DropAttach = false
+		s.HangAttach = true
+		s.AttachReady = ready
+	})
 	done := make(chan int, 1)
 	go func() { done <- h.run("logs", "--follow", "box", sid) }()
 	select {
-	case <-h.fake.AttachReady:
+	case <-ready:
 	case <-time.After(2 * time.Second):
 		t.Fatal("follow did not attach")
 	}
