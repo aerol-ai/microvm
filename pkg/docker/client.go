@@ -519,10 +519,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
-	}
+	hostConfig := sandboxHostConfig(c.privileged, binds)
 
 	if netnsAdopted {
 		hostConfig["NetworkMode"] = "container:" + adoptedNetns.containerID
