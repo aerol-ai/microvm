@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+func TestRecordStageDescClampsNegative(t *testing.T) {
+	timing := &CreateTiming{}
+	timing.RecordStageDesc("boot", -time.Second, "clamped")
+	stages := timing.Stages()
+	if len(stages) != 1 || stages[0].DurMS != 0 || stages[0].Desc != "clamped" {
+		t.Fatalf("stages = %+v", stages)
+	}
+}
+
 func TestWith_ReusesExistingRecorder(t *testing.T) {
 	ctx, first := With(context.Background())
 	ctx2, second := With(ctx)

@@ -8,6 +8,23 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+func TestParkGateNilReceiverIsANoop(t *testing.T) {
+	var g *ParkGate
+	if !g.CanPark(dockerpool.ParkShape{}) {
+		t.Fatal("a missing gate must not block parking")
+	}
+	if err := g.ParkReservation("slot", dockerpool.ParkShape{}); err != nil {
+		t.Fatal(err)
+	}
+	g.MarkParkReady("slot", true)
+	g.ReleasePark("slot")
+	ReleaseParkReservation(nil, "")
+	ReleaseParkReservation(nil, "slot")
+	if a := New(HostInfo{CPUCores: 1, MemoryTotalMB: 512}, Limits{CPUReservationRatio: 1, MemoryReservationRatio: 1}, nil); a != nil {
+		a.AddParkReclaimer(nil)
+	}
+}
+
 func TestParkReservationID(t *testing.T) {
 	if got := ParkReservationID("park-abc"); got != "park:park-abc" {
 		t.Fatalf("id = %q", got)
