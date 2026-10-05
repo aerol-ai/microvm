@@ -755,6 +755,11 @@ calls at `service.go:2890` and `:5133`. Create works like this in FQDN mode:
      parse them as `-d` arguments.
 2. Once the driver returns the IP: `gateway.Attach` over the UDS, then
    `ClearBlockAllEgress`.
+   - Both run alongside the row persist, and the create waits for them before
+     returning. The policy is compiled while `rt.Create` runs (§8.2, latency
+     amendment).
+   - The driver's DROP covers the sandbox until Attach succeeds, so running
+     these alongside other steps opens no window.
    - If Attach fails, or the gateway is unreachable or version-skewed, the
      create fails with 503 and rolls back the way a policy failure does today
      (container removed).
@@ -1423,6 +1428,7 @@ depend on P2-6.
 | EF-74 | Profile PUT during a rolling upgrade: one Raft server with `fv` below the profile-ops version (live, then failed with old last-known meta, then absent from gossip); all upgraded; `nodeMeta` encoded with every field at maximum length | 503 `ErrClusterVersion` in the first three cases; accepted when all report it; encoded meta stays under memberlist's 512 bytes (eng re-review D1) | gossip + FSM test (rule 6) |
 | EF-75 | Gateway restarts while sandboxd is down; sandboxd later reports a new bridge | listeners bind from the snapshot's bridge list; the new bridge is bound and self-tested when reported; the gateway never opens the docker socket (eng re-review S5) | gateway unit |
 | EF-77 | One sandbox fills `@rejected_flows` to its size (port scan to unique destinations); another allowlist-mode sandbox then connects to a raw IP and an unlisted port | the second sandbox's flows are still rejected; the scan's inserts are metered; `aerolvm_egress_audit_dropped_total{reason="set_full"}` rises (eng re-review S10) | gateway nft test against a real kernel netns (integration tag) + backend fake for rule shape |
+| EF-78 | Create latency for each kind in the §8.2 budget table (no policy, block-all, CIDR list, hostnames, profile reference with a cold worker cache, first create after a failed boot connect), single-node benchmark before and after; gateway mode again at 1,000 sandboxes on one node | every kind within its §8.2 budget; `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` appear in the benchmark report; `svc_egress_join` near 0 when the overlap hides the work (latency amendment) | benchmark (gate) + service unit (overlap join and both rollback points) |
 | EF-76 | Learn mode on docker, WASM and isolate for the same traffic | identical `suggested_allow_out` from the shared `Recorder`; a debounced snapshot rewrites only the changed sandbox's file (eng re-review S7, S9) | egresspolicy unit + gateway unit |
 
 Engine assignment: EF-47, EF-48, EF-49, EF-51 and EF-56 run in the D16
@@ -1443,26 +1449,80 @@ Phase 3 starts.
    - Toggling learn mode re-attaches via BlockAll → Attach → clear BlockAll (or hold on failure, D16),
      which is safe to retry.
    - No pool or port allocation.
-2. **Boot-path latency.** **Call-out required.**
-   - Non-gateway creates add one `hasHostnames()` scan (no I/O).
-   - Block-all and CIDR-allowlist creates add one `AEROLVM-INPUT` rule insert
-     (P0-5), the same cost as an existing netrules op.
-   - Creates that reference profiles add one profile lookup plus `builtin:`
-     version pinning. That is a store or FSM read on server-tier nodes, a local
-     cache read on dedicated workers, and one server-tier RPC on a worker cache
-     miss (failure → 503).
-   - Learn-mode creates add the same Attach as FQDN creates.
-   - FQDN creates add:
-     - one UDS round-trip to the egress-gateway process (D9; expected sub-ms);
-     - one nft netlink batch inside the gateway (expected sub-ms);
-     - one extra `ClearBlockAllEgress` (an existing rule op);
-     - on Attach failure only: one `egress_hold` store write plus one `sbx-egress-hold` rule insert (D16), off the success path.
-   - First-call case: if the boot-time connect failed, the first FQDN create
-     runs it (UDS connect, version handshake and full `Sync`, expected low ms)
-     behind the latch.
-   - Warm containerd parks gain one resolv.conf bind mount at park time (D14),
-     which is off the create path.
-   - Measure with the existing single-node benchmark before and after.
+2. **Boot-path latency.** **Call-out required.** The latency amendment
+   (2026-10-06, requested by the user after the eng re-review) turns the
+   expected costs into budgets. Those budgets are a gate, measured per create
+   stage.
+   - **Budgets** are p50 / p99 on the existing single-node benchmark, before
+     and after. Gateway rows are also measured at 1,000 sandboxes on one node
+     (EF-73). A miss blocks the stack (EF-78).
+
+     | Create kind | Work added to the create path | Budget |
+     |---|---|---|
+     | No egress policy (most creates) | One in-memory `hasHostnames()` scan. No I/O and no new stage. | Within noise of the baseline (≤1 ms p50) |
+     | Block-all or CIDR list | One `AEROLVM-INPUT` rule (P0-5), written in-process through the default netlink netrules backend (`SB_NETRULES_BACKEND=netlink`, no exec) | ≤1 ms p50 |
+     | Gateway mode (hostnames, profiles, learn) | `svc_egress_prepare` (compile the policy, resolve profiles, pin `builtin:` versions) runs alongside `rt.Create`. `svc_egress_attach` (one UDS request on a persistent connection, one nft batch, one `ClearBlockAllEgress`) runs alongside the row persist. | `svc_egress_join` ≤2 ms p50; `svc_egress_attach` ≤10 ms p99 at 1,000 sandboxes per node |
+     | Profile reference with a cold worker cache | One server-tier RPC inside `svc_egress_prepare`, hidden under `rt.Create`. A failure → 503. | No added p50 while `rt.Create` takes longer than the RPC. Misses are counted in `aerolvm_egress_profile_cache_miss_total`. |
+     | First gateway-mode create after a failed boot-time connect | UDS connect, version handshake and a full `Sync`, once, behind the latch | ≤50 ms, once per sandboxd start |
+
+   - **How the gateway work leaves the critical path:**
+     - **Prepare runs alongside the runtime.**
+       - `svc_egress_prepare` starts before `rt.Create`. It is pure CPU, plus
+         one RPC on a worker cache miss.
+       - Built-in profiles are compiled into the binary and never miss.
+       - Compiled apply plans are cached by policy content hash, so identical
+         policies compile once per node. Shared profiles and built-ins are the
+         common case.
+       - Its result is joined before Attach. A failure fails the create with
+         503 and takes the Attach-failure rollback below.
+     - **Attach runs alongside persistence.**
+       - Once `rt.Create` returns the IP, Attach followed by
+         `ClearBlockAllEgress` runs alongside credential sealing, the row
+         build and `svc_persist`.
+       - The create waits for it before returning 2xx, so 2xx still means the
+         policy is live.
+       - The driver's DROP covers the sandbox until Attach succeeds, so the
+         overlap opens no egress window.
+       - Rollback on an Attach failure:
+         - Before persist: the existing runtime-failure cleanup.
+         - After persist: the existing mount-persist rollback chain
+           (`service.go:2033-2038`: `RollbackSandboxCreate`, public-route
+           delete, destroy, mount cleanup, admission release), plus an
+           owner-checked `Detach`.
+       - In cluster mode this all happens inside the create leg, which
+         already overlaps the secrets seal. `cluster_promote` is unchanged.
+     - **No connect per create.** The bootstrap latch opens a small pool of
+       persistent UDS connections; each Attach is one request on one of them.
+     - **Lever, used only if EF-73 misses the p99 budget: group commit.** The
+       gateway applies Attaches that arrive within 1 ms of each other as one
+       nft transaction. That bounds the interval-set (`allow_cidr`) commit
+       cost when many sandboxes start at once on a dense node. It is not
+       built unless the measurement asks for it.
+   - **Measured, not estimated.**
+     - `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` (the
+       time the create actually waited) are recorded through
+       `pkg/createtiming`, like `svc_persist` and `svc_caddy`, so benchmark
+       reports break them out.
+     - The P1-5 PR runs the single-node benchmark before and after for each
+       create kind in the table.
+   - **Unchanged facts:**
+     - Warm containerd parks gain one resolv.conf bind mount at park time
+       (D14), off the create path.
+     - Gateway-mode creates stay warm-pool eligible: the driver-facing copy
+       only sets `NetworkBlockAll`, which warm adopt already applies.
+     - Dropping `CAP_NET_RAW` (CEO D8), capability-aware placement (CEO D20)
+       and the profile version gate (eng re-review D1) add no create work.
+     - On Attach failure only: one `egress_hold` store write plus one
+       `sbx-egress-hold` rule insert (D16), off the success path.
+   - **Phase 3 inspect sandboxes** are the one known regression.
+     - They take the full cold create, because the warm pool rejects any
+       create with env or mounts (`internal/runtime/containerd/warm_adopt.go:28`,
+       `pkg/docker/docker_pool.go:66`).
+     - The Phase 3 PR calls this out.
+     - Lever, designed with Phase 3: deliver the CA file through the per-slot
+       bind mount D14 uses for resolv.conf, and the CA env vars through
+       toolboxd's exec environment at adopt rather than container env. That
+       keeps inspect sandboxes warm-eligible.
 3. **Lazy bootstrap.** `EnsureEgressGatewayReady`: atomic.Bool + mutex,
    best-effort at daemon start, retried on the first FQDN create. A failure
    leaves the latch unset.
@@ -4122,6 +4182,33 @@ Parallelization: no new lanes.
 - Parallelization: 4 lanes, 4 parallel at launch / 8 sequential steps after
   (unchanged; new tasks join existing steps).
 - Lake Score: 2/2 = both answers picked the 10/10 option.
+
+## Latency amendment (2026-10-06, user request after the eng re-review)
+
+The user asked for create latency to be addressed in the plan. This is a
+direct user-requested change made after the review runs, so it is not part of
+their ledgers or the report below.
+
+What changed:
+- **§8.2:** expected costs are now per-kind budgets, enforced as a gate
+  (EF-78).
+- **The gateway work runs alongside create steps that already exist.**
+  - Policy compile and profile resolution run alongside `rt.Create`.
+  - Attach and the rule clear run alongside the row persist.
+  - The create still waits before returning 2xx, and the driver DROP keeps
+    the window closed.
+- **Rollback** after persist reuses the existing mount-persist chain.
+- **New create-timing stages:** `svc_egress_prepare`, `svc_egress_attach` and
+  `svc_egress_join`.
+- **Group commit** in the gateway is recorded as a lever, built only if EF-73
+  misses the p99 budget.
+- **Phase 3:** the inspect-sandbox cold path is called out, with a
+  warm-eligibility lever to design with Phase 3.
+
+- [ ] **T59 (P1, human: ~1 day / CC: ~1h)** — service + egress + benchmark — Overlapped egress prepare/attach, create-timing stages, latency budgets gate
+  - Surfaced by: user request (latency), §8.2
+  - Files: `internal/service/service.go` (`createSandbox`), the `internal/egress` client (persistent connection pool), `pkg/egresspolicy` (compiled-plan cache by content hash), the single-node benchmark report
+  - Verify: EF-78; the service unit test pauses Attach to prove the create waits before 2xx and that both rollback points run
 
 ## GSTACK REVIEW REPORT
 
