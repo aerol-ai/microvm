@@ -202,6 +202,7 @@ it has no `CAP_NET_RAW` (dropped for every sandbox, CEO D8) and no
 | Encrypted ClientHello / no SNI | Policy matches the **outer** SNI and ignores whether the ECH extension is present: Chrome and Firefox send decoy (GREASE) ECH on every hello with the real outer SNI. Real ECH carries the provider's public name as its outer SNI, so it fails the allowlist. Missing SNI is rejected. HTTPS/SVCB RRs get NODATA so clients don't fetch ECH configs. (D6) | 1 |
 | Plain HTTP `Host` switch on a keep-alive connection | Port 80 is checked per request, not per connection. | 1 |
 | DNS rebinding or allowlisted name pointing at an internal IP / metadata endpoint | The proxy's dial control always blocks loopback and link-local (169.254.169.254). Private ranges are blocked unless a CIDR entry allows them. | 1 |
+| Lateral movement into internal networks (private cloud): an allowlist that needs a whole CIDR to reach one internal host; no-policy sandboxes reaching core systems; sandboxes reaching AerolVM control ports on other nodes | Internal zone opens only the resolved IP of an internal-suffix name; operator default, ceiling and `deny_cidrs` floor; node control-port guard on every node (§5.10) | 1 |
 | QUIC (UDP 443) | Rejected (fails fast). | 1 |
 | Spoofing a neighbour's source IP | The proxy is TCP, so a spoofed SYN never completes and identity is safe there. DNS (UDP) and the forward chain are not safe. Fixed by **H2** in Phase 0: `CAP_NET_RAW` is dropped for **every** docker and containerd sandbox (CEO D8), which also protects learn-mode recordings and DNS budgets from neighbours. | 0 |
 | Allowlisted mirror used as a general proxy (the Hugging Face case) | Can't be fixed by host rules. Docs warn. Phase 3 path rules restrict which repos a mirror may serve. | docs / 3 |
@@ -1145,6 +1146,246 @@ apply to isolate.
 
 ---
 
+### 5.10 Private-cloud deployment (requested by the user, 2026-10-06)
+
+**The setting.** AerolVM runs in a bank's private cloud with no route to the
+public internet.
+
+**Why the plan needs this.** The rest of this plan treats the public internet
+as the thing being filtered. Here the threat flips: the risk is a sandbox
+reaching internal systems such as core banking, databases and metadata
+services.
+
+Four gaps follow from the earlier design, plus one ingress gap:
+- **§5.5 dial control.** It refuses private addresses unless the sandbox's
+  own policy has a matching CIDR. So allowing `artifactory.corp.bank.internal`
+  (which resolves to `10.x`) would also mean allowing a whole range, and with
+  it raw connects to every host in that range.
+- **No floor for no-policy sandboxes.** A sandbox with no policy reaches the
+  whole internal network.
+- **Built-in profiles point at public hosts.**
+- **No upstream proxy.** The gateway can't reach outside hosts through the
+  bank's forward proxy.
+- **Ingress certificates.** Caddy's ACME issuer is hard-coded to the public
+  CAs.
+
+Nothing in this section is needed when the operator file is absent: every
+default keeps today's behavior.
+
+**One operator file.** `SB_EGRESS_OPERATOR_FILE` (unset by default) names a
+YAML file, normally `/etc/sandboxd/egress-policy.yaml`.
+- Install, Terraform and Ansible ship the same file to every node from
+  `config/cluster.yml`.
+- One reviewable file fits a bank's change control better than many env vars.
+
+```yaml
+version: 1
+internal_zone:
+  suffixes: [corp.bank.internal]     # names that may resolve to internal ranges
+  cidrs: [10.0.0.0/8]                # the internal ranges those names may reach
+  isolate: false                     # opt-in; false keeps D15's strict isolate block
+default_policy:                      # used when a create sets no egress fields
+  mode: open                         # open (today) | block_all | allowlist
+  allow_out: []                      # mode=allowlist; §5.1 grammar; org: refs in Phase 2
+ceiling:
+  allow_out: []                      # empty = no ceiling; else every effective allow entry must fit inside
+deny_cidrs: []                       # always dropped, above every accept, every mode
+node_control_port_guard: true        # sandboxes never reach AerolVM control ports on any node
+builtin_profiles: true               # false → builtin: references get 400
+org_profiles: {}                     # Phase 2: name → {allow_out, description}
+upstream_proxy:
+  url: ""                            # e.g. http://proxy.corp.bank:8080 (HTTP CONNECT)
+  auth_file: ""                      # optional, mode 0600, read by the gateway only
+  no_proxy: []                       # suffixes and CIDRs; internal_zone is always no-proxy
+  synthetic_dns_cidr: 198.18.0.0/15  # RFC 2544 range, never routed
+```
+
+- **Loading.**
+  - The whole file is parsed and validated, then swapped in through one
+    pointer.
+  - A changed file is picked up by an mtime poll (10 s) or SIGHUP.
+  - An invalid reload keeps the last good file, and counts
+    `aerolvm_egress_operator_config_load_failures_total`.
+  - A file that is present but invalid at boot refuses every create with 503
+    `egress_operator_config_invalid` (fail closed, since the default policy
+    is unknown). An absent file means today's behavior.
+- **Drift.** Each node exports `aerolvm_egress_operator_config_info{hash}`.
+  `SandboxdEgressOperatorConfigDrift` fires when live nodes report different
+  hashes for 10 minutes. The settings are node-local, so they never touch the
+  FSM or gossip.
+
+**PC-1 Internal zone (Phase 1, P1-17).**
+- **What a name under an internal suffix may reach.**
+  - A name under `internal_zone.suffixes` (exact or `*.`) may resolve into
+    `internal_zone.cidrs`.
+  - Only that name's resolved IP is opened: through the proxy for 80/443, or
+    as a learned `(src, ip, port)` element for `host:port` rules.
+  - The sandbox gets no raw access to the range.
+- **Everything else stays blocked.**
+  - A name outside the internal suffixes that resolves into a private range is
+    still refused, which keeps the §4 rebinding protection.
+  - Loopback and link-local (including `169.254.169.254`) are never
+    reachable.
+  - `deny_cidrs` wins over the zone.
+- **One implementation.** The rule lives in the `pkg/egresspolicy` dial
+  control and the learned-IP filter. The gateway proxy, the DNS filter's
+  learned inserts, the WASM mediator and isolate all use it.
+- **Isolate.** Isolate keeps D15's unconditional private-range block unless
+  the operator sets `internal_zone.isolate: true`. That is an explicit opt-in,
+  and the default does not change D15.
+- **Validation.** `internal_zone.cidrs` must be RFC 1918, RFC 6598 or ULA
+  ranges. Loopback, link-local and public ranges are rejected at load.
+- **Internal ports.** Internal services often use other ports, such as
+  Artifactory on 8081 or git over SSH on 22. Those use the existing
+  `host:port` rule, so no new grammar is needed.
+
+**PC-2 Operator default, ceiling and floor (Phase 1, P1-18).**
+- **Default policy.**
+  - A create with no egress fields gets `default_policy`: no block-all, no
+    allow or deny lists, no profiles, no learn mode. This applies to native,
+    E2B and Daytona creates alike.
+  - The default is written into the stored spec at create, like built-in
+    pinning (CEO D11). So GET shows it, failover keeps it, and a later
+    operator edit doesn't change running sandboxes.
+  - `mode: block_all` and `mode: allowlist` on Firecracker get 501 until
+    Phase 4 (`service.go:2137-2145` refuses network options there). That is
+    fail closed. A Firecracker operator keeps `open` or waits for Phase 4.
+- **Ceiling.**
+  - When `ceiling.allow_out` is set, every effective allow entry must be
+    covered by a ceiling entry. That means inline entries, profiles and the
+    default.
+    - A hostname is covered by a ceiling hostname or wildcard.
+    - A CIDR is covered when it is a subset of a ceiling CIDR.
+    - `host:port` is covered by its host.
+  - An entry outside the ceiling gets 400 naming it. This applies to create,
+    PUT, a profile PUT, E2B `updateNetwork` and the check endpoint, which
+    reports `outside_ceiling`.
+  - A deny-list-only policy (default accept) and `mode: open` can't fit any
+    ceiling, so they get 400 when one is set.
+  - Learn mode runs **within** the ceiling. The ceiling is its allowlist, and
+    it records what the sandbox actually used.
+  - The check is in-memory against a compiled matcher, so it costs
+    microseconds at the 1024-entry cap.
+- **Floor.**
+  - `deny_cidrs` is one node-wide rule set installed at bootstrap. It is the
+    top rule of the netrules chain for each sandbox bridge subnet, and the
+    first `@deny_floor` rule in the gateway's forward chain.
+  - It drops matching traffic from every sandbox in every mode, above every
+    accept. It adds no per-create work.
+- **Node control-port guard** (`node_control_port_guard`, default `true`).
+  - A node-wide `@node_control` set of `(node IP, port)` pairs covers every
+    cluster member's API (`21212`), SSH gateway (`2220`), cluster mTLS
+    (`7002`) and Raft ports.
+  - It is filled from gossip membership (debounced; up to 2000 members × 4
+    ports) and dropped in forward for every sandbox.
+  - It extends P0-5, which only protects the local host, to every node.
+    Ingress `80`/`443` stays reachable, so agents keep using the API's
+    load-balanced URL.
+  - **Behavior change** for no-policy sandboxes that call a node's `:21212`
+    directly. The PR calls it out, and an operator can set `false`.
+
+**PC-3 Org profiles and the built-in switch (Phase 2, P2-10).**
+- **Org profiles.**
+  - `org_profiles` defines `org:<name>` profiles, readable by every tenant.
+  - The operator writes them through the file. There is no API write, since
+    AerolVM has no admin role to gate one.
+  - The names and the 512-entry cap follow §5.8.
+  - Unlike built-ins they are **not** pinned. A changed org profile is
+    re-applied to the referencing sandboxes, the same way user profiles are
+    (D21).
+  - Each node re-applies its own sandboxes after a reload, rate-limited by
+    `SB_EGRESS_PROFILE_APPLY_QPS`. No FSM or cross-node RPC is involved.
+  - `generation` is the profile's content hash.
+- **Failure handling.** A sandbox whose referenced org profile disappears, or
+  whose union would exceed 1024, is held (D16, reason `org_profile_invalid`)
+  and alerted. It never runs on a stale list without being flagged.
+- **`builtin_profiles: false`.** `builtin:` references get 400 "built-in
+  profiles disabled on this deployment". Allowing a mirror hostname doesn't
+  configure pip or npm to use it: the image or env still sets the index URL.
+
+**PC-4 Upstream proxy chaining (Phase 1, P1-19).**
+- **When it applies.** When `upstream_proxy.url` is set, an allowed name that
+  is not internal-zone and not `no_proxy` is reached through the bank's proxy.
+- **:443.**
+  1. The proxy checks the SNI against the sandbox's policy as usual.
+  2. It sends `CONNECT <SNI>:443` to the upstream proxy.
+  3. It writes the buffered ClientHello and splices raw conn to raw conn
+     (`internal/netsplice`).
+- **:80.** Requests go out in absolute form through the upstream proxy
+  (`http.Transport.Proxy`).
+- **DNS.**
+  - In a network that only works through a proxy, the bank's resolver often
+    can't resolve outside names.
+  - So for an allowed, proxied name, the DNS filter answers with a synthetic
+    A record from `synthetic_dns_cidr`, with a 30 s TTL and AAAA NODATA. The
+    synthetic IP is held per sandbox and name.
+  - The sandbox connects to that IP on 80/443. The redirect catches any
+    destination, and the proxy routes by SNI or Host, never by IP.
+  - A synthetic IP on any other port is rejected in forward.
+  - Names that aren't allowed still get NXDOMAIN and never reach the proxy.
+- **Limits.**
+  - `host:port` rules on ports other than 80/443 for proxied names get 400 at
+    validation, because a transparent CONNECT on arbitrary ports is out of
+    scope.
+  - An unreachable upstream proxy fails fast with the TLS `access_denied`
+    alert or a 502 on :80, with `reason=upstream_proxy_unavailable`.
+- **Credentials.** They come from `auth_file` (0600). They are never logged,
+  snapshotted or audited (D22).
+- **Runtimes.** WASM and isolate use the same chaining dialer from
+  `pkg/egresspolicy`.
+- **TLS inspection.** The gateway doesn't decrypt TLS, so the bank's own TLS
+  inspection keeps working. Images need the bank's CA, as they do today.
+
+**PC-5 Ingress certificates from an internal CA (separate PR, not in the
+egress stack).**
+- **The gap.** sandboxd writes the on-demand TLS policy with a bare
+  `{"module":"acme"}` issuer (`pkg/caddy/client.go:938`). With no internet,
+  that means public Let's Encrypt or ZeroSSL, so certificate issuance fails.
+- **The fix.**
+  - `SB_TLS_ACME_CA` (an ACME directory URL, such as the bank PKI or
+    step-ca) and `SB_TLS_ACME_CA_ROOT` (a PEM path to trust it) fill the
+    issuer's `ca` and `trusted_roots_pem_files`.
+  - `SB_TLS_ISSUER=internal` selects Caddy's internal issuer for labs.
+  - Unset keeps today's behavior.
+- **Tests.** Unit tests on the generated policy JSON, plus the private-cloud
+  scenario below.
+
+**Runtime coverage.**
+
+| | docker / containerd / gVisor | WASM | isolate | Firecracker |
+|---|---|---|---|---|
+| Internal zone | gateway | mediator | only with `internal_zone.isolate: true` | Phase 4 |
+| Default / ceiling | service | service | service | `open` only until Phase 4 (501) |
+| Floor + node control-port guard | node-wide rules | mediator dial control | isolate dial control | Phase 4 |
+| Upstream proxy | gateway | mediator | isolate egress proxy | Phase 4 |
+
+**Latency and scale (against the §8.2 budgets).**
+- **Creates.**
+  - The default policy is applied in memory at validation. So a no-policy
+    create on a `block_all` or `allowlist` deployment pays that kind's
+    budget.
+  - The ceiling check is in-memory.
+  - The floor and the node guard are node-wide rules installed at bootstrap,
+    so they add no per-create work.
+- **The data path.**
+  - The upstream proxy adds one CONNECT round trip per proxied connection.
+  - Synthetic DNS answers skip the upstream lookup.
+- **Fleet.** Everything is node-local configuration. The guard's
+  member-IP set is at most 8000 elements at 2000 nodes.
+
+**Verification.**
+- A new AWS harness scenario, `single-node-private-cloud` (capability
+  `CapPrivateCloud`), runs in a VPC with no internet gateway or NAT.
+- It installs through the `install.sh` URL overrides (`SANDBOXD_URL`,
+  `TOOLBOXD_URL`, `CHECKSUMS_URL`, `CADDY_BINARY_URL`), served from an S3 VPC
+  endpoint. That also proves the offline install.
+- The scenario includes:
+  - a Route 53 private zone for `corp.bank.internal`;
+  - an internal mock "artifactory" serving a pypi simple index;
+  - a squid upstream proxy;
+  - step-ca.
+- It covers EF-79..EF-84.
+
 ## 6. Phasing (stacked PRs, one per task; merge nothing until the stack is green)
 
 **Phase 0: fix the holes (first in the stack; P0-3 after P1-1)**
@@ -1273,6 +1514,13 @@ apply to isolate.
     failover recreates, first exist in cluster mode (eng re-review S8).
   - Rule-6 tests go in `placement_test.go`.
   - A no-op when cluster mode is off.
+- P1-17: Internal zone (§5.10 PC-1). Covered by EF-79.
+- P1-18: Operator file, default policy, ceiling, floor and node control-port
+  guard (§5.10 PC-2). Covered by EF-80 and EF-81.
+- P1-19: Upstream proxy chaining with synthetic DNS (§5.10 PC-4). Covered by
+  EF-82.
+- P1-20: The `single-node-private-cloud` harness scenario and
+  `CapPrivateCloud` (§5.10).
 
 **Phase 2: live policy.** P2-1 the endpoint and service (§5.8, strict spec-first
 commit, D10); P2-2 five SDKs; P2-3 CLI/MCP `--allow-host` (docs in `cli.mdx` and `mcp.mdx`); P2-4 docs (new page `egress-profiles-and-learn-mode.mdx` for profiles, built-ins, learn mode and the check endpoint, registered under "Network Usage"); P2-5 E2B
@@ -1317,6 +1565,8 @@ commit, D10); P2-2 five SDKs; P2-3 CLI/MCP `--allow-host` (docs in `cli.mdx` and
     returns `{allowed, matched_rule, default_verdict}` from `pkg/egresspolicy`.
   - 5 SDK methods and docs.
   - Tests: table cases mirroring the matcher's.
+- P2-10: Org profiles from the operator file, and the built-in switch (§5.10
+  PC-3). Covered by EF-81 and EF-83.
 
 **Phase 3 (fully specified in §5.9; gated on demand).**
 - P3-1 inspection with method/path rules.
@@ -1427,9 +1677,15 @@ depend on P2-6.
 | EF-73 | Load: DNS filter at the QPS cap, proxy at 16k connections, profile fan-out at 50 sandboxes/s | baselines recorded in the benchmark harness; no collapse at the caps (CEO D23) | benchmark |
 | EF-74 | Profile PUT during a rolling upgrade: one Raft server with `fv` below the profile-ops version (live, then failed with old last-known meta, then absent from gossip); all upgraded; `nodeMeta` encoded with every field at maximum length | 503 `ErrClusterVersion` in the first three cases; accepted when all report it; encoded meta stays under memberlist's 512 bytes (eng re-review D1) | gossip + FSM test (rule 6) |
 | EF-75 | Gateway restarts while sandboxd is down; sandboxd later reports a new bridge | listeners bind from the snapshot's bridge list; the new bridge is bound and self-tested when reported; the gateway never opens the docker socket (eng re-review S5) | gateway unit |
+| EF-76 | Learn mode on docker, WASM and isolate for the same traffic | identical `suggested_allow_out` from the shared `Recorder`; a debounced snapshot rewrites only the changed sandbox's file (eng re-review S7, S9) | egresspolicy unit + gateway unit |
 | EF-77 | One sandbox fills `@rejected_flows` to its size (port scan to unique destinations); another allowlist-mode sandbox then connects to a raw IP and an unlisted port | the second sandbox's flows are still rejected; the scan's inserts are metered; `aerolvm_egress_audit_dropped_total{reason="set_full"}` rises (eng re-review S10) | gateway nft test against a real kernel netns (integration tag) + backend fake for rule shape |
 | EF-78 | Create latency for each kind in the §8.2 budget table (no policy, block-all, CIDR list, hostnames, profile reference with a cold worker cache, first create after a failed boot connect), single-node benchmark before and after; gateway mode again at 1,000 sandboxes on one node | every kind within its §8.2 budget; `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` appear in the benchmark report; `svc_egress_join` near 0 when the overlap hides the work (latency amendment) | benchmark (gate) + service unit (overlap join and both rollback points) |
-| EF-76 | Learn mode on docker, WASM and isolate for the same traffic | identical `suggested_allow_out` from the shared `Recorder`; a debounced snapshot rewrites only the changed sandbox's file (eng re-review S7, S9) | egresspolicy unit + gateway unit |
+| EF-79 | Internal zone: `allow_out: ["artifactory.corp.bank.internal", "git.corp.bank.internal:22"]` with `internal_zone` set; raw connect to a neighbour `10.x` host; `evil.example` resolving to `10.x`; `169.254.169.254`; the same policy on isolate with `internal_zone.isolate` false, then true | 443 via the proxy and `:22` via the learned element succeed; raw neighbour connect, rebinding name and metadata are refused; isolate refuses until opted in (§5.10 PC-1) | egresspolicy unit + integration (private-cloud) |
+| EF-80 | Operator default, ceiling and floor: no-policy create under `block_all` and under `allowlist`; an entry outside the ceiling; a deny-list-only policy under a ceiling; learn mode under a ceiling; a user CIDR allow overlapping `deny_cidrs`; any sandbox (including no-policy) to another node's `:21212`/`:7002`/`:2220` and `:443` | default stored in the spec and shown on GET; 400 naming the entry; 400; learn records only within the ceiling; floor wins; control ports refused, `:443` reachable; Firecracker under a non-open default → 501 (§5.10 PC-2) | service + egresspolicy unit + integration |
+| EF-81 | Operator file: invalid at boot; invalid reload; two nodes with different files; an org profile edited, then removed | creates 503 `egress_operator_config_invalid`; last good kept and failure counted; drift alert fires; edit re-applies to local referencing sandboxes, removal holds them with `org_profile_invalid` (§5.10) | config unit + service + integration |
+| EF-82 | Upstream proxy: allowed external name; a name that isn't allowed; an internal-zone name; proxy down; proxy auth | synthetic A from `synthetic_dns_cidr`, then CONNECT through squid succeeds; NXDOMAIN and nothing reaches squid; internal name goes direct; fast fail with `upstream_proxy_unavailable`; credentials never in logs, snapshot or audit (§5.10 PC-4) | proxy + dnsfilter unit + integration (private-cloud) |
+| EF-83 | `builtin_profiles: false` and a create with `builtin:pypi` | 400 "built-in profiles disabled on this deployment" (§5.10 PC-3) | service unit |
+| EF-84 | Custom domain and on-demand TLS with `SB_TLS_ACME_CA` pointing at step-ca, no internet | certificate issued by the internal CA; generated policy JSON carries `ca` and trusted roots; unset keeps today's issuer (§5.10 PC-5) | caddy client unit + integration (private-cloud) |
 
 Engine assignment: EF-47, EF-48, EF-49, EF-51 and EF-56 run in the D16
 `CapEgressFQDN` scenarios (containerd, docker, gVisor). EF-52 to EF-55 run when
@@ -1582,6 +1838,8 @@ Phase 3 starts.
 | `SB_EGRESS_AUDIT_BUFFER` | `10000` | Gateway-side audit event ring buffer; oldest dropped and counted when full (spec review 1). |
 | `SB_EGRESS_LEARN_MAX` | `1024` | Per-sandbox learn-mode recording cap (P2-7). |
 | `SB_EGRESS_PROFILE_APPLY_QPS` | `50` | Per-node rate of profile re-applies to local sandboxes (P2-6). |
+| `SB_EGRESS_OPERATOR_FILE` | unset | Private-cloud operator policy (§5.10): internal zone, default policy, ceiling, floor, node control-port guard, org profiles, built-in switch, upstream proxy. Unset keeps today's behavior. Must be identical on every node (drift alert). |
+| `SB_TLS_ACME_CA` / `SB_TLS_ACME_CA_ROOT` / `SB_TLS_ISSUER` | unset | Ingress certificates from an internal ACME CA, or Caddy's internal issuer (§5.10 PC-5). Unset keeps today's public ACME issuer. |
 
 ---
 
@@ -4209,6 +4467,50 @@ What changed:
   - Surfaced by: user request (latency), §8.2
   - Files: `internal/service/service.go` (`createSandbox`), the `internal/egress` client (persistent connection pool), `pkg/egresspolicy` (compiled-plan cache by content hash), the single-node benchmark report
   - Verify: EF-78; the service unit test pauses Attach to prove the create waits before 2xx and that both rollback points run
+
+## Private-cloud amendment (2026-10-06, user request)
+
+The user asked for private-cloud support after the latency amendment. Like
+that amendment, it is outside the review runs, so it is not in their ledgers
+or the report below.
+
+What it adds:
+- **§5.10:** a single operator file covering an internal zone, the operator
+  default/ceiling/floor and the node control-port guard, org profiles with a
+  built-in switch, and upstream proxy chaining with synthetic DNS.
+- **Ingress certificates** from an internal CA, as a separate PR.
+- **A private-cloud harness scenario.**
+
+Defaults keep today's behavior, with two points to confirm:
+- **Isolate stays strict unless the operator opts in** (D15 unchanged by
+  default).
+- **The node control-port guard defaults to on.** It changes behavior for
+  sandboxes that call a node's control ports directly.
+
+- [ ] **T60 (P1, human: ~1 day / CC: ~1h)** — pkg/egresspolicy + egress + wasm + isolate — Internal zone in the shared dial control and learned-IP filter; isolate opt-in
+  - Surfaced by: user request (private cloud), §5.10 PC-1
+  - Files: `pkg/egresspolicy` (dial control, learned filter), `internal/egress/dnsfilter`, `internal/egress/proxy`, `pkg/wasm` mediator, `pkg/isolate/egress.go`
+  - Verify: EF-79
+- [ ] **T61 (P1, human: ~2 days / CC: ~2h)** — config + service + netrules + egress — Operator file (load, reload, drift metric), default policy pinned into the spec, ceiling, floor, node control-port guard
+  - Surfaced by: user request (private cloud), §5.10 PC-2
+  - Files: `internal/config` (operator file), `internal/service` (create, PUT and facade validation), `pkg/docker/netrules` (floor rule), `internal/egress` (`@deny_floor`, `@node_control` from gossip), `setup/prometheus` (drift alert)
+  - Verify: EF-80, EF-81
+- [ ] **T62 (P1, human: ~2 days / CC: ~2h)** — egress proxy + dnsfilter + shared dialer — Upstream proxy chaining (CONNECT and absolute-form), synthetic DNS, credentials from file
+  - Surfaced by: user request (private cloud), §5.10 PC-4
+  - Files: `internal/egress/proxy`, `internal/egress/dnsfilter`, `pkg/egresspolicy` (chaining dialer)
+  - Verify: EF-82
+- [ ] **T63 (P2, human: ~1 day / CC: ~1h)** — service + egress — Org profiles from the operator file, local re-apply on reload, built-in switch
+  - Surfaced by: user request (private cloud), §5.10 PC-3
+  - Files: `internal/service` (profile resolution), `internal/egress` (re-apply), `pkg/egresspolicy` (catalogue switch)
+  - Verify: EF-81, EF-83
+- [ ] **T64 (P2, human: ~4h / CC: ~30min)** — pkg/caddy + config — Ingress internal ACME CA or internal issuer (separate PR, outside the egress stack)
+  - Surfaced by: user request (private cloud), §5.10 PC-5
+  - Files: `pkg/caddy/client.go` (on-demand policy issuer), `internal/config`
+  - Verify: EF-84; unit test on the generated policy JSON
+- [ ] **T65 (P1, human: ~2 days / CC: ~2h)** — integration-tests — `single-node-private-cloud` scenario (no IGW/NAT, S3 VPC endpoint install, private zone, mock artifactory, squid, step-ca) and `CapPrivateCloud`
+  - Surfaced by: user request (private cloud), §5.10 Verification
+  - Files: `integration-tests/suite` (scenario, harness capability, use cases), Terraform scenario module
+  - Verify: EF-79..EF-84 green in the scenario
 
 ## GSTACK REVIEW REPORT
 
