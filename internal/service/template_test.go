@@ -703,9 +703,20 @@ func TestCreateTemplate_TwoStageHappyPath(t *testing.T) {
 	if snap.lastReq.MemoryMB != 512 || snap.lastReq.VCPU != 1 {
 		t.Errorf("snapshotter resources = %d MiB / %d vCPU, want 512/1", snap.lastReq.MemoryMB, snap.lastReq.VCPU)
 	}
-	// manifest.json must be on disk for operator debugging.
-	if _, err := os.Stat(filepath.Join(templatesDir, "tpl-two", templateManifestFilename)); err != nil {
-		t.Errorf("manifest.json not written: %v", err)
+	// manifest.json is written after the status flip, on the same
+	// goroutine. Wait for that write; polling the row alone returns
+	// as soon as status is ready.
+	manifestPath := filepath.Join(templatesDir, "tpl-two", templateManifestFilename)
+	deadline := time.Now().Add(5 * time.Second)
+	var statErr error
+	for {
+		if _, statErr = os.Stat(manifestPath); statErr == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if statErr != nil {
+		t.Errorf("manifest.json not written: %v", statErr)
 	}
 }
 

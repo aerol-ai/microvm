@@ -64,7 +64,9 @@ func TestFakeSandboxLifecycleAndListFilters(t *testing.T) {
 			t.Fatalf("dropped create returned a body: %s", raw)
 		}
 	}
-	s.CreateDelay = 0
+	// The dropped reply is a hijack, so the client returning does not
+	// happen-before the handler's read of CreateDelay. Take the same lock.
+	s.Observe(func(sv *Server) { sv.CreateDelay = 0 })
 	if s.Count() != 1 {
 		t.Fatalf("dropped create still stored a sandbox, count = %d", s.Count())
 	}
@@ -419,8 +421,11 @@ func TestFakeAttachSignalAndHang(t *testing.T) {
 		t.Fatalf("exit signal = %q %v", msg, err)
 	}
 
-	s.HangAttach = true
-	s.AttachReady = make(chan struct{})
+	ready := make(chan struct{})
+	s.Observe(func(sv *Server) {
+		sv.HangAttach = true
+		sv.AttachReady = ready
+	})
 	hung := make(chan struct{})
 	go func() {
 		defer close(hung)
@@ -428,11 +433,11 @@ func TestFakeAttachSignalAndHang(t *testing.T) {
 		if err != nil {
 			return
 		}
-		<-s.AttachReady
+		<-ready
 		c.Close()
 	}()
 	select {
-	case <-s.AttachReady:
+	case <-ready:
 	case <-time.After(2 * time.Second):
 		t.Fatal("hanging attach did not start")
 	}
