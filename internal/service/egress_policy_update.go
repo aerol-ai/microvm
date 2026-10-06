@@ -200,7 +200,11 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		return s.effectivePolicy(ctx, old, resolved), nil
 	}
 
-	if err := s.commitPolicySpec(ctx, id, &create); err != nil {
+	st, err := s.store.GetEgressState(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.commitPolicySpec(ctx, id, &create, st.Withheld); err != nil {
 		return nil, err
 	}
 	if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
@@ -278,7 +282,7 @@ func (s *Service) effectivePolicy(ctx context.Context, sb *models.Sandbox, r res
 // failure is returned, so a failover can never bring back the old policy
 // after this call answered 2xx. A sandbox with no replicated spec (single
 // node, pre-cluster) has nothing to commit.
-func (s *Service) commitPolicySpec(ctx context.Context, id string, create *models.CreateSandboxRequest) error {
+func (s *Service) commitPolicySpec(ctx context.Context, id string, create *models.CreateSandboxRequest, withheld []string) error {
 	c := s.Cluster()
 	if c == nil {
 		return nil
@@ -287,7 +291,17 @@ func (s *Service) commitPolicySpec(ctx context.Context, id string, create *model
 	if spec == nil {
 		return nil
 	}
+	// Every egress field: a failover replays the spec, so one left behind
+	// would bring back the old profiles, mode or rules.
 	spec.NetworkBlockAll, spec.NetworkAllowOut, spec.NetworkDenyOut = create.NetworkBlockAll, create.NetworkAllowOut, create.NetworkDenyOut
+	spec.EgressProfiles, spec.NetworkEgressMode, spec.NetworkEgressRules = create.EgressProfiles, create.NetworkEgressMode, create.NetworkEgressRules
+	// Keys withheld at create stay withheld after their inject rule goes
+	// (P3-2).
+	for _, k := range withheld {
+		if !slices.Contains(spec.EgressWithheldEnv, k) {
+			spec.EgressWithheldEnv = append(spec.EgressWithheldEnv, k)
+		}
+	}
 	commitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := c.UpsertSpec(commitCtx, id, spec, cluster.PlacementSecrets{}); err != nil {

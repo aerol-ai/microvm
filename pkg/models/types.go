@@ -634,6 +634,12 @@ type CreateSandboxRequest struct {
 	// node's CA, which the sandbox is given to trust; it has to be set at
 	// create.
 	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EgressWithheldEnv lists env keys the sandbox gets placeholders for
+	// instead of values (P3-2). sandboxd keeps it in the replicated spec, so
+	// a key an inject rule withheld at create stays withheld after the rule
+	// is removed: a recreate on another node must not hand the sandbox a
+	// credential it never had. A create may set it to withhold keys itself.
+	EgressWithheldEnv []string `json:"egress_withheld_env,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
 	// <id>.<domain> ingress route and empty public_url. Pass an explicit true

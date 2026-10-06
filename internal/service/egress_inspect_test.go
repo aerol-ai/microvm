@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -249,5 +250,57 @@ func TestIsolateInject(t *testing.T) {
 	// requests rather than send the placeholder.
 	if got := svc.egressSecrets(ctx, &models.Sandbox{ID: "missing", NetworkEgressRules: injectRules}); len(got) != 0 {
 		t.Fatalf("secrets for an unreadable env = %v", got)
+	}
+}
+
+// TestEgressSpecReplication: a live policy change replicates every egress
+// field, and an env key withheld for an inject rule stays withheld after
+// the rule is removed, through the spec a failover replays (P3-2).
+func TestEgressSpecReplication(t *testing.T) {
+	svc, _, rt := newInspectHarness(t)
+	ctx := ownerCtx("acct")
+	env := map[string]string{"GITHUB_TOKEN": "Bearer ghp_real"}
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", Env: env, NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules})
+	if err != nil {
+		t.Fatal(err)
+	}
+	putProfile(t, svc, ctx, "extra", "pypi.org")
+	stub := &specWriteThroughCluster{Noop: cluster.NewNoop("self", "http://self", ""), spec: &models.CreateSandboxRequest{Image: "alpine", Env: env,
+		NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules}}
+	svc.AttachCluster(stub)
+	plain := []models.EgressRule{{Host: "api.example.org", Inspect: true, Methods: []string{"GET"}}}
+	if _, err := svc.UpdateNetworkPolicy(ctx, resp.ID, models.NetworkPolicyRequest{NetworkAllowOut: []string{"api.example.org"},
+		EgressProfiles: []string{"extra"}, NetworkEgressRules: plain}); err != nil {
+		t.Fatal(err)
+	}
+	calls := stub.calls()
+	if len(calls) != 1 {
+		t.Fatalf("replicated specs = %d", len(calls))
+	}
+	spec := calls[0]
+	if !slices.Equal(spec.EgressProfiles, []string{"extra"}) || len(spec.NetworkEgressRules) != 1 || spec.NetworkEgressRules[0].Inject != nil ||
+		!slices.Equal(spec.EgressWithheldEnv, []string{"GITHUB_TOKEN"}) {
+		t.Fatalf("replicated spec = %+v", spec)
+	}
+
+	// The failover replay of that spec: the key is still a placeholder.
+	svc.AttachCluster(nil)
+	replay := spec
+	replay.Env = env
+	if _, err := svc.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), replay, "sb-recreated"); err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastCreateReq.Env["GITHUB_TOKEN"]; got != "aerolvm-placeholder:GITHUB_TOKEN" {
+		t.Fatalf("recreated sandbox env = %q", got)
+	}
+	if es, _ := svc.store.GetEgressState(ctx, "sb-recreated"); !slices.Equal(es.Withheld, []string{"GITHUB_TOKEN"}) {
+		t.Fatalf("withheld on the new node = %v", es.Withheld)
+	}
+	row, _ := svc.store.Get(ctx, "sb-recreated")
+	if got, err := svc.specFromSandbox(ctx, row); err != nil || !slices.Equal(got.EgressWithheldEnv, []string{"GITHUB_TOKEN"}) {
+		t.Fatalf("ownership replay spec = %+v %v", got, err)
+	}
+	if got := withholdEnv(nil, []string{"MISSING"}); len(got) != 0 {
+		t.Fatalf("a key the env lacks is not invented: %v", got)
 	}
 }

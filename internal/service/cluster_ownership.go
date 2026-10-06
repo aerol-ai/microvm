@@ -282,6 +282,9 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		if err != nil {
 			return nil, fmt.Errorf("load egress profiles for ownership replay %s: %w", sb.ID, err)
 		}
+		if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil {
+			spec.EgressWithheldEnv = st.Withheld
+		}
 		if len(profiles.Refs) > 0 {
 			// Profiles and block-all are exclusive; a block-all row with
 			// references is a replay held until its profiles resolve.

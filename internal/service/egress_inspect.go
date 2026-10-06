@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -223,16 +224,42 @@ func (s *Service) prepareInspect(ctx context.Context, env map[string]string, rul
 			out[k] = v
 		}
 	}
-	// Injected credentials (P3-2): the sandbox gets a placeholder; the
-	// gateway gets the value.
-	for _, k := range injectKeys(rules) {
-		out[k] = egresspolicy.InjectPlaceholder(k)
-	}
+
 	binds := []mounts.ContainerBind{
 		{HostPath: s.egressCACertPath(), ContainerPath: inspectCAPath, ReadOnly: true},
 		{ContainerPath: inspectBundleDir, Tmpfs: true},
 	}
 	return binds, out, nil
+}
+
+// withheldKeys are the env keys a container sandbox gets placeholders for
+// (P3-2): the ones its inject rules name, plus any its spec already
+// withheld, which stay withheld for the sandbox's life.
+func withheldKeys(req *models.CreateSandboxRequest) []string {
+	keys := append([]string(nil), req.EgressWithheldEnv...)
+	for _, k := range injectKeys(req.NetworkEgressRules) {
+		if !slices.Contains(keys, k) {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+// withholdEnv replaces keys' values in a copy of env with placeholders.
+func withholdEnv(env map[string]string, keys []string) map[string]string {
+	if len(keys) == 0 {
+		return env
+	}
+	out := maps.Clone(env)
+	if out == nil {
+		out = map[string]string{}
+	}
+	for _, k := range keys {
+		if _, ok := out[k]; ok {
+			out[k] = egresspolicy.InjectPlaceholder(k)
+		}
+	}
+	return out
 }
 
 // checkInjectKeys requires every injected env key to exist in a sandbox's

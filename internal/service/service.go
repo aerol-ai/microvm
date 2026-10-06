@@ -1669,7 +1669,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if !isStoredSpecReplay(ctx) {
 		s.NormalizeCreateEgressDefault(&req)
 	}
-	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
+	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 || len(req.EgressWithheldEnv) > 0 {
 		if _, cerr := compileCreateEgress(&req); cerr != nil {
 			return nil, cerr
 		}
@@ -1690,10 +1690,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if rerr != nil {
 			return nil, rerr
 		}
-		if mode, rules := req.NetworkEgressMode, req.NetworkEgressRules; len(resolved.Refs) > 0 || mode != "" || len(rules) > 0 {
+		if mode, rules, withheld := req.NetworkEgressMode, req.NetworkEgressRules, withheldKeys(&req); len(resolved.Refs) > 0 || mode != "" || len(rules) > 0 || len(withheld) > 0 {
 			defer func() {
 				if err == nil && resp != nil {
-					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode, rules, held)
+					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode, rules, withheld, held)
 				}
 			}()
 		}
@@ -1964,6 +1964,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, err
 		}
 	}
+	// Credentials the gateway injects, or ever injected for this sandbox,
+	// are placeholders inside it (P3-2), with or without inspect rules now.
+	withheld := withheldKeys(&req)
+	driverReq.Env = withholdEnv(driverReq.Env, withheld)
 
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
 	if err != nil {
