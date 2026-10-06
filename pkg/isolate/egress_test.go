@@ -3,6 +3,7 @@ package isolate
 import (
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -225,4 +226,48 @@ func TestServeEgressSlotFailsClosed(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("owner without policy = %d, want 403 (fail-closed)", rec.Code)
 	}
+}
+
+// TestProxyEgressDenialsExplainAndReport (P1-13, P1-7): every 403 names the
+// destination and why, and every denial for an attributed sandbox reaches
+// the denial observer with the shared reason.
+func TestProxyEgressDenialsExplainAndReport(t *testing.T) {
+	prev := egressTransport
+	t.Cleanup(func() { egressTransport = prev })
+	egressTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, &net.OpError{Op: "dial", Err: egresspolicy.ErrDialRefused}
+	})
+	type denial struct{ id, dest, reason string }
+	var got []denial
+	h := &Host{}
+	h.SetEgressDenialObserver(func(id, dest, reason string) { got = append(got, denial{id, dest, reason}) })
+	cases := []struct {
+		url    string
+		p      EgressPolicy
+		reason string
+		body   string
+	}{
+		{"http://other.example/x", EgressPolicy{Allow: []string{"only.example"}}, DenyReasonHostNotAllowed, "host other.example not allowed (no rule matches)"},
+		{"http://198.51.100.7/x", EgressPolicy{Deny: []string{"198.51.100.0/24"}}, DenyReasonIPNotAllowed, "not allowed (rule 198.51.100.0/24)"},
+		{"http://169.254.169.254/x", EgressPolicy{}, DenyReasonBlockedIP, "is a blocked address"},
+		{"http://rebind.example/x", EgressPolicy{}, DenyReasonBlockedIP, "resolves to a blocked address"},
+	}
+	for _, tc := range cases {
+		rec := httptest.NewRecorder()
+		h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, tc.url, nil), "sb-x", mustPolicy(t, tc.p))
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), tc.body) || !strings.HasPrefix(rec.Body.String(), "aerolvm egress policy:") {
+			t.Fatalf("%s: %d %q, want 403 containing %q", tc.url, rec.Code, rec.Body.String(), tc.body)
+		}
+		if last := got[len(got)-1]; last.id != "sb-x" || last.reason != tc.reason {
+			t.Fatalf("%s: observed %+v, want reason %s", tc.url, last, tc.reason)
+		}
+	}
+	// An unattributed request (empty id) still gets the 403 but no audit.
+	n := len(got)
+	rec := httptest.NewRecorder()
+	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://other.example/", nil), "", mustPolicy(t, EgressPolicy{Allow: []string{"only.example"}}))
+	if rec.Code != http.StatusForbidden || len(got) != n {
+		t.Fatal("an unattributed denial must not be reported")
+	}
+	(*Host)(nil).SetEgressDenialObserver(nil)
 }

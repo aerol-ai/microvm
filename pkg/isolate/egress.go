@@ -1,6 +1,7 @@
 package isolate
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,20 @@ import (
 // through the host egress proxy. Must be non-blocking. Destination is host or
 // host:port — never credentials.
 type EgressObserver func(sandboxID, network, destination string)
+
+// EgressDenialObserver receives each refused egress request with the
+// shared denial reason (plans/egress-domain-filtering.md H5, P1-7), so
+// isolate denials land in the same audit log and counters as the gateway's.
+// Called synchronously on the request path: it must not block.
+type EgressDenialObserver func(sandboxID, destination, reason string)
+
+// Denial reasons, shared with the gateway's vocabulary.
+const (
+	DenyReasonHostNotAllowed = "host_not_allowed"
+	DenyReasonIPNotAllowed   = "ip_not_allowed"
+	DenyReasonBlockedIP      = "blocked_ip"
+	DenyReasonBadRequest     = "bad_request"
+)
 
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
 // egress proxy (plans/isolate-runtime.md §4 Phase 3). Mirrored from the
@@ -152,8 +167,10 @@ func (h *Host) startEgressDenyServer() error {
 		return fmt.Errorf("isolate: listen egress-deny socket: %w", err)
 	}
 	h.egressDenySrv = &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			http.Error(w, "egress denied: sandbox has no egress slot (block-all or pool exhausted)", http.StatusForbidden)
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The socket carries no sandbox identity, so nothing to audit;
+			// the body still says why.
+			http.Error(w, "aerolvm egress policy: host "+r.Host+" not allowed (network_block_all, or the node's isolate egress pool is exhausted)", http.StatusForbidden)
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       30 * time.Second,
@@ -177,7 +194,7 @@ func (h *Host) serveEgressSlot(slot int, w http.ResponseWriter, r *http.Request)
 	p, ok := h.egressPolicy[id]
 	h.mu.RUnlock()
 	if id == "" || !ok || p == nil {
-		http.Error(w, "egress denied: slot has no attributed sandbox", http.StatusForbidden)
+		http.Error(w, "aerolvm egress policy: host "+r.Host+" not allowed (no sandbox owns this egress slot)", http.StatusForbidden)
 		return
 	}
 	h.proxyEgress(w, r, id, p)
@@ -202,18 +219,22 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	}
 	host, port, ok := splitAuthority(authority)
 	if host == "" {
-		http.Error(w, "egress denied: no destination host", http.StatusForbidden)
+		h.denyEgress(w, sandboxID, authority, DenyReasonBadRequest, "aerolvm egress policy: request has no destination host")
 		return
 	}
 	if !ok {
-		http.Error(w, "egress denied: invalid destination port", http.StatusForbidden)
+		h.denyEgress(w, sandboxID, authority, DenyReasonBadRequest, "aerolvm egress policy: "+authority+": invalid destination port")
 		return
 	}
 	// Port semantics are the shared grammar's (plans/egress-domain-filtering.md
 	// §5.1): a bare host allows 80/443 and host:port exactly that port, so the
 	// match is on the port the proxy will actually dial.
-	if allowed, _ := p.MatchHostPort(host, port); !allowed {
-		http.Error(w, "egress denied by sandbox policy", http.StatusForbidden)
+	if allowed, rule := p.MatchHostPort(host, port); !allowed {
+		reason := DenyReasonHostNotAllowed
+		if _, err := netip.ParseAddr(host); err == nil {
+			reason = DenyReasonIPNotAllowed
+		}
+		h.denyEgress(w, sandboxID, authority, reason, egresspolicy.DenyMessage(authority, rule))
 		return
 	}
 	// Defense-in-depth against SSRF: isolate egress runs from the HOST network
@@ -225,7 +246,7 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	// re-checks the resolved IP at dial time (egresspolicy.StrictDialControl).
 	if ip, err := netip.ParseAddr(host); err == nil {
 		if err := isolateDialGuard.Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(ip, port)}); err != nil {
-			http.Error(w, "egress denied: destination is a blocked (loopback/link-local/private) address", http.StatusForbidden)
+			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" is a blocked address (loopback, link-local or private)")
 			return
 		}
 	}
@@ -236,6 +257,12 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	outReq.Host = authority
 	resp, err := egressTransport.RoundTrip(outReq)
 	if err != nil {
+		// A hostname that resolved into a blocked range is refused by the
+		// dial guard: a policy denial, not a network fault.
+		if errors.Is(err, egresspolicy.ErrDialRefused) {
+			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" resolves to a blocked address (loopback, link-local or private)")
+			return
+		}
 		http.Error(w, "egress proxy: "+err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -249,6 +276,18 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// denyEgress answers a refused request with a 403 that names the
+// destination and why (CEO D4), and reports it for audit (H5).
+func (h *Host) denyEgress(w http.ResponseWriter, sandboxID, destination, reason, msg string) {
+	h.mu.RLock()
+	obs := h.egressDenialObserver
+	h.mu.RUnlock()
+	if obs != nil && sandboxID != "" {
+		obs(sandboxID, destination, reason)
+	}
+	http.Error(w, msg, http.StatusForbidden)
 }
 
 // splitAuthority returns the destination host and the port the proxy will

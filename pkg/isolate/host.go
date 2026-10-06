@@ -88,6 +88,8 @@ type Host struct {
 
 	// egressObserver records host-mediated destinations (E3a). Guarded by mu.
 	egressObserver EgressObserver
+	// egressDenialObserver records refused requests (H5). Guarded by mu.
+	egressDenialObserver EgressDenialObserver
 }
 
 // SetEgressObserver installs (or clears) the async egress attribution callback.
@@ -97,6 +99,16 @@ func (h *Host) SetEgressObserver(obs EgressObserver) {
 	}
 	h.mu.Lock()
 	h.egressObserver = obs
+	h.mu.Unlock()
+}
+
+// SetEgressDenialObserver installs (or clears) the denial audit callback.
+func (h *Host) SetEgressDenialObserver(obs EgressDenialObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.egressDenialObserver = obs
 	h.mu.Unlock()
 }
 

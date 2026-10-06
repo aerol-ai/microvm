@@ -122,3 +122,17 @@ func (c *egressCounters) recordLayoutLost() {
 	c.layoutLost.Add(1)
 	egressLayoutLostTotal.Add(1)
 }
+
+// EgressDenialObserver is the callback for denials decided inside sandboxd
+// rather than by the gateway (the isolate egress proxy; P1-7, H5): it adds
+// to aerolvm_egress_denied_total and writes the denial to the audit log
+// when attribution is on. It never blocks the request path: the audit
+// write is handed to a goroutine like the success observer's.
+func (s *Service) EgressDenialObserver() func(sandboxID, destination, reason string) {
+	return func(sandboxID, destination, reason string) {
+		egressDeniedTotal.Add(reason, 1)
+		if s != nil && s.cfg.EgressAttributionEnabled {
+			go s.emitEgressDecision(sandboxID, "tcp", destination, false, reason)
+		}
+	}
+}

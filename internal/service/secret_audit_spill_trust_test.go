@@ -290,3 +290,29 @@ func stringsContainsKind(raw []byte, kind string) bool {
 	}
 	return false
 }
+
+// A spilled WASM denial (H5) keeps its outcome when the reason is in the
+// worker vocabulary: the drain chains it as a failure under the capability's
+// identity, like the HTTP ingest does.
+func TestDrainSpillKeepsWorkerDenial(t *testing.T) {
+	sink := newDrainTestSink(t)
+	now := time.Now().UTC()
+	payload := spillLines(t, auditlog.SpillRecord{
+		Event: SecretAuditEvent{
+			Time: now.Add(-time.Second), EventID: "ae-denied", SandboxID: "sb", Kind: secretAuditKindEgress,
+			Destination: "evil.example:443", Network: "tcp", Result: secretAuditResultFailure, Reason: "host_not_allowed",
+		},
+		Capability: mintDrainTestCapability(t, "sb", "inc-sb", now.Add(time.Hour)),
+	})
+	if err := os.WriteFile(sink.spillPath, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requireSpillDrained(t, sink, "drainSpill returned false")
+	raw, err := os.ReadFile(sink.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"result":"failure"`)) || !bytes.Contains(raw, []byte(`"reason":"host_not_allowed"`)) {
+		t.Fatalf("spilled denial lost its outcome:\n%s", raw)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,6 +47,13 @@ func TestMediatorPolicyDecisions(t *testing.T) {
 		if !errors.Is(err, wasmengine.ErrNetworkEgressBlocked) {
 			t.Fatal("a denial must map to the guest's blocked error")
 		}
+	}
+	// A deny CIDR that decided is named in the error (P1-13).
+	m.SetPolicy("sb", mustPolicy(t, nil, []string{"198.51.100.0/24"}))
+	_, err := m.DialContext(ctx, "sb", "tcp", "198.51.100.9:443")
+	var byRule *wasmengine.EgressDeniedError
+	if !errors.As(err, &byRule) || byRule.Rule != "198.51.100.0/24" || !strings.Contains(err.Error(), "rule 198.51.100.0/24") {
+		t.Fatalf("deny-rule err = %v", err)
 	}
 	// An allowed CIDR that names loopback is still refused by the guard.
 	m.SetPolicy("sb", mustPolicy(t, []string{"127.0.0.0/8"}, nil))
@@ -194,4 +202,31 @@ func TestResidentSetEgressPolicyMessage(t *testing.T) {
 		t.Fatal("live update must replace the policy")
 	}
 	_ = io.EOF
+}
+
+// TestMediatorReportsDenials (H5): every policy denial, including an SNI
+// mismatch caught after the dial, reaches the denial observer with the
+// sandbox, destination and reason; allowed dials do not.
+func TestMediatorReportsDenials(t *testing.T) {
+	m := newNetMediator()
+	type denial struct{ id, addr, reason string }
+	var got []denial
+	m.SetEgressDenialObserver(func(id, _, addr, reason string) { got = append(got, denial{id, addr, reason}) })
+	m.SetPolicy("sb", mustPolicy(t, []string{"pypi.org"}, nil))
+	if _, err := m.DialContext(context.Background(), "sb", "tcp", "evil.example:443"); err == nil {
+		t.Fatal("denied")
+	}
+	if len(got) != 1 || got[0] != (denial{"sb", "evil.example:443", reasonHostNotAllowed}) {
+		t.Fatalf("denials = %+v", got)
+	}
+	c := &sniCheckConn{Conn: &captureConn{}, host: "pypi.org", port: 443, onDeny: func(sni string) {
+		m.observeDenial("sb", "tcp", sni+":443", reasonSNIMismatch)
+	}}
+	if _, err := c.Write(clientHello(t, "evil.example")); err == nil {
+		t.Fatal("fronting must be refused")
+	}
+	if len(got) != 2 || got[1].reason != reasonSNIMismatch || got[1].addr != "evil.example:443" {
+		t.Fatalf("sni denial = %+v", got)
+	}
+	(*NetMediator)(nil).SetEgressDenialObserver(nil)
 }

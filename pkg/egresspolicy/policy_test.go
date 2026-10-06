@@ -317,3 +317,15 @@ func TestNeedsGateway(t *testing.T) {
 		}
 	}
 }
+
+func TestDenyMessage(t *testing.T) {
+	for _, tc := range []struct{ rule, want string }{
+		{"", "aerolvm egress policy: host evil.example not allowed (no rule matches)"},
+		{RuleBlockAll, "aerolvm egress policy: host evil.example not allowed (network_block_all)"},
+		{"10.0.0.0/8", "aerolvm egress policy: host evil.example not allowed (rule 10.0.0.0/8)"},
+	} {
+		if got := DenyMessage("evil.example", tc.rule); got != tc.want {
+			t.Errorf("DenyMessage(%q) = %q, want %q", tc.rule, got, tc.want)
+		}
+	}
+}

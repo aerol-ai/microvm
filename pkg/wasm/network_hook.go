@@ -19,9 +19,15 @@ type EgressDeniedError struct {
 	Host   string
 	Port   uint16
 	Reason string
+	// Rule is the policy entry that decided; empty when none matched and
+	// the default verdict refused (P1-13 names host and rule).
+	Rule string
 }
 
 func (e *EgressDeniedError) Error() string {
+	if e.Rule != "" {
+		return fmt.Sprintf("aerolvm egress policy: %s:%d not allowed (%s, rule %s)", e.Host, e.Port, e.Reason, e.Rule)
+	}
 	return fmt.Sprintf("aerolvm egress policy: %s:%d not allowed (%s)", e.Host, e.Port, e.Reason)
 }
 

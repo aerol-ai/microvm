@@ -47,6 +47,23 @@ const (
 // (or a deny-all list with no allow list) decides.
 const RuleBlockAll = "network_block_all"
 
+// DenyMessage is the text every enforcement point returns for a policy
+// denial (CEO D4, D10 explainable denials): it names the refused
+// destination and the rule that decided, so code in the sandbox can tell a
+// policy refusal from a network fault and ask for the right access. It
+// reveals nothing else about the policy. rule is what a Match* call
+// returned: "" when no rule matched (the default verdict decided).
+func DenyMessage(dest, rule string) string {
+	why := "no rule matches"
+	switch {
+	case rule == RuleBlockAll:
+		why = RuleBlockAll
+	case rule != "":
+		why = "rule " + rule
+	}
+	return "aerolvm egress policy: host " + dest + " not allowed (" + why + ")"
+}
+
 // Spec is the raw policy as it arrives on the wire.
 type Spec struct {
 	AllowOut []string

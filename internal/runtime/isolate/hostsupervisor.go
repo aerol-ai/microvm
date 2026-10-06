@@ -18,6 +18,7 @@ type workerdSupervisor struct {
 	useJail        bool
 	egressPoolSize int
 	egressObserver pkgisolate.EgressObserver
+	denialObserver pkgisolate.EgressDenialObserver
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
@@ -37,6 +38,15 @@ func (s *workerdSupervisor) SetEgressObserver(obs pkgisolate.EgressObserver) {
 		return
 	}
 	s.egressObserver = obs
+}
+
+// SetEgressDenialObserver installs denial audit (H5) on every group host
+// this supervisor spawns.
+func (s *workerdSupervisor) SetEgressDenialObserver(obs pkgisolate.EgressDenialObserver) {
+	if s == nil {
+		return
+	}
+	s.denialObserver = obs
 }
 
 func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (GroupHost, error) {
@@ -77,6 +87,9 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	}
 	if s.egressObserver != nil {
 		host.SetEgressObserver(s.egressObserver)
+	}
+	if s.denialObserver != nil {
+		host.SetEgressDenialObserver(s.denialObserver)
 	}
 	if err := host.Start(ctx); err != nil {
 		return nil, err

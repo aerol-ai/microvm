@@ -17,6 +17,11 @@ import (
 // audit I/O. Destination is host or host:port — never credentials.
 type EgressObserver func(sandboxID, network, address string)
 
+// EgressDenialObserver is notified when policy refuses a dial or a TLS
+// hello (plans/egress-domain-filtering.md H5). Same non-blocking contract
+// as EgressObserver; reason is one of the mediator's denial reasons.
+type EgressDenialObserver func(sandboxID, network, address, reason string)
+
 // NetMediator is the host-mediated TCP egress surface for UC-43. Guest WASI
 // sockets (when wired) and host-side proxies dial through here so bytes and
 // quota blocks are observable per sandbox.
@@ -27,6 +32,8 @@ type NetMediator struct {
 	usage   map[string]*workerNetUsage
 	// observer is called after a successful dial (destination attribution).
 	observer EgressObserver
+	// denialObserver is called when policy refuses a connection (H5).
+	denialObserver EgressDenialObserver
 	// policies are the per-sandbox egress policies (P1-6); guard is the
 	// operator dial guard. No policy keeps the open default.
 	policies map[string]*egresspolicy.Policy
@@ -49,6 +56,25 @@ func (m *NetMediator) SetEgressObserver(obs EgressObserver) {
 	m.mu.Lock()
 	m.observer = obs
 	m.mu.Unlock()
+}
+
+// SetEgressDenialObserver installs (or clears) the denial audit callback.
+func (m *NetMediator) SetEgressDenialObserver(obs EgressDenialObserver) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.denialObserver = obs
+	m.mu.Unlock()
+}
+
+func (m *NetMediator) observeDenial(sandboxID, network, address, reason string) {
+	m.mu.RLock()
+	obs := m.denialObserver
+	m.mu.RUnlock()
+	if obs != nil {
+		obs(sandboxID, network, address, reason)
+	}
 }
 
 func (m *NetMediator) egressObserver() EgressObserver {
@@ -116,7 +142,11 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 	var conn net.Conn
 	var err error
 	if p := m.policyFor(sandboxID); p != nil {
-		conn, err = m.policyDial(ctx, p, network, address)
+		conn, err = m.policyDial(ctx, sandboxID, p, network, address)
+		var denied *wasmengine.EgressDeniedError
+		if errors.As(err, &denied) {
+			m.observeDenial(sandboxID, network, address, denied.Reason)
+		}
 	} else {
 		d := net.Dialer{Timeout: 30 * time.Second}
 		conn, err = d.DialContext(ctx, network, address)

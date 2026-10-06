@@ -70,7 +70,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		}
 		if !allowed && src.Mode == egress.ModeAllowlist {
 			p.observe(Decision{SandboxID: id, Host: host, Port: 80, Reason: ReasonHostNotAllowed, Mode: src.Mode})
-			writeHTTPError(c, http.StatusForbidden, fmt.Sprintf("aerolvm egress policy: host %s not allowed (no rule matches)", host))
+			writeHTTPError(c, http.StatusForbidden, egresspolicy.DenyMessage(host, rule))
 			return
 		}
 		// Only an explicit allow rule skips the policy at dial time (allow

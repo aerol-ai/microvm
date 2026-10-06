@@ -86,7 +86,7 @@ func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
 // link-local always refused, private ranges only when a CIDR allows them).
 // On 443 the guest's TLS SNI must equal the name it dialed, which closes
 // TLS-level fronting inside an allowed IP.
-func (m *NetMediator) policyDial(ctx context.Context, p *egresspolicy.Policy, network, address string) (net.Conn, error) {
+func (m *NetMediator) policyDial(ctx context.Context, sandboxID string, p *egresspolicy.Policy, network, address string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
@@ -110,7 +110,7 @@ func (m *NetMediator) policyDial(ctx context.Context, p *egresspolicy.Policy, ne
 		if isIP == nil {
 			reason = reasonIPNotAllowed
 		}
-		return nil, &wasmengine.EgressDeniedError{Host: host, Port: port, Reason: reason}
+		return nil, &wasmengine.EgressDeniedError{Host: host, Port: port, Reason: reason, Rule: rule}
 	}
 	name := host
 	if isIP == nil {
@@ -125,7 +125,9 @@ func (m *NetMediator) policyDial(ctx context.Context, p *egresspolicy.Policy, ne
 		return nil, err
 	}
 	if port == 443 && isIP != nil {
-		return &sniCheckConn{Conn: conn, host: host, port: port}, nil
+		return &sniCheckConn{Conn: conn, host: host, port: port, onDeny: func(sni string) {
+			m.observeDenial(sandboxID, network, net.JoinHostPort(sni, portStr), reasonSNIMismatch)
+		}}, nil
 	}
 	return conn, nil
 }
@@ -137,6 +139,8 @@ type sniCheckConn struct {
 	net.Conn
 	host string
 	port uint16
+	// onDeny reports a fronting attempt for audit (H5); nil in tests.
+	onDeny func(sni string)
 
 	mu      sync.Mutex
 	decided bool
@@ -156,6 +160,9 @@ func (c *sniCheckConn) Write(p []byte) (int, error) {
 		return len(p), nil
 	case err == nil && hello.ServerName != "" && !strings.EqualFold(hello.ServerName, c.host):
 		_ = c.Conn.Close()
+		if c.onDeny != nil {
+			c.onDeny(hello.ServerName)
+		}
 		return 0, &wasmengine.EgressDeniedError{Host: hello.ServerName, Port: c.port, Reason: reasonSNIMismatch}
 	}
 	c.decided = true

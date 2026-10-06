@@ -107,3 +107,18 @@ func TestEgressGauges(t *testing.T) {
 		t.Fatal("no wired service reads 0")
 	}
 }
+
+// TestEgressDenialObserver (P1-7, H5): denials decided in sandboxd (the
+// isolate proxy) count in the shared series and reach the audit log when
+// attribution is on.
+func TestEgressDenialObserver(t *testing.T) {
+	before := deniedTotal("host_not_allowed")
+	var nilSvc *Service
+	nilSvc.EgressDenialObserver()("sb", "evil.example:443", "host_not_allowed")
+	svc, _, _ := newEgressHarness(t)
+	svc.cfg.EgressAttributionEnabled = true
+	svc.EgressDenialObserver()("sb", "evil.example:443", "host_not_allowed")
+	if got := deniedTotal("host_not_allowed") - before; got != 2 {
+		t.Fatalf("denials counted = %d, want 2", got)
+	}
+}
