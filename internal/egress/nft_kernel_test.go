@@ -274,7 +274,7 @@ func TestKernelDataPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	sbx := netip.MustParseAddr(kSbxIP)
-	if err := g.Attach(Spec{ID: "sb", IP: sbx, Mode: ModeAllowlist, AllowOut: []string{"pypi.org"}}); err != nil {
+	if err := g.Attach(Spec{ID: "sb", IP: sbx, AllowOut: []string{"pypi.org"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -306,7 +306,7 @@ func TestKernelDataPath(t *testing.T) {
 		}
 	})
 	t.Run("allow CIDR forwards directly", func(t *testing.T) {
-		if err := g.Update(Spec{ID: "sb", IP: sbx, Mode: ModeAllowlist, AllowOut: []string{"pypi.org", kRemoteIP + "/32"}}); err != nil {
+		if err := g.Update(Spec{ID: "sb", IP: sbx, AllowOut: []string{"pypi.org", kRemoteIP + "/32"}}); err != nil {
 			t.Fatal(err)
 		}
 		if got := dialFromSandbox(t, remote9000); got != "OK remote-9000" {
@@ -317,7 +317,7 @@ func TestKernelDataPath(t *testing.T) {
 		}
 	})
 	t.Run("learned host:port opens one port", func(t *testing.T) {
-		if err := g.Update(Spec{ID: "sb", IP: sbx, Mode: ModeAllowlist, AllowOut: []string{"github.com:22"}}); err != nil {
+		if err := g.Update(Spec{ID: "sb", IP: sbx, AllowOut: []string{"github.com:22"}}); err != nil {
 			t.Fatal(err)
 		}
 		if got := dialFromSandbox(t, net.JoinHostPort(kRemoteIP, "22")); got != "REFUSED" {

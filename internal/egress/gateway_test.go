@@ -45,49 +45,53 @@ func newTestGateway(t *testing.T) (*Gateway, *MemBackend, *flushRecorder) {
 }
 
 func allowSpec(id string, ip netip.Addr, allow ...string) Spec {
-	return Spec{ID: id, IP: ip, Mode: ModeAllowlist, AllowOut: allow}
+	return Spec{ID: id, IP: ip, AllowOut: allow}
 }
 
 func TestAttachInstallsElementsPerMode(t *testing.T) {
 	cases := []struct {
-		mode    Mode
+		name    string
+		spec    Spec
 		modeSet string
 	}{
-		{ModeAllowlist, SetSrcDenyDefault},
-		{ModeDenylist, SetSrcAccept},
-		{ModeLearn, SetLearnSrc},
+		{"allowlist", Spec{ID: "sb", IP: ipA, AllowOut: []string{"pypi.org", "10.0.0.0/8", "1.2.3.4/32"}}, SetSrcDenyDefault},
+		{"mixed allow-wins", Spec{ID: "sb", IP: ipA, AllowOut: []string{"pypi.org", "10.0.0.0/8", "1.2.3.4/32"}, DenyOut: []string{"10.1.0.0/16"}}, SetSrcAccept},
+		{"learn", Spec{ID: "sb", IP: ipA, Learn: true}, SetLearnSrc},
 	}
 	for _, tc := range cases {
-		t.Run(string(tc.mode), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			g, be, _ := newTestGateway(t)
-			spec := Spec{ID: "sb", IP: ipA, Mode: tc.mode}
-			if tc.mode != ModeLearn {
-				spec.AllowOut = []string{"pypi.org", "10.0.0.0/8", "1.2.3.4"}
-				spec.DenyOut = []string{"10.1.0.0/16"}
-			}
-			if err := g.Attach(spec); err != nil {
+			if err := g.Attach(tc.spec); err != nil {
 				t.Fatal(err)
 			}
 			if !be.Has(SetFQDNSrc, Elem{Src: ipA}) || !be.Has(tc.modeSet, Elem{Src: ipA}) {
 				t.Fatal("source not in fqdn_src and its mode set")
 			}
-			if tc.mode != ModeLearn {
-				want := Elem{Src: ipA, Dst: netip.MustParseAddr("10.0.0.0"), DstEnd: netip.MustParseAddr("10.255.255.255")}
-				if !be.Has(SetAllowCIDR, want) {
-					t.Fatal("allow CIDR interval missing")
-				}
-				if !be.Has(SetAllowCIDR, Elem{Src: ipA, Dst: netip.MustParseAddr("1.2.3.4"), DstEnd: netip.MustParseAddr("1.2.3.4")}) {
-					t.Fatal("bare IP must become a /32 interval")
-				}
-				if be.Len(SetDenyCIDR) != 1 {
-					t.Fatal("deny CIDR missing")
-				}
-				if be.Len(SetAllowCIDR) != 2 {
-					t.Fatalf("hostnames must not reach the nft layer; allow_cidr=%d", be.Len(SetAllowCIDR))
-				}
+			if tc.spec.Learn {
+				return
+			}
+			want := Elem{Src: ipA, Dst: netip.MustParseAddr("10.0.0.0"), DstEnd: netip.MustParseAddr("10.255.255.255")}
+			if !be.Has(SetAllowCIDR, want) {
+				t.Fatal("allow CIDR interval missing")
+			}
+			if !be.Has(SetAllowCIDR, Elem{Src: ipA, Dst: netip.MustParseAddr("1.2.3.4"), DstEnd: netip.MustParseAddr("1.2.3.4")}) {
+				t.Fatal("a /32 must be a one-address interval")
+			}
+			if be.Len(SetAllowCIDR) != 2 {
+				t.Fatalf("hostnames must not reach the nft layer; allow_cidr=%d", be.Len(SetAllowCIDR))
+			}
+			if be.Len(SetDenyCIDR) != len(tc.spec.DenyOut) {
+				t.Fatal("deny CIDRs not installed")
 			}
 			if be.Has(SetBlockedSrc, Elem{Src: ipA}) {
 				t.Fatal("unblocked sandbox in blocked_src")
+			}
+			src, ok := g.Source(ipA)
+			if !ok || src.Policy == nil {
+				t.Fatal("Source must expose the compiled policy")
+			}
+			if allowed, _ := src.Policy.MatchHost("pypi.org"); !allowed {
+				t.Fatal("compiled matcher must allow pypi.org")
 			}
 		})
 	}
@@ -96,15 +100,16 @@ func TestAttachInstallsElementsPerMode(t *testing.T) {
 func TestAttachRejectsBadSpecs(t *testing.T) {
 	g, _, _ := newTestGateway(t)
 	bad := []Spec{
-		{IP: ipA, Mode: ModeAllowlist},
-		{ID: "x", IP: netip.MustParseAddr("fd00::1"), Mode: ModeAllowlist},
-		{ID: "x", IP: ipA, Mode: "weird"},
-		{ID: "x", IP: ipA, Mode: ModeAllowlist, AllowOut: []string{"2001:db8::/32"}},
-		{ID: "x", IP: ipA, Mode: ModeDenylist, DenyOut: []string{"2001:db8::1"}},
+		{IP: ipA, AllowOut: []string{"pypi.org"}},
+		{ID: "x", IP: netip.MustParseAddr("fd00::1"), AllowOut: []string{"pypi.org"}},
+		{ID: "x", IP: ipA, DenyOut: []string{"evil.com"}},
+		{ID: "x", IP: ipA, AllowOut: []string{"*.com"}},
+		{ID: "x", IP: ipA, DenyOut: []string{"0.0.0.0/0"}},
+		{ID: "x", IP: ipA, AllowOut: []string{"2001:db8::/32"}},
 	}
 	for i, s := range bad {
 		if err := g.Attach(s); err == nil {
-			t.Fatalf("case %d: want error", i)
+			t.Fatalf("case %d (%+v): want error", i, s)
 		}
 	}
 }
@@ -354,7 +359,7 @@ func TestSyncReplacesAndPreservesLearned(t *testing.T) {
 	if be.Has(SetFQDNSrc, Elem{Src: ipB}) || !be.Has(SetFQDNSrc, Elem{Src: newIP}) {
 		t.Fatal("Sync did not replace source sets")
 	}
-	if err := g.Sync([]Spec{{ID: "bad", IP: ipA, Mode: "?"}}); err == nil {
+	if err := g.Sync([]Spec{{ID: "bad", IP: ipA, DenyOut: []string{"evil.com"}}}); err == nil {
 		t.Fatal("Sync must validate specs")
 	}
 	be.FailApply = errors.New("busy")

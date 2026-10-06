@@ -14,7 +14,8 @@ import (
 	"time"
 )
 
-// Mode is a gateway-mode sandbox's default verdict class.
+// Mode is a gateway-mode sandbox's nft class, derived from its compiled
+// policy: the default verdict picks the source set.
 type Mode string
 
 const (
@@ -44,12 +45,13 @@ const (
 
 // Spec is the desired gateway state for one sandbox, as sandboxd sends it.
 type Spec struct {
-	ID   string     `json:"id"`
-	IP   netip.Addr `json:"ip"`
-	Mode Mode       `json:"mode"`
-	// AllowOut / DenyOut are the raw policy entries (§5.1 grammar). The nft
-	// layer consumes only their CIDRs; hostnames feed the DNS filter and the
-	// proxy through the compiled matcher.
+	ID string     `json:"id"`
+	IP netip.Addr `json:"ip"`
+	// Learn selects learn mode (CEO X1): allow-all while recording.
+	Learn bool `json:"learn,omitempty"`
+	// AllowOut / DenyOut are the raw policy entries (§5.1 grammar), compiled
+	// once by pkg/egresspolicy. The nft layer consumes the CIDRs; the DNS
+	// filter and the proxy share the compiled matcher.
 	AllowOut []string `json:"allow_out,omitempty"`
 	DenyOut  []string `json:"deny_out,omitempty"`
 	// Blocked carries sandboxd's view of the block reasons, so Attach and Sync

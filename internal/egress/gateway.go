@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // DefaultLearnedMax caps (ip, port) learned elements per sandbox
@@ -45,6 +47,8 @@ type Options struct {
 // entry is one attached sandbox.
 type entry struct {
 	spec    Spec
+	pol     *egresspolicy.Policy
+	mode    Mode
 	allow   []netip.Prefix
 	deny    []netip.Prefix
 	blocked BlockReason
@@ -126,8 +130,8 @@ func (g *Gateway) lockSandbox(id string) func() {
 	return mu.Unlock
 }
 
-// compile validates a spec and extracts its CIDRs. Hostname entries are the
-// matcher's business; CIDR entries are the nft layer's.
+// compile validates a spec through pkg/egresspolicy, the one grammar every
+// runtime shares, and derives the nft class from the compiled policy.
 func compile(spec Spec) (*entry, error) {
 	if strings.TrimSpace(spec.ID) == "" {
 		return nil, errors.New("egress: spec without sandbox id")
@@ -135,42 +139,41 @@ func compile(spec Spec) (*entry, error) {
 	if !spec.IP.Is4() {
 		return nil, fmt.Errorf("egress: sandbox %s: gateway mode needs an IPv4 source, got %q", spec.ID, spec.IP)
 	}
-	switch spec.Mode {
-	case ModeAllowlist, ModeDenylist, ModeLearn:
+	mode := egresspolicy.ModeEnforce
+	if spec.Learn {
+		mode = egresspolicy.ModeLearn
+	}
+	pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: spec.AllowOut, DenyOut: spec.DenyOut, Mode: mode})
+	if err != nil {
+		return nil, fmt.Errorf("egress: sandbox %s: %w", spec.ID, err)
+	}
+	if pol.BlockAll() {
+		// Block-all wins and nothing is redirected (EF-14): sandboxd keeps such
+		// a sandbox out of gateway mode entirely.
+		return nil, fmt.Errorf("egress: sandbox %s: block-all is not a gateway-mode policy", spec.ID)
+	}
+	e := &entry{spec: spec, pol: pol, blocked: spec.Blocked, hash: specHash(spec)}
+	switch {
+	case spec.Learn:
+		e.mode = ModeLearn
+	case pol.DefaultVerdict() == egresspolicy.VerdictDeny:
+		e.mode = ModeAllowlist
 	default:
-		return nil, fmt.Errorf("egress: sandbox %s: unknown mode %q", spec.ID, spec.Mode)
+		e.mode = ModeDenylist
 	}
-	allow, err := cidrEntries(spec.AllowOut)
-	if err != nil {
-		return nil, fmt.Errorf("egress: sandbox %s allow_out: %w", spec.ID, err)
-	}
-	deny, err := cidrEntries(spec.DenyOut)
-	if err != nil {
-		return nil, fmt.Errorf("egress: sandbox %s deny_out: %w", spec.ID, err)
-	}
-	return &entry{spec: spec, allow: allow, deny: deny, blocked: spec.Blocked, hash: specHash(spec)}, nil
-}
-
-// cidrEntries returns the CIDR (or bare IP) entries of a policy list.
-func cidrEntries(list []string) ([]netip.Prefix, error) {
-	var out []netip.Prefix
-	for _, raw := range list {
-		s := strings.TrimSpace(raw)
-		if p, err := netip.ParsePrefix(s); err == nil {
-			if !p.Addr().Is4() {
-				return nil, fmt.Errorf("%q: IPv6 is not supported in gateway mode", raw)
-			}
-			out = append(out, p.Masked())
-			continue
+	for _, p := range pol.AllowCIDRs() {
+		if !p.Addr().Is4() {
+			return nil, fmt.Errorf("egress: sandbox %s: %s: IPv6 is not supported in gateway mode", spec.ID, p)
 		}
-		if a, err := netip.ParseAddr(s); err == nil {
-			if !a.Is4() {
-				return nil, fmt.Errorf("%q: IPv6 is not supported in gateway mode", raw)
-			}
-			out = append(out, netip.PrefixFrom(a, 32))
-		}
+		e.allow = append(e.allow, p)
 	}
-	return out, nil
+	for _, p := range pol.DenyCIDRs() {
+		if !p.Addr().Is4() {
+			return nil, fmt.Errorf("egress: sandbox %s: %s: IPv6 is not supported in gateway mode", spec.ID, p)
+		}
+		e.deny = append(e.deny, p)
+	}
+	return e, nil
 }
 
 func specHash(s Spec) string {
@@ -194,7 +197,7 @@ func lastAddr(p netip.Prefix) netip.Addr {
 func (e *entry) elements() map[string][]Elem {
 	src := e.spec.IP
 	out := map[string][]Elem{SetFQDNSrc: {{Src: src}}}
-	switch e.spec.Mode {
+	switch e.mode {
 	case ModeAllowlist:
 		out[SetSrcDenyDefault] = []Elem{{Src: src}}
 	case ModeDenylist:
@@ -510,14 +513,28 @@ func (g *Gateway) sweepLearned(next map[string]*entry, changed map[string]bool) 
 
 // Lookup resolves a source IP to its sandbox, for the DNS filter and proxy.
 func (g *Gateway) Lookup(src netip.Addr) (Spec, BlockReason, bool) {
+	s, ok := g.Source(src)
+	return s.Spec, s.Blocked, ok
+}
+
+// Source is one attached sandbox as the data path sees it.
+type Source struct {
+	Spec    Spec
+	Policy  *egresspolicy.Policy
+	Mode    Mode
+	Blocked BlockReason
+}
+
+// Source resolves a source IP to its sandbox and compiled policy.
+func (g *Gateway) Source(src netip.Addr) (Source, bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	id, ok := g.bySrc[src]
 	if !ok {
-		return Spec{}, 0, false
+		return Source{}, false
 	}
 	e := g.byID[id]
-	return e.spec, e.blocked, true
+	return Source{Spec: e.spec, Policy: e.pol, Mode: e.mode, Blocked: e.blocked}, true
 }
 
 // IsBlocked reports the in-memory block bit (including the restart block).

@@ -70,7 +70,7 @@ func TestClientServerRoundTrip(t *testing.T) {
 	if err := c.SetBlocked(ctx, "ghost", BlockHold, true); !errors.Is(err, ErrNotAttached) {
 		t.Fatalf("unknown sandbox err = %v, want ErrNotAttached", err)
 	}
-	if err := c.Attach(ctx, Spec{ID: "bad", IP: ipB, Mode: "weird"}); err == nil || errors.Is(err, ErrUnavailable) {
+	if err := c.Attach(ctx, Spec{ID: "bad", IP: ipB, DenyOut: []string{"evil.com"}}); err == nil || errors.Is(err, ErrUnavailable) {
 		t.Fatalf("invalid spec err = %v, want a plain validation error", err)
 	}
 	st, err := c.Ready(ctx)
