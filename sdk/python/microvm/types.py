@@ -431,6 +431,9 @@ class SandboxData(TypedDict, total=False):
     osUser: str
     env: Dict[str, str]
     networkBlockAll: bool
+    # Hostname-egress state on get (container runtimes): "active", "held" or
+    # "unavailable". Absent otherwise.
+    egressStatus: str
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -465,6 +468,47 @@ class NetworkUsage(TypedDict, total=False):
     quotaExceededAt: str
     # Absent until the netstats poller has produced at least one sample.
     lastSampledAt: str
+
+
+class AuditEvent(TypedDict, total=False):
+    """One record from a sandbox's audit log (``sandbox.audit()``).
+
+    ``kind`` is ``"egress"`` for outbound connections and denials; a denial
+    has ``result`` ``"failure"`` and the policy ``reason``
+    (``"host_not_allowed"``, ``"sni_not_allowed"``, ...).
+    """
+
+    time: str
+    kind: str
+    result: str
+    reason: str
+    destination: str
+    network: str
+    actor: str
+    ref: str
+    eventID: str
+    incarnationID: str
+    dropped: int
+
+
+class AuditCoverage(TypedDict):
+    answered: List[str]
+    missing: List[str]
+    partial: bool
+
+
+class AuditPage(TypedDict, total=False):
+    events: List[AuditEvent]
+    coverage: AuditCoverage
+    # Pass to ``audit({"cursor": ...})`` for the next page.
+    nextCursor: str
+
+
+class AuditOptions(TypedDict, total=False):
+    kind: str
+    limit: int
+    cursor: str
+    incarnationID: str
 
 
 class SetNetworkLimitsOptions(TypedDict, total=False):

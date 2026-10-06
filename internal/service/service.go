@@ -2749,6 +2749,7 @@ func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts Get
 		return nil, err
 	}
 	s.attachFailoverReady(ctx, sb)
+	sb.EgressStatus = s.EgressStatus(ctx, sb)
 	if opts.IncludeEnv {
 		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id, sb.AuditIncarnationID)
 		if loadErr != nil {

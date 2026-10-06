@@ -542,6 +542,10 @@ pub struct Sandbox {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "network_block_all")]
     pub network_block_all: bool,
+    /// Hostname-egress state on get (container runtimes): "active", "held"
+    /// or "unavailable". `None` otherwise, and on list results.
+    #[serde(default, rename = "egress_status", skip_serializing_if = "Option::is_none")]
+    pub egress_status: Option<String>,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
     #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
@@ -712,6 +716,75 @@ pub struct Session {
 pub struct SessionList {
     pub sessions: Vec<Session>,
 }
+
+/// One record from a sandbox's audit log (`Sandbox::audit`). Kind "egress"
+/// covers outbound connections and denials; a denial has result "failure"
+/// and the policy reason ("host_not_allowed", "sni_not_allowed", ...).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditEvent {
+    pub time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub result: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_id: Option<String>,
+    /// Records lost at this point (a gap record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<i64>,
+}
+
+/// Which nodes answered an audit read.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditCoverage {
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub answered: Vec<String>,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub missing: Vec<String>,
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// One page of a sandbox's audit log.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditPage {
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub events: Vec<AuditEvent>,
+    #[serde(default)]
+    pub coverage: AuditCoverage,
+    /// Pass back as `AuditOptions::cursor` for the next page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Filters and paging for `Sandbox::audit`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditOptions {
+    pub kind: Option<String>,
+    pub limit: Option<u32>,
+    pub cursor: Option<String>,
+    pub incarnation_id: Option<String>,
+}
+
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
 
 /// Per-sandbox network byte counters and the configured caps that drive the
 /// quota enforcer. `bytes_in` is traffic the container received (ingress);

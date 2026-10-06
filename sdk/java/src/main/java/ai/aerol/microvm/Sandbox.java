@@ -2,6 +2,8 @@ package ai.aerol.microvm;
 
 import java.util.List;
 
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CloneGeneration;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -174,6 +176,18 @@ public class Sandbox extends SandboxData {
 
     public NetworkUsage setNetworkLimits(SetNetworkLimitsOptions options) {
         return client.setNetworkLimits(id, options);
+    }
+
+    /**
+     * Reads one page of this sandbox's audit log: outbound connections and
+     * egress denials (kind {@code "egress"}) and secret reads.
+     */
+    public AuditPage audit(AuditOptions options) {
+        return client.getAudit(id, options);
+    }
+
+    public AuditPage audit() {
+        return client.getAudit(id, null);
     }
 
     private void apply(SandboxData data) {

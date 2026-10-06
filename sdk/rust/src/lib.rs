@@ -25,7 +25,8 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
+    AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
     CreateWasmModuleOptions,
     CustomDomain,
@@ -481,6 +482,12 @@ impl Sandbox {
 
     pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
         self.client.set_network_limits(&self.data.id, opts)
+    }
+
+    /// Reads one page of this sandbox's audit log: outbound connections and
+    /// egress denials (kind "egress") and secret reads.
+    pub fn audit(&self, opts: AuditOptions) -> Result<AuditPage, Error> {
+        self.client.get_audit(&self.data.id, opts)
     }
 }
 
@@ -1132,6 +1139,23 @@ impl Client {
             &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id),
             None,
         )
+    }
+
+    pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
+        let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), id);
+        if let Some(kind) = &opts.kind {
+            path = append_query_param(&path, "kind", kind);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(inc) = &opts.incarnation_id {
+            path = append_query_param(&path, "incarnation_id", inc);
+        }
+        self.do_json::<(), AuditPage>(Method::GET, &path, None)
     }
 
     pub fn set_network_limits(
@@ -2954,6 +2978,61 @@ mod tests {
         );
         assert_eq!(gen.generation, "2d0d8c69");
         assert_eq!(gen.resumed_at, 1700000000000000000);
+    }
+
+    #[test]
+    fn get_audit_sends_filters_and_maps_page() {
+        let body = serde_json::json!({
+            "events": [{
+                "time": "2026-10-06T10:00:00Z",
+                "kind": "egress",
+                "result": "failure",
+                "reason": "host_not_allowed",
+                "destination": "evil.example:443",
+                "event_id": "ae-1"
+            }],
+            "coverage": {"answered": ["n1"], "missing": null, "partial": false},
+            "next_cursor": "c2"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit(
+                "sb-1",
+                AuditOptions {
+                    kind: Some("egress".to_string()),
+                    limit: Some(50),
+                    cursor: Some("c1".to_string()),
+                    incarnation_id: Some("inc-1".to_string()),
+                },
+            )
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with(
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.events[0].reason.as_deref(), Some("host_not_allowed"));
+        assert_eq!(page.events[0].event_id.as_deref(), Some("ae-1"));
+        assert_eq!(page.coverage.answered, vec!["n1".to_string()]);
+        assert!(page.coverage.missing.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn get_audit_without_options_and_null_events() {
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"events": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit("sb-1", AuditOptions::default())
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/audit HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.events.is_empty());
     }
 
     #[test]

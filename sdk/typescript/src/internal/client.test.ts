@@ -1367,3 +1367,86 @@ test("internal client retries 421 Misdirected Request", async () => {
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
 });
+
+test("internal client getAudit sends filters and maps the page", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        events: [
+          {
+            time: "2026-10-06T10:00:00Z",
+            kind: "egress",
+            result: "failure",
+            reason: "host_not_allowed",
+            destination: "evil.example:443",
+            network: "tcp",
+            event_id: "ae-1",
+            incarnation_id: "inc-1",
+          },
+        ],
+        coverage: { answered: ["node-a"], missing: null, partial: false },
+        next_cursor: "c2",
+      });
+    },
+  });
+
+  const page = await client.getAudit("sb-audit", { kind: "egress", limit: 50, cursor: "c1", incarnationID: "inc-1" });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  const url = new URL(seenRequest.url);
+  assert.equal(url.pathname, "/v1/sandboxes/sb-audit/audit");
+  assert.equal(url.searchParams.get("kind"), "egress");
+  assert.equal(url.searchParams.get("limit"), "50");
+  assert.equal(url.searchParams.get("cursor"), "c1");
+  assert.equal(url.searchParams.get("incarnation_id"), "inc-1");
+  assert.equal(page.events[0].reason, "host_not_allowed");
+  assert.equal(page.events[0].eventID, "ae-1");
+  assert.deepEqual(page.coverage, { answered: ["node-a"], missing: [], partial: false });
+  assert.equal(page.nextCursor, "c2");
+});
+
+test("internal client getAudit without options sends no query and tolerates null events", async () => {
+  let seenURL = "";
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenURL = new Request(input, init).url;
+      return jsonResponse({ events: null });
+    },
+  });
+  const page = await client.getAudit("sb-x");
+  assert.ok(seenURL.endsWith("/v1/sandboxes/sb-x/audit"));
+  assert.deepEqual(page, { events: [], coverage: { answered: [], missing: [], partial: false } });
+});
+
+test("sandbox.audit reads its own sandbox's log", async () => {
+  const urls: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      urls.push(req.url);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      return jsonResponse({ events: [], coverage: { answered: [], missing: [], partial: false } });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  await sandbox.audit({ kind: "egress" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+});
+
+test("get maps egress_status for gateway-mode sandboxes", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ ...apiSandbox("sb-eg"), egress_status: "held" }),
+  });
+  const sandbox = await client.get("sb-eg");
+  assert.equal(sandbox.egressStatus, "held");
+});

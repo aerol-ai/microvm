@@ -5,6 +5,9 @@ export type { MicroVMConfig } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
   AddCustomDomainOptions,
+  AuditEvent,
+  AuditOptions,
+  AuditPage,
   BinaryLike,
   BuildImageOptions,
   BuildImagePushOptions,

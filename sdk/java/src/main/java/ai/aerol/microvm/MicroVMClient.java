@@ -9,6 +9,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -26,6 +27,9 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
@@ -543,6 +547,42 @@ public class MicroVMClient {
 
     public NetworkUsage getNetworkUsage(String sandboxId) {
         return doJson("GET", sandboxPath(sandboxId) + "/network/usage", null, NetworkUsage.class);
+    }
+
+    /**
+     * Reads one page of a sandbox's audit log: outbound connections and
+     * egress denials (kind {@code "egress"}) and secret reads.
+     */
+    public AuditPage getAudit(String sandboxId, AuditOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "kind", options.getKind());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "incarnation_id", options.getIncarnationId());
+        }
+        AuditPage page = doJson("GET", sandboxPath(sandboxId) + "/audit" + query, null, AuditPage.class);
+        if (page == null) {
+            page = new AuditPage();
+        }
+        if (page.events == null) {
+            page.events = new ArrayList<>();
+        }
+        if (page.coverage == null) {
+            page.coverage = new AuditCoverage();
+        }
+        return page;
+    }
+
+    public AuditPage getAudit(String sandboxId) {
+        return getAudit(sandboxId, null);
+    }
+
+    private static void appendQuery(StringBuilder query, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        query.append(query.length() == 0 ? '?' : '&').append(key).append('=').append(encodeQueryValue(value));
     }
 
     /**

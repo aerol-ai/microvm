@@ -495,3 +495,29 @@ func TestSuperviseReleasesHoldsOnRecovery(t *testing.T) {
 		t.Fatal("held gauge must return to 0")
 	}
 }
+
+// TestGetShowsEgressStatus (D16): GET carries egress_status for a container
+// sandbox in gateway mode, and nothing for other sandboxes or runtimes.
+func TestGetShowsEgressStatus(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	ctx := context.Background()
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"pypi.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.GetSandboxWithOptions(ctx, resp.ID, GetSandboxOptions{})
+	if err != nil || got.EgressStatus != EgressStatusActive {
+		t.Fatalf("gateway-mode GET egress_status = %q, %v", got.EgressStatus, err)
+	}
+	plain, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"10.0.0.0/8"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := svc.GetSandboxWithOptions(ctx, plain.ID, GetSandboxOptions{}); got.EgressStatus != "" {
+		t.Fatalf("CIDR-only sandbox egress_status = %q", got.EgressStatus)
+	}
+	wasm := &models.Sandbox{Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}}
+	if svc.EgressStatus(ctx, wasm) != "" || svc.EgressStatus(ctx, nil) != "" {
+		t.Fatal("WASM filters in its mediator: no gateway status")
+	}
+}

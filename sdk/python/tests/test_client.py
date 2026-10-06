@@ -79,6 +79,22 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if method == "GET" and path.startswith("/v1/sandboxes/sb-1/audit"):
+            return {
+                "events": [
+                    {
+                        "time": "2026-10-06T10:00:00Z",
+                        "kind": "egress",
+                        "result": "failure",
+                        "reason": "host_not_allowed",
+                        "destination": "evil.example:443",
+                        "event_id": "ae-1",
+                    },
+                    {"time": "2026-10-06T10:00:01Z", "result": "gap", "kind": "gap", "dropped": 3},
+                ],
+                "coverage": {"answered": ["node-a"], "missing": None, "partial": False},
+                "next_cursor": "c2",
+            }
         if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
             return {
                 "sandbox_id": "sb-1",
@@ -726,6 +742,35 @@ class ClientTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_sandbox_maps_egress_status(self):
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "egress_status": "unavailable"})["egressStatus"], "unavailable")
+        self.assertNotIn("egressStatus", _from_api_sandbox({"id": "sb"}))
+
+    def test_get_audit_sends_filters_and_maps_page(self):
+        client = RecordingMicroVM()
+
+        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1"})
+
+        self.assertEqual(
+            client.calls[0],
+            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", None),
+        )
+        self.assertEqual(page["events"][0]["reason"], "host_not_allowed")
+        self.assertEqual(page["events"][0]["eventID"], "ae-1")
+        self.assertEqual(page["events"][1]["dropped"], 3)
+        self.assertEqual(page["coverage"], {"answered": ["node-a"], "missing": [], "partial": False})
+        self.assertEqual(page["nextCursor"], "c2")
+
+    def test_sandbox_audit_without_options(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.audit()
+
+        self.assertEqual(client.calls[-1], ("GET", "/v1/sandboxes/sb-1/audit", None))
 
     def test_get_network_usage_maps_response_shape(self):
         client = RecordingMicroVM()

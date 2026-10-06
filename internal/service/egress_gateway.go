@@ -440,7 +440,9 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 // EgressStatus reports a sandbox's egress status for GET: "" for a sandbox
 // outside gateway mode, otherwise active, held or unavailable.
 func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
-	if !isGatewayMode(sb) {
+	// WASM and isolate filter hostnames in their own mediators; only the
+	// container runtimes go through the gateway.
+	if sb == nil || !models.RuntimeUsesEgressGateway(sb.Runtime) || !isGatewayMode(sb) {
 		return ""
 	}
 	st, err := s.store.GetEgressState(ctx, sb.ID)

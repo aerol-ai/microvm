@@ -800,6 +800,13 @@ type Sandbox struct {
 	// allow-wins precedence (plans/egress-domain-filtering.md D4).
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	// EgressStatus is the hostname-egress state on GET for a sandbox whose
+	// policy needs the egress gateway: "active", "held" (attach failed or the
+	// stored policy is invalid; no egress until it attaches) or
+	// "unavailable" (the gateway is down or lost its table). Empty for every
+	// other sandbox, and on list responses (plans/egress-domain-filtering.md
+	// D16). Response-only: never stored.
+	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
 	// (treated as allowed); a non-nil false makes ExposePort refuse to install
 	// a public route. Persisted so the gate survives restarts.

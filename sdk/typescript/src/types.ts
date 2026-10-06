@@ -497,6 +497,12 @@ export interface Sandbox {
   osUser: string;
   env?: Record<string, string>;
   networkBlockAll: boolean;
+  /**
+   * Hostname-egress state on `get` for a sandbox whose allow list names
+   * hosts (container runtimes): "active", "held" or "unavailable". Absent
+   * otherwise, and on list results.
+   */
+  egressStatus?: string;
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -542,6 +548,42 @@ export interface NetworkUsage {
   quotaExceededAt?: string;
   /** Absent until the netstats poller has produced at least one sample. */
   lastSampledAt?: string;
+}
+
+/** One record from a sandbox's audit log (`sandbox.audit()`). */
+export interface AuditEvent {
+  time: string;
+  /** "egress" for outbound connections and denials; secret kinds otherwise. */
+  kind?: string;
+  /** "success", or "failure" for a denial. */
+  result: string;
+  /** Why it was denied, e.g. "host_not_allowed", "sni_not_allowed". */
+  reason?: string;
+  /** host:port (or host) the sandbox tried to reach. */
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  eventID?: string;
+  incarnationID?: string;
+  /** Records lost at this point (a gap record). */
+  dropped?: number;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  /** Which nodes answered; `partial` is true when some could not. */
+  coverage: { answered: string[]; missing: string[]; partial: boolean };
+  /** Pass to `audit({ cursor })` for the next page. */
+  nextCursor?: string;
+}
+
+export interface AuditOptions {
+  /** Only this kind, e.g. "egress". */
+  kind?: string;
+  limit?: number;
+  cursor?: string;
+  incarnationID?: string;
 }
 
 export interface SetNetworkLimitsOptions {

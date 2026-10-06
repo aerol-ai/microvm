@@ -1,6 +1,10 @@
 package types
 
-import "github.com/aerol-ai/microvm/pkg/models"
+import (
+	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+)
 
 type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
@@ -125,6 +129,47 @@ const (
 
 type NetworkUsage = models.NetworkUsage
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
+
+// AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
+// "egress" covers outbound connections and denials; a denial has Result
+// "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).
+type AuditEvent struct {
+	Time          time.Time `json:"time"`
+	Kind          string    `json:"kind,omitempty"`
+	Result        string    `json:"result"`
+	Reason        string    `json:"reason,omitempty"`
+	Destination   string    `json:"destination,omitempty"`
+	Network       string    `json:"network,omitempty"`
+	Actor         string    `json:"actor,omitempty"`
+	Ref           string    `json:"ref,omitempty"`
+	EventID       string    `json:"event_id,omitempty"`
+	IncarnationID string    `json:"incarnation_id,omitempty"`
+	// Dropped counts records lost at this point (a gap record).
+	Dropped int64 `json:"dropped,omitempty"`
+}
+
+// AuditCoverage reports which nodes answered an audit read.
+type AuditCoverage struct {
+	Answered []string `json:"answered"`
+	Missing  []string `json:"missing"`
+	Partial  bool     `json:"partial"`
+}
+
+// AuditPage is one page of a sandbox's audit log.
+type AuditPage struct {
+	Events   []AuditEvent  `json:"events"`
+	Coverage AuditCoverage `json:"coverage"`
+	// NextCursor, when set, reads the next page via AuditOptions.Cursor.
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// AuditOptions filters and pages Sandbox.Audit. Zero values are omitted.
+type AuditOptions struct {
+	Kind          string
+	Limit         int
+	Cursor        string
+	IncarnationID string
+}
 
 // CustomDomain is the per-hostname row attached to a sandbox. Status moves
 // pending_dns → issuing → ready (or failed), driven server-side by Caddy's

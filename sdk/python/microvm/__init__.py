@@ -1,6 +1,9 @@
 from .client import MicroVM
 from .image import Image
 from .types import (
+    AuditEvent,
+    AuditOptions,
+    AuditPage,
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
@@ -19,6 +22,9 @@ from .types import (
 )
 
 __all__ = [
+    "AuditEvent",
+    "AuditOptions",
+    "AuditPage",
     "BuildImagePushOptions",
     "BuildImageResult",
     "CloneGeneration",

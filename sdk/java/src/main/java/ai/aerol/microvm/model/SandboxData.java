@@ -29,6 +29,11 @@ public class SandboxData {
     public String osUser;
     public Map<String, String> env;
     public boolean networkBlockAll;
+    /**
+     * Hostname-egress state on get (container runtimes): "active", "held" or
+     * "unavailable". Null otherwise, and on list results.
+     */
+    public String egressStatus;
     public boolean toolboxEnabled;
     public String sshPublicKey;
     public String sshPrivateKey;
@@ -76,6 +81,7 @@ public class SandboxData {
         osUser = other.osUser;
         env = other.env == null ? null : new LinkedHashMap<>(other.env);
         networkBlockAll = other.networkBlockAll;
+        egressStatus = other.egressStatus;
         toolboxEnabled = other.toolboxEnabled;
         sshPublicKey = other.sshPublicKey;
         sshPrivateKey = other.sshPrivateKey;

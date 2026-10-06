@@ -323,6 +323,12 @@ func (c *Client) CloneGeneration(ctx context.Context, id string) (sdktypes.Clone
 	return sdktypes.CloneGeneration{Generation: res.Generation, ResumedAt: res.ResumedAt}, nil
 }
 
+// GetAudit reads one page of a sandbox's audit log: outbound connections
+// and egress denials (Kind "egress") and secret reads.
+func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return c.inner.GetAudit(ctx, id, opts)
+}
+
 // SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
 // nil to keep the current value; pass a pointer to zero to set "unlimited".
 // Raising a cap above current usage clears the per-IP iptables block on the
@@ -694,6 +700,11 @@ func (s *Sandbox) Resize(ctx context.Context, opts sdktypes.ResizeSandboxOptions
 
 func (s *Sandbox) GetNetworkUsage(ctx context.Context) (sdktypes.NetworkUsage, error) {
 	return s.client.GetNetworkUsage(ctx, s.ID)
+}
+
+// Audit reads one page of this sandbox's audit log (see Client.GetAudit).
+func (s *Sandbox) Audit(ctx context.Context, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return s.client.GetAudit(ctx, s.ID, opts)
 }
 
 func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {

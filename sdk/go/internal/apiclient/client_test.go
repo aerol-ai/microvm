@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 func TestTransportClientCases(t *testing.T) {
@@ -164,6 +165,27 @@ func TestTransportClientCases(t *testing.T) {
 				}
 				if usage.BytesIn != 1024 || usage.BytesOutLimit != 0 || usage.QuotaExceeded {
 					t.Fatalf("unexpected usage: %+v", usage)
+				}
+			},
+		},
+		{
+			name: "get_audit_without_options_sends_no_query_and_never_returns_nil_events",
+			run: func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method != http.MethodGet || r.URL.Path != "/v1/sandboxes/sb-a/audit" || r.URL.RawQuery != "" {
+						t.Fatalf("unexpected request: %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+					}
+					_, _ = w.Write([]byte(`{"events":null,"coverage":{"answered":[],"missing":[],"partial":false}}`))
+				}))
+				defer server.Close()
+				client := NewClient(server.URL, ClientOptions{PATToken: "pat-token", HTTPClient: server.Client()})
+				page, err := client.GetAudit(ctx, "sb-a", sdktypes.AuditOptions{})
+				if err != nil || page.Events == nil || len(page.Events) != 0 {
+					t.Fatalf("GetAudit() = %+v, %v", page, err)
+				}
+				server.Close()
+				if _, err := client.GetAudit(ctx, "sb-a", sdktypes.AuditOptions{}); err == nil {
+					t.Fatal("transport errors surface")
 				}
 			},
 		},

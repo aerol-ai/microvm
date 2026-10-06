@@ -41,6 +41,9 @@ from .types import (
     MountSpec,
     MountSpecRedacted,
     NetworkUsage,
+    AuditEvent,
+    AuditOptions,
+    AuditPage,
     PlatformVolumeMount,
     RegisterSnapshotOptions,
     ResizeOptions,
@@ -403,6 +406,11 @@ class Sandbox:
 
     def set_network_limits(self, options: SetNetworkLimitsOptions) -> NetworkUsage:
         return self._client.set_network_limits(self.id, options)
+
+    def audit(self, options: Optional[AuditOptions] = None) -> AuditPage:
+        """Read this sandbox's audit log: outbound connections and egress
+        denials (``kind="egress"``) and secret reads."""
+        return self._client.get_audit(self.id, options)
 
     @property
     def id(self) -> str:
@@ -789,6 +797,23 @@ class MicroVM:
     def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
         payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
         return _from_api_network_usage(payload)
+
+    def get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None) -> AuditPage:
+        opts = options or {}
+        params: Dict[str, str] = {}
+        if opts.get("kind"):
+            params["kind"] = opts["kind"]
+        if opts.get("limit") is not None:
+            params["limit"] = str(opts["limit"])
+        if opts.get("cursor"):
+            params["cursor"] = opts["cursor"]
+        if opts.get("incarnationID"):
+            params["incarnation_id"] = opts["incarnationID"]
+        path = f"{self._version_prefix}/sandboxes/{sandbox_id}/audit"
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None)
+        return _from_api_audit_page(payload or {})
 
     def set_network_limits(self, sandbox_id: str, options: SetNetworkLimitsOptions) -> NetworkUsage:
         body = _to_api_set_network_limits_options(options)
@@ -1537,6 +1562,45 @@ def _to_api_set_network_limits_options(options: SetNetworkLimitsOptions) -> Dict
     )
 
 
+_AUDIT_EVENT_FIELDS = (
+    ("time", "time"),
+    ("kind", "kind"),
+    ("result", "result"),
+    ("reason", "reason"),
+    ("destination", "destination"),
+    ("network", "network"),
+    ("actor", "actor"),
+    ("ref", "ref"),
+    ("event_id", "eventID"),
+    ("incarnation_id", "incarnationID"),
+)
+
+
+def _from_api_audit_page(payload: Dict[str, Any]) -> AuditPage:
+    events: List[AuditEvent] = []
+    for raw in payload.get("events") or []:
+        event: AuditEvent = {}
+        for api_key, key in _AUDIT_EVENT_FIELDS:
+            value = raw.get(api_key)
+            if value not in (None, ""):
+                event[key] = str(value)  # type: ignore[literal-required]
+        if raw.get("dropped"):
+            event["dropped"] = int(raw["dropped"])
+        events.append(event)
+    coverage = payload.get("coverage") or {}
+    page: AuditPage = {
+        "events": events,
+        "coverage": {
+            "answered": list(coverage.get("answered") or []),
+            "missing": list(coverage.get("missing") or []),
+            "partial": bool(coverage.get("partial") or False),
+        },
+    }
+    if payload.get("next_cursor"):
+        page["nextCursor"] = str(payload["next_cursor"])
+    return page
+
+
 def _from_api_network_usage(payload: Dict[str, Any]) -> NetworkUsage:
     result: NetworkUsage = {
         "sandboxID": str(_first_of(payload, "sandbox_id", "sandboxID") or ""),
@@ -1634,6 +1698,9 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     container_ip = _first_of(sandbox, "container_ip", "containerIP")
     if container_ip not in (None, ""):
         result["containerIP"] = str(container_ip)
+    egress_status = _first_of(sandbox, "egress_status", "egressStatus")
+    if egress_status not in (None, ""):
+        result["egressStatus"] = str(egress_status)
     env = _first_of(sandbox, "env")
     if isinstance(env, dict) and len(env) > 0:
         result["env"] = {str(key): str(value) for key, value in env.items()}

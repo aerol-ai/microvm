@@ -41,6 +41,9 @@ import type {
   MountSpec,
   MountSpecRedacted,
   NetworkUsage,
+  AuditEvent,
+  AuditOptions,
+  AuditPage,
   PlatformVolumeMount,
   RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
@@ -175,6 +178,7 @@ interface ApiSandbox {
   os_user: string;
   env?: Record<string, string>;
   network_block_all: boolean;
+  egress_status?: string;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -310,6 +314,26 @@ interface ApiPlatformVolumeMount {
   name: string;
   path: string;
   read_only?: boolean;
+}
+
+interface ApiAuditEvent {
+  time: string;
+  kind?: string;
+  result: string;
+  reason?: string;
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  event_id?: string;
+  incarnation_id?: string;
+  dropped?: number;
+}
+
+interface ApiAuditPage {
+  events: ApiAuditEvent[] | null;
+  coverage?: { answered?: string[] | null; missing?: string[] | null; partial?: boolean };
+  next_cursor?: string;
 }
 
 interface ApiNetworkUsage {
@@ -810,6 +834,20 @@ export class APIClient {
     return fromApiNetworkUsage(response);
   }
 
+  async getAudit(id: string, options: AuditOptions = {}): Promise<AuditPage> {
+    const params = new URLSearchParams();
+    if (options.kind) params.set("kind", options.kind);
+    if (options.limit !== undefined) params.set("limit", String(options.limit));
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.incarnationID) params.set("incarnation_id", options.incarnationID);
+    const query = params.toString();
+    const response = await this.doJSON<ApiAuditPage>(
+      "GET",
+      `${this.versionPrefix}/sandboxes/${id}/audit${query ? `?${query}` : ""}`,
+    );
+    return fromApiAuditPage(response);
+  }
+
   async setNetworkLimits(id: string, options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
     const response = await this.doJSON<ApiNetworkUsage>(
       "PATCH",
@@ -992,6 +1030,7 @@ export class SandboxResource implements Sandbox {
   declare osUser: string;
   declare env?: Record<string, string>;
   declare networkBlockAll: boolean;
+  declare egressStatus?: string;
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -1155,6 +1194,15 @@ export class SandboxResource implements Sandbox {
     return this.client.setNetworkLimits(this.id, options);
   }
 
+  /**
+   * Reads this sandbox's audit log: outbound connections and egress denials
+   * (`kind: "egress"`), and secret reads. Denials carry `result: "failure"`
+   * and the policy `reason`.
+   */
+  async audit(options?: AuditOptions): Promise<AuditPage> {
+    return this.client.getAudit(this.id, options);
+  }
+
   toJSON(): Sandbox {
     return cloneSandbox(this);
   }
@@ -1272,6 +1320,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     osUser: sandbox.os_user,
     env: sandbox.env,
     networkBlockAll: sandbox.network_block_all,
+    egressStatus: sandbox.egress_status || undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),
@@ -1476,6 +1525,31 @@ function fromApiMountSpecRedacted(mount: ApiMountSpecRedacted): MountSpecRedacte
     readOnly: mount.read_only ?? false,
     hasCredentials: mount.has_credentials,
   };
+}
+
+function fromApiAuditPage(page: ApiAuditPage): AuditPage {
+  const out: AuditPage = {
+    events: (page.events ?? []).map((e): AuditEvent => ({
+      time: e.time,
+      kind: e.kind,
+      result: e.result,
+      reason: e.reason,
+      destination: e.destination,
+      network: e.network,
+      actor: e.actor,
+      ref: e.ref,
+      eventID: e.event_id,
+      incarnationID: e.incarnation_id,
+      dropped: e.dropped,
+    })),
+    coverage: {
+      answered: page.coverage?.answered ?? [],
+      missing: page.coverage?.missing ?? [],
+      partial: page.coverage?.partial ?? false,
+    },
+  };
+  if (page.next_cursor) out.nextCursor = page.next_cursor;
+  return out;
 }
 
 function fromApiNetworkUsage(usage: ApiNetworkUsage): NetworkUsage {

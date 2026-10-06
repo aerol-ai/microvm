@@ -24,6 +24,13 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]models.Sandbox{{ID: "sb1", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/mounts":
 			_ = json.NewEncoder(w).Encode(map[string]any{"mounts": []models.MountSpecRedacted{{Type: models.MountTypeS3, Target: "/workspace", Source: "bucket/path"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/audit":
+			q := r.URL.Query()
+			if q.Get("kind") != "egress" || q.Get("limit") != "50" || q.Get("cursor") != "c1" || q.Get("incarnation_id") != "inc-1" {
+				http.Error(w, "bad query "+r.URL.RawQuery, http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"events":[{"time":"2026-10-06T10:00:00Z","kind":"egress","result":"failure","reason":"host_not_allowed","destination":"evil.example:443","event_id":"ae-1"}],"coverage":{"answered":["n1"],"missing":[],"partial":false},"next_cursor":"c2"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/usage":
 			_ = json.NewEncoder(w).Encode(models.NetworkUsage{SandboxID: "sb1", BytesIn: 10, BytesOut: 20})
 		case r.Method == http.MethodPatch && r.URL.Path == "/v1/sandboxes/sb1/network/limits":
@@ -171,6 +178,11 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if _, err := sb.GetNetworkUsage(ctx); err != nil {
 		t.Fatalf("Sandbox.GetNetworkUsage() error = %v", err)
+	}
+	page, err := sb.Audit(ctx, sdktypes.AuditOptions{Kind: "egress", Limit: 50, Cursor: "c1", IncarnationID: "inc-1"})
+	if err != nil || len(page.Events) != 1 || page.Events[0].Reason != "host_not_allowed" || page.Events[0].EventID != "ae-1" ||
+		page.NextCursor != "c2" || page.Coverage.Answered[0] != "n1" {
+		t.Fatalf("Sandbox.Audit() = %+v, %v", page, err)
 	}
 	if _, err := sb.SetNetworkLimits(ctx, sdktypes.SetNetworkLimitsOptions{NetworkBytesInLimit: &limit}); err != nil {
 		t.Fatalf("Sandbox.SetNetworkLimits() error = %v", err)

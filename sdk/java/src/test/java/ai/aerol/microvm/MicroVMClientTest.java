@@ -28,6 +28,8 @@ import ai.aerol.microvm.internal.JsonSupport;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -846,6 +848,50 @@ class MicroVMClientTest {
             assertEquals("PATCH", patchMethod.get());
             assertEquals(4096, ((Number) patchBody.get().get("network_bytes_in_limit")).longValue());
             assertEquals(1, patchBody.get().size(), "unset fields should not be serialized");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void auditSendsFiltersAndMapsPage() throws Exception {
+        AtomicReference<String> query = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/audit".equals(path)) {
+                query.set(exchange.getRequestURI().getRawQuery());
+                if (exchange.getRequestURI().getRawQuery() == null) {
+                    writeJson(exchange, 200, mapOf("events", null));
+                    return;
+                }
+                writeJson(exchange, 200, mapOf(
+                    "events", List.of(mapOf(
+                        "time", "2026-10-06T10:00:00Z",
+                        "kind", "egress",
+                        "result", "failure",
+                        "reason", "host_not_allowed",
+                        "destination", "evil.example:443",
+                        "event_id", "ae-1"
+                    )),
+                    "coverage", mapOf("answered", List.of("n1"), "missing", List.of(), "partial", false),
+                    "next_cursor", "c2"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1"));
+            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", query.get());
+            assertEquals("host_not_allowed", page.events.get(0).reason);
+            assertEquals("ae-1", page.events.get(0).eventId);
+            assertEquals(List.of("n1"), page.coverage.answered);
+            assertEquals("c2", page.nextCursor);
+
+            AuditPage empty = client.getAudit("sb-1");
+            assertTrue(empty.events.isEmpty());
+            assertTrue(!empty.coverage.partial);
         } finally {
             server.stop(0);
         }
