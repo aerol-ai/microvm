@@ -330,6 +330,9 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err := service.NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
+	// Pin bare built-in profiles here, on the owner after any forward, so
+	// the spec promoted below carries this node's version (CEO D11).
+	service.NormalizeCreateEgressProfiles(&req)
 	c := svc.Cluster()
 
 	// Reserved path: overlap CreateSandboxWithID with the secrets seal, then

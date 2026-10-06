@@ -449,7 +449,18 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
 	// WASM and isolate filter hostnames in their own mediators; only the
 	// container runtimes go through the gateway.
-	if sb == nil || !models.RuntimeUsesEgressGateway(sb.Runtime) || !isGatewayMode(sb) {
+	if sb == nil || !models.RuntimeUsesEgressGateway(sb.Runtime) {
+		return ""
+	}
+	if !isGatewayMode(sb) {
+		// A failover replay whose profiles this node can't resolve runs
+		// block-all, held, until they can (CEO D11): unavailable, since no
+		// policy of the owner's is in force.
+		if sb.NetworkBlockAll {
+			if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil && st.HoldReason == egressHoldProfileUnavailable {
+				return EgressStatusUnavailable
+			}
+		}
 		return ""
 	}
 	st, err := s.store.GetEgressState(ctx, sb.ID)

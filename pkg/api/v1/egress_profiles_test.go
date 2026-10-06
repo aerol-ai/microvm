@@ -63,6 +63,11 @@ func TestV1EgressProfiles(t *testing.T) {
 	}{
 		{http.MethodDelete, "/v1/egress-profiles/cidrs", nil, http.StatusConflict},
 		{http.MethodGet, "/v1/egress-profiles/missing", nil, http.StatusNotFound},
+		// Built-ins are global and read-only (P2-8).
+		{http.MethodGet, "/v1/egress-profiles/builtin:pypi", nil, http.StatusOK},
+		{http.MethodGet, "/v1/egress-profiles/builtin:nope", nil, http.StatusNotFound},
+		{http.MethodPut, "/v1/egress-profiles/builtin:pypi", models.EgressProfileRequest{AllowOut: []string{"x.example"}}, http.StatusBadRequest},
+		{http.MethodDelete, "/v1/egress-profiles/builtin:pypi", nil, http.StatusBadRequest},
 		{http.MethodPut, "/v1/egress-profiles/Bad", models.EgressProfileRequest{}, http.StatusBadRequest},
 		{http.MethodPut, "/v1/egress-profiles/ok", "not an object", http.StatusBadRequest},
 		{http.MethodGet, "/v1/egress-profiles?limit=x", nil, http.StatusBadRequest},

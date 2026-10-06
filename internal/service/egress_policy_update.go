@@ -126,6 +126,8 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		if req.NetworkEgressMode == models.NetworkEgressModeLearn && (req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0) {
 			return nil, ErrEgressLearnConflict
 		}
+	} else if err := s.refuseDisabledBuiltins(req.EgressProfiles); err != nil {
+		return nil, err
 	}
 	create := models.CreateSandboxRequest{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut,
 		EgressProfiles: req.EgressProfiles, NetworkEgressMode: req.NetworkEgressMode}
@@ -137,6 +139,9 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	if err != nil {
 		return nil, err
 	}
+	// The replicated spec keeps built-ins pinned (CEO D11): a bare
+	// builtin:<name> here moves the sandbox to this node's newest version.
+	create.EgressProfiles = resolved.Refs
 	effective := create
 	effective.NetworkAllowOut = resolved.Effective
 	pol, err := compileCreateEgressEffective(&effective)

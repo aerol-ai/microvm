@@ -31,7 +31,7 @@ func TestUnion(t *testing.T) {
 }
 
 func TestValidateProfileRefs(t *testing.T) {
-	for _, ok := range [][]string{nil, {"python-deps"}, {"org:bank-mirrors", "builtin:pypi", "builtin:pypi@20261006", "a.b_c-1"}} {
+	for _, ok := range [][]string{nil, {"python-deps"}, {"org:bank-mirrors", "builtin:npm", "builtin:pypi@20261006", "a.b_c-1"}} {
 		if err := ValidateProfileRefs(ok); err != nil {
 			t.Fatalf("%v: %v", ok, err)
 		}
@@ -40,7 +40,7 @@ func TestValidateProfileRefs(t *testing.T) {
 	for i := range tooMany {
 		tooMany[i] = fmt.Sprintf("p%d", i)
 	}
-	for _, bad := range [][]string{{"Upper"}, {"-lead"}, {"org:"}, {"builtin:@1"}, {"a", "a"}, {"x:y"}, tooMany} {
+	for _, bad := range [][]string{{"Upper"}, {"-lead"}, {"org:"}, {"builtin:@1"}, {"a", "a"}, {"builtin:pypi", "builtin:pypi@20261006"}, {"x:y"}, tooMany} {
 		if err := ValidateProfileRefs(bad); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("%v: err = %v", bad, err)
 		}

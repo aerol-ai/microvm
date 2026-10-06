@@ -282,6 +282,9 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 			return nil, fmt.Errorf("load egress profiles for ownership replay %s: %w", sb.ID, err)
 		}
 		if len(profiles.Refs) > 0 {
+			// Profiles and block-all are exclusive; a block-all row with
+			// references is a replay held until its profiles resolve.
+			spec.NetworkBlockAll = false
 			spec.NetworkAllowOut = profiles.Inline
 			for _, r := range profiles.Refs {
 				spec.EgressProfiles = append(spec.EgressProfiles, r.Name)

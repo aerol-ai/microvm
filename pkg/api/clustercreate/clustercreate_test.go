@@ -385,6 +385,11 @@ func newCreateService(t *testing.T, c cluster.Client, withCipher bool) (*service
 
 func newCreateServiceWithRuntime(t *testing.T, c cluster.Client, rt *fakeRuntime, withCipher bool) (*service.Service, *store.Store) {
 	t.Helper()
+	return newCreateServiceWithConfig(t, c, rt, withCipher, nil)
+}
+
+func newCreateServiceWithConfig(t *testing.T, c cluster.Client, rt *fakeRuntime, withCipher bool, mutate func(*config.Config)) (*service.Service, *store.Store) {
+	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "state.db"))
 	if err != nil {
@@ -411,6 +416,9 @@ func newCreateServiceWithRuntime(t *testing.T, c cluster.Client, rt *fakeRuntime
 	}
 
 	cfg := config.Config{EnableCaddy: false, EnableCluster: c != nil, ToolboxPort: 2280}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	svc := service.New(cfg, logger, st, rt, nil, caddy.New(cfg), cipher, mgr, nil)
 	if c != nil {

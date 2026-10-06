@@ -105,6 +105,7 @@ func (r *apiRecordingRuntime) ClearNetworkBlockIngress(string) error            
 type promoteStubCluster struct {
 	*cluster.Noop
 	recordCalls   []string
+	recordSpecs   []*models.CreateSandboxRequest
 	recordErr     error
 	recordDelay   time.Duration
 	cancelCalls   []string
@@ -145,13 +146,14 @@ func (c *promoteStubCluster) SelfNodeID() string {
 	return c.Noop.SelfNodeID()
 }
 
-func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, _ *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+func (c *promoteStubCluster) RecordPlacement(_ context.Context, id string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
 	if c.recordDelay > 0 {
 		time.Sleep(c.recordDelay)
 	}
 	// Append before returning err so "errored but committed" (§7.2) is the
 	// default stub behavior — a client-side Raft error after FSM apply.
 	c.recordCalls = append(c.recordCalls, id)
+	c.recordSpecs = append(c.recordSpecs, spec)
 	if incarnationID := strings.TrimSpace(placementSecrets.IncarnationID); incarnationID != "" {
 		c.placementInc = incarnationID
 	}
@@ -173,6 +175,11 @@ func (c *promoteStubCluster) DeletePlacementExact(ctx context.Context, id, _, _ 
 }
 
 func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client) (*handlers, *storepkg.Store) {
+	t.Helper()
+	return newClusterCreateHarnessWithConfig(t, rt, stub, nil)
+}
+
+func newClusterCreateHarnessWithConfig(t *testing.T, rt *apiRecordingRuntime, stub cluster.Client, mutate func(*config.Config)) (*handlers, *storepkg.Store) {
 	t.Helper()
 	st, err := storepkg.Open(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -197,6 +204,9 @@ func newClusterCreateHarness(t *testing.T, rt *apiRecordingRuntime, stub cluster
 		EnableCaddy:       false,
 		EnableCluster:     !singleNode,
 		HTTPClientTimeout: time.Second,
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	caddyClient := caddy.New(cfg)
 	admitter := capacity.New(

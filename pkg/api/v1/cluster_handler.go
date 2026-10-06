@@ -202,6 +202,9 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Pin bare built-in profiles here, on the owner after any forward, so
+	// the spec promoted below carries this node's version (CEO D11).
+	service.NormalizeCreateEgressProfiles(&req)
 	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return

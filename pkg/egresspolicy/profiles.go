@@ -45,20 +45,23 @@ func ValidateProfileRefs(refs []string) error {
 	}
 	seen := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
-		name := ref
+		name, key := ref, ref
 		switch {
 		case strings.HasPrefix(ref, OrgProfilePrefix):
 			name = strings.TrimPrefix(ref, OrgProfilePrefix)
 		case strings.HasPrefix(ref, BuiltinProfilePrefix):
+			// One version of a built-in per sandbox: a bare name and its
+			// pinned form are the same profile.
 			name, _, _ = strings.Cut(strings.TrimPrefix(ref, BuiltinProfilePrefix), "@")
+			key = BuiltinProfilePrefix + name
 		}
 		if !ValidProfileName(name) {
 			return &EntryError{Field: FieldEgressProfiles, Entry: ref, Reason: "not a profile name (" + profileNameRe.String() + ", optionally after org: or builtin:)"}
 		}
-		if _, dup := seen[ref]; dup {
+		if _, dup := seen[key]; dup {
 			return &EntryError{Field: FieldEgressProfiles, Entry: ref, Reason: "listed twice"}
 		}
-		seen[ref] = struct{}{}
+		seen[key] = struct{}{}
 	}
 	return nil
 }

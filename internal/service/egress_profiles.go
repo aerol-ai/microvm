@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,8 +162,9 @@ func (s *Service) checkProfileUnionCaps(ctx context.Context, owner, name string,
 		for _, r := range state.Refs {
 			n, ok := counts[r.Name]
 			if !ok {
-				p, err := s.egressProfileBackend().GetEgressProfile(ctx, owner, r.Name)
-				if err != nil && !errors.Is(err, ErrEgressProfileNotFound) {
+				p, err := s.lookupEgressProfile(ctx, owner, r.Name)
+				if err != nil && !errors.Is(err, ErrEgressProfileNotFound) && !errors.Is(err, egresspolicy.ErrBuiltinUnknown) &&
+					!errors.Is(err, ErrEgressProfileUnavailable) {
 					return err
 				}
 				if n, err = countHostnames(p.AllowOut); err != nil {
@@ -191,8 +193,17 @@ func countHostnames(entries []string) (int, error) {
 	return egresspolicy.CountHostnames(parsed), nil
 }
 
-// GetEgressProfile returns one of the caller's profiles.
+// GetEgressProfile returns one of the caller's profiles, or a built-in one:
+// builtin:<name> is its newest version, builtin:<name>@<version> that one.
 func (s *Service) GetEgressProfile(ctx context.Context, name string) (*models.EgressProfile, error) {
+	if strings.HasPrefix(name, egresspolicy.BuiltinProfilePrefix) {
+		b, err := egresspolicy.ResolveBuiltin(name)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrEgressProfileNotFound, err)
+		}
+		return &models.EgressProfile{Name: b.Ref, AllowOut: b.AllowOut, Generation: b.Version,
+			Description: "AerolVM built-in profile " + b.Name + ", version " + strconv.FormatInt(b.Version, 10)}, nil
+	}
 	owner, _ := ownerScope(ctx)
 	p, err := s.egressProfileBackend().GetEgressProfile(ctx, owner, name)
 	if err != nil {
@@ -261,15 +272,17 @@ func (s *Service) resolveEgressProfiles(ctx context.Context, owner string, inlin
 		return r, err
 	}
 	lists := make([][]string, 0, len(refs))
+	r.Refs = make([]string, 0, len(refs))
 	for _, ref := range refs {
-		if strings.HasPrefix(ref, egresspolicy.OrgProfilePrefix) || strings.HasPrefix(ref, egresspolicy.BuiltinProfilePrefix) {
-			return r, fmt.Errorf("%w: egress_profiles entry %q: org: and builtin: profiles are not available yet", egresspolicy.ErrInvalid, ref)
-		}
-		p, err := s.egressProfileBackend().GetEgressProfile(ctx, owner, ref)
-		if errors.Is(err, ErrEgressProfileNotFound) {
+		p, err := s.lookupEgressProfile(ctx, owner, ref)
+		switch {
+		case errors.Is(err, ErrEgressProfileNotFound):
 			return r, fmt.Errorf("%w: egress_profiles entry %q: no such profile", egresspolicy.ErrInvalid, ref)
-		}
-		if err != nil {
+		case errors.Is(err, egresspolicy.ErrBuiltinUnknown), errors.Is(err, egresspolicy.ErrInvalid):
+			return r, fmt.Errorf("%w: egress_profiles entry %q: %v", egresspolicy.ErrInvalid, ref, err)
+		case errors.Is(err, ErrEgressProfileUnavailable):
+			return r, err
+		case err != nil:
 			return r, fmt.Errorf("%w: %v", ErrEgressProfileUnavailable, err)
 		}
 		n, err := countHostnames(p.AllowOut)
@@ -278,7 +291,8 @@ func (s *Service) resolveEgressProfiles(ctx context.Context, owner string, inlin
 		}
 		r.Hostnames += n
 		lists = append(lists, p.AllowOut)
-		r.Applied = append(r.Applied, models.EgressProfileRef{Name: ref, Generation: p.Generation})
+		r.Refs = append(r.Refs, p.Ref)
+		r.Applied = append(r.Applied, models.EgressProfileRef{Name: p.Ref, Generation: p.Generation})
 	}
 	if r.Hostnames > egresspolicy.MaxUnionHostnames {
 		return r, fmt.Errorf("%w: network_allow_out and egress_profiles have %d hostname entries together; the limit is %d",
@@ -288,6 +302,82 @@ func (s *Service) resolveEgressProfiles(ctx context.Context, owner string, inlin
 		return r, err
 	}
 	return r, nil
+}
+
+// egressProfileBody is a referenced profile's entries at its current
+// generation. Ref is the reference as the spec stores it: a bare built-in
+// comes back pinned.
+type egressProfileBody struct {
+	Ref        string
+	AllowOut   []string
+	Generation int64
+}
+
+// lookupEgressProfile reads the profile a reference names. A built-in comes
+// from the binary's catalogue, its version standing in for a generation: a
+// pinned version never changes, so the re-apply pass never sees one move. A
+// version this node's catalogue doesn't have yet is unavailable, not unknown:
+// a newer node pinned it, and the sandbox fails closed until it is owned by a
+// node that has it (CEO D11).
+func (s *Service) lookupEgressProfile(ctx context.Context, owner, ref string) (egressProfileBody, error) {
+	switch {
+	case strings.HasPrefix(ref, egresspolicy.BuiltinProfilePrefix):
+		b, err := egresspolicy.ResolveBuiltin(ref)
+		if errors.Is(err, egresspolicy.ErrBuiltinVersionMissing) {
+			return egressProfileBody{}, fmt.Errorf("%w: %v", ErrEgressProfileUnavailable, err)
+		}
+		if err != nil {
+			return egressProfileBody{}, err
+		}
+		return egressProfileBody{Ref: b.Ref, AllowOut: b.AllowOut, Generation: b.Version}, nil
+	case strings.HasPrefix(ref, egresspolicy.OrgProfilePrefix):
+		return egressProfileBody{}, fmt.Errorf("%w: org: profiles are not available yet", egresspolicy.ErrInvalid)
+	}
+	p, err := s.egressProfileBackend().GetEgressProfile(ctx, owner, ref)
+	if err != nil {
+		return egressProfileBody{}, err
+	}
+	return egressProfileBody{Ref: ref, AllowOut: p.AllowOut, Generation: p.Generation}, nil
+}
+
+// NormalizeCreateEgressProfiles pins each bare builtin:<name> in a create to
+// this node's newest version, so the spec the cluster replicates carries the
+// pinned form and a failover rebuilds the same list (CEO D11). The owner node
+// calls it after any forward, so the pin is its own catalogue's. Other
+// references are left for the create to resolve.
+func NormalizeCreateEgressProfiles(req *models.CreateSandboxRequest) {
+	var pinned []string
+	for i, ref := range req.EgressProfiles {
+		if !strings.HasPrefix(ref, egresspolicy.BuiltinProfilePrefix) || strings.Contains(ref, "@") {
+			continue
+		}
+		if b, err := egresspolicy.ResolveBuiltin(ref); err == nil {
+			// Copy before the first write: the caller's request shares the
+			// backing array.
+			if pinned == nil {
+				pinned = append([]string(nil), req.EgressProfiles...)
+			}
+			pinned[i] = b.Ref
+		}
+	}
+	if pinned != nil {
+		req.EgressProfiles = pinned
+	}
+}
+
+// refuseDisabledBuiltins applies the operator file's built-in switch
+// (§5.10 PC-3) to references a caller supplies. It never touches a running
+// sandbox: replays and re-applies keep the built-ins they were created with.
+func (s *Service) refuseDisabledBuiltins(refs []string) error {
+	if s.egressOperator().BuiltinProfiles() {
+		return nil
+	}
+	for _, ref := range refs {
+		if strings.HasPrefix(ref, egresspolicy.BuiltinProfilePrefix) {
+			return fmt.Errorf("%w: egress_profiles entry %q: built-in profiles disabled on this deployment", egresspolicy.ErrInvalid, ref)
+		}
+	}
+	return nil
 }
 
 // showEgressProfiles puts the inline allow list and the profile references
@@ -326,15 +416,43 @@ func sbID(sb *models.Sandbox) string {
 	return sb.ID
 }
 
+// resolveCreateEgress expands a create's profile references into req's
+// effective allow list. A failover replay can't refuse a spec the cluster
+// already holds, so one whose profiles can't be read here (a built-in
+// version newer than this node's catalogue, a profile read that failed)
+// runs block-all and held instead (CEO D11, G7); the re-apply pass lifts
+// the hold once they resolve. held reports that case.
+func (s *Service) resolveCreateEgress(ctx context.Context, ownerRef string, req *models.CreateSandboxRequest) (resolvedEgress, bool, error) {
+	resolved, err := s.resolveEgressProfiles(ctx, ownerRef, req.NetworkAllowOut, req.EgressProfiles)
+	if err == nil {
+		req.NetworkAllowOut = resolved.Effective
+		return resolved, false, nil
+	}
+	if !isStoredSpecReplay(ctx) || !errors.Is(err, ErrEgressProfileUnavailable) {
+		return resolved, false, err
+	}
+	s.logger.Warn("egress: profiles unavailable on failover; sandbox runs block-all until they resolve", "error", err)
+	resolved = resolvedEgress{Inline: req.NetworkAllowOut, Refs: req.EgressProfiles}
+	// deny_out stays: the re-apply restores it with the allow list.
+	req.NetworkBlockAll, req.NetworkAllowOut, req.EgressProfiles = true, nil, nil
+	return resolved, true, nil
+}
+
 // recordCreateEgressState stores a new sandbox's profile references, inline
 // list and egress mode next to the row the create wrote. Without them the
 // row's effective list would have nothing to explain it, profile updates
 // would never reach the sandbox and a learn-mode sandbox would read as
-// enforce, so a failure undoes the create.
-func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string) error {
+// enforce, so a failure undoes the create. held records the profile hold a
+// replay that ran block-all needs, so the re-apply pass revisits it.
+func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string, held bool) error {
 	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef, Mode: mode})
 	if err == nil && len(r.Applied) > 0 {
 		err = s.store.SetEgressProfilesApplied(ctx, sb.ID, r.Applied)
+	}
+	if err == nil && held {
+		if err = s.store.SetEgressHold(ctx, sb.ID, egressHoldProfileUnavailable, time.Now().UTC()); err == nil {
+			s.refreshHeldGauge(ctx)
+		}
 	}
 	if err != nil {
 		if derr := s.DestroySandbox(context.WithoutCancel(ctx), sb.ID); derr != nil {

@@ -129,7 +129,7 @@ func TestCreateWithEgressProfiles(t *testing.T) {
 		req  models.CreateSandboxRequest
 	}{
 		{"unknown profile", models.CreateSandboxRequest{Image: "alpine", EgressProfiles: []string{"nope"}}},
-		{"reserved prefix", models.CreateSandboxRequest{Image: "alpine", EgressProfiles: []string{"builtin:pypi"}}},
+		{"unknown built-in", models.CreateSandboxRequest{Image: "alpine", EgressProfiles: []string{"builtin:nope"}}},
 		{"block-all", models.CreateSandboxRequest{Image: "alpine", NetworkBlockAll: true, EgressProfiles: []string{"python"}}},
 		{"firecracker", models.CreateSandboxRequest{Image: "alpine", Runtime: models.RuntimeFirecracker, EgressProfiles: []string{"python"}}},
 	} {

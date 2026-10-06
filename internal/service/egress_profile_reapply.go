@@ -5,9 +5,11 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -65,10 +67,11 @@ func (s *Service) reapplyEgressProfiles(ctx context.Context) {
 		k := profileKey{r.OwnerRef, r.Profile}
 		gen, ok := current[k]
 		if !ok {
-			p, err := s.egressProfileBackend().GetEgressProfile(ctx, r.OwnerRef, r.Profile)
+			p, err := s.lookupEgressProfile(ctx, r.OwnerRef, r.Profile)
 			switch {
-			case errors.Is(err, ErrEgressProfileNotFound):
-				gen = -1 // gone: re-applying holds the sandbox
+			case errors.Is(err, ErrEgressProfileNotFound), errors.Is(err, egresspolicy.ErrBuiltinUnknown),
+				errors.Is(err, ErrEgressProfileUnavailable) && strings.HasPrefix(r.Profile, egresspolicy.BuiltinProfilePrefix):
+				gen = -1 // gone, or a built-in version this node lacks: re-applying holds the sandbox
 			case err != nil:
 				s.logger.Warn("egress: read profile for re-apply", "profile", r.Profile, "error", err)
 				continue
@@ -143,6 +146,9 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	}
 	next := *old
 	next.NetworkAllowOut = resolved.Effective
+	// Profiles and block-all are exclusive, so a block-all row here is a
+	// failover replay that ran block-all until its profiles resolved.
+	next.NetworkBlockAll = false
 	st, err := s.store.GetEgressState(ctx, id)
 	if err != nil {
 		return err
@@ -159,6 +165,14 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 		}
 		if err := s.applyPolicyTransition(ctx, old, &next); err != nil {
 			return err
+		}
+		// A container's attach lifts its hold; the WASM and isolate
+		// mediators have only the record to clear.
+		if held && (s.isWasmSandbox(old) || s.isIsolateSandbox(old)) {
+			if err := s.store.ClearEgressHold(ctx, id, time.Now().UTC()); err != nil {
+				return err
+			}
+			s.refreshHeldGauge(ctx)
 		}
 	}
 	return s.store.SetEgressProfilesApplied(ctx, id, resolved.Applied)

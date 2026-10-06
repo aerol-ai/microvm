@@ -1,6 +1,6 @@
 ---
 title: Egress Profiles and Learn Mode
-description: Name an allow list once and use it from many sandboxes, learn an allow list from a trusted run, and check a policy before you create anything.
+description: Name an allow list once and use it from many sandboxes, start from built-in lists for common registries, learn an allow list from a trusted run, and check a policy before you create anything.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -243,6 +243,115 @@ profile; deleting one that is already gone succeeds.
 
 ---
 
+## Built-in profiles
+
+AerolVM ships allow lists for common package registries and source hosts.
+Reference one as `builtin:<name>` anywhere you would use your own profile, on
+its own or next to yours.
+
+| Name | Covers |
+|---|---|
+| `builtin:pypi` | pip: `pypi.org` and `files.pythonhosted.org` |
+| `builtin:npm` | npm and Yarn registries |
+| `builtin:github` | `github.com`, its API, raw files, release downloads, `git` over SSH and `ghcr.io` |
+| `builtin:huggingface` | `huggingface.co` and its download hosts |
+| `builtin:golang-proxy` | the Go module proxy and checksum database |
+| `builtin:crates` | `crates.io` and its download host |
+| `builtin:apt-ubuntu` | the Ubuntu archive and security mirrors |
+| `builtin:docker-hub` | Docker Hub's registry, token service and download host, for tools like `crane` |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['builtin:pypi', 'builtin:github'],
+    })
+    console.log(sandbox.egressProfiles) // ['builtin:pypi@20261006', 'builtin:github@20261006']
+
+    const pypi = await client.getEgressProfile('builtin:pypi')
+    console.log(pypi.allowOut)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['builtin:pypi', 'builtin:github'],
+    })
+    print(sandbox.egressProfiles)  # ['builtin:pypi@20261006', 'builtin:github@20261006']
+
+    pypi = client.get_egress_profile('builtin:pypi')
+    print(pypi['allowOut'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"builtin:pypi", "builtin:github"},
+    })
+    if err != nil {
+        return err
+    }
+    fmt.Println(sandbox.EgressProfiles) // [builtin:pypi@20261006 builtin:github@20261006]
+
+    pypi, err := client.GetEgressProfile(ctx, "builtin:pypi")
+    if err != nil {
+        return err
+    }
+    fmt.Println(pypi.AllowOut)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["builtin:pypi".to_string(), "builtin:github".to_string()]),
+        ..Default::default()
+    })?;
+    println!("{:?}", sandbox.data.egress_profiles); // builtin:pypi@20261006, builtin:github@20261006
+
+    let pypi = client.get_egress_profile("builtin:pypi")?;
+    println!("{:?}", pypi.allow_out);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("builtin:pypi", "builtin:github"))
+    );
+    System.out.println(sandbox.egressProfiles); // [builtin:pypi@20261006, builtin:github@20261006]
+
+    EgressProfile pypi = client.getEgressProfile("builtin:pypi");
+    System.out.println(pypi.allowOut);
+    ```
+  </TabItem>
+</Tabs>
+
+- **Pinned at create.** `builtin:pypi` is stored as
+  `builtin:pypi@<YYYYMMDD>`, the date of the list the node had when the
+  sandbox was created. Upgrading AerolVM never changes what a running sandbox
+  can reach. To move a sandbox to the newest list, call `setNetworkPolicy` with
+  the bare name again. You can also ask for a dated version yourself.
+- **Read-only.** You can read a built-in with `getEgressProfile` (the bare name
+  gives the newest version), but not change or delete it. A built-in counts
+  toward the 16-profile and 1024-entry limits like any other profile.
+- **During an upgrade.** If a sandbox pinned to a list newer than a node has
+  moves to that node, for example after a failover in the middle of a rolling
+  upgrade, it runs with all outbound traffic blocked and
+  `egressStatus: "unavailable"` until it is on a node that has that version.
+  A new create asking for such a version on an older node gets `503`; retry it.
+- **Missing a host?** The lists are maintained by hand. If a tool needs a host
+  a list lacks, add the host to `networkAllowOut` next to the built-in.
+- **Switched off.** Your operator can turn built-ins off. Then a create or
+  policy change that names one gets `400` "built-in profiles disabled on this
+  deployment", and sandboxes that already use one keep it.
+
+---
+
 ## Learn an allow list
 
 Writing an allow list for a workload you didn't write is guesswork. **Learn
@@ -415,8 +524,8 @@ caught when the sandbox connects.
 ## Limitations
 
 - **Firecracker** sandboxes can't use profiles yet.
-- **Org and built-in profiles** (`org:` and `builtin:` names) aren't available
-  yet; those names are reserved.
+- **Org profiles** (`org:` names) aren't available yet; the prefix is
+  reserved.
 - **Learn mode and the E2B SDK.** `updateNetwork` keeps a sandbox in learn
   mode; setting lists on a learn-mode sandbox from the E2B SDK is refused with
   `409`. Switch it with `setNetworkPolicy`.

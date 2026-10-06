@@ -1659,18 +1659,25 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// its own copy of req, keeps the references.
 	// Learn mode (P2-7) rides the same side state as the references.
 	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
-		if _, err := compileCreateEgress(&req); err != nil {
-			return nil, err
+		if _, cerr := compileCreateEgress(&req); cerr != nil {
+			return nil, cerr
 		}
-		resolved, err := s.resolveEgressProfiles(ctx, ownerRef, req.NetworkAllowOut, req.EgressProfiles)
-		if err != nil {
-			return nil, err
+		if !isStoredSpecReplay(ctx) {
+			if rerr := s.refuseDisabledBuiltins(req.EgressProfiles); rerr != nil {
+				return nil, rerr
+			}
 		}
-		req.NetworkAllowOut = resolved.Effective
+		// rerr, not err: the deferred record must see and set the named
+		// result, or a failed record would undo the create and still
+		// report success.
+		resolved, held, rerr := s.resolveCreateEgress(ctx, ownerRef, &req)
+		if rerr != nil {
+			return nil, rerr
+		}
 		if mode := req.NetworkEgressMode; len(resolved.Refs) > 0 || mode != "" {
 			defer func() {
 				if err == nil && resp != nil {
-					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode)
+					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode, held)
 				}
 			}()
 		}
