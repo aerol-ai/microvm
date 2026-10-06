@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/aerol-ai/microvm/internal/egress"
 	"io"
 	"log/slog"
 	mathrand "math/rand"
@@ -352,6 +353,19 @@ type Service struct {
 	// count.
 	l4ActivityGenerations map[string]uint64
 	l4ActivitySeq         uint64
+
+	// Egress gateway (plans/egress-domain-filtering.md §5.3). egressAPI is
+	// the UDS client to the separate egress-gateway process (nil = feature
+	// off; egressGateway() returns egress.Noop then). egressReady/egressMu
+	// are the EnsureLayer4Ready-shaped lazy bootstrap: connect, hand over the
+	// bridges, full Sync. egressBridges discovers the sandbox bridges
+	// (sandboxd has the docker socket; the gateway does not, S5).
+	egressAPI     egress.API
+	egressBridges func(context.Context) []egress.Bridge
+	egressMu      sync.Mutex
+	egressReady   atomic.Bool
+	egressSubOnce sync.Once
+	egressStats   egressCounters
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -1835,14 +1849,27 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	prepareStart := time.Now()
 	egressPol, err := compileCreateEgress(&req)
 	if err != nil {
 		releaseAdmission()
 		return nil, err
 	}
-	if egressPol.GatewayMode() {
-		releaseAdmission()
-		return nil, ErrEgressGatewayRequired
+	// Hostname rules (gateway mode) need the egress gateway. The driver gets
+	// a driver-facing copy: block-all and no lists, so its existing create,
+	// warm-adopt and park paths stay fail-closed unchanged and hostnames
+	// never reach netrules. The gateway attach then lifts the block
+	// (plans/egress-domain-filtering.md §5.7).
+	gatewayMode := egressPol.GatewayMode()
+	driverReq := req
+	if gatewayMode {
+		if !s.egressEnabled() {
+			releaseAdmission()
+			return nil, ErrEgressGatewayRequired
+		}
+		driverReq.NetworkBlockAll = true
+		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
+		createtiming.From(ctx).RecordStage("svc_egress_prepare", time.Since(prepareStart))
 	}
 
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
@@ -1873,16 +1900,35 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenEngine == "" {
 		chosenEngine = models.ContainerEngineDocker
 	}
+	// egressDone carries the gateway attach, which runs alongside sealing and
+	// the row persist (latency amendment §8.2). waitEgress joins it; every
+	// exit after the runtime create joins first, so the attach never races a
+	// rollback.
+	var egressDone chan error
+	waitEgress := func() error {
+		if egressDone == nil {
+			return nil
+		}
+		joinStart := time.Now()
+		err := <-egressDone
+		egressDone = nil
+		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
+		return err
+	}
 	rollbackDestroy := func(partial *models.Sandbox) {
 		if partial == nil {
 			return
+		}
+		_ = waitEgress()
+		if gatewayMode {
+			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
 		}
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
 		_ = ociRt.Destroy(rollback.Context(), partial)
 	}
 
-	state, err := ociRt.Create(ctx, req, sandboxID, toolboxToken, binds)
+	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
@@ -1895,6 +1941,23 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	s.releaseAdoptedParkReservation(state)
+	if gatewayMode {
+		cr, ok := runtime.AsContainerRuntime(ociRt)
+		attachSB := &models.Sandbox{ID: sandboxID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
+			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut}
+		egressDone = make(chan error, 1)
+		go func() {
+			attachStart := time.Now()
+			var err error
+			if !ok {
+				err = ErrEgressGatewayRequired
+			} else {
+				err = s.attachSandboxEgress(ctx, attachSB, cr)
+			}
+			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
+			egressDone <- err
+		}()
+	}
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
 	// or encrypt error doesn't leave a half-created sandbox: we already passed
@@ -2066,6 +2129,25 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		"network_block_all", sandbox.NetworkBlockAll,
 		"mount_count", len(req.Mounts),
 	)
+	if err := waitEgress(); err != nil {
+		if isStoredSpecReplay(ctx) {
+			// A failover recreate never refuses its stored spec: the sandbox
+			// comes up held (driver block-all stays, hold recorded) and
+			// reconcile retries the attach (CEO D16).
+			if cr, ok := runtime.AsContainerRuntime(ociRt); ok {
+				s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
+			}
+		} else {
+			// Same rollback chain as a mount-persist failure; 2xx would claim
+			// a live policy the gateway never applied.
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			rollbackDestroy(sandbox)
+			cleanupMounts()
+			releaseAdmission()
+			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
+		}
+	}
 	platformVolumesCommitted = true
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
@@ -2883,10 +2965,32 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			return nil, fmt.Errorf("apply network block on start: %w", err)
 		}
 	}
-	// Reapply the selective-egress policy for the same reason — the stop event
-	// clears it. Comment-tagged rules are distinct from the blanket block, so
-	// this composes with NetworkBlockAll above. Fail closed on error.
-	if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+	// A gateway-mode sandbox is shut with a block-all DROP and re-attached to
+	// the egress gateway. If the attach fails it stays shut and held
+	// (egress_status unavailable) and reconcile retries; the start itself
+	// succeeds (plans/egress-domain-filtering.md §5.7, CEO D16).
+	if isGatewayMode(sandbox) {
+		cr, ok := runtime.AsContainerRuntime(rt)
+		if !ok {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			return nil, fmt.Errorf("apply egress on start: runtime %q does not support egress filtering", sandbox.Runtime)
+		}
+		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+			_ = s.mounts.UnmountAll(id)
+			releaseAdmission()
+			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
+			return nil, fmt.Errorf("apply network block on start: %w", err)
+		}
+		if err := s.attachSandboxEgress(ctx, sandbox, cr); err != nil {
+			s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
+		}
+	} else if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+		// Reapply the selective-egress policy for the same reason: the stop
+		// event clears it. Comment-tagged rules are distinct from the blanket
+		// block, so this composes with NetworkBlockAll above. Fail closed.
 		cr, ok := runtime.AsContainerRuntime(rt)
 		if !ok {
 			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
@@ -2977,6 +3081,11 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	rt, err := s.runtimeForSandbox(sandbox)
 	if err != nil {
 		return err
+	}
+	// Leave the egress gateway before the runtime goes; the gateway's IP
+	// ownership check makes a late detach after IP reuse harmless (D5).
+	if isGatewayMode(sandbox) {
+		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
 	}
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
@@ -5127,10 +5236,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					)
 				}
 			}
-			// Heal the selective-egress policy the same way. Comment-tagged
-			// rules survive independently of the blanket block, and the
-			// netrules Exists check keeps the reapply idempotent.
-			if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+			// Gateway-mode sandboxes are healed through the gateway: a held
+			// sandbox gets its attach retried (the hold lifts only on
+			// success), and the gateway's own Sync covers the rest. Their
+			// hostname lists never go to netrules.
+			if isGatewayMode(sandbox) {
+				s.reconcileSandboxEgress(ctx, sandbox)
+			} else if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
+				// Heal the selective-egress policy the same way. Comment-tagged
+				// rules survive independently of the blanket block, and the
+				// netrules Exists check keeps the reapply idempotent.
 				cr, err := s.containerRuntimeForSandbox(sandbox)
 				if err != nil {
 					s.logger.Warn("reconcile reapply egress policy skipped",

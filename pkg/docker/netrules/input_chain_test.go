@@ -258,3 +258,36 @@ func TestAllowPlusDenyAllIsAllowlist(t *testing.T) {
 		t.Fatalf("clear left rules: %v", be.rules)
 	}
 }
+
+// TestHoldIsDisjoint covers D16: the hold DROP survives a quota clear and a
+// policy clear, and only ClearHoldEgress removes it.
+func TestHoldIsDisjoint(t *testing.T) {
+	be := &memBackend{}
+	mgr := NewWithBackend(be)
+	const ip = "10.0.0.30"
+	if err := mgr.HoldEgress(ip); err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.HoldEgress(ip); err != nil {
+		t.Fatal(err)
+	}
+	if be.countMatching(egressHoldComment) != 1 {
+		t.Fatal("hold must be idempotent")
+	}
+	_ = mgr.BlockAllEgress(ip)
+	_ = mgr.ClearBlockAllEgress(ip)
+	_ = mgr.ClearEgressPolicy(ip, []string{"1.1.1.1/32"}, nil)
+	if be.countMatching(egressHoldComment) != 1 {
+		t.Fatal("quota/block and policy clears must not lift a hold")
+	}
+	if err := mgr.ClearHoldEgress(ip); err != nil {
+		t.Fatal(err)
+	}
+	if be.countMatching(egressHoldComment) != 0 {
+		t.Fatal("ClearHoldEgress must remove the hold")
+	}
+	disabled := NewWithBackend(nil)
+	if disabled.HoldEgress(ip) != nil || disabled.ClearHoldEgress(ip) != nil || mgr.HoldEgress("") != nil {
+		t.Fatal("disabled manager and empty IP are no-ops")
+	}
+}

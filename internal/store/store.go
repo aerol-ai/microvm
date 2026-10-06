@@ -374,6 +374,20 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// firewall rules (egress plan P0-6), so it stays an index probe as the
 		// destroyed-row history grows.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_container_ip ON sandboxes(container_ip);`,
+		// sandbox_egress holds egress-gateway state that outlives a process:
+		// the fail-closed hold (plans/egress-domain-filtering.md CEO D16), and
+		// in Phase 2 the learn mode and pinned profiles. A side table keeps the
+		// hot sandboxes row and its many SELECT lists untouched; rows go with
+		// their sandbox.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress (
+			sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
+			hold_reason TEXT NOT NULL DEFAULT '',
+			hold_since DATETIME,
+			egress_mode TEXT NOT NULL DEFAULT '',
+			profiles_json TEXT NOT NULL DEFAULT '[]',
+			updated_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of

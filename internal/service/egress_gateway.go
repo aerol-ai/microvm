@@ -1,0 +1,496 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/netip"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/models"
+)
+
+// Hold reasons stored in sandbox_egress.hold_reason (CEO D16).
+const (
+	egressHoldAttachFailed  = "attach_failed"
+	egressHoldUnavailable   = "gateway_unavailable"
+	egressHoldLayoutLost    = "layout_lost"
+	egressHoldPolicyInvalid = "policy_invalid"
+)
+
+// Egress status shown on GET (egress_status).
+const (
+	EgressStatusActive      = "active"
+	EgressStatusHeld        = "held"
+	EgressStatusUnavailable = "unavailable"
+)
+
+// egressAttachTimeout bounds one UDS round trip on the create path.
+const egressAttachTimeout = 5 * time.Second
+
+// egressCounters are the sandboxd-side egress metrics (P1-12).
+type egressCounters struct {
+	attachFailed  atomic.Uint64
+	held          atomic.Int64
+	gatewayUp     atomic.Bool
+	lastSync      atomic.Int64 // unix nanos
+	lastHeartbeat atomic.Int64
+	auditDropped  atomic.Uint64
+	fqdnSandboxes atomic.Int64
+	proxyConns    atomic.Int64
+	layoutLost    atomic.Uint64
+	denied        reasonCounts
+}
+
+// reasonCounts counts denials by reason (aerolvm_egress_denied_total).
+type reasonCounts struct {
+	mu sync.Mutex
+	m  map[string]uint64
+}
+
+func (r *reasonCounts) add(reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.m == nil {
+		r.m = map[string]uint64{}
+	}
+	r.m[reason]++
+}
+
+func (r *reasonCounts) snapshot() map[string]uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]uint64, len(r.m))
+	for k, v := range r.m {
+		out[k] = v
+	}
+	return out
+}
+
+// SetEgressGateway wires the gateway client and the bridge discovery. A nil
+// api leaves the feature off (Noop).
+func (s *Service) SetEgressGateway(api egress.API, bridges func(context.Context) []egress.Bridge) {
+	s.egressAPI = api
+	s.egressBridges = bridges
+}
+
+// egressGateway returns the client, or Noop when the feature is off.
+func (s *Service) egressGateway() egress.API {
+	if s == nil || s.egressAPI == nil || !s.cfg.EgressFQDNEnabled {
+		return egress.Noop{}
+	}
+	return s.egressAPI
+}
+
+// egressEnabled reports whether hostname filtering can run on this node:
+// the feature is on, a gateway client is wired, and the node is not running
+// privileged sandboxes (they hold NET_RAW/NET_ADMIN and could step around
+// the gateway, CEO D18).
+func (s *Service) egressEnabled() bool {
+	return s != nil && s.egressAPI != nil && s.cfg.EgressFQDNEnabled && !s.cfg.ContainerPrivileged
+}
+
+// EnsureEgressGatewayReady connects to the gateway and pushes the node's full
+// state: the sandbox bridges, then a Sync of every gateway-mode sandbox. Same
+// atomic.Bool + mutex single-flight shape as EnsureLayer4Ready; called
+// best-effort at daemon start and lazily before the first attach. A failure
+// leaves the latch unset.
+func (s *Service) EnsureEgressGatewayReady(ctx context.Context) error {
+	if !s.egressEnabled() {
+		return fmt.Errorf("%w: hostname egress filtering is disabled on this node", egress.ErrUnavailable)
+	}
+	if s.egressReady.Load() {
+		return nil
+	}
+	s.egressMu.Lock()
+	defer s.egressMu.Unlock()
+	if s.egressReady.Load() {
+		return nil
+	}
+	if err := s.syncEgressGatewayLocked(ctx); err != nil {
+		s.egressStats.gatewayUp.Store(false)
+		return err
+	}
+	s.egressReady.Store(true)
+	s.egressStats.gatewayUp.Store(true)
+	s.egressSubOnce.Do(func() { go s.consumeEgressEvents(context.WithoutCancel(ctx)) })
+	return nil
+}
+
+// syncEgressGatewayLocked hands over bridges and replaces the gateway's state
+// with the store's. Callers hold egressMu.
+func (s *Service) syncEgressGatewayLocked(ctx context.Context) error {
+	gw := s.egressGateway()
+	if _, err := gw.Ready(ctx); err != nil {
+		return err
+	}
+	if s.egressBridges != nil {
+		if err := gw.SetBridges(ctx, s.egressBridges(ctx)); err != nil {
+			return fmt.Errorf("egress gateway bridges: %w", err)
+		}
+	}
+	specs, err := s.localEgressSpecs(ctx)
+	if err != nil {
+		return err
+	}
+	if err := gw.Sync(ctx, specs); err != nil {
+		return err
+	}
+	s.egressStats.lastSync.Store(time.Now().UnixNano())
+	s.egressStats.fqdnSandboxes.Store(int64(len(specs)))
+	return nil
+}
+
+// ResyncEgressGateway forces a full Sync (gateway restart, table loss).
+func (s *Service) ResyncEgressGateway(ctx context.Context) error {
+	if !s.egressEnabled() {
+		return nil
+	}
+	s.egressMu.Lock()
+	defer s.egressMu.Unlock()
+	err := s.syncEgressGatewayLocked(ctx)
+	s.egressReady.Store(err == nil)
+	s.egressStats.gatewayUp.Store(err == nil)
+	return err
+}
+
+// localEgressSpecs builds a Spec for every started gateway-mode sandbox on
+// this node, with its current block reasons.
+func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
+	rows, err := s.store.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sandboxes for egress sync: %w", err)
+	}
+	holds, err := s.store.ListEgressHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var specs []egress.Spec
+	for _, sb := range rows {
+		if sb.Status != models.SandboxStatusStarted || sb.ContainerIP == "" {
+			continue
+		}
+		spec, ok := s.egressSpecFor(sb, holds[sb.ID] != "")
+		if !ok {
+			continue
+		}
+		specs = append(specs, spec)
+	}
+	return specs, nil
+}
+
+// sandboxPolicy compiles a stored sandbox's egress policy.
+func sandboxPolicy(sb *models.Sandbox) (*egresspolicy.Policy, error) {
+	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut, BlockAll: sb.NetworkBlockAll})
+}
+
+// isGatewayMode reports whether a stored sandbox runs in gateway mode:
+// hostname rules (or, in Phase 2, learn mode / profiles) and not block-all.
+func isGatewayMode(sb *models.Sandbox) bool {
+	if sb == nil || sb.NetworkBlockAll {
+		return false
+	}
+	pol, err := sandboxPolicy(sb)
+	return err == nil && pol.GatewayMode()
+}
+
+// egressSpecFor builds the gateway Spec for a gateway-mode sandbox.
+func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, bool) {
+	if !isGatewayMode(sb) {
+		return egress.Spec{}, false
+	}
+	ip, err := netip.ParseAddr(sb.ContainerIP)
+	if err != nil {
+		return egress.Spec{}, false
+	}
+	spec := egress.Spec{ID: sb.ID, IP: ip, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut}
+	if sb.NetworkQuotaExceeded && sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit {
+		spec.Blocked |= egress.BlockQuota
+	}
+	if held {
+		spec.Blocked |= egress.BlockHold
+	}
+	return spec, true
+}
+
+// attachSandboxEgress puts a started gateway-mode sandbox under the gateway
+// and lifts the driver's temporary block-all. The driver installed that DROP
+// at create (the driver-facing copy) so the sandbox was shut until now; on any
+// failure it stays shut and the sandbox is held (CEO D16).
+func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) error {
+	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
+	defer cancel()
+	spec, ok := s.egressSpecFor(sb, false)
+	if !ok {
+		return nil
+	}
+	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
+		s.egressStats.attachFailed.Add(1)
+		return err
+	}
+	if err := s.egressGateway().Attach(ctx, spec); err != nil {
+		s.egressStats.attachFailed.Add(1)
+		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
+			s.egressReady.Store(false)
+		}
+		return err
+	}
+	if err := s.releaseEgressHold(ctx, sb, cr); err != nil {
+		return err
+	}
+	// The driver's block-all DROP has done its job; quota and real block-all
+	// keep their own DROPs (applyNetworkQuotaState, NetworkBlockAll).
+	if !sb.NetworkBlockAll && !sb.NetworkQuotaExceeded {
+		if err := cr.ClearNetworkBlockEgress(sb.ContainerIP); err != nil {
+			return fmt.Errorf("lift driver block after egress attach: %w", err)
+		}
+	}
+	return nil
+}
+
+// holdSandboxEgress records and enforces the fail-closed hold: the store
+// row, the hold DROP in the host firewall, and the gateway's blocked bit for
+// the redirect path (S3). Each layer alone keeps the sandbox shut, so every
+// step is best-effort after the first.
+func (s *Service) holdSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, reason string) {
+	now := time.Now().UTC()
+	if err := s.store.SetEgressHold(ctx, sb.ID, reason, now); err != nil {
+		s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
+	}
+	if holder, ok := cr.(runtime.EgressHolder); ok && sb.ContainerIP != "" {
+		if err := holder.ApplyEgressHold(sb.ContainerIP); err != nil {
+			s.logger.Warn("egress: install hold DROP failed", "sandbox_id", sb.ID, "error", err)
+		}
+	}
+	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockHold, true); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+		s.logger.Warn("egress: gateway hold failed", "sandbox_id", sb.ID, "error", err)
+	}
+	s.refreshHeldGauge(ctx)
+	s.logger.Warn("egress: sandbox held", "sandbox_id", sb.ID, "reason", reason)
+}
+
+// releaseEgressHold lifts a hold after a successful attach. Nothing else
+// lifts one.
+func (s *Service) releaseEgressHold(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) error {
+	st, err := s.store.GetEgressState(ctx, sb.ID)
+	if err != nil {
+		return err
+	}
+	if st.HoldReason == "" {
+		return nil
+	}
+	if holder, ok := cr.(runtime.EgressHolder); ok && sb.ContainerIP != "" {
+		if err := holder.ClearEgressHold(sb.ContainerIP); err != nil {
+			return fmt.Errorf("lift egress hold DROP: %w", err)
+		}
+	}
+	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockHold, false); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+		return err
+	}
+	if err := s.store.ClearEgressHold(ctx, sb.ID, time.Now().UTC()); err != nil {
+		return err
+	}
+	s.refreshHeldGauge(ctx)
+	return nil
+}
+
+func (s *Service) refreshHeldGauge(ctx context.Context) {
+	if holds, err := s.store.ListEgressHolds(ctx); err == nil {
+		s.egressStats.held.Store(int64(len(holds)))
+	}
+}
+
+// detachSandboxEgress removes a sandbox from the gateway. The gateway checks
+// the IP still belongs to it (D5), so a late call after IP reuse is safe.
+func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, ip string) {
+	if !s.egressEnabled() || ip == "" {
+		return
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
+	defer cancel()
+	if err := s.egressGateway().Detach(ctx, sb.ID, addr); err != nil {
+		s.logger.Warn("egress: detach failed (gateway Sync will drop it)", "sandbox_id", sb.ID, "error", err)
+	}
+}
+
+// setEgressQuotaBlock mirrors a quota block into the gateway's @blocked_src
+// for a gateway-mode sandbox (eng re-review D2).
+func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, on bool) {
+	if !s.egressEnabled() || !isGatewayMode(sb) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
+	defer cancel()
+	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockQuota, on); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+		s.logger.Warn("egress: quota block not mirrored to the gateway", "sandbox_id", sb.ID, "on", on, "error", err)
+	}
+}
+
+// EgressStatus reports a sandbox's egress status for GET: "" for a sandbox
+// outside gateway mode, otherwise active, held or unavailable.
+func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
+	if !isGatewayMode(sb) {
+		return ""
+	}
+	st, err := s.store.GetEgressState(ctx, sb.ID)
+	if err == nil && st.HoldReason != "" {
+		if st.HoldReason == egressHoldUnavailable || st.HoldReason == egressHoldLayoutLost {
+			return EgressStatusUnavailable
+		}
+		return EgressStatusHeld
+	}
+	return EgressStatusActive
+}
+
+// consumeEgressEvents streams gateway events into the audit log and metrics,
+// resubscribing with backoff while the gateway is away.
+func (s *Service) consumeEgressEvents(ctx context.Context) {
+	sub, ok := s.egressAPI.(interface {
+		Subscribe(context.Context) (<-chan egress.Event, error)
+	})
+	if !ok {
+		return
+	}
+	backoff := time.Second
+	for ctx.Err() == nil {
+		events, err := sub.Subscribe(ctx)
+		if err != nil {
+			s.egressStats.gatewayUp.Store(false)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second
+		for ev := range events {
+			s.handleEgressEvent(ctx, ev)
+		}
+		// The stream broke: the gateway restarted or went away. Its state
+		// may be a snapshot behind ours, so re-sync once it is back.
+		s.egressReady.Store(false)
+	}
+}
+
+// handleEgressEvent records one gateway event.
+func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
+	switch ev.Kind {
+	case "audit":
+		allowed := ev.Result == "allowed"
+		s.emitEgressDecision(ev.SandboxID, "tcp", ev.Destination, allowed, ev.Reason)
+		if !allowed && ev.Reason != "" {
+			s.egressStats.denied.add(ev.Reason)
+		}
+	case "heartbeat":
+		s.egressStats.gatewayUp.Store(true)
+		s.egressStats.lastHeartbeat.Store(time.Now().UnixNano())
+		s.egressStats.auditDropped.Store(ev.AuditDropped)
+		s.egressStats.fqdnSandboxes.Store(int64(ev.FQDNSandboxes))
+		s.egressStats.proxyConns.Store(int64(ev.ProxyConns))
+		if ev.LayoutLostSeen {
+			s.onEgressLayoutLost(ctx)
+		}
+	}
+}
+
+// onEgressLayoutLost answers a lost nft table (CEO D17): every gateway-mode
+// sandbox is held (its host-firewall hold DROP covers the window), then a
+// full Sync re-applies the gateway state and successful attaches release
+// the holds.
+func (s *Service) onEgressLayoutLost(ctx context.Context) {
+	s.egressStats.layoutLost.Add(1)
+	rows, err := s.store.List(ctx)
+	if err != nil {
+		return
+	}
+	for _, sb := range rows {
+		if sb.Status != models.SandboxStatusStarted || !isGatewayMode(sb) {
+			continue
+		}
+		if cr, err := s.containerRuntimeForSandbox(sb); err == nil {
+			s.holdSandboxEgress(ctx, sb, cr, egressHoldLayoutLost)
+		}
+	}
+	if err := s.ResyncEgressGateway(ctx); err != nil {
+		s.logger.Error("egress: re-sync after table loss failed; sandboxes stay held", "error", err)
+		return
+	}
+	for _, sb := range rows {
+		if sb.Status != models.SandboxStatusStarted || !isGatewayMode(sb) {
+			continue
+		}
+		if cr, err := s.containerRuntimeForSandbox(sb); err == nil {
+			if err := s.attachSandboxEgress(ctx, sb, cr); err != nil {
+				s.logger.Warn("egress: re-attach after table loss failed; sandbox stays held", "sandbox_id", sb.ID, "error", err)
+			}
+		}
+	}
+}
+
+// emitEgressDecision writes a gateway decision into the hash-chained audit
+// log: allowed connections as success, denials as failure with the reason.
+func (s *Service) emitEgressDecision(sandboxID, network, destination string, allowed bool, reason string) {
+	if s == nil || !s.cfg.EgressAttributionEnabled {
+		return
+	}
+	sandboxID = strings.TrimSpace(sandboxID)
+	if sandboxID == "" {
+		return
+	}
+	sink := s.secretAuditSink()
+	if sink == nil {
+		return
+	}
+	result, why := secretAuditResultSuccess, secretAuditReasonOK
+	if !allowed {
+		result, why = secretAuditResultFailure, reason
+	}
+	actor := s.auditActor()
+	incarnationID, ownerRef := s.auditIdentityFor(sandboxID)
+	sink.Emit(SecretAuditEvent{
+		Time:          time.Now().UTC(),
+		Actor:         actor,
+		SandboxID:     sandboxID,
+		Result:        result,
+		Reason:        why,
+		NodeID:        actor,
+		Kind:          secretAuditKindEgress,
+		Destination:   strings.TrimSpace(destination),
+		Network:       network,
+		IncarnationID: incarnationID,
+		OwnerRef:      ownerRef,
+	})
+}
+
+// reconcileSandboxEgress retries the attach of a held gateway-mode sandbox;
+// the hold lifts only when the attach succeeds (CEO D16).
+func (s *Service) reconcileSandboxEgress(ctx context.Context, sb *models.Sandbox) {
+	if !s.egressEnabled() || sb.ContainerIP == "" {
+		return
+	}
+	st, err := s.store.GetEgressState(ctx, sb.ID)
+	if err != nil || st.HoldReason == "" {
+		return
+	}
+	cr, err := s.containerRuntimeForSandbox(sb)
+	if err != nil {
+		return
+	}
+	if err := s.attachSandboxEgress(ctx, sb, cr); err != nil {
+		s.logger.Debug("egress: held sandbox still not attachable", "sandbox_id", sb.ID, "reason", st.HoldReason, "error", err)
+	}
+}

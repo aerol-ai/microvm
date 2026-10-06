@@ -84,6 +84,15 @@ type IPOwnerResolver interface {
 	IPOwner(ctx context.Context, ip string) (sandboxID string, err error)
 }
 
+// EgressHolder is implemented by container runtimes that can install the
+// fail-closed egress hold: a comment-tagged DROP of its own that quota and
+// limits code never touch (plans/egress-domain-filtering.md CEO D16). Only a
+// successful gateway attach clears it.
+type EgressHolder interface {
+	ApplyEgressHold(containerIP string) error
+	ClearEgressHold(containerIP string) error
+}
+
 type ContainerRuntime interface {
 	Runtime
 

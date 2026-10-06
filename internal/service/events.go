@@ -192,8 +192,15 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 			}
 			// Selective-egress rules are comment-tagged, so ClearNetworkRules
 			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container.
-			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+			// before the IP is recycled to another container. A gateway-mode
+			// sandbox's lists never reached netrules; it leaves the gateway
+			// and its hold DROP instead.
+			if isGatewayMode(sandbox) {
+				s.detachSandboxEgress(ctx, sandbox, previousIP)
+				if holder, ok := cr.(runtime.EgressHolder); ok {
+					_ = holder.ClearEgressHold(previousIP)
+				}
+			} else if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
 				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 		}
@@ -265,8 +272,15 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			}
 			// Selective-egress rules are comment-tagged, so ClearNetworkRules
 			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container.
-			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+			// before the IP is recycled to another container. A gateway-mode
+			// sandbox's lists never reached netrules; it leaves the gateway
+			// and its hold DROP instead.
+			if isGatewayMode(sandbox) {
+				s.detachSandboxEgress(ctx, sandbox, previousIP)
+				if holder, ok := cr.(runtime.EgressHolder); ok {
+					_ = holder.ClearEgressHold(previousIP)
+				}
+			} else if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
 				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 		}
@@ -362,7 +376,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	// unrestricted until the next reconcile pass. Re-apply before anything
 	// else and fail closed: a sandbox whose isolation can't be restored is
 	// stopped (egress plan P0-4).
-	if err := s.reapplyEgressOnStart(rt, sandbox); err != nil {
+	if err := s.reapplyEgressOnStart(ctx, rt, sandbox); err != nil {
 		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 		sandbox.Status = models.SandboxStatusError
 		sandbox.LastError = err.Error()
@@ -414,7 +428,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 // reapplyEgressOnStart restores block-all and the selective-egress policy on
 // the sandbox's current IP. Both netrules operations are Exists-guarded, so a
 // start the API already drove (and already applied) costs two lookups.
-func (s *Service) reapplyEgressOnStart(rt runtime.Runtime, sandbox *models.Sandbox) error {
+func (s *Service) reapplyEgressOnStart(ctx context.Context, rt runtime.Runtime, sandbox *models.Sandbox) error {
 	hasPolicy := len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0
 	if !sandbox.NetworkBlockAll && !hasPolicy {
 		return nil
@@ -422,6 +436,18 @@ func (s *Service) reapplyEgressOnStart(rt runtime.Runtime, sandbox *models.Sandb
 	cr, ok := runtime.AsContainerRuntime(rt)
 	if !ok {
 		return fmt.Errorf("runtime %q does not support network rules", sandbox.Runtime)
+	}
+	if isGatewayMode(sandbox) {
+		// Shut first, then hand the sandbox back to the gateway. A failed
+		// attach leaves it shut and held rather than stopping it: the hold
+		// is the gateway-mode fail-closed state (CEO D16).
+		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+		if err := s.attachSandboxEgress(ctx, sandbox, cr); err != nil {
+			s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
+		}
+		return nil
 	}
 	if sandbox.NetworkBlockAll {
 		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {

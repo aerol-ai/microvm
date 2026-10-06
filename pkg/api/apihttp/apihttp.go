@@ -156,6 +156,21 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())
 		return
 	}
+	// An option this runtime or build can't honor (Firecracker egress before
+	// Phase 4, hostname filtering without the gateway) is 501, not a 400:
+	// the request is well-formed, this node just can't serve it.
+	if errors.Is(err, models.ErrRuntimeNotImplemented) {
+		WriteError(w, http.StatusNotImplemented, err.Error())
+		return
+	}
+	// The egress gateway couldn't attach a hostname-filtered sandbox: the
+	// create was rolled back, retry once the gateway is back
+	// (plans/egress-domain-filtering.md G7).
+	if errors.Is(err, service.ErrEgressGatewayUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrPublicTrafficDisabled) {
 		WriteError(w, http.StatusConflict, err.Error())
 		return

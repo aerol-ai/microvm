@@ -414,6 +414,37 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	return m.deleteInputRules(inputSpecs...)
 }
 
+// egressHoldComment tags the fail-closed hold DROP (plans/
+// egress-domain-filtering.md CEO D16). It is its own rule, not the shared
+// block-all/quota DROP, so quota and limits code (ClearBlockAllEgress) can
+// never lift a hold, and a hold never lifts a block.
+const egressHoldComment = "sbx-egress-hold"
+
+func holdSpec(ip string) []string {
+	return []string{"-s", ip, "-m", "comment", "--comment", egressHoldComment, "-j", "DROP"}
+}
+
+// HoldEgress installs the hold DROP for containerIP. Idempotent.
+func (m *Manager) HoldEgress(containerIP string) error {
+	if !m.Enabled() || containerIP == "" {
+		return nil
+	}
+	unlock := m.lockIP(containerIP)
+	defer unlock()
+	return m.ensurePolicyRule(holdSpec(containerIP)...)
+}
+
+// ClearHoldEgress removes the hold DROP. Only a successful attach lifts a
+// hold; callers enforce that.
+func (m *Manager) ClearHoldEgress(containerIP string) error {
+	if !m.Enabled() || containerIP == "" {
+		return nil
+	}
+	unlock := m.lockIP(containerIP)
+	defer unlock()
+	return m.deletePolicyRule(holdSpec(containerIP)...)
+}
+
 // normalizeLists maps "allow + deny 0.0.0.0/0" to allow-only (D4).
 func normalizeLists(allow, deny []string) ([]string, []string) {
 	if len(allow) == 0 {

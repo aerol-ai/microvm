@@ -645,6 +645,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		hostPortForwarder = newHostPortForwarder(logger)
 	}
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
+	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means

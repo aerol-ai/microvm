@@ -163,6 +163,10 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 	// `quota_exceeded` flag stuck true even after the operator raises the
 	// limit and the over-quota condition no longer holds.
 	if sandbox.ContainerIP != "" {
+		// Mirror the egress quota into the gateway's @blocked_src for a
+		// gateway-mode sandbox (eng re-review D2). The DROP below stays as
+		// the second layer.
+		s.setEgressQuotaBlock(ctx, sandbox, overOut)
 		cr, err := s.containerRuntimeForSandbox(sandbox)
 		if err != nil {
 			s.logger.Warn("apply network quota skipped: runtime has no container network rules",

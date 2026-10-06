@@ -211,7 +211,17 @@ type Config struct {
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
-	NetrulesBackend    string
+	NetrulesBackend string
+	// EgressFQDNEnabled turns on hostname egress filtering through the
+	// egress-gateway process (plans/egress-domain-filtering.md, CEO D25).
+	// Inert until a sandbox uses a hostname rule. Off means hostname
+	// policies get 501. SB_EGRESS_FQDN_ENABLED.
+	EgressFQDNEnabled bool
+	// EgressGatewaySocket is the gateway's UDS (SB_EGRESS_GATEWAY_SOCKET).
+	EgressGatewaySocket string
+	// EgressOperatorFile is the private-cloud operator policy (§5.10,
+	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
+	EgressOperatorFile string
 	EnableEventMonitor bool
 	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
@@ -1661,6 +1671,9 @@ func Load() (Config, error) {
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
+		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
+		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
+		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),

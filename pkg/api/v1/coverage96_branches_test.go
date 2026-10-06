@@ -851,7 +851,8 @@ func TestC96bClusterListJSBundlesWrapBranches(t *testing.T) {
 		svc.ClearClusterForTest()
 		rr := httptest.NewRecorder()
 		c96bHandlers(svc).clusterListJSBundlesWrap(rr, httptest.NewRequest(http.MethodGet, "/v1/js-bundles", nil))
-		c96bExpect(t, rr, http.StatusBadRequest)
+		// Isolate isn't enabled on this node: ErrRuntimeNotImplemented is a 501.
+		c96bExpect(t, rr, http.StatusNotImplemented)
 	})
 	t.Run("sweep_admission_fails", func(t *testing.T) {
 		svc := c96bServiceWithCluster(config.Config{EnableCluster: true}, c96bOpenStore(t), cluster.NewNoop("self", "http://self", ""))
