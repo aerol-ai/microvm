@@ -19,9 +19,12 @@ var ErrInvalidAtBoot = errors.New("egress operator file invalid")
 // an mtime poll (and Reload, e.g. on SIGHUP); an invalid reload keeps the last
 // good one and counts a failure.
 type Watcher struct {
-	path     string
-	cur      atomic.Pointer[Operator]
-	mtime    atomic.Int64
+	path string
+	cur  atomic.Pointer[Operator]
+	// tried is the mtime of the last attempt, good or bad: the poll loads a
+	// given version of the file once, so a broken edit counts one failure
+	// rather than one per tick.
+	tried    atomic.Int64
 	failures atomic.Uint64
 	bootErr  error
 	log      *slog.Logger
@@ -74,6 +77,7 @@ func (w *Watcher) Reload() error {
 		w.failures.Add(1)
 		return err
 	}
+	w.tried.Store(st.ModTime().UnixNano())
 	op, err := Load(w.path)
 	if err != nil {
 		w.failures.Add(1)
@@ -82,7 +86,6 @@ func (w *Watcher) Reload() error {
 		}
 		return err
 	}
-	w.mtime.Store(st.ModTime().UnixNano())
 	prev := w.cur.Swap(op)
 	if w.onChange != nil && (prev == nil || prev.Hash() != op.Hash()) {
 		w.onChange(op)
@@ -103,7 +106,7 @@ func (w *Watcher) Run(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			st, err := os.Stat(w.path)
-			if err != nil || st.ModTime().UnixNano() == w.mtime.Load() {
+			if err != nil || st.ModTime().UnixNano() == w.tried.Load() {
 				continue
 			}
 			_ = w.Reload()

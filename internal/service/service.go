@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"io"
 	"log/slog"
 	mathrand "math/rand"
@@ -368,6 +369,9 @@ type Service struct {
 	egressStats   egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it.
 	egressSelfTest *egressSelfTest
+	// egressOperatorWatcher holds the private-cloud operator file (§5.10);
+	// nil = no file, today's behavior.
+	egressOperatorWatcher *operator.Watcher
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -1635,6 +1639,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// payload fails before admission/mounts/docker.Create burn resources.
 	// On success req.CustomDomains is rewritten with the canonical slice.
 	if err := s.validateCreateCustomDomains(&req); err != nil {
+		return nil, err
+	}
+	// Operator default policy and ceiling (§5.10 PC-2): in memory, before
+	// any runtime is chosen, so native and facade creates of every runtime
+	// get the same answer and the stored spec carries the result.
+	if err := s.applyEgressOperatorPolicy(&req, isStoredSpecReplay(ctx)); err != nil {
 		return nil, err
 	}
 

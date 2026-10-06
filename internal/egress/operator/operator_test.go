@@ -171,11 +171,16 @@ func TestWatcherLastGoodAndBootError(t *testing.T) {
 	if w.Current().DefaultMode() != ModeBlockAll || w.Failures() == 0 {
 		t.Fatal("last good file must survive an invalid reload")
 	}
-	// The mtime poll picks up a valid edit.
+	// The poll does not re-parse the same broken version every tick.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	failed := w.Failures()
 	go w.Run(ctx, 20*time.Millisecond)
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	if w.Failures() != failed {
+		t.Fatalf("one broken edit counted %d failures", w.Failures()-failed)
+	}
+	// The mtime poll picks up a valid edit.
 	if err := os.WriteFile(path, []byte("version: 1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

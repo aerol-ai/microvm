@@ -735,3 +735,30 @@ groups:
           summary: "egress gateway self-test is failing on a sandbox bridge"
           description: "The per-bridge self-test on {{ $labels.instance }} has failed for 5 minutes: a probe sent through the redirect never reached the gateway. Hostname-filtered creates get 501 on this node. The sandboxd log names the bridge and the cause."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#selftestfailing"
+
+      # Nodes run different private-cloud operator files (§5.10): the
+      # default policy, ceiling, floor or proxy differ by node, so the same
+      # create behaves differently depending on placement.
+      - alert: SandboxdEgressOperatorConfigDrift
+        expr: count(count by (key) (aerolvm_egress_operator_config_info)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "nodes are running different egress operator files"
+          description: "aerolvm_egress_operator_config_info reports {{ $value }} distinct file hashes across the fleet. Ship the same /etc/sandboxd/egress-policy.yaml to every node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#operatorfile"
+
+      # An edit of the operator file did not validate; the node keeps the
+      # last good file, so nothing changed, but the operator's edit is not live.
+      - alert: SandboxdEgressOperatorConfigReloadFailed
+        expr: increase(aerolvm_egress_operator_config_load_failures_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress operator file failed to load"
+          description: "The operator file on {{ $labels.instance }} did not validate. A node that booted with it refuses every create (503 egress_operator_config_invalid); a running node keeps its last good file. The sandboxd log names the field."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#operatorfile"

@@ -26,6 +26,8 @@ do not use the gateway and are unaffected by every alert below.
 | `SandboxdEgressAttachFailures` | sandboxd failed to attach more than 2 sandboxes in 10 minutes. |
 | `SandboxdEgressSandboxesHeld` | Sandboxes have been held without egress for 10 minutes. |
 | `SandboxdEgressAuditDropped` | The gateway's audit ring overflowed; audit records are missing. |
+| `SandboxdEgressOperatorConfigDrift` | Nodes run different operator files. |
+| `SandboxdEgressOperatorConfigReloadFailed` | An operator file edit did not validate. |
 | `SandboxdEgressSelfTestFailing` | Probe traffic sent through the redirect never reached the gateway; the node refuses hostname-filtered creates. |
 
 ## Severity
@@ -174,6 +176,33 @@ A bridge that does not exist yet (containerd's `aerolvm0` before the first
 sandbox) is not a failure; it is tested once it appears. Failed bridges are
 retried with backoff up to every 5 minutes, and immediately on the next
 sandboxd or gateway restart.
+
+## OperatorFile
+
+Private-cloud deployments set `SB_EGRESS_OPERATOR_FILE` (normally
+`/etc/sandboxd/egress-policy.yaml`) for the default policy, the ceiling, the
+deny floor, the internal zone and the upstream proxy. sandboxd reads it for
+the default policy and the ceiling; the gateway reads it for the internal
+zone, the floor and the proxy.
+
+- **Edits.** sandboxd picks up a change within 10 seconds, or at once on
+  `systemctl kill -s HUP sandboxd`. An edit that does not validate is
+  ignored: the last good file stays live, sandboxd logs
+  `egress operator file invalid` with the field, and
+  `SandboxdEgressOperatorConfigReloadFailed` fires. The gateway reads the
+  file at start; restart `aerolvm-egress-gateway` after changing the
+  internal zone, floor or proxy.
+- **Invalid at boot.** A sandboxd that starts with a file present but invalid
+  refuses every create with `503 egress_operator_config_invalid`, because
+  the default policy is unknown. Fix the file; the next poll picks it up and
+  creates resume.
+- **Drift.** Every node exports `aerolvm_egress_operator_config_info` with
+  the file's hash as its label. `SandboxdEgressOperatorConfigDrift` fires
+  when nodes disagree for 10 minutes; ship the same file everywhere
+  (`config/cluster.yml` drives install, Terraform and Ansible).
+- **Running sandboxes.** The default policy is written into each sandbox's
+  spec at create, so editing the file never changes a running sandbox, and a
+  failover recreate keeps what the sandbox was created with.
 
 ## Tracing and logs
 

@@ -1117,6 +1117,12 @@ const ErrorCodeArtifactNodeUnavailable = "artifact_node_unavailable"
 // (plans/egress-domain-filtering.md G7, CEO D20). Retrying is the recovery.
 const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 
+// ErrorCodeEgressOperatorConfigInvalid is returned (503) for every create
+// while the egress operator file is present but invalid at boot: the
+// deployment's default egress policy is unknown, so creates fail closed
+// (plans/egress-domain-filtering.md §5.10).
+const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming
 // a facade later would require a one-shot UPDATE.

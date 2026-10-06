@@ -496,3 +496,13 @@ func TestWriteStoreAwareError_EgressGatewayUnavailable(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w: bad yaml", service.ErrEgressOperatorConfigInvalid))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressOperatorConfigInvalid {
+		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}

@@ -166,6 +166,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	// The egress gateway couldn't attach a hostname-filtered sandbox: the
 	// create was rolled back, retry once the gateway is back
 	// (plans/egress-domain-filtering.md G7).
+	if errors.Is(err, service.ErrEgressOperatorConfigInvalid) {
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressOperatorConfigInvalid, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrEgressGatewayUnavailable) || errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
 		w.Header().Set("Retry-After", "5")
 		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())

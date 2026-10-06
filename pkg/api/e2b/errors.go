@@ -81,6 +81,22 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}
+	// Egress sentinels (plans/egress-domain-filtering.md), mirroring
+	// apihttp: hostname filtering this node can't offer is 501; a gateway
+	// or operator file that isn't usable right now is 503.
+	if errors.Is(err, service.ErrEgressOperatorConfigInvalid) {
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressGatewayUnavailable) || errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrRuntimeNotImplemented) {
+		WriteError(w, http.StatusNotImplemented, err.Error())
+		return
+	}
 	if errors.Is(err, store.ErrSnapshotNameConflict) {
 		WriteError(w, http.StatusConflict, "Snapshot name already in use")
 		return
