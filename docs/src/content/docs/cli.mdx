@@ -114,6 +114,17 @@ aerolvm exec build-box --cwd /app --env CI=1 --timeout 15m -- npm test
 - **WASM sandboxes** have no streaming exec. `exec` runs the command buffered, without stdin, and prints the output when it finishes. `-i` and `-t` are refused.
 - **Isolate sandboxes** run a single `fetch` handler, with no shell and no filesystem. `exec`, `cp` and `ls` return `unsupported_runtime`; use the SDK's invoke call instead. See [Isolate Sandbox](/isolate-sandbox).
 
+## Limiting outbound network
+
+`--allow-host` gives a new sandbox an allow list: it reaches only the destinations you name, and everything else is refused. Repeat the flag or pass a comma list. An entry is a host, a `*.` wildcard, `host:port` or a CIDR.
+
+```sh
+aerolvm create --name build-box --image python:3.12 --allow-host pypi.org --allow-host '*.pythonhosted.org'
+aerolvm create --name deploy --allow-host github.com:22,10.0.0.0/8
+```
+
+`--block-network` turns outbound traffic off entirely, so it can't be combined with `--allow-host`. To change the list of a running sandbox, use `setNetworkPolicy` from an SDK. [Egress Domain Filtering](/egress-domain-filtering) covers the rules and how a denial is reported.
+
 ## Debugging
 
 `--debug` logs every API request and response status to stderr. The token is redacted.

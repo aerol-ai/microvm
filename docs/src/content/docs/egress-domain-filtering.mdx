@@ -236,6 +236,67 @@ A create that names hostnames while the node's gateway can't take it answers
 `503` with code `egress_gateway_unavailable` and a `Retry-After`; retry it. In
 a cluster, such creates are placed only on nodes whose gateway is ready.
 
+## Change the policy of a running sandbox
+
+`setNetworkPolicy` replaces a sandbox's whole policy while it runs. A list you
+leave out is cleared, so an empty call means open egress. The call returns once
+the new policy is enforced, and connections the new policy no longer allows are
+closed.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.setNetworkPolicy({
+      networkAllowOut: ['pypi.org', '*.pythonhosted.org', 'registry.npmjs.org'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.set_network_policy({
+        'networkAllowOut': ['pypi.org', '*.pythonhosted.org', 'registry.npmjs.org'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: []string{"pypi.org", "*.pythonhosted.org", "registry.npmjs.org"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "registry.npmjs.org".to_string(),
+        ],
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.setNetworkPolicy(
+        new NetworkPolicyOptions()
+            .setNetworkAllowOut(List.of("pypi.org", "*.pythonhosted.org", "registry.npmjs.org"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+- **Safe to retry.** Sending the policy a sandbox already has changes nothing.
+- **Never briefly open.** Outbound traffic is shut for the moment of the swap,
+  so neither the old nor the new policy is ever bypassed.
+- **Stopped sandboxes** keep the new policy and apply it when they start.
+- **Failures** come back as `503` with a code saying what happened:
+  `spec_commit_failed` means nothing changed (in a cluster, the new policy
+  couldn't be recorded); `apply_failed_held` means the policy is stored but
+  couldn't be applied, so the sandbox has no egress until a retry succeeds. A
+  sandbox that is still being created answers `409`; retry once it is up.
+
 ---
 
 ## Runtimes
@@ -303,5 +364,5 @@ refused with `503` and code `egress_operator_config_invalid` until it's fixed.
 - **IPv4 only.** As with network isolation, IPv6 egress isn't filtered.
 - **Names, not paths.** The filter decides on the hostname. It doesn't read
   HTTPS content, so it can't allow one path or method and refuse another.
-- **Set at create.** The policy is fixed when the sandbox is created.
-- **Firecracker** doesn't support hostname entries yet.
+- **Firecracker** doesn't support hostname entries yet, and can't change a
+  policy while the sandbox runs.

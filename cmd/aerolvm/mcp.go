@@ -37,6 +37,9 @@ Flags:
   --create-if-missing   create the pinned sandbox if it doesn't exist
   --image I             image for the created sandbox
   --runtime R           runtime for the created sandbox
+  --allow-host H        limit the created sandbox's outbound network to these
+                        destinations (repeatable or comma list): a host,
+                        *.domain, host:port or CIDR
   --toolsets LIST       core (default), files, process, or all (comma list)
   --read-only           offer only tools that change nothing
   --ephemeral           destroy the pinned sandbox when the server exits

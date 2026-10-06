@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/agenttools"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -61,6 +62,10 @@ type Options struct {
 	CreateIfMissing bool
 	Image           string
 	Runtime         string
+	// AllowHosts limits the created sandbox's outbound traffic to these
+	// hosts, *.domain wildcards, host:port pairs and CIDRs, so the model
+	// can't reach anything else (plans/egress-domain-filtering.md P2-3).
+	AllowHosts []string
 	// Toolsets lists the enabled toolsets; empty means core.
 	Toolsets []string
 	// ReadOnly registers only tools that change nothing.
@@ -130,6 +135,11 @@ func (o *Options) Validate() error {
 		}
 		return optErr(param, "only applies with create_if_missing")
 	}
+	if len(o.AllowHosts) > 0 && !o.CreateIfMissing {
+		// Only the pinned create applies it: an unpinned server would
+		// otherwise look fenced while every sandbox_create stays open.
+		return optErr("allow_host", "only applies with create_if_missing")
+	}
 	if o.Runtime != "" && !contains(MCPRuntimes, o.Runtime) {
 		return optErr("runtime", "must be one of %s", strings.Join(MCPRuntimes, ", "))
 	}
@@ -157,7 +167,7 @@ func (o *Options) Validate() error {
 // RemoteParams are the options the remote endpoint takes as URL query
 // parameters (CEO review CF1). The token stays in the Authorization header;
 // stdio-only options (ephemeral, max_creates, ...) are not accepted there.
-var RemoteParams = []string{"sandbox", "create_if_missing", "image", "runtime", "toolsets", "read_only"}
+var RemoteParams = []string{"sandbox", "create_if_missing", "image", "runtime", "allow_host", "toolsets", "read_only"}
 
 // BindFlags registers the stdio flags on fs (query names with dashes) and
 // returns a parser that validates them. It and ParseQuery are the only two
@@ -171,6 +181,7 @@ func BindFlags(fs *flag.FlagSet) func() (Options, error) {
 	fs.BoolVar(&opts.CreateIfMissing, "create-if-missing", false, "")
 	fs.StringVar(&opts.Image, "image", "", "")
 	fs.StringVar(&opts.Runtime, "runtime", "", "")
+	fs.Var((*agenttools.HostList)(&opts.AllowHosts), "allow-host", "")
 	fs.StringVar(&toolsets, "toolsets", ToolsetCore, "")
 	fs.BoolVar(&opts.ReadOnly, "read-only", false, "")
 	fs.BoolVar(&opts.Ephemeral, "ephemeral", false, "")
@@ -207,6 +218,8 @@ func ParseQuery(q url.Values) (Options, error) {
 			opts.Image = value
 		case "runtime":
 			opts.Runtime = value
+		case "allow_host":
+			_ = (*agenttools.HostList)(&opts.AllowHosts).Set(value)
 		case "toolsets":
 			opts.Toolsets = ParseToolsets(value)
 		case "create_if_missing", "read_only":

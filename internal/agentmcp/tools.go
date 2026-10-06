@@ -179,6 +179,7 @@ type createIn struct {
 	MemoryMB             int               `json:"memory_mb,omitempty" jsonschema:"memory in MiB"`
 	Env                  map[string]string `json:"env,omitempty" jsonschema:"environment variables"`
 	DestroyIfIdleMinutes int               `json:"destroy_if_idle_minutes,omitempty" jsonschema:"destroy after this many idle minutes (default 1440)"`
+	AllowHosts           []string          `json:"allow_hosts,omitempty" jsonschema:"allow outbound network to only these destinations: hosts like pypi.org, wildcards like *.github.com, host:port or CIDRs; omit for open outbound"`
 }
 
 type createOut struct {
@@ -214,6 +215,7 @@ func (s *Server) sandboxCreate(ctx context.Context, in createIn) (createOut, str
 		MemoryMB:  in.MemoryMB,
 		Env:       in.Env,
 		Lifecycle: s.opts.lifecycle(minutes(in.DestroyIfIdleMinutes)),
+		AllowOut:  in.AllowHosts,
 	})
 	if err != nil {
 		return createOut{}, "", err

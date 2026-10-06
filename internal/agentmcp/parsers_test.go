@@ -28,6 +28,8 @@ func TestStdioAndRemoteParsersAgree(t *testing.T) {
 		{"sandbox": "my-agent", "runtime": "isolate", "create_if_missing": "true"},
 		{"sandbox": "sb-0123456789abcdef", "create_if_missing": "true"},
 		{"sandbox": "my-agent", "image": "alpine"},
+		{"sandbox": "my-agent", "create_if_missing": "true", "allow_host": "pypi.org, *.github.com"},
+		{"sandbox": "my-agent", "allow_host": "pypi.org"},
 	}
 	for _, c := range cases {
 		q := url.Values{}
@@ -56,7 +58,7 @@ func TestStdioAndRemoteParsersAgree(t *testing.T) {
 		}
 		// Stdio-only knobs keep their flag defaults; compare the shared ones.
 		remote.Remote = false
-		stdioShared := Options{Sandbox: stdio.Sandbox, CreateIfMissing: stdio.CreateIfMissing, Image: stdio.Image, Runtime: stdio.Runtime, Toolsets: stdio.Toolsets, ReadOnly: stdio.ReadOnly}
+		stdioShared := Options{Sandbox: stdio.Sandbox, CreateIfMissing: stdio.CreateIfMissing, Image: stdio.Image, Runtime: stdio.Runtime, AllowHosts: stdio.AllowHosts, Toolsets: stdio.Toolsets, ReadOnly: stdio.ReadOnly}
 		if !reflect.DeepEqual(stdioShared, remote) {
 			t.Fatalf("%v:\nstdio  %+v\nremote %+v", c, stdioShared, remote)
 		}
@@ -127,5 +129,15 @@ func TestInputSchemaCacheIsCopyOnWrite(t *testing.T) {
 	b := inputSchema[createIn]("sandbox_create")
 	if _, ok := b.Properties["name"]; !ok || len(b.Properties["runtime"].Enum) != 0 {
 		t.Fatal("editing one copy changed the cached schema")
+	}
+}
+
+// TestAllowHostNeedsPinnedCreate: an unpinned server with --allow-host would
+// look fenced while every sandbox_create stays open, so it is refused.
+func TestAllowHostNeedsPinnedCreate(t *testing.T) {
+	o := Options{AllowHosts: []string{"pypi.org"}}
+	var oe *OptionError
+	if err := o.Validate(); !errors.As(err, &oe) || oe.Param != "allow_host" || oe.Flag() != "--allow-host" {
+		t.Fatalf("Validate = %v", err)
 	}
 }

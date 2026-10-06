@@ -119,7 +119,7 @@ Tools come in three toolsets. The server offers `core` unless you pass `--toolse
 
 `--read-only` offers only the tools that change nothing: listing, reading, searching and logs.
 
-Every tool that acts on a sandbox takes a `sandbox` argument, an ID or a name. `sandbox_create` is safe to retry: asking for a name you already have returns that sandbox instead of making a second one.
+Every tool that acts on a sandbox takes a `sandbox` argument, an ID or a name. `sandbox_create` is safe to retry: asking for a name you already have returns that sandbox instead of making a second one. Its `allow_hosts` argument limits the new sandbox's outbound network to the hosts, `*.` wildcards, `host:port` pairs and CIDRs it lists; see [Egress Domain Filtering](/egress-domain-filtering).
 
 ## Pinned mode
 
@@ -133,6 +133,11 @@ aerolvm mcp --sandbox my-agent --create-if-missing --image python:3.12
 - With `--create-if-missing`, the sandbox is created on the first tool call that needs it, not when the server starts.
 - If the sandbox disappears, for example after it was destroyed for idling, the next call creates a new one. The result tells the model that files from earlier calls are gone.
 - `--ephemeral` destroys the sandbox when the server exits.
+- `--allow-host` limits the created sandbox's outbound network to the destinations you list (repeat it or pass a comma list), so the model can only reach those. It needs `--create-if-missing`: an unpinned server refuses it, since the model chooses its own `allow_hosts` there.
+
+```sh
+aerolvm mcp --sandbox my-agent --create-if-missing --image python:3.12 --allow-host pypi.org,*.pythonhosted.org
+```
 
 Pass the same flags to `aerolvm mcp config` to get a client snippet that starts the server pinned.
 
@@ -173,6 +178,7 @@ The remote endpoint is always pinned. The query string chooses the sandbox and t
 | `sandbox` | The sandbox name or ID. Required. |
 | `create_if_missing` | `true` to create the sandbox on first use. |
 | `image`, `runtime` | What to create it from. |
+| `allow_host` | Outbound destinations the created sandbox may reach, as a comma list. Needs `create_if_missing`. |
 | `toolsets` | `core` (default), `files`, `process`, or `all`, as a comma list. |
 | `read_only` | `true` for the tools that change nothing. |
 

@@ -49,11 +49,14 @@ Flags:
   --stop-if-idle D     stop after this long idle, e.g. 30m (files are kept)
   --destroy-if-idle D  destroy after this long idle, e.g. 24h
   --block-network      no outbound network
+  --allow-host H       allow outbound to only these destinations (repeatable
+                       or comma list): a host, *.domain, host:port or CIDR
   --json               print the sandbox as JSON, plus "created": true|false
 
 Examples:
   aerolvm create --name build-box --image python:3.12 --destroy-if-idle 2h
   id=$(aerolvm create --image node:22 --json | jq -r .id)
+  aerolvm create --image python:3.12 --allow-host pypi.org --allow-host '*.pythonhosted.org'
 `
 
 const listHelp = `List sandboxes, one page at a time.

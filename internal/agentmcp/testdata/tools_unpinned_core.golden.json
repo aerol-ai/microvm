@@ -318,6 +318,16 @@
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "allow_hosts": {
+          "description": "allow outbound network to only these destinations: hosts like pypi.org, wildcards like *.github.com, host:port or CIDRs; omit for open outbound",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        },
         "cpu": {
           "description": "CPU cores",
           "type": "number"

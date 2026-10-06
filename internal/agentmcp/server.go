@@ -214,6 +214,7 @@ func (s *Server) pinnedTarget(ctx context.Context, needShell bool) (*microvm.San
 		Image:     s.opts.Image,
 		Runtime:   s.opts.Runtime,
 		Lifecycle: s.opts.lifecycle(0),
+		AllowOut:  s.opts.AllowHosts,
 	})
 	if err != nil {
 		return nil, Notice{}, err

@@ -25,6 +25,7 @@ func runCreate(ctx context.Context, a *app, args []string) int {
 		blockNetwork         bool
 	)
 	env, tags := kvList{}, kvList{}
+	var allowHosts agenttools.HostList
 	fs.StringVar(&name, "name", "", "")
 	fs.StringVar(&image, "image", "", "")
 	fs.StringVar(&runtime, "runtime", "", "")
@@ -35,6 +36,7 @@ func runCreate(ctx context.Context, a *app, args []string) int {
 	fs.DurationVar(&stopIdle, "stop-if-idle", 0, "")
 	fs.DurationVar(&destroy, "destroy-if-idle", 0, "")
 	fs.BoolVar(&blockNetwork, "block-network", false, "")
+	fs.Var(&allowHosts, "allow-host", "")
 	pos, _, err := parseArgs(fs, args)
 	if err != nil {
 		return a.flagError(c, "create", err)
@@ -42,9 +44,12 @@ func runCreate(ctx context.Context, a *app, args []string) int {
 	if len(pos) > 0 {
 		return a.usageError(c, "create", "unexpected argument %q (use --name)", pos[0])
 	}
+	if blockNetwork && len(allowHosts) > 0 {
+		return a.usageError(c, "create", "--block-network and --allow-host can't be combined")
+	}
 	spec := agenttools.CreateSpec{
 		Name: name, Image: image, Runtime: runtime, CPU: cpu, MemoryMB: memoryMB,
-		Env: env.orNil(), Tags: tags.orNil(), BlockNetwork: blockNetwork,
+		Env: env.orNil(), Tags: tags.orNil(), BlockNetwork: blockNetwork, AllowOut: allowHosts,
 	}
 	if stopIdle > 0 || destroy > 0 {
 		spec.Lifecycle = &models.Lifecycle{StopIfIdleFor: stopIdle, DestroyIfIdleFor: destroy}
