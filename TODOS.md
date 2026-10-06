@@ -273,22 +273,25 @@ what, why, the caveat that motivated capturing it, and where to start.
 - **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true, plus a soak
   of about one release cycle.
 
-## L4 splice drops the response after a client half-close
+## L4 splice drops the response after a client half-close — FIXED (egress P1-0)
 
-- **What:** Make `spliceConns` (`internal/service/l4proxy.go`) wait for
-  **both** directions, bounded by an idle timeout, instead of closing both
-  sides when the first direction ends.
-- **Why:** Found while testing the 3A extraction (2026-09-28). A client that
-  sends its request, then half-closes its write side, never receives the
-  response. That affects netcat-style and some database and RPC clients. The
-  L4 wake proxy has always behaved this way; the extraction preserved it.
-- **Pros:** correct TCP semantics for half-closing clients.
-- **Cons:** waiting for both sides needs an idle timeout, so a peer that never
-  closes cannot pin goroutines and caps slots.
-- **Start:** the `<-done` in `spliceConns`. The contract is pinned by
-  `TestSpliceConnsWritesBufferedPrefixFirst`; change that test with the fix.
-- **Depends on:** nothing. It matters more once sandboxd owns raw TCP host
-  ports (plans/ingress-proxy-routing.md §3.5).
+- **What it was:** `spliceConns` (`internal/service/l4proxy.go`) returned
+  when the first direction ended and closed both sides. A client that sent its
+  request and then half-closed its write side never received the response
+  (netcat-style, some database and RPC clients). Found while testing the 3A
+  extraction (2026-09-28).
+- **Fix:** the splice and the connection limiter moved to `internal/netsplice`
+  (egress plan P1-0, D12/D17) as `netsplice.Splice` and `netsplice.Limiter`.
+  `Splice` waits for both directions, forwards each EOF as a `CloseWrite`, and
+  closes both conns only when both are done, on a copy error, or on an
+  optional idle timeout (`WithIdleTimeout`). It still copies raw conn to raw
+  conn, so splice(2) applies. Pinned by `TestSpliceHalfCloseDeliversTheRest`
+  (both directions) and `TestSpliceIdleTimeout`.
+- **Residual:** the L4 wake proxy passes no idle timeout, because wake-proxied
+  database connections legitimately sit idle for hours. A peer that
+  half-closes and whose other side never closes now holds its active slot
+  until it does, where the old code dropped it at once. The egress proxy is
+  expected to pass an idle timeout.
 
 ## Caddy route upsert does not retry a transport EOF (unconfirmed)
 

@@ -4,17 +4,15 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
-	"io"
-	"net"
 	"strconv"
 	"strings"
-	"sync"
 )
 
-// Shared raw-TCP proxy primitives. The L4 wake proxy uses them today. The
-// sandboxd-owned host-port listeners in plans/ingress-proxy-routing.md §3.5
-// will use them next, so connection caps, half-close and PROXY parsing exist
-// once, not once per proxy (eng review 3A).
+// PROXY protocol parsing for the L4 wake proxy. The splice and the
+// connection limiter it pairs with live in internal/netsplice, shared with
+// the egress FQDN proxy (plans/egress-domain-filtering.md D12, D17), so
+// connection caps, half-close and PROXY parsing exist once, not once per
+// proxy (eng review 3A).
 
 // proxyHeader is a parsed PROXY protocol v1 line.
 type proxyHeader struct {
@@ -66,110 +64,4 @@ func readProxyV1DestinationPort(br *bufio.Reader) (int, error) {
 		return 0, err
 	}
 	return h.DstPort, nil
-}
-
-// connLimiter caps concurrent connections per key (a sandbox ID) and
-// globally. The hooks run under the limiter's lock, so state tied to a key's
-// first acquire or last release (the wake proxy's activity generation)
-// changes atomically with the count. The wake proxy relied on that when all
-// of this lived under Service.l4LimitMu.
-type connLimiter struct {
-	perKeyMax func() int
-	globalMax func() int
-
-	mu     sync.Mutex
-	byKey  map[string]int
-	global int
-}
-
-func newConnLimiter(perKeyMax, globalMax func() int) *connLimiter {
-	return &connLimiter{perKeyMax: perKeyMax, globalMax: globalMax, byKey: make(map[string]int)}
-}
-
-// tryAcquire reserves one slot for key. onAcquire(first) and the returned
-// release's onRelease(last) run under the lock; either may be nil. The
-// release func is idempotent, so a double release cannot drive counts
-// negative or free another connection's slot.
-func (l *connLimiter) tryAcquire(key string, onAcquire func(first bool), onRelease func(last bool)) (func(), bool) {
-	perKeyMax, globalMax := l.perKeyMax(), l.globalMax()
-	l.mu.Lock()
-	if l.byKey[key] >= perKeyMax || l.global >= globalMax {
-		l.mu.Unlock()
-		return nil, false
-	}
-	first := l.byKey[key] == 0
-	l.byKey[key]++
-	l.global++
-	if onAcquire != nil {
-		onAcquire(first)
-	}
-	l.mu.Unlock()
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			l.mu.Lock()
-			defer l.mu.Unlock()
-			last := l.byKey[key] <= 1
-			if last {
-				delete(l.byKey, key)
-			} else {
-				l.byKey[key]--
-			}
-			if l.global > 0 {
-				l.global--
-			}
-			if onRelease != nil {
-				onRelease(last)
-			}
-		})
-	}, true
-}
-
-// withLock runs fn with the limiter's lock held, passing the live count for
-// key. Use it for state guarded by the hooks.
-func (l *connLimiter) withLock(key string, fn func(count int)) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	fn(l.byKey[key])
-}
-
-// spliceConns copies downstream<->upstream until either side finishes, then
-// closes both. Bytes already buffered in br (read past a PROXY header, or a
-// peeked ClientHello) are written upstream FIRST. The copy then runs
-// raw-conn to raw-conn: wrapping downstream in io.MultiReader (the old
-// shape) hid the *net.TCPConn from io.Copy, so client->upstream bytes could
-// not use Linux splice(2) and went through user space (eng review 7A).
-func spliceConns(downstream, upstream net.Conn, br *bufio.Reader) error {
-	if br != nil {
-		if n := br.Buffered(); n > 0 {
-			prefix, err := br.Peek(n)
-			if err != nil {
-				return fmt.Errorf("read buffered prefix: %w", err)
-			}
-			if _, err := upstream.Write(prefix); err != nil {
-				return fmt.Errorf("write buffered prefix: %w", err)
-			}
-			_, _ = br.Discard(n)
-		}
-	}
-	done := make(chan struct{}, 2)
-	go proxyCopyAndCloseWrite(upstream, downstream, done)
-	go proxyCopyAndCloseWrite(downstream, upstream, done)
-	<-done
-	_ = downstream.Close()
-	_ = upstream.Close()
-	return nil
-}
-
-// proxyCopyAndCloseWrite copies src to dst, then half-closes dst so the peer
-// sees EOF while the other direction keeps flowing.
-func proxyCopyAndCloseWrite(dst net.Conn, src io.Reader, done chan<- struct{}) {
-	_, _ = io.Copy(dst, src)
-	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-	} else {
-		_ = dst.Close()
-	}
-	done <- struct{}{}
 }

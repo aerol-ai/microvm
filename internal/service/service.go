@@ -23,6 +23,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
@@ -335,7 +336,7 @@ type Service struct {
 	// l4Active counts connections already admitted to proxy bytes. Keeping
 	// both lets cold-start bursts shed excess work without blocking
 	// unrelated warm traffic accounting. See l4Limiters (lazy) and
-	// connLimiter (l4proxy.go).
+	// netsplice.Limiter.
 	// routeWriter, when set, replaces s.caddy for every per-sandbox route
 	// write (publicRoutes, eng review 4A). nil means the concrete client.
 	// Written only through setRouteWriter (routing mode switches at boot,
@@ -344,10 +345,11 @@ type Service struct {
 	routeWriterMu sync.RWMutex
 
 	l4LimitersOnce sync.Once
-	l4Pending      *connLimiter
-	l4Active       *connLimiter
+	l4Pending      *netsplice.Limiter
+	l4Active       *netsplice.Limiter
 	// l4ActivityGenerations / l4ActivitySeq are guarded by l4Active's lock
-	// (connLimiter hooks), so a generation changes atomically with the count.
+	// (netsplice.Limiter hooks), so a generation changes atomically with the
+	// count.
 	l4ActivityGenerations map[string]uint64
 	l4ActivitySeq         uint64
 
