@@ -882,6 +882,25 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(data["networkEgressRules"], [{"host": "example.com", "ports": [80], "paths": ["/ok/*"]}])
         self.assertNotIn("networkEgressRules", _from_api_sandbox({"id": "sb"}))
 
+    def test_egress_rule_inject(self):
+        client = RecordingMicroVM()
+        rule = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secretRef": "env:GITHUB_TOKEN"}}
+        wire = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}}
+        sandbox = client.create({"image": "alpine", "env": {"GITHUB_TOKEN": "Bearer ghp_x"}, "networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [wire])
+
+        # The recorder answers with the wire rules it was sent; the SDK maps
+        # them back. A snake_case secret_ref is accepted on the way in too.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"], "networkEgressRules": [wire, {"host": "api.github.com"}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [wire, {"host": "api.github.com"}])
+        self.assertEqual(policy["networkEgressRules"], [rule, {"host": "api.github.com"}])
+        self.assertEqual(sandbox.networkEgressRules, [rule, {"host": "api.github.com"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{**wire, "ports": [443]}]})
+        self.assertEqual(data["networkEgressRules"], [{**rule, "ports": [443]}])
+
     def test_sandbox_maps_egress_profiles(self):
         from microvm.client import _from_api_sandbox
 

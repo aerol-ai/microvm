@@ -887,7 +887,7 @@ class MicroVM:
             body["network_egress_mode"] = str(mode)
         rules = _first_of(options, "networkEgressRules", "network_egress_rules")
         if rules is not None:
-            body["network_egress_rules"] = _egress_rules(rules)
+            body["network_egress_rules"] = _egress_rules(rules, wire=True)
         payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
         policy: NetworkPolicy = {
             "networkBlockAll": bool(payload.get("network_block_all", False)),
@@ -1819,9 +1819,10 @@ def _from_api_egress_profile(payload: Dict[str, Any]) -> EgressProfile:
     return result
 
 
-def _egress_rules(rules: Optional[List[Dict[str, Any]]]) -> List[EgressRule]:
-    # The wire and SDK keys are the same words, so this only drops unset
-    # keys and pins the types; it reads both directions.
+def _egress_rules(rules: Optional[List[Dict[str, Any]]], wire: bool = False) -> List[EgressRule]:
+    # The wire and SDK keys are the same words except inject's secretRef
+    # (secret_ref on the wire), so this drops unset keys, pins the types and
+    # reads either spelling; wire picks the one it writes.
     result: List[EgressRule] = []
     for r in rules or []:
         rule: EgressRule = {"host": str(r.get("host") or "")}
@@ -1833,12 +1834,16 @@ def _egress_rules(rules: Optional[List[Dict[str, Any]]]) -> List[EgressRule]:
             rule["paths"] = [str(p) for p in r["paths"]]
         if r.get("inspect"):
             rule["inspect"] = True
+        inject = r.get("inject")
+        if inject:
+            ref = str(_first_of(inject, "secretRef", "secret_ref") or "")
+            rule["inject"] = {"header": str(inject.get("header") or ""), ("secret_ref" if wire else "secretRef"): ref}  # type: ignore[typeddict-item]
         result.append(rule)
     return result
 
 
 def _egress_rules_or_none(rules: Optional[List[Dict[str, Any]]]) -> Optional[List[EgressRule]]:
-    return None if rules is None else _egress_rules(rules)
+    return None if rules is None else _egress_rules(rules, wire=True)
 
 
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:

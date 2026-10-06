@@ -30,6 +30,12 @@ public class EgressRule {
      * request's Host must then equal the TLS server name.
      */
     public boolean inspect;
+    /**
+     * Replace a header on the requests this rule allows with a secret from the
+     * sandbox's own env, which the sandbox itself only sees as a placeholder.
+     * Needs inspect.
+     */
+    public EgressInject inject;
 
     public EgressRule setHost(String host) {
         this.host = host;
@@ -53,6 +59,11 @@ public class EgressRule {
 
     public EgressRule setInspect(boolean inspect) {
         this.inspect = inspect;
+        return this;
+    }
+
+    public EgressRule setInject(EgressInject inject) {
+        this.inject = inject;
         return this;
     }
 }

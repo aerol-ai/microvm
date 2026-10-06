@@ -29,7 +29,7 @@ const (
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
 	// CapEgressFQDN gates the hostname egress use cases (UC-180..182, UC-185,
-	// UC-190..201; plans/egress-domain-filtering.md P1-10, Phases 2-3). Advertisement-only: install.sh
+	// UC-190..202; plans/egress-domain-filtering.md P1-10, Phases 2-3). Advertisement-only: install.sh
 	// installs and starts the aerolvm-egress-gateway units on every node and
 	// SB_EGRESS_FQDN_ENABLED defaults on, so a scenario advertises it when its
 	// container nodes are not privileged (a privileged node refuses hostname
@@ -619,6 +619,7 @@ var Registry = []UseCase{
 	{ID: "UC-199", Title: "Built-in profile builtin:apt-ubuntu alone runs apt-get update and a package download (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	{ID: "UC-200", Title: "Built-in profile builtin:docker-hub alone runs crane pull (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	{ID: "UC-201", Title: "Inspect rule on 443 (EF-52, EF-53): the ruled GET passes through TLS inspection trusting the node CA via SSL_CERT_FILE; a POST or an unruled path gets the gateway's 403", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-202", Title: "Credential injection (EF-54): the sandbox's env holds only aerolvm-placeholder:TEST_TOKEN, and postman-echo receives the real token the gateway put in the Authorization header", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

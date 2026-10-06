@@ -3,8 +3,10 @@ package microvm
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 func TestClientAndSandboxWrappers(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
+	var policyBody []byte
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -38,8 +41,9 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/usage":
 			_ = json.NewEncoder(w).Encode(models.NetworkUsage{SandboxID: "sb1", BytesIn: 10, BytesOut: 20})
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/sandboxes/sb1/network/policy":
+			policyBody, _ = io.ReadAll(r.Body)
 			var req models.NetworkPolicyRequest
-			_ = json.NewDecoder(r.Body).Decode(&req)
+			_ = json.Unmarshal(policyBody, &req)
 			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressRules: req.NetworkEgressRules, EgressStatus: "active"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/learned":
 			_ = json.NewEncoder(w).Encode(models.NetworkLearned{Mode: "learn", Entries: []models.NetworkLearnedEntry{{Host: "pypi.org", Ports: []uint16{443}}}})
@@ -227,6 +231,19 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if len(sb.NetworkEgressRules) != 1 || sb.NetworkEgressRules[0].Host != "api.github.com" || !sb.NetworkEgressRules[0].Inspect || sb.NetworkEgressRules[0].Paths[0] != "/repos/acme/**" {
 		t.Fatalf("Sandbox rules after SetNetworkPolicy = %+v", sb.NetworkEgressRules)
+	}
+	if strings.Contains(string(policyBody), `"inject"`) {
+		t.Fatalf("a rule without inject must not send one: %s", policyBody)
+	}
+	rule.Inject = &sdktypes.EgressInject{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"}
+	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}, NetworkEgressRules: []sdktypes.EgressRule{rule}}); err != nil {
+		t.Fatalf("Sandbox.SetNetworkPolicy(inject) error = %v", err)
+	}
+	if !strings.Contains(string(policyBody), `"inject":{"header":"Authorization","secret_ref":"env:GITHUB_TOKEN"}`) {
+		t.Fatalf("inject on the wire = %s", policyBody)
+	}
+	if got := sb.NetworkEgressRules[0].Inject; got == nil || got.Header != "Authorization" || got.SecretRef != "env:GITHUB_TOKEN" {
+		t.Fatalf("Sandbox rule inject after SetNetworkPolicy = %+v", got)
 	}
 	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}}); err != nil || sb.NetworkEgressRules != nil {
 		t.Fatalf("a policy without rules must clear them: %+v, %v", sb.NetworkEgressRules, err)

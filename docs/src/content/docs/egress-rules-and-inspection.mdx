@@ -13,7 +13,8 @@ plain HTTP the egress gateway already reads every request. For HTTPS, an
 **inspect** rule makes the gateway terminate TLS with a certificate authority
 (CA) that belongs to the node, check each request, and open its own TLS
 connection to the real host. Only a sandbox created with an inspect rule
-trusts that CA.
+trusts that CA. An inspect rule can also **inject** a credential, such as an
+API token, that the sandbox itself never holds.
 
 ---
 
@@ -188,6 +189,7 @@ allowed hosts are unaffected; their HTTPS still passes through unopened.
 | `methods` | Exact and upper case, like `GET` or `HEAD`. Empty allows any method. |
 | `paths` | Globs on the request path. Empty allows any path. |
 | `inspect` | Terminate TLS on 443 so the rule can see each request. |
+| `inject` | `{header, secretRef}`: set `header` on the requests the rule allows to the value of the env key `secretRef` names (`env:<KEY>`). Needs `inspect`. See [Inject a credential](#inject-a-credential). |
 
 In paths, `*` matches any characters within one segment, and `**`, written as
 a whole segment, matches any number of segments, none included:
@@ -277,6 +279,147 @@ first:
 
 ---
 
+## Inject a credential
+
+Anything a sandbox can read, a hijacked agent can send somewhere else. An
+`inject` rule keeps a credential out of the sandbox: you pass it in the
+create's `env` as usual and name it in the rule, the sandbox only ever sees a
+placeholder, and the egress gateway puts the real value on the requests the
+rule allows. This sandbox can call the GitHub API with a token it can't leak:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      env: { GITHUB_TOKEN: 'Bearer ghp_...' },
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        {
+          host: 'api.github.com',
+          inspect: true,
+          paths: ['/repos/**'],
+          inject: { header: 'Authorization', secretRef: 'env:GITHUB_TOKEN' },
+        },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'env': {'GITHUB_TOKEN': 'Bearer ghp_...'},
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {
+                'host': 'api.github.com',
+                'inspect': True,
+                'paths': ['/repos/**'],
+                'inject': {'header': 'Authorization', 'secretRef': 'env:GITHUB_TOKEN'},
+            },
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        Env:             map[string]string{"GITHUB_TOKEN": "Bearer ghp_..."},
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "api.github.com",
+            Inspect: true,
+            Paths:   []string{"/repos/**"},
+            Inject:  &sdktypes.EgressInject{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        env: Some(HashMap::from([("GITHUB_TOKEN".to_string(), "Bearer ghp_...".to_string())])),
+        network_allow_out: Some(vec!["api.github.com".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "api.github.com".to_string(),
+            inspect: true,
+            paths: vec!["/repos/**".to_string()],
+            inject: Some(EgressInject {
+                header: "Authorization".to_string(),
+                secret_ref: "env:GITHUB_TOKEN".to_string(),
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEnv(Map.of("GITHUB_TOKEN", "Bearer ghp_..."))
+            .setNetworkAllowOut(List.of("api.github.com"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setPaths(List.of("/repos/**"))
+                .setInject(new EgressInject()
+                    .setHeader("Authorization")
+                    .setSecretRef("env:GITHUB_TOKEN"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `GITHUB_TOKEN` holds `aerolvm-placeholder:GITHUB_TOKEN`.
+Code there sends its requests the ordinary way, for example with
+`Authorization: $GITHUB_TOKEN`, and `api.github.com` receives
+`Authorization: Bearer ghp_...`.
+
+- **The value is the whole header.** The gateway replaces the header, it
+  doesn't fill in part of it, so put the scheme in the env value
+  (`Bearer ghp_...`, `token ghp_...`). Whatever the sandbox sends in that
+  header, or nothing at all, the host receives the real value.
+- **Headers only.** The value is only ever set as the header the rule names,
+  never written into a body, a URL or another header. A placeholder the
+  sandbox puts anywhere else reaches the host as a placeholder.
+- **Only on requests the rule allows.** The header is set on the requests this
+  rule admits by host, method and path, and nowhere else. A request to another
+  host carries what the sandbox sent, which at most is the placeholder.
+- **The sandbox never holds it.** Docker, containerd and gVisor sandboxes get
+  the placeholder in their environment. The node's egress gateway gets the
+  value, keeps it in memory and never writes it to its disk. A hijacked agent
+  can't send a key it never had to anyone.
+- **Never sent with the placeholder.** If the gateway doesn't have the value,
+  the request is refused with `403` (`secret_missing`) rather than sent
+  without it.
+- **What a rule needs.** `inspect: true`, since the credential is only added
+  inside the gateway's own TLS; an `inject` rule on port 80 is refused with
+  `400`. `secretRef` is `env:<KEY>`, and the key must be in the create's `env`
+  (`400` otherwise).
+- **Headers you can't inject.** Headers that frame or route a request are
+  refused with `400`: `Host`, `Content-Length`, `Transfer-Encoding`,
+  `Connection`, `Upgrade`, `TE`, `Trailer`, `Keep-Alive`,
+  `Proxy-Authorization` and `Proxy-Connection`.
+- **Audit names, not values.** The [audit log](/egress-domain-filtering#see-what-was-refused)
+  names an inject rule with its header and reference, such as
+  `rules[0] api.github.com (inject Authorization from env:GITHUB_TOKEN)`,
+  never with the value.
+- **Rotating means recreating.** A sandbox's env can't be changed after create,
+  so to use a new token, recreate the sandbox with it.
+- **Isolate.** An isolate sandbox never sees its env, so nothing is replaced
+  with a placeholder. Its egress proxy sets the header from the sandbox's
+  sealed env, with the same `secret_missing` refusal.
+
+---
+
 ## Change rules on a running sandbox
 
 `setNetworkPolicy` replaces the rules along with the rest of the policy. This
@@ -354,6 +497,12 @@ adds a second rule so the sandbox can also open issues:
   rules". A sandbox created with one can add, change and remove inspect rules
   freely, and keeps trusting the CA. If you may want inspection later, start
   with an inspect rule.
+- **Injected keys are chosen at create.** On Docker, containerd and gVisor, a
+  later policy can inject only keys that an inject rule named at create, since
+  only those were kept out of the sandbox. Injecting any other key is refused
+  with `409` "recreate the sandbox with this inject rule": the sandbox already
+  holds that value in clear, so injecting it would protect nothing. On isolate,
+  any key in the sandbox's env can be injected (`400` if it isn't there).
 - **Safe to retry.** Sending the same policy again changes nothing.
 
 ---
@@ -362,8 +511,8 @@ adds a second rule so the sandbox can also open issues:
 
 | Runtime | Egress rules |
 |---|---|
-| Docker, containerd, gVisor | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA |
-| Isolate | every rule, inspect included, with no CA: the isolate's egress proxy already sees each request in plain text |
+| Docker, containerd, gVisor | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA, and inject rules leave a placeholder in the sandbox's env |
+| Isolate | every rule, inspect and inject included, with no CA: the isolate's egress proxy already sees each request in plain text, and the sandbox never sees its env |
 | WASM | not supported: rules are refused with `501` |
 | Firecracker | not supported: rules are refused with `501` |
 
@@ -374,8 +523,9 @@ adds a second rule so the sandbox can also open issues:
 - **Inspected traffic is decrypted on the node.** The gateway decrypts each
   inspected request and response in memory to check it, then encrypts it again
   for the real host or the sandbox. Credentials the sandbox sends to an
-  inspected host are visible to the node in that moment. Inspect only the hosts
-  you need to.
+  inspected host are visible to the node in that moment, and an injected
+  credential is held by the node's gateway for the sandbox's life. Inspect
+  only the hosts you need to.
 - **Java's trust store isn't covered.** The JVM ignores the variables above, so
   a Java client fails the handshake with an inspected host until you import
   `/etc/aerolvm/egress-ca.pem` into the trust store it uses.

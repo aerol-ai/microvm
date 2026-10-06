@@ -1618,3 +1618,35 @@ test("egress rules: create, the policy answer and the sandbox's own copy", async
   assert.deepEqual(cleared.networkEgressRules, []);
   assert.equal(sandbox.networkEgressRules, undefined);
 });
+
+test("egress rules: inject goes out as secret_ref and comes back as secretRef", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secretRef: "env:GITHUB_TOKEN" } };
+  const wire = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secret_ref: "env:GITHUB_TOKEN" } };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: [wire] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-inject"), network_egress_rules: [{ ...wire, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({
+    image: "alpine",
+    env: { GITHUB_TOKEN: "Bearer ghp_x" },
+    networkAllowOut: ["api.github.com"],
+    networkEgressRules: [rule],
+  });
+  assert.deepEqual(bodies[0].network_egress_rules, [wire]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  // A rule without inject goes out unchanged, with no inject key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule, { host: "api.github.com" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [wire, { host: "api.github.com" }]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+});

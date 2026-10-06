@@ -155,7 +155,7 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
-## Egress domain filtering (UC-179..UC-201)
+## Egress domain filtering (UC-179..UC-202)
 
 `suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
 `suite/egress_phase3_test.go` and `suite/egress_private_cloud_test.go` cover
@@ -188,6 +188,13 @@ Phases 2-3).
   termination, and the gateway's own 403 (naming `network_egress_rules`) for a
   POST and for an unruled path. It calls the public GitHub API unauthenticated,
   so a 403 on the GET may be GitHub's rate limit; the failure prints the body.
+  UC-202 (EF-54, P3-2) creates a `python:3.12-alpine` sandbox with a random
+  `TEST_TOKEN` in its env and an inspect rule on `postman-echo.com` for
+  `/headers` that injects `Authorization` from `env:TEST_TOKEN`. Inside, the
+  env holds only `aerolvm-placeholder:TEST_TOKEN`; `urllib` sends that
+  placeholder as `Authorization`, and the echoed headers must show the real
+  token the gateway put in its place. It depends on the public
+  `postman-echo.com` service being up.
 - UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
   can't reach host services) only need `docker`.
 - **`private-cloud`** (`single-node-private-cloud`, `make

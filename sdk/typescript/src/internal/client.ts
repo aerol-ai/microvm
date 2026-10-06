@@ -195,6 +195,19 @@ function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
   return out;
 }
 
+// Only inject's secretRef is spelled differently on the wire, so a rule
+// otherwise goes through as written and the server applies its own port
+// default.
+type ApiEgressRule = Omit<EgressRule, "inject"> & { inject?: { header: string; secret_ref: string } };
+
+function toApiEgressRule({ inject, ...rule }: EgressRule): ApiEgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secret_ref: inject.secretRef } } : rule;
+}
+
+function fromApiEgressRule({ inject, ...rule }: ApiEgressRule): EgressRule {
+  return inject ? { ...rule, inject: { header: inject.header, secretRef: inject.secret_ref } } : rule;
+}
+
 interface ApiSandbox {
   id: string;
   name?: string;
@@ -214,7 +227,7 @@ interface ApiSandbox {
   egress_profiles?: string[];
   egress_profiles_applied?: { name: string; generation: number }[];
   network_egress_mode?: string;
-  network_egress_rules?: EgressRule[] | null;
+  network_egress_rules?: ApiEgressRule[] | null;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -921,7 +934,7 @@ export class APIClient {
       network_deny_out: string[] | null;
       egress_profiles?: string[] | null;
       network_egress_mode?: string;
-      network_egress_rules?: EgressRule[] | null;
+      network_egress_rules?: ApiEgressRule[] | null;
       effective_hostname_count?: number;
       egress_status?: string;
     }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
@@ -930,7 +943,7 @@ export class APIClient {
       network_deny_out: options.networkDenyOut ?? [],
       egress_profiles: options.egressProfiles ?? [],
       network_egress_mode: options.networkEgressMode,
-      network_egress_rules: options.networkEgressRules,
+      network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
     });
     const policy: NetworkPolicy = {
       networkBlockAll: response.network_block_all,
@@ -938,7 +951,7 @@ export class APIClient {
       networkDenyOut: response.network_deny_out ?? [],
       egressProfiles: response.egress_profiles ?? [],
       networkEgressMode: response.network_egress_mode ?? "enforce",
-      networkEgressRules: response.network_egress_rules ?? [],
+      networkEgressRules: (response.network_egress_rules ?? []).map(fromApiEgressRule),
       effectiveHostnameCount: response.effective_hostname_count ?? 0,
     };
     if (response.egress_status) policy.egressStatus = response.egress_status;
@@ -1395,7 +1408,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_deny_out: options.networkDenyOut,
     egress_profiles: options.egressProfiles,
     network_egress_mode: options.networkEgressMode,
-    network_egress_rules: options.networkEgressRules,
+    network_egress_rules: options.networkEgressRules?.map(toApiEgressRule),
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1495,7 +1508,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
     egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
     networkEgressMode: sandbox.network_egress_mode || undefined,
-    networkEgressRules: sandbox.network_egress_rules?.length ? sandbox.network_egress_rules : undefined,
+    networkEgressRules: sandbox.network_egress_rules?.length ? sandbox.network_egress_rules.map(fromApiEgressRule) : undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),

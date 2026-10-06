@@ -163,6 +163,14 @@ type NetworkLearnedEntry = models.NetworkLearnedEntry
 // gateway terminate TLS with the node's CA (set at create).
 type EgressRule = models.EgressRule
 
+// EgressInject is an EgressRule's credential injection, {Header,
+// SecretRef}. SecretRef is "env:<KEY>", a key in the create's Env whose value
+// is the whole header value (e.g. "Bearer ghp_..."). A container sandbox
+// sees "aerolvm-placeholder:<KEY>" in its env instead, and the egress gateway
+// replaces Header with the real value on each request the rule allows. Needs
+// Inspect; rotating the value means recreating the sandbox.
+type EgressInject = models.EgressInject
+
 // Egress modes for NetworkEgressMode.
 const (
 	NetworkEgressModeEnforce = models.NetworkEgressModeEnforce

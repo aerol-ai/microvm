@@ -2,13 +2,16 @@
 
 package suite
 
-// Phase 3 egress use cases (plans/egress-domain-filtering.md §5.9, P3-1):
-// method and path rules on an inspected HTTPS host, driven by a real TLS
-// client that trusts the node's CA only through the environment the create
-// gave it (EF-52, EF-53).
+// Phase 3 egress use cases (plans/egress-domain-filtering.md §5.9, P3-1,
+// P3-2): method and path rules on an inspected HTTPS host, driven by a real
+// TLS client that trusts the node's CA only through the environment the
+// create gave it (EF-52, EF-53), and credential injection into a header the
+// sandbox only holds a placeholder for (EF-54).
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -87,5 +90,55 @@ func TestEgressInspectRules(t *testing.T) {
 		if status(label) != "403" || !strings.Contains(lines[label], "network_egress_rules") {
 			t.Fatalf("%s must get the gateway's 403 naming the rules:\n%s", label, out)
 		}
+	}
+}
+
+// injectProbe sends GET /headers to postman-echo with the env's placeholder
+// as Authorization and prints the authorization header the echo received.
+// Only double quotes inside, so it fits in sh's single quotes.
+const injectProbe = `
+import json, os, urllib.request
+req = urllib.request.Request("https://postman-echo.com/headers",
+                             headers={"Authorization": os.environ.get("TEST_TOKEN", ""), "User-Agent": "aerolvm-itest"})
+try:
+    with urllib.request.urlopen(req, timeout=20) as r:
+        print("auth", json.load(r).get("headers", {}).get("authorization", ""))
+except Exception as e:
+    print("error", type(e).__name__, str(e).replace("\n", " "))
+`
+
+// UC-202 (EF-54, P3-2) — credential injection: the sandbox's env holds only
+// the placeholder, it sends that placeholder as Authorization, and the
+// upstream echoes the real token the gateway put in its place. A hijacked
+// agent can't leak a key it never had.
+func TestEgressInjectCredential(t *testing.T) {
+	harness.Require(t, sc, "UC-202")
+	c := client(t)
+	nonce := make([]byte, 8)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	token := "Bearer aerolvm-itest-" + hex.EncodeToString(nonce)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+		Name:            harness.UniqueName(sc, t),
+		Image:           "python:3.12-alpine",
+		Env:             map[string]string{"TEST_TOKEN": token},
+		NetworkAllowOut: []string{"postman-echo.com"},
+		NetworkEgressRules: []sdktypes.EgressRule{{
+			Host:    "postman-echo.com",
+			Inspect: true,
+			Paths:   []string{"/headers"},
+			Inject:  &sdktypes.EgressInject{Header: "Authorization", SecretRef: "env:TEST_TOKEN"},
+		}},
+	})
+	waitRunning(t, sb)
+
+	if got := strings.TrimSpace(egressExec(t, sb, "echo $TEST_TOKEN")); got != "aerolvm-placeholder:TEST_TOKEN" {
+		t.Fatalf("the sandbox must hold the placeholder, not the token: %q", got)
+	}
+	out := egressExec(t, sb, "python3 -c '"+injectProbe+"' 2>&1")
+	auth, ok := strings.CutPrefix(strings.TrimSpace(out), "auth ")
+	if !ok || auth != token {
+		t.Fatalf("the upstream must receive the injected token in place of the placeholder:\n%s", out)
 	}
 }

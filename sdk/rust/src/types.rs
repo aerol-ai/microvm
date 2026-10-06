@@ -860,6 +860,28 @@ pub struct EgressRule {
     /// The request's Host must then equal the TLS server name.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inspect: bool,
+    /// Replace a header on the requests this rule allows with a secret from
+    /// the sandbox's own env, which the sandbox itself only sees as a
+    /// placeholder. Needs `inspect`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<EgressInject>,
+}
+
+/// A rule's credential injection. The sandbox's env holds
+/// `aerolvm-placeholder:<KEY>` in place of the value, and the egress gateway
+/// replaces `header` with the real value on each request the rule allows,
+/// so code in the sandbox never holds the secret.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressInject {
+    /// The header to replace, such as `Authorization`. It is replaced, never
+    /// added to a body or URL. Headers that frame or route the request, such
+    /// as `Host` or `Content-Length`, can't be injected.
+    pub header: String,
+    /// `"env:<KEY>"`: a key in the create's `env`, whose value is the whole
+    /// header value (for example `Bearer ghp_...`). Rotating it means
+    /// recreating the sandbox.
+    #[serde(rename = "secret_ref")]
+    pub secret_ref: String,
 }
 
 /// A named allowlist sandboxes reference through `egress_profiles`.

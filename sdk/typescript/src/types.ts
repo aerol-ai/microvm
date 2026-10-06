@@ -697,6 +697,33 @@ export interface EgressRule {
    * The request's Host must then equal the TLS server name.
    */
   inspect?: boolean;
+  /**
+   * Replace a header on the requests this rule allows with a secret from
+   * the sandbox's own `env`, which the sandbox itself only sees as a
+   * placeholder. Needs `inspect: true`.
+   */
+  inject?: EgressInject;
+}
+
+/**
+ * A rule's credential injection. The sandbox's env holds
+ * `aerolvm-placeholder:<KEY>` in place of the value, and the egress gateway
+ * replaces `header` with the real value on each request the rule allows, so
+ * code in the sandbox never holds the secret.
+ */
+export interface EgressInject {
+  /**
+   * The header to replace, such as `Authorization`. It is replaced, never
+   * added to a body or URL. Headers that frame or route the request, such as
+   * `Host` or `Content-Length`, can't be injected.
+   */
+  header: string;
+  /**
+   * `"env:<KEY>"`: a key in the create's `env`, whose value is the whole
+   * header value (for example `Bearer ghp_...`). Rotating it means
+   * recreating the sandbox.
+   */
+  secretRef: string;
 }
 
 /**
