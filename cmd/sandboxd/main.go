@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -17,6 +18,7 @@ var (
 	runWasmWorkerCLI       = worker.RunCLI
 	runWasmResidentHostCLI = worker.RunCLIResident
 	runIsolateJailShim     = isolate.RunJailShim
+	runEgressGatewayCLI    = gatewayd.RunCLI
 	osExit                 = os.Exit
 )
 
@@ -77,6 +79,17 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// Egress gateway: its own long-lived process under its own systemd unit
+	// (plans/egress-domain-filtering.md D9), so sandboxd restarts never
+	// interrupt hostname-filtered egress. Same binary, new subcommand.
+	if len(os.Args) >= 2 && os.Args[1] == gatewayd.Subcommand {
+		if err := runEgressGatewayCLI(ctx, logger); err != nil {
+			logger.Error("egress gateway exited with error", "error", err)
+			osExit(1)
+		}
+		return
+	}
 
 	if err := run(ctx, logger); err != nil {
 		logger.Error("sandboxd exited with error", "error", err)

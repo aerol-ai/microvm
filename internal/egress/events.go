@@ -83,3 +83,6 @@ func (h *EventHub) requeue(events []Event) {
 	}
 	h.buf = merged
 }
+
+// TakeAllForTest drains the hub (tests in other packages).
+func (h *EventHub) TakeAllForTest() []Event { return h.take(h.Len()) }

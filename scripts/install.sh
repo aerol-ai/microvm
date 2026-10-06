@@ -1768,6 +1768,71 @@ EOF
 	chmod 0600 /etc/sandboxd/sandboxd.env
 }
 
+# write_egress_gateway_units installs the egress gateway (plans/
+# egress-domain-filtering.md D9, CEO D22): a dedicated unprivileged user, a
+# root-owned 0600 control socket created by systemd, and the hardened unit.
+# The gateway's own env file holds only SB_EGRESS_* settings, never the
+# daemon's secrets.
+write_egress_gateway_units() {
+	if ! id aerolvm-egress >/dev/null 2>&1; then
+		useradd --system --no-create-home --shell /usr/sbin/nologin aerolvm-egress
+	fi
+	mkdir -p /etc/sandboxd
+	if [[ ! -f /etc/sandboxd/egress-gateway.env ]]; then
+		cat > /etc/sandboxd/egress-gateway.env <<EOF
+# Egress gateway settings (setup/config-defaults.md). sandboxd reads the same
+# SB_EGRESS_GATEWAY_SOCKET from its own env.
+SB_EGRESS_GATEWAY_SOCKET=/run/aerolvm/egress-gateway.sock
+SB_EGRESS_DNS_PORT=53054
+SB_EGRESS_PROXY_PORT=15080
+EOF
+		chmod 0644 /etc/sandboxd/egress-gateway.env
+	fi
+	cat > /etc/systemd/system/aerolvm-egress-gateway.socket <<EOF
+[Unit]
+Description=AerolVM egress gateway control socket
+
+[Socket]
+ListenStream=/run/aerolvm/egress-gateway.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
+EOF
+	cat > /etc/systemd/system/aerolvm-egress-gateway.service <<EOF
+[Unit]
+Description=AerolVM egress gateway (filtering DNS + SNI/Host proxy)
+After=network-online.target containerd.service docker.service
+Wants=network-online.target
+Requires=aerolvm-egress-gateway.socket
+
+[Service]
+Type=simple
+User=aerolvm-egress
+Group=aerolvm-egress
+EnvironmentFile=-/etc/sandboxd/egress-gateway.env
+ExecStart=$INSTALL_PREFIX/sandboxd egress-gateway
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+StateDirectory=aerolvm-egress
+StateDirectoryMode=0700
+LimitCORE=0
+LimitNOFILE=131072
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 write_local_systemd_unit() {
 	cat > /etc/systemd/system/sandboxd.service <<EOF
 [Unit]
@@ -2001,9 +2066,11 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	# the engine here since this branch skips install_packages.
 	ensure_docker
 	write_local_systemd_unit
+	write_egress_gateway_units
 	write_healthcheck_script
 	write_healthcheck_units
 	systemctl daemon-reload
+	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
 	echo "PAT token: $PAT_TOKEN"
@@ -2048,10 +2115,12 @@ write_caddy_systemd_dropin
 write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
+write_egress_gateway_units
 write_healthcheck_script
 write_healthcheck_units
 
 systemctl daemon-reload
+systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
 systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
 echo "AerolVM installed"
