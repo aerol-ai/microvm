@@ -3358,6 +3358,56 @@ mod tests {
     }
 
     #[test]
+    fn egress_rule_binaries_round_trip() {
+        let git = serde_json::json!({"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]});
+        let pip = serde_json::json!({"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]});
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["github.com:22", "pypi.org"],
+            "network_deny_out": [],
+            "network_egress_rules": [git.clone(), pip.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [git.clone(), {"host": "pypi.org", "binaries": null}]
+        }))
+        .expect("sandbox data should parse");
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].binaries, vec!["/usr/bin/git".to_string()]);
+        assert!(parsed[1].binaries.is_empty());
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "github.com".to_string(),
+            ports: vec![22],
+            binaries: vec!["/usr/bin/git".to_string()],
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "pypi.org".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["github.com:22".to_string(), "pypi.org".to_string()],
+                network_egress_rules: vec![rule.clone(), plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([git, {"host": "pypi.org"}])
+        );
+        assert_eq!(policy.network_egress_rules[0], rule);
+        assert_eq!(policy.network_egress_rules[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+    }
+
+    #[test]
     fn exec_request_defaults_the_options() {
         let req = ExecRequest { command: "true".to_string(), ..Default::default() };
         assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());

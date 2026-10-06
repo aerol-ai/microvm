@@ -1029,6 +1029,59 @@ class MicroVMClientTest {
     }
 
     @Test
+    void egressRuleBinariesGoOutAndComeBack() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireGit = mapOf("host", "github.com", "ports", List.of(22), "binaries", List.of("/usr/bin/git"));
+        Map<String, Object> wirePip = mapOf("host", "pypi.org", "ports", List.of(443), "binaries", List.of("/usr/local/bin/pip"));
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("github.com:22", "pypi.org"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule git = new EgressRule()
+                .setHost("github.com")
+                .setPorts(List.of(22))
+                .setBinaries(List.of("/usr/bin/git"));
+            EgressRule pip = new EgressRule()
+                .setHost("pypi.org")
+                .setPorts(List.of(443))
+                .setBinaries(List.of("/usr/local/bin/pip"));
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, pip)));
+            assertEquals(List.of(wireGit, wirePip), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/bin/git"), sandbox.networkEgressRules.get(0).binaries);
+            assertEquals(List.of(22), sandbox.networkEgressRules.get(0).ports);
+
+            // A rule without binaries sends no binaries key.
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, new EgressRule().setHost("pypi.org").setBinaries(null))));
+            assertEquals(List.of(wireGit, mapOf("host", "pypi.org")), policyBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/local/bin/pip"), policy.networkEgressRules.get(1).binaries);
+            assertEquals(List.of("/usr/local/bin/pip"), sandbox.networkEgressRules.get(1).binaries);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void networkLearnedMapsNulls() throws Exception {
         HttpServer server = startServer(exchange -> {
             if ("/v1/sandboxes/sb-1/network/learned".equals(exchange.getRequestURI().getPath())) {

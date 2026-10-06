@@ -232,8 +232,8 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	if len(sb.NetworkEgressRules) != 1 || sb.NetworkEgressRules[0].Host != "api.github.com" || !sb.NetworkEgressRules[0].Inspect || sb.NetworkEgressRules[0].Paths[0] != "/repos/acme/**" {
 		t.Fatalf("Sandbox rules after SetNetworkPolicy = %+v", sb.NetworkEgressRules)
 	}
-	if strings.Contains(string(policyBody), `"inject"`) {
-		t.Fatalf("a rule without inject must not send one: %s", policyBody)
+	if strings.Contains(string(policyBody), `"inject"`) || strings.Contains(string(policyBody), `"binaries"`) {
+		t.Fatalf("a rule without inject or binaries must not send either: %s", policyBody)
 	}
 	rule.Inject = &sdktypes.EgressInject{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"}
 	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}, NetworkEgressRules: []sdktypes.EgressRule{rule}}); err != nil {
@@ -244,6 +244,16 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if got := sb.NetworkEgressRules[0].Inject; got == nil || got.Header != "Authorization" || got.SecretRef != "env:GITHUB_TOKEN" {
 		t.Fatalf("Sandbox rule inject after SetNetworkPolicy = %+v", got)
+	}
+	git := sdktypes.EgressRule{Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/git"}}
+	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"github.com:22"}, NetworkEgressRules: []sdktypes.EgressRule{git}}); err != nil {
+		t.Fatalf("Sandbox.SetNetworkPolicy(binaries) error = %v", err)
+	}
+	if !strings.Contains(string(policyBody), `{"host":"github.com","ports":[22],"binaries":["/usr/bin/git"]}`) {
+		t.Fatalf("binaries on the wire = %s", policyBody)
+	}
+	if got := sb.NetworkEgressRules[0]; len(got.Binaries) != 1 || got.Binaries[0] != "/usr/bin/git" || got.Ports[0] != 22 {
+		t.Fatalf("Sandbox rule binaries after SetNetworkPolicy = %+v", got)
 	}
 	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}}); err != nil || sb.NetworkEgressRules != nil {
 		t.Fatalf("a policy without rules must clear them: %+v, %v", sb.NetworkEgressRules, err)

@@ -1834,6 +1834,8 @@ def _egress_rules(rules: Optional[List[Dict[str, Any]]], wire: bool = False) -> 
             rule["paths"] = [str(p) for p in r["paths"]]
         if r.get("inspect"):
             rule["inspect"] = True
+        if r.get("binaries"):
+            rule["binaries"] = [str(b) for b in r["binaries"]]
         inject = r.get("inject")
         if inject:
             ref = str(_first_of(inject, "secretRef", "secret_ref") or "")

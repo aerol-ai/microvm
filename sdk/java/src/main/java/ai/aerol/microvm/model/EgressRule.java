@@ -5,10 +5,10 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * One method and path rule. Rules refine a host the allow list already admits:
- * a request to a ruled host passes when some rule for that host admits its
- * method and path, and gets a 403 otherwise. A host no rule names keeps its
- * allow-list decision.
+ * One method, path or program rule. Rules refine a host the allow list already
+ * admits: a request to a ruled host passes when some rule for that host admits
+ * its program, method and path, and gets a 403 otherwise. A host no rule names
+ * keeps its allow-list decision.
  */
 // NON_DEFAULT leaves out empty lists and inspect=false, so a rule goes on the
 // wire as written and the server applies its own port default.
@@ -16,7 +16,11 @@ import java.util.List;
 public class EgressRule {
     /** An exact name or {@code *.} wildcard, without a port. */
     public String host;
-    /** {@code [80]} by default, or {@code [443]} with inspect; only 80 and 443. */
+    /**
+     * {@code [80]} by default, or {@code [443]} with inspect; only 80 and 443,
+     * except that a rule with only binaries may name any port the allow list
+     * opens.
+     */
     public List<Integer> ports = new ArrayList<>();
     /** Exact, upper case ({@code GET}, {@code POST}); empty allows any. */
     public List<String> methods = new ArrayList<>();
@@ -36,6 +40,15 @@ public class EgressRule {
      * Needs inspect.
      */
     public EgressInject inject;
+    /**
+     * Limit the rule to connections opened by these executables: clean absolute
+     * paths inside the sandbox, at most 16. For an interpreter (python, node, a
+     * shell) the script it runs counts too, so {@code /usr/local/bin/pip}
+     * works. A rule with only binaries decides whole connections, on any port
+     * the allow list opens. Runc sandboxes only (docker and containerd); least
+     * privilege for trusted tooling, not a security boundary.
+     */
+    public List<String> binaries = new ArrayList<>();
 
     public EgressRule setHost(String host) {
         this.host = host;
@@ -64,6 +77,11 @@ public class EgressRule {
 
     public EgressRule setInject(EgressInject inject) {
         this.inject = inject;
+        return this;
+    }
+
+    public EgressRule setBinaries(List<String> binaries) {
+        this.binaries = binaries == null ? new ArrayList<>() : binaries;
         return this;
     }
 }

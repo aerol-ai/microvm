@@ -1650,3 +1650,30 @@ test("egress rules: inject goes out as secret_ref and comes back as secretRef", 
   assert.deepEqual(pol.networkEgressRules, [rule]);
   assert.deepEqual(sandbox.networkEgressRules, [rule]);
 });
+
+test("egress rules: binaries go out and come back as written", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const git = { host: "github.com", ports: [22], binaries: ["/usr/bin/git"] };
+  const pip = { host: "pypi.org", ports: [443], binaries: ["/usr/local/bin/pip"] };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["github.com:22", "pypi.org"], network_deny_out: [], network_egress_rules: [git, pip] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-binaries"), network_egress_rules: [git, pip] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, pip] });
+  assert.deepEqual(bodies[0].network_egress_rules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+
+  // A rule without binaries goes out with no binaries key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, { host: "pypi.org" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
+  assert.deepEqual(pol.networkEgressRules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+});

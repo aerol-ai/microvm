@@ -838,15 +838,17 @@ pub struct NetworkPolicy {
     pub egress_status: Option<String>,
 }
 
-/// One method and path rule. Rules refine a host the allow list already
-/// admits: a request to a ruled host passes when some rule for that host
-/// admits its method and path, and gets a 403 otherwise. A host no rule
-/// names keeps its allow-list decision.
+/// One method, path or program rule. Rules refine a host the allow list
+/// already admits: a request to a ruled host passes when some rule for that
+/// host admits its program, method and path, and gets a 403 otherwise. A
+/// host no rule names keeps its allow-list decision.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct EgressRule {
     /// An exact name or `*.` wildcard, without a port.
     pub host: String,
-    /// `[80]` by default, or `[443]` with `inspect`; only 80 and 443.
+    /// `[80]` by default, or `[443]` with `inspect`; only 80 and 443, except
+    /// that a rule with only `binaries` may name any port the allow list
+    /// opens.
     #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
     pub ports: Vec<u16>,
     /// Exact, upper case (`GET`, `POST`); empty allows any.
@@ -865,6 +867,15 @@ pub struct EgressRule {
     /// placeholder. Needs `inspect`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<EgressInject>,
+    /// Limit the rule to connections opened by these executables: clean
+    /// absolute paths inside the sandbox, at most 16. For an interpreter
+    /// (python, node, a shell) the script it runs counts too, so
+    /// `/usr/local/bin/pip` works. A rule with only `binaries` decides whole
+    /// connections, on any port the allow list opens. Runc sandboxes only
+    /// (docker and containerd); least privilege for trusted tooling, not a
+    /// security boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub binaries: Vec<String>,
 }
 
 /// A rule's credential injection. The sandbox's env holds

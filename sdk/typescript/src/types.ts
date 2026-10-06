@@ -675,15 +675,18 @@ export interface NetworkPolicy {
 }
 
 /**
- * One method and path rule. Rules refine a host the allow list already
- * admits: a request to a ruled host passes when some rule for that host
- * admits its method and path, and gets a 403 otherwise. A host no rule names
- * keeps its allow-list decision.
+ * One method, path or program rule. Rules refine a host the allow list
+ * already admits: a request to a ruled host passes when some rule for that
+ * host admits its program, method and path, and gets a 403 otherwise. A host
+ * no rule names keeps its allow-list decision.
  */
 export interface EgressRule {
   /** An exact name or `*.` wildcard, without a port. */
   host: string;
-  /** `[80]` by default, or `[443]` with `inspect`; only 80 and 443. */
+  /**
+   * `[80]` by default, or `[443]` with `inspect`; only 80 and 443, except
+   * that a rule with only `binaries` may name any port the allow list opens.
+   */
   ports?: number[];
   /** Exact, upper case (`GET`, `POST`); empty allows any. */
   methods?: string[];
@@ -703,6 +706,16 @@ export interface EgressRule {
    * placeholder. Needs `inspect: true`.
    */
   inject?: EgressInject;
+  /**
+   * Limit the rule to connections opened by these executables: clean
+   * absolute paths inside the sandbox, at most 16. For an interpreter
+   * (python, node, a shell) the script it runs counts too, so
+   * `/usr/local/bin/pip` works. A rule with only `binaries` decides whole
+   * connections, on any port the allow list opens. Runc sandboxes only
+   * (docker and containerd); least privilege for trusted tooling, not a
+   * security boundary.
+   */
+  binaries?: string[];
 }
 
 /**

@@ -156,11 +156,16 @@ type NetworkLearned = models.NetworkLearned
 // NetworkLearnedEntry is one destination a learn-mode sandbox reached.
 type NetworkLearnedEntry = models.NetworkLearnedEntry
 
-// EgressRule is one method and path rule for NetworkEgressRules. It refines
-// a host the allow list already admits: a request to a ruled host passes
-// when some rule for it admits the method and path, and gets 403 otherwise.
-// Ports default to [80], or [443] with Inspect, which makes the egress
-// gateway terminate TLS with the node's CA (set at create).
+// EgressRule is one method, path or program rule for NetworkEgressRules. It
+// refines a host the allow list already admits: a request to a ruled host
+// passes when some rule for it admits the program, method and path, and gets
+// 403 otherwise. Ports default to [80], or [443] with Inspect, which makes
+// the egress gateway terminate TLS with the node's CA (set at create).
+// Binaries limits the rule to connections opened by those executables
+// (absolute paths inside the sandbox, at most 16; an interpreter's script
+// counts, so "/usr/local/bin/pip" works). A rule with only Binaries decides
+// whole connections, on any port the allow list opens. Runc sandboxes only
+// (docker and containerd); least privilege, not a security boundary.
 type EgressRule = models.EgressRule
 
 // EgressInject is an EgressRule's credential injection, {Header,

@@ -901,6 +901,24 @@ class ClientTests(unittest.TestCase):
         data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{**wire, "ports": [443]}]})
         self.assertEqual(data["networkEgressRules"], [{**rule, "ports": [443]}])
 
+    def test_egress_rule_binaries(self):
+        client = RecordingMicroVM()
+        git = {"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]}
+        pip = {"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]}
+        sandbox = client.create({"image": "alpine", "networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, pip]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [git, pip])
+
+        # A rule without binaries goes out with no binaries key at all.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, {"host": "pypi.org", "binaries": []}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(policy["networkEgressRules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(sandbox.networkEgressRules, [git, {"host": "pypi.org"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [git, pip]})
+        self.assertEqual(data["networkEgressRules"], [git, pip])
+
     def test_sandbox_maps_egress_profiles(self):
         from microvm.client import _from_api_sandbox
 

@@ -1,6 +1,6 @@
 ---
 title: Egress Rules and Inspection
-description: Allow only some methods and paths on an allowed host, over plain HTTP as it is and over HTTPS by checking requests through a per-node CA the sandbox trusts.
+description: Allow only some methods, paths or programs on an allowed host, over plain HTTP as it is and over HTTPS by checking requests through a per-node CA the sandbox trusts.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -14,7 +14,8 @@ plain HTTP the egress gateway already reads every request. For HTTPS, an
 (CA) that belongs to the node, check each request, and open its own TLS
 connection to the real host. Only a sandbox created with an inspect rule
 trusts that CA. An inspect rule can also **inject** a credential, such as an
-API token, that the sandbox itself never holds.
+API token, that the sandbox itself never holds, and any rule can be limited to
+the **programs** allowed to use it.
 
 ---
 
@@ -185,11 +186,12 @@ allowed hosts are unaffected; their HTTPS still passes through unopened.
 | Field | Meaning |
 |---|---|
 | `host` | An exact name or `*.` wildcard, without a port. The allow list (`networkAllowOut` or a [profile](/egress-profiles-and-learn-mode)) must already allow it; a rule for a host that isn't allowed is refused with `400`. |
-| `ports` | `[80]` by default, or `[443]` with `inspect`. Only 80 and 443; a rule on 443 needs `inspect: true`. |
+| `ports` | `[80]` by default, or `[443]` with `inspect`. Only 80 and 443, and a rule on 443 needs `inspect: true`, except for a rule with only `binaries`: it may name any port the allow list opens, and 443 without `inspect`. |
 | `methods` | Exact and upper case, like `GET` or `HEAD`. Empty allows any method. |
 | `paths` | Globs on the request path. Empty allows any path. |
 | `inspect` | Terminate TLS on 443 so the rule can see each request. |
 | `inject` | `{header, secretRef}`: set `header` on the requests the rule allows to the value of the env key `secretRef` names (`env:<KEY>`). Needs `inspect`. See [Inject a credential](#inject-a-credential). |
+| `binaries` | Absolute paths, inside the sandbox, of the programs that may use the rule. Empty allows any program. Docker and containerd sandboxes on runc only. See [Limit a rule to programs](#limit-a-rule-to-programs). |
 
 In paths, `*` matches any characters within one segment, and `**`, written as
 a whole segment, matches any number of segments, none included:
@@ -202,8 +204,9 @@ a whole segment, matches any number of segments, none included:
 | `/files/**/raw` | `/files/raw`, `/files/a/b/raw` | `/files/a/b` |
 
 - **Rules are alternatives.** A request passes when any rule for its host and
-  port admits both its method and its path. A request no rule admits gets a
-  `403`. A host no rule names keeps its allow-list decision.
+  port admits both its method and its path (and its program, for a rule with
+  `binaries`). A request no rule admits gets a `403`. A host no rule names
+  keeps its allow-list decision.
 - **Paths only.** Rules match the path, not the query string, and a rule's
   path can't hold `?`, `#`, `%` or spaces.
 - **No ambiguous paths.** On a ruled host, a path with `.` or `..` segments,
@@ -211,13 +214,14 @@ a whole segment, matches any number of segments, none included:
   refused with `403` (`path_not_canonical`), since a server could read it as
   another path. That is what keeps `/repos/acme/../../admin` from passing as
   `/repos/acme/**`. One trailing slash is fine.
-- **Limits.** Up to 32 rules, each with up to 16 methods and 32 paths of at
-  most 256 bytes.
+- **Limits.** Up to 32 rules, each with up to 16 methods, 32 paths and 16
+  binaries of at most 256 bytes.
 - **An allow list to refine.** Rules need hostname entries, so they're refused
   with `400` alongside `networkBlockAll` or learn mode.
 - **Audit.** Refusals are written to the sandbox's
   [audit log](/egress-domain-filtering#see-what-was-refused) with reason
-  `rule_denied` or `path_not_canonical`.
+  `rule_denied` or `path_not_canonical`, or `binary_not_allowed` or
+  `binary_unknown` for a rule with `binaries`.
 
 ---
 
@@ -420,6 +424,135 @@ Code there sends its requests the ordinary way, for example with
 
 ---
 
+## Limit a rule to programs
+
+A rule's `binaries` names the programs in the sandbox that may use it. This
+sandbox lets ssh, which git runs for SSH remotes, reach `github.com` on port
+22, and pip reach `pypi.org` over HTTPS. No other program in the sandbox can
+make either connection:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['github.com:22', 'pypi.org'],
+      networkEgressRules: [
+        { host: 'github.com', ports: [22], binaries: ['/usr/bin/ssh'] },
+        { host: 'pypi.org', ports: [443], binaries: ['/usr/local/bin/pip'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['github.com:22', 'pypi.org'],
+        'networkEgressRules': [
+            {'host': 'github.com', 'ports': [22], 'binaries': ['/usr/bin/ssh']},
+            {'host': 'pypi.org', 'ports': [443], 'binaries': ['/usr/local/bin/pip']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"github.com:22", "pypi.org"},
+        NetworkEgressRules: []sdktypes.EgressRule{
+            {Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/ssh"}},
+            {Host: "pypi.org", Ports: []uint16{443}, Binaries: []string{"/usr/local/bin/pip"}},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let rule = |host: &str, port: u16, binary: &str| EgressRule {
+        host: host.to_string(),
+        ports: vec![port],
+        binaries: vec![binary.to_string()],
+        ..Default::default()
+    };
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec!["github.com:22".to_string(), "pypi.org".to_string()]),
+        network_egress_rules: Some(vec![
+            rule("github.com", 22, "/usr/bin/ssh"),
+            rule("pypi.org", 443, "/usr/local/bin/pip"),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+            .setNetworkEgressRules(List.of(
+                new EgressRule().setHost("github.com").setPorts(List.of(22))
+                    .setBinaries(List.of("/usr/bin/ssh")),
+                new EgressRule().setHost("pypi.org").setPorts(List.of(443))
+                    .setBinaries(List.of("/usr/local/bin/pip"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `git clone git@github.com:acme/widgets.git` connects, and
+pip reads the package index on `pypi.org`. `curl https://pypi.org/simple/`, or
+a Python script opening its own connection to either host, is refused. pip
+downloads packages from `files.pythonhosted.org`, so a sandbox that installs
+them allows and rules that host the same way.
+
+- **Paths inside the sandbox.** Each entry is a clean absolute path, such as
+  `/usr/bin/ssh`, at most 16 per rule. The gateway compares the program with
+  the file at that path in the sandbox by device and inode, so a copy of it
+  elsewhere doesn't count.
+- **The program that opens the connection.** What counts is the process that
+  holds the connection, not the one that started it. git runs `ssh` for SSH
+  remotes and `git-remote-https` for HTTPS ones, so a rule for git's traffic
+  names those, and admits any use of them, not only git's. A child that a
+  listed program starts isn't admitted for it.
+- **Interpreted programs by their script.** For an interpreter (python, node,
+  ruby, perl, php, a shell or busybox), the script it runs counts too, when
+  it's started with the script's absolute path, as a `#!` script is. That's
+  how `/usr/local/bin/pip`, a Python script, works. `python -m pip` runs as
+  `python`, so it isn't admitted.
+- **Whole connections, on any port.** A rule with only `binaries` (no
+  `methods`, `paths` or `inject`, and no `inspect`) decides whole connections,
+  so it may be on any port the allow list opens, such as `github.com:22`, and
+  on 443 without inspection. Set its `ports`: without them a rule covers port
+  80. A rule covers only its own ports, so the `pypi.org` rule above leaves
+  port 80 to the allow list.
+- **With methods and paths.** Combined with `methods` and `paths` (and
+  `inspect` on 443), the request rules apply only to the listed programs.
+  Rules for one host are alternatives, so a request passes if any rule admits
+  both its program and its method and path.
+- **Refused, never let through.** A connection from a program that no rule for
+  its host and port admits is refused: on 443 with a TLS `access_denied` alert,
+  on 80 with a `403` that names `network_egress_rules` binaries, and on other
+  ports with an immediate TCP reset. The audit reason is `binary_not_allowed`,
+  or `binary_unknown` when the gateway couldn't trace the connection to a
+  program, which it then refuses rather than allow.
+- **TCP only.** UDP to a host and port that a rule with `binaries` covers is
+  refused.
+- **Docker and containerd on runc.** The gateway traces each connection to its
+  program from the node, which gVisor's own network stack hides. gVisor,
+  Firecracker, WASM and isolate sandboxes refuse `binaries` with `501`. The
+  node needs cgroup v2, which is your operator's concern: without it, covered
+  connections are refused with `binary_unknown`.
+- **Least privilege, not a boundary.** Per-binary rules keep trusted tooling to
+  the hosts it needs, but they don't contain a hostile process: root in the
+  sandbox can replace a listed binary, and code that controls an interpreter's
+  environment, such as `PYTHONPATH`, runs under the script's name.
+
+---
+
 ## Change rules on a running sandbox
 
 `setNetworkPolicy` replaces the rules along with the rest of the policy. This
@@ -509,12 +642,13 @@ adds a second rule so the sandbox can also open issues:
 
 ## Runtimes
 
-| Runtime | Egress rules |
-|---|---|
-| Docker, containerd, gVisor | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA, and inject rules leave a placeholder in the sandbox's env |
-| Isolate | every rule, inspect and inject included, with no CA: the isolate's egress proxy already sees each request in plain text, and the sandbox never sees its env |
-| WASM | not supported: rules are refused with `501` |
-| Firecracker | not supported: rules are refused with `501` |
+| Runtime | Egress rules | `binaries` |
+|---|---|---|
+| Docker, containerd | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA, and inject rules leave a placeholder in the sandbox's env | supported on runc, with cgroup v2 on the node |
+| gVisor | as on Docker and containerd | refused with `501`: gVisor's network stack hides which program opened a connection |
+| Isolate | every rule, inspect and inject included, with no CA: the isolate's egress proxy already sees each request in plain text, and the sandbox never sees its env | refused with `501` |
+| WASM | not supported: rules are refused with `501` | refused with `501` |
+| Firecracker | not supported: rules are refused with `501` | refused with `501` |
 
 ---
 
@@ -535,6 +669,8 @@ adds a second rule so the sandbox can also open issues:
   replicated spec and count toward its 4 KB inline limit along with the rest of
   the policy, so a long rule list can push a create over it. A failover keeps
   the rules, and a sandbox recreated on another node trusts that node's CA.
-- **HTTP on 80 and 443 only.** Rules can't apply to other ports or protocols.
+- **Methods and paths on 80 and 443 only.** Method, path and inject rules are
+  HTTP on ports 80 and 443. A rule with only `binaries` works on any TCP port
+  the allow list opens; no rule applies to UDP.
 - **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
   sandbox's rules, since the E2B API has no way to name them.

@@ -155,7 +155,7 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
-## Egress domain filtering (UC-179..UC-202)
+## Egress domain filtering (UC-179..UC-203)
 
 `suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
 `suite/egress_phase3_test.go` and `suite/egress_private_cloud_test.go` cover
@@ -195,6 +195,15 @@ Phases 2-3).
   placeholder as `Authorization`, and the echoed headers must show the real
   token the gateway put in its place. It depends on the public
   `postman-echo.com` service being up.
+  UC-203 (EF-55, P3-3) creates a `python:3.12-alpine` sandbox, pinned to the
+  `docker` runtime (runc under either engine, never runsc, which refuses
+  `binaries` with 501), allowed `pypi.org` and `files.pythonhosted.org` with a
+  binaries-only rule on 443 for each naming `/usr/local/bin/pip`. Inside,
+  `pip install requests` must pass without inspection (the gateway names pip by
+  its script), and busybox `wget` to `https://pypi.org/simple/` must be
+  refused at the TLS handshake. The node needs cgroup v2, which the Ubuntu
+  22.04 AMIs have; on cgroup v1 every covered connection is refused
+  (`binary_unknown`).
 - UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
   can't reach host services) only need `docker`.
 - **`private-cloud`** (`single-node-private-cloud`, `make
