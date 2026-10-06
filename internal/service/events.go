@@ -357,6 +357,20 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
+	// The stop event cleared this sandbox's per-IP rules (the IP can be
+	// recycled), so a start the API didn't drive would otherwise run
+	// unrestricted until the next reconcile pass. Re-apply before anything
+	// else and fail closed: a sandbox whose isolation can't be restored is
+	// stopped (egress plan P0-4).
+	if err := s.reapplyEgressOnStart(rt, sandbox); err != nil {
+		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+		sandbox.Status = models.SandboxStatusError
+		sandbox.LastError = err.Error()
+		if uerr := s.store.Upsert(ctx, sandbox); uerr != nil {
+			s.logger.Warn("record start-event egress failure", "sandbox_id", sandbox.ID, "error", uerr)
+		}
+		return fmt.Errorf("reapply egress on start event: %w", err)
+	}
 	// A successful start (whether driven by the API, a wake, or
 	// out-of-band `docker start`) means the sandbox is live again, so
 	// drop wake_armed. The next stop is the one that decides whether
@@ -386,6 +400,39 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		}
 	}
 	s.syncAllowedPorts(ctx, sandbox)
+	// Quota blocks are re-evaluated against the stored counters, the same
+	// way reconcile heals them, so an over-quota sandbox started out of band
+	// is blocked again right away.
+	if sandbox.NetworkQuotaExceeded {
+		overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
+		overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
+		s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
+	}
+	return nil
+}
+
+// reapplyEgressOnStart restores block-all and the selective-egress policy on
+// the sandbox's current IP. Both netrules operations are Exists-guarded, so a
+// start the API already drove (and already applied) costs two lookups.
+func (s *Service) reapplyEgressOnStart(rt runtime.Runtime, sandbox *models.Sandbox) error {
+	hasPolicy := len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0
+	if !sandbox.NetworkBlockAll && !hasPolicy {
+		return nil
+	}
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		return fmt.Errorf("runtime %q does not support network rules", sandbox.Runtime)
+	}
+	if sandbox.NetworkBlockAll {
+		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+	}
+	if hasPolicy {
+		if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+			return fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
 	return nil
 }
 
