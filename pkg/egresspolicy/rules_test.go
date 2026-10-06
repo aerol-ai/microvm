@@ -154,3 +154,51 @@ func TestCanonicalRequestPath(t *testing.T) {
 		}
 	}
 }
+
+// TestRuleInject (P3-2): an inject rule names a header and an env key, needs
+// inspection, and never on port 80; its audit name carries the secret_ref,
+// never a value.
+func TestRuleInject(t *testing.T) {
+	pol := rulesPolicy(t)
+	inj := &InjectSpec{Header: "authorization", SecretRef: "env:GITHUB_TOKEN"}
+	rs, err := CompileRules([]RuleSpec{{Host: "api.github.com", Inspect: true, Paths: []string{"/repos/**"}, Inject: inj}}, pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := rs.Decide("api.github.com", 443, "GET", "/repos/acme/x")
+	h, key, ok := d.Rule.Inject()
+	if !ok || h != "Authorization" || key != "GITHUB_TOKEN" {
+		t.Fatalf("inject = %q %q %v", h, key, ok)
+	}
+	if name := d.Rule.Name(); name != "rules[0] api.github.com (inject Authorization from env:GITHUB_TOKEN)" {
+		t.Fatalf("name = %q", name)
+	}
+	var none *Rule
+	if _, _, ok := none.Inject(); ok {
+		t.Fatal("nil rule injects nothing")
+	}
+	for name, spec := range map[string]RuleSpec{
+		"no inspect":   {Host: "plain.example.org", Inject: inj},
+		"port 80":      {Host: "api.github.com", Inspect: true, Ports: []uint16{80, 443}, Inject: inj},
+		"bad ref":      {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: "Authorization", SecretRef: "GITHUB_TOKEN"}},
+		"bad key":      {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: "Authorization", SecretRef: "env:1BAD"}},
+		"reserved":     {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: "Host", SecretRef: "env:K"}},
+		"bad header":   {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: "X Bad", SecretRef: "env:K"}},
+		"empty header": {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: "", SecretRef: "env:K"}},
+		"long header":  {Host: "api.github.com", Inspect: true, Inject: &InjectSpec{Header: strings.Repeat("x", 65), SecretRef: "env:K"}},
+	} {
+		if _, err := CompileRules([]RuleSpec{spec}, pol); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	keys := InjectEnvKeys([]RuleSpec{{Inject: inj}, {}, {Inject: inj}, {Inject: &InjectSpec{SecretRef: "env:B_2"}}, {Inject: &InjectSpec{SecretRef: "nope"}}})
+	if strings.Join(keys, ",") != "GITHUB_TOKEN,B_2" {
+		t.Fatalf("keys = %v", keys)
+	}
+	if InjectPlaceholder("K") != "aerolvm-placeholder:K" {
+		t.Fatal("placeholder")
+	}
+	if _, ok := InjectEnvKey("env:" + strings.Repeat("A", 129)); ok {
+		t.Fatal("over-long key")
+	}
+}

@@ -287,6 +287,9 @@ type NetworkPolicyWrite struct {
 	// created trusting the node's CA, and is never cleared.
 	Rules     []models.EgressRule
 	InspectCA bool
+	// Withheld are the env keys the create replaced with placeholders
+	// (P3-2); empty leaves the recorded set alone.
+	Withheld []string
 }
 
 // WriteNetworkPolicy stores a sandbox's policy, its profile references and
@@ -371,12 +374,18 @@ func writeEgressProfilesTx(ctx context.Context, tx *sql.Tx, id string, p Network
 		}
 		rules = string(b)
 	}
+	withheld := ""
+	if len(p.Withheld) > 0 {
+		withheld = mustMarshalStringSlice(p.Withheld)
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, egress_mode, rules_json, inspect_ca, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, egress_mode, rules_json, inspect_ca, withheld_env_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET inline_allow_json = excluded.inline_allow_json,
 			egress_mode = excluded.egress_mode, rules_json = excluded.rules_json,
-			inspect_ca = MAX(sandbox_egress.inspect_ca, excluded.inspect_ca), updated_at = excluded.updated_at
-	`, id, inline, p.Mode, rules, p.InspectCA, now); err != nil {
+			inspect_ca = MAX(sandbox_egress.inspect_ca, excluded.inspect_ca),
+			withheld_env_json = CASE WHEN excluded.withheld_env_json != '' THEN excluded.withheld_env_json ELSE sandbox_egress.withheld_env_json END,
+			updated_at = excluded.updated_at
+	`, id, inline, p.Mode, rules, p.InspectCA, withheld, now); err != nil {
 		return fmt.Errorf("write inline allow list: %w", err)
 	}
 	return nil

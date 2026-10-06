@@ -999,6 +999,21 @@ type EgressRule struct {
 	// Inspect terminates TLS on 443 with the node's CA so requests can be
 	// checked, and makes the gateway require Host to equal the SNI.
 	Inspect bool `json:"inspect,omitempty"`
+	// Inject replaces a header on the requests this rule allows with a
+	// secret from the sandbox's own env, which the sandbox itself only
+	// sees as a placeholder (P3-2). Needs Inspect.
+	Inject *EgressInject `json:"inject,omitempty"`
+}
+
+// EgressInject is a rule's credential injection (plans/egress-domain-
+// filtering.md §5.9, P3-2).
+type EgressInject struct {
+	// Header is replaced, never added to or substituted inside bodies.
+	Header string `json:"header"`
+	// SecretRef is "env:<KEY>": a key in the sandbox's env, withheld from
+	// the sandbox (it gets "aerolvm-placeholder:<KEY>") and handed to the
+	// egress gateway instead. Rotating it means recreating the sandbox.
+	SecretRef string `json:"secret_ref"`
 }
 
 // Egress modes (NetworkEgressMode).

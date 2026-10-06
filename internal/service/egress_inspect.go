@@ -12,6 +12,8 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
 
@@ -23,6 +25,11 @@ import (
 // its own trust store plus the CA; nothing else trusts it. A failover
 // recreate builds the bundle again from the new node's CA, so trust follows
 // the node that terminates TLS.
+
+// ErrEgressInjectRecreate is a live policy change that injects an env key
+// the sandbox already holds in clear (409, P3-2): only keys withheld at
+// create can be protected.
+var ErrEgressInjectRecreate = errors.New("recreate the sandbox with this inject rule: only env keys withheld at create can be injected")
 
 // ErrEgressInspectRecreate is a live policy change that adds an inspect
 // rule to a container sandbox created without one: trusting the node's CA
@@ -196,7 +203,7 @@ func (s *Service) resyncEgressCA(ctx context.Context) error {
 // exists and the gateway has it, and the sandbox gets the CA file, the
 // bundle's tmpfs and the environment. Runs before the runtime create; the
 // first inspect create on a node also pays the CA generation.
-func (s *Service) prepareInspect(ctx context.Context, env map[string]string) ([]mounts.ContainerBind, map[string]string, error) {
+func (s *Service) prepareInspect(ctx context.Context, env map[string]string, rules []models.EgressRule) ([]mounts.ContainerBind, map[string]string, error) {
 	ca, err := s.ensureEgressCA()
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
@@ -216,9 +223,66 @@ func (s *Service) prepareInspect(ctx context.Context, env map[string]string) ([]
 			out[k] = v
 		}
 	}
+	// Injected credentials (P3-2): the sandbox gets a placeholder; the
+	// gateway gets the value.
+	for _, k := range injectKeys(rules) {
+		out[k] = egresspolicy.InjectPlaceholder(k)
+	}
 	binds := []mounts.ContainerBind{
 		{HostPath: s.egressCACertPath(), ContainerPath: inspectCAPath, ReadOnly: true},
 		{ContainerPath: inspectBundleDir, Tmpfs: true},
 	}
 	return binds, out, nil
+}
+
+// checkInjectKeys requires every injected env key to exist in a sandbox's
+// sealed env, for a runtime that never shows the env to the sandbox
+// (isolate).
+func (s *Service) checkInjectKeys(ctx context.Context, sb *models.Sandbox, keys []string) error {
+	env, err := s.loadEnv(ctx, sb.ID, sb.AuditIncarnationID)
+	if err != nil {
+		return err
+	}
+	return requireInjectKeys(env, keys)
+}
+
+// injectKeys lists the env keys a rule set injects.
+func injectKeys(rules []models.EgressRule) []string {
+	return egresspolicy.InjectEnvKeys(egressRuleSpecs(rules))
+}
+
+func requireInjectKeys(env map[string]string, keys []string) error {
+	for _, k := range keys {
+		if _, ok := env[k]; !ok {
+			return fmt.Errorf("%w: network_egress_rules inject secret_ref env:%s: the sandbox's env has no %s", egresspolicy.ErrInvalid, k, k)
+		}
+	}
+	return nil
+}
+
+// egressSecrets returns the values a sandbox's inject rules send (P3-2):
+// from the env a create holds in memory, or the sealed env otherwise. A
+// value it can't read is left out, so its requests are refused at the
+// gateway rather than sent with the placeholder.
+func (s *Service) egressSecrets(ctx context.Context, sb *models.Sandbox) map[string]string {
+	keys := injectKeys(sb.NetworkEgressRules)
+	if len(keys) == 0 {
+		return nil
+	}
+	env := sb.Env
+	if requireInjectKeys(env, keys) != nil {
+		loaded, err := s.loadEnv(ctx, sb.ID, sb.AuditIncarnationID)
+		if err != nil {
+			s.logger.Warn("egress: injected credentials unavailable; requests that need them are refused", "sandbox_id", sb.ID, "error", err)
+			return nil
+		}
+		env = loaded
+	}
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		if v, ok := env[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }

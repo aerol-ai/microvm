@@ -61,6 +61,9 @@ func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 	out := make([]egresspolicy.RuleSpec, len(rules))
 	for i, r := range rules {
 		out[i] = egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect}
+		if r.Inject != nil {
+			out[i].Inject = &egresspolicy.InjectSpec{Header: r.Inject.Header, SecretRef: r.Inject.SecretRef}
+		}
 	}
 	return out
 }

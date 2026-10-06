@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -39,6 +40,8 @@ const (
 	DenyReasonRuleDenied = "rule_denied"
 	// DenyReasonPathNotCanonical: a ruled host's path could be read two ways.
 	DenyReasonPathNotCanonical = "path_not_canonical"
+	// DenyReasonSecretMissing: an inject rule's value never reached the host.
+	DenyReasonSecretMissing = "secret_missing"
 )
 
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
@@ -56,6 +59,8 @@ type EgressPolicy struct {
 	// Rules are method and path rules (P3-1). The host proxies plaintext
 	// requests itself, so it checks them without terminating any TLS.
 	Rules []egresspolicy.RuleSpec
+	// Secrets are inject rules' values by env key (P3-2), memory only.
+	Secrets map[string]string
 }
 
 // LearnObserver is told each destination a learn-mode sandbox reached. The
@@ -136,6 +141,10 @@ func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
 	}
 	h.egressPolicy[id] = p
 	h.egressRules[id] = rules
+	if h.egressSecrets == nil {
+		h.egressSecrets = make(map[string]map[string]string)
+	}
+	h.egressSecrets[id] = maps.Clone(raw.Secrets)
 
 	if p.BlockAll() {
 		// No slot for block-all: it binds EGRESS_DENY. Drop any prior slot.
@@ -295,7 +304,9 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	}
 	h.mu.RLock()
 	rules := h.egressRules[sandboxID]
+	secrets := h.egressSecrets[sandboxID]
 	h.mu.RUnlock()
+	var injectHeader, injectValue string
 	if rules.Has(host, port) {
 		path, ok := egresspolicy.CanonicalRequestPath(r.URL.EscapedPath())
 		if !ok {
@@ -303,10 +314,21 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 				"aerolvm egress policy: "+authority+": path has dot segments, empty segments or encoded slashes, which network_egress_rules refuse")
 			return
 		}
-		if d := rules.Decide(host, port, r.Method, path); !d.Allowed {
+		d := rules.Decide(host, port, r.Method, path)
+		if !d.Allowed {
 			h.denyEgress(w, sandboxID, authority, DenyReasonRuleDenied,
 				"aerolvm egress policy: "+r.Method+" "+path+" on "+authority+" is not allowed by network_egress_rules")
 			return
+		}
+		// Credential injection (P3-2): never sent with the value missing.
+		if header, key, ok := d.Rule.Inject(); ok {
+			v := secrets[key]
+			if v == "" {
+				h.denyEgress(w, sandboxID, authority, DenyReasonSecretMissing,
+					"aerolvm egress policy: the credential env:"+key+" for "+authority+" is not available, so the request was not sent")
+				return
+			}
+			injectHeader, injectValue = header, v
 		}
 	}
 	// Defense-in-depth against SSRF: isolate egress runs from the HOST network
@@ -323,6 +345,10 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 		}
 	}
 	outReq := r.Clone(r.Context())
+	if injectHeader != "" {
+		outReq.Header.Del(injectHeader)
+		outReq.Header.Set(injectHeader, injectValue)
+	}
 	outReq.RequestURI = ""
 	outReq.URL.Scheme = "https"
 	outReq.URL.Host = authority

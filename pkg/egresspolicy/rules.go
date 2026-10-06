@@ -2,6 +2,7 @@ package egresspolicy
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -40,6 +41,66 @@ type RuleSpec struct {
 	Paths []string `json:"paths,omitempty"`
 	// Inspect terminates TLS on 443 so the rule can see requests.
 	Inspect bool `json:"inspect,omitempty"`
+	// Inject replaces a request header with a secret the sandbox never
+	// holds (P3-2). It needs an inspected rule on 443.
+	Inject *InjectSpec `json:"inject,omitempty"`
+}
+
+// InjectSpec names the header a rule sets and where its value comes from.
+type InjectSpec struct {
+	Header string `json:"header"`
+	// SecretRef is "env:<KEY>", a key in the sandbox's own sealed env
+	// (CEO D13). The sandbox sees a placeholder in its place.
+	SecretRef string `json:"secret_ref"`
+}
+
+// InjectEnvPrefix starts a secret_ref that names an env key.
+const InjectEnvPrefix = "env:"
+
+// InjectPlaceholder is what an injected env key holds inside the sandbox.
+func InjectPlaceholder(key string) string { return "aerolvm-placeholder:" + key }
+
+// InjectEnvKey returns the env key a secret_ref names.
+func InjectEnvKey(ref string) (string, bool) {
+	key, ok := strings.CutPrefix(ref, InjectEnvPrefix)
+	if !ok || !isEnvKey(key) {
+		return "", false
+	}
+	return key, true
+}
+
+func isEnvKey(k string) bool {
+	if k == "" || len(k) > 128 {
+		return false
+	}
+	for i, c := range k {
+		if c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// InjectEnvKeys lists the env keys rules inject, deduplicated in order.
+func InjectEnvKeys(specs []RuleSpec) []string {
+	var out []string
+	for _, s := range specs {
+		if s.Inject == nil {
+			continue
+		}
+		if k, ok := InjectEnvKey(s.Inject.SecretRef); ok && !containsString(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// reservedInjectHeaders can't be injected: they frame the request or route
+// it, so replacing them would change what is sent, not who it authenticates.
+var reservedInjectHeaders = map[string]bool{
+	"host": true, "content-length": true, "transfer-encoding": true, "connection": true, "upgrade": true,
+	"te": true, "trailer": true, "keep-alive": true, "proxy-authorization": true, "proxy-connection": true,
 }
 
 // Rule is one compiled rule.
@@ -50,11 +111,26 @@ type Rule struct {
 	methods []string
 	paths   []string
 	inspect bool
+	inject  *InjectSpec
 }
 
-// Name identifies a rule in audit records and denials.
+// Inject returns the header the rule sets and its env key, if any.
+func (r *Rule) Inject() (header, key string, ok bool) {
+	if r == nil || r.inject == nil {
+		return "", "", false
+	}
+	key, _ = InjectEnvKey(r.inject.SecretRef)
+	return r.inject.Header, key, true
+}
+
+// Name identifies a rule in audit records and denials. An inject rule
+// names its header and secret_ref, never the value.
 func (r *Rule) Name() string {
-	return "rules[" + strconv.Itoa(r.Index) + "] " + r.host.String()
+	n := "rules[" + strconv.Itoa(r.Index) + "] " + r.host.String()
+	if r.inject != nil {
+		n += " (inject " + r.inject.Header + " from " + r.inject.SecretRef + ")"
+	}
+	return n
 }
 
 // Rules is a sandbox's compiled rule list. The nil *Rules has no rules.
@@ -108,6 +184,20 @@ func compileRule(i int, s RuleSpec, pol *Policy) (*Rule, error) {
 		return nil, bad("host %q must be a hostname or *. wildcard without a port", s.Host)
 	}
 	r := &Rule{Index: i, host: e, inspect: s.Inspect}
+	if s.Inject != nil {
+		h := http.CanonicalHeaderKey(strings.TrimSpace(s.Inject.Header))
+		if !isHeaderToken(h) || reservedInjectHeaders[strings.ToLower(h)] {
+			return nil, bad("inject header %q is not a header that can carry a credential", s.Inject.Header)
+		}
+		if _, ok := InjectEnvKey(s.Inject.SecretRef); !ok {
+			return nil, bad("inject secret_ref %q must be env:<KEY>", s.Inject.SecretRef)
+		}
+		// A credential only ever travels inside the gateway's own TLS.
+		if !s.Inspect {
+			return nil, bad("inject needs inspect: true, so the credential is only added inside TLS")
+		}
+		r.inject = &InjectSpec{Header: h, SecretRef: s.Inject.SecretRef}
+	}
 	r.ports = append(r.ports, s.Ports...)
 	if len(r.ports) == 0 {
 		r.ports = []uint16{80}
@@ -121,6 +211,9 @@ func compileRule(i int, s RuleSpec, pol *Policy) (*Rule, error) {
 		}
 		if p == 443 && !s.Inspect {
 			return nil, bad("port 443 is encrypted; set inspect: true to check its requests")
+		}
+		if p == 80 && s.Inject != nil {
+			return nil, bad("inject on port 80 would send the credential in clear; use 443")
 		}
 		if pol == nil {
 			continue
@@ -153,6 +246,18 @@ func compileRule(i int, s RuleSpec, pol *Policy) (*Rule, error) {
 		r.paths = append(r.paths, p)
 	}
 	return r, nil
+}
+
+func isHeaderToken(h string) bool {
+	if h == "" || len(h) > 64 {
+		return false
+	}
+	for _, c := range h {
+		if !(c == '-' || (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) {
+			return false
+		}
+	}
+	return true
 }
 
 func isMethodToken(m string) bool {

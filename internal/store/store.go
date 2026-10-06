@@ -966,6 +966,11 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// on, since the bundle stays mounted for the container's life.
 		`ALTER TABLE sandbox_egress ADD COLUMN rules_json TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE sandbox_egress ADD COLUMN inspect_ca INTEGER NOT NULL DEFAULT 0;`,
+		// The env keys a create withheld from the sandbox for credential
+		// injection (P3-2): the sandbox holds placeholders for them, so a
+		// later inject rule may use them, while any other key is already in
+		// the sandbox's hands. Set once at create.
+		`ALTER TABLE sandbox_egress ADD COLUMN withheld_env_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and

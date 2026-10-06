@@ -477,9 +477,15 @@ func (s *Service) resolveCreateEgress(ctx context.Context, ownerRef string, req 
 func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string, rules []models.EgressRule, held bool) error {
 	// A container sandbox created with an inspect rule trusts the node's CA
 	// for its whole life, so a later policy change may add more (P3-1).
+	// Its injected env keys were replaced with placeholders, so later inject
+	// rules may use them (P3-2).
 	inspectCA := hasInspectRule(rules) && models.RuntimeUsesEgressGateway(sb.Runtime)
+	var withheld []string
+	if inspectCA {
+		withheld = injectKeys(rules)
+	}
 	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef, Mode: mode,
-		Rules: rules, InspectCA: inspectCA})
+		Rules: rules, InspectCA: inspectCA, Withheld: withheld})
 	if err == nil && len(r.Applied) > 0 {
 		err = s.store.SetEgressProfilesApplied(ctx, sb.ID, r.Applied)
 	}

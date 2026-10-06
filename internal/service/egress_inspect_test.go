@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -155,5 +156,98 @@ func TestInspectCreateFailsClosed(t *testing.T) {
 	svc.cipher = nil
 	if _, _, err := svc.loadEgressCA(); err == nil {
 		t.Fatal("no cipher, no key")
+	}
+}
+
+var injectRules = []models.EgressRule{{Host: "api.example.org", Inspect: true, Paths: []string{"/repos/**"},
+	Inject: &models.EgressInject{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"}}}
+
+// TestCreateWithInjectRule (EF-54, P3-2): the sandbox holds a placeholder,
+// the gateway the value; the withheld key is recorded; after a gateway
+// restart the value comes back from the sealed env.
+func TestCreateWithInjectRule(t *testing.T) {
+	svc, gw, rt := newInspectHarness(t)
+	ctx := ownerCtx("acct")
+	env := map[string]string{"GITHUB_TOKEN": "Bearer ghp_real", "APP": "1"}
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", Env: env, NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rt.lastCreateReq.Env["GITHUB_TOKEN"]; got != "aerolvm-placeholder:GITHUB_TOKEN" || rt.lastCreateReq.Env["APP"] != "1" {
+		t.Fatalf("sandbox env = %v", rt.lastCreateReq.Env)
+	}
+	if env["GITHUB_TOKEN"] != "Bearer ghp_real" {
+		t.Fatal("the caller's env must keep the value")
+	}
+	if got := gw.attached[resp.ID].Secrets["GITHUB_TOKEN"]; got != "Bearer ghp_real" {
+		t.Fatalf("gateway secret = %q", got)
+	}
+	if es, _ := svc.store.GetEgressState(ctx, resp.ID); !slices.Equal(es.Withheld, []string{"GITHUB_TOKEN"}) {
+		t.Fatalf("withheld = %v", es.Withheld)
+	}
+	specs, err := svc.localEgressSpecs(context.Background())
+	if err != nil || len(specs) != 1 || specs[0].Secrets["GITHUB_TOKEN"] != "Bearer ghp_real" {
+		t.Fatalf("resync specs = %+v %v", specs, err)
+	}
+
+	// Live: keeping the withheld key is fine and re-reads the sealed env; a
+	// key the sandbox holds in clear is 409.
+	if _, err := svc.UpdateNetworkPolicy(ctx, resp.ID, models.NetworkPolicyRequest{NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: append(slices.Clone(injectRules),
+		models.EgressRule{Host: "api.example.org", Inspect: true, Methods: []string{"GET"}})}); err != nil {
+		t.Fatal(err)
+	}
+	if got := gw.attached[resp.ID].Secrets["GITHUB_TOKEN"]; got != "Bearer ghp_real" {
+		t.Fatalf("secret after PUT = %q", got)
+	}
+	clear := []models.EgressRule{{Host: "api.example.org", Inspect: true, Inject: &models.EgressInject{Header: "X-Key", SecretRef: "env:APP"}}}
+	if _, err := svc.UpdateNetworkPolicy(ctx, resp.ID, models.NetworkPolicyRequest{NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: clear}); !errors.Is(err, ErrEgressInjectRecreate) {
+		t.Fatalf("inject a key held in clear: %v", err)
+	}
+
+	// The key must be in the create's env.
+	if _, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules}); !errors.Is(err, egresspolicy.ErrInvalid) {
+		t.Fatalf("missing env key: %v", err)
+	}
+}
+
+// TestIsolateInject: an isolate never sees its env, so nothing is withheld;
+// the host gets the value from the sealed env, which must hold the key.
+func TestIsolateInject(t *testing.T) {
+	svc, _, _ := newInspectHarness(t)
+	iso := newMediator()
+	svc.isolate = iso
+	svc.cfg.EgressFQDNEnabled = false
+	ctx := context.Background()
+	seedPolicySandbox(t, svc, models.Sandbox{ID: "sb-iso", Runtime: models.RuntimeIsolate, AuditIncarnationID: "inc-iso"})
+	req := models.NetworkPolicyRequest{NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules}
+	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-iso", req); err == nil {
+		t.Fatal("no sealed env with the key: refused")
+	}
+	row, _ := svc.store.Get(ctx, "sb-iso")
+	putEnv := func(env map[string]string) {
+		t.Helper()
+		sealed, err := svc.sealEnv(row.ID, row.AuditIncarnationID, env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.store.PutEnv(ctx, row.ID, sealed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putEnv(map[string]string{"GITHUB_TOKEN": "Bearer iso"})
+	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-iso", req); err != nil {
+		t.Fatal(err)
+	}
+	if got := iso.secrets["sb-iso"]["GITHUB_TOKEN"]; got != "Bearer iso" {
+		t.Fatalf("isolate secret = %q", got)
+	}
+	putEnv(map[string]string{"OTHER": "x"})
+	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-iso", models.NetworkPolicyRequest{NetworkAllowOut: []string{"api.example.org"}, NetworkEgressRules: injectRules}); !errors.Is(err, egresspolicy.ErrInvalid) {
+		t.Fatalf("key gone from the env: %v", err)
+	}
+	// An unreadable env leaves the value out: the host refuses those
+	// requests rather than send the placeholder.
+	if got := svc.egressSecrets(ctx, &models.Sandbox{ID: "missing", NetworkEgressRules: injectRules}); len(got) != 0 {
+		t.Fatalf("secrets for an unreadable env = %v", got)
 	}
 }

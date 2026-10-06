@@ -283,13 +283,23 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	if _, ok, err := LoadSnapshot(path); ok || err != nil {
 		t.Fatalf("missing snapshot = %v, %v", ok, err)
 	}
-	in := Snapshot{Specs: []Spec{allowSpec("sb", ipA, "pypi.org")}, Bridges: []Bridge{{Name: "docker0", GatewayIP: netip.MustParseAddr("172.17.0.1")}}}
+	spec := allowSpec("sb", ipA, "pypi.org")
+	spec.Secrets = map[string]string{"GITHUB_TOKEN": "ghp_real"}
+	in := Snapshot{Specs: []Spec{spec}, Bridges: []Bridge{{Name: "docker0", GatewayIP: netip.MustParseAddr("172.17.0.1")}}}
 	if err := SaveSnapshot(path, in); err != nil {
 		t.Fatal(err)
 	}
 	out, ok, err := LoadSnapshot(path)
 	if err != nil || !ok || len(out.Specs) != 1 || out.Bridges[0].Name != "docker0" {
 		t.Fatalf("load = %+v, %v, %v", out, ok, err)
+	}
+	// Injected credentials never reach the disk (P3-2), and the caller's
+	// spec keeps them.
+	if raw, _ := os.ReadFile(path); strings.Contains(string(raw), "ghp_real") || out.Specs[0].Secrets != nil {
+		t.Fatal("a secret reached the snapshot")
+	}
+	if in.Specs[0].Secrets["GITHUB_TOKEN"] != "ghp_real" {
+		t.Fatal("SaveSnapshot must not modify the caller's specs")
 	}
 	if err := os.WriteFile(path, []byte("{nope"), 0o600); err != nil {
 		t.Fatal(err)

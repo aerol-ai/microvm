@@ -1673,6 +1673,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if _, cerr := compileCreateEgress(&req); cerr != nil {
 			return nil, cerr
 		}
+		// An inject rule's key must be in the env the sandbox is created
+		// with (P3-2).
+		if ierr := requireInjectKeys(req.Env, injectKeys(req.NetworkEgressRules)); ierr != nil {
+			return nil, ierr
+		}
 		if !isStoredSpecReplay(ctx) {
 			if rerr := s.refuseDisabledBuiltins(req.EgressProfiles); rerr != nil {
 				return nil, rerr
@@ -1950,7 +1955,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// known regression).
 	var inspectBinds []mounts.ContainerBind
 	if hasInspectRule(req.NetworkEgressRules) {
-		inspectBinds, driverReq.Env, err = s.prepareInspect(ctx, req.Env)
+		inspectBinds, driverReq.Env, err = s.prepareInspect(ctx, req.Env, req.NetworkEgressRules)
 		if err != nil {
 			releaseAdmission()
 			return nil, err
@@ -2030,7 +2035,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		cr, ok := runtime.AsContainerRuntime(ociRt)
 		attachSB := &models.Sandbox{ID: sandboxID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
 			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
-			NetworkEgressRules: req.NetworkEgressRules}
+			NetworkEgressRules: req.NetworkEgressRules, Env: req.Env}
 		egressDone = make(chan error, 1)
 		go func() {
 			attachStart := time.Now()

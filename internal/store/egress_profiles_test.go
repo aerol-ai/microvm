@@ -215,6 +215,25 @@ func TestEgressRulesStored(t *testing.T) {
 	if es, _ := st.GetEgressState(ctx, "sb-rules"); !es.InspectCA {
 		t.Fatal("inspect_ca must never be cleared")
 	}
+	// Withheld env keys (P3-2) are set once and survive later writes.
+	if err := st.SetSandboxEgressProfiles(ctx, "sb-rules", NetworkPolicyWrite{Withheld: []string{"GITHUB_TOKEN"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.WriteNetworkPolicy(ctx, "sb-rules", NetworkPolicyWrite{}); err != nil {
+		t.Fatal(err)
+	}
+	if es, _ := st.GetEgressState(ctx, "sb-rules"); len(es.Withheld) != 1 || es.Withheld[0] != "GITHUB_TOKEN" {
+		t.Fatalf("withheld = %v", es.Withheld)
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_egress SET withheld_env_json = '{bad' WHERE sandbox_id = 'sb-rules'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetEgressState(ctx, "sb-rules"); err == nil {
+		t.Fatal("corrupt withheld keys must fail the read")
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_egress SET withheld_env_json = '' WHERE sandbox_id = 'sb-rules'`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_egress SET rules_json = '{bad' WHERE sandbox_id = 'sb-rules'`); err != nil {
 		t.Fatal(err)
 	}

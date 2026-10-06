@@ -60,6 +60,10 @@ type Spec struct {
 	// (plans/egress-domain-filtering.md §5.9, P3-1); the proxy holds each
 	// request to a ruled host to them.
 	Rules []egresspolicy.RuleSpec `json:"rules,omitempty"`
+	// Secrets are the values inject rules send, by env key (P3-2). They
+	// cross the UDS and live in memory only: SaveSnapshot drops them, and
+	// sandboxd's Sync after a restart brings them back.
+	Secrets map[string]string `json:"secrets,omitempty"`
 	// Blocked carries sandboxd's view of the block reasons, so Attach and Sync
 	// apply the latest block state themselves (Section 4: callers never read
 	// the blocked state and act on it).

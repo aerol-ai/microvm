@@ -327,7 +327,7 @@ func TestPhase3LiveEgressPolicyUpdate(t *testing.T) {
 		return strings.Contains(string(b), "status=403")
 	}
 	update := func(id string, blockAll bool, allow []string) {
-		if err := d.UpdateEgressPolicy(id, blockAll, allow, nil, false, nil); err != nil {
+		if err := d.UpdateEgressPolicy(id, blockAll, allow, nil, false, nil, nil); err != nil {
 			t.Fatalf("update %s: %v", id, err)
 		}
 	}

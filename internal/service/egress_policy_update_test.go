@@ -375,6 +375,7 @@ type policyMediatorRuntime struct {
 	blocked map[string]bool
 	learn   map[string]bool
 	rules   map[string][]egresspolicy.RuleSpec
+	secrets map[string]map[string]string
 	err     error
 }
 
@@ -401,13 +402,17 @@ func (m *policyMediatorRuntime) SetNetworkBlocks(id string, _, out bool) {
 	m.blocked[id] = out
 }
 
-func (m *policyMediatorRuntime) UpdateEgressPolicy(id string, blockAll bool, allow, _ []string, learn bool, rules []egresspolicy.RuleSpec) error {
+func (m *policyMediatorRuntime) UpdateEgressPolicy(id string, blockAll bool, allow, _ []string, learn bool, rules []egresspolicy.RuleSpec, secrets map[string]string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.rules == nil {
 		m.rules = map[string][]egresspolicy.RuleSpec{}
 	}
 	m.rules[id] = rules
+	if m.secrets == nil {
+		m.secrets = map[string]map[string]string{}
+	}
+	m.secrets[id] = secrets
 	m.set[id] = allow
 	m.blocked[id] = blockAll
 	m.learn[id] = learn

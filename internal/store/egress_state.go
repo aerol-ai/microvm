@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -15,6 +16,8 @@ type EgressState struct {
 	HoldSince  time.Time
 	// InspectCA: the sandbox was created trusting the node's CA (P3-1).
 	InspectCA bool
+	// Withheld are the env keys the sandbox holds placeholders for (P3-2).
+	Withheld []string
 }
 
 // SetEgressHold records the fail-closed hold and its reason (CEO D16). It is
@@ -54,9 +57,10 @@ func (s *Store) ClearEgressHold(ctx context.Context, sandboxID string, now time.
 func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressState, error) {
 	st := EgressState{SandboxID: sandboxID}
 	var since sql.NullTime
+	var withheld string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT hold_reason, hold_since, inspect_ca FROM sandbox_egress WHERE sandbox_id = ?
-	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA)
+		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json FROM sandbox_egress WHERE sandbox_id = ?
+	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -65,6 +69,11 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 	}
 	if since.Valid {
 		st.HoldSince = since.Time
+	}
+	if withheld != "" {
+		if err := json.Unmarshal([]byte(withheld), &st.Withheld); err != nil {
+			return st, fmt.Errorf("get egress state: withheld env keys: %w", err)
+		}
 	}
 	return st, nil
 }

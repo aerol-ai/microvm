@@ -14,7 +14,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)
 	ctx := context.Background()
-	if err := d.UpdateEgressPolicy("missing", true, nil, nil, false, nil); err == nil {
+	if err := d.UpdateEgressPolicy("missing", true, nil, nil, false, nil, nil); err == nil {
 		t.Fatal("an unknown sandbox must be an error")
 	}
 	if _, err := d.Create(ctx, models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "a.js", TenantID: "acme",
@@ -29,7 +29,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	}
 
 	// Loaded: the host gets the new policy now.
-	if err := d.UpdateEgressPolicy("sb-1", false, []string{"pypi.org"}, []string{"10.0.0.0/8"}, false, nil); err != nil {
+	if err := d.UpdateEgressPolicy("sb-1", false, []string{"pypi.org"}, []string{"10.0.0.0/8"}, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostPolicy(); got.BlockAll || !slices.Equal(got.Allow, []string{"pypi.org"}) || !slices.Equal(got.Deny, []string{"10.0.0.0/8"}) {
@@ -43,7 +43,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	}
 	d.groupsMu.Unlock()
 	d.reapIdleGroups(time.Hour)
-	if err := d.UpdateEgressPolicy("sb-1", true, nil, nil, false, nil); err != nil {
+	if err := d.UpdateEgressPolicy("sb-1", true, nil, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if hostPolicy().BlockAll {
@@ -90,7 +90,7 @@ func TestIsolateLearnMode(t *testing.T) {
 	}
 	d.groupsMu.Unlock()
 	d.reapIdleGroups(time.Hour)
-	if err := d.UpdateEgressPolicy("sb-l", false, []string{"pypi.org"}, nil, false, nil); err != nil {
+	if err := d.UpdateEgressPolicy("sb-l", false, []string{"pypi.org"}, nil, false, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	l, err := d.EgressLearned("sb-l")
@@ -126,11 +126,23 @@ func (s *learnSupervisor) SetLearnObserver(obs pkgisolate.LearnObserver) { s.obs
 // lists, on create and on every update.
 func TestPolicyFromCreateCarriesRules(t *testing.T) {
 	rules := ruleSpecs([]models.EgressRule{{Host: "api.example.com", Inspect: true, Methods: []string{"GET"}}})
-	p := policyFromCreate(false, []string{"api.example.com"}, nil, false, rules)
+	p := policyFromCreate(false, []string{"api.example.com"}, nil, false, rules, nil)
 	if len(p.Rules) != 1 || p.Rules[0].Host != "api.example.com" || !p.Rules[0].Inspect || p.Rules[0].Methods[0] != "GET" {
 		t.Fatalf("policy = %+v", p)
 	}
 	if len(ruleSpecs(nil)) != 0 {
 		t.Fatal("no rules")
+	}
+	// Injected values come from the env, by key (P3-2).
+	inj := ruleSpecs([]models.EgressRule{{Host: "api.example.com", Inspect: true, Inject: &models.EgressInject{Header: "Authorization", SecretRef: "env:TOKEN"}}})
+	secrets := injectSecrets(inj, map[string]string{"TOKEN": "v", "OTHER": "x"})
+	if len(secrets) != 1 || secrets["TOKEN"] != "v" || injectSecrets(rules, map[string]string{"TOKEN": "v"}) != nil {
+		t.Fatalf("secrets = %v", secrets)
+	}
+	if got := injectSecrets(inj, nil); len(got) != 0 {
+		t.Fatalf("no env, no secrets: %v", got)
+	}
+	if p := policyFromCreate(false, nil, nil, false, inj, secrets); p.Secrets["TOKEN"] != "v" || p.Rules[0].Inject.SecretRef != "env:TOKEN" {
+		t.Fatalf("policy = %+v", p)
 	}
 }

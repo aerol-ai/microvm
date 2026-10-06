@@ -113,7 +113,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 				writeHTTPError(c, http.StatusForbidden, ruleDenyMessage(req, host, reason))
 				return
 			}
-			rule = r
+			rule = r.Name()
 		}
 		// Only an explicit allow rule skips the policy at dial time (allow
 		// wins, D4); a default-accept verdict leaves deny CIDRs in force.
@@ -165,17 +165,17 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 }
 
 // checkRules holds one request to a ruled host's rules (P3-1). It returns
-// the allowing rule's name, or the denial reason.
-func checkRules(rs *egresspolicy.Rules, host string, port uint16, req *http.Request) (rule, reason string, ok bool) {
+// the allowing rule, or the denial reason.
+func checkRules(rs *egresspolicy.Rules, host string, port uint16, req *http.Request) (rule *egresspolicy.Rule, reason string, ok bool) {
 	path, ok := egresspolicy.CanonicalRequestPath(req.URL.EscapedPath())
 	if !ok {
-		return "", ReasonPathNotCanonical, false
+		return nil, ReasonPathNotCanonical, false
 	}
 	d := rs.Decide(host, port, req.Method, path)
 	if !d.Allowed {
-		return "", ReasonRuleDenied, false
+		return nil, ReasonRuleDenied, false
 	}
-	return d.Rule.Name(), "", true
+	return d.Rule, "", true
 }
 
 // ruleDenyMessage explains a rule denial in the 403 body (CEO D4).

@@ -70,6 +70,9 @@ type Host struct {
 	bundles      map[string]*jsbundle.Bundle     // sandbox id → pinned bundle
 	egressPolicy map[string]*egresspolicy.Policy // sandbox id → compiled outbound policy
 	egressRules  map[string]*egresspolicy.Rules  // sandbox id → method and path rules (P3-1)
+	// egressSecrets holds inject rules' values by sandbox id (P3-2), memory
+	// only.
+	egressSecrets map[string]map[string]string
 	// Egress slot allocation (§4): a sandbox with a non-block-all policy is
 	// assigned a slot; its dedicated egress listener (slotSrv[slot]) is bound
 	// lazily on assignment and torn down on Unload. Attribution is the socket,
@@ -223,6 +226,7 @@ func (h *Host) Unload(id string) int {
 	delete(h.bundles, id)
 	delete(h.egressPolicy, id)
 	delete(h.egressRules, id)
+	delete(h.egressSecrets, id)
 	if slot, ok := h.slotByID[id]; ok {
 		h.freeSlotLocked(id, slot)
 	}

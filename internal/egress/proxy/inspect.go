@@ -42,6 +42,10 @@ const (
 	ReasonHostMismatch = "host_mismatch"
 	// ReasonBodyTooLarge: an inspected request body is over the cap.
 	ReasonBodyTooLarge = "body_too_large"
+	// ReasonSecretMissing: an inject rule's value hasn't reached the gateway
+	// (P3-2), so the request is refused rather than sent with the
+	// placeholder.
+	ReasonSecretMissing = "secret_missing"
 )
 
 // Inspector issues the certificate the proxy presents for an inspected
@@ -210,12 +214,24 @@ func (h *inspectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if cur.Rules.Has(h.name, 443) {
-		name, reason, ok := checkRules(cur.Rules, h.name, 443, r)
+		matched, reason, ok := checkRules(cur.Rules, h.name, 443, r)
 		if !ok {
 			h.deny(w, cur.Mode, http.StatusForbidden, reason, ruleDenyMessage(r, h.name, reason))
 			return
 		}
-		rule = name
+		rule = matched.Name()
+		// Credential injection (P3-2): the configured header is replaced
+		// with the real value, never added to or substituted in a body.
+		if header, key, inject := matched.Inject(); inject {
+			value, ok := cur.Spec.Secrets[key]
+			if !ok || value == "" {
+				h.deny(w, cur.Mode, http.StatusForbidden, ReasonSecretMissing,
+					fmt.Sprintf("aerolvm egress policy: the credential env:%s for %s is not available, so the request was not sent", key, h.name))
+				return
+			}
+			r.Header.Del(header)
+			r.Header.Set(header, value)
+		}
 	}
 	max := h.p.cfg.InspectMaxBody
 	if r.ContentLength > max {

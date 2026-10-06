@@ -193,3 +193,38 @@ func TestInspectOnlyRuledHosts(t *testing.T) {
 		t.Fatal("no host")
 	}
 }
+
+// TestInspectInject (EF-54, P3-2): the upstream gets the real header in
+// place of the sandbox's placeholder; the audit names the rule and
+// secret_ref but never the value; with no value the request is refused,
+// never sent with the placeholder.
+func TestInspectInject(t *testing.T) {
+	inject := egresspolicy.RuleSpec{Host: "api.example.com", Inspect: true, Paths: []string{"/repos/**"},
+		Inject: &egresspolicy.InjectSpec{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"}}
+	r := newInspectRig(t, Config{}, inject)
+	spec := allowSpec("api.example.com", "other.example.com")
+	spec.IP = peer
+	spec.Rules = []egresspolicy.RuleSpec{inject}
+	spec.Secrets = map[string]string{"GITHUB_TOKEN": "Bearer ghp_real"}
+	if err := r.gw.Update(spec); err != nil {
+		t.Fatal(err)
+	}
+	c := r.client(true)
+	code, body, _ := do(t, c, http.MethodGet, "https://api.example.com/repos/acme/x", "", "")
+	if code != 200 || !strings.Contains(body, "auth=Bearer ghp_real") {
+		t.Fatalf("injected: %d %q", code, body)
+	}
+	d := r.last()
+	if d.Rule != "rules[0] api.example.com (inject Authorization from env:GITHUB_TOKEN)" || strings.Contains(fmt.Sprint(d), "ghp_real") {
+		t.Fatalf("audit = %+v", d)
+	}
+
+	spec.Secrets = nil
+	if err := r.gw.Update(spec); err != nil {
+		t.Fatal(err)
+	}
+	code, body, _ = do(t, c, http.MethodGet, "https://api.example.com/repos/acme/x", "", "")
+	if code != 403 || !strings.Contains(body, "env:GITHUB_TOKEN") || r.last().Reason != ReasonSecretMissing {
+		t.Fatalf("missing secret: %d %q", code, body)
+	}
+}

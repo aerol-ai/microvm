@@ -123,5 +123,6 @@ func (a *hostAdapter) SetEgressPolicy(id string, p EgressPolicy) {
 		Deny:     p.Deny,
 		Learn:    p.Learn,
 		Rules:    p.Rules,
+		Secrets:  p.Secrets,
 	})
 }

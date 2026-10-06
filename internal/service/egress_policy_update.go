@@ -40,7 +40,7 @@ type wasmEgressPolicySetter interface {
 // isolateEgressPolicyUpdater replaces an isolate sandbox's egress proxy
 // policy live.
 type isolateEgressPolicyUpdater interface {
-	UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec) error
+	UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec, secrets map[string]string) error
 }
 
 // egressPolicyLocks serializes policy updates per sandbox (§5.8 step 2). A
@@ -170,6 +170,17 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		if !st.InspectCA {
 			return nil, ErrEgressInspectRecreate
 		}
+		// A key the sandbox holds in clear is already exposed: injecting it
+		// now would protect nothing (P3-2).
+		for _, k := range injectKeys(next.NetworkEgressRules) {
+			if !slices.Contains(st.Withheld, k) {
+				return nil, fmt.Errorf("%w: the sandbox holds %s in clear", ErrEgressInjectRecreate, k)
+			}
+		}
+	} else if keys := injectKeys(next.NetworkEgressRules); len(keys) > 0 {
+		if err := s.checkInjectKeys(ctx, old, keys); err != nil {
+			return nil, err
+		}
 	}
 	if containerRT && pol.GatewayMode() {
 		if !s.egressEnabled() {
@@ -214,7 +225,7 @@ func (s *Service) applyPolicyTransition(ctx context.Context, old, next *models.S
 	case s.isWasmSandbox(old):
 		return s.applyWasmPolicy(next)
 	case s.isIsolateSandbox(old):
-		return s.applyIsolatePolicy(next)
+		return s.applyIsolatePolicy(ctx, next)
 	case next.Status == models.SandboxStatusStarted:
 		return s.applyContainerPolicy(ctx, old, next)
 	}
@@ -227,7 +238,8 @@ func samePolicy(a, b *models.Sandbox) bool {
 }
 
 func sameEgressRule(a, b models.EgressRule) bool {
-	return a.Host == b.Host && a.Inspect == b.Inspect && slices.Equal(a.Ports, b.Ports) && slices.Equal(a.Methods, b.Methods) && slices.Equal(a.Paths, b.Paths)
+	return a.Host == b.Host && a.Inspect == b.Inspect && slices.Equal(a.Ports, b.Ports) && slices.Equal(a.Methods, b.Methods) && slices.Equal(a.Paths, b.Paths) &&
+		(a.Inject == nil) == (b.Inject == nil) && (a.Inject == nil || *a.Inject == *b.Inject)
 }
 
 // sameProfiles reports whether the stored references, their applied
@@ -303,13 +315,13 @@ func (s *Service) applyWasmPolicy(sb *models.Sandbox) error {
 	return nil
 }
 
-func (s *Service) applyIsolatePolicy(sb *models.Sandbox) error {
+func (s *Service) applyIsolatePolicy(ctx context.Context, sb *models.Sandbox) error {
 	updater, ok := s.isolate.(isolateEgressPolicyUpdater)
 	if !ok {
 		return errors.New("isolate runtime cannot update egress policy")
 	}
 	return updater.UpdateEgressPolicy(sb.ID, sb.NetworkBlockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn,
-		egressRuleSpecs(sb.NetworkEgressRules))
+		egressRuleSpecs(sb.NetworkEgressRules), s.egressSecrets(ctx, sb))
 }
 
 // applyContainerPolicy moves a running container sandbox from old's policy to

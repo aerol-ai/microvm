@@ -193,6 +193,7 @@ func compile(spec Spec) (*entry, error) {
 
 func specHash(s Spec) string {
 	s.Blocked = 0 // block state changes must not discard learned elements
+	s.Secrets = nil
 	b, _ := json.Marshal(s)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])

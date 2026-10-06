@@ -28,6 +28,13 @@ type Snapshot struct {
 // the directory so the rename itself is durable.
 func SaveSnapshot(path string, s Snapshot) error {
 	s.Version = snapshotVersion
+	// Injected credentials never touch the disk (P3-2).
+	specs := make([]Spec, len(s.Specs))
+	for i, sp := range s.Specs {
+		sp.Secrets = nil
+		specs[i] = sp
+	}
+	s.Specs = specs
 	b, err := json.Marshal(s)
 	if err != nil {
 		return err

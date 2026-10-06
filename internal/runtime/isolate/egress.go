@@ -1,6 +1,8 @@
 package isolate
 
 import (
+	"maps"
+
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -19,6 +21,10 @@ type EgressPolicy struct {
 	// Rules are method and path rules (P3-1), checked on the plaintext
 	// requests the host proxies.
 	Rules []egresspolicy.RuleSpec
+	// Secrets are the values inject rules set, by env key (P3-2). An
+	// isolate never sees its env, so nothing is withheld from it; the host
+	// adds them to the requests it proxies.
+	Secrets map[string]string
 }
 
 // EgressPolicySetter is implemented by GroupHost production adapters so the
@@ -29,14 +35,30 @@ type EgressPolicySetter interface {
 }
 
 // policyFromCreate maps CreateSandboxRequest network fields onto EgressPolicy.
-func policyFromCreate(blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec) EgressPolicy {
+func policyFromCreate(blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec, secrets map[string]string) EgressPolicy {
 	return EgressPolicy{
 		BlockAll: blockAll,
 		Allow:    append([]string(nil), allow...),
 		Deny:     append([]string(nil), deny...),
 		Learn:    learn,
 		Rules:    append([]egresspolicy.RuleSpec(nil), rules...),
+		Secrets:  maps.Clone(secrets),
 	}
+}
+
+// injectSecrets picks the values a rule set injects from a sandbox's env.
+func injectSecrets(rules []egresspolicy.RuleSpec, env map[string]string) map[string]string {
+	keys := egresspolicy.InjectEnvKeys(rules)
+	if len(keys) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(keys))
+	for _, k := range keys {
+		if v, ok := env[k]; ok {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // ruleSpecs converts the wire rules (the service does the same for the
@@ -44,7 +66,11 @@ func policyFromCreate(blockAll bool, allow, deny []string, learn bool, rules []e
 func ruleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 	out := make([]egresspolicy.RuleSpec, 0, len(rules))
 	for _, r := range rules {
-		out = append(out, egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect})
+		spec := egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect}
+		if r.Inject != nil {
+			spec.Inject = &egresspolicy.InjectSpec{Header: r.Inject.Header, SecretRef: r.Inject.SecretRef}
+		}
+		out = append(out, spec)
 	}
 	return out
 }
