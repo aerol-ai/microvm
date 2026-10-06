@@ -5,10 +5,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // EgressObserver is notified when a sandbox is allowed to contact a destination
@@ -18,11 +21,22 @@ type EgressObserver func(sandboxID, network, destination string)
 
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
 // egress proxy (plans/isolate-runtime.md §4 Phase 3). Mirrored from the
-// driver-level type so pkg/isolate does not import the runtime package.
+// driver-level type so pkg/isolate does not import the runtime package. The
+// lists use the shared pkg/egresspolicy grammar and its allow-wins precedence
+// (plans/egress-domain-filtering.md D4, D15), the same as every other runtime.
 type EgressPolicy struct {
 	BlockAll bool
 	Allow    []string
 	Deny     []string
+}
+
+// isolateDialGuard is isolate's posture (D15): isolate egress leaves from the
+// host's own network namespace, so private, unspecified and multicast
+// destinations stay unreachable even if a policy CIDR names them.
+var isolateDialGuard = egresspolicy.DialGuard{Strict: true}
+
+func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
+	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll})
 }
 
 // SetEgressPolicy registers (or replaces) the outbound policy for a sandbox and
@@ -31,17 +45,28 @@ type EgressPolicy struct {
 // sandbox binds EGRESS_DENY. Until a policy is set — or when the pool is
 // exhausted — the sandbox has no slot and its egress is denied (fail-closed).
 // Called after Load; Unload clears both policy and slot.
-func (h *Host) SetEgressPolicy(id string, p EgressPolicy) {
+//
+// Creates validate the lists first (internal/service), so a policy that does
+// not compile here is a stored row from before the shared grammar (for
+// example a hostname in Deny, D15). It is enforced as block-all rather than
+// guessed at: fail closed, never open.
+func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
 	if id == "" {
 		return
 	}
+	p, err := compileEgressPolicy(raw)
+	if err != nil {
+		h.logger.Error("isolate: egress policy does not compile; sandbox egress is blocked",
+			"group", h.cfg.GroupKey, "sandbox", id, "err", err)
+		p = egresspolicy.BlockAllPolicy()
+	}
 	h.mu.Lock()
 	if h.egressPolicy == nil {
-		h.egressPolicy = make(map[string]EgressPolicy)
+		h.egressPolicy = make(map[string]*egresspolicy.Policy)
 	}
 	h.egressPolicy[id] = p
 
-	if p.BlockAll {
+	if p.BlockAll() {
 		// No slot for block-all: it binds EGRESS_DENY. Drop any prior slot.
 		if slot, ok := h.slotByID[id]; ok {
 			h.freeSlotLocked(id, slot)
@@ -151,17 +176,17 @@ func (h *Host) serveEgressSlot(slot int, w http.ResponseWriter, r *http.Request)
 	}
 	p, ok := h.egressPolicy[id]
 	h.mu.RUnlock()
-	if id == "" || !ok {
+	if id == "" || !ok || p == nil {
 		http.Error(w, "egress denied: slot has no attributed sandbox", http.StatusForbidden)
 		return
 	}
 	h.proxyEgress(w, r, id, p)
 }
 
-// proxyEgress enforces p (allowlist/denylist + SSRF IP-range block) and proxies
-// the request. The isolate reaches this only via its own slot socket, so p is
-// unambiguously this sandbox's policy. sandboxID attributes the destination for
-// audit (E3a); empty id skips observation.
+// proxyEgress enforces p (the shared egresspolicy matcher + SSRF IP-range
+// block) and proxies the request. The isolate reaches this only via its own
+// slot socket, so p is unambiguously this sandbox's policy. sandboxID
+// attributes the destination for audit (E3a); empty id skips observation.
 //
 // workerd delivers an external egress service the request with the target
 // authority in the Host header and only path+query in the URL — and it does NOT
@@ -170,20 +195,24 @@ func (h *Host) serveEgressSlot(slot int, w http.ResponseWriter, r *http.Request)
 // from the Host header and force https: an isolate cannot make a plaintext
 // egress call, which is the safe default for an allowlist proxy and the only
 // scheme we can honor unambiguously.
-func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID string, p EgressPolicy) {
+func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID string, p *egresspolicy.Policy) {
 	authority := r.Host
 	if authority == "" {
 		authority = r.URL.Host
 	}
-	host := authority
-	if hname, _, err := net.SplitHostPort(authority); err == nil {
-		host = hname
-	}
+	host, port, ok := splitAuthority(authority)
 	if host == "" {
 		http.Error(w, "egress denied: no destination host", http.StatusForbidden)
 		return
 	}
-	if !egressAllowed(p, host) {
+	if !ok {
+		http.Error(w, "egress denied: invalid destination port", http.StatusForbidden)
+		return
+	}
+	// Port semantics are the shared grammar's (plans/egress-domain-filtering.md
+	// §5.1): a bare host allows 80/443 and host:port exactly that port, so the
+	// match is on the port the proxy will actually dial.
+	if allowed, _ := p.MatchHostPort(host, port); !allowed {
 		http.Error(w, "egress denied by sandbox policy", http.StatusForbidden)
 		return
 	}
@@ -193,10 +222,12 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	// (169.254.169.254 → instance IAM credentials). Reject an IP-literal
 	// destination in a special-use range up front, and — because a hostname can
 	// resolve into those ranges (or be rebound) — the shared egressTransport
-	// re-checks the resolved IP at dial time (egressDialControl).
-	if ip := net.ParseIP(host); ip != nil && isBlockedEgressIP(ip) {
-		http.Error(w, "egress denied: destination is a blocked (loopback/link-local/private) address", http.StatusForbidden)
-		return
+	// re-checks the resolved IP at dial time (egresspolicy.StrictDialControl).
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if err := isolateDialGuard.Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(ip, port)}); err != nil {
+			http.Error(w, "egress denied: destination is a blocked (loopback/link-local/private) address", http.StatusForbidden)
+			return
+		}
 	}
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
@@ -220,88 +251,37 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func egressAllowed(p EgressPolicy, host string) bool {
-	if p.BlockAll {
-		return false
+// splitAuthority returns the destination host and the port the proxy will
+// dial. The proxy always upgrades to https, so an authority without a port
+// is dialed, and policed, as 443. ok is false for a port that is not 1-65535.
+func splitAuthority(authority string) (host string, port uint16, ok bool) {
+	h, portStr, err := net.SplitHostPort(authority)
+	if err != nil {
+		return strings.TrimSuffix(strings.TrimPrefix(authority, "["), "]"), 443, true
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
-	for _, d := range p.Deny {
-		if hostMatches(host, d) {
-			return false
-		}
+	n, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || n == 0 {
+		return h, 0, false
 	}
-	if len(p.Allow) == 0 {
-		return true
-	}
-	for _, a := range p.Allow {
-		if hostMatches(host, a) {
-			return true
-		}
-	}
-	return false
+	return h, uint16(n), true
 }
 
 // egressTransport is the shared outbound transport for the egress proxy. Its
 // dial Control hook runs AFTER DNS resolution with the concrete IP, so it
 // blocks special-use destinations even when reached via a hostname (or a
 // rebound one) — the authoritative SSRF guard behind the literal check in
-// serveEgress. Typed as RoundTripper so offline tests can swap in a fake
-// without dialing the network.
+// proxyEgress. The hook is policy-independent (strict mode), which is what
+// makes it safe to pool connections across sandboxes. Typed as RoundTripper
+// so offline tests can swap in a fake without dialing the network.
 var egressTransport http.RoundTripper = &http.Transport{
 	DialContext: (&net.Dialer{
 		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
-		Control:   egressDialControl,
+		Control:   egresspolicy.StrictDialControl,
 	}).DialContext,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          100,
 	IdleConnTimeout:       90 * time.Second,
 	TLSHandshakeTimeout:   10 * time.Second,
 	ExpectContinueTimeout: time.Second,
-}
-
-func egressDialControl(_, address string, _ syscall.RawConn) error {
-	host := address
-	if h, _, err := net.SplitHostPort(address); err == nil {
-		host = h
-	}
-	if ip := net.ParseIP(host); ip != nil && isBlockedEgressIP(ip) {
-		return fmt.Errorf("egress denied: destination %s is in a blocked (loopback/link-local/private) range", ip)
-	}
-	return nil
-}
-
-// isBlockedEgressIP reports whether ip is in a range untrusted isolate code
-// must never reach through the host proxy: loopback (the sandboxd API), link-
-// local (cloud metadata 169.254.169.254 / fe80::/10), private (RFC1918 + ULA),
-// unspecified, and multicast.
-func isBlockedEgressIP(ip net.IP) bool {
-	return ip.IsLoopback() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsPrivate() ||
-		ip.IsUnspecified() ||
-		ip.IsMulticast() ||
-		ip.IsInterfaceLocalMulticast()
-}
-
-func hostMatches(host, rule string) bool {
-	rule = strings.ToLower(strings.TrimSpace(rule))
-	if rule == "" {
-		return false
-	}
-	if strings.Contains(rule, "/") {
-		_, n, err := net.ParseCIDR(rule)
-		if err != nil {
-			return false
-		}
-		ip := net.ParseIP(host)
-		return ip != nil && n.Contains(ip)
-	}
-	if host == rule {
-		return true
-	}
-	if strings.HasPrefix(rule, ".") && strings.HasSuffix(host, rule) {
-		return true
-	}
-	return false
 }

@@ -1,18 +1,15 @@
 package isolate
 
-import (
-	"net"
-	"strings"
-)
-
 // EgressPolicy is the per-sandbox outbound policy the host-side egress proxy
 // enforces (plans/isolate-runtime.md §4 Phase 3). Mapped from existing
 // CreateSandboxRequest fields (NetworkBlockAll / NetworkAllowOut /
-// NetworkDenyOut) — net-new grant fields wait for the §10.1 checkpoint.
+// NetworkDenyOut) — net-new grant fields wait for the §10.1 checkpoint. The
+// driver only carries it: matching lives in pkg/isolate on the shared
+// pkg/egresspolicy grammar (plans/egress-domain-filtering.md §5.6, CQ4).
 type EgressPolicy struct {
 	BlockAll bool
 	Allow    []string // CIDRs / hosts; empty + !BlockAll = allow-all (self-host default)
-	Deny     []string
+	Deny     []string // CIDRs only (hostnames are rejected at create, D15)
 }
 
 // EgressPolicySetter is implemented by GroupHost production adapters so the
@@ -20,57 +17,6 @@ type EgressPolicy struct {
 // not implement it (egress is fail-closed until policy is set on a real host).
 type EgressPolicySetter interface {
 	SetEgressPolicy(sandboxID string, p EgressPolicy)
-}
-
-// egressAllowed reports whether an outbound request to host (hostname or IP)
-// is permitted under p. Deny wins over allow; BlockAll denies everything;
-// empty Allow with !BlockAll allows all (operator/self-host default).
-func egressAllowed(p EgressPolicy, host string) bool {
-	if p.BlockAll {
-		return false
-	}
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	for _, d := range p.Deny {
-		if hostMatches(host, d) {
-			return false
-		}
-	}
-	if len(p.Allow) == 0 {
-		return true
-	}
-	for _, a := range p.Allow {
-		if hostMatches(host, a) {
-			return true
-		}
-	}
-	return false
-}
-
-func hostMatches(host, rule string) bool {
-	rule = strings.ToLower(strings.TrimSpace(rule))
-	if rule == "" {
-		return false
-	}
-	// CIDR form.
-	if strings.Contains(rule, "/") {
-		_, n, err := net.ParseCIDR(rule)
-		if err != nil {
-			return false
-		}
-		ip := net.ParseIP(host)
-		return ip != nil && n.Contains(ip)
-	}
-	if host == rule {
-		return true
-	}
-	// Suffix match for "*.example.com" style rules expressed as ".example.com".
-	if strings.HasPrefix(rule, ".") && strings.HasSuffix(host, rule) {
-		return true
-	}
-	return false
 }
 
 // policyFromCreate maps CreateSandboxRequest network fields onto EgressPolicy.

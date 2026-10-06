@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"strings"
 	"time"
 
@@ -57,6 +58,15 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	}
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
+	}
+	// Isolate lists use the shared grammar: *. wildcards, allow-wins
+	// precedence, hostnames refused in deny lists (D15). Validating here makes
+	// a bad entry a 400 at create instead of a stored policy the host later
+	// enforces as block-all (egress plan P0-3).
+	if _, err := egresspolicy.Compile(egresspolicy.Spec{
+		AllowOut: req.NetworkAllowOut, DenyOut: req.NetworkDenyOut, BlockAll: req.NetworkBlockAll,
+	}); err != nil {
+		return nil, err
 	}
 	bundleRef := models.ModuleRefForCreate(req)
 	if bundleRef == "" {

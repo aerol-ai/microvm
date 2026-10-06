@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
 
@@ -66,8 +67,8 @@ type Host struct {
 	started atomic.Bool
 
 	mu           sync.RWMutex
-	bundles      map[string]*jsbundle.Bundle // sandbox id → pinned bundle
-	egressPolicy map[string]EgressPolicy     // sandbox id → outbound policy
+	bundles      map[string]*jsbundle.Bundle     // sandbox id → pinned bundle
+	egressPolicy map[string]*egresspolicy.Policy // sandbox id → compiled outbound policy
 	// Egress slot allocation (§4): a sandbox with a non-block-all policy is
 	// assigned a slot; its dedicated egress listener (slotSrv[slot]) is bound
 	// lazily on assignment and torn down on Unload. Attribution is the socket,
@@ -155,7 +156,7 @@ func NewHost(cfg HostConfig) (*Host, error) {
 		egressDenySock: filepath.Join(cfg.RunDir, egressDenySocketName),
 		egressSocks:    egressSocks,
 		bundles:        make(map[string]*jsbundle.Bundle),
-		egressPolicy:   make(map[string]EgressPolicy),
+		egressPolicy:   make(map[string]*egresspolicy.Policy),
 		slotByID:       make(map[string]int),
 		idBySlot:       make([]string, cfg.EgressPoolSize),
 		slotSrv:        make([]*http.Server, cfg.EgressPoolSize),
