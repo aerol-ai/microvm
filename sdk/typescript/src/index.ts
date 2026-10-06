@@ -8,6 +8,8 @@ export type {
   AuditEvent,
   AuditOptions,
   AuditPage,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
   BinaryLike,
   BuildImageOptions,
   BuildImagePushOptions,

@@ -918,6 +918,29 @@ type NetworkUsage struct {
 }
 
 // UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// NetworkPolicyCheckRequest is POST /v1/network/policy/check: would a sandbox
+// created with these egress fields reach Destination? Destination is "host",
+// "host:port", "IP" or "IP:port"; a bare host is checked as the web ports.
+// No sandbox is involved (plans/egress-domain-filtering.md P2-9, CEO D5).
+type NetworkPolicyCheckRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all,omitempty"`
+	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
+	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	Destination     string   `json:"destination"`
+}
+
+// NetworkPolicyCheckResponse answers a policy check. MatchedRule is the entry
+// that decided, "" when the default verdict did. The check does not resolve
+// DNS, so deny CIDRs that a hostname's address would hit at connect time are
+// not evaluated. OutsideCeiling names the first allow entry outside this
+// deployment's operator ceiling (a create with it would get 400).
+type NetworkPolicyCheckResponse struct {
+	Allowed        bool   `json:"allowed"`
+	MatchedRule    string `json:"matched_rule"`
+	DefaultVerdict string `json:"default_verdict"`
+	OutsideCeiling string `json:"outside_ceiling,omitempty"`
+}
+
 // Each field is a pointer so the handler can distinguish "leave alone" (nil)
 // from "set to unlimited" (pointer to zero). Negative values are rejected at
 // the service layer.

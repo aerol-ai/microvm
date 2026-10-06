@@ -14,6 +14,8 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
   IngressTarget,
   Lifecycle,
   GetOptions,
@@ -171,6 +173,15 @@ export class MicroVM {
 
   async health(): Promise<HealthStatus> {
     return this.client.health();
+  }
+
+  /**
+   * Asks whether a sandbox created with these egress fields would reach a
+   * destination, using the same matcher the filter enforces. No sandbox is
+   * needed.
+   */
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    return this.client.checkNetworkPolicy(options);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

@@ -44,6 +44,8 @@ import type {
   AuditEvent,
   AuditOptions,
   AuditPage,
+  NetworkPolicyCheckOptions,
+  NetworkPolicyCheckResult,
   PlatformVolumeMount,
   RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
@@ -814,6 +816,27 @@ export class APIClient {
   async health(): Promise<HealthStatus> {
     const response = await this.doJSON<ApiHealthStatus>("GET", "/health");
     return fromApiHealthStatus(response);
+  }
+
+  async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
+    const response = await this.doJSON<{
+      allowed: boolean;
+      matched_rule: string;
+      default_verdict: string;
+      outside_ceiling?: string;
+    }>("POST", this.versioned("/network/policy/check"), {
+      network_block_all: options.networkBlockAll,
+      network_allow_out: options.networkAllowOut,
+      network_deny_out: options.networkDenyOut,
+      destination: options.destination,
+    });
+    const result: NetworkPolicyCheckResult = {
+      allowed: response.allowed,
+      matchedRule: response.matched_rule ?? "",
+      defaultVerdict: response.default_verdict,
+    };
+    if (response.outside_ceiling) result.outsideCeiling = response.outside_ceiling;
+    return result;
   }
 
   async mounts(id: string): Promise<MountSpecRedacted[]> {

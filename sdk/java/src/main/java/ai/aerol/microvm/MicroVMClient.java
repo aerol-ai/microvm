@@ -28,6 +28,8 @@ import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.BuildImageOptions;
@@ -805,6 +807,15 @@ public class MicroVMClient {
 
     public HealthStatus health() {
         return doJson("GET", "/health", null, HealthStatus.class);
+    }
+
+    /**
+     * Asks whether a sandbox created with these egress fields would reach a
+     * destination, with the same matcher the filter enforces. No sandbox is
+     * needed.
+     */
+    public NetworkPolicyCheckResult checkNetworkPolicy(NetworkPolicyCheckOptions options) {
+        return doJson("POST", versioned("/network/policy/check"), options, NetworkPolicyCheckResult.class);
     }
 
     public ExecStreamHandle execStream(String sandboxId, ExecStreamOptions options) {

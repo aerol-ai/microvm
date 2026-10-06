@@ -586,6 +586,28 @@ export interface AuditOptions {
   incarnationID?: string;
 }
 
+/**
+ * Would a sandbox created with these egress fields reach `destination`?
+ * `destination` is "host", "host:port", "IP" or "IP:port"; a bare host is
+ * checked as the web ports.
+ */
+export interface NetworkPolicyCheckOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+  destination: string;
+}
+
+export interface NetworkPolicyCheckResult {
+  allowed: boolean;
+  /** The entry that decided; "" when the default verdict did. */
+  matchedRule: string;
+  /** "allow" or "deny": what happens to a destination no entry matches. */
+  defaultVerdict: string;
+  /** The first allow entry outside this deployment's ceiling, if any. */
+  outsideCeiling?: string;
+}
+
 export interface SetNetworkLimitsOptions {
   /** Omit (undefined) to leave unchanged. `0` means unlimited. */
   networkBytesInLimit?: number;

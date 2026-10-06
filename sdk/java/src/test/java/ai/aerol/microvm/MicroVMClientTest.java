@@ -29,6 +29,8 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
@@ -848,6 +850,31 @@ class MicroVMClientTest {
             assertEquals("PATCH", patchMethod.get());
             assertEquals(4096, ((Number) patchBody.get().get("network_bytes_in_limit")).longValue());
             assertEquals(1, patchBody.get().size(), "unset fields should not be serialized");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void checkNetworkPolicyPostsAndMaps() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/network/policy/check".equals(exchange.getRequestURI().getPath())) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("allowed", true, "matched_rule", "*.github.com", "default_verdict", "deny"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + exchange.getRequestURI());
+        });
+        try {
+            NetworkPolicyCheckResult res = clientFor(server).checkNetworkPolicy(
+                new NetworkPolicyCheckOptions().setNetworkAllowOut(List.of("*.github.com")).setDestination("api.github.com"));
+            assertTrue(res.allowed);
+            assertEquals("*.github.com", res.matchedRule);
+            assertEquals("deny", res.defaultVerdict);
+            assertEquals(List.of("*.github.com"), body.get().get("network_allow_out"));
+            assertEquals("api.github.com", body.get().get("destination"));
+            assertTrue(!body.get().containsKey("network_block_all"), "unset fields are not sent");
         } finally {
             server.stop(0);
         }

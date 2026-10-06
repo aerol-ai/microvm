@@ -434,6 +434,22 @@ func (h *handlers) getNetworkUsage(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, usage)
 }
 
+// checkNetworkPolicy answers whether a policy would let a sandbox reach a
+// destination, without a sandbox (plans/egress-domain-filtering.md P2-9).
+func (h *handlers) checkNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyCheckRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.CheckNetworkPolicy(r.Context(), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
 func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {
 	var req models.UpdateNetworkLimitsRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {

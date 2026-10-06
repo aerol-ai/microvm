@@ -111,6 +111,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	// Pure policy evaluation: no sandbox, so no owner forwarding.
+	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Auth(http.HandlerFunc(h.checkNetworkPolicy)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Auth(withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))

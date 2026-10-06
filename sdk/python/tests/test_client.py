@@ -79,6 +79,8 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if method == "POST" and path == "/v1/network/policy/check":
+            return {"allowed": True, "matched_rule": "*.github.com", "default_verdict": "deny", "outside_ceiling": "x.example"}
         if method == "GET" and path.startswith("/v1/sandboxes/sb-1/audit"):
             return {
                 "events": [
@@ -741,6 +743,20 @@ class ClientTests(unittest.TestCase):
                     "platform_volumes": [],
                 },
             ),
+        )
+
+    def test_check_network_policy(self):
+        client = RecordingMicroVM()
+
+        result = client.check_network_policy({"networkAllowOut": ["*.github.com"], "destination": "api.github.com"})
+
+        method, path, body = client.calls[0]
+        self.assertEqual((method, path), ("POST", "/v1/network/policy/check"))
+        self.assertEqual(body["network_allow_out"], ["*.github.com"])
+        self.assertEqual(body["destination"], "api.github.com")
+        self.assertEqual(
+            result,
+            {"allowed": True, "matchedRule": "*.github.com", "defaultVerdict": "deny", "outsideCeiling": "x.example"},
         )
 
     def test_sandbox_maps_egress_status(self):

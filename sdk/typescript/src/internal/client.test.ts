@@ -1450,3 +1450,23 @@ test("get maps egress_status for gateway-mode sandboxes", async () => {
   const sandbox = await client.get("sb-eg");
   assert.equal(sandbox.egressStatus, "held");
 });
+
+test("checkNetworkPolicy posts the policy and maps the answer", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ allowed: true, matched_rule: "*.github.com", default_verdict: "deny", outside_ceiling: "x.example" });
+    },
+  });
+  const res = await client.checkNetworkPolicy({ networkAllowOut: ["*.github.com"], destination: "api.github.com" });
+  assert.ok(seen && seen.url.endsWith("/v1/network/policy/check"));
+  assert.equal(seen?.method, "POST");
+  assert.deepEqual(body.network_allow_out, ["*.github.com"]);
+  assert.equal(body.destination, "api.github.com");
+  assert.deepEqual(res, { allowed: true, matchedRule: "*.github.com", defaultVerdict: "deny", outsideCeiling: "x.example" });
+});

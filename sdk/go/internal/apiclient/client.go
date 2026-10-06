@@ -660,6 +660,14 @@ func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.Network
 	return response, nil
 }
 
+// CheckNetworkPolicy evaluates a policy against a destination without a
+// sandbox.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, request models.NetworkPolicyCheckRequest) (models.NetworkPolicyCheckResponse, error) {
+	var response models.NetworkPolicyCheckResponse
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/network/policy/check", request, &response)
+	return response, err
+}
+
 // GetAudit reads one page of a sandbox's audit log.
 func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
 	values := make(url.Values)

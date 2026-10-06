@@ -768,6 +768,34 @@ pub struct AuditPage {
     pub next_cursor: Option<String>,
 }
 
+/// Asks whether a sandbox created with these egress fields would reach
+/// `destination` ("host", "host:port", "IP" or "IP:port").
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyCheckOptions {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub network_block_all: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_deny_out: Vec<String>,
+    pub destination: String,
+}
+
+/// The answer to a policy check.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyCheckResult {
+    pub allowed: bool,
+    /// The entry that decided; empty when the default verdict did.
+    #[serde(default)]
+    pub matched_rule: String,
+    /// "allow" or "deny": what happens to a destination no entry matches.
+    #[serde(default)]
+    pub default_verdict: String,
+    /// The first allow entry outside this deployment's ceiling, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_ceiling: Option<String>,
+}
+
 /// Filters and paging for `Sandbox::audit`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuditOptions {

@@ -128,6 +128,15 @@ const (
 )
 
 type NetworkUsage = models.NetworkUsage
+
+// NetworkPolicyCheckOptions asks whether a sandbox created with these egress
+// fields would reach Destination ("host", "host:port", "IP" or "IP:port").
+type NetworkPolicyCheckOptions = models.NetworkPolicyCheckRequest
+
+// NetworkPolicyCheckResult is the answer: Allowed, the deciding MatchedRule
+// ("" for the default verdict), DefaultVerdict, and OutsideCeiling when an
+// allow entry is outside this deployment's ceiling.
+type NetworkPolicyCheckResult = models.NetworkPolicyCheckResponse
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
 
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind

@@ -44,6 +44,8 @@ from .types import (
     AuditEvent,
     AuditOptions,
     AuditPage,
+    NetworkPolicyCheckOptions,
+    NetworkPolicyCheckResult,
     PlatformVolumeMount,
     RegisterSnapshotOptions,
     ResizeOptions,
@@ -797,6 +799,26 @@ class MicroVM:
     def get_network_usage(self, sandbox_id: str) -> NetworkUsage:
         payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/usage", None)
         return _from_api_network_usage(payload)
+
+    def check_network_policy(self, options: NetworkPolicyCheckOptions) -> NetworkPolicyCheckResult:
+        """Ask whether a sandbox created with these egress fields would reach
+        a destination, with the same matcher the filter enforces. No sandbox
+        is needed."""
+        body = {
+            "network_block_all": bool(options.get("networkBlockAll", False)),
+            "network_allow_out": list(options.get("networkAllowOut") or []),
+            "network_deny_out": list(options.get("networkDenyOut") or []),
+            "destination": options.get("destination", ""),
+        }
+        payload = self._do_json("POST", f"{self._version_prefix}/network/policy/check", body) or {}
+        result: NetworkPolicyCheckResult = {
+            "allowed": bool(payload.get("allowed", False)),
+            "matchedRule": str(payload.get("matched_rule") or ""),
+            "defaultVerdict": str(payload.get("default_verdict") or ""),
+        }
+        if payload.get("outside_ceiling"):
+            result["outsideCeiling"] = str(payload["outside_ceiling"])
+        return result
 
     def get_audit(self, sandbox_id: str, options: Optional[AuditOptions] = None) -> AuditPage:
         opts = options or {}

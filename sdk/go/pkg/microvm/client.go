@@ -323,6 +323,13 @@ func (c *Client) CloneGeneration(ctx context.Context, id string) (sdktypes.Clone
 	return sdktypes.CloneGeneration{Generation: res.Generation, ResumedAt: res.ResumedAt}, nil
 }
 
+// CheckNetworkPolicy asks whether a sandbox created with these egress fields
+// would reach a destination, with the same matcher the filter enforces. No
+// sandbox is needed.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyCheckOptions) (sdktypes.NetworkPolicyCheckResult, error) {
+	return c.inner.CheckNetworkPolicy(ctx, opts)
+}
+
 // GetAudit reads one page of a sandbox's audit log: outbound connections
 // and egress denials (Kind "egress") and secret reads.
 func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {

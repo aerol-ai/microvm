@@ -126,15 +126,8 @@ func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, re
 		return nil
 	}
 	if !hasEgressFields(req) {
-		switch op.DefaultMode() {
-		case operator.ModeBlockAll:
-			req.NetworkBlockAll = true
-		case operator.ModeAllowlist:
-			allow, err := expandOrgRefs(op, op.DefaultAllowOut())
-			if err != nil {
-				return err
-			}
-			req.NetworkAllowOut = allow
+		if err := applyOperatorDefault(op, req); err != nil {
+			return err
 		}
 	}
 	// A transparent CONNECT on arbitrary ports is out of scope (§5.10 PC-4):
@@ -156,6 +149,22 @@ func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, re
 		if err := c.Fits(pol); err != nil {
 			return fmt.Errorf("%w: egress policy is outside this deployment's ceiling: %v", egresspolicy.ErrInvalid, err)
 		}
+	}
+	return nil
+}
+
+// applyOperatorDefault writes the operator's default policy into a request
+// that says nothing about egress.
+func applyOperatorDefault(op *operator.Operator, req *models.CreateSandboxRequest) error {
+	switch op.DefaultMode() {
+	case operator.ModeBlockAll:
+		req.NetworkBlockAll = true
+	case operator.ModeAllowlist:
+		allow, err := expandOrgRefs(op, op.DefaultAllowOut())
+		if err != nil {
+			return err
+		}
+		req.NetworkAllowOut = allow
 	}
 	return nil
 }

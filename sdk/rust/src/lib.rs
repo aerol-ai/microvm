@@ -26,6 +26,7 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    NetworkPolicyCheckOptions, NetworkPolicyCheckResult,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
     CreateWasmModuleOptions,
@@ -1101,6 +1102,20 @@ impl Client {
 
     pub fn health(&self) -> Result<HealthStatus, Error> {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
+    }
+
+    /// Asks whether a sandbox created with these egress fields would reach a
+    /// destination, with the same matcher the filter enforces. No sandbox is
+    /// needed.
+    pub fn check_network_policy(
+        &self,
+        opts: NetworkPolicyCheckOptions,
+    ) -> Result<NetworkPolicyCheckResult, Error> {
+        self.do_json::<NetworkPolicyCheckOptions, NetworkPolicyCheckResult>(
+            Method::POST,
+            &format!("{}/network/policy/check", self.version_prefix()),
+            Some(&opts),
+        )
     }
 
     pub fn mounts(&self, id: &str) -> Result<Vec<MountSpecRedacted>, Error> {
@@ -2978,6 +2993,27 @@ mod tests {
         );
         assert_eq!(gen.generation, "2d0d8c69");
         assert_eq!(gen.resumed_at, 1700000000000000000);
+    }
+
+    #[test]
+    fn check_network_policy_posts_and_maps() {
+        let body = serde_json::json!({"allowed": true, "matched_rule": "*.github.com", "default_verdict": "deny"}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let res = client
+            .check_network_policy(NetworkPolicyCheckOptions {
+                network_allow_out: vec!["*.github.com".to_string()],
+                destination: "api.github.com".to_string(),
+                ..Default::default()
+            })
+            .expect("check should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/network/policy/check HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(request.contains("\"network_allow_out\":[\"*.github.com\"]"), "body: {}", request);
+        assert!(!request.contains("network_block_all"), "unset fields are not sent: {}", request);
+        assert!(res.allowed);
+        assert_eq!(res.matched_rule, "*.github.com");
+        assert_eq!(res.outside_ceiling, None);
     }
 
     #[test]

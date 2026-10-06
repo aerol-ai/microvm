@@ -24,6 +24,10 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			_ = json.NewEncoder(w).Encode([]models.Sandbox{{ID: "sb1", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/mounts":
 			_ = json.NewEncoder(w).Encode(map[string]any{"mounts": []models.MountSpecRedacted{{Type: models.MountTypeS3, Target: "/workspace", Source: "bucket/path"}}})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/network/policy/check":
+			var req models.NetworkPolicyCheckRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			_ = json.NewEncoder(w).Encode(models.NetworkPolicyCheckResponse{Allowed: req.Destination == "api.github.com", MatchedRule: "*.github.com", DefaultVerdict: "deny"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/audit":
 			q := r.URL.Query()
 			if q.Get("kind") != "egress" || q.Get("limit") != "50" || q.Get("cursor") != "c1" || q.Get("incarnation_id") != "inc-1" {
@@ -178,6 +182,10 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if _, err := sb.GetNetworkUsage(ctx); err != nil {
 		t.Fatalf("Sandbox.GetNetworkUsage() error = %v", err)
+	}
+	check, err := client.CheckNetworkPolicy(ctx, sdktypes.NetworkPolicyCheckOptions{NetworkAllowOut: []string{"*.github.com"}, Destination: "api.github.com"})
+	if err != nil || !check.Allowed || check.MatchedRule != "*.github.com" || check.DefaultVerdict != "deny" {
+		t.Fatalf("CheckNetworkPolicy() = %+v, %v", check, err)
 	}
 	page, err := sb.Audit(ctx, sdktypes.AuditOptions{Kind: "egress", Limit: 50, Cursor: "c1", IncarnationID: "inc-1"})
 	if err != nil || len(page.Events) != 1 || page.Events[0].Reason != "host_not_allowed" || page.Events[0].EventID != "ae-1" ||

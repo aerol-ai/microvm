@@ -511,6 +511,29 @@ class AuditOptions(TypedDict, total=False):
     incarnationID: str
 
 
+class NetworkPolicyCheckOptions(TypedDict, total=False):
+    """Would a sandbox created with these egress fields reach ``destination``?
+
+    ``destination`` is "host", "host:port", "IP" or "IP:port"; a bare host is
+    checked as the web ports.
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    destination: str
+
+
+class NetworkPolicyCheckResult(TypedDict, total=False):
+    allowed: bool
+    # The entry that decided; "" when the default verdict did.
+    matchedRule: str
+    # "allow" or "deny": what happens to a destination no entry matches.
+    defaultVerdict: str
+    # The first allow entry outside this deployment's ceiling, if any.
+    outsideCeiling: str
+
+
 class SetNetworkLimitsOptions(TypedDict, total=False):
     # Omit a key to leave that direction unchanged. 0 means unlimited.
     networkBytesInLimit: int
