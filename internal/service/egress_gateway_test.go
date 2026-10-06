@@ -31,6 +31,9 @@ type fakeGateway struct {
 	probeErr     error
 	control      []netip.AddrPort
 	controlCalls int
+	learned      map[string]json.RawMessage
+	learnedErr   error
+	forgotten    []string
 }
 
 func newFakeGateway() *fakeGateway {
@@ -89,7 +92,25 @@ func (f *fakeGateway) Probe(_ context.Context, p egress.ProbeRequest) (egress.Pr
 	}
 	return f.probeRes, f.probeErr
 }
-func (f *fakeGateway) Learned(context.Context, string) (json.RawMessage, error) { return nil, nil }
+func (f *fakeGateway) Learned(_ context.Context, id string) (json.RawMessage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.learnedErr != nil {
+		return nil, f.learnedErr
+	}
+	if raw, ok := f.learned[id]; ok {
+		return raw, nil
+	}
+	return json.RawMessage(`{"truncated":false,"entries":[],"cidrs":[],"suggested_allow_out":[],"suggested_profile":null}`), nil
+}
+
+func (f *fakeGateway) ForgetLearned(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forgotten = append(f.forgotten, id)
+	delete(f.learned, id)
+	return nil
+}
 func (f *fakeGateway) SetNodeControl(_ context.Context, eps []netip.AddrPort) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

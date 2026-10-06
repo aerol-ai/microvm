@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -13,7 +14,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	sup := &fakeSupervisor{}
 	d := newCreateDriver(t, GroupPerTenant, sup)
 	ctx := context.Background()
-	if err := d.UpdateEgressPolicy("missing", true, nil, nil); err == nil {
+	if err := d.UpdateEgressPolicy("missing", true, nil, nil, false); err == nil {
 		t.Fatal("an unknown sandbox must be an error")
 	}
 	if _, err := d.Create(ctx, models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "a.js", TenantID: "acme",
@@ -28,7 +29,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	}
 
 	// Loaded: the host gets the new policy now.
-	if err := d.UpdateEgressPolicy("sb-1", false, []string{"pypi.org"}, []string{"10.0.0.0/8"}); err != nil {
+	if err := d.UpdateEgressPolicy("sb-1", false, []string{"pypi.org"}, []string{"10.0.0.0/8"}, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := hostPolicy(); got.BlockAll || !slices.Equal(got.Allow, []string{"pypi.org"}) || !slices.Equal(got.Deny, []string{"10.0.0.0/8"}) {
@@ -42,7 +43,7 @@ func TestUpdateEgressPolicy(t *testing.T) {
 	}
 	d.groupsMu.Unlock()
 	d.reapIdleGroups(time.Hour)
-	if err := d.UpdateEgressPolicy("sb-1", true, nil, nil); err != nil {
+	if err := d.UpdateEgressPolicy("sb-1", true, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if hostPolicy().BlockAll {
@@ -59,3 +60,64 @@ func TestUpdateEgressPolicy(t *testing.T) {
 		t.Fatalf("the reload pushed %+v, want the updated block-all", got)
 	}
 }
+
+// TestIsolateLearnMode (P2-7): the supervisor's hosts report learn-mode
+// destinations to the driver, whose recording outlives an idle reap and a
+// switch to enforce, and goes with the sandbox.
+func TestIsolateLearnMode(t *testing.T) {
+	sup := &learnSupervisor{fakeSupervisor: &fakeSupervisor{}}
+	d := newCreateDriver(t, GroupPerTenant, sup.fakeSupervisor)
+	d.SetHostSupervisor(sup)
+	if sup.observer == nil {
+		t.Fatal("the driver must install its learn observer")
+	}
+	ctx := context.Background()
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "a.js", TenantID: "acme", NetworkEgressMode: "learn"}, "sb-l", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	host := sup.hosts[0]
+	host.mu.Lock()
+	learnPolicy := host.egress["sb-l"]
+	host.mu.Unlock()
+	if !learnPolicy.Learn {
+		t.Fatalf("host policy = %+v", learnPolicy)
+	}
+	sup.observer("sb-l", "pypi.org", 443)
+	sup.observer("unknown", "x.example", 443) // ignored
+	d.groupsMu.Lock()
+	for _, g := range d.groups {
+		g.lastUsed = time.Now().Add(-2 * time.Hour)
+	}
+	d.groupsMu.Unlock()
+	d.reapIdleGroups(time.Hour)
+	if err := d.UpdateEgressPolicy("sb-l", false, []string{"pypi.org"}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	l, err := d.EgressLearned("sb-l")
+	if err != nil || len(l.Entries) != 1 || l.Entries[0].Host != "pypi.org" {
+		t.Fatalf("recording = %+v %v", l, err)
+	}
+	if _, err := d.EgressLearned("unknown"); err == nil {
+		t.Fatal("an unknown sandbox must be an error")
+	}
+	if err := d.Destroy(ctx, &models.Sandbox{ID: "sb-l"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.EgressLearned("sb-l"); err == nil {
+		t.Fatal("the recording must go with the sandbox")
+	}
+	if _, err := d.Create(ctx, models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "a.js", TenantID: "acme"}, "sb-e", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if l, err := d.EgressLearned("sb-e"); err != nil || len(l.Entries) != 0 {
+		t.Fatalf("no recording yet = %+v %v", l, err)
+	}
+}
+
+// learnSupervisor is a fakeSupervisor that accepts a learn observer.
+type learnSupervisor struct {
+	*fakeSupervisor
+	observer pkgisolate.LearnObserver
+}
+
+func (s *learnSupervisor) SetLearnObserver(obs pkgisolate.LearnObserver) { s.observer = obs }

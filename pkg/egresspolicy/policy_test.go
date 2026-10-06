@@ -342,3 +342,24 @@ func TestCompileMaxHostnames(t *testing.T) {
 		t.Fatalf("union cap: %v", err)
 	}
 }
+
+func TestNeedsGatewayWith(t *testing.T) {
+	for _, tc := range []struct {
+		allow    []string
+		blockAll bool
+		learn    bool
+		profiles int
+		want     bool
+	}{
+		{nil, false, false, 0, false},
+		{[]string{"10.0.0.0/8"}, false, false, 0, false},
+		{[]string{"pypi.org"}, false, false, 0, true},
+		{nil, false, true, 0, true},
+		{nil, false, false, 2, true},
+		{nil, true, true, 2, false},
+	} {
+		if got := NeedsGatewayWith(tc.allow, nil, tc.blockAll, tc.learn, tc.profiles); got != tc.want {
+			t.Fatalf("%+v: got %v", tc, got)
+		}
+	}
+}

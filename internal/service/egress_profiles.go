@@ -326,13 +326,14 @@ func sbID(sb *models.Sandbox) string {
 	return sb.ID
 }
 
-// recordCreateEgressProfiles stores a new sandbox's profile references and
-// inline list next to the row the create wrote. Without them the row's
-// effective list would have nothing to explain it and profile updates
-// would never reach the sandbox, so a failure undoes the create.
-func (s *Service) recordCreateEgressProfiles(ctx context.Context, sb *models.Sandbox, r resolvedEgress) error {
-	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef})
-	if err == nil {
+// recordCreateEgressState stores a new sandbox's profile references, inline
+// list and egress mode next to the row the create wrote. Without them the
+// row's effective list would have nothing to explain it, profile updates
+// would never reach the sandbox and a learn-mode sandbox would read as
+// enforce, so a failure undoes the create.
+func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string) error {
+	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef, Mode: mode})
+	if err == nil && len(r.Applied) > 0 {
 		err = s.store.SetEgressProfilesApplied(ctx, sb.ID, r.Applied)
 	}
 	if err != nil {
@@ -341,8 +342,11 @@ func (s *Service) recordCreateEgressProfiles(ctx context.Context, sb *models.San
 		}
 		return fmt.Errorf("record egress profiles: %w", err)
 	}
-	sb.NetworkAllowOut = r.Inline
-	sb.EgressProfiles = r.Refs
-	sb.EgressProfilesApplied = r.Applied
+	sb.NetworkEgressMode = mode
+	if len(r.Refs) > 0 {
+		sb.NetworkAllowOut = r.Inline
+		sb.EgressProfiles = r.Refs
+		sb.EgressProfilesApplied = r.Applied
+	}
 	return nil
 }

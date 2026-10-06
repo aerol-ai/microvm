@@ -153,7 +153,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	if held || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
 		if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
 			BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
-			Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef,
+			Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef, Mode: old.NetworkEgressMode,
 		}); err != nil {
 			return err
 		}

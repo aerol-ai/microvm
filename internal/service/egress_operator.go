@@ -99,7 +99,8 @@ func (s *Service) egressOperator() *operator.Operator {
 
 // hasEgressFields reports whether a create says anything about egress.
 func hasEgressFields(req *models.CreateSandboxRequest) bool {
-	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 ||
+		req.NetworkEgressMode != ""
 }
 
 // applyEgressOperatorPolicy applies the operator file to a create (§5.10

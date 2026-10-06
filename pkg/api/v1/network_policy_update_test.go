@@ -50,3 +50,17 @@ func TestV1UpdateNetworkPolicy(t *testing.T) {
 		}
 	}
 }
+
+// TestV1NetworkLearned (P2-7): the learned route answers from the service;
+// a sandbox on a runtime without learn mode is a 501.
+func TestV1NetworkLearned(t *testing.T) {
+	env := newCustomDomainsV1Env(t, nil)
+	seedSandboxRowV1(t, env.store, "sb-1")
+	// The env has no egress gateway, so a container sandbox can't be read.
+	if rr := do(t, env.mux, http.MethodGet, "/v1/sandboxes/sb-1/network/learned", nil); rr.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := do(t, env.mux, http.MethodGet, "/v1/sandboxes/missing/network/learned", nil); rr.Code != http.StatusNotFound {
+		t.Fatalf("missing = %d", rr.Code)
+	}
+}

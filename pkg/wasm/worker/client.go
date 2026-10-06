@@ -6,6 +6,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
@@ -308,8 +309,8 @@ func (c *Client) NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err er
 
 // SetEgressPolicy replaces the sandbox's egress policy at the worker-side
 // mediator (live update). Empty lists remove the policy.
-func (c *Client) SetEgressPolicy(sandboxID string, allowOut, denyOut []string) error {
-	body, err := encodePayload(setEgressPolicyPayload{AllowOut: allowOut, DenyOut: denyOut})
+func (c *Client) SetEgressPolicy(sandboxID string, allowOut, denyOut []string, learn bool) error {
+	body, err := encodePayload(setEgressPolicyPayload{AllowOut: allowOut, DenyOut: denyOut, Learn: learn})
 	if err != nil {
 		return err
 	}
@@ -318,6 +319,22 @@ func (c *Client) SetEgressPolicy(sandboxID string, allowOut, denyOut []string) e
 		return err
 	}
 	return c.expectOK(reply)
+}
+
+// EgressLearned reads a sandbox's learn-mode recording from its worker.
+func (c *Client) EgressLearned(sandboxID string) (egresspolicy.Learned, error) {
+	reply, err := c.roundTrip(Envelope{Type: MsgEgressLearned, SandboxID: sandboxID})
+	if err != nil {
+		return egresspolicy.Learned{}, err
+	}
+	if reply.Type != MsgOK {
+		return egresspolicy.Learned{}, c.expectOK(reply)
+	}
+	var l egresspolicy.Learned
+	if err := decodePayload(reply.Payload, &l); err != nil {
+		return egresspolicy.Learned{}, err
+	}
+	return l, nil
 }
 
 // SetNetworkBlocks applies quota blocks at the worker-side socket mediator (UC-43).

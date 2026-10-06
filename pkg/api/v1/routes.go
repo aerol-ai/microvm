@@ -114,6 +114,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// Live egress policy (plans/egress-domain-filtering.md §5.8): forwarded
 	// to the owner, the only node that can apply it to the running sandbox.
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/network/policy", d.Auth(wrap(http.HandlerFunc(h.updateNetworkPolicy))))
+	// Learn-mode recording (P2-7): the owner holds it, so it is forwarded.
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/learned", d.Auth(wrap(http.HandlerFunc(h.getNetworkLearned))))
 	// Named egress profiles (D21). Not sandbox-scoped, so no owner
 	// forwarding; in a cluster the service writes them through Raft.
 	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.putEgressProfile)))

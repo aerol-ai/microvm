@@ -103,7 +103,7 @@ func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	if errors.Is(err, service.ErrEgressProfilesConflict) {
+	if errors.Is(err, service.ErrEgressProfilesConflict) || errors.Is(err, service.ErrEgressLearnConflict) {
 		WriteError(w, http.StatusConflict, err.Error())
 		return
 	}

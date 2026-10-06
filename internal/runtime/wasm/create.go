@@ -165,7 +165,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 
 	d.seedNetworkBlocks(sandboxID, req.NetworkBlockAll, req.NetworkBlockAll)
-	d.seedNetworkPolicy(sandboxID, req.NetworkAllowOut, req.NetworkDenyOut)
+	d.seedNetworkPolicy(sandboxID, req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkEgressMode == models.NetworkEgressModeLearn)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            req.Env,
 		Args:           wasmArgs(req),

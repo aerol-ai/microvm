@@ -2,6 +2,7 @@ package gatewayd
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 func TestBridgeListenerLifecycle(t *testing.T) {
@@ -122,5 +124,56 @@ func TestRunEntrypoint(t *testing.T) {
 	t.Setenv("SB_EGRESS_OPERATOR_FILE", "")
 	if err := RunCLI(ctx, slog.New(slog.NewTextHandler(io.Discard, nil))); err != nil {
 		t.Fatalf("RunCLI: %v", err)
+	}
+}
+
+// TestDaemonLearnRecordingLifecycle (P2-7): a recording survives a gateway
+// restart, only a changed recording is rewritten, and forget_learned drops
+// it from memory and disk.
+func TestDaemonLearnRecordingLifecycle(t *testing.T) {
+	state := t.TempDir()
+	be := egress.NewMemBackend()
+	r := startDaemon(t, state, be)
+	ctx := context.Background()
+	learnIP := netip.MustParseAddr("127.0.0.3")
+	if err := r.client.Attach(ctx, egress.Spec{ID: "ln", IP: learnIP, Learn: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.d.recorder("ln").ObserveHost("pypi.org", 443)
+	r.d.saveNow()
+	path := filepath.Join(state, "learn", "ln.json")
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Unchanged: not rewritten.
+	time.Sleep(20 * time.Millisecond)
+	r.d.saveNow()
+	if again, _ := os.Stat(path); !again.ModTime().Equal(first.ModTime()) {
+		t.Fatal("an unchanged recording must not be rewritten")
+	}
+	r.stop(t)
+
+	r2 := startDaemon(t, state, be)
+	raw, err := r2.client.Learned(ctx, "ln")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got egresspolicy.Learned
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Entries) != 1 || got.Entries[0].Host != "pypi.org" {
+		t.Fatalf("recording after restart = %s, %v", raw, err)
+	}
+	if err := r2.client.ForgetLearned(ctx, "ln"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("forget must remove the file: %v", err)
+	}
+	raw, _ = r2.client.Learned(ctx, "ln")
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Entries) != 0 {
+		t.Fatalf("recording after forget = %s", raw)
+	}
+	if err := r2.client.ForgetLearned(ctx, "ln"); err != nil {
+		t.Fatalf("forgetting twice is a no-op: %v", err)
 	}
 }

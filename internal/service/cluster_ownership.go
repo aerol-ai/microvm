@@ -265,6 +265,7 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		NetworkBlockAll:    sb.NetworkBlockAll,
 		NetworkAllowOut:    sb.NetworkAllowOut,
 		NetworkDenyOut:     sb.NetworkDenyOut,
+		NetworkEgressMode:  sb.NetworkEgressMode,
 		AllowPublicTraffic: sb.AllowPublicTraffic,
 		ContainerCommand:   sb.ContainerCommand,
 		Runtime:            sb.Runtime,

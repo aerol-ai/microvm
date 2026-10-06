@@ -271,6 +271,16 @@ func NeedsGateway(allow, deny []string, blockAll bool) bool {
 	return err == nil && p.GatewayMode()
 }
 
+// NeedsGatewayWith is NeedsGateway for a create that may also be in learn
+// mode or reference egress profiles: learn mode always needs the gateway, and
+// a referenced profile may hold hostnames that placement can't see.
+func NeedsGatewayWith(allow, deny []string, blockAll, learn bool, profiles int) bool {
+	if blockAll {
+		return false
+	}
+	return learn || profiles > 0 || NeedsGateway(allow, deny, blockAll)
+}
+
 // AllowEntries returns the deduplicated allow entries in input order.
 func (p *Policy) AllowEntries() []Entry { return append([]Entry(nil), p.allow...) }
 

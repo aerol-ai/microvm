@@ -444,7 +444,8 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 		out.MemoryMB += 8
 	}
 	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
-		egresspolicy.NeedsGateway(req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkBlockAll)
+		egresspolicy.NeedsGatewayWith(req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkBlockAll,
+			req.NetworkEgressMode == models.NetworkEgressModeLearn, len(req.EgressProfiles))
 	if req.GPUs != nil {
 		want := req.GPUs.Count
 		if want <= 0 {

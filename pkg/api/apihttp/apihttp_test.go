@@ -541,6 +541,7 @@ func TestWriteStoreAwareError_EgressProfiles(t *testing.T) {
 		{fmt.Errorf("%w: sb-1", service.ErrEgressProfileCapExceeded), http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded},
 		{fmt.Errorf("%w: no leader", service.ErrEgressProfileUnavailable), http.StatusServiceUnavailable, ""},
 		{service.ErrEgressProfilesConflict, http.StatusConflict, ""},
+		{service.ErrEgressLearnConflict, http.StatusConflict, ""},
 	} {
 		rr := httptest.NewRecorder()
 		WriteStoreAwareError(discardLogger(), rr, tc.err)

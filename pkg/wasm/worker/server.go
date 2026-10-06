@@ -495,8 +495,16 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
-			s.mediator().SetPolicy(env.SandboxID, compileLists(p.AllowOut, p.DenyOut))
+			s.mediator().SetPolicy(env.SandboxID, compileLists(p.AllowOut, p.DenyOut, p.Learn))
 			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgEgressLearned:
+			body, encErr := encodePayload(s.mediator().Learned(env.SandboxID))
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
 		case MsgSetNetworkBlocks:

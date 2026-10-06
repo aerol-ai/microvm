@@ -2095,6 +2095,9 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.CustomDomains = customDomains
 
+	if err := s.attachEgressModes(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
+		return nil, err
+	}
 	return sandbox, nil
 }
 
@@ -2153,6 +2156,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
+		if err := s.attachEgressModes(ctx, byID); err != nil {
+			return nil, err
+		}
 	}
 
 	return sandboxes, nil
@@ -2197,15 +2203,20 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }
@@ -2250,15 +2261,20 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }

@@ -622,6 +622,12 @@ type CreateSandboxRequest struct {
 	// update re-applies to every sandbox that references it
 	// (plans/egress-domain-filtering.md D21).
 	EgressProfiles []string `json:"egress_profiles,omitempty"`
+	// NetworkEgressMode is "enforce" (the default) or "learn". Learn mode
+	// allows all outbound traffic and records what the sandbox reaches, for
+	// GET /network/learned to turn into an allow list. It is open egress by
+	// design: trusted runs only. It needs empty lists, no profiles and no
+	// block-all (plans/egress-domain-filtering.md CEO D2).
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
 	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
@@ -813,6 +819,9 @@ type Sandbox struct {
 	// inline list instead.
 	EgressProfiles        []string           `json:"egress_profiles,omitempty"`
 	EgressProfilesApplied []EgressProfileRef `json:"egress_profiles_applied,omitempty"`
+	// NetworkEgressMode is "learn" for a sandbox recording its egress, and
+	// empty (enforce) otherwise.
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
@@ -940,6 +949,8 @@ type NetworkPolicyRequest struct {
 	NetworkAllowOut []string `json:"network_allow_out"`
 	NetworkDenyOut  []string `json:"network_deny_out"`
 	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" (empty means the same) or "learn".
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
 }
 
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
@@ -951,10 +962,41 @@ type NetworkPolicy struct {
 	NetworkAllowOut []string `json:"network_allow_out"`
 	NetworkDenyOut  []string `json:"network_deny_out"`
 	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" or "learn".
+	NetworkEgressMode string `json:"network_egress_mode"`
 	// EffectiveHostnameCount counts the hostname entries in force: inline
 	// plus every referenced profile's (at most 1024).
 	EffectiveHostnameCount int    `json:"effective_hostname_count"`
 	EgressStatus           string `json:"egress_status,omitempty"`
+}
+
+// Egress modes (NetworkEgressMode).
+const (
+	NetworkEgressModeEnforce = "enforce"
+	NetworkEgressModeLearn   = "learn"
+)
+
+// NetworkLearned is GET /v1/sandboxes/{id}/network/learned: what a sandbox
+// reached while in learn mode, and the allow list that would have allowed
+// it. Exactly one of SuggestedAllowOut and SuggestedProfile holds the list:
+// the inline list when it fits 64 hostnames, a profile body otherwise.
+// Truncated means recording stopped at the cap.
+type NetworkLearned struct {
+	Mode              string                `json:"mode"`
+	Truncated         bool                  `json:"truncated"`
+	Entries           []NetworkLearnedEntry `json:"entries"`
+	CIDRs             []string              `json:"cidrs"`
+	SuggestedAllowOut []string              `json:"suggested_allow_out"`
+	SuggestedProfile  *EgressProfileRequest `json:"suggested_profile"`
+}
+
+// NetworkLearnedEntry is one destination a learn-mode sandbox reached.
+type NetworkLearnedEntry struct {
+	Host      string    `json:"host"`
+	Ports     []uint16  `json:"ports"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Hits      uint64    `json:"hits"`
 }
 
 // EgressProfile is a named allowlist sandboxes reference by name

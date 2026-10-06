@@ -32,6 +32,7 @@ const (
 	opProbe      = "probe"
 	opSubscribe  = "subscribe"
 	opLearned    = "learned"
+	opForget     = "forget_learned"
 	opNodeCtl    = "node_control"
 )
 

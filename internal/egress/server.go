@@ -24,6 +24,8 @@ type ServerHooks struct {
 	Listeners func() []string
 	// Learned returns a sandbox's learn-mode recording (Phase 2).
 	Learned func(id string) (json.RawMessage, error)
+	// ForgetLearned discards a destroyed sandbox's recording.
+	ForgetLearned func(id string) error
 	// Changed is called after any state change so the snapshot can be saved.
 	Changed func()
 	// NodeControl replaces the control endpoints of the node-wide guard.
@@ -208,6 +210,14 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 			return nil, fmt.Errorf("%w: learn mode not supported", ErrUnavailable)
 		}
 		return s.hooks.Learned(id)
+	case opForget:
+		var id string
+		if err = json.Unmarshal(req.Payload, &id); err != nil {
+			return nil, err
+		}
+		if s.hooks.ForgetLearned != nil {
+			err = s.hooks.ForgetLearned(id)
+		}
 	case opNodeCtl:
 		var eps []netip.AddrPort
 		if err = json.Unmarshal(req.Payload, &eps); err != nil {

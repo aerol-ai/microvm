@@ -31,6 +31,7 @@ func TestWriteStoreAwareErrorCoverage95(t *testing.T) {
 		{name: "egress_apply_failed_held", err: service.ErrEgressApplyFailedHeld, wantStatus: http.StatusServiceUnavailable},
 		{name: "egress_policy_busy", err: service.ErrEgressPolicyBusy, wantStatus: http.StatusConflict},
 		{name: "egress_profiles_conflict", err: service.ErrEgressProfilesConflict, wantStatus: http.StatusConflict},
+		{name: "egress_learn_conflict", err: service.ErrEgressLearnConflict, wantStatus: http.StatusConflict},
 		{name: "egress_selftest_failed", err: service.ErrEgressSelfTestFailed, wantStatus: http.StatusNotImplemented},
 	}
 	for _, tc := range cases {

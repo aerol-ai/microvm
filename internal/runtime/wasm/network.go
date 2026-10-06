@@ -62,7 +62,10 @@ type networkGateway struct {
 	httpProxy func(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
 
-type egressLists struct{ allow, deny []string }
+type egressLists struct {
+	allow, deny []string
+	learn       bool
+}
 
 func newNetworkGateway() *networkGateway {
 	return &networkGateway{
@@ -74,11 +77,11 @@ func newNetworkGateway() *networkGateway {
 	}
 }
 
-// setPolicy records a sandbox's egress lists.
-func (g *networkGateway) setPolicy(sandboxID string, allow, deny []string) {
+// setPolicy records a sandbox's egress lists and learn mode.
+func (g *networkGateway) setPolicy(sandboxID string, allow, deny []string, learn bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	g.policies[sandboxID] = egressLists{allow: append([]string(nil), allow...), deny: append([]string(nil), deny...)}
+	g.policies[sandboxID] = egressLists{allow: append([]string(nil), allow...), deny: append([]string(nil), deny...), learn: learn}
 }
 
 // policyFor returns a sandbox's egress lists.

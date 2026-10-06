@@ -26,9 +26,12 @@ type Recorder struct {
 	max       int
 	now       func() time.Time
 	truncated bool
-	hosts     map[string]*observation
-	flows     map[netip.Addr]*observation // direct-IP flows with no DNS name
-	ipName    map[netip.Addr]string       // last name a served DNS answer mapped to the IP
+	// version counts changes, so a saver rewrites only recordings that
+	// moved since it last wrote them.
+	version uint64
+	hosts   map[string]*observation
+	flows   map[netip.Addr]*observation // direct-IP flows with no DNS name
+	ipName  map[netip.Addr]string       // last name a served DNS answer mapped to the IP
 }
 
 type observation struct {
@@ -50,6 +53,34 @@ func NewRecorder(max int) *Recorder {
 		flows:  make(map[netip.Addr]*observation),
 		ipName: make(map[netip.Addr]string),
 	}
+}
+
+// RestoreRecorder rebuilds a recorder from a saved Snapshot, so a recording
+// outlives a restart of whatever holds it. The IP-to-name correlation is not
+// saved: flows after the restart correlate again once the sandbox resolves
+// the names, and until then count as direct-IP flows.
+func RestoreRecorder(max int, l Learned) *Recorder {
+	r := NewRecorder(max)
+	r.truncated = l.Truncated
+	for _, e := range l.Entries {
+		c := canonicalName(e.Host)
+		if c == "" {
+			continue
+		}
+		o := &observation{ports: make(map[uint16]struct{}, len(e.Ports)), first: e.FirstSeen, last: e.LastSeen, hits: e.Hits}
+		for _, p := range e.Ports {
+			o.ports[p] = struct{}{}
+		}
+		r.hosts[c] = o
+	}
+	for _, raw := range l.CIDRs {
+		p, err := netip.ParsePrefix(raw)
+		if err != nil || !p.IsSingleIP() {
+			continue
+		}
+		r.flows[p.Addr()] = &observation{ports: make(map[uint16]struct{})}
+	}
+	return r
 }
 
 // ObserveDNS records a name the sandbox resolved and the A/AAAA answers it
@@ -127,9 +158,17 @@ func record[K comparable](r *Recorder, m map[K]*observation, key K, port uint16)
 	}
 	o.last = now
 	o.hits++
+	r.version++
 	if port != 0 {
 		o.ports[port] = struct{}{}
 	}
+}
+
+// Version reports how many observations have changed the recording.
+func (r *Recorder) Version() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.version
 }
 
 // LearnedEntry is one observed name (GET /network/learned "entries").

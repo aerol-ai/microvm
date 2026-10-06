@@ -313,3 +313,27 @@ func TestRecorderConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestRestoreRecorder(t *testing.T) {
+	r := NewRecorder(10)
+	r.ObserveHost("pypi.org", 443)
+	r.ObserveHost("pypi.org", 443)
+	r.ObserveFlow(netip.MustParseAddr("203.0.113.9"), 5432)
+	if r.Version() != 3 {
+		t.Fatalf("version = %d", r.Version())
+	}
+	snap := r.Snapshot()
+	restored := RestoreRecorder(10, snap)
+	again := restored.Snapshot()
+	if len(again.Entries) != 1 || again.Entries[0].Hits != 2 || again.Entries[0].Ports[0] != 443 || len(again.CIDRs) != 1 {
+		t.Fatalf("restored = %+v", again)
+	}
+	restored.ObserveHost("files.pythonhosted.org", 443)
+	if len(restored.Snapshot().Entries) != 2 {
+		t.Fatal("a restored recording keeps recording")
+	}
+	bad := Learned{Truncated: true, Entries: []LearnedEntry{{Host: ""}}, CIDRs: []string{"10.0.0.0/8", "bad"}}
+	if got := RestoreRecorder(10, bad).Snapshot(); len(got.Entries) != 0 || len(got.CIDRs) != 0 || !got.Truncated {
+		t.Fatalf("invalid saved entries are skipped: %+v", got)
+	}
+}

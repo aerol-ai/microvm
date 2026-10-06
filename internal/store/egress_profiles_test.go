@@ -133,3 +133,52 @@ func TestEgressProfileReferences(t *testing.T) {
 		t.Fatalf("no ids: %v %v", got, err)
 	}
 }
+
+// TestEgressModeHydration: the learn-mode marker loads with every sandbox
+// read, so no path sees a learn-mode sandbox as enforce.
+func TestEgressModeHydration(t *testing.T) {
+	st := openEgressProfileStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"sb-learn", "sb-plain"} {
+		if err := st.Create(ctx, &models.Sandbox{ID: id, Image: "alpine", Status: models.SandboxStatusStarted, OwnerRef: "acct", Runtime: models.RuntimeDocker}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.SetSandboxEgressProfiles(ctx, "sb-learn", NetworkPolicyWrite{Mode: models.NetworkEgressModeLearn}); err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := st.Get(ctx, "sb-learn"); sb.NetworkEgressMode != models.NetworkEgressModeLearn {
+		t.Fatalf("Get = %q", sb.NetworkEgressMode)
+	}
+	if sb, _ := st.Get(ctx, "sb-plain"); sb.NetworkEgressMode != "" {
+		t.Fatalf("plain = %q", sb.NetworkEgressMode)
+	}
+	check := func(name string, list []*models.Sandbox, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sb := range list {
+			want := ""
+			if sb.ID == "sb-learn" {
+				want = models.NetworkEgressModeLearn
+			}
+			if sb.NetworkEgressMode != want {
+				t.Fatalf("%s: %s mode = %q", name, sb.ID, sb.NetworkEgressMode)
+			}
+		}
+	}
+	all, err := st.List(ctx)
+	check("List", all, err)
+	byOwner, err := st.ListByOwner(ctx, "acct")
+	check("ListByOwner", byOwner, err)
+	byRuntime, err := st.ListByRuntime(ctx, models.RuntimeDocker)
+	check("ListByRuntime", byRuntime, err)
+	// Back to enforce clears it.
+	if err := st.WriteNetworkPolicy(ctx, "sb-learn", NetworkPolicyWrite{}); err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := st.Get(ctx, "sb-learn"); sb.NetworkEgressMode != "" {
+		t.Fatalf("after enforce = %q", sb.NetworkEgressMode)
+	}
+}

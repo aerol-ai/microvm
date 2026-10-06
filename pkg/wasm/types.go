@@ -34,6 +34,9 @@ type Capabilities struct {
 	EgressAllowOut  []string `json:"egress_allow_out,omitempty"`
 	EgressDenyOut   []string `json:"egress_deny_out,omitempty"`
 	EgressPolicySet bool     `json:"egress_policy_set,omitempty"`
+	// EgressLearn selects learn mode: open egress, recorded by the
+	// mediator for GET /network/learned (P2-7).
+	EgressLearn bool `json:"egress_learn,omitempty"`
 }
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.

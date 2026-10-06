@@ -281,6 +281,8 @@ type NetworkPolicyWrite struct {
 	Inline   []string
 	Profiles []string
 	OwnerRef string
+	// Mode is the egress mode, "learn" or "" (enforce).
+	Mode string
 }
 
 // WriteNetworkPolicy stores a sandbox's policy, its profile references and
@@ -358,9 +360,10 @@ func writeEgressProfilesTx(ctx context.Context, tx *sql.Tx, id string, p Network
 		inline = mustMarshalStringSlice(p.Inline)
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT(sandbox_id) DO UPDATE SET inline_allow_json = excluded.inline_allow_json, updated_at = excluded.updated_at
-	`, id, inline, now); err != nil {
+		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, egress_mode, updated_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET inline_allow_json = excluded.inline_allow_json,
+			egress_mode = excluded.egress_mode, updated_at = excluded.updated_at
+	`, id, inline, p.Mode, now); err != nil {
 		return fmt.Errorf("write inline allow list: %w", err)
 	}
 	return nil
@@ -382,4 +385,37 @@ func (s *Store) SetEgressProfilesApplied(ctx context.Context, id string, applied
 		}
 	}
 	return tx.Commit()
+}
+
+// attachEgressModes sets NetworkEgressMode on the sandboxes that have one.
+// The mode lives in sandbox_egress; loading it with every sandbox read keeps
+// it on the model every path sees, like exposed ports. Only learn-mode
+// sandboxes have a non-empty mode, so the query reads a handful of rows.
+func (s *Store) attachEgressModes(ctx context.Context, byID map[string]*models.Sandbox) error {
+	if len(byID) == 0 {
+		return nil
+	}
+	query := `SELECT sandbox_id, egress_mode FROM sandbox_egress WHERE egress_mode != ''`
+	var args []any
+	if len(byID) == 1 {
+		for id := range byID {
+			query += ` AND sandbox_id = ?`
+			args = append(args, id)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("load egress modes: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, mode string
+		if err := rows.Scan(&id, &mode); err != nil {
+			return fmt.Errorf("scan egress mode: %w", err)
+		}
+		if sb, ok := byID[id]; ok {
+			sb.NetworkEgressMode = mode
+		}
+	}
+	return rows.Err()
 }

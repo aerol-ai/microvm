@@ -25,6 +25,10 @@ type API interface {
 	SetBridges(ctx context.Context, bridges []Bridge) error
 	Probe(ctx context.Context, p ProbeRequest) (ProbeResult, error)
 	Learned(ctx context.Context, id string) (json.RawMessage, error)
+	// ForgetLearned discards a sandbox's learn-mode recording; sandboxd
+	// calls it on destroy. A recording outlives learn → enforce so the
+	// owner can still read it, so detach alone can't drop it.
+	ForgetLearned(ctx context.Context, id string) error
 	// SetNodeControl replaces the node-wide control-port guard's endpoints
 	// (§5.10 PC-2).
 	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
@@ -67,6 +71,9 @@ func (Noop) SetNodeControl(context.Context, []netip.AddrPort) error { return nil
 func (Noop) Learned(context.Context, string) (json.RawMessage, error) {
 	return nil, fmt.Errorf("%w: gateway disabled", ErrUnavailable)
 }
+
+// ForgetLearned is a no-op: without a gateway there is no recording.
+func (Noop) ForgetLearned(context.Context, string) error { return nil }
 
 // clientConn is one handshaken UDS connection.
 type clientConn struct {
@@ -259,6 +266,10 @@ func (c *Client) Learned(ctx context.Context, id string) (json.RawMessage, error
 	var raw json.RawMessage
 	err := c.call(ctx, opLearned, id, &raw)
 	return raw, err
+}
+
+func (c *Client) ForgetLearned(ctx context.Context, id string) error {
+	return c.call(ctx, opForget, id, nil)
 }
 
 // Subscribe opens a dedicated event-stream connection. Events arrive on the

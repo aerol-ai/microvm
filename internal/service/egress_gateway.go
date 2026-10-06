@@ -265,7 +265,8 @@ func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
 
 // sandboxPolicy compiles a stored sandbox's egress policy.
 func sandboxPolicy(sb *models.Sandbox) (*egresspolicy.Policy, error) {
-	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut, BlockAll: sb.NetworkBlockAll})
+	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut, BlockAll: sb.NetworkBlockAll,
+		Mode: egresspolicy.Mode(sb.NetworkEgressMode), MaxHostnames: egresspolicy.MaxUnionHostnames})
 }
 
 // isGatewayMode reports whether a stored sandbox runs in gateway mode:
@@ -287,7 +288,8 @@ func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, boo
 	if err != nil {
 		return egress.Spec{}, false
 	}
-	spec := egress.Spec{ID: sb.ID, IP: ip, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut}
+	spec := egress.Spec{ID: sb.ID, IP: ip, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut,
+		Learn: sb.NetworkEgressMode == models.NetworkEgressModeLearn}
 	if sb.NetworkQuotaExceeded && sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit {
 		spec.Blocked |= egress.BlockQuota
 	}
@@ -499,8 +501,14 @@ func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
 	switch ev.Kind {
 	case "audit":
 		// Audit only: denials are counted from the heartbeat's totals,
-		// which stay exact when the audit ring drops events.
-		s.emitEgressDecision(ev.SandboxID, "tcp", ev.Destination, ev.Result == "allowed", ev.Reason)
+		// which stay exact when the audit ring drops events. A learn-mode
+		// connection is open egress by design, so the audit says so on
+		// every one of them (CEO D2).
+		reason := ev.Reason
+		if ev.Mode == string(egress.ModeLearn) && ev.Result == "allowed" {
+			reason = egressAuditReasonLearnMode
+		}
+		s.emitEgressDecision(ev.SandboxID, "tcp", ev.Destination, ev.Result == "allowed", reason)
 	case "heartbeat":
 		s.egressStats.gatewayUp.Store(true)
 		s.egressStats.lastHeartbeat.Store(time.Now().UnixNano())
@@ -548,6 +556,10 @@ func (s *Service) onEgressLayoutLost(ctx context.Context) {
 	}
 }
 
+// egressAuditReasonLearnMode marks an allowed connection a learn-mode
+// sandbox made.
+const egressAuditReasonLearnMode = "learn_mode"
+
 // emitEgressDecision writes a gateway decision into the hash-chained audit
 // log: allowed connections as success, denials as failure with the reason.
 func (s *Service) emitEgressDecision(sandboxID, network, destination string, allowed bool, reason string) {
@@ -565,6 +577,8 @@ func (s *Service) emitEgressDecision(sandboxID, network, destination string, all
 	result, why := secretAuditResultSuccess, secretAuditReasonOK
 	if !allowed {
 		result, why = secretAuditResultFailure, reason
+	} else if reason == egressAuditReasonLearnMode {
+		why = reason
 	}
 	actor := s.auditActor()
 	incarnationID, ownerRef := s.auditIdentityFor(sandboxID)

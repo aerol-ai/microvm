@@ -45,10 +45,21 @@ func compileEgress(req *models.CreateSandboxRequest, maxHostnames int) (*egressp
 		AllowOut:     req.NetworkAllowOut,
 		DenyOut:      req.NetworkDenyOut,
 		BlockAll:     req.NetworkBlockAll,
+		Mode:         egresspolicy.Mode(req.NetworkEgressMode),
 		MaxHostnames: maxHostnames,
 	})
 	if err != nil {
 		return nil, err
+	}
+	// The stored mode is "learn" or empty; "enforce" is the default spelled
+	// out.
+	if pol.Mode() == egresspolicy.ModeLearn {
+		req.NetworkEgressMode = models.NetworkEgressModeLearn
+		if len(req.EgressProfiles) > 0 {
+			return nil, fmt.Errorf("%w: network_egress_mode %q can't be combined with egress_profiles", egresspolicy.ErrInvalid, egresspolicy.ModeLearn)
+		}
+	} else {
+		req.NetworkEgressMode = ""
 	}
 	if req.NetworkBlockAll && len(req.EgressProfiles) > 0 {
 		return nil, fmt.Errorf("%w: egress_profiles can't be combined with network_block_all", egresspolicy.ErrInvalid)

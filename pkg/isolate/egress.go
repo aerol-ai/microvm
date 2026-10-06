@@ -46,7 +46,14 @@ type EgressPolicy struct {
 	BlockAll bool
 	Allow    []string
 	Deny     []string
+	// Learn selects learn mode (P2-7): open egress, each destination
+	// reported to the learn observer.
+	Learn bool
 }
+
+// LearnObserver is told each destination a learn-mode sandbox reached. The
+// driver owns the recordings, so they outlive a reaped group.
+type LearnObserver func(sandboxID, host string, port uint16)
 
 // isolateGuard is isolate's dial posture (D15): isolate egress leaves from
 // the host's own network namespace, so it is always strict: no private
@@ -81,7 +88,11 @@ func currentIsolateGuard() egresspolicy.DialGuard {
 }
 
 func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
-	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll, MaxHostnames: egresspolicy.MaxUnionHostnames})
+	mode := egresspolicy.ModeEnforce
+	if p.Learn {
+		mode = egresspolicy.ModeLearn
+	}
+	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll, Mode: mode, MaxHostnames: egresspolicy.MaxUnionHostnames})
 }
 
 // SetEgressPolicy registers (or replaces) the outbound policy for a sandbox and
@@ -298,6 +309,9 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	}
 	// Successful upstream contact — record destination (bytes stay on netstats).
 	h.observeEgress(sandboxID, "tcp", authority)
+	if p.Mode() == egresspolicy.ModeLearn {
+		h.observeLearn(sandboxID, host, port)
+	}
 	defer resp.Body.Close()
 	for k, vals := range resp.Header {
 		for _, v := range vals {

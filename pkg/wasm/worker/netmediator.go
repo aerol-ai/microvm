@@ -41,6 +41,10 @@ type NetMediator struct {
 	// upstream chains allowed names through the operator's proxy
 	// (§5.10 PC-4); nil dials direct.
 	upstream *egresspolicy.Upstream
+	// learn holds the recordings of sandboxes that have been in learn
+	// mode (P2-7). A recording outlives a switch to enforce, so the owner
+	// can still read it; ForgetLearned drops it when the sandbox goes.
+	learn map[string]*egresspolicy.Recorder
 }
 
 func newNetMediator() *NetMediator {

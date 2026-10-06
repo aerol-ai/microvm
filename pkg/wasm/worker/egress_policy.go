@@ -40,6 +40,47 @@ func (m *NetMediator) SetPolicy(sandboxID string, p *egresspolicy.Policy) {
 		return
 	}
 	m.policies[sandboxID] = p
+	if p.Mode() == egresspolicy.ModeLearn {
+		if m.learn == nil {
+			m.learn = map[string]*egresspolicy.Recorder{}
+		}
+		if m.learn[sandboxID] == nil {
+			m.learn[sandboxID] = egresspolicy.NewRecorder(egresspolicy.DefaultLearnMax)
+		}
+	}
+}
+
+// Learned returns a sandbox's learn-mode recording (empty if it has none).
+func (m *NetMediator) Learned(sandboxID string) egresspolicy.Learned {
+	m.mu.RLock()
+	r := m.learn[sandboxID]
+	m.mu.RUnlock()
+	if r == nil {
+		return egresspolicy.NewRecorder(egresspolicy.DefaultLearnMax).Snapshot()
+	}
+	return r.Snapshot()
+}
+
+// ForgetLearned drops a sandbox's recording when its instance goes.
+func (m *NetMediator) ForgetLearned(sandboxID string) {
+	m.mu.Lock()
+	delete(m.learn, sandboxID)
+	m.mu.Unlock()
+}
+
+// recordLearned notes a connection a learn-mode sandbox made. Only dials
+// that went through are recorded, so an address the dial guard refuses never
+// becomes a suggestion.
+func (m *NetMediator) recordLearned(sandboxID string, p *egresspolicy.Policy, host string, port uint16) {
+	if p.Mode() != egresspolicy.ModeLearn {
+		return
+	}
+	m.mu.RLock()
+	r := m.learn[sandboxID]
+	m.mu.RUnlock()
+	if r != nil {
+		r.ObserveHost(host, port)
+	}
 }
 
 // ApplyCapsPolicy installs the policy carried in caps, when the caps carry
@@ -48,15 +89,19 @@ func (m *NetMediator) ApplyCapsPolicy(sandboxID string, caps wasmengine.Capabili
 	if !caps.EgressPolicySet {
 		return
 	}
-	m.SetPolicy(sandboxID, compileLists(caps.EgressAllowOut, caps.EgressDenyOut))
+	m.SetPolicy(sandboxID, compileLists(caps.EgressAllowOut, caps.EgressDenyOut, caps.EgressLearn))
 }
 
-// compileLists compiles raw lists; empty lists mean no policy.
-func compileLists(allow, deny []string) *egresspolicy.Policy {
-	if len(allow) == 0 && len(deny) == 0 {
+// compileLists compiles raw lists; empty lists mean no policy, unless the
+// sandbox is in learn mode, which is open egress that is recorded.
+func compileLists(allow, deny []string, learn bool) *egresspolicy.Policy {
+	mode := egresspolicy.ModeEnforce
+	if learn {
+		mode = egresspolicy.ModeLearn
+	} else if len(allow) == 0 && len(deny) == 0 {
 		return nil
 	}
-	p, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: allow, DenyOut: deny, MaxHostnames: egresspolicy.MaxUnionHostnames})
+	p, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: allow, DenyOut: deny, Mode: mode, MaxHostnames: egresspolicy.MaxUnionHostnames})
 	if err != nil {
 		return egresspolicy.BlockAllPolicy()
 	}
@@ -159,6 +204,7 @@ func (m *NetMediator) policyDial(ctx context.Context, sandboxID string, p *egres
 		}
 		return nil, err
 	}
+	m.recordLearned(sandboxID, p, host, port)
 	if port == 443 && isIP != nil {
 		return &sniCheckConn{Conn: conn, host: host, port: port, onDeny: func(sni string) {
 			m.observeDenial(sandboxID, network, net.JoinHostPort(sni, portStr), reasonSNIMismatch)

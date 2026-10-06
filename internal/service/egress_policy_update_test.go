@@ -373,14 +373,25 @@ type policyMediatorRuntime struct {
 	mu      sync.Mutex
 	set     map[string][]string
 	blocked map[string]bool
+	learn   map[string]bool
 	err     error
 }
 
-func (m *policyMediatorRuntime) SetEgressPolicy(id string, allow, _ []string) error {
+func (m *policyMediatorRuntime) SetEgressPolicy(id string, allow, _ []string, learn bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.set[id] = allow
+	m.learn[id] = learn
 	return m.err
+}
+
+func (m *policyMediatorRuntime) EgressLearned(id string) (egresspolicy.Learned, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.err != nil {
+		return egresspolicy.Learned{}, m.err
+	}
+	return egresspolicy.Learned{Entries: []egresspolicy.LearnedEntry{{Host: id + ".example"}}}, nil
 }
 
 func (m *policyMediatorRuntime) SetNetworkBlocks(id string, _, out bool) {
@@ -389,16 +400,17 @@ func (m *policyMediatorRuntime) SetNetworkBlocks(id string, _, out bool) {
 	m.blocked[id] = out
 }
 
-func (m *policyMediatorRuntime) UpdateEgressPolicy(id string, blockAll bool, allow, _ []string) error {
+func (m *policyMediatorRuntime) UpdateEgressPolicy(id string, blockAll bool, allow, _ []string, learn bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.set[id] = allow
 	m.blocked[id] = blockAll
+	m.learn[id] = learn
 	return m.err
 }
 
 func newMediator() *policyMediatorRuntime {
-	return &policyMediatorRuntime{recordingRuntime: &recordingRuntime{}, set: map[string][]string{}, blocked: map[string]bool{}}
+	return &policyMediatorRuntime{recordingRuntime: &recordingRuntime{}, set: map[string][]string{}, blocked: map[string]bool{}, learn: map[string]bool{}}
 }
 
 func TestUpdateNetworkPolicyMediatedRuntimes(t *testing.T) {

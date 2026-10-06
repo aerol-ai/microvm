@@ -9,8 +9,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"github.com/aerol-ai/microvm/internal/egress"
-	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"io"
 	"log/slog"
 	mathrand "math/rand"
@@ -25,6 +23,8 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
@@ -1657,7 +1657,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// the references so the operator's ceiling and everything after it see
 	// the effective allow list. The replicated spec, built by the caller from
 	// its own copy of req, keeps the references.
-	if len(req.EgressProfiles) > 0 {
+	// Learn mode (P2-7) rides the same side state as the references.
+	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
 		if _, err := compileCreateEgress(&req); err != nil {
 			return nil, err
 		}
@@ -1666,11 +1667,13 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return nil, err
 		}
 		req.NetworkAllowOut = resolved.Effective
-		defer func() {
-			if err == nil && resp != nil {
-				err = s.recordCreateEgressProfiles(ctx, &resp.Sandbox, resolved)
-			}
-		}()
+		if mode := req.NetworkEgressMode; len(resolved.Refs) > 0 || mode != "" {
+			defer func() {
+				if err == nil && resp != nil {
+					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode)
+				}
+			}()
+		}
 	}
 	// Operator default policy and ceiling (§5.10 PC-2): in memory, before
 	// any runtime is chosen, so native and facade creates of every runtime
@@ -1996,7 +1999,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(ociRt)
 		attachSB := &models.Sandbox{ID: sandboxID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
-			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut}
+			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
 		egressDone = make(chan error, 1)
 		go func() {
 			attachStart := time.Now()
@@ -2017,7 +2020,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// rollback chain as any later store error below.
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		rollbackDestroy(&models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, Engine: chosenEngine, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut})
+		rollbackDestroy(&models.Sandbox{ID: state.SandboxID, ContainerID: state.ContainerID, Runtime: chosenRuntime, Engine: chosenEngine, ContainerIP: state.ContainerIP, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode})
 		cleanupMounts()
 		releaseAdmission()
 		return nil, err
@@ -2039,6 +2042,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		NetworkEgressMode:    req.NetworkEgressMode,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
@@ -2278,7 +2282,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBlockAll {
 		return nil, unsupportedFirecrackerOption("network_block_all")
 	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 {
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
 		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out / egress_profiles)")
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
@@ -2359,6 +2363,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		NetworkEgressMode:    req.NetworkEgressMode,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
@@ -3145,6 +3150,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
+	s.forgetLearned(ctx, sandbox)
 	if s.testAfterRuntimeDestroy != nil {
 		s.testAfterRuntimeDestroy()
 	}

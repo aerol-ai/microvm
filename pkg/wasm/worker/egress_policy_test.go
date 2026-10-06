@@ -191,13 +191,13 @@ func TestResidentSetEgressPolicyMessage(t *testing.T) {
 	if srv.mediator().policyFor("sb") == nil {
 		t.Fatal("instantiate caps must install the policy")
 	}
-	if err := client.SetEgressPolicy("sb", nil, nil); err != nil {
+	if err := client.SetEgressPolicy("sb", nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if srv.mediator().policyFor("sb") != nil {
 		t.Fatal("set_egress_policy with empty lists must remove the policy")
 	}
-	if err := client.SetEgressPolicy("sb", []string{"github.com"}, nil); err != nil {
+	if err := client.SetEgressPolicy("sb", []string{"github.com"}, nil, false); err != nil {
 		t.Fatal(err)
 	}
 	if p := srv.mediator().policyFor("sb"); p == nil {
@@ -314,5 +314,70 @@ func TestMediatorUpstream(t *testing.T) {
 	_ = c.Close()
 	if line != "hello\n" || <-seen != "CONNECT pypi.org:8443 HTTP/1.1" {
 		t.Fatalf("tunnel = %q", line)
+	}
+}
+
+// TestMediatorLearnMode (P2-7): learn mode allows every destination and
+// records it; the recording is read over the worker RPC and dropped when
+// the instance stops.
+func TestMediatorLearnMode(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	dir := t.TempDir()
+	modPath := wasmmod.WriteMinimalWasm(t, dir, "demo.wasm")
+	srv := &ResidentServer{}
+	client, _ := serveResidentWith(t, srv)
+	if _, err := client.LoadModule("host", modPath, 0); err != nil {
+		t.Fatal(err)
+	}
+	caps := nonListenCaps("wasm")
+	caps.EgressPolicySet, caps.EgressLearn = true, true
+	if err := client.Instantiate("sb", caps); err != nil {
+		t.Fatal(err)
+	}
+	m := srv.mediator()
+	p := m.policyFor("sb")
+	if p == nil || p.Mode() != egresspolicy.ModeLearn {
+		t.Fatal("caps must install learn mode")
+	}
+	// The dial guard still applies in learn mode, and a refused dial is
+	// not recorded.
+	if _, err := m.DialContext(context.Background(), "sb", "tcp", ln.Addr().String()); err == nil {
+		t.Fatal("loopback stays refused in learn mode")
+	}
+	if l := m.Learned("sb"); len(l.CIDRs) != 0 {
+		t.Fatalf("a refused dial was recorded: %+v", l)
+	}
+	m.recordLearned("sb", p, "203.0.113.9", 5432)
+	m.recordLearned("sb", mustPolicy(t, []string{"pypi.org"}, nil), "pypi.org", 443) // enforce: not recorded
+	l, err := client.EgressLearned("sb")
+	if err != nil || len(l.CIDRs) != 1 {
+		t.Fatalf("recording = %+v %v", l, err)
+	}
+	// Switching to enforce keeps the recording readable.
+	if err := client.SetEgressPolicy("sb", []string{"127.0.0.1/32"}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := client.EgressLearned("sb"); len(l.CIDRs) != 1 {
+		t.Fatalf("after enforce = %+v", l)
+	}
+	if err := client.SetEgressPolicy("sb", nil, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	m.ForgetLearned("sb")
+	if l := m.Learned("sb"); len(l.CIDRs) != 0 || len(l.Entries) != 0 {
+		t.Fatalf("after forget = %+v", l)
 	}
 }

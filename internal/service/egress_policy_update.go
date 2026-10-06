@@ -34,13 +34,13 @@ var ErrEgressPolicyBusy = errors.New("sandbox is changing state; retry the egres
 
 // wasmEgressPolicySetter replaces a WASM sandbox's mediator policy live.
 type wasmEgressPolicySetter interface {
-	SetEgressPolicy(sandboxID string, allow, deny []string) error
+	SetEgressPolicy(sandboxID string, allow, deny []string, learn bool) error
 }
 
 // isolateEgressPolicyUpdater replaces an isolate sandbox's egress proxy
 // policy live.
 type isolateEgressPolicyUpdater interface {
-	UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string) error
+	UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool) error
 }
 
 // egressPolicyLocks serializes policy updates per sandbox (§5.8 step 2). A
@@ -78,6 +78,11 @@ func (s *Service) UpdateNetworkLists(ctx context.Context, id string, blockAll bo
 	return s.updateNetworkPolicy(ctx, id, models.NetworkPolicyRequest{NetworkBlockAll: blockAll, NetworkAllowOut: allowOut, NetworkDenyOut: denyOut}, true)
 }
 
+// ErrEgressLearnConflict is a facade update that sets lists on a learn-mode
+// sandbox (409): learn mode needs empty lists, and switching it to enforce is
+// the owner's call, through the native API.
+var ErrEgressLearnConflict = errors.New("sandbox is in egress learn mode; switch it to enforce with the native policy API before setting lists")
+
 // ErrEgressProfilesConflict is a facade block-all on a sandbox that
 // references egress profiles (409).
 var ErrEgressProfilesConflict = errors.New("sandbox references egress profiles; clear them with the native policy API before blocking all egress")
@@ -114,8 +119,16 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		if req.NetworkBlockAll && len(req.EgressProfiles) > 0 {
 			return nil, ErrEgressProfilesConflict
 		}
+		// Learn mode needs empty lists, so a facade that sets lists on a
+		// learn-mode sandbox is told so rather than silently switched to
+		// enforce (D19).
+		req.NetworkEgressMode = old.NetworkEgressMode
+		if req.NetworkEgressMode == models.NetworkEgressModeLearn && (req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0) {
+			return nil, ErrEgressLearnConflict
+		}
 	}
-	create := models.CreateSandboxRequest{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressProfiles: req.EgressProfiles}
+	create := models.CreateSandboxRequest{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut,
+		EgressProfiles: req.EgressProfiles, NetworkEgressMode: req.NetworkEgressMode}
 	if _, err := compileCreateEgress(&create); err != nil {
 		return nil, err
 	}
@@ -137,6 +150,7 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	}
 	next := *old
 	next.NetworkBlockAll, next.NetworkAllowOut, next.NetworkDenyOut = effective.NetworkBlockAll, effective.NetworkAllowOut, effective.NetworkDenyOut
+	next.NetworkEgressMode = effective.NetworkEgressMode
 	containerRT := !s.isWasmSandbox(old) && !s.isIsolateSandbox(old)
 	if containerRT && pol.GatewayMode() {
 		if !s.egressEnabled() {
@@ -158,7 +172,7 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	}
 	if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
 		BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
-		Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef,
+		Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef, Mode: next.NetworkEgressMode,
 	}); err != nil {
 		return nil, err
 	}
@@ -188,7 +202,8 @@ func (s *Service) applyPolicyTransition(ctx context.Context, old, next *models.S
 }
 
 func samePolicy(a, b *models.Sandbox) bool {
-	return a.NetworkBlockAll == b.NetworkBlockAll && slices.Equal(a.NetworkAllowOut, b.NetworkAllowOut) && slices.Equal(a.NetworkDenyOut, b.NetworkDenyOut)
+	return a.NetworkBlockAll == b.NetworkBlockAll && slices.Equal(a.NetworkAllowOut, b.NetworkAllowOut) && slices.Equal(a.NetworkDenyOut, b.NetworkDenyOut) &&
+		a.NetworkEgressMode == b.NetworkEgressMode
 }
 
 // sameProfiles reports whether the stored references, their applied
@@ -211,6 +226,7 @@ func (s *Service) effectivePolicy(ctx context.Context, sb *models.Sandbox, r res
 		NetworkAllowOut:        append([]string{}, inline...),
 		NetworkDenyOut:         append([]string{}, sb.NetworkDenyOut...),
 		EgressProfiles:         append([]string{}, r.Refs...),
+		NetworkEgressMode:      egressModeName(sb.NetworkEgressMode),
 		EffectiveHostnameCount: effective,
 		EgressStatus:           s.EgressStatus(ctx, sb),
 	}
@@ -254,7 +270,7 @@ func (s *Service) applyWasmPolicy(sb *models.Sandbox) error {
 	if !ok {
 		return errors.New("wasm runtime cannot update egress policy")
 	}
-	if err := setter.SetEgressPolicy(sb.ID, sb.NetworkAllowOut, sb.NetworkDenyOut); err != nil {
+	if err := setter.SetEgressPolicy(sb.ID, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn); err != nil {
 		return err
 	}
 	overIn, overOut := quotaOver(sb)
@@ -267,7 +283,7 @@ func (s *Service) applyIsolatePolicy(sb *models.Sandbox) error {
 	if !ok {
 		return errors.New("isolate runtime cannot update egress policy")
 	}
-	return updater.UpdateEgressPolicy(sb.ID, sb.NetworkBlockAll, sb.NetworkAllowOut, sb.NetworkDenyOut)
+	return updater.UpdateEgressPolicy(sb.ID, sb.NetworkBlockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn)
 }
 
 // applyContainerPolicy moves a running container sandbox from old's policy to
@@ -326,4 +342,12 @@ func (s *Service) applyContainerPolicy(ctx context.Context, old, nu *models.Sand
 		return fmt.Errorf("lift the swap block: %w", err)
 	}
 	return nil
+}
+
+// egressModeName spells out the stored mode for responses.
+func egressModeName(mode string) string {
+	if mode == models.NetworkEgressModeLearn {
+		return models.NetworkEgressModeLearn
+	}
+	return models.NetworkEgressModeEnforce
 }

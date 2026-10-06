@@ -19,6 +19,15 @@ type workerdSupervisor struct {
 	egressPoolSize int
 	egressObserver pkgisolate.EgressObserver
 	denialObserver pkgisolate.EgressDenialObserver
+	learnObserver  pkgisolate.LearnObserver
+}
+
+// SetLearnObserver installs learn-mode recording on every group host.
+func (s *workerdSupervisor) SetLearnObserver(obs pkgisolate.LearnObserver) {
+	if s == nil {
+		return
+	}
+	s.learnObserver = obs
 }
 
 // NewHostSupervisor builds the production supervisor over the isolate config.
@@ -91,6 +100,9 @@ func (s *workerdSupervisor) SpawnGroup(ctx context.Context, spec JailSpec) (Grou
 	if s.denialObserver != nil {
 		host.SetEgressDenialObserver(s.denialObserver)
 	}
+	if s.learnObserver != nil {
+		host.SetLearnObserver(s.learnObserver)
+	}
 	if err := host.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -109,5 +121,6 @@ func (a *hostAdapter) SetEgressPolicy(id string, p EgressPolicy) {
 		BlockAll: p.BlockAll,
 		Allow:    p.Allow,
 		Deny:     p.Deny,
+		Learn:    p.Learn,
 	})
 }

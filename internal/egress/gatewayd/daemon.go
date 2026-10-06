@@ -54,6 +54,9 @@ type Daemon struct {
 
 	learnMu sync.Mutex
 	learn   map[string]*egresspolicy.Recorder
+	// savedLearn is the recorder version last written to disk, per sandbox;
+	// only the save loop touches it.
+	savedLearn map[string]uint64
 
 	probeMu sync.Mutex
 	probes  map[netip.Addr]*egress.ProbeResult
@@ -81,6 +84,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		hub:          egress.NewEventHub(cfg.AuditBuffer),
 		dirty:        make(chan struct{}, 1),
 		learn:        map[string]*egresspolicy.Recorder{},
+		savedLearn:   map[string]uint64{},
 		probes:       map[netip.Addr]*egress.ProbeResult{},
 		denied:       map[string]uint64{},
 		started:      time.Now().UTC(),
@@ -108,12 +112,13 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{
-		SetBridges:  d.setBridges,
-		Probe:       d.probe,
-		Listeners:   d.lns.Addrs,
-		Learned:     d.learned,
-		Changed:     d.markDirty,
-		NodeControl: d.setNodeControl,
+		SetBridges:    d.setBridges,
+		Probe:         d.probe,
+		Listeners:     d.lns.Addrs,
+		Learned:       d.learned,
+		ForgetLearned: d.forgetLearned,
+		Changed:       d.markDirty,
+		NodeControl:   d.setNodeControl,
 	}, deps.Peer, d.hub, log)
 	if err := d.restore(); err != nil {
 		log.Warn("egress: snapshot not restored; waiting for sandboxd sync", "error", err)
@@ -367,6 +372,22 @@ func (d *Daemon) learned(id string) (json.RawMessage, error) {
 	return json.Marshal(r.Snapshot())
 }
 
+// forgetLearned drops a destroyed sandbox's recording, in memory and on disk.
+func (d *Daemon) forgetLearned(id string) error {
+	d.learnMu.Lock()
+	delete(d.learn, id)
+	d.learnMu.Unlock()
+	err := os.Remove(d.recordingPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
+func (d *Daemon) recordingPath(id string) string {
+	return filepath.Join(d.cfg.StateDir, "learn", safeName(id)+".json")
+}
+
 // ---- background loops ----
 
 func (d *Daemon) heartbeatLoop(ctx context.Context) {
@@ -522,29 +543,52 @@ func (d *Daemon) saveNow() {
 		recs[id] = r
 	}
 	d.learnMu.Unlock()
-	dir := filepath.Join(d.cfg.StateDir, "learn")
+	// Only recordings that changed are rewritten (S9): at density a full
+	// rewrite would be ~100 MB every few seconds.
 	for id, r := range recs {
+		v := r.Version()
+		if d.savedLearn[id] == v {
+			continue
+		}
 		b, err := json.Marshal(r.Snapshot())
 		if err != nil {
 			continue
 		}
-		if err := writeFileAtomic(filepath.Join(dir, safeName(id)+".json"), b); err != nil {
+		if err := writeFileAtomic(d.recordingPath(id), b); err != nil {
 			d.log.Warn("egress: save learn recording", "sandbox_id", id, "error", err)
+			continue
+		}
+		d.savedLearn[id] = v
+		// A forget that ran while this was being written must win.
+		d.learnMu.Lock()
+		_, live := d.learn[id]
+		d.learnMu.Unlock()
+		if !live {
+			_ = os.Remove(d.recordingPath(id))
+			delete(d.savedLearn, id)
 		}
 	}
 }
 
-// loadRecordings reports which learn recordings exist on disk. Recordings are
-// rebuilt from live traffic; the files are what GET /learned serves until the
-// first new observation (best effort across a gateway restart).
+// loadRecordings restores the learn recordings saved on disk, so GET
+// /learned answers the same across a gateway restart and new traffic adds to
+// what was recorded. A recording is restored for any sandbox the snapshot
+// knows, learning or not: one switched to enforce stays readable until its
+// sandbox is destroyed.
 func (d *Daemon) loadRecordings(specs []egress.Spec) {
 	for _, s := range specs {
-		if !s.Learn {
+		b, err := os.ReadFile(d.recordingPath(s.ID))
+		if err != nil {
 			continue
 		}
-		if _, err := os.Stat(filepath.Join(d.cfg.StateDir, "learn", safeName(s.ID)+".json")); err == nil {
-			d.recorder(s.ID)
+		var l egresspolicy.Learned
+		if err := json.Unmarshal(b, &l); err != nil {
+			d.log.Warn("egress: learn recording unreadable; starting it over", "sandbox_id", s.ID, "error", err)
+			continue
 		}
+		d.learnMu.Lock()
+		d.learn[s.ID] = egresspolicy.RestoreRecorder(d.cfg.LearnMax, l)
+		d.learnMu.Unlock()
 	}
 }
 

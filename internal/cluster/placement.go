@@ -69,7 +69,8 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	// its first create did: failover must not land it on a node that can
 	// only answer 501.
 	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
-		egresspolicy.NeedsGateway(spec.NetworkAllowOut, spec.NetworkDenyOut, spec.NetworkBlockAll)
+		egresspolicy.NeedsGatewayWith(spec.NetworkAllowOut, spec.NetworkDenyOut, spec.NetworkBlockAll,
+			spec.NetworkEgressMode == models.NetworkEgressModeLearn, len(spec.EgressProfiles))
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {

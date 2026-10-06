@@ -199,6 +199,7 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		NetworkEgressMode:    req.NetworkEgressMode,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		Name:                 strings.TrimSpace(req.Name),
 		Tags:                 req.Tags,

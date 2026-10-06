@@ -51,7 +51,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("isolate: load bundle onto group %q: %w", groupKey, err)
 	}
 
-	egress := policyFromCreate(req.NetworkBlockAll, req.NetworkAllowOut, req.NetworkDenyOut)
+	egress := policyFromCreate(req.NetworkBlockAll, req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkEgressMode == models.NetworkEgressModeLearn)
 	if setter, ok := host.(EgressPolicySetter); ok {
 		setter.SetEgressPolicy(sandboxID, egress)
 	}

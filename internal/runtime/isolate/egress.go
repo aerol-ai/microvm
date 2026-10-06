@@ -10,6 +10,7 @@ type EgressPolicy struct {
 	BlockAll bool
 	Allow    []string // CIDRs / hosts; empty + !BlockAll = allow-all (self-host default)
 	Deny     []string // CIDRs only (hostnames are rejected at create, D15)
+	Learn    bool     // learn mode (P2-7): open egress, recorded by the driver
 }
 
 // EgressPolicySetter is implemented by GroupHost production adapters so the
@@ -20,10 +21,11 @@ type EgressPolicySetter interface {
 }
 
 // policyFromCreate maps CreateSandboxRequest network fields onto EgressPolicy.
-func policyFromCreate(blockAll bool, allow, deny []string) EgressPolicy {
+func policyFromCreate(blockAll bool, allow, deny []string, learn bool) EgressPolicy {
 	return EgressPolicy{
 		BlockAll: blockAll,
 		Allow:    append([]string(nil), allow...),
 		Deny:     append([]string(nil), deny...),
+		Learn:    learn,
 	}
 }

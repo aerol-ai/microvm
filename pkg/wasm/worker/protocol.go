@@ -25,6 +25,7 @@ const (
 	MsgNetstatsTick     MessageType = "netstats_tick"
 	MsgSetNetworkBlocks MessageType = "set_network_blocks"
 	MsgSetEgressPolicy  MessageType = "set_egress_policy"
+	MsgEgressLearned    MessageType = "egress_learned"
 	MsgSetListenPort    MessageType = "set_listen_port"
 	MsgListenPort       MessageType = "listen_port"
 	MsgProxyHTTP        MessageType = "proxy_http"

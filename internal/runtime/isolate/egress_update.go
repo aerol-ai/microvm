@@ -1,6 +1,10 @@
 package isolate
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+)
 
 // UpdateEgressPolicy replaces a sandbox's egress policy live
 // (plans/egress-domain-filtering.md §5.8). The record keeps it for the next
@@ -12,8 +16,8 @@ import "fmt"
 // controller keys its loader cache by id and slot, so the next request
 // compiles a fresh isolate bound to the new slot instead of reusing one
 // still bound to the old one.
-func (d *Driver) UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string) error {
-	p := policyFromCreate(blockAll, allow, deny)
+func (d *Driver) UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool) error {
+	p := policyFromCreate(blockAll, allow, deny, learn)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	rec := d.byID[sandboxID]
@@ -34,4 +38,41 @@ func (d *Driver) UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny
 		setter.SetEgressPolicy(sandboxID, p)
 	}
 	return nil
+}
+
+// observeLearn records a destination a learn-mode sandbox reached. The
+// recordings live here, not in the group host, so an idle reap that stops
+// the host keeps them.
+func (d *Driver) observeLearn(sandboxID, host string, port uint16) {
+	d.mu.Lock()
+	rec := d.byID[sandboxID]
+	if rec == nil {
+		d.mu.Unlock()
+		return
+	}
+	if rec.learn == nil {
+		rec.learn = egresspolicy.NewRecorder(egresspolicy.DefaultLearnMax)
+	}
+	r := rec.learn
+	d.mu.Unlock()
+	r.ObserveHost(host, port)
+}
+
+// EgressLearned returns a sandbox's learn-mode recording; it stays readable
+// after a switch to enforce, until the sandbox is destroyed.
+func (d *Driver) EgressLearned(sandboxID string) (egresspolicy.Learned, error) {
+	d.mu.Lock()
+	rec := d.byID[sandboxID]
+	var r *egresspolicy.Recorder
+	if rec != nil {
+		r = rec.learn
+	}
+	d.mu.Unlock()
+	if rec == nil {
+		return egresspolicy.Learned{}, fmt.Errorf("isolate: unknown sandbox %q", sandboxID)
+	}
+	if r == nil {
+		return egresspolicy.NewRecorder(0).Snapshot(), nil
+	}
+	return r.Snapshot(), nil
 }

@@ -503,6 +503,17 @@ func (h *handlers) deleteEgressProfile(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// getNetworkLearned returns a learn-mode sandbox's recording and the allow
+// list it suggests (P2-7).
+func (h *handlers) getNetworkLearned(w http.ResponseWriter, r *http.Request) {
+	learned, err := h.deps.Service.GetNetworkLearned(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, learned)
+}
+
 // updateNetworkPolicy replaces a sandbox's egress policy live (§5.8). The
 // body is a full replace, so the same body twice is a no-op.
 func (h *handlers) updateNetworkPolicy(w http.ResponseWriter, r *http.Request) {

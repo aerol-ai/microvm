@@ -90,6 +90,27 @@ type Host struct {
 	egressObserver EgressObserver
 	// egressDenialObserver records refused requests (H5). Guarded by mu.
 	egressDenialObserver EgressDenialObserver
+	// learnObserver records learn-mode destinations (P2-7). Guarded by mu.
+	learnObserver LearnObserver
+}
+
+// SetLearnObserver installs (or clears) the learn-mode recording callback.
+func (h *Host) SetLearnObserver(obs LearnObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.learnObserver = obs
+	h.mu.Unlock()
+}
+
+func (h *Host) observeLearn(sandboxID, host string, port uint16) {
+	h.mu.RLock()
+	obs := h.learnObserver
+	h.mu.RUnlock()
+	if obs != nil && sandboxID != "" {
+		obs(sandboxID, host, port)
+	}
 }
 
 // SetEgressObserver installs (or clears) the async egress attribution callback.

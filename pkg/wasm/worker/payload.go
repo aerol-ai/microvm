@@ -79,6 +79,8 @@ type netstatsResultPayload struct {
 type setEgressPolicyPayload struct {
 	AllowOut []string `json:"allow_out,omitempty"`
 	DenyOut  []string `json:"deny_out,omitempty"`
+	// Learn selects learn mode (P2-7); the lists are then empty.
+	Learn bool `json:"learn,omitempty"`
 }
 
 type setNetworkBlocksPayload struct {

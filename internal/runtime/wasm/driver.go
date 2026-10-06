@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -122,31 +123,36 @@ func (d *Driver) bindNetworkBlocks(sandboxID string, caps *wasmengine.Capabiliti
 	// The policy rides along every time, marked as set, so the mediator
 	// always has the current one and a re-instantiation can't drop it.
 	pol := d.net.policyFor(sandboxID)
-	caps.EgressAllowOut, caps.EgressDenyOut, caps.EgressPolicySet = pol.allow, pol.deny, true
+	caps.EgressAllowOut, caps.EgressDenyOut, caps.EgressPolicySet, caps.EgressLearn = pol.allow, pol.deny, true, pol.learn
 }
 
 // seedNetworkPolicy records a sandbox's egress lists before any worker
 // message, so bindNetworkBlocks carries them into the first instantiation.
-func (d *Driver) seedNetworkPolicy(sandboxID string, allow, deny []string) {
+func (d *Driver) seedNetworkPolicy(sandboxID string, allow, deny []string, learn bool) {
 	if d == nil || d.net == nil {
 		return
 	}
-	d.net.setPolicy(sandboxID, allow, deny)
+	d.net.setPolicy(sandboxID, allow, deny, learn)
 }
 
 // egressPolicySetter is the optional live-update hook on a worker client.
 type egressPolicySetter interface {
-	SetEgressPolicy(sandboxID string, allowOut, denyOut []string) error
+	SetEgressPolicy(sandboxID string, allowOut, denyOut []string, learn bool) error
+}
+
+// egressLearnReader is the optional recording read on a worker client.
+type egressLearnReader interface {
+	EgressLearned(sandboxID string) (egresspolicy.Learned, error)
 }
 
 // SetEgressPolicy replaces a WASM sandbox's egress policy live (Phase 2
 // PUT): the driver's record for future instantiations, and the running
 // worker's mediator now.
-func (d *Driver) SetEgressPolicy(sandboxID string, allow, deny []string) error {
+func (d *Driver) SetEgressPolicy(sandboxID string, allow, deny []string, learn bool) error {
 	if d == nil {
 		return nil
 	}
-	d.seedNetworkPolicy(sandboxID, allow, deny)
+	d.seedNetworkPolicy(sandboxID, allow, deny, learn)
 	d.mu.Lock()
 	inst := d.byID[sandboxID]
 	d.mu.Unlock()
@@ -157,7 +163,28 @@ func (d *Driver) SetEgressPolicy(sandboxID string, allow, deny []string) error {
 	if !ok {
 		return fmt.Errorf("wasm worker client cannot update egress policy")
 	}
-	return setter.SetEgressPolicy(sandboxID, allow, deny)
+	return setter.SetEgressPolicy(sandboxID, allow, deny, learn)
+}
+
+// EgressLearned reads a sandbox's learn-mode recording from its running
+// worker. The recording lives in the worker's mediator, so a sandbox that
+// isn't running has none to read: that is an empty recording, not an error.
+func (d *Driver) EgressLearned(sandboxID string) (egresspolicy.Learned, error) {
+	empty := egresspolicy.NewRecorder(0).Snapshot()
+	if d == nil {
+		return empty, nil
+	}
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	d.mu.Unlock()
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+		return empty, nil
+	}
+	reader, ok := d.newWorkerClient(inst.socketPath).(egressLearnReader)
+	if !ok {
+		return egresspolicy.Learned{}, fmt.Errorf("wasm worker client cannot read learn recordings")
+	}
+	return reader.EgressLearned(sandboxID)
 }
 
 // seedNetworkBlocks records blocks known before any worker message, so

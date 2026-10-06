@@ -3,6 +3,7 @@ package isolate
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -199,4 +200,35 @@ func TestSetEgressPolicyEdges(t *testing.T) {
 	if _, ok := h2.slotByID["sb-x"]; ok {
 		t.Fatal("listen failure must fall back to deny-all (no slot)")
 	}
+}
+
+// TestProxyEgressLearnMode (P2-7): a learn-mode policy allows anything, and
+// each successful upstream contact reaches the learn observer; an enforce
+// policy never does.
+func TestProxyEgressLearnMode(t *testing.T) {
+	old := egressTransport
+	t.Cleanup(func() { egressTransport = old })
+	egressTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("ok")), Header: http.Header{}}, nil
+	})
+	var seen []string
+	h := &Host{}
+	h.SetLearnObserver(func(id, host string, port uint16) {
+		seen = append(seen, fmt.Sprintf("%s %s:%d", id, host, port))
+	})
+	learn := mustPolicy(t, EgressPolicy{Learn: true})
+	if learn.Mode() != egresspolicy.ModeLearn {
+		t.Fatalf("mode = %q", learn.Mode())
+	}
+	rec := httptest.NewRecorder()
+	h.proxyEgress(rec, httptest.NewRequest(http.MethodGet, "http://anything.example/", nil), "sb-l", learn)
+	if rec.Code != http.StatusOK || len(seen) != 1 || seen[0] != "sb-l anything.example:443" {
+		t.Fatalf("learn = %d %v", rec.Code, seen)
+	}
+	h.proxyEgress(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "http://api.example.com/", nil), "sb-e", mustPolicy(t, EgressPolicy{}))
+	if len(seen) != 1 {
+		t.Fatalf("an enforce policy must not be recorded: %v", seen)
+	}
+	var nilHost *Host
+	nilHost.SetLearnObserver(nil)
 }
