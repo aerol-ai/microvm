@@ -13,7 +13,6 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -33,9 +32,7 @@ const (
 )
 
 // OrgProfilePrefix marks operator-defined profiles every tenant can use.
-const OrgProfilePrefix = "org:"
-
-var profileNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+const OrgProfilePrefix = egresspolicy.OrgProfilePrefix
 
 // File is the YAML document.
 type File struct {
@@ -137,8 +134,8 @@ func Parse(raw []byte) (*Operator, error) {
 	o.ceiling = c
 
 	for name, p := range f.OrgProfiles {
-		if !profileNameRe.MatchString(name) {
-			return nil, fmt.Errorf("egress operator file: org profile %q: names match %s", name, profileNameRe)
+		if err := egresspolicy.ValidateProfileName(name); err != nil {
+			return nil, fmt.Errorf("egress operator file: org profile: %w", err)
 		}
 		entries, err := egresspolicy.ParseAllowList("org_profiles."+name, p.AllowOut, egresspolicy.MaxProfileHostnames)
 		if err != nil {
@@ -148,7 +145,7 @@ func Parse(raw []byte) (*Operator, error) {
 		for i, e := range entries {
 			raw[i] = e.String()
 		}
-		pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: raw})
+		pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: raw, MaxHostnames: egresspolicy.MaxProfileHostnames})
 		if err != nil {
 			return nil, fmt.Errorf("egress operator file: org profile %s: %w", name, err)
 		}

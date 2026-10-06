@@ -24,6 +24,9 @@ const (
 	egressHoldUnavailable   = "gateway_unavailable"
 	egressHoldLayoutLost    = "layout_lost"
 	egressHoldPolicyInvalid = "policy_invalid"
+	// egressHoldProfileUnavailable: a referenced profile couldn't be read or
+	// is gone. Only the profile re-apply pass lifts it.
+	egressHoldProfileUnavailable = "profile_unavailable"
 )
 
 // Egress status shown on GET (egress_status).
@@ -389,7 +392,9 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 		return
 	}
 	for id, reason := range holds {
-		if reason == egressHoldPolicyInvalid {
+		// An invalid stored policy and an unresolvable profile can't be fixed
+		// by re-attaching the stored list; their owners lift those holds.
+		if reason == egressHoldPolicyInvalid || reason == egressHoldProfileUnavailable {
 			continue
 		}
 		sb, err := s.store.Get(ctx, id)

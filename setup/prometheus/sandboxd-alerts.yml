@@ -696,6 +696,18 @@ groups:
           description: "More than 2 gateway attaches failed on {{ $labels.instance }} in 10 minutes. Each failure is a hostname-filtered create answered 503 or a running sandbox held without egress."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#attachfailures"
 
+      # A changed profile that can't reach a sandbox leaves it held.
+      - alert: SandboxdEgressProfileApplyFailing
+        expr: increase(aerolvm_egress_profile_apply_failed_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress profile changes are not reaching some sandboxes"
+          description: "Re-applying a changed egress profile kept failing on {{ $labels.instance }} for 10 minutes. The affected sandboxes are held without egress until it succeeds."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#profileapplyfailing"
+
       # Held sandboxes have no egress at all until the hold lifts.
       - alert: SandboxdEgressSandboxesHeld
         expr: aerolvm_egress_held_sandboxes > 0

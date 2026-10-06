@@ -25,6 +25,9 @@ var (
 	egressAuditDroppedTotal = expvar.NewInt("aerolvm_egress_audit_dropped_total")
 	egressAttachFailedTotal = expvar.NewInt("aerolvm_egress_attach_failed_total")
 	egressLayoutLostTotal   = expvar.NewInt("aerolvm_egress_layout_lost_total")
+	// egressProfileApplyFailedTotal counts sandboxes a profile change could
+	// not be applied to; each is held (D16) and retried on the next pass.
+	egressProfileApplyFailedTotal = expvar.NewInt("aerolvm_egress_profile_apply_failed_total")
 
 	// activeEgressStats is the Service the gauges read: the one whose
 	// gateway was wired last (one per daemon; tests wire many).

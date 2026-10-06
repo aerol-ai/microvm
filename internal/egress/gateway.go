@@ -149,7 +149,9 @@ func compile(spec Spec) (*entry, error) {
 	if spec.Learn {
 		mode = egresspolicy.ModeLearn
 	}
-	pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: spec.AllowOut, DenyOut: spec.DenyOut, Mode: mode})
+	// sandboxd sends the effective list (inline entries plus referenced
+	// profiles), already held to the inline cap at the API.
+	pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: spec.AllowOut, DenyOut: spec.DenyOut, Mode: mode, MaxHostnames: egresspolicy.MaxUnionHostnames})
 	if err != nil {
 		return nil, fmt.Errorf("egress: sandbox %s: %w", spec.ID, err)
 	}

@@ -273,6 +273,20 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		TemplateID:         sb.TemplateID,
 		OverlaySizeGB:      sb.OverlaySizeGB,
 	}
+	// The row stores the effective allow list; a replay needs the inline
+	// list and the references, so profile changes keep reaching it.
+	if s.store != nil {
+		profiles, err := s.store.GetSandboxEgressProfiles(ctx, sb.ID)
+		if err != nil {
+			return nil, fmt.Errorf("load egress profiles for ownership replay %s: %w", sb.ID, err)
+		}
+		if len(profiles.Refs) > 0 {
+			spec.NetworkAllowOut = profiles.Inline
+			for _, r := range profiles.Refs {
+				spec.EgressProfiles = append(spec.EgressProfiles, r.Name)
+			}
+		}
+	}
 	lc := sb.Lifecycle
 	spec.Lifecycle = &lc
 	if isStoppedFirecrackerSnapshotRow(sb) {

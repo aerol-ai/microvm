@@ -70,6 +70,12 @@ type Spec struct {
 	DenyOut  []string
 	BlockAll bool
 	Mode     Mode
+	// MaxHostnames is the hostname cap AllowOut is held to. Zero means
+	// MaxInlineHostnames, the cap on what a create or policy PUT writes
+	// inline. Enforcement points compile a sandbox's effective list (inline
+	// entries plus every referenced profile) with MaxUnionHostnames, and a
+	// profile is held to MaxProfileHostnames.
+	MaxHostnames int
 }
 
 // Policy is a compiled, immutable egress policy. It is safe for concurrent
@@ -107,7 +113,7 @@ type Policy struct {
 //     allowlist (the portable "allow these, deny everything" form);
 //   - 0.0.0.0/0 denied with no allow list, or BlockAll: block-all.
 //
-// Hostnames are allowed only in AllowOut (at most MaxInlineHostnames). Learn
+// Hostnames are allowed only in AllowOut (at most spec.MaxHostnames). Learn
 // mode requires empty lists and no block-all. Every error matches ErrInvalid
 // and names the offending entry or field.
 func Compile(spec Spec) (*Policy, error) {
@@ -115,7 +121,11 @@ func Compile(spec Spec) (*Policy, error) {
 	if err != nil {
 		return nil, err
 	}
-	allow, err := ParseAllowList(FieldAllowOut, spec.AllowOut, MaxInlineHostnames)
+	maxHostnames := spec.MaxHostnames
+	if maxHostnames <= 0 {
+		maxHostnames = MaxInlineHostnames
+	}
+	allow, err := ParseAllowList(FieldAllowOut, spec.AllowOut, maxHostnames)
 	if err != nil {
 		return nil, err
 	}

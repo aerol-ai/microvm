@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"strings"
 	"time"
 
@@ -63,9 +62,7 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// precedence, hostnames refused in deny lists (D15). Validating here makes
 	// a bad entry a 400 at create instead of a stored policy the host later
 	// enforces as block-all (egress plan P0-3).
-	if _, err := egresspolicy.Compile(egresspolicy.Spec{
-		AllowOut: req.NetworkAllowOut, DenyOut: req.NetworkDenyOut, BlockAll: req.NetworkBlockAll,
-	}); err != nil {
+	if _, err := compileCreateEgressEffective(&req); err != nil {
 		return nil, err
 	}
 	bundleRef := models.ModuleRefForCreate(req)

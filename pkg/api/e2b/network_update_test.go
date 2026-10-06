@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // TestUpdateNetwork covers P2-5: E2B's PUT /sandboxes/{id}/network replaces
@@ -93,5 +95,38 @@ func TestUpdateNetwork(t *testing.T) {
 	// Explicitly empty rules and proxy are "not set".
 	if rr := put(id, `{"rules":{},"egressProxy":null}`); rr.Code != http.StatusNoContent {
 		t.Fatalf("empty rules: status = %d", rr.Code)
+	}
+}
+
+// TestUpdateNetworkKeepsProfiles: E2B can't express egress profiles, so its
+// update keeps a sandbox's references (D19), and its block-all over them is
+// a 409.
+func TestUpdateNetworkKeepsProfiles(t *testing.T) {
+	svc, _, handler := newE2BHandlerTestEnv(t)
+	ctx := context.Background()
+	create := httptest.NewRecorder()
+	handler.ServeHTTP(create, httptest.NewRequest(http.MethodPost, "/e2b/sandboxes", strings.NewReader(`{"templateID":"base"}`)))
+	var created sandboxResponse
+	_ = json.NewDecoder(create.Body).Decode(&created)
+	if _, err := svc.PutEgressProfile(ctx, "cidrs", models.EgressProfileRequest{AllowOut: []string{"1.1.1.0/24"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.UpdateNetworkPolicy(ctx, created.SandboxID, models.NetworkPolicyRequest{EgressProfiles: []string{"cidrs"}}); err != nil {
+		t.Fatal(err)
+	}
+	put := func(body string) int {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/e2b/sandboxes/"+created.SandboxID+"/network", strings.NewReader(body)))
+		return rr.Code
+	}
+	if code := put(`{"allowOut":["8.8.8.0/24"]}`); code != http.StatusNoContent {
+		t.Fatalf("status = %d", code)
+	}
+	sb, _ := svc.GetSandbox(ctx, created.SandboxID)
+	if !slices.Equal(sb.EgressProfiles, []string{"cidrs"}) || !slices.Equal(sb.NetworkAllowOut, []string{"8.8.8.0/24"}) {
+		t.Fatalf("after E2B update: %v %v", sb.EgressProfiles, sb.NetworkAllowOut)
+	}
+	if code := put(`{"allow_internet_access":false}`); code != http.StatusConflict {
+		t.Fatalf("block-all over profiles = %d", code)
 	}
 }

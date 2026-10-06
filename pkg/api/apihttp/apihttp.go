@@ -189,6 +189,28 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld, err.Error())
 		return
 	}
+	// Named egress profiles (D21).
+	if errors.Is(err, service.ErrEgressProfileNotFound) {
+		WriteError(w, http.StatusNotFound, "egress profile not found")
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfilesConflict) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileInUse) {
+		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileInUse, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileCapExceeded) {
+		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrEgressPolicyBusy) {
 		w.Header().Set("Retry-After", "1")
 		WriteError(w, http.StatusConflict, err.Error())

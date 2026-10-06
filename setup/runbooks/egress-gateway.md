@@ -28,6 +28,7 @@ do not use the gateway and are unaffected by every alert below.
 | `SandboxdEgressAuditDropped` | The gateway's audit ring overflowed; audit records are missing. |
 | `SandboxdEgressOperatorConfigDrift` | Nodes run different operator files. |
 | `SandboxdEgressOperatorConfigReloadFailed` | An operator file edit did not validate. |
+| `SandboxdEgressProfileApplyFailing` | A changed egress profile could not be applied to some sandboxes; they are held. |
 | `SandboxdEgressSelfTestFailing` | Probe traffic sent through the redirect never reached the gateway; the node refuses hostname-filtered creates. |
 
 ## Severity
@@ -54,6 +55,7 @@ Networking dashboard (`setup/grafana/d7-ingress-networking.json`).
 | `aerolvm_egress_denied_total{key=<reason>}` | Denials by reason. Exact even when audit events drop. |
 | `aerolvm_egress_attach_failed_total` | Failed attaches (each one a 503 create or a held sandbox). |
 | `aerolvm_egress_layout_lost_total` | Table rebuilds after the nft table vanished. |
+| `aerolvm_egress_profile_apply_failed_total` | Sandboxes a changed egress profile could not be applied to (each one held until the next pass succeeds). |
 | `aerolvm_egress_audit_dropped_total` | Audit events lost to ring overflow. |
 | `aerolvm_egress_dns_queries_total` | Queries reaching the filtering resolver; `rate()` is the DNS QPS. |
 | `aerolvm_egress_proxy_connections` | Connections the proxy holds open now. |
@@ -141,6 +143,23 @@ the next successful attach: when the gateway recovers, on sandbox start, or
 on the reconcile pass. A hold that does not lift while
 `aerolvm_egress_gateway_up` is 1 points at that sandbox's policy; the
 sandboxd log names the reason.
+
+## ProfileApplyFailing
+
+When an egress profile changes, every node re-applies it to its own
+sandboxes that reference it, at most `SB_EGRESS_PROFILE_APPLY_QPS` (default
+50) per second, every 10 seconds and at once on the node that took the
+change. A sandbox the new profile can't be applied to is shut: its
+`egress_status` reads `held`, and the pass retries it every 10 seconds.
+
+1. The sandboxd log line `egress: profile change not applied` names the
+   sandbox and the error.
+2. `profile_unavailable` holds mean a referenced profile couldn't be read.
+   In a cluster, check that this node reaches the server tier. A profile
+   that is gone keeps the sandbox held until its owner changes the
+   sandbox's `egress_profiles` with `PUT /v1/sandboxes/{id}/network/policy`.
+3. Other errors are the same as attach failures; see
+   [AttachFailures](#attachfailures).
 
 ## AuditDropped
 

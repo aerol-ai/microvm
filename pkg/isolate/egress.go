@@ -81,7 +81,7 @@ func currentIsolateGuard() egresspolicy.DialGuard {
 }
 
 func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
-	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll})
+	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll, MaxHostnames: egresspolicy.MaxUnionHostnames})
 }
 
 // SetEgressPolicy registers (or replaces) the outbound policy for a sandbox and

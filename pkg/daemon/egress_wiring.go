@@ -64,6 +64,16 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }
 
+// wireEgressProfiles starts the re-apply pass for named egress profiles
+// (D21) on every node that owns sandboxes: profiles apply to every runtime,
+// with or without the gateway. Each node re-applies its own sandboxes.
+func wireEgressProfiles(ctx context.Context, cfg config.Config, svc *service.Service) {
+	if !cfg.IsWorker() {
+		return
+	}
+	go svc.SuperviseEgressProfiles(ctx)
+}
+
 // firstHost returns the first host address of a subnet, the CNI bridge's
 // gateway.
 func firstHost(subnet string) (netip.Addr, bool) {

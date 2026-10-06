@@ -617,6 +617,11 @@ type CreateSandboxRequest struct {
 	// the sandbox may reach anything except these. A deny of 0.0.0.0/0 with
 	// no allow list is block-all and is stored as NetworkBlockAll.
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
+	// EgressProfiles names egress profiles whose entries join
+	// NetworkAllowOut; the union is capped at 1024 hostnames. A profile
+	// update re-applies to every sandbox that references it
+	// (plans/egress-domain-filtering.md D21).
+	EgressProfiles []string `json:"egress_profiles,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
 	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
@@ -800,6 +805,14 @@ type Sandbox struct {
 	// allow-wins precedence (plans/egress-domain-filtering.md D4).
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	// EgressProfiles are the profiles this sandbox references, and
+	// EgressProfilesApplied the generation of each that is live, so a caller
+	// can see when a profile update has reached it. On the stored row
+	// NetworkAllowOut is the effective list (inline entries plus every
+	// profile's), which is what enforcement reads; API responses show the
+	// inline list instead.
+	EgressProfiles        []string           `json:"egress_profiles,omitempty"`
+	EgressProfilesApplied []EgressProfileRef `json:"egress_profiles_applied,omitempty"`
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
@@ -926,6 +939,7 @@ type NetworkPolicyRequest struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
 	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressProfiles  []string `json:"egress_profiles"`
 }
 
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
@@ -936,7 +950,42 @@ type NetworkPolicy struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
 	NetworkDenyOut  []string `json:"network_deny_out"`
-	EgressStatus    string   `json:"egress_status,omitempty"`
+	EgressProfiles  []string `json:"egress_profiles"`
+	// EffectiveHostnameCount counts the hostname entries in force: inline
+	// plus every referenced profile's (at most 1024).
+	EffectiveHostnameCount int    `json:"effective_hostname_count"`
+	EgressStatus           string `json:"egress_status,omitempty"`
+}
+
+// EgressProfile is a named allowlist sandboxes reference by name
+// (plans/egress-domain-filtering.md D21). Profiles are owner-scoped like
+// sandbox names; Generation goes up by one on every change.
+type EgressProfile struct {
+	Name        string    `json:"name"`
+	AllowOut    []string  `json:"allow_out"`
+	Description string    `json:"description,omitempty"`
+	Generation  int64     `json:"generation"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// EgressProfileRequest is the body of PUT /v1/egress-profiles/{name}, a full
+// replace: the same body twice is a no-op.
+type EgressProfileRequest struct {
+	AllowOut    []string `json:"allow_out"`
+	Description string   `json:"description,omitempty"`
+}
+
+// EgressProfileList is one page of GET /v1/egress-profiles.
+type EgressProfileList struct {
+	Profiles   []EgressProfile `json:"profiles"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+// EgressProfileRef is a profile and the generation of it a sandbox has live.
+type EgressProfileRef struct {
+	Name       string `json:"name"`
+	Generation int64  `json:"generation"`
 }
 
 // ErrorCodeEgressSpecCommitFailed is returned (503) when a policy update
@@ -948,6 +997,13 @@ const ErrorCodeEgressSpecCommitFailed = "spec_commit_failed"
 // egress until a retry (the PUT is idempotent) or the reconcile pass
 // applies it.
 const ErrorCodeEgressApplyFailedHeld = "apply_failed_held"
+
+// ErrorCodeEgressProfileInUse is a profile DELETE while sandboxes reference it.
+const ErrorCodeEgressProfileInUse = "egress_profile_in_use"
+
+// ErrorCodeEgressProfileCapExceeded is a profile PUT that would push a
+// referencing sandbox past the 1024-hostname union cap.
+const ErrorCodeEgressProfileCapExceeded = "egress_profile_cap_exceeded"
 
 // NetworkPolicyCheckRequest is POST /v1/network/policy/check: would a sandbox
 // created with these egress fields reach Destination? Destination is "host",

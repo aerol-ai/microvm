@@ -222,8 +222,12 @@ type Config struct {
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
-	EnableEventMonitor bool
-	EnableSSHGateway   bool
+	// EgressProfileApplyQPS bounds how many sandboxes per second this node
+	// re-applies after an egress profile changes, so one profile edit can't
+	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
+	EgressProfileApplyQPS int
+	EnableEventMonitor    bool
+	EnableSSHGateway      bool
 	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
 	// of the box; flip to false on a per-host basis to opt that host out of
@@ -1674,6 +1678,7 @@ func Load() (Config, error) {
 		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
 		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),

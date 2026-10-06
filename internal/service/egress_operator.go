@@ -99,7 +99,7 @@ func (s *Service) egressOperator() *operator.Operator {
 
 // hasEgressFields reports whether a create says anything about egress.
 func hasEgressFields(req *models.CreateSandboxRequest) bool {
-	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0
 }
 
 // applyEgressOperatorPolicy applies the operator file to a create (§5.10
@@ -149,7 +149,9 @@ func checkEgressOperatorLimits(op *operator.Operator, req *models.CreateSandboxR
 		}
 	}
 	if c := op.Ceiling(); c != nil {
-		pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: req.NetworkAllowOut, DenyOut: req.NetworkDenyOut, BlockAll: req.NetworkBlockAll})
+		// req carries the effective list here: inline entries plus every
+		// referenced profile's.
+		pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: req.NetworkAllowOut, DenyOut: req.NetworkDenyOut, BlockAll: req.NetworkBlockAll, MaxHostnames: egresspolicy.MaxUnionHostnames})
 		if err != nil {
 			return err
 		}

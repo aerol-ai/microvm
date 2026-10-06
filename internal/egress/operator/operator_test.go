@@ -3,6 +3,7 @@ package operator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -243,5 +244,24 @@ func TestUpstreamDialer(t *testing.T) {
 	noAuth, _ := Parse([]byte("version: 1\nupstream_proxy: {url: \"http://p:3128\"}\n"))
 	if up, err := noAuth.UpstreamDialer(); err != nil || up.ProxyHeader() != nil {
 		t.Fatalf("no auth_file: %v", err)
+	}
+}
+
+// TestParseLargeOrgProfile: an org profile is held to the profile cap (512),
+// not the 64-entry inline cap a create gets.
+func TestParseLargeOrgProfile(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("version: 1\norg_profiles:\n  big:\n    allow_out:\n")
+	for i := 0; i < 100; i++ {
+		fmt.Fprintf(&b, "      - h%d.example.com\n", i)
+	}
+	if _, err := Parse([]byte(b.String())); err != nil {
+		t.Fatalf("a 100-host org profile must parse: %v", err)
+	}
+	for i := 100; i < 513; i++ {
+		fmt.Fprintf(&b, "      - h%d.example.com\n", i)
+	}
+	if _, err := Parse([]byte(b.String())); err == nil {
+		t.Fatal("a profile over 512 hostnames must be refused")
 	}
 }

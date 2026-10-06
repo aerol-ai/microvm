@@ -377,6 +377,13 @@ type Service struct {
 	egressControlPushed atomic.Pointer[string]
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
+	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
+	// (profileKick creates it).
+	egressProfileKick     chan struct{}
+	egressProfileKickOnce sync.Once
+	// egressProfiles stores named egress profiles; nil is the local store
+	// (single node). A cluster swaps in its Raft-backed store.
+	egressProfiles egressProfileBackend
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -1646,6 +1653,25 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.validateCreateCustomDomains(&req); err != nil {
 		return nil, err
 	}
+	// Named egress profiles (D21): validate the inline lists, then expand
+	// the references so the operator's ceiling and everything after it see
+	// the effective allow list. The replicated spec, built by the caller from
+	// its own copy of req, keeps the references.
+	if len(req.EgressProfiles) > 0 {
+		if _, err := compileCreateEgress(&req); err != nil {
+			return nil, err
+		}
+		resolved, err := s.resolveEgressProfiles(ctx, ownerRef, req.NetworkAllowOut, req.EgressProfiles)
+		if err != nil {
+			return nil, err
+		}
+		req.NetworkAllowOut = resolved.Effective
+		defer func() {
+			if err == nil && resp != nil {
+				err = s.recordCreateEgressProfiles(ctx, &resp.Sandbox, resolved)
+			}
+		}()
+	}
 	// Operator default policy and ceiling (§5.10 PC-2): in memory, before
 	// any runtime is chosen, so native and facade creates of every runtime
 	// get the same answer and the stored spec carries the result.
@@ -1867,7 +1893,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 
 	prepareStart := time.Now()
-	egressPol, err := compileCreateEgress(&req)
+	egressPol, err := compileCreateEgressEffective(&req)
 	if err != nil {
 		releaseAdmission()
 		return nil, err
@@ -2252,8 +2278,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBlockAll {
 		return nil, unsupportedFirecrackerOption("network_block_all")
 	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
-		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out)")
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 {
+		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out / egress_profiles)")
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
@@ -2752,6 +2778,7 @@ func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts Get
 	}
 	s.attachFailoverReady(ctx, sb)
 	sb.EgressStatus = s.EgressStatus(ctx, sb)
+	s.showEgressProfiles(ctx, sb)
 	if opts.IncludeEnv {
 		env, loadErr := s.loadEnv(ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID), id, sb.AuditIncarnationID)
 		if loadErr != nil {
@@ -2807,6 +2834,7 @@ func (s *Service) ListSandboxesWithOptions(ctx context.Context, tagFilter map[st
 }
 
 func (s *Service) applyListEnvOptions(ctx context.Context, sandboxes []*models.Sandbox, opts GetSandboxOptions) error {
+	s.showEgressProfiles(ctx, sandboxes...)
 	if opts.IncludeEnv {
 		loadCtx := ContextWithSecretAuditCorrelation(ctx, opts.CorrelationID)
 		for _, sb := range sandboxes {

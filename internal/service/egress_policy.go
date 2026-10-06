@@ -26,15 +26,36 @@ var ErrEgressGatewayRequired = fmt.Errorf("hostname egress filtering needs the e
 // clean up twice). Every error matches egresspolicy.ErrInvalid and names the
 // offending entry (400).
 func compileCreateEgress(req *models.CreateSandboxRequest) (*egresspolicy.Policy, error) {
+	return compileEgress(req, egresspolicy.MaxInlineHostnames)
+}
+
+// compileCreateEgressEffective compiles a create whose allow list may
+// already hold its profiles' entries: with profiles, the list is the
+// effective one, so it is held to the union cap (the inline part was held to
+// the inline cap before the expansion).
+func compileCreateEgressEffective(req *models.CreateSandboxRequest) (*egresspolicy.Policy, error) {
+	if len(req.EgressProfiles) > 0 {
+		return compileEgress(req, egresspolicy.MaxUnionHostnames)
+	}
+	return compileCreateEgress(req)
+}
+
+func compileEgress(req *models.CreateSandboxRequest, maxHostnames int) (*egresspolicy.Policy, error) {
 	pol, err := egresspolicy.Compile(egresspolicy.Spec{
-		AllowOut: req.NetworkAllowOut,
-		DenyOut:  req.NetworkDenyOut,
-		BlockAll: req.NetworkBlockAll,
+		AllowOut:     req.NetworkAllowOut,
+		DenyOut:      req.NetworkDenyOut,
+		BlockAll:     req.NetworkBlockAll,
+		MaxHostnames: maxHostnames,
 	})
 	if err != nil {
 		return nil, err
 	}
-	if pol.BlockAll() && !req.NetworkBlockAll {
+	if req.NetworkBlockAll && len(req.EgressProfiles) > 0 {
+		return nil, fmt.Errorf("%w: egress_profiles can't be combined with network_block_all", egresspolicy.ErrInvalid)
+	}
+	// With profiles the allow entries come from them, so a deny-all inline
+	// list is the portable allowlist spelling, not block-all.
+	if pol.BlockAll() && !req.NetworkBlockAll && len(req.EgressProfiles) == 0 {
 		req.NetworkBlockAll = true
 		req.NetworkAllowOut, req.NetworkDenyOut = nil, nil
 	}

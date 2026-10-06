@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -64,19 +65,27 @@ func (l *egressPolicyLocks) lock(id string) func() {
 // stopped container is only stored; Start applies it. Sending the current
 // policy again is a no-op, so the PUT is safe to retry.
 func (s *Service) UpdateNetworkPolicy(ctx context.Context, id string, req models.NetworkPolicyRequest) (*models.NetworkPolicy, error) {
-	create := models.CreateSandboxRequest{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut}
-	pol, err := compileCreateEgress(&create)
-	if err != nil {
-		return nil, err
-	}
+	return s.updateNetworkPolicy(ctx, id, req, false)
+}
+
+// UpdateNetworkLists replaces a sandbox's block-all flag and allow and deny
+// lists and keeps its profile references, for facades whose APIs can't
+// express profiles (E2B updateNetwork, D19). The references are read under
+// the same per-sandbox lock as the write, so a concurrent native PUT can't
+// be undone. Block-all on a sandbox that references profiles is a 409:
+// clearing them is the owner's call, through the native API.
+func (s *Service) UpdateNetworkLists(ctx context.Context, id string, blockAll bool, allowOut, denyOut []string) (*models.NetworkPolicy, error) {
+	return s.updateNetworkPolicy(ctx, id, models.NetworkPolicyRequest{NetworkBlockAll: blockAll, NetworkAllowOut: allowOut, NetworkDenyOut: denyOut}, true)
+}
+
+// ErrEgressProfilesConflict is a facade block-all on a sandbox that
+// references egress profiles (409).
+var ErrEgressProfilesConflict = errors.New("sandbox references egress profiles; clear them with the native policy API before blocking all egress")
+
+func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models.NetworkPolicyRequest, keepProfiles bool) (*models.NetworkPolicy, error) {
 	if s.egressOperatorWatcher != nil {
 		if err := s.egressOperatorWatcher.BootError(); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrEgressOperatorConfigInvalid, err)
-		}
-	}
-	if op := s.egressOperator(); op != nil {
-		if err := checkEgressOperatorLimits(op, &create); err != nil {
-			return nil, err
 		}
 	}
 	unlock := s.egressPolicyLocks.lock(id)
@@ -93,8 +102,41 @@ func (s *Service) UpdateNetworkPolicy(ctx context.Context, id string, req models
 	case models.SandboxStatusCreating, models.SandboxStatusAwaitingRuntime, models.SandboxStatusPassivateFailed:
 		return nil, fmt.Errorf("%w (status %s)", ErrEgressPolicyBusy, old.Status)
 	}
+	prior, err := s.store.GetSandboxEgressProfiles(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if keepProfiles {
+		req.EgressProfiles = nil
+		for _, r := range prior.Refs {
+			req.EgressProfiles = append(req.EgressProfiles, r.Name)
+		}
+		if req.NetworkBlockAll && len(req.EgressProfiles) > 0 {
+			return nil, ErrEgressProfilesConflict
+		}
+	}
+	create := models.CreateSandboxRequest{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressProfiles: req.EgressProfiles}
+	if _, err := compileCreateEgress(&create); err != nil {
+		return nil, err
+	}
+	// Profiles resolve in the sandbox owner's namespace, whoever calls.
+	resolved, err := s.resolveEgressProfiles(ctx, old.OwnerRef, create.NetworkAllowOut, create.EgressProfiles)
+	if err != nil {
+		return nil, err
+	}
+	effective := create
+	effective.NetworkAllowOut = resolved.Effective
+	pol, err := compileCreateEgressEffective(&effective)
+	if err != nil {
+		return nil, err
+	}
+	if op := s.egressOperator(); op != nil {
+		if err := checkEgressOperatorLimits(op, &effective); err != nil {
+			return nil, err
+		}
+	}
 	next := *old
-	next.NetworkBlockAll, next.NetworkAllowOut, next.NetworkDenyOut = create.NetworkBlockAll, create.NetworkAllowOut, create.NetworkDenyOut
+	next.NetworkBlockAll, next.NetworkAllowOut, next.NetworkDenyOut = effective.NetworkBlockAll, effective.NetworkAllowOut, effective.NetworkDenyOut
 	containerRT := !s.isWasmSandbox(old) && !s.isIsolateSandbox(old)
 	if containerRT && pol.GatewayMode() {
 		if !s.egressEnabled() {
@@ -107,43 +149,70 @@ func (s *Service) UpdateNetworkPolicy(ctx context.Context, id string, req models
 			return nil, fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
 		}
 	}
-	if samePolicy(old, &next) && s.EgressStatus(ctx, old) != EgressStatusHeld && s.EgressStatus(ctx, old) != EgressStatusUnavailable {
-		return s.effectivePolicy(ctx, old), nil
+	if samePolicy(old, &next) && sameProfiles(prior, resolved) && s.EgressStatus(ctx, old) != EgressStatusHeld && s.EgressStatus(ctx, old) != EgressStatusUnavailable {
+		return s.effectivePolicy(ctx, old, resolved), nil
 	}
 
 	if err := s.commitPolicySpec(ctx, id, &create); err != nil {
 		return nil, err
 	}
-	if err := s.store.SetNetworkPolicy(ctx, id, next.NetworkBlockAll, next.NetworkAllowOut, next.NetworkDenyOut); err != nil {
+	if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
+		BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
+		Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef,
+	}); err != nil {
 		return nil, err
 	}
-	// The WASM and isolate drivers keep the policy for the next
-	// instantiation as well, so they hear about every update; a stopped
-	// container has nothing live and Start reads the stored row.
-	switch {
-	case s.isWasmSandbox(old):
-		err = s.applyWasmPolicy(&next)
-	case s.isIsolateSandbox(old):
-		err = s.applyIsolatePolicy(&next)
-	case next.Status == models.SandboxStatusStarted:
-		err = s.applyContainerPolicy(ctx, old, &next)
-	}
-	if err != nil {
+	if err := s.applyPolicyTransition(ctx, old, &next); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrEgressApplyFailedHeld, err)
 	}
-	return s.effectivePolicy(ctx, &next), nil
+	if err := s.store.SetEgressProfilesApplied(ctx, id, resolved.Applied); err != nil {
+		return nil, err
+	}
+	return s.effectivePolicy(ctx, &next, resolved), nil
+}
+
+// applyPolicyTransition makes a stored policy change live. The WASM and
+// isolate drivers keep the policy for the next instantiation as well, so
+// they hear about every change; a stopped container has nothing live and
+// Start reads the stored row.
+func (s *Service) applyPolicyTransition(ctx context.Context, old, next *models.Sandbox) error {
+	switch {
+	case s.isWasmSandbox(old):
+		return s.applyWasmPolicy(next)
+	case s.isIsolateSandbox(old):
+		return s.applyIsolatePolicy(next)
+	case next.Status == models.SandboxStatusStarted:
+		return s.applyContainerPolicy(ctx, old, next)
+	}
+	return nil
 }
 
 func samePolicy(a, b *models.Sandbox) bool {
 	return a.NetworkBlockAll == b.NetworkBlockAll && slices.Equal(a.NetworkAllowOut, b.NetworkAllowOut) && slices.Equal(a.NetworkDenyOut, b.NetworkDenyOut)
 }
 
-func (s *Service) effectivePolicy(ctx context.Context, sb *models.Sandbox) *models.NetworkPolicy {
+// sameProfiles reports whether the stored references, their applied
+// generations and the inline list already match a resolution.
+func sameProfiles(prior store.SandboxEgressProfiles, r resolvedEgress) bool {
+	if len(r.Refs) == 0 {
+		return len(prior.Refs) == 0
+	}
+	return slices.Equal(prior.Refs, r.Applied) && slices.Equal(prior.Inline, r.Inline)
+}
+
+func (s *Service) effectivePolicy(ctx context.Context, sb *models.Sandbox, r resolvedEgress) *models.NetworkPolicy {
+	inline := sb.NetworkAllowOut
+	if len(r.Refs) > 0 {
+		inline = r.Inline
+	}
+	effective, _ := countHostnames(sb.NetworkAllowOut)
 	return &models.NetworkPolicy{
-		NetworkBlockAll: sb.NetworkBlockAll,
-		NetworkAllowOut: append([]string{}, sb.NetworkAllowOut...),
-		NetworkDenyOut:  append([]string{}, sb.NetworkDenyOut...),
-		EgressStatus:    s.EgressStatus(ctx, sb),
+		NetworkBlockAll:        sb.NetworkBlockAll,
+		NetworkAllowOut:        append([]string{}, inline...),
+		NetworkDenyOut:         append([]string{}, sb.NetworkDenyOut...),
+		EgressProfiles:         append([]string{}, r.Refs...),
+		EffectiveHostnameCount: effective,
+		EgressStatus:           s.EgressStatus(ctx, sb),
 	}
 }
 

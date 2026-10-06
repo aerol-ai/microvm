@@ -526,9 +526,10 @@ func (h *handlers) updateNetwork(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// E2B can't express egress profiles, so the update keeps the sandbox's
+	// (D19).
 	blockAll, allow, deny := e2bEgressPolicy(req.AllowOut, req.DenyOut, req.AllowInternetAccess)
-	policy := models.NetworkPolicyRequest{NetworkBlockAll: blockAll, NetworkAllowOut: allow, NetworkDenyOut: deny}
-	if _, err := h.deps.Service.UpdateNetworkPolicy(r.Context(), sandbox.ID, policy); err != nil {
+	if _, err := h.deps.Service.UpdateNetworkLists(r.Context(), sandbox.ID, blockAll, allow, deny); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

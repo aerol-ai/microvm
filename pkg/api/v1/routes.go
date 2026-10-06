@@ -114,6 +114,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// Live egress policy (plans/egress-domain-filtering.md §5.8): forwarded
 	// to the owner, the only node that can apply it to the running sandbox.
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/network/policy", d.Auth(wrap(http.HandlerFunc(h.updateNetworkPolicy))))
+	// Named egress profiles (D21). Not sandbox-scoped, so no owner
+	// forwarding; in a cluster the service writes them through Raft.
+	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.putEgressProfile)))
+	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.getEgressProfile)))
+	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.deleteEgressProfile)))
+	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Auth(http.HandlerFunc(h.listEgressProfiles)))
 	// Pure policy evaluation: no sandbox, so no owner forwarding.
 	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Auth(http.HandlerFunc(h.checkNetworkPolicy)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —

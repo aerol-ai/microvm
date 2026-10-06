@@ -529,3 +529,25 @@ func TestWriteStoreAwareError_EgressPolicyUpdate(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteStoreAwareError_EgressProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{service.ErrEgressProfileNotFound, http.StatusNotFound, ""},
+		{fmt.Errorf("%w: 2 sandbox(es)", service.ErrEgressProfileInUse), http.StatusConflict, models.ErrorCodeEgressProfileInUse},
+		{fmt.Errorf("%w: sb-1", service.ErrEgressProfileCapExceeded), http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded},
+		{fmt.Errorf("%w: no leader", service.ErrEgressProfileUnavailable), http.StatusServiceUnavailable, ""},
+		{service.ErrEgressProfilesConflict, http.StatusConflict, ""},
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, tc.err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != tc.status || body.Code != tc.code {
+			t.Fatalf("%v: status=%d code=%q", tc.err, rr.Code, body.Code)
+		}
+	}
+}

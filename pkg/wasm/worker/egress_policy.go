@@ -56,7 +56,7 @@ func compileLists(allow, deny []string) *egresspolicy.Policy {
 	if len(allow) == 0 && len(deny) == 0 {
 		return nil
 	}
-	p, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: allow, DenyOut: deny})
+	p, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: allow, DenyOut: deny, MaxHostnames: egresspolicy.MaxUnionHostnames})
 	if err != nil {
 		return egresspolicy.BlockAllPolicy()
 	}

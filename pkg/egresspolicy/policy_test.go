@@ -329,3 +329,16 @@ func TestDenyMessage(t *testing.T) {
 		}
 	}
 }
+
+func TestCompileMaxHostnames(t *testing.T) {
+	var allow []string
+	for i := 0; i < MaxInlineHostnames+1; i++ {
+		allow = append(allow, fmt.Sprintf("h%d.example.com", i))
+	}
+	if _, err := Compile(Spec{AllowOut: allow}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("inline cap: err = %v", err)
+	}
+	if _, err := Compile(Spec{AllowOut: allow, MaxHostnames: MaxUnionHostnames}); err != nil {
+		t.Fatalf("union cap: %v", err)
+	}
+}

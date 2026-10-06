@@ -388,6 +388,34 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
+		// egress_profiles are named allowlists sandboxes reference
+		// (plans/egress-domain-filtering.md D21). Owner-scoped like sandbox
+		// names; this table is the single-node store, a cluster keeps them in
+		// the Raft FSM.
+		`CREATE TABLE IF NOT EXISTS egress_profiles (
+			owner_ref TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			allow_out_json TEXT NOT NULL DEFAULT '[]',
+			description TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (owner_ref, name)
+		);`,
+		// sandbox_egress_profiles is each sandbox's profile references, in
+		// order, with the generation of each that is live. It is an index
+		// rather than sandbox_egress.profiles_json (left unused) so a profile
+		// update finds its referencing sandboxes with an index probe, and
+		// delete-in-use is one query, at any fleet size.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress_profiles (
+			sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			profile TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			applied_generation INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (sandbox_id, profile)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of
@@ -925,6 +953,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// permanently undistributed.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`,
 		`ALTER TABLE firecracker_templates ADD COLUMN push_claimed_at DATETIME;`,
+		// A sandbox that references egress profiles stores its effective
+		// allow list (inline plus every profile's) in
+		// sandboxes.network_allow_out_json, which every enforcement path
+		// already reads, and its inline list here for GET and policy
+		// replays. Empty means no profiles: the row's list is the inline one.
+		`ALTER TABLE sandbox_egress ADD COLUMN inline_allow_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
