@@ -1,0 +1,307 @@
+---
+title: Egress Domain Filtering
+description: Let a sandbox reach only the hostnames you list, like pypi.org or *.github.com, and see exactly what it was refused.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+An agent that installs packages or calls one API rarely needs the whole
+internet. **Egress domain filtering** lets a sandbox reach only the hostnames
+you name, such as `pypi.org` or `*.githubusercontent.com`, and nothing else.
+You write names, not IP ranges: AerolVM resolves them, follows them as their
+addresses change, and checks the name on every connection, so a sandbox can't
+reach another site that happens to share an allowed CDN address.
+
+It uses the same `networkAllowOut` field as [Network Isolation](/network-isolation/),
+which takes CIDRs too. A list can mix hostnames and CIDRs.
+
+---
+
+## Allow a few hostnames
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"pypi.org", "*.pythonhosted.org", "github.com:22"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "github.com:22".to_string(),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("pypi.org", "*.pythonhosted.org", "github.com:22"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+`pip install requests` now works, and `curl https://example.com` fails at once
+with a message naming the host. Nothing else changes: the sandbox resolves
+names and opens connections the ordinary way.
+
+### What an entry means
+
+| Entry | Allows |
+|---|---|
+| `pypi.org` | `pypi.org` on ports 80 and 443 |
+| `*.pythonhosted.org` | every name under `pythonhosted.org` (not `pythonhosted.org` itself) on 80 and 443 |
+| `github.com:22` | `github.com` on port 22 only |
+| `10.20.0.0/16` | that address range on any port |
+
+- Names are case-insensitive and a trailing dot is ignored.
+- A list holds up to 64 hostnames, plus any number of CIDRs.
+- Write `example.com` and `*.example.com` to allow a name and its subdomains.
+- `networkDenyOut` takes CIDRs only. When both lists are set, an allow match
+  wins, then a deny match drops, then the rest is allowed. Add
+  `networkDenyOut: ['0.0.0.0/0']` to make the allow list the only way out.
+
+### What the sandbox sees
+
+- **DNS** answers only for allowed names. Any other name gets `NXDOMAIN` with an
+  Extended DNS Error that reads `aerolvm egress policy: <name> not allowed`.
+- **HTTPS** to a name that isn't allowed fails during the handshake with a TLS
+  `access_denied` alert. The check uses the server name the client sends, so
+  a connection to an allowed address that asks for another site is refused too.
+- **HTTP** gets a `403` whose body names the host and the rule that decided.
+- **Anything else** (a raw IP, another port) is refused straight away with a
+  TCP reset, unless a CIDR or `host:port` entry allows it.
+
+Every one of these fails fast with a reason, so an agent can stop retrying and
+ask for access instead of waiting on a timeout.
+
+---
+
+## See what was refused
+
+Denials are recorded in the sandbox's audit log with the destination and the
+reason. Read them with `audit`, filtered to egress events:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await sandbox.audit({ kind: 'egress' })
+    for (const event of page.events) {
+      if (event.result === 'failure') {
+        console.log(`${event.time} ${event.destination} refused: ${event.reason}`)
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = sandbox.audit({'kind': 'egress'})
+    for event in page['events']:
+        if event['result'] == 'failure':
+            print(f"{event['time']} {event.get('destination')} refused: {event.get('reason')}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := sandbox.Audit(ctx, sdktypes.AuditOptions{Kind: "egress"})
+    if err != nil {
+        return err
+    }
+    for _, event := range page.Events {
+        if event.Result == "failure" {
+            fmt.Printf("%s %s refused: %s\n", event.Time, event.Destination, event.Reason)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = sandbox.audit(AuditOptions {
+        kind: Some("egress".to_string()),
+        ..Default::default()
+    })?;
+    for event in page.events.iter().filter(|e| e.result == "failure") {
+        println!("{} {:?} refused: {:?}", event.time, event.destination, event.reason);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    AuditPage page = sandbox.audit(new AuditOptions().setKind("egress"));
+    for (AuditEvent event : page.events) {
+        if ("failure".equals(event.result)) {
+            System.out.println(event.time + " " + event.destination + " refused: " + event.reason);
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Reasons you will see:
+
+| Reason | Meaning |
+|---|---|
+| `dns_not_allowed` | a DNS query for a name no entry covers |
+| `host_not_allowed` | HTTP (or a WASM or isolate connection) to a name no entry covers |
+| `sni_not_allowed` | HTTPS for a name no entry covers |
+| `no_sni` | HTTPS without a server name, to an address no CIDR allows |
+| `ip_not_allowed` | a direct connection to an address no CIDR allows (WASM, isolate) |
+| `sni_mismatch` | a WASM sandbox connected to an allowed name but asked TLS for another |
+| `blocked_ip` | an allowed name that resolves to a private, loopback or metadata address |
+| `firewall_reject` | another port or protocol, refused by the host firewall |
+| `dns_rate_limited` | too many DNS queries from the sandbox |
+| `conn_cap` | the sandbox has too many connections open through the filter |
+| `upstream_proxy_unavailable` | the operator's upstream proxy couldn't be reached (private networks) |
+
+Pass `nextCursor` back as `cursor` to read older pages.
+
+---
+
+## Check the filter's state
+
+On container runtimes the filter runs in a separate per-node service, the
+egress gateway. If it is down, sandboxes that use hostnames are held with no
+egress at all rather than left unfiltered, and `get` reports why:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const current = await client.get(sandbox.id)
+    console.log(current.egressStatus) // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    current = client.get(sandbox.id)
+    print(getattr(current, 'egressStatus', None))  # "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    current, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        return err
+    }
+    fmt.Println(current.EgressStatus) // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let current = client.get(&sandbox.data.id)?;
+    println!("{:?}", current.data.egress_status); // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox current = client.get(sandbox.id);
+    System.out.println(current.egressStatus); // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+</Tabs>
+
+- **`active`**: filtering as listed.
+- **`unavailable`**: the gateway is down or restarting; egress comes back by
+  itself within seconds of it returning.
+- **`held`**: the policy couldn't be applied. The sandbox stays shut until it
+  can be.
+
+A create that names hostnames while the node's gateway can't take it answers
+`503` with code `egress_gateway_unavailable` and a `Retry-After`; retry it. In
+a cluster, such creates are placed only on nodes whose gateway is ready.
+
+---
+
+## Runtimes
+
+| Runtime | Hostname filtering |
+|---|---|
+| Docker, containerd, gVisor | the node's egress gateway (DNS filter plus a TLS/HTTP name check) |
+| WASM | enforced inside the WASM network mediator; a denied connect returns an error naming the host and rule |
+| Isolate | enforced by the isolate egress proxy, which always uses HTTPS and returns a `403` naming the host |
+| Firecracker | not yet: hostname entries are refused with `501` |
+
+A node can't offer hostname filtering when privileged sandboxes are enabled on
+it, when its sandbox bridge carries IPv6, or when its host firewall drops the
+gateway's redirected traffic (the gateway checks this itself at start). Creates
+that use hostnames get `501` there; CIDR-only policies keep working.
+
+---
+
+## Private networks
+
+For a deployment with no route to the internet, such as a bank's private
+cloud, the operator can describe the network in one file,
+`/etc/sandboxd/egress-policy.yaml`, set through `SB_EGRESS_OPERATOR_FILE`. Every
+setting is optional, and without the file nothing changes.
+
+```yaml
+version: 1
+internal_zone:
+  suffixes: [corp.bank.internal]     # names that may resolve to internal ranges
+  cidrs: [10.0.0.0/8]                # the internal ranges those names may reach
+default_policy:
+  mode: allowlist                    # open | block_all | allowlist, for creates that set no egress
+  allow_out: [artifactory.corp.bank.internal]
+ceiling:
+  allow_out: ["*.corp.bank.internal", pypi.org]   # every allow entry must fit inside
+deny_cidrs: [10.50.0.0/16]           # always dropped, for every sandbox
+node_control_port_guard: true        # sandboxes can't reach AerolVM control ports on any node
+upstream_proxy:
+  url: http://proxy.corp.bank.internal:3128
+  auth_file: /etc/sandboxd/proxy-auth   # user:password, mode 0600
+  no_proxy: [mirror.corp.bank.internal]
+```
+
+- **Internal zone.** A name under a listed suffix may resolve into the listed
+  ranges, and only that name's address is opened. Raw connections into the
+  range, other names that resolve there, and metadata addresses stay blocked.
+- **Default policy.** A create that says nothing about egress gets this one,
+  stored with the sandbox, so editing the file later never changes a running
+  sandbox.
+- **Ceiling.** An allow entry that doesn't fit is refused with `400` naming it.
+- **Deny floor and control-port guard.** Applied to every sandbox on the node,
+  whatever its policy.
+- **Upstream proxy.** Allowed names outside the internal zone and `no_proxy`
+  leave through the bank's proxy. Their DNS answers are placeholder addresses,
+  since the proxy, not the sandbox, resolves outside names. `host:port`
+  entries for these names must use port 80 or 443.
+
+If the file is present but invalid when sandboxd starts, every create is
+refused with `503` and code `egress_operator_config_invalid` until it's fixed.
+
+---
+
+## Limitations
+
+- **IPv4 only.** As with network isolation, IPv6 egress isn't filtered.
+- **Names, not paths.** The filter decides on the hostname. It doesn't read
+  HTTPS content, so it can't allow one path or method and refuse another.
+- **Set at create.** The policy is fixed when the sandbox is created.
+- **Firecracker** doesn't support hostname entries yet.

@@ -39,6 +39,10 @@ feature is still mid-rollout.
 | `SB_FIRECRACKER_OVERLAY_ENABLED` | true |
 | `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` — sync wait on HA create for ≥1 peer ACK before return. Cluster mode requires a positive value; remaining peers stay async. |
 | `SB_EGRESS_ATTRIBUTION_ENABLED` | true — host-mediated egress destinations (wasm + isolate) into audit JSONL; dial-path only, never create. Set false to disable. |
+| `SB_EGRESS_FQDN_ENABLED` | true — hostname entries in `network_allow_out` (plans/egress-domain-filtering.md, CEO D25). Inert until a sandbox uses one: no per-sandbox state otherwise. Needs the `aerolvm-egress-gateway` unit for container runtimes; without it (or on a privileged node) hostname creates get 501. `false` refuses them everywhere. |
+| `SB_EGRESS_GATEWAY_SOCKET` | `/run/aerolvm/egress-gateway.sock` — sandboxd ↔ egress-gateway UDS, created root-owned 0600 by `aerolvm-egress-gateway.socket`. |
+| `SB_EGRESS_OPERATOR_FILE` | unset — the private-cloud operator file (default policy, ceiling, deny floor, internal zone, upstream proxy, control-port guard); see `setup/runbooks/egress-gateway.md`. Unset keeps every default. An invalid file at boot refuses creates (503) until fixed. |
+| Egress gateway (`/etc/sandboxd/egress-gateway.env`) | `SB_EGRESS_DNS_PORT` 53054, `SB_EGRESS_PROXY_PORT` 15080, `SB_EGRESS_DNS_UPSTREAMS` (host resolver), `SB_EGRESS_DNS_QPS` 50 per sandbox, `SB_EGRESS_PROXY_MAX_CONNS` 16384 per node, `SB_EGRESS_PROXY_MAX_CONNS_PER_SANDBOX` 512, `SB_EGRESS_LEARNED_MAX` 512 per sandbox, `SB_EGRESS_AUDIT_BUFFER` 10000 events, `SB_EGRESS_STATE_DIR` `/var/lib/aerolvm-egress`, `SB_EGRESS_PEER_CGROUP` `sandboxd.service`. Sized for the 100k-sandbox fleet budget (plans/egress-domain-filtering.md §8.2). |
 
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |

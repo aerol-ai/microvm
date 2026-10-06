@@ -417,4 +417,4 @@ For details on setting up quotas, see the [Network Usage & Quotas](/network-usag
 ## Limitations
 
 - **IPv4 Only**: Network isolation and byte limits are applied to IPv4 routes. If the sandbox has IPv6 routing enabled, those connections are not blocked.
-- **CIDR-based, not domain-based**: Selective egress (`networkAllowOut` / `networkDenyOut`) matches on IP CIDRs, not hostnames. There is no domain allowlist or DNS-only mode — allow the CIDRs your destination resolves to.
+- **Hostnames need the egress gateway**: `networkAllowOut` also takes hostnames, `*.` wildcards and `host:port` entries (see [Egress Domain Filtering](/egress-domain-filtering/)). On container runtimes they are enforced by the node's egress gateway; on a node that can't run it, a create with hostname entries is refused with `501`, while CIDR-only policies keep working. `networkDenyOut` takes CIDRs only.
