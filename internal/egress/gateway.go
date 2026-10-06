@@ -63,6 +63,16 @@ func (e *entry) kernelBlocked() bool { return e.blocked&^BlockRestart != 0 }
 type learnKey struct {
 	dst  netip.Addr
 	port uint16
+	// bin: the element is in bin_learned, so the flow is redirected to the
+	// proxy to be traced to its executable (P3-3), not accepted directly.
+	bin bool
+}
+
+func (k learnKey) set() string {
+	if k.bin {
+		return SetBinLearned
+	}
+	return SetAllowLearned
 }
 
 // Gateway holds per-node gateway state and drives the Backend.
@@ -80,7 +90,10 @@ type Gateway struct {
 	bySrc map[netip.Addr]string
 
 	learnedMu sync.Mutex
-	learned   map[string]map[learnKey]time.Time // shadow of allow_learned (D18)
+	learned   map[string]map[learnKey]time.Time // shadow of allow_learned and bin_learned (D18)
+	// binNames names each bin_learned destination, so the proxy knows which
+	// host a redirected flow is for.
+	binNames map[string]map[learnKey]string
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
@@ -92,16 +105,17 @@ type Gateway struct {
 // New builds a Gateway. Call Bootstrap before use.
 func New(opts Options) *Gateway {
 	g := &Gateway{
-		be:      opts.Backend,
-		layout:  opts.Layout,
-		ct:      opts.Conntrack,
-		maxLrn:  opts.LearnedMax,
-		log:     opts.Logger,
-		now:     opts.Now,
-		byID:    map[string]*entry{},
-		bySrc:   map[netip.Addr]string{},
-		learned: map[string]map[learnKey]time.Time{},
-		conns:   map[string]map[*TrackedConn]struct{}{},
+		be:       opts.Backend,
+		layout:   opts.Layout,
+		ct:       opts.Conntrack,
+		maxLrn:   opts.LearnedMax,
+		log:      opts.Logger,
+		now:      opts.Now,
+		byID:     map[string]*entry{},
+		bySrc:    map[netip.Addr]string{},
+		learned:  map[string]map[learnKey]time.Time{},
+		binNames: map[string]map[learnKey]string{},
+		conns:    map[string]map[*TrackedConn]struct{}{},
 	}
 	if g.maxLrn <= 0 {
 		g.maxLrn = DefaultLearnedMax
@@ -489,42 +503,46 @@ func (g *Gateway) Sync(specs []Spec) error {
 	return nil
 }
 
-// sweepLearned reconciles allow_learned against the synced state straight
-// from the kernel. After a gateway restart the shadow map is empty, so the
-// kernel is the only record: elements whose source no longer belongs to an
-// attached, unchanged sandbox are deleted, and the rest seed the shadow with
-// an already-due expiry (the next DNS answer refreshes them with one write).
+// sweepLearned reconciles allow_learned and bin_learned against the synced
+// state straight from the kernel. After a gateway restart the shadow map is
+// empty, so the kernel is the only record: elements whose source no longer
+// belongs to an attached, unchanged sandbox are deleted, and the rest seed
+// the shadow with an already-due expiry (the next DNS answer refreshes them
+// with one write, and gives a bin_learned element its name back; until then
+// the proxy refuses its flows).
 func (g *Gateway) sweepLearned(next map[string]*entry, changed map[string]bool) {
-	elems, err := g.be.List(SetAllowLearned)
-	if err != nil {
-		g.log.Warn("egress: list learned elements for sync failed", "error", err)
-		return
-	}
 	owner := map[netip.Addr]string{}
 	for id, e := range next {
 		owner[e.spec.IP] = id
 	}
 	now := g.now()
-	var stale []Elem
-	g.learnedMu.Lock()
-	for _, el := range elems {
-		id, ok := owner[el.Src]
-		if !ok || changed[id] {
-			stale = append(stale, Elem{Src: el.Src, Dst: el.Dst, Port: el.Port})
+	for _, set := range []string{SetAllowLearned, SetBinLearned} {
+		elems, err := g.be.List(set)
+		if err != nil {
+			g.log.Warn("egress: list learned elements for sync failed", "set", set, "error", err)
 			continue
 		}
-		if g.learned[id] == nil {
-			g.learned[id] = map[learnKey]time.Time{}
+		var stale []Elem
+		g.learnedMu.Lock()
+		for _, el := range elems {
+			id, ok := owner[el.Src]
+			if !ok || changed[id] {
+				stale = append(stale, Elem{Src: el.Src, Dst: el.Dst, Port: el.Port})
+				continue
+			}
+			if g.learned[id] == nil {
+				g.learned[id] = map[learnKey]time.Time{}
+			}
+			k := learnKey{dst: el.Dst, port: el.Port, bin: set == SetBinLearned}
+			if _, known := g.learned[id][k]; !known {
+				g.learned[id][k] = now
+			}
 		}
-		k := learnKey{dst: el.Dst, port: el.Port}
-		if _, known := g.learned[id][k]; !known {
-			g.learned[id][k] = now
-		}
-	}
-	g.learnedMu.Unlock()
-	if len(stale) > 0 {
-		if err := g.be.Apply([]Op{{Set: SetAllowLearned, Del: true, Elems: stale}}); err != nil {
-			g.log.Warn("egress: delete stale learned elements failed", "error", err)
+		g.learnedMu.Unlock()
+		if len(stale) > 0 {
+			if err := g.be.Apply([]Op{{Set: set, Del: true, Elems: stale}}); err != nil {
+				g.log.Warn("egress: delete stale learned elements failed", "set", set, "error", err)
+			}
 		}
 	}
 }
@@ -607,6 +625,13 @@ func (g *Gateway) Restore(specs []Spec) error {
 // TTL. The shadow map skips the netlink write while the element has more than
 // half its timeout left (D18); the per-sandbox cap fails closed (EF-62).
 func (g *Gateway) AddLearned(id string, dst netip.Addr, port uint16, ttl time.Duration) error {
+	return g.LearnFor(id, "", dst, port, ttl)
+}
+
+// LearnFor is AddLearned for an answer to name. When a rule traces name's
+// port to executables (P3-3), the element goes to bin_learned instead: the
+// flow is redirected to the proxy, which checks the binary before dialing.
+func (g *Gateway) LearnFor(id, name string, dst netip.Addr, port uint16, ttl time.Duration) error {
 	if !dst.Is4() {
 		return fmt.Errorf("egress: learned destination %s is not IPv4", dst)
 	}
@@ -617,7 +642,7 @@ func (g *Gateway) AddLearned(id string, dst netip.Addr, port uint16, ttl time.Du
 		return fmt.Errorf("%w: %s", ErrNotAttached, id)
 	}
 	now := g.now()
-	k := learnKey{dst: dst, port: port}
+	k := learnKey{dst: dst, port: port, bin: name != "" && port != 80 && port != 443 && e.rules.NeedsBinary(name, port)}
 	g.learnedMu.Lock()
 	shadow := g.learned[id]
 	if exp, ok := shadow[k]; ok && exp.Sub(now) > ttl/2 {
@@ -629,7 +654,7 @@ func (g *Gateway) AddLearned(id string, dst netip.Addr, port uint16, ttl time.Du
 		return ErrLearnedCap
 	}
 	g.learnedMu.Unlock()
-	if err := g.be.Apply([]Op{{Set: SetAllowLearned, Elems: []Elem{{Src: e.spec.IP, Dst: dst, Port: port, Timeout: ttl}}}}); err != nil {
+	if err := g.be.Apply([]Op{{Set: k.set(), Elems: []Elem{{Src: e.spec.IP, Dst: dst, Port: port, Timeout: ttl}}}}); err != nil {
 		return fmt.Errorf("%w: learned %s: %v", ErrUnavailable, id, err)
 	}
 	g.learnedMu.Lock()
@@ -637,8 +662,23 @@ func (g *Gateway) AddLearned(id string, dst netip.Addr, port uint16, ttl time.Du
 		g.learned[id] = map[learnKey]time.Time{}
 	}
 	g.learned[id][k] = now.Add(ttl)
+	if k.bin {
+		if g.binNames[id] == nil {
+			g.binNames[id] = map[learnKey]string{}
+		}
+		g.binNames[id][k] = name
+	}
 	g.learnedMu.Unlock()
 	return nil
+}
+
+// BinName returns the name a bin_learned destination was answered for, for
+// the proxy to decide a redirected flow (P3-3).
+func (g *Gateway) BinName(id string, dst netip.AddrPort) (string, bool) {
+	g.learnedMu.Lock()
+	defer g.learnedMu.Unlock()
+	name, ok := g.binNames[id][learnKey{dst: dst.Addr(), port: dst.Port(), bin: true}]
+	return name, ok
 }
 
 func (g *Gateway) liveLearnedLocked(id string, now time.Time) int {
@@ -648,6 +688,7 @@ func (g *Gateway) liveLearnedLocked(id string, now time.Time) int {
 			n++
 		} else {
 			delete(g.learned[id], k)
+			delete(g.binNames[id], k)
 		}
 	}
 	return n
@@ -659,15 +700,22 @@ func (g *Gateway) flushLearned(id string, src netip.Addr) {
 	g.learnedMu.Lock()
 	shadow := g.learned[id]
 	delete(g.learned, id)
+	delete(g.binNames, id)
 	g.learnedMu.Unlock()
 	if len(shadow) == 0 {
 		return
 	}
-	elems := make([]Elem, 0, len(shadow))
+	bySet := map[string][]Elem{}
 	for k := range shadow {
-		elems = append(elems, Elem{Src: src, Dst: k.dst, Port: k.port})
+		bySet[k.set()] = append(bySet[k.set()], Elem{Src: src, Dst: k.dst, Port: k.port})
 	}
-	if err := g.be.Apply([]Op{{Set: SetAllowLearned, Del: true, Elems: elems}}); err != nil {
+	var ops []Op
+	for _, set := range []string{SetAllowLearned, SetBinLearned} {
+		if elems := bySet[set]; len(elems) > 0 {
+			ops = append(ops, Op{Set: set, Del: true, Elems: elems})
+		}
+	}
+	if err := g.be.Apply(ops); err != nil {
 		// Elements expire on their own timeout; log and move on.
 		g.log.Warn("egress: flush learned elements failed", "sandbox_id", id, "error", err)
 	}

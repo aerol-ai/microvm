@@ -65,6 +65,9 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	if _, err := compileCreateEgressEffective(&req); err != nil {
 		return nil, err
 	}
+	if hasBinariesRule(req.NetworkEgressRules) {
+		return nil, unsupportedBinaries(models.RuntimeIsolate)
+	}
 	bundleRef := models.ModuleRefForCreate(req)
 	if bundleRef == "" {
 		return nil, errors.New("module_ref or image is required for isolate runtime (the JS/TS bundle reference)")

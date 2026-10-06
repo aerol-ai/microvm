@@ -134,3 +134,49 @@ func TestReapplyKeepsEgressRules(t *testing.T) {
 		t.Fatalf("re-applied spec = %+v", spec)
 	}
 }
+
+var gitOnly = []models.EgressRule{{Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/git"}}}
+
+// TestEgressRulesBinaries (P3-3): a runc sandbox's gateway spec carries the
+// init pid to trace from; gVisor and isolate refuse binaries.
+func TestEgressRulesBinaries(t *testing.T) {
+	svc, gw, rt := newPolicyHarness(t)
+	rt.pid = 4242
+	ctx := ownerCtx("acct")
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"github.com:22"}, NetworkEgressRules: gitOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec := gw.attached[resp.ID]; spec.Pid != 4242 || len(spec.Rules) != 1 || spec.Rules[0].Binaries[0] != "/usr/bin/git" {
+		t.Fatalf("gateway spec = %+v", spec)
+	}
+	specs, err := svc.localEgressSpecs(context.Background())
+	if err != nil || len(specs) != 1 || specs[0].Pid != 4242 {
+		t.Fatalf("resync specs = %+v %v", specs, err)
+	}
+	// No pid: traced flows are refused at the gateway, never guessed.
+	rt.pidErr = errors.New("not running")
+	if specs, _ := svc.localEgressSpecs(context.Background()); specs[0].Pid != 0 {
+		t.Fatalf("pid without a running task = %d", specs[0].Pid)
+	}
+	if svc.egressPid(ctx, &models.Sandbox{ID: "x"}) != 0 {
+		t.Fatal("no rules, no pid")
+	}
+
+	if _, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", Runtime: models.RuntimeGvisor, NetworkAllowOut: []string{"github.com:22"},
+		NetworkEgressRules: gitOnly}); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("gVisor: %v", err)
+	}
+	if _, err := svc.createIsolateSandbox(ctx, models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "b", NetworkAllowOut: []string{"github.com:22"},
+		NetworkEgressRules: gitOnly}, ""); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		t.Fatalf("isolate create: %v", err)
+	}
+	seedPolicySandbox(t, svc, models.Sandbox{ID: "sb-iso", Runtime: models.RuntimeIsolate})
+	seedPolicySandbox(t, svc, models.Sandbox{ID: "sb-gv", Runtime: models.RuntimeGvisor})
+	svc.isolate = newMediator()
+	for _, id := range []string{"sb-iso", "sb-gv"} {
+		if _, err := svc.UpdateNetworkPolicy(context.Background(), id, models.NetworkPolicyRequest{NetworkAllowOut: []string{"github.com:22"}, NetworkEgressRules: gitOnly}); !errors.Is(err, models.ErrRuntimeNotImplemented) {
+			t.Fatalf("%s PUT: %v", id, err)
+		}
+	}
+}

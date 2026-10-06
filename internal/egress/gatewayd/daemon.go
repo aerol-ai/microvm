@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
+	"github.com/aerol-ai/microvm/internal/egress/procid"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
@@ -111,6 +112,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		MaxConns: cfg.ProxyMaxConns, MaxConnsPerSandbox: cfg.ProxyMaxPerSandbox,
 		Guard: deps.Guard, OriginalDst: deps.OriginalDst, Dialer: deps.Dialer, Logger: log, Upstream: deps.Upstream,
 		InspectMaxBody: cfg.InspectMaxBody,
+		Identify:       procid.Resolver{}.Matcher,
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{

@@ -1003,6 +1003,11 @@ type EgressRule struct {
 	// secret from the sandbox's own env, which the sandbox itself only
 	// sees as a placeholder (P3-2). Needs Inspect.
 	Inject *EgressInject `json:"inject,omitempty"`
+	// Binaries limits the rule to connections opened by these executables
+	// (absolute paths inside the sandbox; an interpreter's script counts),
+	// on runc sandboxes only (P3-3). A rule with only binaries decides
+	// whole connections, on any port the allow list opens.
+	Binaries []string `json:"binaries,omitempty"`
 }
 
 // EgressInject is a rule's credential injection (plans/egress-domain-

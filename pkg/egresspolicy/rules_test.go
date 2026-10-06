@@ -2,6 +2,7 @@ package egresspolicy
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -200,5 +201,68 @@ func TestRuleInject(t *testing.T) {
 	}
 	if _, ok := InjectEnvKey("env:" + strings.Repeat("A", 129)); ok {
 		t.Fatal("over-long key")
+	}
+}
+
+// TestRuleBinaries (P3-3): binaries narrow a rule to executables; a rule
+// that only names binaries decides whole connections on any allowed port.
+func TestRuleBinaries(t *testing.T) {
+	pol, err := Compile(Spec{AllowOut: []string{"github.com", "github.com:22", "pypi.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, err := CompileRules([]RuleSpec{
+		{Host: "github.com", Ports: []uint16{22, 443}, Binaries: []string{"/usr/bin/git"}},
+		{Host: "pypi.org", Ports: []uint16{443}, Binaries: []string{"/usr/local/bin/pip"}},
+		{Host: "pypi.org", Inspect: true, Methods: []string{"GET"}, Binaries: []string{"/usr/bin/curl"}},
+	}, pol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rs.HasBinaries() || !rs.NeedsBinary("github.com", 22) || rs.NeedsBinary("github.com", 80) || rs.NeedsBinary("other.org", 22) {
+		t.Fatal("NeedsBinary")
+	}
+	if got := rs.BinaryPorts("github.com"); len(got) != 1 || got[0] != 22 {
+		t.Fatalf("BinaryPorts = %v", got)
+	}
+	if rs.BinaryPorts("pypi.org") != nil || (*Rules)(nil).BinaryPorts("x") != nil || (*Rules)(nil).HasBinaries() {
+		t.Fatal("no binary ports")
+	}
+	is := func(want ...string) func(string) bool {
+		return func(p string) bool { return slices.Contains(want, p) }
+	}
+	if _, ok := rs.AdmitConn("github.com", 22, is("/usr/bin/git")); !ok {
+		t.Fatal("git on 22")
+	}
+	if _, ok := rs.AdmitConn("github.com", 22, is("/usr/bin/curl")); ok {
+		t.Fatal("curl on 22 must be refused")
+	}
+	// pip's connection-level rule admits it; curl's admits it only to GET.
+	sub, ok := rs.AdmitConn("pypi.org", 443, is("/usr/bin/curl"))
+	if !ok || sub.Decide("pypi.org", 443, "POST", "/x").Allowed || !sub.Decide("pypi.org", 443, "GET", "/x").Allowed {
+		t.Fatal("curl on pypi")
+	}
+	sub, ok = rs.AdmitConn("pypi.org", 443, is("/usr/local/bin/pip"))
+	if !ok || !sub.Decide("pypi.org", 443, "POST", "/upload").Allowed || !sub.Has("github.com", 22) {
+		t.Fatal("pip on pypi, and rules for other hosts kept")
+	}
+	if sub, ok := rs.AdmitConn("other.org", 443, is()); !ok || sub.Has("other.org", 443) {
+		t.Fatal("unruled host")
+	}
+	if sub, ok := (*Rules)(nil).AdmitConn("x", 1, is()); !ok || sub != nil {
+		t.Fatal("nil rules admit everything")
+	}
+	for name, spec := range map[string]RuleSpec{
+		"relative":              {Host: "github.com", Ports: []uint16{22}, Binaries: []string{"usr/bin/git"}},
+		"unclean":               {Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/../bin/git"}},
+		"too many":              {Host: "github.com", Ports: []uint16{22}, Binaries: strings.Fields(strings.Repeat("/x ", 17))},
+		"methods on 22":         {Host: "github.com", Ports: []uint16{22}, Methods: []string{"GET"}, Binaries: []string{"/usr/bin/git"}},
+		"22 no binaries":        {Host: "github.com", Ports: []uint16{22}},
+		"22 not allowed":        {Host: "pypi.org", Ports: []uint16{22}, Binaries: []string{"/usr/bin/git"}},
+		"443 paths, no inspect": {Host: "pypi.org", Ports: []uint16{443}, Paths: []string{"/x"}, Binaries: []string{"/usr/bin/curl"}},
+	} {
+		if _, err := CompileRules([]RuleSpec{spec}, pol); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

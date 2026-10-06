@@ -66,7 +66,7 @@ func injectSecrets(rules []egresspolicy.RuleSpec, env map[string]string) map[str
 func ruleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 	out := make([]egresspolicy.RuleSpec, 0, len(rules))
 	for _, r := range rules {
-		spec := egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect}
+		spec := egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect, Binaries: r.Binaries}
 		if r.Inject != nil {
 			spec.Inject = &egresspolicy.InjectSpec{Header: r.Inject.Header, SecretRef: r.Inject.SecretRef}
 		}

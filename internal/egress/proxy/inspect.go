@@ -105,7 +105,7 @@ func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 // serveInspect terminates TLS for an inspected name and serves its requests
 // until the client leaves, the connection idles out, or a policy change
 // closes it.
-func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, name string, nameAllowed bool) {
+func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, dst netip.AddrPort, name string, nameAllowed bool, is func(string) bool) {
 	id := src.Spec.ID
 	ins := p.currentInspector()
 	if ins == nil {
@@ -147,7 +147,7 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, na
 	}
 	defer tr.CloseIdleConnections()
 
-	h := &inspectHandler{p: p, id: id, peer: peer, name: name, rp: &httputil.ReverseProxy{
+	h := &inspectHandler{p: p, id: id, peer: peer, name: name, conn: c, dst: dst, is: is, rp: &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.Out.URL.Scheme = "https"
 			pr.Out.URL.Host = name
@@ -182,6 +182,11 @@ type inspectHandler struct {
 	peer netip.Addr
 	name string
 	rp   *httputil.ReverseProxy
+	// conn, dst and is trace the connection for per-binary rules (P3-3);
+	// is is traced once and reused for every request.
+	conn net.Conn
+	dst  netip.AddrPort
+	is   func(string) bool
 }
 
 func (h *inspectHandler) deny(w http.ResponseWriter, mode egress.Mode, status int, reason, msg string) {
@@ -213,8 +218,13 @@ func (h *inspectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.deny(w, cur.Mode, http.StatusForbidden, ReasonHostNotAllowed, egresspolicy.DenyMessage(h.name, rule))
 		return
 	}
-	if cur.Rules.Has(h.name, 443) {
-		matched, reason, ok := checkRules(cur.Rules, h.name, 443, r)
+	rules, reason, ok := h.p.admit(cur, cur.Rules, h.conn, h.dst, h.name, 443, &h.is)
+	if !ok {
+		h.deny(w, cur.Mode, http.StatusForbidden, reason, fmt.Sprintf("aerolvm egress policy: this program may not reach %s (network_egress_rules binaries)", h.name))
+		return
+	}
+	if rules.Has(h.name, 443) {
+		matched, reason, ok := checkRules(rules, h.name, 443, r)
 		if !ok {
 			h.deny(w, cur.Mode, http.StatusForbidden, reason, ruleDenyMessage(r, h.name, reason))
 			return

@@ -60,12 +60,24 @@ func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 	}
 	out := make([]egresspolicy.RuleSpec, len(rules))
 	for i, r := range rules {
-		out[i] = egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect}
+		out[i] = egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect, Binaries: r.Binaries}
 		if r.Inject != nil {
 			out[i].Inject = &egresspolicy.InjectSpec{Header: r.Inject.Header, SecretRef: r.Inject.SecretRef}
 		}
 	}
 	return out
+}
+
+// hasBinariesRule reports whether a rule names binaries (P3-3).
+func hasBinariesRule(rules []models.EgressRule) bool {
+	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return len(r.Binaries) > 0 })
+}
+
+// unsupportedBinaries: the runtime's processes are invisible to the host
+// (gVisor's netstack, a microVM) or it has no binaries (isolate, WASM), so
+// a per-binary rule couldn't be enforced (P3-3).
+func unsupportedBinaries(runtime string) error {
+	return fmt.Errorf("runtime %q does not support binaries in network_egress_rules (runc only): %w", runtime, models.ErrRuntimeNotImplemented)
 }
 
 // hasInspectRule reports whether a rule needs TLS terminated, so the sandbox

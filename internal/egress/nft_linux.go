@@ -24,8 +24,9 @@ const TableName = "aerolvm_egress"
 // layoutVersion is bumped whenever the static layout changes. A table carrying
 // another version's marker is replaced in one transaction. v2: node-wide
 // floor and control-port guard for every sandbox on the bridges, not only
-// gateway-mode ones (§5.10 PC-2).
-const layoutVersion = 2
+// gateway-mode ones (§5.10 PC-2). v3: bin_learned and its redirect for
+// per-binary rules (P3-3).
+const layoutVersion = 3
 
 // Dynamic flow sets are sized explicitly so a full set is a known state (S10).
 const (
@@ -66,6 +67,7 @@ var setDefs = []setDef{
 	{name: SetDenyFloor, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr), interval: true, concat: true},
 	{name: SetNodeControl, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), interval: true, concat: true},
 	{name: SetAllowLearned, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, concat: true},
+	{name: SetBinLearned, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, concat: true},
 	{name: SetLearnFlows, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, dynamic: true, size: flowSetSize, concat: true},
 	{name: SetRejectedFlows, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, dynamic: true, size: flowSetSize, concat: true},
 	{name: setRejectMeter, key: nftables.TypeIPAddr, timeout: true, dynamic: true, size: flowSetSize},
@@ -319,7 +321,7 @@ func encodeElems(set string, list []Elem) ([]nftables.SetElement, error) {
 		case SetNodeControl:
 			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
 			el.KeyEnd = append(append(ip4(srcEnd(e)), ip4(e.Dst)...), port4(e.Port)...)
-		case SetAllowLearned, SetLearnFlows, SetRejectedFlows:
+		case SetAllowLearned, SetBinLearned, SetLearnFlows, SetRejectedFlows:
 			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
 			el.Timeout = e.Timeout
 		default:
@@ -368,7 +370,7 @@ func decodeElems(set string, raw []nftables.SetElement) []Elem {
 			if end := addrAt(r.KeyEnd, 0); end != e.Src {
 				e.SrcEnd = end
 			}
-		case SetAllowLearned, SetLearnFlows, SetRejectedFlows:
+		case SetAllowLearned, SetBinLearned, SetLearnFlows, SetRejectedFlows:
 			e.Dst = addrAt(r.Key, 4)
 			if len(r.Key) >= 10 {
 				e.Port = binary.BigEndian.Uint16(r.Key[8:10])
@@ -501,12 +503,15 @@ func (b *NFTBackend) addChains(c *nftables.Conn, cfg LayoutConfig) {
 	tcp, udp := byte(unix.IPPROTO_TCP), byte(unix.IPPROTO_UDP)
 
 	// prerouting: DNS first, so a CIDR-allowed resolver can't bypass the
-	// filter; then CIDR-allowed destinations skip the proxy; then 80/443.
+	// filter; then flows a per-binary rule traces go to the proxy (P3-3),
+	// ahead of the CIDR skip so a broad CIDR can't skip the binary check;
+	// then CIDR-allowed destinations skip the proxy; then 80/443.
 	add(pre,
 		notIPv4Return(),
 		cat(saddrNotIn(SetFQDNSrc), []expr.Any{verdict(expr.VerdictReturn)}),
 		cat(l4proto(udp), dportEq(53), redirectTo(cfg.DNSPort)),
 		cat(l4proto(tcp), dportEq(53), redirectTo(cfg.DNSPort)),
+		cat(l4proto(tcp), flowKey(), []expr.Any{&expr.Lookup{SourceRegister: reg1, SetName: SetBinLearned}}, redirectTo(cfg.ProxyPort)),
 		cat(pairIn(SetAllowCIDR), []expr.Any{verdict(expr.VerdictAccept)}),
 		cat(l4proto(tcp), dportEq(80), redirectTo(cfg.ProxyPort)),
 		cat(l4proto(tcp), dportEq(443), redirectTo(cfg.ProxyPort)),

@@ -60,6 +60,10 @@ type Spec struct {
 	// (plans/egress-domain-filtering.md §5.9, P3-1); the proxy holds each
 	// request to a ruled host to them.
 	Rules []egresspolicy.RuleSpec `json:"rules,omitempty"`
+	// Pid is the sandbox's init process on the host, for tracing a
+	// connection to its executable when rules name binaries (P3-3); 0 when
+	// none do.
+	Pid int `json:"pid,omitempty"`
 	// Secrets are the values inject rules send, by env key (P3-2). They
 	// cross the UDS and live in memory only: SaveSnapshot drops them, and
 	// sandboxd's Sync after a restart brings them back.
@@ -94,10 +98,14 @@ const (
 	SetAllowCIDR      = "allow_cidr"
 	SetDenyCIDR       = "deny_cidr"
 	SetAllowLearned   = "allow_learned"
-	SetLearnFlows     = "learn_flows"
-	SetRejectedFlows  = "rejected_flows"
-	SetDenyFloor      = "deny_floor"
-	SetNodeControl    = "node_control"
+	// SetBinLearned holds (src, dst, port) for host:port rules that trace
+	// connections to executables (P3-3): prerouting redirects them to the
+	// proxy instead of accepting them in forward.
+	SetBinLearned    = "bin_learned"
+	SetLearnFlows    = "learn_flows"
+	SetRejectedFlows = "rejected_flows"
+	SetDenyFloor     = "deny_floor"
+	SetNodeControl   = "node_control"
 )
 
 // managedSets are the sets whose contents Sync replaces from sandboxd's state.

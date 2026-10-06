@@ -23,6 +23,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 const (
@@ -331,6 +333,34 @@ func TestKernelDataPath(t *testing.T) {
 		}
 		if got := dialFromSandbox(t, remote9000); got != "REFUSED" {
 			t.Fatalf("other port on the learned IP must stay closed: %s", got)
+		}
+	})
+	t.Run("a per-binary host:port is redirected to the proxy", func(t *testing.T) {
+		// P3-3: the flow reaches the proxy, which traces its executable,
+		// even with a CIDR allow covering the address.
+		spec := Spec{ID: "sb", IP: sbx, AllowOut: []string{"github.com:22", kRemoteIP + "/32"},
+			Rules: []egresspolicy.RuleSpec{{Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/git"}}}}
+		if err := g.Update(spec); err != nil {
+			t.Fatal(err)
+		}
+		if err := g.LearnFor("sb", "github.com", netip.MustParseAddr(kRemoteIP), 22, time.Minute); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, net.JoinHostPort(kRemoteIP, "22")); got != "OK proxy" {
+			t.Fatalf("got %s, want the host proxy", got)
+		}
+		if name, ok := g.BinName("sb", netip.AddrPortFrom(netip.MustParseAddr(kRemoteIP), 22)); !ok || name != "github.com" {
+			t.Fatalf("BinName = %q %v", name, ok)
+		}
+		if err := g.Update(Spec{ID: "sb", IP: sbx, AllowOut: []string{"github.com:22"}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, net.JoinHostPort(kRemoteIP, "22")); got != "REFUSED" {
+			t.Fatalf("a changed policy flushes the redirect: %s", got)
+		}
+		// Leave the learned port the next subtests expect.
+		if err := g.AddLearned("sb", netip.MustParseAddr(kRemoteIP), 22, time.Minute); err != nil {
+			t.Fatal(err)
 		}
 	})
 	t.Run("blocked sandbox is dropped, stays in fqdn_src", func(t *testing.T) {

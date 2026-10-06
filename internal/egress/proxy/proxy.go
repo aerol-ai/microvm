@@ -47,6 +47,12 @@ const (
 	ReasonUnknownSource  = "unknown_source"
 	ReasonDialFailed     = "dial_failed"
 	ReasonBadRequest     = "bad_request"
+	// ReasonBinaryNotAllowed: a per-binary rule covers the destination and
+	// the connection's executable isn't listed (P3-3).
+	ReasonBinaryNotAllowed = "binary_not_allowed"
+	// ReasonBinaryUnknown: the connection couldn't be traced to an
+	// executable, so a per-binary rule can't admit it.
+	ReasonBinaryUnknown = "binary_unknown"
 	// ReasonRuleDenied: a ruled host's request matched no rule (P3-1).
 	ReasonRuleDenied = "rule_denied"
 	// ReasonPathNotCanonical: a ruled host's request path could be read two
@@ -59,7 +65,14 @@ const (
 type Sources interface {
 	Source(netip.Addr) (egress.Source, bool)
 	Track(id, host string, port uint16, conn net.Conn) *egress.TrackedConn
+	// BinName names the host a redirected per-binary flow is for (P3-3).
+	BinName(id string, dst netip.AddrPort) (string, bool)
 }
+
+// Identifier traces a sandbox connection local→remote to its executable
+// (P3-3, *procid.Resolver): is(path) reports whether the connection's
+// process is the binary at path inside the sandbox.
+type Identifier func(pid int, local, remote netip.AddrPort) (is func(path string) bool, err error)
 
 // Decision is one decided connection or request, for audit and learn mode.
 type Decision struct {
@@ -108,6 +121,9 @@ type Config struct {
 	UpstreamRoots *x509.CertPool
 	// InspectMaxBody caps an inspected request body (P3-1).
 	InspectMaxBody int64
+	// Identify traces connections for per-binary rules (P3-3); nil refuses
+	// every connection a per-binary rule covers.
+	Identify Identifier
 }
 
 // Proxy serves redirected connections.
@@ -243,9 +259,86 @@ func (p *Proxy) handle(c net.Conn) {
 	case 80:
 		p.serveHTTP(c, src, dst)
 	default:
-		// Only 80/443 are redirected; anything else is a misconfiguration.
+		// Other ports reach the proxy only through bin_learned (P3-3).
+		p.serveTraced(c, src, dst)
+	}
+}
+
+// identify traces c, whose original destination is dst, to its executable.
+func (p *Proxy) identify(src egress.Source, c net.Conn, dst netip.AddrPort) (func(string) bool, error) {
+	if p.cfg.Identify == nil {
+		return nil, errors.New("this gateway can't trace connections to executables")
+	}
+	local, err := netip.ParseAddrPort(c.RemoteAddr().String())
+	if err != nil {
+		return nil, err
+	}
+	return p.cfg.Identify(src.Spec.Pid, netip.AddrPortFrom(local.Addr().Unmap(), local.Port()), dst)
+}
+
+// admit holds a connection to host:port to per-binary rules (P3-3) and
+// returns the rules its requests are then held to. is is traced on first
+// need and cached in *is.
+func (p *Proxy) admit(src egress.Source, rules *egresspolicy.Rules, c net.Conn, dst netip.AddrPort, host string, port uint16,
+	is *func(string) bool) (*egresspolicy.Rules, string, bool) {
+	if !rules.NeedsBinary(host, port) {
+		return rules, "", true
+	}
+	if *is == nil {
+		fn, err := p.identify(src, c, dst)
+		if err != nil {
+			p.log.Debug("egress proxy: trace connection", "sandbox_id", src.Spec.ID, "host", host, "error", err)
+			return nil, ReasonBinaryUnknown, false
+		}
+		*is = fn
+	}
+	admitted, ok := rules.AdmitConn(host, port, *is)
+	if !ok {
+		return nil, ReasonBinaryNotAllowed, false
+	}
+	return admitted, "", true
+}
+
+// serveTraced decides a flow bin_learned redirected (P3-3): a port other
+// than 80/443 to a host a per-binary rule covers. It is a raw TCP splice
+// once the executable is admitted; a refusal resets the connection.
+func (p *Proxy) serveTraced(c net.Conn, src egress.Source, dst netip.AddrPort) {
+	id := src.Spec.ID
+	deny := func(reason, host string) {
+		p.observe(Decision{SandboxID: id, Host: host, Port: dst.Port(), Reason: reason, Mode: src.Mode})
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0) // RST: fail fast (CEO D10)
+		}
 		_ = c.Close()
 	}
+	name, ok := p.src.BinName(id, dst)
+	if !ok {
+		deny(ReasonBinaryUnknown, dst.String())
+		return
+	}
+	allowed, rule := src.Policy.MatchHostPort(name, dst.Port())
+	if !allowed {
+		deny(ReasonHostNotAllowed, name)
+		return
+	}
+	var is func(string) bool
+	if _, reason, ok := p.admit(src, src.Rules, c, dst, name, dst.Port(), &is); !ok {
+		deny(reason, name)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
+	up, err := p.cfg.Dialer.DialContext(ctx, p.dialer(src.Policy, name, rule != ""), "tcp", dst.String())
+	cancel()
+	if err != nil {
+		reason := ReasonDialFailed
+		if egresspolicyRefused(err) {
+			reason = ReasonBlockedIP
+		}
+		deny(reason, name)
+		return
+	}
+	p.observe(Decision{SandboxID: id, Host: name, Port: dst.Port(), Allowed: true, Rule: rule, Mode: src.Mode})
+	p.splice(c, up, nil, id, name, dst.Port())
 }
 
 // overCapClose answers an over-cap connection without reading it: the TLS

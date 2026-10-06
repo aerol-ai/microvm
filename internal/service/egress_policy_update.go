@@ -162,6 +162,9 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	if len(next.NetworkEgressRules) > 0 && s.isWasmSandbox(old) {
 		return nil, unsupportedWasmEgressRules()
 	}
+	if hasBinariesRule(next.NetworkEgressRules) && (s.isIsolateSandbox(old) || old.Runtime == models.RuntimeGvisor) {
+		return nil, unsupportedBinaries(old.Runtime)
+	}
 	if containerRT && hasInspectRule(next.NetworkEgressRules) {
 		st, err := s.store.GetEgressState(ctx, id)
 		if err != nil {
@@ -239,6 +242,7 @@ func samePolicy(a, b *models.Sandbox) bool {
 
 func sameEgressRule(a, b models.EgressRule) bool {
 	return a.Host == b.Host && a.Inspect == b.Inspect && slices.Equal(a.Ports, b.Ports) && slices.Equal(a.Methods, b.Methods) && slices.Equal(a.Paths, b.Paths) &&
+		slices.Equal(a.Binaries, b.Binaries) &&
 		(a.Inject == nil) == (b.Inject == nil) && (a.Inject == nil || *a.Inject == *b.Inject)
 }
 

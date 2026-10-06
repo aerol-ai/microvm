@@ -37,7 +37,7 @@ type fakeLearner struct {
 	ttls  []time.Duration
 }
 
-func (l *fakeLearner) AddLearned(id string, dst netip.Addr, port uint16, ttl time.Duration) error {
+func (l *fakeLearner) LearnFor(id, _ string, dst netip.Addr, port uint16, ttl time.Duration) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.err != nil {

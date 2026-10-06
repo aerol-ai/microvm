@@ -274,6 +274,7 @@ func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
 			continue
 		}
 		spec.Secrets = s.egressSecrets(ctx, sb)
+		spec.Pid = s.egressPid(ctx, sb)
 		specs = append(specs, spec)
 	}
 	return specs, nil
@@ -329,6 +330,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		return nil
 	}
 	spec.Secrets = s.egressSecrets(ctx, sb)
+	spec.Pid = s.egressPid(ctx, sb)
 	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
 		s.egressStats.recordAttachFailed()
 		return err

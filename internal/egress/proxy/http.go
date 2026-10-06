@@ -38,6 +38,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	// hook reads the current request's name and match result.
 	var curName string
 	var curAllowed, curProxied bool
+	var is func(string) bool // the connection's executable, traced on first need (P3-3)
 	up := p.cfg.Upstream
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -106,8 +107,14 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			writeHTTPError(c, http.StatusForbidden, egresspolicy.DenyMessage(host, rule))
 			return
 		}
-		if src.Rules.Has(host, 80) {
-			r, reason, ok := checkRules(src.Rules, host, 80, req)
+		rules, reason, ok := p.admit(src, src.Rules, c, dst, host, 80, &is)
+		if !ok {
+			p.observe(Decision{SandboxID: id, Host: host, Port: 80, Reason: reason, Mode: src.Mode})
+			writeHTTPError(c, http.StatusForbidden, fmt.Sprintf("aerolvm egress policy: this program may not reach %s (network_egress_rules binaries)", host))
+			return
+		}
+		if rules.Has(host, 80) {
+			r, reason, ok := checkRules(rules, host, 80, req)
 			if !ok {
 				p.observe(Decision{SandboxID: id, Host: host, Port: 80, Reason: reason, Mode: src.Mode})
 				writeHTTPError(c, http.StatusForbidden, ruleDenyMessage(req, host, reason))

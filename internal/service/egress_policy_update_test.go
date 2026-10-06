@@ -29,6 +29,13 @@ type policyRuntime struct {
 	applyErr   error
 	liftErr    error
 	blockCalls int
+	pid        int
+	pidErr     error
+}
+
+// ContainerPID stands in for the drivers' init-pid lookup (P3-3).
+func (p *policyRuntime) ContainerPID(context.Context, string) (int, error) {
+	return p.pid, p.pidErr
 }
 
 func (p *policyRuntime) ApplyEgressPolicy(_ string, allow, _ []string) error {

@@ -1732,6 +1732,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
+	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
+		return nil, unsupportedBinaries(chosenRuntime)
+	}
 	durability, err := models.NormalizeCreateDurability(req.Durability, chosenRuntime)
 	if err != nil {
 		return nil, err
@@ -2033,7 +2036,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	s.releaseAdoptedParkReservation(state)
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(ociRt)
-		attachSB := &models.Sandbox{ID: sandboxID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
+		attachSB := &models.Sandbox{ID: sandboxID, ContainerID: state.ContainerID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
 			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
 			NetworkEgressRules: req.NetworkEgressRules, Env: req.Env}
 		egressDone = make(chan error, 1)

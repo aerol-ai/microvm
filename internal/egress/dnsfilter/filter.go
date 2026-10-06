@@ -49,9 +49,10 @@ type Sources interface {
 	Source(netip.Addr) (egress.Source, bool)
 }
 
-// Learner opens (src, ip, port) for a host:port rule (*egress.Gateway).
+// Learner opens (src, ip, port) for a host:port rule (*egress.Gateway). The
+// name lets the gateway send a flow a per-binary rule traces to the proxy.
 type Learner interface {
-	AddLearned(id string, dst netip.Addr, port uint16, ttl time.Duration) error
+	LearnFor(id, name string, dst netip.Addr, port uint16, ttl time.Duration) error
 }
 
 // Decision is one decided query, for audit and learn-mode recording.
@@ -295,7 +296,7 @@ func (f *Filter) learn(s egress.Source, name string, resp *dns.Msg, answers []ne
 			if err := f.cfg.Guard.Check(s.Policy, egresspolicy.DialTarget{Name: name, NameAllowed: true, Addr: netip.AddrPortFrom(ip, port)}); err != nil {
 				continue // loopback, link-local, private outside the zone: never learned
 			}
-			if err := f.learner.AddLearned(s.Spec.ID, ip, port, ttl); err != nil {
+			if err := f.learner.LearnFor(s.Spec.ID, name, ip, port, ttl); err != nil {
 				if errors.Is(err, egress.ErrLearnedCap) {
 					return ReasonLearnedCap, err
 				}

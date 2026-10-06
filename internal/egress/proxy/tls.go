@@ -70,9 +70,17 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			return
 		}
 		nameAllowed, rule = allowed && r != "", r
-		if src.Rules.Inspected(name) {
+		// Per-binary rules (P3-3) admit the connection's executable first;
+		// the rules that admitted it decide inspection.
+		var is func(string) bool
+		rules, reason, ok := p.admit(src, src.Rules, c, dst, name, 443, &is)
+		if !ok {
+			deny(reason, name)
+			return
+		}
+		if rules.Inspected(name) {
 			// An inspect rule: terminate TLS and check each request (P3-1).
-			p.serveInspect(c, br, src, name, nameAllowed)
+			p.serveInspect(c, br, src, dst, name, nameAllowed, is)
 			return
 		}
 		target = net.JoinHostPort(name, "443")

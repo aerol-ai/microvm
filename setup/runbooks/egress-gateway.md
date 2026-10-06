@@ -285,6 +285,31 @@ host's trust store (plans/egress-domain-filtering.md §5.9).
   `host_mismatch` (a `Host` other than the TLS name, answered `421`) and
   `body_too_large` (over `SB_EGRESS_INSPECT_MAX_BODY_BYTES`, `413`).
 
+## PerBinaryRules
+
+A rule with `binaries` admits only connections opened by those executables
+(plans/egress-domain-filtering.md §5.9 P3-3), on runc sandboxes. The gateway
+traces each covered connection from the host: the socket in the sandbox's
+network namespace (`/proc/<init pid>/net/tcp`), the processes in its cgroup
+holding it, and each one's executable (or, for an interpreter, its script),
+compared by device and inode with the listed path resolved inside the
+sandbox. Ports other than 80 and 443 reach the proxy through the
+`bin_learned` set, which the DNS filter fills for host:port entries a
+per-binary rule covers.
+
+- **Needs cgroup v2** and the sandbox's init pid (sandboxd sends it with
+  each attach). On a cgroup v1 host, or when the pid is unknown, covered
+  connections are refused with `binary_unknown`, never let through.
+- **TCP only.** UDP to a covered host:port is refused.
+- **Denials:** `binary_not_allowed` (the executable isn't listed) and
+  `binary_unknown` (the connection couldn't be traced, or a redirected flow
+  arrived before its name was learned again after a gateway restart; the
+  next DNS answer fixes that).
+- **Least privilege, not a boundary.** Root in the sandbox can replace a
+  listed binary, and code that controls an interpreter's environment can
+  run under its script's name. gVisor, Firecracker, WASM and isolate refuse
+  `binaries` with 501.
+
 ## UpstreamProxy
 
 With `upstream_proxy.url` set, allowed names that are neither in the

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -21,6 +22,7 @@ const FieldEgressRules = "network_egress_rules"
 // each request's check cheap.
 const (
 	MaxRules        = 32
+	maxRuleBinaries = 16
 	maxRuleMethods  = 16
 	maxRulePaths    = 32
 	maxRulePathLen  = 256
@@ -44,6 +46,11 @@ type RuleSpec struct {
 	// Inject replaces a request header with a secret the sandbox never
 	// holds (P3-2). It needs an inspected rule on 443.
 	Inject *InjectSpec `json:"inject,omitempty"`
+	// Binaries limits the rule to connections opened by these executables,
+	// absolute paths inside the sandbox (P3-3). A rule with binaries and no
+	// methods, paths or inject works at connection level on any port the
+	// allow list opens, 443 without inspection included.
+	Binaries []string `json:"binaries,omitempty"`
 }
 
 // InjectSpec names the header a rule sets and where its value comes from.
@@ -105,13 +112,14 @@ var reservedInjectHeaders = map[string]bool{
 
 // Rule is one compiled rule.
 type Rule struct {
-	Index   int
-	host    Entry
-	ports   []uint16
-	methods []string
-	paths   []string
-	inspect bool
-	inject  *InjectSpec
+	Index    int
+	host     Entry
+	ports    []uint16
+	methods  []string
+	paths    []string
+	inspect  bool
+	inject   *InjectSpec
+	binaries []string
 }
 
 // Inject returns the header the rule sets and its env key, if any.
@@ -205,11 +213,23 @@ func compileRule(i int, s RuleSpec, pol *Policy) (*Rule, error) {
 			r.ports = []uint16{443}
 		}
 	}
-	for _, p := range r.ports {
-		if p != 80 && p != 443 {
-			return nil, bad("port %d: method and path rules apply to ports 80 and 443", p)
+	if len(s.Binaries) > maxRuleBinaries {
+		return nil, bad("%d binaries; the limit is %d", len(s.Binaries), maxRuleBinaries)
+	}
+	for _, b := range s.Binaries {
+		if !strings.HasPrefix(b, "/") || len(b) > maxRulePathLen || path.Clean(b) != b || strings.ContainsRune(b, 0) {
+			return nil, bad("binary %q must be a clean absolute path inside the sandbox (at most %d bytes)", b, maxRulePathLen)
 		}
-		if p == 443 && !s.Inspect {
+		r.binaries = append(r.binaries, b)
+	}
+	// A rule that only names binaries decides whole connections, so it
+	// needs no view of the requests.
+	connOnly := len(s.Binaries) > 0 && len(s.Methods) == 0 && len(s.Paths) == 0 && s.Inject == nil && !s.Inspect
+	for _, p := range r.ports {
+		if p != 80 && p != 443 && !connOnly {
+			return nil, bad("port %d: method and path rules apply to ports 80 and 443; on other ports a rule can only name binaries", p)
+		}
+		if p == 443 && !s.Inspect && !connOnly {
 			return nil, bad("port 443 is encrypted; set inspect: true to check its requests")
 		}
 		if p == 80 && s.Inject != nil {
@@ -270,6 +290,94 @@ func isMethodToken(m string) bool {
 		}
 	}
 	return true
+}
+
+// NeedsBinary reports whether a connection to host:port must be traced to
+// its executable (P3-3): some rule for it names binaries.
+func (rs *Rules) NeedsBinary(host string, port uint16) bool {
+	return rs.anyFor(host, port, func(r *Rule) bool { return len(r.binaries) > 0 })
+}
+
+// HasBinaries reports whether any rule names binaries.
+func (rs *Rules) HasBinaries() bool {
+	if rs == nil {
+		return false
+	}
+	for _, r := range rs.rules {
+		if len(r.binaries) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// BinaryPorts lists the ports, other than 80 and 443, that rules for host
+// trace to executables: the gateway proxies those flows (P3-3).
+func (rs *Rules) BinaryPorts(host string) []uint16 {
+	if rs == nil {
+		return nil
+	}
+	name := canonicalName(host)
+	var out []uint16
+	for _, r := range rs.rules {
+		if len(r.binaries) == 0 || name == "" || !r.host.coversName(name) {
+			continue
+		}
+		for _, p := range r.ports {
+			if p != 80 && p != 443 && !slicesContains(out, p) {
+				out = append(out, p)
+			}
+		}
+	}
+	return out
+}
+
+func slicesContains(list []uint16, v uint16) bool {
+	for _, x := range list {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// AdmitConn holds a connection to host:port to the rules' binaries: is
+// reports whether the connection's process is the executable at a listed
+// path. It returns the rules the connection's requests are then held to
+// (those for host:port that admitted it, plus every rule for other hosts),
+// and false when rules for host:port exist and none admits the process. A
+// rule without binaries admits any process.
+func (rs *Rules) AdmitConn(host string, port uint16, is func(path string) bool) (*Rules, bool) {
+	if rs == nil {
+		return nil, true
+	}
+	name := canonicalName(host)
+	out := &Rules{rules: make([]*Rule, 0, len(rs.rules))}
+	ruled, admitted := false, false
+	for _, r := range rs.rules {
+		if !r.covers(name, port) {
+			out.rules = append(out.rules, r)
+			continue
+		}
+		ruled = true
+		if len(r.binaries) == 0 || r.admitsBinary(is) {
+			admitted = true
+			out.rules = append(out.rules, r)
+		}
+	}
+	if ruled && !admitted {
+		return nil, false
+	}
+	return out, true
+}
+
+func (r *Rule) admitsBinary(is func(path string) bool) bool {
+	for _, b := range r.binaries {
+		if is(b) {
+			return true
+		}
+	}
+	return false
 }
 
 // Inspects reports whether any rule needs TLS terminated (P3-1): the

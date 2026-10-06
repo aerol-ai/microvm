@@ -260,6 +260,32 @@ func requireInjectKeys(env map[string]string, keys []string) error {
 	return nil
 }
 
+// egressPid returns the host pid of a sandbox's init process, which the
+// gateway traces connections from when rules name binaries (P3-3); 0 when
+// none do, or when the runtime can't say (the gateway then refuses the
+// flows those rules cover rather than guess).
+func (s *Service) egressPid(ctx context.Context, sb *models.Sandbox) int {
+	if !hasBinariesRule(sb.NetworkEgressRules) || sb.ContainerID == "" {
+		return 0
+	}
+	cr, err := s.containerRuntimeForSandbox(sb)
+	if err != nil {
+		return 0
+	}
+	lookup, ok := cr.(interface {
+		ContainerPID(ctx context.Context, containerRef string) (int, error)
+	})
+	if !ok {
+		return 0
+	}
+	pid, err := lookup.ContainerPID(ctx, sb.ContainerID)
+	if err != nil {
+		s.logger.Warn("egress: sandbox pid unavailable; its per-binary flows are refused", "sandbox_id", sb.ID, "error", err)
+		return 0
+	}
+	return pid
+}
+
 // egressSecrets returns the values a sandbox's inject rules send (P3-2):
 // from the env a create holds in memory, or the sealed env otherwise. A
 // value it can't read is left out, so its requests are refused at the

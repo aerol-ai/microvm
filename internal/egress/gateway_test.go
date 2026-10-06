@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 var (
@@ -503,5 +505,58 @@ func TestAttachPolicyChangeClosesNarrowedConns(t *testing.T) {
 	}
 	if g.ConnCount("sb") != 1 {
 		t.Fatal("an unchanged policy must not close connections")
+	}
+}
+
+// TestLearnForBinaries (P3-3): an answer for a host:port a per-binary rule
+// covers goes to bin_learned with its name, so the proxy can decide the
+// redirected flow; flush and a restart sweep handle both sets.
+func TestLearnForBinaries(t *testing.T) {
+	g, be, _ := newTestGateway(t)
+	spec := allowSpec("sb", ipA, "github.com:22", "gitlab.com:22")
+	spec.Rules = []egresspolicy.RuleSpec{{Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/git"}}}
+	if err := g.Attach(spec); err != nil {
+		t.Fatal(err)
+	}
+	gh, gl := netip.MustParseAddr("140.82.112.3"), netip.MustParseAddr("172.65.251.78")
+	if err := g.LearnFor("sb", "github.com", gh, 22, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.LearnFor("sb", "gitlab.com", gl, 22, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if !be.Has(SetBinLearned, Elem{Src: ipA, Dst: gh, Port: 22}) || be.Has(SetAllowLearned, Elem{Src: ipA, Dst: gh, Port: 22}) {
+		t.Fatal("a per-binary host:port must be redirected, not opened")
+	}
+	if !be.Has(SetAllowLearned, Elem{Src: ipA, Dst: gl, Port: 22}) || be.Has(SetBinLearned, Elem{Src: ipA, Dst: gl, Port: 22}) {
+		t.Fatal("an unruled host:port is opened as before")
+	}
+	if name, ok := g.BinName("sb", netip.AddrPortFrom(gh, 22)); !ok || name != "github.com" {
+		t.Fatalf("BinName = %q %v", name, ok)
+	}
+	if _, ok := g.BinName("sb", netip.AddrPortFrom(gl, 22)); ok {
+		t.Fatal("an opened flow has no bin name")
+	}
+	// A restart: the kernel keeps both sets; the sweep seeds the shadow,
+	// and only the next answer brings the name back.
+	g2 := New(Options{Backend: be})
+	if err := g2.Sync([]Spec{spec}); err != nil {
+		t.Fatal(err)
+	}
+	if !be.Has(SetBinLearned, Elem{Src: ipA, Dst: gh, Port: 22}) {
+		t.Fatal("an unchanged sandbox keeps its bin_learned element across a restart")
+	}
+	if _, ok := g2.BinName("sb", netip.AddrPortFrom(gh, 22)); ok {
+		t.Fatal("no name until the next answer")
+	}
+	// A policy change flushes both sets exactly.
+	if err := g.Update(allowSpec("sb", ipA, "github.com:22")); err != nil {
+		t.Fatal(err)
+	}
+	if be.Has(SetBinLearned, Elem{Src: ipA, Dst: gh, Port: 22}) || be.Has(SetAllowLearned, Elem{Src: ipA, Dst: gl, Port: 22}) {
+		t.Fatal("a changed policy must flush both learned sets")
+	}
+	if _, ok := g.BinName("sb", netip.AddrPortFrom(gh, 22)); ok {
+		t.Fatal("flushed names go too")
 	}
 }
