@@ -47,6 +47,7 @@ from .types import (
     EgressProfile,
     EgressProfileList,
     EgressProfileOptions,
+    EgressRule,
     ListEgressProfilesOptions,
     NetworkLearned,
     NetworkPolicy,
@@ -426,6 +427,10 @@ class Sandbox:
             self._data["networkEgressMode"] = "learn"
         else:
             self._data.pop("networkEgressMode", None)
+        if policy.get("networkEgressRules"):
+            self._data["networkEgressRules"] = policy["networkEgressRules"]
+        else:
+            self._data.pop("networkEgressRules", None)
         if "egressStatus" in policy:
             self._data["egressStatus"] = policy["egressStatus"]
         else:
@@ -880,6 +885,9 @@ class MicroVM:
         mode = _first_of(options, "networkEgressMode", "network_egress_mode")
         if mode:
             body["network_egress_mode"] = str(mode)
+        rules = _first_of(options, "networkEgressRules", "network_egress_rules")
+        if rules is not None:
+            body["network_egress_rules"] = _egress_rules(rules)
         payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
         policy: NetworkPolicy = {
             "networkBlockAll": bool(payload.get("network_block_all", False)),
@@ -887,6 +895,7 @@ class MicroVM:
             "networkDenyOut": list(payload.get("network_deny_out") or []),
             "egressProfiles": list(payload.get("egress_profiles") or []),
             "networkEgressMode": str(payload.get("network_egress_mode") or "enforce"),
+            "networkEgressRules": _egress_rules(payload.get("network_egress_rules")),
             "effectiveHostnameCount": int(payload.get("effective_hostname_count") or 0),
         }
         if payload.get("egress_status"):
@@ -1351,6 +1360,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_deny_out": _first_of(options, "networkDenyOut", "network_deny_out"),
             "egress_profiles": _first_of(options, "egressProfiles", "egress_profiles"),
             "network_egress_mode": _first_of(options, "networkEgressMode", "network_egress_mode"),
+            "network_egress_rules": _egress_rules_or_none(_first_of(options, "networkEgressRules", "network_egress_rules")),
             "allow_public_traffic": _first_of(options, "allowPublicTraffic", "allow_public_traffic"),
             "mask_request_host": _first_of(options, "maskRequestHost", "mask_request_host"),
             "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
@@ -1809,6 +1819,28 @@ def _from_api_egress_profile(payload: Dict[str, Any]) -> EgressProfile:
     return result
 
 
+def _egress_rules(rules: Optional[List[Dict[str, Any]]]) -> List[EgressRule]:
+    # The wire and SDK keys are the same words, so this only drops unset
+    # keys and pins the types; it reads both directions.
+    result: List[EgressRule] = []
+    for r in rules or []:
+        rule: EgressRule = {"host": str(r.get("host") or "")}
+        if r.get("ports"):
+            rule["ports"] = [int(p) for p in r["ports"]]
+        if r.get("methods"):
+            rule["methods"] = [str(m) for m in r["methods"]]
+        if r.get("paths"):
+            rule["paths"] = [str(p) for p in r["paths"]]
+        if r.get("inspect"):
+            rule["inspect"] = True
+        result.append(rule)
+    return result
+
+
+def _egress_rules_or_none(rules: Optional[List[Dict[str, Any]]]) -> Optional[List[EgressRule]]:
+    return None if rules is None else _egress_rules(rules)
+
+
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     exposed_ports = _first_of(sandbox, "exposed_ports", "exposedPorts") or []
     lifecycle = _first_of(sandbox, "lifecycle")
@@ -1856,6 +1888,9 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     egress_mode = _first_of(sandbox, "network_egress_mode", "networkEgressMode")
     if egress_mode:
         result["networkEgressMode"] = str(egress_mode)
+    egress_rules = _first_of(sandbox, "network_egress_rules", "networkEgressRules")
+    if egress_rules:
+        result["networkEgressRules"] = _egress_rules(egress_rules)
     applied = _first_of(sandbox, "egress_profiles_applied", "egressProfilesApplied")
     if applied:
         result["egressProfilesApplied"] = [{"name": str(r.get("name", "")), "generation": int(r.get("generation", 0))} for r in applied]

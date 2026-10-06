@@ -12,6 +12,7 @@ export type {
   EgressProfileList,
   EgressProfileOptions,
   EgressProfileRef,
+  EgressRule,
   ListEgressProfilesOptions,
   NetworkLearned,
   NetworkLearnedEntry,

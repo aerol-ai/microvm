@@ -156,6 +156,13 @@ type NetworkLearned = models.NetworkLearned
 // NetworkLearnedEntry is one destination a learn-mode sandbox reached.
 type NetworkLearnedEntry = models.NetworkLearnedEntry
 
+// EgressRule is one method and path rule for NetworkEgressRules. It refines
+// a host the allow list already admits: a request to a ruled host passes
+// when some rule for it admits the method and path, and gets 403 otherwise.
+// Ports default to [80], or [443] with Inspect, which makes the egress
+// gateway terminate TLS with the node's CA (set at create).
+type EgressRule = models.EgressRule
+
 // Egress modes for NetworkEgressMode.
 const (
 	NetworkEgressModeEnforce = models.NetworkEgressModeEnforce

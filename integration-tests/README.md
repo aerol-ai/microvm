@@ -155,11 +155,12 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
-## Egress domain filtering (UC-179..UC-200)
+## Egress domain filtering (UC-179..UC-201)
 
-`suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go` and
-`suite/egress_private_cloud_test.go` cover hostname egress filtering
-(plans/egress-domain-filtering.md P1-10, P1-20, Phase 2).
+`suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
+`suite/egress_phase3_test.go` and `suite/egress_private_cloud_test.go` cover
+hostname egress filtering (plans/egress-domain-filtering.md P1-10, P1-20,
+Phases 2-3).
 
 - **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
   `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
@@ -180,6 +181,13 @@ every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-
   public registries, so a failure there may be registry drift: the built-in
   lists are kept by hand and these UCs are how operators catch a stale one
   (CEO D12).
+- Phase 3, also on `egress-fqdn`: UC-201 (EF-52, EF-53) creates a
+  `python:3.12-alpine` sandbox allowed `api.github.com` with an inspect rule
+  for `GET /repos/**`. Python's `urllib`, trusting the node CA only through
+  `SSL_CERT_FILE`, gets a 200 for the ruled GET through the gateway's TLS
+  termination, and the gateway's own 403 (naming `network_egress_rules`) for a
+  POST and for an unruled path. It calls the public GitHub API unauthenticated,
+  so a 403 on the GET may be GitHub's rate limit; the failure prints the body.
 - UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
   can't reach host services) only need `docker`.
 - **`private-cloud`** (`single-node-private-cloud`, `make

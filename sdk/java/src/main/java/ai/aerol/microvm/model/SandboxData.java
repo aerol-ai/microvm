@@ -39,6 +39,8 @@ public class SandboxData {
     public List<EgressProfileRef> egressProfilesApplied;
     /** "learn" while the sandbox records its egress; null otherwise. */
     public String networkEgressMode;
+    /** Method and path rules on the sandbox's egress; null or empty when it has none. */
+    public List<EgressRule> networkEgressRules;
     public boolean toolboxEnabled;
     public String sshPublicKey;
     public String sshPrivateKey;
@@ -90,6 +92,7 @@ public class SandboxData {
         egressProfiles = other.egressProfiles;
         egressProfilesApplied = other.egressProfilesApplied;
         networkEgressMode = other.networkEgressMode;
+        networkEgressRules = other.networkEgressRules;
         toolboxEnabled = other.toolboxEnabled;
         sshPublicKey = other.sshPublicKey;
         sshPrivateKey = other.sshPrivateKey;

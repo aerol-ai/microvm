@@ -15,6 +15,7 @@ public class NetworkPolicyOptions {
     private List<String> networkDenyOut = new ArrayList<>();
     private List<String> egressProfiles = new ArrayList<>();
     private String networkEgressMode;
+    private List<EgressRule> networkEgressRules = new ArrayList<>();
 
     public boolean getNetworkBlockAll() {
         return networkBlockAll;
@@ -59,6 +60,20 @@ public class NetworkPolicyOptions {
 
     public NetworkPolicyOptions setNetworkEgressMode(String networkEgressMode) {
         this.networkEgressMode = networkEgressMode;
+        return this;
+    }
+
+    /**
+     * Method and path rules; replaces the sandbox's. Adding an inspect rule to a
+     * container sandbox created without one is refused with 409: recreate it
+     * with the rule.
+     */
+    public List<EgressRule> getNetworkEgressRules() {
+        return networkEgressRules;
+    }
+
+    public NetworkPolicyOptions setNetworkEgressRules(List<EgressRule> networkEgressRules) {
+        this.networkEgressRules = networkEgressRules == null ? new ArrayList<>() : networkEgressRules;
         return this;
     }
 }

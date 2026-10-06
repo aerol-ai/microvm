@@ -382,6 +382,8 @@ refused with `503` and code `egress_operator_config_invalid` until it's fixed.
 
 - **IPv4 only.** As with network isolation, IPv6 egress isn't filtered.
 - **Names, not paths.** The filter decides on the hostname. It doesn't read
-  HTTPS content, so it can't allow one path or method and refuse another.
+  HTTPS content, so on its own it can't allow one path or method and refuse
+  another. [Egress rules](/egress-rules-and-inspection) add that, on plain
+  HTTP and on HTTPS hosts you choose to inspect.
 - **Firecracker** doesn't support hostname entries yet, and can't change a
   policy while the sandbox runs.

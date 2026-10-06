@@ -1,0 +1,390 @@
+---
+title: Egress Rules and Inspection
+description: Allow only some methods and paths on an allowed host, over plain HTTP as it is and over HTTPS by checking requests through a per-node CA the sandbox trusts.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+[Egress Domain Filtering](/egress-domain-filtering) decides by hostname: once
+`api.github.com` is allowed, a sandbox can call any endpoint on it, including
+ones that write. **Egress rules** narrow an allowed host to the requests you
+expect, by method and path, such as `GET /repos/acme/**` and nothing else. On
+plain HTTP the egress gateway already reads every request. For HTTPS, an
+**inspect** rule makes the gateway terminate TLS with a certificate authority
+(CA) that belongs to the node, check each request, and open its own TLS
+connection to the real host. Only a sandbox created with an inspect rule
+trusts that CA.
+
+---
+
+## Allow some paths on a plain-HTTP host
+
+Debian's package mirror is served over plain HTTP, so a rule on port 80 needs
+no extra setup. This sandbox can fetch packages and nothing else from
+`deb.debian.org`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'debian:12',
+      networkAllowOut: ['deb.debian.org'],
+      networkEgressRules: [
+        { host: 'deb.debian.org', methods: ['GET'], paths: ['/debian/**', '/debian-security/**'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'debian:12',
+        'networkAllowOut': ['deb.debian.org'],
+        'networkEgressRules': [
+            {'host': 'deb.debian.org', 'methods': ['GET'], 'paths': ['/debian/**', '/debian-security/**']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "debian:12",
+        NetworkAllowOut: []string{"deb.debian.org"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "deb.debian.org",
+            Methods: []string{"GET"},
+            Paths:   []string{"/debian/**", "/debian-security/**"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "debian:12".to_string(),
+        network_allow_out: Some(vec!["deb.debian.org".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "deb.debian.org".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/debian/**".to_string(), "/debian-security/**".to_string()],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("debian:12")
+            .setNetworkAllowOut(List.of("deb.debian.org"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("deb.debian.org")
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/debian/**", "/debian-security/**"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+`apt-get update` and `apt-get install` work as before. A `POST`, or a `GET` for
+any other path on `deb.debian.org`, gets a `403` whose body says what was
+refused, for example `aerolvm egress policy: GET /admin on deb.debian.org is
+not allowed by network_egress_rules`.
+
+A rule on port 80 doesn't touch HTTPS to the same host: without an inspect
+rule, HTTPS is still decided by the hostname alone.
+
+---
+
+## Inspect HTTPS
+
+A rule on port 443 needs `inspect: true`. This sandbox may read the `acme`
+organization's repositories through the GitHub API and do nothing else there:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        { host: 'api.github.com', inspect: true, methods: ['GET'], paths: ['/repos/acme/**'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['GET'], 'paths': ['/repos/acme/**']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "api.github.com",
+            Inspect: true,
+            Methods: []string{"GET"},
+            Paths:   []string{"/repos/acme/**"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec!["api.github.com".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "api.github.com".to_string(),
+            inspect: true,
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("api.github.com"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/repos/acme/**"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `GET https://api.github.com/repos/acme/widgets` works the
+ordinary way: the client sees a certificate for `api.github.com`, issued by the
+node's CA, which the sandbox trusts. A `POST` to the same URL, or a `GET` of
+`https://api.github.com/users/octocat`, gets a `403` from the gateway. Other
+allowed hosts are unaffected; their HTTPS still passes through unopened.
+
+### How a rule matches
+
+| Field | Meaning |
+|---|---|
+| `host` | An exact name or `*.` wildcard, without a port. The allow list (`networkAllowOut` or a [profile](/egress-profiles-and-learn-mode)) must already allow it; a rule for a host that isn't allowed is refused with `400`. |
+| `ports` | `[80]` by default, or `[443]` with `inspect`. Only 80 and 443; a rule on 443 needs `inspect: true`. |
+| `methods` | Exact and upper case, like `GET` or `HEAD`. Empty allows any method. |
+| `paths` | Globs on the request path. Empty allows any path. |
+| `inspect` | Terminate TLS on 443 so the rule can see each request. |
+
+In paths, `*` matches any characters within one segment, and `**`, written as
+a whole segment, matches any number of segments, none included:
+
+| Pattern | Matches | Doesn't match |
+|---|---|---|
+| `/repos/acme/*` | `/repos/acme/widgets` | `/repos/acme`, `/repos/acme/widgets/issues` |
+| `/repos/acme/**` | `/repos/acme`, `/repos/acme/widgets/issues/1` | `/repos/other/widgets` |
+| `/v1/*.json` | `/v1/index.json` | `/v1/a/index.json` |
+| `/files/**/raw` | `/files/raw`, `/files/a/b/raw` | `/files/a/b` |
+
+- **Rules are alternatives.** A request passes when any rule for its host and
+  port admits both its method and its path. A request no rule admits gets a
+  `403`. A host no rule names keeps its allow-list decision.
+- **Paths only.** Rules match the path, not the query string, and a rule's
+  path can't hold `?`, `#`, `%` or spaces.
+- **No ambiguous paths.** On a ruled host, a path with `.` or `..` segments,
+  empty segments (`//`), an encoded slash (`%2F`, `%5C`) or a backslash is
+  refused with `403` (`path_not_canonical`), since a server could read it as
+  another path. That is what keeps `/repos/acme/../../admin` from passing as
+  `/repos/acme/**`. One trailing slash is fine.
+- **Limits.** Up to 32 rules, each with up to 16 methods and 32 paths of at
+  most 256 bytes.
+- **An allow list to refine.** Rules need hostname entries, so they're refused
+  with `400` alongside `networkBlockAll` or learn mode.
+- **Audit.** Refusals are written to the sandbox's
+  [audit log](/egress-domain-filtering#see-what-was-refused) with reason
+  `rule_denied` or `path_not_canonical`.
+
+---
+
+## What the sandbox trusts
+
+Only a sandbox **created** with at least one inspect rule trusts the node's CA.
+It gets the CA and a bundle that adds it to the image's own trust store:
+
+| Path | What it holds |
+|---|---|
+| `/etc/aerolvm/egress-ca.pem` | The node's CA certificate, read-only |
+| `/run/aerolvm/ca-bundle.pem` | The image's trust store plus the CA, written when the sandbox starts, before your command or any exec runs |
+
+Its environment points common TLS clients at them:
+
+| Variable | Points at | Read by |
+|---|---|---|
+| `SSL_CERT_FILE` | the bundle | OpenSSL-based clients, Python's `ssl` and `urllib`, Go on Linux |
+| `REQUESTS_CA_BUNDLE` | the bundle | Python `requests` |
+| `PIP_CERT` | the bundle | pip |
+| `CURL_CA_BUNDLE` | the bundle | curl |
+| `NODE_EXTRA_CA_CERTS` | the CA | Node.js, which adds it to its built-in list |
+| `AEROLVM_EGRESS_CA`, `AEROLVM_EGRESS_CA_BUNDLE` | the CA, the bundle | your own tooling |
+
+- **Your settings win.** A variable the create sets itself is left alone, so
+  you can point a client at a bundle of your own. Include the CA in it.
+- **The system store is unchanged.** A client that ignores these variables and
+  reads the image's default trust store won't trust the CA; point it at the
+  bundle.
+- **One CA per node.** sandboxd creates it the first time a sandbox on the node
+  asks for inspection and keeps its key sealed on disk. The gateway holds the
+  key in memory only and issues each host a certificate that lasts 24 hours.
+- **Nothing else trusts it.** Sandboxes created without an inspect rule don't
+  get the CA.
+
+---
+
+## Host must match, and bodies are capped
+
+On an inspected connection the gateway checks every request, not only the
+first:
+
+- **Host must match.** Each request's `Host` must equal the name the client
+  sent when it opened TLS. Anything else gets `421` (`host_mismatch`). This
+  closes domain fronting: a connection to an allowed name can't carry requests
+  for another site behind the same CDN.
+- **Bodies are capped.** A request body over your operator's limit gets `413`
+  (`body_too_large`). The default is 256 MiB, set by
+  `SB_EGRESS_INSPECT_MAX_BODY_BYTES`.
+- **Current policy.** HTTP/1.1 keep-alive and HTTP/2 both work, and each
+  request is checked against the policy in force at that moment, so a
+  `setNetworkPolicy` change reaches connections that are already open.
+- **Verified upstream.** The gateway's own connection to the real host is
+  checked against the node's trust store, and goes through your operator's
+  upstream proxy when there is one.
+- **Never unchecked.** If the gateway doesn't have the node's CA, the
+  handshake fails with a TLS `access_denied` alert (`inspect_unavailable`)
+  rather than letting the connection through unchecked.
+
+---
+
+## Change rules on a running sandbox
+
+`setNetworkPolicy` replaces the rules along with the rest of the policy. This
+adds a second rule so the sandbox can also open issues:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.setNetworkPolicy({
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        { host: 'api.github.com', inspect: true, methods: ['GET'], paths: ['/repos/acme/**'] },
+        { host: 'api.github.com', inspect: true, methods: ['POST'], paths: ['/repos/acme/*/issues'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.set_network_policy({
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['GET'], 'paths': ['/repos/acme/**']},
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['POST'], 'paths': ['/repos/acme/*/issues']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{
+            {Host: "api.github.com", Inspect: true, Methods: []string{"GET"}, Paths: []string{"/repos/acme/**"}},
+            {Host: "api.github.com", Inspect: true, Methods: []string{"POST"}, Paths: []string{"/repos/acme/*/issues"}},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let rule = |method: &str, path: &str| EgressRule {
+        host: "api.github.com".to_string(),
+        inspect: true,
+        methods: vec![method.to_string()],
+        paths: vec![path.to_string()],
+        ..Default::default()
+    };
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: vec!["api.github.com".to_string()],
+        network_egress_rules: vec![rule("GET", "/repos/acme/**"), rule("POST", "/repos/acme/*/issues")],
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+        .setNetworkAllowOut(List.of("api.github.com"))
+        .setNetworkEgressRules(List.of(
+            new EgressRule().setHost("api.github.com").setInspect(true)
+                .setMethods(List.of("GET")).setPaths(List.of("/repos/acme/**")),
+            new EgressRule().setHost("api.github.com").setInspect(true)
+                .setMethods(List.of("POST")).setPaths(List.of("/repos/acme/*/issues")))));
+    ```
+  </TabItem>
+</Tabs>
+
+- **A full replace.** Rules you leave out are removed, as with every field of
+  `setNetworkPolicy`, and a policy with no rules leaves each host to the allow
+  list. The sandbox's `networkEgressRules` reflects the new list.
+- **Inspection starts at create.** Trusting the CA is set up when the sandbox
+  is created. Adding an inspect rule to a Docker, containerd or gVisor sandbox
+  created without one is refused with `409` "recreate the sandbox with inspect
+  rules". A sandbox created with one can add, change and remove inspect rules
+  freely, and keeps trusting the CA. If you may want inspection later, start
+  with an inspect rule.
+- **Safe to retry.** Sending the same policy again changes nothing.
+
+---
+
+## Runtimes
+
+| Runtime | Egress rules |
+|---|---|
+| Docker, containerd, gVisor | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA |
+| Isolate | every rule, inspect included, with no CA: the isolate's egress proxy already sees each request in plain text |
+| WASM | not supported: rules are refused with `501` |
+| Firecracker | not supported: rules are refused with `501` |
+
+---
+
+## Limitations
+
+- **Inspected traffic is decrypted on the node.** The gateway decrypts each
+  inspected request and response in memory to check it, then encrypts it again
+  for the real host or the sandbox. Credentials the sandbox sends to an
+  inspected host are visible to the node in that moment. Inspect only the hosts
+  you need to.
+- **Java's trust store isn't covered.** The JVM ignores the variables above, so
+  a Java client fails the handshake with an inspected host until you import
+  `/etc/aerolvm/egress-ca.pem` into the trust store it uses.
+- **Certificate pinning.** A client that pins a server's certificate or key
+  rejects the gateway's certificate, so its hosts can't be inspected.
+- **The 4 KB cluster cap.** In a cluster, rules travel with the sandbox's
+  replicated spec and count toward its 4 KB inline limit along with the rest of
+  the policy, so a long rule list can push a create over it. A failover keeps
+  the rules, and a sandbox recreated on another node trusts that node's CA.
+- **HTTP on 80 and 443 only.** Rules can't apply to other ports or protocols.
+- **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
+  sandbox's rules, since the E2B API has no way to name them.

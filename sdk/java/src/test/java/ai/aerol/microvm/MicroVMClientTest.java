@@ -32,6 +32,7 @@ import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.EgressRule;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
@@ -921,6 +922,55 @@ class MicroVMClientTest {
 
             clientFor(server).setNetworkPolicy("sb-1", null);
             assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRulesOnCreateAndPolicy() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireRule = mapOf("host", "api.github.com", "ports", List.of(443), "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("api.github.com"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule rule = new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/repos/acme/**"));
+            Map<String, Object> sentRule = mapOf("host", "api.github.com", "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule)));
+            assertEquals(List.of(sentRule), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of(443), sandbox.networkEgressRules.get(0).ports);
+            assertTrue(sandbox.networkEgressRules.get(0).inspect);
+
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(new EgressRule().setHost("api.github.com"))));
+            assertEquals(List.of(mapOf("host", "api.github.com")), policyBody.get().get("network_egress_rules"));
+            assertEquals("/repos/acme/**", policy.networkEgressRules.get(0).paths.get(0));
+            assertEquals(policy.networkEgressRules, sandbox.networkEgressRules);
         } finally {
             server.stop(0);
         }

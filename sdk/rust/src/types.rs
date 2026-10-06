@@ -199,6 +199,12 @@ pub struct CreateOptions {
     /// `"enforce"`.
     #[serde(rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
     pub network_egress_mode: Option<String>,
+    /// Method and path rules that refine hosts the allow list already admits
+    /// (at most 32). An inspect rule makes the egress gateway terminate TLS
+    /// on 443 with the node's CA, which only a sandbox created with such a
+    /// rule trusts, so set inspect rules here rather than adding them later.
+    #[serde(rename = "network_egress_rules", skip_serializing_if = "Option::is_none")]
+    pub network_egress_rules: Option<Vec<EgressRule>>,
     /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
     /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
     /// only via the toolbox proxy and SSH gateway.
@@ -564,6 +570,9 @@ pub struct Sandbox {
     /// `"learn"` while the sandbox records its egress.
     #[serde(default, rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
     pub network_egress_mode: Option<String>,
+    /// Method and path rules on the sandbox's egress; `None` when it has none.
+    #[serde(default, rename = "network_egress_rules", skip_serializing_if = "Option::is_none")]
+    pub network_egress_rules: Option<Vec<EgressRule>>,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
     #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
@@ -799,6 +808,11 @@ pub struct NetworkPolicyOptions {
     /// `"enforce"` or `"learn"`; empty is `"enforce"`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub network_egress_mode: String,
+    /// Replaces the method and path rules. Adding an inspect rule to a
+    /// container sandbox created without one is refused with 409: recreate
+    /// it with the rule.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network_egress_rules: Vec<EgressRule>,
 }
 
 /// The policy a sandbox enforces after `set_network_policy`.
@@ -814,12 +828,38 @@ pub struct NetworkPolicy {
     /// `"enforce"` or `"learn"`.
     #[serde(default)]
     pub network_egress_mode: String,
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub network_egress_rules: Vec<EgressRule>,
     /// Hostname entries in force: inline plus every profile's (at most 1024).
     #[serde(default)]
     pub effective_hostname_count: usize,
     /// "active", "held" or "unavailable" for hostname rules on a container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
+}
+
+/// One method and path rule. Rules refine a host the allow list already
+/// admits: a request to a ruled host passes when some rule for that host
+/// admits its method and path, and gets a 403 otherwise. A host no rule
+/// names keeps its allow-list decision.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressRule {
+    /// An exact name or `*.` wildcard, without a port.
+    pub host: String,
+    /// `[80]` by default, or `[443]` with `inspect`; only 80 and 443.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub ports: Vec<u16>,
+    /// Exact, upper case (`GET`, `POST`); empty allows any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub methods: Vec<String>,
+    /// Path globs: `*` within one segment, `**` as a whole segment for any
+    /// number of them. Empty allows any path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "null_as_empty")]
+    pub paths: Vec<String>,
+    /// Terminate TLS on 443 with the node's CA so the rule can see requests.
+    /// The request's Host must then equal the TLS server name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inspect: bool,
 }
 
 /// A named allowlist sandboxes reference through `egress_profiles`.

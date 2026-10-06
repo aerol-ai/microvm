@@ -48,6 +48,7 @@ import type {
   EgressProfileList,
   EgressProfileOptions,
   EgressProfileRef,
+  EgressRule,
   ListEgressProfilesOptions,
   NetworkLearned,
   NetworkPolicy,
@@ -213,6 +214,7 @@ interface ApiSandbox {
   egress_profiles?: string[];
   egress_profiles_applied?: { name: string; generation: number }[];
   network_egress_mode?: string;
+  network_egress_rules?: EgressRule[] | null;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -919,6 +921,7 @@ export class APIClient {
       network_deny_out: string[] | null;
       egress_profiles?: string[] | null;
       network_egress_mode?: string;
+      network_egress_rules?: EgressRule[] | null;
       effective_hostname_count?: number;
       egress_status?: string;
     }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
@@ -927,6 +930,7 @@ export class APIClient {
       network_deny_out: options.networkDenyOut ?? [],
       egress_profiles: options.egressProfiles ?? [],
       network_egress_mode: options.networkEgressMode,
+      network_egress_rules: options.networkEgressRules,
     });
     const policy: NetworkPolicy = {
       networkBlockAll: response.network_block_all,
@@ -934,6 +938,7 @@ export class APIClient {
       networkDenyOut: response.network_deny_out ?? [],
       egressProfiles: response.egress_profiles ?? [],
       networkEgressMode: response.network_egress_mode ?? "enforce",
+      networkEgressRules: response.network_egress_rules ?? [],
       effectiveHostnameCount: response.effective_hostname_count ?? 0,
     };
     if (response.egress_status) policy.egressStatus = response.egress_status;
@@ -1169,6 +1174,7 @@ export class SandboxResource implements Sandbox {
   declare egressProfiles?: string[];
   declare egressProfilesApplied?: EgressProfileRef[];
   declare networkEgressMode?: string;
+  declare networkEgressRules?: EgressRule[];
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -1343,6 +1349,7 @@ export class SandboxResource implements Sandbox {
     this.egressStatus = policy.egressStatus;
     this.egressProfiles = policy.egressProfiles.length ? policy.egressProfiles : undefined;
     this.networkEgressMode = policy.networkEgressMode === "learn" ? "learn" : undefined;
+    this.networkEgressRules = policy.networkEgressRules.length ? policy.networkEgressRules : undefined;
     return policy;
   }
 
@@ -1388,6 +1395,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_deny_out: options.networkDenyOut,
     egress_profiles: options.egressProfiles,
     network_egress_mode: options.networkEgressMode,
+    network_egress_rules: options.networkEgressRules,
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1487,6 +1495,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
     egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
     networkEgressMode: sandbox.network_egress_mode || undefined,
+    networkEgressRules: sandbox.network_egress_rules?.length ? sandbox.network_egress_rules : undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),

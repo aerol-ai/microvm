@@ -40,7 +40,7 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/sandboxes/sb1/network/policy":
 			var req models.NetworkPolicyRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
-			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressStatus: "active"})
+			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressRules: req.NetworkEgressRules, EgressStatus: "active"})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/learned":
 			_ = json.NewEncoder(w).Encode(models.NetworkLearned{Mode: "learn", Entries: []models.NetworkLearnedEntry{{Host: "pypi.org", Ports: []uint16{443}}}})
 		case r.URL.Path == "/v1/egress-profiles/python" && r.Method == http.MethodDelete:
@@ -220,6 +220,16 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if sb.EgressStatus != "active" || len(sb.NetworkDenyOut) != 1 || sb.NetworkAllowOut[0] != "pypi.org" {
 		t.Fatalf("Sandbox fields after SetNetworkPolicy = %+v", sb.Sandbox)
+	}
+	rule := sdktypes.EgressRule{Host: "api.github.com", Methods: []string{"GET"}, Paths: []string{"/repos/acme/**"}, Inspect: true}
+	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}, NetworkEgressRules: []sdktypes.EgressRule{rule}}); err != nil {
+		t.Fatalf("Sandbox.SetNetworkPolicy(rules) error = %v", err)
+	}
+	if len(sb.NetworkEgressRules) != 1 || sb.NetworkEgressRules[0].Host != "api.github.com" || !sb.NetworkEgressRules[0].Inspect || sb.NetworkEgressRules[0].Paths[0] != "/repos/acme/**" {
+		t.Fatalf("Sandbox rules after SetNetworkPolicy = %+v", sb.NetworkEgressRules)
+	}
+	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"api.github.com"}}); err != nil || sb.NetworkEgressRules != nil {
+		t.Fatalf("a policy without rules must clear them: %+v, %v", sb.NetworkEgressRules, err)
 	}
 	learned, err := sb.Learned(ctx)
 	if err != nil || learned.Mode != "learn" || len(learned.Entries) != 1 {

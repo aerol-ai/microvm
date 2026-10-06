@@ -191,6 +191,7 @@ public class Sandbox extends SandboxData {
         egressProfiles = policy.egressProfiles;
         egressStatus = policy.egressStatus;
         networkEgressMode = "learn".equals(policy.networkEgressMode) ? "learn" : null;
+        networkEgressRules = policy.networkEgressRules;
         return policy;
     }
 

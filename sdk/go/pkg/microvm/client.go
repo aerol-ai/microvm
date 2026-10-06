@@ -763,6 +763,7 @@ func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPol
 	}
 	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
 	s.EgressProfiles, s.EgressStatus = policy.EgressProfiles, policy.EgressStatus
+	s.NetworkEgressRules = policy.NetworkEgressRules
 	s.NetworkEgressMode = ""
 	if policy.NetworkEgressMode == sdktypes.NetworkEgressModeLearn {
 		s.NetworkEgressMode = sdktypes.NetworkEgressModeLearn

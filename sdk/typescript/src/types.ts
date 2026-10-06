@@ -211,6 +211,14 @@ export interface CreateOptions {
    */
   networkEgressMode?: "enforce" | "learn";
   /**
+   * Method and path rules that refine hosts the allow list already admits
+   * (at most 32). A rule with `inspect: true` makes the egress gateway
+   * terminate TLS on 443 with the node's CA, which only a sandbox created
+   * with such a rule trusts, so set inspect rules here rather than adding
+   * them later.
+   */
+  networkEgressRules?: EgressRule[];
+  /**
    * Whether the sandbox may be exposed to the public internet. Omitted defaults
    * to private (no public URL, `exposePort` fails). Set `true` to opt in to
    * public exposure; `false` permanently refuses it for this sandbox.
@@ -524,6 +532,8 @@ export interface Sandbox {
   egressProfilesApplied?: EgressProfileRef[];
   /** `"learn"` while the sandbox records its egress; absent otherwise. */
   networkEgressMode?: string;
+  /** Method and path rules on the sandbox's egress; absent when it has none. */
+  networkEgressRules?: EgressRule[];
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -641,6 +651,12 @@ export interface NetworkPolicyOptions {
   networkDenyOut?: string[];
   egressProfiles?: string[];
   networkEgressMode?: "enforce" | "learn";
+  /**
+   * Replaces the method and path rules. Adding an inspect rule to a
+   * container sandbox created without one is refused with 409: recreate it
+   * with the rule.
+   */
+  networkEgressRules?: EgressRule[];
 }
 
 /** The policy a sandbox enforces after `setNetworkPolicy`. */
@@ -651,10 +667,36 @@ export interface NetworkPolicy {
   egressProfiles: string[];
   /** `"enforce"` or `"learn"`. */
   networkEgressMode: string;
+  networkEgressRules: EgressRule[];
   /** Hostname entries in force: inline plus every profile's (at most 1024). */
   effectiveHostnameCount: number;
   /** "active", "held" or "unavailable" for hostname rules on a container. */
   egressStatus?: string;
+}
+
+/**
+ * One method and path rule. Rules refine a host the allow list already
+ * admits: a request to a ruled host passes when some rule for that host
+ * admits its method and path, and gets a 403 otherwise. A host no rule names
+ * keeps its allow-list decision.
+ */
+export interface EgressRule {
+  /** An exact name or `*.` wildcard, without a port. */
+  host: string;
+  /** `[80]` by default, or `[443]` with `inspect`; only 80 and 443. */
+  ports?: number[];
+  /** Exact, upper case (`GET`, `POST`); empty allows any. */
+  methods?: string[];
+  /**
+   * Path globs: `*` within one segment, `**` as a whole segment for any
+   * number of them. Empty allows any path.
+   */
+  paths?: string[];
+  /**
+   * Terminate TLS on 443 with the node's CA so the rule can see requests.
+   * The request's Host must then equal the TLS server name.
+   */
+  inspect?: boolean;
 }
 
 /**

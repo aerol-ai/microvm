@@ -26,8 +26,8 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
-    EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, ListEgressProfilesOptions,
-    NetworkLearned, NetworkLearnedEntry,
+    EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    ListEgressProfilesOptions, NetworkLearned, NetworkLearnedEntry,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
@@ -502,6 +502,11 @@ impl Sandbox {
             Some("learn".to_string())
         } else {
             None
+        };
+        self.data.network_egress_rules = if policy.network_egress_rules.is_empty() {
+            None
+        } else {
+            Some(policy.network_egress_rules.clone())
         };
         Ok(policy)
     }
@@ -2238,6 +2243,7 @@ mod tests {
             network_deny_out: None,
             egress_profiles: None,
             network_egress_mode: None,
+            network_egress_rules: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -3243,6 +3249,52 @@ mod tests {
         assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
         assert!(!sandbox.data.network_block_all);
         assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn set_network_policy_sends_and_syncs_egress_rules() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [{"host": "api.github.com", "ports": [443], "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [{"host": "old.example", "ports": null}]
+        }))
+        .expect("sandbox data should parse");
+        assert_eq!(data.network_egress_rules.as_ref().map(|r| r[0].ports.is_empty()), Some(true));
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            inspect: true,
+            ..Default::default()
+        };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([{"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}])
+        );
+        assert_eq!(policy.network_egress_rules[0].ports, vec![443]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].host, "api.github.com");
+        assert!(synced[0].inspect);
     }
 
     #[test]

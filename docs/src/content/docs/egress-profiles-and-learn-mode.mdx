@@ -103,6 +103,10 @@ same body again changes nothing, so it is safe to retry.
   together hold at most 1024 hostname entries, counted per list.
 - **Profiles and block-all don't mix.** `networkBlockAll` with
   `egressProfiles` is refused.
+- **Narrower than a host.** To allow only some methods or paths on a host a
+  profile allows, add [egress rules](/egress-rules-and-inspection) to the
+  sandbox. If a profile change later drops that host, its rules stop
+  mattering: the host is refused anyway.
 
 ---
 

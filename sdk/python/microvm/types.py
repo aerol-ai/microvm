@@ -172,6 +172,11 @@ class CreateOptions(TypedDict, total=False):
     # learned() can suggest an allow list. Trusted runs only. Omitted is
     # "enforce".
     networkEgressMode: str
+    # Method and path rules that refine hosts the allow list already admits
+    # (at most 32). An inspect rule makes the egress gateway terminate TLS on
+    # 443 with the node's CA, which only a sandbox created with such a rule
+    # trusts, so set inspect rules here rather than adding them later.
+    networkEgressRules: List["EgressRule"]
     # Whether the sandbox may be exposed publicly. Omitted defaults to private
     # (no public URL, expose_port fails). True opts in; False permanently refuses.
     allowPublicTraffic: bool
@@ -447,6 +452,8 @@ class SandboxData(TypedDict, total=False):
     egressProfilesApplied: List["EgressProfileRef"]
     # "learn" while the sandbox records its egress; absent otherwise.
     networkEgressMode: str
+    # Method and path rules on the sandbox's egress; absent when it has none.
+    networkEgressRules: List["EgressRule"]
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -597,6 +604,10 @@ class NetworkPolicyOptions(TypedDict, total=False):
     networkDenyOut: List[str]
     egressProfiles: List[str]
     networkEgressMode: str
+    # Replaces the method and path rules. Adding an inspect rule to a
+    # container sandbox created without one is refused with 409: recreate it
+    # with the rule.
+    networkEgressRules: List["EgressRule"]
 
 
 class NetworkPolicy(TypedDict, total=False):
@@ -606,8 +617,31 @@ class NetworkPolicy(TypedDict, total=False):
     egressProfiles: List[str]
     # "enforce" or "learn".
     networkEgressMode: str
+    networkEgressRules: List["EgressRule"]
     # Hostname entries in force: inline plus every profile's (at most 1024).
     effectiveHostnameCount: int
+    # "active", "held" or "unavailable" for hostname rules on a container.
+    egressStatus: str
+
+
+class EgressRule(TypedDict, total=False):
+    """One method and path rule. Rules refine a host the allow list
+    already admits: a request to a ruled host passes when some rule for that
+    host admits its method and path, and gets a 403 otherwise. A host no rule
+    names keeps its allow-list decision."""
+
+    # An exact name or "*." wildcard, without a port. Required.
+    host: str
+    # [80] by default, or [443] with inspect; only 80 and 443.
+    ports: List[int]
+    # Exact, upper case ("GET", "POST"); empty allows any.
+    methods: List[str]
+    # Path globs: "*" within one segment, "**" as a whole segment for any
+    # number of them. Empty allows any path.
+    paths: List[str]
+    # Terminate TLS on 443 with the node's CA so the rule can see requests.
+    # The request's Host must then equal the TLS server name.
+    inspect: bool
 
 
 class NetworkLearnedEntry(TypedDict, total=False):
@@ -630,8 +664,6 @@ class NetworkLearned(TypedDict, total=False):
     cidrs: List[str]
     suggestedAllowOut: List[str]
     suggestedProfile: "EgressProfileOptions"
-    # "active", "held" or "unavailable" for hostname rules on a container.
-    egressStatus: str
 
 
 class SetNetworkLimitsOptions(TypedDict, total=False):

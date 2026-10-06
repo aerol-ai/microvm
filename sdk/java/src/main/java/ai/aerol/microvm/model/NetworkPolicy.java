@@ -11,6 +11,7 @@ public class NetworkPolicy {
     public List<String> egressProfiles = new ArrayList<>();
     /** "enforce" or "learn". */
     public String networkEgressMode;
+    public List<EgressRule> networkEgressRules = new ArrayList<>();
     /** Hostname entries in force: inline plus every profile's (at most 1024). */
     public int effectiveHostnameCount;
     /** "active", "held" or "unavailable" for hostname rules on a container, or null. */
