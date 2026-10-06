@@ -9,6 +9,10 @@ capabilities:
   # (single-node.tfvars sets enable_custom_domains=true and the Terraform
   # bootstrap injects SB_ENABLE_CUSTOM_DOMAINS), so the feature is live here.
   - custom-domains
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-10): install.sh
+  # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
+  # on, so UC-180..182 run here.
+  - egress-fqdn
   # NOTE: UC-35/36 additionally require external-dns-zone, which this scenario
   # does NOT advertise. A real custom domain must live OUTSIDE the base domain
   # (the API rejects hosts under the wildcard) and prove ownership via a TXT

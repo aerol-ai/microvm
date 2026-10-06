@@ -28,6 +28,18 @@ const (
 	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
+	// CapEgressFQDN gates the hostname egress use cases (UC-180..182, UC-185;
+	// plans/egress-domain-filtering.md P1-10). Advertisement-only: install.sh
+	// installs and starts the aerolvm-egress-gateway units on every node and
+	// SB_EGRESS_FQDN_ENABLED defaults on, so a scenario advertises it when its
+	// container nodes are not privileged (a privileged node refuses hostname
+	// policies with 501 by design).
+	CapEgressFQDN Capability = "egress-fqdn"
+	// CapPrivateCloud gates UC-186..189 (§5.10): the node carries an egress
+	// operator file plus node-local stand-ins for a bank network (a dnsmasq
+	// resolver with internal names, an internal HTTP service, a squid upstream
+	// proxy). Only single-node-private-cloud advertises it.
+	CapPrivateCloud Capability = "private-cloud"
 	// CapIsolateJail gates UC-109: the node runs isolate with
 	// SB_ISOLATE_USE_JAIL=true (the default) and the suite may SSH in to
 	// inspect the workerd process. Only single-node-isolate-jail advertises it;
@@ -199,7 +211,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
-	CapRemoteMCP: true,
+	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -582,6 +594,19 @@ var Registry = []UseCase{
 	{ID: "UC-176", Title: "aerolvm CLI: create, exec, cp, expose and destroy; on a cluster a non-owner node resolves the name", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-177", Title: "aerolvm mcp (stdio): the same flow through an MCP client; a pinned server creates lazily with the idle lifecycle", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-178", Title: "Remote /mcp: a pinned call creates through the API domain, then a node that doesn't own the sandbox serves it", Requires: []Capability{CapRemoteMCP, CapCluster, CapDomain}, Implemented: true},
+
+	// Egress domain filtering (plans/egress-domain-filtering.md P1-10, P1-20).
+	{ID: "UC-179", Title: "Allow-out CIDR: the listed range is reachable, everything else is dropped", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-180", Title: "Hostname allowlist: an allowed name is reachable over HTTPS; another name gets NXDOMAIN and a fast refusal; GET shows egress_status active", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-181", Title: "Explainable denials: a denied HTTP host gets a 403 naming host and rule, and the denial is in the sandbox's audit log", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-182", Title: "host:port and *. entries: the listed port opens, the web ports of a port-only entry stay shut, subdomains match a wildcard", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-183", Title: "Every container sandbox runs without CAP_NET_RAW, so it can't spoof a neighbour's source address", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-184", Title: "A block-all sandbox can't open connections to host services on its bridge gateway", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-185", Title: "Latency gate: gateway-mode creates report svc_egress_* stages and stay inside the join and attach budgets", Requires: []Capability{CapEgressFQDN, CapBenchmark}, Implemented: true},
+	{ID: "UC-186", Title: "Private cloud upstream proxy: an allowed outside name gets a synthetic answer and is fetched through the operator's proxy", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-187", Title: "Private cloud internal zone: an internal name reaches its internal port; a name outside the zone resolving into it is refused", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-188", Title: "Private cloud deny floor: an operator deny CIDR is dropped for a sandbox with no policy", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-189", Title: "Private cloud control-port guard: a sandbox can't reach the node's API port, while ingress 443 stays reachable", Requires: []Capability{CapPrivateCloud}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

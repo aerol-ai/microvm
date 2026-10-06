@@ -155,6 +155,29 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
+## Egress domain filtering (UC-179..UC-189)
+
+`suite/egress_fqdn_test.go` and `suite/egress_private_cloud_test.go` cover
+hostname egress filtering (plans/egress-domain-filtering.md P1-10, P1-20).
+
+- **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
+  `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
+  traffic through the node's egress gateway (allowed name over HTTPS, NXDOMAIN
+  and a fast refusal for others, the 403 naming host and rule, the denial in
+  `sandbox.audit()`, `host:port` and `*.` entries). UC-185 is the EF-78
+  latency gate: with `AEROL_BENCH=1` it reads the `svc_egress_*` stages from
+  Server-Timing and fails over the join (≤2 ms p50) and attach (≤10 ms p99)
+  budgets (`AEROL_EGRESS_JOIN_P50_MS` / `AEROL_EGRESS_ATTACH_P99_MS` override).
+- UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
+  can't reach host services) only need `docker`.
+- **`private-cloud`** (`single-node-private-cloud`, `make
+  integration-single-private-cloud`): the node runs dnsmasq with internal names,
+  an internal HTTP service and squid, wired into the egress operator file.
+  UC-186..189 cover the upstream proxy with synthetic DNS, the internal zone
+  (and its rebinding refusal), the deny floor and the control-port guard. The
+  node keeps its internet gateway; a no-egress VPC with an offline install is
+  the remaining part of P1-20.
+
 ## Create benchmark (UC-94 / UC-95)
 
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live
