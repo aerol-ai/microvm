@@ -163,7 +163,9 @@ func (c *Client) put(cc *clientConn) {
 
 // call sends one request and waits for its response. A transport failure
 // closes the connection; the next call dials a fresh one.
-func (c *Client) call(ctx context.Context, op string, in any, out any) error {
+func (c *Client) call(ctx context.Context, op string, in any, out any) (err error) {
+	ctx, span := startClientSpan(ctx, op)
+	defer func() { endSpan(span, err) }()
 	cc, err := c.get(ctx)
 	if err != nil {
 		return err
@@ -181,7 +183,7 @@ func (c *Client) call(ctx context.Context, op string, in any, out any) error {
 	}
 	_ = cc.c.SetDeadline(dl)
 	id := c.nextID.Add(1)
-	if err := writeFrame(cc.c, request{ID: id, Op: op, Payload: payload}); err != nil {
+	if err := writeFrame(cc.c, request{ID: id, Op: op, Payload: payload, Trace: injectTrace(ctx)}); err != nil {
 		_ = cc.c.Close()
 		return fmt.Errorf("%w: %s: %v", ErrUnavailable, op, err)
 	}

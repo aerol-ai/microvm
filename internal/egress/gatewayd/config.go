@@ -15,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
+	"github.com/aerol-ai/microvm/internal/observability"
 )
 
 // Config is the gateway process configuration (rows in setup/config-defaults.md).
@@ -41,6 +42,10 @@ type Config struct {
 	SnapshotDebounce time.Duration
 	// OperatorFile is the private-cloud operator policy (§5.10).
 	OperatorFile string
+	// Traces reads sandboxd's SB_OTEL_TRACES_* settings, so one env file
+	// turns tracing on for both processes and gateway spans join sandboxd's
+	// traces (P1-15).
+	Traces observability.OTELTracesConfig
 }
 
 // Defaults.
@@ -110,10 +115,39 @@ func FromEnv() (Config, error) {
 		}
 		cfg.DNSQPS = f
 	}
+	cfg.Traces = observability.OTELTracesConfig{
+		Endpoint:    firstNonEmpty(os.Getenv("SB_OTEL_TRACES_ENDPOINT"), os.Getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")),
+		SampleRatio: 0.05,
+		ServiceName: "aerolvm-egress-gateway",
+	}
+	cfg.Traces.Enabled = cfg.Traces.Endpoint != ""
+	if v := strings.TrimSpace(os.Getenv("SB_OTEL_TRACES_ENABLED")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return cfg, fmt.Errorf("SB_OTEL_TRACES_ENABLED: want a boolean, got %q", v)
+		}
+		cfg.Traces.Enabled = b
+	}
+	if v := strings.TrimSpace(os.Getenv("SB_OTEL_TRACES_SAMPLE_RATIO")); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return cfg, fmt.Errorf("SB_OTEL_TRACES_SAMPLE_RATIO: want 0..1, got %q", v)
+		}
+		cfg.Traces.SampleRatio = f
+	}
 	if cfg.DNSPort == cfg.ProxyPort {
 		return cfg, fmt.Errorf("SB_EGRESS_DNS_PORT and SB_EGRESS_PROXY_PORT must differ")
 	}
 	return cfg, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func envOr(name, def string) string {

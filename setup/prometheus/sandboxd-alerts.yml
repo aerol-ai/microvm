@@ -647,3 +647,76 @@ groups:
           summary: "More than 20% of remote MCP tool calls are failing"
           description: "Over 20% of /mcp tool calls have ended in api_error for 10 minutes. Agents connected over remote MCP are seeing platform failures; check the 'mcp tool call' log lines (outcome=api_error) for the tool and code."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md"
+
+  # Hostname egress filtering (plans/egress-domain-filtering.md P1-12, P1-15).
+  # The aerolvm-egress-gateway unit owns the nft table, the filtering DNS
+  # resolver and the SNI/Host proxy; sandboxd exports its state. Gateway-mode
+  # sandboxes fail closed when it is away, so these alerts mean "filtered
+  # sandboxes have no egress", never "egress is unfiltered".
+  - name: sandboxd.egress
+    interval: 30s
+    rules:
+      # The node has hostname-filtered sandboxes and no live gateway: their
+      # egress is held (fail closed) and new gateway-mode creates get 503.
+      # Gated on fqdn_sandboxes so nodes without the feature never fire.
+      - alert: SandboxdEgressGatewayDown
+        expr: aerolvm_egress_gateway_up == 0 and aerolvm_egress_fqdn_sandboxes > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: egress
+        annotations:
+          summary: "egress gateway down with hostname-filtered sandboxes on the node"
+          description: "aerolvm_egress_gateway_up has been 0 for 1 minute on {{ $labels.instance }} while {{ $value }} gateway-mode sandboxes are present. Their egress is held (fail closed) and new hostname-filtered creates are refused with 503 egress_gateway_unavailable; in a cluster, placement stops sending them here."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#gatewaydown"
+
+      # The gateway found its nft table missing and rebuilt it (CEO D17). The
+      # window without filtering was one heartbeat; something on the host is
+      # flushing nftables.
+      - alert: SandboxdEgressTableLost
+        expr: increase(aerolvm_egress_layout_lost_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress gateway nft table was lost and rebuilt"
+          description: "The inet aerolvm_egress table disappeared on {{ $labels.instance }} and was rebuilt. Gateway-mode sandboxes were held and re-attached. Find what flushes nftables on this host (a firewall manager, a provisioning script, `nft flush ruleset`)."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#tablelost"
+
+      # Each failure is a 503 create or a held sandbox.
+      - alert: SandboxdEgressAttachFailures
+        expr: increase(aerolvm_egress_attach_failed_total[10m]) > 2
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "sandboxd cannot attach sandboxes to the egress gateway"
+          description: "More than 2 gateway attaches failed on {{ $labels.instance }} in 10 minutes. Each failure is a hostname-filtered create answered 503 or a running sandbox held without egress."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#attachfailures"
+
+      # Held sandboxes have no egress at all until the hold lifts.
+      - alert: SandboxdEgressSandboxesHeld
+        expr: aerolvm_egress_held_sandboxes > 0
+        for: 10m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "sandboxes have been held without egress for 10 minutes"
+          description: "{{ $value }} gateway-mode sandboxes on {{ $labels.instance }} have been held (fail closed) for 10 minutes. A hold lifts on the next successful attach; a long hold means the gateway is not recovering."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#sandboxesheld"
+
+      # Filtering is unaffected; the audit trail has gaps. Denial counters
+      # stay exact (they come from the gateway's totals, not the stream).
+      - alert: SandboxdEgressAuditDropped
+        expr: increase(aerolvm_egress_audit_dropped_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: egress
+        annotations:
+          summary: "egress audit events are being dropped"
+          description: "The gateway's audit ring on {{ $labels.instance }} overflowed before sandboxd drained it. Enforcement is unaffected and aerolvm_egress_denied_total stays exact, but per-connection audit records are missing."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#auditdropped"

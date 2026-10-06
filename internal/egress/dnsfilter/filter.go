@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -96,12 +97,18 @@ type Filter struct {
 
 	limMu    sync.Mutex
 	limiters map[string]*limiterEntry
+
+	queries atomic.Uint64
 }
 
 type limiterEntry struct {
 	lim  *rate.Limiter
 	seen time.Time
 }
+
+// Queries returns how many queries reached the filter, refused ones included
+// (aerolvm_egress_dns_queries_total; rate() of it is the DNS QPS panel).
+func (f *Filter) Queries() uint64 { return f.queries.Load() }
 
 // New builds a Filter.
 func New(src Sources, learner Learner, observe Observer, cfg Config) *Filter {
@@ -147,6 +154,7 @@ func isTCP(w dns.ResponseWriter) bool {
 
 // ServeDNS implements dns.Handler.
 func (f *Filter) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+	f.queries.Add(1)
 	src := remoteAddr(w)
 	s, ok := f.src.Source(src)
 	if !ok {

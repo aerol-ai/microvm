@@ -56,6 +56,7 @@ type Daemon struct {
 	probeMu sync.Mutex
 	probes  map[netip.Addr]*egress.ProbeResult
 
+	started      time.Time
 	statsMu      sync.Mutex
 	denied       map[string]uint64
 	layoutLost   bool
@@ -78,6 +79,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		learn:        map[string]*egresspolicy.Recorder{},
 		probes:       map[netip.Addr]*egress.ProbeResult{},
 		denied:       map[string]uint64{},
+		started:      time.Now().UTC(),
 		seenRejected: map[egress.Elem]time.Time{},
 	}
 	d.gw = egress.New(egress.Options{
@@ -258,6 +260,17 @@ func (d *Daemon) probe(p egress.ProbeRequest) (egress.ProbeResult, error) {
 
 // ---- observers: audit events and learn recording ----
 
+// logDecision writes one gateway decision with the fields log pipelines key
+// on (P1-15). Debug level: the audit stream is the durable record, and at
+// node scale an Info line per connection would drown everything else.
+func (d *Daemon) logDecision(path, sandboxID string, allowed bool, dest, reason, rule string, mode egress.Mode) {
+	if !d.log.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	d.log.Debug("egress decision", "path", path, "sandbox_id", sandboxID, "allowed", allowed,
+		"destination", dest, "reason", reason, "rule", rule, "mode", string(mode))
+}
+
 func (d *Daemon) countDenied(reason string) {
 	d.statsMu.Lock()
 	d.denied[reason]++
@@ -275,6 +288,7 @@ func (d *Daemon) onDNS(dec dnsfilter.Decision) {
 	if dec.Allowed || dec.Reason == "" {
 		return
 	}
+	d.logDecision("dns", dec.SandboxID, false, dec.Name, dec.Reason, dec.Rule, dec.Mode)
 	d.countDenied(dec.Reason)
 	d.hub.Publish(egress.Event{Kind: "audit", SandboxID: dec.SandboxID, Result: "denied", Reason: dec.Reason,
 		Destination: dec.Name, Rule: dec.Rule, Mode: string(dec.Mode), Time: time.Now().UTC()})
@@ -290,6 +304,7 @@ func (d *Daemon) onProxy(dec proxy.Decision) {
 	}
 	ev := egress.Event{Kind: "audit", SandboxID: dec.SandboxID, Destination: dest, Rule: dec.Rule,
 		Reason: dec.Reason, Mode: string(dec.Mode), Time: time.Now().UTC()}
+	d.logDecision("proxy", dec.SandboxID, dec.Allowed, dest, dec.Reason, dec.Rule, dec.Mode)
 	if dec.Allowed {
 		ev.Result = "allowed"
 		if dec.Mode == egress.ModeLearn {
@@ -370,7 +385,8 @@ func (d *Daemon) heartbeat() {
 		}
 	}
 	d.hub.Publish(egress.Event{Kind: "heartbeat", LayoutOK: !lost, LayoutLostSeen: lostSeen,
-		AuditDropped: d.hub.Dropped(), FQDNSandboxes: n, ProxyConns: d.px.Active(), Time: time.Now().UTC()})
+		AuditDropped: d.hub.Dropped(), FQDNSandboxes: n, ProxyConns: d.px.Active(), ProxyConnCap: d.cfg.ProxyMaxConns,
+		Denied: d.DeniedCounts(), DNSQueries: d.dns.Queries(), GatewayStart: d.started, Time: time.Now().UTC()})
 }
 
 // AckLayoutLost clears the latched table-loss flag once sandboxd re-synced.

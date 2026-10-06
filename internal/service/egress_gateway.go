@@ -11,9 +11,11 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Hold reasons stored in sandbox_egress.hold_reason (CEO D16).
@@ -44,23 +46,26 @@ type egressCounters struct {
 	auditDropped  atomic.Uint64
 	fqdnSandboxes atomic.Int64
 	proxyConns    atomic.Int64
+	proxyConnCap  atomic.Int64
 	layoutLost    atomic.Uint64
 	denied        reasonCounts
+	totals        gatewayTotals
 }
 
-// reasonCounts counts denials by reason (aerolvm_egress_denied_total).
+// reasonCounts counts this Service's denials by reason, the per-node view
+// of aerolvm_egress_denied_total.
 type reasonCounts struct {
 	mu sync.Mutex
 	m  map[string]uint64
 }
 
-func (r *reasonCounts) add(reason string) {
+func (r *reasonCounts) addN(reason string, n uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.m == nil {
 		r.m = map[string]uint64{}
 	}
-	r.m[reason]++
+	r.m[reason] += n
 }
 
 func (r *reasonCounts) snapshot() map[string]uint64 {
@@ -78,6 +83,9 @@ func (r *reasonCounts) snapshot() map[string]uint64 {
 func (s *Service) SetEgressGateway(api egress.API, bridges func(context.Context) []egress.Bridge) {
 	s.egressAPI = api
 	s.egressBridges = bridges
+	if api != nil {
+		activeEgressStats.Store(&s.egressStats)
+	}
 }
 
 // egressGateway returns the client, or Noop when the feature is off.
@@ -119,13 +127,18 @@ func (s *Service) EnsureEgressGatewayReady(ctx context.Context) error {
 	}
 	s.egressReady.Store(true)
 	s.egressStats.gatewayUp.Store(true)
+	// Holds persist across sandboxd restarts; seed the gauge the supervisor
+	// keys its retries on.
+	s.refreshHeldGauge(ctx)
 	s.egressSubOnce.Do(func() { go s.consumeEgressEvents(context.WithoutCancel(ctx)) })
 	return nil
 }
 
 // syncEgressGatewayLocked hands over bridges and replaces the gateway's state
 // with the store's. Callers hold egressMu.
-func (s *Service) syncEgressGatewayLocked(ctx context.Context) error {
+func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
+	ctx, span := observability.StartSpan(ctx, "egress.sync")
+	defer func() { observability.EndSpan(span, err) }()
 	gw := s.egressGateway()
 	if _, err := gw.Ready(ctx); err != nil {
 		return err
@@ -157,8 +170,9 @@ func (s *Service) EgressGatewayReady() bool {
 }
 
 // SuperviseEgressGateway re-runs the gateway bootstrap whenever the latch is
-// down: at startup before the gateway is up, and after its event stream
-// breaks (a gateway restart). The lazy retry on create is not enough in
+// down (at startup before the gateway is up, and after its event stream
+// breaks on a gateway restart), and re-attaches held sandboxes once it is
+// back. The lazy retry on create is not enough in
 // cluster mode, where placement stops sending gateway-mode creates to a node
 // that isn't ready, so nothing else would bring it back. One atomic load per
 // tick while ready; logs only when the failure changes.
@@ -185,6 +199,9 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 				s.logger.Info("egress gateway ready")
 			}
 			lastErr = msg
+		}
+		if s.EgressGatewayReady() && s.egressStats.held.Load() > 0 {
+			s.retryEgressHolds(ctx)
 		}
 		select {
 		case <-ctx.Done():
@@ -270,7 +287,9 @@ func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, boo
 // and lifts the driver's temporary block-all. The driver installed that DROP
 // at create (the driver-facing copy) so the sandbox was shut until now; on any
 // failure it stays shut and the sandbox is held (CEO D16).
-func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) error {
+func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) (err error) {
+	ctx, span := observability.StartSpan(ctx, "egress.attach", attribute.String("sandbox_id", sb.ID))
+	defer func() { observability.EndSpan(span, err) }()
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
 	spec, ok := s.egressSpecFor(sb, false)
@@ -278,11 +297,11 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		return nil
 	}
 	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
-		s.egressStats.attachFailed.Add(1)
+		s.egressStats.recordAttachFailed()
 		return err
 	}
 	if err := s.egressGateway().Attach(ctx, spec); err != nil {
-		s.egressStats.attachFailed.Add(1)
+		s.egressStats.recordAttachFailed()
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
 			s.egressReady.Store(false)
 		}
@@ -345,6 +364,29 @@ func (s *Service) releaseEgressHold(ctx context.Context, sb *models.Sandbox, cr 
 	}
 	s.refreshHeldGauge(ctx)
 	return nil
+}
+
+// retryEgressHolds re-attaches held, running sandboxes once the gateway is
+// ready, so a hold from a gateway outage lifts within one supervisor tick
+// rather than on the next reconcile pass. An invalid stored policy can never
+// attach and is left for its owner to replace; stopped sandboxes re-attach
+// on start.
+func (s *Service) retryEgressHolds(ctx context.Context) {
+	holds, err := s.store.ListEgressHolds(ctx)
+	if err != nil {
+		return
+	}
+	for id, reason := range holds {
+		if reason == egressHoldPolicyInvalid {
+			continue
+		}
+		sb, err := s.store.Get(ctx, id)
+		if err != nil || sb.Status != models.SandboxStatusStarted {
+			continue
+		}
+		s.reconcileSandboxEgress(ctx, sb)
+	}
+	s.refreshHeldGauge(ctx)
 }
 
 func (s *Service) refreshHeldGauge(ctx context.Context) {
@@ -437,17 +479,16 @@ func (s *Service) consumeEgressEvents(ctx context.Context) {
 func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
 	switch ev.Kind {
 	case "audit":
-		allowed := ev.Result == "allowed"
-		s.emitEgressDecision(ev.SandboxID, "tcp", ev.Destination, allowed, ev.Reason)
-		if !allowed && ev.Reason != "" {
-			s.egressStats.denied.add(ev.Reason)
-		}
+		// Audit only: denials are counted from the heartbeat's totals,
+		// which stay exact when the audit ring drops events.
+		s.emitEgressDecision(ev.SandboxID, "tcp", ev.Destination, ev.Result == "allowed", ev.Reason)
 	case "heartbeat":
 		s.egressStats.gatewayUp.Store(true)
 		s.egressStats.lastHeartbeat.Store(time.Now().UnixNano())
-		s.egressStats.auditDropped.Store(ev.AuditDropped)
+		s.egressStats.observeHeartbeat(ev)
 		s.egressStats.fqdnSandboxes.Store(int64(ev.FQDNSandboxes))
 		s.egressStats.proxyConns.Store(int64(ev.ProxyConns))
+		s.egressStats.proxyConnCap.Store(int64(ev.ProxyConnCap))
 		if ev.LayoutLostSeen {
 			s.onEgressLayoutLost(ctx)
 		}
@@ -459,7 +500,7 @@ func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
 // full Sync re-applies the gateway state and successful attaches release
 // the holds.
 func (s *Service) onEgressLayoutLost(ctx context.Context) {
-	s.egressStats.layoutLost.Add(1)
+	s.egressStats.recordLayoutLost()
 	rows, err := s.store.List(ctx)
 	if err != nil {
 		return

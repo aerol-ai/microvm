@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
+	"github.com/aerol-ai/microvm/internal/observability"
 )
 
 // Subcommand is how sandboxd is invoked to run the gateway.
@@ -30,6 +31,13 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	guard, err := guardFromOperatorFile(cfg.OperatorFile)
 	if err != nil {
 		return err
+	}
+	// Tracing is best-effort: a bad collector endpoint must not keep the
+	// gateway, and with it hostname-filtered egress, from starting.
+	if shutdown, err := observability.StartOTELTraces(ctx, log, cfg.Traces); err != nil {
+		log.Warn("egress gateway: trace exporter not started", "error", err)
+	} else if shutdown != nil {
+		defer func() { _ = shutdown(context.WithoutCancel(ctx)) }()
 	}
 	be, ct := productionKernel()
 	d, err := New(cfg, Deps{

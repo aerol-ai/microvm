@@ -123,6 +123,9 @@ func newEgressHarness(t *testing.T) (*Service, *fakeGateway, *holdRuntime) {
 	svc, _, _ := newServiceRuntimeHarnessAtPath(t, filepath.Join(t.TempDir(), "state.db"), rt)
 	svc.cfg.EgressFQDNEnabled = true
 	gw := newFakeGateway()
+	// A live (silent) event stream, as a healthy gateway has; without one
+	// the subscriber marks the gateway down. Tests that need events replace it.
+	gw.events = make(chan egress.Event)
 	svc.SetEgressGateway(gw, func(context.Context) []egress.Bridge {
 		return []egress.Bridge{{Name: "docker0", GatewayIP: netip.MustParseAddr("172.17.0.1")}}
 	})
@@ -331,6 +334,10 @@ func TestLayoutLostHoldsAndReattaches(t *testing.T) {
 	}
 	svc.cfg.EgressAttributionEnabled = true
 	svc.handleEgressEvent(ctx, egress.Event{Kind: "audit", SandboxID: resp.ID, Result: "denied", Reason: "sni_not_allowed", Destination: "evil.example:443"})
+	if svc.egressStats.denied.snapshot()["sni_not_allowed"] != 0 {
+		t.Fatal("audit events must not count denials; the heartbeat totals do")
+	}
+	svc.handleEgressEvent(ctx, egress.Event{Kind: "heartbeat", Denied: map[string]uint64{"sni_not_allowed": 1}})
 	if svc.egressStats.denied.snapshot()["sni_not_allowed"] != 1 {
 		t.Fatal("denials must be counted")
 	}
@@ -383,7 +390,6 @@ func TestEgressGatewayReadyAdvertised(t *testing.T) {
 // a cluster placement sends none to a node that isn't ready.
 func TestSuperviseEgressGatewayRecovers(t *testing.T) {
 	svc, gw, _ := newEgressHarness(t)
-	gw.events = make(chan egress.Event)
 	gw.mu.Lock()
 	gw.readyErr = egress.ErrUnavailable
 	gw.mu.Unlock()
@@ -429,4 +435,47 @@ func TestSuperviseEgressGatewayRecovers(t *testing.T) {
 	// Feature off: returns at once.
 	svc.cfg.EgressFQDNEnabled = false
 	svc.SuperviseEgressGateway(context.Background(), 0)
+}
+
+// TestSuperviseReleasesHoldsOnRecovery: a sandbox held while the gateway was
+// down gets its egress back within a supervisor tick of the gateway
+// returning, without waiting for the reconcile pass.
+func TestSuperviseReleasesHoldsOnRecovery(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	ctx := context.Background()
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"pypi.org"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := svc.store.Get(ctx, resp.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cr, err := svc.containerRuntimeForSandbox(sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.holdSandboxEgress(ctx, sb, cr, egressHoldUnavailable)
+	if st, _ := svc.store.GetEgressState(ctx, resp.ID); st.HoldReason == "" {
+		t.Fatal("setup: sandbox must be held")
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { svc.SuperviseEgressGateway(runCtx, 5*time.Millisecond); close(done) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		st, _ := svc.store.GetEgressState(ctx, resp.ID)
+		if st.HoldReason == "" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hold never lifted after the gateway was ready")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+	if svc.egressStats.held.Load() != 0 {
+		t.Fatal("held gauge must return to 0")
+	}
 }

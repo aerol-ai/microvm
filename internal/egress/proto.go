@@ -121,10 +121,18 @@ type Event struct {
 	// Heartbeat fields.
 	LayoutOK       bool   `json:"layout_ok,omitempty"`
 	AuditDropped   uint64 `json:"audit_dropped,omitempty"`
-	AttachFailed   uint64 `json:"attach_failed,omitempty"`
 	FQDNSandboxes  int    `json:"fqdn_sandboxes,omitempty"`
 	ProxyConns     int    `json:"proxy_conns,omitempty"`
+	ProxyConnCap   int    `json:"proxy_conn_cap,omitempty"`
 	LayoutLostSeen bool   `json:"layout_lost,omitempty"`
+	// Cumulative since gateway start. Denials by reason come from the
+	// gateway's own counters, not the audit stream, so they stay exact
+	// when the audit ring drops events.
+	Denied     map[string]uint64 `json:"denied,omitempty"`
+	DNSQueries uint64            `json:"dns_queries,omitempty"`
+	// GatewayStart identifies the gateway process the totals belong to, so
+	// sandboxd can tell a restart from a quiet interval.
+	GatewayStart time.Time `json:"gateway_start,omitempty"`
 }
 
 // ErrVersionMismatch means the peer speaks a protocol two or more versions

@@ -124,7 +124,9 @@ func (s *Server) handle(c net.Conn) {
 			s.stream(c, req.ID)
 			return
 		}
+		span := startServerSpan(req.Trace, req.Op)
 		payload, err := s.dispatch(req)
+		endSpan(span, err)
 		resp := response{ID: req.ID, Payload: payload}
 		if err != nil {
 			resp.Code, resp.Error = codeFor(err), err.Error()

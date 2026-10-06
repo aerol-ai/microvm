@@ -374,3 +374,17 @@ func TestFormErrAndHelpers(t *testing.T) {
 		f.allow(string(rune('a' + i%26)))
 	}
 }
+
+// TestQueriesCounted: every query that reaches the filter counts, refused
+// ones included (aerolvm_egress_dns_queries_total, the DNS QPS panel).
+func TestQueriesCounted(t *testing.T) {
+	f := New(&fakeSources{src: map[netip.Addr]egress.Source{}}, nil, nil, Config{Upstreams: []string{"127.0.0.1:1"}})
+	m := new(dns.Msg)
+	m.SetQuestion("pypi.org.", dns.TypeA)
+	for i := 0; i < 3; i++ {
+		f.ServeDNS(&recordWriter{remote: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4000}}, m)
+	}
+	if f.Queries() != 3 {
+		t.Fatalf("Queries() = %d, want 3", f.Queries())
+	}
+}

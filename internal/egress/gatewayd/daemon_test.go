@@ -2,11 +2,13 @@ package gatewayd
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -234,6 +236,11 @@ func TestDaemonTableLossRebuild(t *testing.T) {
 	if hb.LayoutOK || !hb.LayoutLostSeen || hb.FQDNSandboxes != 1 {
 		t.Fatalf("heartbeat = %+v", hb)
 	}
+	// Totals for sandboxd's monotonic counters ride every heartbeat, tagged
+	// with this process's start so a restart is unambiguous (P1-12).
+	if hb.GatewayStart.IsZero() || hb.Denied == nil {
+		t.Fatalf("heartbeat must carry totals and the gateway start: %+v", hb)
+	}
 	r.d.AckLayoutLost()
 	r.d.heartbeat()
 	for _, e := range r.d.Events().TakeAllForTest() {
@@ -296,11 +303,27 @@ func TestConfigFromEnv(t *testing.T) {
 	if len(cfg.DNSUpstreams) != 2 || cfg.DNSUpstreams[0] != "10.0.0.2:53" || cfg.DNSUpstreams[1] != "10.0.0.3:5353" {
 		t.Fatalf("upstreams = %v", cfg.DNSUpstreams)
 	}
+	if cfg.Traces.Enabled || cfg.Traces.ServiceName != "aerolvm-egress-gateway" {
+		t.Fatalf("traces default off: %+v", cfg.Traces)
+	}
+	// sandboxd's tracing env turns the gateway's on too, endpoint alone
+	// included, so one env file traces both processes (P1-15).
+	t.Setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://otel:4318")
+	t.Setenv("SB_OTEL_TRACES_SAMPLE_RATIO", "0.5")
+	if cfg, err = FromEnv(); err != nil || !cfg.Traces.Enabled || cfg.Traces.Endpoint != "http://otel:4318" || cfg.Traces.SampleRatio != 0.5 {
+		t.Fatalf("traces = %+v err=%v", cfg.Traces, err)
+	}
+	t.Setenv("SB_OTEL_TRACES_ENABLED", "false")
+	if cfg, _ = FromEnv(); cfg.Traces.Enabled {
+		t.Fatal("an explicit false wins over the endpoint")
+	}
 	for name, val := range map[string]string{
-		"SB_EGRESS_DNS_PORT":    "nope",
-		"SB_EGRESS_PROXY_PORT":  "0",
-		"SB_EGRESS_DNS_QPS":     "-1",
-		"SB_EGRESS_LEARNED_MAX": "x",
+		"SB_EGRESS_DNS_PORT":          "nope",
+		"SB_EGRESS_PROXY_PORT":        "0",
+		"SB_EGRESS_DNS_QPS":           "-1",
+		"SB_EGRESS_LEARNED_MAX":       "x",
+		"SB_OTEL_TRACES_ENABLED":      "maybe",
+		"SB_OTEL_TRACES_SAMPLE_RATIO": "2",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(name, val)
@@ -344,5 +367,24 @@ func TestSocketListenerAndGuard(t *testing.T) {
 	}
 	if safeName("a/b.c") != "a_b_c" {
 		t.Fatal("safeName")
+	}
+}
+
+// TestLogDecisionFields (P1-15): every gateway decision logs sandbox_id,
+// reason, rule and mode at debug, and costs nothing when debug is off.
+func TestLogDecisionFields(t *testing.T) {
+	var buf strings.Builder
+	d := &Daemon{log: slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	d.logDecision("proxy", "sb-1", false, "evil.example:443", "sni_not_allowed", "", egress.ModeAllowlist)
+	for _, want := range []string{`"sandbox_id":"sb-1"`, `"reason":"sni_not_allowed"`, `"rule":""`, `"mode":"allowlist"`, `"path":"proxy"`} {
+		if !strings.Contains(buf.String(), want) {
+			t.Fatalf("log %s missing %s", buf.String(), want)
+		}
+	}
+	buf.Reset()
+	d.log = slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	d.logDecision("dns", "sb-1", false, "evil.example", "host_not_allowed", "", egress.ModeAllowlist)
+	if buf.Len() != 0 {
+		t.Fatal("decisions must not log above debug")
 	}
 }

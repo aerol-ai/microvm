@@ -223,13 +223,281 @@
       ],
       "title": "Ingress caddy batch pressure",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "id": 6,
+      "panels": [],
+      "title": "Egress gateway (hostname filtering)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "aerolvm_egress_gateway_up{instance=~\"$node\"}",
+          "legendFormat": "up {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "aerolvm_egress_fqdn_sandboxes{instance=~\"$node\"}",
+          "legendFormat": "filtered {{instance}}",
+          "refId": "B"
+        },
+        {
+          "expr": "aerolvm_egress_held_sandboxes{instance=~\"$node\"}",
+          "legendFormat": "held {{instance}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Gateway up / hostname-filtered sandboxes",
+      "type": "timeseries",
+      "description": "Gateway down with filtered sandboxes present fires SandboxdEgressGatewayDown; held sandboxes have no egress until re-attached."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "aerolvm_egress_gateway_heartbeat_age_seconds{instance=~\"$node\"}",
+          "legendFormat": "heartbeat {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "aerolvm_egress_gateway_sync_age_seconds{instance=~\"$node\"}",
+          "legendFormat": "full sync {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Gateway heartbeat / sync age",
+      "type": "timeseries",
+      "description": "Heartbeats arrive every 5s. Sync age counts from the last full state replace; -1 means never."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (key) (rate(aerolvm_egress_denied_total{instance=~\"$node\"}[5m]))",
+          "legendFormat": "{{key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Denials by reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(aerolvm_egress_attach_failed_total{instance=~\"$node\"}[5m]))",
+          "legendFormat": "attach failed",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(aerolvm_egress_layout_lost_total{instance=~\"$node\"}[5m]))",
+          "legendFormat": "table rebuilt",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(aerolvm_egress_audit_dropped_total{instance=~\"$node\"}[5m]))",
+          "legendFormat": "audit dropped",
+          "refId": "C"
+        }
+      ],
+      "title": "Attach failures / table rebuilds / audit drops",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 41
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "aerolvm_egress_proxy_connections{instance=~\"$node\"}",
+          "legendFormat": "open {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "aerolvm_egress_proxy_connections_cap{instance=~\"$node\"}",
+          "legendFormat": "cap {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Proxy connections vs cap",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 41
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (instance) (rate(aerolvm_egress_dns_queries_total{instance=~\"$node\"}[5m]))",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Filtering DNS QPS",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
   "schemaVersion": 39,
   "tags": [
     "aerolvm",
-    "ingress"
+    "ingress",
+    "egress"
   ],
   "templating": {
     "list": [
