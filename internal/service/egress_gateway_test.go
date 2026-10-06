@@ -27,6 +27,8 @@ type fakeGateway struct {
 	attachErr error
 	readyErr  error
 	events    chan egress.Event
+	probeRes  egress.ProbeResult
+	probeErr  error
 }
 
 func newFakeGateway() *fakeGateway {
@@ -77,8 +79,13 @@ func (f *fakeGateway) SetBridges(_ context.Context, b []egress.Bridge) error {
 	f.bridges = b
 	return nil
 }
-func (f *fakeGateway) Probe(context.Context, egress.ProbeRequest) (egress.ProbeResult, error) {
-	return egress.ProbeResult{}, nil
+func (f *fakeGateway) Probe(_ context.Context, p egress.ProbeRequest) (egress.ProbeResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if p.Begin {
+		return egress.ProbeResult{}, f.probeErr
+	}
+	return f.probeRes, f.probeErr
 }
 func (f *fakeGateway) Learned(context.Context, string) (json.RawMessage, error) { return nil, nil }
 func (f *fakeGateway) Subscribe(ctx context.Context) (<-chan egress.Event, error) {

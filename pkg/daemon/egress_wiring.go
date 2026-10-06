@@ -53,7 +53,13 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 		}
 		return out
 	}
+	// Bridged sandbox-to-sandbox traffic must pass the netfilter hooks for
+	// the redirect to see it (CEO D18); the self-test then confirms it.
+	if err := ensureForwardingSysctls(); err != nil {
+		logger.Warn("egress: bridge netfilter not enabled; the gateway self-test will fail", "error", err)
+	}
 	svc.SetEgressGateway(egress.NewClient(cfg.EgressGatewaySocket), bridges)
+	svc.SetEgressSelfTest(egress.NewProbeNet())
 	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }
 

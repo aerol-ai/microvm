@@ -366,6 +366,8 @@ type Service struct {
 	egressReady   atomic.Bool
 	egressSubOnce sync.Once
 	egressStats   egressCounters
+	// egressSelfTest is the per-bridge self-test (T41); nil skips it.
+	egressSelfTest *egressSelfTest
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the
@@ -1866,6 +1868,15 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if !s.egressEnabled() {
 			releaseAdmission()
 			return nil, ErrEgressGatewayRequired
+		}
+		if s.egressSelfTestFailed() {
+			releaseAdmission()
+			return nil, ErrEgressSelfTestFailed
+		}
+		if s.egressSelfTestPending() {
+			// Startup only: the first probe round is still running.
+			releaseAdmission()
+			return nil, fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
 		}
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil

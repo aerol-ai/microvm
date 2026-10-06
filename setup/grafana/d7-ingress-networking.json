@@ -278,9 +278,14 @@
           "expr": "aerolvm_egress_held_sandboxes{instance=~\"$node\"}",
           "legendFormat": "held {{instance}}",
           "refId": "C"
+        },
+        {
+          "expr": "aerolvm_egress_selftest_ok{instance=~\"$node\"}",
+          "legendFormat": "self-test ok {{instance}}",
+          "refId": "D"
         }
       ],
-      "title": "Gateway up / hostname-filtered sandboxes",
+      "title": "Gateway up / self-test / hostname-filtered sandboxes",
       "type": "timeseries",
       "description": "Gateway down with filtered sandboxes present fires SandboxdEgressGatewayDown; held sandboxes have no egress until re-attached."
     },

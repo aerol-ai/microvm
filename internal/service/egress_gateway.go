@@ -155,6 +155,10 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	if err := gw.Sync(ctx, specs); err != nil {
 		return err
 	}
+	// Every full sync asks for a re-test of every bridge: it runs at startup
+	// and after a gateway restart, the two times the redirect path may have
+	// changed. The supervisor runs it, off any create path.
+	s.requestEgressSelfTests()
 	s.egressStats.lastSync.Store(time.Now().UnixNano())
 	s.egressStats.fqdnSandboxes.Store(int64(len(specs)))
 	return nil
@@ -166,7 +170,8 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 // (plans/egress-domain-filtering.md CEO D20). Two atomic loads: it runs on
 // every heartbeat and every /v1/capacity read.
 func (s *Service) EgressGatewayReady() bool {
-	return s.egressEnabled() && s.egressReady.Load() && s.egressStats.gatewayUp.Load()
+	return s.egressEnabled() && s.egressReady.Load() && s.egressStats.gatewayUp.Load() &&
+		!s.egressSelfTestFailed() && !s.egressSelfTestPending()
 }
 
 // SuperviseEgressGateway re-runs the gateway bootstrap whenever the latch is
@@ -200,6 +205,7 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 			}
 			lastErr = msg
 		}
+		s.retryEgressSelfTests(ctx, false)
 		if s.EgressGatewayReady() && s.egressStats.held.Load() > 0 {
 			s.retryEgressHolds(ctx)
 		}
@@ -207,6 +213,8 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-s.egressSelfTestKick():
+			s.retryEgressSelfTests(ctx, true)
 		}
 	}
 }
@@ -300,6 +308,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		s.egressStats.recordAttachFailed()
 		return err
 	}
+	s.kickEgressSelfTest()
 	if err := s.egressGateway().Attach(ctx, spec); err != nil {
 		s.egressStats.recordAttachFailed()
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {

@@ -26,6 +26,7 @@ do not use the gateway and are unaffected by every alert below.
 | `SandboxdEgressAttachFailures` | sandboxd failed to attach more than 2 sandboxes in 10 minutes. |
 | `SandboxdEgressSandboxesHeld` | Sandboxes have been held without egress for 10 minutes. |
 | `SandboxdEgressAuditDropped` | The gateway's audit ring overflowed; audit records are missing. |
+| `SandboxdEgressSelfTestFailing` | Probe traffic sent through the redirect never reached the gateway; the node refuses hostname-filtered creates. |
 
 ## Severity
 
@@ -54,6 +55,8 @@ Networking dashboard (`setup/grafana/d7-ingress-networking.json`).
 | `aerolvm_egress_audit_dropped_total` | Audit events lost to ring overflow. |
 | `aerolvm_egress_dns_queries_total` | Queries reaching the filtering resolver; `rate()` is the DNS QPS. |
 | `aerolvm_egress_proxy_connections` | Connections the proxy holds open now. |
+| `aerolvm_egress_selftest_ok` | 0 while some sandbox bridge fails its self-test. |
+| `aerolvm_egress_selftest_failures_total` | Failed self-test runs. |
 | `aerolvm_egress_proxy_connections_cap` | The node-wide proxy connection cap (`SB_EGRESS_PROXY_MAX_CONNS`). |
 
 The capacity heartbeat (`GET /v1/capacity`) also carries
@@ -146,6 +149,31 @@ unaffected and `aerolvm_egress_denied_total` stays exact. Raise
 `SB_EGRESS_AUDIT_BUFFER` if drops recur outside sandboxd restarts, and look
 at `aerolvm_egress_denied_total` by reason for a sandbox retrying a denied
 host in a tight loop.
+
+## SelfTestFailing
+
+At gateway startup, after every gateway restart, and when a bridge first
+appears, sandboxd checks each sandbox bridge. It builds a throwaway netns
+(`aerolvm-egprobe<N>`) joined to the bridge by a veth, with the reserved
+address `169.254.250.<N+1>`, sends one DNS query and one TCP connect to port
+443 through the redirect, and asks the gateway whether both arrived. The
+sandboxd log line `egress gateway self-test failed` names the bridge and the
+cause:
+
+- `redirected traffic did not reach the gateway`: the host's input path
+  drops it. ufw, firewalld or a hardened AMI with an INPUT policy of DROP
+  are the usual causes. Allow TCP and UDP to `SB_EGRESS_DNS_PORT` (default
+  53054) and TCP to `SB_EGRESS_PROXY_PORT` (default 15080) arriving on the
+  sandbox bridges (`docker0`, `aerolvm0`).
+- `bridge-nf-call-iptables is not 1`: load `br_netfilter` and set the
+  sysctl; sandboxd sets it at startup, so something reset it.
+- `carries IPv6`: the gateway redirects IPv4 only, so a bridge with a global
+  IPv6 address cannot be filtered. Disable IPv6 on the sandbox bridge.
+
+A bridge that does not exist yet (containerd's `aerolvm0` before the first
+sandbox) is not a failure; it is tested once it appears. Failed bridges are
+retried with backoff up to every 5 minutes, and immediately on the next
+sandboxd or gateway restart.
 
 ## Tracing and logs
 
