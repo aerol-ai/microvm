@@ -69,9 +69,11 @@ func (s *Service) reapplyEgressProfiles(ctx context.Context) {
 		if !ok {
 			p, err := s.lookupEgressProfile(ctx, r.OwnerRef, r.Profile)
 			switch {
-			case errors.Is(err, ErrEgressProfileNotFound), errors.Is(err, egresspolicy.ErrBuiltinUnknown),
+			case errors.Is(err, ErrEgressProfileNotFound), errors.Is(err, egresspolicy.ErrBuiltinUnknown), errors.Is(err, ErrOrgProfileInvalid),
 				errors.Is(err, ErrEgressProfileUnavailable) && strings.HasPrefix(r.Profile, egresspolicy.BuiltinProfilePrefix):
-				gen = -1 // gone, or a built-in version this node lacks: re-applying holds the sandbox
+				// Gone, out of the operator file, or a built-in version this
+				// node lacks: re-applying holds the sandbox.
+				gen = -1
 			case err != nil:
 				s.logger.Warn("egress: read profile for re-apply", "profile", r.Profile, "error", err)
 				continue
@@ -88,7 +90,7 @@ func (s *Service) reapplyEgressProfiles(ctx context.Context) {
 	// be back at the same generation it had when the sandbox last applied it.
 	if holds, err := s.store.ListEgressHolds(ctx); err == nil {
 		for id, reason := range holds {
-			if reason == egressHoldProfileUnavailable {
+			if isProfileHold(reason) {
 				stale[id] = true
 			}
 		}
@@ -141,7 +143,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	}
 	resolved, err := s.resolveEgressProfiles(ctx, old.OwnerRef, prior.Inline, names)
 	if err != nil {
-		s.holdForProfiles(ctx, old)
+		s.holdForProfiles(ctx, old, profileHoldReason(err, names))
 		return err
 	}
 	next := *old
@@ -155,7 +157,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	}
 	// A profile hold is lifted only by a re-apply, even one whose list
 	// didn't change while the profile was unreadable.
-	held := st.HoldReason == egressHoldProfileUnavailable
+	held := isProfileHold(st.HoldReason)
 	if held || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
 		if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
 			BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
@@ -182,7 +184,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 // resolved, so it never keeps serving entries its owner may have removed.
 // The WASM and isolate mediators keep their last policy until a re-apply
 // succeeds.
-func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox) {
+func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox, reason string) {
 	if sb.Status != models.SandboxStatusStarted || sb.ContainerIP == "" || s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
 		return
 	}
@@ -190,5 +192,21 @@ func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox) {
 	if err != nil {
 		return
 	}
-	s.holdSandboxEgress(ctx, sb, cr, egressHoldProfileUnavailable)
+	s.holdSandboxEgress(ctx, sb, cr, reason)
+}
+
+// profileHoldReason names why a sandbox's profiles stopped resolving. An org
+// profile is checked by no one before a reload lands (the file has no API
+// and the cluster's cap check can't see it), so a reference that left the
+// file, or a union over the cap on a sandbox that uses org profiles, is
+// org_profile_invalid (§5.10 PC-3).
+func profileHoldReason(err error, refs []string) string {
+	if errors.Is(err, ErrOrgProfileInvalid) {
+		return egressHoldOrgProfileInvalid
+	}
+	usesOrg := slices.ContainsFunc(refs, func(r string) bool { return strings.HasPrefix(r, egresspolicy.OrgProfilePrefix) })
+	if usesOrg && errors.Is(err, egresspolicy.ErrInvalid) {
+		return egressHoldOrgProfileInvalid
+	}
+	return egressHoldProfileUnavailable
 }

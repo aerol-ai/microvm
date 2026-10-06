@@ -1658,6 +1658,11 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// the effective allow list. The replicated spec, built by the caller from
 	// its own copy of req, keeps the references.
 	// Learn mode (P2-7) rides the same side state as the references.
+	// The operator default goes first: its org profiles are references too.
+	// The cluster create paths already applied it to the spec they promote.
+	if !isStoredSpecReplay(ctx) {
+		s.NormalizeCreateEgressDefault(&req)
+	}
 	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
 		if _, cerr := compileCreateEgress(&req); cerr != nil {
 			return nil, cerr

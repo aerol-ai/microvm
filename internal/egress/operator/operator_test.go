@@ -59,6 +59,9 @@ func TestParseFull(t *testing.T) {
 	if allowed, _ := pol.MatchHostPort("git.corp.bank.internal", 22); !allowed {
 		t.Fatal("org profile host:port not compiled")
 	}
+	if entries, desc, ok := op.OrgProfileEntries("org:baseline"); !ok || len(entries) != 2 || entries[1] != "git.corp.bank.internal:22" || desc != "internal git" {
+		t.Fatalf("org profile entries = %v %q %v", entries, desc, ok)
+	}
 	if op.Ceiling() == nil || op.InternalZone() == nil || len(op.DenyFloor()) != 1 {
 		t.Fatal("ceiling, zone and floor must be set")
 	}
@@ -93,6 +96,9 @@ func TestNilOperatorDefaults(t *testing.T) {
 	}
 	if _, ok := op.OrgProfile("org:x"); ok {
 		t.Fatal("nil operator has no profiles")
+	}
+	if _, _, ok := op.OrgProfileEntries("org:x"); ok {
+		t.Fatal("nil operator has no profile entries")
 	}
 	if g := op.Guard(); g.Zone != nil || g.Strict {
 		t.Fatal("nil guard")

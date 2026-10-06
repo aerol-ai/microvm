@@ -28,7 +28,7 @@ do not use the gateway and are unaffected by every alert below.
 | `SandboxdEgressAuditDropped` | The gateway's audit ring overflowed; audit records are missing. |
 | `SandboxdEgressOperatorConfigDrift` | Nodes run different operator files. |
 | `SandboxdEgressOperatorConfigReloadFailed` | An operator file edit did not validate. |
-| `SandboxdEgressProfileApplyFailing` | A changed egress profile could not be applied to some sandboxes; they are held. |
+| `SandboxdEgressProfileApplyFailing` | A changed egress profile, org profile or built-in version could not be applied to some sandboxes; they are held. |
 | `SandboxdEgressSelfTestFailing` | Probe traffic sent through the redirect never reached the gateway; the node refuses hostname-filtered creates. |
 
 ## Severity
@@ -158,7 +158,19 @@ change. A sandbox the new profile can't be applied to is shut: its
    In a cluster, check that this node reaches the server tier. A profile
    that is gone keeps the sandbox held until its owner changes the
    sandbox's `egress_profiles` with `PUT /v1/sandboxes/{id}/network/policy`.
-3. Other errors are the same as attach failures; see
+   A sandbox pinned to a built-in profile version newer than this node's
+   build (`builtin:<name>@<date>`, after a failover in the middle of a
+   rolling upgrade) is held the same way, running block-all with
+   `egress_status: unavailable`; finish the upgrade and it lifts within 10
+   seconds.
+3. `org_profile_invalid` holds follow an operator file edit: an `org:`
+   profile that sandboxes on this node reference was removed, or grew so
+   that some sandbox's allow list and profiles together pass 1024 hostname
+   entries. Put the profile back or shrink it, ship the file to every node,
+   and the next pass lifts the hold. Nothing checks an edit against the
+   sandboxes using it before it lands, so review `org_profiles` changes
+   against what references them.
+4. Other errors are the same as attach failures; see
    [AttachFailures](#attachfailures).
 
 ## AuditDropped
@@ -222,7 +234,14 @@ reads it for the internal zone, its copy of the floor and the proxy.
   (`config/cluster.yml` drives install, Terraform and Ansible).
 - **Running sandboxes.** The default policy is written into each sandbox's
   spec at create, so editing the file never changes a running sandbox, and a
-  failover recreate keeps what the sandbox was created with.
+  failover recreate keeps what the sandbox was created with. The exception
+  is `org_profiles`: a sandbox references an org profile (directly, or
+  through the default) rather than copying it, so an edit reaches every
+  sandbox using it within 10 seconds, paced by
+  `SB_EGRESS_PROFILE_APPLY_QPS`. A removed or oversized one holds them
+  ([ProfileApplyFailing](#profileapplyfailing)).
+- **Built-in profiles (`builtin_profiles`, on by default).** `false` refuses
+  new `builtin:` references with 400; sandboxes already using one keep it.
 - **Deny floor (`deny_cidrs`).** Dropped for every sandbox in every mode, in
   three places: the host firewall chain `AEROLVM-FLOOR` (jumped from the top
   of `DOCKER-USER` or `AEROLVM-USER`, rewritten by sandboxd when the file

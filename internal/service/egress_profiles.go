@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -36,6 +38,11 @@ var ErrEgressProfileCapExceeded = errors.New("egress profile update would exceed
 // ErrEgressProfileUnavailable means the profiles a policy references could
 // not be read right now (503, retry).
 var ErrEgressProfileUnavailable = errors.New("egress profiles are unavailable")
+
+// ErrOrgProfileInvalid is an org: reference the operator file doesn't define
+// (400 at create and policy PUT; a hold with reason org_profile_invalid on a
+// running sandbox, §5.10 PC-3).
+var ErrOrgProfileInvalid = errors.New("org egress profile is not defined")
 
 const (
 	// maxProfileDescription bounds a profile's free-text description.
@@ -193,9 +200,17 @@ func countHostnames(entries []string) (int, error) {
 	return egresspolicy.CountHostnames(parsed), nil
 }
 
-// GetEgressProfile returns one of the caller's profiles, or a built-in one:
-// builtin:<name> is its newest version, builtin:<name>@<version> that one.
+// GetEgressProfile returns one of the caller's profiles, a built-in one
+// (builtin:<name> is its newest version, builtin:<name>@<version> that one)
+// or one of the operator's org profiles, which every tenant can read.
 func (s *Service) GetEgressProfile(ctx context.Context, name string) (*models.EgressProfile, error) {
+	if strings.HasPrefix(name, egresspolicy.OrgProfilePrefix) {
+		entries, desc, ok := s.egressOperator().OrgProfileEntries(name)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrEgressProfileNotFound, name)
+		}
+		return &models.EgressProfile{Name: name, AllowOut: entries, Description: desc, Generation: orgProfileGeneration(entries)}, nil
+	}
 	if strings.HasPrefix(name, egresspolicy.BuiltinProfilePrefix) {
 		b, err := egresspolicy.ResolveBuiltin(name)
 		if err != nil {
@@ -278,7 +293,9 @@ func (s *Service) resolveEgressProfiles(ctx context.Context, owner string, inlin
 		switch {
 		case errors.Is(err, ErrEgressProfileNotFound):
 			return r, fmt.Errorf("%w: egress_profiles entry %q: no such profile", egresspolicy.ErrInvalid, ref)
-		case errors.Is(err, egresspolicy.ErrBuiltinUnknown), errors.Is(err, egresspolicy.ErrInvalid):
+		case errors.Is(err, ErrOrgProfileInvalid):
+			return r, fmt.Errorf("%w: egress_profiles entry %q: %w", egresspolicy.ErrInvalid, ref, err)
+		case errors.Is(err, egresspolicy.ErrBuiltinUnknown):
 			return r, fmt.Errorf("%w: egress_profiles entry %q: %v", egresspolicy.ErrInvalid, ref, err)
 		case errors.Is(err, ErrEgressProfileUnavailable):
 			return r, err
@@ -331,13 +348,26 @@ func (s *Service) lookupEgressProfile(ctx context.Context, owner, ref string) (e
 		}
 		return egressProfileBody{Ref: b.Ref, AllowOut: b.AllowOut, Generation: b.Version}, nil
 	case strings.HasPrefix(ref, egresspolicy.OrgProfilePrefix):
-		return egressProfileBody{}, fmt.Errorf("%w: org: profiles are not available yet", egresspolicy.ErrInvalid)
+		entries, _, ok := s.egressOperator().OrgProfileEntries(ref)
+		if !ok {
+			return egressProfileBody{}, fmt.Errorf("%w: %s is not in this deployment's operator file", ErrOrgProfileInvalid, ref)
+		}
+		return egressProfileBody{Ref: ref, AllowOut: entries, Generation: orgProfileGeneration(entries)}, nil
 	}
 	p, err := s.egressProfileBackend().GetEgressProfile(ctx, owner, ref)
 	if err != nil {
 		return egressProfileBody{}, err
 	}
 	return egressProfileBody{Ref: ref, AllowOut: p.AllowOut, Generation: p.Generation}, nil
+}
+
+// orgProfileGeneration is an org profile's generation: a hash of its
+// entries, since the operator file has no counter (§5.10 PC-3). Any edit
+// changes it, so the re-apply pass sees the edit; positive, so it never
+// collides with the pass's -1 for "gone".
+func orgProfileGeneration(entries []string) int64 {
+	sum := sha256.Sum256([]byte(strings.Join(entries, "\n")))
+	return max(int64(binary.BigEndian.Uint64(sum[:8])>>1), 1)
 }
 
 // NormalizeCreateEgressProfiles pins each bare builtin:<name> in a create to

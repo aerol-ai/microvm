@@ -15,17 +15,21 @@ import (
 // policy applies. A ceiling breach is reported in OutsideCeiling rather than
 // refused, so a caller can see why a create would fail. Pure and read-only:
 // no sandbox, no I/O.
-func (s *Service) CheckNetworkPolicy(_ context.Context, req models.NetworkPolicyCheckRequest) (*models.NetworkPolicyCheckResponse, error) {
+func (s *Service) CheckNetworkPolicy(ctx context.Context, req models.NetworkPolicyCheckRequest) (*models.NetworkPolicyCheckResponse, error) {
 	create := models.CreateSandboxRequest{
 		NetworkBlockAll: req.NetworkBlockAll,
 		NetworkAllowOut: req.NetworkAllowOut,
 		NetworkDenyOut:  req.NetworkDenyOut,
 	}
 	op := s.egressOperator()
-	if op != nil && !hasEgressFields(&create) {
-		if err := applyOperatorDefault(op, &create); err != nil {
+	s.NormalizeCreateEgressDefault(&create)
+	// The default's org profiles are references; check their entries.
+	if len(create.EgressProfiles) > 0 {
+		r, err := s.resolveEgressProfiles(ctx, "", create.NetworkAllowOut, create.EgressProfiles)
+		if err != nil {
 			return nil, err
 		}
+		create.NetworkAllowOut = r.Effective
 	}
 	pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: create.NetworkAllowOut, DenyOut: create.NetworkDenyOut, BlockAll: create.NetworkBlockAll})
 	if err != nil {

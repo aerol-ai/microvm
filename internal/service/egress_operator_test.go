@@ -34,7 +34,12 @@ func TestOperatorDefaultPolicyIsStored(t *testing.T) {
 	}
 	sb, _ := svc.store.Get(ctx, resp.ID)
 	if len(sb.NetworkAllowOut) != 2 || sb.NetworkAllowOut[0] != "pypi.org" || sb.NetworkAllowOut[1] != "*.npmjs.org" {
-		t.Fatalf("stored allow_out = %v, want the default with org refs expanded", sb.NetworkAllowOut)
+		t.Fatalf("effective allow_out = %v, want the default with its org profile", sb.NetworkAllowOut)
+	}
+	// The org profile is a reference, so an edit to it reaches the sandbox
+	// (§5.10 PC-3).
+	if len(resp.EgressProfiles) != 1 || resp.EgressProfiles[0] != "org:mirrors" || len(resp.NetworkAllowOut) != 1 {
+		t.Fatalf("create response = %v %v", resp.NetworkAllowOut, resp.EgressProfiles)
 	}
 	req := models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}
 	if err := svc.applyEgressOperatorPolicy(&req, false); err != nil || len(req.NetworkAllowOut) != 1 {
@@ -150,16 +155,16 @@ func TestUpstreamPortRule(t *testing.T) {
 func TestNormalizeCreateEgressDefault(t *testing.T) {
 	svc, _, _ := newEgressHarness(t)
 	none := models.CreateSandboxRequest{}
-	if err := svc.NormalizeCreateEgressDefault(&none); err != nil || hasEgressFields(&none) {
-		t.Fatalf("no operator file: %+v %v", none, err)
+	if svc.NormalizeCreateEgressDefault(&none); hasEgressFields(&none) {
+		t.Fatalf("no operator file: %+v", none)
 	}
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ndefault_policy: {mode: block_all}\n"))
 	req := models.CreateSandboxRequest{}
-	if err := svc.NormalizeCreateEgressDefault(&req); err != nil || !req.NetworkBlockAll {
-		t.Fatalf("block_all default: %+v %v", req, err)
+	if svc.NormalizeCreateEgressDefault(&req); !req.NetworkBlockAll {
+		t.Fatalf("block_all default: %+v", req)
 	}
 	own := models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}
-	if err := svc.NormalizeCreateEgressDefault(&own); err != nil || own.NetworkBlockAll {
-		t.Fatalf("explicit policy rewritten: %+v %v", own, err)
+	if svc.NormalizeCreateEgressDefault(&own); own.NetworkBlockAll {
+		t.Fatalf("explicit policy rewritten: %+v", own)
 	}
 }

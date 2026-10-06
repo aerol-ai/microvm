@@ -52,11 +52,15 @@ func (s *Service) SetEgressOperator(w *operator.Watcher) {
 }
 
 // OnEgressOperatorChange is the watcher's change callback: it refreshes the
-// drift metric and the host-firewall floor. The gateway reads the file
-// itself; the control-port guard follows on the next supervisor tick.
+// drift metric and the host-firewall floor, and wakes the profile re-apply
+// pass so an edited or removed org profile reaches this node's sandboxes
+// (§5.10 PC-3; each node re-applies its own, paced like any profile change).
+// The gateway reads the file itself; the control-port guard follows on the
+// next supervisor tick.
 func (s *Service) OnEgressOperatorChange(op *operator.Operator) {
 	publishOperatorHash(op)
 	s.applyEgressFloor(context.Background(), op)
+	s.kickEgressProfileReapply()
 }
 
 // applyEgressFloor installs the operator's deny_cidrs as a node-wide DROP on
@@ -114,8 +118,7 @@ func hasEgressFields(req *models.CreateSandboxRequest) bool {
 //
 // A failover replay is exempt from both: its stored spec already carries
 // what was decided at create, and a ceiling tightened since must not strand
-// a running sandbox. Org references in the default are expanded to their
-// entries until profiles exist as references (Phase 2).
+// a running sandbox.
 func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, replay bool) error {
 	if s.egressOperatorWatcher != nil {
 		if err := s.egressOperatorWatcher.BootError(); err != nil {
@@ -127,9 +130,7 @@ func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, re
 		return nil
 	}
 	if !hasEgressFields(req) {
-		if err := applyOperatorDefault(op, req); err != nil {
-			return err
-		}
+		applyOperatorDefault(op, req)
 	}
 	return checkEgressOperatorLimits(op, req)
 }
@@ -170,45 +171,27 @@ func checkEgressOperatorLimits(op *operator.Operator, req *models.CreateSandboxR
 // the default so it can't pick up a file edited since; without this a
 // defaulted sandbox would come back open after failover. Placement also has
 // to see a hostname default to send the create to a gateway-ready node.
-func (s *Service) NormalizeCreateEgressDefault(req *models.CreateSandboxRequest) error {
-	op := s.egressOperator()
-	if op == nil || hasEgressFields(req) {
-		return nil
+func (s *Service) NormalizeCreateEgressDefault(req *models.CreateSandboxRequest) {
+	if op := s.egressOperator(); op != nil && !hasEgressFields(req) {
+		applyOperatorDefault(op, req)
 	}
-	return applyOperatorDefault(op, req)
 }
 
 // applyOperatorDefault writes the operator's default policy into a request
-// that says nothing about egress.
-func applyOperatorDefault(op *operator.Operator, req *models.CreateSandboxRequest) error {
+// that says nothing about egress. Org profiles in the default become
+// references, not copies, so an edit to one reaches the sandboxes created
+// with it (§5.10 PC-3); the file's parse already proved they exist.
+func applyOperatorDefault(op *operator.Operator, req *models.CreateSandboxRequest) {
 	switch op.DefaultMode() {
 	case operator.ModeBlockAll:
 		req.NetworkBlockAll = true
 	case operator.ModeAllowlist:
-		allow, err := expandOrgRefs(op, op.DefaultAllowOut())
-		if err != nil {
-			return err
-		}
-		req.NetworkAllowOut = allow
-	}
-	return nil
-}
-
-// expandOrgRefs replaces org:<name> entries with the profile's entries.
-func expandOrgRefs(op *operator.Operator, entries []string) ([]string, error) {
-	var out []string
-	for _, e := range entries {
-		if !strings.HasPrefix(e, operator.OrgProfilePrefix) {
-			out = append(out, e)
-			continue
-		}
-		p, ok := op.OrgProfile(e)
-		if !ok {
-			return nil, fmt.Errorf("%w: default policy references unknown %s", egresspolicy.ErrInvalid, e)
-		}
-		for _, entry := range p.AllowEntries() {
-			out = append(out, entry.String())
+		for _, e := range op.DefaultAllowOut() {
+			if strings.HasPrefix(e, operator.OrgProfilePrefix) {
+				req.EgressProfiles = append(req.EgressProfiles, e)
+			} else {
+				req.NetworkAllowOut = append(req.NetworkAllowOut, e)
+			}
 		}
 	}
-	return out, nil
 }

@@ -1,6 +1,6 @@
 ---
 title: Egress Profiles and Learn Mode
-description: Name an allow list once and use it from many sandboxes, start from built-in lists for common registries, learn an allow list from a trusted run, and check a policy before you create anything.
+description: Name an allow list once and use it from many sandboxes, start from built-in lists for common registries or your operator's org lists, learn an allow list from a trusted run, and check a policy before you create anything.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -352,6 +352,91 @@ its own or next to yours.
 
 ---
 
+## Org profiles
+
+On a private network, your operator can publish allow lists for everyone on
+the deployment, such as the bank's package mirrors, as `org:<name>` profiles.
+Every account can read them and reference them like its own; only the
+operator can change them.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const mirrors = await client.getEgressProfile('org:mirrors')
+    console.log(mirrors.allowOut, mirrors.description)
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['org:mirrors', 'python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    mirrors = client.get_egress_profile('org:mirrors')
+    print(mirrors['allowOut'], mirrors.get('description'))
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['org:mirrors', 'python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    mirrors, err := client.GetEgressProfile(ctx, "org:mirrors")
+    if err != nil {
+        return err
+    }
+    fmt.Println(mirrors.AllowOut, mirrors.Description)
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"org:mirrors", "python-deps"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mirrors = client.get_egress_profile("org:mirrors")?;
+    println!("{:?} {}", mirrors.allow_out, mirrors.description);
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["org:mirrors".to_string(), "python-deps".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfile mirrors = client.getEgressProfile("org:mirrors");
+    System.out.println(mirrors.allowOut + " " + mirrors.description);
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("org:mirrors", "python-deps"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+- **Not pinned.** Unlike built-ins, a sandbox follows its org profiles: when
+  the operator edits one, every sandbox that uses it picks up the change
+  within about 10 seconds, and `generation` changes.
+- **The default policy.** When the operator's default policy names org
+  profiles, a sandbox created without any egress settings references them, so
+  it follows edits too.
+- **When one goes away.** If the operator removes an org profile a sandbox
+  uses, or grows it so the sandbox would pass the 1024-entry limit, that
+  sandbox is shut (`egressStatus: "held"`) until the operator fixes it.
+- **Unknown names** are refused with `400` at create and in
+  `setNetworkPolicy`. Org profiles don't appear in `listEgressProfiles`; your
+  operator publishes their names.
+
+---
+
 ## Learn an allow list
 
 Writing an allow list for a workload you didn't write is guesswork. **Learn
@@ -524,8 +609,6 @@ caught when the sandbox connects.
 ## Limitations
 
 - **Firecracker** sandboxes can't use profiles yet.
-- **Org profiles** (`org:` names) aren't available yet; the prefix is
-  reserved.
 - **Learn mode and the E2B SDK.** `updateNetwork` keeps a sandbox in learn
   mode; setting lists on a learn-mode sandbox from the E2B SDK is refused with
   `409`. Switch it with `setNetworkPolicy`.

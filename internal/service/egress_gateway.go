@@ -27,7 +27,17 @@ const (
 	// egressHoldProfileUnavailable: a referenced profile couldn't be read or
 	// is gone. Only the profile re-apply pass lifts it.
 	egressHoldProfileUnavailable = "profile_unavailable"
+	// egressHoldOrgProfileInvalid: a referenced org profile left the operator
+	// file, or its entries pushed the sandbox past the union cap (§5.10
+	// PC-3). Only the profile re-apply pass lifts it.
+	egressHoldOrgProfileInvalid = "org_profile_invalid"
 )
+
+// isProfileHold reports whether only the profile re-apply pass may lift a
+// hold: re-attaching the stored list can't fix what the profiles broke.
+func isProfileHold(reason string) bool {
+	return reason == egressHoldProfileUnavailable || reason == egressHoldOrgProfileInvalid
+}
 
 // Egress status shown on GET (egress_status).
 const (
@@ -396,7 +406,7 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 	for id, reason := range holds {
 		// An invalid stored policy and an unresolvable profile can't be fixed
 		// by re-attaching the stored list; their owners lift those holds.
-		if reason == egressHoldPolicyInvalid || reason == egressHoldProfileUnavailable {
+		if reason == egressHoldPolicyInvalid || isProfileHold(reason) {
 			continue
 		}
 		sb, err := s.store.Get(ctx, id)

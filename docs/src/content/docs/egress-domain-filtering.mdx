@@ -337,7 +337,12 @@ internal_zone:
   cidrs: [10.0.0.0/8]                # the internal ranges those names may reach
 default_policy:
   mode: allowlist                    # open | block_all | allowlist, for creates that set no egress
-  allow_out: [artifactory.corp.bank.internal]
+  allow_out: [artifactory.corp.bank.internal, "org:mirrors"]
+org_profiles:                        # org:<name> lists every account can use
+  mirrors:
+    allow_out: [pypi.mirror.corp.bank.internal, npm.mirror.corp.bank.internal]
+    description: package mirrors
+builtin_profiles: false              # refuse builtin: profiles, which name public hosts
 ceiling:
   allow_out: ["*.corp.bank.internal", pypi.org]   # every allow entry must fit inside
 deny_cidrs: [10.50.0.0/16]           # always dropped, for every sandbox
@@ -353,7 +358,13 @@ upstream_proxy:
   range, other names that resolve there, and metadata addresses stay blocked.
 - **Default policy.** A create that says nothing about egress gets this one,
   stored with the sandbox, so editing the file later never changes a running
-  sandbox.
+  sandbox. Org profiles it names are the exception: they stay references.
+- **Org profiles.** Every account can reference `org:<name>` profiles; an
+  edit reaches the sandboxes using them within about 10 seconds. See
+  [Org profiles](/egress-profiles-and-learn-mode#org-profiles).
+- **Built-in profiles.** `builtin_profiles: false` refuses
+  [built-in profiles](/egress-profiles-and-learn-mode#built-in-profiles) with
+  `400`, for networks where their public hosts are unreachable anyway.
 - **Ceiling.** An allow entry that doesn't fit is refused with `400` naming it.
 - **Deny floor and control-port guard.** Applied to every sandbox on the node,
   whatever its policy.

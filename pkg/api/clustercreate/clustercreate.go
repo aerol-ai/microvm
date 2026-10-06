@@ -116,10 +116,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
-	if err := svc.NormalizeCreateEgressDefault(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return Decision{}, false
-	}
+	svc.NormalizeCreateEgressDefault(&req)
 	if opts.Normalize != nil {
 		if err := opts.Normalize(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -334,9 +331,7 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	if err := service.NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}
-	if err := svc.NormalizeCreateEgressDefault(&req); err != nil {
-		return nil, err
-	}
+	svc.NormalizeCreateEgressDefault(&req)
 	// Pin bare built-in profiles here, on the owner after any forward, so
 	// the spec promoted below carries this node's version (CEO D11).
 	service.NormalizeCreateEgressProfiles(&req)

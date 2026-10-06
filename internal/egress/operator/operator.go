@@ -330,6 +330,21 @@ func (o *Operator) OrgProfile(name string) (*egresspolicy.Policy, bool) {
 	return p, ok
 }
 
+// OrgProfileEntries returns an org profile's canonical allow entries and
+// description, for a sandbox that references it (§5.10 PC-3).
+func (o *Operator) OrgProfileEntries(ref string) ([]string, string, bool) {
+	p, ok := o.OrgProfile(ref)
+	if !ok {
+		return nil, "", false
+	}
+	entries := p.AllowEntries()
+	out := make([]string, len(entries))
+	for i, e := range entries {
+		out[i] = e.String()
+	}
+	return out, o.file.OrgProfiles[strings.TrimPrefix(ref, OrgProfilePrefix)].Description, true
+}
+
 // OrgProfileNames lists the org profiles, sorted.
 func (o *Operator) OrgProfileNames() []string {
 	if o == nil {

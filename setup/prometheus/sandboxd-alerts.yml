@@ -705,7 +705,7 @@ groups:
           component: egress
         annotations:
           summary: "egress profile changes are not reaching some sandboxes"
-          description: "Re-applying a changed egress profile kept failing on {{ $labels.instance }} for 10 minutes. The affected sandboxes are held without egress until it succeeds."
+          description: "Re-applying egress profiles kept failing on {{ $labels.instance }} for 10 minutes: a changed or missing profile, an org profile removed or grown past the cap by an operator file edit, or a built-in version this node lacks. The affected sandboxes are held without egress until it succeeds."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#profileapplyfailing"
 
       # Held sandboxes have no egress at all until the hold lifts.
