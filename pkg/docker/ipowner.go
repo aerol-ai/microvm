@@ -57,6 +57,19 @@ func ipOwnerFromContainerName(name string) string {
 
 var _ runtime.EgressHolder = (*Client)(nil)
 
+// SetEgressFloor installs the operator's node-wide deny floor for the
+// sandbox network's subnet (§5.10 PC-2).
+func (c *Client) SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error {
+	if c.networkRules == nil || !c.networkRules.Enabled() {
+		return nil
+	}
+	sn, err := c.SandboxBridge(ctx)
+	if err != nil {
+		return err
+	}
+	return c.networkRules.SetFloor(sn.Subnet, cidrs)
+}
+
 // ApplyEgressHold installs the fail-closed hold DROP (CEO D16).
 func (c *Client) ApplyEgressHold(containerIP string) error {
 	return c.networkRules.HoldEgress(containerIP)
@@ -67,11 +80,20 @@ func (c *Client) ClearEgressHold(containerIP string) error {
 	return c.networkRules.ClearHoldEgress(containerIP)
 }
 
-// SandboxBridge returns the Linux bridge and gateway IP of the sandbox
-// network (SB_DOCKER_NETWORK, default "bridge" → docker0). sandboxd hands it
-// to the egress gateway, which has no docker socket access (plans/
+// SandboxNetwork is the sandbox network's bridge as the egress gateway needs
+// it: where to listen (Gateway on Name) and which sources the node-wide
+// floor and control-port guard cover (Subnet, §5.10 PC-2).
+type SandboxNetwork struct {
+	Name    string
+	Gateway netip.Addr
+	Subnet  netip.Prefix
+}
+
+// SandboxBridge returns the Linux bridge, gateway IP and subnet of the
+// sandbox network (SB_DOCKER_NETWORK, default "bridge" → docker0). sandboxd
+// hands it to the egress gateway, which has no docker socket access (plans/
 // egress-domain-filtering.md S5, CEO D21).
-func (c *Client) SandboxBridge(ctx context.Context) (string, netip.Addr, error) {
+func (c *Client) SandboxBridge(ctx context.Context) (SandboxNetwork, error) {
 	network := c.network
 	if network == "" {
 		network = "bridge"
@@ -87,7 +109,7 @@ func (c *Client) SandboxBridge(ctx context.Context) (string, netip.Addr, error) 
 		} `json:"IPAM"`
 	}
 	if err := c.doJSON(ctx, http.MethodGet, "/networks/"+url.PathEscape(network), nil, nil, nil, &resp); err != nil {
-		return "", netip.Addr{}, err
+		return SandboxNetwork{}, err
 	}
 	name := resp.Options["com.docker.network.bridge.name"]
 	if name == "" {
@@ -100,8 +122,12 @@ func (c *Client) SandboxBridge(ctx context.Context) (string, netip.Addr, error) 
 	for _, cfg := range resp.IPAM.Config {
 		gw, err := netip.ParseAddr(cfg.Gateway)
 		if err == nil && gw.Is4() {
-			return name, gw, nil
+			sn := SandboxNetwork{Name: name, Gateway: gw}
+			if p, err := netip.ParsePrefix(cfg.Subnet); err == nil && p.Addr().Is4() {
+				sn.Subnet = p.Masked()
+			}
+			return sn, nil
 		}
 	}
-	return name, netip.Addr{}, fmt.Errorf("docker network %s has no IPv4 gateway", network)
+	return SandboxNetwork{Name: name}, fmt.Errorf("docker network %s has no IPv4 gateway", network)
 }

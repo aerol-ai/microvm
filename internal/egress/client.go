@@ -25,6 +25,9 @@ type API interface {
 	SetBridges(ctx context.Context, bridges []Bridge) error
 	Probe(ctx context.Context, p ProbeRequest) (ProbeResult, error)
 	Learned(ctx context.Context, id string) (json.RawMessage, error)
+	// SetNodeControl replaces the node-wide control-port guard's endpoints
+	// (§5.10 PC-2).
+	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
 }
 
 // Noop is the API when there is no gateway. Anything that would put a sandbox
@@ -57,6 +60,10 @@ func (Noop) SetBridges(context.Context, []Bridge) error {
 func (Noop) Probe(context.Context, ProbeRequest) (ProbeResult, error) {
 	return ProbeResult{}, fmt.Errorf("%w: gateway disabled", ErrUnavailable)
 }
+
+// SetNodeControl is a no-op: without a gateway there is no table to guard.
+func (Noop) SetNodeControl(context.Context, []netip.AddrPort) error { return nil }
+
 func (Noop) Learned(context.Context, string) (json.RawMessage, error) {
 	return nil, fmt.Errorf("%w: gateway disabled", ErrUnavailable)
 }
@@ -230,6 +237,13 @@ func (c *Client) Ready(ctx context.Context) (ReadyStatus, error) {
 	err := c.call(ctx, opReady, nil, &st)
 	return st, err
 }
+func (c *Client) SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error {
+	if endpoints == nil {
+		endpoints = []netip.AddrPort{}
+	}
+	return c.call(ctx, opNodeCtl, endpoints, nil)
+}
+
 func (c *Client) SetBridges(ctx context.Context, bridges []Bridge) error {
 	if bridges == nil {
 		bridges = []Bridge{}

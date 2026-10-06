@@ -21,6 +21,7 @@ type nftAPI interface {
 	DelRule(r *nftables.Rule) error
 	ListChains() ([]*nftables.Chain, error)
 	AddChain(c *nftables.Chain) *nftables.Chain
+	FlushChain(c *nftables.Chain)
 	Flush() error
 }
 
@@ -210,6 +211,13 @@ func (b *netlinkBackend) EnsureForwardJump(userChain string) error {
 	if err != nil {
 		return err
 	}
+	// iptables-nft creates base chains lazily; a containerd-only host may
+	// have the filter table but no FORWARD chain until something adds a
+	// rule. Create it the way iptables-nft would, as EnsureInputChain does
+	// for INPUT.
+	if err := ensureBaseChain(conn, tbl, "FORWARD", nftables.ChainHookForward); err != nil {
+		return err
+	}
 	rules, err := conn.GetRules(tbl, fwd)
 	if err != nil {
 		return fmt.Errorf("nft get FORWARD rules: %w", err)
@@ -303,32 +311,9 @@ func (b *netlinkBackend) EnsureInputChain(chain string) error {
 	input := &nftables.Chain{Name: "INPUT", Table: tbl}
 	// iptables-nft creates base chains lazily, on the first rule added to
 	// them, and dockerd never adds one to INPUT. So on a docker or containerd
-	// host the filter table usually has FORWARD but no INPUT chain yet; create
-	// it the way iptables-nft would (filter hook, priority 0, policy accept).
-	chains, err := conn.ListChains()
-	if err != nil {
-		return fmt.Errorf("nft list chains: %w", err)
-	}
-	hasInput := false
-	for _, c := range chains {
-		if c != nil && c.Name == "INPUT" && c.Table != nil && c.Table.Name == tbl.Name && c.Table.Family == tbl.Family {
-			hasInput = true
-			break
-		}
-	}
-	if !hasInput {
-		accept := nftables.ChainPolicyAccept
-		conn.AddChain(&nftables.Chain{
-			Name:     "INPUT",
-			Table:    tbl,
-			Type:     nftables.ChainTypeFilter,
-			Hooknum:  nftables.ChainHookInput,
-			Priority: nftables.ChainPriorityFilter,
-			Policy:   &accept,
-		})
-		if err := conn.Flush(); err != nil {
-			return fmt.Errorf("nft add INPUT base chain: %w", err)
-		}
+	// host the filter table usually has FORWARD but no INPUT chain yet.
+	if err := ensureBaseChain(conn, tbl, "INPUT", nftables.ChainHookInput); err != nil {
+		return err
 	}
 	inRules, err := conn.GetRules(tbl, input)
 	if err != nil {
@@ -362,4 +347,86 @@ func lookupTableChain(table, chain string) (*nftables.Table, *nftables.Chain, er
 	tbl := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: table}
 	ch := &nftables.Chain{Name: chain, Table: tbl}
 	return tbl, ch, nil
+}
+
+// EnsureJumpChain implements floorBackend: child exists and parent's first
+// rule jumps to it.
+//
+// NOTE: same offline-coverage caveat as EnsureUserChain; the live kernel
+// path is exercised by the kerneltest-tagged floor test.
+func (b *netlinkBackend) EnsureJumpChain(parent, child string) error {
+	if err := b.EnsureUserChain(child); err != nil {
+		return err
+	}
+	tbl, pch, err := lookupTableChain("filter", parent)
+	if err != nil {
+		return err
+	}
+	conn, err := b.newConn()
+	if err != nil {
+		return err
+	}
+	rules, err := conn.GetRules(tbl, pch)
+	if err != nil {
+		return fmt.Errorf("nft get %s rules: %w", parent, err)
+	}
+	for _, r := range rules {
+		for _, e := range r.Exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictJump && v.Chain == child {
+				return nil
+			}
+		}
+	}
+	conn.InsertRule(&nftables.Rule{Table: tbl, Chain: pch, Exprs: []expr.Any{
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictJump, Chain: child},
+	}})
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nft insert %s jump to %s: %w", parent, child, err)
+	}
+	return nil
+}
+
+// FlushChain implements floorBackend.
+func (b *netlinkBackend) FlushChain(chain string) error {
+	tbl, ch, err := lookupTableChain("filter", chain)
+	if err != nil {
+		return err
+	}
+	conn, err := b.newConn()
+	if err != nil {
+		return err
+	}
+	conn.FlushChain(&nftables.Chain{Name: ch.Name, Table: tbl})
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nft flush %s: %w", chain, err)
+	}
+	return nil
+}
+
+// ensureBaseChain adds a filter base chain (policy accept, priority 0) when
+// the table has none of that name yet.
+func ensureBaseChain(conn nftAPI, tbl *nftables.Table, name string, hook *nftables.ChainHook) error {
+	chains, err := conn.ListChains()
+	if err != nil {
+		return fmt.Errorf("nft list chains: %w", err)
+	}
+	for _, c := range chains {
+		if c != nil && c.Name == name && c.Table != nil && c.Table.Name == tbl.Name && c.Table.Family == tbl.Family {
+			return nil
+		}
+	}
+	accept := nftables.ChainPolicyAccept
+	conn.AddChain(&nftables.Chain{
+		Name:     name,
+		Table:    tbl,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  hook,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &accept,
+	})
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nft add %s base chain: %w", name, err)
+	}
+	return nil
 }

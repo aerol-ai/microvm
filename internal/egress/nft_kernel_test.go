@@ -378,4 +378,46 @@ func TestKernelDataPath(t *testing.T) {
 			t.Fatalf("after detach: %s", got)
 		}
 	})
+	// §5.10 PC-2: the node-wide floor and control-port guard apply to a
+	// sandbox that is not in gateway mode at all (it was just detached).
+	t.Run("node-wide floor drops for every sandbox", func(t *testing.T) {
+		sbxNet := netip.MustParsePrefix(kSbxIP + "/24")
+		if err := g.SetNodeWide(NodeWide{Subnets: []netip.Prefix{sbxNet}, Floor: []netip.Prefix{netip.MustParsePrefix(kRemoteIP + "/32")}}); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, remote9000); !strings.HasPrefix(got, "TIMEOUT") {
+			t.Fatalf("floor: %s, want a silent drop", got)
+		}
+		if err := g.SetNodeWide(NodeWide{Subnets: []netip.Prefix{sbxNet}, ControlKnown: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, remote9000); got != "OK remote-9000" {
+			t.Fatalf("floor cleared: %s", got)
+		}
+	})
+	t.Run("control-port guard drops other nodes and this host", func(t *testing.T) {
+		sbxNet := netip.MustParsePrefix(kSbxIP + "/24")
+		ctl := []netip.AddrPort{
+			netip.AddrPortFrom(netip.MustParseAddr(kRemoteIP), 9000),  // another node's control port
+			netip.AddrPortFrom(netip.MustParseAddr(kHostSbx), kProxy), // this host
+		}
+		if err := g.SetNodeWide(NodeWide{Subnets: []netip.Prefix{sbxNet}, Control: ctl, ControlKnown: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, remote9000); !strings.HasPrefix(got, "TIMEOUT") {
+			t.Fatalf("remote control port: %s, want dropped", got)
+		}
+		if got := dialFromSandbox(t, net.JoinHostPort(kRemoteIP, "443")); got != "OK remote-443" {
+			t.Fatalf("ingress-style ports stay reachable: %s", got)
+		}
+		if got := dialFromSandbox(t, net.JoinHostPort(kHostSbx, fmt.Sprint(kProxy))); !strings.HasPrefix(got, "TIMEOUT") {
+			t.Fatalf("local control port: %s, want dropped", got)
+		}
+		if err := g.SetNodeWide(NodeWide{Subnets: []netip.Prefix{sbxNet}, ControlKnown: true}); err != nil {
+			t.Fatal(err)
+		}
+		if got := dialFromSandbox(t, remote9000); got != "OK remote-9000" {
+			t.Fatalf("guard cleared: %s", got)
+		}
+	})
 }

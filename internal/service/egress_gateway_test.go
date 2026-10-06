@@ -18,17 +18,19 @@ import (
 
 // fakeGateway records the egress API calls sandboxd makes.
 type fakeGateway struct {
-	mu        sync.Mutex
-	attached  map[string]egress.Spec
-	detached  []string
-	blocked   map[string]egress.BlockReason
-	synced    [][]egress.Spec
-	bridges   []egress.Bridge
-	attachErr error
-	readyErr  error
-	events    chan egress.Event
-	probeRes  egress.ProbeResult
-	probeErr  error
+	mu           sync.Mutex
+	attached     map[string]egress.Spec
+	detached     []string
+	blocked      map[string]egress.BlockReason
+	synced       [][]egress.Spec
+	bridges      []egress.Bridge
+	attachErr    error
+	readyErr     error
+	events       chan egress.Event
+	probeRes     egress.ProbeResult
+	probeErr     error
+	control      []netip.AddrPort
+	controlCalls int
 }
 
 func newFakeGateway() *fakeGateway {
@@ -88,6 +90,13 @@ func (f *fakeGateway) Probe(_ context.Context, p egress.ProbeRequest) (egress.Pr
 	return f.probeRes, f.probeErr
 }
 func (f *fakeGateway) Learned(context.Context, string) (json.RawMessage, error) { return nil, nil }
+func (f *fakeGateway) SetNodeControl(_ context.Context, eps []netip.AddrPort) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.control = append([]netip.AddrPort(nil), eps...)
+	f.controlCalls++
+	return nil
+}
 func (f *fakeGateway) Subscribe(ctx context.Context) (<-chan egress.Event, error) {
 	if f.events == nil {
 		return nil, egress.ErrUnavailable

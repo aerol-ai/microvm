@@ -157,8 +157,10 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	}
 	// Every full sync asks for a re-test of every bridge: it runs at startup
 	// and after a gateway restart, the two times the redirect path may have
-	// changed. The supervisor runs it, off any create path.
+	// changed. The supervisor runs it, off any create path. A restarted
+	// gateway also needs the control-port guard list again.
 	s.requestEgressSelfTests()
+	s.egressControlPushed.Store(nil)
 	s.egressStats.lastSync.Store(time.Now().UnixNano())
 	s.egressStats.fqdnSandboxes.Store(int64(len(specs)))
 	return nil
@@ -206,6 +208,7 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 			lastErr = msg
 		}
 		s.retryEgressSelfTests(ctx, false)
+		s.syncNodeControl(ctx)
 		if s.EgressGatewayReady() && s.egressStats.held.Load() > 0 {
 			s.retryEgressHolds(ctx)
 		}

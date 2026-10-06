@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"net/netip"
 
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 )
@@ -87,4 +88,13 @@ func (d *Driver) ClearEgressHold(containerIP string) error {
 		return nil
 	}
 	return d.networkRules.ClearHoldEgress(containerIP)
+}
+
+// SetEgressFloor installs the operator's node-wide deny floor for the CNI
+// bridge subnet (§5.10 PC-2).
+func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
+	if d.networkRules == nil {
+		return nil
+	}
+	return d.networkRules.SetFloor(d.networkRules.BridgeSubnet(), cidrs)
 }

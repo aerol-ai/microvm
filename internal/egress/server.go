@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 )
@@ -25,6 +26,8 @@ type ServerHooks struct {
 	Learned func(id string) (json.RawMessage, error)
 	// Changed is called after any state change so the snapshot can be saved.
 	Changed func()
+	// NodeControl replaces the control endpoints of the node-wide guard.
+	NodeControl func([]netip.AddrPort) error
 }
 
 // PeerCheck vets a new UDS connection (SO_PEERCRED, CEO D22).
@@ -205,6 +208,15 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 			return nil, fmt.Errorf("%w: learn mode not supported", ErrUnavailable)
 		}
 		return s.hooks.Learned(id)
+	case opNodeCtl:
+		var eps []netip.AddrPort
+		if err = json.Unmarshal(req.Payload, &eps); err != nil {
+			return nil, err
+		}
+		if s.hooks.NodeControl == nil {
+			return nil, fmt.Errorf("%w: node control guard not supported", ErrUnavailable)
+		}
+		err = s.hooks.NodeControl(eps)
 	default:
 		return nil, fmt.Errorf("unknown op %q", req.Op)
 	}

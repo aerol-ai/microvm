@@ -32,6 +32,7 @@ const (
 	opProbe      = "probe"
 	opSubscribe  = "subscribe"
 	opLearned    = "learned"
+	opNodeCtl    = "node_control"
 )
 
 // request is one client frame.
@@ -82,6 +83,9 @@ type setBlockedPayload struct {
 type Bridge struct {
 	Name      string     `json:"name"`
 	GatewayIP netip.Addr `json:"gateway_ip"`
+	// Subnet scopes the node-wide floor and control-port guard to the
+	// sandboxes on this bridge; zero (an older sandboxd) leaves them off.
+	Subnet netip.Prefix `json:"subnet,omitempty"`
 }
 
 // ProbeRequest asks the gateway to treat a probe source as gateway-mode for

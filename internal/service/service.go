@@ -372,6 +372,9 @@ type Service struct {
 	// egressOperatorWatcher holds the private-cloud operator file (§5.10);
 	// nil = no file, today's behavior.
 	egressOperatorWatcher *operator.Watcher
+	// egressControlPushed is the control-port guard list last pushed to the
+	// gateway; nil after a full sync, so a restarted gateway gets it again.
+	egressControlPushed atomic.Pointer[string]
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the

@@ -127,10 +127,11 @@ func TestDialGuardControl(t *testing.T) {
 			t.Errorf("Control(%q) = %v, want %s", addr, err, reason)
 		}
 	}
-	if err := StrictDialControl("tcp", "10.0.0.1:443", nil); !errors.Is(err, ErrDialRefused) {
+	strict := DialGuard{Strict: true}.Control(nil, "", false)
+	if err := strict("tcp", "10.0.0.1:443", nil); !errors.Is(err, ErrDialRefused) {
 		t.Fatalf("strict control allowed a private address: %v", err)
 	}
-	if err := StrictDialControl("tcp", "8.8.8.8:443", nil); err != nil {
+	if err := strict("tcp", "8.8.8.8:443", nil); err != nil {
 		t.Fatalf("strict control refused a public address: %v", err)
 	}
 }

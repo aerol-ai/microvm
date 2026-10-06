@@ -64,7 +64,10 @@ type Spec struct {
 // Src only (source sets), Src+Dst(+DstEnd for interval CIDRs), or
 // Src+Dst+Port (learned and dynamic flow sets).
 type Elem struct {
-	Src     netip.Addr    `json:"src"`
+	Src netip.Addr `json:"src"`
+	// SrcEnd is the inclusive end of a source range (a bridge subnet in the
+	// node-wide deny_floor and node_control sets); zero means Src alone.
+	SrcEnd  netip.Addr    `json:"src_end,omitempty"`
 	Dst     netip.Addr    `json:"dst,omitempty"`
 	DstEnd  netip.Addr    `json:"dst_end,omitempty"` // inclusive end of a CIDR range
 	Port    uint16        `json:"port,omitempty"`

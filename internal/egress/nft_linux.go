@@ -22,8 +22,10 @@ import (
 const TableName = "aerolvm_egress"
 
 // layoutVersion is bumped whenever the static layout changes. A table carrying
-// another version's marker is replaced in one transaction.
-const layoutVersion = 1
+// another version's marker is replaced in one transaction. v2: node-wide
+// floor and control-port guard for every sandbox on the bridges, not only
+// gateway-mode ones (§5.10 PC-2).
+const layoutVersion = 2
 
 // Dynamic flow sets are sized explicitly so a full set is a known state (S10).
 const (
@@ -62,7 +64,7 @@ var setDefs = []setDef{
 	{name: SetAllowCIDR, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr), interval: true, concat: true},
 	{name: SetDenyCIDR, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr), interval: true, concat: true},
 	{name: SetDenyFloor, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr), interval: true, concat: true},
-	{name: SetNodeControl, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeInetService), concat: true},
+	{name: SetNodeControl, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), interval: true, concat: true},
 	{name: SetAllowLearned, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, concat: true},
 	{name: SetLearnFlows, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, dynamic: true, size: flowSetSize, concat: true},
 	{name: SetRejectedFlows, key: nftables.MustConcatSetType(nftables.TypeIPAddr, nftables.TypeIPAddr, nftables.TypeInetService), timeout: true, dynamic: true, size: flowSetSize, concat: true},
@@ -307,13 +309,16 @@ func encodeElems(set string, list []Elem) ([]nftables.SetElement, error) {
 		switch set {
 		case SetFQDNSrc, SetSrcDenyDefault, SetSrcAccept, SetLearnSrc, SetBlockedSrc:
 			el.Key = ip4(e.Src)
-		case SetAllowCIDR, SetDenyCIDR:
+		case SetAllowCIDR, SetDenyCIDR, SetDenyFloor:
 			end := e.DstEnd
 			if !end.IsValid() {
 				end = e.Dst
 			}
 			el.Key = append(ip4(e.Src), ip4(e.Dst)...)
-			el.KeyEnd = append(ip4(e.Src), ip4(end)...)
+			el.KeyEnd = append(ip4(srcEnd(e)), ip4(end)...)
+		case SetNodeControl:
+			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
+			el.KeyEnd = append(append(ip4(srcEnd(e)), ip4(e.Dst)...), port4(e.Port)...)
 		case SetAllowLearned, SetLearnFlows, SetRejectedFlows:
 			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
 			el.Timeout = e.Timeout
@@ -323,6 +328,15 @@ func encodeElems(set string, list []Elem) ([]nftables.SetElement, error) {
 		out = append(out, el)
 	}
 	return out, nil
+}
+
+// srcEnd is the inclusive end of an element's source range: a bridge
+// subnet for the node-wide sets, the single sandbox IP otherwise.
+func srcEnd(e Elem) netip.Addr {
+	if e.SrcEnd.IsValid() {
+		return e.SrcEnd
+	}
+	return e.Src
 }
 
 func addrAt(b []byte, off int) netip.Addr {
@@ -340,9 +354,20 @@ func decodeElems(set string, raw []nftables.SetElement) []Elem {
 		}
 		e := Elem{Src: addrAt(r.Key, 0)}
 		switch set {
-		case SetAllowCIDR, SetDenyCIDR:
+		case SetAllowCIDR, SetDenyCIDR, SetDenyFloor:
 			e.Dst = addrAt(r.Key, 4)
 			e.DstEnd = addrAt(r.KeyEnd, 4)
+			if end := addrAt(r.KeyEnd, 0); end != e.Src {
+				e.SrcEnd = end
+			}
+		case SetNodeControl:
+			e.Dst = addrAt(r.Key, 4)
+			if len(r.Key) >= 10 {
+				e.Port = binary.BigEndian.Uint16(r.Key[8:10])
+			}
+			if end := addrAt(r.KeyEnd, 0); end != e.Src {
+				e.SrcEnd = end
+			}
 		case SetAllowLearned, SetLearnFlows, SetRejectedFlows:
 			e.Dst = addrAt(r.Key, 4)
 			if len(r.Key) >= 10 {
@@ -487,12 +512,15 @@ func (b *NFTBackend) addChains(c *nftables.Conn, cfg LayoutConfig) {
 		cat(l4proto(tcp), dportEq(443), redirectTo(cfg.ProxyPort)),
 	)
 
-	// forward: only gateway-mode sources are filtered here.
+	// forward: the node-wide floor and control-port guard first, for every
+	// sandbox on the bridges (their elements are keyed by bridge subnet, so
+	// nothing else matches); then only gateway-mode sources are filtered.
 	add(fwd,
 		notIPv4Return(),
+		cat(pairIn(SetDenyFloor), []expr.Any{&expr.Counter{}, verdict(expr.VerdictDrop)}),
+		cat(l4proto(tcp), flowKey(), []expr.Any{&expr.Lookup{SourceRegister: reg1, SetName: SetNodeControl}, &expr.Counter{}, verdict(expr.VerdictDrop)}),
 		cat(saddrNotIn(SetFQDNSrc), []expr.Any{verdict(expr.VerdictReturn)}),
 		cat(saddrIn(SetBlockedSrc), []expr.Any{&expr.Counter{}, verdict(expr.VerdictDrop)}),
-		cat(pairIn(SetDenyFloor), []expr.Any{&expr.Counter{}, verdict(expr.VerdictDrop)}),
 		cat(ctEstablished(), []expr.Any{verdict(expr.VerdictAccept)}),
 	)
 	add(fwd, auditThenReject(cat(l4proto(udp), dportEq(53)))...)
@@ -519,6 +547,8 @@ func (b *NFTBackend) addChains(c *nftables.Conn, cfg LayoutConfig) {
 	add(in,
 		notIPv4Return(),
 		cat(ctEstablished(), []expr.Any{verdict(expr.VerdictAccept)}),
+		// This node's own control ports, from any sandbox on the bridges.
+		cat(l4proto(tcp), flowKey(), []expr.Any{&expr.Lookup{SourceRegister: reg1, SetName: SetNodeControl}, &expr.Counter{}, verdict(expr.VerdictDrop)}),
 		cat(saddrIn(SetBlockedSrc), []expr.Any{&expr.Counter{}, verdict(expr.VerdictDrop)}),
 		cat(saddrIn(SetFQDNSrc), l4proto(udp), dportEq(cfg.DNSPort), []expr.Any{verdict(expr.VerdictAccept)}),
 		cat(saddrIn(SetFQDNSrc), l4proto(tcp), dportEq(cfg.DNSPort), []expr.Any{verdict(expr.VerdictAccept)}),

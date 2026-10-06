@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -229,4 +231,37 @@ func TestMediatorReportsDenials(t *testing.T) {
 		t.Fatalf("sni denial = %+v", got)
 	}
 	(*NetMediator)(nil).SetEgressDenialObserver(nil)
+}
+
+// TestInstallOperatorGuard (§5.10): the worker applies the operator file's
+// internal zone and floor; a file it can't load leaves it strict.
+func TestInstallOperatorGuard(t *testing.T) {
+	m := newNetMediator()
+	installOperatorGuard(m)
+	if m.dialGuard().Strict || m.dialGuard().Zone != nil {
+		t.Fatal("no file: the default guard")
+	}
+	path := filepath.Join(t.TempDir(), "egress-policy.yaml")
+	if err := os.WriteFile(path, []byte("version: 1\ninternal_zone: {suffixes: [corp.bank.internal], cidrs: [10.0.0.0/8]}\ndeny_cidrs: [10.66.0.0/16]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SB_EGRESS_OPERATOR_FILE", path)
+	installOperatorGuard(m)
+	if g := m.dialGuard(); g.Zone == nil || len(g.DenyFloor) != 1 || g.Strict {
+		t.Fatalf("operator guard = %+v", g)
+	}
+	t.Setenv("SB_EGRESS_OPERATOR_FILE", filepath.Join(t.TempDir(), "missing.yaml"))
+	installOperatorGuard(m)
+	if !m.dialGuard().Strict {
+		t.Fatal("an unreadable file must leave the worker strict")
+	}
+	found := false
+	for _, kv := range workerEnvironment() {
+		if strings.HasPrefix(kv, "SB_EGRESS_OPERATOR_FILE=") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("workers must inherit SB_EGRESS_OPERATOR_FILE")
+	}
 }

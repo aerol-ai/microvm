@@ -83,6 +83,9 @@ type Gateway struct {
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
+
+	nwMu     sync.Mutex
+	nodeWide NodeWide
 }
 
 // New builds a Gateway. Call Bootstrap before use.
@@ -116,6 +119,9 @@ func New(opts Options) *Gateway {
 func (g *Gateway) Bootstrap() error {
 	if err := g.be.EnsureLayout(g.layout); err != nil {
 		return fmt.Errorf("egress layout: %w", err)
+	}
+	if err := g.reapplyNodeWide(); err != nil {
+		return fmt.Errorf("egress node-wide rules: %w", err)
 	}
 	return nil
 }

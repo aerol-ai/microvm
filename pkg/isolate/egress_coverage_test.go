@@ -46,17 +46,18 @@ func TestEgressDialControl(t *testing.T) {
 	if control == nil {
 		t.Fatal("egress transport must dial through the guarded dialer")
 	}
-	if err := egresspolicy.StrictDialControl("tcp", "127.0.0.1:80", nil); err == nil {
+	strict := currentIsolateGuard().Control(nil, "", false)
+	if err := strict("tcp", "127.0.0.1:80", nil); err == nil {
 		t.Fatal("loopback must be denied")
 	}
-	if err := egresspolicy.StrictDialControl("tcp", "169.254.169.254:80", nil); err == nil {
+	if err := strict("tcp", "169.254.169.254:80", nil); err == nil {
 		t.Fatal("link-local must be denied")
 	}
-	if err := egresspolicy.StrictDialControl("tcp", "8.8.8.8:443", nil); err != nil {
+	if err := strict("tcp", "8.8.8.8:443", nil); err != nil {
 		t.Fatalf("public IP must be allowed: %v", err)
 	}
 	// No port → treat whole address as host.
-	if err := egresspolicy.StrictDialControl("tcp", "10.0.0.1", nil); err == nil {
+	if err := strict("tcp", "10.0.0.1", nil); err == nil {
 		t.Fatal("private IP without port must be denied")
 	}
 	// A real dial to a loopback listener is refused before connect.

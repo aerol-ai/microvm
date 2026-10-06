@@ -21,6 +21,8 @@ type fakeNFT struct {
 	appended   []*nftables.Rule
 	deleted    []*nftables.Rule
 	addedChain []*nftables.Chain
+	// flushedChains records FlushChain calls (the floor chain).
+	flushedChains []string
 }
 
 func (f *fakeNFT) GetRules(*nftables.Table, *nftables.Chain) ([]*nftables.Rule, error) {
@@ -80,6 +82,11 @@ func (f *fakeNFT) AddChain(c *nftables.Chain) *nftables.Chain {
 }
 
 func (f *fakeNFT) Flush() error { return f.flushErr }
+
+func (f *fakeNFT) FlushChain(c *nftables.Chain) {
+	f.flushedChains = append(f.flushedChains, c.Name)
+	f.rules = nil
+}
 
 // TestNetlinkEnsureUserChainIdempotent covers the C1 bootstrap logic offline:
 // AddChain on an absent chain, no-op when it already exists. (Live nftables

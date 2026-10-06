@@ -13,6 +13,7 @@ package runtime
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -91,6 +92,14 @@ type IPOwnerResolver interface {
 type EgressHolder interface {
 	ApplyEgressHold(containerIP string) error
 	ClearEgressHold(containerIP string) error
+}
+
+// EgressFloorSetter is implemented by container runtimes that can install
+// the operator's node-wide deny floor for every sandbox on their bridge
+// (plans/egress-domain-filtering.md §5.10 PC-2). It works without the
+// egress gateway, which carries its own copy of the floor.
+type EgressFloorSetter interface {
+	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
 }
 
 type ContainerRuntime interface {

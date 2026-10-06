@@ -56,7 +56,9 @@ type Daemon struct {
 	probeMu sync.Mutex
 	probes  map[netip.Addr]*egress.ProbeResult
 
-	started      time.Time
+	started time.Time
+	// floor is the operator's deny_cidrs, node-wide for every sandbox.
+	floor        []netip.Prefix
 	statsMu      sync.Mutex
 	denied       map[string]uint64
 	layoutLost   bool
@@ -82,6 +84,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		started:      time.Now().UTC(),
 		seenRejected: map[egress.Elem]time.Time{},
 	}
+	d.floor = deps.Guard.DenyFloor
 	d.gw = egress.New(egress.Options{
 		Backend:    deps.Backend,
 		Conntrack:  deps.Conntrack,
@@ -103,11 +106,12 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{
-		SetBridges: d.setBridges,
-		Probe:      d.probe,
-		Listeners:  d.lns.Addrs,
-		Learned:    d.learned,
-		Changed:    d.markDirty,
+		SetBridges:  d.setBridges,
+		Probe:       d.probe,
+		Listeners:   d.lns.Addrs,
+		Learned:     d.learned,
+		Changed:     d.markDirty,
+		NodeControl: d.setNodeControl,
 	}, deps.Peer, d.hub, log)
 	if err := d.restore(); err != nil {
 		log.Warn("egress: snapshot not restored; waiting for sandboxd sync", "error", err)
@@ -144,7 +148,27 @@ func (d *Daemon) restore() error {
 }
 
 func (d *Daemon) setBridges(bridges []egress.Bridge) error {
-	return d.lns.Set(bridges)
+	if err := d.lns.Set(bridges); err != nil {
+		return err
+	}
+	nw := d.gw.NodeWideState()
+	nw.Subnets = nil
+	for _, b := range bridges {
+		if b.Subnet.IsValid() {
+			nw.Subnets = append(nw.Subnets, b.Subnet)
+		}
+	}
+	nw.Floor = d.floor
+	return d.gw.SetNodeWide(nw)
+}
+
+// setNodeControl replaces the control endpoints the node-wide guard drops
+// (sandboxd sends them from cluster membership, §5.10 PC-2).
+func (d *Daemon) setNodeControl(eps []netip.AddrPort) error {
+	nw := d.gw.NodeWideState()
+	nw.Control, nw.ControlKnown = eps, true
+	nw.Floor = d.floor
+	return d.gw.SetNodeWide(nw)
 }
 
 func (d *Daemon) markDirty() {

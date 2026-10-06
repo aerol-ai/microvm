@@ -5,12 +5,15 @@ import (
 	"expvar"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 func TestFirstHost(t *testing.T) {
@@ -52,5 +55,24 @@ func TestWireEgressOperator(t *testing.T) {
 	wireEgressOperator(ctx, config.Config{EgressOperatorFile: path}, svc, log)
 	if v := expvar.Get("aerolvm_egress_operator_config_load_failures_total"); v == nil || v.String() != "1" {
 		t.Fatalf("the invalid boot load must be wired and counted, got %v", v)
+	}
+}
+
+// TestWireEgressOperatorIsolateGuard: the isolate guard follows the file.
+func TestWireEgressOperatorIsolateGuard(t *testing.T) {
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := service.New(config.Config{}, log, nil, nil, nil, nil, nil, nil, nil)
+	path := filepath.Join(t.TempDir(), "egress-policy.yaml")
+	// A public range: strict isolate would otherwise allow it.
+	if err := os.WriteFile(path, []byte("version: 1\ndeny_cidrs: [203.0.113.0/24]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(func() { pkgisolate.SetEgressDialGuard(egresspolicy.DialGuard{}) })
+	wireEgressOperator(ctx, config.Config{EgressOperatorFile: path}, svc, log)
+	g := pkgisolate.EgressDialGuard()
+	if err := g.Check(nil, egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("203.0.113.9:443")}); err == nil || !g.Strict {
+		t.Fatalf("isolate must refuse the operator floor and stay strict: %v", err)
 	}
 }

@@ -173,15 +173,6 @@ func (g DialGuard) Control(p *Policy, name string, nameAllowed bool) func(networ
 	}
 }
 
-// StrictDialControl is a ready net.Dialer.Control for isolate's shared egress
-// transport: DialGuard{Strict: true} with no per-sandbox policy, so it is
-// safe to share across sandboxes and pooled connections.
-func StrictDialControl(network, address string, c syscall.RawConn) error {
-	return strictGuard.Control(nil, "", false)(network, address, c)
-}
-
-var strictGuard = DialGuard{Strict: true}
-
 // InternalZone is the operator's internal zone (§5.10 PC-1): names under its
 // suffixes may resolve into its CIDRs, and only those names. A name outside
 // the suffixes that resolves into private space stays refused, which keeps

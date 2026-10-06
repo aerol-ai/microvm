@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -20,7 +21,7 @@ const egressSuperviseInterval = 5 * time.Second
 
 // bridgeSource is the docker side of bridge discovery (*docker.Client).
 type bridgeSource interface {
-	SandboxBridge(ctx context.Context) (string, netip.Addr, error)
+	SandboxBridge(ctx context.Context) (docker.SandboxNetwork, error)
 }
 
 // wireEgressGateway connects sandboxd to the egress-gateway process when
@@ -29,7 +30,7 @@ type bridgeSource interface {
 // the gateway, which has no docker socket access (S5). The first connect is
 // supervised: retried every few seconds while down, and lazily on the
 // first gateway-mode create.
-func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, docker bridgeSource, logger *slog.Logger) {
+func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, dockerNet bridgeSource, logger *slog.Logger) {
 	if !cfg.EgressFQDNEnabled || goruntime.GOOS != "linux" || !cfg.IsWorker() {
 		return
 	}
@@ -39,16 +40,16 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 	}
 	bridges := func(ctx context.Context) []egress.Bridge {
 		var out []egress.Bridge
-		if docker != nil {
-			if name, gw, err := docker.SandboxBridge(ctx); err == nil && gw.Is4() {
-				out = append(out, egress.Bridge{Name: name, GatewayIP: gw})
+		if dockerNet != nil {
+			if sn, err := dockerNet.SandboxBridge(ctx); err == nil && sn.Gateway.Is4() {
+				out = append(out, egress.Bridge{Name: sn.Name, GatewayIP: sn.Gateway, Subnet: sn.Subnet})
 			} else if err != nil {
 				logger.Warn("egress: docker bridge discovery failed", "error", err)
 			}
 		}
 		if cfg.ContainerEngine == models.ContainerEngineContainerd {
 			if gw, ok := firstHost(cni.DefaultBridgeSubnet); ok {
-				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw})
+				out = append(out, egress.Bridge{Name: "aerolvm0", GatewayIP: gw, Subnet: netip.MustParsePrefix(cni.DefaultBridgeSubnet).Masked()})
 			}
 		}
 		return out

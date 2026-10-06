@@ -182,8 +182,9 @@ sandboxd or gateway restart.
 Private-cloud deployments set `SB_EGRESS_OPERATOR_FILE` (normally
 `/etc/sandboxd/egress-policy.yaml`) for the default policy, the ceiling, the
 deny floor, the internal zone and the upstream proxy. sandboxd reads it for
-the default policy and the ceiling; the gateway reads it for the internal
-zone, the floor and the proxy.
+the default policy, the ceiling, the host-firewall floor, the control-port
+guard and the isolate guard; WASM workers read it at start; the gateway
+reads it for the internal zone, its copy of the floor and the proxy.
 
 - **Edits.** sandboxd picks up a change within 10 seconds, or at once on
   `systemctl kill -s HUP sandboxd`. An edit that does not validate is
@@ -203,6 +204,18 @@ zone, the floor and the proxy.
 - **Running sandboxes.** The default policy is written into each sandbox's
   spec at create, so editing the file never changes a running sandbox, and a
   failover recreate keeps what the sandbox was created with.
+- **Deny floor (`deny_cidrs`).** Dropped for every sandbox in every mode, in
+  three places: the host firewall chain `AEROLVM-FLOOR` (jumped from the top
+  of `DOCKER-USER` or `AEROLVM-USER`, rewritten by sandboxd when the file
+  changes), the gateway's `deny_floor` set, and the WASM and isolate dial
+  guards. Check the host copy with `sudo iptables -S AEROLVM-FLOOR`.
+- **Control-port guard (`node_control_port_guard`, on by default when a file
+  is present).** Sandboxes cannot open TCP connections to any cluster
+  member's API, SSH gateway, Raft, gossip or cluster mTLS port, including
+  this node's. Ingress 80/443 stays reachable. sandboxd sends the endpoint
+  list to the gateway (`node_control` set) and refreshes it as membership
+  changes. A tool inside a sandbox that called a node's `:21212` directly
+  now times out; point it at the ingress URL, or set the guard to `false`.
 
 ## Tracing and logs
 

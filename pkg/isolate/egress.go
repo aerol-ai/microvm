@@ -1,6 +1,7 @@
 package isolate
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -45,10 +47,30 @@ type EgressPolicy struct {
 	Deny     []string
 }
 
-// isolateDialGuard is isolate's posture (D15): isolate egress leaves from the
-// host's own network namespace, so private, unspecified and multicast
-// destinations stay unreachable even if a policy CIDR names them.
-var isolateDialGuard = egresspolicy.DialGuard{Strict: true}
+// isolateGuard is isolate's dial posture (D15): isolate egress leaves from
+// the host's own network namespace, so it is always strict: no private
+// destination, whatever a policy CIDR says. The private-cloud operator file
+// (§5.10) adds its deny floor, and its internal zone only with the explicit
+// internal_zone.isolate opt-in. nil means the default strict guard.
+var isolateGuard atomic.Pointer[egresspolicy.DialGuard]
+
+// SetEgressDialGuard installs the operator's guard for every isolate host in
+// this process. Strict is forced on: the operator can widen isolate only
+// through ZoneInStrict.
+func SetEgressDialGuard(g egresspolicy.DialGuard) {
+	g.Strict = true
+	isolateGuard.Store(&g)
+}
+
+// EgressDialGuard returns the guard isolate egress dials with now.
+func EgressDialGuard() egresspolicy.DialGuard { return currentIsolateGuard() }
+
+func currentIsolateGuard() egresspolicy.DialGuard {
+	if g := isolateGuard.Load(); g != nil {
+		return *g
+	}
+	return egresspolicy.DialGuard{Strict: true}
+}
 
 func compileEgressPolicy(p EgressPolicy) (*egresspolicy.Policy, error) {
 	return egresspolicy.Compile(egresspolicy.Spec{AllowOut: p.Allow, DenyOut: p.Deny, BlockAll: p.BlockAll})
@@ -243,10 +265,10 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 	// (169.254.169.254 → instance IAM credentials). Reject an IP-literal
 	// destination in a special-use range up front, and — because a hostname can
 	// resolve into those ranges (or be rebound) — the shared egressTransport
-	// re-checks the resolved IP at dial time (egresspolicy.StrictDialControl).
+	// re-checks the resolved IP at dial time (guardedDial).
 	if ip, err := netip.ParseAddr(host); err == nil {
-		if err := isolateDialGuard.Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(ip, port)}); err != nil {
-			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" is a blocked address (loopback, link-local or private)")
+		if err := currentIsolateGuard().Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(ip, port)}); err != nil {
+			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" is a blocked address ("+dialReason(err)+")")
 			return
 		}
 	}
@@ -260,7 +282,7 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 		// A hostname that resolved into a blocked range is refused by the
 		// dial guard: a policy denial, not a network fault.
 		if errors.Is(err, egresspolicy.ErrDialRefused) {
-			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" resolves to a blocked address (loopback, link-local or private)")
+			h.denyEgress(w, sandboxID, authority, DenyReasonBlockedIP, "aerolvm egress policy: host "+authority+" resolves to a blocked address ("+dialReason(err)+")")
 			return
 		}
 		http.Error(w, "egress proxy: "+err.Error(), http.StatusBadGateway)
@@ -305,19 +327,41 @@ func splitAuthority(authority string) (host string, port uint16, ok bool) {
 	return h, uint16(n), true
 }
 
-// egressTransport is the shared outbound transport for the egress proxy. Its
-// dial Control hook runs AFTER DNS resolution with the concrete IP, so it
-// blocks special-use destinations even when reached via a hostname (or a
-// rebound one) — the authoritative SSRF guard behind the literal check in
-// proxyEgress. The hook is policy-independent (strict mode), which is what
-// makes it safe to pool connections across sandboxes. Typed as RoundTripper
-// so offline tests can swap in a fake without dialing the network.
+// dialReason names why the guard refused, for the 403 body.
+func dialReason(err error) string {
+	var de *egresspolicy.DialError
+	if errors.As(err, &de) {
+		if de.Rule != "" {
+			return de.Reason + " " + de.Rule
+		}
+		return de.Reason
+	}
+	return "blocked"
+}
+
+// guardedDial dials with the isolate guard's Control hook, which runs AFTER
+// DNS resolution with the concrete IP: it blocks special-use destinations
+// even when reached through a hostname (or a rebound one), the authoritative
+// SSRF guard behind the literal check in proxyEgress. The hostname is passed
+// along so an operator internal zone (when opted in for isolate) can admit
+// names under its suffixes. The hook is policy-independent, which is what
+// keeps pooling connections across sandboxes safe.
+func guardedDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	name := ""
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		if _, perr := netip.ParseAddr(host); perr != nil {
+			name = host
+		}
+	}
+	d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: currentIsolateGuard().Control(nil, name, false)}
+	return d.DialContext(ctx, network, addr)
+}
+
+// egressTransport is the shared outbound transport for the egress proxy,
+// dialing through guardedDial. Typed as RoundTripper so offline tests can
+// swap in a fake without dialing the network.
 var egressTransport http.RoundTripper = &http.Transport{
-	DialContext: (&net.Dialer{
-		Timeout:   10 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control:   egresspolicy.StrictDialControl,
-	}).DialContext,
+	DialContext:           guardedDial,
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          100,
 	IdleConnTimeout:       90 * time.Second,

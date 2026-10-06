@@ -36,6 +36,7 @@ func (s *ResidentServer) mediator() *NetMediator {
 	if s.net == nil {
 		s.net = newNetMediator()
 		installDefaultEgressObserver(s.net, s.auditBinding)
+		installOperatorGuard(s.net)
 	}
 	return s.net
 }

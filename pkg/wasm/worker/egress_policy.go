@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
@@ -72,6 +74,24 @@ func (m *NetMediator) SetDialGuard(g egresspolicy.DialGuard) {
 	m.mu.Lock()
 	m.guard = g
 	m.mu.Unlock()
+}
+
+// installOperatorGuard applies the private-cloud operator file's internal
+// zone and deny floor to this worker's dials (plans/egress-domain-
+// filtering.md §5.10, runtime coverage: WASM uses the mediator's dial
+// control). The worker reads the file once at start; a file it can't load
+// leaves it strict (no private destination at all) rather than open.
+func installOperatorGuard(m *NetMediator) {
+	path := strings.TrimSpace(os.Getenv("SB_EGRESS_OPERATOR_FILE"))
+	if path == "" {
+		return
+	}
+	op, err := operator.Load(path)
+	if err != nil {
+		m.SetDialGuard(egresspolicy.DialGuard{Strict: true})
+		return
+	}
+	m.SetDialGuard(op.Guard())
 }
 
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {

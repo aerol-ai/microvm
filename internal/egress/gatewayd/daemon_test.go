@@ -388,3 +388,29 @@ func TestLogDecisionFields(t *testing.T) {
 		t.Fatal("decisions must not log above debug")
 	}
 }
+
+// TestDaemonNodeWide (§5.10 PC-2): bridges with subnets bring the operator
+// floor; sandboxd's endpoints fill the control-port guard over the UDS.
+func TestDaemonNodeWide(t *testing.T) {
+	be := egress.NewMemBackend()
+	r := startDaemon(t, t.TempDir(), be)
+	r.d.floor = []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}
+	ctx := context.Background()
+	br := egress.Bridge{Name: "lo", GatewayIP: lo, Subnet: netip.MustParsePrefix("127.0.0.0/8")}
+	if err := r.client.SetBridges(ctx, []egress.Bridge{br}); err != nil {
+		t.Fatal(err)
+	}
+	if be.Len(egress.SetDenyFloor) != 1 {
+		t.Fatalf("floor elements = %d, want 1", be.Len(egress.SetDenyFloor))
+	}
+	eps := []netip.AddrPort{netip.MustParseAddrPort("10.0.0.5:21212"), netip.MustParseAddrPort("10.0.0.6:7002")}
+	if err := r.client.SetNodeControl(ctx, eps); err != nil {
+		t.Fatal(err)
+	}
+	if be.Len(egress.SetNodeControl) != 2 {
+		t.Fatalf("control elements = %d, want 2", be.Len(egress.SetNodeControl))
+	}
+	if err := r.client.SetNodeControl(ctx, nil); err != nil || be.Len(egress.SetNodeControl) != 0 {
+		t.Fatalf("an empty list clears the guard: %v %d", err, be.Len(egress.SetNodeControl))
+	}
+}

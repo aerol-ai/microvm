@@ -1,6 +1,7 @@
 package isolate
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -90,18 +91,18 @@ func TestIsolateDialGuardBlocks(t *testing.T) {
 		"fc00::1",         // ULA
 	}
 	for _, s := range blocked {
-		if err := isolateDialGuard.Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err == nil {
+		if err := currentIsolateGuard().Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err == nil {
 			t.Errorf("%s allowed, want blocked", s)
 		}
 	}
 	// Strict mode: a policy CIDR does not open a private range on isolate.
 	cidr := mustPolicy(t, EgressPolicy{Allow: []string{"10.0.0.0/8"}})
-	if err := isolateDialGuard.Check(cidr, egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("10.0.0.5:443")}); err == nil {
+	if err := currentIsolateGuard().Check(cidr, egresspolicy.DialTarget{Addr: netip.MustParseAddrPort("10.0.0.5:443")}); err == nil {
 		t.Error("CIDR-allowed private address reachable on isolate")
 	}
 	allowed := []string{"8.8.8.8", "203.0.113.10", "2606:4700:4700::1111"}
 	for _, s := range allowed {
-		if err := isolateDialGuard.Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err != nil {
+		if err := currentIsolateGuard().Check(nil, egresspolicy.DialTarget{Addr: netip.AddrPortFrom(netip.MustParseAddr(s), 443)}); err != nil {
 			t.Errorf("%s blocked (%v), want allowed (public address)", s, err)
 		}
 	}
@@ -270,4 +271,39 @@ func TestProxyEgressDenialsExplainAndReport(t *testing.T) {
 		t.Fatal("an unattributed denial must not be reported")
 	}
 	(*Host)(nil).SetEgressDenialObserver(nil)
+}
+
+// TestSetEgressDialGuard (§5.10): the operator guard stays strict; its floor
+// applies, and the internal zone only with the isolate opt-in, matched by
+// the name being dialed.
+func TestSetEgressDialGuard(t *testing.T) {
+	t.Cleanup(func() { isolateGuard.Store(nil) })
+	zone, err := egresspolicy.NewInternalZone([]string{"corp.bank.internal"}, []string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	SetEgressDialGuard(egresspolicy.DialGuard{Zone: zone})
+	g := currentIsolateGuard()
+	if !g.Strict {
+		t.Fatal("isolate stays strict")
+	}
+	art := egresspolicy.DialTarget{Name: "artifactory.corp.bank.internal", Addr: netip.MustParseAddrPort("10.1.2.3:443")}
+	if err := g.Check(nil, art); err == nil {
+		t.Fatal("the zone must not apply to isolate without the opt-in")
+	}
+	SetEgressDialGuard(egresspolicy.DialGuard{Zone: zone, ZoneInStrict: true, DenyFloor: []netip.Prefix{netip.MustParsePrefix("10.9.0.0/16")}})
+	g = currentIsolateGuard()
+	if err := g.Check(nil, art); err != nil {
+		t.Fatalf("opted-in zone name: %v", err)
+	}
+	if err := g.Check(nil, egresspolicy.DialTarget{Name: "evil.example", Addr: netip.MustParseAddrPort("10.1.2.3:443")}); err == nil {
+		t.Fatal("a name outside the zone resolving inside it is still refused")
+	}
+	if err := g.Check(nil, egresspolicy.DialTarget{Name: "x.corp.bank.internal", Addr: netip.MustParseAddrPort("10.9.0.1:443")}); err == nil {
+		t.Fatal("the floor wins over the zone")
+	}
+	// guardedDial hands the name to the guard: a zone name may dial its IP.
+	if _, err := guardedDial(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, egresspolicy.ErrDialRefused) {
+		t.Fatalf("loopback dial = %v", err)
+	}
 }

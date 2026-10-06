@@ -110,3 +110,27 @@ func (e *execBackend) EnsureInputChain(chain string) error {
 	}
 	return nil
 }
+
+// EnsureJumpChain implements floorBackend.
+func (e *execBackend) EnsureJumpChain(parent, child string) error {
+	if err := e.EnsureUserChain(child); err != nil {
+		return err
+	}
+	jump := []string{"-j", child}
+	exists, err := e.ipt.Exists("filter", parent, jump...)
+	if err != nil {
+		return fmt.Errorf("check %s jump to %s: %w", parent, child, err)
+	}
+	if exists {
+		return nil
+	}
+	if err := e.ipt.Insert("filter", parent, 1, jump...); err != nil {
+		return fmt.Errorf("insert %s jump to %s: %w", parent, child, err)
+	}
+	return nil
+}
+
+// FlushChain implements floorBackend.
+func (e *execBackend) FlushChain(chain string) error {
+	return e.ipt.ClearChain("filter", chain)
+}

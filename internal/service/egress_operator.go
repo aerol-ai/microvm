@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"expvar"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"sync/atomic"
 
 	"github.com/aerol-ai/microvm/internal/egress/operator"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -45,14 +47,35 @@ func (s *Service) SetEgressOperator(w *operator.Watcher) {
 	if w != nil {
 		activeEgressOperatorFn.Store(w)
 		publishOperatorHash(w.Current())
+		s.applyEgressFloor(context.Background(), w.Current())
 	}
 }
 
 // OnEgressOperatorChange is the watcher's change callback: it refreshes the
-// drift metric. Node-wide rules that depend on the file follow in their own
-// paths (the gateway reads the file itself).
+// drift metric and the host-firewall floor. The gateway reads the file
+// itself; the control-port guard follows on the next supervisor tick.
 func (s *Service) OnEgressOperatorChange(op *operator.Operator) {
 	publishOperatorHash(op)
+	s.applyEgressFloor(context.Background(), op)
+}
+
+// applyEgressFloor installs the operator's deny_cidrs as a node-wide DROP on
+// each container engine's bridge (§5.10 PC-2). It is the floor's copy that
+// works without the egress gateway; failures are logged, not fatal, because
+// the gateway's own floor and the WASM/isolate dial guards still hold it.
+func (s *Service) applyEgressFloor(ctx context.Context, op *operator.Operator) {
+	if s == nil || op == nil {
+		return
+	}
+	for _, rt := range []runtime.Runtime{s.docker, s.containerd} {
+		fs, ok := rt.(runtime.EgressFloorSetter)
+		if !ok || rt == nil {
+			continue
+		}
+		if err := fs.SetEgressFloor(ctx, op.DenyFloor()); err != nil {
+			s.logger.Error("egress: deny floor not installed on the host firewall", "error", err)
+		}
+	}
 }
 
 func publishOperatorHash(op *operator.Operator) {

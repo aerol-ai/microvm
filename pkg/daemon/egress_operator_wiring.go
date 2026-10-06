@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/service"
+	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
 
 // egressOperatorPoll is how often a changed operator file is noticed
@@ -27,7 +28,13 @@ func wireEgressOperator(ctx context.Context, cfg config.Config, svc *service.Ser
 	if cfg.EgressOperatorFile == "" {
 		return
 	}
-	w := operator.NewWatcher(cfg.EgressOperatorFile, logger, svc.OnEgressOperatorChange)
+	// Isolate egress leaves from sandboxd's own process, so its guard follows
+	// the file here (the internal zone only with internal_zone.isolate).
+	onChange := func(op *operator.Operator) {
+		svc.OnEgressOperatorChange(op)
+		pkgisolate.SetEgressDialGuard(op.IsolateGuard())
+	}
+	w := operator.NewWatcher(cfg.EgressOperatorFile, logger, onChange)
 	if err := w.BootError(); err != nil {
 		logger.Error("egress operator file invalid; every create is refused with 503 until it is fixed", "path", cfg.EgressOperatorFile, "error", err)
 	}
