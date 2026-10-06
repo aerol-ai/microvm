@@ -163,7 +163,13 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		return nil, unsupportedWasmEgressRules()
 	}
 	if containerRT && hasInspectRule(next.NetworkEgressRules) {
-		return nil, errInspectUnavailable()
+		st, err := s.store.GetEgressState(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !st.InspectCA {
+			return nil, ErrEgressInspectRecreate
+		}
 	}
 	if containerRT && pol.GatewayMode() {
 		if !s.egressEnabled() {

@@ -211,6 +211,10 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, err.Error())
 		return
 	}
+	if errors.Is(err, service.ErrEgressInspectRecreate) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrEgressPolicyBusy) {
 		w.Header().Set("Retry-After", "1")
 		WriteError(w, http.StatusConflict, err.Error())

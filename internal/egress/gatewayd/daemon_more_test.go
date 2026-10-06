@@ -10,10 +10,12 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/egress/inspect"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
@@ -175,5 +177,28 @@ func TestDaemonLearnRecordingLifecycle(t *testing.T) {
 	}
 	if err := r2.client.ForgetLearned(ctx, "ln"); err != nil {
 		t.Fatalf("forgetting twice is a no-op: %v", err)
+	}
+}
+
+// TestDaemonInspectCA (P3-1): the CA arrives over the UDS and reaches the
+// proxy; a bad one is refused; it is never written to the snapshot.
+func TestDaemonInspectCA(t *testing.T) {
+	state := t.TempDir()
+	r := startDaemon(t, state, egress.NewMemBackend())
+	ctx := context.Background()
+	certPEM, keyPEM, err := inspect.GenerateCA("node", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.SetInspectCA(ctx, egress.InspectCA{CertPEM: certPEM, KeyPEM: []byte("junk")}); err == nil {
+		t.Fatal("a bad CA must be refused")
+	}
+	if err := r.client.SetInspectCA(ctx, egress.InspectCA{CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	r.d.saveNow()
+	b, _ := os.ReadFile(filepath.Join(state, "snapshot.json"))
+	if strings.Contains(string(b), "PRIVATE KEY") || strings.Contains(string(b), "key_pem") {
+		t.Fatal("the CA key must never reach the snapshot")
 	}
 }

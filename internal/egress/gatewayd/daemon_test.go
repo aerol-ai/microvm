@@ -293,11 +293,12 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("SB_EGRESS_DNS_UPSTREAMS", "10.0.0.2, 10.0.0.3:5353")
 	t.Setenv("SB_EGRESS_DNS_QPS", "12.5")
 	t.Setenv("SB_EGRESS_LEARNED_MAX", "7")
+	t.Setenv("SB_EGRESS_INSPECT_MAX_BODY_BYTES", "1048576")
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DNSPort != 5353 || cfg.ProxyPort != 15081 || cfg.DNSQPS != 12.5 || cfg.LearnedMax != 7 {
+	if cfg.DNSPort != 5353 || cfg.ProxyPort != 15081 || cfg.DNSQPS != 12.5 || cfg.LearnedMax != 7 || cfg.InspectMaxBody != 1<<20 {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 	if len(cfg.DNSUpstreams) != 2 || cfg.DNSUpstreams[0] != "10.0.0.2:53" || cfg.DNSUpstreams[1] != "10.0.0.3:5353" {
@@ -318,12 +319,13 @@ func TestConfigFromEnv(t *testing.T) {
 		t.Fatal("an explicit false wins over the endpoint")
 	}
 	for name, val := range map[string]string{
-		"SB_EGRESS_DNS_PORT":          "nope",
-		"SB_EGRESS_PROXY_PORT":        "0",
-		"SB_EGRESS_DNS_QPS":           "-1",
-		"SB_EGRESS_LEARNED_MAX":       "x",
-		"SB_OTEL_TRACES_ENABLED":      "maybe",
-		"SB_OTEL_TRACES_SAMPLE_RATIO": "2",
+		"SB_EGRESS_DNS_PORT":               "nope",
+		"SB_EGRESS_PROXY_PORT":             "0",
+		"SB_EGRESS_DNS_QPS":                "-1",
+		"SB_EGRESS_LEARNED_MAX":            "x",
+		"SB_EGRESS_INSPECT_MAX_BODY_BYTES": "0",
+		"SB_OTEL_TRACES_ENABLED":           "maybe",
+		"SB_OTEL_TRACES_SAMPLE_RATIO":      "2",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv(name, val)

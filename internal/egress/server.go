@@ -30,6 +30,8 @@ type ServerHooks struct {
 	Changed func()
 	// NodeControl replaces the control endpoints of the node-wide guard.
 	NodeControl func([]netip.AddrPort) error
+	// InspectCA installs the inspection CA (P3-1), memory only.
+	InspectCA func(InspectCA) error
 }
 
 // PeerCheck vets a new UDS connection (SO_PEERCRED, CEO D22).
@@ -227,6 +229,15 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 			return nil, fmt.Errorf("%w: node control guard not supported", ErrUnavailable)
 		}
 		err = s.hooks.NodeControl(eps)
+	case opInspectCA:
+		var ca InspectCA
+		if err = json.Unmarshal(req.Payload, &ca); err != nil {
+			return nil, err
+		}
+		if s.hooks.InspectCA == nil {
+			return nil, fmt.Errorf("%w: inspection not supported", ErrUnavailable)
+		}
+		err = s.hooks.InspectCA(ca)
 	default:
 		return nil, fmt.Errorf("unknown op %q", req.Op)
 	}

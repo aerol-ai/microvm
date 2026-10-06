@@ -70,6 +70,11 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			return
 		}
 		nameAllowed, rule = allowed && r != "", r
+		if src.Rules.Inspected(name) {
+			// An inspect rule: terminate TLS and check each request (P3-1).
+			p.serveInspect(c, br, src, name, nameAllowed)
+			return
+		}
 		target = net.JoinHostPort(name, "443")
 	}
 

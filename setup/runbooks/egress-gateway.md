@@ -255,6 +255,36 @@ reads it for the internal zone, its copy of the floor and the proxy.
   changes. A tool inside a sandbox that called a node's `:21212` directly
   now times out; point it at the ingress URL, or set the guard to `false`.
 
+## Inspection
+
+A sandbox created with `inspect: true` rules has its TLS to those hosts
+terminated by the gateway, which checks every request against the rules
+and opens its own TLS to the real host, verified against the gateway
+host's trust store (plans/egress-domain-filtering.md §5.9).
+
+- **The node CA.** sandboxd creates it on the first inspect create, in
+  the `egress-ca/` directory next to its database: `node-ca.pem` (the
+  certificate inspect sandboxes mount) and `ca.json` (the certificate and
+  the key sealed with the node cipher). The gateway gets the key over its
+  socket and keeps it in memory only. After a gateway restart sandboxd
+  sends it again before re-attaching anything, and until then an inspected
+  connection is refused (`inspect_unavailable`), never passed through.
+- **Trust in the sandbox.** Only sandboxes created with inspect rules
+  trust it. toolboxd writes `/run/aerolvm/ca-bundle.pem` at start: the
+  image's own trust store plus the CA. `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+  `PIP_CERT` and `CURL_CA_BUNDLE` point at it and `NODE_EXTRA_CA_CERTS` at
+  the CA, unless the create set them itself. Java's trust store is not
+  covered. A failover recreate mounts the new node's CA.
+- **Upstream certificate errors** show as `502` with reason `dial_failed`:
+  the real host's certificate didn't verify against the gateway host's
+  roots. On a private network, install the bank's CA on the node.
+- **Rotating the CA** is deliberate: stop creating inspect sandboxes,
+  remove `egress-ca/`, restart sandboxd, and recreate every sandbox that
+  trusted the old one. The CA is valid for ten years.
+- **Denials** carry reasons `rule_denied`, `path_not_canonical`,
+  `host_mismatch` (a `Host` other than the TLS name, answered `421`) and
+  `body_too_large` (over `SB_EGRESS_INSPECT_MAX_BODY_BYTES`, `413`).
+
 ## UpstreamProxy
 
 With `upstream_proxy.url` set, allowed names that are neither in the

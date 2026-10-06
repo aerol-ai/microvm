@@ -34,6 +34,7 @@ const (
 	opLearned    = "learned"
 	opForget     = "forget_learned"
 	opNodeCtl    = "node_control"
+	opInspectCA  = "set_inspect_ca"
 )
 
 // request is one client frame.
@@ -66,6 +67,14 @@ const (
 	codeInvalid     = "invalid"
 	codeVersion     = "version"
 )
+
+// InspectCA is the node's inspection CA (P3-1). The gateway keeps it in
+// memory only, never in its snapshot; sandboxd sends it again after every
+// gateway restart.
+type InspectCA struct {
+	CertPEM []byte `json:"cert_pem"`
+	KeyPEM  []byte `json:"key_pem"`
+}
 
 type detachPayload struct {
 	ID string     `json:"id"`

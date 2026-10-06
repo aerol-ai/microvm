@@ -161,6 +161,11 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 			return fmt.Errorf("egress gateway bridges: %w", err)
 		}
 	}
+	// Before the Sync: an inspect sandbox it re-attaches must never meet a
+	// gateway without the CA (it would be refused, not passed through).
+	if err := s.resyncEgressCA(ctx); err != nil {
+		return err
+	}
 	specs, err := s.localEgressSpecs(ctx)
 	if err != nil {
 		return err

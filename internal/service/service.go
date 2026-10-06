@@ -365,8 +365,14 @@ type Service struct {
 	egressBridges func(context.Context) []egress.Bridge
 	egressMu      sync.Mutex
 	egressReady   atomic.Bool
-	egressSubOnce sync.Once
-	egressStats   egressCounters
+	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
+	// egressCAMu single-flights its creation, and egressCAPushed records
+	// that the connected gateway has it.
+	egressCA       atomic.Pointer[egress.InspectCA]
+	egressCAMu     sync.Mutex
+	egressCAPushed atomic.Bool
+	egressSubOnce  sync.Once
+	egressStats    egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it.
 	egressSelfTest *egressSelfTest
 	// egressOperatorWatcher holds the private-cloud operator file (§5.10);
@@ -1920,10 +1926,6 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// (plans/egress-domain-filtering.md §5.7).
 	gatewayMode := egressPol.GatewayMode()
 	driverReq := req
-	if hasInspectRule(req.NetworkEgressRules) {
-		releaseAdmission()
-		return nil, errInspectUnavailable()
-	}
 	if gatewayMode {
 		if !s.egressEnabled() {
 			releaseAdmission()
@@ -1941,6 +1943,18 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
 		createtiming.From(ctx).RecordStage("svc_egress_prepare", time.Since(prepareStart))
+	}
+	// Inspect rules (P3-1): the gateway gets the node CA before any traffic,
+	// and the sandbox the CA file, the bundle's tmpfs and the environment.
+	// Mounts and env keep this create off the warm pools (§8.2's one
+	// known regression).
+	var inspectBinds []mounts.ContainerBind
+	if hasInspectRule(req.NetworkEgressRules) {
+		inspectBinds, driverReq.Env, err = s.prepareInspect(ctx, req.Env)
+		if err != nil {
+			releaseAdmission()
+			return nil, err
+		}
 	}
 
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
@@ -1999,7 +2013,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		_ = ociRt.Destroy(rollback.Context(), partial)
 	}
 
-	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, binds)
+	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {

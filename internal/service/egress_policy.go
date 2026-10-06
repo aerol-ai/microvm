@@ -71,12 +71,6 @@ func hasInspectRule(rules []models.EgressRule) bool {
 	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return r.Inspect })
 }
 
-// errInspectUnavailable refuses inspect rules on container runtimes until
-// the gateway can terminate TLS.
-func errInspectUnavailable() error {
-	return fmt.Errorf("inspect rules on container runtimes are not available yet: %w", models.ErrRuntimeNotImplemented)
-}
-
 // unsupportedWasmEgressRules: the WASM mediator dials raw sockets and sees
 // no requests, so method and path rules have nothing to check (CEO D14
 // leaves Phase 3 on WASM unspecified).

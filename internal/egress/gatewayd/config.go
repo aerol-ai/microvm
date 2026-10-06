@@ -31,6 +31,8 @@ type Config struct {
 	ProxyMaxConns      int
 	ProxyMaxPerSandbox int
 	AuditBuffer        int
+	// InspectMaxBody caps an inspected request body (P3-1).
+	InspectMaxBody int64
 	// PeerUIDs and PeerCgroup gate the UDS (CEO D22).
 	PeerUIDs   []uint32
 	PeerCgroup string
@@ -69,6 +71,7 @@ func FromEnv() (Config, error) {
 		ProxyMaxConns:      proxy.DefaultMaxConns,
 		ProxyMaxPerSandbox: proxy.DefaultMaxConnsPerSandbox,
 		AuditBuffer:        egress.DefaultAuditBuffer,
+		InspectMaxBody:     proxy.DefaultInspectMaxBody,
 		PeerUIDs:           []uint32{0},
 		PeerCgroup:         envOr("SB_EGRESS_PEER_CGROUP", "sandboxd.service"),
 		HeartbeatInterval:  5 * time.Second,
@@ -107,6 +110,13 @@ func FromEnv() (Config, error) {
 			}
 			*dst = n
 		}
+	}
+	if v := strings.TrimSpace(os.Getenv("SB_EGRESS_INSPECT_MAX_BODY_BYTES")); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || n <= 0 {
+			return cfg, fmt.Errorf("SB_EGRESS_INSPECT_MAX_BODY_BYTES: want a positive integer, got %q", v)
+		}
+		cfg.InspectMaxBody = n
 	}
 	if v := strings.TrimSpace(os.Getenv("SB_EGRESS_DNS_QPS")); v != "" {
 		f, err := strconv.ParseFloat(v, 64)

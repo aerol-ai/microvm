@@ -34,6 +34,8 @@ type fakeGateway struct {
 	learned      map[string]json.RawMessage
 	learnedErr   error
 	forgotten    []string
+	inspectCA    []egress.InspectCA
+	inspectErr   error
 }
 
 func newFakeGateway() *fakeGateway {
@@ -109,6 +111,15 @@ func (f *fakeGateway) ForgetLearned(_ context.Context, id string) error {
 	defer f.mu.Unlock()
 	f.forgotten = append(f.forgotten, id)
 	delete(f.learned, id)
+	return nil
+}
+func (f *fakeGateway) SetInspectCA(_ context.Context, ca egress.InspectCA) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.inspectErr != nil {
+		return f.inspectErr
+	}
+	f.inspectCA = append(f.inspectCA, ca)
 	return nil
 }
 func (f *fakeGateway) SetNodeControl(_ context.Context, eps []netip.AddrPort) error {

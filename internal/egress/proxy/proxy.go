@@ -8,12 +8,14 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -101,6 +103,11 @@ type Config struct {
 	// Upstream chains allowed names through the operator's proxy
 	// (§5.10 PC-4); nil dials direct.
 	Upstream *egresspolicy.Upstream
+	// UpstreamRoots verifies the real host behind an inspected connection;
+	// nil is the gateway host's system roots.
+	UpstreamRoots *x509.CertPool
+	// InspectMaxBody caps an inspected request body (P3-1).
+	InspectMaxBody int64
 }
 
 // Proxy serves redirected connections.
@@ -115,6 +122,8 @@ type Proxy struct {
 	mu      sync.Mutex
 	active  int
 	closing bool
+
+	inspector atomic.Pointer[inspectorBox]
 }
 
 // New builds a Proxy.
@@ -133,6 +142,9 @@ func New(src Sources, observe Observer, cfg Config) *Proxy {
 	}
 	if cfg.HelloTimeout <= 0 {
 		cfg.HelloTimeout = defaultHelloTimeout
+	}
+	if cfg.InspectMaxBody <= 0 {
+		cfg.InspectMaxBody = DefaultInspectMaxBody
 	}
 	if cfg.OriginalDst == nil {
 		cfg.OriginalDst = OriginalDst

@@ -19,6 +19,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
+	"github.com/aerol-ai/microvm/internal/egress/inspect"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
@@ -109,6 +110,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 	d.px = proxy.New(d.gw, d.onProxy, proxy.Config{
 		MaxConns: cfg.ProxyMaxConns, MaxConnsPerSandbox: cfg.ProxyMaxPerSandbox,
 		Guard: deps.Guard, OriginalDst: deps.OriginalDst, Dialer: deps.Dialer, Logger: log, Upstream: deps.Upstream,
+		InspectMaxBody: cfg.InspectMaxBody,
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{
@@ -119,11 +121,24 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		ForgetLearned: d.forgetLearned,
 		Changed:       d.markDirty,
 		NodeControl:   d.setNodeControl,
+		InspectCA:     d.setInspectCA,
 	}, deps.Peer, d.hub, log)
 	if err := d.restore(); err != nil {
 		log.Warn("egress: snapshot not restored; waiting for sandboxd sync", "error", err)
 	}
 	return d, nil
+}
+
+// setInspectCA installs the node's inspection CA (P3-1). It lives in memory
+// only: the key never reaches the snapshot, and sandboxd sends it again
+// after every gateway start, before its Sync.
+func (d *Daemon) setInspectCA(ca egress.InspectCA) error {
+	a, err := inspect.New(ca.CertPEM, ca.KeyPEM, nil)
+	if err != nil {
+		return err
+	}
+	d.px.SetInspector(a)
+	return nil
 }
 
 // Gateway exposes the core (tests, metrics).

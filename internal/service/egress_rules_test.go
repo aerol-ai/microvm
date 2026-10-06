@@ -42,8 +42,6 @@ func TestCreateWithEgressRules(t *testing.T) {
 	}{
 		"rule for a host not allowed": {models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"plain.example.org"},
 			NetworkEgressRules: []models.EgressRule{{Host: "evil.example.net"}}}, egresspolicy.ErrInvalid},
-		"inspect on a container": {models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"api.example.org"},
-			NetworkEgressRules: []models.EgressRule{{Host: "api.example.org", Inspect: true}}}, models.ErrRuntimeNotImplemented},
 		"firecracker": {models.CreateSandboxRequest{Image: "alpine", Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"plain.example.org"},
 			NetworkEgressRules: getOnly}, models.ErrRuntimeNotImplemented},
 	} {
@@ -77,9 +75,10 @@ func TestUpdateNetworkPolicyRules(t *testing.T) {
 	if _, err := svc.UpdateNetworkLists(ctx, "sb-pol", false, []string{"pypi.org"}, nil); !errors.Is(err, egresspolicy.ErrInvalid) {
 		t.Fatalf("facade update orphaning a rule: %v", err)
 	}
+	// Trusting the CA is set up at create: adding inspection later is 409.
 	inspect := []models.EgressRule{{Host: "plain.example.org", Inspect: true}}
-	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", models.NetworkPolicyRequest{NetworkAllowOut: []string{"plain.example.org"}, NetworkEgressRules: inspect}); !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("inspect on a container: %v", err)
+	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", models.NetworkPolicyRequest{NetworkAllowOut: []string{"plain.example.org"}, NetworkEgressRules: inspect}); !errors.Is(err, ErrEgressInspectRecreate) {
+		t.Fatalf("inspect on a sandbox created without it: %v", err)
 	}
 	// Clearing them.
 	if got, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", models.NetworkPolicyRequest{NetworkAllowOut: []string{"plain.example.org"}}); err != nil || len(got.NetworkEgressRules) != 0 {

@@ -32,6 +32,8 @@ type API interface {
 	// SetNodeControl replaces the node-wide control-port guard's endpoints
 	// (§5.10 PC-2).
 	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
+	// SetInspectCA hands the gateway the node's inspection CA (P3-1).
+	SetInspectCA(ctx context.Context, ca InspectCA) error
 }
 
 // Noop is the API when there is no gateway. Anything that would put a sandbox
@@ -74,6 +76,12 @@ func (Noop) Learned(context.Context, string) (json.RawMessage, error) {
 
 // ForgetLearned is a no-op: without a gateway there is no recording.
 func (Noop) ForgetLearned(context.Context, string) error { return nil }
+
+// SetInspectCA fails: without a gateway nothing can be inspected, and an
+// inspect sandbox must stay shut rather than run unchecked.
+func (Noop) SetInspectCA(context.Context, InspectCA) error {
+	return fmt.Errorf("%w: gateway disabled", ErrUnavailable)
+}
 
 // clientConn is one handshaken UDS connection.
 type clientConn struct {
@@ -270,6 +278,10 @@ func (c *Client) Learned(ctx context.Context, id string) (json.RawMessage, error
 
 func (c *Client) ForgetLearned(ctx context.Context, id string) error {
 	return c.call(ctx, opForget, id, nil)
+}
+
+func (c *Client) SetInspectCA(ctx context.Context, ca InspectCA) error {
+	return c.call(ctx, opInspectCA, ca, nil)
 }
 
 // Subscribe opens a dedicated event-stream connection. Events arrive on the

@@ -34,6 +34,7 @@ type recordingRuntime struct {
 	createState      *models.SandboxRuntimeState
 	createErr        error
 	lastCreateReq    models.CreateSandboxRequest
+	lastCreateMounts []mounts.ContainerBind
 	lastCreateID     string
 	lastToolboxToken string
 
@@ -69,9 +70,10 @@ type leaderCluster struct {
 
 func (c *leaderCluster) Leader() string { return c.leader }
 
-func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *recordingRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	r.createCalls++
 	r.lastCreateReq = req
+	r.lastCreateMounts = binds
 	r.lastCreateID = sandboxID
 	r.lastToolboxToken = toolboxToken
 	if r.createErr != nil {
