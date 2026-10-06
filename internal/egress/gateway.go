@@ -48,6 +48,7 @@ type Options struct {
 type entry struct {
 	spec    Spec
 	pol     *egresspolicy.Policy
+	rules   *egresspolicy.Rules
 	mode    Mode
 	allow   []netip.Prefix
 	deny    []netip.Prefix
@@ -160,7 +161,13 @@ func compile(spec Spec) (*entry, error) {
 		// a sandbox out of gateway mode entirely.
 		return nil, fmt.Errorf("egress: sandbox %s: block-all is not a gateway-mode policy", spec.ID)
 	}
-	e := &entry{spec: spec, pol: pol, blocked: spec.Blocked, hash: specHash(spec)}
+	// sandboxd checked rule hosts against the allow list; one a profile
+	// change has since dropped is inert, not an error.
+	rules, err := egresspolicy.CompileRules(spec.Rules, nil)
+	if err != nil {
+		return nil, fmt.Errorf("egress: sandbox %s: %w", spec.ID, err)
+	}
+	e := &entry{spec: spec, pol: pol, rules: rules, blocked: spec.Blocked, hash: specHash(spec)}
 	switch {
 	case spec.Learn:
 		e.mode = ModeLearn
@@ -531,6 +538,7 @@ func (g *Gateway) Lookup(src netip.Addr) (Spec, BlockReason, bool) {
 type Source struct {
 	Spec    Spec
 	Policy  *egresspolicy.Policy
+	Rules   *egresspolicy.Rules
 	Mode    Mode
 	Blocked BlockReason
 }
@@ -544,7 +552,7 @@ func (g *Gateway) Source(src netip.Addr) (Source, bool) {
 		return Source{}, false
 	}
 	e := g.byID[id]
-	return Source{Spec: e.spec, Policy: e.pol, Mode: e.mode, Blocked: e.blocked}, true
+	return Source{Spec: e.spec, Policy: e.pol, Rules: e.rules, Mode: e.mode, Blocked: e.blocked}, true
 }
 
 // IsBlocked reports the in-memory block bit (including the restart block).

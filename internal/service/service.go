@@ -1663,7 +1663,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if !isStoredSpecReplay(ctx) {
 		s.NormalizeCreateEgressDefault(&req)
 	}
-	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
+	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
 		if _, cerr := compileCreateEgress(&req); cerr != nil {
 			return nil, cerr
 		}
@@ -1679,10 +1679,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		if rerr != nil {
 			return nil, rerr
 		}
-		if mode := req.NetworkEgressMode; len(resolved.Refs) > 0 || mode != "" {
+		if mode, rules := req.NetworkEgressMode, req.NetworkEgressRules; len(resolved.Refs) > 0 || mode != "" || len(rules) > 0 {
 			defer func() {
 				if err == nil && resp != nil {
-					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode, held)
+					err = s.recordCreateEgressState(ctx, &resp.Sandbox, resolved, mode, rules, held)
 				}
 			}()
 		}
@@ -1920,6 +1920,10 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// (plans/egress-domain-filtering.md §5.7).
 	gatewayMode := egressPol.GatewayMode()
 	driverReq := req
+	if hasInspectRule(req.NetworkEgressRules) {
+		releaseAdmission()
+		return nil, errInspectUnavailable()
+	}
 	if gatewayMode {
 		if !s.egressEnabled() {
 			releaseAdmission()
@@ -2011,7 +2015,8 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(ociRt)
 		attachSB := &models.Sandbox{ID: sandboxID, ContainerIP: state.ContainerIP, Runtime: chosenRuntime, Engine: chosenEngine,
-			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
+			NetworkEgressRules: req.NetworkEgressRules}
 		egressDone = make(chan error, 1)
 		go func() {
 			attachStart := time.Now()
@@ -2055,6 +2060,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
 		NetworkEgressMode:    req.NetworkEgressMode,
+		NetworkEgressRules:   req.NetworkEgressRules,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,
@@ -2294,8 +2300,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBlockAll {
 		return nil, unsupportedFirecrackerOption("network_block_all")
 	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" {
-		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out / egress_profiles)")
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
+		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out / egress_profiles / network_egress_rules)")
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
@@ -2376,6 +2382,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
 		NetworkEgressMode:    req.NetworkEgressMode,
+		NetworkEgressRules:   req.NetworkEgressRules,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,

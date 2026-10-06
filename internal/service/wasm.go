@@ -41,6 +41,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if _, err := compileCreateEgress(&req); err != nil {
 		return nil, err
 	}
+	if len(req.NetworkEgressRules) > 0 {
+		return nil, unsupportedWasmEgressRules()
+	}
 	if strings.TrimSpace(req.TemplateID) != "" {
 		return nil, fmt.Errorf("runtime %q does not support template_id (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)

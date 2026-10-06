@@ -283,6 +283,10 @@ type NetworkPolicyWrite struct {
 	OwnerRef string
 	// Mode is the egress mode, "learn" or "" (enforce).
 	Mode string
+	// Rules are the method and path rules (P3-1); InspectCA marks a sandbox
+	// created trusting the node's CA, and is never cleared.
+	Rules     []models.EgressRule
+	InspectCA bool
 }
 
 // WriteNetworkPolicy stores a sandbox's policy, its profile references and
@@ -359,11 +363,20 @@ func writeEgressProfilesTx(ctx context.Context, tx *sql.Tx, id string, p Network
 	if len(p.Profiles) > 0 {
 		inline = mustMarshalStringSlice(p.Inline)
 	}
+	rules := ""
+	if len(p.Rules) > 0 {
+		b, err := json.Marshal(p.Rules)
+		if err != nil {
+			return fmt.Errorf("write egress rules: %w", err)
+		}
+		rules = string(b)
+	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, egress_mode, updated_at) VALUES (?, ?, ?, ?)
+		INSERT INTO sandbox_egress (sandbox_id, inline_allow_json, egress_mode, rules_json, inspect_ca, updated_at) VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET inline_allow_json = excluded.inline_allow_json,
-			egress_mode = excluded.egress_mode, updated_at = excluded.updated_at
-	`, id, inline, p.Mode, now); err != nil {
+			egress_mode = excluded.egress_mode, rules_json = excluded.rules_json,
+			inspect_ca = MAX(sandbox_egress.inspect_ca, excluded.inspect_ca), updated_at = excluded.updated_at
+	`, id, inline, p.Mode, rules, p.InspectCA, now); err != nil {
 		return fmt.Errorf("write inline allow list: %w", err)
 	}
 	return nil
@@ -387,15 +400,16 @@ func (s *Store) SetEgressProfilesApplied(ctx context.Context, id string, applied
 	return tx.Commit()
 }
 
-// attachEgressModes sets NetworkEgressMode on the sandboxes that have one.
-// The mode lives in sandbox_egress; loading it with every sandbox read keeps
-// it on the model every path sees, like exposed ports. Only learn-mode
-// sandboxes have a non-empty mode, so the query reads a handful of rows.
+// attachEgressModes sets NetworkEgressMode and NetworkEgressRules on the
+// sandboxes that have them. Both live in sandbox_egress; loading them with
+// every sandbox read keeps them on the model every path sees, like exposed
+// ports. Only learn-mode sandboxes and ones with rules have a row to load,
+// so the query reads a handful of rows.
 func (s *Store) attachEgressModes(ctx context.Context, byID map[string]*models.Sandbox) error {
 	if len(byID) == 0 {
 		return nil
 	}
-	query := `SELECT sandbox_id, egress_mode FROM sandbox_egress WHERE egress_mode != ''`
+	query := `SELECT sandbox_id, egress_mode, rules_json FROM sandbox_egress WHERE (egress_mode != '' OR rules_json != '')`
 	var args []any
 	if len(byID) == 1 {
 		for id := range byID {
@@ -409,12 +423,19 @@ func (s *Store) attachEgressModes(ctx context.Context, byID map[string]*models.S
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id, mode string
-		if err := rows.Scan(&id, &mode); err != nil {
+		var id, mode, rules string
+		if err := rows.Scan(&id, &mode, &rules); err != nil {
 			return fmt.Errorf("scan egress mode: %w", err)
 		}
-		if sb, ok := byID[id]; ok {
-			sb.NetworkEgressMode = mode
+		sb, ok := byID[id]
+		if !ok {
+			continue
+		}
+		sb.NetworkEgressMode = mode
+		if rules != "" {
+			if err := json.Unmarshal([]byte(rules), &sb.NetworkEgressRules); err != nil {
+				return fmt.Errorf("decode egress rules for %s: %w", id, err)
+			}
 		}
 	}
 	return rows.Err()

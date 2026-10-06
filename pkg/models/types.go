@@ -628,6 +628,12 @@ type CreateSandboxRequest struct {
 	// design: trusted runs only. It needs empty lists, no profiles and no
 	// block-all (plans/egress-domain-filtering.md CEO D2).
 	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are method and path rules that refine hosts the
+	// allow list admits (plans/egress-domain-filtering.md §5.9, P3-1). An
+	// inspect rule makes the egress gateway terminate TLS on 443 with the
+	// node's CA, which the sandbox is given to trust; it has to be set at
+	// create.
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
 	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
@@ -822,6 +828,8 @@ type Sandbox struct {
 	// NetworkEgressMode is "learn" for a sandbox recording its egress, and
 	// empty (enforce) otherwise.
 	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are the sandbox's method and path rules (P3-1).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
@@ -951,6 +959,9 @@ type NetworkPolicyRequest struct {
 	EgressProfiles  []string `json:"egress_profiles"`
 	// NetworkEgressMode is "enforce" (empty means the same) or "learn".
 	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules replaces the method and path rules. Adding an
+	// inspect rule needs a sandbox created with one (409 otherwise).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
 }
 
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
@@ -963,11 +974,31 @@ type NetworkPolicy struct {
 	NetworkDenyOut  []string `json:"network_deny_out"`
 	EgressProfiles  []string `json:"egress_profiles"`
 	// NetworkEgressMode is "enforce" or "learn".
-	NetworkEgressMode string `json:"network_egress_mode"`
+	NetworkEgressMode  string       `json:"network_egress_mode"`
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
 	// EffectiveHostnameCount counts the hostname entries in force: inline
 	// plus every referenced profile's (at most 1024).
 	EffectiveHostnameCount int    `json:"effective_hostname_count"`
 	EgressStatus           string `json:"egress_status,omitempty"`
+}
+
+// EgressRule is one method and path rule (plans/egress-domain-filtering.md
+// §5.9, P3-1). Rules for one host are alternatives: a request to a ruled
+// host passes when some rule admits its method and path, and is refused
+// with 403 otherwise. A host no rule names keeps its allow-list decision.
+type EgressRule struct {
+	// Host is an exact name or "*." wildcard the allow list already admits.
+	Host string `json:"host"`
+	// Ports is [80] by default, or [443] with Inspect; only 80 and 443.
+	Ports []uint16 `json:"ports,omitempty"`
+	// Methods are exact, upper case; empty allows any.
+	Methods []string `json:"methods,omitempty"`
+	// Paths are globs: "*" within a segment, "**" as a whole segment for
+	// any number of them; empty allows any.
+	Paths []string `json:"paths,omitempty"`
+	// Inspect terminates TLS on 443 with the node's CA so requests can be
+	// checked, and makes the gateway require Host to equal the SNI.
+	Inspect bool `json:"inspect,omitempty"`
 }
 
 // Egress modes (NetworkEgressMode).

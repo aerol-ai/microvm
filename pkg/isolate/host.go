@@ -69,6 +69,7 @@ type Host struct {
 	mu           sync.RWMutex
 	bundles      map[string]*jsbundle.Bundle     // sandbox id → pinned bundle
 	egressPolicy map[string]*egresspolicy.Policy // sandbox id → compiled outbound policy
+	egressRules  map[string]*egresspolicy.Rules  // sandbox id → method and path rules (P3-1)
 	// Egress slot allocation (§4): a sandbox with a non-block-all policy is
 	// assigned a slot; its dedicated egress listener (slotSrv[slot]) is bound
 	// lazily on assignment and torn down on Unload. Attribution is the socket,
@@ -221,6 +222,7 @@ func (h *Host) Unload(id string) int {
 	h.mu.Lock()
 	delete(h.bundles, id)
 	delete(h.egressPolicy, id)
+	delete(h.egressRules, id)
 	if slot, ok := h.slotByID[id]; ok {
 		h.freeSlotLocked(id, slot)
 	}

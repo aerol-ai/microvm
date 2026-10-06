@@ -182,3 +182,43 @@ func TestEgressModeHydration(t *testing.T) {
 		t.Fatalf("after enforce = %q", sb.NetworkEgressMode)
 	}
 }
+
+// TestEgressRulesStored (P3-1): rules ride the side table and every sandbox
+// read; inspect_ca is set at create and never cleared by a later write.
+func TestEgressRulesStored(t *testing.T) {
+	st := openEgressProfileStore(t)
+	ctx := context.Background()
+	if err := st.Create(ctx, &models.Sandbox{ID: "sb-rules", Image: "alpine", Status: models.SandboxStatusStarted, OwnerRef: "acct", Runtime: models.RuntimeDocker}); err != nil {
+		t.Fatal(err)
+	}
+	rules := []models.EgressRule{{Host: "api.github.com", Inspect: true, Methods: []string{"GET"}, Paths: []string{"/repos/**"}}}
+	if err := st.SetSandboxEgressProfiles(ctx, "sb-rules", NetworkPolicyWrite{Rules: rules, InspectCA: true}); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := st.Get(ctx, "sb-rules")
+	if err != nil || len(sb.NetworkEgressRules) != 1 || sb.NetworkEgressRules[0].Paths[0] != "/repos/**" || !sb.NetworkEgressRules[0].Inspect {
+		t.Fatalf("Get rules = %+v %v", sb.NetworkEgressRules, err)
+	}
+	if list, err := st.List(ctx); err != nil || len(list) != 1 || len(list[0].NetworkEgressRules) != 1 {
+		t.Fatalf("List rules = %+v %v", list, err)
+	}
+	if es, _ := st.GetEgressState(ctx, "sb-rules"); !es.InspectCA {
+		t.Fatal("inspect_ca must be set")
+	}
+	// A later policy write replaces the rules and keeps the CA flag.
+	if err := st.WriteNetworkPolicy(ctx, "sb-rules", NetworkPolicyWrite{}); err != nil {
+		t.Fatal(err)
+	}
+	if sb, _ := st.Get(ctx, "sb-rules"); len(sb.NetworkEgressRules) != 0 {
+		t.Fatalf("rules after clearing = %+v", sb.NetworkEgressRules)
+	}
+	if es, _ := st.GetEgressState(ctx, "sb-rules"); !es.InspectCA {
+		t.Fatal("inspect_ca must never be cleared")
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_egress SET rules_json = '{bad' WHERE sandbox_id = 'sb-rules'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get(ctx, "sb-rules"); err == nil {
+		t.Fatal("corrupt rules must fail the read, not load as none")
+	}
+}

@@ -474,8 +474,12 @@ func (s *Service) resolveCreateEgress(ctx context.Context, ownerRef string, req 
 // would never reach the sandbox and a learn-mode sandbox would read as
 // enforce, so a failure undoes the create. held records the profile hold a
 // replay that ran block-all needs, so the re-apply pass revisits it.
-func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string, held bool) error {
-	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef, Mode: mode})
+func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbox, r resolvedEgress, mode string, rules []models.EgressRule, held bool) error {
+	// A container sandbox created with an inspect rule trusts the node's CA
+	// for its whole life, so a later policy change may add more (P3-1).
+	inspectCA := hasInspectRule(rules) && models.RuntimeUsesEgressGateway(sb.Runtime)
+	err := s.store.SetSandboxEgressProfiles(ctx, sb.ID, store.NetworkPolicyWrite{Inline: r.Inline, Profiles: r.Refs, OwnerRef: sb.OwnerRef, Mode: mode,
+		Rules: rules, InspectCA: inspectCA})
 	if err == nil && len(r.Applied) > 0 {
 		err = s.store.SetEgressProfilesApplied(ctx, sb.ID, r.Applied)
 	}
@@ -491,6 +495,7 @@ func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbo
 		return fmt.Errorf("record egress profiles: %w", err)
 	}
 	sb.NetworkEgressMode = mode
+	sb.NetworkEgressRules = rules
 	if len(r.Refs) > 0 {
 		sb.NetworkAllowOut = r.Inline
 		sb.EgressProfiles = r.Refs

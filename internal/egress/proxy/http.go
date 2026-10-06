@@ -106,6 +106,15 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			writeHTTPError(c, http.StatusForbidden, egresspolicy.DenyMessage(host, rule))
 			return
 		}
+		if src.Rules.Has(host, 80) {
+			r, reason, ok := checkRules(src.Rules, host, 80, req)
+			if !ok {
+				p.observe(Decision{SandboxID: id, Host: host, Port: 80, Reason: reason, Mode: src.Mode})
+				writeHTTPError(c, http.StatusForbidden, ruleDenyMessage(req, host, reason))
+				return
+			}
+			rule = r
+		}
 		// Only an explicit allow rule skips the policy at dial time (allow
 		// wins, D4); a default-accept verdict leaves deny CIDRs in force.
 		curName, curAllowed = host, allowed && rule != ""
@@ -153,6 +162,28 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			return
 		}
 	}
+}
+
+// checkRules holds one request to a ruled host's rules (P3-1). It returns
+// the allowing rule's name, or the denial reason.
+func checkRules(rs *egresspolicy.Rules, host string, port uint16, req *http.Request) (rule, reason string, ok bool) {
+	path, ok := egresspolicy.CanonicalRequestPath(req.URL.EscapedPath())
+	if !ok {
+		return "", ReasonPathNotCanonical, false
+	}
+	d := rs.Decide(host, port, req.Method, path)
+	if !d.Allowed {
+		return "", ReasonRuleDenied, false
+	}
+	return d.Rule.Name(), "", true
+}
+
+// ruleDenyMessage explains a rule denial in the 403 body (CEO D4).
+func ruleDenyMessage(req *http.Request, host, reason string) string {
+	if reason == ReasonPathNotCanonical {
+		return fmt.Sprintf("aerolvm egress policy: %s: path %q has dot segments, empty segments or encoded slashes, which network_egress_rules refuse", host, req.URL.EscapedPath())
+	}
+	return fmt.Sprintf("aerolvm egress policy: %s %s on %s is not allowed by network_egress_rules", req.Method, req.URL.EscapedPath(), host)
 }
 
 func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, host, target string, pol *egresspolicy.Policy, allowed, proxied bool) {

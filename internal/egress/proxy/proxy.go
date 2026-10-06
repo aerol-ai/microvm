@@ -45,6 +45,11 @@ const (
 	ReasonUnknownSource  = "unknown_source"
 	ReasonDialFailed     = "dial_failed"
 	ReasonBadRequest     = "bad_request"
+	// ReasonRuleDenied: a ruled host's request matched no rule (P3-1).
+	ReasonRuleDenied = "rule_denied"
+	// ReasonPathNotCanonical: a ruled host's request path could be read two
+	// ways (dot segments, encoded slashes), so no rule can vouch for it.
+	ReasonPathNotCanonical = "path_not_canonical"
 )
 
 // Sources resolves a peer IP to its sandbox and registers live connections

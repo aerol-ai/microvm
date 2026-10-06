@@ -16,8 +16,8 @@ import (
 // controller keys its loader cache by id and slot, so the next request
 // compiles a fresh isolate bound to the new slot instead of reusing one
 // still bound to the old one.
-func (d *Driver) UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool) error {
-	p := policyFromCreate(blockAll, allow, deny, learn)
+func (d *Driver) UpdateEgressPolicy(sandboxID string, blockAll bool, allow, deny []string, learn bool, rules []egresspolicy.RuleSpec) error {
+	p := policyFromCreate(blockAll, allow, deny, learn, rules)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	rec := d.byID[sandboxID]

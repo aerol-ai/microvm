@@ -959,6 +959,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// already reads, and its inline list here for GET and policy
 		// replays. Empty means no profiles: the row's list is the inline one.
 		`ALTER TABLE sandbox_egress ADD COLUMN inline_allow_json TEXT NOT NULL DEFAULT '';`,
+		// Phase 3 method and path rules (plans/egress-domain-filtering.md
+		// §5.9). inspect_ca records that the sandbox was created trusting the
+		// node's CA, the one thing a later policy change can't add: a live
+		// PUT may add an inspect rule only when it is set. It only ever turns
+		// on, since the bundle stays mounted for the container's life.
+		`ALTER TABLE sandbox_egress ADD COLUMN rules_json TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_egress ADD COLUMN inspect_ca INTEGER NOT NULL DEFAULT 0;`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and

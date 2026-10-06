@@ -12,6 +12,8 @@ import (
 	"errors"
 	"net/netip"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // Mode is a gateway-mode sandbox's nft class, derived from its compiled
@@ -54,6 +56,10 @@ type Spec struct {
 	// filter and the proxy share the compiled matcher.
 	AllowOut []string `json:"allow_out,omitempty"`
 	DenyOut  []string `json:"deny_out,omitempty"`
+	// Rules are the method and path rules for hosts the lists allow
+	// (plans/egress-domain-filtering.md §5.9, P3-1); the proxy holds each
+	// request to a ruled host to them.
+	Rules []egresspolicy.RuleSpec `json:"rules,omitempty"`
 	// Blocked carries sandboxd's view of the block reasons, so Attach and Sync
 	// apply the latest block state themselves (Section 4: callers never read
 	// the blocked state and act on it).

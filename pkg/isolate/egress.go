@@ -35,6 +35,10 @@ const (
 	DenyReasonIPNotAllowed   = "ip_not_allowed"
 	DenyReasonBlockedIP      = "blocked_ip"
 	DenyReasonBadRequest     = "bad_request"
+	// DenyReasonRuleDenied: a ruled host's request matched no rule (P3-1).
+	DenyReasonRuleDenied = "rule_denied"
+	// DenyReasonPathNotCanonical: a ruled host's path could be read two ways.
+	DenyReasonPathNotCanonical = "path_not_canonical"
 )
 
 // EgressPolicy is the per-sandbox outbound policy enforced by the host-side
@@ -49,6 +53,9 @@ type EgressPolicy struct {
 	// Learn selects learn mode (P2-7): open egress, each destination
 	// reported to the learn observer.
 	Learn bool
+	// Rules are method and path rules (P3-1). The host proxies plaintext
+	// requests itself, so it checks them without terminating any TLS.
+	Rules []egresspolicy.RuleSpec
 }
 
 // LearnObserver is told each destination a learn-mode sandbox reached. The
@@ -111,16 +118,24 @@ func (h *Host) SetEgressPolicy(id string, raw EgressPolicy) {
 		return
 	}
 	p, err := compileEgressPolicy(raw)
+	var rules *egresspolicy.Rules
+	if err == nil {
+		rules, err = egresspolicy.CompileRules(raw.Rules, nil)
+	}
 	if err != nil {
 		h.logger.Error("isolate: egress policy does not compile; sandbox egress is blocked",
 			"group", h.cfg.GroupKey, "sandbox", id, "err", err)
-		p = egresspolicy.BlockAllPolicy()
+		p, rules = egresspolicy.BlockAllPolicy(), nil
 	}
 	h.mu.Lock()
 	if h.egressPolicy == nil {
 		h.egressPolicy = make(map[string]*egresspolicy.Policy)
 	}
+	if h.egressRules == nil {
+		h.egressRules = make(map[string]*egresspolicy.Rules)
+	}
 	h.egressPolicy[id] = p
+	h.egressRules[id] = rules
 
 	if p.BlockAll() {
 		// No slot for block-all: it binds EGRESS_DENY. Drop any prior slot.
@@ -277,6 +292,22 @@ func (h *Host) proxyEgress(w http.ResponseWriter, r *http.Request, sandboxID str
 		}
 		h.denyEgress(w, sandboxID, authority, reason, egresspolicy.DenyMessage(authority, rule))
 		return
+	}
+	h.mu.RLock()
+	rules := h.egressRules[sandboxID]
+	h.mu.RUnlock()
+	if rules.Has(host, port) {
+		path, ok := egresspolicy.CanonicalRequestPath(r.URL.EscapedPath())
+		if !ok {
+			h.denyEgress(w, sandboxID, authority, DenyReasonPathNotCanonical,
+				"aerolvm egress policy: "+authority+": path has dot segments, empty segments or encoded slashes, which network_egress_rules refuse")
+			return
+		}
+		if d := rules.Decide(host, port, r.Method, path); !d.Allowed {
+			h.denyEgress(w, sandboxID, authority, DenyReasonRuleDenied,
+				"aerolvm egress policy: "+r.Method+" "+path+" on "+authority+" is not allowed by network_egress_rules")
+			return
+		}
 	}
 	// Defense-in-depth against SSRF: isolate egress runs from the HOST network
 	// namespace, so a hostname allowlist alone would still let untrusted tenant

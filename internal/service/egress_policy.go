@@ -3,6 +3,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -34,10 +35,53 @@ func compileCreateEgress(req *models.CreateSandboxRequest) (*egresspolicy.Policy
 // effective one, so it is held to the union cap (the inline part was held to
 // the inline cap before the expansion).
 func compileCreateEgressEffective(req *models.CreateSandboxRequest) (*egresspolicy.Policy, error) {
+	var pol *egresspolicy.Policy
+	var err error
 	if len(req.EgressProfiles) > 0 {
-		return compileEgress(req, egresspolicy.MaxUnionHostnames)
+		pol, err = compileEgress(req, egresspolicy.MaxUnionHostnames)
+	} else {
+		pol, err = compileCreateEgress(req)
 	}
-	return compileCreateEgress(req)
+	if err != nil {
+		return nil, err
+	}
+	// Rules refine the effective list, so they are checked against it.
+	if _, err := egresspolicy.CompileRules(egressRuleSpecs(req.NetworkEgressRules), pol); err != nil {
+		return nil, err
+	}
+	return pol, nil
+}
+
+// egressRuleSpecs converts the wire rules for pkg/egresspolicy and the
+// gateway.
+func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]egresspolicy.RuleSpec, len(rules))
+	for i, r := range rules {
+		out[i] = egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect}
+	}
+	return out
+}
+
+// hasInspectRule reports whether a rule needs TLS terminated, so the sandbox
+// must trust the node's CA (P3-1).
+func hasInspectRule(rules []models.EgressRule) bool {
+	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return r.Inspect })
+}
+
+// errInspectUnavailable refuses inspect rules on container runtimes until
+// the gateway can terminate TLS.
+func errInspectUnavailable() error {
+	return fmt.Errorf("inspect rules on container runtimes are not available yet: %w", models.ErrRuntimeNotImplemented)
+}
+
+// unsupportedWasmEgressRules: the WASM mediator dials raw sockets and sees
+// no requests, so method and path rules have nothing to check (CEO D14
+// leaves Phase 3 on WASM unspecified).
+func unsupportedWasmEgressRules() error {
+	return fmt.Errorf("runtime %q does not support network_egress_rules: %w", models.RuntimeWasm, models.ErrRuntimeNotImplemented)
 }
 
 func compileEgress(req *models.CreateSandboxRequest, maxHostnames int) (*egresspolicy.Policy, error) {

@@ -13,6 +13,8 @@ type EgressState struct {
 	SandboxID  string
 	HoldReason string
 	HoldSince  time.Time
+	// InspectCA: the sandbox was created trusting the node's CA (P3-1).
+	InspectCA bool
 }
 
 // SetEgressHold records the fail-closed hold and its reason (CEO D16). It is
@@ -53,8 +55,8 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 	st := EgressState{SandboxID: sandboxID}
 	var since sql.NullTime
 	err := s.db.QueryRowContext(ctx, `
-		SELECT hold_reason, hold_since FROM sandbox_egress WHERE sandbox_id = ?
-	`, sandboxID).Scan(&st.HoldReason, &since)
+		SELECT hold_reason, hold_since, inspect_ca FROM sandbox_egress WHERE sandbox_id = ?
+	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}

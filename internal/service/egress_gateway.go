@@ -299,7 +299,7 @@ func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, boo
 		return egress.Spec{}, false
 	}
 	spec := egress.Spec{ID: sb.ID, IP: ip, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut,
-		Learn: sb.NetworkEgressMode == models.NetworkEgressModeLearn}
+		Learn: sb.NetworkEgressMode == models.NetworkEgressModeLearn, Rules: egressRuleSpecs(sb.NetworkEgressRules)}
 	if sb.NetworkQuotaExceeded && sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit {
 		spec.Blocked |= egress.BlockQuota
 	}
