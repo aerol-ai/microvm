@@ -153,7 +153,7 @@ func TestDetachRemovesEverything(t *testing.T) {
 	}
 	c1, c2 := net.Pipe()
 	defer c2.Close()
-	g.Track("sb", "github.com", c1)
+	g.Track("sb", "github.com", 443, c1)
 	if err := g.Detach("sb", ipA); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +183,7 @@ func TestBlockReasonsAreKeyed(t *testing.T) {
 	}
 	c1, c2 := net.Pipe()
 	defer c2.Close()
-	g.Track("sb", "pypi.org", c1)
+	g.Track("sb", "pypi.org", 443, c1)
 	if err := g.SetBlocked("sb", BlockAll, true); err != nil {
 		t.Fatal(err)
 	}
@@ -437,9 +437,9 @@ func TestSpecsAndConnRegistry(t *testing.T) {
 	defer c2.Close()
 	c3, c4 := net.Pipe()
 	defer c4.Close()
-	g.Track("b", "pypi.org", c1)
-	g.Track("b", "github.com", c3)
-	if n := g.CloseConnsWhere("b", func(h string) bool { return h == "github.com" }); n != 1 {
+	g.Track("b", "pypi.org", 443, c1)
+	g.Track("b", "github.com", 443, c3)
+	if n := g.CloseConnsWhere("b", func(h string, _ uint16) bool { return h == "github.com" }); n != 1 {
 		t.Fatalf("closed %d, want 1", n)
 	}
 	if g.ConnCount("b") != 1 {
@@ -472,5 +472,36 @@ func TestLastAddr(t *testing.T) {
 		if got := lastAddr(netip.MustParsePrefix(in)); got.String() != want {
 			t.Fatalf("lastAddr(%s) = %s, want %s", in, got, want)
 		}
+	}
+}
+
+// TestAttachPolicyChangeClosesNarrowedConns covers §5.8 FQDN → FQDN′: a
+// policy update closes the proxied connections the new policy no longer
+// allows and leaves the rest open.
+func TestAttachPolicyChangeClosesNarrowedConns(t *testing.T) {
+	g, _, _ := newTestGateway(t)
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org", "github.com", "151.101.0.0/16")); err != nil {
+		t.Fatal(err)
+	}
+	pipes := func() net.Conn {
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		return a
+	}
+	g.Track("sb", "pypi.org", 443, pipes())
+	g.Track("sb", "github.com", 443, pipes())
+	g.Track("sb", "151.101.1.1", 80, pipes())
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org")); err != nil {
+		t.Fatal(err)
+	}
+	if n := g.ConnCount("sb"); n != 1 {
+		t.Fatalf("%d connections left, want only pypi.org's", n)
+	}
+	// Re-sending the same policy closes nothing.
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org")); err != nil {
+		t.Fatal(err)
+	}
+	if g.ConnCount("sb") != 1 {
+		t.Fatal("an unchanged policy must not close connections")
 	}
 }

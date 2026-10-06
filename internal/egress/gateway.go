@@ -320,9 +320,11 @@ func (g *Gateway) Attach(spec Spec) error {
 	g.mu.Unlock()
 	if policyChanged {
 		// A narrowed policy must not keep serving through learned
-		// (ip, port) pairs or established flows it no longer allows (D2).
+		// (ip, port) pairs, established flows or proxied connections it no
+		// longer allows (D2, §5.8 FQDN → FQDN′).
 		g.flushLearned(spec.ID, old.spec.IP)
 		g.flushConntrack(old.spec.IP)
+		g.CloseConnsWhere(spec.ID, func(host string, port uint16) bool { return !nu.permits(host, port) })
 	}
 	if nu.kernelBlocked() && (old == nil || !old.kernelBlocked()) {
 		g.closeConns(spec.ID)

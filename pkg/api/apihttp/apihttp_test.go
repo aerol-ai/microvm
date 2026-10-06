@@ -506,3 +506,26 @@ func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
 		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
 	}
 }
+
+// TestWriteStoreAwareError_EgressPolicyUpdate: the live-update failures are
+// told apart by status and code (plans/egress-domain-filtering.md §5.8), and
+// every one carries a Retry-After since the PUT is idempotent.
+func TestWriteStoreAwareError_EgressPolicyUpdate(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{fmt.Errorf("%w: no leader", service.ErrEgressSpecCommitFailed), http.StatusServiceUnavailable, models.ErrorCodeEgressSpecCommitFailed},
+		{fmt.Errorf("%w: attach", service.ErrEgressApplyFailedHeld), http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld},
+		{fmt.Errorf("%w (status creating)", service.ErrEgressPolicyBusy), http.StatusConflict, ""},
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, tc.err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != tc.status || body.Code != tc.code || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("%v: status=%d code=%q retry=%q", tc.err, rr.Code, body.Code, rr.Header().Get("Retry-After"))
+		}
+	}
+}

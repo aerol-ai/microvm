@@ -19,9 +19,11 @@ import (
 
 // serveHTTP handles a redirected :80 connection. Every request on a
 // keep-alive connection is checked on its own Host, so switching Host on the
-// second request is caught (§5.5).
+// second request is caught (§5.5), and against the sandbox's policy as it is
+// now, so a live update (§5.8) or a block reaches the next request too.
 func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	id, pol := src.Spec.ID, src.Policy
+	peer := peerAddr(c)
 	br := bufio.NewReader(c)
 	var tracked *egress.TrackedConn
 	defer func() {
@@ -72,6 +74,16 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			return
 		}
 		_ = c.SetReadDeadline(time.Time{})
+		cur, ok := p.src.Source(peer)
+		switch {
+		case !ok || cur.Spec.ID != id:
+			p.observe(Decision{SandboxID: id, Port: 80, Reason: ReasonUnknownSource, Mode: src.Mode})
+			return
+		case cur.Blocked != 0:
+			p.observe(Decision{SandboxID: id, Port: 80, Reason: ReasonBlocked, Mode: cur.Mode})
+			return
+		}
+		src, pol = cur, cur.Policy
 		if req.Method == http.MethodConnect {
 			p.observe(Decision{SandboxID: id, Port: 80, Reason: ReasonBadRequest, Mode: src.Mode})
 			writeHTTPError(c, http.StatusBadRequest, "aerolvm egress policy: CONNECT is not supported on port 80")
@@ -99,7 +111,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		curName, curAllowed = host, allowed && rule != ""
 		curProxied = up != nil && !up.Bypass(host)
 		if tracked == nil {
-			tracked = p.src.Track(id, host, c)
+			tracked = p.src.Track(id, host, 80, c)
 		}
 		p.observe(Decision{SandboxID: id, Host: host, Port: 80, Allowed: true, Rule: rule, Mode: src.Mode})
 
@@ -161,7 +173,7 @@ func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, hos
 		_ = up.Close()
 		return
 	}
-	p.splice(c, up, br, id, host)
+	p.splice(c, up, br, id, host, 80)
 }
 
 // requestHost returns the request's host without port. The port, if any,

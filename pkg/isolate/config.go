@@ -8,12 +8,12 @@
 // CONTROLLER worker with a `workerLoader` binding. Sandbox traffic arrives at
 // the controller keyed by the x-sb-id header (the driver sets it; clients
 // cannot forge it because the driver's proxy owns the socket). The controller
-// calls env.LOADER.get(id, provider); on a cache miss the provider fetches the
+// calls env.LOADER.get(id#slot, provider); on a cache miss the provider fetches the
 // sandbox's bundle from the HOST service binding — a tiny bundle-server the Go
 // host serves over a unix socket — so the driver never has to restart the
 // process or push code through workerd's config. Loaded isolates are cached by
-// id (the warm path: ~0.3ms) and auto-evicted when idle; a re-fetch on the
-// next request transparently reloads.
+// id and egress slot (the warm path: ~0.3ms) and auto-evicted when idle; a
+// re-fetch on the next request transparently reloads.
 package isolate
 
 import (
@@ -62,10 +62,12 @@ const controllerJS = `export default {
     // is exhausted) binds EGRESS_DENY, which fail-closed 403s (spike-proven
     // 2026-07-18; plans/isolate-runtime.md §4).
     const slot = spec.egress_slot;
-    const outbound = (slot === undefined || slot === null || slot < 0)
-      ? env.EGRESS_DENY
-      : env["EGRESS_" + slot];
-    const worker = env.LOADER.get(id, async () => ({
+    const denied = slot === undefined || slot === null || slot < 0;
+    const outbound = denied ? env.EGRESS_DENY : env["EGRESS_" + slot];
+    // The cache key carries the slot: a live policy change that moves the
+    // sandbox between a slot and EGRESS_DENY must not reuse an isolate whose
+    // globalOutbound is still bound to the old slot.
+    const worker = env.LOADER.get(id + "#" + (denied ? "deny" : slot), async () => ({
       compatibilityDate: spec.compatibility_date,
       mainModule: spec.main_module,
       modules: spec.modules,

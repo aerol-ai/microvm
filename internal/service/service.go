@@ -375,6 +375,8 @@ type Service struct {
 	// egressControlPushed is the control-port guard list last pushed to the
 	// gateway; nil after a full sync, so a restarted gateway gets it again.
 	egressControlPushed atomic.Pointer[string]
+	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
+	egressPolicyLocks egressPolicyLocks
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the

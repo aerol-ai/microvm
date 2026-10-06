@@ -434,3 +434,42 @@ func TestRequestHostAndHelpers(t *testing.T) {
 		t.Fatal("refusal detection")
 	}
 }
+
+// TestHTTPKeepAliveSeesPolicyUpdate covers §5.8 on :80: the second request on
+// a keep-alive connection is judged by the policy as it is after a live
+// update, not the one the connection was opened under.
+func TestHTTPKeepAliveSeesPolicyUpdate(t *testing.T) {
+	r := newRig(t, 80, allowSpec("pypi.org", "files.example"), Config{})
+	backend := httpBackend(t)
+	r.dialer.resolve["pypi.org"], r.dialer.backend["pypi.org"] = "151.101.0.223", backend
+	r.dialer.resolve["files.example"], r.dialer.backend["files.example"] = "151.101.0.224", backend
+	c, err := net.Dial("tcp", r.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	br := bufio.NewReader(c)
+	get := func(host string) string {
+		if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		return resp.Status
+	}
+	if got := get("files.example"); !strings.HasPrefix(got, "200") {
+		t.Fatalf("first request = %s", got)
+	}
+	spec := allowSpec("files.example")
+	spec.IP = peer
+	if err := r.gw.Attach(spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := get("pypi.org"); !strings.HasPrefix(got, "403") {
+		t.Fatalf("a host the update removed was served on the open connection: %s", got)
+	}
+}

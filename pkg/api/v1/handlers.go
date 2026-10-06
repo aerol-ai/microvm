@@ -450,6 +450,22 @@ func (h *handlers) checkNetworkPolicy(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
+// updateNetworkPolicy replaces a sandbox's egress policy live (§5.8). The
+// body is a full replace, so the same body twice is a no-op.
+func (h *handlers) updateNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.UpdateNetworkPolicy(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
 func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {
 	var req models.UpdateNetworkLimitsRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {

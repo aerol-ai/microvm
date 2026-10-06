@@ -130,6 +130,13 @@ func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, re
 			return err
 		}
 	}
+	return checkEgressOperatorLimits(op, req)
+}
+
+// checkEgressOperatorLimits holds a policy to the operator file's limits:
+// the upstream proxy's ports and the ceiling. Creates and live updates
+// (§5.8) share it, so an update can't reach what a create couldn't.
+func checkEgressOperatorLimits(op *operator.Operator, req *models.CreateSandboxRequest) error {
 	// A transparent CONNECT on arbitrary ports is out of scope (§5.10 PC-4):
 	// host:port rules for names the upstream proxies must be 80 or 443.
 	for _, raw := range req.NetworkAllowOut {

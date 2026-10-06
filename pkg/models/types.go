@@ -918,6 +918,37 @@ type NetworkUsage struct {
 }
 
 // UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// NetworkPolicyRequest is PUT /v1/sandboxes/{id}/network/policy
+// (plans/egress-domain-filtering.md §5.8): a full replace of the sandbox's
+// egress policy, with the same fields and rules as create. Sending the same
+// body twice is a no-op.
+type NetworkPolicyRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+}
+
+// NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
+// means it is stored, replicated in a cluster, and live on a running
+// sandbox. EgressStatus is set for a container sandbox in gateway mode, as
+// on GET.
+type NetworkPolicy struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressStatus    string   `json:"egress_status,omitempty"`
+}
+
+// ErrorCodeEgressSpecCommitFailed is returned (503) when a policy update
+// could not be committed to the cluster's replicated spec; nothing changed.
+const ErrorCodeEgressSpecCommitFailed = "spec_commit_failed"
+
+// ErrorCodeEgressApplyFailedHeld is returned (503) when a policy update is
+// stored but could not be made live; a container sandbox is held without
+// egress until a retry (the PUT is idempotent) or the reconcile pass
+// applies it.
+const ErrorCodeEgressApplyFailedHeld = "apply_failed_held"
+
 // NetworkPolicyCheckRequest is POST /v1/network/policy/check: would a sandbox
 // created with these egress fields reach Destination? Destination is "host",
 // "host:port", "IP" or "IP:port"; a bare host is checked as the web ports.

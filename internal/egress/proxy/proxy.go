@@ -51,7 +51,7 @@ const (
 // (*egress.Gateway).
 type Sources interface {
 	Source(netip.Addr) (egress.Source, bool)
-	Track(id, host string, conn net.Conn) *egress.TrackedConn
+	Track(id, host string, port uint16, conn net.Conn) *egress.TrackedConn
 }
 
 // Decision is one decided connection or request, for audit and learn mode.
@@ -257,8 +257,8 @@ func (p *Proxy) dialer(pol *egresspolicy.Policy, name string, nameAllowed bool) 
 
 // splice tracks the downstream conn against the sandbox (a block, detach or
 // narrowing closes it) and copies until both sides finish.
-func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string) {
-	tc := p.src.Track(id, host, c)
+func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string, port uint16) {
+	tc := p.src.Track(id, host, port, c)
 	defer tc.Close()
 	defer up.Close()
 	if err := netsplice.Splice(c, up, br, netsplice.WithIdleTimeout(p.cfg.IdleTimeout)); err != nil && !errors.Is(err, netsplice.ErrIdleTimeout) {

@@ -175,6 +175,25 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
 		return
 	}
+	// Live policy updates (plans/egress-domain-filtering.md §5.8): two
+	// distinct 503 bodies so a caller knows whether anything changed, and a
+	// 409 while the sandbox is mid-create. The PUT is idempotent, so all
+	// three are safe to retry as-is.
+	if errors.Is(err, service.ErrEgressSpecCommitFailed) {
+		w.Header().Set("Retry-After", "5")
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressSpecCommitFailed, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressApplyFailedHeld) {
+		w.Header().Set("Retry-After", "5")
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressPolicyBusy) {
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrPublicTrafficDisabled) {
 		WriteError(w, http.StatusConflict, err.Error())
 		return
