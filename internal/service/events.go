@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -185,7 +186,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil && !s.ipClaimedByOther(ctx, sandbox.ID, previousIP, cr) {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
@@ -258,7 +259,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil && !s.ipClaimedByOther(ctx, sandbox.ID, previousIP, cr) {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
@@ -386,4 +387,38 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	}
 	s.syncAllowedPorts(ctx, sandbox)
 	return nil
+}
+
+// ipClaimedByOther reports whether a sandbox other than sandboxID may be using
+// ip now: per the store (creating/started rows and claimed netns slots) or,
+// when the runtime can tell, its live network view. Stop and destroy events
+// arrive asynchronously, so by the time one is handled the IP may already
+// belong to a new sandbox; clearing then would strip the new owner's DROP and
+// leave it unrestricted (egress plan P0-6). A lookup error also counts as
+// claimed: a stale rule left behind fails closed and reconcile cleans it,
+// while a wrong clear fails open.
+func (s *Service) ipClaimedByOther(ctx context.Context, sandboxID, ip string, cr runtime.ContainerRuntime) bool {
+	claimants, err := s.store.SandboxIDsClaimingContainerIP(ctx, ip)
+	if err != nil {
+		s.logger.Warn("skip event rule clear: ip owner lookup failed", "sandbox_id", sandboxID, "ip", ip, "error", err)
+		return true
+	}
+	for _, id := range claimants {
+		if id != sandboxID {
+			s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", id)
+			return true
+		}
+	}
+	if resolver, ok := cr.(runtime.IPOwnerResolver); ok {
+		owner, err := resolver.IPOwner(ctx, ip)
+		if err != nil {
+			s.logger.Warn("skip event rule clear: runtime ip owner lookup failed", "sandbox_id", sandboxID, "ip", ip, "error", err)
+			return true
+		}
+		if owner != "" && owner != sandboxID {
+			s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", owner)
+			return true
+		}
+	}
+	return false
 }

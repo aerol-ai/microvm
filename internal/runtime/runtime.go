@@ -73,6 +73,17 @@ type Runtime interface {
 // ContainerRuntime extends Runtime with per-IP network rules and the in-container
 // toolbox port allowlist. Docker and Firecracker satisfy both; WASM satisfies
 // only Runtime and uses host-mediated sockets instead.
+// IPOwnerResolver is implemented by container runtimes that can report which
+// sandbox currently holds a bridge IP. Event-driven rule clears consult it so
+// a late stop or destroy event for an old owner never strips the rules of a
+// sandbox that has since been given the same IP — which would leave the new
+// sandbox unrestricted (plans/egress-domain-filtering.md P0-6). It catches the
+// window before the new owner's store row records the IP. An empty id means
+// no sandbox holds the IP (free or parked pool slots included).
+type IPOwnerResolver interface {
+	IPOwner(ctx context.Context, ip string) (sandboxID string, err error)
+}
+
 type ContainerRuntime interface {
 	Runtime
 

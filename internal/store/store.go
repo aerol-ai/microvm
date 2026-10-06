@@ -369,6 +369,11 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		// idx_sandboxes_container_ip backs SandboxIDsClaimingContainerIP, the
+		// owner check every stop/destroy event runs before clearing per-IP
+		// firewall rules (egress plan P0-6), so it stays an index probe as the
+		// destroyed-row history grows.
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_container_ip ON sandboxes(container_ip);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of
