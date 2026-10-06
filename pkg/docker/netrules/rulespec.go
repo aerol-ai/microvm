@@ -14,11 +14,13 @@ const (
 	verdictUnset verdictKind = iota
 	verdictDrop
 	verdictAccept
+	verdictReturn
 )
 
 // parsedRule is the Manager's iptables-shaped argv decoded into the fields
 // the netlink backend needs. Only the shapes Manager emits are supported:
-// -s/-d address-or-CIDR, optional -m comment --comment, and -j DROP|ACCEPT.
+// -s/-d address-or-CIDR, optional -m comment --comment, and -j
+// DROP|ACCEPT|RETURN (RETURN is used by the AEROLVM-INPUT allowlist rules).
 type parsedRule struct {
 	src     *net.IPNet
 	dst     *net.IPNet
@@ -88,6 +90,8 @@ func parseRulespec(rulespec ...string) (parsedRule, error) {
 				out.verdict = verdictDrop
 			case "ACCEPT":
 				out.verdict = verdictAccept
+			case "RETURN":
+				out.verdict = verdictReturn
 			default:
 				return parsedRule{}, fmt.Errorf("netrules: unsupported verdict %q", v)
 			}

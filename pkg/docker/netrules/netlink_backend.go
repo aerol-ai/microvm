@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/xt"
 )
 
 // nftAPI is the Conn surface netlinkBackend needs. *nftables.Conn satisfies
@@ -16,6 +17,7 @@ import (
 type nftAPI interface {
 	GetRules(t *nftables.Table, c *nftables.Chain) ([]*nftables.Rule, error)
 	InsertRule(r *nftables.Rule) *nftables.Rule
+	AddRule(r *nftables.Rule) *nftables.Rule
 	DelRule(r *nftables.Rule) error
 	ListChains() ([]*nftables.Chain, error)
 	AddChain(c *nftables.Chain) *nftables.Chain
@@ -87,17 +89,26 @@ func (b *netlinkBackend) Insert(table, chain string, pos int, rulespec ...string
 		return err
 	}
 	rule := &nftables.Rule{Table: tbl, Chain: ch, Exprs: exprs}
-	// Manager always Inserts at position 1 (top). nftables InsertRule without
-	// Position inserts at the beginning of the chain — same semantics.
+	// Position 1 is the top: nftables InsertRule without Position inserts at
+	// the beginning of the chain. A position past the last rule appends, the
+	// same as `iptables -I chain N` with N = len+1. Without the append, a
+	// position-2 insert into a one-rule chain would land ABOVE that rule —
+	// for AEROLVM-INPUT that puts a per-IP DROP above the established-return
+	// rule and cuts sandboxd's toolbox replies.
 	if pos > 1 {
 		rules, gerr := conn.GetRules(tbl, ch)
 		if gerr != nil {
 			return fmt.Errorf("nft get rules for insert pos: %w", gerr)
 		}
 		idx := pos - 1
-		if idx < len(rules) {
-			rule.Position = rules[idx].Handle
+		if idx >= len(rules) {
+			conn.AddRule(rule)
+			if err := conn.Flush(); err != nil {
+				return fmt.Errorf("nft append: %w", err)
+			}
+			return nil
 		}
+		rule.Position = rules[idx].Handle
 	}
 	conn.InsertRule(rule)
 	if err := conn.Flush(); err != nil {
@@ -221,6 +232,125 @@ func (b *netlinkBackend) EnsureForwardJump(userChain string) error {
 	})
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("nft insert FORWARD jump to %s: %w", userChain, err)
+	}
+	return nil
+}
+
+// inputEstablishedReturnExprs is the established-return rule in exactly the
+// shape iptables-nft writes for `-m conntrack --ctstate RELATED,ESTABLISHED
+// -j RETURN`: the xt conntrack match (rev 3), not a native ct expression.
+// Matching iptables-nft byte for byte keeps `iptables -S` able to list the
+// chain (a native rule it can't render breaks its listing) and lets the exec
+// backend find and reuse a rule this backend created, and vice versa.
+func inputEstablishedReturnExprs() []expr.Any {
+	info := &xt.ConntrackMtinfo3{}
+	info.MatchFlags = uint16(xt.ConntrackState)
+	info.StateMask = uint16(expr.CtStateBitESTABLISHED | expr.CtStateBitRELATED)
+	return []expr.Any{
+		&expr.Match{Name: "conntrack", Rev: 3, Info: info},
+		&expr.Counter{},
+		&expr.Verdict{Kind: expr.VerdictReturn},
+	}
+}
+
+func isEstablishedReturn(r *nftables.Rule) bool {
+	var ct, ret bool
+	for _, e := range r.Exprs {
+		switch x := e.(type) {
+		case *expr.Match:
+			ct = ct || x.Name == "conntrack"
+		case *expr.Verdict:
+			ret = ret || x.Kind == expr.VerdictReturn
+		}
+	}
+	return ct && ret
+}
+
+// EnsureInputChain creates the input chain (see inputBootstrapBackend), its
+// established-return first rule, and the INPUT jump. Each step is idempotent.
+//
+// NOTE: same offline-coverage caveat as EnsureUserChain; the live kernel
+// path is exercised by the integration-tagged test.
+func (b *netlinkBackend) EnsureInputChain(chain string) error {
+	if err := b.EnsureUserChain(chain); err != nil {
+		return err
+	}
+	tbl, ch, err := lookupTableChain("filter", chain)
+	if err != nil {
+		return err
+	}
+	conn, err := b.newConn()
+	if err != nil {
+		return err
+	}
+	rules, err := conn.GetRules(tbl, ch)
+	if err != nil {
+		return fmt.Errorf("nft get %s rules: %w", chain, err)
+	}
+	hasReturn := false
+	for _, r := range rules {
+		if isEstablishedReturn(r) {
+			hasReturn = true
+			break
+		}
+	}
+	if !hasReturn {
+		conn.InsertRule(&nftables.Rule{Table: tbl, Chain: ch, Exprs: inputEstablishedReturnExprs()})
+		if err := conn.Flush(); err != nil {
+			return fmt.Errorf("nft insert %s established return: %w", chain, err)
+		}
+	}
+	input := &nftables.Chain{Name: "INPUT", Table: tbl}
+	// iptables-nft creates base chains lazily, on the first rule added to
+	// them, and dockerd never adds one to INPUT. So on a docker or containerd
+	// host the filter table usually has FORWARD but no INPUT chain yet; create
+	// it the way iptables-nft would (filter hook, priority 0, policy accept).
+	chains, err := conn.ListChains()
+	if err != nil {
+		return fmt.Errorf("nft list chains: %w", err)
+	}
+	hasInput := false
+	for _, c := range chains {
+		if c != nil && c.Name == "INPUT" && c.Table != nil && c.Table.Name == tbl.Name && c.Table.Family == tbl.Family {
+			hasInput = true
+			break
+		}
+	}
+	if !hasInput {
+		accept := nftables.ChainPolicyAccept
+		conn.AddChain(&nftables.Chain{
+			Name:     "INPUT",
+			Table:    tbl,
+			Type:     nftables.ChainTypeFilter,
+			Hooknum:  nftables.ChainHookInput,
+			Priority: nftables.ChainPriorityFilter,
+			Policy:   &accept,
+		})
+		if err := conn.Flush(); err != nil {
+			return fmt.Errorf("nft add INPUT base chain: %w", err)
+		}
+	}
+	inRules, err := conn.GetRules(tbl, input)
+	if err != nil {
+		return fmt.Errorf("nft get INPUT rules: %w", err)
+	}
+	for _, r := range inRules {
+		for _, e := range r.Exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictJump && v.Chain == chain {
+				return nil
+			}
+		}
+	}
+	conn.InsertRule(&nftables.Rule{
+		Table: tbl,
+		Chain: input,
+		Exprs: []expr.Any{
+			&expr.Counter{},
+			&expr.Verdict{Kind: expr.VerdictJump, Chain: chain},
+		},
+	})
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("nft insert INPUT jump to %s: %w", chain, err)
 	}
 	return nil
 }

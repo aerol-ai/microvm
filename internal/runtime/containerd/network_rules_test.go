@@ -89,6 +89,9 @@ type netrulesMemBackend struct {
 	rules []string
 }
 
+// EnsureInputChain satisfies the netrules input bootstrap (P0-5).
+func (m *netrulesMemBackend) EnsureInputChain(string) error { return nil }
+
 func (m *netrulesMemBackend) Exists(table, chain string, spec ...string) (bool, error) {
 	key := table + "|" + chain
 	for _, s := range spec {

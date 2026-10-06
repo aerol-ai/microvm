@@ -132,6 +132,11 @@ func ruleKey(table, chain string, spec ...string) string {
 	return table + "/" + chain + "/" + strings.Join(spec, " ")
 }
 
+// EnsureInputChain satisfies the netrules input bootstrap (P0-5): block-all
+// and allowlist rules also guard host INPUT, so a fake must be able to
+// create AEROLVM-INPUT for those paths to succeed.
+func (m *memRuleBackend) EnsureInputChain(string) error { return nil }
+
 func (m *memRuleBackend) Exists(table, chain string, spec ...string) (bool, error) {
 	return slices.Contains(m.rules, ruleKey(table, chain, spec...)), nil
 }

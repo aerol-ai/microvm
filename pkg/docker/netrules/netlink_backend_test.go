@@ -18,6 +18,7 @@ type fakeNFT struct {
 	flushErr   error
 	delErr     error
 	inserted   []*nftables.Rule
+	appended   []*nftables.Rule
 	deleted    []*nftables.Rule
 	addedChain []*nftables.Chain
 }
@@ -37,6 +38,14 @@ func (f *fakeNFT) InsertRule(r *nftables.Rule) *nftables.Rule {
 	cp := *r
 	cp.Handle = uint64(len(f.rules) + 1)
 	f.rules = append([]*nftables.Rule{&cp}, f.rules...)
+	return &cp
+}
+
+func (f *fakeNFT) AddRule(r *nftables.Rule) *nftables.Rule {
+	f.appended = append(f.appended, r)
+	cp := *r
+	cp.Handle = uint64(len(f.rules) + 1)
+	f.rules = append(f.rules, &cp)
 	return &cp
 }
 
@@ -270,8 +279,9 @@ func TestNetlinkBackendInsertPosBeyondLen(t *testing.T) {
 	if err := b.Insert("filter", "DOCKER-USER", 99, "-s", "10.0.0.1", "-j", "DROP"); err != nil {
 		t.Fatal(err)
 	}
-	if fake.inserted[0].Position != 0 {
-		t.Fatalf("Position = %d, want 0 when idx past end", fake.inserted[0].Position)
+	// Past the end appends, matching `iptables -I chain N` with N > len.
+	if len(fake.appended) != 1 || len(fake.inserted) != 0 {
+		t.Fatalf("appended=%d inserted=%d, want an append when idx is past the end", len(fake.appended), len(fake.inserted))
 	}
 }
 
