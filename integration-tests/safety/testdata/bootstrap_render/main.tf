@@ -26,6 +26,9 @@ locals {
     pat_token = "x"
     cloudflare_api_token = "x"
     acme_email = "x"
+    acme_ca = "x"
+    acme_ca_root_pem = "x"
+    tls_issuer = "x"
     with_firecracker = false
     with_gvisor = false
     with_isolate = false

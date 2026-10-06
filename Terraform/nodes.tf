@@ -73,6 +73,9 @@ resource "aws_instance" "seed" {
     pat_token                                = local.pat_token
     cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
+    acme_ca                                  = local.acme_ca
+    acme_ca_root_pem                         = local.acme_ca_root_pem
+    tls_issuer                               = local.tls_issuer
     with_firecracker                         = local.seed_node.with_firecracker
     with_gvisor                              = local.seed_node.with_gvisor
     with_isolate                             = local.seed_node.with_isolate
@@ -292,6 +295,9 @@ resource "aws_instance" "joiner" {
     pat_token                                = local.pat_token
     cloudflare_api_token                     = local.cloudflare_api_token
     acme_email                               = local.acme_email
+    acme_ca                                  = local.acme_ca
+    acme_ca_root_pem                         = local.acme_ca_root_pem
+    tls_issuer                               = local.tls_issuer
     with_firecracker                         = each.value.with_firecracker
     with_gvisor                              = each.value.with_gvisor
     with_isolate                             = each.value.with_isolate

@@ -22,6 +22,14 @@ locals {
   # local.cluster_ops.ingress.* / local.cluster_secrets.cluster.* everywhere.
   domain_name = local.cluster_ops.ingress.domain_name
   acme_email  = local.cluster_ops.ingress.acme_email
+  # Certificates from an internal CA on a network with no route to Let's
+  # Encrypt (plans/egress-domain-filtering.md §5.10 PC-5). Optional
+  # ingress.acme_ca (an ACME directory URL), ingress.acme_ca_root_pem (its
+  # root, PEM text) and ingress.tls_issuer ("acme" or "internal"); unset
+  # keeps the public CAs.
+  acme_ca          = try(local.cluster_ops.ingress.acme_ca, "")
+  acme_ca_root_pem = try(local.cluster_ops.ingress.acme_ca_root_pem, "")
+  tls_issuer       = try(local.cluster_ops.ingress.tls_issuer, "acme")
   # Custom domains require a public domain (the daemon refuses to boot with
   # SB_ENABLE_CUSTOM_DOMAINS=true and no SB_DOMAIN). AND with domain presence so
   # the no-domain local-mode scenario — which still inherits the shared config's

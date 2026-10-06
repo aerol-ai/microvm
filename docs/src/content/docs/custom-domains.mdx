@@ -15,6 +15,9 @@ Before a custom domain can go `ready`, three things must be true:
 1. **DNS points at the cluster ingress.** Issuance uses ACME HTTP-01, so Let's
    Encrypt must reach the hostname on port 80/443 at your ingress. Until DNS
    resolves, the domain stays `pending_dns`. See [DNS records](#dns-records).
+   On a network without the internet, the operator can issue from an internal
+   CA instead; see
+   [Certificates without the internet](/egress-domain-filtering#certificates-without-the-internet).
 2. **An ownership TXT record is published.** Without it, `attach` returns `403`.
    See [ownership verification](#ownership-verification).
 3. **The sandbox exposes HTTP/HTTPS only on a given PORT).** Custom domains bind to the sandbox

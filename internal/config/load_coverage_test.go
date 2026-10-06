@@ -27,6 +27,28 @@ func TestLoad_HappyPathMinimal(t *testing.T) {
 	}
 }
 
+// TestLoad_TLSIssuer (§5.10 PC-5): an internal ACME CA and its root, or
+// Caddy's own CA, for custom-domain certificates without the internet.
+func TestLoad_TLSIssuer(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	t.Setenv("SB_TLS_ACME_CA", " https://ca.bank.internal/acme/acme/directory ")
+	t.Setenv("SB_TLS_ACME_CA_ROOT", "/etc/sandboxd/bank-root.pem")
+	t.Setenv("SB_TLS_ISSUER", " ACME ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TLSACMECA != "https://ca.bank.internal/acme/acme/directory" || cfg.TLSACMECARoot != "/etc/sandboxd/bank-root.pem" || cfg.TLSIssuer != TLSIssuerACME {
+		t.Fatalf("cfg = %q %q %q", cfg.TLSACMECA, cfg.TLSACMECARoot, cfg.TLSIssuer)
+	}
+	t.Setenv("SB_TLS_ACME_CA", "")
+	t.Setenv("SB_TLS_ACME_CA_ROOT", "")
+	t.Setenv("SB_TLS_ISSUER", "internal")
+	if cfg, err = Load(); err != nil || cfg.TLSIssuer != TLSIssuerInternal {
+		t.Fatalf("internal: %q, %v", cfg.TLSIssuer, err)
+	}
+}
+
 func TestLoad_MissingPATToken(t *testing.T) {
 	// Ensure no inherited token.
 	t.Setenv("SB_PAT_TOKEN", "")
@@ -252,6 +274,26 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			name: "serverless wake start concurrency must be positive",
 			env:  map[string]string{"SB_WAKE_START_CONCURRENCY": "0"},
 			want: "SB_WAKE_START_CONCURRENCY must be > 0",
+		},
+		{
+			name: "tls issuer must be known",
+			env:  map[string]string{"SB_TLS_ISSUER": "letsencrypt"},
+			want: "SB_TLS_ISSUER must be",
+		},
+		{
+			name: "internal tls issuer takes no acme ca",
+			env:  map[string]string{"SB_TLS_ISSUER": "internal", "SB_TLS_ACME_CA": "https://ca.bank.internal/acme/acme/directory"},
+			want: "don't apply when SB_TLS_ISSUER=internal",
+		},
+		{
+			name: "acme ca must be https",
+			env:  map[string]string{"SB_TLS_ACME_CA": "http://ca.bank.internal/directory"},
+			want: "SB_TLS_ACME_CA must be an https ACME directory URL",
+		},
+		{
+			name: "acme ca root must be absolute",
+			env:  map[string]string{"SB_TLS_ACME_CA": "https://ca.bank.internal/directory", "SB_TLS_ACME_CA_ROOT": "root.pem"},
+			want: "SB_TLS_ACME_CA_ROOT must be an absolute path",
 		},
 		{
 			name: "custom domains require domain",

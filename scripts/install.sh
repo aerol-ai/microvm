@@ -17,6 +17,9 @@ IDLE_TIMEOUT_MIN="0"
 DNS_PROVIDER=""
 DNS_API_TOKEN=""
 ACME_EMAIL=""
+ACME_CA=""
+ACME_CA_ROOT=""
+TLS_ISSUER="acme"
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
 CADDY_BINARY_URL=""
 CADDY_BINARY_URL_EXPLICIT="false"
@@ -116,6 +119,17 @@ Options:
                                strongly recommended in domain mode; without
                                it Caddy creates an anonymous account and
                                you get no warnings before things break.
+  --acme-ca <url>              ACME directory to issue from instead of Let's
+                               Encrypt: a bank PKI or step-ca on a network
+                               with no route to the public CAs. Applies to
+                               the wildcard certificates and to custom
+                               domains (SB_TLS_ACME_CA). https only.
+  --acme-ca-root <pem>         PEM file of roots to trust for --acme-ca
+                               (SB_TLS_ACME_CA_ROOT). Absolute path.
+  --tls-issuer <acme|internal> internal: Caddy's own CA issues every
+                               certificate, for labs. No DNS provider is
+                               needed; clients must trust Caddy's root.
+                               Default acme.
   --with-gvisor                Install gVisor's runsc and register it as an
                                alternative OCI runtime in
                                /etc/docker/daemon.json so sandboxes can opt
@@ -500,6 +514,18 @@ while [[ $# -gt 0 ]]; do
 			ACME_EMAIL="$2"
 			shift 2
 			;;
+		--acme-ca)
+			ACME_CA="$2"
+			shift 2
+			;;
+		--acme-ca-root)
+			ACME_CA_ROOT="$2"
+			shift 2
+			;;
+		--tls-issuer)
+			TLS_ISSUER="$2"
+			shift 2
+			;;
 		--with-gvisor)
 			WITH_GVISOR="true"
 			shift
@@ -647,7 +673,35 @@ fi
 # Encrypt 50-cert/week quota for the registered domain and DoS real sandbox
 # provisioning. Operators who can't run DNS-01 should use --local (no TLS,
 # 127.0.0.1 only) or omit --domain to fall back to IP/path mode.
-if [[ -n "$DOMAIN" && -z "$DNS_PROVIDER" ]]; then
+# Certificates from an internal CA (plans/egress-domain-filtering.md §5.10
+# PC-5): a private network can't reach Let's Encrypt. Checked here so a typo
+# fails the install, not the first issuance.
+case "$TLS_ISSUER" in
+acme | internal) ;;
+*)
+	echo "--tls-issuer must be acme or internal, got '$TLS_ISSUER'." >&2
+	exit 1
+	;;
+esac
+if [[ "$TLS_ISSUER" != "acme" || -n "$ACME_CA" || -n "$ACME_CA_ROOT" ]] && [[ -z "$DOMAIN" ]]; then
+	echo "--tls-issuer, --acme-ca and --acme-ca-root need --domain (there is no TLS without one)." >&2
+	exit 1
+fi
+if [[ "$TLS_ISSUER" == "internal" && (-n "$ACME_CA" || -n "$ACME_CA_ROOT") ]]; then
+	echo "--acme-ca and --acme-ca-root don't apply with --tls-issuer internal." >&2
+	exit 1
+fi
+if [[ -n "$ACME_CA" && "$ACME_CA" != https://* ]]; then
+	echo "--acme-ca must be an https ACME directory URL, got '$ACME_CA'." >&2
+	exit 1
+fi
+if [[ -n "$ACME_CA_ROOT" && ("$ACME_CA_ROOT" != /* || ! -f "$ACME_CA_ROOT") ]]; then
+	echo "--acme-ca-root must be an absolute path to an existing PEM file, got '$ACME_CA_ROOT'." >&2
+	exit 1
+fi
+
+# Caddy's internal CA needs no DNS-01: it issues without a challenge.
+if [[ -n "$DOMAIN" && -z "$DNS_PROVIDER" && "$TLS_ISSUER" != "internal" ]]; then
 	echo "--domain requires --dns-provider and --dns-api-token (DNS-01 wildcard TLS)." >&2
 	echo "HTTP-01 on-demand TLS is no longer supported because it exposes the" >&2
 	echo "Let's Encrypt cert-issuance quota to arbitrary-subdomain probes." >&2
@@ -659,7 +713,7 @@ fi
 # in place ACME never needs :443, so caddy-l4 can own it and the regular
 # Caddy HTTPS site moves to 127.0.0.1:8443. In IP/path mode (no --domain)
 # there is no TLS at all and the multiplexer stays off.
-if [[ -n "$DNS_PROVIDER" ]]; then
+if [[ -n "$DNS_PROVIDER" || (-n "$DOMAIN" && "$TLS_ISSUER" == "internal") ]]; then
 	L4_TLS_LISTEN_DEFAULT=":443"
 else
 	L4_TLS_LISTEN_DEFAULT=""
@@ -991,6 +1045,17 @@ SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
 SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
+	# The custom-domain certificate policy sandboxd installs follows the
+	# same issuer as the Caddyfile (§5.10 PC-5).
+	if [[ -n "$ACME_CA" ]]; then
+		echo "SB_TLS_ACME_CA=$ACME_CA" >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ -n "$ACME_CA_ROOT" ]]; then
+		echo "SB_TLS_ACME_CA_ROOT=$ACME_CA_ROOT" >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "$TLS_ISSUER" != "acme" ]]; then
+		echo "SB_TLS_ISSUER=$TLS_ISSUER" >> /etc/sandboxd/sandboxd.env
+	fi
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
 	# /etc/docker/daemon.json lets a sandbox opt into runtime:"runsc", but
 	# the daemon still defaults SB_HOST_RUNTIMES to {"docker"} and only
@@ -1093,6 +1158,19 @@ EOF
 	if [[ -n "$ACME_EMAIL" ]]; then
 		email_line=$'\n\temail '"$ACME_EMAIL"
 	fi
+	# An internal ACME CA (--acme-ca) issues the wildcard certificates as
+	# well as custom domains; sandboxd sets the same CA on the on-demand
+	# policy it installs (SB_TLS_ACME_CA). --tls-issuer internal skips ACME.
+	if [[ -n "$ACME_CA" ]]; then
+		email_line+=$'\n\tacme_ca '"$ACME_CA"
+	fi
+	if [[ -n "$ACME_CA_ROOT" ]]; then
+		email_line+=$'\n\tacme_ca_root '"$ACME_CA_ROOT"
+	fi
+	local tls_block=$'\ttls {\n\t\tdns '"$DNS_PROVIDER"$' {env.SB_DNS_API_TOKEN}\n\t}'
+	if [[ "$TLS_ISSUER" == "internal" ]]; then
+		tls_block=$'\ttls internal'
+	fi
 	local storage_block=""
 	if [[ "$CADDY_STORAGE_S3" == "true" ]]; then
 		storage_block=$'\n\tstorage s3 {'
@@ -1126,9 +1204,7 @@ EOF
 
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
-	tls {
-		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
-	}
+${tls_block}
 	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
 	handle @api {
 		reverse_proxy 127.0.0.1:21212
@@ -1140,9 +1216,7 @@ https://$DOMAIN:8443 {
 
 https://*.$DOMAIN:8443 {
 	bind 127.0.0.1
-	tls {
-		dns $DNS_PROVIDER {env.SB_DNS_API_TOKEN}
-	}
+${tls_block}
 	# close: caddy-l4 picks a backend once per TCP connection, so a client
 	# that connected before its sandbox's route existed would otherwise keep
 	# reusing a connection pinned to this 404. Closing makes its next attempt

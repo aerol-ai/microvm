@@ -376,6 +376,24 @@ upstream_proxy:
 If the file is present but invalid when sandboxd starts, every create is
 refused with `503` and code `egress_operator_config_invalid` until it's fixed.
 
+### Certificates without the internet
+
+Sandbox URLs and [custom domains](/custom-domains) use certificates from Let's
+Encrypt by default, which a private network can't reach. Point them at the
+bank's own CA instead:
+
+| Setting | install.sh flag | What it does |
+|---|---|---|
+| `SB_TLS_ACME_CA` | `--acme-ca <url>` | ACME directory to issue from, such as the bank's PKI or step-ca. https only. |
+| `SB_TLS_ACME_CA_ROOT` | `--acme-ca-root <pem>` | Root certificate to trust when talking to that CA. Absolute path. |
+| `SB_TLS_ISSUER` | `--tls-issuer internal` | Caddy's own CA issues every certificate, with no DNS provider. For labs: clients must trust Caddy's root. |
+
+The install flags set both the wildcard certificates and the custom-domain
+certificates; the environment variables alone cover custom domains. Changing
+them takes effect the next time sandboxd starts, and unsetting them goes back
+to Let's Encrypt. With an ACME CA, a custom domain's DNS must still lead the
+CA to the ingress for its HTTP challenge; Caddy's own CA needs no challenge.
+
 ---
 
 ## Limitations
