@@ -270,7 +270,9 @@ func TestTranslateCreateSandboxRequestWasmPaths(t *testing.T) {
 		t.Fatalf("expected default public traffic true")
 	}
 
-	_, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
+	// WASM egress lists pass through to the service, which owns the decision
+	// (the mediator enforces them, plans/egress-domain-filtering.md P1-6).
+	wasmReq, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
 		TemplateID: "wasm-mod",
 		Timeout:    intPtr(120),
 		Metadata: map[string]any{
@@ -279,13 +281,13 @@ func TestTranslateCreateSandboxRequestWasmPaths(t *testing.T) {
 		},
 		Network: &sandboxNetworkRequest{AllowOut: []string{"10.0.0.0/8"}},
 	})
-	if err == nil {
-		t.Fatal("expected wasm egress rejection")
+	if err != nil {
+		t.Fatalf("wasm egress lists must pass through: %v", err)
+	}
+	if len(wasmReq.NetworkAllowOut) != 1 || wasmReq.NetworkAllowOut[0] != "10.0.0.0/8" {
+		t.Fatalf("wasm allowOut = %v", wasmReq.NetworkAllowOut)
 	}
 	var reqErr requestError
-	if !errors.As(err, &reqErr) || reqErr.status != http.StatusNotImplemented {
-		t.Fatalf("err = %v, want 501 not implemented", err)
-	}
 
 	_, _, err = h.translateCreateSandboxRequest(context.Background(), createSandboxRequest{
 		TemplateID: "wasm-mod",

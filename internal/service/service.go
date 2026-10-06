@@ -1835,9 +1835,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
-	if err := validateEgressPolicy(req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+	egressPol, err := compileCreateEgress(&req)
+	if err != nil {
 		releaseAdmission()
 		return nil, err
+	}
+	if egressPol.GatewayMode() {
+		releaseAdmission()
+		return nil, ErrEgressGatewayRequired
 	}
 
 	binds, err := s.mounts.MountAll(ctx, sandboxID, req.Mounts)
@@ -6472,30 +6477,6 @@ func (s *Service) syncAllowedPorts(ctx context.Context, sandbox *models.Sandbox)
 	if err := cr.PushAllowedPorts(ctx, sandbox.ContainerIP, sandbox.ToolboxToken, ports); err != nil {
 		s.logger.Warn("failed to sync allowed ports", "sandbox_id", sandbox.ID, "error", err)
 	}
-}
-
-// validateEgressPolicy enforces the selective-egress invariants shared by every
-// API surface (native /v1 and the E2B facade): the allowlist and blocklist are
-// mutually exclusive, every entry must parse as a CIDR, and a deny of the whole
-// address space must be expressed as NetworkBlockAll — a 0.0.0.0/0 catch-all
-// DROP would duplicate the blanket block and confuse cleanup.
-func validateEgressPolicy(allowOut, denyOut []string) error {
-	if len(allowOut) > 0 && len(denyOut) > 0 {
-		return errors.New("network_allow_out and network_deny_out are mutually exclusive")
-	}
-	for _, list := range [][]string{allowOut, denyOut} {
-		for _, cidr := range list {
-			if _, _, err := net.ParseCIDR(strings.TrimSpace(cidr)); err != nil {
-				return fmt.Errorf("invalid egress CIDR %q: %w", cidr, err)
-			}
-		}
-	}
-	for _, cidr := range denyOut {
-		if strings.TrimSpace(cidr) == "0.0.0.0/0" {
-			return errors.New("network_deny_out of 0.0.0.0/0 must be expressed as network_block_all")
-		}
-	}
-	return nil
 }
 
 // maxMaskRequestHostLen bounds the stored value at the DNS name maximum so a

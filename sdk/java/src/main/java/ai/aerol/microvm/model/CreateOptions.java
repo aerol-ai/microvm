@@ -26,10 +26,10 @@ public class CreateOptions {
     public Map<String, String> env;
     public String osUser;
     public Boolean networkBlockAll;
-    /** Egress allowlist of CIDRs; sandbox may reach only these. Mutually exclusive with networkDenyOut. */
+    /** Egress allowlist: CIDRs, hostnames, *.suffix wildcards and host:port entries; with networkDenyOut, allow wins. */
     @JsonProperty("network_allow_out")
     public List<String> networkAllowOut;
-    /** Egress blocklist of CIDRs; sandbox may reach anything except these. Mutually exclusive with networkAllowOut. */
+    /** Egress blocklist of CIDRs (never hostnames); sandbox may reach anything except these. */
     @JsonProperty("network_deny_out")
     public List<String> networkDenyOut;
     /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */

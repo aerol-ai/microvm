@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"io"
 	"log/slog"
 	"net"
@@ -341,23 +342,41 @@ func TestUpdateLifecycleServerlessFlip(t *testing.T) {
 	}
 }
 
-func TestCreateSandboxEgressPolicyRejected(t *testing.T) {
+// TestCreateSandboxEgressPrecedence replaces the old mutual-exclusion test
+// (plans/egress-domain-filtering.md D4): mixed lists are accepted with
+// allow-wins, deny-all alone becomes block-all, a hostname deny is a 400.
+func TestCreateSandboxEgressPrecedence(t *testing.T) {
 	ctx := context.Background()
-	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-	_, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+	rt := &recordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, rt)
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 		Image:           "alpine",
-		NetworkAllowOut: []string{"10.0.0.0/8"},
-		NetworkDenyOut:  []string{"192.168.0.0/16"},
+		NetworkAllowOut: []string{"10.1.0.0/16"},
+		NetworkDenyOut:  []string{"10.0.0.0/8"},
 	})
-	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("err = %v", err)
+	if err != nil {
+		t.Fatalf("mixed lists must be accepted: %v", err)
 	}
-	_, err = svc.CreateSandbox(ctx, models.CreateSandboxRequest{
+	row, err := st.Get(ctx, resp.ID)
+	if err != nil || len(row.NetworkAllowOut) != 1 || len(row.NetworkDenyOut) != 1 {
+		t.Fatalf("stored lists = %+v, %v", row, err)
+	}
+	if len(rt.lastCreateReq.NetworkAllowOut) != 1 || len(rt.lastCreateReq.NetworkDenyOut) != 1 {
+		t.Fatalf("driver must get both lists: %+v", rt.lastCreateReq)
+	}
+	resp, err = svc.CreateSandbox(ctx, models.CreateSandboxRequest{
 		Image:          "alpine",
 		NetworkDenyOut: []string{"0.0.0.0/0"},
 	})
-	if err == nil || !strings.Contains(err.Error(), "network_block_all") {
-		t.Fatalf("deny-all err = %v", err)
+	if err != nil {
+		t.Fatalf("deny-all must be accepted as block-all: %v", err)
+	}
+	if row, _ := st.Get(ctx, resp.ID); !row.NetworkBlockAll || len(row.NetworkDenyOut) != 0 {
+		t.Fatalf("deny-all row = %+v, want block-all without lists", row)
+	}
+	_, err = svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkDenyOut: []string{"evil.com"}})
+	if !errors.Is(err, egresspolicy.ErrInvalid) {
+		t.Fatalf("hostname deny err = %v, want ErrInvalid", err)
 	}
 }
 
@@ -510,24 +529,51 @@ func TestSetEventsSourceAndDockerAuxClient(t *testing.T) {
 	}
 }
 
-func TestValidateEgressPolicy(t *testing.T) {
-	if err := validateEgressPolicy(nil, nil); err != nil {
-		t.Fatalf("empty: %v", err)
+// TestCompileCreateEgress pins the shared-grammar rules for container
+// creates (plans/egress-domain-filtering.md D4, D15): mixed lists are allowed
+// with allow-wins, hostnames are allowed in allow lists and need the gateway,
+// a hostname deny is refused, and deny-all alone folds into block-all.
+func TestCompileCreateEgress(t *testing.T) {
+	cases := []struct {
+		name         string
+		req          models.CreateSandboxRequest
+		wantErr      string
+		wantGateway  bool
+		wantBlockAll bool
+	}{
+		{name: "empty", req: models.CreateSandboxRequest{}},
+		{name: "allow cidr", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}},
+		{name: "deny cidr", req: models.CreateSandboxRequest{NetworkDenyOut: []string{"192.168.0.0/16"}}},
+		{name: "mixed allow-wins", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}, NetworkDenyOut: []string{"192.168.0.0/16"}}},
+		{name: "bad entry", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"not a cidr!"}}, wantErr: "not a cidr"},
+		{name: "hostname deny", req: models.CreateSandboxRequest{NetworkDenyOut: []string{"evil.com"}}, wantErr: "evil.com"},
+		{name: "hostname allow", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"pypi.org"}}, wantGateway: true},
+		{name: "deny all", req: models.CreateSandboxRequest{NetworkDenyOut: []string{"0.0.0.0/0"}}, wantBlockAll: true},
+		{name: "allow + deny all", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"1.1.1.1/32"}, NetworkDenyOut: []string{"0.0.0.0/0"}}},
 	}
-	if err := validateEgressPolicy([]string{"10.0.0.0/8"}, nil); err != nil {
-		t.Fatalf("allow: %v", err)
-	}
-	if err := validateEgressPolicy(nil, []string{"192.168.0.0/16"}); err != nil {
-		t.Fatalf("deny: %v", err)
-	}
-	if err := validateEgressPolicy([]string{"10.0.0.0/8"}, []string{"192.168.0.0/16"}); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("mutual = %v", err)
-	}
-	if err := validateEgressPolicy([]string{"not-a-cidr"}, nil); err == nil || !strings.Contains(err.Error(), "invalid egress CIDR") {
-		t.Fatalf("bad cidr = %v", err)
-	}
-	if err := validateEgressPolicy(nil, []string{"0.0.0.0/0"}); err == nil || !strings.Contains(err.Error(), "network_block_all") {
-		t.Fatalf("deny all = %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := tc.req
+			pol, err := compileCreateEgress(&req)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !errors.Is(err, egresspolicy.ErrInvalid) {
+					t.Fatalf("err = %v, want ErrInvalid naming %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pol.GatewayMode() != tc.wantGateway {
+				t.Fatalf("gateway mode = %v", pol.GatewayMode())
+			}
+			if req.NetworkBlockAll != tc.wantBlockAll {
+				t.Fatalf("block-all = %v", req.NetworkBlockAll)
+			}
+			if tc.wantBlockAll && (req.NetworkAllowOut != nil || req.NetworkDenyOut != nil) {
+				t.Fatal("block-all must drop the lists")
+			}
+		})
 	}
 }
 
@@ -5107,13 +5153,14 @@ func TestCreateSandboxValidationGapsWave7(t *testing.T) {
 	}); err == nil || !strings.Contains(err.Error(), "invalid gpu") {
 		t.Fatalf("bad gpu = %v", err)
 	}
-	// Egress mutual exclusion after admission reservation.
+	// An invalid egress entry after admission reservation (mixed lists are
+	// valid since D4; a hostname deny never is).
 	svc2, _, admit := newServiceRuntimeHarness(t, &recordingRuntime{})
 	_, err := svc2.CreateSandboxWithID(ctx, models.CreateSandboxRequest{
-		Image: "alpine", NetworkAllowOut: []string{"10.0.0.0/8"}, NetworkDenyOut: []string{"192.168.0.0/16"},
-	}, "sb-egress-mutex")
-	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
-		t.Fatalf("egress mutex = %v", err)
+		Image: "alpine", NetworkDenyOut: []string{"evil.com"},
+	}, "sb-egress-invalid")
+	if err == nil || !strings.Contains(err.Error(), "evil.com") {
+		t.Fatalf("invalid egress entry = %v", err)
 	}
 	if admit != nil {
 		// Reservation must have been released on the validation failure.

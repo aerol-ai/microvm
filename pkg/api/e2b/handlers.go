@@ -725,7 +725,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if allowInternetAccess != nil && !*allowInternetAccess {
 		networkBlockAll = true
 	}
-	if len(networkDenyOut) == 1 && networkDenyOut[0] == "0.0.0.0/0" {
+	// denyOut ["0.0.0.0/0"] alone is E2B's "no internet". With a non-empty
+	// allowOut it is the portable allowlist spelling ("allow these, deny the
+	// rest"), so the lists pass through and the service compiles them with
+	// allow-wins precedence (plans/egress-domain-filtering.md D4, S1).
+	if len(networkAllowOut) == 0 && len(networkDenyOut) == 1 && networkDenyOut[0] == "0.0.0.0/0" {
 		networkBlockAll = true
 		if allowInternetAccess == nil {
 			value := false
@@ -733,10 +737,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		}
 	}
 
-	// Effective egress CIDR policy handed to the service. A full block is
-	// carried by NetworkBlockAll (the blanket DROP), so we must not also pass a
-	// 0.0.0.0/0 deny — the service rejects it and it would duplicate the block.
-	// allowOut/denyOut are mutually exclusive per the E2B schema.
+	// Effective egress policy handed to the service. A full block is carried
+	// by NetworkBlockAll (the blanket DROP), so no lists ride along with it.
+	// Otherwise both lists pass through: allowOut alone is an allowlist,
+	// denyOut alone a deny list, both together allow-wins. Hostnames in
+	// allowOut put the sandbox in gateway mode.
 	egressAllowOut := networkAllowOut
 	egressDenyOut := networkDenyOut
 	if networkBlockAll {
@@ -775,12 +780,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, templateID, metadata); err != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	} else if ok {
-		// WASM sandboxes are host-mediated with no container IP, so the
-		// DOCKER-USER egress rules cannot be enforced on them — reject rather
-		// than silently leave the workload unrestricted.
-		if len(egressAllowOut) > 0 || len(egressDenyOut) > 0 {
-			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("selective egress (network.allowOut / network.denyOut) is not supported for wasm sandboxes")
-		}
+		// WASM egress lists are enforced by the worker's mediator; the service
+		// owns that decision (and the 501 on builds without it), so the lists
+		// pass through like any other runtime's.
+		wasmReq.NetworkAllowOut = egressAllowOut
+		wasmReq.NetworkDenyOut = egressDenyOut
 		// WASM has no container filesystem, so a bind-mounted volume could
 		// never appear. Reject rather than silently drop it.
 		if len(platformVolumes) > 0 {

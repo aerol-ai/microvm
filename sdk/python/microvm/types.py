@@ -158,10 +158,11 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
-    # Egress allowlist / blocklist of CIDRs enforced by the host firewall.
-    # networkAllowOut: sandbox may reach ONLY these; everything else is dropped.
-    # networkDenyOut: sandbox may reach anything EXCEPT these. The two are
-    # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
+    # Egress policy. networkAllowOut takes CIDRs, hostnames, *.suffix wildcards
+    # and host:port entries; alone the sandbox may reach ONLY these.
+    # networkDenyOut takes CIDRs only; alone the sandbox may reach anything
+    # EXCEPT these. Both together: allow wins, then deny, then allow by default
+    # (a 0.0.0.0/0 deny makes it an allowlist). A full block is networkBlockAll.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
     # Whether the sandbox may be exposed publicly. Omitted defaults to private

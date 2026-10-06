@@ -593,15 +593,16 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
-	// NetworkAllowOut is an egress allowlist of CIDRs: when non-empty the
-	// sandbox may reach only these destinations and everything else is
-	// dropped. Mutually exclusive with NetworkDenyOut. Enforced by the host
-	// firewall (EnableNetworkRules) and a no-op when network rules are off.
+	// NetworkAllowOut is an egress allowlist: CIDRs, hostnames, *.suffix
+	// wildcards and host:port entries (plans/egress-domain-filtering.md §5.1).
+	// Alone it allows only these destinations. With NetworkDenyOut the
+	// precedence is allow-wins: an allow match passes, then a deny match
+	// drops, then the default is accept; a deny of 0.0.0.0/0 makes it an
+	// allowlist. Hostnames need the egress gateway on container runtimes.
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
-	// NetworkDenyOut is an egress blocklist of CIDRs: the sandbox may reach
-	// anything except these destinations. Mutually exclusive with
-	// NetworkAllowOut. Blocking the entire space is expressed as
-	// NetworkBlockAll, not a denyOut of 0.0.0.0/0.
+	// NetworkDenyOut is an egress blocklist of CIDRs (never hostnames): alone,
+	// the sandbox may reach anything except these. A deny of 0.0.0.0/0 with
+	// no allow list is block-all and is stored as NetworkBlockAll.
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
@@ -780,10 +781,10 @@ type Sandbox struct {
 	// created or patched with. Zero = unlimited.
 	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
-	// NetworkAllowOut / NetworkDenyOut are the egress CIDR policy the sandbox
-	// was created with, persisted so the start and reconcile paths can
-	// reinstall the host-firewall rules after a restart (parity with
-	// NetworkBlockAll). Mutually exclusive; at most one is non-empty.
+	// NetworkAllowOut / NetworkDenyOut are the egress policy the sandbox was
+	// created with, persisted so the start and reconcile paths can reinstall
+	// the rules after a restart (parity with NetworkBlockAll). Both may be set:
+	// allow-wins precedence (plans/egress-domain-filtering.md D4).
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
 	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"

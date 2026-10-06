@@ -186,15 +186,16 @@ export interface CreateOptions {
   osUser?: string;
   networkBlockAll?: boolean;
   /**
-   * Egress allowlist of CIDRs. When set, the sandbox may reach only these
-   * destinations; all other outbound traffic is dropped by the host firewall.
-   * Mutually exclusive with `networkDenyOut`. For a full block use
-   * `networkBlockAll` instead.
+   * Egress allowlist: CIDRs, hostnames (`pypi.org`), `*.suffix` wildcards and
+   * `host:port` entries. Alone, the sandbox may reach only these. With
+   * `networkDenyOut`, allow wins, then deny, then the default is allow; a
+   * deny of `0.0.0.0/0` makes it an allowlist. For a full block use
+   * `networkBlockAll`.
    */
   networkAllowOut?: string[];
   /**
-   * Egress blocklist of CIDRs. When set, the sandbox may reach anything except
-   * these destinations. Mutually exclusive with `networkAllowOut`.
+   * Egress blocklist of CIDRs (never hostnames). Alone, the sandbox may reach
+   * anything except these destinations.
    */
   networkDenyOut?: string[];
   /**

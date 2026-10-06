@@ -303,10 +303,18 @@ const egressPolicyComment = "sbx-egress"
 
 // ApplyEgressPolicy installs a per-container selective egress policy in
 // DOCKER-USER, scoped by source IP and comment-tagged (see egressPolicyComment).
-// Exactly one mode is expected (callers validate mutual exclusivity):
-//   - allowCIDRs non-empty → allowlist: ACCEPT each CIDR, DROP everything else.
-//   - denyCIDRs non-empty  → blocklist: DROP each CIDR, leave the rest to
+// The mode follows the shared allow-wins precedence (plans/
+// egress-domain-filtering.md D4):
+//   - allowCIDRs only → allowlist: ACCEPT each CIDR, DROP everything else.
+//   - denyCIDRs only  → blocklist: DROP each CIDR, leave the rest to
 //     Docker's default ACCEPT.
+//   - both            → allow wins, then deny, then default ACCEPT: ACCEPTs
+//     sit above the DROPs and there is no catch-all.
+//
+// "allow + deny 0.0.0.0/0" is the portable allowlist spelling (E2B's
+// allowOut + denyOut all): normalizeLists maps it to allow-only here, in the
+// one place every apply and clear goes through, so a clear from the stored
+// row always mirrors what the apply installed.
 //
 // Re-apply is idempotent: every rule is Exists-checked before Insert, so the
 // start/reconcile reapply paths can call this repeatedly without duplicating.
@@ -316,7 +324,24 @@ func (m *Manager) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	allowCIDRs, denyCIDRs = normalizeLists(allowCIDRs, denyCIDRs)
 
+	if len(allowCIDRs) > 0 && len(denyCIDRs) > 0 {
+		// Mixed lists: DROPs first, then each ACCEPT at position 1 so every
+		// ACCEPT lands above every DROP (allow wins). Default accept, so no
+		// catch-all and no host-INPUT rules (same as a deny list).
+		for _, cidr := range denyCIDRs {
+			if err := m.ensurePolicyRule("-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); err != nil {
+				return err
+			}
+		}
+		for _, cidr := range allowCIDRs {
+			if err := m.ensurePolicyRule("-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if len(allowCIDRs) > 0 {
 		// The catch-all DROP must sit BELOW the per-CIDR ACCEPTs. Insert the
 		// DROP first, then each ACCEPT at position 1 so it lands above the DROP.
@@ -361,12 +386,14 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	allowCIDRs, denyCIDRs = normalizeLists(allowCIDRs, denyCIDRs)
 
 	var specs [][]string
 	for _, cidr := range allowCIDRs {
 		specs = append(specs, []string{"-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"})
 	}
-	if len(allowCIDRs) > 0 {
+	allowlist := len(allowCIDRs) > 0 && len(denyCIDRs) == 0
+	if allowlist {
 		specs = append(specs, []string{"-s", containerIP, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"})
 	}
 	for _, cidr := range denyCIDRs {
@@ -377,7 +404,7 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 			return err
 		}
 	}
-	if len(allowCIDRs) == 0 {
+	if !allowlist {
 		return nil
 	}
 	inputSpecs := [][]string{inputPolicyDropSpec(containerIP)}
@@ -385,6 +412,19 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 		inputSpecs = append(inputSpecs, inputPolicyReturnSpec(containerIP, cidr))
 	}
 	return m.deleteInputRules(inputSpecs...)
+}
+
+// normalizeLists maps "allow + deny 0.0.0.0/0" to allow-only (D4).
+func normalizeLists(allow, deny []string) ([]string, []string) {
+	if len(allow) == 0 {
+		return allow, deny
+	}
+	for _, d := range deny {
+		if strings.TrimSpace(d) == "0.0.0.0/0" {
+			return allow, nil
+		}
+	}
+	return allow, deny
 }
 
 func inputBlockSpec(ip string) []string {

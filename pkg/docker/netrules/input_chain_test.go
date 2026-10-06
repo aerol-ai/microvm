@@ -193,3 +193,68 @@ func TestParseRulespecReturn(t *testing.T) {
 		t.Fatalf("parsed = %+v", r)
 	}
 }
+
+// TestMixedListsAllowWins covers D4 on the netrules path: ACCEPTs above
+// DROPs, no catch-all, no host-INPUT rules; the clear removes exactly that.
+func TestMixedListsAllowWins(t *testing.T) {
+	be := &memBackend{}
+	mgr := NewWithBackend(be)
+	const ip = "10.0.0.20"
+	allow, deny := []string{"10.1.2.0/24"}, []string{"10.0.0.0/8"}
+	if err := mgr.ApplyEgressPolicy(ip, allow, deny); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := be.Exists("filter", "DOCKER-USER", "-s", ip, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); ok {
+		t.Fatal("mixed lists must not install a catch-all DROP")
+	}
+	if be.hasChain(ChainAerolvmInput) {
+		t.Fatal("mixed lists are default-accept: no host-INPUT rules")
+	}
+	// Insert order is the rule order (each Insert lands at the top): the
+	// ACCEPT must be inserted after the DROP so it sits above it.
+	accept := memKey("filter", "DOCKER-USER", "-s", ip, "-d", allow[0], "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT")
+	drop := memKey("filter", "DOCKER-USER", "-s", ip, "-d", deny[0], "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP")
+	ai, di := -1, -1
+	for i, r := range be.rules {
+		if r == accept {
+			ai = i
+		}
+		if r == drop {
+			di = i
+		}
+	}
+	if ai < 0 || di < 0 || ai < di {
+		t.Fatalf("ACCEPT (inserted %d) must come after DROP (inserted %d) so it ends up above it: %v", ai, di, be.rules)
+	}
+	if err := mgr.ClearEgressPolicy(ip, allow, deny); err != nil {
+		t.Fatal(err)
+	}
+	if be.ruleCount() != 0 {
+		t.Fatalf("clear left rules: %v", be.rules)
+	}
+}
+
+// TestAllowPlusDenyAllIsAllowlist: the E2B spelling "allowOut + denyOut
+// 0.0.0.0/0" installs an allowlist, and a clear from the same stored lists
+// removes exactly it.
+func TestAllowPlusDenyAllIsAllowlist(t *testing.T) {
+	be := &memBackend{}
+	mgr := NewWithBackend(be)
+	const ip = "10.0.0.21"
+	allow, deny := []string{"1.1.1.1/32"}, []string{"0.0.0.0/0"}
+	if err := mgr.ApplyEgressPolicy(ip, allow, deny); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := be.Exists("filter", "DOCKER-USER", "-s", ip, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); !ok {
+		t.Fatal("allow + deny-all must be an allowlist with a catch-all DROP")
+	}
+	if ok, _ := be.Exists("filter", "DOCKER-USER", "-s", ip, "-d", "0.0.0.0/0", "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); ok {
+		t.Fatal("the 0.0.0.0/0 deny must not be installed as its own rule")
+	}
+	if err := mgr.ClearEgressPolicy(ip, allow, deny); err != nil {
+		t.Fatal(err)
+	}
+	if be.ruleCount() != 0 {
+		t.Fatalf("clear left rules: %v", be.rules)
+	}
+}

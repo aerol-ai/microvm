@@ -177,7 +177,7 @@ A blanket block is often too strict — an agent may need to reach one specific 
 - **`networkAllowOut`** — the sandbox may reach **only** these CIDRs; all other outbound traffic is dropped.
 - **`networkDenyOut`** — the sandbox may reach anything **except** these CIDRs.
 
-The two are mutually exclusive. A full block is still expressed with `networkBlockAll` rather than a `0.0.0.0/0` deny.
+You can set both lists. Allow wins: a destination in `networkAllowOut` is allowed, then one in `networkDenyOut` is dropped, and anything else is allowed. A `networkDenyOut` of `0.0.0.0/0` together with a `networkAllowOut` turns it into a plain allowlist; on its own it means block everything, the same as `networkBlockAll`. Deny lists take CIDRs only. Allow lists also take hostnames — see [Egress domain filtering](/egress-domain-filtering/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
