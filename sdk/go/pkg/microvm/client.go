@@ -351,6 +351,29 @@ func (c *Client) SetNetworkPolicy(ctx context.Context, id string, opts sdktypes.
 	return c.inner.SetNetworkPolicy(ctx, id, opts)
 }
 
+// PutEgressProfile creates or replaces a named egress profile (a full
+// replace: the same body twice is a no-op). Sandboxes reference it through
+// EgressProfiles, and a change reaches every one of them.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, opts sdktypes.EgressProfileOptions) (sdktypes.EgressProfile, error) {
+	return c.inner.PutEgressProfile(ctx, name, opts)
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (sdktypes.EgressProfile, error) {
+	return c.inner.GetEgressProfile(ctx, name)
+}
+
+// ListEgressProfiles reads one page of your egress profiles by name.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (sdktypes.EgressProfileList, error) {
+	return c.inner.ListEgressProfiles(ctx, opts)
+}
+
+// DeleteEgressProfile deletes a profile; one that sandboxes still reference
+// is refused (409).
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.inner.DeleteEgressProfile(ctx, name)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {
@@ -733,7 +756,7 @@ func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPol
 		return policy, err
 	}
 	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
-	s.EgressStatus = policy.EgressStatus
+	s.EgressProfiles, s.EgressStatus = policy.EgressProfiles, policy.EgressStatus
 	return policy, nil
 }
 

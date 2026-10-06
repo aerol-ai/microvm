@@ -14,6 +14,10 @@ import type {
   ExecStreamHandle,
   ExecStreamOptions,
   HealthStatus,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  ListEgressProfilesOptions,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
   IngressTarget,
@@ -182,6 +186,28 @@ export class MicroVM {
    */
   async checkNetworkPolicy(options: NetworkPolicyCheckOptions): Promise<NetworkPolicyCheckResult> {
     return this.client.checkNetworkPolicy(options);
+  }
+
+  /**
+   * Creates or replaces a named egress profile (a full replace: the same body
+   * twice is a no-op). Sandboxes reference it through `egressProfiles`, and a
+   * change reaches every one of them.
+   */
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    return this.client.putEgressProfile(name, options);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return this.client.getEgressProfile(name);
+  }
+
+  async listEgressProfiles(options?: ListEgressProfilesOptions): Promise<EgressProfileList> {
+    return this.client.listEgressProfiles(options);
+  }
+
+  /** Deletes a profile; one that sandboxes still reference is refused (409). */
+  async deleteEgressProfile(name: string): Promise<void> {
+    return this.client.deleteEgressProfile(name);
   }
 
   async mounts(sandboxID: string): Promise<MountSpecRedacted[]> {

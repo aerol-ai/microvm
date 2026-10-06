@@ -1480,14 +1480,14 @@ test("setNetworkPolicy PUTs the whole policy and maps the effective one", async 
     fetch: async (input, init) => {
       seen = new Request(input, init);
       body = JSON.parse(String(init?.body));
-      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_status: "active" });
+      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_profiles: ["python"], effective_hostname_count: 3, egress_status: "active" });
     },
   });
-  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"] });
+  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"], egressProfiles: ["python"] });
   assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
   assert.equal(seen?.method, "PUT");
-  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [] });
-  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressStatus: "active" });
+  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [], egress_profiles: ["python"] });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], effectiveHostnameCount: 3, egressStatus: "active" });
 });
 
 test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
@@ -1506,4 +1506,47 @@ test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
   assert.equal(res.networkBlockAll, true);
   assert.equal(sandbox.networkBlockAll, true);
   assert.equal(sandbox.egressStatus, undefined);
+});
+
+test("egress profile CRUD maps the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const profile = { name: "python", allow_out: ["pypi.org"], description: "pip", generation: 2, created_at: "c", updated_at: "u" };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.url.includes("/egress-profiles?")) return jsonResponse({ profiles: [profile], next_cursor: "python" });
+      if (req.url.endsWith("/egress-profiles")) return jsonResponse({ profiles: null });
+      return jsonResponse(profile);
+    },
+  });
+  const put = await client.putEgressProfile("python", { allowOut: ["pypi.org"], description: "pip" });
+  assert.deepEqual(put, { name: "python", allowOut: ["pypi.org"], description: "pip", generation: 2, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/egress-profiles/python", body: { allow_out: ["pypi.org"], description: "pip" } });
+  assert.equal((await client.getEgressProfile("python")).generation, 2);
+  const page = await client.listEgressProfiles({ cursor: "a", limit: 10 });
+  assert.equal(page.nextCursor, "python");
+  assert.ok(seen[2].url.endsWith("/v1/egress-profiles?cursor=a&limit=10"));
+  assert.deepEqual(await client.listEgressProfiles(), { profiles: [] });
+  await client.deleteEgressProfile("python");
+  assert.equal(seen[4].method, "DELETE");
+});
+
+test("sandboxes carry their egress profiles", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (_input, init) => {
+      if (init?.body) body = JSON.parse(String(init.body));
+      return jsonResponse({ ...apiSandbox("sb-p"), egress_profiles: ["python"], egress_profiles_applied: [{ name: "python", generation: 2 }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", egressProfiles: ["python"] });
+  assert.deepEqual(body.egress_profiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfilesApplied, [{ name: "python", generation: 2 }]);
 });

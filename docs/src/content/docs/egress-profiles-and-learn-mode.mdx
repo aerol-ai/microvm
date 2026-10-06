@@ -1,0 +1,318 @@
+---
+title: Egress Profiles
+description: Name an allow list once, use it from many sandboxes, change it in one place, and check a policy before you create anything.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+When many sandboxes need the same outbound access, such as a package mirror,
+a source host and an internal API, writing the list into every create gets
+out of date fast. An **egress profile** is a named allow list you keep once.
+Sandboxes reference it by name, and when you change it, every sandbox that
+uses it picks up the change. Profiles use the same entries as
+[Egress Domain Filtering](/egress-domain-filtering): hostnames, `*.` wildcards,
+`host:port` and CIDRs.
+
+---
+
+## Create a profile and use it
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.putEgressProfile('python-deps', {
+      allowOut: ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+      description: 'pip and git over ssh',
+    })
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.put_egress_profile('python-deps', {
+        'allowOut': ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+        'description': 'pip and git over ssh',
+    })
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.PutEgressProfile(ctx, "python-deps", sdktypes.EgressProfileOptions{
+        AllowOut:    []string{"pypi.org", "*.pythonhosted.org", "github.com:22"},
+        Description: "pip and git over ssh",
+    })
+    if err != nil {
+        return err
+    }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"python-deps"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.put_egress_profile("python-deps", EgressProfileOptions {
+        allow_out: vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "github.com:22".to_string(),
+        ],
+        description: "pip and git over ssh".to_string(),
+    })?;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["python-deps".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.putEgressProfile("python-deps", new EgressProfileOptions()
+        .setAllowOut(List.of("pypi.org", "*.pythonhosted.org", "github.com:22"))
+        .setDescription("pip and git over ssh"));
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("python-deps"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+A sandbox's allowed destinations are its own `networkAllowOut` entries plus
+those of every profile it references. A profile is a full replace: sending the
+same body again changes nothing, so it is safe to retry.
+
+- **Names** are lower-case letters, digits, `.`, `_` and `-`, up to 63
+  characters, and belong to your account like sandbox names.
+- **Limits.** A profile holds up to 512 hostname entries, and a sandbox
+  references up to 16 profiles. A sandbox's own entries and all its profiles
+  together hold at most 1024 hostname entries, counted per list.
+- **Profiles and block-all don't mix.** `networkBlockAll` with
+  `egressProfiles` is refused.
+
+---
+
+## Change a profile
+
+Put the profile again with its new entries. Each change raises its
+`generation`, and each sandbox reports the generation it has live in
+`egressProfilesApplied`, so you can tell when a change has reached it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const profile = await client.putEgressProfile('python-deps', {
+      allowOut: ['pypi.org', '*.pythonhosted.org'],
+    })
+    const current = await client.get(sandbox.id)
+    console.log(profile.generation, current.egressProfilesApplied)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    profile = client.put_egress_profile('python-deps', {
+        'allowOut': ['pypi.org', '*.pythonhosted.org'],
+    })
+    current = client.get(sandbox.id)
+    print(profile['generation'], getattr(current, 'egressProfilesApplied', None))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    profile, err := client.PutEgressProfile(ctx, "python-deps", sdktypes.EgressProfileOptions{
+        AllowOut: []string{"pypi.org", "*.pythonhosted.org"},
+    })
+    if err != nil {
+        return err
+    }
+    current, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        return err
+    }
+    fmt.Println(profile.Generation, current.EgressProfilesApplied)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let profile = client.put_egress_profile("python-deps", EgressProfileOptions {
+        allow_out: vec!["pypi.org".to_string(), "*.pythonhosted.org".to_string()],
+        ..Default::default()
+    })?;
+    let current = client.get(&sandbox.data.id)?;
+    println!("{} {:?}", profile.generation, current.data.egress_profiles_applied);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfile profile = client.putEgressProfile("python-deps", new EgressProfileOptions()
+        .setAllowOut(List.of("pypi.org", "*.pythonhosted.org")));
+    Sandbox current = client.get(sandbox.id);
+    System.out.println(profile.generation + " " + current.egressProfilesApplied);
+    ```
+  </TabItem>
+</Tabs>
+
+- **When it applies.** The node you sent the change to applies it to its
+  sandboxes at once. In a cluster, every other node applies it to its own
+  sandboxes within about 30 seconds. Connections the narrowed profile no
+  longer allows are closed.
+- **Refused changes.** A change that would push some sandbox that uses the
+  profile past the 1024-entry limit is refused with `409`
+  (`egress_profile_cap_exceeded`), naming the sandboxes. Nothing changes.
+- **When a sandbox can't take it.** If a change can't be applied to one
+  sandbox, that sandbox is shut (`egressStatus: "held"`) rather than left on
+  the old list, and the change is retried every 10 seconds.
+
+To change which profiles a running sandbox uses, call
+[`setNetworkPolicy`](/egress-domain-filtering#change-the-policy-of-a-running-sandbox)
+with `egressProfiles`.
+
+---
+
+## List and delete
+
+`listEgressProfiles` returns your profiles a page at a time, by name; pass
+`nextCursor` back as `cursor` for the next page. `deleteEgressProfile` refuses
+with `409` (`egress_profile_in_use`) while any sandbox still references the
+profile; deleting one that is already gone succeeds.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await client.listEgressProfiles({ limit: 50 })
+    for (const p of page.profiles) console.log(p.name, p.generation)
+    await client.deleteEgressProfile('python-deps')
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = client.list_egress_profiles({'limit': 50})
+    for p in page['profiles']:
+        print(p['name'], p['generation'])
+    client.delete_egress_profile('python-deps')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := client.ListEgressProfiles(ctx, sdktypes.ListEgressProfilesOptions{Limit: 50})
+    if err != nil {
+        return err
+    }
+    for _, p := range page.Profiles {
+        fmt.Println(p.Name, p.Generation)
+    }
+    err = client.DeleteEgressProfile(ctx, "python-deps")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = client.list_egress_profiles(ListEgressProfilesOptions {
+        limit: Some(50),
+        ..Default::default()
+    })?;
+    for p in &page.profiles {
+        println!("{} {}", p.name, p.generation);
+    }
+    client.delete_egress_profile("python-deps")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfileList page = client.listEgressProfiles(new ListEgressProfilesOptions().setLimit(50));
+    for (EgressProfile p : page.profiles) {
+        System.out.println(p.name + " " + p.generation);
+    }
+    client.deleteEgressProfile("python-deps");
+    ```
+  </TabItem>
+</Tabs>
+
+---
+
+## Check a policy before you use it
+
+`checkNetworkPolicy` answers whether a sandbox created with some egress fields
+would reach a destination, using the same matcher the filter enforces. No
+sandbox is created. The destination is a host, `host:port`, an IP or
+`IP:port`; a bare host is checked on the web ports.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const check = await client.checkNetworkPolicy({
+      networkAllowOut: ['*.github.com'],
+      destination: 'api.github.com',
+    })
+    console.log(check.allowed, check.matchedRule) // true "*.github.com"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    check = client.check_network_policy({
+        'networkAllowOut': ['*.github.com'],
+        'destination': 'api.github.com',
+    })
+    print(check['allowed'], check['matchedRule'])  # True "*.github.com"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    check, err := client.CheckNetworkPolicy(ctx, sdktypes.NetworkPolicyCheckOptions{
+        NetworkAllowOut: []string{"*.github.com"},
+        Destination:     "api.github.com",
+    })
+    if err != nil {
+        return err
+    }
+    fmt.Println(check.Allowed, check.MatchedRule) // true *.github.com
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let check = client.check_network_policy(NetworkPolicyCheckOptions {
+        network_allow_out: vec!["*.github.com".to_string()],
+        destination: "api.github.com".to_string(),
+        ..Default::default()
+    })?;
+    println!("{} {}", check.allowed, check.matched_rule); // true *.github.com
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    NetworkPolicyCheckResult check = client.checkNetworkPolicy(new NetworkPolicyCheckOptions()
+        .setNetworkAllowOut(List.of("*.github.com"))
+        .setDestination("api.github.com"));
+    System.out.println(check.allowed + " " + check.matchedRule); // true *.github.com
+    ```
+  </TabItem>
+</Tabs>
+
+The answer also gives `defaultVerdict`, what happens to a destination no entry
+matches, and `outsideCeiling` when an entry falls outside the limits your
+operator set, which is why such a create would be refused. The check doesn't
+resolve DNS, so a deny CIDR that a hostname's address would hit is only
+caught when the sandbox connects.
+
+---
+
+## Limitations
+
+- **Firecracker** sandboxes can't use profiles yet.
+- **Org and built-in profiles** (`org:` and `builtin:` names) aren't available
+  yet; those names are reserved.
+- **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
+  sandbox's profiles, since the E2B API has no way to name them.

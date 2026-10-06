@@ -165,6 +165,9 @@ class CreateOptions(TypedDict, total=False):
     # (a 0.0.0.0/0 deny makes it an allowlist). A full block is networkBlockAll.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
+    # Named egress profiles whose entries join networkAllowOut (see
+    # put_egress_profile). A profile change reaches every sandbox using it.
+    egressProfiles: List[str]
     # Whether the sandbox may be exposed publicly. Omitted defaults to private
     # (no public URL, expose_port fails). True opts in; False permanently refuses.
     allowPublicTraffic: bool
@@ -434,6 +437,10 @@ class SandboxData(TypedDict, total=False):
     # Hostname-egress state on get (container runtimes): "active", "held" or
     # "unavailable". Absent otherwise.
     egressStatus: str
+    # Egress profiles this sandbox references, and the generation of each
+    # that is live on it.
+    egressProfiles: List[str]
+    egressProfilesApplied: List["EgressProfileRef"]
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -534,6 +541,42 @@ class NetworkPolicyCheckResult(TypedDict, total=False):
     outsideCeiling: str
 
 
+class EgressProfileRef(TypedDict):
+    name: str
+    generation: int
+
+
+class EgressProfile(TypedDict, total=False):
+    """A named allowlist sandboxes reference through ``egressProfiles``.
+    Profiles belong to your account; ``generation`` goes up on every change."""
+
+    name: str
+    # Hostnames, *. wildcards, host:port entries and CIDRs (at most 512 hostnames).
+    allowOut: List[str]
+    description: str
+    generation: int
+    createdAt: str
+    updatedAt: str
+
+
+class EgressProfileOptions(TypedDict, total=False):
+    """The body of ``put_egress_profile``: a full replace."""
+
+    allowOut: List[str]
+    description: str
+
+
+class ListEgressProfilesOptions(TypedDict, total=False):
+    cursor: str
+    limit: int
+
+
+class EgressProfileList(TypedDict, total=False):
+    profiles: List[EgressProfile]
+    # Pass back as ``cursor`` for the next page; absent on the last one.
+    nextCursor: str
+
+
 class NetworkPolicyOptions(TypedDict, total=False):
     """A sandbox's whole egress policy, for ``set_network_policy``.
 
@@ -546,12 +589,16 @@ class NetworkPolicyOptions(TypedDict, total=False):
     networkBlockAll: bool
     networkAllowOut: List[str]
     networkDenyOut: List[str]
+    egressProfiles: List[str]
 
 
 class NetworkPolicy(TypedDict, total=False):
     networkBlockAll: bool
     networkAllowOut: List[str]
     networkDenyOut: List[str]
+    egressProfiles: List[str]
+    # Hostname entries in force: inline plus every profile's (at most 1024).
+    effectiveHostnameCount: int
     # "active", "held" or "unavailable" for hostname rules on a container.
     egressStatus: str
 

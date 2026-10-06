@@ -28,6 +28,10 @@ import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
 import ai.aerol.microvm.model.NetworkPolicyCheckResult;
@@ -576,6 +580,55 @@ public class MicroVMClient {
             page.coverage = new AuditCoverage();
         }
         return page;
+    }
+
+    /**
+     * Creates or replaces a named egress profile (a full replace: the same body
+     * twice is a no-op). A change reaches every sandbox that references it.
+     */
+    public EgressProfile putEgressProfile(String name, EgressProfileOptions options) {
+        EgressProfileOptions body = options == null ? new EgressProfileOptions() : options;
+        return withProfileDefaults(doJson("PUT", egressProfilePath(name), body, EgressProfile.class));
+    }
+
+    public EgressProfile getEgressProfile(String name) {
+        return withProfileDefaults(doJson("GET", egressProfilePath(name), null, EgressProfile.class));
+    }
+
+    public EgressProfileList listEgressProfiles(ListEgressProfilesOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+        }
+        EgressProfileList page = doJson("GET", versioned("/egress-profiles") + query, null, EgressProfileList.class);
+        if (page == null) {
+            page = new EgressProfileList();
+        }
+        if (page.profiles == null) {
+            page.profiles = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public EgressProfileList listEgressProfiles() {
+        return listEgressProfiles(null);
+    }
+
+    /** Deletes a profile; one that sandboxes still reference is refused (409). */
+    public void deleteEgressProfile(String name) {
+        doNoContent("DELETE", egressProfilePath(name), null);
+    }
+
+    private String egressProfilePath(String name) {
+        return versioned("/egress-profiles/" + URLEncoder.encode(name, StandardCharsets.UTF_8));
+    }
+
+    private static EgressProfile withProfileDefaults(EgressProfile profile) {
+        if (profile != null && profile.allowOut == null) {
+            profile.allowOut = new ArrayList<>();
+        }
+        return profile;
     }
 
     public AuditPage getAudit(String sandboxId) {

@@ -26,6 +26,7 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, ListEgressProfilesOptions,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
@@ -491,6 +492,11 @@ impl Sandbox {
         let policy = self.client.set_network_policy(&self.data.id, opts)?;
         self.data.network_block_all = policy.network_block_all;
         self.data.egress_status = policy.egress_status.clone();
+        self.data.egress_profiles = if policy.egress_profiles.is_empty() {
+            None
+        } else {
+            Some(policy.egress_profiles.clone())
+        };
         Ok(policy)
     }
 
@@ -1163,6 +1169,36 @@ impl Client {
             &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id),
             None,
         )
+    }
+
+    fn egress_profile_path(&self, name: &str) -> String {
+        format!("{}/egress-profiles/{}", self.version_prefix(), urlencoding::encode(name))
+    }
+
+    /// Creates or replaces a named egress profile (a full replace: the same
+    /// body twice is a no-op). A change reaches every sandbox using it.
+    pub fn put_egress_profile(&self, name: &str, opts: EgressProfileOptions) -> Result<EgressProfile, Error> {
+        self.do_json::<EgressProfileOptions, EgressProfile>(Method::PUT, &self.egress_profile_path(name), Some(&opts))
+    }
+
+    pub fn get_egress_profile(&self, name: &str) -> Result<EgressProfile, Error> {
+        self.do_json::<(), EgressProfile>(Method::GET, &self.egress_profile_path(name), None)
+    }
+
+    pub fn list_egress_profiles(&self, opts: ListEgressProfilesOptions) -> Result<EgressProfileList, Error> {
+        let mut path = format!("{}/egress-profiles", self.version_prefix());
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), EgressProfileList>(Method::GET, &path, None)
+    }
+
+    /// Deletes a profile; one that sandboxes still reference is refused (409).
+    pub fn delete_egress_profile(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
     }
 
     pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
@@ -2178,6 +2214,7 @@ mod tests {
             network_block_all: None,
             network_allow_out: None,
             network_deny_out: None,
+            egress_profiles: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -3178,11 +3215,43 @@ mod tests {
         );
         assert_eq!(
             request_json_body(&request),
-            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": []})
+            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []})
         );
         assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
         assert!(!sandbox.data.network_block_all);
         assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn egress_profile_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "name": "python", "allow_out": ["pypi.org"], "description": "pip",
+            "generation": 2, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let profile = client
+            .put_egress_profile(
+                "python",
+                EgressProfileOptions { allow_out: vec!["pypi.org".to_string()], description: "pip".to_string() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/egress-profiles/python HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"allow_out": ["pypi.org"], "description": "pip"}));
+        assert_eq!(profile.generation, 2);
+        assert_eq!(profile.description, "pip");
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"profiles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_egress_profiles(ListEgressProfilesOptions { cursor: Some("a".to_string()), limit: Some(5) })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.profiles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
     }
 
     #[test]

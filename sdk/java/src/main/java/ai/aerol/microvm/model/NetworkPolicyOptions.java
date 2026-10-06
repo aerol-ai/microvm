@@ -13,6 +13,7 @@ public class NetworkPolicyOptions {
     private boolean networkBlockAll;
     private List<String> networkAllowOut = new ArrayList<>();
     private List<String> networkDenyOut = new ArrayList<>();
+    private List<String> egressProfiles = new ArrayList<>();
 
     public boolean getNetworkBlockAll() {
         return networkBlockAll;
@@ -38,6 +39,15 @@ public class NetworkPolicyOptions {
 
     public NetworkPolicyOptions setNetworkDenyOut(List<String> networkDenyOut) {
         this.networkDenyOut = networkDenyOut == null ? new ArrayList<>() : networkDenyOut;
+        return this;
+    }
+
+    public List<String> getEgressProfiles() {
+        return egressProfiles;
+    }
+
+    public NetworkPolicyOptions setEgressProfiles(List<String> egressProfiles) {
+        this.egressProfiles = egressProfiles == null ? new ArrayList<>() : egressProfiles;
         return this;
     }
 }

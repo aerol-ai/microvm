@@ -187,6 +187,7 @@ public class Sandbox extends SandboxData {
     public NetworkPolicy setNetworkPolicy(NetworkPolicyOptions options) {
         NetworkPolicy policy = client.setNetworkPolicy(id, options);
         networkBlockAll = policy.networkBlockAll;
+        egressProfiles = policy.egressProfiles;
         egressStatus = policy.egressStatus;
         return policy;
     }

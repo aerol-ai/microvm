@@ -190,6 +190,10 @@ pub struct CreateOptions {
     /// reach anything except these destinations.
     #[serde(rename = "network_deny_out", skip_serializing_if = "Option::is_none")]
     pub network_deny_out: Option<Vec<String>>,
+    /// Named egress profiles whose entries join `network_allow_out` (see
+    /// `put_egress_profile`). A profile change reaches every sandbox using it.
+    #[serde(rename = "egress_profiles", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles: Option<Vec<String>>,
     /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
     /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
     /// only via the toolbox proxy and SSH gateway.
@@ -546,6 +550,12 @@ pub struct Sandbox {
     /// or "unavailable". `None` otherwise, and on list results.
     #[serde(default, rename = "egress_status", skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
+    /// Egress profiles this sandbox references.
+    #[serde(default, rename = "egress_profiles", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles: Option<Vec<String>>,
+    /// The generation of each referenced profile live on the sandbox.
+    #[serde(default, rename = "egress_profiles_applied", skip_serializing_if = "Option::is_none")]
+    pub egress_profiles_applied: Option<Vec<EgressProfileRef>>,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
     #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
@@ -777,6 +787,7 @@ pub struct NetworkPolicyOptions {
     pub network_block_all: bool,
     pub network_allow_out: Vec<String>,
     pub network_deny_out: Vec<String>,
+    pub egress_profiles: Vec<String>,
 }
 
 /// The policy a sandbox enforces after `set_network_policy`.
@@ -787,9 +798,70 @@ pub struct NetworkPolicy {
     pub network_allow_out: Vec<String>,
     #[serde(default)]
     pub network_deny_out: Vec<String>,
+    #[serde(default)]
+    pub egress_profiles: Vec<String>,
+    /// Hostname entries in force: inline plus every profile's (at most 1024).
+    #[serde(default)]
+    pub effective_hostname_count: usize,
     /// "active", "held" or "unavailable" for hostname rules on a container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
+}
+
+/// A named allowlist sandboxes reference through `egress_profiles`.
+/// Profiles belong to your account; `generation` goes up on every change.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfile {
+    pub name: String,
+    /// Hostnames, `*.` wildcards, `host:port` entries and CIDRs.
+    #[serde(default)]
+    pub allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub generation: i64,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// The body of `put_egress_profile`: a full replace.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileOptions {
+    pub allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// Paging for `list_egress_profiles`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListEgressProfilesOptions {
+    pub cursor: Option<String>,
+    pub limit: Option<u32>,
+}
+
+/// One page of egress profiles.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileList {
+    #[serde(default, deserialize_with = "null_as_empty_profiles")]
+    pub profiles: Vec<EgressProfile>,
+    /// Pass back as `cursor` for the next page; absent on the last one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+fn null_as_empty_profiles<'de, D>(d: D) -> Result<Vec<EgressProfile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<EgressProfile>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// A referenced profile and the generation of it live on a sandbox.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct EgressProfileRef {
+    pub name: String,
+    pub generation: i64,
 }
 
 /// Asks whether a sandbox created with these egress fields would reach

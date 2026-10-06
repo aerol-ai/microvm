@@ -32,6 +32,9 @@ public class CreateOptions {
     /** Egress blocklist of CIDRs (never hostnames); sandbox may reach anything except these. */
     @JsonProperty("network_deny_out")
     public List<String> networkDenyOut;
+    /** Named egress profiles whose entries join networkAllowOut; a profile change reaches every sandbox using it. */
+    @JsonProperty("egress_profiles")
+    public List<String> egressProfiles;
     /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
@@ -120,6 +123,11 @@ public class CreateOptions {
 
     public CreateOptions setNetworkDenyOut(List<String> networkDenyOut) {
         this.networkDenyOut = networkDenyOut;
+        return this;
+    }
+
+    public CreateOptions setEgressProfiles(List<String> egressProfiles) {
+        this.egressProfiles = egressProfiles;
         return this;
     }
 

@@ -149,6 +149,26 @@ type NetworkPolicyOptions = models.NetworkPolicyRequest
 // container.
 type NetworkPolicy = models.NetworkPolicy
 
+// EgressProfile is a named allowlist sandboxes reference through
+// EgressProfiles; Generation goes up on every change.
+type EgressProfile = models.EgressProfile
+
+// EgressProfileOptions is the body of PutEgressProfile: a full replace.
+type EgressProfileOptions = models.EgressProfileRequest
+
+// EgressProfileList is one page of ListEgressProfiles.
+type EgressProfileList = models.EgressProfileList
+
+// EgressProfileRef is a referenced profile and the generation of it live on
+// a sandbox (Sandbox.EgressProfilesApplied).
+type EgressProfileRef = models.EgressProfileRef
+
+// ListEgressProfilesOptions pages ListEgressProfiles.
+type ListEgressProfilesOptions struct {
+	Cursor string
+	Limit  int
+}
+
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
 // "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).

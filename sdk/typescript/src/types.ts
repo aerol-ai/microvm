@@ -199,6 +199,12 @@ export interface CreateOptions {
    */
   networkDenyOut?: string[];
   /**
+   * Named egress profiles whose entries join `networkAllowOut` (see
+   * `putEgressProfile`). A profile change reaches every sandbox that
+   * references it.
+   */
+  egressProfiles?: string[];
+  /**
    * Whether the sandbox may be exposed to the public internet. Omitted defaults
    * to private (no public URL, `exposePort` fails). Set `true` to opt in to
    * public exposure; `false` permanently refuses it for this sandbox.
@@ -503,6 +509,13 @@ export interface Sandbox {
    * otherwise, and on list results.
    */
   egressStatus?: string;
+  /** Egress profiles this sandbox references. */
+  egressProfiles?: string[];
+  /**
+   * The generation of each referenced profile that is live on the sandbox,
+   * so a caller can see when a profile change has reached it.
+   */
+  egressProfilesApplied?: EgressProfileRef[];
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -618,6 +631,7 @@ export interface NetworkPolicyOptions {
   networkBlockAll?: boolean;
   networkAllowOut?: string[];
   networkDenyOut?: string[];
+  egressProfiles?: string[];
 }
 
 /** The policy a sandbox enforces after `setNetworkPolicy`. */
@@ -625,8 +639,48 @@ export interface NetworkPolicy {
   networkBlockAll: boolean;
   networkAllowOut: string[];
   networkDenyOut: string[];
+  egressProfiles: string[];
+  /** Hostname entries in force: inline plus every profile's (at most 1024). */
+  effectiveHostnameCount: number;
   /** "active", "held" or "unavailable" for hostname rules on a container. */
   egressStatus?: string;
+}
+
+/**
+ * A named allowlist sandboxes reference through `egressProfiles`. Profiles
+ * belong to your account; `generation` goes up by one on every change.
+ */
+export interface EgressProfile {
+  name: string;
+  /** Hostnames, `*.` wildcards, `host:port` entries and CIDRs (at most 512 hostnames). */
+  allowOut: string[];
+  description?: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The body of `putEgressProfile`: a full replace. */
+export interface EgressProfileOptions {
+  allowOut: string[];
+  description?: string;
+}
+
+export interface ListEgressProfilesOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+export interface EgressProfileList {
+  profiles: EgressProfile[];
+  /** Pass back as `cursor` for the next page; absent on the last one. */
+  nextCursor?: string;
+}
+
+/** A referenced profile and the generation of it that is live on a sandbox. */
+export interface EgressProfileRef {
+  name: string;
+  generation: number;
 }
 
 export interface SetNetworkLimitsOptions {

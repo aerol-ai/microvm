@@ -44,6 +44,10 @@ from .types import (
     AuditEvent,
     AuditOptions,
     AuditPage,
+    EgressProfile,
+    EgressProfileList,
+    EgressProfileOptions,
+    ListEgressProfilesOptions,
     NetworkPolicy,
     NetworkPolicyCheckOptions,
     NetworkPolicyCheckResult,
@@ -861,16 +865,55 @@ class MicroVM:
             "network_block_all": bool(_first_of(options, "networkBlockAll", "network_block_all") or False),
             "network_allow_out": list(_first_of(options, "networkAllowOut", "network_allow_out") or []),
             "network_deny_out": list(_first_of(options, "networkDenyOut", "network_deny_out") or []),
+            "egress_profiles": list(_first_of(options, "egressProfiles", "egress_profiles") or []),
         }
         payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
         policy: NetworkPolicy = {
             "networkBlockAll": bool(payload.get("network_block_all", False)),
             "networkAllowOut": list(payload.get("network_allow_out") or []),
             "networkDenyOut": list(payload.get("network_deny_out") or []),
+            "egressProfiles": list(payload.get("egress_profiles") or []),
+            "effectiveHostnameCount": int(payload.get("effective_hostname_count") or 0),
         }
         if payload.get("egress_status"):
             policy["egressStatus"] = str(payload["egress_status"])
         return policy
+
+    def put_egress_profile(self, name: str, options: EgressProfileOptions) -> EgressProfile:
+        """Create or replace a named egress profile (a full replace: the same
+        body twice is a no-op). A change reaches every sandbox using it."""
+        body: Dict[str, Any] = {"allow_out": list(_first_of(options, "allowOut", "allow_out") or [])}
+        description = _first_of(options, "description")
+        if description:
+            body["description"] = str(description)
+        payload = self._do_json("PUT", self._egress_profile_path(name), body) or {}
+        return _from_api_egress_profile(payload)
+
+    def get_egress_profile(self, name: str) -> EgressProfile:
+        return _from_api_egress_profile(self._do_json("GET", self._egress_profile_path(name), None) or {})
+
+    def list_egress_profiles(self, options: Optional[ListEgressProfilesOptions] = None) -> EgressProfileList:
+        opts = options or {}
+        params: Dict[str, str] = {}
+        if opts.get("cursor"):
+            params["cursor"] = str(opts["cursor"])
+        if opts.get("limit"):
+            params["limit"] = str(int(opts["limit"]))
+        path = f"{self._version_prefix}/egress-profiles"
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None) or {}
+        result: EgressProfileList = {"profiles": [_from_api_egress_profile(p) for p in payload.get("profiles") or []]}
+        if payload.get("next_cursor"):
+            result["nextCursor"] = str(payload["next_cursor"])
+        return result
+
+    def delete_egress_profile(self, name: str) -> None:
+        """Delete a profile; one that sandboxes still reference is refused (409)."""
+        self._do_json("DELETE", self._egress_profile_path(name), None)
+
+    def _egress_profile_path(self, name: str) -> str:
+        return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
@@ -1267,6 +1310,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_block_all": _first_of(options, "networkBlockAll", "network_block_all"),
             "network_allow_out": _first_of(options, "networkAllowOut", "network_allow_out"),
             "network_deny_out": _first_of(options, "networkDenyOut", "network_deny_out"),
+            "egress_profiles": _first_of(options, "egressProfiles", "egress_profiles"),
             "allow_public_traffic": _first_of(options, "allowPublicTraffic", "allow_public_traffic"),
             "mask_request_host": _first_of(options, "maskRequestHost", "mask_request_host"),
             "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
@@ -1712,6 +1756,19 @@ def _from_api_session(session: Dict[str, Any]) -> Session:
     return result
 
 
+def _from_api_egress_profile(payload: Dict[str, Any]) -> EgressProfile:
+    result: EgressProfile = {
+        "name": str(payload.get("name") or ""),
+        "allowOut": list(payload.get("allow_out") or []),
+        "generation": int(payload.get("generation") or 0),
+        "createdAt": str(payload.get("created_at") or ""),
+        "updatedAt": str(payload.get("updated_at") or ""),
+    }
+    if payload.get("description"):
+        result["description"] = str(payload["description"])
+    return result
+
+
 def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     exposed_ports = _first_of(sandbox, "exposed_ports", "exposedPorts") or []
     lifecycle = _first_of(sandbox, "lifecycle")
@@ -1753,6 +1810,12 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     egress_status = _first_of(sandbox, "egress_status", "egressStatus")
     if egress_status not in (None, ""):
         result["egressStatus"] = str(egress_status)
+    egress_profiles = _first_of(sandbox, "egress_profiles", "egressProfiles")
+    if egress_profiles:
+        result["egressProfiles"] = [str(p) for p in egress_profiles]
+    applied = _first_of(sandbox, "egress_profiles_applied", "egressProfilesApplied")
+    if applied:
+        result["egressProfilesApplied"] = [{"name": str(r.get("name", "")), "generation": int(r.get("generation", 0))} for r in applied]
     env = _first_of(sandbox, "env")
     if isinstance(env, dict) and len(env) > 0:
         result["env"] = {str(key): str(value) for key, value in env.items()}

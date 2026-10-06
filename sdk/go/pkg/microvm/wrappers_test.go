@@ -41,6 +41,16 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			var req models.NetworkPolicyRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressStatus: "active"})
+		case r.URL.Path == "/v1/egress-profiles/python" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/v1/egress-profiles/python":
+			_ = json.NewEncoder(w).Encode(models.EgressProfile{Name: "python", AllowOut: []string{"pypi.org"}, Generation: 2})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/egress-profiles":
+			if r.URL.Query().Get("cursor") != "a" || r.URL.Query().Get("limit") != "5" {
+				http.Error(w, "bad query "+r.URL.RawQuery, http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"profiles":null,"next_cursor":"z"}`))
 		case r.Method == http.MethodPatch && r.URL.Path == "/v1/sandboxes/sb1/network/limits":
 			_ = json.NewEncoder(w).Encode(models.NetworkUsage{SandboxID: "sb1", BytesInLimit: 100})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes/sb1/start":
@@ -208,6 +218,20 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if sb.EgressStatus != "active" || len(sb.NetworkDenyOut) != 1 || sb.NetworkAllowOut[0] != "pypi.org" {
 		t.Fatalf("Sandbox fields after SetNetworkPolicy = %+v", sb.Sandbox)
+	}
+	profile, err := client.PutEgressProfile(ctx, "python", sdktypes.EgressProfileOptions{AllowOut: []string{"pypi.org"}})
+	if err != nil || profile.Generation != 2 {
+		t.Fatalf("PutEgressProfile() = %+v, %v", profile, err)
+	}
+	if profile, err := client.GetEgressProfile(ctx, "python"); err != nil || profile.Name != "python" {
+		t.Fatalf("GetEgressProfile() = %+v, %v", profile, err)
+	}
+	profiles, err := client.ListEgressProfiles(ctx, sdktypes.ListEgressProfilesOptions{Cursor: "a", Limit: 5})
+	if err != nil || profiles.Profiles == nil || profiles.NextCursor != "z" {
+		t.Fatalf("ListEgressProfiles() = %+v, %v", profiles, err)
+	}
+	if err := client.DeleteEgressProfile(ctx, "python"); err != nil {
+		t.Fatalf("DeleteEgressProfile() error = %v", err)
 	}
 	if err := sb.UpdateLifecycle(ctx, sdktypes.Lifecycle{StopIfIdleFor: time.Minute}); err != nil {
 		t.Fatalf("Sandbox.UpdateLifecycle() error = %v", err)

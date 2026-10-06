@@ -34,6 +34,9 @@ public class SandboxData {
      * "unavailable". Null otherwise, and on list results.
      */
     public String egressStatus;
+    /** Egress profiles this sandbox references, and the generation of each live on it. */
+    public List<String> egressProfiles;
+    public List<EgressProfileRef> egressProfilesApplied;
     public boolean toolboxEnabled;
     public String sshPublicKey;
     public String sshPrivateKey;
@@ -82,6 +85,8 @@ public class SandboxData {
         env = other.env == null ? null : new LinkedHashMap<>(other.env);
         networkBlockAll = other.networkBlockAll;
         egressStatus = other.egressStatus;
+        egressProfiles = other.egressProfiles;
+        egressProfilesApplied = other.egressProfilesApplied;
         toolboxEnabled = other.toolboxEnabled;
         sshPublicKey = other.sshPublicKey;
         sshPrivateKey = other.sshPrivateKey;

@@ -29,6 +29,10 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
 import ai.aerol.microvm.model.NetworkPolicyOptions;
@@ -908,6 +912,7 @@ class MicroVMClientTest {
             assertEquals(false, body.get().get("network_block_all"));
             assertEquals(List.of("pypi.org"), body.get().get("network_allow_out"));
             assertEquals(List.of(), body.get().get("network_deny_out"));
+            assertEquals(List.of(), body.get().get("egress_profiles"));
             assertEquals(List.of("pypi.org"), policy.networkAllowOut);
             assertEquals("active", policy.egressStatus);
             assertTrue(!sandbox.networkBlockAll);
@@ -915,6 +920,50 @@ class MicroVMClientTest {
 
             clientFor(server).setNetworkPolicy("sb-1", null);
             assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressProfileCrudMapsWireShape() throws Exception {
+        AtomicReference<String> lastQuery = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("DELETE".equals(method) && "/v1/egress-profiles/python".equals(path)) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("GET".equals(method) && "/v1/egress-profiles".equals(path)) {
+                lastQuery.set(exchange.getRequestURI().getRawQuery());
+                writeJson(exchange, 200, mapOf("profiles", null, "next_cursor", "z"));
+                return;
+            }
+            if ("/v1/egress-profiles/python".equals(path)) {
+                if ("PUT".equals(method)) {
+                    body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                }
+                writeJson(exchange, 200, mapOf("name", "python", "allow_out", List.of("pypi.org"), "description", "pip", "generation", 2));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            EgressProfile profile = client.putEgressProfile("python", new EgressProfileOptions().setAllowOut(List.of("pypi.org")).setDescription("pip"));
+            assertEquals(2, profile.generation);
+            assertEquals(List.of("pypi.org"), body.get().get("allow_out"));
+            assertEquals("pip", body.get().get("description"));
+            assertEquals("pip", client.getEgressProfile("python").description);
+            EgressProfileList page = client.listEgressProfiles(new ListEgressProfilesOptions().setCursor("a").setLimit(5));
+            assertEquals("cursor=a&limit=5", lastQuery.get());
+            assertTrue(page.profiles.isEmpty());
+            assertEquals("z", page.nextCursor);
+            assertTrue(client.listEgressProfiles().profiles.isEmpty());
+            client.deleteEgressProfile("python");
         } finally {
             server.stop(0);
         }

@@ -676,6 +676,52 @@ func (c *Client) SetNetworkPolicy(ctx context.Context, id string, request models
 	return response, err
 }
 
+func (c *Client) egressProfilePath(name string) string {
+	return c.versionPrefix + "/egress-profiles/" + url.PathEscape(name)
+}
+
+// PutEgressProfile creates or replaces a named egress profile.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, request models.EgressProfileRequest) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodPut, c.egressProfilePath(name), request, &response)
+	return response, err
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodGet, c.egressProfilePath(name), nil, &response)
+	return response, err
+}
+
+// ListEgressProfiles reads one page of named egress profiles.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (models.EgressProfileList, error) {
+	values := make(url.Values)
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	path := c.versionPrefix + "/egress-profiles"
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var response models.EgressProfileList
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return models.EgressProfileList{}, err
+	}
+	if response.Profiles == nil {
+		response.Profiles = []models.EgressProfile{}
+	}
+	return response, nil
+}
+
+// DeleteEgressProfile removes a named egress profile.
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
+}
+
 // GetAudit reads one page of a sandbox's audit log.
 func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
 	values := make(url.Values)

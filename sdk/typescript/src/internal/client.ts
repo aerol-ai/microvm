@@ -44,6 +44,11 @@ import type {
   AuditEvent,
   AuditOptions,
   AuditPage,
+  EgressProfile,
+  EgressProfileList,
+  EgressProfileOptions,
+  EgressProfileRef,
+  ListEgressProfilesOptions,
   NetworkPolicy,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
@@ -167,6 +172,27 @@ interface ApiFailover {
   policy?: string;
 }
 
+interface ApiEgressProfile {
+  name: string;
+  allow_out: string[] | null;
+  description?: string;
+  generation: number;
+  created_at: string;
+  updated_at: string;
+}
+
+function fromApiEgressProfile(p: ApiEgressProfile): EgressProfile {
+  const out: EgressProfile = {
+    name: p.name,
+    allowOut: p.allow_out ?? [],
+    generation: p.generation,
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+  if (p.description) out.description = p.description;
+  return out;
+}
+
 interface ApiSandbox {
   id: string;
   name?: string;
@@ -183,6 +209,8 @@ interface ApiSandbox {
   env?: Record<string, string>;
   network_block_all: boolean;
   egress_status?: string;
+  egress_profiles?: string[];
+  egress_profiles_applied?: { name: string; generation: number }[];
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -887,19 +915,54 @@ export class APIClient {
       network_block_all: boolean;
       network_allow_out: string[] | null;
       network_deny_out: string[] | null;
+      egress_profiles?: string[] | null;
+      effective_hostname_count?: number;
       egress_status?: string;
     }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
       network_block_all: options.networkBlockAll ?? false,
       network_allow_out: options.networkAllowOut ?? [],
       network_deny_out: options.networkDenyOut ?? [],
+      egress_profiles: options.egressProfiles ?? [],
     });
     const policy: NetworkPolicy = {
       networkBlockAll: response.network_block_all,
       networkAllowOut: response.network_allow_out ?? [],
       networkDenyOut: response.network_deny_out ?? [],
+      egressProfiles: response.egress_profiles ?? [],
+      effectiveHostnameCount: response.effective_hostname_count ?? 0,
     };
     if (response.egress_status) policy.egressStatus = response.egress_status;
     return policy;
+  }
+
+  async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
+    const response = await this.doJSON<ApiEgressProfile>("PUT", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`), {
+      allow_out: options.allowOut,
+      description: options.description,
+    });
+    return fromApiEgressProfile(response);
+  }
+
+  async getEgressProfile(name: string): Promise<EgressProfile> {
+    return fromApiEgressProfile(await this.doJSON<ApiEgressProfile>("GET", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`)));
+  }
+
+  async listEgressProfiles(options: ListEgressProfilesOptions = {}): Promise<EgressProfileList> {
+    const params = new URLSearchParams();
+    if (options.cursor) params.set("cursor", options.cursor);
+    if (options.limit) params.set("limit", String(options.limit));
+    const query = params.toString();
+    const response = await this.doJSON<{ profiles: ApiEgressProfile[] | null; next_cursor?: string }>(
+      "GET",
+      this.versioned(`/egress-profiles${query ? `?${query}` : ""}`),
+    );
+    const list: EgressProfileList = { profiles: (response.profiles ?? []).map(fromApiEgressProfile) };
+    if (response.next_cursor) list.nextCursor = response.next_cursor;
+    return list;
+  }
+
+  async deleteEgressProfile(name: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/egress-profiles/${encodeURIComponent(name)}`));
   }
 
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {
@@ -1076,6 +1139,8 @@ export class SandboxResource implements Sandbox {
   declare env?: Record<string, string>;
   declare networkBlockAll: boolean;
   declare egressStatus?: string;
+  declare egressProfiles?: string[];
+  declare egressProfilesApplied?: EgressProfileRef[];
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -1282,6 +1347,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_block_all: options.networkBlockAll,
     network_allow_out: options.networkAllowOut,
     network_deny_out: options.networkDenyOut,
+    egress_profiles: options.egressProfiles,
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1378,6 +1444,8 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     env: sandbox.env,
     networkBlockAll: sandbox.network_block_all,
     egressStatus: sandbox.egress_status || undefined,
+    egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
+    egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),

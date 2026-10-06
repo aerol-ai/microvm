@@ -79,6 +79,12 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if path.startswith("/v1/egress-profiles"):
+            if method == "DELETE":
+                return None
+            if method == "GET" and path.startswith("/v1/egress-profiles?"):
+                return {"profiles": [{"name": "python", "allow_out": ["pypi.org"], "generation": 1}], "next_cursor": "python"}
+            return {"name": "python", "allow_out": (payload or {}).get("allow_out", ["pypi.org"]), "description": "pip", "generation": 2, "created_at": "c", "updated_at": "u"}
         if method == "PUT" and path == "/v1/sandboxes/sb-1/network/policy":
             out = {
                 "network_block_all": payload.get("network_block_all", False),
@@ -804,12 +810,35 @@ class ClientTests(unittest.TestCase):
 
         self.assertEqual(
             client.calls[0],
-            ("PUT", "/v1/sandboxes/sb-1/network/policy", {"network_block_all": False, "network_allow_out": ["pypi.org"], "network_deny_out": []}),
+            ("PUT", "/v1/sandboxes/sb-1/network/policy", {"network_block_all": False, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []}),
         )
         self.assertEqual(
             policy,
-            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressStatus": "active"},
+            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressProfiles": [], "effectiveHostnameCount": 0, "egressStatus": "active"},
         )
+
+    def test_egress_profile_crud(self):
+        client = RecordingMicroVM()
+
+        profile = client.put_egress_profile("python", {"allowOut": ["pypi.org"], "description": "pip"})
+        self.assertEqual(client.calls[0], ("PUT", "/v1/egress-profiles/python", {"allow_out": ["pypi.org"], "description": "pip"}))
+        self.assertEqual(
+            profile,
+            {"name": "python", "allowOut": ["pypi.org"], "description": "pip", "generation": 2, "createdAt": "c", "updatedAt": "u"},
+        )
+        self.assertEqual(client.get_egress_profile("python")["generation"], 2)
+        page = client.list_egress_profiles({"cursor": "a", "limit": 10})
+        self.assertEqual(client.calls[2][1], "/v1/egress-profiles?cursor=a&limit=10")
+        self.assertEqual(page["nextCursor"], "python")
+        client.delete_egress_profile("python")
+        self.assertEqual(client.calls[3][:2], ("DELETE", "/v1/egress-profiles/python"))
+
+    def test_sandbox_maps_egress_profiles(self):
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "egress_profiles": ["python"], "egress_profiles_applied": [{"name": "python", "generation": 2}]})
+        self.assertEqual(data["egressProfiles"], ["python"])
+        self.assertEqual(data["egressProfilesApplied"], [{"name": "python", "generation": 2}])
 
     def test_sandbox_set_network_policy_updates_fields(self):
         client = RecordingMicroVM()
