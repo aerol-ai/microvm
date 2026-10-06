@@ -206,7 +206,6 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 		Runtime:            models.RuntimeWasm,
 		Name:               "test-wasm",
 		NetworkBlockAll:    true,
-		NetworkAllowOut:    []string{"10.0.0.0/24"},
 		AllowPublicTraffic: &denyPublic,
 	}
 
@@ -231,9 +230,6 @@ func TestWasmCreateSandboxSuccess(t *testing.T) {
 	}
 	if !sandbox.NetworkBlockAll {
 		t.Fatal("expected NetworkBlockAll to be persisted")
-	}
-	if len(sandbox.NetworkAllowOut) != 1 || sandbox.NetworkAllowOut[0] != "10.0.0.0/24" {
-		t.Fatalf("NetworkAllowOut = %v, want [10.0.0.0/24]", sandbox.NetworkAllowOut)
 	}
 	if sandbox.AllowPublicTraffic == nil || *sandbox.AllowPublicTraffic {
 		t.Fatalf("AllowPublicTraffic = %v, want false", sandbox.AllowPublicTraffic)
@@ -492,4 +488,34 @@ func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
 			t.Fatal("failed create should not leave a sandbox row")
 		}
 	})
+}
+
+// TestWasmCreateRejectsEgressLists pins P0-1: the WASM mediator can't enforce
+// allow/deny lists yet, so they are refused (501) rather than stored and
+// silently ignored.
+func TestWasmCreateRejectsEgressLists(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		allow, deny []string
+	}{
+		{name: "allow", allow: []string{"10.0.0.0/24"}},
+		{name: "deny", deny: []string{"10.0.0.0/24"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &wasmRecordingRuntime{}
+			svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+			svc.cfg.EnableWasm = true
+			svc.SetWasmRuntime(rt)
+			_, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+				ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm,
+				NetworkAllowOut: tc.allow, NetworkDenyOut: tc.deny,
+			}, "sb-wasm-lists-"+tc.name)
+			if !errors.Is(err, models.ErrRuntimeNotImplemented) {
+				t.Fatalf("err = %v, want ErrRuntimeNotImplemented", err)
+			}
+			if rt.createCalls != 0 {
+				t.Fatal("runtime must not be called for a refused create")
+			}
+		})
+	}
 }

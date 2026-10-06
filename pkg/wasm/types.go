@@ -18,6 +18,14 @@ type Capabilities struct {
 	// It binds worker egress reports to exactly one sandbox incarnation.
 	AuditCapability  string `json:"audit_capability,omitempty"`
 	AuditIncarnation string `json:"audit_incarnation,omitempty"`
+	// NetworkBlockIngress / NetworkBlockEgress carry network_block_all and
+	// quota blocks into every instantiation, so the worker's mediator refuses
+	// the guest's first dial instead of waiting for a later block message
+	// (egress plan P0-1). Host control metadata like the audit fields. The
+	// worker only ever ADDS blocks from caps; lifting one takes an explicit
+	// set_network_blocks message, so a re-instantiation can't unblock.
+	NetworkBlockIngress bool `json:"network_block_ingress,omitempty"`
+	NetworkBlockEgress  bool `json:"network_block_egress,omitempty"`
 }
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.

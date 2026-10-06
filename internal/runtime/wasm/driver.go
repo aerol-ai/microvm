@@ -109,6 +109,38 @@ func (d *Driver) bindAuditCapability(sandboxID string, caps *wasmengine.Capabili
 	return nil
 }
 
+// bindNetworkBlocks copies the sandbox's current network blocks into caps so
+// the worker enforces them before the guest's first instruction (egress plan
+// P0-1). The driver-side gateway map is the single record: create and start
+// seed it from the request or row, and quota updates go through
+// SetNetworkBlocks.
+func (d *Driver) bindNetworkBlocks(sandboxID string, caps *wasmengine.Capabilities) {
+	if d == nil || d.net == nil || caps == nil {
+		return
+	}
+	caps.NetworkBlockIngress, caps.NetworkBlockEgress = d.net.blocksFor(sandboxID)
+}
+
+// seedNetworkBlocks records blocks known before any worker message, so
+// bindNetworkBlocks can carry them into the first instantiation.
+func (d *Driver) seedNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) {
+	if d == nil || d.net == nil || (!blockIngress && !blockEgress) {
+		return
+	}
+	d.net.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+}
+
+// sandboxNetworkBlocks derives a stored sandbox's blocks: network_block_all
+// blocks both directions, and a crossed byte quota blocks its direction.
+func sandboxNetworkBlocks(sb *models.Sandbox) (ingress, egress bool) {
+	if sb == nil {
+		return false, false
+	}
+	overIn := sb.NetworkBytesInLimit > 0 && sb.NetworkBytesIn >= sb.NetworkBytesInLimit
+	overOut := sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit
+	return sb.NetworkBlockAll || overIn, sb.NetworkBlockAll || overOut
+}
+
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, _ string) (string, error) {
 	sb := &models.Sandbox{ID: sandboxID}
 	path, _, err := d.CheckpointSandbox(ctx, sb)

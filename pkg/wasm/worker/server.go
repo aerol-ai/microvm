@@ -243,6 +243,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
 			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.Instantiate(ctx, p.Caps)
 			if err == nil {
@@ -279,6 +280,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
 			s.bindNetworkHook(env.SandboxID)
 			caps := p.Caps
 			eng := s.eng
@@ -424,6 +426,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
 			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.RestoreSnapshot(ctx, snap, p.Caps)
 			if err == nil {

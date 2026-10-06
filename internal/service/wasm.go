@@ -34,6 +34,12 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
+	// The worker's mediator can only block or allow everything today. Storing
+	// a list it would silently ignore is worse than refusing it; hostname and
+	// CIDR lists land with the mediator policy check (egress plan P0-1, P1-6).
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		return nil, unsupportedWasmOption("network_allow_out / network_deny_out")
+	}
 	if strings.TrimSpace(req.TemplateID) != "" {
 		return nil, fmt.Errorf("runtime %q does not support template_id (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)

@@ -250,6 +250,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
 			s.bindNetworkHook(eng, env.SandboxID)
 			if err := eng.Instantiate(ctx, env.SandboxID, p.Caps); err != nil {
 				s.clearAuditBinding(env.SandboxID)
@@ -278,6 +279,7 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
 			s.bindNetworkHook(eng, env.SandboxID)
 			s.storeCaps(env.SandboxID, p.Caps)
 			result, runErr := eng.Run(ctx, env.SandboxID, p.Caps, p.Export)

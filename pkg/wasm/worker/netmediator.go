@@ -74,6 +74,18 @@ func (m *NetMediator) SetBlocks(sandboxID string, blockIngress, blockEgress bool
 	m.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: blockIngress, egress: blockEgress}
 }
 
+// AddBlocks ORs blocks into the sandbox's current state; it never lifts one.
+// Instantiation paths use it with the blocks carried in caps.
+func (m *NetMediator) AddBlocks(sandboxID string, blockIngress, blockEgress bool) {
+	if sandboxID == "" || (!blockIngress && !blockEgress) {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur := m.blocked[sandboxID]
+	m.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: cur.ingress || blockIngress, egress: cur.egress || blockEgress}
+}
+
 func (m *NetMediator) egressBlocked(sandboxID string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

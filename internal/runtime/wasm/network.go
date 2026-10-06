@@ -164,6 +164,14 @@ func (g *networkGateway) SetNetworkBlocks(sandboxID string, blockIngress, blockE
 	g.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: blockIngress, egress: blockEgress}
 }
 
+// blocksFor returns the sandbox's current ingress/egress blocks.
+func (g *networkGateway) blocksFor(sandboxID string) (ingress, egress bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	b := g.blocked[sandboxID]
+	return b.ingress, b.egress
+}
+
 func (g *networkGateway) DrainNetworkByteCounters() map[string]struct{ BytesIn, BytesOut int64 } {
 	g.mu.Lock()
 	defer g.mu.Unlock()
