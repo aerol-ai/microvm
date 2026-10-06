@@ -306,7 +306,7 @@ closed.
 | Docker, containerd, gVisor | the node's egress gateway (DNS filter plus a TLS/HTTP name check) |
 | WASM | enforced inside the WASM network mediator; a denied connect returns an error naming the host and rule |
 | Isolate | enforced by the isolate egress proxy, which always uses HTTPS and returns a `403` naming the host |
-| Firecracker | not yet: hostname entries are refused with `501` |
+| Firecracker | not yet: hostname entries are refused with `501`; `networkBlockAll` and CIDR lists work, on the VM's own network device |
 
 A node can't offer hostname filtering when privileged sandboxes are enabled on
 it, when its sandbox bridge carries IPv6, or when its host firewall drops the
@@ -385,5 +385,7 @@ refused with `503` and code `egress_operator_config_invalid` until it's fixed.
   HTTPS content, so on its own it can't allow one path or method and refuse
   another. [Egress rules](/egress-rules-and-inspection) add that, on plain
   HTTP and on HTTPS hosts you choose to inspect.
-- **Firecracker** doesn't support hostname entries yet, and can't change a
-  policy while the sandbox runs.
+- **Firecracker** takes `networkBlockAll` and CIDR allow and deny lists, at
+  create and with `setNetworkPolicy` while it runs, enforced on the VM's own
+  network device. Hostname entries, profiles and learn mode aren't supported
+  there yet (`501`).

@@ -2323,11 +2323,8 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
-	if req.NetworkBlockAll {
-		return nil, unsupportedFirecrackerOption("network_block_all")
-	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 || len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
-		return nil, unsupportedFirecrackerOption("selective egress (network_allow_out / network_deny_out / egress_profiles / network_egress_rules)")
+	if err := s.checkFirecrackerEgress(&req); err != nil {
+		return nil, err
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")

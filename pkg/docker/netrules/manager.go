@@ -106,6 +106,10 @@ const (
 
 	ChainDockerUser  = "DOCKER-USER"
 	ChainAerolvmUser = "AEROLVM-USER"
+	// ChainAerolvmFC holds the per-guest-IP rules for Firecracker VMs (egress
+	// Phase 4), apart from the container engines' chains: its FORWARD
+	// accepts are scoped to the TAP subnet.
+	ChainAerolvmFC = "AEROLVM-FC"
 	// ChainAerolvmInput holds per-IP drops for traffic from restricted
 	// sandboxes to the host itself (sandboxd API, SSH gateway, cluster port).
 	// Shared by the dockerd and containerd managers: rules are keyed by

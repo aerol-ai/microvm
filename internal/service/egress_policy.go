@@ -68,6 +68,34 @@ func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 	return out
 }
 
+// checkFirecrackerEgress admits the egress options a Firecracker guest can
+// have (plans/egress-domain-filtering.md Phase 4): block-all and CIDR
+// allow/deny lists, enforced on its guest IP by the node's firewall.
+// Hostname entries, profiles and learn mode need the egress gateway on the
+// TAPs; rules are Phase 3, unspecified on Firecracker. A node without the
+// firewall refuses every egress option, as before.
+func (s *Service) checkFirecrackerEgress(req *models.CreateSandboxRequest) error {
+	if !req.NetworkBlockAll && len(req.NetworkAllowOut) == 0 && len(req.NetworkDenyOut) == 0 &&
+		len(req.EgressProfiles) == 0 && req.NetworkEgressMode == "" && len(req.NetworkEgressRules) == 0 {
+		return nil
+	}
+	fw, ok := s.firecracker.(interface{ NetRulesEnabled() bool })
+	if !ok || !fw.NetRulesEnabled() {
+		return unsupportedFirecrackerOption("egress policies (this node has no firewall for its guests)")
+	}
+	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
+		return unsupportedFirecrackerOption("egress_profiles, network_egress_mode and network_egress_rules")
+	}
+	pol, err := compileCreateEgress(req)
+	if err != nil {
+		return err
+	}
+	if pol.GatewayMode() {
+		return unsupportedFirecrackerOption("hostname egress entries")
+	}
+	return nil
+}
+
 // hasBinariesRule reports whether a rule names binaries (P3-3).
 func hasBinariesRule(rules []models.EgressRule) bool {
 	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return len(r.Binaries) > 0 })

@@ -395,6 +395,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Not fatal: a node that booted before this keeps booting. Without
+		// it the guests have no NAT and the driver no firewall, so the
+		// service keeps refusing their egress options (501).
+		if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
+			logger.Error("firecracker egress: guests get no NAT or egress policies", "error", err)
+		} else {
+			defer stopFCEgress()
+		}
 		// Phase 5: hand the sampler to the driver so Create / WarmSpawn
 		// / tryAcquireWarm / Destroy can Register/Unregister per-VMM
 		// pids. Without this call the sampler stays empty and the

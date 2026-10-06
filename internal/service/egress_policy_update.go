@@ -100,9 +100,6 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	if err != nil {
 		return nil, err
 	}
-	if s.isFirecrackerSandbox(old) {
-		return nil, unsupportedFirecrackerOption("live egress policy updates")
-	}
 	switch old.Status {
 	case models.SandboxStatusCreating, models.SandboxStatusAwaitingRuntime, models.SandboxStatusPassivateFailed:
 		return nil, fmt.Errorf("%w (status %s)", ErrEgressPolicyBusy, old.Status)
@@ -134,6 +131,11 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		EgressProfiles: req.EgressProfiles, NetworkEgressMode: req.NetworkEgressMode, NetworkEgressRules: req.NetworkEgressRules}
 	if _, err := compileCreateEgress(&create); err != nil {
 		return nil, err
+	}
+	if s.isFirecrackerSandbox(old) {
+		if err := s.checkFirecrackerEgress(&create); err != nil {
+			return nil, err
+		}
 	}
 	// Profiles resolve in the sandbox owner's namespace, whoever calls.
 	resolved, err := s.resolveEgressProfiles(ctx, old.OwnerRef, create.NetworkAllowOut, create.EgressProfiles)

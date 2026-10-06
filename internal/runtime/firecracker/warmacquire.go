@@ -95,6 +95,12 @@ func (d *Driver) tryAcquireWarm(
 	if d.warmPool == nil || req.TemplateID == "" || snap == nil || !snap.HasSnapshot {
 		return nil, false, nil
 	}
+	// An egress policy is installed on the guest IP before the VM runs; a
+	// warm VMM is already running, so such a create takes the cold path
+	// (egress Phase 4; the warm pool would need the rules before resume).
+	if req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		return nil, false, nil
+	}
 	if req.OverlaySizeGB > 0 && !snap.HasOverlay {
 		// Same guard as the cold snapshot-load path. Surfacing this as
 		// a hit would lead to a mid-PATCH failure; surfacing it as a

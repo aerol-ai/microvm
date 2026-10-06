@@ -5200,10 +5200,10 @@ func TestCreateFirecrackerRejectsWave7(t *testing.T) {
 		}, "network byte limits"},
 		{"block_all", models.CreateSandboxRequest{
 			Runtime: models.RuntimeFirecracker, Image: "docker://alpine", NetworkBlockAll: true,
-		}, "network_block_all"},
+		}, "egress policies"},
 		{"egress", models.CreateSandboxRequest{
 			Runtime: models.RuntimeFirecracker, Image: "docker://alpine", NetworkAllowOut: []string{"10.0.0.0/8"},
-		}, "selective egress"},
+		}, "egress policies"},
 		{"byte_limits", models.CreateSandboxRequest{
 			Runtime: models.RuntimeFirecracker, Image: "docker://alpine", NetworkBytesInLimit: 100,
 		}, "network byte limits"},

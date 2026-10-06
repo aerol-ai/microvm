@@ -41,7 +41,7 @@ func (r *recordingRun) fn(_ context.Context, name string, args ...string) ([]byt
 }
 
 func newHostWithRun(r *recordingRun) *Host {
-	return &Host{IPCmd: "/test/ip", run: r.fn}
+	return &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(string) error { return nil }}
 }
 
 // TestEnsure_HappyPath confirms the four-step sequence (tuntap add,
@@ -418,4 +418,23 @@ outer:
 		return i
 	}
 	return -1
+}
+
+// TestEnsureRPFilter (egress Phase 4): strict reverse-path filtering is
+// part of bringing a TAP up, and a failure fails the Ensure.
+func TestEnsureRPFilter(t *testing.T) {
+	r := &recordingRun{}
+	var got []string
+	h := &Host{IPCmd: "/test/ip", run: r.fn, rpFilter: func(tap string) error { got = append(got, tap); return nil }}
+	slot := Slot{TapName: "fctap7", HostIP: "172.16.0.29", GuestIP: "172.16.0.30", CIDR: "172.16.0.28/30"}
+	if err := h.Ensure(context.Background(), slot); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "fctap7" {
+		t.Fatalf("rp_filter calls = %v", got)
+	}
+	h.rpFilter = func(string) error { return errors.New("read-only /proc") }
+	if err := h.Ensure(context.Background(), slot); err == nil {
+		t.Fatal("a failed rp_filter must fail the Ensure")
+	}
 }

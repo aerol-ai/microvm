@@ -75,6 +75,9 @@ type Host struct {
 	// it nil and the methods fall through to exec.CommandContext. Kept
 	// unexported so the public surface stays narrow.
 	run runFn
+	// rpFilter turns on strict reverse-path filtering on a TAP; nil is the
+	// platform's (a /proc write on Linux). Seam for tests.
+	rpFilter func(tap string) error
 }
 
 // runFn is the type the test seam injects. Mirrors exec.CommandContext's
@@ -183,6 +186,18 @@ func (h *Host) Ensure(ctx context.Context, slot Slot) error {
 	// up, with no stderr output).
 	if out, err := h.exec(ctx, "link", "set", slot.TapName, "up"); err != nil {
 		return fmt.Errorf("tap host: link set %s up: %w (%s)", slot.TapName, err, strings.TrimSpace(string(out)))
+	}
+
+	// Step 3b: strict reverse-path filtering, so a guest can't send with
+	// another sandbox's source address: the egress gateway and the host
+	// firewall key a sandbox by its source IP (egress Phase 4). A packet
+	// from this TAP whose source routes elsewhere is dropped.
+	rp := h.rpFilter
+	if rp == nil {
+		rp = setStrictRPFilter
+	}
+	if err := rp(slot.TapName); err != nil {
+		return fmt.Errorf("tap host: rp_filter on %s: %w", slot.TapName, err)
 	}
 
 	// Step 4: pin host -> guest L2 resolution when the slot carries a
