@@ -47,6 +47,12 @@ type nodeMeta struct {
 	// running pre-PublicHost builds or with no public host set (IP-mode
 	// deployments where custom domains are disabled anyway).
 	PublicHost string `json:"public_host,omitempty"`
+	// FSMOpsVersion is the FSM op set this build applies (fsmOpsVersion). A
+	// missing field, an older build, reads as 0. Leaders gate writes that
+	// need newer ops on every Raft server reporting it (D19), so it rides
+	// every fallback tier that keeps RaftAddr: dropping it would block those
+	// writes, never allow them early.
+	FSMOpsVersion int `json:"fv,omitempty"`
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -88,6 +94,7 @@ func (d *gossipDelegate) refreshMeta() {
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
+		FSMOpsVersion: fsmOpsVersion,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -116,11 +123,11 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 			// PublicHost dropped first — DNS-helper feature degrades cleanly
 			// (the node just doesn't show up as a target) whereas
 			// raft/identity loss breaks voter join and cross-node routing.
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role},
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role},
-			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role},
-			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role},
-			{NodeID: d.nodeID, RaftAddr: d.raftAddr},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
+			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
+			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
+			{NodeID: d.nodeID, RaftAddr: d.raftAddr, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID},
 		}
 		for _, meta := range fallbacks {
@@ -750,6 +757,7 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.InternalURL = meta.InternalURL
 			m.Role = meta.Role
 			m.PublicHost = meta.PublicHost
+			m.FSMOpsVersion = meta.FSMOpsVersion
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -782,6 +790,7 @@ func (g *gossipNode) selfMember() Member {
 		InternalURL:   meta.InternalURL,
 		Role:          meta.Role,
 		PublicHost:    meta.PublicHost,
+		FSMOpsVersion: meta.FSMOpsVersion,
 		Alive:         true,
 		Capacity:      snap,
 	}

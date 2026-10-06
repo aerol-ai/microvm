@@ -60,6 +60,9 @@ func (s *Service) egressProfileBackend() egressProfileBackend {
 		return s.egressProfiles
 	}
 	if s.ClusterEnabled() {
+		if c, ok := s.Cluster().(egressProfileCluster); ok {
+			return clusterProfiles{c}
+		}
 		// A node's own store would give each node its own profiles.
 		return noClusterProfiles{}
 	}
@@ -118,8 +121,12 @@ func (s *Service) PutEgressProfile(ctx context.Context, name string, req models.
 		}
 	}
 	owner, _ := ownerScope(ctx)
-	if err := s.checkProfileUnionCaps(ctx, owner, name, egresspolicy.CountHostnames(entries)); err != nil {
-		return nil, err
+	// A cluster decides the cap at apply time, against every node's
+	// sandboxes; a single node checks its own.
+	if !s.ClusterEnabled() {
+		if err := s.checkProfileUnionCaps(ctx, owner, name, egresspolicy.CountHostnames(entries)); err != nil {
+			return nil, err
+		}
 	}
 	p, changed, err := s.egressProfileBackend().PutEgressProfile(ctx, owner, name, allow, req.Description, time.Now())
 	if err != nil {

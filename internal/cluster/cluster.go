@@ -392,9 +392,15 @@ type Placement struct {
 	// false means "not public, or recorded by a build that predates this
 	// field"; placementAllowsPublicTraffic still consults Spec when present,
 	// so a legacy row behaves exactly as before until its next write.
-	PublicTraffic bool   `json:"public_traffic,omitempty"`
-	SecretRef     string `json:"secret_ref,omitempty"`
-	SecretVersion int    `json:"secret_version,omitempty"`
+	PublicTraffic bool `json:"public_traffic,omitempty"`
+	// EgressProfiles / EgressInlineHostnames mirror Spec.EgressProfiles and
+	// the hostname count of Spec.NetworkAllowOut on the HOT row, for the
+	// FSM's profile reference index and union-cap check (D21). Empty for a
+	// sandbox without profiles.
+	EgressProfiles        []string `json:"egress_profiles,omitempty"`
+	EgressInlineHostnames int      `json:"egress_inline_hostnames,omitempty"`
+	SecretRef             string   `json:"secret_ref,omitempty"`
+	SecretVersion         int      `json:"secret_version,omitempty"`
 	// SecretRecipients is the seal recipient set recorded at reserve time
 	// (owner + N backups). The create target seals to this set and must not
 	// recompute it. It is empty only when the placement has no replicated
@@ -481,9 +487,11 @@ type Member struct {
 	// (config.EffectivePublicHost). Aggregated by Cluster.IngressTargets to
 	// answer the DNS-helper API. Empty for peers without a public host set
 	// or running pre-PublicHost builds.
-	PublicHost string            `json:"public_host,omitempty"`
-	Alive      bool              `json:"alive"`
-	Capacity   capacity.Snapshot `json:"capacity"`
+	PublicHost string `json:"public_host,omitempty"`
+	// FSMOpsVersion is the peer's gossiped FSM op set (0 for older builds).
+	FSMOpsVersion int               `json:"fsm_ops_version,omitempty"`
+	Alive         bool              `json:"alive"`
+	Capacity      capacity.Snapshot `json:"capacity"`
 	// CapacityUpdatedUnix is when this node's last capacity heartbeat was
 	// observed by the scheduler. CapacityStale means the last heartbeat is
 	// missing or too old for placement admission.
