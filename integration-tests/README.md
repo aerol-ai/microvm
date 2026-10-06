@@ -155,10 +155,11 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
-## Egress domain filtering (UC-179..UC-189)
+## Egress domain filtering (UC-179..UC-200)
 
-`suite/egress_fqdn_test.go` and `suite/egress_private_cloud_test.go` cover
-hostname egress filtering (plans/egress-domain-filtering.md P1-10, P1-20).
+`suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go` and
+`suite/egress_private_cloud_test.go` cover hostname egress filtering
+(plans/egress-domain-filtering.md P1-10, P1-20, Phase 2).
 
 - **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
   `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
@@ -168,6 +169,17 @@ hostname egress filtering (plans/egress-domain-filtering.md P1-10, P1-20).
   latency gate: with `AEROL_BENCH=1` it reads the `svc_egress_*` stages from
   Server-Timing and fails over the join (≤2 ms p50) and attach (≤10 ms p99)
   budgets (`AEROL_EGRESS_JOIN_P50_MS` / `AEROL_EGRESS_ATTACH_P99_MS` override).
+- Phase 2, also on `egress-fqdn`: UC-190 changes a running sandbox's policy,
+  UC-191 converges a named profile change and refuses deleting it while
+  referenced, and UC-192 (EF-48) learns `pip install` in learn mode, then
+  locks to the suggested list. UC-193..200 (EF-49) run each built-in profile's
+  real tool with only that profile: pip, npm, `git clone`, a Hugging Face
+  download, `go mod download`, `cargo fetch`, apt and `crane pull` (in place
+  of `docker pull`, which would need Docker in Docker). They pull the tool
+  images (python, node, alpine/git, golang, rust, ubuntu, crane) and reach the
+  public registries, so a failure there may be registry drift: the built-in
+  lists are kept by hand and these UCs are how operators catch a stale one
+  (CEO D12).
 - UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
   can't reach host services) only need `docker`.
 - **`private-cloud`** (`single-node-private-cloud`, `make

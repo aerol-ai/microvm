@@ -28,8 +28,8 @@ const (
 	// hard-fail. Unlike CapWasm it needs no node-side module staging — the UCs
 	// upload JS bundles over POST /v1/js-bundles at runtime.
 	CapIsolate Capability = "isolate" // V8-isolate (workerd) runtime available
-	// CapEgressFQDN gates the hostname egress use cases (UC-180..182, UC-185;
-	// plans/egress-domain-filtering.md P1-10). Advertisement-only: install.sh
+	// CapEgressFQDN gates the hostname egress use cases (UC-180..182, UC-185,
+	// UC-190..200; plans/egress-domain-filtering.md P1-10, Phase 2). Advertisement-only: install.sh
 	// installs and starts the aerolvm-egress-gateway units on every node and
 	// SB_EGRESS_FQDN_ENABLED defaults on, so a scenario advertises it when its
 	// container nodes are not privileged (a privileged node refuses hostname
@@ -607,6 +607,17 @@ var Registry = []UseCase{
 	{ID: "UC-187", Title: "Private cloud internal zone: an internal name reaches its internal port; a name outside the zone resolving into it is refused", Requires: []Capability{CapPrivateCloud}, Implemented: true},
 	{ID: "UC-188", Title: "Private cloud deny floor: an operator deny CIDR is dropped for a sandbox with no policy", Requires: []Capability{CapPrivateCloud}, Implemented: true},
 	{ID: "UC-189", Title: "Private cloud control-port guard: a sandbox can't reach the node's API port, while ingress 443 stays reachable", Requires: []Capability{CapPrivateCloud}, Implemented: true},
+	{ID: "UC-190", Title: "Live egress policy update: a running sandbox's newly allowed name opens and a dropped one is refused, without a restart", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-191", Title: "Named egress profile: its hosts are reachable, a change converges in egress_profiles_applied, and deleting it while referenced is 409", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-192", Title: "Learn then lock (EF-48): a learn-mode pip install records pypi's hosts, and the suggested list alone runs the same install", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-193", Title: "Built-in profile builtin:pypi alone runs pip install (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-194", Title: "Built-in profile builtin:npm alone runs npm install (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-195", Title: "Built-in profile builtin:github alone runs git clone over HTTPS (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-196", Title: "Built-in profile builtin:huggingface alone downloads a model file (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-197", Title: "Built-in profile builtin:golang-proxy alone runs go mod download (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-198", Title: "Built-in profile builtin:crates alone runs cargo fetch (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-199", Title: "Built-in profile builtin:apt-ubuntu alone runs apt-get update and a package download (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-200", Title: "Built-in profile builtin:docker-hub alone runs crane pull (EF-49)", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
