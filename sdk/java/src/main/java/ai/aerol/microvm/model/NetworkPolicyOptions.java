@@ -14,6 +14,7 @@ public class NetworkPolicyOptions {
     private List<String> networkAllowOut = new ArrayList<>();
     private List<String> networkDenyOut = new ArrayList<>();
     private List<String> egressProfiles = new ArrayList<>();
+    private String networkEgressMode;
 
     public boolean getNetworkBlockAll() {
         return networkBlockAll;
@@ -48,6 +49,16 @@ public class NetworkPolicyOptions {
 
     public NetworkPolicyOptions setEgressProfiles(List<String> egressProfiles) {
         this.egressProfiles = egressProfiles == null ? new ArrayList<>() : egressProfiles;
+        return this;
+    }
+
+    /** "learn" for open egress that is recorded; null or "enforce" otherwise. */
+    public String getNetworkEgressMode() {
+        return networkEgressMode;
+    }
+
+    public NetworkPolicyOptions setNetworkEgressMode(String networkEgressMode) {
+        this.networkEgressMode = networkEgressMode;
         return this;
     }
 }

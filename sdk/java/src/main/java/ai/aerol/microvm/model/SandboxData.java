@@ -37,6 +37,8 @@ public class SandboxData {
     /** Egress profiles this sandbox references, and the generation of each live on it. */
     public List<String> egressProfiles;
     public List<EgressProfileRef> egressProfilesApplied;
+    /** "learn" while the sandbox records its egress; null otherwise. */
+    public String networkEgressMode;
     public boolean toolboxEnabled;
     public String sshPublicKey;
     public String sshPrivateKey;
@@ -87,6 +89,7 @@ public class SandboxData {
         egressStatus = other.egressStatus;
         egressProfiles = other.egressProfiles;
         egressProfilesApplied = other.egressProfilesApplied;
+        networkEgressMode = other.networkEgressMode;
         toolboxEnabled = other.toolboxEnabled;
         sshPublicKey = other.sshPublicKey;
         sshPrivateKey = other.sshPrivateKey;

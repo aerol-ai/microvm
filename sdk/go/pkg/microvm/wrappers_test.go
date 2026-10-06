@@ -41,6 +41,8 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			var req models.NetworkPolicyRequest
 			_ = json.NewDecoder(r.Body).Decode(&req)
 			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressStatus: "active"})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/learned":
+			_ = json.NewEncoder(w).Encode(models.NetworkLearned{Mode: "learn", Entries: []models.NetworkLearnedEntry{{Host: "pypi.org", Ports: []uint16{443}}}})
 		case r.URL.Path == "/v1/egress-profiles/python" && r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
 		case r.URL.Path == "/v1/egress-profiles/python":
@@ -218,6 +220,10 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if sb.EgressStatus != "active" || len(sb.NetworkDenyOut) != 1 || sb.NetworkAllowOut[0] != "pypi.org" {
 		t.Fatalf("Sandbox fields after SetNetworkPolicy = %+v", sb.Sandbox)
+	}
+	learned, err := sb.Learned(ctx)
+	if err != nil || learned.Mode != "learn" || len(learned.Entries) != 1 {
+		t.Fatalf("Sandbox.Learned() = %+v, %v", learned, err)
 	}
 	profile, err := client.PutEgressProfile(ctx, "python", sdktypes.EgressProfileOptions{AllowOut: []string{"pypi.org"}})
 	if err != nil || profile.Generation != 2 {

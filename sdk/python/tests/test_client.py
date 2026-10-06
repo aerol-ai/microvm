@@ -79,6 +79,15 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if path == "/v1/sandboxes/sb-1/network/learned":
+            return {
+                "mode": "learn",
+                "truncated": True,
+                "entries": [{"host": "pypi.org", "ports": [443], "first_seen": "a", "last_seen": "b", "hits": 2}],
+                "cidrs": None,
+                "suggested_allow_out": [],
+                "suggested_profile": {"allow_out": ["x.example"], "description": "d"},
+            }
         if path.startswith("/v1/egress-profiles"):
             if method == "DELETE":
                 return None
@@ -814,7 +823,7 @@ class ClientTests(unittest.TestCase):
         )
         self.assertEqual(
             policy,
-            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressProfiles": [], "effectiveHostnameCount": 0, "egressStatus": "active"},
+            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressProfiles": [], "networkEgressMode": "enforce", "effectiveHostnameCount": 0, "egressStatus": "active"},
         )
 
     def test_egress_profile_crud(self):
@@ -832,6 +841,22 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(page["nextCursor"], "python")
         client.delete_egress_profile("python")
         self.assertEqual(client.calls[3][:2], ("DELETE", "/v1/egress-profiles/python"))
+
+    def test_learn_mode(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "alpine", "networkEgressMode": "learn"})
+        self.assertEqual(client.calls[0][2]["network_egress_mode"], "learn")
+        sandbox.set_network_policy({"networkEgressMode": "learn"})
+        self.assertEqual(client.calls[-1][2]["network_egress_mode"], "learn")
+        learned = sandbox.learned()
+        self.assertEqual(learned["entries"][0], {"host": "pypi.org", "ports": [443], "firstSeen": "a", "lastSeen": "b", "hits": 2})
+        self.assertEqual(learned["cidrs"], [])
+        self.assertEqual(learned["suggestedProfile"], {"allowOut": ["x.example"], "description": "d"})
+        self.assertTrue(learned["truncated"])
+
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "network_egress_mode": "learn"})["networkEgressMode"], "learn")
 
     def test_sandbox_maps_egress_profiles(self):
         from microvm.client import _from_api_sandbox

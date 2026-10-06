@@ -49,6 +49,7 @@ import type {
   EgressProfileOptions,
   EgressProfileRef,
   ListEgressProfilesOptions,
+  NetworkLearned,
   NetworkPolicy,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
@@ -211,6 +212,7 @@ interface ApiSandbox {
   egress_status?: string;
   egress_profiles?: string[];
   egress_profiles_applied?: { name: string; generation: number }[];
+  network_egress_mode?: string;
   toolbox_enabled: boolean;
   ssh_public_key?: string;
   exposed_ports?: ApiExposedPort[];
@@ -916,6 +918,7 @@ export class APIClient {
       network_allow_out: string[] | null;
       network_deny_out: string[] | null;
       egress_profiles?: string[] | null;
+      network_egress_mode?: string;
       effective_hostname_count?: number;
       egress_status?: string;
     }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
@@ -923,16 +926,40 @@ export class APIClient {
       network_allow_out: options.networkAllowOut ?? [],
       network_deny_out: options.networkDenyOut ?? [],
       egress_profiles: options.egressProfiles ?? [],
+      network_egress_mode: options.networkEgressMode,
     });
     const policy: NetworkPolicy = {
       networkBlockAll: response.network_block_all,
       networkAllowOut: response.network_allow_out ?? [],
       networkDenyOut: response.network_deny_out ?? [],
       egressProfiles: response.egress_profiles ?? [],
+      networkEgressMode: response.network_egress_mode ?? "enforce",
       effectiveHostnameCount: response.effective_hostname_count ?? 0,
     };
     if (response.egress_status) policy.egressStatus = response.egress_status;
     return policy;
+  }
+
+  async getNetworkLearned(id: string): Promise<NetworkLearned> {
+    const r = await this.doJSON<{
+      mode: string;
+      truncated: boolean;
+      entries: { host: string; ports: number[] | null; first_seen: string; last_seen: string; hits: number }[] | null;
+      cidrs: string[] | null;
+      suggested_allow_out: string[] | null;
+      suggested_profile?: { allow_out: string[] | null; description?: string } | null;
+    }>("GET", `${this.versionPrefix}/sandboxes/${id}/network/learned`);
+    const learned: NetworkLearned = {
+      mode: r.mode,
+      truncated: r.truncated,
+      entries: (r.entries ?? []).map((e) => ({ host: e.host, ports: e.ports ?? [], firstSeen: e.first_seen, lastSeen: e.last_seen, hits: e.hits })),
+      cidrs: r.cidrs ?? [],
+      suggestedAllowOut: r.suggested_allow_out ?? [],
+    };
+    if (r.suggested_profile) {
+      learned.suggestedProfile = { allowOut: r.suggested_profile.allow_out ?? [], description: r.suggested_profile.description };
+    }
+    return learned;
   }
 
   async putEgressProfile(name: string, options: EgressProfileOptions): Promise<EgressProfile> {
@@ -1141,6 +1168,7 @@ export class SandboxResource implements Sandbox {
   declare egressStatus?: string;
   declare egressProfiles?: string[];
   declare egressProfilesApplied?: EgressProfileRef[];
+  declare networkEgressMode?: string;
   declare toolboxEnabled: boolean;
   declare sshPublicKey?: string;
   declare sshPrivateKey?: string;
@@ -1313,7 +1341,18 @@ export class SandboxResource implements Sandbox {
     const policy = await this.client.setNetworkPolicy(this.id, options);
     this.networkBlockAll = policy.networkBlockAll;
     this.egressStatus = policy.egressStatus;
+    this.egressProfiles = policy.egressProfiles.length ? policy.egressProfiles : undefined;
+    this.networkEgressMode = policy.networkEgressMode === "learn" ? "learn" : undefined;
     return policy;
+  }
+
+  /**
+   * Reads what this sandbox reached in learn mode and the allow list that
+   * would have allowed it. A recording stays readable after the sandbox
+   * switches to enforce, until it is destroyed.
+   */
+  async learned(): Promise<NetworkLearned> {
+    return this.client.getNetworkLearned(this.id);
   }
 
   /**
@@ -1348,6 +1387,7 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     network_allow_out: options.networkAllowOut,
     network_deny_out: options.networkDenyOut,
     egress_profiles: options.egressProfiles,
+    network_egress_mode: options.networkEgressMode,
     allow_public_traffic: options.allowPublicTraffic,
     mask_request_host: options.maskRequestHost,
     network_bytes_in_limit: options.networkBytesInLimit,
@@ -1446,6 +1486,7 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     egressStatus: sandbox.egress_status || undefined,
     egressProfiles: sandbox.egress_profiles?.length ? sandbox.egress_profiles : undefined,
     egressProfilesApplied: sandbox.egress_profiles_applied?.length ? sandbox.egress_profiles_applied : undefined,
+    networkEgressMode: sandbox.network_egress_mode || undefined,
     toolboxEnabled: sandbox.toolbox_enabled,
     sshPublicKey: sandbox.ssh_public_key,
     exposedPorts: sandbox.exposed_ports?.map(fromApiExposedPort),

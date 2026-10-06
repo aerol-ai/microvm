@@ -149,6 +149,19 @@ type NetworkPolicyOptions = models.NetworkPolicyRequest
 // container.
 type NetworkPolicy = models.NetworkPolicy
 
+// NetworkLearned is what a sandbox reached in learn mode and the allow list
+// that would have allowed it (Sandbox.Learned).
+type NetworkLearned = models.NetworkLearned
+
+// NetworkLearnedEntry is one destination a learn-mode sandbox reached.
+type NetworkLearnedEntry = models.NetworkLearnedEntry
+
+// Egress modes for NetworkEgressMode.
+const (
+	NetworkEgressModeEnforce = models.NetworkEgressModeEnforce
+	NetworkEgressModeLearn   = models.NetworkEgressModeLearn
+)
+
 // EgressProfile is a named allowlist sandboxes reference through
 // EgressProfiles; Generation goes up on every change.
 type EgressProfile = models.EgressProfile

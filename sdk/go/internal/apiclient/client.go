@@ -676,6 +676,13 @@ func (c *Client) SetNetworkPolicy(ctx context.Context, id string, request models
 	return response, err
 }
 
+// GetNetworkLearned reads a sandbox's learn-mode recording.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (models.NetworkLearned, error) {
+	var response models.NetworkLearned
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/learned", nil, &response)
+	return response, err
+}
+
 func (c *Client) egressProfilePath(name string) string {
 	return c.versionPrefix + "/egress-profiles/" + url.PathEscape(name)
 }

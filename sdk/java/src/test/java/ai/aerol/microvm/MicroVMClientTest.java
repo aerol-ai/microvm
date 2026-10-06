@@ -33,6 +33,7 @@ import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
 import ai.aerol.microvm.model.NetworkPolicyOptions;
@@ -920,6 +921,35 @@ class MicroVMClientTest {
 
             clientFor(server).setNetworkPolicy("sb-1", null);
             assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void networkLearnedMapsNulls() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            if ("/v1/sandboxes/sb-1/network/learned".equals(exchange.getRequestURI().getPath())) {
+                writeJson(exchange, 200, mapOf(
+                    "mode", "learn",
+                    "truncated", true,
+                    "entries", List.of(mapOf("host", "pypi.org", "ports", null, "hits", 2)),
+                    "cidrs", null,
+                    "suggested_allow_out", null,
+                    "suggested_profile", mapOf("allow_out", List.of("x.example"), "description", "d")));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestURI());
+        });
+        try {
+            NetworkLearned learned = clientFor(server).getNetworkLearned("sb-1");
+            assertEquals("learn", learned.mode);
+            assertTrue(learned.truncated);
+            assertEquals("pypi.org", learned.entries.get(0).host);
+            assertTrue(learned.entries.get(0).ports.isEmpty());
+            assertTrue(learned.cidrs.isEmpty());
+            assertTrue(learned.suggestedAllowOut.isEmpty());
+            assertEquals(List.of("x.example"), learned.suggestedProfile.allowOut);
         } finally {
             server.stop(0);
         }

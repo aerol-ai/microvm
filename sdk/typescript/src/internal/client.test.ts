@@ -1487,7 +1487,7 @@ test("setNetworkPolicy PUTs the whole policy and maps the effective one", async 
   assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
   assert.equal(seen?.method, "PUT");
   assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [], egress_profiles: ["python"] });
-  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], effectiveHostnameCount: 3, egressStatus: "active" });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], networkEgressMode: "enforce", effectiveHostnameCount: 3, egressStatus: "active" });
 });
 
 test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
@@ -1549,4 +1549,40 @@ test("sandboxes carry their egress profiles", async () => {
   assert.deepEqual(body.egress_profiles, ["python"]);
   assert.deepEqual(sandbox.egressProfiles, ["python"]);
   assert.deepEqual(sandbox.egressProfilesApplied, [{ name: "python", generation: 2 }]);
+});
+
+test("learn mode: create, the policy answer and the learned read", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/learned")) {
+        return jsonResponse({
+          mode: "learn",
+          truncated: false,
+          entries: [{ host: "pypi.org", ports: [443], first_seen: "a", last_seen: "b", hits: 3 }],
+          cidrs: null,
+          suggested_allow_out: ["pypi.org"],
+          suggested_profile: { allow_out: ["x.example"], description: "d" },
+        });
+      }
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: [], network_deny_out: [], network_egress_mode: "learn" });
+      }
+      return jsonResponse({ ...apiSandbox("sb-learn"), network_egress_mode: "learn" });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkEgressMode: "learn" });
+  assert.equal(bodies[0].network_egress_mode, "learn");
+  assert.equal(sandbox.networkEgressMode, "learn");
+  const pol = await sandbox.setNetworkPolicy({ networkEgressMode: "learn" });
+  assert.equal(pol.networkEgressMode, "learn");
+  assert.equal(bodies[1].network_egress_mode, "learn");
+  const learned = await sandbox.learned();
+  assert.deepEqual(learned.entries[0], { host: "pypi.org", ports: [443], firstSeen: "a", lastSeen: "b", hits: 3 });
+  assert.deepEqual(learned.cidrs, []);
+  assert.deepEqual(learned.suggestedProfile, { allowOut: ["x.example"], description: "d" });
 });

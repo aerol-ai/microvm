@@ -48,6 +48,7 @@ from .types import (
     EgressProfileList,
     EgressProfileOptions,
     ListEgressProfilesOptions,
+    NetworkLearned,
     NetworkPolicy,
     NetworkPolicyCheckOptions,
     NetworkPolicyCheckResult,
@@ -421,11 +422,20 @@ class Sandbox:
         is safe to retry."""
         policy = self._client.set_network_policy(self.id, options)
         self._data["networkBlockAll"] = policy["networkBlockAll"]
+        if policy.get("networkEgressMode") == "learn":
+            self._data["networkEgressMode"] = "learn"
+        else:
+            self._data.pop("networkEgressMode", None)
         if "egressStatus" in policy:
             self._data["egressStatus"] = policy["egressStatus"]
         else:
             self._data.pop("egressStatus", None)
         return policy
+
+    def learned(self) -> NetworkLearned:
+        """Read what this sandbox reached in learn mode. A recording stays
+        readable after a switch to enforce, until the sandbox is destroyed."""
+        return self._client.get_network_learned(self.id)
 
     def audit(self, options: Optional[AuditOptions] = None) -> AuditPage:
         """Read this sandbox's audit log: outbound connections and egress
@@ -867,17 +877,46 @@ class MicroVM:
             "network_deny_out": list(_first_of(options, "networkDenyOut", "network_deny_out") or []),
             "egress_profiles": list(_first_of(options, "egressProfiles", "egress_profiles") or []),
         }
+        mode = _first_of(options, "networkEgressMode", "network_egress_mode")
+        if mode:
+            body["network_egress_mode"] = str(mode)
         payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
         policy: NetworkPolicy = {
             "networkBlockAll": bool(payload.get("network_block_all", False)),
             "networkAllowOut": list(payload.get("network_allow_out") or []),
             "networkDenyOut": list(payload.get("network_deny_out") or []),
             "egressProfiles": list(payload.get("egress_profiles") or []),
+            "networkEgressMode": str(payload.get("network_egress_mode") or "enforce"),
             "effectiveHostnameCount": int(payload.get("effective_hostname_count") or 0),
         }
         if payload.get("egress_status"):
             policy["egressStatus"] = str(payload["egress_status"])
         return policy
+
+    def get_network_learned(self, sandbox_id: str) -> NetworkLearned:
+        """Read what a sandbox reached in learn mode and the allow list that
+        would have allowed it."""
+        payload = self._do_json("GET", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/learned", None) or {}
+        result: NetworkLearned = {
+            "mode": str(payload.get("mode") or "enforce"),
+            "truncated": bool(payload.get("truncated", False)),
+            "entries": [
+                {
+                    "host": str(e.get("host") or ""),
+                    "ports": [int(p) for p in e.get("ports") or []],
+                    "firstSeen": str(e.get("first_seen") or ""),
+                    "lastSeen": str(e.get("last_seen") or ""),
+                    "hits": int(e.get("hits") or 0),
+                }
+                for e in payload.get("entries") or []
+            ],
+            "cidrs": list(payload.get("cidrs") or []),
+            "suggestedAllowOut": list(payload.get("suggested_allow_out") or []),
+        }
+        profile = payload.get("suggested_profile")
+        if profile:
+            result["suggestedProfile"] = {"allowOut": list(profile.get("allow_out") or []), "description": str(profile.get("description") or "")}
+        return result
 
     def put_egress_profile(self, name: str, options: EgressProfileOptions) -> EgressProfile:
         """Create or replace a named egress profile (a full replace: the same
@@ -1311,6 +1350,7 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "network_allow_out": _first_of(options, "networkAllowOut", "network_allow_out"),
             "network_deny_out": _first_of(options, "networkDenyOut", "network_deny_out"),
             "egress_profiles": _first_of(options, "egressProfiles", "egress_profiles"),
+            "network_egress_mode": _first_of(options, "networkEgressMode", "network_egress_mode"),
             "allow_public_traffic": _first_of(options, "allowPublicTraffic", "allow_public_traffic"),
             "mask_request_host": _first_of(options, "maskRequestHost", "mask_request_host"),
             "network_bytes_in_limit": _first_of(options, "networkBytesInLimit", "network_bytes_in_limit"),
@@ -1813,6 +1853,9 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     egress_profiles = _first_of(sandbox, "egress_profiles", "egressProfiles")
     if egress_profiles:
         result["egressProfiles"] = [str(p) for p in egress_profiles]
+    egress_mode = _first_of(sandbox, "network_egress_mode", "networkEgressMode")
+    if egress_mode:
+        result["networkEgressMode"] = str(egress_mode)
     applied = _first_of(sandbox, "egress_profiles_applied", "egressProfilesApplied")
     if applied:
         result["egressProfilesApplied"] = [{"name": str(r.get("name", "")), "generation": int(r.get("generation", 0))} for r in applied]

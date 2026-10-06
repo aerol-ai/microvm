@@ -27,6 +27,7 @@ use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, ListEgressProfilesOptions,
+    NetworkLearned, NetworkLearnedEntry,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
@@ -497,7 +498,18 @@ impl Sandbox {
         } else {
             Some(policy.egress_profiles.clone())
         };
+        self.data.network_egress_mode = if policy.network_egress_mode == "learn" {
+            Some("learn".to_string())
+        } else {
+            None
+        };
         Ok(policy)
+    }
+
+    /// Reads what this sandbox reached in learn mode. A recording stays
+    /// readable after a switch to enforce, until the sandbox is destroyed.
+    pub fn learned(&self) -> Result<NetworkLearned, Error> {
+        self.client.get_network_learned(&self.data.id)
     }
 
     /// Reads one page of this sandbox's audit log: outbound connections and
@@ -1167,6 +1179,16 @@ impl Client {
         self.do_json::<(), NetworkUsage>(
             Method::GET,
             &format!("{}/sandboxes/{}/network/usage", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    /// Reads what a sandbox reached in learn mode and the allow list that
+    /// would have allowed it.
+    pub fn get_network_learned(&self, id: &str) -> Result<NetworkLearned, Error> {
+        self.do_json::<(), NetworkLearned>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/network/learned", self.version_prefix(), id),
             None,
         )
     }
@@ -2215,6 +2237,7 @@ mod tests {
             network_allow_out: None,
             network_deny_out: None,
             egress_profiles: None,
+            network_egress_mode: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -3220,6 +3243,32 @@ mod tests {
         assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
         assert!(!sandbox.data.network_block_all);
         assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn exec_request_defaults_the_options() {
+        let req = ExecRequest { command: "true".to_string(), ..Default::default() };
+        assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn get_network_learned_maps_nulls() {
+        let body = serde_json::json!({
+            "mode": "learn", "truncated": false,
+            "entries": [{"host": "pypi.org", "ports": null, "hits": 1}],
+            "cidrs": null, "suggested_allow_out": ["pypi.org"], "suggested_profile": null
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let learned = client.get_network_learned("sb-1").expect("learned should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/learned HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(learned.mode, "learn");
+        assert!(learned.entries[0].ports.is_empty());
+        assert!(learned.cidrs.is_empty());
+        assert_eq!(learned.suggested_allow_out, vec!["pypi.org".to_string()]);
+        assert!(learned.suggested_profile.is_none());
     }
 
     #[test]

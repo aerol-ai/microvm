@@ -286,8 +286,8 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
           {
             type: 'link',
             href: '/egress-profiles-and-learn-mode',
-            label: 'Egress Profiles',
-            description: 'Name an allow list once, use it from many sandboxes, and check a policy before creating.',
+            label: 'Egress Profiles and Learn Mode',
+            description: 'Reuse named allow lists, learn one from a trusted run, and check a policy before creating.',
           }
         ]
       },

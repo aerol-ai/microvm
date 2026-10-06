@@ -168,6 +168,10 @@ class CreateOptions(TypedDict, total=False):
     # Named egress profiles whose entries join networkAllowOut (see
     # put_egress_profile). A profile change reaches every sandbox using it.
     egressProfiles: List[str]
+    # "learn" gives the sandbox open egress and records what it reaches, so
+    # learned() can suggest an allow list. Trusted runs only. Omitted is
+    # "enforce".
+    networkEgressMode: str
     # Whether the sandbox may be exposed publicly. Omitted defaults to private
     # (no public URL, expose_port fails). True opts in; False permanently refuses.
     allowPublicTraffic: bool
@@ -441,6 +445,8 @@ class SandboxData(TypedDict, total=False):
     # that is live on it.
     egressProfiles: List[str]
     egressProfilesApplied: List["EgressProfileRef"]
+    # "learn" while the sandbox records its egress; absent otherwise.
+    networkEgressMode: str
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -590,6 +596,7 @@ class NetworkPolicyOptions(TypedDict, total=False):
     networkAllowOut: List[str]
     networkDenyOut: List[str]
     egressProfiles: List[str]
+    networkEgressMode: str
 
 
 class NetworkPolicy(TypedDict, total=False):
@@ -597,8 +604,32 @@ class NetworkPolicy(TypedDict, total=False):
     networkAllowOut: List[str]
     networkDenyOut: List[str]
     egressProfiles: List[str]
+    # "enforce" or "learn".
+    networkEgressMode: str
     # Hostname entries in force: inline plus every profile's (at most 1024).
     effectiveHostnameCount: int
+
+
+class NetworkLearnedEntry(TypedDict, total=False):
+    host: str
+    # Connection ports; empty when the name was only resolved.
+    ports: List[int]
+    firstSeen: str
+    lastSeen: str
+    hits: int
+
+
+class NetworkLearned(TypedDict, total=False):
+    """What a sandbox reached in learn mode, and the allow list that would
+    have allowed it: ``suggestedAllowOut`` when it fits 64 hostnames,
+    otherwise ``suggestedProfile`` (a body for ``put_egress_profile``)."""
+
+    mode: str
+    truncated: bool
+    entries: List[NetworkLearnedEntry]
+    cidrs: List[str]
+    suggestedAllowOut: List[str]
+    suggestedProfile: "EgressProfileOptions"
     # "active", "held" or "unavailable" for hostname rules on a container.
     egressStatus: str
 

@@ -12,6 +12,7 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.ExposeResult;
@@ -189,7 +190,16 @@ public class Sandbox extends SandboxData {
         networkBlockAll = policy.networkBlockAll;
         egressProfiles = policy.egressProfiles;
         egressStatus = policy.egressStatus;
+        networkEgressMode = "learn".equals(policy.networkEgressMode) ? "learn" : null;
         return policy;
+    }
+
+    /**
+     * Reads what this sandbox reached in learn mode. A recording stays readable
+     * after a switch to enforce, until the sandbox is destroyed.
+     */
+    public NetworkLearned learned() {
+        return client.getNetworkLearned(id);
     }
 
     /**

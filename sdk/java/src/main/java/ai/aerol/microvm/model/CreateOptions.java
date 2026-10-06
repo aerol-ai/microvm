@@ -35,6 +35,9 @@ public class CreateOptions {
     /** Named egress profiles whose entries join networkAllowOut; a profile change reaches every sandbox using it. */
     @JsonProperty("egress_profiles")
     public List<String> egressProfiles;
+    /** "learn" gives the sandbox open egress and records what it reaches; trusted runs only. Null is "enforce". */
+    @JsonProperty("network_egress_mode")
+    public String networkEgressMode;
     /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
@@ -128,6 +131,11 @@ public class CreateOptions {
 
     public CreateOptions setEgressProfiles(List<String> egressProfiles) {
         this.egressProfiles = egressProfiles;
+        return this;
+    }
+
+    public CreateOptions setNetworkEgressMode(String networkEgressMode) {
+        this.networkEgressMode = networkEgressMode;
         return this;
     }
 

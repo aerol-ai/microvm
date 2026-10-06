@@ -1,6 +1,6 @@
 ---
-title: Egress Profiles
-description: Name an allow list once, use it from many sandboxes, change it in one place, and check a policy before you create anything.
+title: Egress Profiles and Learn Mode
+description: Name an allow list once and use it from many sandboxes, learn an allow list from a trusted run, and check a policy before you create anything.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -243,6 +243,109 @@ profile; deleting one that is already gone succeeds.
 
 ---
 
+## Learn an allow list
+
+Writing an allow list for a workload you didn't write is guesswork. **Learn
+mode** gives a sandbox open egress for one trusted run and records every
+destination it reaches. Read the recording and it comes with the allow list
+that would have allowed that run, ready to lock the sandbox down.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: 'python:3.12', networkEgressMode: 'learn' })
+    await sandbox.exec('pip install requests')
+
+    const learned = await sandbox.learned()
+    console.log(learned.entries.map((e) => e.host))
+    await sandbox.setNetworkPolicy({ networkAllowOut: learned.suggestedAllowOut })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({'image': 'python:3.12', 'networkEgressMode': 'learn'})
+    sandbox.exec_command('pip install requests')
+
+    learned = sandbox.learned()
+    print([e['host'] for e in learned['entries']])
+    sandbox.set_network_policy({'networkAllowOut': learned['suggestedAllowOut']})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:             "python:3.12",
+        NetworkEgressMode: sdktypes.NetworkEgressModeLearn,
+    })
+    if err != nil {
+        return err
+    }
+    if _, err := sandbox.ExecCommand(ctx, "pip install requests"); err != nil {
+        return err
+    }
+    learned, err := sandbox.Learned(ctx)
+    if err != nil {
+        return err
+    }
+    _, err = sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: learned.SuggestedAllowOut,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_egress_mode: Some("learn".to_string()),
+        ..Default::default()
+    })?;
+    sandbox.exec(ExecRequest {
+        command: "pip install requests".to_string(),
+        ..Default::default()
+    })?;
+
+    let learned = sandbox.learned()?;
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: learned.suggested_allow_out,
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions().setImage("python:3.12").setNetworkEgressMode("learn"));
+    sandbox.exec("pip install requests");
+
+    NetworkLearned learned = sandbox.learned();
+    sandbox.setNetworkPolicy(new NetworkPolicyOptions().setNetworkAllowOut(learned.suggestedAllowOut));
+    ```
+  </TabItem>
+</Tabs>
+
+- **Trusted runs only.** A learn-mode sandbox can reach anything, so use it
+  for code you trust and switch it to enforce before untrusted code runs.
+  Every connection it makes is written to the
+  [audit log](/egress-domain-filtering#see-what-was-refused) with reason
+  `learn_mode`.
+- **Rules.** Learn mode takes no allow or deny lists, no profiles and no
+  block-all; it is never a default. Firecracker sandboxes can't use it.
+- **The suggestion.** Three or more names under one domain collapse to
+  `*.domain` (never a public suffix), non-web ports stay as `host:port`, and
+  addresses reached without a DNS name become single-address CIDRs. When the
+  suggestion holds more than 64 hostnames it comes back as
+  `suggestedProfile`, a body for `putEgressProfile`, instead of
+  `suggestedAllowOut`.
+- **Limits.** A recording holds up to 1024 destinations; past that,
+  `truncated` is true and new destinations aren't recorded.
+- **How long it lasts.** A recording stays readable after the sandbox
+  switches to enforce, and goes when the sandbox is destroyed. It isn't
+  replicated, so a sandbox recreated on another node after a failure starts
+  a new one. A WASM sandbox's recording lives in its running worker and goes
+  when it stops.
+
+---
+
 ## Check a policy before you use it
 
 `checkNetworkPolicy` answers whether a sandbox created with some egress fields
@@ -314,5 +417,8 @@ caught when the sandbox connects.
 - **Firecracker** sandboxes can't use profiles yet.
 - **Org and built-in profiles** (`org:` and `builtin:` names) aren't available
   yet; those names are reserved.
+- **Learn mode and the E2B SDK.** `updateNetwork` keeps a sandbox in learn
+  mode; setting lists on a learn-mode sandbox from the E2B SDK is refused with
+  `409`. Switch it with `setNetworkPolicy`.
 - **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
   sandbox's profiles, since the E2B API has no way to name them.

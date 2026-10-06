@@ -205,6 +205,12 @@ export interface CreateOptions {
    */
   egressProfiles?: string[];
   /**
+   * `"learn"` gives the sandbox open egress and records what it reaches, so
+   * `learned()` can suggest an allow list. Trusted runs only. Needs no lists,
+   * profiles or block-all. Omitted is `"enforce"`.
+   */
+  networkEgressMode?: "enforce" | "learn";
+  /**
    * Whether the sandbox may be exposed to the public internet. Omitted defaults
    * to private (no public URL, `exposePort` fails). Set `true` to opt in to
    * public exposure; `false` permanently refuses it for this sandbox.
@@ -516,6 +522,8 @@ export interface Sandbox {
    * so a caller can see when a profile change has reached it.
    */
   egressProfilesApplied?: EgressProfileRef[];
+  /** `"learn"` while the sandbox records its egress; absent otherwise. */
+  networkEgressMode?: string;
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -632,6 +640,7 @@ export interface NetworkPolicyOptions {
   networkAllowOut?: string[];
   networkDenyOut?: string[];
   egressProfiles?: string[];
+  networkEgressMode?: "enforce" | "learn";
 }
 
 /** The policy a sandbox enforces after `setNetworkPolicy`. */
@@ -640,6 +649,8 @@ export interface NetworkPolicy {
   networkAllowOut: string[];
   networkDenyOut: string[];
   egressProfiles: string[];
+  /** `"enforce"` or `"learn"`. */
+  networkEgressMode: string;
   /** Hostname entries in force: inline plus every profile's (at most 1024). */
   effectiveHostnameCount: number;
   /** "active", "held" or "unavailable" for hostname rules on a container. */
@@ -675,6 +686,31 @@ export interface EgressProfileList {
   profiles: EgressProfile[];
   /** Pass back as `cursor` for the next page; absent on the last one. */
   nextCursor?: string;
+}
+
+/** One destination a learn-mode sandbox reached. */
+export interface NetworkLearnedEntry {
+  host: string;
+  /** Connection ports; empty when the name was only resolved. */
+  ports: number[];
+  firstSeen: string;
+  lastSeen: string;
+  hits: number;
+}
+
+/**
+ * What a sandbox reached in learn mode, and the allow list that would have
+ * allowed it: `suggestedAllowOut` when it fits 64 hostnames, otherwise
+ * `suggestedProfile` (a body for `putEgressProfile`).
+ */
+export interface NetworkLearned {
+  mode: string;
+  /** Recording stopped at its cap. */
+  truncated: boolean;
+  entries: NetworkLearnedEntry[];
+  cidrs: string[];
+  suggestedAllowOut: string[];
+  suggestedProfile?: EgressProfileOptions;
 }
 
 /** A referenced profile and the generation of it that is live on a sandbox. */

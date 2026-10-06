@@ -194,6 +194,11 @@ pub struct CreateOptions {
     /// `put_egress_profile`). A profile change reaches every sandbox using it.
     #[serde(rename = "egress_profiles", skip_serializing_if = "Option::is_none")]
     pub egress_profiles: Option<Vec<String>>,
+    /// `"learn"` gives the sandbox open egress and records what it reaches,
+    /// so `learned` can suggest an allow list. Trusted runs only. `None` is
+    /// `"enforce"`.
+    #[serde(rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
+    pub network_egress_mode: Option<String>,
     /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
     /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
     /// only via the toolbox proxy and SSH gateway.
@@ -556,6 +561,9 @@ pub struct Sandbox {
     /// The generation of each referenced profile live on the sandbox.
     #[serde(default, rename = "egress_profiles_applied", skip_serializing_if = "Option::is_none")]
     pub egress_profiles_applied: Option<Vec<EgressProfileRef>>,
+    /// `"learn"` while the sandbox records its egress.
+    #[serde(default, rename = "network_egress_mode", skip_serializing_if = "Option::is_none")]
+    pub network_egress_mode: Option<String>,
     #[serde(rename = "toolbox_enabled")]
     pub toolbox_enabled: bool,
     #[serde(rename = "ssh_public_key", skip_serializing_if = "Option::is_none")]
@@ -641,7 +649,7 @@ pub struct HealthStatus {
     pub version: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ExecRequest {
     pub command: String,
     #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
@@ -788,6 +796,9 @@ pub struct NetworkPolicyOptions {
     pub network_allow_out: Vec<String>,
     pub network_deny_out: Vec<String>,
     pub egress_profiles: Vec<String>,
+    /// `"enforce"` or `"learn"`; empty is `"enforce"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub network_egress_mode: String,
 }
 
 /// The policy a sandbox enforces after `set_network_policy`.
@@ -800,6 +811,9 @@ pub struct NetworkPolicy {
     pub network_deny_out: Vec<String>,
     #[serde(default)]
     pub egress_profiles: Vec<String>,
+    /// `"enforce"` or `"learn"`.
+    #[serde(default)]
+    pub network_egress_mode: String,
     /// Hostname entries in force: inline plus every profile's (at most 1024).
     #[serde(default)]
     pub effective_hostname_count: usize,
@@ -855,6 +869,61 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Vec<EgressProfile>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// One destination a learn-mode sandbox reached.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkLearnedEntry {
+    pub host: String,
+    /// Connection ports; empty when the name was only resolved.
+    #[serde(default, deserialize_with = "null_as_empty_ports")]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub first_seen: String,
+    #[serde(default)]
+    pub last_seen: String,
+    #[serde(default)]
+    pub hits: u64,
+}
+
+fn null_as_empty_ports<'de, D>(d: D) -> Result<Vec<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<u16>>::deserialize(d)?.unwrap_or_default())
+}
+
+fn null_as_empty_strings<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(d)?.unwrap_or_default())
+}
+
+/// What a sandbox reached in learn mode, and the allow list that would have
+/// allowed it: `suggested_allow_out` when it fits 64 hostnames, otherwise
+/// `suggested_profile` (a body for `put_egress_profile`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkLearned {
+    pub mode: String,
+    /// Recording stopped at its cap.
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default, deserialize_with = "null_as_empty_entries")]
+    pub entries: Vec<NetworkLearnedEntry>,
+    #[serde(default, deserialize_with = "null_as_empty_strings")]
+    pub cidrs: Vec<String>,
+    #[serde(default, deserialize_with = "null_as_empty_strings")]
+    pub suggested_allow_out: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_profile: Option<EgressProfileOptions>,
+}
+
+fn null_as_empty_entries<'de, D>(d: D) -> Result<Vec<NetworkLearnedEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<NetworkLearnedEntry>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// A referenced profile and the generation of it live on a sandbox.

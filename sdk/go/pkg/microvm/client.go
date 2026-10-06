@@ -351,6 +351,12 @@ func (c *Client) SetNetworkPolicy(ctx context.Context, id string, opts sdktypes.
 	return c.inner.SetNetworkPolicy(ctx, id, opts)
 }
 
+// GetNetworkLearned reads what a sandbox reached in learn mode and the
+// allow list that would have allowed it.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (sdktypes.NetworkLearned, error) {
+	return c.inner.GetNetworkLearned(ctx, id)
+}
+
 // PutEgressProfile creates or replaces a named egress profile (a full
 // replace: the same body twice is a no-op). Sandboxes reference it through
 // EgressProfiles, and a change reaches every one of them.
@@ -757,7 +763,18 @@ func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPol
 	}
 	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
 	s.EgressProfiles, s.EgressStatus = policy.EgressProfiles, policy.EgressStatus
+	s.NetworkEgressMode = ""
+	if policy.NetworkEgressMode == sdktypes.NetworkEgressModeLearn {
+		s.NetworkEgressMode = sdktypes.NetworkEgressModeLearn
+	}
 	return policy, nil
+}
+
+// Learned reads what this sandbox reached in learn mode (see
+// Client.GetNetworkLearned). A recording stays readable after a switch to
+// enforce, until the sandbox is destroyed.
+func (s *Sandbox) Learned(ctx context.Context) (sdktypes.NetworkLearned, error) {
+	return s.client.GetNetworkLearned(ctx, s.ID)
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

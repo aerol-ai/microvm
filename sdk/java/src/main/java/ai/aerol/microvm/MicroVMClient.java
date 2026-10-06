@@ -32,6 +32,8 @@ import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkLearnedEntry;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
 import ai.aerol.microvm.model.NetworkPolicyCheckResult;
@@ -580,6 +582,32 @@ public class MicroVMClient {
             page.coverage = new AuditCoverage();
         }
         return page;
+    }
+
+    /**
+     * Reads what a sandbox reached in learn mode and the allow list that would
+     * have allowed it.
+     */
+    public NetworkLearned getNetworkLearned(String sandboxId) {
+        NetworkLearned learned = doJson("GET", sandboxPath(sandboxId) + "/network/learned", null, NetworkLearned.class);
+        if (learned == null) {
+            learned = new NetworkLearned();
+        }
+        if (learned.entries == null) {
+            learned.entries = new ArrayList<>();
+        }
+        for (NetworkLearnedEntry e : learned.entries) {
+            if (e.ports == null) {
+                e.ports = new ArrayList<>();
+            }
+        }
+        if (learned.cidrs == null) {
+            learned.cidrs = new ArrayList<>();
+        }
+        if (learned.suggestedAllowOut == null) {
+            learned.suggestedAllowOut = new ArrayList<>();
+        }
+        return learned;
     }
 
     /**
