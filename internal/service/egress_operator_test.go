@@ -144,3 +144,22 @@ func TestUpstreamPortRule(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeCreateEgressDefault (§5.10 PC-2): the default is written
+// into the caller's request, which is the spec the cluster replicates.
+func TestNormalizeCreateEgressDefault(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	none := models.CreateSandboxRequest{}
+	if err := svc.NormalizeCreateEgressDefault(&none); err != nil || hasEgressFields(&none) {
+		t.Fatalf("no operator file: %+v %v", none, err)
+	}
+	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ndefault_policy: {mode: block_all}\n"))
+	req := models.CreateSandboxRequest{}
+	if err := svc.NormalizeCreateEgressDefault(&req); err != nil || !req.NetworkBlockAll {
+		t.Fatalf("block_all default: %+v %v", req, err)
+	}
+	own := models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}
+	if err := svc.NormalizeCreateEgressDefault(&own); err != nil || own.NetworkBlockAll {
+		t.Fatalf("explicit policy rewritten: %+v %v", own, err)
+	}
+}

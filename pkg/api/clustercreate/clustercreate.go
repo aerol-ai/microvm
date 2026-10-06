@@ -116,6 +116,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		writeError(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
+	if err := svc.NormalizeCreateEgressDefault(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return Decision{}, false
+	}
 	if opts.Normalize != nil {
 		if err := opts.Normalize(&req); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -328,6 +332,9 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 		return nil, err
 	}
 	if err := service.NormalizeCreateFailover(&req); err != nil {
+		return nil, err
+	}
+	if err := svc.NormalizeCreateEgressDefault(&req); err != nil {
 		return nil, err
 	}
 	// Pin bare built-in profiles here, on the owner after any forward, so

@@ -163,6 +163,21 @@ func checkEgressOperatorLimits(op *operator.Operator, req *models.CreateSandboxR
 	return nil
 }
 
+// NormalizeCreateEgressDefault writes the operator's default policy into a
+// create that says nothing about egress, before placement and before the
+// owner records the spec. The cluster replicates the caller's copy of the
+// request, not the one createSandbox defaults, and a failover replay skips
+// the default so it can't pick up a file edited since; without this a
+// defaulted sandbox would come back open after failover. Placement also has
+// to see a hostname default to send the create to a gateway-ready node.
+func (s *Service) NormalizeCreateEgressDefault(req *models.CreateSandboxRequest) error {
+	op := s.egressOperator()
+	if op == nil || hasEgressFields(req) {
+		return nil
+	}
+	return applyOperatorDefault(op, req)
+}
+
 // applyOperatorDefault writes the operator's default policy into a request
 // that says nothing about egress.
 func applyOperatorDefault(op *operator.Operator, req *models.CreateSandboxRequest) error {
