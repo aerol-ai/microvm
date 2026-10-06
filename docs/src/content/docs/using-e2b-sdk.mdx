@@ -53,11 +53,13 @@ sandbox.kill()
 - Execute commands and use file APIs through the `/e2b/runtime` proxy.
 - Create, list, and delete snapshots/templates through the compatibility layer.
 - Preserve common E2B lifecycle metadata such as timeout and pause-on-idle settings.
+- Egress rules: `network.allowOut` and `network.denyOut` on create, and `updateNetwork` on a running sandbox, with hostnames and `*.` wildcards. See [Egress Domain Filtering](/egress-domain-filtering#from-the-e2b-sdk) for the one place the reading is stricter than E2B's.
 
 ## Current gaps
 
 - Template builds are not part of the current facade; use AerolVM images or snapshots instead.
 - Volume mounts are not implemented in the E2B facade yet.
 - Traffic access tokens, metrics, logs, and E2B-style public-host routing are not part of this compatibility surface.
+- `network.rules` (request transforms) and `network.egressProxy` are refused with `501`.
 
 If you already have E2B code in production, migration is usually an environment change rather than an SDK rewrite: set `E2B_API_URL`, `E2B_SANDBOX_URL`, and `E2B_API_KEY` to your AerolVM deployment and keep the same client code.

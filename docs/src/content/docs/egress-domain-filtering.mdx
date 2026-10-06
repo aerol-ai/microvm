@@ -313,6 +313,14 @@ it, when its sandbox bridge carries IPv6, or when its host firewall drops the
 gateway's redirected traffic (the gateway checks this itself at start). Creates
 that use hostnames get `501` there; CIDR-only policies keep working.
 
+### From the E2B SDK
+
+The [E2B facade](/using-e2b-sdk) maps `network.allowOut` and `network.denyOut`
+onto the same rules, on create and through `updateNetwork` on a running
+sandbox. One reading is stricter than E2B's: `allowOut` with no `denyOut` is an
+allowlist here, where E2B would allow everything. `allowOut` together with
+`denyOut: [ALL_TRAFFIC]` means the same on both, so use that form.
+
 ---
 
 ## Private networks
