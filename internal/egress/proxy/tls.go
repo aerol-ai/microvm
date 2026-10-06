@@ -78,12 +78,21 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		host = dst.Addr().String()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
-	up, err := p.cfg.Dialer.DialContext(ctx, p.dialer(pol, name, nameAllowed), "tcp", target)
+	var up net.Conn
+	if name != "" && !isIP && !p.cfg.Upstream.Bypass(name) {
+		// The SNI decided; the operator's proxy tunnels to that name.
+		up, err = p.cfg.Upstream.DialConnect(ctx, target)
+	} else {
+		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, name, nameAllowed), "tcp", target)
+	}
 	cancel()
 	if err != nil {
 		reason := ReasonDialFailed
-		if egresspolicyRefused(err) {
+		switch {
+		case egresspolicyRefused(err):
 			reason = ReasonBlockedIP
+		case errors.Is(err, egresspolicy.ErrUpstreamProxy):
+			reason = ReasonUpstreamProxy
 		}
 		p.log.Debug("egress proxy: dial", "sandbox_id", id, "target", target, "error", err)
 		deny(reason, host)

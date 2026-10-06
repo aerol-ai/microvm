@@ -388,3 +388,50 @@ func TestQueriesCounted(t *testing.T) {
 		t.Fatalf("Queries() = %d, want 3", f.Queries())
 	}
 }
+
+// TestSyntheticAnswersForProxiedNames (§5.10 PC-4, EF-82): an allowed name
+// the upstream proxies gets a synthetic A with the short TTL, no resolver
+// lookup and no learned element; a no_proxy name is resolved as usual; a
+// name that isn't allowed still gets NXDOMAIN.
+func TestSyntheticAnswersForProxiedNames(t *testing.T) {
+	up, err := egresspolicy.NewUpstream("http://10.1.1.1:3128", "", []string{"mirror.example"}, nil, netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startFilter(t, allowlist(t, "pypi.org", "mirror.example", "git.example:22"), Config{Upstream: up})
+	resp := query(t, h.addr, "pypi.org", dns.TypeA, false)
+	if len(resp.Answer) != 1 {
+		t.Fatalf("answer = %v", resp.Answer)
+	}
+	a := resp.Answer[0].(*dns.A)
+	ip, _ := netip.AddrFromSlice(a.A)
+	if !up.IsSynthetic(ip.Unmap()) || a.Hdr.Ttl != 30 {
+		t.Fatalf("synthetic answer = %v ttl=%d", ip, a.Hdr.Ttl)
+	}
+	h.up.mu.Lock()
+	asked := len(h.up.queries)
+	h.up.mu.Unlock()
+	if asked != 0 {
+		t.Fatal("a proxied name must not reach the resolver")
+	}
+	if aaaa := query(t, h.addr, "pypi.org", dns.TypeAAAA, false); len(aaaa.Answer) != 0 || aaaa.Rcode != dns.RcodeSuccess {
+		t.Fatal("AAAA stays NODATA")
+	}
+	query(t, h.addr, "mirror.example", dns.TypeA, false)
+	h.up.mu.Lock()
+	asked = len(h.up.queries)
+	h.up.mu.Unlock()
+	if asked != 1 {
+		t.Fatalf("a no_proxy name is resolved normally (resolver saw %d)", asked)
+	}
+	query(t, h.addr, "git.example", dns.TypeA, false)
+	h.learner.mu.Lock()
+	learned := len(h.learner.added)
+	h.learner.mu.Unlock()
+	if learned != 0 {
+		t.Fatal("a synthetic answer must never become a learned element")
+	}
+	if nx := query(t, h.addr, "evil.example", dns.TypeA, false); nx.Rcode != dns.RcodeNameError {
+		t.Fatal("names that aren't allowed still get NXDOMAIN")
+	}
+}

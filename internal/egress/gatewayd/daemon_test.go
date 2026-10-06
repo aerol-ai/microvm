@@ -354,15 +354,15 @@ func TestSocketListenerAndGuard(t *testing.T) {
 	if err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("socket mode = %v, %v (want 0600, CEO D22)", st.Mode().Perm(), err)
 	}
-	if g, err := guardFromOperatorFile(""); err != nil || g.Zone != nil {
+	if g, up, err := fromOperatorFile(""); err != nil || g.Zone != nil || up != nil {
 		t.Fatal("no operator file = zero guard")
 	}
-	if _, err := guardFromOperatorFile(filepath.Join(dir, "missing.yaml")); err == nil {
+	if _, _, err := fromOperatorFile(filepath.Join(dir, "missing.yaml")); err == nil {
 		t.Fatal("a missing operator file must fail the gateway start")
 	}
 	op := filepath.Join(dir, "op.yaml")
 	_ = os.WriteFile(op, []byte("version: 1\ndeny_cidrs: [10.99.0.0/16]\n"), 0o600)
-	if g, err := guardFromOperatorFile(op); err != nil || len(g.DenyFloor) != 1 {
+	if g, _, err := fromOperatorFile(op); err != nil || len(g.DenyFloor) != 1 {
 		t.Fatalf("operator guard = %+v, %v", g, err)
 	}
 	if safeName("a/b.c") != "a_b_c" {

@@ -35,6 +35,8 @@ type Deps struct {
 	Dialer      proxy.Dialer
 	Peer        egress.PeerCheck
 	Guard       egresspolicy.DialGuard
+	// Upstream is the operator's proxy chain (§5.10 PC-4), or nil.
+	Upstream *egresspolicy.Upstream
 }
 
 // Daemon is a running gateway.
@@ -98,11 +100,11 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		return nil, err
 	}
 	d.dns = dnsfilter.New(d.gw, d.gw, d.onDNS, dnsfilter.Config{
-		Upstreams: cfg.DNSUpstreams, QPS: cfg.DNSQPS, Guard: deps.Guard, Logger: log,
+		Upstreams: cfg.DNSUpstreams, QPS: cfg.DNSQPS, Guard: deps.Guard, Logger: log, Upstream: deps.Upstream,
 	})
 	d.px = proxy.New(d.gw, d.onProxy, proxy.Config{
 		MaxConns: cfg.ProxyMaxConns, MaxConnsPerSandbox: cfg.ProxyMaxPerSandbox,
-		Guard: deps.Guard, OriginalDst: deps.OriginalDst, Dialer: deps.Dialer, Logger: log,
+		Guard: deps.Guard, OriginalDst: deps.OriginalDst, Dialer: deps.Dialer, Logger: log, Upstream: deps.Upstream,
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{

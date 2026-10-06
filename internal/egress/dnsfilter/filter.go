@@ -82,6 +82,10 @@ type Config struct {
 	Guard   egresspolicy.DialGuard
 	Timeout time.Duration
 	Logger  *slog.Logger
+	// Upstream, when set, answers allowed names it proxies with a synthetic
+	// A record instead of asking a resolver that may not know outside names
+	// (§5.10 PC-4).
+	Upstream *egresspolicy.Upstream
 }
 
 // Filter is a dns.Handler.
@@ -201,6 +205,22 @@ func (f *Filter) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	if f.cfg.Upstream != nil && q.Qtype == dns.TypeA && !f.cfg.Upstream.Bypass(name) {
+		// The proxy routes by SNI or Host, so any address in the synthetic
+		// range reaches the right place; nothing is learned, since a
+		// synthetic IP must never open a forward path.
+		ip := f.cfg.Upstream.SyntheticIP(name)
+		resp := new(dns.Msg)
+		resp.SetReply(r)
+		resp.RecursionAvailable = true
+		resp.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: uint32(egresspolicy.SyntheticTTL / time.Second)},
+			A:   ip.AsSlice(),
+		}}
+		f.observe(Decision{SandboxID: id, Name: name, QType: q.Qtype, Allowed: true, Rule: rule, Mode: s.Mode})
+		f.reply(w, r, resp)
+		return
+	}
 	resp, err := f.forward(r, q)
 	if err != nil {
 		f.log.Warn("egress dns: upstream failed", "sandbox_id", id, "name", name, "error", err)

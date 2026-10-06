@@ -1,11 +1,13 @@
 package worker
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -263,5 +265,54 @@ func TestInstallOperatorGuard(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("workers must inherit SB_EGRESS_OPERATOR_FILE")
+	}
+}
+
+// TestMediatorUpstream (§5.10 PC-4): an allowed name the operator proxies is
+// dialed by CONNECT through the upstream, never resolved here.
+func TestMediatorUpstream(t *testing.T) {
+	target, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer target.Close()
+	go func() {
+		c, err := target.Accept()
+		if err == nil {
+			_, _ = c.Write([]byte("hello\n"))
+			_ = c.Close()
+		}
+	}()
+	proxyLn, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer proxyLn.Close()
+	seen := make(chan string, 1)
+	go func() {
+		c, err := proxyLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 1024)
+		n, _ := c.Read(buf)
+		seen <- strings.SplitN(string(buf[:n]), "\r\n", 2)[0]
+		up, err := net.Dial("tcp", target.Addr().String())
+		if err != nil {
+			return
+		}
+		_, _ = c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+		_, _ = io.Copy(c, up)
+	}()
+	up, err := egresspolicy.NewUpstream("http://"+proxyLn.Addr().String(), "", nil, nil, netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := newNetMediator()
+	m.upstream = up
+	m.SetPolicy("sb", mustPolicy(t, []string{"pypi.org:8443"}, nil))
+	c, err := m.DialContext(context.Background(), "sb", "tcp", "pypi.org:8443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, _ := bufio.NewReader(c).ReadString('\n')
+	_ = c.Close()
+	if line != "hello\n" || <-seen != "CONNECT pypi.org:8443 HTTP/1.1" {
+		t.Fatalf("tunnel = %q", line)
 	}
 }

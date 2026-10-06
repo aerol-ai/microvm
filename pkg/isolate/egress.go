@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -61,6 +62,13 @@ func SetEgressDialGuard(g egresspolicy.DialGuard) {
 	g.Strict = true
 	isolateGuard.Store(&g)
 }
+
+// isolateUpstream is the operator's proxy chain (§5.10 PC-4), or nil.
+var isolateUpstream atomic.Pointer[egresspolicy.Upstream]
+
+// SetEgressUpstream installs (nil: removes) the upstream proxy every isolate
+// host's egress goes through for names it proxies.
+func SetEgressUpstream(up *egresspolicy.Upstream) { isolateUpstream.Store(up) }
 
 // EgressDialGuard returns the guard isolate egress dials with now.
 func EgressDialGuard() egresspolicy.DialGuard { return currentIsolateGuard() }
@@ -347,6 +355,17 @@ func dialReason(err error) string {
 // names under its suffixes. The hook is policy-independent, which is what
 // keeps pooling connections across sandboxes safe.
 func guardedDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if up := isolateUpstream.Load(); up != nil && addr == up.Addr() {
+		// The operator's own proxy, which the transport reaches for names it
+		// proxies: not a sandbox destination, so the guard (which would
+		// refuse its private address) does not apply.
+		d := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		c, err := d.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", egresspolicy.ErrUpstreamProxy, err)
+		}
+		return c, nil
+	}
 	name := ""
 	if host, _, err := net.SplitHostPort(addr); err == nil {
 		if _, perr := netip.ParseAddr(host); perr != nil {
@@ -361,7 +380,13 @@ func guardedDial(ctx context.Context, network, addr string) (net.Conn, error) {
 // dialing through guardedDial. Typed as RoundTripper so offline tests can
 // swap in a fake without dialing the network.
 var egressTransport http.RoundTripper = &http.Transport{
-	DialContext:           guardedDial,
+	DialContext: guardedDial,
+	Proxy: func(req *http.Request) (*url.URL, error) {
+		return isolateUpstream.Load().ProxyFunc(req)
+	},
+	GetProxyConnectHeader: func(context.Context, *url.URL, string) (http.Header, error) {
+		return isolateUpstream.Load().ProxyHeader(), nil
+	},
 	ForceAttemptHTTP2:     true,
 	MaxIdleConns:          100,
 	IdleConnTimeout:       90 * time.Second,

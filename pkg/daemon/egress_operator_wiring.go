@@ -33,6 +33,14 @@ func wireEgressOperator(ctx context.Context, cfg config.Config, svc *service.Ser
 	onChange := func(op *operator.Operator) {
 		svc.OnEgressOperatorChange(op)
 		pkgisolate.SetEgressDialGuard(op.IsolateGuard())
+		up, err := op.UpstreamDialer()
+		if err != nil {
+			// Keep the previous chain: sending without the credentials (or
+			// direct, in a network with no other way out) helps nobody.
+			logger.Error("egress upstream proxy not updated for isolate", "error", err)
+			return
+		}
+		pkgisolate.SetEgressUpstream(up)
 	}
 	w := operator.NewWatcher(cfg.EgressOperatorFile, logger, onChange)
 	if err := w.BootError(); err != nil {

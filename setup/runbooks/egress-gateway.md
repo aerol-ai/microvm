@@ -217,6 +217,29 @@ reads it for the internal zone, its copy of the floor and the proxy.
   changes. A tool inside a sandbox that called a node's `:21212` directly
   now times out; point it at the ingress URL, or set the guard to `false`.
 
+## UpstreamProxy
+
+With `upstream_proxy.url` set, allowed names that are neither in the
+internal zone nor in `no_proxy` leave through the operator's HTTP proxy:
+CONNECT for port 443 (and for WASM sockets), the absolute form for port 80.
+Their DNS answers are synthetic addresses from `synthetic_dns_cidr`
+(default `198.18.0.0/15`, never routed, 30 s TTL): the gateway routes by SNI
+or Host, so the address only has to bring the connection to the redirect.
+
+- **Denials with `upstream_proxy_unavailable`.** The proxy is down,
+  unreachable, or refused the tunnel (a 407 means the credentials are
+  wrong). The sandbox sees a TLS `access_denied` alert on 443 or a 502 on
+  80. Check the proxy from the node, then the gateway log at debug level.
+- **Credentials.** `auth_file` holds `user:password` and must be mode 0600
+  (a looser mode stops the gateway at start). It is read by the gateway and
+  sandboxd only, and never logged, snapshotted or audited.
+- **Ports.** A `host:port` rule on a port other than 80 or 443 for a proxied
+  name is refused at create (400): a transparent tunnel on arbitrary ports
+  is out of scope. Put such hosts in the internal zone or `no_proxy`.
+- **Changes.** Restart `aerolvm-egress-gateway` after editing the proxy
+  settings; WASM workers pick them up as they restart; isolate follows the
+  sandboxd reload.
+
 ## Tracing and logs
 
 With `SB_OTEL_TRACES_ENABLED` (or an OTLP traces endpoint) set in the

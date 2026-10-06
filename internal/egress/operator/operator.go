@@ -87,6 +87,7 @@ type Operator struct {
 	defPolicy *egresspolicy.Policy
 	profiles  map[string]*egresspolicy.Policy
 	upstream  *UpstreamProxy
+	proxied   *egresspolicy.Upstream // no credentials: only answers "is this name proxied?"
 	hash      string
 }
 
@@ -210,9 +211,48 @@ func Parse(raw []byte) (*Operator, error) {
 			return nil, fmt.Errorf("egress operator file: upstream_proxy.synthetic_dns_cidr %q: want an IPv4 /24 or wider", syn)
 		}
 		up.Synthetic = p.Masked()
+		// Validate the rest of the chain now (no_proxy entries), so a typo
+		// fails the load rather than the first proxied connection.
+		matcher, err := egresspolicy.NewUpstream(u, "", up.NoProxy, o.zone, up.Synthetic)
+		if err != nil {
+			return nil, fmt.Errorf("egress operator file: upstream_proxy: %w", err)
+		}
 		o.upstream = up
+		o.proxied = matcher
 	}
 	return o, nil
+}
+
+// ProxiesName reports whether name would be reached through the upstream
+// proxy: there is one, and the name is neither internal-zone nor no_proxy.
+func (o *Operator) ProxiesName(name string) bool {
+	return o != nil && o.proxied != nil && !o.proxied.Bypass(name)
+}
+
+// UpstreamDialer builds the upstream chain, reading the credentials from
+// auth_file (it must be mode 0600 or tighter: it holds a password). nil
+// without an upstream_proxy.
+func (o *Operator) UpstreamDialer() (*egresspolicy.Upstream, error) {
+	up := o.Upstream()
+	if up == nil {
+		return nil, nil
+	}
+	auth := ""
+	if up.AuthFile != "" {
+		st, err := os.Stat(up.AuthFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream proxy auth_file: %w", err)
+		}
+		if st.Mode().Perm()&0o077 != 0 {
+			return nil, fmt.Errorf("upstream proxy auth_file %s: mode %v, want 0600", up.AuthFile, st.Mode().Perm())
+		}
+		raw, err := os.ReadFile(up.AuthFile)
+		if err != nil {
+			return nil, fmt.Errorf("upstream proxy auth_file: %w", err)
+		}
+		auth = strings.TrimSpace(string(raw))
+	}
+	return egresspolicy.NewUpstream(up.URL.String(), auth, up.NoProxy, o.zone, up.Synthetic)
 }
 
 // Hash identifies the file's content (aerolvm_egress_operator_config_info).

@@ -201,3 +201,47 @@ func TestWatcherLastGoodAndBootError(t *testing.T) {
 	}
 	nilW.Run(ctx, time.Millisecond)
 }
+
+// TestUpstreamDialer (§5.10 PC-4): credentials come from a 0600 auth_file;
+// a looser mode or a missing file is refused; ProxiesName answers without
+// reading them.
+func TestUpstreamDialer(t *testing.T) {
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "proxy-auth")
+	if err := os.WriteFile(auth, []byte("aerol:s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc := "version: 1\ninternal_zone: {suffixes: [corp.bank.internal], cidrs: [10.0.0.0/8]}\nupstream_proxy: {url: \"http://10.1.1.1:3128\", auth_file: \"" + auth + "\", no_proxy: [mirror.example]}\n"
+	op, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	up, err := op.UpstreamDialer()
+	if err != nil || up.ProxyHeader().Get("Proxy-Authorization") == "" {
+		t.Fatalf("dialer: %v", err)
+	}
+	if !op.ProxiesName("pypi.org") || op.ProxiesName("git.corp.bank.internal") || op.ProxiesName("mirror.example") {
+		t.Fatal("ProxiesName must honor the zone and no_proxy")
+	}
+	if err := os.Chmod(auth, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.UpstreamDialer(); err == nil || !strings.Contains(err.Error(), "0600") {
+		t.Fatalf("a world-readable auth_file must be refused: %v", err)
+	}
+	_ = os.Remove(auth)
+	if _, err := op.UpstreamDialer(); err == nil {
+		t.Fatal("a missing auth_file must be refused")
+	}
+	if _, err := Parse([]byte("version: 1\nupstream_proxy: {url: \"http://p:3128\", no_proxy: [\"bad host!\"]}\n")); err == nil {
+		t.Fatal("a bad no_proxy entry must fail the load")
+	}
+	none, _ := Parse([]byte("version: 1\n"))
+	if up, err := none.UpstreamDialer(); up != nil || err != nil || none.ProxiesName("pypi.org") {
+		t.Fatal("no upstream configured")
+	}
+	noAuth, _ := Parse([]byte("version: 1\nupstream_proxy: {url: \"http://p:3128\"}\n"))
+	if up, err := noAuth.UpstreamDialer(); err != nil || up.ProxyHeader() != nil {
+		t.Fatalf("no auth_file: %v", err)
+	}
+}

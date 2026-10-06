@@ -92,6 +92,11 @@ func installOperatorGuard(m *NetMediator) {
 		return
 	}
 	m.SetDialGuard(op.Guard())
+	if up, err := op.UpstreamDialer(); err == nil {
+		m.mu.Lock()
+		m.upstream = up
+		m.mu.Unlock()
+	}
 }
 
 func (m *NetMediator) dialGuard() egresspolicy.DialGuard {
@@ -136,8 +141,18 @@ func (m *NetMediator) policyDial(ctx context.Context, sandboxID string, p *egres
 	if isIP == nil {
 		name = ""
 	}
-	d := net.Dialer{Timeout: 30 * time.Second, Control: m.dialGuard().Control(p, name, allowed && rule != "")}
-	conn, err := d.DialContext(ctx, network, address)
+	m.mu.RLock()
+	up := m.upstream
+	m.mu.RUnlock()
+	var conn net.Conn
+	if name != "" && !up.Bypass(name) {
+		// An allowed name the operator proxies: tunnel to it by name, so
+		// the proxy (not this host's resolver) decides where it lands.
+		conn, err = up.DialConnect(ctx, address)
+	} else {
+		d := net.Dialer{Timeout: 30 * time.Second, Control: m.dialGuard().Control(p, name, allowed && rule != "")}
+		conn, err = d.DialContext(ctx, network, address)
+	}
 	if err != nil {
 		if errors.Is(err, egresspolicy.ErrDialRefused) {
 			return nil, &wasmengine.EgressDeniedError{Host: host, Port: port, Reason: reasonBlockedIP}

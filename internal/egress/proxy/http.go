@@ -3,11 +3,13 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strings"
 	"time"
 
@@ -33,11 +35,30 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	// Requests on one connection are sequential, so the transport's dial
 	// hook reads the current request's name and match result.
 	var curName string
-	var curAllowed bool
+	var curAllowed, curProxied bool
+	up := p.cfg.Upstream
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if curProxied && addr == up.Addr() {
+				// The operator's own proxy: not a sandbox destination, so
+				// the sandbox dial guard (which would refuse its private
+				// address) does not apply.
+				d := net.Dialer{Timeout: p.cfg.DialTimeout}
+				c, err := d.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %v", egresspolicy.ErrUpstreamProxy, err)
+				}
+				return c, nil
+			}
 			return p.cfg.Dialer.DialContext(ctx, p.dialer(pol, curName, curAllowed), network, addr)
 		},
+		Proxy: func(*http.Request) (*url.URL, error) {
+			if !curProxied {
+				return nil, nil
+			}
+			return &url.URL{Scheme: "http", Host: up.Addr()}, nil
+		},
+		ProxyConnectHeader:    up.ProxyHeader(),
 		MaxIdleConnsPerHost:   1,
 		ResponseHeaderTimeout: 5 * time.Minute,
 		DisableCompression:    true,
@@ -76,6 +97,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		// Only an explicit allow rule skips the policy at dial time (allow
 		// wins, D4); a default-accept verdict leaves deny CIDRs in force.
 		curName, curAllowed = host, allowed && rule != ""
+		curProxied = up != nil && !up.Bypass(host)
 		if tracked == nil {
 			tracked = p.src.Track(id, host, c)
 		}
@@ -86,18 +108,28 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			// After a validated Upgrade (websocket) the exchange is no longer
 			// HTTP request/response: dial once, forward the request, then
 			// splice raw bytes both ways.
-			p.upgrade(c, br, req, id, host, target, pol, curAllowed)
+			p.upgrade(c, br, req, id, host, target, pol, curAllowed, curProxied)
 			return
 		}
 		req.URL.Scheme = "http"
 		req.URL.Host = target
 		req.RequestURI = ""
+		if curProxied {
+			// Absolute form through the upstream carries its credentials
+			// per request.
+			for k, v := range up.ProxyHeader() {
+				req.Header[k] = v
+			}
+		}
 		resp, err := tr.RoundTrip(req)
 		if err != nil {
 			reason := ReasonDialFailed
 			status := http.StatusBadGateway
-			if egresspolicyRefused(err) {
+			switch {
+			case egresspolicyRefused(err):
 				reason, status = ReasonBlockedIP, http.StatusForbidden
+			case errors.Is(err, egresspolicy.ErrUpstreamProxy):
+				reason = ReasonUpstreamProxy
 			}
 			p.observe(Decision{SandboxID: id, Host: host, Port: 80, Reason: reason, Mode: src.Mode})
 			writeHTTPError(c, status, fmt.Sprintf("aerolvm egress policy: %s: %s", host, reason))
@@ -111,9 +143,15 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	}
 }
 
-func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, host, target string, pol *egresspolicy.Policy, allowed bool) {
+func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, host, target string, pol *egresspolicy.Policy, allowed, proxied bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
-	up, err := p.cfg.Dialer.DialContext(ctx, p.dialer(pol, host, allowed), "tcp", target)
+	var up net.Conn
+	var err error
+	if proxied {
+		up, err = p.cfg.Upstream.DialConnect(ctx, target)
+	} else {
+		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, host, allowed), "tcp", target)
+	}
 	cancel()
 	if err != nil {
 		writeHTTPError(c, http.StatusBadGateway, fmt.Sprintf("aerolvm egress policy: %s: %s", host, ReasonDialFailed))

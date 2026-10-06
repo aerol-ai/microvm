@@ -41,6 +41,7 @@ const (
 	ReasonBlockedIP      = "blocked_ip"
 	ReasonBlocked        = "blocked"
 	ReasonConnCap        = "conn_cap"
+	ReasonUpstreamProxy  = "upstream_proxy_unavailable"
 	ReasonUnknownSource  = "unknown_source"
 	ReasonDialFailed     = "dial_failed"
 	ReasonBadRequest     = "bad_request"
@@ -92,6 +93,9 @@ type Config struct {
 	OriginalDst func(net.Conn) (netip.AddrPort, error)
 	Dialer      Dialer
 	Logger      *slog.Logger
+	// Upstream chains allowed names through the operator's proxy
+	// (§5.10 PC-4); nil dials direct.
+	Upstream *egresspolicy.Upstream
 }
 
 // Proxy serves redirected connections.

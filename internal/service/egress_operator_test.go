@@ -119,3 +119,28 @@ func containsAll(s string, subs ...string) bool {
 	}
 	return true
 }
+
+// TestUpstreamPortRule (§5.10 PC-4): host:port rules for proxied names must
+// be 80 or 443; zone and no_proxy names may use any port.
+func TestUpstreamPortRule(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ninternal_zone: {suffixes: [corp.bank.internal], cidrs: [10.0.0.0/8]}\nupstream_proxy: {url: \"http://10.1.1.1:3128\", no_proxy: [mirror.example]}\n"))
+	for _, tc := range []struct {
+		allow string
+		ok    bool
+	}{
+		{"github.com:22", false},
+		{"*.github.com:2222", false},
+		{"github.com", true},
+		{"github.com:8443", false},
+		{"git.corp.bank.internal:22", true},
+		{"mirror.example:8081", true},
+		{"10.0.0.0/8", true},
+	} {
+		req := models.CreateSandboxRequest{NetworkAllowOut: []string{tc.allow}}
+		err := svc.applyEgressOperatorPolicy(&req, false)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v, want ok=%v", tc.allow, err, tc.ok)
+		}
+	}
+}

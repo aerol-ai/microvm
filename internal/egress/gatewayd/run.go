@@ -28,7 +28,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if len(cfg.DNSUpstreams) == 0 {
 		cfg.DNSUpstreams = dnsfilter.DefaultUpstreams("/etc/resolv.conf")
 	}
-	guard, err := guardFromOperatorFile(cfg.OperatorFile)
+	guard, upstream, err := fromOperatorFile(cfg.OperatorFile)
 	if err != nil {
 		return err
 	}
@@ -46,6 +46,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		OriginalDst: proxy.OriginalDst,
 		Peer:        egress.UnixPeerCheck(cfg.PeerUIDs, cfg.PeerCgroup),
 		Guard:       guard,
+		Upstream:    upstream,
 	}, log)
 	if err != nil {
 		return fmt.Errorf("egress gateway: %w", err)

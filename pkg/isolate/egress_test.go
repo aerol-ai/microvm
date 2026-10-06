@@ -307,3 +307,43 @@ func TestSetEgressDialGuard(t *testing.T) {
 		t.Fatalf("loopback dial = %v", err)
 	}
 }
+
+// TestIsolateUpstream (§5.10 PC-4): the shared transport proxies names the
+// operator chains, and the proxy's own address skips the guard (it usually
+// sits in private space the guard refuses).
+func TestIsolateUpstream(t *testing.T) {
+	t.Cleanup(func() { SetEgressUpstream(nil) })
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			_ = c.Close()
+		}
+	}()
+	up, err := egresspolicy.NewUpstream("http://"+ln.Addr().String(), "a:b", []string{"mirror.example"}, nil, netip.MustParsePrefix("198.18.0.0/15"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := egressTransport.(*http.Transport)
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://pypi.org/", nil)); u != nil {
+		t.Fatal("no upstream: direct")
+	}
+	SetEgressUpstream(up)
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://pypi.org/", nil)); u == nil || u.Host != ln.Addr().String() {
+		t.Fatalf("proxied name: %v", u)
+	}
+	if u, _ := tr.Proxy(httptest.NewRequest(http.MethodGet, "https://mirror.example/", nil)); u != nil {
+		t.Fatal("no_proxy name goes direct")
+	}
+	if h, _ := tr.GetProxyConnectHeader(context.Background(), nil, "pypi.org:443"); h.Get("Proxy-Authorization") == "" {
+		t.Fatal("CONNECT carries the credentials")
+	}
+	c, err := guardedDial(context.Background(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("the proxy address must skip the guard: %v", err)
+	}
+	_ = c.Close()
+	if _, err := guardedDial(context.Background(), "tcp", "127.0.0.1:1"); !errors.Is(err, egresspolicy.ErrDialRefused) {
+		t.Fatal("every other loopback dial is still refused")
+	}
+}

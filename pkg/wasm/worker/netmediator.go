@@ -38,6 +38,9 @@ type NetMediator struct {
 	// operator dial guard. No policy keeps the open default.
 	policies map[string]*egresspolicy.Policy
 	guard    egresspolicy.DialGuard
+	// upstream chains allowed names through the operator's proxy
+	// (§5.10 PC-4); nil dials direct.
+	upstream *egresspolicy.Upstream
 }
 
 func newNetMediator() *NetMediator {

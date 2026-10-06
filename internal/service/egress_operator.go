@@ -137,6 +137,17 @@ func (s *Service) applyEgressOperatorPolicy(req *models.CreateSandboxRequest, re
 			req.NetworkAllowOut = allow
 		}
 	}
+	// A transparent CONNECT on arbitrary ports is out of scope (§5.10 PC-4):
+	// host:port rules for names the upstream proxies must be 80 or 443.
+	for _, raw := range req.NetworkAllowOut {
+		e, err := egresspolicy.ParseEntry(raw)
+		if err != nil || e.Port == 0 || e.Port == 80 || e.Port == 443 {
+			continue
+		}
+		if (e.Kind == egresspolicy.KindHost || e.Kind == egresspolicy.KindWildcard) && op.ProxiesName(e.Host) {
+			return fmt.Errorf("%w: network_allow_out entry %q: %s is reached through the upstream proxy, which only carries ports 80 and 443", egresspolicy.ErrInvalid, raw, e.Host)
+		}
+	}
 	if c := op.Ceiling(); c != nil {
 		pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: req.NetworkAllowOut, DenyOut: req.NetworkDenyOut, BlockAll: req.NetworkBlockAll})
 		if err != nil {
