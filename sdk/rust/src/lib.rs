@@ -26,7 +26,7 @@ pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
-    NetworkPolicyCheckOptions, NetworkPolicyCheckResult,
+    NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
     CreateWasmModuleOptions,
@@ -483,6 +483,15 @@ impl Sandbox {
 
     pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
         self.client.set_network_limits(&self.data.id, opts)
+    }
+
+    /// Replaces this sandbox's egress policy while it runs (see
+    /// [`Client::set_network_policy`]) and updates its policy fields.
+    pub fn set_network_policy(&mut self, opts: NetworkPolicyOptions) -> Result<NetworkPolicy, Error> {
+        let policy = self.client.set_network_policy(&self.data.id, opts)?;
+        self.data.network_block_all = policy.network_block_all;
+        self.data.egress_status = policy.egress_status.clone();
+        Ok(policy)
     }
 
     /// Reads one page of this sandbox's audit log: outbound connections and
@@ -1181,6 +1190,21 @@ impl Client {
         self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(
             Method::PATCH,
             &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id),
+            Some(&opts),
+        )
+    }
+
+    /// Replaces a sandbox's egress policy while it runs and returns once the
+    /// new policy is enforced. Sending the same policy again is a no-op, so
+    /// it is safe to retry.
+    pub fn set_network_policy(
+        &self,
+        id: &str,
+        opts: NetworkPolicyOptions,
+    ) -> Result<NetworkPolicy, Error> {
+        self.do_json::<NetworkPolicyOptions, NetworkPolicy>(
+            Method::PUT,
+            &format!("{}/sandboxes/{}/network/policy", self.version_prefix(), id),
             Some(&opts),
         )
     }
@@ -3119,6 +3143,46 @@ mod tests {
             .get_network_usage("sb-fresh")
             .expect("get_network_usage should succeed");
         assert_eq!(usage.last_sampled_at, None);
+    }
+
+    #[test]
+    fn set_network_policy_puts_whole_policy() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["pypi.org"],
+            "network_deny_out": [],
+            "egress_status": "active"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": true,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let mut sandbox = Sandbox::new(client, data);
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/sandboxes/sb-1/network/policy HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": []})
+        );
+        assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
+        assert!(!sandbox.data.network_block_all);
+        assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
     }
 
     #[test]

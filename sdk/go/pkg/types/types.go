@@ -139,6 +139,16 @@ type NetworkPolicyCheckOptions = models.NetworkPolicyCheckRequest
 type NetworkPolicyCheckResult = models.NetworkPolicyCheckResponse
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
 
+// NetworkPolicyOptions is a sandbox's whole egress policy for
+// SetNetworkPolicy. It replaces the current policy: a field left empty is
+// cleared, so the zero value means open egress.
+type NetworkPolicyOptions = models.NetworkPolicyRequest
+
+// NetworkPolicy is the policy a sandbox enforces after SetNetworkPolicy, with
+// EgressStatus ("active", "held", "unavailable") for hostname rules on a
+// container.
+type NetworkPolicy = models.NetworkPolicy
+
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
 // "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).

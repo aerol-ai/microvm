@@ -1470,3 +1470,40 @@ test("checkNetworkPolicy posts the policy and maps the answer", async () => {
   assert.equal(body.destination, "api.github.com");
   assert.deepEqual(res, { allowed: true, matchedRule: "*.github.com", defaultVerdict: "deny", outsideCeiling: "x.example" });
 });
+
+test("setNetworkPolicy PUTs the whole policy and maps the effective one", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_status: "active" });
+    },
+  });
+  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"] });
+  assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
+  assert.equal(seen?.method, "PUT");
+  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [] });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressStatus: "active" });
+});
+
+test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      assert.ok(req.url.endsWith("/v1/sandboxes/sb-own/network/policy"));
+      return jsonResponse({ network_block_all: true, network_allow_out: [], network_deny_out: [] });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  const res = await sandbox.setNetworkPolicy({ networkBlockAll: true });
+  assert.equal(res.networkBlockAll, true);
+  assert.equal(sandbox.networkBlockAll, true);
+  assert.equal(sandbox.egressStatus, undefined);
+});

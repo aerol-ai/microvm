@@ -534,6 +534,28 @@ class NetworkPolicyCheckResult(TypedDict, total=False):
     outsideCeiling: str
 
 
+class NetworkPolicyOptions(TypedDict, total=False):
+    """A sandbox's whole egress policy, for ``set_network_policy``.
+
+    It replaces the current policy: a key left out is cleared, so ``{}``
+    means open egress. The grammar is the create one (hostnames, ``*.``
+    wildcards, ``host:port`` and CIDRs in the allow list; CIDRs only in the
+    deny list).
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+
+
+class NetworkPolicy(TypedDict, total=False):
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    # "active", "held" or "unavailable" for hostname rules on a container.
+    egressStatus: str
+
+
 class SetNetworkLimitsOptions(TypedDict, total=False):
     # Omit a key to leave that direction unchanged. 0 means unlimited.
     networkBytesInLimit: int

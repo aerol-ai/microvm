@@ -28,8 +28,10 @@ import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
 import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
 import ai.aerol.microvm.model.NetworkPolicyCheckResult;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.AuditOptions;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.BuildImageOptions;
@@ -599,6 +601,16 @@ public class MicroVMClient {
 
     public NetworkUsage setNetworkLimits(String sandboxId, SetNetworkLimitsOptions options) {
         return doJson("PATCH", sandboxPath(sandboxId) + "/network/limits", options, NetworkUsage.class);
+    }
+
+    /**
+     * Replaces a sandbox's egress policy while it runs and returns once the new
+     * policy is enforced. Sending the same policy again is a no-op, so it is
+     * safe to retry.
+     */
+    public NetworkPolicy setNetworkPolicy(String sandboxId, NetworkPolicyOptions options) {
+        NetworkPolicyOptions body = options == null ? new NetworkPolicyOptions() : options;
+        return doJson("PUT", sandboxPath(sandboxId) + "/network/policy", body, NetworkPolicy.class);
     }
 
     public ExecResult exec(String sandboxId, ExecRequest request) {

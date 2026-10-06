@@ -44,8 +44,10 @@ import type {
   AuditEvent,
   AuditOptions,
   AuditPage,
+  NetworkPolicy,
   NetworkPolicyCheckOptions,
   NetworkPolicyCheckResult,
+  NetworkPolicyOptions,
   PlatformVolumeMount,
   RegisterSnapshotOptions,
   SetNetworkLimitsOptions,
@@ -880,6 +882,26 @@ export class APIClient {
     return fromApiNetworkUsage(response);
   }
 
+  async setNetworkPolicy(id: string, options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const response = await this.doJSON<{
+      network_block_all: boolean;
+      network_allow_out: string[] | null;
+      network_deny_out: string[] | null;
+      egress_status?: string;
+    }>("PUT", `${this.versionPrefix}/sandboxes/${id}/network/policy`, {
+      network_block_all: options.networkBlockAll ?? false,
+      network_allow_out: options.networkAllowOut ?? [],
+      network_deny_out: options.networkDenyOut ?? [],
+    });
+    const policy: NetworkPolicy = {
+      networkBlockAll: response.network_block_all,
+      networkAllowOut: response.network_allow_out ?? [],
+      networkDenyOut: response.network_deny_out ?? [],
+    };
+    if (response.egress_status) policy.egressStatus = response.egress_status;
+    return policy;
+  }
+
   async createTemplate(options: CreateTemplateOptions): Promise<Template> {
     const response = await this.doJSON<ApiTemplate>("POST", this.versioned("/templates"), {
       id: options.id,
@@ -1215,6 +1237,18 @@ export class SandboxResource implements Sandbox {
 
   async setNetworkLimits(options: SetNetworkLimitsOptions): Promise<NetworkUsage> {
     return this.client.setNetworkLimits(this.id, options);
+  }
+
+  /**
+   * Replaces this sandbox's egress policy while it runs. The call returns
+   * once the new policy is enforced; sending the same policy again is a
+   * no-op, so it is safe to retry.
+   */
+  async setNetworkPolicy(options: NetworkPolicyOptions): Promise<NetworkPolicy> {
+    const policy = await this.client.setNetworkPolicy(this.id, options);
+    this.networkBlockAll = policy.networkBlockAll;
+    this.egressStatus = policy.egressStatus;
+    return policy;
   }
 
   /**

@@ -344,6 +344,13 @@ func (c *Client) SetNetworkLimits(ctx context.Context, id string, opts sdktypes.
 	return c.inner.SetNetworkLimits(ctx, id, opts)
 }
 
+// SetNetworkPolicy replaces a sandbox's egress policy while it runs and
+// returns once the new policy is enforced. Sending the same policy again is
+// a no-op, so it is safe to retry.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	return c.inner.SetNetworkPolicy(ctx, id, opts)
+}
+
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
 	item, err := c.inner.Start(ctx, id)
 	if err != nil {
@@ -716,6 +723,18 @@ func (s *Sandbox) Audit(ctx context.Context, opts sdktypes.AuditOptions) (sdktyp
 
 func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
 	return s.client.SetNetworkLimits(ctx, s.ID, opts)
+}
+
+// SetNetworkPolicy replaces this sandbox's egress policy (see
+// Client.SetNetworkPolicy) and updates its policy fields.
+func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	policy, err := s.client.SetNetworkPolicy(ctx, s.ID, opts)
+	if err != nil {
+		return policy, err
+	}
+	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
+	s.EgressStatus = policy.EgressStatus
+	return policy, nil
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

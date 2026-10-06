@@ -37,6 +37,10 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 			_, _ = w.Write([]byte(`{"events":[{"time":"2026-10-06T10:00:00Z","kind":"egress","result":"failure","reason":"host_not_allowed","destination":"evil.example:443","event_id":"ae-1"}],"coverage":{"answered":["n1"],"missing":[],"partial":false},"next_cursor":"c2"}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/sandboxes/sb1/network/usage":
 			_ = json.NewEncoder(w).Encode(models.NetworkUsage{SandboxID: "sb1", BytesIn: 10, BytesOut: 20})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/sandboxes/sb1/network/policy":
+			var req models.NetworkPolicyRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			_ = json.NewEncoder(w).Encode(models.NetworkPolicy{NetworkBlockAll: req.NetworkBlockAll, NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, EgressStatus: "active"})
 		case r.Method == http.MethodPatch && r.URL.Path == "/v1/sandboxes/sb1/network/limits":
 			_ = json.NewEncoder(w).Encode(models.NetworkUsage{SandboxID: "sb1", BytesInLimit: 100})
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes/sb1/start":
@@ -194,6 +198,16 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 	}
 	if _, err := sb.SetNetworkLimits(ctx, sdktypes.SetNetworkLimitsOptions{NetworkBytesInLimit: &limit}); err != nil {
 		t.Fatalf("Sandbox.SetNetworkLimits() error = %v", err)
+	}
+	policy, err := client.SetNetworkPolicy(ctx, "sb1", sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"pypi.org"}})
+	if err != nil || len(policy.NetworkAllowOut) != 1 || policy.EgressStatus != "active" {
+		t.Fatalf("SetNetworkPolicy() = %+v, %v", policy, err)
+	}
+	if _, err := sb.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{NetworkAllowOut: []string{"pypi.org"}, NetworkDenyOut: []string{"10.0.0.0/8"}}); err != nil {
+		t.Fatalf("Sandbox.SetNetworkPolicy() error = %v", err)
+	}
+	if sb.EgressStatus != "active" || len(sb.NetworkDenyOut) != 1 || sb.NetworkAllowOut[0] != "pypi.org" {
+		t.Fatalf("Sandbox fields after SetNetworkPolicy = %+v", sb.Sandbox)
 	}
 	if err := sb.UpdateLifecycle(ctx, sdktypes.Lifecycle{StopIfIdleFor: time.Minute}); err != nil {
 		t.Fatalf("Sandbox.UpdateLifecycle() error = %v", err)

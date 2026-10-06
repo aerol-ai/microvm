@@ -608,6 +608,27 @@ export interface NetworkPolicyCheckResult {
   outsideCeiling?: string;
 }
 
+/**
+ * A sandbox's whole egress policy, for `setNetworkPolicy`. It replaces the
+ * current policy: a field left out is cleared, so `{}` means open egress.
+ * The grammar is the create one (hostnames, `*.` wildcards, `host:port` and
+ * CIDRs in the allow list; CIDRs only in the deny list).
+ */
+export interface NetworkPolicyOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+}
+
+/** The policy a sandbox enforces after `setNetworkPolicy`. */
+export interface NetworkPolicy {
+  networkBlockAll: boolean;
+  networkAllowOut: string[];
+  networkDenyOut: string[];
+  /** "active", "held" or "unavailable" for hostname rules on a container. */
+  egressStatus?: string;
+}
+
 export interface SetNetworkLimitsOptions {
   /** Omit (undefined) to leave unchanged. `0` means unlimited. */
   networkBytesInLimit?: number;

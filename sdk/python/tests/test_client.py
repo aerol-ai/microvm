@@ -79,6 +79,15 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if method == "PUT" and path == "/v1/sandboxes/sb-1/network/policy":
+            out = {
+                "network_block_all": payload.get("network_block_all", False),
+                "network_allow_out": payload.get("network_allow_out") or None,
+                "network_deny_out": payload.get("network_deny_out") or None,
+            }
+            if payload.get("network_allow_out"):
+                out["egress_status"] = "active"
+            return out
         if method == "POST" and path == "/v1/network/policy/check":
             return {"allowed": True, "matched_rule": "*.github.com", "default_verdict": "deny", "outside_ceiling": "x.example"}
         if method == "GET" and path.startswith("/v1/sandboxes/sb-1/audit"):
@@ -787,6 +796,32 @@ class ClientTests(unittest.TestCase):
         sandbox.audit()
 
         self.assertEqual(client.calls[-1], ("GET", "/v1/sandboxes/sb-1/audit", None))
+
+    def test_set_network_policy_replaces_whole_policy(self):
+        client = RecordingMicroVM()
+
+        policy = client.set_network_policy("sb-1", {"networkAllowOut": ["pypi.org"]})
+
+        self.assertEqual(
+            client.calls[0],
+            ("PUT", "/v1/sandboxes/sb-1/network/policy", {"network_block_all": False, "network_allow_out": ["pypi.org"], "network_deny_out": []}),
+        )
+        self.assertEqual(
+            policy,
+            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressStatus": "active"},
+        )
+
+    def test_sandbox_set_network_policy_updates_fields(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.set_network_policy({"networkAllowOut": ["pypi.org"]})
+        self.assertEqual(sandbox.egressStatus, "active")
+        policy = sandbox.set_network_policy({"networkBlockAll": True})
+
+        self.assertTrue(policy["networkBlockAll"])
+        self.assertTrue(sandbox.networkBlockAll)
+        self.assertNotIn("egressStatus", sandbox.to_dict())
 
     def test_get_network_usage_maps_response_shape(self):
         client = RecordingMicroVM()

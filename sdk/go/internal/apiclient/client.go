@@ -668,6 +668,14 @@ func (c *Client) CheckNetworkPolicy(ctx context.Context, request models.NetworkP
 	return response, err
 }
 
+// SetNetworkPolicy replaces a sandbox's egress policy and returns the
+// effective one.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, request models.NetworkPolicyRequest) (models.NetworkPolicy, error) {
+	var response models.NetworkPolicy
+	err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+id+"/network/policy", request, &response)
+	return response, err
+}
+
 // GetAudit reads one page of a sandbox's audit log.
 func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
 	values := make(url.Values)

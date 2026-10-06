@@ -29,7 +29,9 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.NetworkPolicyCheckResult;
 import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
@@ -875,6 +877,44 @@ class MicroVMClientTest {
             assertEquals(List.of("*.github.com"), body.get().get("network_allow_out"));
             assertEquals("api.github.com", body.get().get("destination"));
             assertTrue(!body.get().containsKey("network_block_all"), "unset fields are not sent");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void setNetworkPolicyPutsWholePolicyAndUpdatesSandbox() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_block_all", true));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("pypi.org"),
+                    "network_deny_out", List.of(),
+                    "egress_status", "active"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            Sandbox sandbox = clientFor(server).get("sb-1");
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions().setNetworkAllowOut(List.of("pypi.org")));
+            assertEquals(false, body.get().get("network_block_all"));
+            assertEquals(List.of("pypi.org"), body.get().get("network_allow_out"));
+            assertEquals(List.of(), body.get().get("network_deny_out"));
+            assertEquals(List.of("pypi.org"), policy.networkAllowOut);
+            assertEquals("active", policy.egressStatus);
+            assertTrue(!sandbox.networkBlockAll);
+            assertEquals("active", sandbox.egressStatus);
+
+            clientFor(server).setNetworkPolicy("sb-1", null);
+            assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
         } finally {
             server.stop(0);
         }

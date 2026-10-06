@@ -12,6 +12,8 @@ import ai.aerol.microvm.model.ExecRequest;
 import ai.aerol.microvm.model.ExecResult;
 import ai.aerol.microvm.model.ExecStreamOptions;
 import ai.aerol.microvm.model.ExposeOptions;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
 import ai.aerol.microvm.model.ExposeResult;
 import ai.aerol.microvm.model.Lifecycle;
 import ai.aerol.microvm.model.NetworkUsage;
@@ -176,6 +178,17 @@ public class Sandbox extends SandboxData {
 
     public NetworkUsage setNetworkLimits(SetNetworkLimitsOptions options) {
         return client.setNetworkLimits(id, options);
+    }
+
+    /**
+     * Replaces this sandbox's egress policy while it runs (see
+     * {@link MicroVMClient#setNetworkPolicy}) and updates its policy fields.
+     */
+    public NetworkPolicy setNetworkPolicy(NetworkPolicyOptions options) {
+        NetworkPolicy policy = client.setNetworkPolicy(id, options);
+        networkBlockAll = policy.networkBlockAll;
+        egressStatus = policy.egressStatus;
+        return policy;
     }
 
     /**

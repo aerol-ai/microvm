@@ -768,6 +768,30 @@ pub struct AuditPage {
     pub next_cursor: Option<String>,
 }
 
+/// A sandbox's whole egress policy, for `set_network_policy`. It replaces the
+/// current policy: an empty field is cleared, so the default means open
+/// egress. The grammar is the create one (hostnames, `*.` wildcards,
+/// `host:port` and CIDRs in the allow list; CIDRs only in the deny list).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicyOptions {
+    pub network_block_all: bool,
+    pub network_allow_out: Vec<String>,
+    pub network_deny_out: Vec<String>,
+}
+
+/// The policy a sandbox enforces after `set_network_policy`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkPolicy {
+    pub network_block_all: bool,
+    #[serde(default)]
+    pub network_allow_out: Vec<String>,
+    #[serde(default)]
+    pub network_deny_out: Vec<String>,
+    /// "active", "held" or "unavailable" for hostname rules on a container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_status: Option<String>,
+}
+
 /// Asks whether a sandbox created with these egress fields would reach
 /// `destination` ("host", "host:port", "IP" or "IP:port").
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]

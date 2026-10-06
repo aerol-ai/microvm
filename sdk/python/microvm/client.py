@@ -44,8 +44,10 @@ from .types import (
     AuditEvent,
     AuditOptions,
     AuditPage,
+    NetworkPolicy,
     NetworkPolicyCheckOptions,
     NetworkPolicyCheckResult,
+    NetworkPolicyOptions,
     PlatformVolumeMount,
     RegisterSnapshotOptions,
     ResizeOptions,
@@ -408,6 +410,18 @@ class Sandbox:
 
     def set_network_limits(self, options: SetNetworkLimitsOptions) -> NetworkUsage:
         return self._client.set_network_limits(self.id, options)
+
+    def set_network_policy(self, options: NetworkPolicyOptions) -> NetworkPolicy:
+        """Replace this sandbox's egress policy while it runs. Returns once
+        the new policy is enforced; the same policy again is a no-op, so it
+        is safe to retry."""
+        policy = self._client.set_network_policy(self.id, options)
+        self._data["networkBlockAll"] = policy["networkBlockAll"]
+        if "egressStatus" in policy:
+            self._data["egressStatus"] = policy["egressStatus"]
+        else:
+            self._data.pop("egressStatus", None)
+        return policy
 
     def audit(self, options: Optional[AuditOptions] = None) -> AuditPage:
         """Read this sandbox's audit log: outbound connections and egress
@@ -841,6 +855,22 @@ class MicroVM:
         body = _to_api_set_network_limits_options(options)
         payload = self._do_json("PATCH", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/limits", body)
         return _from_api_network_usage(payload)
+
+    def set_network_policy(self, sandbox_id: str, options: NetworkPolicyOptions) -> NetworkPolicy:
+        body = {
+            "network_block_all": bool(_first_of(options, "networkBlockAll", "network_block_all") or False),
+            "network_allow_out": list(_first_of(options, "networkAllowOut", "network_allow_out") or []),
+            "network_deny_out": list(_first_of(options, "networkDenyOut", "network_deny_out") or []),
+        }
+        payload = self._do_json("PUT", f"{self._version_prefix}/sandboxes/{sandbox_id}/network/policy", body) or {}
+        policy: NetworkPolicy = {
+            "networkBlockAll": bool(payload.get("network_block_all", False)),
+            "networkAllowOut": list(payload.get("network_allow_out") or []),
+            "networkDenyOut": list(payload.get("network_deny_out") or []),
+        }
+        if payload.get("egress_status"):
+            policy["egressStatus"] = str(payload["egress_status"])
+        return policy
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
