@@ -244,6 +244,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
+			s.mediator().ApplyCapsPolicy(env.SandboxID, p.Caps)
 			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.Instantiate(ctx, p.Caps)
 			if err == nil {
@@ -281,6 +282,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
+			s.mediator().ApplyCapsPolicy(env.SandboxID, p.Caps)
 			s.bindNetworkHook(env.SandboxID)
 			caps := p.Caps
 			eng := s.eng
@@ -427,6 +429,7 @@ func (s *Server) Serve(conn net.Conn) error {
 				continue
 			}
 			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
+			s.mediator().ApplyCapsPolicy(env.SandboxID, p.Caps)
 			s.bindNetworkHook(env.SandboxID)
 			err = s.eng.RestoreSnapshot(ctx, snap, p.Caps)
 			if err == nil {
@@ -480,6 +483,18 @@ func (s *Server) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgSetEgressPolicy:
+			var p setEgressPolicyPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mediator().SetPolicy(env.SandboxID, compileLists(p.AllowOut, p.DenyOut))
 			if err := replyOK(env.SandboxID); err != nil {
 				return err
 			}

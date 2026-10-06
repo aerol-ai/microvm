@@ -306,6 +306,20 @@ func (c *Client) NetstatsTick(sandboxID string) (bytesIn, bytesOut int64, err er
 	return p.BytesIn, p.BytesOut, nil
 }
 
+// SetEgressPolicy replaces the sandbox's egress policy at the worker-side
+// mediator (live update). Empty lists remove the policy.
+func (c *Client) SetEgressPolicy(sandboxID string, allowOut, denyOut []string) error {
+	body, err := encodePayload(setEgressPolicyPayload{AllowOut: allowOut, DenyOut: denyOut})
+	if err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgSetEgressPolicy, SandboxID: sandboxID, Payload: body})
+	if err != nil {
+		return err
+	}
+	return c.expectOK(reply)
+}
+
 // SetNetworkBlocks applies quota blocks at the worker-side socket mediator (UC-43).
 func (c *Client) SetNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) error {
 	body, err := encodePayload(setNetworkBlocksPayload{

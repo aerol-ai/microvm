@@ -93,6 +93,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 
 	blockIn, blockOut := sandboxNetworkBlocks(sandbox)
 	d.seedNetworkBlocks(sandbox.ID, blockIn, blockOut)
+	d.seedNetworkPolicy(sandbox.ID, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            sandbox.Env,
 		Args:           wasmArgsFromSandbox(sandbox),

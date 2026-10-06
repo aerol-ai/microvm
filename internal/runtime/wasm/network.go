@@ -52,11 +52,17 @@ type networkGateway struct {
 	// sandboxID -> guestPort -> listener
 	listeners map[string]map[int]*httpListener
 	// sandboxID -> allowed guest ports (from expose_port / syncAllowedPorts)
-	allowed   map[string]map[int]struct{}
-	usage     map[string]*sandboxNetUsage
-	blocked   map[string]struct{ ingress, egress bool }
+	allowed map[string]map[int]struct{}
+	usage   map[string]*sandboxNetUsage
+	blocked map[string]struct{ ingress, egress bool }
+	// policies are the per-sandbox egress lists, carried into every
+	// instantiation's caps so the worker's mediator enforces them from the
+	// first dial (plans/egress-domain-filtering.md P1-6).
+	policies  map[string]egressLists
 	httpProxy func(sandboxID string, guestPort int, w http.ResponseWriter, r *http.Request) error
 }
+
+type egressLists struct{ allow, deny []string }
 
 func newNetworkGateway() *networkGateway {
 	return &networkGateway{
@@ -64,7 +70,22 @@ func newNetworkGateway() *networkGateway {
 		allowed:   make(map[string]map[int]struct{}),
 		usage:     make(map[string]*sandboxNetUsage),
 		blocked:   make(map[string]struct{ ingress, egress bool }),
+		policies:  make(map[string]egressLists),
 	}
+}
+
+// setPolicy records a sandbox's egress lists.
+func (g *networkGateway) setPolicy(sandboxID string, allow, deny []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.policies[sandboxID] = egressLists{allow: append([]string(nil), allow...), deny: append([]string(nil), deny...)}
+}
+
+// policyFor returns a sandbox's egress lists.
+func (g *networkGateway) policyFor(sandboxID string) egressLists {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.policies[sandboxID]
 }
 
 // SetHTTPProxy registers the driver/worker bridge used for UC-31 guest HTTP.
@@ -138,6 +159,7 @@ func (g *networkGateway) ReleaseSandbox(sandboxID string) {
 	delete(g.allowed, sandboxID)
 	delete(g.usage, sandboxID)
 	delete(g.blocked, sandboxID)
+	delete(g.policies, sandboxID)
 }
 
 func (g *networkGateway) SyncAllowedPorts(sandboxID string, ports []int) {

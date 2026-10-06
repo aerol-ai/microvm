@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -490,32 +491,28 @@ func TestWasmCreateSandboxRollbackBranches(t *testing.T) {
 	})
 }
 
-// TestWasmCreateRejectsEgressLists pins P0-1: the WASM mediator can't enforce
-// allow/deny lists yet, so they are refused (501) rather than stored and
-// silently ignored.
-func TestWasmCreateRejectsEgressLists(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		allow, deny []string
-	}{
-		{name: "allow", allow: []string{"10.0.0.0/24"}},
-		{name: "deny", deny: []string{"10.0.0.0/24"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			rt := &wasmRecordingRuntime{}
-			svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
-			svc.cfg.EnableWasm = true
-			svc.SetWasmRuntime(rt)
-			_, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
-				ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm,
-				NetworkAllowOut: tc.allow, NetworkDenyOut: tc.deny,
-			}, "sb-wasm-lists-"+tc.name)
-			if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-				t.Fatalf("err = %v, want ErrRuntimeNotImplemented", err)
-			}
-			if rt.createCalls != 0 {
-				t.Fatal("runtime must not be called for a refused create")
-			}
-		})
+// TestWasmCreateEgressLists: WASM lists use the shared grammar (P1-6). Valid
+// lists reach the driver; a hostname deny is a 400.
+func TestWasmCreateEgressLists(t *testing.T) {
+	rt := &wasmRecordingRuntime{}
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableWasm = true
+	svc.SetWasmRuntime(rt)
+	resp, err := svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+		ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm,
+		NetworkAllowOut: []string{"pypi.org", "10.0.0.0/8"},
+	}, "sb-wasm-lists")
+	if err != nil {
+		t.Fatalf("valid wasm lists must be accepted: %v", err)
+	}
+	row, _ := st.Get(context.Background(), resp.ID)
+	if len(row.NetworkAllowOut) != 2 {
+		t.Fatalf("stored lists = %v", row.NetworkAllowOut)
+	}
+	_, err = svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{
+		ModuleRef: "hello.wasm", Runtime: models.RuntimeWasm, NetworkDenyOut: []string{"evil.com"},
+	}, "sb-wasm-bad")
+	if !errors.Is(err, egresspolicy.ErrInvalid) {
+		t.Fatalf("hostname deny err = %v, want ErrInvalid", err)
 	}
 }

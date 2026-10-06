@@ -26,6 +26,14 @@ type Capabilities struct {
 	// set_network_blocks message, so a re-instantiation can't unblock.
 	NetworkBlockIngress bool `json:"network_block_ingress,omitempty"`
 	NetworkBlockEgress  bool `json:"network_block_egress,omitempty"`
+	// EgressAllowOut / EgressDenyOut are the sandbox's egress policy in the
+	// shared grammar, enforced by the worker's mediator from the first dial
+	// (plans/egress-domain-filtering.md P1-6). EgressPolicySet marks caps
+	// that carry the policy at all: caps without it leave the mediator's
+	// policy unchanged, so a re-instantiation can never drop a policy.
+	EgressAllowOut  []string `json:"egress_allow_out,omitempty"`
+	EgressDenyOut   []string `json:"egress_deny_out,omitempty"`
+	EgressPolicySet bool     `json:"egress_policy_set,omitempty"`
 }
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.

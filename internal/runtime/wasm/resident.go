@@ -385,6 +385,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 
 	client := d.newWorkerClient(host.socket)
 	d.seedNetworkBlocks(sandboxID, req.NetworkBlockAll, req.NetworkBlockAll)
+	d.seedNetworkPolicy(sandboxID, req.NetworkAllowOut, req.NetworkDenyOut)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            req.Env,
 		Args:           wasmArgs(req),

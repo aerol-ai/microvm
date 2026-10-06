@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
 )
 
@@ -26,6 +27,10 @@ type NetMediator struct {
 	usage   map[string]*workerNetUsage
 	// observer is called after a successful dial (destination attribution).
 	observer EgressObserver
+	// policies are the per-sandbox egress policies (P1-6); guard is the
+	// operator dial guard. No policy keeps the open default.
+	policies map[string]*egresspolicy.Policy
+	guard    egresspolicy.DialGuard
 }
 
 func newNetMediator() *NetMediator {
@@ -108,8 +113,14 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 	if m.egressBlocked(sandboxID) {
 		return nil, wasmengine.ErrNetworkEgressBlocked
 	}
-	d := net.Dialer{Timeout: 30 * time.Second}
-	conn, err := d.DialContext(ctx, network, address)
+	var conn net.Conn
+	var err error
+	if p := m.policyFor(sandboxID); p != nil {
+		conn, err = m.policyDial(ctx, p, network, address)
+	} else {
+		d := net.Dialer{Timeout: 30 * time.Second}
+		conn, err = d.DialContext(ctx, network, address)
+	}
 	if err != nil {
 		return nil, err
 	}

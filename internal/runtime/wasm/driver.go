@@ -119,6 +119,45 @@ func (d *Driver) bindNetworkBlocks(sandboxID string, caps *wasmengine.Capabiliti
 		return
 	}
 	caps.NetworkBlockIngress, caps.NetworkBlockEgress = d.net.blocksFor(sandboxID)
+	// The policy rides along every time, marked as set, so the mediator
+	// always has the current one and a re-instantiation can't drop it.
+	pol := d.net.policyFor(sandboxID)
+	caps.EgressAllowOut, caps.EgressDenyOut, caps.EgressPolicySet = pol.allow, pol.deny, true
+}
+
+// seedNetworkPolicy records a sandbox's egress lists before any worker
+// message, so bindNetworkBlocks carries them into the first instantiation.
+func (d *Driver) seedNetworkPolicy(sandboxID string, allow, deny []string) {
+	if d == nil || d.net == nil {
+		return
+	}
+	d.net.setPolicy(sandboxID, allow, deny)
+}
+
+// egressPolicySetter is the optional live-update hook on a worker client.
+type egressPolicySetter interface {
+	SetEgressPolicy(sandboxID string, allowOut, denyOut []string) error
+}
+
+// SetEgressPolicy replaces a WASM sandbox's egress policy live (Phase 2
+// PUT): the driver's record for future instantiations, and the running
+// worker's mediator now.
+func (d *Driver) SetEgressPolicy(sandboxID string, allow, deny []string) error {
+	if d == nil {
+		return nil
+	}
+	d.seedNetworkPolicy(sandboxID, allow, deny)
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	d.mu.Unlock()
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+		return nil
+	}
+	setter, ok := d.newWorkerClient(inst.socketPath).(egressPolicySetter)
+	if !ok {
+		return fmt.Errorf("wasm worker client cannot update egress policy")
+	}
+	return setter.SetEgressPolicy(sandboxID, allow, deny)
 }
 
 // seedNetworkBlocks records blocks known before any worker message, so

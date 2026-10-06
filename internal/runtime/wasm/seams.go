@@ -102,6 +102,11 @@ func (a workerClientAdapter) SetNetworkBlocks(sandboxID string, blockIngress, bl
 	return a.client.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
 }
 
+// SetEgressPolicy is the optional live-update hook (egressPolicySetter).
+func (a workerClientAdapter) SetEgressPolicy(sandboxID string, allowOut, denyOut []string) error {
+	return a.client.SetEgressPolicy(sandboxID, allowOut, denyOut)
+}
+
 func (a workerClientAdapter) SetListenPort(sandboxID string, port int, host string) error {
 	return a.client.SetListenPort(sandboxID, port, host)
 }
