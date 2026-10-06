@@ -129,6 +129,12 @@ func (s *Service) runEgressSelfTests(ctx context.Context, bridges []egress.Bridg
 	gw := s.egressGateway()
 	var gatewayErr error
 	for i, b := range bridges {
+		// The TAP pool has no bridge device to probe from. Its guests'
+		// traffic is routed, not bridged, and meets the same redirect and
+		// wildcard listeners the container bridges' probes exercise.
+		if b.Wildcard() {
+			continue
+		}
 		st.mu.Lock()
 		cur := st.status[b.Name]
 		st.mu.Unlock()
@@ -225,10 +231,7 @@ func (s *Service) retryEgressSelfTests(ctx context.Context, force bool) {
 	}
 	s.egressMu.Lock()
 	defer s.egressMu.Unlock()
-	var bridges []egress.Bridge
-	if s.egressBridges != nil {
-		bridges = s.egressBridges(ctx)
-	}
+	bridges, _ := s.gatewayBridges(ctx)
 	err := s.egressGateway().SetBridges(ctx, bridges)
 	if err == nil {
 		err = s.runEgressSelfTests(ctx, bridges, all)

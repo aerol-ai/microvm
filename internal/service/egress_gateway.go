@@ -101,6 +101,21 @@ func (s *Service) SetEgressGateway(api egress.API, bridges func(context.Context)
 	}
 }
 
+// gatewayBridges lists what the gateway listens on: the container bridges
+// the daemon discovers and, when the Firecracker guests have a firewall,
+// the TAP pool (Phase 4). ok is false when nothing wires any (tests).
+func (s *Service) gatewayBridges(ctx context.Context) (bridges []egress.Bridge, ok bool) {
+	if s.egressBridges != nil {
+		bridges, ok = s.egressBridges(ctx), true
+	}
+	if fc, isFC := s.firecracker.(interface{ EgressTapSubnet() (netip.Prefix, bool) }); isFC {
+		if subnet, on := fc.EgressTapSubnet(); on {
+			bridges, ok = append(bridges, egress.TapPoolBridge(subnet)), true
+		}
+	}
+	return bridges, ok
+}
+
 // egressGateway returns the client, or Noop when the feature is off.
 func (s *Service) egressGateway() egress.API {
 	if s == nil || s.egressAPI == nil || !s.cfg.EgressFQDNEnabled {
@@ -156,8 +171,8 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	if _, err := gw.Ready(ctx); err != nil {
 		return err
 	}
-	if s.egressBridges != nil {
-		if err := gw.SetBridges(ctx, s.egressBridges(ctx)); err != nil {
+	if bridges, ok := s.gatewayBridges(ctx); ok {
+		if err := gw.SetBridges(ctx, bridges); err != nil {
 			return fmt.Errorf("egress gateway bridges: %w", err)
 		}
 	}
@@ -431,6 +446,41 @@ func (s *Service) refreshHeldGauge(ctx context.Context) {
 	if holds, err := s.store.ListEgressHolds(ctx); err == nil {
 		s.egressStats.held.Store(int64(len(holds)))
 	}
+}
+
+// shutStoppedGuest blocks a stopped gateway-mode Firecracker guest's IP.
+// The guest keeps its slot (and IP) while stopped, a full gateway Sync drops
+// stopped sandboxes, and Start resumes the VM before it re-attaches, so
+// without this a restart in between would leave a resumed guest unfiltered
+// until the attach. Start lifts it when the policy no longer needs it
+// (liftStartedGuest). Best effort: the attach on Start still shuts it.
+func (s *Service) shutStoppedGuest(rt runtime.Runtime, sb *models.Sandbox) {
+	if !isGatewayMode(sb) || sb.ContainerIP == "" {
+		return
+	}
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		return
+	}
+	if err := cr.ApplyNetworkBlockAll(sb.ContainerIP); err != nil {
+		s.logger.Warn("egress: stopped guest not shut; it is shut again on start", "sandbox_id", sb.ID, "error", err)
+	}
+}
+
+// liftStartedGuest lifts shutStoppedGuest's block from a Firecracker guest
+// whose policy changed, while it was stopped, to one without a block.
+func (s *Service) liftStartedGuest(rt runtime.Runtime, sb *models.Sandbox) error {
+	if !s.isFirecrackerSandbox(sb) || sb.NetworkBlockAll || isGatewayMode(sb) || sb.ContainerIP == "" {
+		return nil
+	}
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		return nil
+	}
+	if err := cr.ClearNetworkBlockEgress(sb.ContainerIP); err != nil && !errors.Is(err, models.ErrRuntimeNotImplemented) {
+		return err
+	}
+	return nil
 }
 
 // detachSandboxEgress removes a sandbox from the gateway. The gateway checks

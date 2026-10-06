@@ -188,14 +188,8 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 		}
 	}
 	if containerRT && pol.GatewayMode() {
-		if !s.egressEnabled() {
-			return nil, ErrEgressGatewayRequired
-		}
-		if s.egressSelfTestFailed() {
-			return nil, ErrEgressSelfTestFailed
-		}
-		if s.egressSelfTestPending() {
-			return nil, fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
+		if err := s.requireEgressGateway(); err != nil {
+			return nil, err
 		}
 	}
 	if samePolicy(old, &next) && sameProfiles(prior, resolved) && s.EgressStatus(ctx, old) != EgressStatusHeld && s.EgressStatus(ctx, old) != EgressStatusUnavailable {

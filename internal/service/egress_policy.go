@@ -70,9 +70,11 @@ func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
 
 // checkFirecrackerEgress admits the egress options a Firecracker guest can
 // have (plans/egress-domain-filtering.md Phase 4): block-all and CIDR
-// allow/deny lists, enforced on its guest IP by the node's firewall.
-// Hostname entries, profiles and learn mode need the egress gateway on the
-// TAPs; rules are Phase 3, unspecified on Firecracker. A node without the
+// allow/deny lists on the node's firewall, keyed by the guest IP, and
+// hostname entries, profiles and learn mode through the egress gateway,
+// which serves every TAP (createFirecrackerSandbox checks it is ready).
+// Rules stay unspecified on Firecracker (CEO D14): the per-binary kind
+// can't work at all, the VM is opaque to the host. A node without the
 // firewall refuses every egress option, as before.
 func (s *Service) checkFirecrackerEgress(req *models.CreateSandboxRequest) error {
 	if !req.NetworkBlockAll && len(req.NetworkAllowOut) == 0 && len(req.NetworkDenyOut) == 0 &&
@@ -83,15 +85,24 @@ func (s *Service) checkFirecrackerEgress(req *models.CreateSandboxRequest) error
 	if !ok || !fw.NetRulesEnabled() {
 		return unsupportedFirecrackerOption("egress policies (this node has no firewall for its guests)")
 	}
-	if len(req.EgressProfiles) > 0 || req.NetworkEgressMode != "" || len(req.NetworkEgressRules) > 0 {
-		return unsupportedFirecrackerOption("egress_profiles, network_egress_mode and network_egress_rules")
+	if len(req.NetworkEgressRules) > 0 {
+		return unsupportedFirecrackerOption("network_egress_rules")
 	}
-	pol, err := compileCreateEgress(req)
-	if err != nil {
-		return err
+	return nil
+}
+
+// requireEgressGateway refuses a gateway-mode policy on a node that can't
+// attach the sandbox: the feature is off (501), the self-test failed (501)
+// or hasn't finished yet (503, startup only).
+func (s *Service) requireEgressGateway() error {
+	if !s.egressEnabled() {
+		return ErrEgressGatewayRequired
 	}
-	if pol.GatewayMode() {
-		return unsupportedFirecrackerOption("hostname egress entries")
+	if s.egressSelfTestFailed() {
+		return ErrEgressSelfTestFailed
+	}
+	if s.egressSelfTestPending() {
+		return fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
 	}
 	return nil
 }

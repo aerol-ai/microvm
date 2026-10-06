@@ -105,7 +105,7 @@ func TestResolveOCIRuntime(t *testing.T) {
 func TestRuntimeUsesEgressGateway(t *testing.T) {
 	for rt, want := range map[string]bool{
 		"": true, RuntimeDocker: true, RuntimeGvisor: true, RuntimeKata: true,
-		RuntimeFirecracker: false, RuntimeWasm: false, RuntimeIsolate: false,
+		RuntimeFirecracker: true, RuntimeWasm: false, RuntimeIsolate: false,
 	} {
 		if got := RuntimeUsesEgressGateway(rt); got != want {
 			t.Errorf("RuntimeUsesEgressGateway(%q) = %v, want %v", rt, got, want)

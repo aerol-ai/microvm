@@ -213,6 +213,7 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 	sandbox.Status = models.SandboxStatusStopped
 	sandbox.WakeArmed = armedValue
 	if s.isFirecrackerSandbox(sandbox) {
+		s.shutStoppedGuest(rt, sandbox)
 		sandbox.ContainerID = ""
 		sandbox.ContainerIP = ""
 	}

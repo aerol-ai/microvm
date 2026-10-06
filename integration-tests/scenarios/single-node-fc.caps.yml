@@ -21,3 +21,7 @@ capabilities:
   - domain
   - custom-domains
   - benchmark
+  # Hostname egress filtering: install.sh starts the egress gateway here as on
+  # single-node, and the gateway serves the TAPs (plans/egress-domain-
+  # filtering.md Phase 4), so UC-204 runs a Firecracker guest through it.
+  - egress-fqdn

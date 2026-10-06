@@ -217,12 +217,13 @@ func ValidRuntime(value string) (string, error) {
 
 // RuntimeUsesEgressGateway reports whether hostname egress rules on this
 // runtime are enforced by the node's egress gateway. WASM and isolate filter
-// in their own host-side mediators; Firecracker joins in Phase 4
-// (plans/egress-domain-filtering.md). Cluster placement uses it to route
-// gateway-mode creates only to nodes with a ready gateway.
+// in their own host-side mediators; Firecracker guests reach the gateway
+// through their TAPs (plans/egress-domain-filtering.md Phase 4). Cluster
+// placement uses it to route gateway-mode creates only to nodes with a
+// ready gateway.
 func RuntimeUsesEgressGateway(runtime string) bool {
 	switch runtime {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
 		return true
 	}
 	return false

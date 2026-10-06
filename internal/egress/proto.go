@@ -98,6 +98,19 @@ type Bridge struct {
 	Subnet netip.Prefix `json:"subnet,omitempty"`
 }
 
+// TapPoolBridge is the Firecracker TAP pool as one bridge (Phase 4). Every
+// guest sits behind its own TAP with its own host address, and REDIRECT
+// lands on that address, so the gateway binds its listeners on the
+// wildcard address, behind its input guard (only gateway-mode sources
+// reach the ports), rather than one set per TAP. Subnet scopes the
+// node-wide floor and control-port guard to the guests.
+func TapPoolBridge(subnet netip.Prefix) Bridge {
+	return Bridge{Name: "fctap", GatewayIP: netip.IPv4Unspecified(), Subnet: subnet.Masked()}
+}
+
+// Wildcard reports whether the bridge asks for the wildcard listeners.
+func (b Bridge) Wildcard() bool { return b.GatewayIP.IsUnspecified() }
+
 // ProbeRequest asks the gateway to treat a probe source as gateway-mode for
 // the self-test (T41): sandboxd runs the probe client from a link-local /32
 // in a test netns; the gateway reports whether the probe reached its

@@ -896,9 +896,10 @@ func TestSelectPlacementGatewayModeNoReadyNode(t *testing.T) {
 }
 
 // TestCapacityRequestFromSpecEgressGateway covers which creates need the
-// gateway: hostnames on a container runtime only. WASM and isolate filter in
-// their own mediators; Firecracker joins in Phase 4; block-all redirects
-// nothing; a list that doesn't compile is left to the target's 400.
+// gateway: hostnames on a container runtime or Firecracker (its TAPs reach
+// the gateway, Phase 4). WASM and isolate filter in their own mediators;
+// block-all redirects nothing; a list that doesn't compile is left to the
+// target's 400.
 func TestCapacityRequestFromSpecEgressGateway(t *testing.T) {
 	cases := []struct {
 		name string
@@ -910,7 +911,8 @@ func TestCapacityRequestFromSpecEgressGateway(t *testing.T) {
 		{"mixed with deny cidr", models.CreateSandboxRequest{NetworkAllowOut: []string{"pypi.org"}, NetworkDenyOut: []string{"0.0.0.0/0"}}, true},
 		{"wasm hostname", models.CreateSandboxRequest{Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}}, false},
 		{"isolate hostname", models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, NetworkAllowOut: []string{"pypi.org"}}, false},
-		{"firecracker hostname", models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"pypi.org"}}, false},
+		{"firecracker hostname", models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"pypi.org"}}, true},
+		{"firecracker cidr", models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker, NetworkAllowOut: []string{"10.0.0.0/8"}}, false},
 		{"block-all wins", models.CreateSandboxRequest{NetworkBlockAll: true, NetworkAllowOut: []string{"pypi.org"}}, false},
 		{"cidr only", models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}, false},
 		{"deny only", models.CreateSandboxRequest{NetworkDenyOut: []string{"10.0.0.0/8"}}, false},

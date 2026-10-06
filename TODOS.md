@@ -390,10 +390,14 @@ what, why, the caveat that motivated capturing it, and where to start.
   `rp_filter` per TAP, wired at boot by `pkg/daemon/firecracker_egress_wiring.go`
   and proven on a real kernel with a veth stand-in
   (`internal/network/tap/fc_egress_kernel_test.go`).
+- **Hostname filtering** (part 2): the gateway serves the TAP pool on
+  wildcard listeners behind its input guard (setup/runbooks/egress-gateway.md
+  "Firecracker"), proven on a real kernel by `TestKernelTapPool`.
 - **Still to do:** confirm on a live Firecracker host that a guest reaches
-  the internet and that block-all / CIDR lists hold
+  the internet and that block-all / CIDR lists and a hostname allowlist hold
   (`iptables -t nat -S POSTROUTING | grep aerolvm-fc-masq`,
-  `iptables -S AEROLVM-FC`). Needs a Firecracker bench host; operator-run.
+  `iptables -S AEROLVM-FC`, `nft list set inet aerolvm_egress fqdn_src`).
+  Needs a Firecracker bench host; operator-run.
 
 ## NVMe/io2 data-dir option (infra) — `plans/nvme-datadir.md`
 

@@ -197,7 +197,8 @@ cause:
   drops it. ufw, firewalld or a hardened AMI with an INPUT policy of DROP
   are the usual causes. Allow TCP and UDP to `SB_EGRESS_DNS_PORT` (default
   53054) and TCP to `SB_EGRESS_PROXY_PORT` (default 15080) arriving on the
-  sandbox bridges (`docker0`, `aerolvm0`).
+  sandbox bridges (`docker0`, `aerolvm0`) and, on a Firecracker node, the
+  TAP devices (`fctap*`).
 - `bridge-nf-call-iptables is not 1`: load `br_netfilter` and set the
   sysctl; sandboxd sets it at startup, so something reset it.
 - `carries IPv6`: the gateway redirects IPv4 only, so a bridge with a global
@@ -207,6 +208,38 @@ A bridge that does not exist yet (containerd's `aerolvm0` before the first
 sandbox) is not a failure; it is tested once it appears. Failed bridges are
 retried with backoff up to every 5 minutes, and immediately on the next
 sandboxd or gateway restart.
+
+## Firecracker
+
+Firecracker guests reach the gateway through their TAP devices
+(plans/egress-domain-filtering.md Phase 4). Each guest sits on its own /30
+behind `fctapN`, and the redirect lands on that TAP's host address, so
+sandboxd hands the gateway the whole TAP pool (`SB_FIRECRACKER_TAP_BASE_CIDR`)
+as one bridge named `fctap` and the gateway binds its listeners on
+`0.0.0.0` instead of one address per bridge. The input guard in the
+`aerolvm_egress` table keeps those ports closed to every source that isn't a
+gateway-mode sandbox; the DNS filter and proxy also refuse any source they
+don't know. The pool's CIDR also scopes the node-wide floor and control-port
+guard to the guests.
+
+- **Prerequisite:** the guest firewall (`AEROLVM-FC`, see TODOS.md "Audit
+  Firecracker outbound NAT path"). Without it the driver can't hold a guest
+  shut while it attaches, so every egress option on Firecracker is 501.
+- **Identity:** strict `rp_filter` on each TAP drops a guest that sends from
+  another guest's address, so the source IP the gateway keys on can't be
+  forged.
+- **Stopped guests** keep their slot and IP, so a gateway-mode guest is shut
+  (block-all on its IP in `AEROLVM-FC`) when it stops, and Start re-attaches
+  it before lifting that. A gateway restart while it is stopped can't leave a
+  resumed guest unfiltered.
+- **No self-test for the TAPs:** there is no bridge to join a probe to. Guest
+  traffic meets the same redirect and the same wildcard listeners the
+  container bridges' probes exercise; the routed path itself is covered by
+  `TestKernelTapPool` (internal/egress/gatewayd).
+- **Checks:** `ss -lntu | grep -E ':(53054|15080)'` shows `0.0.0.0`;
+  `nft list set inet aerolvm_egress fqdn_src` lists the guest IPs in gateway
+  mode; `sysctl net.ipv4.conf.fctapN.rp_filter` is `1`.
+- **Rules** (`network_egress_rules`) stay 501 on Firecracker.
 
 ## OperatorFile
 

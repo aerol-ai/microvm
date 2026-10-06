@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -41,6 +42,13 @@ func (d *Driver) SetTapSubnet(p netip.Prefix) { d.tapSubnet = p }
 // NetRulesEnabled reports whether the driver can enforce egress policies.
 func (d *Driver) NetRulesEnabled() bool { return d.netRules != nil }
 
+// EgressTapSubnet returns the TAP pool's base CIDR when the guests have a
+// firewall, so the egress gateway serves them too: hostname entries need
+// the driver's block-all, and the hold, on the guest IP.
+func (d *Driver) EgressTapSubnet() (netip.Prefix, bool) {
+	return d.tapSubnet, d.netRules != nil && d.tapSubnet.IsValid()
+}
+
 func (d *Driver) rules(op string) (NetRules, error) {
 	if d.netRules == nil {
 		return nil, methodNotImplemented(op)
@@ -67,10 +75,15 @@ func (d *Driver) applyCreateEgress(guestIP string, req models.CreateSandboxReque
 }
 
 // clearGuestRules removes every rule keyed by a guest IP, on destroy and on
-// a failed create, so a recycled slot starts clean.
+// a failed create, so a recycled slot starts clean. A gateway-mode guest's
+// lists went to the gateway, never to the firewall, and a hostname handed
+// to iptables would be resolved, so only a CIDR policy's lists are cleared.
 func (d *Driver) clearGuestRules(guestIP string, allow, deny []string) error {
 	if d.netRules == nil || guestIP == "" {
 		return nil
+	}
+	if !firewallLists(allow, deny) {
+		allow, deny = nil, nil
 	}
 	return errors.Join(
 		d.netRules.ClearBlockAllEgress(guestIP),
@@ -168,4 +181,14 @@ func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
 		return nil
 	}
 	return r.SetFloor(d.tapSubnet, cidrs)
+}
+
+// firewallLists reports whether allow/deny is a CIDR policy, the kind the
+// firewall enforces.
+func firewallLists(allow, deny []string) bool {
+	if len(allow) == 0 && len(deny) == 0 {
+		return true
+	}
+	pol, err := egresspolicy.Compile(egresspolicy.Spec{AllowOut: allow, DenyOut: deny, MaxHostnames: egresspolicy.MaxUnionHostnames})
+	return err == nil && !pol.GatewayMode()
 }

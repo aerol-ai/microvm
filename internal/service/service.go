@@ -1935,18 +1935,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	gatewayMode := egressPol.GatewayMode()
 	driverReq := req
 	if gatewayMode {
-		if !s.egressEnabled() {
+		if err := s.requireEgressGateway(); err != nil {
 			releaseAdmission()
-			return nil, ErrEgressGatewayRequired
-		}
-		if s.egressSelfTestFailed() {
-			releaseAdmission()
-			return nil, ErrEgressSelfTestFailed
-		}
-		if s.egressSelfTestPending() {
-			// Startup only: the first probe round is still running.
-			releaseAdmission()
-			return nil, fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
+			return nil, err
 		}
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
@@ -2326,6 +2317,22 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if err := s.checkFirecrackerEgress(&req); err != nil {
 		return nil, err
 	}
+	// Hostname entries, profiles and learn mode go through the egress
+	// gateway, as on the container runtimes: the driver gets a block-all
+	// copy, so the guest boots shut, and the attach lifts it (§5.7).
+	egressPol, err := compileCreateEgressEffective(&req)
+	if err != nil {
+		return nil, err
+	}
+	gatewayMode := egressPol.GatewayMode()
+	driverReq := req
+	if gatewayMode {
+		if err := s.requireEgressGateway(); err != nil {
+			return nil, err
+		}
+		driverReq.NetworkBlockAll = true
+		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
+	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
@@ -2365,7 +2372,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
-	state, err := s.firecracker.Create(ctx, req, sandboxID, toolboxToken, nil)
+	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
 		// Phase 6 PR-A: cold-load corruption intercept. The driver's
 		// configureVMMForLoad path verifies the snapshot checksum and
@@ -2380,10 +2387,43 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		releaseAdmission()
 		return nil, err
 	}
+	// The gateway attach runs alongside the persist, as on the docker path;
+	// destroyVM joins it first, so it never races a rollback.
+	var egressDone chan error
+	waitEgress := func() error {
+		if egressDone == nil {
+			return nil
+		}
+		err := <-egressDone
+		egressDone = nil
+		return err
+	}
+	destroyVM := func(partial *models.Sandbox) {
+		_ = waitEgress()
+		if gatewayMode {
+			s.detachSandboxEgress(rollback.Context(), partial, state.ContainerIP)
+		}
+		_ = s.firecracker.Destroy(rollback.Context(), partial)
+	}
+	if gatewayMode {
+		cr, ok := runtime.AsContainerRuntime(s.firecracker)
+		attachSB := &models.Sandbox{ID: state.SandboxID, ContainerIP: state.ContainerIP, Runtime: req.Runtime,
+			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+		egressDone = make(chan error, 1)
+		go func() {
+			attachStart := time.Now()
+			err := ErrEgressGatewayRequired
+			if ok {
+				err = s.attachSandboxEgress(ctx, attachSB, cr)
+			}
+			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
+			egressDone <- err
+		}()
+	}
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
 	if err != nil {
-		_ = s.firecracker.Destroy(rollback.Context(), &models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
+		destroyVM(&models.Sandbox{ID: state.SandboxID, Runtime: req.Runtime})
 		releaseAdmission()
 		return nil, err
 	}
@@ -2449,7 +2489,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			// partial UpsertSandboxRoute — main route + per-custom-domain leaves —
 			// is fully torn down. See the docker path for the rationale.
 			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
-			_ = s.firecracker.Destroy(rollback.Context(), sandbox)
+			destroyVM(sandbox)
 			releaseAdmission()
 			return nil, err
 		}
@@ -2458,7 +2498,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, idOverride)
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
-		_ = s.firecracker.Destroy(rollback.Context(), sandbox)
+		destroyVM(sandbox)
 		releaseAdmission()
 		return nil, err
 	}
@@ -2466,9 +2506,27 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if err := s.persistCustomDomainsOnCreate(ctx, sandbox.ID, req.CustomDomains); err != nil {
 		_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
 		_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
-		_ = s.firecracker.Destroy(rollback.Context(), sandbox)
+		destroyVM(sandbox)
 		releaseAdmission()
 		return nil, err
+	}
+
+	if err := waitEgress(); err != nil {
+		if isStoredSpecReplay(ctx) {
+			// A failover recreate never refuses its stored spec: the guest
+			// comes up shut and held, and reconcile retries the attach
+			// (CEO D16).
+			if cr, ok := runtime.AsContainerRuntime(s.firecracker); ok {
+				s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
+			}
+		} else {
+			// 2xx would claim a live policy the gateway never applied.
+			_ = s.store.RollbackSandboxCreate(rollback.Context(), sandbox.ID, sandbox.AuditIncarnationID)
+			_ = s.deleteSandboxPublicRoutes(rollback.Context(), sandbox)
+			destroyVM(sandbox)
+			releaseAdmission()
+			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
+		}
 	}
 
 	s.logger.Info("audit sandbox created",
@@ -3066,6 +3124,9 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
 			return nil, fmt.Errorf("apply network block on start: %w", err)
 		}
+	}
+	if err := s.liftStartedGuest(rt, sandbox); err != nil {
+		s.logger.Warn("egress: lift the stop-time block on start failed", "sandbox_id", id, "error", err)
 	}
 	// A gateway-mode sandbox is shut with a block-all DROP and re-attached to
 	// the egress gateway. If the attach fails it stays shut and held

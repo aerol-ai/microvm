@@ -527,7 +527,7 @@ that would have allowed that run, ready to lock the sandbox down.
   [audit log](/egress-domain-filtering#see-what-was-refused) with reason
   `learn_mode`.
 - **Rules.** Learn mode takes no allow or deny lists, no profiles and no
-  block-all; it is never a default. Firecracker sandboxes can't use it.
+  block-all; it is never a default.
 - **The suggestion.** Three or more names under one domain collapse to
   `*.domain` (never a public suffix), non-web ports stay as `host:port`, and
   addresses reached without a DNS name become single-address CIDRs. When the
@@ -612,7 +612,6 @@ caught when the sandbox connects.
 
 ## Limitations
 
-- **Firecracker** sandboxes can't use profiles yet.
 - **Learn mode and the E2B SDK.** `updateNetwork` keeps a sandbox in learn
   mode; setting lists on a learn-mode sandbox from the E2B SDK is refused with
   `409`. Switch it with `setNetworkPolicy`.

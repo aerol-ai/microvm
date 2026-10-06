@@ -23,15 +23,20 @@ func (f *floorRuntime) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) e
 }
 
 // TestOperatorFloorReachesTheHostFirewall (§5.10 PC-2): loading or changing
-// the operator file installs deny_cidrs on each container engine; a failure
-// is logged, not fatal.
+// the operator file installs deny_cidrs on each container engine and the
+// Firecracker TAP subnet (Phase 4); a failure is logged, not fatal.
 func TestOperatorFloorReachesTheHostFirewall(t *testing.T) {
 	svc, _, hr := newEgressHarness(t)
 	rt := &floorRuntime{holdRuntime: hr}
 	svc.docker = rt
+	fc := &floorRuntime{holdRuntime: &holdRuntime{recordingRuntime: &recordingRuntime{}}}
+	svc.SetFirecrackerRuntime(fc)
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ndeny_cidrs: [10.20.0.0/16]\n"))
 	if len(rt.floor) != 1 || len(rt.floor[0]) != 1 || rt.floor[0][0] != netip.MustParsePrefix("10.20.0.0/16") {
 		t.Fatalf("floor = %v", rt.floor)
+	}
+	if len(fc.floor) != 1 || len(fc.floor[0]) != 1 {
+		t.Fatalf("the Firecracker guests get the floor too: %v", fc.floor)
 	}
 	rt.err = errors.New("iptables gone")
 	svc.OnEgressOperatorChange(operatorWatcher(t, "version: 1\n").Current())

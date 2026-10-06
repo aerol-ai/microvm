@@ -64,14 +64,15 @@ func (s *Service) OnEgressOperatorChange(op *operator.Operator) {
 }
 
 // applyEgressFloor installs the operator's deny_cidrs as a node-wide DROP on
-// each container engine's bridge (§5.10 PC-2). It is the floor's copy that
-// works without the egress gateway; failures are logged, not fatal, because
-// the gateway's own floor and the WASM/isolate dial guards still hold it.
+// each container engine's bridge and the Firecracker TAP subnet (§5.10
+// PC-2). It is the floor's copy that works without the egress gateway;
+// failures are logged, not fatal, because the gateway's own floor and the
+// WASM/isolate dial guards still hold it.
 func (s *Service) applyEgressFloor(ctx context.Context, op *operator.Operator) {
 	if s == nil || op == nil {
 		return
 	}
-	for _, rt := range []runtime.Runtime{s.docker, s.containerd} {
+	for _, rt := range []runtime.Runtime{s.docker, s.containerd, s.firecracker} {
 		fs, ok := rt.(runtime.EgressFloorSetter)
 		if !ok || rt == nil {
 			continue

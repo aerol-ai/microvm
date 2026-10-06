@@ -28,10 +28,13 @@ func TestBridgeListenerLifecycle(t *testing.T) {
 	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo}}); err != nil {
 		t.Fatal(err)
 	}
-	// Same bridge again keeps its listeners; a port conflict on a second
-	// bridge name with the same IP is reported.
-	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo}, {Name: "dup", GatewayIP: lo}}); err == nil {
-		t.Fatal("binding the same ports twice must fail")
+	// Same bridge again keeps its listeners; a second bridge on the same
+	// address shares them (REDIRECT lands on the address, not the name).
+	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo}, {Name: "dup", GatewayIP: lo}}); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := r.client.Ready(ctx); len(st.Listeners) != 3 {
+		t.Fatalf("one listener set per address: %v", st.Listeners)
 	}
 	if err := r.client.SetBridges(ctx, nil); err != nil {
 		t.Fatal(err)

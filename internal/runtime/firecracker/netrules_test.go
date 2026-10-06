@@ -149,3 +149,38 @@ func TestNetRuleMethods(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestGatewayGuestRules (Phase 4 part 2): the gateway serves the guests
+// only once the driver has their firewall, and a gateway-mode guest's
+// hostname list is never handed to iptables on destroy.
+func TestGatewayGuestRules(t *testing.T) {
+	d := New(Config{}, nil)
+	if _, ok := d.EgressTapSubnet(); ok {
+		t.Fatal("no firewall, no gateway for the guests")
+	}
+	rules := &fakeNetRules{}
+	d.SetNetRules(rules)
+	if _, ok := d.EgressTapSubnet(); ok {
+		t.Fatal("no TAP subnet, no gateway for the guests")
+	}
+	d.SetTapSubnet(netip.MustParsePrefix("172.16.0.0/16"))
+	if p, ok := d.EgressTapSubnet(); !ok || p.String() != "172.16.0.0/16" {
+		t.Fatalf("EgressTapSubnet = %v, %v", p, ok)
+	}
+
+	if err := d.clearGuestRules("172.16.0.2", []string{"pypi.org", "1.1.1.0/24"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !rules.has("clear-policy 172.16.0.2  ") || rules.has("clear-policy 172.16.0.2 pypi") {
+		t.Fatalf("a hostname list must not reach the firewall: %v", rules.calls)
+	}
+	if err := d.clearGuestRules("172.16.0.6", []string{"1.1.1.0/24"}, []string{"0.0.0.0/0"}); err != nil {
+		t.Fatal(err)
+	}
+	if !rules.has("clear-policy 172.16.0.6 1.1.1.0/24 0.0.0.0/0") {
+		t.Fatalf("a CIDR list is cleared as applied: %v", rules.calls)
+	}
+	if firewallLists([]string{"bad entry"}, nil) {
+		t.Fatal("an invalid list is never handed to the firewall")
+	}
+}

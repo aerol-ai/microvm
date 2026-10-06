@@ -621,6 +621,7 @@ var Registry = []UseCase{
 	{ID: "UC-201", Title: "Inspect rule on 443 (EF-52, EF-53): the ruled GET passes through TLS inspection trusting the node CA via SSL_CERT_FILE; a POST or an unruled path gets the gateway's 403", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	{ID: "UC-202", Title: "Credential injection (EF-54): the sandbox's env holds only aerolvm-placeholder:TEST_TOKEN, and postman-echo receives the real token the gateway put in the Authorization header", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	{ID: "UC-203", Title: "Per-binary rules (EF-55): binaries-only rules on 443 let /usr/local/bin/pip install requests from pypi.org and files.pythonhosted.org without inspection, while busybox wget to pypi.org is refused", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-204", Title: "Firecracker hostname allowlist (Phase 4): a guest reaches the egress gateway over its TAP, fetches the listed name, is refused another fast, and a live block-all shuts it", Requires: []Capability{CapFirecracker, CapEgressFQDN}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

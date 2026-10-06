@@ -155,12 +155,12 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
-## Egress domain filtering (UC-179..UC-203)
+## Egress domain filtering (UC-179..UC-204)
 
 `suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
-`suite/egress_phase3_test.go` and `suite/egress_private_cloud_test.go` cover
-hostname egress filtering (plans/egress-domain-filtering.md P1-10, P1-20,
-Phases 2-3).
+`suite/egress_phase3_test.go`, `suite/egress_firecracker_test.go` and
+`suite/egress_private_cloud_test.go` cover hostname egress filtering
+(plans/egress-domain-filtering.md P1-10, P1-20, Phases 2-4).
 
 - **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
   `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
@@ -204,6 +204,11 @@ Phases 2-3).
   refused at the TLS handshake. The node needs cgroup v2, which the Ubuntu
   22.04 AMIs have; on cgroup v1 every covered connection is refused
   (`binary_unknown`).
+- Phase 4, on `single-node-fc` (`firecracker` + `egress-fqdn`): UC-204
+  creates a Firecracker guest allowed `pypi.org`. Its traffic reaches the
+  egress gateway over its own TAP: the listed name fetches over HTTPS, another
+  is refused fast, `egress_status` is `active`, and a live switch to block-all
+  shuts it. That scenario also runs the docker egress UCs above.
 - UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
   can't reach host services) only need `docker`.
 - **`private-cloud`** (`single-node-private-cloud`, `make

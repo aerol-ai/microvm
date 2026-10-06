@@ -30,7 +30,10 @@ type bound struct {
 // gateway IP. REDIRECT rewrites the destination to the incoming interface's
 // primary address, so binding there (not a wildcard) keeps the listeners off
 // every other interface; IP_FREEBIND lets the bind succeed before a bridge
-// such as aerolvm0 has its first address.
+// such as aerolvm0 has its first address. The Firecracker TAP pool is the
+// exception (egress.TapPoolBridge): one host address per TAP, so with it
+// present a single wildcard set serves every bridge, behind the input
+// guard that drops the ports from any source not in gateway mode.
 type bridgeListeners struct {
 	mu        sync.Mutex
 	dnsPort   uint16
@@ -38,44 +41,53 @@ type bridgeListeners struct {
 	dns       dns.Handler
 	serve     func(net.Listener)
 	listen    func(network, addr string) (net.Listener, net.PacketConn, error)
-	byName    map[string]*bound
+	byIP      map[netip.Addr]*bound
 	bridges   []egress.Bridge
 	log       *slog.Logger
 }
 
 func newBridgeListeners(dnsPort, proxyPort uint16, h dns.Handler, serve func(net.Listener), listen func(network, addr string) (net.Listener, net.PacketConn, error), log *slog.Logger) *bridgeListeners {
-	return &bridgeListeners{dnsPort: dnsPort, proxyPort: proxyPort, dns: h, serve: serve, listen: listen, byName: map[string]*bound{}, log: log}
+	return &bridgeListeners{dnsPort: dnsPort, proxyPort: proxyPort, dns: h, serve: serve, listen: listen, byIP: map[netip.Addr]*bound{}, log: log}
 }
 
-// Set binds new bridges and closes removed ones. Bridges whose address is
-// unchanged keep their listeners.
+// Set binds new bridges and closes removed ones. Addresses still wanted
+// keep their listeners. Removals go first, so a move to or from the
+// wildcard can take the ports.
 func (b *bridgeListeners) Set(bridges []egress.Bridge) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	want := map[string]egress.Bridge{}
+	wildcard := false
 	for _, br := range bridges {
 		if !br.GatewayIP.Is4() {
 			return fmt.Errorf("bridge %s: gateway IP %q is not IPv4 (gateway mode refuses IPv6 bridges, CEO D18)", br.Name, br.GatewayIP)
 		}
-		want[br.Name] = br
+		wildcard = wildcard || br.Wildcard()
+	}
+	want := map[netip.Addr]string{}
+	for _, br := range bridges {
+		if wildcard {
+			want[netip.IPv4Unspecified()] = "*"
+			break
+		}
+		want[br.GatewayIP] = br.Name
 	}
 	var errs []error
-	for name, cur := range b.byName {
-		if br, ok := want[name]; !ok || br.GatewayIP != cur.ip {
+	for ip, cur := range b.byIP {
+		if _, ok := want[ip]; !ok {
 			cur.shutdown()
-			delete(b.byName, name)
+			delete(b.byIP, ip)
 		}
 	}
-	for name, br := range want {
-		if _, ok := b.byName[name]; ok {
+	for ip, name := range want {
+		if _, ok := b.byIP[ip]; ok {
 			continue
 		}
-		bd, err := b.bind(br.GatewayIP)
+		bd, err := b.bind(ip)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("bridge %s: %w", name, err))
 			continue
 		}
-		b.byName[name] = bd
+		b.byIP[ip] = bd
 	}
 	b.bridges = append([]egress.Bridge(nil), bridges...)
 	return errors.Join(errs...)
@@ -109,6 +121,11 @@ func (b *bridgeListeners) bind(ip netip.Addr) (*bound, error) {
 	bd.shutdown = func() {
 		_ = udp.ShutdownContext(context.Background())
 		_ = tcp.ShutdownContext(context.Background())
+		// Shutdown is a no-op on a server whose serve goroutine hasn't
+		// started yet; the sockets must still go, or a rebind of the port
+		// (on the wildcard) fails.
+		_ = pc.Close()
+		_ = tcpLn.Close()
 		_ = proxyLn.Close()
 	}
 	b.log.Info("egress: listeners bound", "ip", ip, "dns_port", b.dnsPort, "proxy_port", b.proxyPort)
@@ -120,7 +137,7 @@ func (b *bridgeListeners) Addrs() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	var out []string
-	for _, bd := range b.byName {
+	for _, bd := range b.byIP {
 		out = append(out, bd.addrs...)
 	}
 	sort.Strings(out)
@@ -138,9 +155,9 @@ func (b *bridgeListeners) Bridges() []egress.Bridge {
 func (b *bridgeListeners) Close() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for name, bd := range b.byName {
+	for ip, bd := range b.byIP {
 		bd.shutdown()
-		delete(b.byName, name)
+		delete(b.byIP, ip)
 	}
 }
 
