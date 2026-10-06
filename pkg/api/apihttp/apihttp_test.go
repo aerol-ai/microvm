@@ -477,3 +477,22 @@ func TestWriteStoreAwareError_RegistryUnavailable(t *testing.T) {
 		t.Errorf("Retry-After = %q, want 5", rr.Header().Get("Retry-After"))
 	}
 }
+
+// TestWriteStoreAwareError_EgressGatewayUnavailable: a local gateway failure
+// and a cluster with no ready gateway both answer 503 with the same code and
+// a Retry-After, not the generic placement 503 (plans/egress-domain-filtering.md
+// G7, CEO D20).
+func TestWriteStoreAwareError_EgressGatewayUnavailable(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("%w: dial", service.ErrEgressGatewayUnavailable),
+		cluster.ErrNoEgressGatewayTarget,
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("%v: status=%d code=%q retry=%q", err, rr.Code, body.Code, rr.Header().Get("Retry-After"))
+		}
+	}
+}

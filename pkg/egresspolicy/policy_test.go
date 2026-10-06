@@ -296,3 +296,24 @@ func TestPolicyHash(t *testing.T) {
 		t.Fatal("mode must be part of the hash")
 	}
 }
+
+func TestNeedsGateway(t *testing.T) {
+	cases := []struct {
+		allow, deny []string
+		blockAll    bool
+		want        bool
+	}{
+		{[]string{"pypi.org"}, nil, false, true},
+		{[]string{"*.github.com"}, []string{"0.0.0.0/0"}, false, true},
+		{[]string{"pypi.org"}, nil, true, false},
+		{[]string{"10.0.0.0/8"}, nil, false, false},
+		{nil, []string{"10.0.0.0/8"}, false, false},
+		{[]string{"bad host!"}, nil, false, false},
+		{nil, nil, false, false},
+	}
+	for _, tc := range cases {
+		if got := NeedsGateway(tc.allow, tc.deny, tc.blockAll); got != tc.want {
+			t.Errorf("NeedsGateway(%v, %v, %v) = %v, want %v", tc.allow, tc.deny, tc.blockAll, got, tc.want)
+		}
+	}
+}

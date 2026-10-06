@@ -215,6 +215,19 @@ func ValidRuntime(value string) (string, error) {
 	}
 }
 
+// RuntimeUsesEgressGateway reports whether hostname egress rules on this
+// runtime are enforced by the node's egress gateway. WASM and isolate filter
+// in their own host-side mediators; Firecracker joins in Phase 4
+// (plans/egress-domain-filtering.md). Cluster placement uses it to route
+// gateway-mode creates only to nodes with a ready gateway.
+func RuntimeUsesEgressGateway(runtime string) bool {
+	switch runtime {
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata:
+		return true
+	}
+	return false
+}
+
 // ValidDurability normalizes and validates a durability class. Empty input
 // passes through so the caller can apply a runtime-specific default.
 func ValidDurability(value string) (string, error) {
@@ -1097,6 +1110,12 @@ type ErrorResponse struct {
 // recovery is to re-create the artifact (re-upload the bundle, rebuild the
 // image), which yields a new node-bound ref.
 const ErrorCodeArtifactNodeUnavailable = "artifact_node_unavailable"
+
+// ErrorCodeEgressGatewayUnavailable is returned (503, with Retry-After) when
+// a sandbox with hostname egress rules can't be filtered right now: the
+// node's egress gateway is down, or in a cluster no node has a ready one
+// (plans/egress-domain-filtering.md G7, CEO D20). Retrying is the recovery.
+const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming

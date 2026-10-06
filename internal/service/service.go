@@ -4712,6 +4712,7 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleInventoryKnown = true
 		snap.LocalWasmModuleIDs = refs
 	}
+	snap.EgressGatewayReady = s.EgressGatewayReady()
 	// Observability-only engine tag (not a placement attribute).
 	if s.cfg.ContainerEngine != "" {
 		snap.ContainerEngine = s.cfg.ContainerEngine

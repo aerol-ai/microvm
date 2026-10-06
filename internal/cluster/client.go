@@ -1644,6 +1644,17 @@ func (c *Cluster) SetLocalWasmModuleIDsProvider(fn func() ([]string, bool)) {
 	c.capacityLeases.SetLocalWasmModuleIDsProvider(fn)
 }
 
+// SetEgressGatewayReadyProvider registers the egress gateway readiness
+// callback so this node's own lease advertises EgressGatewayReady
+// (plans/egress-domain-filtering.md CEO D20). Peers read the same flag from
+// this node's /v1/capacity.
+func (c *Cluster) SetEgressGatewayReadyProvider(fn func() bool) {
+	if c == nil || c.capacityLeases == nil {
+		return
+	}
+	c.capacityLeases.SetEgressGatewayReadyProvider(fn)
+}
+
 func (c *Cluster) membersWithCapacity() []Member {
 	members := c.gossip.members()
 	if c.capacityLeases == nil {

@@ -600,6 +600,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				})
 			}
 		}
+		// Capability-aware placement (plans/egress-domain-filtering.md CEO
+		// D20): our own lease advertises whether hostname-filtered creates
+		// can be attached here. Always registered; false while the gateway
+		// is off, down or not yet synced.
+		if withEgress, ok := clusterClient.(interface {
+			SetEgressGatewayReadyProvider(func() bool)
+		}); ok {
+			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
+		}
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))

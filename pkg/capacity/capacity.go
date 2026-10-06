@@ -102,6 +102,10 @@ type Request struct {
 	// RequiredNodeID pins non-portable local artifacts (for example an image
 	// built on one worker) to the only node that can satisfy the request.
 	RequiredNodeID string
+	// NeedsEgressGateway marks a gateway-mode container create (hostname
+	// egress rules). Placement sends it only to peers advertising
+	// EgressGatewayReady (plans/egress-domain-filtering.md CEO D20).
+	NeedsEgressGateway bool
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -177,6 +181,13 @@ type Snapshot struct {
 	// doesn't have, say, runsc installed. Empty = legacy node, treated as
 	// supporting any runtime so rolling upgrades don't strand pre-D peers.
 	SupportedRuntimes []string `json:"supported_runtimes,omitempty"`
+	// EgressGatewayReady is true while this node's egress gateway is
+	// connected and synced, so hostname-filtered creates can be attached.
+	// Unlike SupportedRuntimes there is no unknown-allow rule: a peer that
+	// omits it (an older build, or the gateway down) gets no gateway-mode
+	// creates, because landing one there means a 501 or a 503 instead of a
+	// filtered sandbox (plans/egress-domain-filtering.md CEO D20).
+	EgressGatewayReady bool `json:"egress_gateway_ready,omitempty"`
 	// ContainerEngine is an observability tag (docker|containerd) so benches
 	// and canary nodes compare engines like-for-like. Deliberately NOT a
 	// placement attribute — see plans/containerd-engine.md §2 D18.

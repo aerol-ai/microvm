@@ -165,6 +165,12 @@ var ErrNoPlacementTarget = errors.New("cluster: no worker placement target avail
 // client can tell "re-create the artifact" from "wait for capacity".
 var ErrArtifactNodeUnavailable = fmt.Errorf("cluster: the node holding this artifact is unavailable: %w", ErrNoPlacementTarget)
 
+// ErrNoEgressGatewayTarget is ErrNoPlacementTarget's form for a gateway-mode
+// create (hostname egress rules) when no candidate node has a ready egress
+// gateway (plans/egress-domain-filtering.md CEO D20). It stays an
+// ErrNoPlacementTarget so every existing 503 mapping still applies.
+var ErrNoEgressGatewayTarget = fmt.Errorf("%w: no node has a ready egress gateway for hostname egress rules", ErrNoPlacementTarget)
+
 // ErrInvalidTopology is returned when the live cluster shape violates a
 // production topology invariant. API layers translate this to 503 so clients
 // retry after the operator fixes membership instead of treating it as a

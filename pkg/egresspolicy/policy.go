@@ -231,6 +231,19 @@ func (p *Policy) GatewayMode() bool {
 	return !p.blockAll && (p.hostnames > 0 || p.mode == ModeLearn)
 }
 
+// NeedsGateway reports whether a container create with these fields lands in
+// gateway mode. Cluster placement asks it for every create before the target
+// is chosen, so it answers false for lists that don't compile: the target's
+// own validation returns the 400. Hostnames only ever appear in allow lists,
+// which makes an empty allow list the common, compile-free answer.
+func NeedsGateway(allow, deny []string, blockAll bool) bool {
+	if blockAll || len(allow) == 0 {
+		return false
+	}
+	p, err := Compile(Spec{AllowOut: allow, DenyOut: deny})
+	return err == nil && p.GatewayMode()
+}
+
 // AllowEntries returns the deduplicated allow entries in input order.
 func (p *Policy) AllowEntries() []Entry { return append([]Entry(nil), p.allow...) }
 

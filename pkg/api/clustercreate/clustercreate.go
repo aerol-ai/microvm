@@ -17,6 +17,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -155,6 +156,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 		if err != nil {
+			if writeNoEgressGateway(w, err) {
+				return Decision{}, false
+			}
 			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 				// The artifact went with its node; no Retry-After, the client
 				// must re-create it (re-upload the bundle / rebuild the image).
@@ -212,6 +216,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
+		if writeNoEgressGateway(w, err) {
+			return Decision{}, false
+		}
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 			// A node-bound js-bundle whose worker is gone: the client must
 			// re-upload, so no Retry-After — waiting changes nothing.
@@ -383,6 +390,19 @@ func CancelReservationBestEffort(ctx context.Context, svc *service.Service, logg
 	cancelReservation(ctx, c, logger, sandboxID)
 }
 
+// writeNoEgressGateway answers a gateway-mode create that no node with a
+// ready egress gateway could take (plans/egress-domain-filtering.md CEO D20):
+// 503 with a code and Retry-After, since a gateway coming back re-advertises
+// within seconds. Reports whether it wrote.
+func writeNoEgressGateway(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
+		return false
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
+	apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
+	return true
+}
+
 func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request {
 	cpu := req.CPU
 	mem := req.MemoryMB
@@ -423,6 +443,8 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
+	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
+		egresspolicy.NeedsGateway(req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkBlockAll)
 	if req.GPUs != nil {
 		want := req.GPUs.Count
 		if want <= 0 {

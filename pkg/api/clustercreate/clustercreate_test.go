@@ -1640,3 +1640,36 @@ func TestOverlapFailureHelpers(t *testing.T) {
 		t.Fatalf("errString: %q / %q", errString(nil), errString(base))
 	}
 }
+
+// TestCapacityRequestFromCreateEgressGateway: the public create path marks
+// hostname-filtered container creates so placement only picks nodes with a
+// ready gateway (plans/egress-domain-filtering.md CEO D20).
+func TestCapacityRequestFromCreateEgressGateway(t *testing.T) {
+	if !CapacityRequestFromCreate(models.CreateSandboxRequest{NetworkAllowOut: []string{"pypi.org"}}).NeedsEgressGateway {
+		t.Fatal("hostname allow list must need the gateway")
+	}
+	for _, req := range []models.CreateSandboxRequest{
+		{NetworkAllowOut: []string{"10.0.0.0/8"}},
+		{Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}},
+		{NetworkBlockAll: true, NetworkAllowOut: []string{"pypi.org"}},
+	} {
+		if CapacityRequestFromCreate(req).NeedsEgressGateway {
+			t.Fatalf("%+v must not need the gateway", req)
+		}
+	}
+}
+
+func TestWriteNoEgressGateway(t *testing.T) {
+	rr := httptest.NewRecorder()
+	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget) {
+		t.Fatal("a plain placement failure is not a gateway failure")
+	}
+	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget) {
+		t.Fatal("gateway sentinel must be written")
+	}
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}

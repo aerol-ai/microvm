@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -64,6 +65,11 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	if runtimeName == models.RuntimeWasm {
 		out.MemoryMB += 8
 	}
+	// A recreate of a hostname-filtered sandbox needs a gateway as much as
+	// its first create did: failover must not land it on a node that can
+	// only answer 501.
+	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
+		egresspolicy.NeedsGateway(spec.NetworkAllowOut, spec.NetworkDenyOut, spec.NetworkBlockAll)
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {
@@ -158,6 +164,12 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["drained"]++
 			continue
 		}
+		// A hard capability rule like drain, kept out of nodeFits so the
+		// empty-set error can name it: "no gateway" is not "cluster full".
+		if req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
+			rejects["egress_gateway"]++
+			continue
+		}
 		if !nodeFits(m, req, pending[m.NodeID]) {
 			rejects["capacity"]++
 			continue
@@ -168,7 +180,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0)
 	}
 
 	// Power-of-two-choices.
@@ -629,9 +641,16 @@ var _ = func() error {
 // request bound to one node by an artifact fails as ErrArtifactNodeUnavailable
 // when that node was not a live capacity-reporting member — the artifact is
 // gone with it, and waiting will not bring it back.
-func noPlacementTargetError(req capacity.Request, requiredReachable bool) error {
+//
+// A gateway-mode create that lost at least one peer only to the gateway rule
+// fails as ErrNoEgressGatewayTarget so the client is told why: some node may
+// have had room, none could filter hostnames.
+func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected bool) error {
 	if req.RequiredNodeID != "" && !requiredReachable {
 		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
+	}
+	if req.NeedsEgressGateway && gatewayRejected {
+		return ErrNoEgressGatewayTarget
 	}
 	return ErrNoPlacementTarget
 }

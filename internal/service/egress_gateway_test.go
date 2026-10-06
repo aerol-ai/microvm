@@ -348,3 +348,85 @@ func TestConsumeEgressEvents(t *testing.T) {
 		t.Fatal("heartbeat not consumed")
 	}
 }
+
+// TestEgressGatewayReadyAdvertised covers the sandboxd half of CEO D20: the
+// capacity snapshot carries readiness, which needs the feature on, the latch
+// set and the gateway seen up.
+func TestEgressGatewayReadyAdvertised(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	if svc.EgressGatewayReady() || svc.Capacity().EgressGatewayReady {
+		t.Fatal("not ready before the bootstrap")
+	}
+	if err := svc.EnsureEgressGatewayReady(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.EgressGatewayReady() || !svc.Capacity().EgressGatewayReady {
+		t.Fatal("a synced gateway must be advertised")
+	}
+	svc.egressStats.gatewayUp.Store(false)
+	if svc.EgressGatewayReady() {
+		t.Fatal("a gateway seen down must not be advertised")
+	}
+	svc.egressStats.gatewayUp.Store(true)
+	svc.cfg.EgressFQDNEnabled = false
+	if svc.EgressGatewayReady() {
+		t.Fatal("the feature off means no gateway")
+	}
+	var nilSvc *Service
+	if nilSvc.EgressGatewayReady() {
+		t.Fatal("nil service")
+	}
+}
+
+// TestSuperviseEgressGatewayRecovers: a gateway that was down at startup, or
+// whose stream broke, is re-synced without waiting for a create, because in
+// a cluster placement sends none to a node that isn't ready.
+func TestSuperviseEgressGatewayRecovers(t *testing.T) {
+	svc, gw, _ := newEgressHarness(t)
+	gw.events = make(chan egress.Event)
+	gw.mu.Lock()
+	gw.readyErr = egress.ErrUnavailable
+	gw.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		svc.SuperviseEgressGateway(ctx, 5*time.Millisecond)
+		close(done)
+	}()
+	waitFor := func(want bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for svc.EgressGatewayReady() != want {
+			if time.Now().After(deadline) {
+				t.Fatalf("EgressGatewayReady never became %v", want)
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}
+	time.Sleep(20 * time.Millisecond)
+	if svc.EgressGatewayReady() {
+		t.Fatal("ready while the gateway is down")
+	}
+	gw.mu.Lock()
+	gw.readyErr = nil
+	gw.mu.Unlock()
+	waitFor(true)
+	// The event stream broke: the latch drops and the supervisor re-syncs.
+	gw.mu.Lock()
+	before := len(gw.synced)
+	gw.mu.Unlock()
+	svc.egressReady.Store(false)
+	waitFor(true)
+	gw.mu.Lock()
+	after := len(gw.synced)
+	gw.mu.Unlock()
+	if after <= before {
+		t.Fatal("recovery must re-sync the gateway")
+	}
+	cancel()
+	<-done
+
+	// Feature off: returns at once.
+	svc.cfg.EgressFQDNEnabled = false
+	svc.SuperviseEgressGateway(context.Background(), 0)
+}

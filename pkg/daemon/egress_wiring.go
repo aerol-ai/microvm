@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/netip"
 	goruntime "runtime"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -12,6 +13,10 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
+
+// egressSuperviseInterval is how quickly a node whose gateway came back
+// re-syncs and re-advertises egress_gateway_ready to placement.
+const egressSuperviseInterval = 5 * time.Second
 
 // bridgeSource is the docker side of bridge discovery (*docker.Client).
 type bridgeSource interface {
@@ -22,7 +27,8 @@ type bridgeSource interface {
 // hostname filtering is on (plans/egress-domain-filtering.md D9). sandboxd
 // discovers the sandbox bridges (docker network, aerolvm0) and hands them to
 // the gateway, which has no docker socket access (S5). The first connect is
-// best-effort here and lazy on the first gateway-mode create.
+// supervised: retried every few seconds while down, and lazily on the
+// first gateway-mode create.
 func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, docker bridgeSource, logger *slog.Logger) {
 	if !cfg.EgressFQDNEnabled || goruntime.GOOS != "linux" || !cfg.IsWorker() {
 		return
@@ -48,11 +54,7 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 		return out
 	}
 	svc.SetEgressGateway(egress.NewClient(cfg.EgressGatewaySocket), bridges)
-	go func() {
-		if err := svc.EnsureEgressGatewayReady(ctx); err != nil {
-			logger.Warn("egress gateway not ready at startup; retried on the first gateway-mode create", "error", err)
-		}
-	}()
+	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }
 
 // firstHost returns the first host address of a subnet, the CNI bridge's

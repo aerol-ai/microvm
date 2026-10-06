@@ -426,6 +426,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}
+		if resp.Error == ErrNoEgressGatewayTarget.Error() {
+			return PlacementTarget{}, nil, nil, ErrNoEgressGatewayTarget
+		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
 			return PlacementTarget{}, nil, nil, err
 		}

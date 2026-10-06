@@ -147,6 +147,53 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) error {
 	return nil
 }
 
+// EgressGatewayReady reports whether this node can attach a hostname-filtered
+// sandbox right now. It is advertised in the capacity heartbeat, so cluster
+// placement sends gateway-mode creates only to nodes where it holds
+// (plans/egress-domain-filtering.md CEO D20). Two atomic loads: it runs on
+// every heartbeat and every /v1/capacity read.
+func (s *Service) EgressGatewayReady() bool {
+	return s.egressEnabled() && s.egressReady.Load() && s.egressStats.gatewayUp.Load()
+}
+
+// SuperviseEgressGateway re-runs the gateway bootstrap whenever the latch is
+// down: at startup before the gateway is up, and after its event stream
+// breaks (a gateway restart). The lazy retry on create is not enough in
+// cluster mode, where placement stops sending gateway-mode creates to a node
+// that isn't ready, so nothing else would bring it back. One atomic load per
+// tick while ready; logs only when the failure changes.
+func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Duration) {
+	if !s.egressEnabled() {
+		return
+	}
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	lastErr := ""
+	for {
+		if !s.egressReady.Load() {
+			msg := ""
+			if err := s.EnsureEgressGatewayReady(ctx); err != nil {
+				msg = err.Error()
+			}
+			switch {
+			case msg != "" && msg != lastErr:
+				s.logger.Warn("egress gateway not ready; hostname-filtered creates are refused here until it is", "error", msg)
+			case msg == "" && lastErr != "":
+				s.logger.Info("egress gateway ready")
+			}
+			lastErr = msg
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // ResyncEgressGateway forces a full Sync (gateway restart, table loss).
 func (s *Service) ResyncEgressGateway(ctx context.Context) error {
 	if !s.egressEnabled() {
