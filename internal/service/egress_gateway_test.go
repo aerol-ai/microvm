@@ -36,6 +36,8 @@ type fakeGateway struct {
 	forgotten    []string
 	inspectCA    []egress.InspectCA
 	inspectErr   error
+	retained     []string
+	retains      int
 }
 
 func newFakeGateway() *fakeGateway {
@@ -111,6 +113,13 @@ func (f *fakeGateway) ForgetLearned(_ context.Context, id string) error {
 	defer f.mu.Unlock()
 	f.forgotten = append(f.forgotten, id)
 	delete(f.learned, id)
+	return nil
+}
+func (f *fakeGateway) RetainLearned(_ context.Context, ids []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.retained = append([]string(nil), ids...)
+	f.retains++
 	return nil
 }
 func (f *fakeGateway) SetInspectCA(_ context.Context, ca egress.InspectCA) error {

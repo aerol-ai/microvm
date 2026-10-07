@@ -33,6 +33,7 @@ const (
 	opSubscribe  = "subscribe"
 	opLearned    = "learned"
 	opForget     = "forget_learned"
+	opRetain     = "retain_learned"
 	opNodeCtl    = "node_control"
 	opInspectCA  = "set_inspect_ca"
 )

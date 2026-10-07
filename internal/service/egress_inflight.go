@@ -44,6 +44,16 @@ func (f *egressInflight) drop(id string) {
 	delete(f.m, id)
 }
 
+func (f *egressInflight) ids() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.m))
+	for id := range f.m {
+		out = append(out, id)
+	}
+	return out
+}
+
 func (f *egressInflight) len() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

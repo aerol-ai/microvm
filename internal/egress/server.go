@@ -26,6 +26,8 @@ type ServerHooks struct {
 	Learned func(id string) (json.RawMessage, error)
 	// ForgetLearned discards a destroyed sandbox's recording.
 	ForgetLearned func(id string) error
+	// RetainLearned discards the recordings of sandboxes not in ids.
+	RetainLearned func(ids []string) error
 	// Changed is called after any state change so the snapshot can be saved.
 	Changed func()
 	// NodeControl replaces the control endpoints of the node-wide guard.
@@ -230,6 +232,18 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 		}
 		if s.hooks.ForgetLearned != nil {
 			err = s.hooks.ForgetLearned(id)
+		}
+	case opRetain:
+		var ids []string
+		if err = json.Unmarshal(req.Payload, &ids); err != nil {
+			return nil, err
+		}
+		if ids == nil {
+			// A null list is a malformed request, never "keep nothing".
+			return nil, fmt.Errorf("%w: retain_learned needs a list", ErrUnavailable)
+		}
+		if s.hooks.RetainLearned != nil {
+			err = s.hooks.RetainLearned(ids)
 		}
 	case opNodeCtl:
 		var eps []netip.AddrPort

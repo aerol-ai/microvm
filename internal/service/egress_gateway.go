@@ -193,6 +193,9 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	if err == nil {
 		err = gw.Sync(ctx, specs)
 	}
+	if err == nil {
+		s.retainLearnedLocked(ctx)
+	}
 	s.egressSyncMu.Unlock()
 	if err != nil {
 		return err
@@ -251,6 +254,11 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 		}
 		s.retryEgressSelfTests(ctx, false)
 		s.syncNodeControl(ctx)
+		if s.egressReady.Load() && time.Since(time.Unix(0, s.egressRetainedAt.Load())) > egressRetainInterval {
+			s.egressSyncMu.Lock()
+			s.retainLearnedLocked(ctx)
+			s.egressSyncMu.Unlock()
+		}
 		if s.EgressGatewayReady() && s.egressStats.held.Load() > 0 {
 			s.retryEgressHolds(ctx)
 		}
@@ -306,6 +314,33 @@ func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
 		specs = append(specs, spec)
 	}
 	return s.egressInflight.merge(specs, started, time.Now()), nil
+}
+
+// egressRetainInterval is how often sandboxd sends the gateway its
+// inventory, besides after every full Sync, so recordings of sandboxes
+// destroyed while the gateway was away don't wait for its next restart.
+const egressRetainInterval = time.Hour
+
+// retainLearnedLocked sends the gateway the inventory of every sandbox this
+// node still holds (any status, so a stopped one keeps its recording) plus
+// the attaches the store doesn't show yet; the gateway drops every other
+// recording (review finding 13). Callers hold egressSyncMu exclusively, so
+// no attach starts recording between the inventory and its use.
+func (s *Service) retainLearnedLocked(ctx context.Context) {
+	rows, err := s.store.List(ctx)
+	if err != nil {
+		return
+	}
+	ids := make([]string, 0, len(rows)+s.egressInflight.len())
+	for _, sb := range rows {
+		ids = append(ids, sb.ID)
+	}
+	ids = append(ids, s.egressInflight.ids()...)
+	if err := s.egressGateway().RetainLearned(ctx, ids); err != nil {
+		s.logger.Warn("egress: learn recordings not collected; retried later", "error", err)
+		return
+	}
+	s.egressRetainedAt.Store(time.Now().UnixNano())
 }
 
 // sandboxPolicy compiles a stored sandbox's egress policy.

@@ -29,6 +29,10 @@ type API interface {
 	// calls it on destroy. A recording outlives learn → enforce so the
 	// owner can still read it, so detach alone can't drop it.
 	ForgetLearned(ctx context.Context, id string) error
+	// RetainLearned drops every recording of a sandbox not in ids, sandboxd's
+	// inventory of the sandboxes this node still holds, so a destroy whose
+	// ForgetLearned never arrived is collected eventually.
+	RetainLearned(ctx context.Context, ids []string) error
 	// SetNodeControl replaces the node-wide control-port guard's endpoints
 	// (§5.10 PC-2).
 	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
@@ -76,6 +80,9 @@ func (Noop) Learned(context.Context, string) (json.RawMessage, error) {
 
 // ForgetLearned is a no-op: without a gateway there is no recording.
 func (Noop) ForgetLearned(context.Context, string) error { return nil }
+
+// RetainLearned is a no-op: without a gateway there is no recording.
+func (Noop) RetainLearned(context.Context, []string) error { return nil }
 
 // SetInspectCA fails: without a gateway nothing can be inspected, and an
 // inspect sandbox must stay shut rather than run unchecked.
@@ -278,6 +285,13 @@ func (c *Client) Learned(ctx context.Context, id string) (json.RawMessage, error
 
 func (c *Client) ForgetLearned(ctx context.Context, id string) error {
 	return c.call(ctx, opForget, id, nil)
+}
+
+func (c *Client) RetainLearned(ctx context.Context, ids []string) error {
+	if ids == nil {
+		ids = []string{}
+	}
+	return c.call(ctx, opRetain, ids, nil)
 }
 
 func (c *Client) SetInspectCA(ctx context.Context, ca InspectCA) error {

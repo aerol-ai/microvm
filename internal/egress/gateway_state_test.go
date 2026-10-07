@@ -349,3 +349,17 @@ func TestRevalidateConns(t *testing.T) {
 		t.Fatal("a connection without a dialed address stays open")
 	}
 }
+
+// TestServerRefusesNullRetain: a retain_learned without a list is malformed;
+// reading it as an empty inventory would delete every recording.
+func TestServerRefusesNullRetain(t *testing.T) {
+	g, _, _ := newHookGateway(t)
+	called := false
+	s := NewServer(g, ServerHooks{RetainLearned: func([]string) error { called = true; return nil }}, nil, NewEventHub(16), nil)
+	if _, err := s.dispatch(request{Op: opRetain, Payload: []byte("null")}); err == nil || called {
+		t.Fatalf("null inventory: err=%v called=%v", err, called)
+	}
+	if _, err := s.dispatch(request{Op: opRetain, Payload: []byte("[]")}); err != nil || !called {
+		t.Fatalf("empty inventory: err=%v called=%v", err, called)
+	}
+}

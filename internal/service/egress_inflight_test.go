@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -108,5 +109,37 @@ func TestLayoutLossRecoveryIsSingleFlight(t *testing.T) {
 	svc.endGaugeBatch(ctx)
 	if svc.egressStats.held.Load() != 0 || svc.egressGaugeDirty.Load() {
 		t.Fatal("the batch's end must recount once")
+	}
+}
+
+// TestFullSyncSendsTheRecordingInventory (review finding 13): every full
+// Sync is followed by the inventory of the sandboxes this node still holds,
+// stopped ones and attaches not yet written included, so the gateway can
+// collect recordings whose forget never arrived.
+func TestFullSyncSendsTheRecordingInventory(t *testing.T) {
+	svc, gw, rt := newEgressHarness(t)
+	ctx := context.Background()
+	stopped := &models.Sandbox{ID: "sb-stopped", Image: "alpine", Status: models.SandboxStatusStopped, CreatedAt: time.Now(), UpdatedAt: time.Now(), LastActiveAt: time.Now()}
+	if err := svc.store.Create(ctx, stopped); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.EnsureEgressGatewayReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inflight := &models.Sandbox{ID: "sb-creating", ContainerIP: "10.0.0.7", Status: models.SandboxStatusStarted, NetworkAllowOut: []string{"pypi.org"}}
+	if err := svc.attachSandboxEgress(ctx, inflight, rt); err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.ResyncEgressGateway(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gw.mu.Lock()
+	retained, n := append([]string(nil), gw.retained...), gw.retains
+	gw.mu.Unlock()
+	if n < 2 || !slices.Contains(retained, "sb-stopped") || !slices.Contains(retained, "sb-creating") {
+		t.Fatalf("inventory = %v after %d sends", retained, n)
+	}
+	if svc.egressRetainedAt.Load() == 0 {
+		t.Fatal("a successful send is recorded for the hourly pacing")
 	}
 }

@@ -374,6 +374,9 @@ type Service struct {
 	// egressGaugeBatch/egressGaugeDirty defer the held gauge's refresh to
 	// the end of a batch (review finding 12).
 	egressRecovering atomic.Bool
+	// egressRetainedAt is when the gateway last got the recording
+	// inventory (unix nanos).
+	egressRetainedAt atomic.Int64
 	egressGaugeBatch atomic.Int32
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);

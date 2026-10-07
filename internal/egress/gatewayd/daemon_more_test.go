@@ -205,3 +205,88 @@ func TestDaemonInspectCA(t *testing.T) {
 		t.Fatal("the CA key must never reach the snapshot")
 	}
 }
+
+// TestStoppedSandboxRecordingSurvivesRestart (review finding 14): a stopped
+// sandbox is detached, so it isn't in the snapshot, but its recording stays
+// readable across a gateway restart and new learning adds to it rather than
+// overwriting it.
+func TestStoppedSandboxRecordingSurvivesRestart(t *testing.T) {
+	state := t.TempDir()
+	be := egress.NewMemBackend()
+	r := startDaemon(t, state, be)
+	ctx := context.Background()
+	ip := netip.MustParseAddr("127.0.0.4")
+	if err := r.client.Attach(ctx, egress.Spec{ID: "st", IP: ip, Learn: true}); err != nil {
+		t.Fatal(err)
+	}
+	r.d.recorder("st").ObserveHost("pypi.org", 443)
+	r.d.saveNow()
+	if err := r.client.Detach(ctx, "st", ip); err != nil { // stop
+		t.Fatal(err)
+	}
+	r.d.saveNow()
+	r.stop(t)
+
+	r2 := startDaemon(t, state, be)
+	raw, err := r2.client.Learned(ctx, "st")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got egresspolicy.Learned
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Entries) != 1 {
+		t.Fatalf("a stopped sandbox's recording must survive the restart: %s, %v", raw, err)
+	}
+	r2.d.recorder("st").ObserveHost("files.pythonhosted.org", 443)
+	if l := r2.d.recorder("st").Snapshot(); len(l.Entries) != 2 {
+		t.Fatalf("new learning must add to the saved recording: %+v", l.Entries)
+	}
+}
+
+// TestRetainLearnedCollectsOrphans (review finding 13): sandboxd's inventory
+// decides which recordings stay; one whose forget never arrived is removed
+// from memory and disk, a retained one (stopped included) stays, and the
+// save loop's version entries go with forgotten recordings.
+func TestRetainLearnedCollectsOrphans(t *testing.T) {
+	state := t.TempDir()
+	r := startDaemon(t, state, egress.NewMemBackend())
+	ctx := context.Background()
+	for _, id := range []string{"keep", "gone"} {
+		r.d.recorder(id).ObserveHost("pypi.org", 443)
+	}
+	r.d.saveNow()
+	if err := os.WriteFile(filepath.Join(state, "learn", "notes.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.RetainLearned(ctx, []string{"keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "learn", "gone.json")); !os.IsNotExist(err) {
+		t.Fatalf("an orphan recording must be removed: %v", err)
+	}
+	for _, f := range []string{"keep.json", "notes.txt"} {
+		if _, err := os.Stat(filepath.Join(state, "learn", f)); err != nil {
+			t.Fatalf("%s must stay: %v", f, err)
+		}
+	}
+	r.d.learnMu.Lock()
+	_, gone := r.d.learn["gone"]
+	r.d.learnMu.Unlock()
+	if gone {
+		t.Fatal("the orphan must leave memory too")
+	}
+	r.d.saveNow()
+	r.d.saveMu.Lock()
+	_, stale := r.d.savedLearn["gone"]
+	r.d.saveMu.Unlock()
+	if stale {
+		t.Fatal("a collected recording's saved version must be pruned")
+	}
+	// An empty inventory is "keep nothing" (a null one is refused, see
+	// TestServerRefusesNullRetain).
+	if err := r.client.RetainLearned(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "learn", "keep.json")); !os.IsNotExist(err) {
+		t.Fatal("an empty inventory keeps no recording")
+	}
+}

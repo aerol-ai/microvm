@@ -132,6 +132,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		Listeners:     d.lns.Addrs,
 		Learned:       d.learned,
 		ForgetLearned: d.forgetLearned,
+		RetainLearned: d.retainLearned,
 		Changed:       d.markDirty,
 		NodeControl:   d.setNodeControl,
 		LossGen:       d.layoutLossGen,
@@ -427,7 +428,12 @@ func (d *Daemon) recorder(id string) *egresspolicy.Recorder {
 	defer d.learnMu.Unlock()
 	r := d.learn[id]
 	if r == nil {
-		r = egresspolicy.NewRecorder(d.cfg.LearnMax)
+		// A recording saved on disk (a stopped sandbox's, one from before
+		// a restart) is picked up, so new traffic adds to it rather than a
+		// fresh recorder overwriting it (review finding 14).
+		if r = d.loadRecordingLocked(id); r == nil {
+			r = egresspolicy.NewRecorder(d.cfg.LearnMax)
+		}
 		d.learn[id] = r
 	}
 	return r
@@ -436,11 +442,75 @@ func (d *Daemon) recorder(id string) *egresspolicy.Recorder {
 func (d *Daemon) learned(id string) (json.RawMessage, error) {
 	d.learnMu.Lock()
 	r := d.learn[id]
+	if r == nil {
+		// Readable until the sandbox is destroyed, attached or not: a stopped
+		// sandbox's recording is on disk only after a restart.
+		if r = d.loadRecordingLocked(id); r != nil {
+			d.learn[id] = r
+		}
+	}
 	d.learnMu.Unlock()
 	if r == nil {
 		return json.Marshal(egresspolicy.NewRecorder(d.cfg.LearnMax).Snapshot())
 	}
 	return json.Marshal(r.Snapshot())
+}
+
+// loadRecordingLocked reads a sandbox's saved recording, or nil if it has
+// none (or it can't be read). Callers hold learnMu.
+func (d *Daemon) loadRecordingLocked(id string) *egresspolicy.Recorder {
+	b, err := os.ReadFile(d.recordingPath(id))
+	if err != nil {
+		return nil
+	}
+	var l egresspolicy.Learned
+	if err := json.Unmarshal(b, &l); err != nil {
+		d.log.Warn("egress: learn recording unreadable; starting it over", "sandbox_id", id, "error", err)
+		return nil
+	}
+	return egresspolicy.RestoreRecorder(d.cfg.LearnMax, l)
+}
+
+// retainLearned drops every recording, in memory and on disk, of a sandbox
+// not in ids: sandboxd's inventory of every sandbox this node still holds,
+// started or stopped, plus attaches it hasn't written yet. A destroy whose
+// forget_learned never reached the gateway (it was down), and the delete
+// paths that don't send one, are collected here (review finding 13).
+// Membership in the inventory, not attachment, decides, so a stopped
+// sandbox keeps its recording until it is destroyed.
+func (d *Daemon) retainLearned(ids []string) error {
+	keep := make(map[string]bool, len(ids))
+	keepFiles := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		keep[id] = true
+		keepFiles[safeName(id)+".json"] = true
+	}
+	d.learnMu.Lock()
+	for id := range d.learn {
+		if !keep[id] {
+			delete(d.learn, id)
+		}
+	}
+	d.learnMu.Unlock()
+	dir := filepath.Join(d.cfg.StateDir, "learn")
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, e := range ents {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") || keepFiles[name] {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // forgetLearned drops a destroyed sandbox's recording, in memory and on disk.
@@ -634,6 +704,12 @@ func (d *Daemon) saveNow() {
 		recs[id] = r
 	}
 	d.learnMu.Unlock()
+	// A forgotten or collected recording's version entry goes with it.
+	for id := range d.savedLearn {
+		if _, ok := recs[id]; !ok {
+			delete(d.savedLearn, id)
+		}
+	}
 	// Only recordings that changed are rewritten (S9): at density a full
 	// rewrite would be ~100 MB every few seconds.
 	for id, r := range recs {
@@ -667,19 +743,12 @@ func (d *Daemon) saveNow() {
 // knows, learning or not: one switched to enforce stays readable until its
 // sandbox is destroyed.
 func (d *Daemon) loadRecordings(specs []egress.Spec) {
+	d.learnMu.Lock()
+	defer d.learnMu.Unlock()
 	for _, s := range specs {
-		b, err := os.ReadFile(d.recordingPath(s.ID))
-		if err != nil {
-			continue
+		if r := d.loadRecordingLocked(s.ID); r != nil {
+			d.learn[s.ID] = r
 		}
-		var l egresspolicy.Learned
-		if err := json.Unmarshal(b, &l); err != nil {
-			d.log.Warn("egress: learn recording unreadable; starting it over", "sandbox_id", s.ID, "error", err)
-			continue
-		}
-		d.learnMu.Lock()
-		d.learn[s.ID] = egresspolicy.RestoreRecorder(d.cfg.LearnMax, l)
-		d.learnMu.Unlock()
 	}
 }
 
