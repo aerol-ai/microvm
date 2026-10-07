@@ -128,8 +128,8 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	case ip.IsMulticast() || ip == broadcast:
 		return refuse(DialReasonMulticast, "")
 	}
-	if pfx, ok := firstContaining(g.DenyFloor, ip); ok {
-		return refuse(DialReasonDenyFloor, pfx.String())
+	if err := g.CheckFloor(t.Addr); err != nil {
+		return err
 	}
 	zoned := g.Zone != nil && (!g.Strict || g.ZoneInStrict) && g.Zone.Covers(t.Name, ip)
 	if isPrivate(ip) && !zoned {
@@ -153,11 +153,32 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	return nil
 }
 
+// CheckFloor applies only the operator deny floor. The floor is the one guard
+// rule that binds a sandbox with no policy of its own (§5.10 PC-2: it drops
+// matching traffic from every sandbox in every mode); the private-range rule
+// and the internal zone only narrow what a policy's allow rules open.
+func (g DialGuard) CheckFloor(addr netip.AddrPort) error {
+	ip := addr.Addr().Unmap()
+	if pfx, ok := firstContaining(g.DenyFloor, ip); ok {
+		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
+	}
+	return nil
+}
+
 // Control returns a net.Dialer.Control hook that applies Check to every
 // resolved address the dialer tries. The hook only ever sees the resolved
 // "ip:port", so bind it per dial with the name and match result the caller
 // already computed.
 func (g DialGuard) Control(p *Policy, name string, nameAllowed bool) func(network, address string, c syscall.RawConn) error {
+	return ControlHook(func(ap netip.AddrPort) error {
+		return g.Check(p, DialTarget{Name: name, NameAllowed: nameAllowed, Addr: ap})
+	})
+}
+
+// ControlHook adapts a decision on the resolved address to a
+// net.Dialer.Control hook, for callers whose decision is not Check itself
+// (the WASM mediator's no-policy dials apply only the floor).
+func ControlHook(check func(netip.AddrPort) error) func(network, address string, c syscall.RawConn) error {
 	return func(_, address string, _ syscall.RawConn) error {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
@@ -169,7 +190,7 @@ func (g DialGuard) Control(p *Policy, name string, nameAllowed bool) func(networ
 			}
 			ap = netip.AddrPortFrom(ip, 0)
 		}
-		return g.Check(p, DialTarget{Name: name, NameAllowed: nameAllowed, Addr: ap})
+		return check(ap)
 	}
 }
 

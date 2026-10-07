@@ -136,6 +136,53 @@ func TestDialGuardControl(t *testing.T) {
 	}
 }
 
+// TestDialGuardCheckFloor: the floor alone is what binds a no-policy sandbox,
+// so CheckFloor refuses only floor ranges (loopback and private included when
+// listed), never what the private-range or always-on rules would.
+func TestDialGuardCheckFloor(t *testing.T) {
+	g := DialGuard{
+		Strict:    true, // ignored: only the floor applies
+		DenyFloor: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("203.0.113.0/24")},
+	}
+	tests := []struct {
+		addr string
+		rule string // "" = allowed
+	}{
+		{"127.0.0.1:80", "127.0.0.0/8"},
+		{"[::ffff:203.0.113.9]:443", "203.0.113.0/24"}, // v4-mapped must not dodge the floor
+		{"10.0.0.1:443", ""},
+		{"169.254.169.254:80", ""},
+		{"8.8.8.8:443", ""},
+	}
+	for _, tc := range tests {
+		err := g.CheckFloor(ap(tc.addr))
+		if tc.rule == "" {
+			if err != nil {
+				t.Errorf("CheckFloor(%s) = %v, want allowed", tc.addr, err)
+			}
+			continue
+		}
+		var de *DialError
+		if !errors.As(err, &de) || de.Reason != DialReasonDenyFloor || de.Rule != tc.rule || !errors.Is(err, ErrDialRefused) {
+			t.Errorf("CheckFloor(%s) = %#v, want deny_floor %s", tc.addr, err, tc.rule)
+		}
+	}
+	if err := (DialGuard{}).CheckFloor(ap("127.0.0.1:80")); err != nil {
+		t.Fatalf("no floor refuses nothing: %v", err)
+	}
+	ctl := ControlHook(g.CheckFloor)
+	if err := ctl("tcp", "203.0.113.1:22", nil); !errors.Is(err, ErrDialRefused) {
+		t.Fatalf("ControlHook did not apply the check: %v", err)
+	}
+	if err := ctl("tcp", "198.51.100.1", nil); err != nil {
+		t.Fatalf("ControlHook bare IP: %v", err)
+	}
+	var de *DialError
+	if err := ctl("tcp", "not-an-address", nil); !errors.As(err, &de) || de.Reason != DialReasonInvalid {
+		t.Fatalf("ControlHook must fail closed on a bad address: %v", err)
+	}
+}
+
 func TestNewInternalZone(t *testing.T) {
 	valid := []struct{ suffixes, cidrs []string }{
 		{[]string{"corp.bank.internal"}, []string{"10.0.0.0/8"}},

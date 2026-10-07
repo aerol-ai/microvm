@@ -41,6 +41,14 @@ func (s *ResidentServer) mediator() *NetMediator {
 	return s.net
 }
 
+// close stops the mediator's operator-file poll with the worker.
+func (s *ResidentServer) close() {
+	s.mu.Lock()
+	m := s.net
+	s.mu.Unlock()
+	m.stopOperatorWatch()
+}
+
 func (s *ResidentServer) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
@@ -418,6 +426,7 @@ func ServeSocketPathResident(socketPath string) error {
 	}
 	defer ln.Close()
 	srv := &ResidentServer{}
+	defer srv.close()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

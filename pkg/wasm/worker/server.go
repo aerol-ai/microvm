@@ -51,6 +51,14 @@ func (s *Server) mediator() *NetMediator {
 	return s.net
 }
 
+// close stops the mediator's operator-file poll with the worker.
+func (s *Server) close() {
+	s.mu.Lock()
+	m := s.net
+	s.mu.Unlock()
+	m.stopOperatorWatch()
+}
+
 func (s *Server) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
@@ -630,6 +638,7 @@ func ServeSocketPath(socketPath string) error {
 	}
 	defer ln.Close()
 	srv := &Server{}
+	defer srv.close()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

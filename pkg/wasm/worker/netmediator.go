@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -45,6 +44,20 @@ type NetMediator struct {
 	// mode (P2-7). A recording outlives a switch to enforce, so the owner
 	// can still read it; ForgetLearned drops it when the sandbox goes.
 	learn map[string]*egresspolicy.Recorder
+	// stopOperator ends the SB_EGRESS_OPERATOR_FILE poll (§5.10) that keeps
+	// a running worker's floor, zone and upstream current; operatorDone
+	// closes once it has. Both nil without the file.
+	stopOperator context.CancelFunc
+	operatorDone chan struct{}
+
+	// conns are the live mediated connections per sandbox, each with the
+	// destination it was admitted for, so a narrowed policy, an egress block
+	// or a tightened operator guard closes the ones it no longer admits
+	// (the gateway's registry, internal/egress/conns.go). An entry leaves
+	// when its connection closes, and the engine closes every connection of
+	// an instance it stops, so the registry holds only open sockets.
+	connMu sync.Mutex
+	conns  map[string]map[*meteredConn]struct{}
 }
 
 func newNetMediator() *NetMediator {
@@ -104,12 +117,17 @@ func (m *NetMediator) SetBlocks(sandboxID string, blockIngress, blockEgress bool
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if !blockIngress && !blockEgress {
 		delete(m.blocked, sandboxID)
-		return
+	} else {
+		m.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: blockIngress, egress: blockEgress}
 	}
-	m.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: blockIngress, egress: blockEgress}
+	m.mu.Unlock()
+	if blockEgress {
+		// A block stops bytes, not just new dials: the gateway closes a
+		// newly blocked sandbox's proxied connections the same way.
+		m.revalidate(sandboxID)
+	}
 }
 
 // AddBlocks ORs blocks into the sandbox's current state; it never lifts one.
@@ -119,9 +137,12 @@ func (m *NetMediator) AddBlocks(sandboxID string, blockIngress, blockEgress bool
 		return
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	cur := m.blocked[sandboxID]
 	m.blocked[sandboxID] = struct{ ingress, egress bool }{ingress: cur.ingress || blockIngress, egress: cur.egress || blockEgress}
+	m.mu.Unlock()
+	if blockEgress {
+		m.revalidate(sandboxID)
+	}
 }
 
 func (m *NetMediator) egressBlocked(sandboxID string) bool {
@@ -147,17 +168,21 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 		return nil, wasmengine.ErrNetworkEgressBlocked
 	}
 	var conn net.Conn
+	var dest connDest
 	var err error
 	if p := m.policyFor(sandboxID); p != nil {
-		conn, err = m.policyDial(ctx, sandboxID, p, network, address)
+		conn, dest, err = m.policyDial(ctx, sandboxID, p, network, address)
+	} else {
+		conn, dest, err = m.openDial(ctx, network, address)
+	}
+	if err != nil {
 		var denied *wasmengine.EgressDeniedError
 		if errors.As(err, &denied) {
 			m.observeDenial(sandboxID, network, address, denied.Reason)
 		}
-	} else {
-		d := net.Dialer{Timeout: 30 * time.Second}
-		conn, err = d.DialContext(ctx, network, address)
+		return nil, err
 	}
+	mc, err := m.track(sandboxID, dest, conn)
 	if err != nil {
 		return nil, err
 	}
@@ -165,13 +190,97 @@ func (m *NetMediator) DialContext(ctx context.Context, sandboxID, network, addre
 		// Observer is responsible for non-blocking enqueue (bounded pool).
 		obs(sandboxID, network, address)
 	}
-	u := m.usageFor(sandboxID)
-	return &meteredConn{Conn: conn, usage: u}, nil
+	return mc, nil
 }
 
+// track registers a mediated connection against its sandbox, then confirms
+// its admission still holds. A policy, block or guard change that landed
+// while the dial was in flight scanned the registry before this connection
+// was in it, so it is re-decided here against the current state; a change
+// after registration finds it in the registry.
+func (m *NetMediator) track(sandboxID string, dest connDest, conn net.Conn) (net.Conn, error) {
+	mc := &meteredConn{Conn: conn, usage: m.usageFor(sandboxID), m: m, sandboxID: sandboxID, dest: dest}
+	m.connMu.Lock()
+	if m.conns == nil {
+		m.conns = map[string]map[*meteredConn]struct{}{}
+	}
+	if m.conns[sandboxID] == nil {
+		m.conns[sandboxID] = map[*meteredConn]struct{}{}
+	}
+	m.conns[sandboxID][mc] = struct{}{}
+	m.connMu.Unlock()
+	if !admits(m.admissionState(sandboxID), dest) {
+		_ = mc.Close()
+		return nil, wasmengine.ErrNetworkEgressBlocked
+	}
+	return mc, nil
+}
+
+func (m *NetMediator) untrack(c *meteredConn) {
+	m.connMu.Lock()
+	defer m.connMu.Unlock()
+	delete(m.conns[c.sandboxID], c)
+	if len(m.conns[c.sandboxID]) == 0 {
+		delete(m.conns, c.sandboxID)
+	}
+}
+
+// admission is what a sandbox's connections are decided against.
+type admission struct {
+	blocked bool
+	policy  *egresspolicy.Policy
+	guard   egresspolicy.DialGuard
+}
+
+func (m *NetMediator) admissionState(sandboxID string) admission {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return admission{blocked: m.blocked[sandboxID].egress, policy: m.policies[sandboxID], guard: m.guard}
+}
+
+// revalidate closes the sandbox's live connections that an egress block, its
+// current policy or the operator guard would not admit now.
+func (m *NetMediator) revalidate(sandboxID string) {
+	a := m.admissionState(sandboxID)
+	m.connMu.Lock()
+	var victims []*meteredConn
+	for c := range m.conns[sandboxID] {
+		if !admits(a, c.dest) {
+			victims = append(victims, c)
+		}
+	}
+	m.connMu.Unlock()
+	// Closed outside connMu: Close unregisters, which takes it again.
+	for _, c := range victims {
+		_ = c.Close()
+	}
+}
+
+// revalidateAll re-decides every sandbox's live connections: a guard change
+// binds all of them.
+func (m *NetMediator) revalidateAll() {
+	m.connMu.Lock()
+	ids := make([]string, 0, len(m.conns))
+	for id := range m.conns {
+		ids = append(ids, id)
+	}
+	m.connMu.Unlock()
+	for _, id := range ids {
+		m.revalidate(id)
+	}
+}
+
+// meteredConn counts a mediated connection's bytes and keeps it in the
+// mediator's registry until it closes.
 type meteredConn struct {
 	net.Conn
 	usage *workerNetUsage
+
+	m         *NetMediator
+	sandboxID string
+	dest      connDest
+	once      sync.Once
+	closeErr  error
 }
 
 func (c *meteredConn) Read(p []byte) (int, error) {
@@ -183,14 +292,21 @@ func (c *meteredConn) Read(p []byte) (int, error) {
 }
 
 func (c *meteredConn) Write(p []byte) (int, error) {
-	if c.usage != nil {
-		// Parent may have closed egress mid-flight; best-effort reject new writes.
-	}
 	n, err := c.Conn.Write(p)
 	if n > 0 {
 		c.usage.bytesOut.Add(int64(n))
 	}
 	return n, err
+}
+
+// Close closes the connection once, whether the guest or a revocation gets
+// there first, and drops it from the registry.
+func (c *meteredConn) Close() error {
+	c.once.Do(func() {
+		c.closeErr = c.Conn.Close()
+		c.m.untrack(c)
+	})
+	return c.closeErr
 }
 
 // Copy counts bytes moved through the mediator for tests and host proxies.
