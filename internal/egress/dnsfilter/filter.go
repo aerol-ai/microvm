@@ -262,6 +262,10 @@ func (f *Filter) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 				f.reply(w, r, withEDE(failure(r, dns.RcodeRefused, ""), "aerolvm egress policy: learned cap"))
 				return
 			}
+			if reason == ReasonNotAllowed {
+				f.reply(w, r, failure(r, dns.RcodeNameError, ""))
+				return
+			}
 			f.reply(w, r, failure(r, dns.RcodeServerFailure, ""))
 			return
 		}
@@ -323,6 +327,10 @@ func (f *Filter) learn(s egress.Source, name string, resp *dns.Msg, answers []ne
 			if err := f.learner.LearnFor(s.Spec.ID, name, ip, port, ttl); err != nil {
 				if errors.Is(err, egress.ErrLearnedCap) {
 					return ReasonLearnedCap, err
+				}
+				if errors.Is(err, egress.ErrNotPermitted) {
+					// The policy changed while the upstream answered.
+					return ReasonNotAllowed, err
 				}
 				return "learned_write_failed", err
 			}

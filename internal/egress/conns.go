@@ -16,19 +16,33 @@ type TrackedConn struct {
 	// redirected port it came in on.
 	Host string
 	Port uint16
-	// dst is the address the proxy dialed for it, when it dialed one
-	// directly (SetDst), so a reloaded operator guard can revoke it.
-	dst  netip.AddrPort
+	// dsts are the upstream addresses the proxy dialed directly for it
+	// (AddDst): one for a spliced stream, one per upstream connection of an
+	// HTTP or inspected exchange. A reloaded operator guard revokes the
+	// connection if it refuses any of them.
+	dsts []netip.AddrPort
 	once sync.Once
 	g    *Gateway
 	id   string
 }
 
-// SetDst records the upstream address the connection was dialed to.
-func (c *TrackedConn) SetDst(dst netip.AddrPort) {
+// maxTrackedDsts bounds the addresses one connection remembers: a
+// keep-alive exchange that reached more upstreams keeps the latest.
+const maxTrackedDsts = 16
+
+// AddDst records an upstream address the connection was dialed to.
+func (c *TrackedConn) AddDst(dst netip.AddrPort) {
 	c.g.connMu.Lock()
-	c.dst = dst
-	c.g.connMu.Unlock()
+	defer c.g.connMu.Unlock()
+	for _, d := range c.dsts {
+		if d == dst {
+			return
+		}
+	}
+	if len(c.dsts) == maxTrackedDsts {
+		c.dsts = c.dsts[1:]
+	}
+	c.dsts = append(c.dsts, dst)
 }
 
 // Close closes the underlying connection and unregisters it.
@@ -94,13 +108,13 @@ func (g *Gateway) RevalidateConns(revoke func(pol *egresspolicy.Policy, host str
 	type conn struct {
 		c       *TrackedConn
 		id, hst string
-		dst     netip.AddrPort
+		dsts    []netip.AddrPort
 	}
 	g.connMu.Lock()
 	var all []conn
 	for id, cs := range g.conns {
 		for c := range cs {
-			all = append(all, conn{c: c, id: id, hst: c.Host, dst: c.dst})
+			all = append(all, conn{c: c, id: id, hst: c.Host, dsts: append([]netip.AddrPort(nil), c.dsts...)})
 		}
 	}
 	g.connMu.Unlock()
@@ -113,9 +127,16 @@ func (g *Gateway) RevalidateConns(revoke func(pol *egresspolicy.Policy, host str
 		if e != nil {
 			pol = e.pol
 		}
-		if revoke(pol, c.hst, c.dst) {
-			_ = c.c.Close()
-			n++
+		dsts := c.dsts
+		if len(dsts) == 0 {
+			dsts = []netip.AddrPort{{}}
+		}
+		for _, d := range dsts {
+			if revoke(pol, c.hst, d) {
+				_ = c.c.Close()
+				n++
+				break
+			}
 		}
 	}
 	return n

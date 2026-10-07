@@ -157,7 +157,10 @@ func (b *NFTBackend) EnsureLayout(cfg LayoutConfig) error {
 		// sandboxes never see a table-less window (layout changes are always
 		// one batch), and carry its contents over with every gateway-mode
 		// source blocked until sandboxd's Sync (migrateContents).
-		carried = migrateContents(b.carriedElements(c))
+		var err error
+		if carried, err = b.carriedElements(c); err != nil {
+			return fmt.Errorf("egress layout: keeping the existing table rather than replace it unfiltered: %w", err)
+		}
 		c.DelTable(b.table)
 	}
 	c.AddTable(b.table)
@@ -189,23 +192,32 @@ func (b *NFTBackend) EnsureLayout(cfg LayoutConfig) error {
 	return nil
 }
 
-// carriedElements reads the carried sets of the table being replaced. A set
-// whose key type changed between versions can't be decoded as this
-// version's, so it is left behind (it starts empty, as before).
-func (b *NFTBackend) carriedElements(c *nftables.Conn) map[string][]Elem {
-	out := map[string][]Elem{}
-	for _, name := range carriedSets {
-		old, err := c.GetSetByName(b.table, name)
-		if err != nil || old.KeyType.Name != b.sets[name].KeyType.Name || old.Interval != b.sets[name].Interval {
-			continue
+// carriedElements reads the carried sets of the table being replaced and
+// plans the new table's contents (carryContents decides what a failure
+// means).
+func (b *NFTBackend) carriedElements(c *nftables.Conn) (map[string][]Elem, error) {
+	sets, err := c.GetSets(b.table)
+	if err != nil {
+		return nil, fmt.Errorf("list sets: %w", err)
+	}
+	byName := map[string]*nftables.Set{}
+	for _, s := range sets {
+		byName[s.Name] = s
+	}
+	return carryContents(func(name string) ([]Elem, bool, bool, error) {
+		old, ok := byName[name]
+		if !ok {
+			return nil, false, false, nil
+		}
+		if old.KeyType.Name != b.sets[name].KeyType.Name || old.Interval != b.sets[name].Interval {
+			return nil, true, false, nil
 		}
 		raw, err := c.GetSetElements(old)
 		if err != nil {
-			continue
+			return nil, true, true, err
 		}
-		out[name] = decodeElems(name, raw)
-	}
-	return out
+		return decodeElems(name, raw), true, true, nil
+	})
 }
 
 // CheckLayout implements Backend: the table, its marker, every set and the

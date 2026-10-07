@@ -18,6 +18,9 @@ type MemBackend struct {
 	FailApply error
 	// Calls counts Apply+Replace transactions.
 	Calls int
+	// FailCarry, when set, makes reading the sets a layout replacement
+	// carries fail (the old layout is then kept).
+	FailCarry error
 }
 
 // NewMemBackend returns an empty MemBackend with no layout.
@@ -31,13 +34,24 @@ func (m *MemBackend) EnsureLayout(cfg LayoutConfig) error {
 	}
 	var carried map[string][]Elem
 	if m.present {
-		old := map[string][]Elem{}
-		for name, set := range m.sets {
-			for e := range set {
-				old[name] = append(old[name], e)
+		var err error
+		carried, err = carryContents(func(name string) ([]Elem, bool, bool, error) {
+			if m.FailCarry != nil {
+				return nil, true, true, m.FailCarry
 			}
+			set, ok := m.sets[name]
+			if !ok {
+				return nil, false, false, nil
+			}
+			var out []Elem
+			for e := range set {
+				out = append(out, e)
+			}
+			return out, true, true, nil
+		})
+		if err != nil {
+			return err
 		}
-		carried = migrateContents(old)
 	}
 	m.present, m.layout = true, cfg
 	m.sets = map[string]map[Elem]struct{}{}

@@ -331,7 +331,7 @@ func TestRevalidateConns(t *testing.T) {
 	d1, d2 := net.Pipe()
 	defer d2.Close()
 	denied := g.Track("sb", "pypi.org", 443, c1)
-	denied.SetDst(netip.MustParseAddrPort("10.50.0.7:443"))
+	denied.AddDst(netip.MustParseAddrPort("10.50.0.7:443"))
 	kept := g.Track("sb", "pypi.org", 80, d1)
 	defer kept.Close()
 	n := g.RevalidateConns(func(_ *egresspolicy.Policy, host string, dst netip.AddrPort) bool {
@@ -361,5 +361,58 @@ func TestServerRefusesNullRetain(t *testing.T) {
 	}
 	if _, err := s.dispatch(request{Op: opRetain, Payload: []byte("[]")}); err != nil || !called {
 		t.Fatalf("empty inventory: err=%v called=%v", err, called)
+	}
+}
+
+// TestCarryContentsFailsClosed (review 2 finding 8): a layout replacement
+// that can't read what it must carry keeps the old table instead of
+// starting the sources empty; a set the old layout lacks starts empty, and
+// a per-source set whose type changed is dropped (its sources are blocked
+// until Sync anyway), but a required one aborts.
+func TestCarryContentsFailsClosed(t *testing.T) {
+	src := Elem{Src: ipA}
+	old := map[string][]Elem{SetFQDNSrc: {src}, SetSrcDenyDefault: {src}}
+	read := func(broken string, retyped string) SetRead {
+		return func(name string) ([]Elem, bool, bool, error) {
+			switch {
+			case name == broken:
+				return nil, true, true, errors.New("netlink: EBUSY")
+			case name == retyped:
+				return nil, true, false, nil
+			}
+			elems, ok := old[name]
+			return elems, ok, true, nil
+		}
+	}
+	got, err := carryContents(read("", ""))
+	if err != nil || !slices.Contains(got[SetBlockedSrc], src) || !slices.Contains(got[SetSrcDenyDefault], src) {
+		t.Fatalf("carried = %v, %v", got, err)
+	}
+	for _, name := range []string{SetFQDNSrc, SetDenyCIDR} {
+		if _, err := carryContents(read(name, "")); err == nil {
+			t.Fatalf("a failed read of %s must abort the replacement", name)
+		}
+	}
+	if _, err := carryContents(read("", SetFQDNSrc)); err == nil {
+		t.Fatal("a required set that changed type must abort the replacement")
+	}
+	if got, err := carryContents(read("", SetSrcDenyDefault)); err != nil || len(got[SetSrcDenyDefault]) != 0 || !slices.Contains(got[SetBlockedSrc], src) {
+		t.Fatalf("a retyped per-source set is dropped, the source still blocked: %v, %v", got, err)
+	}
+
+	// The memory backend keeps the old layout, contents and all.
+	be := NewMemBackend()
+	if err := be.EnsureLayout(LayoutConfig{DNSPort: 1, ProxyPort: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Apply([]Op{{Set: SetFQDNSrc, Elems: []Elem{src}}}); err != nil {
+		t.Fatal(err)
+	}
+	be.FailCarry = errors.New("netlink: EBUSY")
+	if err := be.EnsureLayout(LayoutConfig{DNSPort: 3, ProxyPort: 4}); err == nil {
+		t.Fatal("a failed carry must fail the replacement")
+	}
+	if !be.Has(SetFQDNSrc, src) {
+		t.Fatal("the old table must be kept when the replacement is refused")
 	}
 }

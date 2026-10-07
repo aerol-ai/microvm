@@ -92,11 +92,12 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
 	var up net.Conn
+	var upDst netip.AddrPort
 	if chain := p.upstream(); name != "" && !isIP && !chain.Bypass(name) {
 		// The SNI decided; the operator's proxy tunnels to that name.
 		up, err = chain.DialConnect(ctx, target)
 	} else {
-		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, name, nameAllowed), "tcp", target)
+		up, upDst, err = p.dialGuarded(ctx, pol, name, nameAllowed, "tcp", target)
 	}
 	cancel()
 	if err != nil {
@@ -112,7 +113,7 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	p.observe(Decision{SandboxID: id, Host: host, Port: 443, Allowed: true, Rule: rule, Mode: src.Mode})
-	p.splice(c, up, br, id, host, 443)
+	p.splice(c, up, br, id, host, 443, pol, nameAllowed, upDst)
 }
 
 // egresspolicyRefused reports a dial the shared guard refused (loopback,

@@ -117,6 +117,9 @@ type Gateway struct {
 	// cleanup still pending.
 	pendingLearned map[netip.Addr]map[string][]Elem
 	pendingCT      map[netip.Addr]struct{}
+	// sweepPending holds sources whose kernel learned elements a Sync
+	// couldn't list: the elements are unknown, so the sweep is redone.
+	sweepPending map[netip.Addr]bool
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
@@ -141,6 +144,7 @@ func New(opts Options) *Gateway {
 		binNames:       map[string]map[learnKey]string{},
 		pendingLearned: map[netip.Addr]map[string][]Elem{},
 		pendingCT:      map[netip.Addr]struct{}{},
+		sweepPending:   map[netip.Addr]bool{},
 		conns:          map[string]map[*TrackedConn]struct{}{},
 	}
 	if g.maxLrn <= 0 {
@@ -384,7 +388,7 @@ func (g *Gateway) Attach(spec Spec) error {
 	if old != nil {
 		// Keep block reasons the gateway already holds (e.g. a hold set while
 		// sandboxd computed this spec): blocks only lift via SetBlocked.
-		nu.blocked |= old.blocked &^ BlockRestart
+		nu.blocked |= old.blocked &^ (BlockRestart | BlockCleanup)
 	}
 	if owned && prevOwner != spec.ID {
 		g.log.Warn("egress: attach purges previous owner of recycled ip", "ip", spec.IP, "previous", prevOwner, "sandbox_id", spec.ID)
@@ -430,9 +434,43 @@ func (g *Gateway) Attach(spec Spec) error {
 		srcs = append(srcs, old.spec.IP)
 	}
 	if err := g.retryCleanup(srcs...); err != nil {
+		// Shut it here too, not only through sandboxd's hold: the gateway
+		// itself never serves a source with revoked entries left.
+		if berr := g.setCleanupBlock(nu, true); berr != nil {
+			g.log.Warn("egress: cleanup block not applied", "sandbox_id", spec.ID, "error", berr)
+		}
 		return fmt.Errorf("%w: attach %s: %v", ErrUnavailable, spec.ID, err)
 	}
 	return nil
+}
+
+// cleanupPending reports whether a source has revocation work left.
+func (g *Gateway) cleanupPending(src netip.Addr) bool {
+	g.learnedMu.Lock()
+	defer g.learnedMu.Unlock()
+	_, ct := g.pendingCT[src]
+	return len(g.pendingLearned[src]) > 0 || ct || g.sweepPending[src]
+}
+
+// setCleanupBlock sets or clears BlockCleanup on an attached entry and
+// writes @blocked_src if that changes it. Callers hold opMu (shared, with
+// the sandbox's lock, or exclusive).
+func (g *Gateway) setCleanupBlock(e *entry, on bool) error {
+	g.mu.Lock()
+	if on {
+		e.blocked |= BlockCleanup
+	} else {
+		e.blocked &^= BlockCleanup
+	}
+	differs := e.inBlockedSrc != e.kernelBlocked()
+	g.mu.Unlock()
+	if on {
+		g.closeConns(e.spec.ID)
+	}
+	if !differs {
+		return nil
+	}
+	return g.applyBlockedLocked(e)
 }
 
 // Update replaces an attached sandbox's policy (FQDN → FQDN′). Same as Attach
@@ -599,6 +637,21 @@ func (g *Gateway) Sync(specs []Spec) error {
 		g.flushLearned(id, old.spec.IP)
 	}
 	g.sweepLearned(next, changed)
+	// A kept sandbox whose revoked entries the kernel still holds is shut
+	// until they are deleted (BlockCleanup), the same invariant Attach
+	// keeps: a Sync is never the acknowledgement of a revocation that
+	// didn't happen.
+	var errs []error
+	for _, e := range next {
+		if g.cleanupPending(e.spec.IP) {
+			if err := g.setCleanupBlock(e, true); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("%w: sync: shut sandboxes with pending cleanup: %v", ErrUnavailable, err)
+	}
 	return nil
 }
 
@@ -618,7 +671,16 @@ func (g *Gateway) sweepLearned(next map[string]*entry, changed map[string]bool) 
 	for _, set := range []string{SetAllowLearned, SetBinLearned} {
 		elems, err := g.be.List(set)
 		if err != nil {
+			// The stale elements are unknown: every changed sandbox's source
+			// is swept again until a listing succeeds, shut meanwhile.
 			g.log.Warn("egress: list learned elements for sync failed", "set", set, "error", err)
+			g.learnedMu.Lock()
+			for id := range changed {
+				if e := next[id]; e != nil {
+					g.sweepPending[e.spec.IP] = true
+				}
+			}
+			g.learnedMu.Unlock()
 			continue
 		}
 		var stale []Elem
@@ -640,10 +702,62 @@ func (g *Gateway) sweepLearned(next map[string]*entry, changed map[string]bool) 
 		g.learnedMu.Unlock()
 		if len(stale) > 0 {
 			if err := g.be.Apply([]Op{{Set: set, Del: true, Elems: stale}}); err != nil {
-				g.log.Warn("egress: delete stale learned elements failed", "set", set, "error", err)
+				// Kept until deleted: retried, and Attach of the source (a
+				// new owner included) waits for it.
+				g.log.Warn("egress: delete stale learned elements failed; retrying", "set", set, "error", err)
+				g.learnedMu.Lock()
+				for _, el := range stale {
+					p := g.pendingLearned[el.Src]
+					if p == nil {
+						p = map[string][]Elem{}
+						g.pendingLearned[el.Src] = p
+					}
+					if !slices.Contains(p[set], el) {
+						p[set] = append(p[set], el)
+					}
+				}
+				g.learnedMu.Unlock()
 			}
 		}
 	}
+}
+
+// resweep redoes a failed Sync sweep for one source: every learned element
+// of it that the shadow doesn't know is stale (the shadow of a changed
+// sandbox was cleared), and goes to pendingLearned.
+func (g *Gateway) resweep(src netip.Addr) error {
+	g.mu.RLock()
+	id := g.bySrc[src]
+	g.mu.RUnlock()
+	for _, set := range []string{SetAllowLearned, SetBinLearned} {
+		elems, err := g.be.List(set)
+		if err != nil {
+			return err
+		}
+		g.learnedMu.Lock()
+		for _, el := range elems {
+			if el.Src != src {
+				continue
+			}
+			if _, known := g.learned[id][learnKey{dst: el.Dst, port: el.Port, bin: set == SetBinLearned}]; known && id != "" {
+				continue
+			}
+			p := g.pendingLearned[src]
+			if p == nil {
+				p = map[string][]Elem{}
+				g.pendingLearned[src] = p
+			}
+			e := Elem{Src: el.Src, Dst: el.Dst, Port: el.Port}
+			if !slices.Contains(p[set], e) {
+				p[set] = append(p[set], e)
+			}
+		}
+		g.learnedMu.Unlock()
+	}
+	g.learnedMu.Lock()
+	delete(g.sweepPending, src)
+	g.learnedMu.Unlock()
+	return nil
 }
 
 // Lookup resolves a source IP to its sandbox, for the DNS filter and proxy.
@@ -748,13 +862,24 @@ func (g *Gateway) LearnFor(id, name string, dst netip.Addr, port uint16, ttl tim
 	if !dst.Is4() {
 		return fmt.Errorf("egress: learned destination %s is not IPv4", dst)
 	}
+	// Serialized with the sandbox's transitions and checked against the
+	// policy in force at the write: an answer the DNS filter admitted under
+	// a policy that has since been narrowed must not put the revoked
+	// destination back (review 2 finding 6).
 	g.opMu.RLock()
 	defer g.opMu.RUnlock()
+	unlock := g.lockSandbox(id)
+	defer unlock()
 	g.mu.RLock()
 	e := g.byID[id]
 	g.mu.RUnlock()
 	if e == nil {
 		return fmt.Errorf("%w: %s", ErrNotAttached, id)
+	}
+	if name != "" {
+		if ok, _ := e.pol.MatchHostPort(name, port); !ok {
+			return fmt.Errorf("%w: %s:%d", ErrNotPermitted, name, port)
+		}
 	}
 	now := g.now()
 	k := learnKey{dst: dst, port: port, bin: name != "" && port != 80 && port != 443 && e.rules.NeedsBinary(name, port)}
@@ -961,18 +1086,51 @@ func (g *Gateway) RetryDirty() error {
 		unlock()
 	}
 	g.learnedMu.Lock()
-	srcs := make([]netip.Addr, 0, len(g.pendingLearned)+len(g.pendingCT))
+	set := map[netip.Addr]bool{}
 	for src := range g.pendingLearned {
-		srcs = append(srcs, src)
+		set[src] = true
 	}
 	for src := range g.pendingCT {
-		if _, ok := g.pendingLearned[src]; !ok {
-			srcs = append(srcs, src)
-		}
+		set[src] = true
+	}
+	for src := range g.sweepPending {
+		set[src] = true
 	}
 	g.learnedMu.Unlock()
-	if err := g.retryCleanup(srcs...); err != nil {
-		errs = append(errs, err)
+	for src := range set {
+		if g.sweepPendingFor(src) {
+			if err := g.resweep(src); err != nil {
+				errs = append(errs, fmt.Errorf("sweep learned elements of %s: %w", src, err))
+				continue
+			}
+		}
+		if err := g.retryCleanup(src); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		// Clean now: lift the gateway's own block from the source's owner.
+		g.mu.RLock()
+		id := g.bySrc[src]
+		g.mu.RUnlock()
+		if id == "" {
+			continue
+		}
+		unlock := g.lockSandbox(id)
+		g.mu.RLock()
+		e := g.byID[id]
+		g.mu.RUnlock()
+		if e != nil && e.blocked&BlockCleanup != 0 && !g.cleanupPending(src) {
+			if err := g.setCleanupBlock(e, false); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		unlock()
 	}
 	return errors.Join(errs...)
+}
+
+func (g *Gateway) sweepPendingFor(src netip.Addr) bool {
+	g.learnedMu.Lock()
+	defer g.learnedMu.Unlock()
+	return g.sweepPending[src]
 }

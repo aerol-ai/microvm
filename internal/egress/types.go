@@ -10,6 +10,7 @@ package egress
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -44,6 +45,11 @@ const (
 	// every snapshot sandbox until sandboxd's Sync confirms the real state.
 	// It never reaches @blocked_src, so long-lived flows survive an upgrade.
 	BlockRestart
+	// BlockCleanup is the gateway's own: a sandbox kept by a Sync whose
+	// source still has revoked learned elements or conntrack entries the
+	// kernel wouldn't delete is shut until they are gone (RetryDirty), so
+	// a Sync never leaves a narrowed sandbox running on what it revoked.
+	BlockCleanup
 )
 
 // Spec is the desired gateway state for one sandbox, as sandboxd sends it.
@@ -145,6 +151,44 @@ func migrateContents(old map[string][]Elem) map[string][]Elem {
 	return out
 }
 
+// mustCarry are the carried sets a replacement can't start without: the
+// sources (fqdn_src, so they can be blocked), their blocks, and the
+// node-wide floor and guard, which bind sandboxes outside gateway mode too.
+// The per-source class and CIDR sets aren't needed while every carried
+// source is blocked until Sync.
+var mustCarry = map[string]bool{SetFQDNSrc: true, SetBlockedSrc: true, SetDenyFloor: true, SetNodeControl: true}
+
+// SetRead reads one set of the layout being replaced: present reports
+// whether the old layout has it, compatible whether its key type is this
+// version's (so its elements decode).
+type SetRead func(name string) (elems []Elem, present, compatible bool, err error)
+
+// carryContents reads what a layout replacement carries over and plans the
+// replacement table's contents (migrateContents). A failed read, or a
+// required set whose type changed, aborts: replacing the table without the
+// sources would leave every gateway sandbox unfiltered until sandboxd's next
+// Sync, so the old table (still enforcing) is kept and the error reported
+// instead (review 2 finding 8). A set the old layout doesn't have starts
+// empty.
+func carryContents(read SetRead) (map[string][]Elem, error) {
+	old := map[string][]Elem{}
+	for _, name := range carriedSets {
+		elems, present, compatible, err := read(name)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("read set %s of the layout being replaced: %w", name, err)
+		case !present:
+			continue
+		case !compatible && mustCarry[name]:
+			return nil, fmt.Errorf("set %s changed type; the layout migration must convert it before replacing the table", name)
+		case !compatible:
+			continue
+		}
+		old[name] = elems
+	}
+	return migrateContents(old), nil
+}
+
 // Op adds or deletes elements of one set. A slice of Ops is applied in one
 // nft transaction.
 type Op struct {
@@ -185,6 +229,11 @@ type Backend interface {
 
 // ErrLayoutMissing means the gateway's nft table, a chain or a set is gone.
 var ErrLayoutMissing = errors.New("egress: nft layout missing")
+
+// ErrNotPermitted is returned when a learned destination is no longer
+// allowed by the sandbox's current policy (a DNS answer that outlived the
+// policy it was admitted under).
+var ErrNotPermitted = errors.New("egress: not permitted by the current policy")
 
 // ErrUnavailable is returned when the gateway can't apply a change; callers
 // keep (or set) the fail-closed hold (CEO D16).

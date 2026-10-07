@@ -514,7 +514,7 @@ func TestOperatorReloadReachesTheGateway(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c2.Close()
 	tc := r.d.Gateway().Track("sb", "pypi.org", 443, c1)
-	tc.SetDst(netip.MustParseAddrPort("10.50.0.7:443"))
+	tc.AddDst(netip.MustParseAddrPort("10.50.0.7:443"))
 	floorBefore := be.Len(egress.SetDenyFloor)
 	op, err := operator.Parse([]byte("version: 1\ndeny_cidrs: [10.50.0.0/16]\n"))
 	if err != nil {

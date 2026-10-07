@@ -14,8 +14,10 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -354,7 +356,7 @@ func (p *Proxy) serveTraced(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
-	up, err := p.cfg.Dialer.DialContext(ctx, p.dialer(src.Policy, name, rule != ""), "tcp", dst.String())
+	up, upDst, err := p.dialGuarded(ctx, src.Policy, name, rule != "", "tcp", dst.String())
 	cancel()
 	if err != nil {
 		reason := ReasonDialFailed
@@ -365,7 +367,7 @@ func (p *Proxy) serveTraced(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	p.observe(Decision{SandboxID: id, Host: name, Port: dst.Port(), Allowed: true, Rule: rule, Mode: src.Mode})
-	p.splice(c, up, nil, id, name, dst.Port())
+	p.splice(c, up, nil, id, name, dst.Port(), src.Policy, rule != "", upDst)
 }
 
 // overCapClose answers an over-cap connection without reading it: the TLS
@@ -392,18 +394,78 @@ func (p *Proxy) dialer(pol *egresspolicy.Policy, name string, nameAllowed bool) 
 	return &net.Dialer{Timeout: p.cfg.DialTimeout, Control: p.guard().Control(pol, name, nameAllowed)}
 }
 
+// dialGuarded dials addr through the guard read now and returns the address
+// the guard admitted for the connection (the one the dialer's Control saw;
+// the connection's own remote address when it is among them).
+func (p *Proxy) dialGuarded(ctx context.Context, pol *egresspolicy.Policy, name string, nameAllowed bool, network, addr string) (net.Conn, netip.AddrPort, error) {
+	var mu sync.Mutex
+	var seen []netip.AddrPort
+	d := p.dialer(pol, name, nameAllowed)
+	inner := d.Control
+	d.Control = func(network, address string, c syscall.RawConn) error {
+		if ap, err := netip.ParseAddrPort(address); err == nil {
+			mu.Lock()
+			seen = append(seen, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
+			mu.Unlock()
+		}
+		if inner != nil {
+			return inner(network, address, c)
+		}
+		return nil
+	}
+	up, err := p.cfg.Dialer.DialContext(ctx, d, network, addr)
+	if err != nil {
+		return nil, netip.AddrPort{}, err
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seen) == 0 {
+		return up, netip.AddrPort{}, nil
+	}
+	dst := seen[len(seen)-1]
+	if a, ok := up.RemoteAddr().(*net.TCPAddr); ok {
+		if ra := a.AddrPort(); ra.IsValid() {
+			ra = netip.AddrPortFrom(ra.Addr().Unmap(), ra.Port())
+			if slices.Contains(seen, ra) {
+				dst = ra
+			}
+		}
+	}
+	return up, dst, nil
+}
+
+// admitDialed records a directly dialed upstream's address on the tracked
+// downstream and checks it against the guard in force now. The dial was
+// guarded by the guard read when it started; an operator reload that landed
+// meanwhile revalidates only the connections already recorded, so this check
+// after recording closes the gap (review 2 finding 7). A zero dst (a
+// connection through the operator's proxy) is neither recorded nor checked;
+// tc may be nil.
+func (p *Proxy) admitDialed(up net.Conn, dst netip.AddrPort, tc *egress.TrackedConn, pol *egresspolicy.Policy, name string, nameAllowed bool) error {
+	if !dst.IsValid() {
+		return nil
+	}
+	if tc != nil {
+		tc.AddDst(dst)
+	}
+	if err := p.guard().Check(pol, egresspolicy.DialTarget{Name: name, NameAllowed: nameAllowed, Addr: dst}); err != nil {
+		_ = up.Close()
+		return err
+	}
+	return nil
+}
+
 // splice tracks the downstream conn against the sandbox (a block, detach or
-// narrowing closes it) and copies until both sides finish.
-func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string, port uint16) {
+// narrowing closes it) and copies until both sides finish. dst is the
+// directly dialed upstream address (zero through the operator's proxy),
+// recorded and checked against the current guard.
+func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string, port uint16, pol *egresspolicy.Policy, nameAllowed bool, dst netip.AddrPort) {
 	tc := p.src.Track(id, host, port, c)
 	defer tc.Close()
 	defer up.Close()
-	if a, ok := up.RemoteAddr().(*net.TCPAddr); ok && p.upstream().Bypass(host) {
-		// Dialed directly (not through the operator's proxy): a reloaded
-		// guard checks this address.
-		if ap := a.AddrPort(); ap.IsValid() {
-			tc.SetDst(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
-		}
+	if err := p.admitDialed(up, dst, tc, pol, host, nameAllowed); err != nil {
+		p.log.Debug("egress proxy: upstream refused by the current guard", "sandbox_id", id, "host", host, "error", err)
+		return
 	}
 	if err := netsplice.Splice(c, up, br, netsplice.WithIdleTimeout(p.cfg.IdleTimeout)); err != nil && !errors.Is(err, netsplice.ErrIdleTimeout) {
 		p.log.Debug("egress proxy: splice", "sandbox_id", id, "error", err)

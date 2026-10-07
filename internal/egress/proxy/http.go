@@ -53,7 +53,16 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 				}
 				return c, nil
 			}
-			return p.cfg.Dialer.DialContext(ctx, p.dialer(pol, curName, curAllowed), network, addr)
+			uc, dst, err := p.dialGuarded(ctx, pol, curName, curAllowed, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			// Recorded on the tracked downstream (so a reloaded guard
+			// revokes the exchange) and checked against the current guard.
+			if err := p.admitDialed(uc, dst, tracked, pol, curName, curAllowed); err != nil {
+				return nil, err
+			}
+			return uc, nil
 		},
 		Proxy: func(*http.Request) (*url.URL, error) {
 			if !curProxied {
@@ -196,13 +205,14 @@ func ruleDenyMessage(req *http.Request, host, reason string) string {
 func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, host, target string, pol *egresspolicy.Policy, allowed, proxied bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
 	var up net.Conn
+	var upDst netip.AddrPort
 	var err error
 	// The chain is read once: a reload may have removed it since the request
 	// was routed, and then the guarded direct dial applies.
 	if chain := p.upstream(); proxied && chain != nil {
 		up, err = chain.DialConnect(ctx, target)
 	} else {
-		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, host, allowed), "tcp", target)
+		up, upDst, err = p.dialGuarded(ctx, pol, host, allowed, "tcp", target)
 	}
 	cancel()
 	if err != nil {
@@ -213,7 +223,7 @@ func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, hos
 		_ = up.Close()
 		return
 	}
-	p.splice(c, up, br, id, host, 80)
+	p.splice(c, up, br, id, host, 80, pol, allowed, upDst)
 }
 
 // requestHost returns the request's host without port. The port, if any,

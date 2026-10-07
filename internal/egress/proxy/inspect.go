@@ -136,7 +136,16 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, ds
 			if up != nil && !up.Bypass(name) {
 				return up.DialConnect(ctx, net.JoinHostPort(name, "443"))
 			}
-			return p.cfg.Dialer.DialContext(ctx, p.dialer(pol, name, nameAllowed), network, net.JoinHostPort(name, "443"))
+			uc, dst, err := p.dialGuarded(ctx, pol, name, nameAllowed, network, net.JoinHostPort(name, "443"))
+			if err != nil {
+				return nil, err
+			}
+			// Each upstream connection of the inspected exchange is
+			// recorded on it, so a reloaded guard revokes the exchange.
+			if err := p.admitDialed(uc, dst, tc, pol, name, nameAllowed); err != nil {
+				return nil, err
+			}
+			return uc, nil
 		},
 		TLSClientConfig:       &tls.Config{ServerName: name, RootCAs: p.cfg.UpstreamRoots, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2:     true,
