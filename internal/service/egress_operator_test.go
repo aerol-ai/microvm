@@ -3,11 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"expvar"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -166,5 +168,24 @@ func TestNormalizeCreateEgressDefault(t *testing.T) {
 	own := models.CreateSandboxRequest{NetworkAllowOut: []string{"10.0.0.0/8"}}
 	if svc.NormalizeCreateEgressDefault(&own); own.NetworkBlockAll {
 		t.Fatalf("explicit policy rewritten: %+v", own)
+	}
+}
+
+// TestGatewayOperatorDrift (review finding 7): the gateway's heartbeat says
+// which operator file it enforces, and a mismatch with sandboxd's shows on
+// aerolvm_egress_operator_gateway_drift.
+func TestGatewayOperatorDrift(t *testing.T) {
+	svc, _, _ := newEgressHarness(t)
+	w := operatorWatcher(t, "version: 1\ndeny_cidrs: [10.20.0.0/16]\n")
+	svc.SetEgressOperator(w)
+	t.Cleanup(func() { activeEgressOperatorFn.Store(nil); egressGatewayOperatorHash.Store(nil) })
+	drift := func() any { return expvar.Get("aerolvm_egress_operator_gateway_drift").(expvar.Func)() }
+	svc.handleEgressEvent(context.Background(), egress.Event{Kind: "heartbeat", OperatorHash: "stale"})
+	if drift() != 1 {
+		t.Fatal("a gateway on another operator file must show as drift")
+	}
+	svc.handleEgressEvent(context.Background(), egress.Event{Kind: "heartbeat", OperatorHash: w.Current().Hash()})
+	if drift() != 0 {
+		t.Fatal("a gateway on sandboxd's file is not drift")
 	}
 }

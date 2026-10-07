@@ -39,7 +39,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	var curName string
 	var curAllowed, curProxied bool
 	var is func(string) bool // the connection's executable, traced on first need (P3-3)
-	up := p.cfg.Upstream
+	up := p.upstream()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if curProxied && addr == up.Addr() {
@@ -197,8 +197,10 @@ func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, hos
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
 	var up net.Conn
 	var err error
-	if proxied {
-		up, err = p.cfg.Upstream.DialConnect(ctx, target)
+	// The chain is read once: a reload may have removed it since the request
+	// was routed, and then the guarded direct dial applies.
+	if chain := p.upstream(); proxied && chain != nil {
+		up, err = chain.DialConnect(ctx, target)
 	} else {
 		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, host, allowed), "tcp", target)
 	}

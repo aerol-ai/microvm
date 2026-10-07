@@ -229,6 +229,21 @@ func RuntimeUsesEgressGateway(runtime string) bool {
 	return false
 }
 
+// RuntimeMediatesEgress reports whether a runtime filters egress in its own
+// host-side mediator (WASM's worker, isolate's egress proxy) rather than the
+// node's egress gateway.
+func RuntimeMediatesEgress(runtime string) bool {
+	return runtime == RuntimeWasm || runtime == RuntimeIsolate
+}
+
+// CreateHasEgress reports whether a create sets any egress field. Cluster
+// placement sends such a mediated-runtime create only to peers that enforce
+// them (capacity Snapshot.MediatedEgress).
+func CreateHasEgress(req *CreateSandboxRequest) bool {
+	return req != nil && (req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 ||
+		req.NetworkEgressMode != "" || len(req.EgressProfiles) > 0 || len(req.NetworkEgressRules) > 0)
+}
+
 // ValidDurability normalizes and validates a durability class. Empty input
 // passes through so the caller can apply a runtime-specific default.
 func ValidDurability(value string) (string, error) {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/internal/observability"
 )
@@ -28,7 +29,17 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if len(cfg.DNSUpstreams) == 0 {
 		cfg.DNSUpstreams = dnsfilter.DefaultUpstreams("/etc/resolv.conf")
 	}
-	guard, upstream, err := fromOperatorFile(cfg.OperatorFile)
+	// The operator file is watched like sandboxd's (poll and SIGHUP): a
+	// reload reaches the running filter and proxy (review finding 7). An
+	// invalid file at start still refuses to start; an invalid reload keeps
+	// the last good one.
+	var d *Daemon
+	w := operator.NewWatcher(cfg.OperatorFile, log, func(op *operator.Operator) {
+		if d != nil {
+			d.SetOperator(op)
+		}
+	})
+	guard, upstream, err := fromOperator(cfg.OperatorFile, w)
 	if err != nil {
 		return err
 	}
@@ -40,7 +51,7 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 		defer func() { _ = shutdown(context.WithoutCancel(ctx)) }()
 	}
 	be, ct := productionKernel()
-	d, err := New(cfg, Deps{
+	d, err = New(cfg, Deps{
 		Backend:     be,
 		Conntrack:   ct,
 		OriginalDst: proxy.OriginalDst,
@@ -51,6 +62,13 @@ func Run(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("egress gateway: %w", err)
 	}
+	if op := w.Current(); op != nil {
+		d.opMu.Lock()
+		d.opHash = op.Hash()
+		d.opMu.Unlock()
+	}
+	go w.Run(ctx, operatorPoll)
+	go reloadOnHUP(ctx, w)
 	ln, err := socketListener(cfg.SocketPath)
 	if err != nil {
 		return err

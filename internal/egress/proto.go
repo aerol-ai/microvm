@@ -160,6 +160,10 @@ type Event struct {
 	// GatewayStart identifies the gateway process the totals belong to, so
 	// sandboxd can tell a restart from a quiet interval.
 	GatewayStart time.Time `json:"gateway_start,omitempty"`
+	// OperatorHash is the operator file the gateway enforces right now, so
+	// sandboxd can report drift between what it validated and what the
+	// gateway applied (review finding 7).
+	OperatorHash string `json:"operator_hash,omitempty"`
 }
 
 // ErrVersionMismatch means the peer speaks a protocol two or more versions

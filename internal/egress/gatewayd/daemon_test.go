@@ -15,6 +15,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 )
 
 var lo = netip.MustParseAddr("127.0.0.1")
@@ -493,5 +494,50 @@ func TestLayoutLossAckIsGenerational(t *testing.T) {
 	r.d.statsMu.Unlock()
 	if lost {
 		t.Fatal("a Sync covering the latest loss must clear it")
+	}
+}
+
+// TestOperatorReloadReachesTheGateway (review finding 7): a reloaded operator
+// file reaches the running gateway: the node-wide floor is rewritten, the
+// applied hash is reported, and proxied streams to a newly denied range
+// close.
+func TestOperatorReloadReachesTheGateway(t *testing.T) {
+	be := egress.NewMemBackend()
+	r := startDaemon(t, t.TempDir(), be)
+	ctx := context.Background()
+	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo, Subnet: netip.MustParsePrefix("127.0.0.0/8")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.Attach(ctx, egress.Spec{ID: "sb", IP: lo, AllowOut: []string{"pypi.org"}}); err != nil {
+		t.Fatal(err)
+	}
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	tc := r.d.Gateway().Track("sb", "pypi.org", 443, c1)
+	tc.SetDst(netip.MustParseAddrPort("10.50.0.7:443"))
+	floorBefore := be.Len(egress.SetDenyFloor)
+	op, err := operator.Parse([]byte("version: 1\ndeny_cidrs: [10.50.0.0/16]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.d.SetOperator(op)
+	if r.d.OperatorHash() != op.Hash() {
+		t.Fatal("the applied operator hash must be reported")
+	}
+	if be.Len(egress.SetDenyFloor) <= floorBefore {
+		t.Fatal("the node-wide deny floor must be rewritten")
+	}
+	if _, err := c2.Write([]byte("x")); err == nil {
+		t.Fatal("a stream into the newly denied range must close")
+	}
+	r.d.heartbeat()
+	var hb egress.Event
+	for _, e := range r.d.Events().TakeAllForTest() {
+		if e.Kind == "heartbeat" {
+			hb = e
+		}
+	}
+	if hb.OperatorHash != op.Hash() {
+		t.Fatalf("heartbeat operator hash = %q", hb.OperatorHash)
 	}
 }

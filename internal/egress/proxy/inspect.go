@@ -130,7 +130,7 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, ds
 	_ = c.SetDeadline(time.Time{})
 
 	pol := src.Policy
-	up := p.cfg.Upstream
+	up := p.upstream()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if up != nil && !up.Bypass(name) {

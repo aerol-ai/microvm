@@ -925,3 +925,56 @@ func TestCapacityRequestFromSpecEgressGateway(t *testing.T) {
 		}
 	}
 }
+
+// TestMediatedEgressPlacement (review finding 10): a WASM or isolate create
+// that sets an egress field, and its recreate, lands only on a peer whose
+// mediators enforce egress policies; an older peer (no MediatedEgress)
+// stored the lists and ignored them. Without egress fields every peer fits.
+func TestMediatedEgressPlacement(t *testing.T) {
+	members := []Member{{NodeID: "server-a", APIURL: "http://server-a", Alive: true, Role: config.NodeRoleServer}}
+	for _, id := range []string{"worker-old", "worker-new"} {
+		m := heteroWorker(id, []string{models.RuntimeWasm, models.RuntimeIsolate})
+		m.Capacity.MediatedEgress = id == "worker-new"
+		members = append(members, m)
+	}
+	index := newGossipMemberIndex()
+	index.replace(members)
+	c := &Cluster{nodeID: "server-a", apiURL: "http://server-a", fsm: newPlacementFSM(), gossip: &gossipNode{memberIndex: index}}
+
+	for name, spec := range map[string]models.CreateSandboxRequest{
+		"wasm allow list":  {Runtime: models.RuntimeWasm, NetworkAllowOut: []string{"pypi.org"}},
+		"wasm block-all":   {Runtime: models.RuntimeWasm, NetworkBlockAll: true},
+		"isolate learn":    {Runtime: models.RuntimeIsolate, NetworkEgressMode: models.NetworkEgressModeLearn},
+		"isolate profiles": {Runtime: models.RuntimeIsolate, EgressProfiles: []string{"web"}},
+		"isolate rules":    {Runtime: models.RuntimeIsolate, NetworkEgressRules: []models.EgressRule{{Host: "x"}}},
+		"wasm deny CIDRs":  {Runtime: models.RuntimeWasm, NetworkDenyOut: []string{"10.0.0.0/8"}},
+	} {
+		spec.CPU, spec.MemoryMB = 1, 100
+		req := capacityRequestFromSpec(&spec)
+		if !req.NeedsMediatedEgress || req.NeedsEgressGateway {
+			t.Fatalf("%s: request = %+v", name, req)
+		}
+		for i := 0; i < 50; i++ {
+			target, err := c.SelectPlacement(req)
+			if err != nil || target.NodeID != "worker-new" {
+				t.Fatalf("%s: placed on %q (%v), want worker-new", name, target.NodeID, err)
+			}
+		}
+	}
+	plain := capacityRequestFromSpec(&models.CreateSandboxRequest{Runtime: models.RuntimeWasm, CPU: 1, MemoryMB: 100})
+	docker := capacityRequestFromSpec(&models.CreateSandboxRequest{Runtime: models.RuntimeDocker, CPU: 1, MemoryMB: 100, NetworkBlockAll: true})
+	if plain.NeedsMediatedEgress || docker.NeedsMediatedEgress {
+		t.Fatal("only mediated runtimes with egress fields need the capability")
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 200; i++ {
+		target, err := c.SelectPlacement(plain)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen[target.NodeID] = true
+	}
+	if !seen["worker-old"] {
+		t.Fatal("a WASM create without egress fields still uses older peers")
+	}
+}

@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // hookBackend wraps a MemBackend so a test can fail or stall chosen writes.
@@ -313,5 +315,37 @@ func TestSandboxLocksAreReleased(t *testing.T) {
 	<-done
 	if g.lockCount() != 0 {
 		t.Fatal("the lock must go with its last holder")
+	}
+}
+
+// TestRevalidateConns: a tightened guard closes the streams it now refuses;
+// a connection with no recorded address (not dialed directly) is left to
+// its next request's dial.
+func TestRevalidateConns(t *testing.T) {
+	g, _, _ := newHookGateway(t)
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org")); err != nil {
+		t.Fatal(err)
+	}
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	d1, d2 := net.Pipe()
+	defer d2.Close()
+	denied := g.Track("sb", "pypi.org", 443, c1)
+	denied.SetDst(netip.MustParseAddrPort("10.50.0.7:443"))
+	kept := g.Track("sb", "pypi.org", 80, d1)
+	defer kept.Close()
+	n := g.RevalidateConns(func(_ *egresspolicy.Policy, host string, dst netip.AddrPort) bool {
+		return dst.IsValid() && netip.MustParsePrefix("10.50.0.0/16").Contains(dst.Addr())
+	})
+	if n != 1 {
+		t.Fatalf("closed %d connections, want 1", n)
+	}
+	if _, err := c2.Write([]byte("x")); err == nil {
+		t.Fatal("the refused stream must be closed")
+	}
+	go func() { _, _ = d1.Write([]byte("y")) }()
+	buf := make([]byte, 1)
+	if _, err := d2.Read(buf); err != nil {
+		t.Fatal("a connection without a dialed address stays open")
 	}
 }

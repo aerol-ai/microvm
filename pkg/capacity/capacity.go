@@ -106,6 +106,9 @@ type Request struct {
 	// egress rules). Placement sends it only to peers advertising
 	// EgressGatewayReady (plans/egress-domain-filtering.md CEO D20).
 	NeedsEgressGateway bool
+	// NeedsMediatedEgress marks a WASM or isolate create that sets an egress
+	// field. Placement sends it only to peers advertising MediatedEgress.
+	NeedsMediatedEgress bool
 }
 
 // Snapshot is a read-only view of admitter state, suitable for an HTTP
@@ -188,6 +191,13 @@ type Snapshot struct {
 	// creates, because landing one there means a 501 or a 503 instead of a
 	// filtered sandbox (plans/egress-domain-filtering.md CEO D20).
 	EgressGatewayReady bool `json:"egress_gateway_ready,omitempty"`
+	// MediatedEgress is true on builds whose WASM and isolate mediators
+	// enforce egress policies (block-all, lists, profiles, learn mode). An
+	// older build stored a WASM create's lists and ignored them, so, as for
+	// the gateway, a peer that omits it gets no policy-bearing mediated
+	// create: during a rolling upgrade those wait for an upgraded peer
+	// rather than run unfiltered (review finding 10).
+	MediatedEgress bool `json:"mediated_egress,omitempty"`
 	// ContainerEngine is an observability tag (docker|containerd) so benches
 	// and canary nodes compare engines like-for-like. Deliberately NOT a
 	// placement attribute — see plans/containerd-engine.md §2 D18.
@@ -691,6 +701,9 @@ func (a *Admitter) Snapshot() Snapshot {
 	}
 
 	snap := Snapshot{
+		// A property of this build: its WASM and isolate mediators enforce
+		// egress policies (review finding 10).
+		MediatedEgress:            true,
 		HostCPUCores:              a.host.CPUCores,
 		HostMemoryTotalMB:         a.host.MemoryTotalMB,
 		HostDiskTotalGB:           a.host.DiskTotalGB,

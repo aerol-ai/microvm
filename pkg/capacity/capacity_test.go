@@ -1,6 +1,7 @@
 package capacity
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -938,5 +939,19 @@ func TestSnapshotSandboxesByRuntime(t *testing.T) {
 	_ = a.Snapshot()
 	if v := sandboxesByRuntime.Get("wasm"); v != nil {
 		t.Fatalf("sandboxes_by_runtime{key=wasm} should be deleted after release, got %v", v)
+	}
+}
+
+// TestSnapshotAdvertisesMediatedEgress (review finding 10): this build's
+// snapshot says its WASM and isolate mediators enforce egress policies, so
+// placement can tell it from an older peer that omits the field.
+func TestSnapshotAdvertisesMediatedEgress(t *testing.T) {
+	a := New(HostInfo{CPUCores: 2, MemoryTotalMB: 2048}, Limits{}, fakeProbe{free: 100})
+	if !a.Snapshot().MediatedEgress {
+		t.Fatal("the snapshot must advertise MediatedEgress")
+	}
+	var old Snapshot
+	if err := json.Unmarshal([]byte(`{"host_cpu_cores":2}`), &old); err != nil || old.MediatedEgress {
+		t.Fatalf("a peer that omits the field must read as not enforcing: %+v, %v", old, err)
 	}
 }

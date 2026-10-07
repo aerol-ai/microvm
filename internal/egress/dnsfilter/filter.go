@@ -104,6 +104,30 @@ type Filter struct {
 	limiters map[string]*limiterEntry
 
 	queries atomic.Uint64
+
+	// opMu guards cfg.Guard and cfg.Upstream, which an operator-file reload
+	// replaces while queries run (review finding 7).
+	opMu sync.RWMutex
+}
+
+// SetOperator replaces the dial guard and upstream chain from a reloaded
+// operator file; queries after it see the new ones.
+func (f *Filter) SetOperator(g egresspolicy.DialGuard, up *egresspolicy.Upstream) {
+	f.opMu.Lock()
+	f.cfg.Guard, f.cfg.Upstream = g, up
+	f.opMu.Unlock()
+}
+
+func (f *Filter) guard() egresspolicy.DialGuard {
+	f.opMu.RLock()
+	defer f.opMu.RUnlock()
+	return f.cfg.Guard
+}
+
+func (f *Filter) upstream() *egresspolicy.Upstream {
+	f.opMu.RLock()
+	defer f.opMu.RUnlock()
+	return f.cfg.Upstream
 }
 
 type limiterEntry struct {
@@ -206,11 +230,11 @@ func (f *Filter) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	if f.cfg.Upstream != nil && q.Qtype == dns.TypeA && !f.cfg.Upstream.Bypass(name) {
+	if up := f.upstream(); up != nil && q.Qtype == dns.TypeA && !up.Bypass(name) {
 		// The proxy routes by SNI or Host, so any address in the synthetic
 		// range reaches the right place; nothing is learned, since a
 		// synthetic IP must never open a forward path.
-		ip := f.cfg.Upstream.SyntheticIP(name)
+		ip := up.SyntheticIP(name)
 		resp := new(dns.Msg)
 		resp.SetReply(r)
 		resp.RecursionAvailable = true
@@ -293,7 +317,7 @@ func (f *Filter) learn(s egress.Source, name string, resp *dns.Msg, answers []ne
 	ttl := clampTTL(minTTL(resp))
 	for _, ip := range answers {
 		for _, port := range ports {
-			if err := f.cfg.Guard.Check(s.Policy, egresspolicy.DialTarget{Name: name, NameAllowed: true, Addr: netip.AddrPortFrom(ip, port)}); err != nil {
+			if err := f.guard().Check(s.Policy, egresspolicy.DialTarget{Name: name, NameAllowed: true, Addr: netip.AddrPortFrom(ip, port)}); err != nil {
 				continue // loopback, link-local, private outside the zone: never learned
 			}
 			if err := f.learner.LearnFor(s.Spec.ID, name, ip, port, ttl); err != nil {

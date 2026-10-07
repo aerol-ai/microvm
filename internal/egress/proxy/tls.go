@@ -92,9 +92,9 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
 	var up net.Conn
-	if name != "" && !isIP && !p.cfg.Upstream.Bypass(name) {
+	if chain := p.upstream(); name != "" && !isIP && !chain.Bypass(name) {
 		// The SNI decided; the operator's proxy tunnels to that name.
-		up, err = p.cfg.Upstream.DialConnect(ctx, target)
+		up, err = chain.DialConnect(ctx, target)
 	} else {
 		up, err = p.cfg.Dialer.DialContext(ctx, p.dialer(pol, name, nameAllowed), "tcp", target)
 	}

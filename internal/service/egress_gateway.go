@@ -20,7 +20,12 @@ import (
 
 // Hold reasons stored in sandbox_egress.hold_reason (CEO D16).
 const (
-	egressHoldAttachFailed  = "attach_failed"
+	egressHoldAttachFailed = "attach_failed"
+	// egressHoldApplyFailed: a stored policy change (live PUT, profile
+	// re-apply) didn't finish applying, so what is enforced may not be what
+	// is stored. The sandbox is shut until a retry applies it (review
+	// finding 2).
+	egressHoldApplyFailed   = "apply_failed"
 	egressHoldUnavailable   = "gateway_unavailable"
 	egressHoldLayoutLost    = "layout_lost"
 	egressHoldPolicyInvalid = "policy_invalid"
@@ -451,6 +456,12 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 		if err != nil || sb.Status != models.SandboxStatusStarted {
 			continue
 		}
+		if reason == egressHoldApplyFailed {
+			if err := s.reapplyStoredPolicy(ctx, id); err != nil {
+				s.logger.Debug("egress: held policy still not applied", "sandbox_id", id, "error", err)
+			}
+			continue
+		}
 		s.reconcileSandboxEgress(ctx, sb)
 	}
 	s.refreshHeldGauge(ctx)
@@ -550,32 +561,35 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 }
 
 // EgressStatus reports a sandbox's egress status for GET: "" for a sandbox
-// outside gateway mode, otherwise active, held or unavailable.
+// outside gateway mode and not held, otherwise active, held or unavailable.
+// A hold shows on every runtime: a policy that failed to apply, or profiles
+// that can't be resolved, hold WASM, isolate and CIDR sandboxes too.
 func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
-	// WASM and isolate filter hostnames in their own mediators; only the
-	// container runtimes go through the gateway.
-	if sb == nil || !models.RuntimeUsesEgressGateway(sb.Runtime) {
+	if sb == nil || !hasEgressConfig(sb) {
 		return ""
 	}
-	if !isGatewayMode(sb) {
-		// A failover replay whose profiles this node can't resolve runs
-		// block-all, held, until they can (CEO D11): unavailable, since no
-		// policy of the owner's is in force.
-		if sb.NetworkBlockAll {
-			if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil && st.HoldReason == egressHoldProfileUnavailable {
-				return EgressStatusUnavailable
-			}
-		}
-		return ""
-	}
-	st, err := s.store.GetEgressState(ctx, sb.ID)
-	if err == nil && st.HoldReason != "" {
-		if st.HoldReason == egressHoldUnavailable || st.HoldReason == egressHoldLayoutLost {
+	gw := models.RuntimeUsesEgressGateway(sb.Runtime) && isGatewayMode(sb)
+	if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil && st.HoldReason != "" {
+		switch st.HoldReason {
+		case egressHoldUnavailable, egressHoldLayoutLost, egressHoldProfileUnavailable:
+			// A failover replay whose profiles this node can't resolve runs
+			// block-all, held, until they can (CEO D11): no policy of the
+			// owner's is in force.
 			return EgressStatusUnavailable
 		}
 		return EgressStatusHeld
 	}
-	return EgressStatusActive
+	if gw {
+		return EgressStatusActive
+	}
+	return ""
+}
+
+// hasEgressConfig reports whether a sandbox has any egress setting, so a
+// sandbox with none skips the egress state read.
+func hasEgressConfig(sb *models.Sandbox) bool {
+	return sb.NetworkBlockAll || len(sb.NetworkAllowOut) > 0 || len(sb.NetworkDenyOut) > 0 ||
+		sb.NetworkEgressMode != "" || len(sb.NetworkEgressRules) > 0 || len(sb.EgressProfiles) > 0
 }
 
 // consumeEgressEvents streams gateway events into the audit log and metrics,
@@ -632,6 +646,7 @@ func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
 		s.egressStats.fqdnSandboxes.Store(int64(ev.FQDNSandboxes))
 		s.egressStats.proxyConns.Store(int64(ev.ProxyConns))
 		s.egressStats.proxyConnCap.Store(int64(ev.ProxyConnCap))
+		s.observeGatewayOperator(ev.OperatorHash)
 		if ev.LayoutLostSeen {
 			s.onEgressLayoutLost(ctx)
 		}

@@ -71,6 +71,9 @@ func capacityRequestFromSpec(spec *models.CreateSandboxRequest) capacity.Request
 	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
 		egresspolicy.NeedsGatewayWith(spec.NetworkAllowOut, spec.NetworkDenyOut, spec.NetworkBlockAll,
 			spec.NetworkEgressMode == models.NetworkEgressModeLearn, len(spec.EgressProfiles))
+	// WASM and isolate filter in their own mediators, which an older peer
+	// lacks: it would store the policy and ignore it (review finding 10).
+	out.NeedsMediatedEgress = models.RuntimeMediatesEgress(runtimeName) && models.CreateHasEgress(spec)
 	if spec.GPUs != nil {
 		want := spec.GPUs.Count
 		if want <= 0 {
@@ -169,6 +172,10 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 		// empty-set error can name it: "no gateway" is not "cluster full".
 		if req.NeedsEgressGateway && !m.Capacity.EgressGatewayReady {
 			rejects["egress_gateway"]++
+			continue
+		}
+		if req.NeedsMediatedEgress && !m.Capacity.MediatedEgress {
+			rejects["mediated_egress"]++
 			continue
 		}
 		if !nodeFits(m, req, pending[m.NodeID]) {

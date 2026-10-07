@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
 	"github.com/aerol-ai/microvm/internal/egress/inspect"
+	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/egress/procid"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -57,15 +58,22 @@ type Daemon struct {
 	learnMu sync.Mutex
 	learn   map[string]*egresspolicy.Recorder
 	// savedLearn is the recorder version last written to disk, per sandbox;
-	// only the save loop touches it.
+	// saveMu serializes saveNow (the save loop, Close and tests), which
+	// alone touches it, so two saves never both see a version as unsaved.
+	saveMu     sync.Mutex
 	savedLearn map[string]uint64
 
 	probeMu sync.Mutex
 	probes  map[netip.Addr]*egress.ProbeResult
 
 	started time.Time
-	// floor is the operator's deny_cidrs, node-wide for every sandbox.
+	// floor is the operator's deny_cidrs, node-wide for every sandbox;
+	// upstream and opHash are the rest of the operator file in force. opMu
+	// guards the three: a reload replaces them while the server runs.
+	opMu       sync.Mutex
 	floor      []netip.Prefix
+	upstream   *egresspolicy.Upstream
+	opHash     string
 	statsMu    sync.Mutex
 	denied     map[string]uint64
 	layoutLost bool
@@ -95,7 +103,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		started:      time.Now().UTC(),
 		seenRejected: map[egress.Elem]time.Time{},
 	}
-	d.floor = deps.Guard.DenyFloor
+	d.floor, d.upstream = deps.Guard.DenyFloor, deps.Upstream
 	d.gw = egress.New(egress.Options{
 		Backend:    deps.Backend,
 		Conntrack:  deps.Conntrack,
@@ -187,8 +195,49 @@ func (d *Daemon) setBridges(bridges []egress.Bridge) error {
 			nw.Subnets = append(nw.Subnets, b.Subnet)
 		}
 	}
-	nw.Floor = d.floor
+	nw.Floor = d.denyFloor()
 	return d.gw.SetNodeWide(nw)
+}
+
+func (d *Daemon) denyFloor() []netip.Prefix {
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	return d.floor
+}
+
+// SetOperator applies a reloaded operator file (review finding 7): the DNS
+// filter and the proxy get the new dial guard and upstream chain, the
+// node-wide deny floor is rewritten, and proxied connections the new guard
+// refuses are closed. An upstream chain that can't be built (unreadable
+// credentials) keeps the previous one, as sandboxd does for isolate.
+func (d *Daemon) SetOperator(op *operator.Operator) {
+	guard := op.Guard()
+	d.opMu.Lock()
+	up, err := op.UpstreamDialer()
+	if err != nil {
+		d.log.Error("egress operator file: upstream proxy not updated", "error", err)
+		up = d.upstream
+	}
+	d.floor, d.upstream, d.opHash = guard.DenyFloor, up, op.Hash()
+	d.opMu.Unlock()
+	d.dns.SetOperator(guard, up)
+	d.px.SetOperator(guard, up)
+	nw := d.gw.NodeWideState()
+	nw.Floor = guard.DenyFloor
+	if err := d.gw.SetNodeWide(nw); err != nil {
+		d.log.Error("egress operator file: deny floor not rewritten", "error", err)
+	}
+	closed := d.gw.RevalidateConns(func(pol *egresspolicy.Policy, host string, dst netip.AddrPort) bool {
+		return dst.IsValid() && guard.Check(pol, egresspolicy.DialTarget{Name: host, NameAllowed: true, Addr: dst}) != nil
+	})
+	d.log.Info("egress operator file applied", "hash", op.Hash(), "connections_closed", closed)
+}
+
+// OperatorHash is the operator file in force ("" without one).
+func (d *Daemon) OperatorHash() string {
+	d.opMu.Lock()
+	defer d.opMu.Unlock()
+	return d.opHash
 }
 
 // setNodeControl replaces the control endpoints the node-wide guard drops
@@ -196,7 +245,7 @@ func (d *Daemon) setBridges(bridges []egress.Bridge) error {
 func (d *Daemon) setNodeControl(eps []netip.AddrPort) error {
 	nw := d.gw.NodeWideState()
 	nw.Control, nw.ControlKnown = eps, true
-	nw.Floor = d.floor
+	nw.Floor = d.denyFloor()
 	return d.gw.SetNodeWide(nw)
 }
 
@@ -461,7 +510,7 @@ func (d *Daemon) heartbeat() {
 	}
 	d.hub.Publish(egress.Event{Kind: "heartbeat", LayoutOK: !lost, LayoutLostSeen: lostSeen,
 		AuditDropped: d.hub.Dropped(), FQDNSandboxes: n, ProxyConns: d.px.Active(), ProxyConnCap: d.cfg.ProxyMaxConns,
-		Denied: d.DeniedCounts(), DNSQueries: d.dns.Queries(), GatewayStart: d.started, Time: time.Now().UTC()})
+		Denied: d.DeniedCounts(), DNSQueries: d.dns.Queries(), GatewayStart: d.started, OperatorHash: d.OperatorHash(), Time: time.Now().UTC()})
 }
 
 // layoutLossGen is the table-loss generation an incoming Sync starts from.
@@ -568,6 +617,8 @@ func (d *Daemon) snapshotLoop(ctx context.Context) {
 // their own per-sandbox files so one change never rewrites every recording
 // on the node (eng re-review S9).
 func (d *Daemon) saveNow() {
+	d.saveMu.Lock()
+	defer d.saveMu.Unlock()
 	var specs []egress.Spec
 	for _, s := range d.gw.Specs() {
 		if !strings.HasPrefix(s.ID, probePrefix) {

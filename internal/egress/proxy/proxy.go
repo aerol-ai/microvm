@@ -140,6 +140,31 @@ type Proxy struct {
 	closing bool
 
 	inspector atomic.Pointer[inspectorBox]
+
+	// opMu guards cfg.Guard and cfg.Upstream, which an operator-file reload
+	// replaces while connections are served (review finding 7).
+	opMu sync.RWMutex
+}
+
+// SetOperator replaces the dial guard and upstream chain from a reloaded
+// operator file; dials after it use the new ones. Connections already open
+// are revalidated by the gateway (Gateway.RevalidateConns).
+func (p *Proxy) SetOperator(g egresspolicy.DialGuard, up *egresspolicy.Upstream) {
+	p.opMu.Lock()
+	p.cfg.Guard, p.cfg.Upstream = g, up
+	p.opMu.Unlock()
+}
+
+func (p *Proxy) guard() egresspolicy.DialGuard {
+	p.opMu.RLock()
+	defer p.opMu.RUnlock()
+	return p.cfg.Guard
+}
+
+func (p *Proxy) upstream() *egresspolicy.Upstream {
+	p.opMu.RLock()
+	defer p.opMu.RUnlock()
+	return p.cfg.Upstream
 }
 
 // New builds a Proxy.
@@ -362,7 +387,7 @@ func (p *Proxy) overCapClose(c net.Conn, src egress.Source, port uint16) {
 // dialer returns a net.Dialer whose Control applies the dial guard to every
 // resolved address, bound to this connection's name and match result.
 func (p *Proxy) dialer(pol *egresspolicy.Policy, name string, nameAllowed bool) *net.Dialer {
-	return &net.Dialer{Timeout: p.cfg.DialTimeout, Control: p.cfg.Guard.Control(pol, name, nameAllowed)}
+	return &net.Dialer{Timeout: p.cfg.DialTimeout, Control: p.guard().Control(pol, name, nameAllowed)}
 }
 
 // splice tracks the downstream conn against the sandbox (a block, detach or
@@ -371,6 +396,13 @@ func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string, port u
 	tc := p.src.Track(id, host, port, c)
 	defer tc.Close()
 	defer up.Close()
+	if a, ok := up.RemoteAddr().(*net.TCPAddr); ok && p.upstream().Bypass(host) {
+		// Dialed directly (not through the operator's proxy): a reloaded
+		// guard checks this address.
+		if ap := a.AddrPort(); ap.IsValid() {
+			tc.SetDst(netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()))
+		}
+	}
 	if err := netsplice.Splice(c, up, br, netsplice.WithIdleTimeout(p.cfg.IdleTimeout)); err != nil && !errors.Is(err, netsplice.ErrIdleTimeout) {
 		p.log.Debug("egress proxy: splice", "sandbox_id", id, "error", err)
 	}

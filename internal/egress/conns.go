@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // TrackedConn is a proxied connection registered against its sandbox, so a
@@ -14,9 +16,19 @@ type TrackedConn struct {
 	// redirected port it came in on.
 	Host string
 	Port uint16
+	// dst is the address the proxy dialed for it, when it dialed one
+	// directly (SetDst), so a reloaded operator guard can revoke it.
+	dst  netip.AddrPort
 	once sync.Once
 	g    *Gateway
 	id   string
+}
+
+// SetDst records the upstream address the connection was dialed to.
+func (c *TrackedConn) SetDst(dst netip.AddrPort) {
+	c.g.connMu.Lock()
+	c.dst = dst
+	c.g.connMu.Unlock()
 }
 
 // Close closes the underlying connection and unregisters it.
@@ -72,6 +84,41 @@ func (g *Gateway) CloseConnsWhere(id string, pred func(host string, port uint16)
 		_ = c.Close()
 	}
 	return len(victims)
+}
+
+// RevalidateConns closes every tracked connection that revoke reports as no
+// longer allowed, given its sandbox's policy, host and dialed address (a
+// zero address when it wasn't dialed directly). An operator-file reload uses
+// it to apply a tightened guard to streams already open.
+func (g *Gateway) RevalidateConns(revoke func(pol *egresspolicy.Policy, host string, dst netip.AddrPort) bool) int {
+	type conn struct {
+		c       *TrackedConn
+		id, hst string
+		dst     netip.AddrPort
+	}
+	g.connMu.Lock()
+	var all []conn
+	for id, cs := range g.conns {
+		for c := range cs {
+			all = append(all, conn{c: c, id: id, hst: c.Host, dst: c.dst})
+		}
+	}
+	g.connMu.Unlock()
+	n := 0
+	for _, c := range all {
+		g.mu.RLock()
+		e := g.byID[c.id]
+		g.mu.RUnlock()
+		var pol *egresspolicy.Policy
+		if e != nil {
+			pol = e.pol
+		}
+		if revoke(pol, c.hst, c.dst) {
+			_ = c.c.Close()
+			n++
+		}
+	}
+	return n
 }
 
 // permits reports whether e's policy still allows a proxied connection to

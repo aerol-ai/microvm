@@ -451,6 +451,9 @@ func CapacityRequestFromCreate(req models.CreateSandboxRequest) capacity.Request
 	out.NeedsEgressGateway = models.RuntimeUsesEgressGateway(runtimeName) &&
 		egresspolicy.NeedsGatewayWith(req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkBlockAll,
 			req.NetworkEgressMode == models.NetworkEgressModeLearn, len(req.EgressProfiles))
+	// WASM and isolate filter in their own mediators, which an older peer
+	// lacks: it would store the policy and ignore it (review finding 10).
+	out.NeedsMediatedEgress = models.RuntimeMediatesEgress(runtimeName) && models.CreateHasEgress(&req)
 	if req.GPUs != nil {
 		want := req.GPUs.Count
 		if want <= 0 {

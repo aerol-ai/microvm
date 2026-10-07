@@ -2019,12 +2019,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			return
 		}
 		_ = waitEgress()
-		if gatewayMode {
-			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
-		}
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
-		_ = ociRt.Destroy(rollback.Context(), partial)
+		// Destroy first: a container that outlives a failed rollback stays
+		// filtered (attached, or still behind the driver's block-all).
+		destroyErr := ociRt.Destroy(rollback.Context(), partial)
+		if gatewayMode && destroyErr == nil {
+			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
+		}
 	}
 
 	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
@@ -2412,10 +2414,11 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	}
 	destroyVM := func(partial *models.Sandbox) {
 		_ = waitEgress()
-		if gatewayMode {
+		// As on the docker path: a VM that outlives a failed rollback stays
+		// filtered.
+		if err := s.firecracker.Destroy(rollback.Context(), partial); err == nil && gatewayMode {
 			s.detachSandboxEgress(rollback.Context(), partial, state.ContainerIP)
 		}
-		_ = s.firecracker.Destroy(rollback.Context(), partial)
 	}
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(s.firecracker)
@@ -3259,13 +3262,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	// Leave the egress gateway before the runtime goes; the gateway's IP
-	// ownership check makes a late detach after IP reuse harmless (D5).
-	if isGatewayMode(sandbox) {
-		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
-	}
+	// Leave the egress gateway only once the runtime is gone: a destroy that
+	// fails leaves the sandbox running, and still filtered, for the retry
+	// (review finding 3). The gateway's IP ownership check makes the late
+	// detach harmless if the IP was reused meanwhile (D5), and a new owner's
+	// Attach purges the old entry itself.
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
+	}
+	if isGatewayMode(sandbox) {
+		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
 	}
 	s.forgetLearned(ctx, sandbox)
 	if s.testAfterRuntimeDestroy != nil {

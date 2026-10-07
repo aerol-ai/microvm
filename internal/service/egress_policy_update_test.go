@@ -222,7 +222,7 @@ func TestUpdateNetworkPolicyAttachFailureHolds(t *testing.T) {
 	if !slices.Equal(row.NetworkAllowOut, []string{"pypi.org"}) {
 		t.Fatal("the store is the source of truth: the new policy must be kept")
 	}
-	if st, _ := svc.store.GetEgressState(ctx, "sb-pol"); st.HoldReason != egressHoldAttachFailed {
+	if st, _ := svc.store.GetEgressState(ctx, "sb-pol"); st.HoldReason != egressHoldApplyFailed {
 		t.Fatalf("hold = %q", st.HoldReason)
 	}
 	if len(rt.holds) != 1 || rt.lifted(policyIP) {

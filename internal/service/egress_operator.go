@@ -29,6 +29,9 @@ var (
 	egressOperatorInfo     = expvar.NewMap("aerolvm_egress_operator_config_info")
 	egressOperatorInfoMu   sync.Mutex
 	activeEgressOperatorFn atomic.Pointer[operator.Watcher]
+	// egressGatewayOperatorHash is the operator file the gateway reports it
+	// enforces (its heartbeat), for the drift gauge below.
+	egressGatewayOperatorHash atomic.Pointer[string]
 )
 
 func init() {
@@ -38,6 +41,32 @@ func init() {
 		}
 		return 0
 	}))
+	// 1 while the gateway enforces another operator file than the one
+	// sandboxd validated (a reload it hasn't applied, or a stale process):
+	// what the node reports must be what it enforces (review finding 7).
+	expvar.Publish("aerolvm_egress_operator_gateway_drift", expvar.Func(func() any {
+		w, gw := activeEgressOperatorFn.Load(), egressGatewayOperatorHash.Load()
+		if w == nil || w.Current() == nil || gw == nil {
+			return 0
+		}
+		if *gw != w.Current().Hash() {
+			return 1
+		}
+		return 0
+	}))
+}
+
+// observeGatewayOperator records the operator file a gateway heartbeat says
+// is in force, and logs when it stops matching sandboxd's.
+func (s *Service) observeGatewayOperator(hash string) {
+	prev := egressGatewayOperatorHash.Swap(&hash)
+	op := s.egressOperator()
+	if op == nil || (prev != nil && *prev == hash) {
+		return
+	}
+	if hash != op.Hash() {
+		s.logger.Warn("egress gateway enforces another operator file than sandboxd's; it reloads within its poll interval", "gateway_hash", hash, "sandboxd_hash", op.Hash())
+	}
 }
 
 // SetEgressOperator wires the operator-file watcher (nil: no file, today's
@@ -55,7 +84,8 @@ func (s *Service) SetEgressOperator(w *operator.Watcher) {
 // drift metric and the host-firewall floor, and wakes the profile re-apply
 // pass so an edited or removed org profile reaches this node's sandboxes
 // (§5.10 PC-3; each node re-applies its own, paced like any profile change).
-// The gateway reads the file itself; the control-port guard follows on the
+// The gateway and the WASM workers watch the file themselves (the gateway's
+// heartbeat reports what it applied); the control-port guard follows on the
 // next supervisor tick.
 func (s *Service) OnEgressOperatorChange(op *operator.Operator) {
 	publishOperatorHash(op)

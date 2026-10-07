@@ -70,9 +70,12 @@ func (s *Service) reapplyEgressProfiles(ctx context.Context) {
 			p, err := s.lookupEgressProfile(ctx, r.OwnerRef, r.Profile)
 			switch {
 			case errors.Is(err, ErrEgressProfileNotFound), errors.Is(err, egresspolicy.ErrBuiltinUnknown), errors.Is(err, ErrOrgProfileInvalid),
-				errors.Is(err, ErrEgressProfileUnavailable) && strings.HasPrefix(r.Profile, egresspolicy.BuiltinProfilePrefix):
-				// Gone, out of the operator file, or a built-in version this
-				// node lacks: re-applying holds the sandbox.
+				errors.Is(err, ErrEgressProfileUnavailable):
+				// Gone, out of the operator file, a built-in version this node
+				// lacks, or a profile this worker can't read fresher than the
+				// 30 s staleness bound (the cache stops serving past it): the
+				// owner may have narrowed it, so re-applying holds the
+				// sandbox until it can be read (C-PROF, G7; review finding 6).
 				gen = -1
 			case err != nil:
 				s.logger.Warn("egress: read profile for re-apply", "profile", r.Profile, "error", err)
@@ -166,7 +169,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 		}); err != nil {
 			return err
 		}
-		if err := s.applyPolicyTransition(ctx, old, &next); err != nil {
+		if err := s.applyStoredTransition(ctx, old, &next); err != nil {
 			return err
 		}
 		// A container's attach lifts its hold; the WASM and isolate
@@ -181,19 +184,22 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	return s.store.SetEgressProfilesApplied(ctx, id, resolved.Applied)
 }
 
-// holdForProfiles shuts a running container sandbox whose profiles can't be
-// resolved, so it never keeps serving entries its owner may have removed.
-// The WASM and isolate mediators keep their last policy until a re-apply
-// succeeds.
+// holdForProfiles shuts a sandbox whose profiles can't be resolved, on every
+// runtime, so it never keeps serving entries its owner may have removed:
+// containers through the host-firewall hold, the WASM and isolate mediators
+// through block-all until a re-apply succeeds (review finding 6). A stopped
+// sandbox gets the record only; its start re-applies through the pass.
 func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox, reason string) {
-	if sb.Status != models.SandboxStatusStarted || sb.ContainerIP == "" || s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
+	if sb.Status != models.SandboxStatusStarted {
+		if err := s.store.SetEgressHold(ctx, sb.ID, reason, time.Now().UTC()); err == nil {
+			s.refreshHeldGauge(ctx)
+		}
 		return
 	}
-	cr, err := s.containerRuntimeForSandbox(sb)
-	if err != nil {
+	if !s.isWasmSandbox(sb) && !s.isIsolateSandbox(sb) && sb.ContainerIP == "" {
 		return
 	}
-	s.holdSandboxEgress(ctx, sb, cr, reason)
+	s.holdUnapplied(ctx, sb, reason)
 }
 
 // profileHoldReason names why a sandbox's profiles stopped resolving. An org
