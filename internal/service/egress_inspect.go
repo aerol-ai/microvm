@@ -310,7 +310,51 @@ func (s *Service) egressPid(ctx context.Context, sb *models.Sandbox) int {
 		s.logger.Warn("egress: sandbox pid unavailable; its per-binary flows are refused", "sandbox_id", sb.ID, "error", err)
 		return 0
 	}
+	// Remembered by container, so a restart (a new container, a new init
+	// process) is never answered with the old pid.
+	s.egressPids.Store(sb.ID, egressPidEntry{container: sb.ContainerID, pid: pid})
 	return pid
+}
+
+type egressPidEntry struct {
+	container string
+	pid       int
+}
+
+// ErrEgressProcidRefused refuses an executable lookup for a sandbox that
+// isn't a started, gateway-mode sandbox with per-binary rules on this node.
+var ErrEgressProcidRefused = errors.New("egress: no per-binary rules to trace for this sandbox")
+
+// EgressProcidAuthorize answers the gateway's executable lookup (review
+// finding 16) for one sandbox: the pid of its init process from sandboxd's
+// own record, and the paths its rules list, the only ones it may be asked
+// about. The gateway names a sandbox, never a pid.
+func (s *Service) EgressProcidAuthorize(ctx context.Context, sandboxID string) (int, []string, error) {
+	sb, err := s.store.Get(ctx, sandboxID)
+	if err != nil {
+		return 0, nil, err
+	}
+	if sb.Status != models.SandboxStatusStarted || !models.RuntimeUsesEgressGateway(sb.Runtime) || !isGatewayMode(sb) || !hasBinariesRule(sb.NetworkEgressRules) {
+		return 0, nil, ErrEgressProcidRefused
+	}
+	var allowed []string
+	for _, r := range sb.NetworkEgressRules {
+		for _, b := range r.Binaries {
+			if !slices.Contains(allowed, b) {
+				allowed = append(allowed, b)
+			}
+		}
+	}
+	pid := 0
+	if v, ok := s.egressPids.Load(sb.ID); ok && v.(egressPidEntry).container == sb.ContainerID {
+		pid = v.(egressPidEntry).pid
+	} else {
+		pid = s.egressPid(ctx, sb)
+	}
+	if pid <= 0 {
+		return 0, nil, fmt.Errorf("%w: its process is unknown", ErrEgressProcidRefused)
+	}
+	return pid, allowed, nil
 }
 
 // egressSecrets returns the values a sandbox's inject rules send (P3-2):

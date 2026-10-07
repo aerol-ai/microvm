@@ -384,7 +384,6 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			hold_reason TEXT NOT NULL DEFAULT '',
 			hold_since DATETIME,
 			egress_mode TEXT NOT NULL DEFAULT '',
-			profiles_json TEXT NOT NULL DEFAULT '[]',
 			updated_at DATETIME NOT NULL
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
@@ -403,10 +402,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (owner_ref, name)
 		);`,
 		// sandbox_egress_profiles is each sandbox's profile references, in
-		// order, with the generation of each that is live. It is an index
-		// rather than sandbox_egress.profiles_json (left unused) so a profile
-		// update finds its referencing sandboxes with an index probe, and
-		// delete-in-use is one query, at any fleet size.
+		// order, with the generation of each that is live. It is an index,
+		// not a JSON column on sandbox_egress, so a profile update finds its
+		// referencing sandboxes with an index probe, and delete-in-use is one
+		// query, at any fleet size. It is the only record of references.
 		`CREATE TABLE IF NOT EXISTS sandbox_egress_profiles (
 			sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
 			owner_ref TEXT NOT NULL DEFAULT '',

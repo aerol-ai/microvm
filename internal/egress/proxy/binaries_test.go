@@ -29,7 +29,7 @@ func (f *fakeIdentity) set(exe string, err error) {
 	f.exe, f.err = exe, err
 }
 
-func (f *fakeIdentity) identify(pid int, _, _ netip.AddrPort) (func(string) bool, error) {
+func (f *fakeIdentity) identify(_ string, pid int, _, _ netip.AddrPort, _ []string) (func(string) bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pids = append(f.pids, pid)

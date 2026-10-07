@@ -219,6 +219,13 @@ type Config struct {
 	EgressFQDNEnabled bool
 	// EgressGatewaySocket is the gateway's UDS (SB_EGRESS_GATEWAY_SOCKET).
 	EgressGatewaySocket string
+	// EgressProcidSocket is where sandboxd answers the gateway's executable
+	// lookups for per-binary rules (SB_EGRESS_PROCID_SOCKET); empty turns
+	// them off (the rules' flows are then refused).
+	EgressProcidSocket string
+	// EgressGatewayUser is the gateway's system user, the only peer the
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	EgressGatewayUser string
 	// EgressOperatorFile is the private-cloud operator policy (§5.10,
 	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
 	EgressOperatorFile string
@@ -1688,6 +1695,8 @@ func Load() (Config, error) {
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
 		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
 		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
+		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
+		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),

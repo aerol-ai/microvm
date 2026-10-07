@@ -123,7 +123,7 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		MaxConns: cfg.ProxyMaxConns, MaxConnsPerSandbox: cfg.ProxyMaxPerSandbox,
 		Guard: deps.Guard, OriginalDst: deps.OriginalDst, Dialer: deps.Dialer, Logger: log, Upstream: deps.Upstream,
 		InspectMaxBody: cfg.InspectMaxBody,
-		Identify:       procid.Resolver{}.Matcher,
+		Identify:       identifier(cfg.ProcidSocket),
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{
@@ -787,3 +787,18 @@ func writeFileAtomic(path string, b []byte) error {
 
 // errNoSocket is returned when neither socket activation nor a path is set.
 var errNoSocket = errors.New("egress gateway: no socket configured")
+
+// identifier asks sandboxd which executable holds a traced connection: the
+// gateway runs unprivileged and can't read a sandbox's /proc itself (review
+// finding 16). sandboxd resolves the sandbox's process from its own record,
+// so the pid the gateway holds isn't sent. No socket refuses per-binary
+// flows (binary_unknown), never admits them.
+func identifier(socket string) proxy.Identifier {
+	if socket == "" {
+		return nil
+	}
+	c := procid.Client{Path: socket}
+	return func(sandboxID string, _ int, local, remote netip.AddrPort, paths []string) (func(string) bool, error) {
+		return c.Match(sandboxID, local, remote, paths)
+	}
+}

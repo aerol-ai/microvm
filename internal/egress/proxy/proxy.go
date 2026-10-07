@@ -70,9 +70,11 @@ type Sources interface {
 }
 
 // Identifier traces a sandbox connection local→remote to its executable
-// (P3-3, *procid.Resolver): is(path) reports whether the connection's
-// process is the binary at path inside the sandbox.
-type Identifier func(pid int, local, remote netip.AddrPort) (is func(path string) bool, err error)
+// (P3-3): is(path) reports whether the connection's process is the binary
+// at path inside the sandbox, for the paths its rules list. In production
+// sandboxd answers it (procid.Client): the gateway can't read the
+// sandbox's /proc itself (review finding 16).
+type Identifier func(sandboxID string, pid int, local, remote netip.AddrPort, paths []string) (is func(path string) bool, err error)
 
 // Decision is one decided connection or request, for audit and learn mode.
 type Decision struct {
@@ -290,7 +292,7 @@ func (p *Proxy) handle(c net.Conn) {
 }
 
 // identify traces c, whose original destination is dst, to its executable.
-func (p *Proxy) identify(src egress.Source, c net.Conn, dst netip.AddrPort) (func(string) bool, error) {
+func (p *Proxy) identify(src egress.Source, rules *egresspolicy.Rules, c net.Conn, dst netip.AddrPort) (func(string) bool, error) {
 	if p.cfg.Identify == nil {
 		return nil, errors.New("this gateway can't trace connections to executables")
 	}
@@ -298,7 +300,7 @@ func (p *Proxy) identify(src egress.Source, c net.Conn, dst netip.AddrPort) (fun
 	if err != nil {
 		return nil, err
 	}
-	return p.cfg.Identify(src.Spec.Pid, netip.AddrPortFrom(local.Addr().Unmap(), local.Port()), dst)
+	return p.cfg.Identify(src.Spec.ID, src.Spec.Pid, netip.AddrPortFrom(local.Addr().Unmap(), local.Port()), dst, rules.Binaries())
 }
 
 // admit holds a connection to host:port to per-binary rules (P3-3) and
@@ -310,7 +312,7 @@ func (p *Proxy) admit(src egress.Source, rules *egresspolicy.Rules, c net.Conn, 
 		return rules, "", true
 	}
 	if *is == nil {
-		fn, err := p.identify(src, c, dst)
+		fn, err := p.identify(src, rules, c, dst)
 		if err != nil {
 			p.log.Debug("egress proxy: trace connection", "sandbox_id", src.Spec.ID, "host", host, "error", err)
 			return nil, ReasonBinaryUnknown, false

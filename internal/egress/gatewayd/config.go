@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/dnsfilter"
+	"github.com/aerol-ai/microvm/internal/egress/procid"
 	"github.com/aerol-ai/microvm/internal/egress/proxy"
 	"github.com/aerol-ai/microvm/internal/observability"
 )
@@ -44,6 +45,9 @@ type Config struct {
 	SnapshotDebounce time.Duration
 	// OperatorFile is the private-cloud operator policy (§5.10).
 	OperatorFile string
+	// ProcidSocket is sandboxd's executable-lookup socket for per-binary
+	// rules (P3-3, review finding 16); empty refuses them.
+	ProcidSocket string
 	// Traces reads sandboxd's SB_OTEL_TRACES_* settings, so one env file
 	// turns tracing on for both processes and gateway spans join sandboxd's
 	// traces (P1-15).
@@ -63,6 +67,7 @@ func FromEnv() (Config, error) {
 	cfg := Config{
 		SocketPath:         envOr("SB_EGRESS_GATEWAY_SOCKET", DefaultSocketPath),
 		StateDir:           envOr("SB_EGRESS_STATE_DIR", DefaultStateDir),
+		ProcidSocket:       envOr("SB_EGRESS_PROCID_SOCKET", procid.DefaultSocket),
 		DNSPort:            DefaultDNSPort,
 		ProxyPort:          DefaultProxyPort,
 		DNSQPS:             dnsfilter.DefaultQPS,

@@ -330,9 +330,18 @@ sandbox. Ports other than 80 and 443 reach the proxy through the
 `bin_learned` set, which the DNS filter fills for host:port entries a
 per-binary rule covers.
 
-- **Needs cgroup v2** and the sandbox's init pid (sandboxd sends it with
-  each attach). On a cgroup v1 host, or when the pid is unknown, covered
-  connections are refused with `binary_unknown`, never let through.
+- **sandboxd does the tracing.** The gateway runs as the unprivileged
+  `aerolvm-egress` user and can't read another user's `/proc/<pid>/fd`, so it
+  asks sandboxd (root) over `SB_EGRESS_PROCID_SOCKET` (default
+  `/run/aerolvm/egress-procid.sock`, group `aerolvm-egress`, mode 0660, and
+  only that uid is answered). A request names a sandbox; sandboxd uses its own
+  record of the sandbox's init process and only the paths that sandbox's
+  rules list. If sandboxd can't find the gateway user
+  (`SB_EGRESS_GATEWAY_USER`) or bind the socket, it logs `egress: executable
+  lookups unavailable` and covered connections are refused.
+- **Needs cgroup v2.** On a cgroup v1 host, or when the sandbox's process is
+  unknown, covered connections are refused with `binary_unknown`, never let
+  through.
 - **TCP only.** UDP to a covered host:port is refused.
 - **Denials:** `binary_not_allowed` (the executable isn't listed) and
   `binary_unknown` (the connection couldn't be traced, or a redirected flow

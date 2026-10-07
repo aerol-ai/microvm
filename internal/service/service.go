@@ -377,6 +377,9 @@ type Service struct {
 	// egressRetainedAt is when the gateway last got the recording
 	// inventory (unix nanos).
 	egressRetainedAt atomic.Int64
+	// egressPids remembers each per-binary sandbox's init pid by container,
+	// for the gateway's executable lookups (sandbox id → egressPidEntry).
+	egressPids       sync.Map
 	egressGaugeBatch atomic.Int32
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);

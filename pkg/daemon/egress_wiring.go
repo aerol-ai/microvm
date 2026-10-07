@@ -60,6 +60,9 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 		logger.Warn("egress: bridge netfilter not enabled; the gateway self-test will fail", "error", err)
 	}
 	svc.SetEgressGateway(egress.NewClient(cfg.EgressGatewaySocket), bridges)
+	if err := startEgressProcid(ctx, cfg, svc, logger); err != nil {
+		logger.Warn("egress: executable lookups unavailable; per-binary rule flows are refused", "error", err)
+	}
 	svc.SetEgressSelfTest(egress.NewProbeNet())
 	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }

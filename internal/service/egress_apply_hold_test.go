@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -174,5 +175,56 @@ func TestStaleProfilesHoldEveryRuntime(t *testing.T) {
 		if st, _ := svc.store.GetEgressState(ctx, id); st.HoldReason != "" {
 			t.Fatalf("%s: hold = %q after the profile came back", id, st.HoldReason)
 		}
+	}
+}
+
+// TestEgressProcidAuthorize (review finding 16): sandboxd answers the
+// gateway's executable lookups for a started gateway-mode sandbox with
+// per-binary rules, with its own record of the sandbox's init pid (renewed
+// when the container changes) and only the paths those rules list.
+func TestEgressProcidAuthorize(t *testing.T) {
+	ctx := context.Background()
+	svc, _, rt := newPolicyHarness(t)
+	rt.pid = 4242
+	rules := []models.EgressRule{{Host: "pypi.org", Ports: []uint16{443}, Binaries: []string{"/usr/local/bin/pip", "/usr/bin/git"}},
+		{Host: "github.com", Ports: []uint16{443}, Binaries: []string{"/usr/bin/git"}}}
+	sb := seedPolicySandbox(t, svc, models.Sandbox{NetworkAllowOut: []string{"pypi.org", "github.com"}})
+	withRules := func(id string) {
+		t.Helper()
+		if err := svc.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{AllowOut: []string{"pypi.org", "github.com"}, Rules: rules}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withRules(sb.ID)
+	pid, paths, err := svc.EgressProcidAuthorize(ctx, sb.ID)
+	if err != nil || pid != 4242 || !slices.Equal(paths, []string{"/usr/local/bin/pip", "/usr/bin/git"}) {
+		t.Fatalf("authorize = %d %v %v", pid, paths, err)
+	}
+	rt.pid = 9999 // cached for the same container
+	if pid, _, _ := svc.EgressProcidAuthorize(ctx, sb.ID); pid != 4242 {
+		t.Fatalf("pid = %d, want the cached 4242", pid)
+	}
+	row, _ := svc.store.Get(ctx, sb.ID)
+	row.ContainerID = "ctr-restarted"
+	if err := svc.store.Upsert(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if pid, _, _ := svc.EgressProcidAuthorize(ctx, sb.ID); pid != 9999 {
+		t.Fatalf("a new container must not get the old pid, got %d", pid)
+	}
+
+	plain := seedPolicySandbox(t, svc, models.Sandbox{ID: "sb-plain", NetworkAllowOut: []string{"pypi.org"}})
+	stopped := seedPolicySandbox(t, svc, models.Sandbox{ID: "sb-stopped", Status: models.SandboxStatusStopped, NetworkAllowOut: []string{"pypi.org"}})
+	withRules(stopped.ID)
+	for _, id := range []string{plain.ID, stopped.ID, "sb-missing"} {
+		if _, _, err := svc.EgressProcidAuthorize(ctx, id); err == nil {
+			t.Fatalf("%s: a sandbox without traceable per-binary rules must be refused", id)
+		}
+	}
+	rt.pid, rt.pidErr = 0, errors.New("no such container")
+	row.ContainerID = "ctr-gone"
+	_ = svc.store.Upsert(ctx, row)
+	if _, _, err := svc.EgressProcidAuthorize(ctx, sb.ID); !errors.Is(err, ErrEgressProcidRefused) {
+		t.Fatalf("an unknown process must be refused: %v", err)
 	}
 }

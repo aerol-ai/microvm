@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -309,6 +310,23 @@ func (rs *Rules) HasBinaries() bool {
 		}
 	}
 	return false
+}
+
+// Binaries lists every executable the rules name, once each: the paths a
+// traced connection is checked against.
+func (rs *Rules) Binaries() []string {
+	if rs == nil {
+		return nil
+	}
+	var out []string
+	for _, r := range rs.rules {
+		for _, b := range r.binaries {
+			if !slices.Contains(out, b) {
+				out = append(out, b)
+			}
+		}
+	}
+	return out
 }
 
 // BinaryPorts lists the ports, other than 80 and 443, that rules for host
