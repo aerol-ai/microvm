@@ -162,6 +162,9 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	// didn't change while the profile was unreadable.
 	held := isProfileHold(st.HoldReason)
 	if held || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
+		if err := s.recordAppliedBeforeChange(ctx, old, st); err != nil {
+			return err
+		}
 		if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
 			BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
 			Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef, Mode: old.NetworkEgressMode,
@@ -169,16 +172,9 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 		}); err != nil {
 			return err
 		}
-		if err := s.applyStoredTransition(ctx, old, &next); err != nil {
+		// The profiles were just resolved, so a profile hold may lift too.
+		if err := s.applyStoredTransition(ctx, old, &next, allHolds); err != nil {
 			return err
-		}
-		// A container's attach lifts its hold; the WASM and isolate
-		// mediators have only the record to clear.
-		if held && (s.isWasmSandbox(old) || s.isIsolateSandbox(old)) {
-			if err := s.store.ClearEgressHold(ctx, id, time.Now().UTC()); err != nil {
-				return err
-			}
-			s.refreshHeldGauge(ctx)
 		}
 	}
 	return s.store.SetEgressProfilesApplied(ctx, id, resolved.Applied)
@@ -191,7 +187,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 // sandbox gets the record only; its start re-applies through the pass.
 func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox, reason string) {
 	if sb.Status != models.SandboxStatusStarted {
-		if err := s.store.SetEgressHold(ctx, sb.ID, reason, time.Now().UTC()); err == nil {
+		if err := s.recordHold(ctx, sb.ID, reason); err == nil {
 			s.refreshHeldGauge(ctx)
 		}
 		return

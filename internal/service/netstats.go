@@ -139,7 +139,7 @@ func (s *Service) applyNetworkQuotaState(ctx context.Context, sandbox *models.Sa
 		return
 	}
 	if s.isWasmSandbox(sandbox) {
-		s.syncWasmNetworkPolicy(sandbox, overIn, overOut)
+		s.syncWasmNetworkPolicy(ctx, sandbox, overIn, overOut)
 		if overIn || overOut {
 			if err := s.store.MarkNetworkQuotaExceeded(ctx, sandbox.ID, time.Now().UTC()); err != nil && !errors.Is(err, store.ErrNotFound) {
 				s.logger.Warn("mark network quota exceeded failed",

@@ -970,6 +970,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// later inject rule may use them, while any other key is already in
 		// the sandbox's hands. Set once at create.
 		`ALTER TABLE sandbox_egress ADD COLUMN withheld_env_json TEXT NOT NULL DEFAULT '';`,
+		// The egress policy last applied to the sandbox, as opposed to the
+		// stored (desired) one on the sandbox row: a transition that failed
+		// part way has to tear down what is really enforced, not what was
+		// asked for (PR #622 review 2 finding 1). Empty: the stored policy
+		// is the applied one.
+		`ALTER TABLE sandbox_egress ADD COLUMN applied_policy_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and

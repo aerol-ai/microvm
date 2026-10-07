@@ -28,8 +28,9 @@ type bridgeSource interface {
 // hostname filtering is on (plans/egress-domain-filtering.md D9). sandboxd
 // discovers the sandbox bridges (docker network, aerolvm0) and hands them to
 // the gateway, which has no docker socket access (S5). The first connect is
-// supervised: retried every few seconds while down, and lazily on the
-// first gateway-mode create.
+// supervised (SuperviseEgressGateway, started for every worker by
+// wireEgressProfiles): retried every few seconds while down, and lazily on
+// the first gateway-mode create.
 func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Service, dockerNet bridgeSource, logger *slog.Logger) {
 	if !cfg.EgressFQDNEnabled || goruntime.GOOS != "linux" || !cfg.IsWorker() {
 		return
@@ -64,7 +65,6 @@ func wireEgressGateway(ctx context.Context, cfg config.Config, svc *service.Serv
 		logger.Warn("egress: executable lookups unavailable; per-binary rule flows are refused", "error", err)
 	}
 	svc.SetEgressSelfTest(egress.NewProbeNet())
-	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }
 
 // wireEgressProfiles starts the re-apply pass for named egress profiles
@@ -75,6 +75,11 @@ func wireEgressProfiles(ctx context.Context, cfg config.Config, svc *service.Ser
 		return
 	}
 	go svc.SuperviseEgressProfiles(ctx)
+	// Every worker, gateway or not: it also retries stored policies that
+	// failed to apply, which WASM and isolate need on a node without the
+	// gateway (PR #622 review 2 finding 10). Its gateway work runs only when
+	// the gateway is wired.
+	go svc.SuperviseEgressGateway(ctx, egressSuperviseInterval)
 }
 
 // firstHost returns the first host address of a subnet, the CNI bridge's

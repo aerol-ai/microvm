@@ -489,9 +489,22 @@ func TestSuperviseEgressGatewayRecovers(t *testing.T) {
 	cancel()
 	<-done
 
-	// Feature off: returns at once.
+	// Feature off: it keeps only the policy retry, which needs no gateway,
+	// and touches no gateway state; it stops with its context.
 	svc.cfg.EgressFQDNEnabled = false
-	svc.SuperviseEgressGateway(context.Background(), 0)
+	svc.egressReady.Store(false)
+	gw.mu.Lock()
+	gw.readyErr = nil
+	synced := len(gw.synced)
+	gw.mu.Unlock()
+	offCtx, offCancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer offCancel()
+	svc.SuperviseEgressGateway(offCtx, time.Millisecond)
+	gw.mu.Lock()
+	defer gw.mu.Unlock()
+	if svc.egressReady.Load() || len(gw.synced) != synced {
+		t.Fatal("with the feature off the supervisor must not bring the gateway up")
+	}
 }
 
 // TestSuperviseReleasesHoldsOnRecovery: a sandbox held while the gateway was

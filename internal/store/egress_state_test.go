@@ -65,3 +65,38 @@ func TestEgressHoldLifecycle(t *testing.T) {
 		t.Fatal("closed store must error")
 	}
 }
+
+// TestEgressHoldRankedAndAppliedPolicy (PR #622 review 2): a ranked hold
+// write never replaces a stronger reason, and the applied policy record
+// round-trips (nil until written).
+func TestEgressHoldRankedAndAppliedPolicy(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := st.Upsert(ctx, &models.Sandbox{ID: "sb", Image: "img", Status: models.SandboxStatusStarted, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	rank := map[string]int{"weak": 1, "strong": 2}
+	for _, step := range []struct{ reason, want string }{{"weak", "weak"}, {"strong", "strong"}, {"weak", "strong"}, {"strong", "strong"}} {
+		if err := st.SetEgressHoldRanked(ctx, "sb", step.reason, rank, now); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := st.GetEgressState(ctx, "sb"); got.HoldReason != step.want {
+			t.Fatalf("after %s: hold = %q, want %q", step.reason, got.HoldReason, step.want)
+		}
+	}
+	if err := st.SetEgressHoldRanked(ctx, "sb", "", rank, now); err == nil {
+		t.Fatal("an empty reason must be refused")
+	}
+	got, _ := st.GetEgressState(ctx, "sb")
+	if got.Applied != nil {
+		t.Fatal("no applied policy before one is written")
+	}
+	p := AppliedPolicy{AllowOut: []string{"pypi.org"}, Mode: "learn"}
+	if err := st.SetAppliedEgressPolicy(ctx, "sb", p, now); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetEgressState(ctx, "sb"); got.Applied == nil || got.Applied.AllowOut[0] != "pypi.org" || got.Applied.Mode != "learn" {
+		t.Fatalf("applied = %+v", got.Applied)
+	}
+}

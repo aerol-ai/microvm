@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,68 @@ type EgressState struct {
 	InspectCA bool
 	// Withheld are the env keys the sandbox holds placeholders for (P3-2).
 	Withheld []string
+	// Applied is the policy last applied to the sandbox; nil when the stored
+	// policy is the applied one.
+	Applied *AppliedPolicy
+}
+
+// AppliedPolicy is the part of a sandbox's egress policy that decides what
+// is enforced and how it is torn down.
+type AppliedPolicy struct {
+	BlockAll bool     `json:"block_all,omitempty"`
+	AllowOut []string `json:"allow_out,omitempty"`
+	DenyOut  []string `json:"deny_out,omitempty"`
+	Mode     string   `json:"mode,omitempty"`
+}
+
+// SetAppliedEgressPolicy records the policy now enforced for a sandbox.
+func (s *Store) SetAppliedEgressPolicy(ctx context.Context, sandboxID string, p AppliedPolicy, now time.Time) error {
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO sandbox_egress (sandbox_id, applied_policy_json, updated_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			applied_policy_json = excluded.applied_policy_json,
+			updated_at = excluded.updated_at
+	`, sandboxID, string(raw), now.UTC())
+	if err != nil {
+		return fmt.Errorf("set applied egress policy: %w", err)
+	}
+	return nil
+}
+
+// SetEgressHoldRanked records a hold unless the sandbox already has a
+// stronger one: rank maps each reason to its strength (unknown is 0), and a
+// reason is only replaced by one at least as strong, in one statement, so
+// a weaker hold racing a stronger one can't overwrite it.
+func (s *Store) SetEgressHoldRanked(ctx context.Context, sandboxID, reason string, rank map[string]int, now time.Time) error {
+	if reason == "" {
+		return errors.New("egress hold needs a reason")
+	}
+	var cases strings.Builder
+	cases.WriteString("CASE sandbox_egress.hold_reason")
+	args := []any{}
+	for r, n := range rank {
+		cases.WriteString(" WHEN ? THEN ?")
+		args = append(args, r, n)
+	}
+	cases.WriteString(" ELSE 0 END")
+	query := `
+		INSERT INTO sandbox_egress (sandbox_id, hold_reason, hold_since, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(sandbox_id) DO UPDATE SET
+			hold_reason = CASE WHEN (` + cases.String() + `) > ? THEN sandbox_egress.hold_reason ELSE excluded.hold_reason END,
+			hold_since = COALESCE(sandbox_egress.hold_since, excluded.hold_since),
+			updated_at = excluded.updated_at`
+	all := append([]any{sandboxID, reason, now.UTC(), now.UTC()}, args...)
+	all = append(all, rank[reason])
+	if _, err := s.db.ExecContext(ctx, query, all...); err != nil {
+		return fmt.Errorf("set egress hold: %w", err)
+	}
+	return nil
 }
 
 // SetEgressHold records the fail-closed hold and its reason (CEO D16). It is
@@ -57,10 +120,10 @@ func (s *Store) ClearEgressHold(ctx context.Context, sandboxID string, now time.
 func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressState, error) {
 	st := EgressState{SandboxID: sandboxID}
 	var since sql.NullTime
-	var withheld string
+	var withheld, applied string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json FROM sandbox_egress WHERE sandbox_id = ?
-	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld)
+		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json, applied_policy_json FROM sandbox_egress WHERE sandbox_id = ?
+	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld, &applied)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -73,6 +136,12 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 	if withheld != "" {
 		if err := json.Unmarshal([]byte(withheld), &st.Withheld); err != nil {
 			return st, fmt.Errorf("get egress state: withheld env keys: %w", err)
+		}
+	}
+	if applied != "" {
+		st.Applied = &AppliedPolicy{}
+		if err := json.Unmarshal([]byte(applied), st.Applied); err != nil {
+			return st, fmt.Errorf("get egress state: applied policy: %w", err)
 		}
 	}
 	return st, nil

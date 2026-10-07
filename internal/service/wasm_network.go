@@ -45,7 +45,7 @@ func (s *Service) drainWasmNetworkCounters(ctx context.Context) {
 	netstatsServiceSink{svc: s}.handleNetworkSamples(ctx, samples)
 }
 
-func (s *Service) syncWasmNetworkPolicy(sandbox *models.Sandbox, overIn, overOut bool) {
+func (s *Service) syncWasmNetworkPolicy(ctx context.Context, sandbox *models.Sandbox, overIn, overOut bool) {
 	if sandbox == nil || !s.isWasmSandbox(sandbox) {
 		return
 	}
@@ -53,7 +53,10 @@ func (s *Service) syncWasmNetworkPolicy(sandbox *models.Sandbox, overIn, overOut
 	if !ok || sink == nil {
 		return
 	}
+	// Egress is shut for block-all, the quota, and any recorded hold: a
+	// quota sample below the limit must not reopen a sandbox held for an
+	// unresolved profile or an unapplied policy (review 2 finding 4).
 	blockIn := overIn || sandbox.NetworkBlockAll
-	blockOut := overOut || sandbox.NetworkBlockAll
+	blockOut := overOut || sandbox.NetworkBlockAll || s.egressHeld(ctx, sandbox)
 	sink.SetNetworkBlocks(sandbox.ID, blockIn, blockOut)
 }

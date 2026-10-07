@@ -65,9 +65,14 @@ func TestHeldPolicyIsRetriedBySupervisor(t *testing.T) {
 		t.Fatal("the swap block must stay while the rules are missing")
 	}
 	rt.applyErr = nil
+	// The gateway's hold pass doesn't own an apply hold; the policy retry does.
 	svc.retryEgressHolds(ctx)
+	if st, _ := svc.store.GetEgressState(ctx, sb.ID); st.HoldReason != egressHoldApplyFailed {
+		t.Fatalf("the gateway hold pass must leave an apply hold, hold = %q", st.HoldReason)
+	}
+	svc.retryUnappliedPolicies(ctx)
 	if st, _ := svc.store.GetEgressState(ctx, sb.ID); st.HoldReason != "" {
-		t.Fatalf("the hold pass must apply the stored policy, hold = %q", st.HoldReason)
+		t.Fatalf("the policy retry must apply the stored policy, hold = %q", st.HoldReason)
 	}
 	if last := rt.applied[len(rt.applied)-1]; !slices.Equal(last, []string{"8.8.8.0/24"}) {
 		t.Fatalf("applied %v", rt.applied)

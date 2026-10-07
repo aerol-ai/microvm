@@ -370,6 +370,7 @@ type Service struct {
 	// show yet into it (review finding 1).
 	egressSyncMu   sync.RWMutex
 	egressInflight egressInflight
+	egressBlocks   egressBlockTracker
 	// egressRecovering single-flights the table-loss recovery, and
 	// egressGaugeBatch/egressGaugeDirty defer the held gauge's refresh to
 	// the end of a batch (review finding 12).
@@ -3279,6 +3280,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if isGatewayMode(sandbox) {
 		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
 	}
+	s.egressPids.Delete(id)
 	s.forgetLearned(ctx, sandbox)
 	if s.testAfterRuntimeDestroy != nil {
 		s.testAfterRuntimeDestroy()

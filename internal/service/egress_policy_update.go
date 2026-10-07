@@ -205,6 +205,9 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	if err := s.commitPolicySpec(ctx, id, &create, st.Withheld); err != nil {
 		return nil, err
 	}
+	if err := s.recordAppliedBeforeChange(ctx, old, st); err != nil {
+		return nil, err
+	}
 	if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
 		BlockAll: next.NetworkBlockAll, AllowOut: next.NetworkAllowOut, DenyOut: next.NetworkDenyOut,
 		Inline: resolved.Inline, Profiles: resolved.Refs, OwnerRef: old.OwnerRef, Mode: next.NetworkEgressMode,
@@ -212,7 +215,8 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	}); err != nil {
 		return nil, err
 	}
-	if err := s.applyStoredTransition(ctx, old, &next); err != nil {
+	// The profiles were resolved for this request, so it may lift any hold.
+	if err := s.applyStoredTransition(ctx, old, &next, allHolds); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrEgressApplyFailedHeld, err)
 	}
 	if err := s.store.SetEgressProfilesApplied(ctx, id, resolved.Applied); err != nil {
@@ -221,25 +225,57 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	return s.effectivePolicy(ctx, &next, resolved), nil
 }
 
-// applyStoredTransition applies a policy change already in the store. A
-// failure holds the sandbox (apply_failed) on every runtime, so it is shut
-// rather than left on whatever the half-applied transition enforces, and
-// the hold is what tells a retry, and the supervisor, that the stored
-// policy still has to be applied. Success releases any hold the transition
-// replaced.
-func (s *Service) applyStoredTransition(ctx context.Context, old, next *models.Sandbox) error {
-	if err := s.applyPolicyTransition(ctx, old, next); err != nil {
+// applyStoredTransition applies a policy change already in the store. The
+// transition starts from what is enforced, the recorded applied policy when
+// there is one, not from the stored row: after a failed apply the row holds
+// the desired policy, and tearing down from it would leave the old one in
+// force (review 2 finding 1). A failure holds the sandbox (apply_failed) on
+// every runtime, so it is shut rather than left on a half-applied
+// transition, and the hold tells a retry and the supervisor that the
+// stored policy still has to be applied. Success records it as applied and
+// releases the holds in release, the ones the caller resolved.
+func (s *Service) applyStoredTransition(ctx context.Context, old, next *models.Sandbox, release []string) error {
+	applied := s.appliedView(ctx, old)
+	if err := s.applyPolicyTransition(ctx, applied, next); err != nil {
 		s.holdUnapplied(ctx, next, egressHoldApplyFailed)
 		return err
 	}
-	if s.isWasmSandbox(next) || s.isIsolateSandbox(next) {
-		return s.releaseMediatedHold(ctx, next.ID)
+	if err := s.store.SetAppliedEgressPolicy(ctx, next.ID, appliedOf(next), time.Now().UTC()); err != nil {
+		s.holdUnapplied(ctx, next, egressHoldApplyFailed)
+		return err
 	}
-	return nil
+	return s.releaseHold(ctx, next, release...)
+}
+
+// recordAppliedBeforeChange records the policy in force before the stored
+// policy is overwritten, the first time there is no record yet: with no
+// hold, the stored row is what is enforced.
+func (s *Service) recordAppliedBeforeChange(ctx context.Context, old *models.Sandbox, st store.EgressState) error {
+	if st.Applied != nil || st.HoldReason != "" {
+		return nil
+	}
+	return s.store.SetAppliedEgressPolicy(ctx, old.ID, appliedOf(old), time.Now().UTC())
+}
+
+// appliedView is sb with the policy that is really enforced: the recorded
+// applied one, else the stored one.
+func (s *Service) appliedView(ctx context.Context, sb *models.Sandbox) *models.Sandbox {
+	st, err := s.store.GetEgressState(ctx, sb.ID)
+	if err != nil || st.Applied == nil {
+		return sb
+	}
+	v := *sb
+	v.NetworkBlockAll, v.NetworkAllowOut, v.NetworkDenyOut, v.NetworkEgressMode = st.Applied.BlockAll, st.Applied.AllowOut, st.Applied.DenyOut, st.Applied.Mode
+	return &v
+}
+
+func appliedOf(sb *models.Sandbox) store.AppliedPolicy {
+	return store.AppliedPolicy{BlockAll: sb.NetworkBlockAll, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut, Mode: sb.NetworkEgressMode}
 }
 
 // reapplyStoredPolicy applies a held sandbox's stored policy again (the
-// supervisor's retry of an apply_failed hold).
+// supervisor's retry of an apply_failed hold). It resolved no profiles, so a
+// profile hold stays.
 func (s *Service) reapplyStoredPolicy(ctx context.Context, id string) error {
 	unlock := s.egressPolicyLocks.lock(id)
 	defer unlock()
@@ -247,60 +283,102 @@ func (s *Service) reapplyStoredPolicy(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	return s.applyStoredTransition(ctx, sb, sb)
+	return s.applyStoredTransition(ctx, sb, sb, applyHolds)
 }
 
 // holdUnapplied shuts a sandbox whose stored policy isn't enforced and
-// records why. Containers get the host-firewall hold DROP and the gateway's
-// block; the WASM and isolate mediators get block-all, which their next
-// successful policy apply replaces. Best effort after the record: each
-// layer alone keeps the sandbox shut.
+// records why (unless a stronger hold is there). Containers get the
+// host-firewall hold DROP and the gateway's block; the WASM and isolate
+// mediators get block-all, composed from the recorded hold so a quota or
+// policy sync can't undo it. Best effort after the record: each layer alone
+// keeps the sandbox shut.
 func (s *Service) holdUnapplied(ctx context.Context, sb *models.Sandbox, reason string) {
-	switch {
-	case s.isWasmSandbox(sb):
-		if err := s.store.SetEgressHold(ctx, sb.ID, reason, time.Now().UTC()); err != nil {
+	if s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
+		if err := s.recordHold(ctx, sb.ID, reason); err != nil {
+			s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
+			// The composed sync reads the hold back from the store, which
+			// just failed: shut the mediator directly instead.
+			s.shutMediator(sb)
+		} else {
+			s.syncMediatedBlocks(ctx, sb)
+		}
+		s.refreshHeldGauge(ctx)
+		return
+	}
+	cr, err := s.containerRuntimeForSandbox(sb)
+	if err != nil {
+		if err := s.recordHold(ctx, sb.ID, reason); err != nil {
 			s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
 		}
+		s.refreshHeldGauge(ctx)
+		return
+	}
+	s.holdSandboxEgress(ctx, sb, cr, reason)
+}
+
+// syncMediatedBlocks pushes a WASM or isolate sandbox's block state, which
+// composes block-all, quota and any recorded hold, to its mediator.
+func (s *Service) syncMediatedBlocks(ctx context.Context, sb *models.Sandbox) {
+	switch {
+	case s.isWasmSandbox(sb):
+		overIn, overOut := quotaOver(sb)
+		s.syncWasmNetworkPolicy(ctx, sb, overIn, overOut)
+	case s.isIsolateSandbox(sb):
+		if err := s.applyIsolatePolicy(ctx, sb); err != nil {
+			s.logger.Warn("egress: isolate block state not applied", "sandbox_id", sb.ID, "error", err)
+		}
+	}
+}
+
+// shutMediator puts a WASM or isolate sandbox's egress on block-all
+// without consulting the store.
+func (s *Service) shutMediator(sb *models.Sandbox) {
+	switch {
+	case s.isWasmSandbox(sb):
 		if sink, ok := s.wasm.(wasmNetworkPolicySink); ok && sink != nil {
 			overIn, _ := quotaOver(sb)
 			sink.SetNetworkBlocks(sb.ID, overIn || sb.NetworkBlockAll, true)
 		}
-		s.refreshHeldGauge(ctx)
 	case s.isIsolateSandbox(sb):
-		if err := s.store.SetEgressHold(ctx, sb.ID, reason, time.Now().UTC()); err != nil {
-			s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
-		}
 		if updater, ok := s.isolate.(isolateEgressPolicyUpdater); ok {
 			if err := updater.UpdateEgressPolicy(sb.ID, true, nil, nil, false, nil, nil); err != nil {
 				s.logger.Warn("egress: isolate hold not applied", "sandbox_id", sb.ID, "error", err)
 			}
 		}
-		s.refreshHeldGauge(ctx)
-	default:
-		cr, err := s.containerRuntimeForSandbox(sb)
-		if err != nil {
-			if err := s.store.SetEgressHold(ctx, sb.ID, reason, time.Now().UTC()); err != nil {
-				s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
-			}
-			s.refreshHeldGauge(ctx)
-			return
-		}
-		s.holdSandboxEgress(ctx, sb, cr, reason)
 	}
 }
 
-// releaseMediatedHold clears a WASM or isolate sandbox's hold record once
-// its mediator has the stored policy (the apply itself lifted block-all).
-func (s *Service) releaseMediatedHold(ctx context.Context, id string) error {
+// releaseHold lifts a sandbox's hold if its reason is in allowed, on any
+// runtime: a container's hold DROP and gateway block, a mediator's
+// block-all (re-synced without it), or just the record of a container with
+// nothing running.
+func (s *Service) releaseHold(ctx context.Context, sb *models.Sandbox, allowed ...string) error {
+	if s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
+		released, err := s.releaseMediatedHold(ctx, sb.ID, allowed...)
+		if err != nil || !released {
+			return err
+		}
+		s.syncMediatedBlocks(ctx, sb)
+		return nil
+	}
+	if cr, err := s.containerRuntimeForSandbox(sb); err == nil {
+		return s.releaseEgressHold(ctx, sb, cr, allowed...)
+	}
+	_, err := s.releaseMediatedHold(ctx, sb.ID, allowed...)
+	return err
+}
+
+// releaseMediatedHold clears a hold record whose reason is in allowed.
+func (s *Service) releaseMediatedHold(ctx context.Context, id string, allowed ...string) (bool, error) {
 	st, err := s.store.GetEgressState(ctx, id)
-	if err != nil || st.HoldReason == "" {
-		return err
+	if err != nil || st.HoldReason == "" || !slices.Contains(allowed, st.HoldReason) {
+		return false, err
 	}
 	if err := s.store.ClearEgressHold(ctx, id, time.Now().UTC()); err != nil {
-		return err
+		return false, err
 	}
 	s.refreshHeldGauge(ctx)
-	return nil
+	return true, nil
 }
 
 // applyPolicyTransition makes a stored policy change live. The WASM and
@@ -310,7 +388,7 @@ func (s *Service) releaseMediatedHold(ctx context.Context, id string) error {
 func (s *Service) applyPolicyTransition(ctx context.Context, old, next *models.Sandbox) error {
 	switch {
 	case s.isWasmSandbox(old):
-		return s.applyWasmPolicy(next)
+		return s.applyWasmPolicy(ctx, next)
 	case s.isIsolateSandbox(old):
 		return s.applyIsolatePolicy(ctx, next)
 	case next.Status == models.SandboxStatusStarted:
@@ -400,7 +478,7 @@ func quotaOver(sb *models.Sandbox) (in, out bool) {
 	return in, out
 }
 
-func (s *Service) applyWasmPolicy(sb *models.Sandbox) error {
+func (s *Service) applyWasmPolicy(ctx context.Context, sb *models.Sandbox) error {
 	setter, ok := s.wasm.(wasmEgressPolicySetter)
 	if !ok {
 		return errors.New("wasm runtime cannot update egress policy")
@@ -409,16 +487,20 @@ func (s *Service) applyWasmPolicy(sb *models.Sandbox) error {
 		return err
 	}
 	overIn, overOut := quotaOver(sb)
-	s.syncWasmNetworkPolicy(sb, overIn, overOut)
+	s.syncWasmNetworkPolicy(ctx, sb, overIn, overOut)
 	return nil
 }
 
+// applyIsolatePolicy sends an isolate sandbox its stored policy, shut
+// (block-all) while any hold is recorded: a hold is lifted only by the
+// release that resolves it, never by a policy push (review 2 finding 4).
 func (s *Service) applyIsolatePolicy(ctx context.Context, sb *models.Sandbox) error {
 	updater, ok := s.isolate.(isolateEgressPolicyUpdater)
 	if !ok {
 		return errors.New("isolate runtime cannot update egress policy")
 	}
-	return updater.UpdateEgressPolicy(sb.ID, sb.NetworkBlockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn,
+	blockAll := sb.NetworkBlockAll || s.egressHeld(ctx, sb)
+	return updater.UpdateEgressPolicy(sb.ID, blockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn,
 		egressRuleSpecs(sb.NetworkEgressRules), s.egressSecrets(ctx, sb))
 }
 
@@ -450,20 +532,18 @@ func (s *Service) applyContainerPolicy(ctx context.Context, old, nu *models.Sand
 			return fmt.Errorf("clear the old egress rules: %w", err)
 		}
 	}
-	// A hold is released only once the new policy is in place (the caller
-	// holds on any failure): a gateway attach releases it itself.
+	// Holds are released by the caller once the new policy is in place
+	// (applyStoredTransition), each by what resolves it; the hold DROP and
+	// the gateway's hold block outlive the swap DROP lifted here.
 	switch {
 	case nu.NetworkBlockAll:
-		return s.releaseEgressHold(ctx, nu, cr)
+		return nil
 	case newGW:
 		return s.attachSandboxEgress(ctx, nu, cr)
 	case len(nu.NetworkAllowOut) > 0 || len(nu.NetworkDenyOut) > 0:
 		if err := cr.ApplyEgressPolicy(ip, nu.NetworkAllowOut, nu.NetworkDenyOut); err != nil {
 			return fmt.Errorf("apply the new egress rules: %w", err)
 		}
-	}
-	if err := s.releaseEgressHold(ctx, nu, cr); err != nil {
-		return err
 	}
 	if _, overOut := quotaOver(nu); overOut {
 		return nil // the quota keeps the same DROP
