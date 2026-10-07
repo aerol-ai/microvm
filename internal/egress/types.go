@@ -11,6 +11,7 @@ package egress
 import (
 	"errors"
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -114,6 +115,34 @@ const (
 var managedSets = []string{
 	SetFQDNSrc, SetSrcDenyDefault, SetSrcAccept, SetLearnSrc, SetBlockedSrc,
 	SetAllowCIDR, SetDenyCIDR,
+}
+
+// carriedSets are copied into the replacement table when the layout of
+// another version is replaced (EnsureLayout): the per-source sets and the
+// node-wide floor and guard. Learned and flow sets, whose elements carry
+// timeouts, start empty: a lost learned element only denies until the next
+// DNS answer.
+var carriedSets = append(append([]string(nil), managedSets...), SetDenyFloor, SetNodeControl)
+
+// migrateContents is what the replacement table starts with: the carried
+// sets as they were, and every carried gateway-mode source also in
+// @blocked_src. Replacing a layout used to install empty sets, which is the
+// same as no filtering for every sandbox until sandboxd's next Sync; this
+// keeps them shut instead (D13), and the Sync lifts it.
+func migrateContents(old map[string][]Elem) map[string][]Elem {
+	out := map[string][]Elem{}
+	for _, name := range carriedSets {
+		if elems := old[name]; len(elems) > 0 {
+			out[name] = append([]Elem(nil), elems...)
+		}
+	}
+	for _, e := range old[SetFQDNSrc] {
+		b := Elem{Src: e.Src}
+		if !slices.Contains(out[SetBlockedSrc], b) {
+			out[SetBlockedSrc] = append(out[SetBlockedSrc], b)
+		}
+	}
+	return out
 }
 
 // Op adds or deletes elements of one set. A slice of Ops is applied in one

@@ -243,12 +243,31 @@ func TestKernelLayoutLifecycle(t *testing.T) {
 	if cidrs, _ := be.List(SetAllowCIDR); len(cidrs) != 0 {
 		t.Fatalf("allow_cidr after Replace = %+v", cidrs)
 	}
-	// Another layout version (different ports) replaces the table.
+	// Another layout version (different ports) replaces the table in one
+	// transaction, carrying the per-source sets with every gateway-mode
+	// source blocked until Sync (review finding 11); learned elements, with
+	// their timeouts, start over.
+	cidr := Elem{Src: other, Dst: netip.MustParseAddr("192.168.0.0"), DstEnd: netip.MustParseAddr("192.168.255.255")}
+	if err := be.Apply([]Op{{Set: SetAllowCIDR, Elems: []Elem{cidr}}}); err != nil {
+		t.Fatal(err)
+	}
 	if err := be.EnsureLayout(LayoutConfig{DNSPort: kDNSPort + 1, ProxyPort: kProxy}); err != nil {
 		t.Fatal(err)
 	}
-	if srcs, _ := be.List(SetFQDNSrc); len(srcs) != 0 {
-		t.Fatal("layout change must rebuild the table")
+	if err := be.CheckLayout(); err != nil {
+		t.Fatal(err)
+	}
+	if srcs, _ := be.List(SetFQDNSrc); len(srcs) != 1 || srcs[0].Src != other {
+		t.Fatalf("fqdn_src must be carried: %+v", srcs)
+	}
+	if blocked, _ := be.List(SetBlockedSrc); len(blocked) != 1 || blocked[0].Src != other {
+		t.Fatalf("carried sources must be blocked until Sync: %+v", blocked)
+	}
+	if cidrs, _ := be.List(SetAllowCIDR); len(cidrs) != 1 || cidrs[0].DstEnd != cidr.DstEnd {
+		t.Fatalf("allow_cidr intervals must be carried: %+v", cidrs)
+	}
+	if learned, _ := be.List(SetAllowLearned); len(learned) != 0 {
+		t.Fatalf("learned elements start over: %+v", learned)
 	}
 	// Table loss is detected.
 	krun(t, "nft", "delete", "table", "inet", TableName)

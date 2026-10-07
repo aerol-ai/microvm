@@ -29,8 +29,24 @@ func (m *MemBackend) EnsureLayout(cfg LayoutConfig) error {
 	if m.present && m.layout == cfg {
 		return nil
 	}
+	var carried map[string][]Elem
+	if m.present {
+		old := map[string][]Elem{}
+		for name, set := range m.sets {
+			for e := range set {
+				old[name] = append(old[name], e)
+			}
+		}
+		carried = migrateContents(old)
+	}
 	m.present, m.layout = true, cfg
 	m.sets = map[string]map[Elem]struct{}{}
+	for name, elems := range carried {
+		set := m.setLocked(name)
+		for _, e := range elems {
+			set[key(e)] = struct{}{}
+		}
+	}
 	return nil
 }
 

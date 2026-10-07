@@ -54,9 +54,14 @@ type entry struct {
 	deny    []netip.Prefix
 	blocked BlockReason
 	hash    string
+	// inBlockedSrc is whether @blocked_src holds the source right now, the
+	// kernel's side of blocked. They differ after a failed write: the
+	// in-memory reasons already deny (DNS filter, proxy) while the kernel
+	// write is retried, and diffs start from what the kernel really has.
+	inBlockedSrc bool
 }
 
-// kernelBlocked is the block state reflected in @blocked_src. The restart
+// kernelBlocked is the block state that belongs in @blocked_src. The restart
 // block stays in memory (eng re-review D2).
 func (e *entry) kernelBlocked() bool { return e.blocked&^BlockRestart != 0 }
 
@@ -77,13 +82,23 @@ func (k learnKey) set() string {
 
 // Gateway holds per-node gateway state and drives the Backend.
 type Gateway struct {
-	be      Backend
-	layout  LayoutConfig
-	ct      ConntrackFlusher
-	maxLrn  int
-	log     *slog.Logger
-	now     func() time.Time
-	sbLocks sync.Map // sandbox id -> *sync.Mutex (per-sandbox serialization)
+	be     Backend
+	layout LayoutConfig
+	ct     ConntrackFlusher
+	maxLrn int
+	log    *slog.Logger
+	now    func() time.Time
+
+	// opMu makes Sync (and Restore) exclusive against every per-sandbox
+	// state transition: Attach, Detach, SetBlocked, learning. Each of those
+	// is a kernel write followed by a map update, and a Sync replacing the
+	// sets between the two would leave a sandbox reported attached with no
+	// kernel rules, unfiltered.
+	opMu sync.RWMutex
+	// Per-sandbox locks, reference counted so a destroyed sandbox's lock goes
+	// away with its last holder.
+	lockMu sync.Mutex
+	locks  map[string]*sbLock
 
 	mu    sync.RWMutex
 	byID  map[string]*entry
@@ -94,6 +109,14 @@ type Gateway struct {
 	// binNames names each bin_learned destination, so the proxy knows which
 	// host a redirected flow is for.
 	binNames map[string]map[learnKey]string
+	// pendingLearned holds learned elements whose delete failed, by source
+	// IP, and pendingCT the sources whose conntrack flush failed. Both are
+	// retried until they succeed: an element left behind keeps a revoked
+	// destination open until its timeout, and the next owner of a recycled
+	// IP would inherit it. Attach refuses to succeed for a source with
+	// cleanup still pending.
+	pendingLearned map[netip.Addr]map[string][]Elem
+	pendingCT      map[netip.Addr]struct{}
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
@@ -105,17 +128,20 @@ type Gateway struct {
 // New builds a Gateway. Call Bootstrap before use.
 func New(opts Options) *Gateway {
 	g := &Gateway{
-		be:       opts.Backend,
-		layout:   opts.Layout,
-		ct:       opts.Conntrack,
-		maxLrn:   opts.LearnedMax,
-		log:      opts.Logger,
-		now:      opts.Now,
-		byID:     map[string]*entry{},
-		bySrc:    map[netip.Addr]string{},
-		learned:  map[string]map[learnKey]time.Time{},
-		binNames: map[string]map[learnKey]string{},
-		conns:    map[string]map[*TrackedConn]struct{}{},
+		be:             opts.Backend,
+		layout:         opts.Layout,
+		ct:             opts.Conntrack,
+		maxLrn:         opts.LearnedMax,
+		log:            opts.Logger,
+		now:            opts.Now,
+		byID:           map[string]*entry{},
+		bySrc:          map[netip.Addr]string{},
+		locks:          map[string]*sbLock{},
+		learned:        map[string]map[learnKey]time.Time{},
+		binNames:       map[string]map[learnKey]string{},
+		pendingLearned: map[netip.Addr]map[string][]Elem{},
+		pendingCT:      map[netip.Addr]struct{}{},
+		conns:          map[string]map[*TrackedConn]struct{}{},
 	}
 	if g.maxLrn <= 0 {
 		g.maxLrn = DefaultLearnedMax
@@ -144,11 +170,39 @@ func (g *Gateway) Bootstrap() error {
 // CheckLayout is the table-loss probe (CEO D17).
 func (g *Gateway) CheckLayout() error { return g.be.CheckLayout() }
 
+type sbLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockSandbox serializes one sandbox's transitions. The entry is dropped
+// when its last holder or waiter is done, so churn doesn't grow the map
+// (the pkg/docker/netrules lockIP pattern).
 func (g *Gateway) lockSandbox(id string) func() {
-	v, _ := g.sbLocks.LoadOrStore(id, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	g.lockMu.Lock()
+	l := g.locks[id]
+	if l == nil {
+		l = &sbLock{}
+		g.locks[id] = l
+	}
+	l.refs++
+	g.lockMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		g.lockMu.Lock()
+		if l.refs--; l.refs == 0 {
+			delete(g.locks, id)
+		}
+		g.lockMu.Unlock()
+	}
+}
+
+// lockCount is the number of live per-sandbox locks (tests).
+func (g *Gateway) lockCount() int {
+	g.lockMu.Lock()
+	defer g.lockMu.Unlock()
+	return len(g.locks)
 }
 
 // compile validates a spec through pkg/egresspolicy, the one grammar every
@@ -247,13 +301,24 @@ func (e *entry) elements() map[string][]Elem {
 	return out
 }
 
-// diffOps returns the ops that move the kernel from old's elements to nu's.
-// Deletes come first in the batch; within one nft transaction the order only
-// matters for readability, the commit is atomic.
+// kernelElements is what the kernel holds for an entry: its elements, with
+// @blocked_src as last applied rather than as wanted.
+func (e *entry) kernelElements() map[string][]Elem {
+	out := e.elements()
+	delete(out, SetBlockedSrc)
+	if e.inBlockedSrc {
+		out[SetBlockedSrc] = []Elem{{Src: e.spec.IP}}
+	}
+	return out
+}
+
+// diffOps returns the ops that move the kernel from what old holds to nu's
+// elements. Deletes come first in the batch; within one nft transaction the
+// order only matters for readability, the commit is atomic.
 func diffOps(old, nu *entry) []Op {
 	var oldE, newE map[string][]Elem
 	if old != nil {
-		oldE = old.elements()
+		oldE = old.kernelElements()
 	}
 	if nu != nil {
 		newE = nu.elements()
@@ -298,12 +363,17 @@ func subtract(a, b []Elem) []Elem {
 // sandbox is purged first: netns slots recycle IPs, and a late Detach for the
 // old owner must never remove the new owner's entries (D5). The spec's
 // Blocked reasons are applied in the same batch, so an Attach can't re-open a
-// sandbox a concurrent quota block just closed (Section 4).
+// sandbox a concurrent quota block just closed (Section 4). It succeeds only
+// once nothing a previous policy or owner of the source allowed is left in
+// the kernel: a failed cleanup is an error, so sandboxd keeps the sandbox
+// held, and the next Attach retries it.
 func (g *Gateway) Attach(spec Spec) error {
 	nu, err := compile(spec)
 	if err != nil {
 		return err
 	}
+	g.opMu.RLock()
+	defer g.opMu.RUnlock()
 	unlock := g.lockSandbox(spec.ID)
 	defer unlock()
 
@@ -334,6 +404,7 @@ func (g *Gateway) Attach(spec Spec) error {
 			return fmt.Errorf("%w: attach %s: %v", ErrUnavailable, spec.ID, err)
 		}
 	}
+	nu.inBlockedSrc = nu.kernelBlocked()
 	policyChanged := old != nil && (old.hash != nu.hash)
 	g.mu.Lock()
 	if old != nil && old.spec.IP != spec.IP && g.bySrc[old.spec.IP] == spec.ID {
@@ -346,13 +417,20 @@ func (g *Gateway) Attach(spec Spec) error {
 		// A narrowed policy must not keep serving through learned
 		// (ip, port) pairs, established flows or proxied connections it no
 		// longer allows (D2, §5.8 FQDN → FQDN′).
+		g.CloseConnsWhere(spec.ID, func(host string, port uint16) bool { return !nu.permits(host, port) })
 		g.flushLearned(spec.ID, old.spec.IP)
 		g.flushConntrack(old.spec.IP)
-		g.CloseConnsWhere(spec.ID, func(host string, port uint16) bool { return !nu.permits(host, port) })
 	}
 	if nu.kernelBlocked() && (old == nil || !old.kernelBlocked()) {
 		g.closeConns(spec.ID)
 		g.flushConntrack(spec.IP)
+	}
+	srcs := []netip.Addr{spec.IP}
+	if old != nil && old.spec.IP != spec.IP {
+		srcs = append(srcs, old.spec.IP)
+	}
+	if err := g.retryCleanup(srcs...); err != nil {
+		return fmt.Errorf("%w: attach %s: %v", ErrUnavailable, spec.ID, err)
 	}
 	return nil
 }
@@ -371,6 +449,8 @@ func (g *Gateway) Update(spec Spec) error {
 
 // Detach removes a sandbox, but only if ip is still its source (D5).
 func (g *Gateway) Detach(id string, ip netip.Addr) error {
+	g.opMu.RLock()
+	defer g.opMu.RUnlock()
 	unlock := g.lockSandbox(id)
 	defer unlock()
 	g.mu.RLock()
@@ -384,8 +464,10 @@ func (g *Gateway) Detach(id string, ip netip.Addr) error {
 }
 
 // purge removes every trace of a sandbox: set elements, learned elements,
-// tracked connections and conntrack entries. Callers hold its lock or are
-// purging a previous owner from inside another sandbox's Attach.
+// tracked connections and conntrack entries. Callers hold opMu (shared) and
+// its lock, or are purging a previous owner from inside another sandbox's
+// Attach. Learned and conntrack cleanup that fails stays pending; the next
+// Attach of that source must finish it first.
 func (g *Gateway) purge(id string) error {
 	g.mu.RLock()
 	old := g.byID[id]
@@ -404,8 +486,8 @@ func (g *Gateway) purge(id string) error {
 		delete(g.bySrc, old.spec.IP)
 	}
 	g.mu.Unlock()
-	g.flushLearned(id, old.spec.IP)
 	g.closeConns(id)
+	g.flushLearned(id, old.spec.IP)
 	g.flushConntrack(old.spec.IP)
 	return nil
 }
@@ -413,51 +495,63 @@ func (g *Gateway) purge(id string) error {
 // SetBlocked sets or clears one block reason. The sandbox is in @blocked_src
 // while any kernel reason is set; becoming blocked also closes its proxied
 // connections and flushes its conntrack entries, so a sandbox at its quota
-// can't keep downloading over flows already open (EF-13).
+// can't keep downloading over flows already open (EF-13). The wanted reasons
+// take effect in memory first, so the DNS filter and proxy deny at once, and
+// the connections are closed even when the kernel write fails; a failed
+// write leaves the kernel side marked unapplied, so an identical retry (or
+// RetryDirty) writes it again instead of finding nothing to do.
 func (g *Gateway) SetBlocked(id string, reason BlockReason, on bool) error {
+	g.opMu.RLock()
+	defer g.opMu.RUnlock()
 	unlock := g.lockSandbox(id)
 	defer unlock()
-	g.mu.RLock()
+	g.mu.Lock()
 	cur := g.byID[id]
-	g.mu.RUnlock()
 	if cur == nil {
+		g.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrNotAttached, id)
 	}
-	nu := *cur
+	want := cur.blocked
 	if on {
-		nu.blocked |= reason
+		want |= reason
 	} else {
-		nu.blocked &^= reason
+		want &^= reason
 	}
-	if nu.blocked == cur.blocked {
-		return nil
-	}
-	if cur.kernelBlocked() != nu.kernelBlocked() {
-		op := Op{Set: SetBlockedSrc, Del: !nu.kernelBlocked(), Elems: []Elem{{Src: cur.spec.IP}}}
-		if err := g.be.Apply([]Op{op}); err != nil {
-			// The in-memory bit still makes the DNS filter and proxy deny.
-			g.mu.Lock()
-			if on {
-				cur.blocked |= reason
-			}
-			g.mu.Unlock()
-			return fmt.Errorf("%w: set blocked %s: %v", ErrUnavailable, id, err)
-		}
-	}
-	g.mu.Lock()
-	cur.blocked = nu.blocked
+	newly := on && want != cur.blocked
+	cur.blocked = want
+	pending := cur.inBlockedSrc != cur.kernelBlocked()
 	g.mu.Unlock()
-	if on {
+	if on && (newly || pending) {
 		g.closeConns(id)
 		g.flushConntrack(cur.spec.IP)
 	}
+	if !pending {
+		return nil
+	}
+	return g.applyBlockedLocked(cur)
+}
+
+// applyBlockedLocked writes an entry's wanted @blocked_src membership.
+// Callers hold opMu (shared) and the sandbox's lock.
+func (g *Gateway) applyBlockedLocked(e *entry) error {
+	g.mu.RLock()
+	want := e.kernelBlocked()
+	g.mu.RUnlock()
+	op := Op{Set: SetBlockedSrc, Del: !want, Elems: []Elem{{Src: e.spec.IP}}}
+	if err := g.be.Apply([]Op{op}); err != nil {
+		return fmt.Errorf("%w: set blocked %s: %v", ErrUnavailable, e.spec.ID, err)
+	}
+	g.mu.Lock()
+	e.inBlockedSrc = want
+	g.mu.Unlock()
 	return nil
 }
 
 // Sync replaces the whole gateway state with sandboxd's (D13). Managed sets
 // are replaced atomically. Learned elements and recordings survive for
 // sandboxes whose policy is unchanged and are flushed for removed or changed
-// ones. Sync also lifts the restart block.
+// ones. Sync also lifts the restart block. It runs alone: no Attach, Detach
+// or SetBlocked is between its kernel write and its map swap.
 func (g *Gateway) Sync(specs []Spec) error {
 	next := map[string]*entry{}
 	for _, s := range specs {
@@ -476,6 +570,8 @@ func (g *Gateway) Sync(specs []Spec) error {
 			contents[name] = append(contents[name], elems...)
 		}
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
 	if err := g.be.Replace(contents); err != nil {
 		return fmt.Errorf("%w: sync: %v", ErrUnavailable, err)
 	}
@@ -484,6 +580,7 @@ func (g *Gateway) Sync(specs []Spec) error {
 	g.byID = next
 	g.bySrc = map[netip.Addr]string{}
 	for id, e := range next {
+		e.inBlockedSrc = e.kernelBlocked()
 		g.bySrc[e.spec.IP] = id
 	}
 	g.mu.Unlock()
@@ -494,10 +591,12 @@ func (g *Gateway) Sync(specs []Spec) error {
 			continue
 		}
 		changed[id] = true
-		g.flushLearned(id, old.spec.IP)
 		if !ok {
 			g.closeConns(id)
+		} else {
+			g.CloseConnsWhere(id, func(host string, port uint16) bool { return !nu.permits(host, port) })
 		}
+		g.flushLearned(id, old.spec.IP)
 	}
 	g.sweepLearned(next, changed)
 	return nil
@@ -604,6 +703,19 @@ func (g *Gateway) Specs() []Spec {
 // proxy lookups (denying) until Sync; with none it leaves the sets as they
 // are (D13, eng re-review D2).
 func (g *Gateway) Restore(specs []Spec) error {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	// Which sources the kernel already blocks (a matching layout keeps the
+	// sets; a migrated one blocks every carried source). Unknown counts as
+	// not blocked: the next write then adds rather than deletes, and an add
+	// of an element already there is harmless while a delete of a missing
+	// one fails.
+	inBlocked := map[netip.Addr]bool{}
+	if elems, err := g.be.List(SetBlockedSrc); err == nil {
+		for _, e := range elems {
+			inBlocked[e.Src] = true
+		}
+	}
 	next := map[string]*entry{}
 	bySrc := map[netip.Addr]string{}
 	for _, s := range specs {
@@ -612,6 +724,7 @@ func (g *Gateway) Restore(specs []Spec) error {
 			return err
 		}
 		e.blocked |= BlockRestart
+		e.inBlockedSrc = inBlocked[s.IP]
 		next[s.ID] = e
 		bySrc[s.IP] = s.ID
 	}
@@ -635,6 +748,8 @@ func (g *Gateway) LearnFor(id, name string, dst netip.Addr, port uint16, ttl tim
 	if !dst.Is4() {
 		return fmt.Errorf("egress: learned destination %s is not IPv4", dst)
 	}
+	g.opMu.RLock()
+	defer g.opMu.RUnlock()
 	g.mu.RLock()
 	e := g.byID[id]
 	g.mu.RUnlock()
@@ -695,37 +810,169 @@ func (g *Gateway) liveLearnedLocked(id string, now time.Time) int {
 }
 
 // flushLearned deletes a sandbox's learned elements exactly (the shadow map
-// knows them) and forgets the shadow.
+// knows them) and forgets the shadow. The elements move to pendingLearned
+// first and leave it only once the kernel delete succeeds.
 func (g *Gateway) flushLearned(id string, src netip.Addr) {
 	g.learnedMu.Lock()
 	shadow := g.learned[id]
 	delete(g.learned, id)
 	delete(g.binNames, id)
+	if len(shadow) > 0 {
+		p := g.pendingLearned[src]
+		if p == nil {
+			p = map[string][]Elem{}
+			g.pendingLearned[src] = p
+		}
+		for k := range shadow {
+			e := Elem{Src: src, Dst: k.dst, Port: k.port}
+			if !slices.Contains(p[k.set()], e) {
+				p[k.set()] = append(p[k.set()], e)
+			}
+		}
+	}
 	g.learnedMu.Unlock()
-	if len(shadow) == 0 {
-		return
+	if err := g.retryLearnedFlush(src); err != nil {
+		g.log.Warn("egress: flush learned elements failed; retrying", "sandbox_id", id, "src", src, "error", err)
 	}
-	bySet := map[string][]Elem{}
-	for k := range shadow {
-		bySet[k.set()] = append(bySet[k.set()], Elem{Src: src, Dst: k.dst, Port: k.port})
+}
+
+// retryLearnedFlush deletes src's pending learned elements. An element can
+// expire on its own before the delete, and a delete of a missing element
+// fails the whole nft transaction, so a failed batch is narrowed to what the
+// kernel still holds and tried once more.
+func (g *Gateway) retryLearnedFlush(src netip.Addr) error {
+	g.learnedMu.Lock()
+	pend := g.pendingLearned[src]
+	g.learnedMu.Unlock()
+	if len(pend) == 0 {
+		return nil
 	}
+	ops := learnedDeleteOps(pend)
+	err := g.be.Apply(ops)
+	if err != nil {
+		still := map[string][]Elem{}
+		for set, elems := range pend {
+			cur, lerr := g.be.List(set)
+			if lerr != nil {
+				return err
+			}
+			for _, e := range elems {
+				if slices.ContainsFunc(cur, func(c Elem) bool { return key(c) == key(e) }) {
+					still[set] = append(still[set], e)
+				}
+			}
+		}
+		if ops := learnedDeleteOps(still); len(ops) > 0 {
+			if err = g.be.Apply(ops); err != nil {
+				g.learnedMu.Lock()
+				g.pendingLearned[src] = still
+				g.learnedMu.Unlock()
+				return err
+			}
+		}
+	}
+	g.learnedMu.Lock()
+	delete(g.pendingLearned, src)
+	g.learnedMu.Unlock()
+	return nil
+}
+
+func learnedDeleteOps(bySet map[string][]Elem) []Op {
 	var ops []Op
 	for _, set := range []string{SetAllowLearned, SetBinLearned} {
 		if elems := bySet[set]; len(elems) > 0 {
 			ops = append(ops, Op{Set: set, Del: true, Elems: elems})
 		}
 	}
-	if err := g.be.Apply(ops); err != nil {
-		// Elements expire on their own timeout; log and move on.
-		g.log.Warn("egress: flush learned elements failed", "sandbox_id", id, "error", err)
-	}
+	return ops
 }
 
+// flushConntrack deletes established flows from ip. A failure is kept and
+// retried, like a learned flush.
 func (g *Gateway) flushConntrack(ip netip.Addr) {
 	if g.ct == nil || !ip.IsValid() {
 		return
 	}
-	if err := g.ct.FlushSource(ip); err != nil {
-		g.log.Warn("egress: conntrack flush failed", "ip", ip, "error", err)
+	g.learnedMu.Lock()
+	g.pendingCT[ip] = struct{}{}
+	g.learnedMu.Unlock()
+	if err := g.retryConntrackFlush(ip); err != nil {
+		g.log.Warn("egress: conntrack flush failed; retrying", "ip", ip, "error", err)
 	}
+}
+
+func (g *Gateway) retryConntrackFlush(ip netip.Addr) error {
+	g.learnedMu.Lock()
+	_, pending := g.pendingCT[ip]
+	g.learnedMu.Unlock()
+	if !pending || g.ct == nil {
+		return nil
+	}
+	if err := g.ct.FlushSource(ip); err != nil {
+		return err
+	}
+	g.learnedMu.Lock()
+	delete(g.pendingCT, ip)
+	g.learnedMu.Unlock()
+	return nil
+}
+
+// retryCleanup finishes the pending learned and conntrack cleanup of the
+// given sources.
+func (g *Gateway) retryCleanup(srcs ...netip.Addr) error {
+	var errs []error
+	for _, src := range srcs {
+		if err := g.retryLearnedFlush(src); err != nil {
+			errs = append(errs, fmt.Errorf("learned elements of %s: %w", src, err))
+		}
+		if err := g.retryConntrackFlush(src); err != nil {
+			errs = append(errs, fmt.Errorf("conntrack of %s: %w", src, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// RetryDirty re-drives every kernel write that failed: @blocked_src
+// membership that differs from the wanted reasons, and pending learned and
+// conntrack cleanup. The gateway's heartbeat runs it, so a transient nft or
+// netlink failure is repaired without waiting for sandboxd.
+func (g *Gateway) RetryDirty() error {
+	g.opMu.RLock()
+	defer g.opMu.RUnlock()
+	g.mu.RLock()
+	var dirty []string
+	for id, e := range g.byID {
+		if e.inBlockedSrc != e.kernelBlocked() {
+			dirty = append(dirty, id)
+		}
+	}
+	g.mu.RUnlock()
+	var errs []error
+	for _, id := range dirty {
+		unlock := g.lockSandbox(id)
+		g.mu.RLock()
+		e := g.byID[id]
+		g.mu.RUnlock()
+		if e != nil && e.inBlockedSrc != e.kernelBlocked() {
+			if err := g.applyBlockedLocked(e); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		unlock()
+	}
+	g.learnedMu.Lock()
+	srcs := make([]netip.Addr, 0, len(g.pendingLearned)+len(g.pendingCT))
+	for src := range g.pendingLearned {
+		srcs = append(srcs, src)
+	}
+	for src := range g.pendingCT {
+		if _, ok := g.pendingLearned[src]; !ok {
+			srcs = append(srcs, src)
+		}
+	}
+	g.learnedMu.Unlock()
+	if err := g.retryCleanup(srcs...); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }

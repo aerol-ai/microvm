@@ -40,11 +40,18 @@ type running struct {
 
 func startDaemon(t *testing.T, stateDir string, be *egress.MemBackend) *running {
 	t.Helper()
+	return startDaemonOn(t, stateDir, be, freePort(t), freePort(t))
+}
+
+// startDaemonOn starts a daemon on given ports; the ports are part of the nft
+// layout, so a restart on the same ones keeps it and new ones replace it.
+func startDaemonOn(t *testing.T, stateDir string, be *egress.MemBackend, dnsPort, proxyPort uint16) *running {
+	t.Helper()
 	sockDir, _ := os.MkdirTemp("", "egd")
 	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
 	cfg := Config{
 		SocketPath: filepath.Join(sockDir, "gw.sock"), StateDir: stateDir,
-		DNSPort: freePort(t), ProxyPort: freePort(t), DNSQPS: 1000,
+		DNSPort: dnsPort, ProxyPort: proxyPort, DNSQPS: 1000,
 		DNSUpstreams:      []string{"127.0.0.1:1"},
 		HeartbeatInterval: time.Hour, FlowReadInterval: time.Hour, SnapshotDebounce: 10 * time.Millisecond,
 		AuditBuffer: 100, LearnMax: 64,
@@ -195,7 +202,7 @@ func TestDaemonRestartRestoresSnapshot(t *testing.T) {
 	if _, ok, err := egress.LoadSnapshot(filepath.Join(state, "snapshot.json")); !ok || err != nil {
 		t.Fatalf("snapshot not written: %v %v", ok, err)
 	}
-	r2 := startDaemon(t, state, be)
+	r2 := startDaemonOn(t, state, be, r.cfg.DNSPort, r.cfg.ProxyPort)
 	if !r2.d.Gateway().IsBlocked("sb") {
 		t.Fatal("restored sandbox must be restart-blocked until Sync")
 	}
@@ -241,7 +248,10 @@ func TestDaemonTableLossRebuild(t *testing.T) {
 	if hb.GatewayStart.IsZero() || hb.Denied == nil {
 		t.Fatalf("heartbeat must carry totals and the gateway start: %+v", hb)
 	}
-	r.d.AckLayoutLost()
+	// sandboxd's authoritative Sync acknowledges the loss it covered.
+	if err := r.client.Sync(context.Background(), r.d.Gateway().Specs()); err != nil {
+		t.Fatal(err)
+	}
 	r.d.heartbeat()
 	for _, e := range r.d.Events().TakeAllForTest() {
 		if e.Kind == "heartbeat" && (!e.LayoutOK || e.LayoutLostSeen) {
@@ -414,5 +424,74 @@ func TestDaemonNodeWide(t *testing.T) {
 	}
 	if err := r.client.SetNodeControl(ctx, nil); err != nil || be.Len(egress.SetNodeControl) != 0 {
 		t.Fatalf("an empty list clears the guard: %v %d", err, be.Len(egress.SetNodeControl))
+	}
+}
+
+// TestDaemonLayoutMigrationKeepsSandboxesShut (review finding 11): a gateway
+// that starts with another layout (here, other ports) replaces the table but
+// carries its sources over, blocked, so no attached sandbox runs unfiltered
+// before sandboxd's Sync; the Sync lifts the block.
+func TestDaemonLayoutMigrationKeepsSandboxesShut(t *testing.T) {
+	state := t.TempDir()
+	be := egress.NewMemBackend()
+	r := startDaemon(t, state, be)
+	ctx := context.Background()
+	spec := egress.Spec{ID: "sb", IP: lo, AllowOut: []string{"pypi.org", "10.1.0.0/16"}}
+	if err := r.client.SetBridges(ctx, []egress.Bridge{{Name: "lo", GatewayIP: lo, Subnet: netip.MustParsePrefix("127.0.0.0/8")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.Attach(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.SetNodeControl(ctx, []netip.AddrPort{netip.MustParseAddrPort("10.0.0.5:21212")}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	r.stop(t)
+	r2 := startDaemon(t, state, be) // new ports: a new layout
+	for _, set := range []string{egress.SetFQDNSrc, egress.SetBlockedSrc} {
+		if !be.Has(set, egress.Elem{Src: lo}) {
+			t.Fatalf("%s must carry the source through the migration", set)
+		}
+	}
+	if be.Len(egress.SetAllowCIDR) == 0 || be.Len(egress.SetNodeControl) == 0 {
+		t.Fatalf("per-source CIDRs and the node-wide guard must be carried: allow_cidr=%d node_control=%d",
+			be.Len(egress.SetAllowCIDR), be.Len(egress.SetNodeControl))
+	}
+	if !r2.d.Gateway().IsBlocked("sb") {
+		t.Fatal("restored sandbox must stay blocked until Sync")
+	}
+	if err := r2.client.Sync(ctx, []egress.Spec{spec}); err != nil {
+		t.Fatal(err)
+	}
+	if be.Has(egress.SetBlockedSrc, egress.Elem{Src: lo}) || r2.d.Gateway().IsBlocked("sb") {
+		t.Fatal("Sync must lift the migration block")
+	}
+}
+
+// TestLayoutLossAckIsGenerational (review finding 12): only a Sync that began
+// after the latest loss clears it; a loss detected while that Sync ran stays
+// reported for the next one.
+func TestLayoutLossAckIsGenerational(t *testing.T) {
+	be := egress.NewMemBackend()
+	r := startDaemon(t, t.TempDir(), be)
+	be.DropLayout()
+	r.d.heartbeat() // loss 1
+	gen := r.d.layoutLossGen()
+	be.DropLayout()
+	r.d.heartbeat() // loss 2, detected "during" a Sync that started at gen
+	r.d.layoutSynced(gen)
+	r.d.statsMu.Lock()
+	lost := r.d.layoutLost
+	r.d.statsMu.Unlock()
+	if !lost {
+		t.Fatal("a loss detected after the Sync started must stay reported")
+	}
+	r.d.layoutSynced(r.d.layoutLossGen())
+	r.d.statsMu.Lock()
+	lost = r.d.layoutLost
+	r.d.statsMu.Unlock()
+	if lost {
+		t.Fatal("a Sync covering the latest loss must clear it")
 	}
 }

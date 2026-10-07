@@ -365,6 +365,17 @@ type Service struct {
 	egressBridges func(context.Context) []egress.Bridge
 	egressMu      sync.Mutex
 	egressReady   atomic.Bool
+	// egressSyncMu makes a full Sync exclusive against attaches and detaches
+	// (shared), and egressInflight carries the attaches the store doesn't
+	// show yet into it (review finding 1).
+	egressSyncMu   sync.RWMutex
+	egressInflight egressInflight
+	// egressRecovering single-flights the table-loss recovery, and
+	// egressGaugeBatch/egressGaugeDirty defer the held gauge's refresh to
+	// the end of a batch (review finding 12).
+	egressRecovering atomic.Bool
+	egressGaugeBatch atomic.Int32
+	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
 	// that the connected gateway has it.
@@ -2240,6 +2251,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 	platformVolumesCommitted = true
+	s.settleEgressAttach(sandbox.ID)
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
 		return nil, err
@@ -2528,6 +2540,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
 		}
 	}
+	s.settleEgressAttach(sandbox.ID)
 
 	s.logger.Info("audit sandbox created",
 		"sandbox_id", sandbox.ID,
@@ -3182,6 +3195,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return nil, err
 	}
+	s.settleEgressAttach(id)
 	refreshed, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err

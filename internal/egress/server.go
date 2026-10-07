@@ -32,6 +32,11 @@ type ServerHooks struct {
 	NodeControl func([]netip.AddrPort) error
 	// InspectCA installs the inspection CA (P3-1), memory only.
 	InspectCA func(InspectCA) error
+	// LossGen and Synced acknowledge a lost table (CEO D17): LossGen is read
+	// as sandboxd's Sync starts and Synced is called with it once the Sync
+	// succeeded, so only a loss that Sync covered is cleared.
+	LossGen func() uint64
+	Synced  func(lossGen uint64)
 }
 
 // PeerCheck vets a new UDS connection (SO_PEERCRED, CEO D22).
@@ -175,7 +180,13 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 		if err = json.Unmarshal(req.Payload, &specs); err != nil {
 			return nil, err
 		}
-		err = s.g.Sync(specs)
+		var gen uint64
+		if s.hooks.LossGen != nil {
+			gen = s.hooks.LossGen()
+		}
+		if err = s.g.Sync(specs); err == nil && s.hooks.Synced != nil {
+			s.hooks.Synced(gen)
+		}
 	case opReady:
 		st := ReadyStatus{Layout: s.g.CheckLayout() == nil}
 		if s.hooks.Listeners != nil {

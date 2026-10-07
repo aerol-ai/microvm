@@ -148,13 +148,16 @@ func (b *NFTBackend) EnsureLayout(cfg LayoutConfig) error {
 			exists = true
 		}
 	}
+	var carried map[string][]Elem
 	if exists {
 		if _, err := c.GetSetByName(b.table, markerSetName(cfg)); err == nil {
 			return nil // matching layout: keep set contents (D13)
 		}
 		// Another version: replace it in the same transaction, so the
 		// sandboxes never see a table-less window (layout changes are always
-		// one batch).
+		// one batch), and carry its contents over with every gateway-mode
+		// source blocked until sandboxd's Sync (migrateContents).
+		carried = migrateContents(b.carriedElements(c))
 		c.DelTable(b.table)
 	}
 	c.AddTable(b.table)
@@ -170,11 +173,39 @@ func (b *NFTBackend) EnsureLayout(cfg LayoutConfig) error {
 			return fmt.Errorf("add set %s: %w", d.name, err)
 		}
 	}
+	for name, list := range carried {
+		elems, err := encodeElems(name, list)
+		if err != nil {
+			return fmt.Errorf("carry %s: %w", name, err)
+		}
+		if err := c.SetAddElements(b.sets[name], elems); err != nil {
+			return fmt.Errorf("carry %s: %w", name, err)
+		}
+	}
 	b.addChains(c, cfg)
 	if err := c.Flush(); err != nil {
 		return fmt.Errorf("create egress layout: %w", err)
 	}
 	return nil
+}
+
+// carriedElements reads the carried sets of the table being replaced. A set
+// whose key type changed between versions can't be decoded as this
+// version's, so it is left behind (it starts empty, as before).
+func (b *NFTBackend) carriedElements(c *nftables.Conn) map[string][]Elem {
+	out := map[string][]Elem{}
+	for _, name := range carriedSets {
+		old, err := c.GetSetByName(b.table, name)
+		if err != nil || old.KeyType.Name != b.sets[name].KeyType.Name || old.Interval != b.sets[name].Interval {
+			continue
+		}
+		raw, err := c.GetSetElements(old)
+		if err != nil {
+			continue
+		}
+		out[name] = decodeElems(name, raw)
+	}
+	return out
 }
 
 // CheckLayout implements Backend: the table, its marker, every set and the

@@ -65,10 +65,13 @@ type Daemon struct {
 
 	started time.Time
 	// floor is the operator's deny_cidrs, node-wide for every sandbox.
-	floor        []netip.Prefix
-	statsMu      sync.Mutex
-	denied       map[string]uint64
-	layoutLost   bool
+	floor      []netip.Prefix
+	statsMu    sync.Mutex
+	denied     map[string]uint64
+	layoutLost bool
+	// lossGen counts detected table losses; a sandboxd Sync that started
+	// after the latest one acknowledges it (layoutSynced).
+	lossGen      uint64
 	seenRejected map[egress.Elem]time.Time
 }
 
@@ -123,6 +126,8 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 		ForgetLearned: d.forgetLearned,
 		Changed:       d.markDirty,
 		NodeControl:   d.setNodeControl,
+		LossGen:       d.layoutLossGen,
+		Synced:        d.layoutSynced,
 		InspectCA:     d.setInspectCA,
 	}, deps.Peer, d.hub, log)
 	if err := d.restore(); err != nil {
@@ -438,9 +443,15 @@ func (d *Daemon) heartbeat() {
 	d.statsMu.Lock()
 	if lost {
 		d.layoutLost = true
+		d.lossGen++
 	}
 	lostSeen := d.layoutLost
 	d.statsMu.Unlock()
+	// Kernel writes that failed (a block, a learned or conntrack cleanup)
+	// are re-driven here rather than waiting for sandboxd.
+	if err := d.gw.RetryDirty(); err != nil {
+		d.log.Warn("egress: retrying failed kernel writes", "error", err)
+	}
 	specs := d.gw.Specs()
 	n := 0
 	for _, s := range specs {
@@ -453,11 +464,23 @@ func (d *Daemon) heartbeat() {
 		Denied: d.DeniedCounts(), DNSQueries: d.dns.Queries(), GatewayStart: d.started, Time: time.Now().UTC()})
 }
 
-// AckLayoutLost clears the latched table-loss flag once sandboxd re-synced.
-func (d *Daemon) AckLayoutLost() {
+// layoutLossGen is the table-loss generation an incoming Sync starts from.
+func (d *Daemon) layoutLossGen() uint64 {
 	d.statsMu.Lock()
-	d.layoutLost = false
-	d.statsMu.Unlock()
+	defer d.statsMu.Unlock()
+	return d.lossGen
+}
+
+// layoutSynced clears the latched table loss once sandboxd's Sync, begun
+// after the latest loss, succeeded: sandboxd has held, re-synced and is
+// re-attaching, so reporting the loss again would only repeat that. A loss
+// detected while the Sync ran stays reported.
+func (d *Daemon) layoutSynced(gen uint64) {
+	d.statsMu.Lock()
+	defer d.statsMu.Unlock()
+	if d.lossGen == gen {
+		d.layoutLost = false
+	}
 }
 
 // DeniedCounts returns denials by reason (aerolvm_egress_denied_total).

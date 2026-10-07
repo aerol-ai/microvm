@@ -181,11 +181,15 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	if err := s.resyncEgressCA(ctx); err != nil {
 		return err
 	}
+	// No attach or detach runs between reading the state and the gateway
+	// applying it, and the attaches the store doesn't show yet are included.
+	s.egressSyncMu.Lock()
 	specs, err := s.localEgressSpecs(ctx)
-	if err != nil {
-		return err
+	if err == nil {
+		err = gw.Sync(ctx, specs)
 	}
-	if err := gw.Sync(ctx, specs); err != nil {
+	s.egressSyncMu.Unlock()
+	if err != nil {
 		return err
 	}
 	// Every full sync asks for a re-test of every bridge: it runs at startup
@@ -280,9 +284,13 @@ func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
 		return nil, err
 	}
 	var specs []egress.Spec
+	started := map[string]netip.Addr{}
 	for _, sb := range rows {
 		if sb.Status != models.SandboxStatusStarted || sb.ContainerIP == "" {
 			continue
+		}
+		if ip, err := netip.ParseAddr(sb.ContainerIP); err == nil {
+			started[sb.ID] = ip
 		}
 		spec, ok := s.egressSpecFor(sb, holds[sb.ID] != "")
 		if !ok {
@@ -292,7 +300,7 @@ func (s *Service) localEgressSpecs(ctx context.Context) ([]egress.Spec, error) {
 		spec.Pid = s.egressPid(ctx, sb)
 		specs = append(specs, spec)
 	}
-	return specs, nil
+	return s.egressInflight.merge(specs, started, time.Now()), nil
 }
 
 // sandboxPolicy compiles a stored sandbox's egress policy.
@@ -351,7 +359,13 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		return err
 	}
 	s.kickEgressSelfTest()
-	if err := s.egressGateway().Attach(ctx, spec); err != nil {
+	s.egressSyncMu.RLock()
+	err = s.egressGateway().Attach(ctx, spec)
+	if err == nil {
+		s.egressInflight.put(spec)
+	}
+	s.egressSyncMu.RUnlock()
+	if err != nil {
 		s.egressStats.recordAttachFailed()
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
 			s.egressReady.Store(false)
@@ -442,7 +456,22 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 	s.refreshHeldGauge(ctx)
 }
 
+// endGaugeBatch closes a batch opened with egressGaugeBatch.Add(1) and runs
+// the one gauge refresh the batch deferred.
+func (s *Service) endGaugeBatch(ctx context.Context) {
+	if s.egressGaugeBatch.Add(-1) == 0 && s.egressGaugeDirty.Swap(false) {
+		s.refreshHeldGauge(ctx)
+	}
+}
+
+// refreshHeldGauge recounts the held sandboxes. Inside a batch (a table-loss
+// recovery holds and re-attaches every gateway sandbox) the recount is
+// deferred to the batch's end: per sandbox it would be quadratic.
 func (s *Service) refreshHeldGauge(ctx context.Context) {
+	if s.egressGaugeBatch.Load() > 0 {
+		s.egressGaugeDirty.Store(true)
+		return
+	}
 	if holds, err := s.store.ListEgressHolds(ctx); err == nil {
 		s.egressStats.held.Store(int64(len(holds)))
 	}
@@ -495,10 +524,17 @@ func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, i
 	}
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
+	s.egressSyncMu.RLock()
+	defer s.egressSyncMu.RUnlock()
+	s.egressInflight.drop(sb.ID)
 	if err := s.egressGateway().Detach(ctx, sb.ID, addr); err != nil {
 		s.logger.Warn("egress: detach failed (gateway Sync will drop it)", "sandbox_id", sb.ID, "error", err)
 	}
 }
+
+// settleEgressAttach marks a create's or start's attach as covered by its
+// store row, once that row is written.
+func (s *Service) settleEgressAttach(id string) { s.egressInflight.drop(id) }
 
 // setEgressQuotaBlock mirrors a quota block into the gateway's @blocked_src
 // for a gateway-mode sandbox (eng re-review D2).
@@ -607,7 +643,15 @@ func (s *Service) handleEgressEvent(ctx context.Context, ev egress.Event) {
 // full Sync re-applies the gateway state and successful attaches release
 // the holds.
 func (s *Service) onEgressLayoutLost(ctx context.Context) {
+	// One recovery at a time: heartbeats keep reporting the loss until the
+	// gateway sees this recovery's Sync succeed.
+	if !s.egressRecovering.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.egressRecovering.Store(false)
 	s.egressStats.recordLayoutLost()
+	s.egressGaugeBatch.Add(1)
+	defer s.endGaugeBatch(ctx)
 	rows, err := s.store.List(ctx)
 	if err != nil {
 		return
