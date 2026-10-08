@@ -489,7 +489,7 @@ func (s *Service) recordCreateEgressState(ctx context.Context, sb *models.Sandbo
 		err = s.store.SetEgressProfilesApplied(ctx, sb.ID, r.Applied)
 	}
 	if err == nil && held {
-		if err = s.recordHold(ctx, sb.ID, egressHoldProfileUnavailable); err == nil {
+		if err = s.recordHoldOnly(ctx, sb.ID, egressHoldProfileUnavailable); err == nil {
 			s.refreshHeldGauge(ctx)
 		}
 	}

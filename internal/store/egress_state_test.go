@@ -66,10 +66,10 @@ func TestEgressHoldLifecycle(t *testing.T) {
 	}
 }
 
-// TestEgressHoldRankedAndAppliedPolicy (PR #622 review 2): a ranked hold
-// write never replaces a stronger reason, and the applied policy record
-// round-trips (nil until written).
-func TestEgressHoldRankedAndAppliedPolicy(t *testing.T) {
+// TestEgressHoldRankedAndInstalled (PR #622 reviews 2 and 3): a ranked hold
+// write never replaces a stronger reason; a conditional clear lifts only the
+// reason it names; the installed record round-trips (nil until written).
+func TestEgressHoldRankedAndInstalled(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)
@@ -88,15 +88,31 @@ func TestEgressHoldRankedAndAppliedPolicy(t *testing.T) {
 	if err := st.SetEgressHoldRanked(ctx, "sb", "", rank, now); err == nil {
 		t.Fatal("an empty reason must be refused")
 	}
-	got, _ := st.GetEgressState(ctx, "sb")
-	if got.Applied != nil {
-		t.Fatal("no applied policy before one is written")
+	if cleared, err := st.ClearEgressHoldIf(ctx, "sb", "weak", now); err != nil || cleared {
+		t.Fatalf("a clear naming another reason must leave the hold: %v %v", cleared, err)
 	}
-	p := AppliedPolicy{AllowOut: []string{"pypi.org"}, Mode: "learn"}
-	if err := st.SetAppliedEgressPolicy(ctx, "sb", p, now); err != nil {
+	if cleared, err := st.ClearEgressHoldIf(ctx, "sb", "strong", now); err != nil || !cleared {
+		t.Fatalf("a clear naming the reason must lift it: %v %v", cleared, err)
+	}
+	if cleared, _ := st.ClearEgressHoldIf(ctx, "sb", "", now); cleared {
+		t.Fatal("an empty reason clears nothing")
+	}
+	got, _ := st.GetEgressState(ctx, "sb")
+	if got.HoldReason != "" || got.Installed != nil {
+		t.Fatalf("state = %+v", got)
+	}
+	inst := InstalledEgress{Gateway: true, CIDR: []CIDRRules{{Allow: []string{"8.8.8.0/24"}}}}
+	if err := st.SetInstalledEgress(ctx, "sb", inst, now); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := st.GetEgressState(ctx, "sb"); got.Applied == nil || got.Applied.AllowOut[0] != "pypi.org" || got.Applied.Mode != "learn" {
-		t.Fatalf("applied = %+v", got.Applied)
+	if got, _ := st.GetEgressState(ctx, "sb"); got.Installed == nil || !got.Installed.Gateway || len(got.Installed.CIDR) != 1 || got.Installed.CIDR[0].Allow[0] != "8.8.8.0/24" {
+		t.Fatalf("installed = %+v", got.Installed)
+	}
+	_ = st.Close()
+	if err := st.SetInstalledEgress(ctx, "sb", inst, now); err == nil {
+		t.Fatal("closed store must error")
+	}
+	if _, err := st.ClearEgressHoldIf(ctx, "sb", "x", now); err == nil {
+		t.Fatal("closed store must error")
 	}
 }

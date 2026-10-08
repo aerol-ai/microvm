@@ -209,18 +209,26 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	}
 	// No attach or detach runs between reading the state and the gateway
 	// applying it, and the attaches the store doesn't show yet are included.
+	//
+	// Block writers aren't held off (a hold takes effect at once): the
+	// gateway's block write number, read before the snapshot, tells it which
+	// writes are newer than the specs, and those keep their effect (review 3
+	// finding 1). Writes that never reached the gateway are re-applied after
+	// the replacement; one still failing fails the Sync, so the gateway isn't
+	// reported ready on a state missing a block.
 	s.egressSyncMu.Lock()
-	s.egressBlocks.start()
-	specs, err := s.localEgressSpecs(ctx)
+	var specs []egress.Spec
+	since, err := gw.BlockGen(ctx)
 	if err == nil {
-		err = gw.Sync(ctx, specs)
+		specs, err = s.localEgressSpecs(ctx)
 	}
-	changed := s.egressBlocks.stop()
 	if err == nil {
-		// A hold or quota block that changed after the specs were read
-		// would be undone by the Sync's replacement: re-apply each from the
-		// store, which the change wrote first (review 2 finding 2).
-		s.reapplyBlocks(ctx, changed)
+		err = gw.Sync(ctx, specs, since)
+	}
+	if err == nil {
+		err = s.retryPendingBlocks(ctx)
+	}
+	if err == nil {
 		s.retainLearnedLocked(ctx)
 	}
 	s.egressSyncMu.Unlock()
@@ -262,6 +270,8 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	lastErr := ""
+	// Holds persist across restarts: count them now, gateway or not.
+	s.refreshHeldGauge(ctx)
 	for {
 		// Applying stored policies doesn't need the gateway (WASM, isolate,
 		// CIDR containers), so it runs on every node (review 2 finding 10).
@@ -294,8 +304,13 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 			s.retainLearnedLocked(ctx)
 			s.egressSyncMu.Unlock()
 		}
-		if s.EgressGatewayReady() && s.egressStats.held.Load() > 0 {
-			s.retryEgressHolds(ctx)
+		if s.EgressGatewayReady() {
+			if err := s.retryPendingBlocks(ctx); err != nil {
+				s.logger.Warn("egress: gateway blocks still pending", "error", err)
+			}
+			if s.egressStats.held.Load() > 0 {
+				s.retryEgressHolds(ctx)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -434,7 +449,11 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 	defer func() { observability.EndSpan(span, err) }()
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
-	spec, ok := s.egressSpecFor(sb, false)
+	// A held sandbox attaches shut, whatever the hold's class: only the
+	// release that resolves it lifts the gateway's block. An unreadable
+	// record counts as held.
+	held, _ := s.egressHeld(ctx, sb)
+	spec, ok := s.egressSpecFor(sb, held)
 	if !ok {
 		return nil
 	}
@@ -474,8 +493,15 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 // holdSandboxEgress records and enforces the fail-closed hold: the store
 // row, the hold DROP in the host firewall, and the gateway's blocked bit for
 // the redirect path (S3). Each layer alone keeps the sandbox shut, so every
-// step is best-effort after the first.
+// step is best-effort after the first; a gateway write that fails stays
+// pending until it lands.
 func (s *Service) holdSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, reason string) {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
+	s.holdSandboxEgressLocked(ctx, sb, cr, reason)
+}
+
+func (s *Service) holdSandboxEgressLocked(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, reason string) {
 	if err := s.recordHold(ctx, sb.ID, reason); err != nil {
 		s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
 	}
@@ -484,17 +510,28 @@ func (s *Service) holdSandboxEgress(ctx context.Context, sb *models.Sandbox, cr 
 			s.logger.Warn("egress: install hold DROP failed", "sandbox_id", sb.ID, "error", err)
 		}
 	}
-	s.egressBlockSeen(sb.ID)
-	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockHold, true); err != nil && !errors.Is(err, egress.ErrNotAttached) {
-		s.logger.Warn("egress: gateway hold failed", "sandbox_id", sb.ID, "error", err)
+	if err := s.setGatewayBlock(ctx, sb.ID, egress.BlockHold, true); err != nil {
+		s.logger.Warn("egress: gateway hold failed; retried until it lands", "sandbox_id", sb.ID, "error", err)
 	}
 	s.refreshHeldGauge(ctx)
 	s.logger.Warn("egress: sandbox held", "sandbox_id", sb.ID, "reason", reason)
 }
 
 // recordHold persists a hold reason unless a stronger one is already there.
+// Callers hold the sandbox's hold lock.
 func (s *Service) recordHold(ctx context.Context, id, reason string) error {
+	if reason == egressHoldApplyFailed {
+		s.egressApplyIdle.Store(false)
+	}
 	return s.store.SetEgressHoldRanked(ctx, id, reason, holdRank, time.Now().UTC())
+}
+
+// recordHoldOnly records a hold with nothing to enforce yet (a stopped
+// sandbox, one still being created).
+func (s *Service) recordHoldOnly(ctx context.Context, id, reason string) error {
+	unlock := s.egressHoldLocks.lock(id)
+	defer unlock()
+	return s.recordHold(ctx, id, reason)
 }
 
 // releaseEgressHold lifts a container sandbox's hold, if its reason is one
@@ -502,6 +539,16 @@ func (s *Service) recordHold(ctx context.Context, id, reason string) error {
 // applied policy apply holds, and only an apply that resolved the profiles
 // lifts a profile hold.
 func (s *Service) releaseEgressHold(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, allowed ...string) error {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
+	return s.releaseEgressHoldLocked(ctx, sb, cr, allowed...)
+}
+
+// releaseEgressHoldLocked runs under the sandbox's hold lock, so no hold
+// can land between reading the reason and lifting what enforces it
+// (review 3 finding 2); the record is cleared only if it still holds the
+// reason read, as a second guard.
+func (s *Service) releaseEgressHoldLocked(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, allowed ...string) error {
 	st, err := s.store.GetEgressState(ctx, sb.ID)
 	if err != nil {
 		return err
@@ -509,16 +556,23 @@ func (s *Service) releaseEgressHold(ctx context.Context, sb *models.Sandbox, cr 
 	if st.HoldReason == "" || !slices.Contains(allowed, st.HoldReason) {
 		return nil
 	}
-	if holder, ok := cr.(runtime.EgressHolder); ok && sb.ContainerIP != "" {
+	holder, _ := cr.(runtime.EgressHolder)
+	if holder != nil && sb.ContainerIP != "" {
 		if err := holder.ClearEgressHold(sb.ContainerIP); err != nil {
 			return fmt.Errorf("lift egress hold DROP: %w", err)
 		}
 	}
-	if err := s.store.ClearEgressHold(ctx, sb.ID, time.Now().UTC()); err != nil {
+	cleared, err := s.store.ClearEgressHoldIf(ctx, sb.ID, st.HoldReason, time.Now().UTC())
+	if err != nil || !cleared {
+		// The record still holds: put its DROP back.
+		if holder != nil && sb.ContainerIP != "" {
+			if herr := holder.ApplyEgressHold(sb.ContainerIP); herr != nil {
+				s.logger.Warn("egress: hold DROP not restored", "sandbox_id", sb.ID, "error", herr)
+			}
+		}
 		return err
 	}
-	s.egressBlockSeen(sb.ID)
-	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockHold, false); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+	if err := s.setGatewayBlock(ctx, sb.ID, egress.BlockHold, false); err != nil {
 		return err
 	}
 	s.refreshHeldGauge(ctx)
@@ -553,31 +607,56 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 // retryUnappliedPolicies re-applies the stored policy of every sandbox held
 // apply_failed, on every runtime and whether or not this node has a gateway:
 // a WASM or isolate apply recovers when its mediator does (review 2 finding
-// 10). A gateway-mode container waits for a ready gateway.
+// 10). A container that needs the gateway (to attach, or to detach what a
+// partial apply left) waits for a ready one. The pass reads the store until
+// it finds no apply hold left, from the first tick after a restart: the
+// held gauge is a report, not the record (review 3 finding 8).
 func (s *Service) retryUnappliedPolicies(ctx context.Context) {
-	if s.egressStats.held.Load() == 0 {
+	if s.egressApplyIdle.Load() {
 		return
 	}
+	// Cleared before the read: a hold recorded after it sets it again.
+	s.egressApplyIdle.Store(true)
 	holds, err := s.store.ListEgressHolds(ctx)
 	if err != nil {
+		s.egressApplyIdle.Store(false)
 		return
 	}
+	left := false
 	for id, reason := range holds {
 		if reason != egressHoldApplyFailed {
 			continue
 		}
+		left = true
 		sb, err := s.store.Get(ctx, id)
 		if err != nil {
 			continue
 		}
 		mediated := s.isWasmSandbox(sb) || s.isIsolateSandbox(sb)
-		if !mediated && (sb.Status != models.SandboxStatusStarted || (isGatewayMode(sb) && !s.EgressGatewayReady())) {
+		if !mediated && sb.Status != models.SandboxStatusStarted {
+			continue
+		}
+		if !mediated && !s.EgressGatewayReady() && s.needsGateway(ctx, sb) {
 			continue
 		}
 		if err := s.reapplyStoredPolicy(ctx, id); err != nil {
 			s.logger.Debug("egress: held policy still not applied", "sandbox_id", id, "error", err)
 		}
 	}
+	if left {
+		s.egressApplyIdle.Store(false)
+	}
+}
+
+// needsGateway reports whether applying a container sandbox's stored policy
+// talks to the gateway: to attach it, or to detach an attachment a partial
+// apply may have left.
+func (s *Service) needsGateway(ctx context.Context, sb *models.Sandbox) bool {
+	if isGatewayMode(sb) {
+		return true
+	}
+	inst, err := s.installedEgress(ctx, sb)
+	return err != nil || inst.Gateway
 }
 
 // endGaugeBatch closes a batch opened with egressGaugeBatch.Add(1) and runs
@@ -639,21 +718,33 @@ func (s *Service) liftStartedGuest(rt runtime.Runtime, sb *models.Sandbox) error
 // detachSandboxEgress removes a sandbox from the gateway. The gateway checks
 // the IP still belongs to it (D5), so a late call after IP reuse is safe.
 func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, ip string) {
+	if err := s.detachEgress(ctx, sb, ip); err != nil {
+		s.logger.Warn("egress: detach failed (gateway Sync will drop it)", "sandbox_id", sb.ID, "error", err)
+	}
+}
+
+// detachEgress removes a sandbox from the gateway and reports a failure. A
+// running sandbox leaving gateway mode needs it acknowledged (review 3
+// finding 4); terminal cleanup (destroy, stop) goes through
+// detachSandboxEgress, which leaves a failure to the next full Sync. Without
+// a gateway on this node nothing can be attached.
+func (s *Service) detachEgress(ctx context.Context, sb *models.Sandbox, ip string) error {
 	if !s.egressEnabled() || ip == "" {
-		return
+		return nil
 	}
 	addr, err := netip.ParseAddr(ip)
 	if err != nil {
-		return
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
 	s.egressSyncMu.RLock()
 	defer s.egressSyncMu.RUnlock()
 	s.egressInflight.drop(sb.ID)
-	if err := s.egressGateway().Detach(ctx, sb.ID, addr); err != nil {
-		s.logger.Warn("egress: detach failed (gateway Sync will drop it)", "sandbox_id", sb.ID, "error", err)
+	if err := s.egressGateway().Detach(ctx, sb.ID, addr); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+		return err
 	}
+	return nil
 }
 
 // settleEgressAttach marks a create's or start's attach as covered by its
@@ -668,8 +759,9 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 	}
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
-	s.egressBlockSeen(sb.ID)
-	if err := s.egressGateway().SetBlocked(ctx, sb.ID, egress.BlockQuota, on); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
+	if err := s.setGatewayBlock(ctx, sb.ID, egress.BlockQuota, on); err != nil {
 		s.logger.Warn("egress: quota block not mirrored to the gateway", "sandbox_id", sb.ID, "on", on, "error", err)
 	}
 }

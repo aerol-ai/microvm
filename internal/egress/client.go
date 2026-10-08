@@ -20,7 +20,12 @@ type API interface {
 	Update(ctx context.Context, spec Spec) error
 	Detach(ctx context.Context, id string, ip netip.Addr) error
 	SetBlocked(ctx context.Context, id string, reason BlockReason, on bool) error
-	Sync(ctx context.Context, specs []Spec) error
+	// BlockGen is the gateway's newest block write number. sandboxd reads
+	// it before the snapshot a full Sync is built from.
+	BlockGen(ctx context.Context) (uint64, error)
+	// Sync replaces the gateway state with specs built from a snapshot that
+	// covers block writes up to since (Gateway.SyncSince).
+	Sync(ctx context.Context, specs []Spec, since uint64) error
 	Ready(ctx context.Context) (ReadyStatus, error)
 	SetBridges(ctx context.Context, bridges []Bridge) error
 	Probe(ctx context.Context, p ProbeRequest) (ProbeResult, error)
@@ -58,7 +63,10 @@ func (Noop) Detach(context.Context, string, netip.Addr) error {
 	return nil
 }
 func (Noop) SetBlocked(context.Context, string, BlockReason, bool) error { return nil }
-func (Noop) Sync(context.Context, []Spec) error {
+func (Noop) BlockGen(context.Context) (uint64, error) {
+	return 0, fmt.Errorf("%w: gateway disabled", ErrUnavailable)
+}
+func (Noop) Sync(context.Context, []Spec, uint64) error {
 	return fmt.Errorf("%w: gateway disabled", ErrUnavailable)
 }
 func (Noop) Ready(context.Context) (ReadyStatus, error) {
@@ -248,11 +256,16 @@ func (c *Client) Detach(ctx context.Context, id string, ip netip.Addr) error {
 func (c *Client) SetBlocked(ctx context.Context, id string, reason BlockReason, on bool) error {
 	return c.call(ctx, opSetBlocked, setBlockedPayload{ID: id, Reason: reason, On: on}, nil)
 }
-func (c *Client) Sync(ctx context.Context, specs []Spec) error {
+func (c *Client) BlockGen(ctx context.Context) (uint64, error) {
+	var p blockGenPayload
+	err := c.call(ctx, opBlockGen, nil, &p)
+	return p.Gen, err
+}
+func (c *Client) Sync(ctx context.Context, specs []Spec, since uint64) error {
 	if specs == nil {
 		specs = []Spec{}
 	}
-	return c.call(ctx, opSync, specs, nil)
+	return c.call(ctx, opSync, syncPayload{Specs: specs, Since: since}, nil)
 }
 func (c *Client) Ready(ctx context.Context) (ReadyStatus, error) {
 	var st ReadyStatus

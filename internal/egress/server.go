@@ -1,12 +1,14 @@
 package egress
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"sync"
@@ -178,17 +180,24 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 		}
 		err = s.g.SetBlocked(p.ID, p.Reason, p.On)
 	case opSync:
-		var specs []Spec
-		if err = json.Unmarshal(req.Payload, &specs); err != nil {
+		p := syncPayload{Since: math.MaxUint64}
+		if trimmed := bytes.TrimSpace(req.Payload); len(trimmed) > 0 && trimmed[0] == '[' {
+			err = json.Unmarshal(req.Payload, &p.Specs)
+		} else {
+			err = json.Unmarshal(req.Payload, &p)
+		}
+		if err != nil {
 			return nil, err
 		}
 		var gen uint64
 		if s.hooks.LossGen != nil {
 			gen = s.hooks.LossGen()
 		}
-		if err = s.g.Sync(specs); err == nil && s.hooks.Synced != nil {
+		if err = s.g.SyncSince(p.Since, p.Specs); err == nil && s.hooks.Synced != nil {
 			s.hooks.Synced(gen)
 		}
+	case opBlockGen:
+		out = blockGenPayload{Gen: s.g.BlockGen()}
 	case opReady:
 		st := ReadyStatus{Layout: s.g.CheckLayout() == nil}
 		if s.hooks.Listeners != nil {
@@ -242,6 +251,7 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 			// A null list is a malformed request, never "keep nothing".
 			return nil, fmt.Errorf("%w: retain_learned needs a list", ErrUnavailable)
 		}
+		s.g.RetainBlocks(ids)
 		if s.hooks.RetainLearned != nil {
 			err = s.hooks.RetainLearned(ids)
 		}

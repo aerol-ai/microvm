@@ -3,6 +3,7 @@ package gatewayd
 import (
 	"context"
 	"log/slog"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -213,7 +214,7 @@ func TestDaemonRestartRestoresSnapshot(t *testing.T) {
 	if st, err := r2.client.Ready(ctx); err != nil || len(st.Listeners) != 3 {
 		t.Fatalf("listeners not rebound from the snapshot: %+v %v", st, err)
 	}
-	if err := r2.client.Sync(ctx, []egress.Spec{{ID: "sb", IP: lo, AllowOut: []string{"pypi.org"}}}); err != nil {
+	if err := r2.client.Sync(ctx, []egress.Spec{{ID: "sb", IP: lo, AllowOut: []string{"pypi.org"}}}, math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	if r2.d.Gateway().IsBlocked("sb") {
@@ -250,7 +251,7 @@ func TestDaemonTableLossRebuild(t *testing.T) {
 		t.Fatalf("heartbeat must carry totals and the gateway start: %+v", hb)
 	}
 	// sandboxd's authoritative Sync acknowledges the loss it covered.
-	if err := r.client.Sync(context.Background(), r.d.Gateway().Specs()); err != nil {
+	if err := r.client.Sync(context.Background(), r.d.Gateway().Specs(), math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	r.d.heartbeat()
@@ -462,7 +463,7 @@ func TestDaemonLayoutMigrationKeepsSandboxesShut(t *testing.T) {
 	if !r2.d.Gateway().IsBlocked("sb") {
 		t.Fatal("restored sandbox must stay blocked until Sync")
 	}
-	if err := r2.client.Sync(ctx, []egress.Spec{spec}); err != nil {
+	if err := r2.client.Sync(ctx, []egress.Spec{spec}, math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	if be.Has(egress.SetBlockedSrc, egress.Elem{Src: lo}) || r2.d.Gateway().IsBlocked("sb") {

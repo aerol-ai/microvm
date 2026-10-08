@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -86,7 +87,7 @@ func TestClientServerRoundTrip(t *testing.T) {
 	if raw, err := c.Learned(ctx, "sb"); err != nil || !strings.Contains(string(raw), "learn") {
 		t.Fatalf("Learned = %s, %v", raw, err)
 	}
-	if err := c.Sync(ctx, nil); err != nil {
+	if err := c.Sync(ctx, nil, math.MaxUint64); err != nil {
 		t.Fatal(err)
 	}
 	if be.Has(SetFQDNSrc, Elem{Src: ipA}) {
@@ -256,7 +257,7 @@ func TestNoopFailsClosed(t *testing.T) {
 	for name, err := range map[string]error{
 		"attach":  n.Attach(ctx, Spec{}),
 		"update":  n.Update(ctx, Spec{}),
-		"sync":    n.Sync(ctx, nil),
+		"sync":    n.Sync(ctx, nil, 0),
 		"bridges": n.SetBridges(ctx, nil),
 	} {
 		if !errors.Is(err, ErrUnavailable) {
@@ -312,5 +313,39 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if _, _, err := LoadSnapshot(path); err == nil {
 		t.Fatal("unknown snapshot version must error")
+	}
+}
+
+// TestSyncCarriesTheBlockGen: the client reads the gateway's block write
+// number and sends it with a Sync; a write after it survives the Sync. A
+// bare spec array (no number) is treated as current.
+func TestSyncCarriesTheBlockGen(t *testing.T) {
+	c, g, _, _ := startServer(t, ServerHooks{}, nil)
+	ctx := context.Background()
+	spec := allowSpec("sb", ipA, "pypi.org")
+	if err := c.Attach(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	since, err := c.BlockGen(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetBlocked(ctx, "sb", BlockHold, true); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := c.BlockGen(ctx); got <= since {
+		t.Fatalf("block gen %d after a write, was %d", got, since)
+	}
+	if err := c.Sync(ctx, []Spec{spec}, since); err != nil {
+		t.Fatal(err)
+	}
+	if !g.IsBlocked("sb") {
+		t.Fatal("the hold written after the snapshot must survive the Sync")
+	}
+	if err := c.call(ctx, opSync, []Spec{spec}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if g.IsBlocked("sb") {
+		t.Fatal("a bare spec array is current and replaces the block state")
 	}
 }

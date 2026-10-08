@@ -205,7 +205,7 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	if err := s.commitPolicySpec(ctx, id, &create, st.Withheld); err != nil {
 		return nil, err
 	}
-	if err := s.recordAppliedBeforeChange(ctx, old, st); err != nil {
+	if err := s.markTransition(ctx, old, &next, st); err != nil {
 		return nil, err
 	}
 	if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
@@ -225,52 +225,101 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	return s.effectivePolicy(ctx, &next, resolved), nil
 }
 
-// applyStoredTransition applies a policy change already in the store. The
-// transition starts from what is enforced, the recorded applied policy when
-// there is one, not from the stored row: after a failed apply the row holds
-// the desired policy, and tearing down from it would leave the old one in
-// force (review 2 finding 1). A failure holds the sandbox (apply_failed) on
-// every runtime, so it is shut rather than left on a half-applied
-// transition, and the hold tells a retry and the supervisor that the
-// stored policy still has to be applied. Success records it as applied and
-// releases the holds in release, the ones the caller resolved.
+// applyStoredTransition applies a policy change already in the store. A
+// container's transition starts from the enforcement that may be installed
+// (the installed record), not from the stored row or the last policy that
+// fully applied: before any side effect the record grows to include the
+// target, so after a partial apply it holds both, and the next transition,
+// to this target or another, tears down everything either left (review 3
+// finding 3). A failure holds the sandbox (apply_failed) on every runtime,
+// so it is shut rather than left on a half-applied transition, and the hold
+// tells a retry and the supervisor that the stored policy still has to be
+// applied. Success narrows the record to the target and releases the holds
+// in release, the ones the caller resolved.
 func (s *Service) applyStoredTransition(ctx context.Context, old, next *models.Sandbox, release []string) error {
-	applied := s.appliedView(ctx, old)
-	if err := s.applyPolicyTransition(ctx, applied, next); err != nil {
-		s.holdUnapplied(ctx, next, egressHoldApplyFailed)
-		return err
+	inst, err := s.installedEgress(ctx, old)
+	if err == nil {
+		inst, err = s.widenInstalled(ctx, next.ID, inst, installedOf(next))
 	}
-	if err := s.store.SetAppliedEgressPolicy(ctx, next.ID, appliedOf(next), time.Now().UTC()); err != nil {
+	if err == nil {
+		err = s.applyPolicyTransition(ctx, old, inst, next)
+	}
+	if err == nil {
+		err = s.store.SetInstalledEgress(ctx, next.ID, installedOf(next), time.Now().UTC())
+	}
+	if err != nil {
 		s.holdUnapplied(ctx, next, egressHoldApplyFailed)
 		return err
 	}
 	return s.releaseHold(ctx, next, release...)
 }
 
-// recordAppliedBeforeChange records the policy in force before the stored
-// policy is overwritten, the first time there is no record yet: with no
-// hold, the stored row is what is enforced.
-func (s *Service) recordAppliedBeforeChange(ctx context.Context, old *models.Sandbox, st store.EgressState) error {
-	if st.Applied != nil || st.HoldReason != "" {
-		return nil
+// maxInstalledCIDR bounds the CIDR rule sets one sandbox's record keeps: one
+// per transition that failed to a new target since the last success.
+const maxInstalledCIDR = 16
+
+// markTransition records, before the stored policy changes, that the next
+// policy's enforcement may be installed alongside what is there now. A
+// crash between the stored write and the apply then leaves a record that
+// still names the old enforcement.
+func (s *Service) markTransition(ctx context.Context, old, next *models.Sandbox, st store.EgressState) error {
+	inst := installedOf(old)
+	if st.Installed != nil {
+		inst = *st.Installed
 	}
-	return s.store.SetAppliedEgressPolicy(ctx, old.ID, appliedOf(old), time.Now().UTC())
+	_, err := s.widenInstalled(ctx, old.ID, inst, installedOf(next))
+	return err
 }
 
-// appliedView is sb with the policy that is really enforced: the recorded
-// applied one, else the stored one.
-func (s *Service) appliedView(ctx context.Context, sb *models.Sandbox) *models.Sandbox {
+// widenInstalled records inst plus want and returns it; it writes only
+// when that adds something.
+func (s *Service) widenInstalled(ctx context.Context, id string, inst, want store.InstalledEgress) (store.InstalledEgress, error) {
+	wider := unionInstalled(inst, want)
+	if len(wider.CIDR) > maxInstalledCIDR {
+		return inst, fmt.Errorf("egress: %d unfinished policy transitions; apply one policy until it succeeds", len(wider.CIDR))
+	}
+	if wider.Gateway == inst.Gateway && len(wider.CIDR) == len(inst.CIDR) {
+		return inst, nil
+	}
+	return wider, s.store.SetInstalledEgress(ctx, id, wider, time.Now().UTC())
+}
+
+// installedEgress is the host enforcement that may be in place for sb: the
+// record, or what its stored policy installs when there is none.
+func (s *Service) installedEgress(ctx context.Context, sb *models.Sandbox) (store.InstalledEgress, error) {
 	st, err := s.store.GetEgressState(ctx, sb.ID)
-	if err != nil || st.Applied == nil {
-		return sb
+	if err != nil {
+		return store.InstalledEgress{}, err
 	}
-	v := *sb
-	v.NetworkBlockAll, v.NetworkAllowOut, v.NetworkDenyOut, v.NetworkEgressMode = st.Applied.BlockAll, st.Applied.AllowOut, st.Applied.DenyOut, st.Applied.Mode
-	return &v
+	if st.Installed != nil {
+		return *st.Installed, nil
+	}
+	return installedOf(sb), nil
 }
 
-func appliedOf(sb *models.Sandbox) store.AppliedPolicy {
-	return store.AppliedPolicy{BlockAll: sb.NetworkBlockAll, AllowOut: sb.NetworkAllowOut, DenyOut: sb.NetworkDenyOut, Mode: sb.NetworkEgressMode}
+// installedOf is the host enforcement sb's policy installs on a container:
+// a gateway attachment, or one CIDR rule set, or only the block-all DROP
+// (which is the policy swap's own block, and needs no record).
+func installedOf(sb *models.Sandbox) store.InstalledEgress {
+	switch {
+	case isGatewayMode(sb):
+		return store.InstalledEgress{Gateway: true}
+	case !sb.NetworkBlockAll && (len(sb.NetworkAllowOut) > 0 || len(sb.NetworkDenyOut) > 0):
+		return store.InstalledEgress{CIDR: []store.CIDRRules{{Allow: sb.NetworkAllowOut, Deny: sb.NetworkDenyOut}}}
+	}
+	return store.InstalledEgress{}
+}
+
+func unionInstalled(a, b store.InstalledEgress) store.InstalledEgress {
+	out := store.InstalledEgress{Gateway: a.Gateway || b.Gateway, CIDR: slices.Clone(a.CIDR)}
+	for _, r := range b.CIDR {
+		if !slices.ContainsFunc(out.CIDR, func(o store.CIDRRules) bool {
+			return slices.Equal(o.Allow, r.Allow) && slices.Equal(o.Deny, r.Deny)
+		}) {
+			out.CIDR = append(out.CIDR, r)
+		}
+	}
+	return out
 }
 
 // reapplyStoredPolicy applies a held sandbox's stored policy again (the
@@ -293,6 +342,8 @@ func (s *Service) reapplyStoredPolicy(ctx context.Context, id string) error {
 // policy sync can't undo it. Best effort after the record: each layer alone
 // keeps the sandbox shut.
 func (s *Service) holdUnapplied(ctx context.Context, sb *models.Sandbox, reason string) {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
 	if s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
 		if err := s.recordHold(ctx, sb.ID, reason); err != nil {
 			s.logger.Warn("egress: persist hold failed", "sandbox_id", sb.ID, "reason", reason, "error", err)
@@ -300,7 +351,7 @@ func (s *Service) holdUnapplied(ctx context.Context, sb *models.Sandbox, reason 
 			// just failed: shut the mediator directly instead.
 			s.shutMediator(sb)
 		} else {
-			s.syncMediatedBlocks(ctx, sb)
+			s.syncMediatedBlocksLocked(ctx, sb)
 		}
 		s.refreshHeldGauge(ctx)
 		return
@@ -313,18 +364,19 @@ func (s *Service) holdUnapplied(ctx context.Context, sb *models.Sandbox, reason 
 		s.refreshHeldGauge(ctx)
 		return
 	}
-	s.holdSandboxEgress(ctx, sb, cr, reason)
+	s.holdSandboxEgressLocked(ctx, sb, cr, reason)
 }
 
-// syncMediatedBlocks pushes a WASM or isolate sandbox's block state, which
-// composes block-all, quota and any recorded hold, to its mediator.
-func (s *Service) syncMediatedBlocks(ctx context.Context, sb *models.Sandbox) {
+// syncMediatedBlocksLocked pushes a WASM or isolate sandbox's block state,
+// which composes block-all, quota and any recorded hold, to its mediator.
+// Callers hold the sandbox's hold lock.
+func (s *Service) syncMediatedBlocksLocked(ctx context.Context, sb *models.Sandbox) {
 	switch {
 	case s.isWasmSandbox(sb):
 		overIn, overOut := quotaOver(sb)
-		s.syncWasmNetworkPolicy(ctx, sb, overIn, overOut)
+		s.syncWasmBlocksLocked(ctx, sb, overIn, overOut)
 	case s.isIsolateSandbox(sb):
-		if err := s.applyIsolatePolicy(ctx, sb); err != nil {
+		if err := s.applyIsolatePolicyLocked(ctx, sb); err != nil {
 			s.logger.Warn("egress: isolate block state not applied", "sandbox_id", sb.ID, "error", err)
 		}
 	}
@@ -351,48 +403,54 @@ func (s *Service) shutMediator(sb *models.Sandbox) {
 // releaseHold lifts a sandbox's hold if its reason is in allowed, on any
 // runtime: a container's hold DROP and gateway block, a mediator's
 // block-all (re-synced without it), or just the record of a container with
-// nothing running.
+// nothing running. It runs under the sandbox's hold lock, like every hold
+// write.
 func (s *Service) releaseHold(ctx context.Context, sb *models.Sandbox, allowed ...string) error {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
 	if s.isWasmSandbox(sb) || s.isIsolateSandbox(sb) {
-		released, err := s.releaseMediatedHold(ctx, sb.ID, allowed...)
+		released, err := s.clearHoldRecord(ctx, sb.ID, allowed...)
 		if err != nil || !released {
 			return err
 		}
-		s.syncMediatedBlocks(ctx, sb)
+		s.syncMediatedBlocksLocked(ctx, sb)
 		return nil
 	}
 	if cr, err := s.containerRuntimeForSandbox(sb); err == nil {
-		return s.releaseEgressHold(ctx, sb, cr, allowed...)
+		return s.releaseEgressHoldLocked(ctx, sb, cr, allowed...)
 	}
-	_, err := s.releaseMediatedHold(ctx, sb.ID, allowed...)
+	_, err := s.clearHoldRecord(ctx, sb.ID, allowed...)
 	return err
 }
 
-// releaseMediatedHold clears a hold record whose reason is in allowed.
-func (s *Service) releaseMediatedHold(ctx context.Context, id string, allowed ...string) (bool, error) {
+// clearHoldRecord clears a hold record whose reason is in allowed, and only
+// if it still holds the reason read. Callers hold the sandbox's hold lock.
+func (s *Service) clearHoldRecord(ctx context.Context, id string, allowed ...string) (bool, error) {
 	st, err := s.store.GetEgressState(ctx, id)
 	if err != nil || st.HoldReason == "" || !slices.Contains(allowed, st.HoldReason) {
 		return false, err
 	}
-	if err := s.store.ClearEgressHold(ctx, id, time.Now().UTC()); err != nil {
+	cleared, err := s.store.ClearEgressHoldIf(ctx, id, st.HoldReason, time.Now().UTC())
+	if err != nil || !cleared {
 		return false, err
 	}
 	s.refreshHeldGauge(ctx)
 	return true, nil
 }
 
-// applyPolicyTransition makes a stored policy change live. The WASM and
-// isolate drivers keep the policy for the next instantiation as well, so
-// they hear about every change; a stopped container has nothing live and
-// Start reads the stored row.
-func (s *Service) applyPolicyTransition(ctx context.Context, old, next *models.Sandbox) error {
+// applyPolicyTransition makes a stored policy change live, from the
+// enforcement that may be installed (inst). The WASM and isolate drivers
+// replace the whole policy and keep it for the next instantiation as well,
+// so they hear about every change; a stopped container has nothing live
+// and Start reads the stored row.
+func (s *Service) applyPolicyTransition(ctx context.Context, old *models.Sandbox, inst store.InstalledEgress, next *models.Sandbox) error {
 	switch {
 	case s.isWasmSandbox(old):
 		return s.applyWasmPolicy(ctx, next)
 	case s.isIsolateSandbox(old):
 		return s.applyIsolatePolicy(ctx, next)
 	case next.Status == models.SandboxStatusStarted:
-		return s.applyContainerPolicy(ctx, old, next)
+		return s.applyContainerPolicy(ctx, inst, next)
 	}
 	return nil
 }
@@ -495,21 +553,39 @@ func (s *Service) applyWasmPolicy(ctx context.Context, sb *models.Sandbox) error
 // (block-all) while any hold is recorded: a hold is lifted only by the
 // release that resolves it, never by a policy push (review 2 finding 4).
 func (s *Service) applyIsolatePolicy(ctx context.Context, sb *models.Sandbox) error {
+	unlock := s.egressHoldLocks.lock(sb.ID)
+	defer unlock()
+	return s.applyIsolatePolicyLocked(ctx, sb)
+}
+
+// applyIsolatePolicyLocked runs under the sandbox's hold lock. A hold that
+// can't be read counts as held: the isolate is pushed shut and the error
+// returned, so the apply isn't reported as done (review 3 finding 7).
+func (s *Service) applyIsolatePolicyLocked(ctx context.Context, sb *models.Sandbox) error {
 	updater, ok := s.isolate.(isolateEgressPolicyUpdater)
 	if !ok {
 		return errors.New("isolate runtime cannot update egress policy")
 	}
-	blockAll := sb.NetworkBlockAll || s.egressHeld(ctx, sb)
-	return updater.UpdateEgressPolicy(sb.ID, blockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn,
-		egressRuleSpecs(sb.NetworkEgressRules), s.egressSecrets(ctx, sb))
+	held, herr := s.egressHeld(ctx, sb)
+	blockAll := sb.NetworkBlockAll || held
+	if err := updater.UpdateEgressPolicy(sb.ID, blockAll, sb.NetworkAllowOut, sb.NetworkDenyOut, sb.NetworkEgressMode == models.NetworkEgressModeLearn,
+		egressRuleSpecs(sb.NetworkEgressRules), s.egressSecrets(ctx, sb)); err != nil {
+		return err
+	}
+	if herr != nil {
+		return fmt.Errorf("egress hold state unknown, isolate kept shut: %w", herr)
+	}
+	return nil
 }
 
-// applyContainerPolicy moves a running container sandbox from old's policy to
-// nu's (§5.8 transitions). It always tightens first: a block-all DROP covers
-// the whole swap, the old mode is torn down under it, the new one is put in
-// place, and only then is the DROP lifted. A gateway attach that fails holds
-// the sandbox (D16); the DROP stays either way.
-func (s *Service) applyContainerPolicy(ctx context.Context, old, nu *models.Sandbox) error {
+// applyContainerPolicy moves a running container sandbox to nu's policy from
+// whatever enforcement may be installed (inst, §5.8 transitions). It always
+// tightens first: a block-all DROP covers the whole swap, everything inst
+// names is torn down under it, the new mode is put in place, and only then
+// is the DROP lifted. Each step must succeed, a detach included (review 3
+// finding 4): the caller holds the sandbox on any failure, and the DROP
+// stays either way.
+func (s *Service) applyContainerPolicy(ctx context.Context, inst store.InstalledEgress, nu *models.Sandbox) error {
 	ip := nu.ContainerIP
 	if ip == "" {
 		return nil
@@ -518,18 +594,22 @@ func (s *Service) applyContainerPolicy(ctx context.Context, old, nu *models.Sand
 	if err != nil {
 		return err
 	}
-	oldGW, newGW := isGatewayMode(old), isGatewayMode(nu)
+	newGW := isGatewayMode(nu)
 	if err := cr.ApplyNetworkBlockAll(ip); err != nil {
 		return fmt.Errorf("block egress for the policy swap: %w", err)
 	}
-	// Leave the old mode. Gateway to gateway stays attached: Attach with the
-	// new spec swaps the rules and flushes what the old policy learned.
-	switch {
-	case oldGW && !newGW:
-		s.detachSandboxEgress(ctx, old, ip)
-	case !oldGW && (len(old.NetworkAllowOut) > 0 || len(old.NetworkDenyOut) > 0):
-		if err := cr.ClearEgressPolicy(ip, old.NetworkAllowOut, old.NetworkDenyOut); err != nil {
+	// Tear down every CIDR rule set that may be installed (removal is
+	// idempotent), the target's own included: it goes back in below. Gateway
+	// to gateway stays attached: Attach with the new spec swaps the rules and
+	// flushes what the old policy learned.
+	for _, r := range inst.CIDR {
+		if err := cr.ClearEgressPolicy(ip, r.Allow, r.Deny); err != nil {
 			return fmt.Errorf("clear the old egress rules: %w", err)
+		}
+	}
+	if inst.Gateway && !newGW {
+		if err := s.detachEgress(ctx, nu, ip); err != nil {
+			return fmt.Errorf("leave the egress gateway: %w", err)
 		}
 	}
 	// Holds are released by the caller once the new policy is in place

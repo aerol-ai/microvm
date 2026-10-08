@@ -370,7 +370,16 @@ type Service struct {
 	// show yet into it (review finding 1).
 	egressSyncMu   sync.RWMutex
 	egressInflight egressInflight
-	egressBlocks   egressBlockTracker
+	// egressHoldLocks serializes each sandbox's hold record with the
+	// enforcement derived from it (egress_blocks.go).
+	egressHoldLocks egressPolicyLocks
+	// egressBlocksPending holds sandboxes whose last gateway block write
+	// failed; they are re-applied from the store until one succeeds.
+	egressBlocksPending egressBlockPending
+	// egressApplyIdle is true once a pass found no apply_failed hold left;
+	// recording one clears it. Zero (false) at start, so the first pass
+	// after a restart reads the store (review 3 finding 8).
+	egressApplyIdle atomic.Bool
 	// egressRecovering single-flights the table-loss recovery, and
 	// egressGaugeBatch/egressGaugeDirty defer the held gauge's refresh to
 	// the end of a batch (review finding 12).

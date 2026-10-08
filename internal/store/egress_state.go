@@ -19,35 +19,43 @@ type EgressState struct {
 	InspectCA bool
 	// Withheld are the env keys the sandbox holds placeholders for (P3-2).
 	Withheld []string
-	// Applied is the policy last applied to the sandbox; nil when the stored
-	// policy is the applied one.
-	Applied *AppliedPolicy
+	// Installed is the host enforcement that may be in place for the
+	// sandbox; nil when it is what the stored policy installs.
+	Installed *InstalledEgress
 }
 
-// AppliedPolicy is the part of a sandbox's egress policy that decides what
-// is enforced and how it is torn down.
-type AppliedPolicy struct {
-	BlockAll bool     `json:"block_all,omitempty"`
-	AllowOut []string `json:"allow_out,omitempty"`
-	DenyOut  []string `json:"deny_out,omitempty"`
-	Mode     string   `json:"mode,omitempty"`
+// InstalledEgress is the host enforcement that may be in place for a
+// container sandbox: whether a gateway attachment may exist, and which CIDR
+// rule sets may be installed. After a transition that didn't finish it is a
+// superset (the old enforcement and the new), so the next transition tears
+// down everything a partial apply left behind.
+type InstalledEgress struct {
+	Gateway bool        `json:"gateway,omitempty"`
+	CIDR    []CIDRRules `json:"cidr,omitempty"`
 }
 
-// SetAppliedEgressPolicy records the policy now enforced for a sandbox.
-func (s *Store) SetAppliedEgressPolicy(ctx context.Context, sandboxID string, p AppliedPolicy, now time.Time) error {
-	raw, err := json.Marshal(p)
+// CIDRRules is one CIDR rule set, as ApplyEgressPolicy installs it.
+type CIDRRules struct {
+	Allow []string `json:"allow,omitempty"`
+	Deny  []string `json:"deny,omitempty"`
+}
+
+// SetInstalledEgress records the host enforcement that may now be in place
+// for a sandbox.
+func (s *Store) SetInstalledEgress(ctx context.Context, sandboxID string, inst InstalledEgress, now time.Time) error {
+	raw, err := json.Marshal(inst)
 	if err != nil {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO sandbox_egress (sandbox_id, applied_policy_json, updated_at)
+		INSERT INTO sandbox_egress (sandbox_id, installed_egress_json, updated_at)
 		VALUES (?, ?, ?)
 		ON CONFLICT(sandbox_id) DO UPDATE SET
-			applied_policy_json = excluded.applied_policy_json,
+			installed_egress_json = excluded.installed_egress_json,
 			updated_at = excluded.updated_at
 	`, sandboxID, string(raw), now.UTC())
 	if err != nil {
-		return fmt.Errorf("set applied egress policy: %w", err)
+		return fmt.Errorf("set installed egress: %w", err)
 	}
 	return nil
 }
@@ -103,7 +111,25 @@ func (s *Store) SetEgressHold(ctx context.Context, sandboxID, reason string, now
 	return nil
 }
 
-// ClearEgressHold lifts the hold. Only a successful gateway attach calls it.
+// ClearEgressHoldIf lifts a hold only if its reason is still reason, the
+// one the caller resolved, and reports whether it did: a different hold
+// written since is left in place.
+func (s *Store) ClearEgressHoldIf(ctx context.Context, sandboxID, reason string, now time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE sandbox_egress SET hold_reason = '', hold_since = NULL, updated_at = ?
+		WHERE sandbox_id = ? AND hold_reason = ? AND hold_reason != ''
+	`, now.UTC(), sandboxID, reason)
+	if err != nil {
+		return false, fmt.Errorf("clear egress hold: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("clear egress hold: %w", err)
+	}
+	return n > 0, nil
+}
+
+// ClearEgressHold lifts the hold whatever its reason.
 func (s *Store) ClearEgressHold(ctx context.Context, sandboxID string, now time.Time) error {
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE sandbox_egress SET hold_reason = '', hold_since = NULL, updated_at = ?
@@ -120,10 +146,10 @@ func (s *Store) ClearEgressHold(ctx context.Context, sandboxID string, now time.
 func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressState, error) {
 	st := EgressState{SandboxID: sandboxID}
 	var since sql.NullTime
-	var withheld, applied string
+	var withheld, installed string
 	err := s.db.QueryRowContext(ctx, `
-		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json, applied_policy_json FROM sandbox_egress WHERE sandbox_id = ?
-	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld, &applied)
+		SELECT hold_reason, hold_since, inspect_ca, withheld_env_json, installed_egress_json FROM sandbox_egress WHERE sandbox_id = ?
+	`, sandboxID).Scan(&st.HoldReason, &since, &st.InspectCA, &withheld, &installed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return st, nil
 	}
@@ -138,10 +164,10 @@ func (s *Store) GetEgressState(ctx context.Context, sandboxID string) (EgressSta
 			return st, fmt.Errorf("get egress state: withheld env keys: %w", err)
 		}
 	}
-	if applied != "" {
-		st.Applied = &AppliedPolicy{}
-		if err := json.Unmarshal([]byte(applied), st.Applied); err != nil {
-			return st, fmt.Errorf("get egress state: applied policy: %w", err)
+	if installed != "" {
+		st.Installed = &InstalledEgress{}
+		if err := json.Unmarshal([]byte(installed), st.Installed); err != nil {
+			return st, fmt.Errorf("get egress state: installed egress: %w", err)
 		}
 	}
 	return st, nil

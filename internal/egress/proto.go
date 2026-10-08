@@ -36,7 +36,21 @@ const (
 	opRetain     = "retain_learned"
 	opNodeCtl    = "node_control"
 	opInspectCA  = "set_inspect_ca"
+	opBlockGen   = "block_gen"
 )
+
+// syncPayload is a full Sync: the specs, and the number of the newest block
+// write the snapshot they were built from covers (Gateway.SyncSince). A
+// bare spec array, from a client that doesn't send it, is treated as
+// current.
+type syncPayload struct {
+	Specs []Spec `json:"specs"`
+	Since uint64 `json:"since"`
+}
+
+type blockGenPayload struct {
+	Gen uint64 `json:"gen"`
+}
 
 // request is one client frame.
 type request struct {

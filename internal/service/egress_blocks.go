@@ -3,77 +3,118 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// egressBlockTracker records which sandboxes had a gateway block (hold,
-// quota) change while a full Sync was being built and applied. The Sync
-// replaces the gateway's state with specs read from the store at its start,
-// so a change landing in between would be undone; the changed sandboxes are
-// re-applied from the store once the Sync is done (review 2 finding 2).
-// Block writers aren't held off meanwhile: a hold must take effect at once.
-type egressBlockTracker struct {
-	mu      sync.Mutex
-	active  bool
-	changed map[string]bool
+// Hold enforcement has one lifecycle across every writer (PR #622 review
+// 3). A sandbox's hold record and everything enforced from it (the host
+// hold DROP, the gateway's hold block, a mediator's block-all) change only
+// under the sandbox's hold lock (Service.egressHoldLocks), so a release
+// that read a weaker reason can't lift the external blocks of a stronger
+// hold that arrived meanwhile: the hold waits, then lands on top. The
+// record is the truth; every external layer is derived from it.
+//
+// A block write that doesn't reach the gateway is not forgotten: the
+// sandbox goes into egressBlockPending and its blocks are re-applied from
+// the store until one write succeeds. A full Sync re-applies them after
+// its replacement and fails while any is still pending, so the gateway is
+// not reported ready on a state that is missing a hold.
+
+// egressBlockPending is the set of sandboxes whose gateway blocks may differ
+// from their record.
+type egressBlockPending struct {
+	mu  sync.Mutex
+	ids map[string]bool
 }
 
-func (t *egressBlockTracker) start() {
-	t.mu.Lock()
-	t.active, t.changed = true, map[string]bool{}
-	t.mu.Unlock()
+func (p *egressBlockPending) add(id string) {
+	p.mu.Lock()
+	if p.ids == nil {
+		p.ids = map[string]bool{}
+	}
+	p.ids[id] = true
+	p.mu.Unlock()
 }
 
-func (t *egressBlockTracker) stop() []string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.active = false
-	out := make([]string, 0, len(t.changed))
-	for id := range t.changed {
+func (p *egressBlockPending) remove(id string) {
+	p.mu.Lock()
+	delete(p.ids, id)
+	p.mu.Unlock()
+}
+
+func (p *egressBlockPending) list() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.ids))
+	for id := range p.ids {
 		out = append(out, id)
 	}
-	t.changed = nil
+	sort.Strings(out)
 	return out
 }
 
-func (t *egressBlockTracker) seen(id string) {
-	t.mu.Lock()
-	if t.active {
-		t.changed[id] = true
+// setGatewayBlock sends one block write to the gateway. A sandbox the
+// gateway doesn't have is fine (the gateway keeps the write for its attach);
+// any other failure leaves the sandbox pending.
+func (s *Service) setGatewayBlock(ctx context.Context, id string, reason egress.BlockReason, on bool) error {
+	err := s.egressGateway().SetBlocked(ctx, id, reason, on)
+	if err == nil || errors.Is(err, egress.ErrNotAttached) {
+		return nil
 	}
-	t.mu.Unlock()
+	s.egressBlocksPending.add(id)
+	return err
 }
 
-// egressBlockSeen notes a block change for a Sync in progress. Writers call
-// it after recording the change in the store and before telling the
-// gateway.
-func (s *Service) egressBlockSeen(id string) { s.egressBlocks.seen(id) }
+// retryPendingBlocks re-applies, from the store, the gateway blocks of every
+// sandbox whose last block write failed. It reports the ones still failing.
+func (s *Service) retryPendingBlocks(ctx context.Context) error {
+	var errs []error
+	for _, id := range s.egressBlocksPending.list() {
+		unlock := s.egressHoldLocks.lock(id)
+		err := s.reapplyBlocksLocked(ctx, id)
+		unlock()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", id, err))
+			continue
+		}
+		s.egressBlocksPending.remove(id)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("egress: gateway blocks not applied: %w", err)
+	}
+	return nil
+}
 
-// reapplyBlocks sets each sandbox's gateway hold and quota blocks to what
-// the store says now.
-func (s *Service) reapplyBlocks(ctx context.Context, ids []string) {
+// reapplyBlocksLocked sets a sandbox's gateway hold and quota blocks to what
+// the store says now. Callers hold the sandbox's hold lock.
+func (s *Service) reapplyBlocksLocked(ctx context.Context, id string) error {
+	sb, err := s.store.Get(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	held, err := s.egressHeld(ctx, sb)
+	if err != nil {
+		return err
+	}
 	gw := s.egressGateway()
-	for _, id := range ids {
-		sb, err := s.store.Get(ctx, id)
-		if err != nil {
-			continue
-		}
-		st, err := s.store.GetEgressState(ctx, id)
-		if err != nil {
-			continue
-		}
-		for reason, on := range map[egress.BlockReason]bool{
-			egress.BlockHold:  st.HoldReason != "",
-			egress.BlockQuota: gatewayQuotaBlocked(sb),
-		} {
-			if err := gw.SetBlocked(ctx, id, reason, on); err != nil && !errors.Is(err, egress.ErrNotAttached) {
-				s.logger.Warn("egress: block not re-applied after the full sync", "sandbox_id", id, "error", err)
-			}
+	for _, b := range []struct {
+		reason egress.BlockReason
+		on     bool
+	}{{egress.BlockHold, held}, {egress.BlockQuota, gatewayQuotaBlocked(sb)}} {
+		if err := gw.SetBlocked(ctx, id, b.reason, b.on); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+			return err
 		}
 	}
+	return nil
 }
 
 // gatewayQuotaBlocked reports whether the stored row puts the sandbox over
@@ -83,11 +124,17 @@ func gatewayQuotaBlocked(sb *models.Sandbox) bool {
 	return sb.NetworkQuotaExceeded && sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit
 }
 
-// egressHeld reports whether a sandbox has any hold recorded.
-func (s *Service) egressHeld(ctx context.Context, sb *models.Sandbox) bool {
+// egressHeld reports whether a sandbox has a hold recorded. A record that
+// can't be read counts as held: every caller derives a block from it, and an
+// unknown hold must never reopen a sandbox (review 3 finding 7). The error
+// is returned too, for callers that report an apply as unconfirmed.
+func (s *Service) egressHeld(ctx context.Context, sb *models.Sandbox) (bool, error) {
 	if s.store == nil {
-		return false
+		return false, nil
 	}
 	st, err := s.store.GetEgressState(ctx, sb.ID)
-	return err == nil && st.HoldReason != ""
+	if err != nil {
+		return true, err
+	}
+	return st.HoldReason != "", nil
 }

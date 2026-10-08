@@ -162,7 +162,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	// didn't change while the profile was unreadable.
 	held := isProfileHold(st.HoldReason)
 	if held || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
-		if err := s.recordAppliedBeforeChange(ctx, old, st); err != nil {
+		if err := s.markTransition(ctx, old, &next, st); err != nil {
 			return err
 		}
 		if err := s.store.WriteNetworkPolicy(ctx, id, store.NetworkPolicyWrite{
@@ -187,7 +187,7 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 // sandbox gets the record only; its start re-applies through the pass.
 func (s *Service) holdForProfiles(ctx context.Context, sb *models.Sandbox, reason string) {
 	if sb.Status != models.SandboxStatusStarted {
-		if err := s.recordHold(ctx, sb.ID, reason); err == nil {
+		if err := s.recordHoldOnly(ctx, sb.ID, reason); err == nil {
 			s.refreshHeldGauge(ctx)
 		}
 		return

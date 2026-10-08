@@ -14,8 +14,9 @@ import (
 // acceptingGateway attaches everything, so a gateway-mode create succeeds.
 type acceptingGateway struct{ egress.Noop }
 
-func (acceptingGateway) Attach(context.Context, egress.Spec) error { return nil }
-func (acceptingGateway) Sync(context.Context, []egress.Spec) error { return nil }
+func (acceptingGateway) Attach(context.Context, egress.Spec) error         { return nil }
+func (acceptingGateway) BlockGen(context.Context) (uint64, error)          { return 0, nil }
+func (acceptingGateway) Sync(context.Context, []egress.Spec, uint64) error { return nil }
 func (acceptingGateway) Ready(context.Context) (egress.ReadyStatus, error) {
 	return egress.ReadyStatus{}, nil
 }
