@@ -104,3 +104,123 @@ func TestCleanupBlockLiftsWhenCleanupSucceeds(t *testing.T) {
 		t.Fatal("the redone sweep must delete an element the shadow doesn't know")
 	}
 }
+
+// TestSyncSinceKeepsNewerBlockWrites (review 3 finding 1): a full Sync
+// built from a snapshot taken before a block write never undoes it; a write
+// the snapshot covers is replaced by the spec, a release included.
+func TestSyncSinceKeepsNewerBlockWrites(t *testing.T) {
+	g := New(Options{Backend: NewMemBackend()})
+	if err := g.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	a, b := allowSpec("a", ipA, "pypi.org"), allowSpec("b", ipB, "pypi.org")
+	for _, s := range []Spec{a, b} {
+		if err := g.Attach(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// b is held before the snapshot and released in it.
+	if err := g.SetBlocked("b", BlockHold, true); err != nil {
+		t.Fatal(err)
+	}
+	since := g.BlockGen()
+	// a is held after the snapshot was read: the stale spec says unheld.
+	if err := g.SetBlocked("a", BlockHold, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SyncSince(since, []Spec{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	if !g.IsBlocked("a") {
+		t.Fatal("a stale snapshot lifted a hold written after it")
+	}
+	if g.IsBlocked("b") {
+		t.Fatal("a hold the snapshot covers is replaced by the spec")
+	}
+	// A release written after the snapshot wins over a stale held spec.
+	since = g.BlockGen()
+	if err := g.SetBlocked("a", BlockHold, false); err != nil {
+		t.Fatal(err)
+	}
+	held := a
+	held.Blocked = BlockHold
+	if err := g.SyncSince(since, []Spec{held, b}); err != nil {
+		t.Fatal(err)
+	}
+	if g.IsBlocked("a") {
+		t.Fatal("a release written after the snapshot must win over its stale hold")
+	}
+	// A plain Sync is current: it covers every write and drops the records.
+	if err := g.Sync([]Spec{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	g.mu.RLock()
+	n := len(g.writes)
+	g.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("writes a Sync covers must be dropped, %d left", n)
+	}
+}
+
+// TestAttachTakesABlockWrittenBeforeIt: a hold set while the sandbox wasn't
+// attached (racing its attach) applies when it attaches; a release doesn't
+// lift a spec's hold that way. RetainBlocks drops records of sandboxes the
+// node no longer holds.
+func TestAttachTakesABlockWrittenBeforeIt(t *testing.T) {
+	g := New(Options{Backend: NewMemBackend()})
+	if err := g.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.SetBlocked("sb", BlockHold, true); !errors.Is(err, ErrNotAttached) {
+		t.Fatalf("SetBlocked before attach = %v", err)
+	}
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org")); err != nil {
+		t.Fatal(err)
+	}
+	if !g.IsBlocked("sb") {
+		t.Fatal("a hold written before the attach must apply")
+	}
+	if err := g.SetBlocked("other", BlockHold, false); !errors.Is(err, ErrNotAttached) {
+		t.Fatal(err)
+	}
+	held := allowSpec("other", ipB, "pypi.org")
+	held.Blocked = BlockHold
+	if err := g.Attach(held); err != nil {
+		t.Fatal(err)
+	}
+	if !g.IsBlocked("other") {
+		t.Fatal("a release written before the attach must not lift the spec's hold")
+	}
+	g.RetainBlocks([]string{"sb"})
+	g.mu.RLock()
+	_, kept := g.writes["sb"]
+	_, dropped := g.writes["other"]
+	g.mu.RUnlock()
+	if !kept || dropped {
+		t.Fatalf("RetainBlocks kept=%v dropped=%v", kept, dropped)
+	}
+}
+
+// TestAttachKeepsTheCleanupBlockUntilClean (review 3 finding 5): a source
+// with cleanup pending is attached shut, and the block lifts once the
+// cleanup, a redone sweep included, has finished.
+func TestAttachKeepsTheCleanupBlockUntilClean(t *testing.T) {
+	be := NewMemBackend()
+	g := New(Options{Backend: be})
+	if err := g.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	g.learnedMu.Lock()
+	g.sweepPending[ipA] = true
+	g.learnedMu.Unlock()
+	stale := Elem{Src: ipA, Dst: netip.MustParseAddr("140.82.112.3"), Port: 22}
+	if err := be.Apply([]Op{{Set: SetAllowLearned, Elems: []Elem{stale}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Attach(allowSpec("sb", ipA, "pypi.org")); err != nil {
+		t.Fatal(err)
+	}
+	if be.Has(SetAllowLearned, stale) || g.IsBlocked("sb") || be.Has(SetBlockedSrc, Elem{Src: ipA}) {
+		t.Fatal("a successful cleanup must delete the stale element and lift the block")
+	}
+}

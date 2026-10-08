@@ -113,7 +113,7 @@ func (p *Proxy) serveTLS(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	p.observe(Decision{SandboxID: id, Host: host, Port: 443, Allowed: true, Rule: rule, Mode: src.Mode})
-	p.splice(c, up, br, id, host, 443, pol, nameAllowed, upDst)
+	p.splice(c, up, br, admission{ip: src.Spec.IP, id: id, host: host, port: 443, pol: pol, nameAllowed: nameAllowed}, upDst)
 }
 
 // egresspolicyRefused reports a dial the shared guard refused (loopback,

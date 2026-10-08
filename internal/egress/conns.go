@@ -144,15 +144,25 @@ func (g *Gateway) RevalidateConns(revoke func(pol *egresspolicy.Policy, host str
 
 // permits reports whether e's policy still allows a proxied connection to
 // host on port, by the same rule the proxy applied when it opened it.
-func (e *entry) permits(host string, port uint16) bool {
-	if e.mode != ModeAllowlist {
+func (e *entry) permits(host string, port uint16) bool { return permits(e.mode, e.pol, host, port) }
+
+// Permits is the test a policy change applies to a source's open
+// connections, against its current policy: the proxy uses it on a
+// connection registered after the change's sweep.
+func (s Source) Permits(host string, port uint16) bool { return permits(s.Mode, s.Policy, host, port) }
+
+func permits(mode Mode, pol *egresspolicy.Policy, host string, port uint16) bool {
+	if mode != ModeAllowlist {
 		return true
 	}
+	if pol == nil {
+		return false
+	}
 	if ip, err := netip.ParseAddr(host); err == nil {
-		ok, _ := e.pol.MatchIP(ip, port)
+		ok, _ := pol.MatchIP(ip, port)
 		return ok
 	}
-	ok, _ := e.pol.MatchHostPort(host, port)
+	ok, _ := pol.MatchHostPort(host, port)
 	return ok
 }
 

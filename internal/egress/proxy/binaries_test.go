@@ -174,7 +174,9 @@ func TestBinariesTraced(t *testing.T) {
 	}
 	// A dial the guard refuses (the backend address is unknown here).
 	id.set("/usr/bin/git", nil)
+	r.dialer.mu.Lock()
 	delete(r.dialer.backend, "93.184.216.34")
+	r.dialer.mu.Unlock()
 	if _, err := dial(); err == nil || r.last().Reason != ReasonDialFailed {
 		t.Fatalf("dial failure: %v %+v", err, r.last())
 	}

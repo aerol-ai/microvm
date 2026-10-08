@@ -47,19 +47,25 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 				// the sandbox dial guard (which would refuse its private
 				// address) does not apply.
 				d := net.Dialer{Timeout: p.cfg.DialTimeout}
-				c, err := d.DialContext(ctx, network, addr)
+				uc, err := d.DialContext(ctx, network, addr)
 				if err != nil {
 					return nil, fmt.Errorf("%w: %v", egresspolicy.ErrUpstreamProxy, err)
 				}
-				return c, nil
+				// No sandbox destination to record, but the sandbox is
+				// checked again now that the dial is done.
+				if err := p.admitDialed(uc, netip.AddrPort{}, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, nameAllowed: curAllowed}); err != nil {
+					return nil, err
+				}
+				return uc, nil
 			}
 			uc, dst, err := p.dialGuarded(ctx, pol, curName, curAllowed, network, addr)
 			if err != nil {
 				return nil, err
 			}
 			// Recorded on the tracked downstream (so a reloaded guard
-			// revokes the exchange) and checked against the current guard.
-			if err := p.admitDialed(uc, dst, tracked, pol, curName, curAllowed); err != nil {
+			// revokes the exchange), checked against the current guard, and
+			// the sandbox checked again.
+			if err := p.admitDialed(uc, dst, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, nameAllowed: curAllowed}); err != nil {
 				return nil, err
 			}
 			return uc, nil
@@ -145,7 +151,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			// After a validated Upgrade (websocket) the exchange is no longer
 			// HTTP request/response: dial once, forward the request, then
 			// splice raw bytes both ways.
-			p.upgrade(c, br, req, id, host, target, pol, curAllowed, curProxied)
+			p.upgrade(c, br, req, admission{ip: peer, id: id, host: host, port: 80, pol: pol, nameAllowed: curAllowed}, target, curProxied)
 			return
 		}
 		req.URL.Scheme = "http"
@@ -202,7 +208,8 @@ func ruleDenyMessage(req *http.Request, host, reason string) string {
 	return fmt.Sprintf("aerolvm egress policy: %s %s on %s is not allowed by network_egress_rules", req.Method, req.URL.EscapedPath(), host)
 }
 
-func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, host, target string, pol *egresspolicy.Policy, allowed, proxied bool) {
+func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, a admission, target string, proxied bool) {
+	host := a.host
 	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.DialTimeout)
 	var up net.Conn
 	var upDst netip.AddrPort
@@ -212,7 +219,7 @@ func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, hos
 	if chain := p.upstream(); proxied && chain != nil {
 		up, err = chain.DialConnect(ctx, target)
 	} else {
-		up, upDst, err = p.dialGuarded(ctx, pol, host, allowed, "tcp", target)
+		up, upDst, err = p.dialGuarded(ctx, a.pol, host, a.nameAllowed, "tcp", target)
 	}
 	cancel()
 	if err != nil {
@@ -223,7 +230,7 @@ func (p *Proxy) upgrade(c net.Conn, br *bufio.Reader, req *http.Request, id, hos
 		_ = up.Close()
 		return
 	}
-	p.splice(c, up, br, id, host, 80, pol, allowed, upDst)
+	p.splice(c, up, br, a, upDst)
 }
 
 // requestHost returns the request's host without port. The port, if any,

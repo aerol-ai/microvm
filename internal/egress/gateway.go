@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/netip"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -121,6 +123,15 @@ type Gateway struct {
 	// couldn't list: the elements are unknown, so the sweep is redone.
 	sweepPending map[netip.Addr]bool
 
+	// blockGen numbers block writes, and writes keeps each sandbox's newest
+	// write per reason, attached or not (guarded by mu). A full Sync carries
+	// the number sandboxd read before taking its snapshot, so a write that
+	// reached the gateway after that is newer than the snapshot and is kept
+	// over it: a stale Sync never lifts a newer hold, nor re-sets a block a
+	// newer release lifted (PR #622 review 3 finding 1).
+	blockGen atomic.Uint64
+	writes   map[string]*blockWrites
+
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
 
@@ -145,6 +156,7 @@ func New(opts Options) *Gateway {
 		pendingLearned: map[netip.Addr]map[string][]Elem{},
 		pendingCT:      map[netip.Addr]struct{}{},
 		sweepPending:   map[netip.Addr]bool{},
+		writes:         map[string]*blockWrites{},
 		conns:          map[string]map[*TrackedConn]struct{}{},
 	}
 	if g.maxLrn <= 0 {
@@ -384,17 +396,34 @@ func (g *Gateway) Attach(spec Spec) error {
 	g.mu.RLock()
 	old := g.byID[spec.ID]
 	prevOwner, owned := g.bySrc[spec.IP]
+	if w := g.writes[spec.ID]; w != nil {
+		// A block set while the sandbox wasn't attached (a hold racing this
+		// attach) applies now. Only blocks: a lift reaches an attached
+		// sandbox through SetBlocked.
+		nu.blocked |= w.on & serviceBlocks
+	}
 	g.mu.RUnlock()
 	if old != nil {
 		// Keep block reasons the gateway already holds (e.g. a hold set while
-		// sandboxd computed this spec): blocks only lift via SetBlocked.
-		nu.blocked |= old.blocked &^ (BlockRestart | BlockCleanup)
+		// sandboxd computed this spec): blocks only lift via SetBlocked. The
+		// cleanup block stays until the cleanup below finishes.
+		nu.blocked |= old.blocked &^ BlockRestart
 	}
 	if owned && prevOwner != spec.ID {
 		g.log.Warn("egress: attach purges previous owner of recycled ip", "ip", spec.IP, "previous", prevOwner, "sandbox_id", spec.ID)
 		if err := g.purge(prevOwner); err != nil {
 			return err
 		}
+	}
+	srcs := []netip.Addr{spec.IP}
+	if old != nil && old.spec.IP != spec.IP {
+		srcs = append(srcs, old.spec.IP)
+	}
+	// A source with revocation work left, its own or a purged previous
+	// owner's, is shut from the first kernel write: the block lifts only
+	// once the cleanup has finished (review 3 finding 5).
+	if g.cleanupPending(spec.IP) {
+		nu.blocked |= BlockCleanup
 	}
 	var ops []Op
 	if old != nil && old.spec.IP != spec.IP {
@@ -429,11 +458,7 @@ func (g *Gateway) Attach(spec Spec) error {
 		g.closeConns(spec.ID)
 		g.flushConntrack(spec.IP)
 	}
-	srcs := []netip.Addr{spec.IP}
-	if old != nil && old.spec.IP != spec.IP {
-		srcs = append(srcs, old.spec.IP)
-	}
-	if err := g.retryCleanup(srcs...); err != nil {
+	if err := g.finishCleanup(srcs...); err != nil {
 		// Shut it here too, not only through sandboxd's hold: the gateway
 		// itself never serves a source with revoked entries left.
 		if berr := g.setCleanupBlock(nu, true); berr != nil {
@@ -441,7 +466,31 @@ func (g *Gateway) Attach(spec Spec) error {
 		}
 		return fmt.Errorf("%w: attach %s: %v", ErrUnavailable, spec.ID, err)
 	}
+	if nu.blocked&BlockCleanup != 0 {
+		if err := g.setCleanupBlock(nu, false); err != nil {
+			return fmt.Errorf("%w: attach %s: lift the cleanup block: %v", ErrUnavailable, spec.ID, err)
+		}
+	}
 	return nil
+}
+
+// finishCleanup completes every pending revocation stage of the given
+// sources: a sweep a Sync couldn't list, then the learned deletes and
+// conntrack flushes. A source is clean only when all three are done.
+func (g *Gateway) finishCleanup(srcs ...netip.Addr) error {
+	var errs []error
+	for _, src := range srcs {
+		if g.sweepPendingFor(src) {
+			if err := g.resweep(src); err != nil {
+				errs = append(errs, fmt.Errorf("sweep learned elements of %s: %w", src, err))
+				continue
+			}
+		}
+		if err := g.retryCleanup(src); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // cleanupPending reports whether a source has revocation work left.
@@ -544,6 +593,12 @@ func (g *Gateway) SetBlocked(id string, reason BlockReason, on bool) error {
 	unlock := g.lockSandbox(id)
 	defer unlock()
 	g.mu.Lock()
+	w := g.writes[id]
+	if w == nil {
+		w = &blockWrites{}
+		g.writes[id] = w
+	}
+	w.set(reason&serviceBlocks, on, g.blockGen.Add(1))
 	cur := g.byID[id]
 	if cur == nil {
 		g.mu.Unlock()
@@ -585,12 +640,23 @@ func (g *Gateway) applyBlockedLocked(e *entry) error {
 	return nil
 }
 
-// Sync replaces the whole gateway state with sandboxd's (D13). Managed sets
-// are replaced atomically. Learned elements and recordings survive for
+// BlockGen is the number of the newest block write. sandboxd reads it
+// before the snapshot a full Sync is built from and passes it to SyncSince.
+func (g *Gateway) BlockGen() uint64 { return g.blockGen.Load() }
+
+// Sync replaces the gateway state with specs that are current as of the
+// call: every earlier block write is covered by them. sandboxd, whose
+// snapshot is older than its call, uses SyncSince.
+func (g *Gateway) Sync(specs []Spec) error { return g.SyncSince(math.MaxUint64, specs) }
+
+// SyncSince replaces the whole gateway state with sandboxd's (D13), from a
+// snapshot taken after block write number since. A block write newer than
+// that keeps its effect over the spec's block reasons. Managed sets are
+// replaced atomically. Learned elements and recordings survive for
 // sandboxes whose policy is unchanged and are flushed for removed or changed
 // ones. Sync also lifts the restart block. It runs alone: no Attach, Detach
 // or SetBlocked is between its kernel write and its map swap.
-func (g *Gateway) Sync(specs []Spec) error {
+func (g *Gateway) SyncSince(since uint64, specs []Spec) error {
 	next := map[string]*entry{}
 	for _, s := range specs {
 		e, err := compile(s)
@@ -599,6 +665,17 @@ func (g *Gateway) Sync(specs []Spec) error {
 		}
 		next[s.ID] = e
 	}
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	// Under opMu every block write is either here already, or waits and
+	// lands after the swap.
+	g.mu.RLock()
+	for id, e := range next {
+		if w := g.writes[id]; w != nil {
+			e.blocked = w.newerThan(since, e.blocked)
+		}
+	}
+	g.mu.RUnlock()
 	contents := map[string][]Elem{}
 	for _, name := range managedSets {
 		contents[name] = nil
@@ -608,8 +685,6 @@ func (g *Gateway) Sync(specs []Spec) error {
 			contents[name] = append(contents[name], elems...)
 		}
 	}
-	g.opMu.Lock()
-	defer g.opMu.Unlock()
 	if err := g.be.Replace(contents); err != nil {
 		return fmt.Errorf("%w: sync: %v", ErrUnavailable, err)
 	}
@@ -620,6 +695,12 @@ func (g *Gateway) Sync(specs []Spec) error {
 	for id, e := range next {
 		e.inBlockedSrc = e.kernelBlocked()
 		g.bySrc[e.spec.IP] = id
+	}
+	// The snapshot covers every write up to since.
+	for id, w := range g.writes {
+		if w.newest() <= since {
+			delete(g.writes, id)
+		}
 	}
 	g.mu.Unlock()
 	changed := map[string]bool{}
@@ -758,6 +839,23 @@ func (g *Gateway) resweep(src netip.Addr) error {
 	delete(g.sweepPending, src)
 	g.learnedMu.Unlock()
 	return nil
+}
+
+// RetainBlocks drops the block writes of sandboxes not in ids, sandboxd's
+// inventory of the sandboxes this node holds: a sandbox held but never
+// attached (a CIDR policy) leaves a record nothing else removes.
+func (g *Gateway) RetainBlocks(ids []string) {
+	keep := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		keep[id] = true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for id := range g.writes {
+		if !keep[id] {
+			delete(g.writes, id)
+		}
+	}
 }
 
 // Lookup resolves a source IP to its sandbox, for the DNS filter and proxy.
@@ -1098,13 +1196,7 @@ func (g *Gateway) RetryDirty() error {
 	}
 	g.learnedMu.Unlock()
 	for src := range set {
-		if g.sweepPendingFor(src) {
-			if err := g.resweep(src); err != nil {
-				errs = append(errs, fmt.Errorf("sweep learned elements of %s: %w", src, err))
-				continue
-			}
-		}
-		if err := g.retryCleanup(src); err != nil {
+		if err := g.finishCleanup(src); err != nil {
 			errs = append(errs, err)
 			continue
 		}

@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -367,7 +368,7 @@ func (p *Proxy) serveTraced(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	p.observe(Decision{SandboxID: id, Host: name, Port: dst.Port(), Allowed: true, Rule: rule, Mode: src.Mode})
-	p.splice(c, up, nil, id, name, dst.Port(), src.Policy, rule != "", upDst)
+	p.splice(c, up, nil, admission{ip: src.Spec.IP, id: id, host: name, port: dst.Port(), pol: src.Policy, nameAllowed: rule != ""}, upDst)
 }
 
 // overCapClose answers an over-cap connection without reading it: the TLS
@@ -441,16 +442,52 @@ func (p *Proxy) dialGuarded(ctx context.Context, pol *egresspolicy.Policy, name 
 // after recording closes the gap (review 2 finding 7). A zero dst (a
 // connection through the operator's proxy) is neither recorded nor checked;
 // tc may be nil.
-func (p *Proxy) admitDialed(up net.Conn, dst netip.AddrPort, tc *egress.TrackedConn, pol *egresspolicy.Policy, name string, nameAllowed bool) error {
-	if !dst.IsValid() {
-		return nil
+func (p *Proxy) admitDialed(up net.Conn, dst netip.AddrPort, tc *egress.TrackedConn, a admission) error {
+	if dst.IsValid() {
+		if tc != nil {
+			tc.AddDst(dst)
+		}
+		if err := p.guard().Check(a.pol, egresspolicy.DialTarget{Name: a.host, NameAllowed: a.nameAllowed, Addr: dst}); err != nil {
+			_ = up.Close()
+			return err
+		}
 	}
 	if tc != nil {
-		tc.AddDst(dst)
+		if err := p.stillAdmitted(a); err != nil {
+			_ = up.Close()
+			return err
+		}
 	}
-	if err := p.guard().Check(pol, egresspolicy.DialTarget{Name: name, NameAllowed: nameAllowed, Addr: dst}); err != nil {
-		_ = up.Close()
-		return err
+	return nil
+}
+
+// admission is what a connection was let through for: its sandbox (by
+// source IP and id), destination, and the policy that admitted it.
+type admission struct {
+	ip          netip.Addr
+	id, host    string
+	port        uint16
+	pol         *egresspolicy.Policy
+	nameAllowed bool
+}
+
+// stillAdmitted re-reads a connection's sandbox once the connection is
+// registered (Track) and its upstream dialed. A revocation (policy change,
+// block, detach) updates the gateway's state before it sweeps registered
+// connections, so a connection registered after the sweep sees the new
+// state here, and one registered before it is closed by the sweep: a dial
+// in flight across a revocation never starts forwarding (PR #622 review 3
+// finding 6). Through the operator's proxy there is no destination
+// address, and this is the whole check.
+func (p *Proxy) stillAdmitted(a admission) error {
+	cur, ok := p.src.Source(a.ip)
+	switch {
+	case !ok || cur.Spec.ID != a.id:
+		return fmt.Errorf("egress proxy: %s no longer attached", a.id)
+	case cur.Blocked != 0:
+		return fmt.Errorf("egress proxy: %s egress is blocked", a.id)
+	case cur.Policy != a.pol && !cur.Permits(a.host, a.port):
+		return fmt.Errorf("egress proxy: %s:%d revoked by a policy change", a.host, a.port)
 	}
 	return nil
 }
@@ -458,16 +495,17 @@ func (p *Proxy) admitDialed(up net.Conn, dst netip.AddrPort, tc *egress.TrackedC
 // splice tracks the downstream conn against the sandbox (a block, detach or
 // narrowing closes it) and copies until both sides finish. dst is the
 // directly dialed upstream address (zero through the operator's proxy),
-// recorded and checked against the current guard.
-func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, id, host string, port uint16, pol *egresspolicy.Policy, nameAllowed bool, dst netip.AddrPort) {
-	tc := p.src.Track(id, host, port, c)
+// recorded and checked against the current guard; the sandbox itself is
+// checked again once the connection is tracked.
+func (p *Proxy) splice(c, up net.Conn, br *bufio.Reader, a admission, dst netip.AddrPort) {
+	tc := p.src.Track(a.id, a.host, a.port, c)
 	defer tc.Close()
 	defer up.Close()
-	if err := p.admitDialed(up, dst, tc, pol, host, nameAllowed); err != nil {
-		p.log.Debug("egress proxy: upstream refused by the current guard", "sandbox_id", id, "host", host, "error", err)
+	if err := p.admitDialed(up, dst, tc, a); err != nil {
+		p.log.Debug("egress proxy: upstream refused after registration", "sandbox_id", a.id, "host", a.host, "error", err)
 		return
 	}
 	if err := netsplice.Splice(c, up, br, netsplice.WithIdleTimeout(p.cfg.IdleTimeout)); err != nil && !errors.Is(err, netsplice.ErrIdleTimeout) {
-		p.log.Debug("egress proxy: splice", "sandbox_id", id, "error", err)
+		p.log.Debug("egress proxy: splice", "sandbox_id", a.id, "error", err)
 	}
 }

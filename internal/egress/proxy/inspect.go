@@ -133,16 +133,25 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, ds
 	up := p.upstream()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			a := admission{ip: peer, id: id, host: name, port: 443, pol: pol, nameAllowed: nameAllowed}
 			if up != nil && !up.Bypass(name) {
-				return up.DialConnect(ctx, net.JoinHostPort(name, "443"))
+				uc, err := up.DialConnect(ctx, net.JoinHostPort(name, "443"))
+				if err != nil {
+					return nil, err
+				}
+				if err := p.admitDialed(uc, netip.AddrPort{}, tc, a); err != nil {
+					return nil, err
+				}
+				return uc, nil
 			}
 			uc, dst, err := p.dialGuarded(ctx, pol, name, nameAllowed, network, net.JoinHostPort(name, "443"))
 			if err != nil {
 				return nil, err
 			}
 			// Each upstream connection of the inspected exchange is
-			// recorded on it, so a reloaded guard revokes the exchange.
-			if err := p.admitDialed(uc, dst, tc, pol, name, nameAllowed); err != nil {
+			// recorded on it, so a reloaded guard revokes the exchange, and
+			// the sandbox is checked again once dialed.
+			if err := p.admitDialed(uc, dst, tc, a); err != nil {
 				return nil, err
 			}
 			return uc, nil

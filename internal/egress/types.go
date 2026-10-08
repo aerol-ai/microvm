@@ -52,6 +52,53 @@ const (
 	BlockCleanup
 )
 
+// serviceBlocks are the reasons sandboxd sets with SetBlocked; the restart
+// and cleanup blocks are the gateway's own.
+const serviceBlocks = ^(BlockRestart | BlockCleanup)
+
+// blockWrites is a sandbox's newest block write per reason: whether it set
+// or cleared the reason, and its number.
+type blockWrites struct {
+	on  BlockReason
+	gen [8]uint64
+}
+
+func (w *blockWrites) set(reasons BlockReason, on bool, gen uint64) {
+	for i := range w.gen {
+		bit := BlockReason(1) << i
+		if reasons&bit == 0 {
+			continue
+		}
+		w.gen[i] = gen
+		if on {
+			w.on |= bit
+		} else {
+			w.on &^= bit
+		}
+	}
+}
+
+// newerThan returns blocked with every reason written after since taken
+// from the write.
+func (w *blockWrites) newerThan(since uint64, blocked BlockReason) BlockReason {
+	for i, gen := range w.gen {
+		if gen <= since {
+			continue
+		}
+		bit := BlockReason(1) << i
+		blocked = blocked&^bit | w.on&bit
+	}
+	return blocked
+}
+
+func (w *blockWrites) newest() uint64 {
+	var n uint64
+	for _, gen := range w.gen {
+		n = max(n, gen)
+	}
+	return n
+}
+
 // Spec is the desired gateway state for one sandbox, as sandboxd sends it.
 type Spec struct {
 	ID string     `json:"id"`

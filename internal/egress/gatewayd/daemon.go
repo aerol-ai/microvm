@@ -544,6 +544,14 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 	}
 }
 
+// resyncSelf re-applies the gateway's own state after a layout rebuild. A
+// block write landing between reading the state and applying it is newer
+// than the copy, so it is kept.
+func (d *Daemon) resyncSelf() error {
+	since := d.gw.BlockGen()
+	return d.gw.SyncSince(since, d.gw.Specs())
+}
+
 // heartbeat checks the table (CEO D17). On loss it rebuilds the layout in one
 // batch and re-applies its in-memory state at once, so the window without
 // filtering is one interval; the heartbeat then tells sandboxd, which holds
@@ -555,7 +563,7 @@ func (d *Daemon) heartbeat() {
 		d.log.Error("egress: nft layout lost; rebuilding", "error", err)
 		if err := d.gw.Bootstrap(); err != nil {
 			d.log.Error("egress: layout rebuild failed", "error", err)
-		} else if err := d.gw.Sync(d.gw.Specs()); err != nil {
+		} else if err := d.resyncSelf(); err != nil {
 			d.log.Error("egress: re-apply after rebuild failed", "error", err)
 		}
 	}
