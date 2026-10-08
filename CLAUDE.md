@@ -4,6 +4,10 @@ Self-hosted or managed multi-tenant Docker-backed sandbox platform. Go daemon + 
 For non-trivial changes, invoke the matching project skill before coding (they live in
 [`.claude/skills/`](./.claude/skills/) — see the "Project skills" table below).
 Read [`pr-review.md`](./pr-review.md) before opening any PR that touches the server.
+Every PR description follows [`.github/pull_request_template.md`](./.github/pull_request_template.md)
+and the §A–§D description standard in `pr-review.md`. `gh pr create --body` bypasses
+GitHub's auto-fill, so write the body from the template into a file, run the §B
+citation check on it, and pass it with `--body-file`.
 
 ## Hard rules
 
