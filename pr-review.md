@@ -2,7 +2,12 @@
 
 Every PR touching `internal/service`, `internal/store`, `pkg/caddy`, `pkg/api`, or the SDKs must be reviewed against the rules below. The PR description must explicitly call out each rule it touches — silence is not acceptable on these axes.
 
-The fill-in template lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md) and is auto-populated by GitHub when a PR is opened. This file is the rationale and the reviewer's reference; the template is what authors fill in.
+The fill-in template lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md) and is auto-populated by GitHub when a PR is opened in the web UI. This file is the rationale and the reviewer's reference; the template is what authors fill in.
+
+This file has two halves:
+
+- **§1–§8, the code rules.** What the change itself must get right (idempotency, boot latency, failure paths, cluster safety, …).
+- **§A–§D, the description standard.** How to write the PR description so that a reviewer who has never opened this repo can finish the review without asking the author anything.
 
 ## 1. Idempotency
 
@@ -322,6 +327,151 @@ the reviewer walk the same branches the code walks.
 the diagram alone? Does every error branch in the diff appear as a branch in
 the diagram?
 
+---
+
+# Writing the PR description (§A–§D)
+
+The template's "How to review" section is long on purpose. A reviewer should be
+able to open the PR, follow it top to bottom, and reach a decision without
+messaging the author or reverse-engineering the diff. §A says what to write, §B
+how to prove the names in it are real, §C how to draw the impact map, and §D
+what the reviewer does with all of it.
+
+## A. The "How to review" standard
+
+### A.1 Who it is for
+
+Write for someone who has never opened this repository: a new hire on day one,
+a support engineer, a reviewer from another team. If understanding a step needs
+knowledge that only exists in your head (or in a Slack thread), that knowledge
+belongs in the description.
+
+### A.2 The nine parts
+
+| Part | Holds | Optional when |
+|---|---|---|
+| ✅ Quick start | Commit table (# · short SHA · plain-words purpose · which Part 3 step reviews it) and the ≈ total review time. Only PR-specific notes: where to start, what is safe to skim, a stacked base. | Never |
+| 0 · The change in one picture | The problem in everyday terms (an analogy or small table) plus **real** before → after numbers, naming the data and window they came from. | Never (a test-only fix still has numbers: a pass rate over N runs, a failing CI run id) |
+| 1 · Dictionary | One line per domain term, identifier, or abbreviation the reviewer meets (L4, host-port pool, owner node, FSM apply, warm pool, …). | Trivial tier |
+| 2 · How the request flows | A 3–6 line diagram of the call path through the touched layers, with the changed hop marked. | Only one layer touched: write "(n/a: one layer)" |
+| 3 · Review steps | One step per logical change, each in the five-part format (§A.3). The most important step is marked ⭐. | Never |
+| 4 · Run the tests | Exact commands (narrow `go test -run`, coverage, SDK suites, integration target) and the expected result. | Never |
+| 5 · Try it | A table of exact inputs (SDK call, env var, command; full ids), what the reviewer should see, and what they should NOT see. | No user- or operator-visible change: say why |
+| 6 · Red flags | "❌ If you see X…" conditions that would mean the PR is wrong, including at least one behaviour that must NOT change. | Never |
+| 7 · Not in this PR | Known gaps deliberately left out, so the reviewer does not block on them. | Nothing was left out: say so |
+
+### A.3 The five-part step format
+
+Every Part 3 step has exactly these five fields:
+
+- **Open:** the file and a *searchable* name inside it (`path/to/file.go`, search **`Symbol`**). Never a line number.
+- **What it does:** before → now, in plain words, and why the change was needed.
+- **Check:** numbered yes/no questions the reviewer can answer by reading the code. Not "looks fine?"; something that is either true or false.
+- **Example:** one concrete input traced through: before it produced X, now it produces Y.
+- **Test:** the test function and file that proves it, or "no test: verified only by <how>".
+
+Worked example (written against the existing L4 bootstrap latch):
+
+> **Step 2: the L4 bootstrap retries after a failed daemon start ⭐ ⏱ 6 min**
+> - **Open:** `internal/service/service.go`, search **`ensureLayer4Ready`**
+> - **What it does:** before, if Caddy was not reachable when the daemon
+>   started, every later TCP expose failed with "layer4 app missing" until a
+>   restart. Now the first TCP expose re-runs the bootstrap once; success is
+>   remembered so later calls skip it.
+> - **Check:**
+>   1. Is `l4Ready` read with `Load()` both before *and* after taking `l4Mu`, so
+>      concurrent first callers trigger exactly one bootstrap?
+>   2. On a bootstrap error, does the function return before `l4Ready.Store(true)`,
+>      leaving the latch unset for the next caller?
+> - **Example:** daemon starts while Caddy is down, then Caddy comes up. Before:
+>   the first `ExposePort(..., "tcp")` errored. After: it bootstraps L4 and
+>   returns a `tcp://` URL.
+> - **Test:** `TestEnsureLayer4ReadyRetriesAfterBootFailure` in
+>   `internal/service/layer4_bootstrap_test.go`
+
+### A.4 Writing rules
+
+1. **Searchable names, never line numbers.** Lines drift with every push; a function name does not.
+2. **Real, verified numbers.** Every number comes from something you ran. Say the command, data, and window (`go test -count=50`, "CI run 37346773781", "3 boots on a c7i.xlarge"). "Should be faster" is not a number.
+3. **Full ids.** Sandbox ids, node ids, CI run ids, and PR numbers are written in full. Short commit SHAs are allowed only in the Quick start table.
+4. **Plain words first, precision second.** The Summary has no backticked identifiers; precision goes in "What changed" and Part 3.
+5. **One step per logical change,** ordered by commit or by data flow, not by file name.
+6. **Every step names its test** or says "no test: verified only by <how>".
+7. **Mark the single most important step with ⭐,** the one that, if wrong, makes the PR wrong.
+8. **Honest times.** Each step has a ⏱ estimate; the Quick start total is their sum.
+9. **Write only what is true of THIS PR.** Do not restate the review procedure (§D) or generic advice. A line that would read the same in any PR is deleted.
+
+### A.5 Tiers
+
+| Tier | When | What is required |
+|---|---|---|
+| Trivial | Docs, comments, version pin, or mechanical rename; no behaviour change; ≲ 50 lines | Summary, impact map, Quick start, one Part 3 step, Part 6. Safety axes answered with "N/A - <reason>". |
+| Standard | Everything else that changes behaviour | All nine parts (with the "optional when" rules from §A.2), code-path diagram (§8), all Safety axes. |
+| High-risk | Touches the TCP host-port pool or L4 bootstrap (§6), cluster placement / FSM / forwarding (§7), the `CreateSandbox` boot path (§2), the store schema, or mount inputs (§5) | Standard, plus: Part 5 is mandatory (a local daemon run or a named integration target), Part 6 lists at least three red flags, and every touched Safety axis is answered with specifics. "N/A" on a touched axis is a bounce. |
+
+## B. Citation check
+
+Every function, test, and file named in the description must exist on the
+branch head. Reviewers spot-check at least three names; one missing name is
+enough to bounce the description back. Run this against your draft before
+posting (write the draft to a file and use `gh pr create --body-file`):
+
+```bash
+body=pr-body.md   # your draft description
+# Tests cited as `TestXxx` must be real test functions.
+grep -oE '`Test[A-Z][A-Za-z0-9_]*`' "$body" | tr -d '`' | sort -u | while read -r t; do
+  git grep -qE "func $t\(" -- '*_test.go' || echo "MISSING test:   $t"
+done
+# Names cited as "search **`Name`**" must be real Go functions or methods.
+grep -oE '\*\*`[^`]+`\*\*' "$body" | tr -d '*`' | sed 's/.*\.//' | sort -u | while read -r f; do
+  git grep -qE "func (\([^)]*\) )?$f[\[(]" -- '*.go' || echo "MISSING symbol: $f"
+done
+# Backticked repo paths must exist.
+grep -oE '`[A-Za-z0-9_./-]+/[A-Za-z0-9_.-]+`' "$body" | tr -d '`' | sed 's#/\.\.\.$##' | sort -u | while read -r p; do
+  [ -e "$p" ] || echo "MISSING path:   $p"
+done
+```
+
+No output means every cited name resolved. The script cannot judge whether a
+name is the *right* one; that is still the reviewer's call.
+
+## C. The repo impact map
+
+The impact map answers "which layers does this PR touch?" before the reviewer
+opens a file. It is a different diagram from the §8 code-path diagram, which
+answers "how does control flow through the changed code?".
+
+- Start from the starter diagram in the template. Delete every node and edge
+  the PR does not touch.
+- Put every touched node in the `touched` class.
+- Label new or changed edges (`-->|"new: …"|`, `-->|"changed: …"|`).
+- At most 12 nodes. Needing more means the PR is too big; split it.
+- It must match the diff. A touched node with no file in the diff, or a changed
+  directory with no node, is a bounce.
+- Required on every PR, test-only and docs-only included (one or two touched
+  nodes is a fine map). The §8 code-path diagram may be N/A for docs, comment,
+  or test-only changes; the impact map may not.
+
+## D. Review procedure
+
+This is the same for every PR, which is why authors do not repeat it in the
+description (§A.4 rule 9).
+
+1. **Orient (≤ 3 min).** Read the Summary and the impact map. If you cannot say
+   in one sentence what the PR does and which layers it touches, bounce the
+   description.
+2. **Check out the branch:** `gh pr checkout <number>`.
+3. **Run Part 4 first.** If anything is red, stop and bounce with the output.
+4. **Spot-check citations (§B).** Pick at least three names from Part 3 and
+   confirm they exist. One missing name means bounce.
+5. **Walk Part 3 in order.** Answer every Check item yes or no. Start from the ⭐
+   step if time is short.
+6. **Do Part 5** when present, using the exact inputs given.
+7. **Go through Part 6** and the Safety axes against §1–§8. A touched axis
+   answered "N/A" is a bounce.
+8. **Decide.** Approve, or request changes citing the step and Check number
+   ("Step 2, Check 1: …"), or bounce the description citing the missing part.
+
 ## PR description template
 
-Lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub auto-fills new PRs with it. Authors must answer every section; "N/A — <one-line reason>" is valid, empty is not.
+Lives at [`.github/pull_request_template.md`](./.github/pull_request_template.md). GitHub auto-fills new PRs with it when they are opened in the web UI; `gh pr create --body` and most agents bypass the auto-fill, so build the body from the template yourself (`gh pr create --body-file`). Authors must answer every section; "N/A — <one-line reason>" is valid, empty is not.
