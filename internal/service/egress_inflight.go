@@ -54,6 +54,13 @@ func (f *egressInflight) ids() []string {
 	return out
 }
 
+func (f *egressInflight) has(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.m[id]
+	return ok
+}
+
 func (f *egressInflight) len() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

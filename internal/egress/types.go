@@ -9,6 +9,8 @@
 package egress
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -51,6 +53,27 @@ const (
 	// a Sync never leaves a narrowed sandbox running on what it revoked.
 	BlockCleanup
 )
+
+// SyncToken names a point in one gateway process's block writes: the
+// process's epoch, and the newest write number then (Gateway.SyncToken).
+type SyncToken struct {
+	Epoch uint64 `json:"epoch"`
+	Gen   uint64 `json:"gen"`
+}
+
+// newEpoch picks a gateway process's epoch: random, so a restarted process
+// never reuses one, and never 0, which stands for a missing token.
+func newEpoch() uint64 {
+	var b [8]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			panic("egress: no randomness for the gateway epoch: " + err.Error())
+		}
+		if e := binary.LittleEndian.Uint64(b[:]); e != 0 {
+			return e
+		}
+	}
+}
 
 // serviceBlocks are the reasons sandboxd sets with SetBlocked; the restart
 // and cleanup blocks are the gateway's own.

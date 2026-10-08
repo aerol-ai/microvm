@@ -548,8 +548,8 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 // block write landing between reading the state and applying it is newer
 // than the copy, so it is kept.
 func (d *Daemon) resyncSelf() error {
-	since := d.gw.BlockGen()
-	return d.gw.SyncSince(since, d.gw.Specs())
+	tok := d.gw.SyncToken()
+	return d.gw.SyncFrom(tok, d.gw.Specs())
 }
 
 // heartbeat checks the table (CEO D17). On loss it rebuilds the layout in one

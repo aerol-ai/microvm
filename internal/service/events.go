@@ -195,7 +195,7 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 			// before the IP is recycled to another container. A gateway-mode
 			// sandbox's lists never reached netrules; it leaves the gateway
 			// and its hold DROP instead.
-			if isGatewayMode(sandbox) {
+			if s.mayBeAttached(ctx, sandbox) {
 				s.detachSandboxEgress(ctx, sandbox, previousIP)
 				if holder, ok := cr.(runtime.EgressHolder); ok {
 					_ = holder.ClearEgressHold(previousIP)
@@ -275,7 +275,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			// before the IP is recycled to another container. A gateway-mode
 			// sandbox's lists never reached netrules; it leaves the gateway
 			// and its hold DROP instead.
-			if isGatewayMode(sandbox) {
+			if s.mayBeAttached(ctx, sandbox) {
 				s.detachSandboxEgress(ctx, sandbox, previousIP)
 				if holder, ok := cr.(runtime.EgressHolder); ok {
 					_ = holder.ClearEgressHold(previousIP)

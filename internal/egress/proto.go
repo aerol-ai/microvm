@@ -39,17 +39,13 @@ const (
 	opBlockGen   = "block_gen"
 )
 
-// syncPayload is a full Sync: the specs, and the number of the newest block
-// write the snapshot they were built from covers (Gateway.SyncSince). A
-// bare spec array, from a client that doesn't send it, is treated as
-// current.
+// syncPayload is a full Sync: the specs, and the token of the block writes
+// the snapshot they were built from covers (Gateway.SyncFrom). The token is
+// required: without one nothing says the snapshot is newer than the
+// gateway's writes (PR #622 review 4 finding 6).
 type syncPayload struct {
-	Specs []Spec `json:"specs"`
-	Since uint64 `json:"since"`
-}
-
-type blockGenPayload struct {
-	Gen uint64 `json:"gen"`
+	Specs []Spec     `json:"specs"`
+	Token *SyncToken `json:"token"`
 }
 
 // request is one client frame.

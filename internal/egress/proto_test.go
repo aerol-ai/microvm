@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -87,7 +86,11 @@ func TestClientServerRoundTrip(t *testing.T) {
 	if raw, err := c.Learned(ctx, "sb"); err != nil || !strings.Contains(string(raw), "learn") {
 		t.Fatalf("Learned = %s, %v", raw, err)
 	}
-	if err := c.Sync(ctx, nil, math.MaxUint64); err != nil {
+	tok, err := c.SyncToken(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Sync(ctx, nil, tok); err != nil {
 		t.Fatal(err)
 	}
 	if be.Has(SetFQDNSrc, Elem{Src: ipA}) {
@@ -257,7 +260,7 @@ func TestNoopFailsClosed(t *testing.T) {
 	for name, err := range map[string]error{
 		"attach":  n.Attach(ctx, Spec{}),
 		"update":  n.Update(ctx, Spec{}),
-		"sync":    n.Sync(ctx, nil, 0),
+		"sync":    n.Sync(ctx, nil, SyncToken{}),
 		"bridges": n.SetBridges(ctx, nil),
 	} {
 		if !errors.Is(err, ErrUnavailable) {
@@ -316,36 +319,47 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSyncCarriesTheBlockGen: the client reads the gateway's block write
-// number and sends it with a Sync; a write after it survives the Sync. A
-// bare spec array (no number) is treated as current.
-func TestSyncCarriesTheBlockGen(t *testing.T) {
+// TestSyncCarriesTheToken: the client reads the gateway's sync token and
+// sends it with a Sync; a write after it survives the Sync. A Sync without
+// a token (a bare spec array, or an object missing it) or with another
+// process's epoch is refused and changes nothing (review 4 findings 3, 6).
+func TestSyncCarriesTheToken(t *testing.T) {
 	c, g, _, _ := startServer(t, ServerHooks{}, nil)
 	ctx := context.Background()
 	spec := allowSpec("sb", ipA, "pypi.org")
 	if err := c.Attach(ctx, spec); err != nil {
 		t.Fatal(err)
 	}
-	since, err := c.BlockGen(ctx)
-	if err != nil {
-		t.Fatal(err)
+	tok, err := c.SyncToken(ctx)
+	if err != nil || tok.Epoch == 0 {
+		t.Fatalf("token %+v, %v", tok, err)
 	}
 	if err := c.SetBlocked(ctx, "sb", BlockHold, true); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := c.BlockGen(ctx); got <= since {
-		t.Fatalf("block gen %d after a write, was %d", got, since)
+	if got, _ := c.SyncToken(ctx); got.Gen <= tok.Gen || got.Epoch != tok.Epoch {
+		t.Fatalf("token %+v after a write, was %+v", got, tok)
 	}
-	if err := c.Sync(ctx, []Spec{spec}, since); err != nil {
+	if err := c.Sync(ctx, []Spec{spec}, tok); err != nil {
 		t.Fatal(err)
 	}
 	if !g.IsBlocked("sb") {
 		t.Fatal("the hold written after the snapshot must survive the Sync")
 	}
-	if err := c.call(ctx, opSync, []Spec{spec}, nil); err != nil {
-		t.Fatal(err)
+	for name, payload := range map[string]any{
+		"bare array":    []Spec{spec},
+		"missing token": map[string]any{"specs": []Spec{spec}},
+		"zero epoch":    map[string]any{"specs": []Spec{spec}, "token": SyncToken{Gen: 99}},
+	} {
+		if err := c.call(ctx, opSync, payload, nil); err == nil {
+			t.Fatalf("%s: a Sync without a token must be refused", name)
+		}
+		if !g.IsBlocked("sb") {
+			t.Fatalf("%s: a refused Sync changed the block state", name)
+		}
 	}
-	if g.IsBlocked("sb") {
-		t.Fatal("a bare spec array is current and replaces the block state")
+	other := SyncToken{Epoch: tok.Epoch + 1, Gen: 1 << 40}
+	if err := c.Sync(ctx, []Spec{spec}, other); !errors.Is(err, ErrUnavailable) || !g.IsBlocked("sb") {
+		t.Fatalf("another process's token: %v blocked=%v", err, g.IsBlocked("sb"))
 	}
 }

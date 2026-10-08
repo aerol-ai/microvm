@@ -53,7 +53,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 				}
 				// No sandbox destination to record, but the sandbox is
 				// checked again now that the dial is done.
-				if err := p.admitDialed(uc, netip.AddrPort{}, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, nameAllowed: curAllowed}); err != nil {
+				if err := p.admitDialed(uc, netip.AddrPort{}, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, rules: src.Rules, nameAllowed: curAllowed}); err != nil {
 					return nil, err
 				}
 				return uc, nil
@@ -65,7 +65,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			// Recorded on the tracked downstream (so a reloaded guard
 			// revokes the exchange), checked against the current guard, and
 			// the sandbox checked again.
-			if err := p.admitDialed(uc, dst, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, nameAllowed: curAllowed}); err != nil {
+			if err := p.admitDialed(uc, dst, tracked, admission{ip: peer, id: id, host: curName, port: 80, pol: pol, rules: src.Rules, nameAllowed: curAllowed}); err != nil {
 				return nil, err
 			}
 			return uc, nil
@@ -151,7 +151,7 @@ func (p *Proxy) serveHTTP(c net.Conn, src egress.Source, dst netip.AddrPort) {
 			// After a validated Upgrade (websocket) the exchange is no longer
 			// HTTP request/response: dial once, forward the request, then
 			// splice raw bytes both ways.
-			p.upgrade(c, br, req, admission{ip: peer, id: id, host: host, port: 80, pol: pol, nameAllowed: curAllowed}, target, curProxied)
+			p.upgrade(c, br, req, admission{ip: peer, id: id, host: host, port: 80, pol: pol, rules: src.Rules, nameAllowed: curAllowed}, target, curProxied)
 			return
 		}
 		req.URL.Scheme = "http"

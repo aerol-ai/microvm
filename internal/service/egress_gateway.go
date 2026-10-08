@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"go.opentelemetry.io/otel/attribute"
@@ -211,19 +213,22 @@ func (s *Service) syncEgressGatewayLocked(ctx context.Context) (err error) {
 	// applying it, and the attaches the store doesn't show yet are included.
 	//
 	// Block writers aren't held off (a hold takes effect at once): the
-	// gateway's block write number, read before the snapshot, tells it which
-	// writes are newer than the specs, and those keep their effect (review 3
+	// gateway's sync token, read before the snapshot, tells it which writes
+	// are newer than the specs, and those keep their effect (review 3
 	// finding 1). Writes that never reached the gateway are re-applied after
 	// the replacement; one still failing fails the Sync, so the gateway isn't
 	// reported ready on a state missing a block.
 	s.egressSyncMu.Lock()
 	var specs []egress.Spec
-	since, err := gw.BlockGen(ctx)
+	tok, err := gw.SyncToken(ctx)
 	if err == nil {
 		specs, err = s.localEgressSpecs(ctx)
 	}
 	if err == nil {
-		err = gw.Sync(ctx, specs, since)
+		// A gateway that restarted since the token refuses it (another
+		// process's write numbers order nothing here): the Sync fails and
+		// the supervisor runs a new one (review 4 finding 3).
+		err = gw.Sync(ctx, specs, tok)
 	}
 	if err == nil {
 		err = s.retryPendingBlocks(ctx)
@@ -305,6 +310,7 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 			s.egressSyncMu.Unlock()
 		}
 		if s.EgressGatewayReady() {
+			s.retryTerminalDetaches(ctx)
 			if err := s.retryPendingBlocks(ctx); err != nil {
 				s.logger.Warn("egress: gateway blocks still pending", "error", err)
 			}
@@ -655,7 +661,7 @@ func (s *Service) needsGateway(ctx context.Context, sb *models.Sandbox) bool {
 	if isGatewayMode(sb) {
 		return true
 	}
-	inst, err := s.installedEgress(ctx, sb)
+	inst, _, err := s.installedEgress(ctx, sb)
 	return err != nil || inst.Gateway
 }
 
@@ -719,8 +725,90 @@ func (s *Service) liftStartedGuest(rt runtime.Runtime, sb *models.Sandbox) error
 // the IP still belongs to it (D5), so a late call after IP reuse is safe.
 func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, ip string) {
 	if err := s.detachEgress(ctx, sb, ip); err != nil {
-		s.logger.Warn("egress: detach failed (gateway Sync will drop it)", "sandbox_id", sb.ID, "error", err)
+		// The sandbox is going (destroy, a stopped container's IP going
+		// back to the pool), so nothing else will detach it: keep the
+		// intent and retry it every supervisor tick until it lands (PR
+		// #622 review 4 finding 5).
+		if addr, perr := netip.ParseAddr(ip); perr == nil {
+			s.egressDetachPending.add(sb.ID, addr)
+		}
+		s.logger.Warn("egress: detach failed; retried until it lands", "sandbox_id", sb.ID, "error", err)
 	}
+}
+
+// mayBeAttached reports whether the gateway may hold sb: its stored policy
+// is gateway mode, or the installed record says a gateway attachment may
+// be left from a transition that didn't finish. Unknown counts as yes; a
+// detach of a sandbox the gateway doesn't have is a no-op.
+func (s *Service) mayBeAttached(ctx context.Context, sb *models.Sandbox) bool {
+	if isGatewayMode(sb) {
+		return true
+	}
+	inst, _, err := s.installedEgress(ctx, sb)
+	return err != nil || inst.Gateway
+}
+
+// egressDetachPending is the set of terminal detaches that failed, by
+// sandbox, with the source they were attached at.
+type egressDetachPending struct {
+	mu sync.Mutex
+	m  map[string]netip.Addr
+}
+
+func (p *egressDetachPending) add(id string, ip netip.Addr) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.m == nil {
+		p.m = map[string]netip.Addr{}
+	}
+	p.m[id] = ip
+}
+
+func (p *egressDetachPending) snapshot() map[string]netip.Addr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.m)
+}
+
+func (p *egressDetachPending) removeIf(id string, ip netip.Addr) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.m[id] == ip {
+		delete(p.m, id)
+	}
+}
+
+// retryTerminalDetaches retries every failed terminal detach. It runs under
+// the full-sync lock, so no attach is between its check and its detach: a
+// sandbox attached again since (a start, a recreate under the same id) owns
+// its gateway entry, and the intent is dropped instead.
+func (s *Service) retryTerminalDetaches(ctx context.Context) {
+	for id, ip := range s.egressDetachPending.snapshot() {
+		if err := s.retryTerminalDetach(ctx, id, ip); err != nil {
+			s.logger.Debug("egress: terminal detach still failing", "sandbox_id", id, "error", err)
+			continue
+		}
+		s.egressDetachPending.removeIf(id, ip)
+	}
+}
+
+func (s *Service) retryTerminalDetach(ctx context.Context, id string, ip netip.Addr) error {
+	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
+	defer cancel()
+	s.egressSyncMu.Lock()
+	defer s.egressSyncMu.Unlock()
+	if s.egressInflight.has(id) {
+		return nil
+	}
+	if sb, err := s.store.Get(ctx, id); err == nil && sb.Status == models.SandboxStatusStarted {
+		return nil
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	if err := s.egressGateway().Detach(ctx, id, ip); err != nil && !errors.Is(err, egress.ErrNotAttached) {
+		return err
+	}
+	return nil
 }
 
 // detachEgress removes a sandbox from the gateway and reports a failure. A

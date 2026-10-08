@@ -417,6 +417,31 @@ func (rs *Rules) Inspected(host string) bool {
 	return rs.anyFor(host, 443, func(r *Rule) bool { return r.inspect })
 }
 
+// Fingerprint names, in order, every rule that decides connections to host
+// on port: its host, ports, methods, paths, inspection, injection and
+// binaries. Equal fingerprints decide every connection to host:port the
+// same way, so an open connection admitted under one stays admitted under
+// the other; a different one means it must be decided again. It is "" for
+// a host no rule names.
+func (rs *Rules) Fingerprint(host string, port uint16) string {
+	if rs == nil {
+		return ""
+	}
+	name := canonicalName(host)
+	var b strings.Builder
+	for _, r := range rs.rules {
+		if !r.covers(name, port) {
+			continue
+		}
+		inject := ""
+		if r.inject != nil {
+			inject = r.inject.Header + "<-" + r.inject.SecretRef
+		}
+		fmt.Fprintf(&b, "%s|%v|%q|%q|%t|%q|%q;", r.host.String(), r.ports, r.methods, r.paths, r.inspect, inject, r.binaries)
+	}
+	return b.String()
+}
+
 // Has reports whether any rule names host on port.
 func (rs *Rules) Has(host string, port uint16) bool {
 	return rs.anyFor(host, port, func(*Rule) bool { return true })

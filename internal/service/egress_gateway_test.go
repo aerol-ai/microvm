@@ -23,9 +23,9 @@ type fakeGateway struct {
 	detached     []string
 	blocked      map[string]egress.BlockReason
 	synced       [][]egress.Spec
-	since        []uint64
-	gen          uint64
-	genErr       error
+	tokens       []egress.SyncToken
+	tok          egress.SyncToken
+	tokErr       error
 	bridges      []egress.Bridge
 	attachErr    error
 	readyErr     error
@@ -74,16 +74,16 @@ func (f *fakeGateway) SetBlocked(_ context.Context, id string, r egress.BlockRea
 	}
 	return nil
 }
-func (f *fakeGateway) BlockGen(context.Context) (uint64, error) {
+func (f *fakeGateway) SyncToken(context.Context) (egress.SyncToken, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.gen, f.genErr
+	return f.tok, f.tokErr
 }
-func (f *fakeGateway) Sync(_ context.Context, specs []egress.Spec, since uint64) error {
+func (f *fakeGateway) Sync(_ context.Context, specs []egress.Spec, tok egress.SyncToken) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.synced = append(f.synced, specs)
-	f.since = append(f.since, since)
+	f.tokens = append(f.tokens, tok)
 	return nil
 }
 func (f *fakeGateway) Ready(context.Context) (egress.ReadyStatus, error) {

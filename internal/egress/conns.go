@@ -146,6 +146,20 @@ func (g *Gateway) RevalidateConns(revoke func(pol *egresspolicy.Policy, host str
 // host on port, by the same rule the proxy applied when it opened it.
 func (e *entry) permits(host string, port uint16) bool { return permits(e.mode, e.pol, host, port) }
 
+// revokes reports whether a connection to host:port admitted under old is
+// refused or decided differently under e: its host is no longer allowed,
+// or the rules that decide it (binaries, inspection, injection) changed,
+// so it must be decided again (PR #622 review 4 finding 2).
+func (e *entry) revokes(old *entry, host string, port uint16) bool {
+	return !e.permits(host, port) || old.rules.Fingerprint(host, port) != e.rules.Fingerprint(host, port)
+}
+
+// Revoked is the same test for a connection the proxy admitted under
+// rules, against the source's current policy and rules.
+func (s Source) Revoked(rules *egresspolicy.Rules, host string, port uint16) bool {
+	return !s.Permits(host, port) || rules.Fingerprint(host, port) != s.Rules.Fingerprint(host, port)
+}
+
 // Permits is the test a policy change applies to a source's open
 // connections, against its current policy: the proxy uses it on a
 // connection registered after the change's sweep.

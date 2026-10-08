@@ -3,7 +3,6 @@ package gatewayd
 import (
 	"context"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -214,7 +213,7 @@ func TestDaemonRestartRestoresSnapshot(t *testing.T) {
 	if st, err := r2.client.Ready(ctx); err != nil || len(st.Listeners) != 3 {
 		t.Fatalf("listeners not rebound from the snapshot: %+v %v", st, err)
 	}
-	if err := r2.client.Sync(ctx, []egress.Spec{{ID: "sb", IP: lo, AllowOut: []string{"pypi.org"}}}, math.MaxUint64); err != nil {
+	if err := r2.client.Sync(ctx, []egress.Spec{{ID: "sb", IP: lo, AllowOut: []string{"pypi.org"}}}, syncToken(t, r2.client)); err != nil {
 		t.Fatal(err)
 	}
 	if r2.d.Gateway().IsBlocked("sb") {
@@ -251,7 +250,7 @@ func TestDaemonTableLossRebuild(t *testing.T) {
 		t.Fatalf("heartbeat must carry totals and the gateway start: %+v", hb)
 	}
 	// sandboxd's authoritative Sync acknowledges the loss it covered.
-	if err := r.client.Sync(context.Background(), r.d.Gateway().Specs(), math.MaxUint64); err != nil {
+	if err := r.client.Sync(context.Background(), r.d.Gateway().Specs(), syncToken(t, r.client)); err != nil {
 		t.Fatal(err)
 	}
 	r.d.heartbeat()
@@ -463,7 +462,7 @@ func TestDaemonLayoutMigrationKeepsSandboxesShut(t *testing.T) {
 	if !r2.d.Gateway().IsBlocked("sb") {
 		t.Fatal("restored sandbox must stay blocked until Sync")
 	}
-	if err := r2.client.Sync(ctx, []egress.Spec{spec}, math.MaxUint64); err != nil {
+	if err := r2.client.Sync(ctx, []egress.Spec{spec}, syncToken(t, r2.client)); err != nil {
 		t.Fatal(err)
 	}
 	if be.Has(egress.SetBlockedSrc, egress.Elem{Src: lo}) || r2.d.Gateway().IsBlocked("sb") {
@@ -541,4 +540,15 @@ func TestOperatorReloadReachesTheGateway(t *testing.T) {
 	if hb.OperatorHash != op.Hash() {
 		t.Fatalf("heartbeat operator hash = %q", hb.OperatorHash)
 	}
+}
+
+// syncToken reads the gateway's sync token, as sandboxd does before a full
+// Sync.
+func syncToken(t *testing.T, c *egress.Client) egress.SyncToken {
+	t.Helper()
+	tok, err := c.SyncToken(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
 }

@@ -98,14 +98,14 @@ func (g *newerHoldSyncGateway) SetBlocked(_ context.Context, id string, r egress
 	}
 	return g.real.SetBlocked(id, r, on)
 }
-func (g *newerHoldSyncGateway) BlockGen(context.Context) (uint64, error) {
-	return g.real.BlockGen(), nil
+func (g *newerHoldSyncGateway) SyncToken(context.Context) (egress.SyncToken, error) {
+	return g.real.SyncToken(), nil
 }
-func (g *newerHoldSyncGateway) Sync(_ context.Context, ss []egress.Spec, since uint64) error {
+func (g *newerHoldSyncGateway) Sync(_ context.Context, ss []egress.Spec, tok egress.SyncToken) error {
 	if g.beforeSync != nil {
 		g.beforeSync()
 	}
-	if err := g.real.SyncSince(since, ss); err != nil {
+	if err := g.real.SyncFrom(tok, ss); err != nil {
 		return err
 	}
 	if g.beforeSync != nil {
@@ -264,12 +264,12 @@ func TestFailedBlockWriteStaysPendingAndFailsTheSync(t *testing.T) {
 	}
 	fake.mu.Lock()
 	blocked := fake.blocked[sb.ID]&egress.BlockHold != 0
-	since := fake.since[len(fake.since)-1]
+	since := fake.tokens[len(fake.tokens)-1]
 	fake.mu.Unlock()
 	if !blocked || len(svc.egressBlocksPending.list()) != 0 {
 		t.Fatalf("the pending hold must land: blocked=%v pending=%v", blocked, svc.egressBlocksPending.list())
 	}
-	if since != fake.gen {
+	if since != fake.tok {
 		t.Fatalf("the Sync must carry the block gen read before its snapshot: %d", since)
 	}
 	// The supervisor's retry lands a write that failed outside a Sync.
@@ -281,7 +281,7 @@ func TestFailedBlockWriteStaysPendingAndFailsTheSync(t *testing.T) {
 	}
 	// A block gen that can't be read fails the Sync before anything changes.
 	fake.mu.Lock()
-	fake.genErr = egress.ErrUnavailable
+	fake.tokErr = egress.ErrUnavailable
 	n := len(fake.synced)
 	fake.mu.Unlock()
 	if err := svc.ResyncEgressGateway(ctx); err == nil {

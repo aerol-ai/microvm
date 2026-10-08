@@ -117,11 +117,18 @@ func (s *Service) reapplyBlocksLocked(ctx context.Context, id string) error {
 	return nil
 }
 
-// gatewayQuotaBlocked reports whether the stored row puts the sandbox over
-// its egress quota: the same test for a full Sync's specs and the blocks it
-// re-applies, so the two never disagree.
+// gatewayQuotaBlocked reports whether the stored counters put the sandbox
+// over its egress quota: the same test for a full Sync's specs, an attach,
+// the blocks a retry re-applies, and the quota mirror itself
+// (applyNetworkQuotaState's overOut). The counters and limits are stored
+// before the mirror writes a quota block or lifts one, so a snapshot read
+// after a write's sync token always holds the state that write enforced.
+// The NetworkQuotaExceeded flag isn't used: it is stored only after the
+// mirror's write, and a Sync between the two would drop a block its token
+// claims to cover (PR #622 review 4 finding 4).
 func gatewayQuotaBlocked(sb *models.Sandbox) bool {
-	return sb.NetworkQuotaExceeded && sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit
+	_, overOut := quotaOver(sb)
+	return overOut
 }
 
 // egressHeld reports whether a sandbox has a hold recorded. A record that

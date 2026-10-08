@@ -105,10 +105,10 @@ func TestCleanupBlockLiftsWhenCleanupSucceeds(t *testing.T) {
 	}
 }
 
-// TestSyncSinceKeepsNewerBlockWrites (review 3 finding 1): a full Sync
+// TestSyncFromKeepsNewerBlockWrites (review 3 finding 1): a full Sync
 // built from a snapshot taken before a block write never undoes it; a write
 // the snapshot covers is replaced by the spec, a release included.
-func TestSyncSinceKeepsNewerBlockWrites(t *testing.T) {
+func TestSyncFromKeepsNewerBlockWrites(t *testing.T) {
 	g := New(Options{Backend: NewMemBackend()})
 	if err := g.Bootstrap(); err != nil {
 		t.Fatal(err)
@@ -123,12 +123,12 @@ func TestSyncSinceKeepsNewerBlockWrites(t *testing.T) {
 	if err := g.SetBlocked("b", BlockHold, true); err != nil {
 		t.Fatal(err)
 	}
-	since := g.BlockGen()
+	since := g.SyncToken()
 	// a is held after the snapshot was read: the stale spec says unheld.
 	if err := g.SetBlocked("a", BlockHold, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := g.SyncSince(since, []Spec{a, b}); err != nil {
+	if err := g.SyncFrom(since, []Spec{a, b}); err != nil {
 		t.Fatal(err)
 	}
 	if !g.IsBlocked("a") {
@@ -138,13 +138,13 @@ func TestSyncSinceKeepsNewerBlockWrites(t *testing.T) {
 		t.Fatal("a hold the snapshot covers is replaced by the spec")
 	}
 	// A release written after the snapshot wins over a stale held spec.
-	since = g.BlockGen()
+	since = g.SyncToken()
 	if err := g.SetBlocked("a", BlockHold, false); err != nil {
 		t.Fatal(err)
 	}
 	held := a
 	held.Blocked = BlockHold
-	if err := g.SyncSince(since, []Spec{held, b}); err != nil {
+	if err := g.SyncFrom(since, []Spec{held, b}); err != nil {
 		t.Fatal(err)
 	}
 	if g.IsBlocked("a") {

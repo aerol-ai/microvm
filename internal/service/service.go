@@ -376,6 +376,9 @@ type Service struct {
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
+	// egressDetachPending holds terminal detaches that failed; the
+	// supervisor retries them (egress_gateway.go).
+	egressDetachPending egressDetachPending
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -3286,7 +3289,9 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
-	if isGatewayMode(sandbox) {
+	// The installed record counts too: a transition that didn't finish may
+	// have left a gateway attachment under a non-gateway policy.
+	if s.mayBeAttached(ctx, sandbox) {
 		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
 	}
 	s.egressPids.Delete(id)

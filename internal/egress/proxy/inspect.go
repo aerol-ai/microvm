@@ -133,7 +133,7 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, ds
 	up := p.upstream()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			a := admission{ip: peer, id: id, host: name, port: 443, pol: pol, nameAllowed: nameAllowed}
+			a := admission{ip: peer, id: id, host: name, port: 443, pol: pol, rules: src.Rules, nameAllowed: nameAllowed}
 			if up != nil && !up.Bypass(name) {
 				uc, err := up.DialConnect(ctx, net.JoinHostPort(name, "443"))
 				if err != nil {

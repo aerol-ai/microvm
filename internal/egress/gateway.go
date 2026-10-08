@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/netip"
 	"slices"
 	"strings"
@@ -131,6 +130,10 @@ type Gateway struct {
 	// newer release lifted (PR #622 review 3 finding 1).
 	blockGen atomic.Uint64
 	writes   map[string]*blockWrites
+	// epoch names this gateway process. Write numbers restart with the
+	// process, so a token from another process says nothing about this
+	// one's writes, and SyncFrom refuses it (PR #622 review 4 finding 3).
+	epoch uint64
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
@@ -142,6 +145,7 @@ type Gateway struct {
 // New builds a Gateway. Call Bootstrap before use.
 func New(opts Options) *Gateway {
 	g := &Gateway{
+		epoch:          newEpoch(),
 		be:             opts.Backend,
 		layout:         opts.Layout,
 		ct:             opts.Conntrack,
@@ -450,7 +454,7 @@ func (g *Gateway) Attach(spec Spec) error {
 		// A narrowed policy must not keep serving through learned
 		// (ip, port) pairs, established flows or proxied connections it no
 		// longer allows (D2, §5.8 FQDN → FQDN′).
-		g.CloseConnsWhere(spec.ID, func(host string, port uint16) bool { return !nu.permits(host, port) })
+		g.CloseConnsWhere(spec.ID, func(host string, port uint16) bool { return nu.revokes(old, host, port) })
 		g.flushLearned(spec.ID, old.spec.IP)
 		g.flushConntrack(old.spec.IP)
 	}
@@ -640,23 +644,32 @@ func (g *Gateway) applyBlockedLocked(e *entry) error {
 	return nil
 }
 
-// BlockGen is the number of the newest block write. sandboxd reads it
-// before the snapshot a full Sync is built from and passes it to SyncSince.
-func (g *Gateway) BlockGen() uint64 { return g.blockGen.Load() }
+// SyncToken names a point in this gateway process's block writes: its
+// epoch and the newest write number. sandboxd reads it before the snapshot
+// a full Sync is built from and passes it to SyncFrom.
+func (g *Gateway) SyncToken() SyncToken {
+	return SyncToken{Epoch: g.epoch, Gen: g.blockGen.Load()}
+}
 
 // Sync replaces the gateway state with specs that are current as of the
-// call: every earlier block write is covered by them. sandboxd, whose
-// snapshot is older than its call, uses SyncSince.
-func (g *Gateway) Sync(specs []Spec) error { return g.SyncSince(math.MaxUint64, specs) }
+// call (in-process callers that build them from the gateway itself, and
+// tests). sandboxd's snapshot is older than its call: it uses SyncFrom.
+func (g *Gateway) Sync(specs []Spec) error { return g.SyncFrom(g.SyncToken(), specs) }
 
-// SyncSince replaces the whole gateway state with sandboxd's (D13), from a
-// snapshot taken after block write number since. A block write newer than
-// that keeps its effect over the spec's block reasons. Managed sets are
-// replaced atomically. Learned elements and recordings survive for
-// sandboxes whose policy is unchanged and are flushed for removed or changed
-// ones. Sync also lifts the restart block. It runs alone: no Attach, Detach
-// or SetBlocked is between its kernel write and its map swap.
-func (g *Gateway) SyncSince(since uint64, specs []Spec) error {
+// SyncFrom replaces the whole gateway state with sandboxd's (D13), from a
+// snapshot taken after the block writes tok covers. A block write newer
+// than that keeps its effect over the spec's block reasons. A token from
+// another gateway process is refused: its numbers don't order this one's
+// writes. Managed sets are replaced atomically. Learned elements and
+// recordings survive for sandboxes whose policy is unchanged and are
+// flushed for removed or changed ones. Sync also lifts the restart block.
+// It runs alone: no Attach, Detach or SetBlocked is between its kernel
+// write and its map swap.
+func (g *Gateway) SyncFrom(tok SyncToken, specs []Spec) error {
+	if tok.Epoch != g.epoch {
+		return fmt.Errorf("%w: sync token is from gateway process %x, this is %x; read a new one", ErrUnavailable, tok.Epoch, g.epoch)
+	}
+	since := tok.Gen
 	next := map[string]*entry{}
 	for _, s := range specs {
 		e, err := compile(s)
@@ -713,7 +726,7 @@ func (g *Gateway) SyncSince(since uint64, specs []Spec) error {
 		if !ok {
 			g.closeConns(id)
 		} else {
-			g.CloseConnsWhere(id, func(host string, port uint16) bool { return !nu.permits(host, port) })
+			g.CloseConnsWhere(id, func(host string, port uint16) bool { return nu.revokes(old, host, port) })
 		}
 		g.flushLearned(id, old.spec.IP)
 	}

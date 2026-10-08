@@ -237,9 +237,9 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 // applied. Success narrows the record to the target and releases the holds
 // in release, the ones the caller resolved.
 func (s *Service) applyStoredTransition(ctx context.Context, old, next *models.Sandbox, release []string) error {
-	inst, err := s.installedEgress(ctx, old)
+	inst, durable, err := s.installedEgress(ctx, old)
 	if err == nil {
-		inst, err = s.widenInstalled(ctx, next.ID, inst, installedOf(next))
+		inst, err = s.widenInstalled(ctx, next.ID, inst, installedOf(next), durable)
 	}
 	if err == nil {
 		err = s.applyPolicyTransition(ctx, old, inst, next)
@@ -263,38 +263,45 @@ const maxInstalledCIDR = 16
 // crash between the stored write and the apply then leaves a record that
 // still names the old enforcement.
 func (s *Service) markTransition(ctx context.Context, old, next *models.Sandbox, st store.EgressState) error {
-	inst := installedOf(old)
+	inst, durable := installedOf(old), false
 	if st.Installed != nil {
-		inst = *st.Installed
+		inst, durable = *st.Installed, true
 	}
-	_, err := s.widenInstalled(ctx, old.ID, inst, installedOf(next))
+	_, err := s.widenInstalled(ctx, old.ID, inst, installedOf(next), durable)
 	return err
 }
 
-// widenInstalled records inst plus want and returns it; it writes only
-// when that adds something.
-func (s *Service) widenInstalled(ctx context.Context, id string, inst, want store.InstalledEgress) (store.InstalledEgress, error) {
+// widenInstalled records inst plus want and returns it. It writes whenever
+// the record isn't durable yet, even if want adds nothing: a record
+// derived from the stored policy (a sandbox never transitioned) names
+// what that policy installed, and once the stored policy changes nothing
+// else does (a hostname → block-all PUT whose detach fails must still
+// find the gateway, review 4 finding 1). A durable record is rewritten
+// only when want adds something.
+func (s *Service) widenInstalled(ctx context.Context, id string, inst, want store.InstalledEgress, durable bool) (store.InstalledEgress, error) {
 	wider := unionInstalled(inst, want)
 	if len(wider.CIDR) > maxInstalledCIDR {
 		return inst, fmt.Errorf("egress: %d unfinished policy transitions; apply one policy until it succeeds", len(wider.CIDR))
 	}
-	if wider.Gateway == inst.Gateway && len(wider.CIDR) == len(inst.CIDR) {
+	if durable && wider.Gateway == inst.Gateway && len(wider.CIDR) == len(inst.CIDR) {
 		return inst, nil
 	}
 	return wider, s.store.SetInstalledEgress(ctx, id, wider, time.Now().UTC())
 }
 
 // installedEgress is the host enforcement that may be in place for sb: the
-// record, or what its stored policy installs when there is none.
-func (s *Service) installedEgress(ctx context.Context, sb *models.Sandbox) (store.InstalledEgress, error) {
+// record, or what its stored policy installs when there is none. durable
+// reports which: a derived value holds only while the stored policy is the
+// one that was applied.
+func (s *Service) installedEgress(ctx context.Context, sb *models.Sandbox) (store.InstalledEgress, bool, error) {
 	st, err := s.store.GetEgressState(ctx, sb.ID)
 	if err != nil {
-		return store.InstalledEgress{}, err
+		return store.InstalledEgress{}, false, err
 	}
 	if st.Installed != nil {
-		return *st.Installed, nil
+		return *st.Installed, true, nil
 	}
-	return installedOf(sb), nil
+	return installedOf(sb), false, nil
 }
 
 // installedOf is the host enforcement sb's policy installs on a container:

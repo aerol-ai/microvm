@@ -368,7 +368,7 @@ func (p *Proxy) serveTraced(c net.Conn, src egress.Source, dst netip.AddrPort) {
 		return
 	}
 	p.observe(Decision{SandboxID: id, Host: name, Port: dst.Port(), Allowed: true, Rule: rule, Mode: src.Mode})
-	p.splice(c, up, nil, admission{ip: src.Spec.IP, id: id, host: name, port: dst.Port(), pol: src.Policy, nameAllowed: rule != ""}, upDst)
+	p.splice(c, up, nil, admission{ip: src.Spec.IP, id: id, host: name, port: dst.Port(), pol: src.Policy, rules: src.Rules, nameAllowed: rule != ""}, upDst)
 }
 
 // overCapClose answers an over-cap connection without reading it: the TLS
@@ -462,12 +462,14 @@ func (p *Proxy) admitDialed(up net.Conn, dst netip.AddrPort, tc *egress.TrackedC
 }
 
 // admission is what a connection was let through for: its sandbox (by
-// source IP and id), destination, and the policy that admitted it.
+// source IP and id), destination, and the policy and rules that admitted
+// it.
 type admission struct {
 	ip          netip.Addr
 	id, host    string
 	port        uint16
 	pol         *egresspolicy.Policy
+	rules       *egresspolicy.Rules
 	nameAllowed bool
 }
 
@@ -477,8 +479,11 @@ type admission struct {
 // connections, so a connection registered after the sweep sees the new
 // state here, and one registered before it is closed by the sweep: a dial
 // in flight across a revocation never starts forwarding (PR #622 review 3
-// finding 6). Through the operator's proxy there is no destination
-// address, and this is the whole check.
+// finding 6). The test is the sweep's own: the host must still be allowed
+// and the rules deciding it (binaries, inspection, injection) unchanged,
+// since a connection admitted raw or under one binary's rule can't be
+// re-decided mid-stream (review 4 finding 2). Through the operator's proxy
+// there is no destination address, and this is the whole check.
 func (p *Proxy) stillAdmitted(a admission) error {
 	cur, ok := p.src.Source(a.ip)
 	switch {
@@ -486,7 +491,7 @@ func (p *Proxy) stillAdmitted(a admission) error {
 		return fmt.Errorf("egress proxy: %s no longer attached", a.id)
 	case cur.Blocked != 0:
 		return fmt.Errorf("egress proxy: %s egress is blocked", a.id)
-	case cur.Policy != a.pol && !cur.Permits(a.host, a.port):
+	case cur.Policy != a.pol && cur.Revoked(a.rules, a.host, a.port):
 		return fmt.Errorf("egress proxy: %s:%d revoked by a policy change", a.host, a.port)
 	}
 	return nil

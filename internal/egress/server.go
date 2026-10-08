@@ -1,14 +1,12 @@
 package egress
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net"
 	"net/netip"
 	"sync"
@@ -180,24 +178,22 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 		}
 		err = s.g.SetBlocked(p.ID, p.Reason, p.On)
 	case opSync:
-		p := syncPayload{Since: math.MaxUint64}
-		if trimmed := bytes.TrimSpace(req.Payload); len(trimmed) > 0 && trimmed[0] == '[' {
-			err = json.Unmarshal(req.Payload, &p.Specs)
-		} else {
-			err = json.Unmarshal(req.Payload, &p)
+		var p syncPayload
+		if err = json.Unmarshal(req.Payload, &p); err != nil {
+			return nil, fmt.Errorf("sync: want {specs, token}: %w", err)
 		}
-		if err != nil {
-			return nil, err
+		if p.Token == nil || p.Token.Epoch == 0 {
+			return nil, errors.New("sync: a sync token (block_gen) is required")
 		}
 		var gen uint64
 		if s.hooks.LossGen != nil {
 			gen = s.hooks.LossGen()
 		}
-		if err = s.g.SyncSince(p.Since, p.Specs); err == nil && s.hooks.Synced != nil {
+		if err = s.g.SyncFrom(*p.Token, p.Specs); err == nil && s.hooks.Synced != nil {
 			s.hooks.Synced(gen)
 		}
 	case opBlockGen:
-		out = blockGenPayload{Gen: s.g.BlockGen()}
+		out = s.g.SyncToken()
 	case opReady:
 		st := ReadyStatus{Layout: s.g.CheckLayout() == nil}
 		if s.hooks.Listeners != nil {

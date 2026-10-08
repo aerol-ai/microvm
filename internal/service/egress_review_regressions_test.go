@@ -74,13 +74,15 @@ func (g *pausingSyncGateway) Attach(_ context.Context, s egress.Spec) error { re
 func (g *pausingSyncGateway) SetBlocked(_ context.Context, id string, r egress.BlockReason, on bool) error {
 	return g.real.SetBlocked(id, r, on)
 }
-func (g *pausingSyncGateway) BlockGen(context.Context) (uint64, error) { return g.real.BlockGen(), nil }
-func (g *pausingSyncGateway) Sync(_ context.Context, specs []egress.Spec, since uint64) error {
+func (g *pausingSyncGateway) SyncToken(context.Context) (egress.SyncToken, error) {
+	return g.real.SyncToken(), nil
+}
+func (g *pausingSyncGateway) Sync(_ context.Context, specs []egress.Spec, tok egress.SyncToken) error {
 	if g.entered != nil {
 		close(g.entered)
 		<-g.resume
 	}
-	return g.real.SyncSince(since, specs)
+	return g.real.SyncFrom(tok, specs)
 }
 func TestFullSyncKeepsAConcurrentHold(t *testing.T) {
 	svc, fake, rt := newPolicyHarness(t)
