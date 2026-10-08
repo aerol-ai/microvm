@@ -53,9 +53,22 @@ var builtinCatalogue = map[string]map[int64][]string{
 	"apt-ubuntu": {20261006: {
 		"archive.ubuntu.com", "*.archive.ubuntu.com", "security.ubuntu.com", "ports.ubuntu.com",
 	}},
-	"docker-hub": {20261006: {
-		"registry-1.docker.io", "auth.docker.io", "index.docker.io", "production.cloudflare.docker.com",
-	}},
+	"docker-hub": {
+		20261006: {
+			"registry-1.docker.io", "auth.docker.io", "index.docker.io", "production.cloudflare.docker.com",
+		},
+		// Docker Hub redirects blob downloads by client: anonymous and
+		// personal pulls to an R2 bucket, and clients on AWS straight to its
+		// S3 bucket in their region (seen live from us-east-1). Both are
+		// exact hosts: their parents are public suffixes, so no wildcard
+		// could cover them. A node in another AWS region needs its regional
+		// bucket's host added inline.
+		20261008: {
+			"registry-1.docker.io", "auth.docker.io", "index.docker.io", "production.cloudflare.docker.com",
+			"docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com",
+			"docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
+		},
+	},
 }
 
 // BuiltinProfile is one resolved built-in profile version.

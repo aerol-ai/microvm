@@ -262,7 +262,7 @@ its own or next to yours.
 | `builtin:golang-proxy` | the Go module proxy and checksum database |
 | `builtin:crates` | `crates.io` and its download host |
 | `builtin:apt-ubuntu` | the Ubuntu archive and security mirrors |
-| `builtin:docker-hub` | Docker Hub's registry, token service and download host, for tools like `crane` |
+| `builtin:docker-hub` | Docker Hub's registry, token service and blob download hosts (Cloudflare, R2, and Docker's S3 bucket in `us-east-1`), for tools like `crane`. On AWS, Docker Hub serves blobs from its bucket in the client's region; outside `us-east-1`, add that bucket's host inline |
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
