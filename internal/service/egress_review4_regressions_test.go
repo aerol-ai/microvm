@@ -170,34 +170,47 @@ func TestDestroyDetachesALeftoverGatewayAttachment(t *testing.T) {
 }
 
 // TestTerminalDetachRetry: a failed terminal detach is retried until it
-// lands; a sandbox attached again under the same id (started) owns its
-// entry, and the intent is dropped without a detach.
+// lands. Only a newer successful attach of the same sandbox cancels it: a
+// row that still says started is no evidence (the stop path detaches before
+// it writes stopped, review 5 finding 4).
 func TestTerminalDetachRetry(t *testing.T) {
 	ctx := context.Background()
 	svc, fake, _ := newPolicyHarness(t)
 	gw := &flakyBlocksGateway{fakeGateway: fake, detachErr: fmt.Errorf("%w: detach failed", egress.ErrUnavailable)}
 	svc.SetEgressGateway(gw, nil)
 	ip := netip.MustParseAddr(policyIP)
-	svc.egressDetachPending.add("gone", ip)
+	detachedIDs := func() []string {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return slices.Clone(fake.detached)
+	}
+	svc.egressDetachPending.add("gone", detachIntent{ip: ip})
 	svc.retryTerminalDetaches(ctx)
 	if _, ok := svc.egressDetachPending.snapshot()["gone"]; !ok {
 		t.Fatal("a detach that still fails stays pending")
 	}
 	gw.detachErr = nil
 	svc.retryTerminalDetaches(ctx)
-	fake.mu.Lock()
-	detached := slices.Contains(fake.detached, "gone")
-	fake.mu.Unlock()
-	if !detached || len(svc.egressDetachPending.snapshot()) != 0 {
-		t.Fatalf("the retry must detach a destroyed sandbox: detached=%v pending=%v", detached, svc.egressDetachPending.snapshot())
+	if !slices.Contains(detachedIDs(), "gone") || len(svc.egressDetachPending.snapshot()) != 0 {
+		t.Fatalf("the retry must detach a destroyed sandbox: detached=%v pending=%v", detachedIDs(), svc.egressDetachPending.snapshot())
 	}
+
+	// A started row with no newer attach: the detach still runs.
 	live := seedPolicySandbox(t, svc, models.Sandbox{ID: "live", NetworkAllowOut: []string{"pypi.org"}})
-	svc.egressDetachPending.add(live.ID, ip)
+	svc.noteAttached(live.ID)
+	svc.egressDetachPending.add(live.ID, detachIntent{ip: ip, after: svc.attachSeq(live.ID)})
 	svc.retryTerminalDetaches(ctx)
-	fake.mu.Lock()
-	detachedLive := slices.Contains(fake.detached, live.ID)
-	fake.mu.Unlock()
-	if detachedLive || len(svc.egressDetachPending.snapshot()) != 0 {
-		t.Fatalf("a started sandbox owns its entry: detached=%v pending=%v", detachedLive, svc.egressDetachPending.snapshot())
+	if !slices.Contains(detachedIDs(), live.ID) {
+		t.Fatal("a row that still says started must not cancel the detach")
+	}
+
+	// An attach after the failed detach owns the entry: no detach.
+	again := seedPolicySandbox(t, svc, models.Sandbox{ID: "again", NetworkAllowOut: []string{"pypi.org"}})
+	svc.noteAttached(again.ID)
+	svc.egressDetachPending.add(again.ID, detachIntent{ip: ip, after: svc.attachSeq(again.ID)})
+	svc.noteAttached(again.ID)
+	svc.retryTerminalDetaches(ctx)
+	if slices.Contains(detachedIDs(), again.ID) || len(svc.egressDetachPending.snapshot()) != 0 {
+		t.Fatalf("a newer attach owns its entry: detached=%v pending=%v", detachedIDs(), svc.egressDetachPending.snapshot())
 	}
 }

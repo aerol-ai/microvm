@@ -278,9 +278,11 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 	// Holds persist across restarts: count them now, gateway or not.
 	s.refreshHeldGauge(ctx)
 	for {
-		// Applying stored policies doesn't need the gateway (WASM, isolate,
-		// CIDR containers), so it runs on every node (review 2 finding 10).
+		// Applying stored policies and clearing a destroyed sandbox's rules
+		// don't need the gateway (WASM, isolate, CIDR containers), so they
+		// run on every node (review 2 finding 10).
 		s.retryUnappliedPolicies(ctx)
+		s.retryRuleClears(ctx)
 		if !s.egressEnabled() {
 			select {
 			case <-ctx.Done():
@@ -402,6 +404,14 @@ func (s *Service) retainLearnedLocked(ctx context.Context) {
 		}
 		return true
 	})
+	// Attach numbers likewise, unless a terminal detach still waits on one.
+	pending := s.egressDetachPending.snapshot()
+	s.egressAttached.Range(func(k, _ any) bool {
+		if _, waits := pending[k.(string)]; !held[k.(string)] && !waits && !s.egressInflight.has(k.(string)) {
+			s.egressAttached.Delete(k)
+		}
+		return true
+	})
 	ids = append(ids, s.egressInflight.ids()...)
 	if err := s.egressGateway().RetainLearned(ctx, ids); err != nil {
 		s.logger.Warn("egress: learn recordings not collected; retried later", "error", err)
@@ -474,6 +484,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 	err = s.egressGateway().Attach(ctx, spec)
 	if err == nil {
 		s.egressInflight.put(spec)
+		s.noteAttached(sb.ID)
 	}
 	s.egressSyncMu.RUnlock()
 	if err != nil {
@@ -621,18 +632,33 @@ func (s *Service) retryUnappliedPolicies(ctx context.Context) {
 	if s.egressApplyIdle.Load() {
 		return
 	}
-	// Cleared before the read: a hold recorded after it sets it again.
+	// Cleared before the reads: a hold or transition recorded after them
+	// sets it again.
 	s.egressApplyIdle.Store(true)
 	holds, err := s.store.ListEgressHolds(ctx)
 	if err != nil {
 		s.egressApplyIdle.Store(false)
 		return
 	}
-	left := false
+	// The work: apply_failed holds, and transitions with no hold to show
+	// for them (a crash after the stored policy changed, review 5 finding
+	// 3), found by their installed record.
+	work := map[string]bool{}
 	for id, reason := range holds {
-		if reason != egressHoldApplyFailed {
-			continue
+		if reason == egressHoldApplyFailed {
+			work[id] = true
 		}
+	}
+	unfinished, err := s.store.ListInstalledEgress(ctx)
+	if err != nil {
+		s.egressApplyIdle.Store(false)
+		return
+	}
+	for _, id := range unfinished {
+		work[id] = true
+	}
+	left := false
+	for id := range work {
 		left = true
 		sb, err := s.store.Get(ctx, id)
 		if err != nil {
@@ -721,18 +747,150 @@ func (s *Service) liftStartedGuest(rt runtime.Runtime, sb *models.Sandbox) error
 	return nil
 }
 
-// detachSandboxEgress removes a sandbox from the gateway. The gateway checks
-// the IP still belongs to it (D5), so a late call after IP reuse is safe.
+// detachSandboxEgress removes a sandbox from the gateway at the end of its
+// life on a source. The gateway checks the IP still belongs to it (D5), so
+// a late call after IP reuse is safe. A failure is kept as an intent naming
+// the attach it undoes, retried every supervisor tick until it lands (PR
+// #622 review 4 finding 5).
 func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, ip string) {
+	attached := s.attachSeq(sb.ID)
 	if err := s.detachEgress(ctx, sb, ip); err != nil {
-		// The sandbox is going (destroy, a stopped container's IP going
-		// back to the pool), so nothing else will detach it: keep the
-		// intent and retry it every supervisor tick until it lands (PR
-		// #622 review 4 finding 5).
 		if addr, perr := netip.ParseAddr(ip); perr == nil {
-			s.egressDetachPending.add(sb.ID, addr)
+			s.egressDetachPending.add(sb.ID, detachIntent{ip: addr, after: attached})
 		}
 		s.logger.Warn("egress: detach failed; retried until it lands", "sandbox_id", sb.ID, "error", err)
+		return
+	}
+	s.egressAttached.CompareAndDelete(sb.ID, attached)
+}
+
+// teardownSandboxEgress removes, at the end of a sandbox's life on ip (a
+// stop, a destroy, a runtime reconcile finds gone), every piece of egress
+// enforcement that may be installed for it: the gateway attachment (retried
+// until it lands), every CIDR rule set the installed record names, and the
+// hold DROP. A partial transition can leave a gateway and CIDR rules at
+// once, so neither excludes the other. Stop, the destroy event, API destroy
+// and reconcile all use it, so none tears down less than another (review 5
+// findings 5 and 6). cr is nil for a runtime without container network
+// rules; rules on an IP another sandbox already claims are left alone.
+//
+// Nothing a failure leaves is forgotten. final is true when the row is
+// going too (a destroy): a rule clear that fails becomes an intent the
+// supervisor retries. Otherwise (a stop) the installed record keeps naming
+// what may still be installed, for the restart's recovery or a destroy.
+func (s *Service) teardownSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, ip string, final bool) {
+	inst, _, err := s.installedEgress(ctx, sb)
+	if err != nil {
+		// Unknown: tear down what the stored policy installs, and try the
+		// detach, a no-op for a sandbox the gateway doesn't have.
+		inst = installedOf(sb)
+		inst.Gateway = true
+	}
+	if inst.Gateway || isGatewayMode(sb) {
+		s.detachSandboxEgress(ctx, sb, ip)
+	}
+	if cr == nil || ip == "" || s.ipClaimedByOther(ctx, sb.ID, ip, cr) {
+		return
+	}
+	left := clearRules(cr, ip, ruleClear{sets: inst.CIDR, hold: true}, func(err error) {
+		s.logger.Warn("egress rule clear failed", "sandbox_id", sb.ID, "ip", ip, "error", err)
+	})
+	if left.empty() {
+		return
+	}
+	if final {
+		s.egressRuleClears.add(ip, ruleClearIntent{sb: models.Sandbox{ID: sb.ID, Runtime: sb.Runtime, Engine: sb.Engine}, left: left})
+		return
+	}
+	rec := store.InstalledEgress{Gateway: inst.Gateway, CIDR: left.sets}
+	if err := s.store.SetInstalledEgress(ctx, sb.ID, rec, time.Now().UTC()); err != nil {
+		s.logger.Warn("egress: rules left after a failed clear are not recorded", "sandbox_id", sb.ID, "error", err)
+	}
+}
+
+// ruleClear is the CIDR rule sets and hold DROP to remove from an IP.
+type ruleClear struct {
+	sets []store.CIDRRules
+	hold bool
+}
+
+func (r ruleClear) empty() bool { return len(r.sets) == 0 && !r.hold }
+
+// clearRules removes rc from ip and returns what it couldn't remove. All
+// removals are idempotent.
+func clearRules(cr runtime.ContainerRuntime, ip string, rc ruleClear, warn func(error)) ruleClear {
+	var left ruleClear
+	for _, r := range rc.sets {
+		if err := cr.ClearEgressPolicy(ip, r.Allow, r.Deny); err != nil {
+			warn(err)
+			left.sets = append(left.sets, r)
+		}
+	}
+	if holder, ok := cr.(runtime.EgressHolder); ok && rc.hold {
+		if err := holder.ClearEgressHold(ip); err != nil {
+			warn(err)
+			left.hold = true
+		}
+	}
+	return left
+}
+
+// ruleClearIntent is a destroyed sandbox's rule clear that failed: enough
+// of the sandbox to find its runtime, and what is left to remove.
+type ruleClearIntent struct {
+	sb   models.Sandbox
+	left ruleClear
+}
+
+// egressRuleClears is the set of failed rule clears of destroyed sandboxes,
+// by IP.
+type egressRuleClears struct {
+	mu sync.Mutex
+	m  map[string]ruleClearIntent
+}
+
+func (p *egressRuleClears) add(ip string, in ruleClearIntent) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.m == nil {
+		p.m = map[string]ruleClearIntent{}
+	}
+	p.m[ip] = in
+}
+
+func (p *egressRuleClears) snapshot() map[string]ruleClearIntent {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return maps.Clone(p.m)
+}
+
+func (p *egressRuleClears) set(ip string, in ruleClearIntent, done bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if done {
+		delete(p.m, ip)
+	} else {
+		p.m[ip] = in
+	}
+}
+
+// retryRuleClears retries the failed rule clears of destroyed sandboxes. An
+// IP another sandbox has claimed since is that sandbox's now, and its rules
+// are its own: the intent is dropped.
+func (s *Service) retryRuleClears(ctx context.Context) {
+	for ip, in := range s.egressRuleClears.snapshot() {
+		cr, err := s.containerRuntimeForSandbox(&in.sb)
+		if err != nil {
+			continue
+		}
+		if s.ipClaimedByOther(ctx, in.sb.ID, ip, cr) {
+			s.egressRuleClears.set(ip, in, true)
+			continue
+		}
+		in.left = clearRules(cr, ip, in.left, func(err error) {
+			s.logger.Debug("egress: rule clear still failing", "sandbox_id", in.sb.ID, "ip", ip, "error", err)
+		})
+		s.egressRuleClears.set(ip, in, in.left.empty())
 	}
 }
 
@@ -748,66 +906,85 @@ func (s *Service) mayBeAttached(ctx context.Context, sb *models.Sandbox) bool {
 	return err != nil || inst.Gateway
 }
 
-// egressDetachPending is the set of terminal detaches that failed, by
-// sandbox, with the source they were attached at.
-type egressDetachPending struct {
-	mu sync.Mutex
-	m  map[string]netip.Addr
+// noteAttached records a successful attach of id with a new, increasing
+// number. A terminal detach names the attach it undoes, so only a newer one
+// cancels it: a row that still says started does not (review 5 finding 4).
+func (s *Service) noteAttached(id string) {
+	s.egressAttached.Store(id, s.egressAttachSeq.Add(1))
 }
 
-func (p *egressDetachPending) add(id string, ip netip.Addr) {
+// attachSeq is the number of id's newest successful attach, 0 for none.
+func (s *Service) attachSeq(id string) uint64 {
+	if v, ok := s.egressAttached.Load(id); ok {
+		return v.(uint64)
+	}
+	return 0
+}
+
+// detachIntent is a terminal detach that failed: the source it was attached
+// at, and the attach it undoes.
+type detachIntent struct {
+	ip    netip.Addr
+	after uint64
+}
+
+// egressDetachPending is the set of terminal detaches that failed, by
+// sandbox.
+type egressDetachPending struct {
+	mu sync.Mutex
+	m  map[string]detachIntent
+}
+
+func (p *egressDetachPending) add(id string, in detachIntent) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.m == nil {
-		p.m = map[string]netip.Addr{}
+		p.m = map[string]detachIntent{}
 	}
-	p.m[id] = ip
+	p.m[id] = in
 }
 
-func (p *egressDetachPending) snapshot() map[string]netip.Addr {
+func (p *egressDetachPending) snapshot() map[string]detachIntent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return maps.Clone(p.m)
 }
 
-func (p *egressDetachPending) removeIf(id string, ip netip.Addr) {
+func (p *egressDetachPending) removeIf(id string, in detachIntent) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.m[id] == ip {
+	if p.m[id] == in {
 		delete(p.m, id)
 	}
 }
 
-// retryTerminalDetaches retries every failed terminal detach. It runs under
-// the full-sync lock, so no attach is between its check and its detach: a
-// sandbox attached again since (a start, a recreate under the same id) owns
-// its gateway entry, and the intent is dropped instead.
+// retryTerminalDetaches retries every failed terminal detach.
 func (s *Service) retryTerminalDetaches(ctx context.Context) {
-	for id, ip := range s.egressDetachPending.snapshot() {
-		if err := s.retryTerminalDetach(ctx, id, ip); err != nil {
+	for id, in := range s.egressDetachPending.snapshot() {
+		if err := s.retryTerminalDetach(ctx, id, in); err != nil {
 			s.logger.Debug("egress: terminal detach still failing", "sandbox_id", id, "error", err)
 			continue
 		}
-		s.egressDetachPending.removeIf(id, ip)
+		s.egressDetachPending.removeIf(id, in)
 	}
 }
 
-func (s *Service) retryTerminalDetach(ctx context.Context, id string, ip netip.Addr) error {
+// retryTerminalDetach runs under the full-sync lock, which every attach
+// holds shared while it attaches and records its number: an attach of the
+// same sandbox after the failed detach owns the gateway entry now, and the
+// intent is dropped instead of undoing it.
+func (s *Service) retryTerminalDetach(ctx context.Context, id string, in detachIntent) error {
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
 	s.egressSyncMu.Lock()
 	defer s.egressSyncMu.Unlock()
-	if s.egressInflight.has(id) {
+	if s.attachSeq(id) > in.after {
 		return nil
 	}
-	if sb, err := s.store.Get(ctx, id); err == nil && sb.Status == models.SandboxStatusStarted {
-		return nil
-	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+	if err := s.egressGateway().Detach(ctx, id, in.ip); err != nil && !errors.Is(err, egress.ErrNotAttached) {
 		return err
 	}
-	if err := s.egressGateway().Detach(ctx, id, ip); err != nil && !errors.Is(err, egress.ErrNotAttached) {
-		return err
-	}
+	s.egressAttached.CompareAndDelete(id, in.after)
 	return nil
 }
 

@@ -199,7 +199,10 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	// The no-op is only for a policy known to be applied: any hold means the
 	// stored policy may not be the enforced one, so an identical retry
 	// applies it (review finding 2).
-	if samePolicy(old, &next) && sameProfiles(prior, resolved) && st.HoldReason == "" {
+	// An installed record means a transition didn't finish (a failed apply,
+	// a crash after the stored write): the identical PUT completes it
+	// (review 5 finding 3).
+	if samePolicy(old, &next) && sameProfiles(prior, resolved) && st.HoldReason == "" && st.Installed == nil {
 		return s.effectivePolicy(ctx, old, resolved), nil
 	}
 	if err := s.commitPolicySpec(ctx, id, &create, st.Withheld); err != nil {
@@ -241,11 +244,17 @@ func (s *Service) applyStoredTransition(ctx context.Context, old, next *models.S
 	if err == nil {
 		inst, err = s.widenInstalled(ctx, next.ID, inst, installedOf(next), durable)
 	}
+	ran := false
 	if err == nil {
-		err = s.applyPolicyTransition(ctx, old, inst, next)
+		ran, err = s.applyPolicyTransition(ctx, old, inst, next)
 	}
-	if err == nil {
-		err = s.store.SetInstalledEgress(ctx, next.ID, installedOf(next), time.Now().UTC())
+	if err == nil && ran {
+		// Applied: what is installed is what the stored policy installs,
+		// so the record goes, and its absence is what tells recovery
+		// there is nothing left to finish. A stopped container ran no
+		// transition, so its record stays until a started one does: the
+		// start and recovery complete it.
+		err = s.store.ClearInstalledEgress(ctx, next.ID, time.Now().UTC())
 	}
 	if err != nil {
 		s.holdUnapplied(ctx, next, egressHoldApplyFailed)
@@ -267,6 +276,9 @@ func (s *Service) markTransition(ctx context.Context, old, next *models.Sandbox,
 	if st.Installed != nil {
 		inst, durable = *st.Installed, true
 	}
+	// Recovery has work until the record is cleared: a crash between here
+	// and the apply leaves no hold to find.
+	s.egressApplyIdle.Store(false)
 	_, err := s.widenInstalled(ctx, old.ID, inst, installedOf(next), durable)
 	return err
 }
@@ -339,7 +351,23 @@ func (s *Service) reapplyStoredPolicy(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	// Under the lock: a PUT that finished meanwhile left nothing to do.
+	st, err := s.store.GetEgressState(ctx, id)
+	if err != nil {
+		return err
+	}
+	if st.Installed == nil && st.HoldReason != egressHoldApplyFailed {
+		return nil
+	}
 	return s.applyStoredTransition(ctx, sb, sb, applyHolds)
+}
+
+// transitionUnfinished reports whether sb has an installed record: its last
+// policy transition didn't finish, and an additive re-apply of the stored
+// policy would leave the old enforcement in place (review 5 finding 3).
+func (s *Service) transitionUnfinished(ctx context.Context, sb *models.Sandbox) bool {
+	st, err := s.store.GetEgressState(ctx, sb.ID)
+	return err == nil && st.Installed != nil
 }
 
 // holdUnapplied shuts a sandbox whose stored policy isn't enforced and
@@ -446,20 +474,20 @@ func (s *Service) clearHoldRecord(ctx context.Context, id string, allowed ...str
 }
 
 // applyPolicyTransition makes a stored policy change live, from the
-// enforcement that may be installed (inst). The WASM and isolate drivers
+// enforcement that may be installed (inst), and reports whether it ran. The WASM and isolate drivers
 // replace the whole policy and keep it for the next instantiation as well,
 // so they hear about every change; a stopped container has nothing live
 // and Start reads the stored row.
-func (s *Service) applyPolicyTransition(ctx context.Context, old *models.Sandbox, inst store.InstalledEgress, next *models.Sandbox) error {
+func (s *Service) applyPolicyTransition(ctx context.Context, old *models.Sandbox, inst store.InstalledEgress, next *models.Sandbox) (bool, error) {
 	switch {
 	case s.isWasmSandbox(old):
-		return s.applyWasmPolicy(ctx, next)
+		return true, s.applyWasmPolicy(ctx, next)
 	case s.isIsolateSandbox(old):
-		return s.applyIsolatePolicy(ctx, next)
+		return true, s.applyIsolatePolicy(ctx, next)
 	case next.Status == models.SandboxStatusStarted:
-		return s.applyContainerPolicy(ctx, inst, next)
+		return true, s.applyContainerPolicy(ctx, inst, next)
 	}
-	return nil
+	return false, nil
 }
 
 func samePolicy(a, b *models.Sandbox) bool {

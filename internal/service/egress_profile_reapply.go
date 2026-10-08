@@ -161,7 +161,9 @@ func (s *Service) reapplySandboxProfiles(ctx context.Context, id string) error {
 	// A profile hold is lifted only by a re-apply, even one whose list
 	// didn't change while the profile was unreadable.
 	held := isProfileHold(st.HoldReason)
-	if held || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
+	// An unfinished transition (an installed record) is completed even
+	// when the list didn't change.
+	if held || st.Installed != nil || !slices.Equal(old.NetworkAllowOut, next.NetworkAllowOut) {
 		if err := s.markTransition(ctx, old, &next, st); err != nil {
 			return err
 		}

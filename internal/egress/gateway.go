@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -122,18 +123,27 @@ type Gateway struct {
 	// couldn't list: the elements are unknown, so the sweep is redone.
 	sweepPending map[netip.Addr]bool
 
-	// blockGen numbers block writes, and writes keeps each sandbox's newest
-	// write per reason, attached or not (guarded by mu). A full Sync carries
-	// the number sandboxd read before taking its snapshot, so a write that
-	// reached the gateway after that is newer than the snapshot and is kept
-	// over it: a stale Sync never lifts a newer hold, nor re-sets a block a
-	// newer release lifted (PR #622 review 3 finding 1).
-	blockGen atomic.Uint64
-	writes   map[string]*blockWrites
+	// writeGen numbers every state write: block writes, attaches and
+	// detaches. writes keeps each sandbox's newest block write per reason,
+	// attached or not, and attachWrites the number of its newest attach or
+	// detach (both guarded by mu). A full Sync carries the number sandboxd
+	// read before taking its snapshot, so a write that reached the gateway
+	// after that is newer than the snapshot and is kept over it: a stale
+	// Sync never lifts a newer hold, re-sets a block a newer release lifted
+	// (PR #622 review 3 finding 1), drops a newer attach, or restores a
+	// sandbox detached since (review 5 finding 2).
+	writeGen     atomic.Uint64
+	writes       map[string]*blockWrites
+	attachWrites map[string]uint64
 	// epoch names this gateway process. Write numbers restart with the
 	// process, so a token from another process says nothing about this
 	// one's writes, and SyncFrom refuses it (PR #622 review 4 finding 3).
 	epoch uint64
+	// lastSynced is the token of the last Sync applied (guarded by opMu,
+	// exclusive). That Sync dropped the write records its token covered, so
+	// an older token can no longer be checked against them, and SyncFrom
+	// refuses it (review 5 finding 1).
+	lastSynced uint64
 
 	connMu sync.Mutex
 	conns  map[string]map[*TrackedConn]struct{}
@@ -161,6 +171,7 @@ func New(opts Options) *Gateway {
 		pendingCT:      map[netip.Addr]struct{}{},
 		sweepPending:   map[netip.Addr]bool{},
 		writes:         map[string]*blockWrites{},
+		attachWrites:   map[string]uint64{},
 		conns:          map[string]map[*TrackedConn]struct{}{},
 	}
 	if g.maxLrn <= 0 {
@@ -449,6 +460,7 @@ func (g *Gateway) Attach(spec Spec) error {
 	}
 	g.byID[spec.ID] = nu
 	g.bySrc[spec.IP] = spec.ID
+	g.attachWrites[spec.ID] = g.writeGen.Add(1)
 	g.mu.Unlock()
 	if policyChanged {
 		// A narrowed policy must not keep serving through learned
@@ -576,6 +588,7 @@ func (g *Gateway) purge(id string) error {
 	if g.bySrc[old.spec.IP] == id {
 		delete(g.bySrc, old.spec.IP)
 	}
+	g.attachWrites[id] = g.writeGen.Add(1)
 	g.mu.Unlock()
 	g.closeConns(id)
 	g.flushLearned(id, old.spec.IP)
@@ -602,7 +615,7 @@ func (g *Gateway) SetBlocked(id string, reason BlockReason, on bool) error {
 		w = &blockWrites{}
 		g.writes[id] = w
 	}
-	w.set(reason&serviceBlocks, on, g.blockGen.Add(1))
+	w.set(reason&serviceBlocks, on, g.writeGen.Add(1))
 	cur := g.byID[id]
 	if cur == nil {
 		g.mu.Unlock()
@@ -648,7 +661,7 @@ func (g *Gateway) applyBlockedLocked(e *entry) error {
 // epoch and the newest write number. sandboxd reads it before the snapshot
 // a full Sync is built from and passes it to SyncFrom.
 func (g *Gateway) SyncToken() SyncToken {
-	return SyncToken{Epoch: g.epoch, Gen: g.blockGen.Load()}
+	return SyncToken{Epoch: g.epoch, Gen: g.writeGen.Load()}
 }
 
 // Sync replaces the gateway state with specs that are current as of the
@@ -680,26 +693,38 @@ func (g *Gateway) SyncFrom(tok SyncToken, specs []Spec) error {
 	}
 	g.opMu.Lock()
 	defer g.opMu.Unlock()
-	// Under opMu every block write is either here already, or waits and
-	// lands after the swap.
+	if since < g.lastSynced {
+		return fmt.Errorf("%w: sync token %d is older than the last sync applied (%d); read a new one", ErrUnavailable, since, g.lastSynced)
+	}
+	// Under opMu every write is either here already, or waits and lands
+	// after the swap. An attach or detach newer than the snapshot keeps the
+	// gateway's state for that sandbox: its current entry, or its absence,
+	// and the newer entry wins its source over a stale owner in the specs.
 	g.mu.RLock()
+	for id, gen := range g.attachWrites {
+		if gen <= since {
+			continue
+		}
+		cur := g.byID[id]
+		if cur == nil {
+			delete(next, id)
+			continue
+		}
+		for other, e := range next {
+			if other != id && e.spec.IP == cur.spec.IP {
+				delete(next, other)
+			}
+		}
+		next[id] = cur
+	}
 	for id, e := range next {
 		if w := g.writes[id]; w != nil {
 			e.blocked = w.newerThan(since, e.blocked)
 		}
 	}
 	g.mu.RUnlock()
-	contents := map[string][]Elem{}
-	for _, name := range managedSets {
-		contents[name] = nil
-	}
-	for _, e := range next {
-		for name, elems := range e.elements() {
-			contents[name] = append(contents[name], elems...)
-		}
-	}
-	if err := g.be.Replace(contents); err != nil {
-		return fmt.Errorf("%w: sync: %v", ErrUnavailable, err)
+	if err := g.replaceManaged(next); err != nil {
+		return err
 	}
 	g.mu.Lock()
 	prev := g.byID
@@ -715,6 +740,12 @@ func (g *Gateway) SyncFrom(tok SyncToken, specs []Spec) error {
 			delete(g.writes, id)
 		}
 	}
+	for id, gen := range g.attachWrites {
+		if gen <= since {
+			delete(g.attachWrites, id)
+		}
+	}
+	g.lastSynced = since
 	g.mu.Unlock()
 	changed := map[string]bool{}
 	for id, old := range prev {
@@ -731,12 +762,58 @@ func (g *Gateway) SyncFrom(tok SyncToken, specs []Spec) error {
 		g.flushLearned(id, old.spec.IP)
 	}
 	g.sweepLearned(next, changed)
-	// A kept sandbox whose revoked entries the kernel still holds is shut
-	// until they are deleted (BlockCleanup), the same invariant Attach
-	// keeps: a Sync is never the acknowledgement of a revocation that
-	// didn't happen.
+	return g.shutPendingCleanup(next)
+}
+
+// Reapply rebuilds the managed sets from the gateway's own state, after
+// the table was rebuilt (gatewayd's heartbeat on a lost table). It is one
+// operation under opMu: an Attach, Detach, policy update or block write
+// lands before or after it, never between reading the state and replacing
+// the sets. Read outside the lock and applied later, a snapshot drops what
+// changed in between, and write numbers can't tell (review 5 finding 2).
+func (g *Gateway) Reapply() error {
+	g.opMu.Lock()
+	defer g.opMu.Unlock()
+	g.mu.RLock()
+	cur := maps.Clone(g.byID)
+	g.mu.RUnlock()
+	if err := g.replaceManaged(cur); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	for _, e := range cur {
+		e.inBlockedSrc = e.kernelBlocked()
+	}
+	g.mu.Unlock()
+	g.sweepLearned(cur, map[string]bool{})
+	return g.shutPendingCleanup(cur)
+}
+
+// replaceManaged writes entries as the whole content of the managed sets,
+// in one transaction. Callers hold opMu exclusively.
+func (g *Gateway) replaceManaged(entries map[string]*entry) error {
+	contents := map[string][]Elem{}
+	for _, name := range managedSets {
+		contents[name] = nil
+	}
+	for _, e := range entries {
+		for name, elems := range e.elements() {
+			contents[name] = append(contents[name], elems...)
+		}
+	}
+	if err := g.be.Replace(contents); err != nil {
+		return fmt.Errorf("%w: sync: %v", ErrUnavailable, err)
+	}
+	return nil
+}
+
+// shutPendingCleanup shuts every entry whose source the kernel still holds
+// revoked entries for (BlockCleanup), the same invariant Attach keeps: a
+// Sync is never the acknowledgement of a revocation that didn't happen.
+// Callers hold opMu exclusively.
+func (g *Gateway) shutPendingCleanup(entries map[string]*entry) error {
 	var errs []error
-	for _, e := range next {
+	for _, e := range entries {
 		if g.cleanupPending(e.spec.IP) {
 			if err := g.setCleanupBlock(e, true); err != nil {
 				errs = append(errs, err)
@@ -867,6 +944,14 @@ func (g *Gateway) RetainBlocks(ids []string) {
 	for id := range g.writes {
 		if !keep[id] {
 			delete(g.writes, id)
+		}
+	}
+	// An attach record outlives its sandbox only as a detach a stale Sync
+	// mustn't undo; once the node no longer holds the sandbox no snapshot
+	// it builds will name it.
+	for id := range g.attachWrites {
+		if !keep[id] && g.byID[id] == nil {
+			delete(g.attachWrites, id)
 		}
 	}
 }

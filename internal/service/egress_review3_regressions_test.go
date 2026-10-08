@@ -345,8 +345,10 @@ func TestDetachFailureHoldsUntilTheRetryDetaches(t *testing.T) {
 	if err := svc.reapplyStoredPolicy(ctx, sb.ID); err != nil {
 		t.Fatal(err)
 	}
+	// Finished: the record goes (what is installed is what the stored
+	// policy installs).
 	st, _ = svc.store.GetEgressState(ctx, sb.ID)
-	if fake.isAttached(sb.ID) || st.HoldReason != "" || st.Installed == nil || st.Installed.Gateway || len(st.Installed.CIDR) != 1 {
+	if fake.isAttached(sb.ID) || st.HoldReason != "" || st.Installed != nil {
 		t.Fatalf("after the retry: attached=%v state=%+v", fake.isAttached(sb.ID), st)
 	}
 }
@@ -371,11 +373,12 @@ func TestInstalledRecordIsBounded(t *testing.T) {
 	if got, _ := svc.store.Get(ctx, sb.ID); !slices.Equal(got.NetworkAllowOut, []string{"8.8.8.0/24"}) {
 		t.Fatalf("the refused PUT changed the stored policy: %v", got.NetworkAllowOut)
 	}
-	// A target already in the record isn't new: it applies and narrows.
+	// A target already in the record isn't new: it applies, and the
+	// finished transition clears the record.
 	if _, err := svc.UpdateNetworkPolicy(ctx, sb.ID, models.NetworkPolicyRequest{NetworkAllowOut: []string{"10.3.0.0/16"}}); err != nil {
 		t.Fatal(err)
 	}
-	if st, _ := svc.store.GetEgressState(ctx, sb.ID); st.Installed == nil || len(st.Installed.CIDR) != 1 {
+	if st, _ := svc.store.GetEgressState(ctx, sb.ID); st.Installed != nil {
 		t.Fatalf("installed = %+v", st.Installed)
 	}
 }

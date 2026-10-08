@@ -26,9 +26,12 @@ type EgressState struct {
 
 // InstalledEgress is the host enforcement that may be in place for a
 // container sandbox: whether a gateway attachment may exist, and which CIDR
-// rule sets may be installed. After a transition that didn't finish it is a
-// superset (the old enforcement and the new), so the next transition tears
-// down everything a partial apply left behind.
+// rule sets may be installed. It is written before a policy transition
+// changes the stored policy and cleared once the transition has applied, so
+// a record exists exactly while a transition is unfinished (a failure, a
+// crash): it is then a superset (the old enforcement and the new), the next
+// transition tears down everything a partial apply left behind, and
+// recovery finds it (ListInstalledEgress).
 type InstalledEgress struct {
 	Gateway bool        `json:"gateway,omitempty"`
 	CIDR    []CIDRRules `json:"cidr,omitempty"`
@@ -38,6 +41,36 @@ type InstalledEgress struct {
 type CIDRRules struct {
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+}
+
+// ClearInstalledEgress drops a sandbox's installed record: its transition
+// applied, and what is installed is what its stored policy installs.
+func (s *Store) ClearInstalledEgress(ctx context.Context, sandboxID string, now time.Time) error {
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE sandbox_egress SET installed_egress_json = '', updated_at = ? WHERE sandbox_id = ?
+	`, now.UTC(), sandboxID); err != nil {
+		return fmt.Errorf("clear installed egress: %w", err)
+	}
+	return nil
+}
+
+// ListInstalledEgress returns the sandboxes with an installed record: those
+// whose last policy transition hasn't finished.
+func (s *Store) ListInstalledEgress(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT sandbox_id FROM sandbox_egress WHERE installed_egress_json != ''`)
+	if err != nil {
+		return nil, fmt.Errorf("list installed egress: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("list installed egress: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // SetInstalledEgress records the host enforcement that may now be in place

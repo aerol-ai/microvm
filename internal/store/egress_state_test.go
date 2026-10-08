@@ -116,3 +116,41 @@ func TestEgressHoldRankedAndInstalled(t *testing.T) {
 		t.Fatal("closed store must error")
 	}
 }
+
+// TestInstalledRecordLifecycle (review 5 finding 3): ListInstalledEgress
+// names exactly the sandboxes with a record, and a cleared one is gone.
+func TestInstalledRecordLifecycle(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	for _, id := range []string{"a", "b"} {
+		if err := st.Upsert(ctx, &models.Sandbox{ID: id, Image: "img", Status: models.SandboxStatusStarted, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ids, err := st.ListInstalledEgress(ctx); err != nil || len(ids) != 0 {
+		t.Fatalf("no records yet: %v %v", ids, err)
+	}
+	for _, id := range []string{"a", "b"} {
+		if err := st.SetInstalledEgress(ctx, id, InstalledEgress{Gateway: true}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.ClearInstalledEgress(ctx, "a", now); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := st.ListInstalledEgress(ctx)
+	if err != nil || len(ids) != 1 || ids[0] != "b" {
+		t.Fatalf("records = %v %v", ids, err)
+	}
+	if got, _ := st.GetEgressState(ctx, "a"); got.Installed != nil {
+		t.Fatalf("a cleared record must read as none: %+v", got.Installed)
+	}
+	_ = st.Close()
+	if _, err := st.ListInstalledEgress(ctx); err == nil {
+		t.Fatal("closed store must error")
+	}
+	if err := st.ClearInstalledEgress(ctx, "b", now); err == nil {
+		t.Fatal("closed store must error")
+	}
+}

@@ -379,6 +379,13 @@ type Service struct {
 	// egressDetachPending holds terminal detaches that failed; the
 	// supervisor retries them (egress_gateway.go).
 	egressDetachPending egressDetachPending
+	// egressAttachSeq numbers successful attaches; egressAttached holds each
+	// sandbox's newest, which a terminal detach intent compares against.
+	egressAttachSeq atomic.Uint64
+	egressAttached  sync.Map
+	// egressRuleClears holds destroyed sandboxes' rule clears that failed;
+	// the supervisor retries them.
+	egressRuleClears egressRuleClears
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -3289,11 +3296,13 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
-	// The installed record counts too: a transition that didn't finish may
-	// have left a gateway attachment under a non-gateway policy.
-	if s.mayBeAttached(ctx, sandbox) {
-		s.detachSandboxEgress(ctx, sandbox, sandbox.ContainerIP)
+	// Everything the installed record names goes: a transition that didn't
+	// finish may have left a gateway attachment and CIDR rules at once.
+	var cr runtime.ContainerRuntime
+	if c, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+		cr = c
 	}
+	s.teardownSandboxEgress(ctx, sandbox, cr, sandbox.ContainerIP, true)
 	s.egressPids.Delete(id)
 	s.forgetLearned(ctx, sandbox)
 	if s.testAfterRuntimeDestroy != nil {
@@ -5321,6 +5330,14 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			} else if s.testForceUnmountErr != nil {
 				s.logger.Warn("reconcile destroyed unmount failed", "sandbox_id", sandbox.ID, "error", s.testForceUnmountErr)
 			}
+			// The runtime is gone, so its egress enforcement on this node goes
+			// now, before the row and its installed record do; it is local
+			// whoever owns the sandbox (review 5 finding 5).
+			var cr runtime.ContainerRuntime
+			if c, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+				cr = c
+			}
+			s.teardownSandboxEgress(ctx, sandbox, cr, sandbox.ContainerIP, true)
 			// Runtime confirmation and teardown can overlap failover. An
 			// authoritative recheck prevents this former owner from deleting the
 			// active lifecycle's replicated secrets, volume attachments, or
@@ -5446,8 +5463,15 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// Gateway-mode sandboxes are healed through the gateway: a held
 			// sandbox gets its attach retried (the hold lifts only on
 			// success), and the gateway's own Sync covers the rest. Their
-			// hostname lists never go to netrules.
-			if isGatewayMode(sandbox) {
+			// hostname lists never go to netrules. A transition that didn't
+			// finish is completed instead of healed: adding the stored rules
+			// would leave the old enforcement in place beside them (review
+			// 5 finding 3).
+			if s.transitionUnfinished(ctx, sandbox) {
+				if err := s.reapplyStoredPolicy(ctx, sandbox.ID); err != nil {
+					s.logger.Warn("reconcile: unfinished egress transition not completed", "sandbox_id", sandbox.ID, "error", err)
+				}
+			} else if isGatewayMode(sandbox) {
 				s.reconcileSandboxEgress(ctx, sandbox)
 			} else if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
 				// Heal the selective-egress policy the same way. Comment-tagged

@@ -544,12 +544,11 @@ func (d *Daemon) heartbeatLoop(ctx context.Context) {
 	}
 }
 
-// resyncSelf re-applies the gateway's own state after a layout rebuild. A
-// block write landing between reading the state and applying it is newer
-// than the copy, so it is kept.
+// resyncSelf re-applies the gateway's own state after a layout rebuild, as
+// one operation against every attach, detach and block write
+// (Gateway.Reapply).
 func (d *Daemon) resyncSelf() error {
-	tok := d.gw.SyncToken()
-	return d.gw.SyncFrom(tok, d.gw.Specs())
+	return d.gw.Reapply()
 }
 
 // heartbeat checks the table (CEO D17). On loss it rebuilds the layout in one

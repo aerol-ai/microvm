@@ -191,18 +191,10 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container. A gateway-mode
-			// sandbox's lists never reached netrules; it leaves the gateway
-			// and its hold DROP instead.
-			if s.mayBeAttached(ctx, sandbox) {
-				s.detachSandboxEgress(ctx, sandbox, previousIP)
-				if holder, ok := cr.(runtime.EgressHolder); ok {
-					_ = holder.ClearEgressHold(previousIP)
-				}
-			} else if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
-			}
+			// above does not remove them. Everything the installed record
+			// names goes before the IP is recycled to another container: the
+			// gateway attachment, every CIDR rule set, the hold DROP.
+			s.teardownSandboxEgress(ctx, sandbox, cr, previousIP, false)
 		}
 	}
 
@@ -271,18 +263,10 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
 			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container. A gateway-mode
-			// sandbox's lists never reached netrules; it leaves the gateway
-			// and its hold DROP instead.
-			if s.mayBeAttached(ctx, sandbox) {
-				s.detachSandboxEgress(ctx, sandbox, previousIP)
-				if holder, ok := cr.(runtime.EgressHolder); ok {
-					_ = holder.ClearEgressHold(previousIP)
-				}
-			} else if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
-			}
+			// above does not remove them. Everything the installed record
+			// names goes before the IP is recycled to another container: the
+			// gateway attachment, every CIDR rule set, the hold DROP.
+			s.teardownSandboxEgress(ctx, sandbox, cr, previousIP, true)
 		}
 	}
 	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
