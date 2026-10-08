@@ -144,18 +144,20 @@ func TestEgressExplainableDenials(t *testing.T) {
 }
 
 // UC-182 — port semantics and wildcards: github.com:22 opens 22 only; a
-// *. entry covers subdomains.
+// *. entry covers subdomains. The wildcard is on pythonhosted.org: one on
+// a public suffix such as githubusercontent.com is refused at create, by
+// design (the github built-in lists those hosts one by one).
 func TestEgressHostPortAndWildcard(t *testing.T) {
 	harness.Require(t, sc, "UC-182")
 	c := client(t)
-	sb := newEgressSandbox(t, c, []string{"github.com:22", "*.githubusercontent.com"}, nil)
+	sb := newEgressSandbox(t, c, []string{"github.com:22", "*.pythonhosted.org"}, nil)
 	if out := egressExec(t, sb, "nc -z -w 10 github.com 22; echo probe_rc=$?"); !strings.Contains(out, "probe_rc=0") {
 		t.Fatalf("github.com:22 must open port 22:\n%s", out)
 	}
 	if rc, _ := timedRC(t, sb, "wget -q -T 15 -O /dev/null https://github.com/"); rc == 0 {
 		t.Fatal("a port-only entry must not open the web ports")
 	}
-	if rc, _ := timedRC(t, sb, "wget -q -T 20 -O /dev/null https://raw.githubusercontent.com/github/gitignore/main/Go.gitignore"); rc != 0 {
+	if rc, _ := timedRC(t, sb, "wget -q -T 20 -O /dev/null https://files.pythonhosted.org/packages/source/s/six/six-1.16.0.tar.gz"); rc != 0 {
 		t.Fatalf("a subdomain must match the wildcard (rc=%d)", rc)
 	}
 }

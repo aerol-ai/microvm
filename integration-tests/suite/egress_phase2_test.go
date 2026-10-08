@@ -230,14 +230,16 @@ func TestEgressBuiltinHuggingface(t *testing.T) {
 
 func TestEgressBuiltinGolangProxy(t *testing.T) {
 	harness.Require(t, sc, "UC-197")
+	// Absolute paths: exec runs a login shell, and Alpine's /etc/profile
+	// drops the image's PATH entries.
 	runBuiltinProfile(t, "builtin:golang-proxy", "golang:1.23-alpine",
-		"cd /tmp && go mod init x >/dev/null 2>&1; go mod download golang.org/x/text@v0.14.0")
+		"cd /tmp && /usr/local/go/bin/go mod init x >/dev/null 2>&1; /usr/local/go/bin/go mod download golang.org/x/text@v0.14.0")
 }
 
 func TestEgressBuiltinCrates(t *testing.T) {
 	harness.Require(t, sc, "UC-198")
 	runBuiltinProfile(t, "builtin:crates", "rust:1-alpine",
-		`cd /tmp && cargo new -q c && cd c && echo 'itoa = "1"' >> Cargo.toml && cargo fetch -q`)
+		`export PATH=/usr/local/cargo/bin:$PATH RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo && cd /tmp && cargo new -q c && cd c && echo 'itoa = "1"' >> Cargo.toml && cargo fetch -q`)
 }
 
 func TestEgressBuiltinAptUbuntu(t *testing.T) {

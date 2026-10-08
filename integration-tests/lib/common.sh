@@ -111,6 +111,12 @@ wait_for_cloud_init() {
       echo "cloud-init: ${target} done (with warnings)"
       return 0
     fi
+    # Finished, but a user-data step failed: waiting longer won't change
+    # it. Return 2 so a caller can tell this from a timeout.
+    if grep -q 'status: error' <<<"$out"; then
+      echo "cloud-init: ${target} finished with an error" >&2
+      return 2
+    fi
     sleep 10
   done
   echo "cloud-init: ${target} did not finish after ${timeout}s" >&2
