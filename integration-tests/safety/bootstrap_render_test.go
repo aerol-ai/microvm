@@ -79,7 +79,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
-		"seed_receiver", "joiner_receiver",
+		"seed_receiver", "joiner_receiver", "seed_public_ca",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -160,6 +160,18 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			for _, want := range mustContain[branch] {
 				if !strings.Contains(out, want) {
 					t.Errorf("rendered %s bootstrap is missing %q", branch, want)
+				}
+			}
+			// The internal-CA flags appear exactly when an internal CA is
+			// configured (PC-5): the seed fixture sets one, the public-CA
+			// branch has none.
+			internalCA := []string{"--acme-ca '", "--acme-ca-root ", "--tls-issuer '"}
+			for _, flag := range internalCA {
+				switch {
+				case branch == "seed_public_ca" && strings.Contains(out, flag):
+					t.Errorf("public-CA bootstrap passes %q", flag)
+				case branch == "seed" && !strings.Contains(out, flag):
+					t.Errorf("internal-CA bootstrap is missing %q", flag)
 				}
 			}
 		})

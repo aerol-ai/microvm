@@ -145,10 +145,10 @@ if [ -n '${acme_email}' ]; then
 fi
 # An internal CA for every certificate (§5.10 PC-5). The root goes where
 # Caddy, which reads it, can.
-%{ if acme_ca != "" ~}
+%{ if acme_ca != null && acme_ca != "" ~}
 INSTALL_ARGS+=(--acme-ca '${acme_ca}')
 %{ endif ~}
-%{ if acme_ca_root_pem != "" ~}
+%{ if acme_ca_root_pem != null && acme_ca_root_pem != "" ~}
 install -d -m 0755 /etc/caddy
 cat > /etc/caddy/acme-ca-root.pem <<'AEROLVM_ACME_CA_ROOT'
 ${acme_ca_root_pem}
@@ -156,7 +156,7 @@ AEROLVM_ACME_CA_ROOT
 chmod 0644 /etc/caddy/acme-ca-root.pem
 INSTALL_ARGS+=(--acme-ca-root /etc/caddy/acme-ca-root.pem)
 %{ endif ~}
-%{ if tls_issuer != "acme" ~}
+%{ if tls_issuer != null && tls_issuer != "" && tls_issuer != "acme" ~}
 INSTALL_ARGS+=(--tls-issuer '${tls_issuer}')
 %{ endif ~}
 %{ if caddy_binary_url != "" ~}
