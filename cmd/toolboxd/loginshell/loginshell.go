@@ -140,6 +140,23 @@ func parse(argv []string) parsed {
 	return p
 }
 
+// profileFile is the temp file the hook is written through. *os.File is
+// what production uses. Tests substitute a file whose write, chmod, or
+// close fails: a real temp file will not, and those are the failures a
+// full disk or a read-only root produces. The caller logs them.
+type profileFile interface {
+	WriteString(string) (int, error)
+	Chmod(os.FileMode) error
+	Close() error
+	Name() string
+}
+
+// createProfileFile is os.CreateTemp. Tests replace it to reach the error
+// returns in InstallProfileHook.
+var createProfileFile = func(dir, pattern string) (profileFile, error) {
+	return os.CreateTemp(dir, pattern)
+}
+
 // InstallProfileHook writes the PATH restore as a profile.d script in dir,
 // for the interactive login shells no command reaches (terminals). It
 // reports whether the hook is in place. A missing dir means no profile
@@ -154,7 +171,7 @@ func InstallProfileHook(dir string) (bool, error) {
 	if cur, err := os.ReadFile(path); err == nil && bytes.Equal(cur, []byte(profileHook)) {
 		return true, nil
 	}
-	tmp, err := os.CreateTemp(dir, "."+profileHookName+".*")
+	tmp, err := createProfileFile(dir, "."+profileHookName+".*")
 	if err != nil {
 		return false, err
 	}

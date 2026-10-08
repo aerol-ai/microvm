@@ -40,6 +40,16 @@ func TestRestoreAfterAProfileReset(t *testing.T) {
 			"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 		{"exported", reset + "\n" + Restore + "\nsh -c 'echo \"$PATH\"'", Env + "=" + image,
 			image + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
+		// A directory that only shares a prefix with the image's first entry
+		// is not "already there": /usr must not count as /usr/bin.
+		{"prefix is not a whole entry", "PATH=/usr/bin:/bin\n" + Restore + "\necho \"$PATH\"", Env + "=/usr",
+			"/usr:/usr/bin:/bin"},
+		{"image path in the middle", "PATH=/usr/bin:" + image + ":/bin\n" + Restore + "\necho \"$PATH\"", Env + "=" + image,
+			image + ":/usr/bin:" + image + ":/bin"},
+		{"already exact", "PATH=" + image + "\n" + Restore + "\necho \"$PATH\"", Env + "=" + image, image},
+		// An empty value is the same as unset: ${AEROLVM_IMAGE_PATH:-} drops it.
+		{"empty value", reset + "\n" + Restore + "\necho \"$PATH\"", Env + "=",
+			"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -86,6 +96,26 @@ func TestArgv(t *testing.T) {
 		{"not a shell", []string{"/usr/bin/env", "-l", "-c", "x"}, -1, false},
 		{"empty", nil, -1, false},
 		{"-c with no command", []string{"/bin/sh", "-lc"}, -1, false},
+		// Long options other than --login take no argument and do not end parsing.
+		{"--noprofile is ignored", []string{"/bin/bash", "--noprofile", "-lc", "go version"}, 3, false},
+		{"--norc then --login", []string{"/bin/zsh", "--norc", "--login", "-c", "go version"}, 4, false},
+		// +o and -O both consume the next argument; a leading + does not set login.
+		{"+o consumes the next argument", []string{"/bin/bash", "+o", "histexpand", "-lc", "go version"}, 4, false},
+		{"-O consumes the next argument", []string{"/bin/bash", "-O", "extglob", "-lc", "go version"}, 4, false},
+		{"-lo consumes the next argument", []string{"/bin/bash", "-lo", "pipefail", "-c", "go version"}, 4, false},
+		{"-c then -- with nothing after", []string{"/bin/sh", "-c", "--"}, -1, false},
+		{"login then --", []string{"/bin/sh", "-l", "--"}, -1, true},
+		// -- stops option parsing, so a command that itself starts with a dash is kept.
+		{"command after -- may start with a dash", []string{"/bin/sh", "-lc", "--", "-n"}, 3, false},
+		// A script operand is not -c's command string. Parsing stops, and the
+		// shell is still treated as one that reads stdin (no -c was given).
+		{"script operand ends option parsing", []string{"/bin/bash", "-l", "script.sh"}, -1, true},
+		{"+l is not a login shell", []string{"/bin/sh", "+l"}, -1, false},
+		{"a lone dash is stdin, not an option", []string{"/bin/sh", "-l", "-"}, -1, true},
+		{"ash", []string{"/bin/ash", "-lc", "go version"}, 2, false},
+		{"dash", []string{"dash", "--login", "-c", "go version"}, 3, false},
+		{"ksh", []string{"/usr/bin/ksh", "-lc", "go version"}, 2, false},
+		{"mksh", []string{"mksh", "-ilc", "go version"}, 2, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -135,6 +165,15 @@ func TestRecord(t *testing.T) {
 	if got := os.Getenv(Env); got != "/runtime/bin" {
 		t.Fatalf("kept %q", got)
 	}
+
+	// An empty PATH is not a search path to put back.
+	t.Setenv(Env, "")
+	os.Unsetenv(Env)
+	t.Setenv("PATH", "")
+	Record()
+	if _, ok := os.LookupEnv(Env); ok {
+		t.Fatal("empty PATH was recorded")
+	}
 }
 
 // TestInstallProfileHook: written once (idempotent), restores the PATH when
@@ -180,5 +219,82 @@ func TestInstallProfileHook(t *testing.T) {
 		if ok, err := InstallProfileHook(ro); ok || err == nil {
 			t.Fatalf("unwritable dir: %v %v", ok, err)
 		}
+	}
+}
+
+// TestInstallProfileHookRewritesAStaleFile: a hook left by an older
+// toolboxd (different bytes) is replaced, so terminals pick up the current
+// restore. The matching-bytes path is the one TestInstallProfileHook covers.
+func TestInstallProfileHookRewritesAStaleFile(t *testing.T) {
+	dir := t.TempDir()
+	hook := filepath.Join(dir, profileHookName)
+	if err := os.WriteFile(hook, []byte("echo stale\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := InstallProfileHook(dir)
+	if err != nil || !ok {
+		t.Fatalf("rewrite: %v %v", ok, err)
+	}
+	got, err := os.ReadFile(hook)
+	if err != nil || string(got) != profileHook {
+		t.Fatalf("hook = %q, %v", got, err)
+	}
+}
+
+// TestInstallProfileHookRenameOntoADirectory: the destination is not a
+// file we can replace (a directory where the hook name should be). Rename
+// fails and the error is returned, rather than reported as installed.
+func TestInstallProfileHookRenameOntoADirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, profileHookName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := InstallProfileHook(dir)
+	if ok || err == nil {
+		t.Fatalf("rename onto a directory: %v %v", ok, err)
+	}
+}
+
+// failProfile is a temp file that fails one step. A real *os.File does not
+// fail write, chmod, or close, so those returns stay dark without this.
+type failProfile struct {
+	name string
+	fail string
+}
+
+func (f *failProfile) Name() string { return f.name }
+func (f *failProfile) WriteString(string) (int, error) {
+	if f.fail == "write" {
+		return 0, os.ErrInvalid
+	}
+	return len(profileHook), nil
+}
+func (f *failProfile) Chmod(os.FileMode) error {
+	if f.fail == "chmod" {
+		return os.ErrInvalid
+	}
+	return nil
+}
+func (f *failProfile) Close() error {
+	if f.fail == "close" {
+		return os.ErrInvalid
+	}
+	return nil
+}
+
+func TestInstallProfileHookFileErrors(t *testing.T) {
+	orig := createProfileFile
+	t.Cleanup(func() { createProfileFile = orig })
+	dir := t.TempDir()
+	for _, step := range []string{"write", "chmod", "close"} {
+		t.Run(step, func(t *testing.T) {
+			createProfileFile = func(dir, pattern string) (profileFile, error) {
+				return &failProfile{name: filepath.Join(dir, "tmp"), fail: step}, nil
+			}
+			ok, err := InstallProfileHook(dir)
+			if ok || err == nil {
+				t.Fatalf("%s: got ok=%v err=%v", step, ok, err)
+			}
+		})
 	}
 }

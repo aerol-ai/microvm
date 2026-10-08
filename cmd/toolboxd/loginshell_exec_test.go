@@ -61,6 +61,12 @@ func TestPrepareLoginShells(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "00-aerolvm-image-path.sh")); err != nil {
 		t.Fatalf("hook: %v", err)
 	}
+	// No profile.d at all (a distroless image) is not a failure: there is
+	// nothing to install, and commands still get the restore themselves.
+	prepareLoginShells(logger, filepath.Join(dir, "missing"))
+	if strings.Contains(logs.String(), "hook not installed") {
+		t.Fatalf("a missing profile.d was logged as a failure: %s", logs.String())
+	}
 	if os.Geteuid() != 0 {
 		ro := filepath.Join(dir, "ro")
 		if err := os.Mkdir(ro, 0o555); err != nil {

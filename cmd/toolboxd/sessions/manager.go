@@ -22,6 +22,12 @@ import (
 	"github.com/creack/pty"
 )
 
+// writeLoginRestore writes the PATH restore as the first line of a
+// stdin-fed login shell. It is io.WriteString. A live pipe accepts this
+// short line, so tests replace it to reach the log-and-continue path
+// (the shell has already gone, and the pipe is closed).
+var writeLoginRestore = io.WriteString
+
 // Config controls Manager behavior. Defaults are sensible for an in-container
 // daemon; everything is overridable via toolboxd env vars.
 type Config struct {
@@ -269,7 +275,7 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		// before any command, once its profile is done. A terminal gets the
 		// same from the profile hook, without echoing a line to the user.
 		if loginshell.LoginWithoutCommand(argv) {
-			if _, err := io.WriteString(stdin, loginshell.Restore+"\n"); err != nil {
+			if _, err := writeLoginRestore(stdin, loginshell.Restore+"\n"); err != nil {
 				m.logger.Warn("login shell PATH restore not written", "session_id", id, "error", err)
 			}
 		}
