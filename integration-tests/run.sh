@@ -20,7 +20,7 @@
 #            single-node-isolate | single-node-isolate-jail | single-node-private-cloud | local-mode | cluster-3-mixed |
 #            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
-#            cluster-3-mixed-wasm | cluster-hetero |
+#            cluster-3-mixed-wasm | cluster-hetero | cluster-hetero-lite |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
 # Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
 #            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |

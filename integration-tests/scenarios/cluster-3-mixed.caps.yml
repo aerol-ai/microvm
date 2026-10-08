@@ -10,6 +10,10 @@ capabilities:
   - cluster
   # SB_MCP_ENABLED=true on every node (tfvars extra_sandboxd_env); gates UC-178.
   - remote-mcp
+  # Hostname egress filtering: install.sh starts the egress gateway on every
+  # node and SB_EGRESS_FQDN_ENABLED defaults on, so the egress use cases run
+  # here, each on whichever node owns its sandbox (UC-216 needs two).
+  - egress-fqdn
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
 expected_members: 3

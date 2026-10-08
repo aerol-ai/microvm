@@ -336,6 +336,11 @@ integration-cluster-hetero:
 	# (UC-58b) run by default; use integration-cluster-hetero-safe to skip them.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
 
+# cluster-hetero without the c5.metal worker (worker-z is a t3.medium): every
+# runtime but Firecracker, ~8 x t3.medium on-demand.
+integration-cluster-hetero-lite:
+	integration-tests/run.sh cluster-hetero-lite $(RUN_FLAGS)
+
 # Same as integration-cluster-hetero but skips node-kill / failover fault injection.
 integration-cluster-hetero-safe:
 	integration-tests/run.sh cluster-hetero --no-disruptive $(RUN_FLAGS)

@@ -446,14 +446,20 @@ build_recorded_receiver() {
 # URL basename, so the names here must match the object keys exactly — and
 # extra entries are harmless because selection is per-asset, not whole-file.
 write_checksums() {
-  local out="$1" f
-  : >"${out}/checksums.txt"
+  local out="$1" f tmp
+  # Built in a private file and renamed into place: two runs building the
+  # same id at once (both --no-build after a tree change) each truncated and
+  # appended to the shared file, so every line came out twice and install.sh
+  # refused the "ambiguous checksum" on every node.
+  tmp=$(mktemp "${out}/.checksums.XXXXXX")
   for f in "${out}"/*; do
     [[ -f "$f" ]] || continue
     case "$(basename "$f")" in checksums.txt | buildinfo.json) continue ;; esac
-    sha256_file_line "$f" >>"${out}/checksums.txt"
+    sha256_file_line "$f" >>"$tmp"
   done
-  LC_ALL=C sort -k2,2 -o "${out}/checksums.txt" "${out}/checksums.txt"
+  LC_ALL=C sort -u -k2,2 -o "$tmp" "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "${out}/checksums.txt"
 }
 
 write_buildinfo() {

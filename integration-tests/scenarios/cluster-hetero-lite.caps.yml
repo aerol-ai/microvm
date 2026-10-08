@@ -1,0 +1,23 @@
+# cluster-hetero WITHOUT the c5.metal: the same 8-member role-separated
+# topology (3 server / 1 ingress / 4 worker) and runtimes, with worker-z a
+# t3.medium, so Firecracker is the only thing it can't cover. The routine
+# hetero run; the metal one (cluster-hetero) is for Firecracker.
+name: cluster-hetero-lite
+capabilities:
+  - docker
+  - platform-volumes
+  - gvisor
+  - wasm
+  - domain
+  - cluster
+  # SB_MCP_ENABLED=true on every node (tfvars extra_sandboxd_env); gates UC-178.
+  - remote-mcp
+  # Hostname egress filtering: every node runs the egress gateway
+  # (install.sh), so the egress use cases run on the workers.
+  - egress-fqdn
+
+expected_members: 8
+
+# Node-kill / failover fault injection, as on cluster-hetero: role separation
+# is what makes it testable without taking the control plane down.
+disruptive: true
