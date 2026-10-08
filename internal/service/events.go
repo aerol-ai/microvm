@@ -190,11 +190,13 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
-			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them. Everything the installed record
-			// names goes before the IP is recycled to another container: the
-			// gateway attachment, every CIDR rule set, the hold DROP.
-			s.teardownSandboxEgress(ctx, sandbox, cr, previousIP, false)
+		}
+		// Selective-egress rules are comment-tagged, so ClearNetworkRules
+		// above does not remove them. Everything the installed record names
+		// is recorded against the address and goes before the IP is
+		// recycled, or, if it already was, by the new owner's rebuild.
+		if err := s.teardownSandboxEgress(ctx, sandbox, previousIP); err != nil {
+			s.logger.Error("egress: rules left at a stopped sandbox's address are retried by this process only", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 		}
 	}
 
@@ -262,11 +264,11 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
-			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them. Everything the installed record
-			// names goes before the IP is recycled to another container: the
-			// gateway attachment, every CIDR rule set, the hold DROP.
-			s.teardownSandboxEgress(ctx, sandbox, cr, previousIP, true)
+		}
+		// As on stop. The row is the retry anchor until the address's rules
+		// are recorded: reconcile finds the runtime gone and tears down again.
+		if err := s.teardownSandboxEgress(ctx, sandbox, previousIP); err != nil {
+			return err
 		}
 	}
 	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
@@ -350,6 +352,14 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 			"previous_ip", sandbox.ContainerIP,
 			"new_ip", state.ContainerIP,
 		)
+		// A row that still says started at another address missed its stop:
+		// what it left there is recorded and cleared before the new address
+		// is enforced (review 6 finding 4).
+		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" {
+			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
+				s.logger.Error("egress: rules left at a moved sandbox's old address are retried by this process only", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
+		}
 	}
 
 	sandbox.ContainerIP = state.ContainerIP
@@ -360,6 +370,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	// unrestricted until the next reconcile pass. Re-apply before anything
 	// else and fail closed: a sandbox whose isolation can't be restored is
 	// stopped (egress plan P0-4).
+	clearGen := s.egressClears.now()
 	if err := s.reapplyEgressOnStart(ctx, rt, sandbox); err != nil {
 		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 		sandbox.Status = models.SandboxStatusError
@@ -377,6 +388,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)
 	}
+	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
 	// Out-of-band start (operator ran `docker start <id>` directly): the
 	// container is already running, so we cannot refuse it via Admit. Use
@@ -409,41 +421,18 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	return nil
 }
 
-// reapplyEgressOnStart restores block-all and the selective-egress policy on
-// the sandbox's current IP. Both netrules operations are Exists-guarded, so a
-// start the API already drove (and already applied) costs two lookups.
+// reapplyEgressOnStart puts the stored egress policy back on a container
+// that started (enforceEgressOnStart). A runtime without host rules is
+// refused only if the sandbox has a policy to enforce.
 func (s *Service) reapplyEgressOnStart(ctx context.Context, rt runtime.Runtime, sandbox *models.Sandbox) error {
-	hasPolicy := len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0
-	if !sandbox.NetworkBlockAll && !hasPolicy {
-		return nil
-	}
 	cr, ok := runtime.AsContainerRuntime(rt)
 	if !ok {
+		if !sandbox.NetworkBlockAll && len(sandbox.NetworkAllowOut) == 0 && len(sandbox.NetworkDenyOut) == 0 {
+			return nil
+		}
 		return fmt.Errorf("runtime %q does not support network rules", sandbox.Runtime)
 	}
-	if isGatewayMode(sandbox) {
-		// Shut first, then hand the sandbox back to the gateway. A failed
-		// attach leaves it shut and held rather than stopping it: the hold
-		// is the gateway-mode fail-closed state (CEO D16).
-		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			return fmt.Errorf("apply network block: %w", err)
-		}
-		if err := s.attachSandboxEgress(ctx, sandbox, cr); err != nil {
-			s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
-		}
-		return nil
-	}
-	if sandbox.NetworkBlockAll {
-		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			return fmt.Errorf("apply network block: %w", err)
-		}
-	}
-	if hasPolicy {
-		if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-			return fmt.Errorf("apply egress policy: %w", err)
-		}
-	}
-	return nil
+	return s.enforceEgressOnStart(ctx, cr, sandbox)
 }
 
 // ipClaimedByOther reports whether a sandbox other than sandboxID may be using
@@ -455,27 +444,14 @@ func (s *Service) reapplyEgressOnStart(ctx context.Context, rt runtime.Runtime, 
 // claimed: a stale rule left behind fails closed and reconcile cleans it,
 // while a wrong clear fails open.
 func (s *Service) ipClaimedByOther(ctx context.Context, sandboxID, ip string, cr runtime.ContainerRuntime) bool {
-	claimants, err := s.store.SandboxIDsClaimingContainerIP(ctx, ip)
-	if err != nil {
-		s.logger.Warn("skip event rule clear: ip owner lookup failed", "sandbox_id", sandboxID, "ip", ip, "error", err)
+	holder, known := s.ipHolder(ctx, cr, ip, sandboxID)
+	switch {
+	case !known:
+		s.logger.Warn("skip event rule clear: ip owner unknown", "sandbox_id", sandboxID, "ip", ip)
 		return true
-	}
-	for _, id := range claimants {
-		if id != sandboxID {
-			s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", id)
-			return true
-		}
-	}
-	if resolver, ok := cr.(runtime.IPOwnerResolver); ok {
-		owner, err := resolver.IPOwner(ctx, ip)
-		if err != nil {
-			s.logger.Warn("skip event rule clear: runtime ip owner lookup failed", "sandbox_id", sandboxID, "ip", ip, "error", err)
-			return true
-		}
-		if owner != "" && owner != sandboxID {
-			s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", owner)
-			return true
-		}
+	case holder != "":
+		s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", holder)
+		return true
 	}
 	return false
 }

@@ -726,6 +726,26 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 				created_at DATETIME NOT NULL
 			);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_volume_deletions_created_at ON pending_volume_deletions(created_at);`,
+		// pending_egress_rule_clears is the durable cleanup ledger for the
+		// host egress rules (CIDR rule sets, the hold DROP) a container
+		// sandbox leaves at an IP: written before the sandbox lets go of the
+		// address (stop, destroy, a runtime found gone or moved) and deleted
+		// once the rules are confirmed gone. It is keyed by where the rules
+		// live (the engine's rule scope and the IP), not by sandbox, and has
+		// no foreign key: the rules outlive the row and the process, and the
+		// IP's next owner has to find them, since rules of the same IP share
+		// specs (the allowlist catch-all, the hold) and an old ACCEPT left
+		// above the new owner's DROP would let it out.
+		`CREATE TABLE IF NOT EXISTS pending_egress_rule_clears (
+				scope TEXT NOT NULL,
+				ip TEXT NOT NULL,
+				sandbox_id TEXT NOT NULL,
+				rules_json TEXT NOT NULL DEFAULT '',
+				hold INTEGER NOT NULL DEFAULT 0,
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL,
+				PRIMARY KEY (scope, ip)
+			);`,
 	}
 
 	for _, stmt := range stmts {

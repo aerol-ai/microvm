@@ -15,7 +15,6 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/internal/runtime"
-	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"go.opentelemetry.io/otel/attribute"
@@ -278,11 +277,10 @@ func (s *Service) SuperviseEgressGateway(ctx context.Context, interval time.Dura
 	// Holds persist across restarts: count them now, gateway or not.
 	s.refreshHeldGauge(ctx)
 	for {
-		// Applying stored policies and clearing a destroyed sandbox's rules
-		// don't need the gateway (WASM, isolate, CIDR containers), so they
-		// run on every node (review 2 finding 10).
+		// Applying stored policies and clearing the rules sandboxes left at
+		// an address don't need the gateway (WASM, isolate, CIDR
+		// containers), so they run on every node (review 2 finding 10).
 		s.retryUnappliedPolicies(ctx)
-		s.retryRuleClears(ctx)
 		if !s.egressEnabled() {
 			select {
 			case <-ctx.Done():
@@ -629,6 +627,8 @@ func (s *Service) retryEgressHolds(ctx context.Context) {
 // it finds no apply hold left, from the first tick after a restart: the
 // held gauge is a report, not the record (review 3 finding 8).
 func (s *Service) retryUnappliedPolicies(ctx context.Context) {
+	// The address ledger first: its own pass is a map snapshot when empty.
+	s.retryRuleClears(ctx)
 	if s.egressApplyIdle.Load() {
 		return
 	}
@@ -762,136 +762,6 @@ func (s *Service) detachSandboxEgress(ctx context.Context, sb *models.Sandbox, i
 		return
 	}
 	s.egressAttached.CompareAndDelete(sb.ID, attached)
-}
-
-// teardownSandboxEgress removes, at the end of a sandbox's life on ip (a
-// stop, a destroy, a runtime reconcile finds gone), every piece of egress
-// enforcement that may be installed for it: the gateway attachment (retried
-// until it lands), every CIDR rule set the installed record names, and the
-// hold DROP. A partial transition can leave a gateway and CIDR rules at
-// once, so neither excludes the other. Stop, the destroy event, API destroy
-// and reconcile all use it, so none tears down less than another (review 5
-// findings 5 and 6). cr is nil for a runtime without container network
-// rules; rules on an IP another sandbox already claims are left alone.
-//
-// Nothing a failure leaves is forgotten. final is true when the row is
-// going too (a destroy): a rule clear that fails becomes an intent the
-// supervisor retries. Otherwise (a stop) the installed record keeps naming
-// what may still be installed, for the restart's recovery or a destroy.
-func (s *Service) teardownSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, ip string, final bool) {
-	inst, _, err := s.installedEgress(ctx, sb)
-	if err != nil {
-		// Unknown: tear down what the stored policy installs, and try the
-		// detach, a no-op for a sandbox the gateway doesn't have.
-		inst = installedOf(sb)
-		inst.Gateway = true
-	}
-	if inst.Gateway || isGatewayMode(sb) {
-		s.detachSandboxEgress(ctx, sb, ip)
-	}
-	if cr == nil || ip == "" || s.ipClaimedByOther(ctx, sb.ID, ip, cr) {
-		return
-	}
-	left := clearRules(cr, ip, ruleClear{sets: inst.CIDR, hold: true}, func(err error) {
-		s.logger.Warn("egress rule clear failed", "sandbox_id", sb.ID, "ip", ip, "error", err)
-	})
-	if left.empty() {
-		return
-	}
-	if final {
-		s.egressRuleClears.add(ip, ruleClearIntent{sb: models.Sandbox{ID: sb.ID, Runtime: sb.Runtime, Engine: sb.Engine}, left: left})
-		return
-	}
-	rec := store.InstalledEgress{Gateway: inst.Gateway, CIDR: left.sets}
-	if err := s.store.SetInstalledEgress(ctx, sb.ID, rec, time.Now().UTC()); err != nil {
-		s.logger.Warn("egress: rules left after a failed clear are not recorded", "sandbox_id", sb.ID, "error", err)
-	}
-}
-
-// ruleClear is the CIDR rule sets and hold DROP to remove from an IP.
-type ruleClear struct {
-	sets []store.CIDRRules
-	hold bool
-}
-
-func (r ruleClear) empty() bool { return len(r.sets) == 0 && !r.hold }
-
-// clearRules removes rc from ip and returns what it couldn't remove. All
-// removals are idempotent.
-func clearRules(cr runtime.ContainerRuntime, ip string, rc ruleClear, warn func(error)) ruleClear {
-	var left ruleClear
-	for _, r := range rc.sets {
-		if err := cr.ClearEgressPolicy(ip, r.Allow, r.Deny); err != nil {
-			warn(err)
-			left.sets = append(left.sets, r)
-		}
-	}
-	if holder, ok := cr.(runtime.EgressHolder); ok && rc.hold {
-		if err := holder.ClearEgressHold(ip); err != nil {
-			warn(err)
-			left.hold = true
-		}
-	}
-	return left
-}
-
-// ruleClearIntent is a destroyed sandbox's rule clear that failed: enough
-// of the sandbox to find its runtime, and what is left to remove.
-type ruleClearIntent struct {
-	sb   models.Sandbox
-	left ruleClear
-}
-
-// egressRuleClears is the set of failed rule clears of destroyed sandboxes,
-// by IP.
-type egressRuleClears struct {
-	mu sync.Mutex
-	m  map[string]ruleClearIntent
-}
-
-func (p *egressRuleClears) add(ip string, in ruleClearIntent) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.m == nil {
-		p.m = map[string]ruleClearIntent{}
-	}
-	p.m[ip] = in
-}
-
-func (p *egressRuleClears) snapshot() map[string]ruleClearIntent {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return maps.Clone(p.m)
-}
-
-func (p *egressRuleClears) set(ip string, in ruleClearIntent, done bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if done {
-		delete(p.m, ip)
-	} else {
-		p.m[ip] = in
-	}
-}
-
-// retryRuleClears retries the failed rule clears of destroyed sandboxes. An
-// IP another sandbox has claimed since is that sandbox's now, and its rules
-// are its own: the intent is dropped.
-func (s *Service) retryRuleClears(ctx context.Context) {
-	for ip, in := range s.egressRuleClears.snapshot() {
-		cr, err := s.containerRuntimeForSandbox(&in.sb)
-		if err != nil {
-			continue
-		}
-		if s.ipClaimedByOther(ctx, in.sb.ID, ip, cr) {
-			s.egressRuleClears.set(ip, in, true)
-			continue
-		}
-		in.left = clearRules(cr, ip, in.left, func(err error) {
-			s.logger.Debug("egress: rule clear still failing", "sandbox_id", in.sb.ID, "ip", ip, "error", err)
-		})
-		s.egressRuleClears.set(ip, in, in.left.empty())
-	}
 }
 
 // mayBeAttached reports whether the gateway may hold sb: its stored policy

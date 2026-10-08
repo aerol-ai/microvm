@@ -715,7 +715,12 @@ func (g *Gateway) SyncFrom(tok SyncToken, specs []Spec) error {
 				delete(next, other)
 			}
 		}
-		next[id] = cur
+		// A copy: next is candidate state, written below under the read
+		// lock while Source and IsBlocked read the live entry, and it must
+		// not change live state before the backend takes it (review 6
+		// finding 5).
+		c := *cur
+		next[id] = &c
 	}
 	for id, e := range next {
 		if w := g.writes[id]; w != nil {

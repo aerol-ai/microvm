@@ -341,25 +341,12 @@ func unionInstalled(a, b store.InstalledEgress) store.InstalledEgress {
 	return out
 }
 
-// reapplyStoredPolicy applies a held sandbox's stored policy again (the
-// supervisor's retry of an apply_failed hold). It resolved no profiles, so a
-// profile hold stays.
+// reapplyStoredPolicy applies a sandbox's stored policy again if there is
+// something to finish (rebuildEgress): the supervisor's retry of an
+// apply_failed hold or an unfinished transition. Under the lock, a PUT that
+// finished meanwhile leaves nothing to do.
 func (s *Service) reapplyStoredPolicy(ctx context.Context, id string) error {
-	unlock := s.egressPolicyLocks.lock(id)
-	defer unlock()
-	sb, err := s.store.Get(ctx, id)
-	if err != nil {
-		return err
-	}
-	// Under the lock: a PUT that finished meanwhile left nothing to do.
-	st, err := s.store.GetEgressState(ctx, id)
-	if err != nil {
-		return err
-	}
-	if st.Installed == nil && st.HoldReason != egressHoldApplyFailed {
-		return nil
-	}
-	return s.applyStoredTransition(ctx, sb, sb, applyHolds)
+	return s.rebuildEgress(ctx, id, nil, false)
 }
 
 // transitionUnfinished reports whether sb has an installed record: its last
@@ -633,6 +620,12 @@ func (s *Service) applyContainerPolicy(ctx context.Context, inst store.Installed
 	if err := cr.ApplyNetworkBlockAll(ip); err != nil {
 		return fmt.Errorf("block egress for the policy swap: %w", err)
 	}
+	// Rules other enforcement left at this address go first, under the
+	// swap block: nu's own rules go back in below, the specs both share
+	// with them included (review 6 findings 1 and 2).
+	if err := s.clearPendingFor(ctx, cr, nu); err != nil {
+		return err
+	}
 	// Tear down every CIDR rule set that may be installed (removal is
 	// idempotent), the target's own included: it goes back in below. Gateway
 	// to gateway stays attached: Attach with the new spec swaps the rules and
@@ -654,7 +647,10 @@ func (s *Service) applyContainerPolicy(ctx context.Context, inst store.Installed
 	case nu.NetworkBlockAll:
 		return nil
 	case newGW:
-		return s.attachSandboxEgress(ctx, nu, cr)
+		if err := s.attachSandboxEgress(ctx, nu, cr); err != nil {
+			return fmt.Errorf("%w: %w", errEgressAttach, err)
+		}
+		return nil
 	case len(nu.NetworkAllowOut) > 0 || len(nu.NetworkDenyOut) > 0:
 		if err := cr.ApplyEgressPolicy(ip, nu.NetworkAllowOut, nu.NetworkDenyOut); err != nil {
 			return fmt.Errorf("apply the new egress rules: %w", err)

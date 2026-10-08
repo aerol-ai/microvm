@@ -154,3 +154,79 @@ func TestInstalledRecordLifecycle(t *testing.T) {
 		t.Fatal("closed store must error")
 	}
 }
+
+// TestPendingEgressRuleClearLedger (review 6 findings 3 and 4): entries are
+// keyed by where the rules live, merge rather than replace, move a
+// sandbox's installed record into the ledger in the same transaction, and
+// outlive the sandbox row.
+func TestPendingEgressRuleClearLedger(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := st.Upsert(ctx, &models.Sandbox{ID: "sb", Image: "img", Status: models.SandboxStatusStarted, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetInstalledEgress(ctx, "sb", InstalledEgress{CIDR: []CIDRRules{{Allow: []string{"8.8.8.0/24"}}}}, now); err != nil {
+		t.Fatal(err)
+	}
+	a := PendingEgressRuleClear{Scope: "docker", IP: "10.0.0.20", SandboxID: "sb", Rules: []CIDRRules{{Allow: []string{"8.8.8.0/24"}}}, Hold: true}
+	got, err := st.AddPendingEgressRuleClear(ctx, a, "sb", now)
+	if err != nil || len(got.Rules) != 1 || !got.Hold {
+		t.Fatalf("add = %+v %v", got, err)
+	}
+	if es, _ := st.GetEgressState(ctx, "sb"); es.Installed != nil {
+		t.Fatalf("the record moves into the ledger: %+v", es.Installed)
+	}
+	b := PendingEgressRuleClear{Scope: "docker", IP: "10.0.0.20", SandboxID: "next", Rules: []CIDRRules{{Allow: []string{"8.8.8.0/24"}}, {Deny: []string{"9.9.9.0/24"}}}}
+	got, err = st.AddPendingEgressRuleClear(ctx, b, "", now.Add(time.Minute))
+	if err != nil || len(got.Rules) != 2 || !got.Hold || got.SandboxID != "next" || !got.CreatedAt.Equal(now) {
+		t.Fatalf("a second add merges: %+v %v", got, err)
+	}
+	other := PendingEgressRuleClear{Scope: "containerd", IP: "10.0.0.20", SandboxID: "c", Rules: []CIDRRules{{Allow: []string{"1.1.1.0/24"}}}}
+	if _, err := st.AddPendingEgressRuleClear(ctx, other, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Delete(ctx, "sb"); err != nil {
+		t.Fatal(err)
+	}
+	list, err := st.ListPendingEgressRuleClears(ctx)
+	if err != nil || len(list) != 2 || list[0].Scope != "containerd" || list[1].Scope != "docker" || len(list[1].Rules) != 2 {
+		t.Fatalf("entries outlive the row, one per scope and address: %+v %v", list, err)
+	}
+
+	left := list[1]
+	left.Rules, left.Hold = left.Rules[1:], false
+	if err := st.SetPendingEgressRuleClear(ctx, left, now); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = st.ListPendingEgressRuleClears(ctx)
+	if len(list[1].Rules) != 1 || list[1].Hold || list[1].Rules[0].Deny[0] != "9.9.9.0/24" {
+		t.Fatalf("set replaces what is left: %+v", list[1])
+	}
+	left.Rules = nil
+	if err := st.SetPendingEgressRuleClear(ctx, left, now); err != nil {
+		t.Fatal(err)
+	}
+	fresh := PendingEgressRuleClear{Scope: "firecracker", IP: "10.1.0.2", Rules: []CIDRRules{{Allow: []string{"7.7.7.0/24"}}}}
+	if err := st.SetPendingEgressRuleClear(ctx, fresh, now); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = st.ListPendingEgressRuleClears(ctx)
+	if len(list) != 2 || list[0].Scope != "containerd" || list[1].Scope != "firecracker" {
+		t.Fatalf("an empty set deletes, a new one inserts: %+v", list)
+	}
+
+	_ = st.Close()
+	if _, err := st.AddPendingEgressRuleClear(ctx, a, "", now); err == nil {
+		t.Fatal("closed store must error")
+	}
+	if err := st.SetPendingEgressRuleClear(ctx, fresh, now); err == nil {
+		t.Fatal("closed store must error")
+	}
+	if err := st.SetPendingEgressRuleClear(ctx, PendingEgressRuleClear{Scope: "x", IP: "y"}, now); err == nil {
+		t.Fatal("closed store must error")
+	}
+	if _, err := st.ListPendingEgressRuleClears(ctx); err == nil {
+		t.Fatal("closed store must error")
+	}
+}

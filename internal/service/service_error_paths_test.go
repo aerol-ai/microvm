@@ -327,6 +327,12 @@ func TestStartSandboxReturnsErrorWhenStoreUpsertFails(t *testing.T) {
 		t.Fatalf("seed sandbox: %v", err)
 	}
 
+	// The supervisor reads the egress address ledger on its first pass at
+	// boot, before any start; with it unread and the store gone, a start
+	// can't rule out leftovers at its address and is refused instead.
+	if err := svc.loadRuleClears(ctx); err != nil {
+		t.Fatal(err)
+	}
 	_, err := svc.StartSandbox(ctx, "sb-start-store-fail")
 	if err == nil || !strings.Contains(err.Error(), "database is closed") {
 		t.Fatalf("StartSandbox() error = %v, want store upsert failure", err)

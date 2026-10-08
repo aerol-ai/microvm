@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -41,6 +42,162 @@ type InstalledEgress struct {
 type CIDRRules struct {
 	Allow []string `json:"allow,omitempty"`
 	Deny  []string `json:"deny,omitempty"`
+}
+
+// PendingEgressRuleClear is the host egress rules that may still be
+// installed at one IP of one rule scope (an engine's firewall) with no
+// sandbox's enforcement accounting for them: the CIDR rule sets, and
+// whether a hold DROP may be there. SandboxID is the last sandbox that left
+// them, for logs only.
+type PendingEgressRuleClear struct {
+	Scope     string
+	IP        string
+	SandboxID string
+	Rules     []CIDRRules
+	Hold      bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Empty reports whether nothing is left to clear.
+func (p PendingEgressRuleClear) Empty() bool { return len(p.Rules) == 0 && !p.Hold }
+
+// AddPendingEgressRuleClear records that p's rules may be left at its IP,
+// merged into whatever is already pending there, and returns the merged
+// entry. With clearInstalledFor set it also drops that sandbox's installed
+// record in the same transaction: the record's rules now belong to the IP,
+// and a crash between the two writes can't leave them in neither place.
+func (s *Store) AddPendingEgressRuleClear(ctx context.Context, p PendingEgressRuleClear, clearInstalledFor string, now time.Time) (PendingEgressRuleClear, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return p, fmt.Errorf("add pending egress rule clear: %w", err)
+	}
+	defer tx.Rollback()
+	merged := p
+	merged.CreatedAt = now.UTC()
+	cur, ok, err := getPendingEgressRuleClear(ctx, tx, p.Scope, p.IP)
+	if err != nil {
+		return p, err
+	}
+	if ok {
+		merged.CreatedAt = cur.CreatedAt
+		merged.Hold = cur.Hold || p.Hold
+		merged.Rules = mergeCIDRRules(cur.Rules, p.Rules)
+	}
+	merged.UpdatedAt = now.UTC()
+	if err := putPendingEgressRuleClear(ctx, tx, merged); err != nil {
+		return p, err
+	}
+	if clearInstalledFor != "" {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE sandbox_egress SET installed_egress_json = '', updated_at = ? WHERE sandbox_id = ?
+		`, now.UTC(), clearInstalledFor); err != nil {
+			return p, fmt.Errorf("add pending egress rule clear: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return p, fmt.Errorf("add pending egress rule clear: %w", err)
+	}
+	return merged, nil
+}
+
+// SetPendingEgressRuleClear records what is left at p's IP after a clear:
+// p replaces the entry, and an empty p deletes it.
+func (s *Store) SetPendingEgressRuleClear(ctx context.Context, p PendingEgressRuleClear, now time.Time) error {
+	if p.Empty() {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM pending_egress_rule_clears WHERE scope = ? AND ip = ?`, p.Scope, p.IP); err != nil {
+			return fmt.Errorf("delete pending egress rule clear: %w", err)
+		}
+		return nil
+	}
+	if p.CreatedAt.IsZero() {
+		p.CreatedAt = now.UTC()
+	}
+	p.UpdatedAt = now.UTC()
+	return putPendingEgressRuleClear(ctx, s.db, p)
+}
+
+// ListPendingEgressRuleClears returns every pending rule clear.
+func (s *Store) ListPendingEgressRuleClears(ctx context.Context) ([]PendingEgressRuleClear, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT scope, ip, sandbox_id, rules_json, hold, created_at, updated_at FROM pending_egress_rule_clears ORDER BY scope, ip
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list pending egress rule clears: %w", err)
+	}
+	defer rows.Close()
+	var out []PendingEgressRuleClear
+	for rows.Next() {
+		p, err := scanPendingEgressRuleClear(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func getPendingEgressRuleClear(ctx context.Context, q queryRower, scope, ip string) (PendingEgressRuleClear, bool, error) {
+	p, err := scanPendingEgressRuleClear(q.QueryRowContext(ctx, `
+		SELECT scope, ip, sandbox_id, rules_json, hold, created_at, updated_at FROM pending_egress_rule_clears WHERE scope = ? AND ip = ?
+	`, scope, ip))
+	if errors.Is(err, sql.ErrNoRows) {
+		return PendingEgressRuleClear{}, false, nil
+	}
+	return p, err == nil, err
+}
+
+func putPendingEgressRuleClear(ctx context.Context, e execer, p PendingEgressRuleClear) error {
+	raw, err := json.Marshal(p.Rules)
+	if err != nil {
+		return err
+	}
+	if _, err := e.ExecContext(ctx, `
+		INSERT INTO pending_egress_rule_clears (scope, ip, sandbox_id, rules_json, hold, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(scope, ip) DO UPDATE SET
+			sandbox_id = excluded.sandbox_id,
+			rules_json = excluded.rules_json,
+			hold = excluded.hold,
+			updated_at = excluded.updated_at
+	`, p.Scope, p.IP, p.SandboxID, string(raw), p.Hold, p.CreatedAt.UTC(), p.UpdatedAt.UTC()); err != nil {
+		return fmt.Errorf("put pending egress rule clear: %w", err)
+	}
+	return nil
+}
+
+func scanPendingEgressRuleClear(row interface{ Scan(...any) error }) (PendingEgressRuleClear, error) {
+	var p PendingEgressRuleClear
+	var raw string
+	if err := row.Scan(&p.Scope, &p.IP, &p.SandboxID, &raw, &p.Hold, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return p, err
+		}
+		return p, fmt.Errorf("scan pending egress rule clear: %w", err)
+	}
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &p.Rules); err != nil {
+			return p, fmt.Errorf("decode pending egress rule clear: %w", err)
+		}
+	}
+	return p, nil
+}
+
+// mergeCIDRRules is a ∪ b, a's order first, without duplicates.
+func mergeCIDRRules(a, b []CIDRRules) []CIDRRules {
+	out := slices.Clone(a)
+	for _, r := range b {
+		if !slices.ContainsFunc(out, func(o CIDRRules) bool {
+			return slices.Equal(o.Allow, r.Allow) && slices.Equal(o.Deny, r.Deny)
+		}) {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // ClearInstalledEgress drops a sandbox's installed record: its transition

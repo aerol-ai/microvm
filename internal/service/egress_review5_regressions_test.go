@@ -199,7 +199,8 @@ func TestUnfinishedTransitionIsCompletedByRecovery(t *testing.T) {
 
 // TestStoppedTransitionKeepsItsRecord: a transition on a stopped container
 // runs nothing live, so its record stays for the start and recovery to
-// complete; and a stop whose rule clear fails keeps naming what is left.
+// complete; and a stop whose rule clear fails records what is left against
+// the address, not the sandbox (review 6 finding 4).
 func TestStoppedTransitionKeepsItsRecord(t *testing.T) {
 	svc, _, rt := newPolicyHarness(t)
 	ctx := context.Background()
@@ -212,33 +213,39 @@ func TestStoppedTransitionKeepsItsRecord(t *testing.T) {
 		t.Fatalf("a stopped transition keeps its record: %+v", st.Installed)
 	}
 
-	// A started one whose stop teardown can't clear its rules records them.
 	run := seedPolicySandbox(t, svc, models.Sandbox{ID: "run", NetworkAllowOut: []string{"9.9.9.0/24"}})
 	rt.clearErr = errors.New("iptables busy")
-	svc.teardownSandboxEgress(ctx, run, rt, run.ContainerIP, false)
+	if err := svc.teardownSandboxEgress(ctx, run, "10.0.0.20"); err != nil {
+		t.Fatal(err)
+	}
 	rt.clearErr = nil
-	st, _ = svc.store.GetEgressState(ctx, run.ID)
-	if st.Installed == nil || len(st.Installed.CIDR) != 1 || st.Installed.CIDR[0].Allow[0] != "9.9.9.0/24" {
-		t.Fatalf("a failed stop clear must be recorded: %+v", st.Installed)
+	e, ok := svc.egressRuleClears.get(ruleClearKey{models.ContainerEngineDocker, "10.0.0.20"})
+	if !ok || len(e.Rules) != 1 || e.Rules[0].Allow[0] != "9.9.9.0/24" || e.SandboxID != "run" {
+		t.Fatalf("a failed stop clear must be recorded against the address: %+v %v", e, ok)
+	}
+	if st, _ := svc.store.GetEgressState(ctx, run.ID); st.Installed != nil {
+		t.Fatalf("the rules moved to the address; the sandbox's record goes: %+v", st.Installed)
 	}
 }
 
 // TestDestroyRuleClearIsRetried: a destroy whose rule clear fails leaves an
-// intent the supervisor retries until it lands; one whose IP another
-// sandbox has claimed since is dropped.
+// entry the supervisor retries until it lands; if another sandbox holds the
+// address by then, that sandbox is rebuilt, which clears the old rules
+// under its swap block and puts its own back (review 6 finding 1).
 func TestDestroyRuleClearIsRetried(t *testing.T) {
 	svc, _, rt := newPolicyHarness(t)
 	ctx := context.Background()
+	key := ruleClearKey{models.ContainerEngineDocker, policyIP}
 	sb := seedPolicySandbox(t, svc, models.Sandbox{NetworkAllowOut: []string{"9.9.9.0/24"}, AuditIncarnationID: "rule-clear"})
 	rt.clearErr = errors.New("iptables busy")
 	if err := svc.DestroySandbox(ctx, sb.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := svc.egressRuleClears.snapshot()[policyIP]; !ok {
-		t.Fatal("a destroy's failed rule clear must be kept as an intent")
+	if _, ok := svc.egressRuleClears.get(key); !ok {
+		t.Fatal("a destroy's failed rule clear must be kept")
 	}
 	svc.retryRuleClears(ctx)
-	if _, ok := svc.egressRuleClears.snapshot()[policyIP]; !ok {
+	if _, ok := svc.egressRuleClears.get(key); !ok {
 		t.Fatal("a clear that still fails stays pending")
 	}
 	rt.clearErr = nil
@@ -249,22 +256,31 @@ func TestDestroyRuleClearIsRetried(t *testing.T) {
 	rt.pmu.Lock()
 	cleared := slices.Clone(rt.cleared)
 	rt.pmu.Unlock()
-	if len(svc.egressRuleClears.snapshot()) != 0 || !slices.ContainsFunc(cleared, func(v []string) bool { return slices.Equal(v, []string{"9.9.9.0/24"}) }) {
+	if _, ok := svc.egressRuleClears.get(key); ok || !slices.ContainsFunc(cleared, func(v []string) bool { return slices.Equal(v, []string{"9.9.9.0/24"}) }) {
 		t.Fatalf("the retry must clear the rules: cleared=%v pending=%v", cleared, svc.egressRuleClears.snapshot())
 	}
+	if list, _ := svc.store.ListPendingEgressRuleClears(ctx); len(list) != 0 {
+		t.Fatalf("a cleared entry leaves the store too: %+v", list)
+	}
 
-	// The IP is someone else's now: the intent goes without a clear.
-	svc.egressRuleClears.add(policyIP, ruleClearIntent{sb: models.Sandbox{ID: "old", Runtime: models.RuntimeDocker}, left: ruleClear{sets: []store.CIDRRules{{Allow: []string{"7.7.7.0/24"}}}}})
-	seedPolicySandbox(t, svc, models.Sandbox{ID: "new-owner", NetworkAllowOut: []string{"1.1.1.0/24"}})
+	// The address is someone else's now: it is rebuilt, not skipped.
+	svc.egressRuleClears.put(store.PendingEgressRuleClear{Scope: key.scope, IP: key.ip, SandboxID: "old", Rules: []store.CIDRRules{{Allow: []string{"7.7.7.0/24"}}}})
+	runningInRuntime(rt, seedPolicySandbox(t, svc, models.Sandbox{ID: "new-owner", NetworkAllowOut: []string{"1.1.1.0/24"}}))
 	rt.pmu.Lock()
-	rt.cleared = nil
+	rt.cleared, rt.applied = nil, nil
 	rt.pmu.Unlock()
 	svc.retryRuleClears(ctx)
 	rt.pmu.Lock()
-	cleared = slices.Clone(rt.cleared)
+	cleared, applied := slices.Clone(rt.cleared), slices.Clone(rt.applied)
 	rt.pmu.Unlock()
-	if len(svc.egressRuleClears.snapshot()) != 0 || len(cleared) != 0 {
-		t.Fatalf("a claimed IP drops the intent without clearing: cleared=%v pending=%v", cleared, svc.egressRuleClears.snapshot())
+	has := func(l [][]string, v string) bool {
+		return slices.ContainsFunc(l, func(x []string) bool { return slices.Equal(x, []string{v}) })
+	}
+	if _, ok := svc.egressRuleClears.get(key); ok || !has(cleared, "7.7.7.0/24") || !has(applied, "1.1.1.0/24") {
+		t.Fatalf("the holder must be rebuilt: cleared=%v applied=%v pending=%v", cleared, applied, svc.egressRuleClears.snapshot())
+	}
+	if !rt.lifted(policyIP) {
+		t.Fatal("the rebuild's swap block must be lifted")
 	}
 }
 

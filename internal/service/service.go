@@ -383,9 +383,13 @@ type Service struct {
 	// sandbox's newest, which a terminal detach intent compares against.
 	egressAttachSeq atomic.Uint64
 	egressAttached  sync.Map
-	// egressRuleClears holds destroyed sandboxes' rule clears that failed;
-	// the supervisor retries them.
+	// egressRuleClears is the working set of the durable ledger of host
+	// egress rules sandboxes left at an address (egress_rule_clears.go);
+	// egressIPLocks serializes each address's entry. Lock order: policy,
+	// then address, then hold.
 	egressRuleClears egressRuleClears
+	egressIPLocks    egressPolicyLocks
+	egressClears     egressClearLog
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -2055,6 +2059,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 
+	// The driver installs the sandbox's rules before its row carries the
+	// address: settleEnforcedEgress checks for a clear in between.
+	clearGen := s.egressClears.now()
 	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
 		cleanupMounts()
@@ -2280,6 +2287,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	platformVolumesCommitted = true
 	s.settleEgressAttach(sandbox.ID)
+	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 	stored, err := s.store.Get(ctx, sandbox.ID)
 	if err != nil {
 		return nil, err
@@ -2412,6 +2420,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
+	clearGen := s.egressClears.now()
 	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
 		// Phase 6 PR-A: cold-load corruption intercept. The driver's
@@ -2570,6 +2579,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 	}
 	s.settleEgressAttach(sandbox.ID)
+	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
 	s.logger.Info("audit sandbox created",
 		"sandbox_id", sandbox.ID,
@@ -3147,69 +3157,27 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 	sandbox.WakeArmed = false
 	sandbox.UpdatedAt = time.Now().UTC()
 	sandbox.LastActiveAt = time.Now().UTC()
-	// Reapply the per-IP egress DROP rule. The stop event clears it (the IP
-	// can be reassigned to another container), so a Stop+Start cycle would
-	// otherwise come back without network isolation. Fail closed: if we can't
-	// reinstall the rule, stop the container and surface the error.
-	if sandbox.NetworkBlockAll {
-		cr, ok := runtime.AsContainerRuntime(rt)
-		if !ok {
-			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
-			_ = s.mounts.UnmountAll(id)
-			releaseAdmission()
-			return nil, fmt.Errorf("apply network block on start: runtime %q does not support network_block_all", sandbox.Runtime)
-		}
-		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
-			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
-			_ = s.mounts.UnmountAll(id)
-			releaseAdmission()
-			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-			return nil, fmt.Errorf("apply network block on start: %w", err)
-		}
-	}
-	if err := s.liftStartedGuest(rt, sandbox); err != nil {
-		s.logger.Warn("egress: lift the stop-time block on start failed", "sandbox_id", id, "error", err)
-	}
-	// A gateway-mode sandbox is shut with a block-all DROP and re-attached to
-	// the egress gateway. If the attach fails it stays shut and held
-	// (egress_status unavailable) and reconcile retries; the start itself
-	// succeeds (plans/egress-domain-filtering.md §5.7, CEO D16).
-	if isGatewayMode(sandbox) {
-		cr, ok := runtime.AsContainerRuntime(rt)
-		if !ok {
-			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
-			_ = s.mounts.UnmountAll(id)
-			releaseAdmission()
-			return nil, fmt.Errorf("apply egress on start: runtime %q does not support egress filtering", sandbox.Runtime)
-		}
-		if err := cr.ApplyNetworkBlockAll(sandbox.ContainerIP); err != nil {
+	// Put the stored egress policy back before the start reports success or
+	// publishes a route: the stop event cleared it, since the IP can be
+	// reassigned to another container. Fail closed: a sandbox whose isolation
+	// can't be restored is stopped. A gateway-mode sandbox whose attach fails
+	// starts shut and held instead (plans/egress-domain-filtering.md §5.7,
+	// CEO D16). An unfinished transition, or rules another sandbox left at
+	// the new address, are rebuilt first (review 6 findings 1 and 2).
+	clearGen := s.egressClears.now()
+	if cr, ok := runtime.AsContainerRuntime(rt); ok {
+		if err := s.enforceEgressOnStart(ctx, cr, sandbox); err != nil {
 			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
 			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-			return nil, fmt.Errorf("apply network block on start: %w", err)
+			return nil, err
 		}
-		if err := s.attachSandboxEgress(ctx, sandbox, cr); err != nil {
-			s.holdSandboxEgress(ctx, sandbox, cr, egressHoldUnavailable)
-		}
-	} else if len(sandbox.NetworkAllowOut) > 0 || len(sandbox.NetworkDenyOut) > 0 {
-		// Reapply the selective-egress policy for the same reason: the stop
-		// event clears it. Comment-tagged rules are distinct from the blanket
-		// block, so this composes with NetworkBlockAll above. Fail closed.
-		cr, ok := runtime.AsContainerRuntime(rt)
-		if !ok {
-			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
-			_ = s.mounts.UnmountAll(id)
-			releaseAdmission()
-			return nil, fmt.Errorf("apply egress policy on start: runtime %q does not support selective egress", sandbox.Runtime)
-		}
-		if err := cr.ApplyEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-			_ = rt.Stop(ctx, s.runtimeRef(sandbox))
-			_ = s.mounts.UnmountAll(id)
-			releaseAdmission()
-			_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
-			return nil, fmt.Errorf("apply egress policy on start: %w", err)
-		}
+	} else if err := egressUnsupportedOnStart(sandbox); err != nil {
+		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+		_ = s.mounts.UnmountAll(id)
+		releaseAdmission()
+		return nil, err
 	}
 
 	if err := s.syncSandboxPublicRoute(ctx, sandbox); err != nil {
@@ -3225,6 +3193,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		return nil, err
 	}
 	s.settleEgressAttach(id)
+	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 	refreshed, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
@@ -3238,6 +3207,20 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		s.warmCacheSet(id)
 	}
 	return refreshed, nil
+}
+
+// egressUnsupportedOnStart refuses a start on a runtime without host rules
+// when the sandbox has egress enforcement for them to carry.
+func egressUnsupportedOnStart(sb *models.Sandbox) error {
+	switch {
+	case sb.NetworkBlockAll:
+		return fmt.Errorf("apply network block on start: runtime %q does not support network_block_all", sb.Runtime)
+	case isGatewayMode(sb):
+		return fmt.Errorf("apply egress on start: runtime %q does not support egress filtering", sb.Runtime)
+	case len(sb.NetworkAllowOut) > 0 || len(sb.NetworkDenyOut) > 0:
+		return fmt.Errorf("apply egress policy on start: runtime %q does not support selective egress", sb.Runtime)
+	}
+	return nil
 }
 
 // StopSandbox is the operator-initiated stop (API surface, manual). It is a
@@ -3297,12 +3280,12 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 		return err
 	}
 	// Everything the installed record names goes: a transition that didn't
-	// finish may have left a gateway attachment and CIDR rules at once.
-	var cr runtime.ContainerRuntime
-	if c, err := s.containerRuntimeForSandbox(sandbox); err == nil {
-		cr = c
+	// finish may have left a gateway attachment and CIDR rules at once. The
+	// row is the retry anchor until those are recorded against the address
+	// (review 6 finding 3); a retried destroy finds the runtime gone.
+	if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
+		return err
 	}
-	s.teardownSandboxEgress(ctx, sandbox, cr, sandbox.ContainerIP, true)
 	s.egressPids.Delete(id)
 	s.forgetLearned(ctx, sandbox)
 	if s.testAfterRuntimeDestroy != nil {
@@ -5332,12 +5315,13 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			}
 			// The runtime is gone, so its egress enforcement on this node goes
 			// now, before the row and its installed record do; it is local
-			// whoever owns the sandbox (review 5 finding 5).
-			var cr runtime.ContainerRuntime
-			if c, err := s.containerRuntimeForSandbox(sandbox); err == nil {
-				cr = c
+			// whoever owns the sandbox (review 5 finding 5). The row stays
+			// for the next pass until the rules are recorded (review 6
+			// finding 3).
+			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
+				s.logger.Warn("reconcile: egress rules of a gone sandbox not recorded; row kept", "sandbox_id", sandbox.ID, "error", err)
+				continue
 			}
-			s.teardownSandboxEgress(ctx, sandbox, cr, sandbox.ContainerIP, true)
 			// Runtime confirmation and teardown can overlap failover. An
 			// authoritative recheck prevents this former owner from deleting the
 			// active lifecycle's replicated secrets, volume attachments, or
@@ -5397,6 +5381,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// A row that says started but whose container stopped or moved
+		// missed the stop (sandboxd was down, the event stream gapped): what
+		// it left at the old address is recorded and cleared now, before
+		// the row forgets the address (review 6 finding 4).
+		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" &&
+			(state.Status != models.SandboxStatusStarted || state.ContainerIP != sandbox.ContainerIP) {
+			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
+				s.logger.Warn("reconcile: egress rules at a moved sandbox's old address not recorded", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
+		}
 		sandbox.ContainerID = state.ContainerID
 		sandbox.ContainerIP = state.ContainerIP
 		sandbox.Status = state.Status
@@ -5466,10 +5460,12 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// hostname lists never go to netrules. A transition that didn't
 			// finish is completed instead of healed: adding the stored rules
 			// would leave the old enforcement in place beside them (review
-			// 5 finding 3).
-			if s.transitionUnfinished(ctx, sandbox) {
-				if err := s.reapplyStoredPolicy(ctx, sandbox.ID); err != nil {
-					s.logger.Warn("reconcile: unfinished egress transition not completed", "sandbox_id", sandbox.ID, "error", err)
+			// 5 finding 3). So is an address with rules another sandbox left
+			// there (review 6 finding 1). Both rebuild at the address
+			// observed now, which the row doesn't have yet.
+			if s.transitionUnfinished(ctx, sandbox) || s.rulesPendingAt(ctx, sandbox) {
+				if err := s.rebuildEgress(ctx, sandbox.ID, sandbox, false); err != nil {
+					s.logger.Warn("reconcile: egress enforcement not rebuilt", "sandbox_id", sandbox.ID, "error", err)
 				}
 			} else if isGatewayMode(sandbox) {
 				s.reconcileSandboxEgress(ctx, sandbox)
