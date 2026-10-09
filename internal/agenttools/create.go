@@ -29,6 +29,27 @@ type CreateSpec struct {
 	// defaults here (stop after 30m idle, destroy after 24h, eng review D7).
 	Lifecycle    *models.Lifecycle
 	BlockNetwork bool
+	// AllowOut limits outbound traffic to these hosts, *.domain wildcards,
+	// host:port pairs and CIDRs; everything else is refused
+	// (plans/egress-domain-filtering.md P2-3).
+	AllowOut []string
+}
+
+// HostList is a repeatable egress-destination flag (CreateSpec.AllowOut) that
+// also takes a comma list, so the flags a printed MCP client config carries
+// parse back the same.
+type HostList []string
+
+func (l *HostList) String() string { return strings.Join(*l, ",") }
+
+// Set appends each non-empty comma-separated entry.
+func (l *HostList) Set(s string) error {
+	for part := range strings.SplitSeq(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			*l = append(*l, part)
+		}
+	}
+	return nil
 }
 
 // CreateResult reports which sandbox a get-or-create landed on.
@@ -112,6 +133,7 @@ func (t *Tools) createOptions(name string, spec CreateSpec) sdktypes.CreateSandb
 		Tags:            tags,
 		Lifecycle:       spec.Lifecycle,
 		NetworkBlockAll: spec.BlockNetwork,
+		NetworkAllowOut: spec.AllowOut,
 	}
 }
 

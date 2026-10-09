@@ -1114,6 +1114,13 @@ func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.T
 		if len(destination) > secretAuditSpillDestMax {
 			destination = destination[:secretAuditSpillDestMax]
 		}
+		// A spilled worker line may report a denial from the fixed
+		// vocabulary (H5). Any other claimed outcome is ignored and the
+		// server's own success/ok stands, as before denials existed.
+		outResult, outReason, ok := workerEgressOutcome(ev.Result, ev.Reason)
+		if !ok {
+			outResult, outReason = secretAuditResultSuccess, secretAuditReasonOK
+		}
 		actor := ""
 		if s.spillActor != nil {
 			actor = s.spillActor()
@@ -1122,8 +1129,9 @@ func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.T
 		if s.spillOwnerRef != nil {
 			ownerRef = s.spillOwnerRef(sandboxID)
 		}
-		// Everything identity- or outcome-bearing is server-controlled; only
-		// the destination, network, time, and event id come from the worker.
+		// Everything identity-bearing is server-controlled; from the worker
+		// come the destination, network, time, event id and a validated
+		// outcome.
 		return SecretAuditEvent{
 			Time:          ev.Time,
 			EventID:       ev.EventID,
@@ -1132,8 +1140,8 @@ func (s *fileAuditSink) sanitizeSpillRecord(rec auditlog.SpillRecord, now time.T
 			SandboxID:     sandboxID,
 			IncarnationID: incarnationID,
 			OwnerRef:      ownerRef,
-			Result:        secretAuditResultSuccess,
-			Reason:        secretAuditReasonOK,
+			Result:        outResult,
+			Reason:        outReason,
 			Kind:          secretAuditKindEgress,
 			Destination:   destination,
 			Network:       strings.TrimSpace(ev.Network),

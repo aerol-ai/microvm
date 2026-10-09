@@ -37,6 +37,9 @@ type Client struct {
 	// adminMu serializes config mutations from every writer in the process
 	// (admin_lock.go). Lock order: adminMu before gate.
 	adminMu sync.Mutex
+
+	// onDemandIssuer issues custom-domain certificates (EnsureOnDemandTLS).
+	onDemandIssuer TLSIssuer
 }
 
 func New(cfg config.Config) *Client {
@@ -53,6 +56,8 @@ func New(cfg config.Config) *Client {
 		enabled:       cfg.EnableCaddy,
 		l4TLSListen:   cfg.L4TLSListen,
 		l4TLSFallback: cfg.L4TLSFallback,
+		onDemandIssuer: TLSIssuer{Internal: cfg.TLSIssuer == config.TLSIssuerInternal,
+			CA: cfg.TLSACMECA, TrustedRoot: cfg.TLSACMECARoot},
 		// Every admin call rides this client, so the instrumenting transport
 		// (pkg/caddy/metrics.go) catches latency + error counters for all of
 		// them without per-call-site instrumentation drift.
@@ -926,16 +931,16 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 		return fmt.Errorf("install on-demand settings failed: %d", status)
 	}
 
-	hasPolicy, err := c.hasOnDemandPolicy(ctx)
+	idx, stored, found, err := c.onDemandPolicy(ctx)
 	if err != nil {
 		return err
 	}
-	if hasPolicy {
-		return nil
+	if found {
+		return c.reconcileOnDemandIssuer(ctx, idx, stored)
 	}
 	policy := map[string]any{
 		"on_demand": true,
-		"issuers":   []map[string]any{{"module": "acme"}},
+		"issuers":   []map[string]any{c.onDemandIssuer.config()},
 	}
 	policyBody, err := json.Marshal(policy)
 	if err != nil {
@@ -957,38 +962,75 @@ func (c *Client) ensureOnDemandTLSLocked(ctx context.Context, askURL string) err
 // entry with on_demand=true. Returns false (no error) when policies is
 // absent — that's the fresh-Caddy case the caller handles by appending.
 func (c *Client) hasOnDemandPolicy(ctx context.Context) (bool, error) {
+	_, _, found, err := c.onDemandPolicy(ctx)
+	return found, err
+}
+
+// onDemandPolicy finds the on_demand=true policy: its index and its issuers
+// (nil when it has none).
+func (c *Client) onDemandPolicy(ctx context.Context) (idx int, issuers json.RawMessage, found bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/config/apps/tls/automation/policies", nil)
 	if err != nil {
-		return false, err
+		return 0, nil, false, err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return false, fmt.Errorf("get policies: %w", err)
+		return 0, nil, false, fmt.Errorf("get policies: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return false, nil
+		return 0, nil, false, nil
 	}
 	if resp.StatusCode >= 400 {
-		return false, fmt.Errorf("get policies failed: %d", resp.StatusCode)
+		return 0, nil, false, fmt.Errorf("get policies failed: %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, fmt.Errorf("read policies body: %w", err)
+		return 0, nil, false, fmt.Errorf("read policies body: %w", err)
 	}
 	if strings.TrimSpace(string(body)) == "null" {
-		return false, nil
+		return 0, nil, false, nil
 	}
-	var policies []map[string]any
+	var policies []map[string]json.RawMessage
 	if err := json.Unmarshal(body, &policies); err != nil {
-		return false, fmt.Errorf("decode policies: %w", err)
+		return 0, nil, false, fmt.Errorf("decode policies: %w", err)
 	}
-	for _, p := range policies {
-		if v, ok := p["on_demand"].(bool); ok && v {
-			return true, nil
+	for i, p := range policies {
+		var onDemand bool
+		if raw, ok := p["on_demand"]; ok && json.Unmarshal(raw, &onDemand) == nil && onDemand {
+			return i, p["issuers"], true, nil
 		}
 	}
-	return false, nil
+	return 0, nil, false, nil
+}
+
+// reconcileOnDemandIssuer points an existing on-demand policy at the
+// configured issuer, so changing SB_TLS_ACME_CA or SB_TLS_ISSUER takes effect
+// on the next start and unsetting them goes back to public ACME. A policy
+// that already has it is left alone, extra fields (an account email)
+// included.
+func (c *Client) reconcileOnDemandIssuer(ctx context.Context, idx int, stored json.RawMessage) error {
+	if c.onDemandIssuer.matches(stored) {
+		return nil
+	}
+	body, err := json.Marshal([]map[string]any{c.onDemandIssuer.config()})
+	if err != nil {
+		return fmt.Errorf("marshal on-demand issuer: %w", err)
+	}
+	// PATCH replaces an existing key; PUT creates a missing one.
+	method := http.MethodPatch
+	if len(stored) == 0 || strings.TrimSpace(string(stored)) == "null" {
+		method = http.MethodPut
+	}
+	target := fmt.Sprintf("%s/config/apps/tls/automation/policies/%d/issuers", c.baseURL, idx)
+	status, err := c.sendJSON(ctx, method, target, body)
+	if err != nil {
+		return err
+	}
+	if status >= 400 {
+		return fmt.Errorf("update on-demand issuer failed: %d", status)
+	}
+	return nil
 }
 
 // EnsureLayer4 idempotently bootstraps the layer4 app and (when tlsListen is

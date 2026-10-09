@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -185,16 +186,17 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil && !s.ipClaimedByOther(ctx, sandbox.ID, previousIP, cr) {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
-			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container.
-			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
-			}
+		}
+		// Selective-egress rules are comment-tagged, so ClearNetworkRules
+		// above does not remove them. Everything the installed record names
+		// is recorded against the address and goes before the IP is
+		// recycled, or, if it already was, by the new owner's rebuild.
+		if err := s.teardownSandboxEgress(ctx, sandbox, previousIP); err != nil {
+			s.logger.Error("egress: rules left at a stopped sandbox's address are retried by this process only", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 		}
 	}
 
@@ -258,16 +260,15 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 		}
 	}
 	if previousIP != "" {
-		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil {
+		if cr, err := s.containerRuntimeForSandbox(sandbox); err == nil && !s.ipClaimedByOther(ctx, sandbox.ID, previousIP, cr) {
 			if err := cr.ClearNetworkRules(previousIP); err != nil {
 				s.logger.Warn("clear network rules failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
 			}
-			// Selective-egress rules are comment-tagged, so ClearNetworkRules
-			// above does not remove them — clear them from the persisted policy
-			// before the IP is recycled to another container.
-			if err := cr.ClearEgressPolicy(previousIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
-				s.logger.Warn("clear egress policy failed", "sandbox_id", sandbox.ID, "ip", previousIP, "error", err)
-			}
+		}
+		// As on stop. The row is the retry anchor until the address's rules
+		// are recorded: reconcile finds the runtime gone and tears down again.
+		if err := s.teardownSandboxEgress(ctx, sandbox, previousIP); err != nil {
+			return err
 		}
 	}
 	if placement, obsolete, err := s.obsoleteLocalPlacement(ctx, sandbox); err != nil {
@@ -351,11 +352,34 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 			"previous_ip", sandbox.ContainerIP,
 			"new_ip", state.ContainerIP,
 		)
+		// A row that still says started at another address missed its stop:
+		// what it left there is recorded and cleared before the new address
+		// is enforced (review 6 finding 4).
+		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" {
+			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
+				s.logger.Error("egress: rules left at a moved sandbox's old address are retried by this process only", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
+			}
+		}
 	}
 
 	sandbox.ContainerIP = state.ContainerIP
 	sandbox.Status = state.Status
 	sandbox.UpdatedAt = time.Now().UTC()
+	// The stop event cleared this sandbox's per-IP rules (the IP can be
+	// recycled), so a start the API didn't drive would otherwise run
+	// unrestricted until the next reconcile pass. Re-apply before anything
+	// else and fail closed: a sandbox whose isolation can't be restored is
+	// stopped (egress plan P0-4).
+	clearGen := s.egressClears.now()
+	if err := s.reapplyEgressOnStart(ctx, rt, sandbox); err != nil {
+		_ = rt.Stop(ctx, s.runtimeRef(sandbox))
+		sandbox.Status = models.SandboxStatusError
+		sandbox.LastError = err.Error()
+		if uerr := s.store.Upsert(ctx, sandbox); uerr != nil {
+			s.logger.Warn("record start-event egress failure", "sandbox_id", sandbox.ID, "error", uerr)
+		}
+		return fmt.Errorf("reapply egress on start event: %w", err)
+	}
 	// A successful start (whether driven by the API, a wake, or
 	// out-of-band `docker start`) means the sandbox is live again, so
 	// drop wake_armed. The next stop is the one that decides whether
@@ -364,6 +388,7 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 	if err := s.store.Upsert(ctx, sandbox); err != nil {
 		return fmt.Errorf("update sandbox runtime: %w", err)
 	}
+	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
 	// Out-of-band start (operator ran `docker start <id>` directly): the
 	// container is already running, so we cannot refuse it via Admit. Use
@@ -385,5 +410,48 @@ func (s *Service) handleStartEvent(ctx context.Context, sandbox *models.Sandbox)
 		}
 	}
 	s.syncAllowedPorts(ctx, sandbox)
+	// Quota blocks are re-evaluated against the stored counters, the same
+	// way reconcile heals them, so an over-quota sandbox started out of band
+	// is blocked again right away.
+	if sandbox.NetworkQuotaExceeded {
+		overIn := sandbox.NetworkBytesInLimit > 0 && sandbox.NetworkBytesIn >= sandbox.NetworkBytesInLimit
+		overOut := sandbox.NetworkBytesOutLimit > 0 && sandbox.NetworkBytesOut >= sandbox.NetworkBytesOutLimit
+		s.applyNetworkQuotaState(ctx, sandbox, overIn, overOut)
+	}
 	return nil
+}
+
+// reapplyEgressOnStart puts the stored egress policy back on a container
+// that started (enforceEgressOnStart). A runtime without host rules is
+// refused only if the sandbox has a policy to enforce.
+func (s *Service) reapplyEgressOnStart(ctx context.Context, rt runtime.Runtime, sandbox *models.Sandbox) error {
+	cr, ok := runtime.AsContainerRuntime(rt)
+	if !ok {
+		if !sandbox.NetworkBlockAll && len(sandbox.NetworkAllowOut) == 0 && len(sandbox.NetworkDenyOut) == 0 {
+			return nil
+		}
+		return fmt.Errorf("runtime %q does not support network rules", sandbox.Runtime)
+	}
+	return s.enforceEgressOnStart(ctx, cr, sandbox)
+}
+
+// ipClaimedByOther reports whether a sandbox other than sandboxID may be using
+// ip now: per the store (creating/started rows and claimed netns slots) or,
+// when the runtime can tell, its live network view. Stop and destroy events
+// arrive asynchronously, so by the time one is handled the IP may already
+// belong to a new sandbox; clearing then would strip the new owner's DROP and
+// leave it unrestricted (egress plan P0-6). A lookup error also counts as
+// claimed: a stale rule left behind fails closed and reconcile cleans it,
+// while a wrong clear fails open.
+func (s *Service) ipClaimedByOther(ctx context.Context, sandboxID, ip string, cr runtime.ContainerRuntime) bool {
+	holder, known := s.ipHolder(ctx, cr, ip, sandboxID)
+	switch {
+	case !known:
+		s.logger.Warn("skip event rule clear: ip owner unknown", "sandbox_id", sandboxID, "ip", ip)
+		return true
+	case holder != "":
+		s.logger.Info("skip event rule clear: ip reassigned", "sandbox_id", sandboxID, "ip", ip, "new_owner", holder)
+		return true
+	}
+	return false
 }

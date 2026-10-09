@@ -211,9 +211,30 @@ type Config struct {
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
-	NetrulesBackend    string
-	EnableEventMonitor bool
-	EnableSSHGateway   bool
+	NetrulesBackend string
+	// EgressFQDNEnabled turns on hostname egress filtering through the
+	// egress-gateway process (plans/egress-domain-filtering.md, CEO D25).
+	// Inert until a sandbox uses a hostname rule. Off means hostname
+	// policies get 501. SB_EGRESS_FQDN_ENABLED.
+	EgressFQDNEnabled bool
+	// EgressGatewaySocket is the gateway's UDS (SB_EGRESS_GATEWAY_SOCKET).
+	EgressGatewaySocket string
+	// EgressProcidSocket is where sandboxd answers the gateway's executable
+	// lookups for per-binary rules (SB_EGRESS_PROCID_SOCKET); empty turns
+	// them off (the rules' flows are then refused).
+	EgressProcidSocket string
+	// EgressGatewayUser is the gateway's system user, the only peer the
+	// lookup socket answers (SB_EGRESS_GATEWAY_USER).
+	EgressGatewayUser string
+	// EgressOperatorFile is the private-cloud operator policy (§5.10,
+	// SB_EGRESS_OPERATOR_FILE). Empty keeps today's behavior.
+	EgressOperatorFile string
+	// EgressProfileApplyQPS bounds how many sandboxes per second this node
+	// re-applies after an egress profile changes, so one profile edit can't
+	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
+	EgressProfileApplyQPS int
+	EnableEventMonitor    bool
+	EnableSSHGateway      bool
 	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
 	// of the box; flip to false on a per-host basis to opt that host out of
@@ -249,6 +270,17 @@ type Config struct {
 	// TLSOnDemandInterval is the daemon-side on-demand TLS issuance budget
 	// refill interval. Default 1m.
 	TLSOnDemandInterval time.Duration
+	// TLSACMECA is the ACME directory URL the on-demand TLS policy issues
+	// from (SB_TLS_ACME_CA): a bank PKI or step-ca on a network with no
+	// route to Let's Encrypt or ZeroSSL (plans/egress-domain-filtering.md
+	// §5.10 PC-5). Empty keeps the public CAs.
+	TLSACMECA string
+	// TLSACMECARoot is a PEM file of roots Caddy trusts when it talks to
+	// TLSACMECA (SB_TLS_ACME_CA_ROOT). Absolute path.
+	TLSACMECARoot string
+	// TLSIssuer selects the on-demand policy's issuer (SB_TLS_ISSUER):
+	// "acme" (default) or "internal", Caddy's own CA, for labs.
+	TLSIssuer string
 	// ACMEDaemonBudgetFraction is the high-water mark on the daemon-wide
 	// ACME issuance bucket — when usage crosses this fraction of Let's
 	// Encrypt's published `new-orders` limit (300 / 3h), TLSAsk returns
@@ -1661,6 +1693,12 @@ func Load() (Config, error) {
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
+		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
+		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
+		EgressProcidSocket:                strings.TrimSpace(getEnv("SB_EGRESS_PROCID_SOCKET", "/run/aerolvm/egress-procid.sock")),
+		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
+		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
+		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
@@ -1670,6 +1708,9 @@ func Load() (Config, error) {
 		CustomDomainVerifyValuePrefix:     getEnv("SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX", "aerol-verify="),
 		TLSOnDemandBurst:                  getEnvInt("SB_TLS_ON_DEMAND_BURST", 5),
 		TLSOnDemandInterval:               getEnvDuration("SB_TLS_ON_DEMAND_INTERVAL", time.Minute),
+		TLSACMECA:                         strings.TrimSpace(getEnv("SB_TLS_ACME_CA", "")),
+		TLSACMECARoot:                     strings.TrimSpace(getEnv("SB_TLS_ACME_CA_ROOT", "")),
+		TLSIssuer:                         strings.ToLower(strings.TrimSpace(getEnv("SB_TLS_ISSUER", TLSIssuerACME))),
 		ACMEDaemonBudgetFraction:          getEnvFloat("SB_ACME_DAEMON_BUDGET_FRACTION", 0.8),
 		ACMEDaemonBudgetWindow:            getEnvDuration("SB_ACME_DAEMON_BUDGET_WINDOW", 3*time.Hour),
 		ACMEDaemonBudgetCapacity:          getEnvInt("SB_ACME_DAEMON_BUDGET_CAPACITY", 300),
@@ -2567,6 +2608,10 @@ func Load() (Config, error) {
 		}
 	}
 
+	if err := validateTLSIssuer(cfg); err != nil {
+		return Config{}, err
+	}
+
 	if cfg.EnableCustomDomains {
 		// Custom-domain ingress relies on a wildcard cert under Domain and a
 		// distinguishable apex to reject base-domain collisions. Without
@@ -3016,4 +3061,36 @@ func splitEnvList(key string) []string {
 		}
 	}
 	return out
+}
+
+// TLS issuers for the on-demand policy (SB_TLS_ISSUER).
+const (
+	TLSIssuerACME     = "acme"
+	TLSIssuerInternal = "internal"
+)
+
+// validateTLSIssuer checks the on-demand issuer settings (§5.10 PC-5). The
+// internal CA takes no ACME directory, and a directory must be an https URL:
+// a typo would otherwise surface only as failed certificates.
+func validateTLSIssuer(cfg Config) error {
+	switch cfg.TLSIssuer {
+	case TLSIssuerACME:
+	case TLSIssuerInternal:
+		if cfg.TLSACMECA != "" || cfg.TLSACMECARoot != "" {
+			return errors.New("SB_TLS_ACME_CA and SB_TLS_ACME_CA_ROOT don't apply when SB_TLS_ISSUER=internal")
+		}
+		return nil
+	default:
+		return fmt.Errorf("SB_TLS_ISSUER must be %q or %q, got %q", TLSIssuerACME, TLSIssuerInternal, cfg.TLSIssuer)
+	}
+	if cfg.TLSACMECA != "" {
+		u, err := url.Parse(cfg.TLSACMECA)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("SB_TLS_ACME_CA must be an https ACME directory URL, got %q", cfg.TLSACMECA)
+		}
+	}
+	if cfg.TLSACMECARoot != "" && !filepath.IsAbs(cfg.TLSACMECARoot) {
+		return fmt.Errorf("SB_TLS_ACME_CA_ROOT must be an absolute path, got %q", cfg.TLSACMECARoot)
+	}
+	return nil
 }

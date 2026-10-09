@@ -128,6 +128,7 @@ func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRu
 	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
 		return nil, err
 	}
+	d.bindNetworkBlocks(sandboxID, &caps)
 	if err := client.Instantiate(sandboxID, caps); err != nil {
 		return nil, fmt.Errorf("instantiate module: %w", err)
 	}

@@ -155,6 +155,70 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
+## Egress domain filtering (UC-179..UC-204)
+
+`suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,
+`suite/egress_phase3_test.go`, `suite/egress_firecracker_test.go` and
+`suite/egress_private_cloud_test.go` cover hostname egress filtering
+(plans/egress-domain-filtering.md P1-10, P1-20, Phases 2-4).
+
+- **`egress-fqdn`** (advertised by `single-node`, `single-node-containerd`,
+  `cluster-3-mixed-docker` and `cluster-3-mixed-gvisor`): UC-180..182 run real
+  traffic through the node's egress gateway (allowed name over HTTPS, NXDOMAIN
+  and a fast refusal for others, the 403 naming host and rule, the denial in
+  `sandbox.audit()`, `host:port` and `*.` entries). UC-185 is the EF-78
+  latency gate: with `AEROL_BENCH=1` it reads the `svc_egress_*` stages from
+  Server-Timing and fails over the join (≤2 ms p50) and attach (≤10 ms p99)
+  budgets (`AEROL_EGRESS_JOIN_P50_MS` / `AEROL_EGRESS_ATTACH_P99_MS` override).
+- Phase 2, also on `egress-fqdn`: UC-190 changes a running sandbox's policy,
+  UC-191 converges a named profile change and refuses deleting it while
+  referenced, and UC-192 (EF-48) learns `pip install` in learn mode, then
+  locks to the suggested list. UC-193..200 (EF-49) run each built-in profile's
+  real tool with only that profile: pip, npm, `git clone`, a Hugging Face
+  download, `go mod download`, `cargo fetch`, apt and `crane pull` (in place
+  of `docker pull`, which would need Docker in Docker). They pull the tool
+  images (python, node, alpine/git, golang, rust, ubuntu, crane) and reach the
+  public registries, so a failure there may be registry drift: the built-in
+  lists are kept by hand and these UCs are how operators catch a stale one
+  (CEO D12).
+- Phase 3, also on `egress-fqdn`: UC-201 (EF-52, EF-53) creates a
+  `python:3.12-alpine` sandbox allowed `api.github.com` with an inspect rule
+  for `GET /repos/**`. Python's `urllib`, trusting the node CA only through
+  `SSL_CERT_FILE`, gets a 200 for the ruled GET through the gateway's TLS
+  termination, and the gateway's own 403 (naming `network_egress_rules`) for a
+  POST and for an unruled path. It calls the public GitHub API unauthenticated,
+  so a 403 on the GET may be GitHub's rate limit; the failure prints the body.
+  UC-202 (EF-54, P3-2) creates a `python:3.12-alpine` sandbox with a random
+  `TEST_TOKEN` in its env and an inspect rule on `postman-echo.com` for
+  `/headers` that injects `Authorization` from `env:TEST_TOKEN`. Inside, the
+  env holds only `aerolvm-placeholder:TEST_TOKEN`; `urllib` sends that
+  placeholder as `Authorization`, and the echoed headers must show the real
+  token the gateway put in its place. It depends on the public
+  `postman-echo.com` service being up.
+  UC-203 (EF-55, P3-3) creates a `python:3.12-alpine` sandbox, pinned to the
+  `docker` runtime (runc under either engine, never runsc, which refuses
+  `binaries` with 501), allowed `pypi.org` and `files.pythonhosted.org` with a
+  binaries-only rule on 443 for each naming `/usr/local/bin/pip`. Inside,
+  `pip install requests` must pass without inspection (the gateway names pip by
+  its script), and busybox `wget` to `https://pypi.org/simple/` must be
+  refused at the TLS handshake. The node needs cgroup v2, which the Ubuntu
+  22.04 AMIs have; on cgroup v1 every covered connection is refused
+  (`binary_unknown`).
+- Phase 4, on `single-node-fc` (`firecracker` + `egress-fqdn`): UC-204
+  creates a Firecracker guest allowed `pypi.org`. Its traffic reaches the
+  egress gateway over its own TAP: the listed name fetches over HTTPS, another
+  is refused fast, `egress_status` is `active`, and a live switch to block-all
+  shuts it. That scenario also runs the docker egress UCs above.
+- UC-179 (CIDR allowlist), UC-183 (no `CAP_NET_RAW`) and UC-184 (block-all
+  can't reach host services) only need `docker`.
+- **`private-cloud`** (`single-node-private-cloud`, `make
+  integration-single-private-cloud`): the node runs dnsmasq with internal names,
+  an internal HTTP service and squid, wired into the egress operator file.
+  UC-186..189 cover the upstream proxy with synthetic DNS, the internal zone
+  (and its rebinding refusal), the deny floor and the control-port guard. The
+  node keeps its internet gateway; a no-egress VPC with an offline install is
+  the remaining part of P1-20.
+
 ## Create benchmark (UC-94 / UC-95)
 
 `suite/benchmark_test.go` is an **opt-in** benchmark that reuses the live

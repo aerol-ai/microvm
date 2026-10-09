@@ -36,8 +36,17 @@ func (s *ResidentServer) mediator() *NetMediator {
 	if s.net == nil {
 		s.net = newNetMediator()
 		installDefaultEgressObserver(s.net, s.auditBinding)
+		installOperatorGuard(s.net)
 	}
 	return s.net
+}
+
+// close stops the mediator's operator-file poll with the worker.
+func (s *ResidentServer) close() {
+	s.mu.Lock()
+	m := s.net
+	s.mu.Unlock()
+	m.stopOperatorWatch()
 }
 
 func (s *ResidentServer) setAuditBinding(sandboxID string, caps wasmengine.Capabilities) {
@@ -250,6 +259,8 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
+			s.mediator().ApplyCapsPolicy(env.SandboxID, p.Caps)
 			s.bindNetworkHook(eng, env.SandboxID)
 			if err := eng.Instantiate(ctx, env.SandboxID, p.Caps); err != nil {
 				s.clearAuditBinding(env.SandboxID)
@@ -278,6 +289,8 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				}
 				continue
 			}
+			s.mediator().AddBlocks(env.SandboxID, p.Caps.NetworkBlockIngress, p.Caps.NetworkBlockEgress)
+			s.mediator().ApplyCapsPolicy(env.SandboxID, p.Caps)
 			s.bindNetworkHook(eng, env.SandboxID)
 			s.storeCaps(env.SandboxID, p.Caps)
 			result, runErr := eng.Run(ctx, env.SandboxID, p.Caps, p.Export)
@@ -343,8 +356,29 @@ func (s *ResidentServer) Serve(conn net.Conn) error {
 				s.clearNetworkHook(eng, env.SandboxID)
 				s.clearAuditBinding(env.SandboxID)
 				_, _ = s.mediator().DrainUsage(env.SandboxID)
+				s.mediator().ForgetLearned(env.SandboxID)
 			}
 			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgSetEgressPolicy:
+			var p setEgressPolicyPayload
+			if err := decodePayload(env.Payload, &p); err != nil {
+				if replyErr(env.SandboxID, err) != nil {
+					return err
+				}
+				continue
+			}
+			s.mediator().SetPolicy(env.SandboxID, compileLists(p.AllowOut, p.DenyOut, p.Learn))
+			if err := replyOK(env.SandboxID); err != nil {
+				return err
+			}
+		case MsgEgressLearned:
+			body, encErr := encodePayload(s.mediator().Learned(env.SandboxID))
+			if encErr != nil {
+				return encErr
+			}
+			if err := writeFrame(conn, Envelope{Type: MsgOK, SandboxID: env.SandboxID, Payload: body}); err != nil {
 				return err
 			}
 		case MsgSetNetworkBlocks:
@@ -392,6 +426,7 @@ func ServeSocketPathResident(socketPath string) error {
 	}
 	defer ln.Close()
 	srv := &ResidentServer{}
+	defer srv.close()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

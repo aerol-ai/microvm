@@ -26,12 +26,26 @@ public class CreateOptions {
     public Map<String, String> env;
     public String osUser;
     public Boolean networkBlockAll;
-    /** Egress allowlist of CIDRs; sandbox may reach only these. Mutually exclusive with networkDenyOut. */
+    /** Egress allowlist: CIDRs, hostnames, *.suffix wildcards and host:port entries; with networkDenyOut, allow wins. */
     @JsonProperty("network_allow_out")
     public List<String> networkAllowOut;
-    /** Egress blocklist of CIDRs; sandbox may reach anything except these. Mutually exclusive with networkAllowOut. */
+    /** Egress blocklist of CIDRs (never hostnames); sandbox may reach anything except these. */
     @JsonProperty("network_deny_out")
     public List<String> networkDenyOut;
+    /** Named egress profiles whose entries join networkAllowOut; a profile change reaches every sandbox using it. */
+    @JsonProperty("egress_profiles")
+    public List<String> egressProfiles;
+    /** "learn" gives the sandbox open egress and records what it reaches; trusted runs only. Null is "enforce". */
+    @JsonProperty("network_egress_mode")
+    public String networkEgressMode;
+    /**
+     * Method and path rules that refine hosts the allow list already admits (at
+     * most 32). An inspect rule makes the egress gateway terminate TLS on 443
+     * with the node's CA, which only a sandbox created with such a rule trusts,
+     * so set inspect rules here rather than adding them later.
+     */
+    @JsonProperty("network_egress_rules")
+    public List<EgressRule> networkEgressRules;
     /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
@@ -120,6 +134,21 @@ public class CreateOptions {
 
     public CreateOptions setNetworkDenyOut(List<String> networkDenyOut) {
         this.networkDenyOut = networkDenyOut;
+        return this;
+    }
+
+    public CreateOptions setEgressProfiles(List<String> egressProfiles) {
+        this.egressProfiles = egressProfiles;
+        return this;
+    }
+
+    public CreateOptions setNetworkEgressMode(String networkEgressMode) {
+        this.networkEgressMode = networkEgressMode;
+        return this;
+    }
+
+    public CreateOptions setNetworkEgressRules(List<EgressRule> networkEgressRules) {
+        this.networkEgressRules = networkEgressRules;
         return this;
     }
 

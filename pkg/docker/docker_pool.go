@@ -249,10 +249,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		pl.BindSpec(),
 	}
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
-	}
+	hostConfig := sandboxHostConfig(c.privileged, binds)
 	if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}

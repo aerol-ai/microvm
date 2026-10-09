@@ -1,0 +1,166 @@
+package service
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
+	"github.com/aerol-ai/microvm/pkg/models"
+)
+
+// ErrEgressGatewayUnavailable means the gateway could not attach the sandbox
+// (unreachable, version skew, a failed nft write). The create rolls back and
+// the API answers 503: a 2xx would claim a policy that is not live.
+var ErrEgressGatewayUnavailable = errors.New("egress gateway unavailable")
+
+// ErrEgressGatewayRequired means a policy needs the egress gateway (hostname
+// entries or learn mode) and this node can't attach the sandbox to one.
+var ErrEgressGatewayRequired = fmt.Errorf("hostname egress filtering needs the egress gateway on this node: %w", models.ErrRuntimeNotImplemented)
+
+// compileCreateEgress validates a container create's egress fields with the
+// shared grammar every runtime uses (plans/egress-domain-filtering.md §5.1,
+// D4, D15): hostnames, *. wildcards and host:port allowed in allow lists, CIDRs
+// only in deny lists, mixed lists with allow-wins precedence. A deny of the
+// whole address space with no allow list is block-all, so it is folded into
+// NetworkBlockAll and the lists are dropped (one blanket DROP, nothing to
+// clean up twice). Every error matches egresspolicy.ErrInvalid and names the
+// offending entry (400).
+func compileCreateEgress(req *models.CreateSandboxRequest) (*egresspolicy.Policy, error) {
+	return compileEgress(req, egresspolicy.MaxInlineHostnames)
+}
+
+// compileCreateEgressEffective compiles a create whose allow list may
+// already hold its profiles' entries: with profiles, the list is the
+// effective one, so it is held to the union cap (the inline part was held to
+// the inline cap before the expansion).
+func compileCreateEgressEffective(req *models.CreateSandboxRequest) (*egresspolicy.Policy, error) {
+	var pol *egresspolicy.Policy
+	var err error
+	if len(req.EgressProfiles) > 0 {
+		pol, err = compileEgress(req, egresspolicy.MaxUnionHostnames)
+	} else {
+		pol, err = compileCreateEgress(req)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Rules refine the effective list, so they are checked against it.
+	if _, err := egresspolicy.CompileRules(egressRuleSpecs(req.NetworkEgressRules), pol); err != nil {
+		return nil, err
+	}
+	return pol, nil
+}
+
+// egressRuleSpecs converts the wire rules for pkg/egresspolicy and the
+// gateway.
+func egressRuleSpecs(rules []models.EgressRule) []egresspolicy.RuleSpec {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]egresspolicy.RuleSpec, len(rules))
+	for i, r := range rules {
+		out[i] = egresspolicy.RuleSpec{Host: r.Host, Ports: r.Ports, Methods: r.Methods, Paths: r.Paths, Inspect: r.Inspect, Binaries: r.Binaries}
+		if r.Inject != nil {
+			out[i].Inject = &egresspolicy.InjectSpec{Header: r.Inject.Header, SecretRef: r.Inject.SecretRef}
+		}
+	}
+	return out
+}
+
+// checkFirecrackerEgress admits the egress options a Firecracker guest can
+// have (plans/egress-domain-filtering.md Phase 4): block-all and CIDR
+// allow/deny lists on the node's firewall, keyed by the guest IP, and
+// hostname entries, profiles and learn mode through the egress gateway,
+// which serves every TAP (createFirecrackerSandbox checks it is ready).
+// Rules stay unspecified on Firecracker (CEO D14): the per-binary kind
+// can't work at all, the VM is opaque to the host. A node without the
+// firewall refuses every egress option, as before.
+func (s *Service) checkFirecrackerEgress(req *models.CreateSandboxRequest) error {
+	if !req.NetworkBlockAll && len(req.NetworkAllowOut) == 0 && len(req.NetworkDenyOut) == 0 &&
+		len(req.EgressProfiles) == 0 && req.NetworkEgressMode == "" && len(req.NetworkEgressRules) == 0 {
+		return nil
+	}
+	fw, ok := s.firecracker.(interface{ NetRulesEnabled() bool })
+	if !ok || !fw.NetRulesEnabled() {
+		return unsupportedFirecrackerOption("egress policies (this node has no firewall for its guests)")
+	}
+	if len(req.NetworkEgressRules) > 0 {
+		return unsupportedFirecrackerOption("network_egress_rules")
+	}
+	return nil
+}
+
+// requireEgressGateway refuses a gateway-mode policy on a node that can't
+// attach the sandbox: the feature is off (501), the self-test failed (501)
+// or hasn't finished yet (503, startup only).
+func (s *Service) requireEgressGateway() error {
+	if !s.egressEnabled() {
+		return ErrEgressGatewayRequired
+	}
+	if s.egressSelfTestFailed() {
+		return ErrEgressSelfTestFailed
+	}
+	if s.egressSelfTestPending() {
+		return fmt.Errorf("%w: the gateway self-test has not finished yet", ErrEgressGatewayUnavailable)
+	}
+	return nil
+}
+
+// hasBinariesRule reports whether a rule names binaries (P3-3).
+func hasBinariesRule(rules []models.EgressRule) bool {
+	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return len(r.Binaries) > 0 })
+}
+
+// unsupportedBinaries: the runtime's processes are invisible to the host
+// (gVisor's netstack, a microVM) or it has no binaries (isolate, WASM), so
+// a per-binary rule couldn't be enforced (P3-3).
+func unsupportedBinaries(runtime string) error {
+	return fmt.Errorf("runtime %q does not support binaries in network_egress_rules (runc only): %w", runtime, models.ErrRuntimeNotImplemented)
+}
+
+// hasInspectRule reports whether a rule needs TLS terminated, so the sandbox
+// must trust the node's CA (P3-1).
+func hasInspectRule(rules []models.EgressRule) bool {
+	return slices.ContainsFunc(rules, func(r models.EgressRule) bool { return r.Inspect })
+}
+
+// unsupportedWasmEgressRules: the WASM mediator dials raw sockets and sees
+// no requests, so method and path rules have nothing to check (CEO D14
+// leaves Phase 3 on WASM unspecified).
+func unsupportedWasmEgressRules() error {
+	return fmt.Errorf("runtime %q does not support network_egress_rules: %w", models.RuntimeWasm, models.ErrRuntimeNotImplemented)
+}
+
+func compileEgress(req *models.CreateSandboxRequest, maxHostnames int) (*egresspolicy.Policy, error) {
+	pol, err := egresspolicy.Compile(egresspolicy.Spec{
+		AllowOut:     req.NetworkAllowOut,
+		DenyOut:      req.NetworkDenyOut,
+		BlockAll:     req.NetworkBlockAll,
+		Mode:         egresspolicy.Mode(req.NetworkEgressMode),
+		MaxHostnames: maxHostnames,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// The stored mode is "learn" or empty; "enforce" is the default spelled
+	// out.
+	if pol.Mode() == egresspolicy.ModeLearn {
+		req.NetworkEgressMode = models.NetworkEgressModeLearn
+		if len(req.EgressProfiles) > 0 {
+			return nil, fmt.Errorf("%w: network_egress_mode %q can't be combined with egress_profiles", egresspolicy.ErrInvalid, egresspolicy.ModeLearn)
+		}
+	} else {
+		req.NetworkEgressMode = ""
+	}
+	if req.NetworkBlockAll && len(req.EgressProfiles) > 0 {
+		return nil, fmt.Errorf("%w: egress_profiles can't be combined with network_block_all", egresspolicy.ErrInvalid)
+	}
+	// With profiles the allow entries come from them, so a deny-all inline
+	// list is the portable allowlist spelling, not block-all.
+	if pol.BlockAll() && !req.NetworkBlockAll && len(req.EgressProfiles) == 0 {
+		req.NetworkBlockAll = true
+		req.NetworkAllowOut, req.NetworkDenyOut = nil, nil
+	}
+	return pol, nil
+}

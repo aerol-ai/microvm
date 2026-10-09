@@ -124,6 +124,9 @@ type DrainStateResponse struct {
 type Agent struct {
 	// drained caches the control plane's drained set (drained_nodes.go).
 	drained drainedNodesCache
+	// profiles caches the egress profiles this worker's sandboxes use
+	// (egress_profiles.go): a worker holds no FSM.
+	profiles egressProfileCache
 
 	// feed is the placement delta feed (agent_placement_feed.go), started
 	// only with SB_INGRESS_PROXY_ROUTING. nil means the page walk.
@@ -425,6 +428,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 	if resp.Error != "" {
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
+		}
+		if resp.Error == ErrNoEgressGatewayTarget.Error() {
+			return PlacementTarget{}, nil, nil, ErrNoEgressGatewayTarget
 		}
 		if err := invalidTopologyFromMessage(resp.Error); err != nil {
 			return PlacementTarget{}, nil, nil, err

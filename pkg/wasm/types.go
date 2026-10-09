@@ -18,6 +18,25 @@ type Capabilities struct {
 	// It binds worker egress reports to exactly one sandbox incarnation.
 	AuditCapability  string `json:"audit_capability,omitempty"`
 	AuditIncarnation string `json:"audit_incarnation,omitempty"`
+	// NetworkBlockIngress / NetworkBlockEgress carry network_block_all and
+	// quota blocks into every instantiation, so the worker's mediator refuses
+	// the guest's first dial instead of waiting for a later block message
+	// (egress plan P0-1). Host control metadata like the audit fields. The
+	// worker only ever ADDS blocks from caps; lifting one takes an explicit
+	// set_network_blocks message, so a re-instantiation can't unblock.
+	NetworkBlockIngress bool `json:"network_block_ingress,omitempty"`
+	NetworkBlockEgress  bool `json:"network_block_egress,omitempty"`
+	// EgressAllowOut / EgressDenyOut are the sandbox's egress policy in the
+	// shared grammar, enforced by the worker's mediator from the first dial
+	// (plans/egress-domain-filtering.md P1-6). EgressPolicySet marks caps
+	// that carry the policy at all: caps without it leave the mediator's
+	// policy unchanged, so a re-instantiation can never drop a policy.
+	EgressAllowOut  []string `json:"egress_allow_out,omitempty"`
+	EgressDenyOut   []string `json:"egress_deny_out,omitempty"`
+	EgressPolicySet bool     `json:"egress_policy_set,omitempty"`
+	// EgressLearn selects learn mode: open egress, recorded by the
+	// mediator for GET /network/learned (P2-7).
+	EgressLearn bool `json:"egress_learn,omitempty"`
 }
 
 // ListenEnabled reports whether wasip1 pre-open TCP listeners are active.

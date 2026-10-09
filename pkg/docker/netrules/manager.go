@@ -67,6 +67,12 @@ type Manager struct {
 	// Service.EnsureLayer4Ready.
 	chainReady atomic.Bool
 	chainMu    sync.Mutex
+	// inputReady latches true once the AEROLVM-INPUT chain, its
+	// established-return rule and the INPUT jump exist. Separate from
+	// chainReady because the dockerd manager never runs EnsureChain (dockerd
+	// owns DOCKER-USER) yet still needs host-INPUT protection (P0-5).
+	inputReady atomic.Bool
+	inputMu    sync.Mutex
 	// bridgeSubnet, when set (containerd engine, e.g. 10.88.0.0/16), makes
 	// EnsureChain also install subnet-scoped FORWARD ACCEPT rules for our
 	// bridge. dockerd sets the FORWARD policy to DROP and only ACCEPTs docker0
@@ -100,6 +106,24 @@ const (
 
 	ChainDockerUser  = "DOCKER-USER"
 	ChainAerolvmUser = "AEROLVM-USER"
+	// ChainAerolvmFC holds the per-guest-IP rules for Firecracker VMs (egress
+	// Phase 4), apart from the container engines' chains: its FORWARD
+	// accepts are scoped to the TAP subnet.
+	ChainAerolvmFC = "AEROLVM-FC"
+	// ChainAerolvmInput holds per-IP drops for traffic from restricted
+	// sandboxes to the host itself (sandboxd API, SSH gateway, cluster port).
+	// Shared by the dockerd and containerd managers: rules are keyed by
+	// sandbox IP and the two bridges never share an IP.
+	ChainAerolvmInput = "AEROLVM-INPUT"
+)
+
+// Comments on AEROLVM-INPUT rules. The block-all drop and the allowlist's
+// input rules must stay disjoint for the same reason egressPolicyComment
+// exists: a quota-driven ClearBlockAllEgress must never remove the
+// allowlist's input drop, and ClearEgressPolicy must never lift a block.
+const (
+	inputBlockComment  = "sbx-input-block"
+	inputPolicyComment = "sbx-egress"
 )
 
 func (m *Manager) filterChain() string {
@@ -200,15 +224,22 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("check existing egress rule: %w", err)
 	}
-	if exists {
-		return false, nil
-	}
 
-	if err := m.ipt.Insert("filter", m.filterChain(), 1, "-s", containerIP, "-j", "DROP"); err != nil {
-		return false, fmt.Errorf("insert egress rule: %w", err)
+	inserted := false
+	if !exists {
+		if err := m.ipt.Insert("filter", m.filterChain(), 1, "-s", containerIP, "-j", "DROP"); err != nil {
+			return false, fmt.Errorf("insert egress rule: %w", err)
+		}
+		inserted = true
 	}
-
-	return true, nil
+	// Block-all also covers the host itself: without this drop a blocked
+	// sandbox still reaches sandboxd's API, the SSH gateway and the cluster
+	// port on its bridge gateway IP, which the FORWARD drop never sees.
+	inputInserted, err := m.ensureInputRule(inputBlockSpec(containerIP))
+	if err != nil {
+		return inserted, err
+	}
+	return inserted || inputInserted, nil
 }
 
 func (m *Manager) ClearBlockAllEgress(containerIP string) error {
@@ -221,7 +252,7 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	if err := m.deleteUntilGone("filter", m.filterChain(), "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete egress rule: %w", err)
 	}
-	return nil
+	return m.deleteInputRules(inputBlockSpec(containerIP))
 }
 
 // BlockAllIngress installs a DROP rule for traffic destined for containerIP,
@@ -276,10 +307,18 @@ const egressPolicyComment = "sbx-egress"
 
 // ApplyEgressPolicy installs a per-container selective egress policy in
 // DOCKER-USER, scoped by source IP and comment-tagged (see egressPolicyComment).
-// Exactly one mode is expected (callers validate mutual exclusivity):
-//   - allowCIDRs non-empty → allowlist: ACCEPT each CIDR, DROP everything else.
-//   - denyCIDRs non-empty  → blocklist: DROP each CIDR, leave the rest to
+// The mode follows the shared allow-wins precedence (plans/
+// egress-domain-filtering.md D4):
+//   - allowCIDRs only → allowlist: ACCEPT each CIDR, DROP everything else.
+//   - denyCIDRs only  → blocklist: DROP each CIDR, leave the rest to
 //     Docker's default ACCEPT.
+//   - both            → allow wins, then deny, then default ACCEPT: ACCEPTs
+//     sit above the DROPs and there is no catch-all.
+//
+// "allow + deny 0.0.0.0/0" is the portable allowlist spelling (E2B's
+// allowOut + denyOut all): normalizeLists maps it to allow-only here, in the
+// one place every apply and clear goes through, so a clear from the stored
+// row always mirrors what the apply installed.
 //
 // Re-apply is idempotent: every rule is Exists-checked before Insert, so the
 // start/reconcile reapply paths can call this repeatedly without duplicating.
@@ -289,7 +328,24 @@ func (m *Manager) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	allowCIDRs, denyCIDRs = normalizeLists(allowCIDRs, denyCIDRs)
 
+	if len(allowCIDRs) > 0 && len(denyCIDRs) > 0 {
+		// Mixed lists: DROPs first, then each ACCEPT at position 1 so every
+		// ACCEPT lands above every DROP (allow wins). Default accept, so no
+		// catch-all and no host-INPUT rules (same as a deny list).
+		for _, cidr := range denyCIDRs {
+			if err := m.ensurePolicyRule("-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); err != nil {
+				return err
+			}
+		}
+		for _, cidr := range allowCIDRs {
+			if err := m.ensurePolicyRule("-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	if len(allowCIDRs) > 0 {
 		// The catch-all DROP must sit BELOW the per-CIDR ACCEPTs. Insert the
 		// DROP first, then each ACCEPT at position 1 so it lands above the DROP.
@@ -298,6 +354,19 @@ func (m *Manager) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 		}
 		for _, cidr := range allowCIDRs {
 			if err := m.ensurePolicyRule("-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"); err != nil {
+				return err
+			}
+		}
+		// An allowlist is default-deny, so the host is off limits too unless
+		// an allowed CIDR covers the host address. Same ordering trick: the
+		// drop goes in first, then each allowed CIDR's RETURN lands above it.
+		// RETURN (not ACCEPT) hands allowed traffic back to INPUT so host
+		// firewalls such as ufw still apply.
+		if _, err := m.ensureInputRule(inputPolicyDropSpec(containerIP)); err != nil {
+			return err
+		}
+		for _, cidr := range allowCIDRs {
+			if _, err := m.ensureInputRule(inputPolicyReturnSpec(containerIP, cidr)); err != nil {
 				return err
 			}
 		}
@@ -321,12 +390,14 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	allowCIDRs, denyCIDRs = normalizeLists(allowCIDRs, denyCIDRs)
 
 	var specs [][]string
 	for _, cidr := range allowCIDRs {
 		specs = append(specs, []string{"-s", containerIP, "-d", cidr, "-m", "comment", "--comment", egressPolicyComment, "-j", "ACCEPT"})
 	}
-	if len(allowCIDRs) > 0 {
+	allowlist := len(allowCIDRs) > 0 && len(denyCIDRs) == 0
+	if allowlist {
 		specs = append(specs, []string{"-s", containerIP, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"})
 	}
 	for _, cidr := range denyCIDRs {
@@ -335,6 +406,130 @@ func (m *Manager) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []
 	for _, spec := range specs {
 		if err := m.deletePolicyRule(spec...); err != nil {
 			return err
+		}
+	}
+	if !allowlist {
+		return nil
+	}
+	inputSpecs := [][]string{inputPolicyDropSpec(containerIP)}
+	for _, cidr := range allowCIDRs {
+		inputSpecs = append(inputSpecs, inputPolicyReturnSpec(containerIP, cidr))
+	}
+	return m.deleteInputRules(inputSpecs...)
+}
+
+// egressHoldComment tags the fail-closed hold DROP (plans/
+// egress-domain-filtering.md CEO D16). It is its own rule, not the shared
+// block-all/quota DROP, so quota and limits code (ClearBlockAllEgress) can
+// never lift a hold, and a hold never lifts a block.
+const egressHoldComment = "sbx-egress-hold"
+
+func holdSpec(ip string) []string {
+	return []string{"-s", ip, "-m", "comment", "--comment", egressHoldComment, "-j", "DROP"}
+}
+
+// HoldEgress installs the hold DROP for containerIP. Idempotent.
+func (m *Manager) HoldEgress(containerIP string) error {
+	if !m.Enabled() || containerIP == "" {
+		return nil
+	}
+	unlock := m.lockIP(containerIP)
+	defer unlock()
+	return m.ensurePolicyRule(holdSpec(containerIP)...)
+}
+
+// ClearHoldEgress removes the hold DROP. Only a successful attach lifts a
+// hold; callers enforce that.
+func (m *Manager) ClearHoldEgress(containerIP string) error {
+	if !m.Enabled() || containerIP == "" {
+		return nil
+	}
+	unlock := m.lockIP(containerIP)
+	defer unlock()
+	return m.deletePolicyRule(holdSpec(containerIP)...)
+}
+
+// normalizeLists maps "allow + deny 0.0.0.0/0" to allow-only (D4).
+func normalizeLists(allow, deny []string) ([]string, []string) {
+	if len(allow) == 0 {
+		return allow, deny
+	}
+	for _, d := range deny {
+		if strings.TrimSpace(d) == "0.0.0.0/0" {
+			return allow, nil
+		}
+	}
+	return allow, deny
+}
+
+func inputBlockSpec(ip string) []string {
+	return []string{"-s", ip, "-m", "comment", "--comment", inputBlockComment, "-j", "DROP"}
+}
+
+func inputPolicyDropSpec(ip string) []string {
+	return []string{"-s", ip, "-m", "comment", "--comment", inputPolicyComment, "-j", "DROP"}
+}
+
+func inputPolicyReturnSpec(ip, cidr string) []string {
+	return []string{"-s", ip, "-d", cidr, "-m", "comment", "--comment", inputPolicyComment, "-j", "RETURN"}
+}
+
+// ensureInputChain bootstraps AEROLVM-INPUT once per Manager lifetime, with
+// the same atomic.Bool + mutex single-flight shape as EnsureChain. It is
+// lazy because the dockerd manager has no EnsureChain call and most
+// sandboxes never need it.
+func (m *Manager) ensureInputChain() error {
+	if m.inputReady.Load() {
+		return nil
+	}
+	m.inputMu.Lock()
+	defer m.inputMu.Unlock()
+	if m.inputReady.Load() {
+		return nil
+	}
+	boot, ok := m.ipt.(inputBootstrapBackend)
+	if !ok {
+		// Same fail-loud contract as EnsureChain: never pretend host
+		// protection is in place.
+		return fmt.Errorf("netrules: backend %T cannot bootstrap the %s chain; block-all sandboxes would still reach host services", m.ipt, ChainAerolvmInput)
+	}
+	if err := boot.EnsureInputChain(ChainAerolvmInput); err != nil {
+		return fmt.Errorf("bootstrap %s: %w", ChainAerolvmInput, err)
+	}
+	m.inputReady.Store(true)
+	return nil
+}
+
+// ensureInputRule installs one per-IP AEROLVM-INPUT rule at position 2, just
+// below the established-return rule, so replies to host-initiated
+// connections (sandboxd→toolboxd) are never dropped. Callers hold the IP lock.
+func (m *Manager) ensureInputRule(spec []string) (bool, error) {
+	if err := m.ensureInputChain(); err != nil {
+		return false, err
+	}
+	exists, err := m.ipt.Exists("filter", ChainAerolvmInput, spec...)
+	if err != nil {
+		return false, fmt.Errorf("check input rule: %w", err)
+	}
+	if exists {
+		return false, nil
+	}
+	if err := m.ipt.Insert("filter", ChainAerolvmInput, 2, spec...); err != nil {
+		return false, fmt.Errorf("insert input rule: %w", err)
+	}
+	return true, nil
+}
+
+// deleteInputRules removes per-IP AEROLVM-INPUT rules. If the chain can't be
+// bootstrapped, no rule can be in it, so the clear is a no-op rather than an
+// error that would fail the caller's whole teardown.
+func (m *Manager) deleteInputRules(specs ...[]string) error {
+	if err := m.ensureInputChain(); err != nil {
+		return nil
+	}
+	for _, spec := range specs {
+		if err := m.deleteUntilGone("filter", ChainAerolvmInput, spec...); err != nil {
+			return fmt.Errorf("delete input rule: %w", err)
 		}
 	}
 	return nil

@@ -265,6 +265,8 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		NetworkBlockAll:    sb.NetworkBlockAll,
 		NetworkAllowOut:    sb.NetworkAllowOut,
 		NetworkDenyOut:     sb.NetworkDenyOut,
+		NetworkEgressMode:  sb.NetworkEgressMode,
+		NetworkEgressRules: sb.NetworkEgressRules,
 		AllowPublicTraffic: sb.AllowPublicTraffic,
 		ContainerCommand:   sb.ContainerCommand,
 		Runtime:            sb.Runtime,
@@ -272,6 +274,26 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		Failover:           sb.Failover,
 		TemplateID:         sb.TemplateID,
 		OverlaySizeGB:      sb.OverlaySizeGB,
+	}
+	// The row stores the effective allow list; a replay needs the inline
+	// list and the references, so profile changes keep reaching it.
+	if s.store != nil {
+		profiles, err := s.store.GetSandboxEgressProfiles(ctx, sb.ID)
+		if err != nil {
+			return nil, fmt.Errorf("load egress profiles for ownership replay %s: %w", sb.ID, err)
+		}
+		if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil {
+			spec.EgressWithheldEnv = st.Withheld
+		}
+		if len(profiles.Refs) > 0 {
+			// Profiles and block-all are exclusive; a block-all row with
+			// references is a replay held until its profiles resolve.
+			spec.NetworkBlockAll = false
+			spec.NetworkAllowOut = profiles.Inline
+			for _, r := range profiles.Refs {
+				spec.EgressProfiles = append(spec.EgressProfiles, r.Name)
+			}
+		}
 	}
 	lc := sb.Lifecycle
 	spec.Lifecycle = &lc

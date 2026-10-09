@@ -507,3 +507,70 @@ func TestAuditIngestThrottlesASandboxOverItsEgressBudget(t *testing.T) {
 		t.Fatalf("file egress=%d markers=%+v, want 2 records and one marker owing 3", egress["sb-flood"], markers)
 	}
 }
+
+// TestAuditIngestRecordsWorkerDenials (H5, P1-7): a WASM worker reports a
+// mediator denial with a reason from the fixed vocabulary; the daemon chains
+// it as a failure and counts it. Any other claimed outcome is refused.
+func TestAuditIngestRecordsWorkerDenials(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	if err := st.Create(t.Context(), &models.Sandbox{ID: "sb-bound", Image: "wasm", Status: models.SandboxStatusStarted, AuditIncarnationID: "inc-1"}); err != nil {
+		t.Fatal(err)
+	}
+	svc := &Service{cfg: config.Config{DBPath: dbPath, EnterpriseMode: true}, store: st}
+	t.Cleanup(svc.CloseSecretAuditSink)
+	ing := &auditIngestServer{svc: svc, token: "master-key"}
+	post := func(body string) int {
+		req := httptest.NewRequest(http.MethodPost, auditIngestPath, bytes.NewBufferString(body))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Header.Set(auditIngestHeaderCap, scopedAuditCapability(t, "master-key", "sb-bound", "inc-1"))
+		rec := httptest.NewRecorder()
+		ing.handleEgress(rec, req)
+		return rec.Code
+	}
+	before := deniedTotal("sni_mismatch")
+	if code := post(`{"destination":"evil.example:443","network":"tcp","result":"failure","reason":"sni_mismatch"}`); code != http.StatusAccepted {
+		t.Fatalf("denial status = %d", code)
+	}
+	if deniedTotal("sni_mismatch") != before+1 {
+		t.Fatal("an ingested denial must be counted")
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(dbPath), "audit", secretAuditFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"result":"failure"`)) || !bytes.Contains(raw, []byte(`"reason":"sni_mismatch"`)) {
+		t.Fatalf("denial not chained as a failure: %s", raw)
+	}
+	for _, bad := range []string{
+		`{"destination":"x:443","result":"failure","reason":"recipient_denied"}`,
+		`{"destination":"x:443","result":"gap"}`,
+		`{"destination":"x:443","reason":"sni_mismatch"}`,
+	} {
+		if code := post(bad); code != http.StatusBadRequest {
+			t.Fatalf("%s: status = %d, want 400", bad, code)
+		}
+	}
+}
+
+func TestWorkerEgressOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		result, reason, wantResult, wantReason string
+		ok                                     bool
+	}{
+		{"", "", secretAuditResultSuccess, secretAuditReasonOK, true},
+		{"success", "ok", secretAuditResultSuccess, secretAuditReasonOK, true},
+		{"failure", "host_not_allowed", secretAuditResultFailure, "host_not_allowed", true},
+		{"failure", "made_up", "", "", false},
+		{"success", "sni_mismatch", "", "", false},
+	} {
+		r, why, ok := workerEgressOutcome(tc.result, tc.reason)
+		if r != tc.wantResult || why != tc.wantReason || ok != tc.ok {
+			t.Errorf("workerEgressOutcome(%q,%q) = %q %q %v", tc.result, tc.reason, r, why, ok)
+		}
+	}
+}

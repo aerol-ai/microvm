@@ -395,6 +395,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		fcDriver.SetRootfsBuilder(&firecrackerRootfsAdapter{inner: ociBuilder})
 		fcDriver.SetTapHost(&firecrackerTapHostAdapter{inner: tap.NewHost(cfg.FirecrackerIPBinary)})
 		fcDriver.SetVsockDialer(fcruntime.NewLinuxVsockDialer())
+		// Not fatal: a node that booted before this keeps booting. Without
+		// it the guests have no NAT and the driver no firewall, so the
+		// service keeps refusing their egress options (501).
+		if stopFCEgress, err := wireFirecrackerEgress(ctx, cfg, logger, fcDriver); err != nil {
+			logger.Error("firecracker egress: guests get no NAT or egress policies", "error", err)
+		} else {
+			defer stopFCEgress()
+		}
 		// Phase 5: hand the sampler to the driver so Create / WarmSpawn
 		// / tryAcquireWarm / Destroy can Register/Unregister per-VMM
 		// pids. Without this call the sampler stays empty and the
@@ -600,6 +608,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 				})
 			}
 		}
+		// Capability-aware placement (plans/egress-domain-filtering.md CEO
+		// D20): our own lease advertises whether hostname-filtered creates
+		// can be attached here. Always registered; false while the gateway
+		// is off, down or not yet synced.
+		if withEgress, ok := clusterClient.(interface {
+			SetEgressGatewayReadyProvider(func() bool)
+		}); ok {
+			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
+		}
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
@@ -645,6 +662,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		hostPortForwarder = newHostPortForwarder(logger)
 	}
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
+	wireEgressOperator(ctx, cfg, svc, logger)
+	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	wireEgressProfiles(ctx, cfg, svc)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
 	// doesn't pay for it. Best-effort by design — failure here just means

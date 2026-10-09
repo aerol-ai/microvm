@@ -79,6 +79,50 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if path == "/v1/sandboxes/sb-1/network/learned":
+            return {
+                "mode": "learn",
+                "truncated": True,
+                "entries": [{"host": "pypi.org", "ports": [443], "first_seen": "a", "last_seen": "b", "hits": 2}],
+                "cidrs": None,
+                "suggested_allow_out": [],
+                "suggested_profile": {"allow_out": ["x.example"], "description": "d"},
+            }
+        if path.startswith("/v1/egress-profiles"):
+            if method == "DELETE":
+                return None
+            if method == "GET" and path.startswith("/v1/egress-profiles?"):
+                return {"profiles": [{"name": "python", "allow_out": ["pypi.org"], "generation": 1}], "next_cursor": "python"}
+            return {"name": "python", "allow_out": (payload or {}).get("allow_out", ["pypi.org"]), "description": "pip", "generation": 2, "created_at": "c", "updated_at": "u"}
+        if method == "PUT" and path == "/v1/sandboxes/sb-1/network/policy":
+            out = {
+                "network_block_all": payload.get("network_block_all", False),
+                "network_allow_out": payload.get("network_allow_out") or None,
+                "network_deny_out": payload.get("network_deny_out") or None,
+            }
+            if payload.get("network_allow_out"):
+                out["egress_status"] = "active"
+            if payload.get("network_egress_rules"):
+                out["network_egress_rules"] = payload["network_egress_rules"]
+            return out
+        if method == "POST" and path == "/v1/network/policy/check":
+            return {"allowed": True, "matched_rule": "*.github.com", "default_verdict": "deny", "outside_ceiling": "x.example"}
+        if method == "GET" and path.startswith("/v1/sandboxes/sb-1/audit"):
+            return {
+                "events": [
+                    {
+                        "time": "2026-10-06T10:00:00Z",
+                        "kind": "egress",
+                        "result": "failure",
+                        "reason": "host_not_allowed",
+                        "destination": "evil.example:443",
+                        "event_id": "ae-1",
+                    },
+                    {"time": "2026-10-06T10:00:01Z", "result": "gap", "kind": "gap", "dropped": 3},
+                ],
+                "coverage": {"answered": ["node-a"], "missing": None, "partial": False},
+                "next_cursor": "c2",
+            }
         if method == "GET" and path == "/v1/sandboxes/sb-1/network/usage":
             return {
                 "sandbox_id": "sb-1",
@@ -726,6 +770,173 @@ class ClientTests(unittest.TestCase):
                 },
             ),
         )
+
+    def test_check_network_policy(self):
+        client = RecordingMicroVM()
+
+        result = client.check_network_policy({"networkAllowOut": ["*.github.com"], "destination": "api.github.com"})
+
+        method, path, body = client.calls[0]
+        self.assertEqual((method, path), ("POST", "/v1/network/policy/check"))
+        self.assertEqual(body["network_allow_out"], ["*.github.com"])
+        self.assertEqual(body["destination"], "api.github.com")
+        self.assertEqual(
+            result,
+            {"allowed": True, "matchedRule": "*.github.com", "defaultVerdict": "deny", "outsideCeiling": "x.example"},
+        )
+
+    def test_sandbox_maps_egress_status(self):
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "egress_status": "unavailable"})["egressStatus"], "unavailable")
+        self.assertNotIn("egressStatus", _from_api_sandbox({"id": "sb"}))
+
+    def test_get_audit_sends_filters_and_maps_page(self):
+        client = RecordingMicroVM()
+
+        page = client.get_audit("sb-1", {"kind": "egress", "limit": 50, "cursor": "c1", "incarnationID": "inc-1"})
+
+        self.assertEqual(
+            client.calls[0],
+            ("GET", "/v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", None),
+        )
+        self.assertEqual(page["events"][0]["reason"], "host_not_allowed")
+        self.assertEqual(page["events"][0]["eventID"], "ae-1")
+        self.assertEqual(page["events"][1]["dropped"], 3)
+        self.assertEqual(page["coverage"], {"answered": ["node-a"], "missing": [], "partial": False})
+        self.assertEqual(page["nextCursor"], "c2")
+
+    def test_sandbox_audit_without_options(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.audit()
+
+        self.assertEqual(client.calls[-1], ("GET", "/v1/sandboxes/sb-1/audit", None))
+
+    def test_set_network_policy_replaces_whole_policy(self):
+        client = RecordingMicroVM()
+
+        policy = client.set_network_policy("sb-1", {"networkAllowOut": ["pypi.org"]})
+
+        self.assertEqual(
+            client.calls[0],
+            ("PUT", "/v1/sandboxes/sb-1/network/policy", {"network_block_all": False, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []}),
+        )
+        self.assertEqual(
+            policy,
+            {"networkBlockAll": False, "networkAllowOut": ["pypi.org"], "networkDenyOut": [], "egressProfiles": [], "networkEgressMode": "enforce", "networkEgressRules": [], "effectiveHostnameCount": 0, "egressStatus": "active"},
+        )
+
+    def test_egress_profile_crud(self):
+        client = RecordingMicroVM()
+
+        profile = client.put_egress_profile("python", {"allowOut": ["pypi.org"], "description": "pip"})
+        self.assertEqual(client.calls[0], ("PUT", "/v1/egress-profiles/python", {"allow_out": ["pypi.org"], "description": "pip"}))
+        self.assertEqual(
+            profile,
+            {"name": "python", "allowOut": ["pypi.org"], "description": "pip", "generation": 2, "createdAt": "c", "updatedAt": "u"},
+        )
+        self.assertEqual(client.get_egress_profile("python")["generation"], 2)
+        page = client.list_egress_profiles({"cursor": "a", "limit": 10})
+        self.assertEqual(client.calls[2][1], "/v1/egress-profiles?cursor=a&limit=10")
+        self.assertEqual(page["nextCursor"], "python")
+        client.delete_egress_profile("python")
+        self.assertEqual(client.calls[3][:2], ("DELETE", "/v1/egress-profiles/python"))
+
+    def test_learn_mode(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "alpine", "networkEgressMode": "learn"})
+        self.assertEqual(client.calls[0][2]["network_egress_mode"], "learn")
+        sandbox.set_network_policy({"networkEgressMode": "learn"})
+        self.assertEqual(client.calls[-1][2]["network_egress_mode"], "learn")
+        learned = sandbox.learned()
+        self.assertEqual(learned["entries"][0], {"host": "pypi.org", "ports": [443], "firstSeen": "a", "lastSeen": "b", "hits": 2})
+        self.assertEqual(learned["cidrs"], [])
+        self.assertEqual(learned["suggestedProfile"], {"allowOut": ["x.example"], "description": "d"})
+        self.assertTrue(learned["truncated"])
+
+        from microvm.client import _from_api_sandbox
+
+        self.assertEqual(_from_api_sandbox({"id": "sb", "network_egress_mode": "learn"})["networkEgressMode"], "learn")
+
+    def test_egress_rules(self):
+        client = RecordingMicroVM()
+        rule = {"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": True}
+        sandbox = client.create({"image": "alpine", "networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [rule])
+
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [rule])
+        self.assertEqual(policy["networkEgressRules"], [rule])
+        self.assertEqual(sandbox.networkEgressRules, [rule])
+
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"]})
+        self.assertNotIn("network_egress_rules", client.calls[-1][2])
+        self.assertEqual(policy["networkEgressRules"], [])
+        self.assertNotIn("networkEgressRules", sandbox.to_dict())
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{"host": "example.com", "ports": [80], "paths": ["/ok/*"]}]})
+        self.assertEqual(data["networkEgressRules"], [{"host": "example.com", "ports": [80], "paths": ["/ok/*"]}])
+        self.assertNotIn("networkEgressRules", _from_api_sandbox({"id": "sb"}))
+
+    def test_egress_rule_inject(self):
+        client = RecordingMicroVM()
+        rule = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secretRef": "env:GITHUB_TOKEN"}}
+        wire = {"host": "api.github.com", "paths": ["/repos/**"], "inspect": True, "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}}
+        sandbox = client.create({"image": "alpine", "env": {"GITHUB_TOKEN": "Bearer ghp_x"}, "networkAllowOut": ["api.github.com"], "networkEgressRules": [rule]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [wire])
+
+        # The recorder answers with the wire rules it was sent; the SDK maps
+        # them back. A snake_case secret_ref is accepted on the way in too.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["api.github.com"], "networkEgressRules": [wire, {"host": "api.github.com"}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [wire, {"host": "api.github.com"}])
+        self.assertEqual(policy["networkEgressRules"], [rule, {"host": "api.github.com"}])
+        self.assertEqual(sandbox.networkEgressRules, [rule, {"host": "api.github.com"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [{**wire, "ports": [443]}]})
+        self.assertEqual(data["networkEgressRules"], [{**rule, "ports": [443]}])
+
+    def test_egress_rule_binaries(self):
+        client = RecordingMicroVM()
+        git = {"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]}
+        pip = {"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]}
+        sandbox = client.create({"image": "alpine", "networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, pip]})
+        self.assertEqual(client.calls[0][2]["network_egress_rules"], [git, pip])
+
+        # A rule without binaries goes out with no binaries key at all.
+        policy = sandbox.set_network_policy({"networkAllowOut": ["github.com:22", "pypi.org"], "networkEgressRules": [git, {"host": "pypi.org", "binaries": []}]})
+        self.assertEqual(client.calls[-1][2]["network_egress_rules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(policy["networkEgressRules"], [git, {"host": "pypi.org"}])
+        self.assertEqual(sandbox.networkEgressRules, [git, {"host": "pypi.org"}])
+
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "network_egress_rules": [git, pip]})
+        self.assertEqual(data["networkEgressRules"], [git, pip])
+
+    def test_sandbox_maps_egress_profiles(self):
+        from microvm.client import _from_api_sandbox
+
+        data = _from_api_sandbox({"id": "sb", "egress_profiles": ["python"], "egress_profiles_applied": [{"name": "python", "generation": 2}]})
+        self.assertEqual(data["egressProfiles"], ["python"])
+        self.assertEqual(data["egressProfilesApplied"], [{"name": "python", "generation": 2}])
+
+    def test_sandbox_set_network_policy_updates_fields(self):
+        client = RecordingMicroVM()
+        sandbox = client.create({"image": "ubuntu:22.04"})
+
+        sandbox.set_network_policy({"networkAllowOut": ["pypi.org"]})
+        self.assertEqual(sandbox.egressStatus, "active")
+        policy = sandbox.set_network_policy({"networkBlockAll": True})
+
+        self.assertTrue(policy["networkBlockAll"])
+        self.assertTrue(sandbox.networkBlockAll)
+        self.assertNotIn("egressStatus", sandbox.to_dict())
 
     def test_get_network_usage_maps_response_shape(self):
         client = RecordingMicroVM()

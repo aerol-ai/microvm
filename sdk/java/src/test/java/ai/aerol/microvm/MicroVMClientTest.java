@@ -28,6 +28,19 @@ import ai.aerol.microvm.internal.JsonSupport;
 import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.EgressInject;
+import ai.aerol.microvm.model.EgressRule;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.CreateOptions;
 import ai.aerol.microvm.model.CreateSessionOptions;
 import ai.aerol.microvm.model.CustomDomain;
@@ -846,6 +859,340 @@ class MicroVMClientTest {
             assertEquals("PATCH", patchMethod.get());
             assertEquals(4096, ((Number) patchBody.get().get("network_bytes_in_limit")).longValue());
             assertEquals(1, patchBody.get().size(), "unset fields should not be serialized");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void checkNetworkPolicyPostsAndMaps() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/network/policy/check".equals(exchange.getRequestURI().getPath())) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("allowed", true, "matched_rule", "*.github.com", "default_verdict", "deny"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + exchange.getRequestURI());
+        });
+        try {
+            NetworkPolicyCheckResult res = clientFor(server).checkNetworkPolicy(
+                new NetworkPolicyCheckOptions().setNetworkAllowOut(List.of("*.github.com")).setDestination("api.github.com"));
+            assertTrue(res.allowed);
+            assertEquals("*.github.com", res.matchedRule);
+            assertEquals("deny", res.defaultVerdict);
+            assertEquals(List.of("*.github.com"), body.get().get("network_allow_out"));
+            assertEquals("api.github.com", body.get().get("destination"));
+            assertTrue(!body.get().containsKey("network_block_all"), "unset fields are not sent");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void setNetworkPolicyPutsWholePolicyAndUpdatesSandbox() throws Exception {
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1".equals(path)) {
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_block_all", true));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("pypi.org"),
+                    "network_deny_out", List.of(),
+                    "egress_status", "active"));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            Sandbox sandbox = clientFor(server).get("sb-1");
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions().setNetworkAllowOut(List.of("pypi.org")));
+            assertEquals(false, body.get().get("network_block_all"));
+            assertEquals(List.of("pypi.org"), body.get().get("network_allow_out"));
+            assertEquals(List.of(), body.get().get("network_deny_out"));
+            assertEquals(List.of(), body.get().get("egress_profiles"));
+            assertEquals(List.of("pypi.org"), policy.networkAllowOut);
+            assertEquals("active", policy.egressStatus);
+            assertTrue(!sandbox.networkBlockAll);
+            assertEquals("active", sandbox.egressStatus);
+
+            clientFor(server).setNetworkPolicy("sb-1", null);
+            assertEquals(List.of(), body.get().get("network_allow_out"), "null options mean open egress");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRulesOnCreateAndPolicy() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireRule = mapOf("host", "api.github.com", "ports", List.of(443), "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("api.github.com"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule rule = new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/repos/acme/**"));
+            Map<String, Object> sentRule = mapOf("host", "api.github.com", "methods", List.of("GET"), "paths", List.of("/repos/acme/**"), "inspect", true);
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule)));
+            assertEquals(List.of(sentRule), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of(443), sandbox.networkEgressRules.get(0).ports);
+            assertTrue(sandbox.networkEgressRules.get(0).inspect);
+
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(new EgressRule().setHost("api.github.com"))));
+            assertEquals(List.of(mapOf("host", "api.github.com")), policyBody.get().get("network_egress_rules"));
+            assertEquals("/repos/acme/**", policy.networkEgressRules.get(0).paths.get(0));
+            assertEquals(policy.networkEgressRules, sandbox.networkEgressRules);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRuleInjectGoesOutAsSecretRef() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireInject = mapOf("header", "Authorization", "secret_ref", "env:GITHUB_TOKEN");
+        Map<String, Object> wireRule = mapOf("host", "api.github.com", "paths", List.of("/repos/**"), "inspect", true, "inject", wireInject);
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("api.github.com"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireRule)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule rule = new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setPaths(List.of("/repos/**"))
+                .setInject(new EgressInject().setHeader("Authorization").setSecretRef("env:GITHUB_TOKEN"));
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setEnv(Map.of("GITHUB_TOKEN", "Bearer ghp_x"))
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule)));
+            assertEquals(List.of(wireRule), createBody.get().get("network_egress_rules"));
+            assertEquals("Authorization", sandbox.networkEgressRules.get(0).inject.header);
+            assertEquals("env:GITHUB_TOKEN", sandbox.networkEgressRules.get(0).inject.secretRef);
+
+            // A rule without inject sends no inject key.
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("api.github.com"))
+                .setNetworkEgressRules(List.of(rule, new EgressRule().setHost("api.github.com"))));
+            assertEquals(List.of(wireRule, mapOf("host", "api.github.com")), policyBody.get().get("network_egress_rules"));
+            assertEquals("env:GITHUB_TOKEN", policy.networkEgressRules.get(0).inject.secretRef);
+            assertEquals("env:GITHUB_TOKEN", sandbox.networkEgressRules.get(0).inject.secretRef);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressRuleBinariesGoOutAndComeBack() throws Exception {
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> policyBody = new AtomicReference<>();
+        Map<String, Object> wireGit = mapOf("host", "github.com", "ports", List.of(22), "binaries", List.of("/usr/bin/git"));
+        Map<String, Object> wirePip = mapOf("host", "pypi.org", "ports", List.of(443), "binaries", List.of("/usr/local/bin/pip"));
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("POST".equals(exchange.getRequestMethod()) && "/v1/sandboxes".equals(path)) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf("id", "sb-1", "image", "alpine", "status", "started", "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            if ("PUT".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/network/policy".equals(path)) {
+                policyBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                writeJson(exchange, 200, mapOf(
+                    "network_block_all", false,
+                    "network_allow_out", List.of("github.com:22", "pypi.org"),
+                    "network_deny_out", List.of(),
+                    "network_egress_rules", List.of(wireGit, wirePip)));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            EgressRule git = new EgressRule()
+                .setHost("github.com")
+                .setPorts(List.of(22))
+                .setBinaries(List.of("/usr/bin/git"));
+            EgressRule pip = new EgressRule()
+                .setHost("pypi.org")
+                .setPorts(List.of(443))
+                .setBinaries(List.of("/usr/local/bin/pip"));
+            Sandbox sandbox = clientFor(server).create(new CreateOptions()
+                .setImage("alpine")
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, pip)));
+            assertEquals(List.of(wireGit, wirePip), createBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/bin/git"), sandbox.networkEgressRules.get(0).binaries);
+            assertEquals(List.of(22), sandbox.networkEgressRules.get(0).ports);
+
+            // A rule without binaries sends no binaries key.
+            NetworkPolicy policy = sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+                .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+                .setNetworkEgressRules(List.of(git, new EgressRule().setHost("pypi.org").setBinaries(null))));
+            assertEquals(List.of(wireGit, mapOf("host", "pypi.org")), policyBody.get().get("network_egress_rules"));
+            assertEquals(List.of("/usr/local/bin/pip"), policy.networkEgressRules.get(1).binaries);
+            assertEquals(List.of("/usr/local/bin/pip"), sandbox.networkEgressRules.get(1).binaries);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void networkLearnedMapsNulls() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            if ("/v1/sandboxes/sb-1/network/learned".equals(exchange.getRequestURI().getPath())) {
+                writeJson(exchange, 200, mapOf(
+                    "mode", "learn",
+                    "truncated", true,
+                    "entries", List.of(mapOf("host", "pypi.org", "ports", null, "hits", 2)),
+                    "cidrs", null,
+                    "suggested_allow_out", null,
+                    "suggested_profile", mapOf("allow_out", List.of("x.example"), "description", "d")));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestURI());
+        });
+        try {
+            NetworkLearned learned = clientFor(server).getNetworkLearned("sb-1");
+            assertEquals("learn", learned.mode);
+            assertTrue(learned.truncated);
+            assertEquals("pypi.org", learned.entries.get(0).host);
+            assertTrue(learned.entries.get(0).ports.isEmpty());
+            assertTrue(learned.cidrs.isEmpty());
+            assertTrue(learned.suggestedAllowOut.isEmpty());
+            assertEquals(List.of("x.example"), learned.suggestedProfile.allowOut);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void egressProfileCrudMapsWireShape() throws Exception {
+        AtomicReference<String> lastQuery = new AtomicReference<>();
+        AtomicReference<Map<String, Object>> body = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if ("DELETE".equals(method) && "/v1/egress-profiles/python".equals(path)) {
+                exchange.sendResponseHeaders(204, -1);
+                exchange.close();
+                return;
+            }
+            if ("GET".equals(method) && "/v1/egress-profiles".equals(path)) {
+                lastQuery.set(exchange.getRequestURI().getRawQuery());
+                writeJson(exchange, 200, mapOf("profiles", null, "next_cursor", "z"));
+                return;
+            }
+            if ("/v1/egress-profiles/python".equals(path)) {
+                if ("PUT".equals(method)) {
+                    body.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                }
+                writeJson(exchange, 200, mapOf("name", "python", "allow_out", List.of("pypi.org"), "description", "pip", "generation", 2));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            EgressProfile profile = client.putEgressProfile("python", new EgressProfileOptions().setAllowOut(List.of("pypi.org")).setDescription("pip"));
+            assertEquals(2, profile.generation);
+            assertEquals(List.of("pypi.org"), body.get().get("allow_out"));
+            assertEquals("pip", body.get().get("description"));
+            assertEquals("pip", client.getEgressProfile("python").description);
+            EgressProfileList page = client.listEgressProfiles(new ListEgressProfilesOptions().setCursor("a").setLimit(5));
+            assertEquals("cursor=a&limit=5", lastQuery.get());
+            assertTrue(page.profiles.isEmpty());
+            assertEquals("z", page.nextCursor);
+            assertTrue(client.listEgressProfiles().profiles.isEmpty());
+            client.deleteEgressProfile("python");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void auditSendsFiltersAndMapsPage() throws Exception {
+        AtomicReference<String> query = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            if ("GET".equals(exchange.getRequestMethod()) && "/v1/sandboxes/sb-1/audit".equals(path)) {
+                query.set(exchange.getRequestURI().getRawQuery());
+                if (exchange.getRequestURI().getRawQuery() == null) {
+                    writeJson(exchange, 200, mapOf("events", null));
+                    return;
+                }
+                writeJson(exchange, 200, mapOf(
+                    "events", List.of(mapOf(
+                        "time", "2026-10-06T10:00:00Z",
+                        "kind", "egress",
+                        "result", "failure",
+                        "reason", "host_not_allowed",
+                        "destination", "evil.example:443",
+                        "event_id", "ae-1"
+                    )),
+                    "coverage", mapOf("answered", List.of("n1"), "missing", List.of(), "partial", false),
+                    "next_cursor", "c2"
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + exchange.getRequestMethod() + " " + path);
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            AuditPage page = client.getAudit("sb-1", new AuditOptions().setKind("egress").setLimit(50).setCursor("c1").setIncarnationId("inc-1"));
+            assertEquals("kind=egress&limit=50&cursor=c1&incarnation_id=inc-1", query.get());
+            assertEquals("host_not_allowed", page.events.get(0).reason);
+            assertEquals("ae-1", page.events.get(0).eventId);
+            assertEquals(List.of("n1"), page.coverage.answered);
+            assertEquals("c2", page.nextCursor);
+
+            AuditPage empty = client.getAudit("sb-1");
+            assertTrue(empty.events.isEmpty());
+            assertTrue(!empty.coverage.partial);
         } finally {
             server.stop(0);
         }

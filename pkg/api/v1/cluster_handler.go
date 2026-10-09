@@ -202,6 +202,10 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// The operator default and pinned built-ins go into the spec promoted
+	// below, so a failover replays them (§5.10 PC-2, CEO D11).
+	h.deps.Service.NormalizeCreateEgressDefault(&req)
+	service.NormalizeCreateEgressProfiles(&req)
 	if err := normalizeCreateRuntimeForPlacement(&req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
@@ -967,6 +971,58 @@ func (h *handlers) clusterInternalArtifactCatalogEpoch(w http.ResponseWriter, r 
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.ArtifactCatalogEpochResponse{Epoch: epoch})
+}
+
+// clusterInternalEgressProfileWrite takes a profile write from a peer (a
+// follower forwarding to the leader, or a worker). The leader applies it
+// after its upgrade gate; FSM refusals answer 200 with a code so the
+// sentinel survives every hop, and 503 means retry elsewhere.
+func (h *handlers) clusterInternalEgressProfileWrite(w http.ResponseWriter, r *http.Request) {
+	writer, ok := h.deps.Service.Cluster().(interface {
+		WriteEgressProfile(context.Context, cluster.EgressProfileWriteRequest) (cluster.EgressProfileWriteResponse, error)
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.EgressProfileWriteRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := writer.WriteEgressProfile(r.Context(), req)
+	if err != nil {
+		if out := cluster.EgressProfileWriteOutcome(err); out.Code != "" {
+			apihttp.WriteJSON(w, http.StatusOK, out)
+			return
+		}
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: egress profile write failed: "+err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// clusterInternalEgressProfileRead answers a worker's profile read from this
+// server's FSM.
+func (h *handlers) clusterInternalEgressProfileRead(w http.ResponseWriter, r *http.Request) {
+	reader, ok := h.deps.Service.Cluster().(interface {
+		ReadEgressProfiles(context.Context, cluster.EgressProfileReadRequest) (cluster.EgressProfileReadResponse, error)
+	})
+	if !ok {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: node holds no placement state")
+		return
+	}
+	var req cluster.EgressProfileReadRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := reader.ReadEgressProfiles(r.Context(), req)
+	if err != nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 // clusterRevokeNodeStorageRetirement withdraws an attestation made in error.

@@ -9,6 +9,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -26,6 +27,19 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.AuditCoverage;
+import ai.aerol.microvm.model.EgressProfile;
+import ai.aerol.microvm.model.EgressProfileList;
+import ai.aerol.microvm.model.EgressProfileOptions;
+import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.NetworkLearned;
+import ai.aerol.microvm.model.NetworkLearnedEntry;
+import ai.aerol.microvm.model.NetworkPolicy;
+import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
+import ai.aerol.microvm.model.NetworkPolicyCheckResult;
+import ai.aerol.microvm.model.NetworkPolicyOptions;
+import ai.aerol.microvm.model.AuditOptions;
+import ai.aerol.microvm.model.AuditPage;
 import ai.aerol.microvm.model.BuildImageOptions;
 import ai.aerol.microvm.model.BuildImagePushOptions;
 import ai.aerol.microvm.model.BuildImageResult;
@@ -546,6 +560,117 @@ public class MicroVMClient {
     }
 
     /**
+     * Reads one page of a sandbox's audit log: outbound connections and
+     * egress denials (kind {@code "egress"}) and secret reads.
+     */
+    public AuditPage getAudit(String sandboxId, AuditOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "kind", options.getKind());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "incarnation_id", options.getIncarnationId());
+        }
+        AuditPage page = doJson("GET", sandboxPath(sandboxId) + "/audit" + query, null, AuditPage.class);
+        if (page == null) {
+            page = new AuditPage();
+        }
+        if (page.events == null) {
+            page.events = new ArrayList<>();
+        }
+        if (page.coverage == null) {
+            page.coverage = new AuditCoverage();
+        }
+        return page;
+    }
+
+    /**
+     * Reads what a sandbox reached in learn mode and the allow list that would
+     * have allowed it.
+     */
+    public NetworkLearned getNetworkLearned(String sandboxId) {
+        NetworkLearned learned = doJson("GET", sandboxPath(sandboxId) + "/network/learned", null, NetworkLearned.class);
+        if (learned == null) {
+            learned = new NetworkLearned();
+        }
+        if (learned.entries == null) {
+            learned.entries = new ArrayList<>();
+        }
+        for (NetworkLearnedEntry e : learned.entries) {
+            if (e.ports == null) {
+                e.ports = new ArrayList<>();
+            }
+        }
+        if (learned.cidrs == null) {
+            learned.cidrs = new ArrayList<>();
+        }
+        if (learned.suggestedAllowOut == null) {
+            learned.suggestedAllowOut = new ArrayList<>();
+        }
+        return learned;
+    }
+
+    /**
+     * Creates or replaces a named egress profile (a full replace: the same body
+     * twice is a no-op). A change reaches every sandbox that references it.
+     */
+    public EgressProfile putEgressProfile(String name, EgressProfileOptions options) {
+        EgressProfileOptions body = options == null ? new EgressProfileOptions() : options;
+        return withProfileDefaults(doJson("PUT", egressProfilePath(name), body, EgressProfile.class));
+    }
+
+    public EgressProfile getEgressProfile(String name) {
+        return withProfileDefaults(doJson("GET", egressProfilePath(name), null, EgressProfile.class));
+    }
+
+    public EgressProfileList listEgressProfiles(ListEgressProfilesOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "cursor", options.getCursor());
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+        }
+        EgressProfileList page = doJson("GET", versioned("/egress-profiles") + query, null, EgressProfileList.class);
+        if (page == null) {
+            page = new EgressProfileList();
+        }
+        if (page.profiles == null) {
+            page.profiles = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public EgressProfileList listEgressProfiles() {
+        return listEgressProfiles(null);
+    }
+
+    /** Deletes a profile; one that sandboxes still reference is refused (409). */
+    public void deleteEgressProfile(String name) {
+        doNoContent("DELETE", egressProfilePath(name), null);
+    }
+
+    private String egressProfilePath(String name) {
+        return versioned("/egress-profiles/" + URLEncoder.encode(name, StandardCharsets.UTF_8));
+    }
+
+    private static EgressProfile withProfileDefaults(EgressProfile profile) {
+        if (profile != null && profile.allowOut == null) {
+            profile.allowOut = new ArrayList<>();
+        }
+        return profile;
+    }
+
+    public AuditPage getAudit(String sandboxId) {
+        return getAudit(sandboxId, null);
+    }
+
+    private static void appendQuery(StringBuilder query, String key, String value) {
+        if (value == null || value.isBlank()) {
+            return;
+        }
+        query.append(query.length() == 0 ? '?' : '&').append(key).append('=').append(encodeQueryValue(value));
+    }
+
+    /**
      * Reads a sandbox's clone-generation token. The token changes whenever the
      * sandbox is resumed from a snapshot, so a change signals "this is a clone."
      * Read-only — the SDK cannot reseed a process inside the guest; see the
@@ -557,6 +682,16 @@ public class MicroVMClient {
 
     public NetworkUsage setNetworkLimits(String sandboxId, SetNetworkLimitsOptions options) {
         return doJson("PATCH", sandboxPath(sandboxId) + "/network/limits", options, NetworkUsage.class);
+    }
+
+    /**
+     * Replaces a sandbox's egress policy while it runs and returns once the new
+     * policy is enforced. Sending the same policy again is a no-op, so it is
+     * safe to retry.
+     */
+    public NetworkPolicy setNetworkPolicy(String sandboxId, NetworkPolicyOptions options) {
+        NetworkPolicyOptions body = options == null ? new NetworkPolicyOptions() : options;
+        return doJson("PUT", sandboxPath(sandboxId) + "/network/policy", body, NetworkPolicy.class);
     }
 
     public ExecResult exec(String sandboxId, ExecRequest request) {
@@ -765,6 +900,15 @@ public class MicroVMClient {
 
     public HealthStatus health() {
         return doJson("GET", "/health", null, HealthStatus.class);
+    }
+
+    /**
+     * Asks whether a sandbox created with these egress fields would reach a
+     * destination, with the same matcher the filter enforces. No sandbox is
+     * needed.
+     */
+    public NetworkPolicyCheckResult checkNetworkPolicy(NetworkPolicyCheckOptions options) {
+        return doJson("POST", versioned("/network/policy/check"), options, NetworkPolicyCheckResult.class);
     }
 
     public ExecStreamHandle execStream(String sandboxId, ExecStreamOptions options) {

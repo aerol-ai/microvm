@@ -17,10 +17,10 @@
 #   --no-build        reuse the last published build id (fast re-provision)
 #
 # Scenarios: single-node | single-node-containerd | single-node-wasm |
-#            single-node-isolate | single-node-isolate-jail | local-mode | cluster-3-mixed |
+#            single-node-isolate | single-node-isolate-jail | single-node-private-cloud | local-mode | cluster-3-mixed |
 #            cluster-3-mixed-docker | cluster-3-mixed-containerd | cluster-3-mixed-fc |
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
-#            cluster-3-mixed-wasm | cluster-hetero |
+#            cluster-3-mixed-wasm | cluster-hetero | cluster-hetero-lite |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
 # Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
 #            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |
@@ -1091,6 +1091,22 @@ run_one() {
     # pipeline changes user_data on every code change.
     wait_for_tls "$leased" || echo "tls: pre-wait timed out; deferring to the health probe" >&2
     wait_for_health "$base_url" "$pat" || inconclusive=1
+    # A healthy API is not a finished box. A scenario's extra_user_data runs
+    # after install and may restart sandboxd and the egress gateway: the
+    # private-cloud one installs dnsmasq and squid and writes the operator
+    # file, and a suite started on the first healthy probe ran every
+    # private-cloud use case before the file was in effect. So wait for
+    # cloud-init too, then probe again. A user-data error is reported, not
+    # fatal: the run goes ahead as it did before this wait existed.
+    if [[ "$inconclusive" != "1" && -n "${AEROL_SSH_IDENTITY_FILE:-}" ]]; then
+      local seed_ip ci_rc=0
+      seed_ip=$(echo "$targets" | jq -r '.seed_ip')
+      wait_for_cloud_init "ubuntu@${seed_ip}" || ci_rc=$?
+      if (( ci_rc != 0 )); then
+        echo "cloud-init: not confirmed done on ${seed_ip} (rc=${ci_rc}); running the suite anyway" >&2
+      fi
+      wait_for_health "$base_url" "$pat" || inconclusive=1
+    fi
   else
     # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the
     # domain branch there's no DNS/TLS wait to absorb boot time, so wait for
@@ -1630,7 +1646,7 @@ elif [[ "$BENCH_ONLY" == "1" ]]; then
     run_one "$SCENARIO"
   fi
 elif [[ "$SCENARIO" == "all" ]]; then
-  for s in local-mode single-node single-node-wasm single-node-isolate single-node-isolate-jail cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64 cluster-mixed-benchmark-with-obs; do
+  for s in local-mode single-node single-node-wasm single-node-isolate single-node-isolate-jail single-node-private-cloud cluster-3-mixed cluster-3-mixed-docker cluster-3-mixed-wasm cluster-3-mixed-fc cluster-3-mixed-gvisor cluster-hetero single-node-fc single-node-fc-arm64 cluster-arm64 cluster-mixed-benchmark-with-obs; do
     ( run_one "$s" )
   done
 else

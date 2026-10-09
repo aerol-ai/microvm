@@ -5,11 +5,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -173,19 +171,6 @@ func TestEnsureTLSWakeListenerAndClose(t *testing.T) {
 	svc.scheduleTLSWakeListenerClose("sb-tls", 8443, time.Millisecond)
 	time.Sleep(5 * time.Millisecond)
 	svc.closeAllTLSWakeListeners()
-}
-
-func TestProxyCopyAndCloseWrite(t *testing.T) {
-	client, server := net.Pipe()
-	defer client.Close()
-	defer server.Close()
-	done := make(chan struct{}, 1)
-	go proxyCopyAndCloseWrite(server, strings.NewReader("hello"), done)
-	buf := make([]byte, 5)
-	if _, err := io.ReadFull(client, buf); err != nil || string(buf) != "hello" {
-		t.Fatalf("read = %q, %v", buf, err)
-	}
-	<-done
 }
 
 // --- template_pull.go adapter ---

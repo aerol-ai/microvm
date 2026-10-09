@@ -477,3 +477,78 @@ func TestWriteStoreAwareError_RegistryUnavailable(t *testing.T) {
 		t.Errorf("Retry-After = %q, want 5", rr.Header().Get("Retry-After"))
 	}
 }
+
+// TestWriteStoreAwareError_EgressGatewayUnavailable: a local gateway failure
+// and a cluster with no ready gateway both answer 503 with the same code and
+// a Retry-After, not the generic placement 503 (plans/egress-domain-filtering.md
+// G7, CEO D20).
+func TestWriteStoreAwareError_EgressGatewayUnavailable(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("%w: dial", service.ErrEgressGatewayUnavailable),
+		cluster.ErrNoEgressGatewayTarget,
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("%v: status=%d code=%q retry=%q", err, rr.Code, body.Code, rr.Header().Get("Retry-After"))
+		}
+	}
+}
+
+func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w: bad yaml", service.ErrEgressOperatorConfigInvalid))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressOperatorConfigInvalid {
+		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}
+
+// TestWriteStoreAwareError_EgressPolicyUpdate: the live-update failures are
+// told apart by status and code (plans/egress-domain-filtering.md §5.8), and
+// every one carries a Retry-After since the PUT is idempotent.
+func TestWriteStoreAwareError_EgressPolicyUpdate(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{fmt.Errorf("%w: no leader", service.ErrEgressSpecCommitFailed), http.StatusServiceUnavailable, models.ErrorCodeEgressSpecCommitFailed},
+		{fmt.Errorf("%w: attach", service.ErrEgressApplyFailedHeld), http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld},
+		{fmt.Errorf("%w (status creating)", service.ErrEgressPolicyBusy), http.StatusConflict, ""},
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, tc.err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != tc.status || body.Code != tc.code || rr.Header().Get("Retry-After") == "" {
+			t.Fatalf("%v: status=%d code=%q retry=%q", tc.err, rr.Code, body.Code, rr.Header().Get("Retry-After"))
+		}
+	}
+}
+
+func TestWriteStoreAwareError_EgressProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{service.ErrEgressProfileNotFound, http.StatusNotFound, ""},
+		{fmt.Errorf("%w: 2 sandbox(es)", service.ErrEgressProfileInUse), http.StatusConflict, models.ErrorCodeEgressProfileInUse},
+		{fmt.Errorf("%w: sb-1", service.ErrEgressProfileCapExceeded), http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded},
+		{fmt.Errorf("%w: no leader", service.ErrEgressProfileUnavailable), http.StatusServiceUnavailable, ""},
+		{service.ErrEgressProfilesConflict, http.StatusConflict, ""},
+		{service.ErrEgressLearnConflict, http.StatusConflict, ""},
+	} {
+		rr := httptest.NewRecorder()
+		WriteStoreAwareError(discardLogger(), rr, tc.err)
+		var body models.ErrorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if rr.Code != tc.status || body.Code != tc.code {
+			t.Fatalf("%v: status=%d code=%q", tc.err, rr.Code, body.Code)
+		}
+	}
+}

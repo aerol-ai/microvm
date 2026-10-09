@@ -323,12 +323,61 @@ func (c *Client) CloneGeneration(ctx context.Context, id string) (sdktypes.Clone
 	return sdktypes.CloneGeneration{Generation: res.Generation, ResumedAt: res.ResumedAt}, nil
 }
 
+// CheckNetworkPolicy asks whether a sandbox created with these egress fields
+// would reach a destination, with the same matcher the filter enforces. No
+// sandbox is needed.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyCheckOptions) (sdktypes.NetworkPolicyCheckResult, error) {
+	return c.inner.CheckNetworkPolicy(ctx, opts)
+}
+
+// GetAudit reads one page of a sandbox's audit log: outbound connections
+// and egress denials (Kind "egress") and secret reads.
+func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return c.inner.GetAudit(ctx, id, opts)
+}
+
 // SetNetworkLimits raises or lifts the per-direction byte caps. Leave a field
 // nil to keep the current value; pass a pointer to zero to set "unlimited".
 // Raising a cap above current usage clears the per-IP iptables block on the
 // next reconcile pass (or immediately if it's already over the new cap).
 func (c *Client) SetNetworkLimits(ctx context.Context, id string, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
 	return c.inner.SetNetworkLimits(ctx, id, opts)
+}
+
+// SetNetworkPolicy replaces a sandbox's egress policy while it runs and
+// returns once the new policy is enforced. Sending the same policy again is
+// a no-op, so it is safe to retry.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	return c.inner.SetNetworkPolicy(ctx, id, opts)
+}
+
+// GetNetworkLearned reads what a sandbox reached in learn mode and the
+// allow list that would have allowed it.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (sdktypes.NetworkLearned, error) {
+	return c.inner.GetNetworkLearned(ctx, id)
+}
+
+// PutEgressProfile creates or replaces a named egress profile (a full
+// replace: the same body twice is a no-op). Sandboxes reference it through
+// EgressProfiles, and a change reaches every one of them.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, opts sdktypes.EgressProfileOptions) (sdktypes.EgressProfile, error) {
+	return c.inner.PutEgressProfile(ctx, name, opts)
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (sdktypes.EgressProfile, error) {
+	return c.inner.GetEgressProfile(ctx, name)
+}
+
+// ListEgressProfiles reads one page of your egress profiles by name.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (sdktypes.EgressProfileList, error) {
+	return c.inner.ListEgressProfiles(ctx, opts)
+}
+
+// DeleteEgressProfile deletes a profile; one that sandboxes still reference
+// is refused (409).
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.inner.DeleteEgressProfile(ctx, name)
 }
 
 func (c *Client) Start(ctx context.Context, id string) (*Sandbox, error) {
@@ -696,8 +745,37 @@ func (s *Sandbox) GetNetworkUsage(ctx context.Context) (sdktypes.NetworkUsage, e
 	return s.client.GetNetworkUsage(ctx, s.ID)
 }
 
+// Audit reads one page of this sandbox's audit log (see Client.GetAudit).
+func (s *Sandbox) Audit(ctx context.Context, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	return s.client.GetAudit(ctx, s.ID, opts)
+}
+
 func (s *Sandbox) SetNetworkLimits(ctx context.Context, opts sdktypes.SetNetworkLimitsOptions) (sdktypes.NetworkUsage, error) {
 	return s.client.SetNetworkLimits(ctx, s.ID, opts)
+}
+
+// SetNetworkPolicy replaces this sandbox's egress policy (see
+// Client.SetNetworkPolicy) and updates its policy fields.
+func (s *Sandbox) SetNetworkPolicy(ctx context.Context, opts sdktypes.NetworkPolicyOptions) (sdktypes.NetworkPolicy, error) {
+	policy, err := s.client.SetNetworkPolicy(ctx, s.ID, opts)
+	if err != nil {
+		return policy, err
+	}
+	s.NetworkBlockAll, s.NetworkAllowOut, s.NetworkDenyOut = policy.NetworkBlockAll, policy.NetworkAllowOut, policy.NetworkDenyOut
+	s.EgressProfiles, s.EgressStatus = policy.EgressProfiles, policy.EgressStatus
+	s.NetworkEgressRules = policy.NetworkEgressRules
+	s.NetworkEgressMode = ""
+	if policy.NetworkEgressMode == sdktypes.NetworkEgressModeLearn {
+		s.NetworkEgressMode = sdktypes.NetworkEgressModeLearn
+	}
+	return policy, nil
+}
+
+// Learned reads what this sandbox reached in learn mode (see
+// Client.GetNetworkLearned). A recording stays readable after a switch to
+// enforce, until the sandbox is destroyed.
+func (s *Sandbox) Learned(ctx context.Context) (sdktypes.NetworkLearned, error) {
+	return s.client.GetNetworkLearned(ctx, s.ID)
 }
 
 func (s *Sandbox) UpdateLifecycle(ctx context.Context, lifecycle sdktypes.Lifecycle) error {

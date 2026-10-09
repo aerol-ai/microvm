@@ -150,6 +150,7 @@ func main() {
 	prepareLoginShells(logger, loginshell.ProfileDir)
 
 	startReaperFn(logger)
+	buildEgressCABundle(logger, systemTrustStores)
 
 	// The parked-mode handshake goroutine reads deferredCmd, so it must be
 	// assigned before the announce below starts that goroutine.

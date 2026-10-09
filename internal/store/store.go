@@ -369,6 +369,52 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// status using the index's row pointers, and the cardinality of
 		// status values is small enough that a composite buys nothing.
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_image ON sandboxes(image);`,
+		// idx_sandboxes_container_ip backs SandboxIDsClaimingContainerIP, the
+		// owner check every stop/destroy event runs before clearing per-IP
+		// firewall rules (egress plan P0-6), so it stays an index probe as the
+		// destroyed-row history grows.
+		`CREATE INDEX IF NOT EXISTS idx_sandboxes_container_ip ON sandboxes(container_ip);`,
+		// sandbox_egress holds egress-gateway state that outlives a process:
+		// the fail-closed hold (plans/egress-domain-filtering.md CEO D16), and
+		// in Phase 2 the learn mode and pinned profiles. A side table keeps the
+		// hot sandboxes row and its many SELECT lists untouched; rows go with
+		// their sandbox.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress (
+			sandbox_id TEXT PRIMARY KEY REFERENCES sandboxes(id) ON DELETE CASCADE,
+			hold_reason TEXT NOT NULL DEFAULT '',
+			hold_since DATETIME,
+			egress_mode TEXT NOT NULL DEFAULT '',
+			updated_at DATETIME NOT NULL
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_hold ON sandbox_egress(hold_reason) WHERE hold_reason != '';`,
+		// egress_profiles are named allowlists sandboxes reference
+		// (plans/egress-domain-filtering.md D21). Owner-scoped like sandbox
+		// names; this table is the single-node store, a cluster keeps them in
+		// the Raft FSM.
+		`CREATE TABLE IF NOT EXISTS egress_profiles (
+			owner_ref TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			allow_out_json TEXT NOT NULL DEFAULT '[]',
+			description TEXT NOT NULL DEFAULT '',
+			generation INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			PRIMARY KEY (owner_ref, name)
+		);`,
+		// sandbox_egress_profiles is each sandbox's profile references, in
+		// order, with the generation of each that is live. It is an index,
+		// not a JSON column on sandbox_egress, so a profile update finds its
+		// referencing sandboxes with an index probe, and delete-in-use is one
+		// query, at any fleet size. It is the only record of references.
+		`CREATE TABLE IF NOT EXISTS sandbox_egress_profiles (
+			sandbox_id TEXT NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			profile TEXT NOT NULL,
+			position INTEGER NOT NULL,
+			applied_generation INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (sandbox_id, profile)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of
@@ -680,6 +726,26 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 				created_at DATETIME NOT NULL
 			);`,
 		`CREATE INDEX IF NOT EXISTS idx_pending_volume_deletions_created_at ON pending_volume_deletions(created_at);`,
+		// pending_egress_rule_clears is the durable cleanup ledger for the
+		// host egress rules (CIDR rule sets, the hold DROP) a container
+		// sandbox leaves at an IP: written before the sandbox lets go of the
+		// address (stop, destroy, a runtime found gone or moved) and deleted
+		// once the rules are confirmed gone. It is keyed by where the rules
+		// live (the engine's rule scope and the IP), not by sandbox, and has
+		// no foreign key: the rules outlive the row and the process, and the
+		// IP's next owner has to find them, since rules of the same IP share
+		// specs (the allowlist catch-all, the hold) and an old ACCEPT left
+		// above the new owner's DROP would let it out.
+		`CREATE TABLE IF NOT EXISTS pending_egress_rule_clears (
+				scope TEXT NOT NULL,
+				ip TEXT NOT NULL,
+				sandbox_id TEXT NOT NULL,
+				rules_json TEXT NOT NULL DEFAULT '',
+				hold INTEGER NOT NULL DEFAULT 0,
+				created_at DATETIME NOT NULL,
+				updated_at DATETIME NOT NULL,
+				PRIMARY KEY (scope, ip)
+			);`,
 	}
 
 	for _, stmt := range stmts {
@@ -906,6 +972,31 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// permanently undistributed.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_claimed_at DATETIME;`,
 		`ALTER TABLE firecracker_templates ADD COLUMN push_claimed_at DATETIME;`,
+		// A sandbox that references egress profiles stores its effective
+		// allow list (inline plus every profile's) in
+		// sandboxes.network_allow_out_json, which every enforcement path
+		// already reads, and its inline list here for GET and policy
+		// replays. Empty means no profiles: the row's list is the inline one.
+		`ALTER TABLE sandbox_egress ADD COLUMN inline_allow_json TEXT NOT NULL DEFAULT '';`,
+		// Phase 3 method and path rules (plans/egress-domain-filtering.md
+		// §5.9). inspect_ca records that the sandbox was created trusting the
+		// node's CA, the one thing a later policy change can't add: a live
+		// PUT may add an inspect rule only when it is set. It only ever turns
+		// on, since the bundle stays mounted for the container's life.
+		`ALTER TABLE sandbox_egress ADD COLUMN rules_json TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sandbox_egress ADD COLUMN inspect_ca INTEGER NOT NULL DEFAULT 0;`,
+		// The env keys a create withheld from the sandbox for credential
+		// injection (P3-2): the sandbox holds placeholders for them, so a
+		// later inject rule may use them, while any other key is already in
+		// the sandbox's hands. Set once at create.
+		`ALTER TABLE sandbox_egress ADD COLUMN withheld_env_json TEXT NOT NULL DEFAULT '';`,
+		// The host enforcement that may be in place for the sandbox (a
+		// gateway attachment, CIDR rule sets), as opposed to the stored
+		// (desired) policy on the sandbox row: a superset while a transition
+		// is unfinished, so the next one tears down everything a partial
+		// apply left behind (PR #622 review 3 findings 3 and 4). Empty: what
+		// the stored policy installs.
+		`ALTER TABLE sandbox_egress ADD COLUMN installed_egress_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
@@ -2042,6 +2133,9 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	}
 	sandbox.CustomDomains = customDomains
 
+	if err := s.attachEgressModes(ctx, map[string]*models.Sandbox{id: sandbox}); err != nil {
+		return nil, err
+	}
 	return sandbox, nil
 }
 
@@ -2100,6 +2194,9 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 		if err := s.attachCustomDomainsBulk(ctx, byID); err != nil {
 			return nil, err
 		}
+		if err := s.attachEgressModes(ctx, byID); err != nil {
+			return nil, err
+		}
 	}
 
 	return sandboxes, nil
@@ -2144,15 +2241,20 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by owner: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }
@@ -2197,15 +2299,20 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 	defer rows.Close()
 
 	var sandboxes []*models.Sandbox
+	byID := map[string]*models.Sandbox{}
 	for rows.Next() {
 		sandbox, err := s.scanSandbox(rows)
 		if err != nil {
 			return nil, err
 		}
 		sandboxes = append(sandboxes, sandbox)
+		byID[sandbox.ID] = sandbox
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate sandboxes by runtime: %w", err)
+	}
+	if err := s.attachEgressModes(ctx, byID); err != nil {
+		return nil, err
 	}
 	return sandboxes, nil
 }

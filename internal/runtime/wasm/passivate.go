@@ -91,6 +91,9 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 		return nil, fmt.Errorf("load module: %w", err)
 	}
 
+	blockIn, blockOut := sandboxNetworkBlocks(sandbox)
+	d.seedNetworkBlocks(sandbox.ID, blockIn, blockOut)
+	d.seedNetworkPolicy(sandbox.ID, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut, sandbox.NetworkEgressMode == models.NetworkEgressModeLearn)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            sandbox.Env,
 		Args:           wasmArgsFromSandbox(sandbox),
@@ -100,6 +103,7 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	if err := d.bindAuditCapability(sandbox.ID, &caps); err != nil {
 		return nil, err
 	}
+	d.bindNetworkBlocks(sandbox.ID, &caps)
 
 	if err := client.Restore(sandbox.ID, checkpointPath, caps); err != nil {
 		if errors.Is(err, models.ErrSnapshotCorrupt) || errors.Is(err, models.ErrSnapshotFenced) {

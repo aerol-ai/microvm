@@ -140,9 +140,9 @@ func netRows() []CatalogueRow {
 
 func egrRows() []CatalogueRow {
 	return []CatalogueRow{
-		row("EGR-01", "Allow-out CIDR is permitted", catEgr(), "", "reachable", scnBoth(), RTContainerd, ""),
-		row("EGR-02", "Deny-out CIDR is blocked", catEgr(), "", "dropped", scnBoth(), RTContainerd, ""),
-		row("EGR-03", "block-all drops real traffic", catEgr(), "", "no egress", scnBoth(), RTContainerd, "UC-98"),
+		row("EGR-01", "Allow-out CIDR is permitted", catEgr(), "", "reachable", scnBoth(), RTContainerd, "UC-179"),
+		row("EGR-02", "Deny-out CIDR is blocked", catEgr(), "", "dropped", scnBoth(), RTContainerd, "UC-98"),
+		row("EGR-03", "block-all drops real traffic", catEgr(), "", "no egress", scnBoth(), RTContainerd, "UC-99"),
 		row("EGR-04", "Byte-in limit enforced (DROP on cross)", catEgr(), "", "capped", scnHetero(), RTContainerd, ""),
 		row("EGR-05", "Byte-out limit enforced", catEgr(), "", "capped", scnHetero(), RTContainerd, ""),
 		row("EGR-06", "Network usage counters returned", catEgr(), "", "counters", scnBoth(), RTContainerd, "UC-37"),

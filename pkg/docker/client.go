@@ -481,7 +481,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		createRequest["Env"] = envValues
 	}
 
+	var tmpfs map[string]string
 	for _, m := range hostMounts {
+		if m.Tmpfs {
+			if tmpfs == nil {
+				tmpfs = map[string]string{}
+			}
+			tmpfs[m.ContainerPath] = strings.Join(m.TmpfsOptions(), ",")
+			continue
+		}
 		entry := fmt.Sprintf("%s:%s", m.HostPath, m.ContainerPath)
 		if m.ReadOnly {
 			entry += ":ro"
@@ -519,9 +527,9 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}()
 
-	hostConfig := map[string]any{
-		"Privileged": c.privileged,
-		"Binds":      binds,
+	hostConfig := sandboxHostConfig(c.privileged, binds)
+	if tmpfs != nil {
+		hostConfig["Tmpfs"] = tmpfs
 	}
 
 	if netnsAdopted {

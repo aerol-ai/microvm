@@ -45,6 +45,8 @@ func exprsFromRulespec(rulespec ...string) ([]expr.Any, error) {
 		kind = expr.VerdictDrop
 	case verdictAccept:
 		kind = expr.VerdictAccept
+	case verdictReturn:
+		kind = expr.VerdictReturn
 	default:
 		return nil, fmt.Errorf("netrules: internal: unset verdict after parse")
 	}

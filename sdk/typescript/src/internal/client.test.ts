@@ -1367,3 +1367,313 @@ test("internal client retries 421 Misdirected Request", async () => {
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
 });
+
+test("internal client getAudit sends filters and maps the page", async () => {
+  let seenRequest: Request | undefined;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenRequest = new Request(input, init);
+      return jsonResponse({
+        events: [
+          {
+            time: "2026-10-06T10:00:00Z",
+            kind: "egress",
+            result: "failure",
+            reason: "host_not_allowed",
+            destination: "evil.example:443",
+            network: "tcp",
+            event_id: "ae-1",
+            incarnation_id: "inc-1",
+          },
+        ],
+        coverage: { answered: ["node-a"], missing: null, partial: false },
+        next_cursor: "c2",
+      });
+    },
+  });
+
+  const page = await client.getAudit("sb-audit", { kind: "egress", limit: 50, cursor: "c1", incarnationID: "inc-1" });
+  assert.ok(seenRequest);
+  assert.equal(seenRequest.method, "GET");
+  const url = new URL(seenRequest.url);
+  assert.equal(url.pathname, "/v1/sandboxes/sb-audit/audit");
+  assert.equal(url.searchParams.get("kind"), "egress");
+  assert.equal(url.searchParams.get("limit"), "50");
+  assert.equal(url.searchParams.get("cursor"), "c1");
+  assert.equal(url.searchParams.get("incarnation_id"), "inc-1");
+  assert.equal(page.events[0].reason, "host_not_allowed");
+  assert.equal(page.events[0].eventID, "ae-1");
+  assert.deepEqual(page.coverage, { answered: ["node-a"], missing: [], partial: false });
+  assert.equal(page.nextCursor, "c2");
+});
+
+test("internal client getAudit without options sends no query and tolerates null events", async () => {
+  let seenURL = "";
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seenURL = new Request(input, init).url;
+      return jsonResponse({ events: null });
+    },
+  });
+  const page = await client.getAudit("sb-x");
+  assert.ok(seenURL.endsWith("/v1/sandboxes/sb-x/audit"));
+  assert.deepEqual(page, { events: [], coverage: { answered: [], missing: [], partial: false } });
+});
+
+test("sandbox.audit reads its own sandbox's log", async () => {
+  const urls: string[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      urls.push(req.url);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      return jsonResponse({ events: [], coverage: { answered: [], missing: [], partial: false } });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  await sandbox.audit({ kind: "egress" });
+  assert.ok(urls[urls.length - 1].endsWith("/v1/sandboxes/sb-own/audit?kind=egress"));
+});
+
+test("get maps egress_status for gateway-mode sandboxes", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async () => jsonResponse({ ...apiSandbox("sb-eg"), egress_status: "held" }),
+  });
+  const sandbox = await client.get("sb-eg");
+  assert.equal(sandbox.egressStatus, "held");
+});
+
+test("checkNetworkPolicy posts the policy and maps the answer", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ allowed: true, matched_rule: "*.github.com", default_verdict: "deny", outside_ceiling: "x.example" });
+    },
+  });
+  const res = await client.checkNetworkPolicy({ networkAllowOut: ["*.github.com"], destination: "api.github.com" });
+  assert.ok(seen && seen.url.endsWith("/v1/network/policy/check"));
+  assert.equal(seen?.method, "POST");
+  assert.deepEqual(body.network_allow_out, ["*.github.com"]);
+  assert.equal(body.destination, "api.github.com");
+  assert.deepEqual(res, { allowed: true, matchedRule: "*.github.com", defaultVerdict: "deny", outsideCeiling: "x.example" });
+});
+
+test("setNetworkPolicy PUTs the whole policy and maps the effective one", async () => {
+  let seen: Request | undefined;
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      seen = new Request(input, init);
+      body = JSON.parse(String(init?.body));
+      return jsonResponse({ network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: null, egress_profiles: ["python"], effective_hostname_count: 3, egress_status: "active" });
+    },
+  });
+  const res = await client.setNetworkPolicy("sb-pol", { networkAllowOut: ["pypi.org"], egressProfiles: ["python"] });
+  assert.ok(seen && seen.url.endsWith("/v1/sandboxes/sb-pol/network/policy"));
+  assert.equal(seen?.method, "PUT");
+  assert.deepEqual(body, { network_block_all: false, network_allow_out: ["pypi.org"], network_deny_out: [], egress_profiles: ["python"] });
+  assert.deepEqual(res, { networkBlockAll: false, networkAllowOut: ["pypi.org"], networkDenyOut: [], egressProfiles: ["python"], networkEgressMode: "enforce", networkEgressRules: [], effectiveHostnameCount: 3, egressStatus: "active" });
+});
+
+test("sandbox.setNetworkPolicy updates its own policy fields", async () => {
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (req.method === "POST") return jsonResponse(apiSandbox("sb-own"));
+      assert.ok(req.url.endsWith("/v1/sandboxes/sb-own/network/policy"));
+      return jsonResponse({ network_block_all: true, network_allow_out: [], network_deny_out: [] });
+    },
+  });
+  const sandbox = await client.create({ image: "ubuntu:22.04" });
+  const res = await sandbox.setNetworkPolicy({ networkBlockAll: true });
+  assert.equal(res.networkBlockAll, true);
+  assert.equal(sandbox.networkBlockAll, true);
+  assert.equal(sandbox.egressStatus, undefined);
+});
+
+test("egress profile CRUD maps the wire shape", async () => {
+  const seen: { method: string; url: string; body?: unknown }[] = [];
+  const profile = { name: "python", allow_out: ["pypi.org"], description: "pip", generation: 2, created_at: "c", updated_at: "u" };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      seen.push({ method: req.method, url: req.url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (req.method === "DELETE") return new Response(null, { status: 204 });
+      if (req.url.includes("/egress-profiles?")) return jsonResponse({ profiles: [profile], next_cursor: "python" });
+      if (req.url.endsWith("/egress-profiles")) return jsonResponse({ profiles: null });
+      return jsonResponse(profile);
+    },
+  });
+  const put = await client.putEgressProfile("python", { allowOut: ["pypi.org"], description: "pip" });
+  assert.deepEqual(put, { name: "python", allowOut: ["pypi.org"], description: "pip", generation: 2, createdAt: "c", updatedAt: "u" });
+  assert.deepEqual(seen[0], { method: "PUT", url: "https://api.example.com/v1/egress-profiles/python", body: { allow_out: ["pypi.org"], description: "pip" } });
+  assert.equal((await client.getEgressProfile("python")).generation, 2);
+  const page = await client.listEgressProfiles({ cursor: "a", limit: 10 });
+  assert.equal(page.nextCursor, "python");
+  assert.ok(seen[2].url.endsWith("/v1/egress-profiles?cursor=a&limit=10"));
+  assert.deepEqual(await client.listEgressProfiles(), { profiles: [] });
+  await client.deleteEgressProfile("python");
+  assert.equal(seen[4].method, "DELETE");
+});
+
+test("sandboxes carry their egress profiles", async () => {
+  let body: Record<string, unknown> = {};
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (_input, init) => {
+      if (init?.body) body = JSON.parse(String(init.body));
+      return jsonResponse({ ...apiSandbox("sb-p"), egress_profiles: ["python"], egress_profiles_applied: [{ name: "python", generation: 2 }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", egressProfiles: ["python"] });
+  assert.deepEqual(body.egress_profiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfiles, ["python"]);
+  assert.deepEqual(sandbox.egressProfilesApplied, [{ name: "python", generation: 2 }]);
+});
+
+test("learn mode: create, the policy answer and the learned read", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/learned")) {
+        return jsonResponse({
+          mode: "learn",
+          truncated: false,
+          entries: [{ host: "pypi.org", ports: [443], first_seen: "a", last_seen: "b", hits: 3 }],
+          cidrs: null,
+          suggested_allow_out: ["pypi.org"],
+          suggested_profile: { allow_out: ["x.example"], description: "d" },
+        });
+      }
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: [], network_deny_out: [], network_egress_mode: "learn" });
+      }
+      return jsonResponse({ ...apiSandbox("sb-learn"), network_egress_mode: "learn" });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkEgressMode: "learn" });
+  assert.equal(bodies[0].network_egress_mode, "learn");
+  assert.equal(sandbox.networkEgressMode, "learn");
+  const pol = await sandbox.setNetworkPolicy({ networkEgressMode: "learn" });
+  assert.equal(pol.networkEgressMode, "learn");
+  assert.equal(bodies[1].network_egress_mode, "learn");
+  const learned = await sandbox.learned();
+  assert.deepEqual(learned.entries[0], { host: "pypi.org", ports: [443], firstSeen: "a", lastSeen: "b", hits: 3 });
+  assert.deepEqual(learned.cidrs, []);
+  assert.deepEqual(learned.suggestedProfile, { allowOut: ["x.example"], description: "d" });
+});
+
+test("egress rules: create, the policy answer and the sandbox's own copy", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", methods: ["GET"], paths: ["/repos/acme/**"], inspect: true };
+  let policyRules: unknown = [rule];
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: policyRules });
+      }
+      return jsonResponse({ ...apiSandbox("sb-rules"), network_egress_rules: [{ ...rule, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[0].network_egress_rules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule] });
+  assert.deepEqual(bodies[1].network_egress_rules, [rule]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+
+  policyRules = null;
+  const cleared = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"] });
+  assert.equal("network_egress_rules" in bodies[2], false);
+  assert.deepEqual(cleared.networkEgressRules, []);
+  assert.equal(sandbox.networkEgressRules, undefined);
+});
+
+test("egress rules: inject goes out as secret_ref and comes back as secretRef", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const rule = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secretRef: "env:GITHUB_TOKEN" } };
+  const wire = { host: "api.github.com", inspect: true, paths: ["/repos/**"], inject: { header: "Authorization", secret_ref: "env:GITHUB_TOKEN" } };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["api.github.com"], network_deny_out: [], network_egress_rules: [wire] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-inject"), network_egress_rules: [{ ...wire, ports: [443] }] });
+    },
+  });
+  const sandbox = await client.create({
+    image: "alpine",
+    env: { GITHUB_TOKEN: "Bearer ghp_x" },
+    networkAllowOut: ["api.github.com"],
+    networkEgressRules: [rule],
+  });
+  assert.deepEqual(bodies[0].network_egress_rules, [wire]);
+  assert.deepEqual(sandbox.networkEgressRules, [{ ...rule, ports: [443] }]);
+
+  // A rule without inject goes out unchanged, with no inject key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["api.github.com"], networkEgressRules: [rule, { host: "api.github.com" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [wire, { host: "api.github.com" }]);
+  assert.deepEqual(pol.networkEgressRules, [rule]);
+  assert.deepEqual(sandbox.networkEgressRules, [rule]);
+});
+
+test("egress rules: binaries go out and come back as written", async () => {
+  const bodies: Record<string, unknown>[] = [];
+  const git = { host: "github.com", ports: [22], binaries: ["/usr/bin/git"] };
+  const pip = { host: "pypi.org", ports: [443], binaries: ["/usr/local/bin/pip"] };
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    fetch: async (input, init) => {
+      const req = new Request(input, init);
+      if (init?.body) bodies.push(JSON.parse(String(init.body)));
+      if (req.url.endsWith("/network/policy")) {
+        return jsonResponse({ network_block_all: false, network_allow_out: ["github.com:22", "pypi.org"], network_deny_out: [], network_egress_rules: [git, pip] });
+      }
+      return jsonResponse({ ...apiSandbox("sb-binaries"), network_egress_rules: [git, pip] });
+    },
+  });
+  const sandbox = await client.create({ image: "alpine", networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, pip] });
+  assert.deepEqual(bodies[0].network_egress_rules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+
+  // A rule without binaries goes out with no binaries key at all.
+  const pol = await sandbox.setNetworkPolicy({ networkAllowOut: ["github.com:22", "pypi.org"], networkEgressRules: [git, { host: "pypi.org" }] });
+  assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
+  assert.deepEqual(pol.networkEgressRules, [git, pip]);
+  assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+});

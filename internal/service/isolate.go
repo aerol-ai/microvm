@@ -58,6 +58,16 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
+	// Isolate lists use the shared grammar: *. wildcards, allow-wins
+	// precedence, hostnames refused in deny lists (D15). Validating here makes
+	// a bad entry a 400 at create instead of a stored policy the host later
+	// enforces as block-all (egress plan P0-3).
+	if _, err := compileCreateEgressEffective(&req); err != nil {
+		return nil, err
+	}
+	if hasBinariesRule(req.NetworkEgressRules) {
+		return nil, unsupportedBinaries(models.RuntimeIsolate)
+	}
 	bundleRef := models.ModuleRefForCreate(req)
 	if bundleRef == "" {
 		return nil, errors.New("module_ref or image is required for isolate runtime (the JS/TS bundle reference)")
@@ -171,6 +181,9 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// freshly-spawned group if load fails (§11 empty-group rule), so the only
 	// thing to unwind here on a LATER failure is admission + the store row +
 	// the driver's own state (Destroy).
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	state, err := s.isolate.Create(ctx, req, sandboxID, "", nil)
 	if err != nil {
 		releaseAdmission()
@@ -192,6 +205,7 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		NetworkEgressMode:    req.NetworkEgressMode,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		Name:                 strings.TrimSpace(req.Name),
 		Tags:                 req.Tags,

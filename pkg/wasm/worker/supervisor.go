@@ -53,6 +53,7 @@ func workerEnvironment() []string {
 		"AEROL_WASM_ENGINE": {}, "AEROL_WASM_COMPILE_CACHE_DIR": {},
 		"SB_AUDIT_INGEST_PORT": {}, "SB_AUDIT_SPILL_DIR": {},
 		"SB_EGRESS_ATTRIBUTION_ENABLED": {}, "SB_NODE_ID": {},
+		"SB_EGRESS_OPERATOR_FILE": {},
 	}
 	out := make([]string, 0, len(allowed))
 	for _, entry := range os.Environ() {

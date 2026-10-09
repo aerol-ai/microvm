@@ -111,6 +111,19 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/mounts", d.Auth(wrap(http.HandlerFunc(h.listMounts))))
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/usage", d.Auth(wrap(http.HandlerFunc(h.getNetworkUsage))))
 	mux.Handle("PATCH "+PathPrefix+"/sandboxes/{id}/network/limits", d.Auth(wrap(http.HandlerFunc(h.updateNetworkLimits))))
+	// Live egress policy (plans/egress-domain-filtering.md §5.8): forwarded
+	// to the owner, the only node that can apply it to the running sandbox.
+	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/network/policy", d.Auth(wrap(http.HandlerFunc(h.updateNetworkPolicy))))
+	// Learn-mode recording (P2-7): the owner holds it, so it is forwarded.
+	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/network/learned", d.Auth(wrap(http.HandlerFunc(h.getNetworkLearned))))
+	// Named egress profiles (D21). Not sandbox-scoped, so no owner
+	// forwarding; in a cluster the service writes them through Raft.
+	mux.Handle("PUT "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.putEgressProfile)))
+	mux.Handle("GET "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.getEgressProfile)))
+	mux.Handle("DELETE "+PathPrefix+"/egress-profiles/{name}", d.Auth(http.HandlerFunc(h.deleteEgressProfile)))
+	mux.Handle("GET "+PathPrefix+"/egress-profiles", d.Auth(http.HandlerFunc(h.listEgressProfiles)))
+	// Pure policy evaluation: no sandbox, so no owner forwarding.
+	mux.Handle("POST "+PathPrefix+"/network/policy/check", d.Auth(http.HandlerFunc(h.checkNetworkPolicy)))
 	// Secret audit history: local JSONL + live fan-out. NOT clusterForwardWrap —
 	// owner-forward would drop pre-failover history (plans/secrets-hardening §E1b).
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}/audit", d.Auth(withAuditLimit(d, http.HandlerFunc(h.getSandboxAudit))))
@@ -202,6 +215,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalNodeStorageRetirementsPath, internalOp(http.HandlerFunc(h.clusterInternalNodeStorageRetirements)))
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalog)))
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
+	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
+	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))

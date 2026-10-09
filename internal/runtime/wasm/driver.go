@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/wasm/statekv"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
@@ -107,6 +108,103 @@ func (d *Driver) bindAuditCapability(sandboxID string, caps *wasmengine.Capabili
 	caps.AuditCapability = capability
 	caps.AuditIncarnation = incarnationID
 	return nil
+}
+
+// bindNetworkBlocks copies the sandbox's current network blocks into caps so
+// the worker enforces them before the guest's first instruction (egress plan
+// P0-1). The driver-side gateway map is the single record: create and start
+// seed it from the request or row, and quota updates go through
+// SetNetworkBlocks.
+func (d *Driver) bindNetworkBlocks(sandboxID string, caps *wasmengine.Capabilities) {
+	if d == nil || d.net == nil || caps == nil {
+		return
+	}
+	caps.NetworkBlockIngress, caps.NetworkBlockEgress = d.net.blocksFor(sandboxID)
+	// The policy rides along every time, marked as set, so the mediator
+	// always has the current one and a re-instantiation can't drop it.
+	pol := d.net.policyFor(sandboxID)
+	caps.EgressAllowOut, caps.EgressDenyOut, caps.EgressPolicySet, caps.EgressLearn = pol.allow, pol.deny, true, pol.learn
+}
+
+// seedNetworkPolicy records a sandbox's egress lists before any worker
+// message, so bindNetworkBlocks carries them into the first instantiation.
+func (d *Driver) seedNetworkPolicy(sandboxID string, allow, deny []string, learn bool) {
+	if d == nil || d.net == nil {
+		return
+	}
+	d.net.setPolicy(sandboxID, allow, deny, learn)
+}
+
+// egressPolicySetter is the optional live-update hook on a worker client.
+type egressPolicySetter interface {
+	SetEgressPolicy(sandboxID string, allowOut, denyOut []string, learn bool) error
+}
+
+// egressLearnReader is the optional recording read on a worker client.
+type egressLearnReader interface {
+	EgressLearned(sandboxID string) (egresspolicy.Learned, error)
+}
+
+// SetEgressPolicy replaces a WASM sandbox's egress policy live (Phase 2
+// PUT): the driver's record for future instantiations, and the running
+// worker's mediator now.
+func (d *Driver) SetEgressPolicy(sandboxID string, allow, deny []string, learn bool) error {
+	if d == nil {
+		return nil
+	}
+	d.seedNetworkPolicy(sandboxID, allow, deny, learn)
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	d.mu.Unlock()
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+		return nil
+	}
+	setter, ok := d.newWorkerClient(inst.socketPath).(egressPolicySetter)
+	if !ok {
+		return fmt.Errorf("wasm worker client cannot update egress policy")
+	}
+	return setter.SetEgressPolicy(sandboxID, allow, deny, learn)
+}
+
+// EgressLearned reads a sandbox's learn-mode recording from its running
+// worker. The recording lives in the worker's mediator, so a sandbox that
+// isn't running has none to read: that is an empty recording, not an error.
+func (d *Driver) EgressLearned(sandboxID string) (egresspolicy.Learned, error) {
+	empty := egresspolicy.NewRecorder(0).Snapshot()
+	if d == nil {
+		return empty, nil
+	}
+	d.mu.Lock()
+	inst := d.byID[sandboxID]
+	d.mu.Unlock()
+	if inst == nil || inst.status != models.SandboxStatusStarted || inst.socketPath == "" {
+		return empty, nil
+	}
+	reader, ok := d.newWorkerClient(inst.socketPath).(egressLearnReader)
+	if !ok {
+		return egresspolicy.Learned{}, fmt.Errorf("wasm worker client cannot read learn recordings")
+	}
+	return reader.EgressLearned(sandboxID)
+}
+
+// seedNetworkBlocks records blocks known before any worker message, so
+// bindNetworkBlocks can carry them into the first instantiation.
+func (d *Driver) seedNetworkBlocks(sandboxID string, blockIngress, blockEgress bool) {
+	if d == nil || d.net == nil || (!blockIngress && !blockEgress) {
+		return
+	}
+	d.net.SetNetworkBlocks(sandboxID, blockIngress, blockEgress)
+}
+
+// sandboxNetworkBlocks derives a stored sandbox's blocks: network_block_all
+// blocks both directions, and a crossed byte quota blocks its direction.
+func sandboxNetworkBlocks(sb *models.Sandbox) (ingress, egress bool) {
+	if sb == nil {
+		return false, false
+	}
+	overIn := sb.NetworkBytesInLimit > 0 && sb.NetworkBytesIn >= sb.NetworkBytesInLimit
+	overOut := sb.NetworkBytesOutLimit > 0 && sb.NetworkBytesOut >= sb.NetworkBytesOutLimit
+	return sb.NetworkBlockAll || overIn, sb.NetworkBlockAll || overOut
 }
 
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, _ string) (string, error) {

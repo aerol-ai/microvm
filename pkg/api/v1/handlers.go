@@ -434,6 +434,102 @@ func (h *handlers) getNetworkUsage(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, usage)
 }
 
+// checkNetworkPolicy answers whether a policy would let a sandbox reach a
+// destination, without a sandbox (plans/egress-domain-filtering.md P2-9).
+func (h *handlers) checkNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyCheckRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.CheckNetworkPolicy(r.Context(), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
+// putEgressProfile creates or replaces a named egress profile (D21): a full
+// replace, so the same body twice is a no-op.
+func (h *handlers) putEgressProfile(w http.ResponseWriter, r *http.Request) {
+	var req models.EgressProfileRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	p, err := h.deps.Service.PutEgressProfile(r.Context(), r.PathValue("name"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, p)
+}
+
+func (h *handlers) getEgressProfile(w http.ResponseWriter, r *http.Request) {
+	p, err := h.deps.Service.GetEgressProfile(r.Context(), r.PathValue("name"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, p)
+}
+
+func (h *handlers) listEgressProfiles(w http.ResponseWriter, r *http.Request) {
+	limit := 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "limit must be a non-negative integer")
+			return
+		}
+		limit = n
+	}
+	page, err := h.deps.Service.ListEgressProfiles(r.Context(), r.URL.Query().Get("cursor"), limit)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, page)
+}
+
+// deleteEgressProfile removes a profile; one sandboxes still reference is a
+// 409, and one that is already gone counts as deleted.
+func (h *handlers) deleteEgressProfile(w http.ResponseWriter, r *http.Request) {
+	if err := h.deps.Service.DeleteEgressProfile(r.Context(), r.PathValue("name")); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// getNetworkLearned returns a learn-mode sandbox's recording and the allow
+// list it suggests (P2-7).
+func (h *handlers) getNetworkLearned(w http.ResponseWriter, r *http.Request) {
+	learned, err := h.deps.Service.GetNetworkLearned(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, learned)
+}
+
+// updateNetworkPolicy replaces a sandbox's egress policy live (§5.8). The
+// body is a full replace, so the same body twice is a no-op.
+func (h *handlers) updateNetworkPolicy(w http.ResponseWriter, r *http.Request) {
+	var req models.NetworkPolicyRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	resp, err := h.deps.Service.UpdateNetworkPolicy(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
+}
+
 func (h *handlers) updateNetworkLimits(w http.ResponseWriter, r *http.Request) {
 	var req models.UpdateNetworkLimitsRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {

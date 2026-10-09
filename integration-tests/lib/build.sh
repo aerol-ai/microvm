@@ -446,14 +446,20 @@ build_recorded_receiver() {
 # URL basename, so the names here must match the object keys exactly — and
 # extra entries are harmless because selection is per-asset, not whole-file.
 write_checksums() {
-  local out="$1" f
-  : >"${out}/checksums.txt"
+  local out="$1" f tmp
+  # Built in a private file and renamed into place: two runs building the
+  # same id at once (both --no-build after a tree change) each truncated and
+  # appended to the shared file, so every line came out twice and install.sh
+  # refused the "ambiguous checksum" on every node.
+  tmp=$(mktemp "${out}/.checksums.XXXXXX")
   for f in "${out}"/*; do
     [[ -f "$f" ]] || continue
     case "$(basename "$f")" in checksums.txt | buildinfo.json) continue ;; esac
-    sha256_file_line "$f" >>"${out}/checksums.txt"
+    sha256_file_line "$f" >>"$tmp"
   done
-  LC_ALL=C sort -k2,2 -o "${out}/checksums.txt" "${out}/checksums.txt"
+  LC_ALL=C sort -u -k2,2 -o "$tmp" "$tmp"
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "${out}/checksums.txt"
 }
 
 write_buildinfo() {
@@ -741,8 +747,26 @@ emit_urls() {
   if (( WITH_CADDY )); then
     printf 'caddy_binary_url        = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/caddy_linux_${arch}")"
   else
-    printf 'caddy_binary_url        = "https://github.com/aerol-ai/microvm/releases/latest/download/caddy_linux_%s"\n' "$arch"
+    printf 'caddy_binary_url        = "%s"\n' "$(release_caddy_url "$arch")"
   fi
+}
+
+# release_caddy_url names the custom Caddy of the newest published release
+# that actually carries it. releases/latest is whatever was published last,
+# and a release whose build job failed is published with no assets (v0.6.5):
+# every node's Caddy download then 404s and install.sh stops before it ever
+# installs sandboxd. The custom Caddy doesn't track sandboxd's version, so an
+# older release's binary is the right one. Falls back to releases/latest
+# when GitHub can't be asked.
+release_caddy_url() {
+  local arch=$1 tag=""
+  tag=$(curl -fsSL "https://api.github.com/repos/aerol-ai/microvm/releases?per_page=30" 2>/dev/null |
+    jq -r --arg a "caddy_linux_${arch}" 'first(.[] | select((.draft | not) and (.prerelease | not) and any(.assets[]; .name == $a)) | .tag_name) // empty' 2>/dev/null) || tag=""
+  if [[ -z "$tag" ]]; then
+    printf 'https://github.com/aerol-ai/microvm/releases/latest/download/caddy_linux_%s' "$arch"
+    return
+  fi
+  printf 'https://github.com/aerol-ai/microvm/releases/download/%s/caddy_linux_%s' "$tag" "$arch"
 }
 
 cmd_urls() {

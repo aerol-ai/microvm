@@ -1,6 +1,10 @@
 package types
 
-import "github.com/aerol-ai/microvm/pkg/models"
+import (
+	"time"
+
+	"github.com/aerol-ai/microvm/pkg/models"
+)
 
 type CreateSandboxOptions = models.CreateSandboxRequest
 type ResizeSandboxOptions = models.ResizeSandboxRequest
@@ -124,7 +128,120 @@ const (
 )
 
 type NetworkUsage = models.NetworkUsage
+
+// NetworkPolicyCheckOptions asks whether a sandbox created with these egress
+// fields would reach Destination ("host", "host:port", "IP" or "IP:port").
+type NetworkPolicyCheckOptions = models.NetworkPolicyCheckRequest
+
+// NetworkPolicyCheckResult is the answer: Allowed, the deciding MatchedRule
+// ("" for the default verdict), DefaultVerdict, and OutsideCeiling when an
+// allow entry is outside this deployment's ceiling.
+type NetworkPolicyCheckResult = models.NetworkPolicyCheckResponse
 type SetNetworkLimitsOptions = models.UpdateNetworkLimitsRequest
+
+// NetworkPolicyOptions is a sandbox's whole egress policy for
+// SetNetworkPolicy. It replaces the current policy: a field left empty is
+// cleared, so the zero value means open egress.
+type NetworkPolicyOptions = models.NetworkPolicyRequest
+
+// NetworkPolicy is the policy a sandbox enforces after SetNetworkPolicy, with
+// EgressStatus ("active", "held", "unavailable") for hostname rules on a
+// container.
+type NetworkPolicy = models.NetworkPolicy
+
+// NetworkLearned is what a sandbox reached in learn mode and the allow list
+// that would have allowed it (Sandbox.Learned).
+type NetworkLearned = models.NetworkLearned
+
+// NetworkLearnedEntry is one destination a learn-mode sandbox reached.
+type NetworkLearnedEntry = models.NetworkLearnedEntry
+
+// EgressRule is one method, path or program rule for NetworkEgressRules. It
+// refines a host the allow list already admits: a request to a ruled host
+// passes when some rule for it admits the program, method and path, and gets
+// 403 otherwise. Ports default to [80], or [443] with Inspect, which makes
+// the egress gateway terminate TLS with the node's CA (set at create).
+// Binaries limits the rule to connections opened by those executables
+// (absolute paths inside the sandbox, at most 16; an interpreter's script
+// counts, so "/usr/local/bin/pip" works). A rule with only Binaries decides
+// whole connections, on any port the allow list opens. Runc sandboxes only
+// (docker and containerd); least privilege, not a security boundary.
+type EgressRule = models.EgressRule
+
+// EgressInject is an EgressRule's credential injection, {Header,
+// SecretRef}. SecretRef is "env:<KEY>", a key in the create's Env whose value
+// is the whole header value (e.g. "Bearer ghp_..."). A container sandbox
+// sees "aerolvm-placeholder:<KEY>" in its env instead, and the egress gateway
+// replaces Header with the real value on each request the rule allows. Needs
+// Inspect; rotating the value means recreating the sandbox.
+type EgressInject = models.EgressInject
+
+// Egress modes for NetworkEgressMode.
+const (
+	NetworkEgressModeEnforce = models.NetworkEgressModeEnforce
+	NetworkEgressModeLearn   = models.NetworkEgressModeLearn
+)
+
+// EgressProfile is a named allowlist sandboxes reference through
+// EgressProfiles; Generation goes up on every change.
+type EgressProfile = models.EgressProfile
+
+// EgressProfileOptions is the body of PutEgressProfile: a full replace.
+type EgressProfileOptions = models.EgressProfileRequest
+
+// EgressProfileList is one page of ListEgressProfiles.
+type EgressProfileList = models.EgressProfileList
+
+// EgressProfileRef is a referenced profile and the generation of it live on
+// a sandbox (Sandbox.EgressProfilesApplied).
+type EgressProfileRef = models.EgressProfileRef
+
+// ListEgressProfilesOptions pages ListEgressProfiles.
+type ListEgressProfilesOptions struct {
+	Cursor string
+	Limit  int
+}
+
+// AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
+// "egress" covers outbound connections and denials; a denial has Result
+// "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).
+type AuditEvent struct {
+	Time          time.Time `json:"time"`
+	Kind          string    `json:"kind,omitempty"`
+	Result        string    `json:"result"`
+	Reason        string    `json:"reason,omitempty"`
+	Destination   string    `json:"destination,omitempty"`
+	Network       string    `json:"network,omitempty"`
+	Actor         string    `json:"actor,omitempty"`
+	Ref           string    `json:"ref,omitempty"`
+	EventID       string    `json:"event_id,omitempty"`
+	IncarnationID string    `json:"incarnation_id,omitempty"`
+	// Dropped counts records lost at this point (a gap record).
+	Dropped int64 `json:"dropped,omitempty"`
+}
+
+// AuditCoverage reports which nodes answered an audit read.
+type AuditCoverage struct {
+	Answered []string `json:"answered"`
+	Missing  []string `json:"missing"`
+	Partial  bool     `json:"partial"`
+}
+
+// AuditPage is one page of a sandbox's audit log.
+type AuditPage struct {
+	Events   []AuditEvent  `json:"events"`
+	Coverage AuditCoverage `json:"coverage"`
+	// NextCursor, when set, reads the next page via AuditOptions.Cursor.
+	NextCursor string `json:"next_cursor,omitempty"`
+}
+
+// AuditOptions filters and pages Sandbox.Audit. Zero values are omitted.
+type AuditOptions struct {
+	Kind          string
+	Limit         int
+	Cursor        string
+	IncarnationID string
+}
 
 // CustomDomain is the per-hostname row attached to a sandbox. Status moves
 // pending_dns → issuing → ready (or failed), driven server-side by Caddy's

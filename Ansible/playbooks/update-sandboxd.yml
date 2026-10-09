@@ -96,6 +96,18 @@
         state: restarted
         daemon_reload: false
 
+    # The egress gateway shares the binary but runs as its own unit (plans/
+    # egress-domain-filtering.md D9). Restarting sandboxd must not restart
+    # it: the swap above leaves it on the old inode, which is fine because the
+    # UDS protocol accepts N and N-1. Restart it only on an operator schedule
+    # (a brief fail-closed pause for hostname-filtered sandboxes on the node).
+    - name: "[{{ inventory_hostname }}] Restart egress gateway (opt-in)"
+      when: restart_egress_gateway | default(false) | bool
+      ansible.builtin.systemd:
+        name: aerolvm-egress-gateway.service
+        state: restarted
+        daemon_reload: false
+
     - name: "[{{ inventory_hostname }}] Wait for /health to come back"
       ansible.builtin.uri:
         url: "{{ sandboxd_health_url }}"

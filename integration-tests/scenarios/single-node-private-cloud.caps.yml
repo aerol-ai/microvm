@@ -1,0 +1,22 @@
+# Single node standing in for a bank's private cloud
+# (plans/egress-domain-filtering.md §5.10, P1-20). Its bootstrap
+# (single-node-private-cloud.tfvars) runs node-local stand-ins (a dnsmasq
+# resolver with internal names, an internal HTTP service on :8081, a squid
+# upstream proxy) and an egress operator file wired to them. Gates
+# UC-186..189.
+#
+# It does NOT advertise egress-fqdn: with an upstream proxy configured, a
+# host:port rule on a non-web port for a proxied name is refused at create by
+# design, which is what UC-182 creates. Nor docker: the operator floor and
+# control-port guard apply to every sandbox here, so the general docker UCs
+# keep running on the scenarios built for them.
+#
+# The node still has an internet gateway: the internal names, the proxy and
+# the floor are what's under test. A no-egress VPC with an offline install
+# from an S3 endpoint and an internal ACME CA is the remaining part of P1-20;
+# it needs the prod Terraform module to support a VPC without an internet
+# gateway.
+name: single-node-private-cloud
+capabilities:
+  - private-cloud
+  - domain

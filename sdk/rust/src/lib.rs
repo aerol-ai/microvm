@@ -25,7 +25,11 @@ pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
-    AddCustomDomainOptions, BuildImageOptions, BuildImagePushOptions, BuildImageResult,
+    AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
+    EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
+    ListEgressProfilesOptions, NetworkLearned, NetworkLearnedEntry,
+    NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
+    BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
     CreateWasmModuleOptions,
     CustomDomain,
@@ -481,6 +485,42 @@ impl Sandbox {
 
     pub fn set_network_limits(&self, opts: SetNetworkLimitsOptions) -> Result<NetworkUsage, Error> {
         self.client.set_network_limits(&self.data.id, opts)
+    }
+
+    /// Replaces this sandbox's egress policy while it runs (see
+    /// [`Client::set_network_policy`]) and updates its policy fields.
+    pub fn set_network_policy(&mut self, opts: NetworkPolicyOptions) -> Result<NetworkPolicy, Error> {
+        let policy = self.client.set_network_policy(&self.data.id, opts)?;
+        self.data.network_block_all = policy.network_block_all;
+        self.data.egress_status = policy.egress_status.clone();
+        self.data.egress_profiles = if policy.egress_profiles.is_empty() {
+            None
+        } else {
+            Some(policy.egress_profiles.clone())
+        };
+        self.data.network_egress_mode = if policy.network_egress_mode == "learn" {
+            Some("learn".to_string())
+        } else {
+            None
+        };
+        self.data.network_egress_rules = if policy.network_egress_rules.is_empty() {
+            None
+        } else {
+            Some(policy.network_egress_rules.clone())
+        };
+        Ok(policy)
+    }
+
+    /// Reads what this sandbox reached in learn mode. A recording stays
+    /// readable after a switch to enforce, until the sandbox is destroyed.
+    pub fn learned(&self) -> Result<NetworkLearned, Error> {
+        self.client.get_network_learned(&self.data.id)
+    }
+
+    /// Reads one page of this sandbox's audit log: outbound connections and
+    /// egress denials (kind "egress") and secret reads.
+    pub fn audit(&self, opts: AuditOptions) -> Result<AuditPage, Error> {
+        self.client.get_audit(&self.data.id, opts)
     }
 }
 
@@ -1096,6 +1136,20 @@ impl Client {
         self.do_json::<(), HealthStatus>(Method::GET, "/health", None)
     }
 
+    /// Asks whether a sandbox created with these egress fields would reach a
+    /// destination, with the same matcher the filter enforces. No sandbox is
+    /// needed.
+    pub fn check_network_policy(
+        &self,
+        opts: NetworkPolicyCheckOptions,
+    ) -> Result<NetworkPolicyCheckResult, Error> {
+        self.do_json::<NetworkPolicyCheckOptions, NetworkPolicyCheckResult>(
+            Method::POST,
+            &format!("{}/network/policy/check", self.version_prefix()),
+            Some(&opts),
+        )
+    }
+
     pub fn mounts(&self, id: &str) -> Result<Vec<MountSpecRedacted>, Error> {
         #[derive(serde::Deserialize)]
         struct MountList {
@@ -1134,6 +1188,63 @@ impl Client {
         )
     }
 
+    /// Reads what a sandbox reached in learn mode and the allow list that
+    /// would have allowed it.
+    pub fn get_network_learned(&self, id: &str) -> Result<NetworkLearned, Error> {
+        self.do_json::<(), NetworkLearned>(
+            Method::GET,
+            &format!("{}/sandboxes/{}/network/learned", self.version_prefix(), id),
+            None,
+        )
+    }
+
+    fn egress_profile_path(&self, name: &str) -> String {
+        format!("{}/egress-profiles/{}", self.version_prefix(), urlencoding::encode(name))
+    }
+
+    /// Creates or replaces a named egress profile (a full replace: the same
+    /// body twice is a no-op). A change reaches every sandbox using it.
+    pub fn put_egress_profile(&self, name: &str, opts: EgressProfileOptions) -> Result<EgressProfile, Error> {
+        self.do_json::<EgressProfileOptions, EgressProfile>(Method::PUT, &self.egress_profile_path(name), Some(&opts))
+    }
+
+    pub fn get_egress_profile(&self, name: &str) -> Result<EgressProfile, Error> {
+        self.do_json::<(), EgressProfile>(Method::GET, &self.egress_profile_path(name), None)
+    }
+
+    pub fn list_egress_profiles(&self, opts: ListEgressProfilesOptions) -> Result<EgressProfileList, Error> {
+        let mut path = format!("{}/egress-profiles", self.version_prefix());
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        self.do_json::<(), EgressProfileList>(Method::GET, &path, None)
+    }
+
+    /// Deletes a profile; one that sandboxes still reference is refused (409).
+    pub fn delete_egress_profile(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
+    }
+
+    pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
+        let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), id);
+        if let Some(kind) = &opts.kind {
+            path = append_query_param(&path, "kind", kind);
+        }
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(cursor) = &opts.cursor {
+            path = append_query_param(&path, "cursor", cursor);
+        }
+        if let Some(inc) = &opts.incarnation_id {
+            path = append_query_param(&path, "incarnation_id", inc);
+        }
+        self.do_json::<(), AuditPage>(Method::GET, &path, None)
+    }
+
     pub fn set_network_limits(
         &self,
         id: &str,
@@ -1142,6 +1253,21 @@ impl Client {
         self.do_json::<SetNetworkLimitsOptions, NetworkUsage>(
             Method::PATCH,
             &format!("{}/sandboxes/{}/network/limits", self.version_prefix(), id),
+            Some(&opts),
+        )
+    }
+
+    /// Replaces a sandbox's egress policy while it runs and returns once the
+    /// new policy is enforced. Sending the same policy again is a no-op, so
+    /// it is safe to retry.
+    pub fn set_network_policy(
+        &self,
+        id: &str,
+        opts: NetworkPolicyOptions,
+    ) -> Result<NetworkPolicy, Error> {
+        self.do_json::<NetworkPolicyOptions, NetworkPolicy>(
+            Method::PUT,
+            &format!("{}/sandboxes/{}/network/policy", self.version_prefix(), id),
             Some(&opts),
         )
     }
@@ -2115,6 +2241,9 @@ mod tests {
             network_block_all: None,
             network_allow_out: None,
             network_deny_out: None,
+            egress_profiles: None,
+            network_egress_mode: None,
+            network_egress_rules: None,
             allow_public_traffic: None,
             mask_request_host: None,
             network_bytes_in_limit: None,
@@ -2957,6 +3086,82 @@ mod tests {
     }
 
     #[test]
+    fn check_network_policy_posts_and_maps() {
+        let body = serde_json::json!({"allowed": true, "matched_rule": "*.github.com", "default_verdict": "deny"}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let res = client
+            .check_network_policy(NetworkPolicyCheckOptions {
+                network_allow_out: vec!["*.github.com".to_string()],
+                destination: "api.github.com".to_string(),
+                ..Default::default()
+            })
+            .expect("check should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("POST /v1/network/policy/check HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(request.contains("\"network_allow_out\":[\"*.github.com\"]"), "body: {}", request);
+        assert!(!request.contains("network_block_all"), "unset fields are not sent: {}", request);
+        assert!(res.allowed);
+        assert_eq!(res.matched_rule, "*.github.com");
+        assert_eq!(res.outside_ceiling, None);
+    }
+
+    #[test]
+    fn get_audit_sends_filters_and_maps_page() {
+        let body = serde_json::json!({
+            "events": [{
+                "time": "2026-10-06T10:00:00Z",
+                "kind": "egress",
+                "result": "failure",
+                "reason": "host_not_allowed",
+                "destination": "evil.example:443",
+                "event_id": "ae-1"
+            }],
+            "coverage": {"answered": ["n1"], "missing": null, "partial": false},
+            "next_cursor": "c2"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit(
+                "sb-1",
+                AuditOptions {
+                    kind: Some("egress".to_string()),
+                    limit: Some(50),
+                    cursor: Some("c1".to_string()),
+                    incarnation_id: Some("inc-1".to_string()),
+                },
+            )
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with(
+                "GET /v1/sandboxes/sb-1/audit?kind=egress&limit=50&cursor=c1&incarnation_id=inc-1 HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.events[0].reason.as_deref(), Some("host_not_allowed"));
+        assert_eq!(page.events[0].event_id.as_deref(), Some("ae-1"));
+        assert_eq!(page.coverage.answered, vec!["n1".to_string()]);
+        assert!(page.coverage.missing.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("c2"));
+    }
+
+    #[test]
+    fn get_audit_without_options_and_null_events() {
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"events": null}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .get_audit("sb-1", AuditOptions::default())
+            .expect("get_audit should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/audit HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.events.is_empty());
+    }
+
+    #[test]
     fn get_network_usage_maps_response_shape() {
         let body = serde_json::json!({
             "sandbox_id": "sb-1",
@@ -3004,6 +3209,260 @@ mod tests {
             .get_network_usage("sb-fresh")
             .expect("get_network_usage should succeed");
         assert_eq!(usage.last_sampled_at, None);
+    }
+
+    #[test]
+    fn set_network_policy_puts_whole_policy() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["pypi.org"],
+            "network_deny_out": [],
+            "egress_status": "active"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": true,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let mut sandbox = Sandbox::new(client, data);
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["pypi.org".to_string()],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("PUT /v1/sandboxes/sb-1/network/policy HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(
+            request_json_body(&request),
+            serde_json::json!({"network_block_all": false, "network_allow_out": ["pypi.org"], "network_deny_out": [], "egress_profiles": []})
+        );
+        assert_eq!(policy.network_allow_out, vec!["pypi.org".to_string()]);
+        assert!(!sandbox.data.network_block_all);
+        assert_eq!(sandbox.data.egress_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn set_network_policy_sends_and_syncs_egress_rules() {
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [{"host": "api.github.com", "ports": [443], "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [{"host": "old.example", "ports": null}]
+        }))
+        .expect("sandbox data should parse");
+        assert_eq!(data.network_egress_rules.as_ref().map(|r| r[0].ports.is_empty()), Some(true));
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            inspect: true,
+            ..Default::default()
+        };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([{"host": "api.github.com", "methods": ["GET"], "paths": ["/repos/acme/**"], "inspect": true}])
+        );
+        assert_eq!(policy.network_egress_rules[0].ports, vec![443]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].host, "api.github.com");
+        assert!(synced[0].inspect);
+    }
+
+    #[test]
+    fn egress_rule_inject_round_trips_as_secret_ref() {
+        let wire = serde_json::json!({
+            "host": "api.github.com", "ports": [443], "paths": ["/repos/**"], "inspect": true,
+            "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}
+        });
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["api.github.com"],
+            "network_deny_out": [],
+            "network_egress_rules": [wire.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [wire.clone(), {"host": "pypi.org", "inject": null}]
+        }))
+        .expect("sandbox data should parse");
+        let inject = EgressInject {
+            header: "Authorization".to_string(),
+            secret_ref: "env:GITHUB_TOKEN".to_string(),
+        };
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].inject.as_ref(), Some(&inject));
+        assert_eq!(parsed[1].inject, None);
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "api.github.com".to_string(),
+            paths: vec!["/repos/**".to_string()],
+            inspect: true,
+            inject: Some(inject.clone()),
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "api.github.com".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["api.github.com".to_string()],
+                network_egress_rules: vec![rule, plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([
+                {"host": "api.github.com", "paths": ["/repos/**"], "inspect": true,
+                 "inject": {"header": "Authorization", "secret_ref": "env:GITHUB_TOKEN"}},
+                {"host": "api.github.com"}
+            ])
+        );
+        assert_eq!(policy.network_egress_rules[0].inject.as_ref(), Some(&inject));
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[0].inject.as_ref(), Some(&inject));
+    }
+
+    #[test]
+    fn egress_rule_binaries_round_trip() {
+        let git = serde_json::json!({"host": "github.com", "ports": [22], "binaries": ["/usr/bin/git"]});
+        let pip = serde_json::json!({"host": "pypi.org", "ports": [443], "binaries": ["/usr/local/bin/pip"]});
+        let body = serde_json::json!({
+            "network_block_all": false,
+            "network_allow_out": ["github.com:22", "pypi.org"],
+            "network_deny_out": [],
+            "network_egress_rules": [git.clone(), pip.clone()]
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker",
+            "network_egress_rules": [git.clone(), {"host": "pypi.org", "binaries": null}]
+        }))
+        .expect("sandbox data should parse");
+        let parsed = data.network_egress_rules.as_ref().expect("rules should parse");
+        assert_eq!(parsed[0].binaries, vec!["/usr/bin/git".to_string()]);
+        assert!(parsed[1].binaries.is_empty());
+        let mut sandbox = Sandbox::new(client, data);
+        let rule = EgressRule {
+            host: "github.com".to_string(),
+            ports: vec![22],
+            binaries: vec!["/usr/bin/git".to_string()],
+            ..Default::default()
+        };
+        let plain = EgressRule { host: "pypi.org".to_string(), ..Default::default() };
+        let policy = sandbox
+            .set_network_policy(NetworkPolicyOptions {
+                network_allow_out: vec!["github.com:22".to_string(), "pypi.org".to_string()],
+                network_egress_rules: vec![rule.clone(), plain],
+                ..Default::default()
+            })
+            .expect("set_network_policy should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert_eq!(
+            request_json_body(&request)["network_egress_rules"],
+            serde_json::json!([git, {"host": "pypi.org"}])
+        );
+        assert_eq!(policy.network_egress_rules[0], rule);
+        assert_eq!(policy.network_egress_rules[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+        let synced = sandbox.data.network_egress_rules.as_ref().expect("rules should be synced");
+        assert_eq!(synced[1].binaries, vec!["/usr/local/bin/pip".to_string()]);
+    }
+
+    #[test]
+    fn exec_request_defaults_the_options() {
+        let req = ExecRequest { command: "true".to_string(), ..Default::default() };
+        assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+    }
+
+    #[test]
+    fn get_network_learned_maps_nulls() {
+        let body = serde_json::json!({
+            "mode": "learn", "truncated": false,
+            "entries": [{"host": "pypi.org", "ports": null, "hits": 1}],
+            "cidrs": null, "suggested_allow_out": ["pypi.org"], "suggested_profile": null
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let learned = client.get_network_learned("sb-1").expect("learned should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/sandboxes/sb-1/network/learned HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(learned.mode, "learn");
+        assert!(learned.entries[0].ports.is_empty());
+        assert!(learned.cidrs.is_empty());
+        assert_eq!(learned.suggested_allow_out, vec!["pypi.org".to_string()]);
+        assert!(learned.suggested_profile.is_none());
+    }
+
+    #[test]
+    fn egress_profile_crud_maps_wire_shape() {
+        let body = serde_json::json!({
+            "name": "python", "allow_out": ["pypi.org"], "description": "pip",
+            "generation": 2, "created_at": "c", "updated_at": "u"
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let profile = client
+            .put_egress_profile(
+                "python",
+                EgressProfileOptions { allow_out: vec!["pypi.org".to_string()], description: "pip".to_string() },
+            )
+            .expect("put should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("PUT /v1/egress-profiles/python HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert_eq!(request_json_body(&request), serde_json::json!({"allow_out": ["pypi.org"], "description": "pip"}));
+        assert_eq!(profile.generation, 2);
+        assert_eq!(profile.description, "pip");
+
+        let (url, request_rx) = spawn_json_server(serde_json::json!({"profiles": null, "next_cursor": "z"}).to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_egress_profiles(ListEgressProfilesOptions { cursor: Some("a".to_string()), limit: Some(5) })
+            .expect("list should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(request.starts_with("GET /v1/egress-profiles?cursor=a&limit=5 HTTP/1.1\r\n"), "unexpected request: {}", request);
+        assert!(page.profiles.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("z"));
     }
 
     #[test]

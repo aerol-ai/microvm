@@ -156,6 +156,70 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())
 		return
 	}
+	// An option this runtime or build can't honor (Firecracker egress before
+	// Phase 4, hostname filtering without the gateway) is 501, not a 400:
+	// the request is well-formed, this node just can't serve it.
+	if errors.Is(err, models.ErrRuntimeNotImplemented) {
+		WriteError(w, http.StatusNotImplemented, err.Error())
+		return
+	}
+	// The egress gateway couldn't attach a hostname-filtered sandbox: the
+	// create was rolled back, retry once the gateway is back
+	// (plans/egress-domain-filtering.md G7).
+	if errors.Is(err, service.ErrEgressOperatorConfigInvalid) {
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressOperatorConfigInvalid, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressGatewayUnavailable) || errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
+		w.Header().Set("Retry-After", "5")
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
+		return
+	}
+	// Live policy updates (plans/egress-domain-filtering.md §5.8): two
+	// distinct 503 bodies so a caller knows whether anything changed, and a
+	// 409 while the sandbox is mid-create. The PUT is idempotent, so all
+	// three are safe to retry as-is.
+	if errors.Is(err, service.ErrEgressSpecCommitFailed) {
+		w.Header().Set("Retry-After", "5")
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressSpecCommitFailed, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressApplyFailedHeld) {
+		w.Header().Set("Retry-After", "5")
+		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld, err.Error())
+		return
+	}
+	// Named egress profiles (D21).
+	if errors.Is(err, service.ErrEgressProfileNotFound) {
+		WriteError(w, http.StatusNotFound, "egress profile not found")
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfilesConflict) || errors.Is(err, service.ErrEgressLearnConflict) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileInUse) {
+		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileInUse, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileCapExceeded) {
+		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressProfileUnavailable) {
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressInspectRecreate) || errors.Is(err, service.ErrEgressInjectRecreate) {
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
+	if errors.Is(err, service.ErrEgressPolicyBusy) {
+		w.Header().Set("Retry-After", "1")
+		WriteError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if errors.Is(err, service.ErrPublicTrafficDisabled) {
 		WriteError(w, http.StatusConflict, err.Error())
 		return

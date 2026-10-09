@@ -2,6 +2,9 @@ package containerd
 
 import (
 	"context"
+	"net/netip"
+
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 )
 
 func (d *Driver) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken string, ports []int) error {
@@ -67,4 +70,31 @@ func (d *Driver) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []s
 		return nil
 	}
 	return d.networkRules.ClearEgressPolicy(containerIP, allowCIDRs, denyCIDRs)
+}
+
+var _ sbruntime.EgressHolder = (*Driver)(nil)
+
+// ApplyEgressHold installs the fail-closed hold DROP (CEO D16).
+func (d *Driver) ApplyEgressHold(containerIP string) error {
+	if d.networkRules == nil {
+		return nil
+	}
+	return d.networkRules.HoldEgress(containerIP)
+}
+
+// ClearEgressHold lifts the hold after a successful gateway attach.
+func (d *Driver) ClearEgressHold(containerIP string) error {
+	if d.networkRules == nil {
+		return nil
+	}
+	return d.networkRules.ClearHoldEgress(containerIP)
+}
+
+// SetEgressFloor installs the operator's node-wide deny floor for the CNI
+// bridge subnet (§5.10 PC-2).
+func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
+	if d.networkRules == nil {
+		return nil
+	}
+	return d.networkRules.SetFloor(d.networkRules.BridgeSubnet(), cidrs)
 }

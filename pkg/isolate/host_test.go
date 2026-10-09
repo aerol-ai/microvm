@@ -192,7 +192,7 @@ func TestEgressDenyServerAndSlotLifecycle(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "no egress slot") {
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), "network_block_all, or the node's isolate egress pool is exhausted") {
 		t.Fatalf("deny status/body = %d %q", resp.StatusCode, body)
 	}
 

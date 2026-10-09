@@ -32,12 +32,19 @@ func TestBuildMountsIncludesToolboxAndHostFilesAndUserBinds(t *testing.T) {
 	binds := []mounts.ContainerBind{
 		{HostPath: "/host/data", ContainerPath: "/data", ReadOnly: false},
 		{HostPath: "/host/ro", ContainerPath: "/ro", ReadOnly: true},
+		{ContainerPath: "/run/aerolvm", Tmpfs: true, TmpfsSize: 2 << 20},
 	}
 	ms := buildMounts(cfg, hf, binds)
 
 	byDest := map[string][]string{}
 	for _, m := range ms {
 		byDest[m.Destination] = m.Options
+		if m.Destination == "/run/aerolvm" && (m.Type != "tmpfs" || !slices.Contains(m.Options, "size=2097152") || !slices.Contains(m.Options, "mode=1777")) {
+			t.Fatalf("tmpfs mount = %+v", m)
+		}
+	}
+	if _, ok := byDest["/run/aerolvm"]; !ok {
+		t.Fatal("tmpfs mount missing")
 	}
 	if _, ok := byDest["/.aerol/toolboxd"]; !ok {
 		t.Fatal("toolbox binary mount missing")

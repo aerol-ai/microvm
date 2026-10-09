@@ -186,17 +186,38 @@ export interface CreateOptions {
   osUser?: string;
   networkBlockAll?: boolean;
   /**
-   * Egress allowlist of CIDRs. When set, the sandbox may reach only these
-   * destinations; all other outbound traffic is dropped by the host firewall.
-   * Mutually exclusive with `networkDenyOut`. For a full block use
-   * `networkBlockAll` instead.
+   * Egress allowlist: CIDRs, hostnames (`pypi.org`), `*.suffix` wildcards and
+   * `host:port` entries. Alone, the sandbox may reach only these. With
+   * `networkDenyOut`, allow wins, then deny, then the default is allow; a
+   * deny of `0.0.0.0/0` makes it an allowlist. For a full block use
+   * `networkBlockAll`.
    */
   networkAllowOut?: string[];
   /**
-   * Egress blocklist of CIDRs. When set, the sandbox may reach anything except
-   * these destinations. Mutually exclusive with `networkAllowOut`.
+   * Egress blocklist of CIDRs (never hostnames). Alone, the sandbox may reach
+   * anything except these destinations.
    */
   networkDenyOut?: string[];
+  /**
+   * Named egress profiles whose entries join `networkAllowOut` (see
+   * `putEgressProfile`). A profile change reaches every sandbox that
+   * references it.
+   */
+  egressProfiles?: string[];
+  /**
+   * `"learn"` gives the sandbox open egress and records what it reaches, so
+   * `learned()` can suggest an allow list. Trusted runs only. Needs no lists,
+   * profiles or block-all. Omitted is `"enforce"`.
+   */
+  networkEgressMode?: "enforce" | "learn";
+  /**
+   * Method and path rules that refine hosts the allow list already admits
+   * (at most 32). A rule with `inspect: true` makes the egress gateway
+   * terminate TLS on 443 with the node's CA, which only a sandbox created
+   * with such a rule trusts, so set inspect rules here rather than adding
+   * them later.
+   */
+  networkEgressRules?: EgressRule[];
   /**
    * Whether the sandbox may be exposed to the public internet. Omitted defaults
    * to private (no public URL, `exposePort` fails). Set `true` to opt in to
@@ -496,6 +517,23 @@ export interface Sandbox {
   osUser: string;
   env?: Record<string, string>;
   networkBlockAll: boolean;
+  /**
+   * Hostname-egress state on `get` for a sandbox whose allow list names
+   * hosts (container runtimes): "active", "held" or "unavailable". Absent
+   * otherwise, and on list results.
+   */
+  egressStatus?: string;
+  /** Egress profiles this sandbox references. */
+  egressProfiles?: string[];
+  /**
+   * The generation of each referenced profile that is live on the sandbox,
+   * so a caller can see when a profile change has reached it.
+   */
+  egressProfilesApplied?: EgressProfileRef[];
+  /** `"learn"` while the sandbox records its egress; absent otherwise. */
+  networkEgressMode?: string;
+  /** Method and path rules on the sandbox's egress; absent when it has none. */
+  networkEgressRules?: EgressRule[];
   toolboxEnabled: boolean;
   sshPublicKey?: string;
   sshPrivateKey?: string;
@@ -541,6 +579,226 @@ export interface NetworkUsage {
   quotaExceededAt?: string;
   /** Absent until the netstats poller has produced at least one sample. */
   lastSampledAt?: string;
+}
+
+/** One record from a sandbox's audit log (`sandbox.audit()`). */
+export interface AuditEvent {
+  time: string;
+  /** "egress" for outbound connections and denials; secret kinds otherwise. */
+  kind?: string;
+  /** "success", or "failure" for a denial. */
+  result: string;
+  /** Why it was denied, e.g. "host_not_allowed", "sni_not_allowed". */
+  reason?: string;
+  /** host:port (or host) the sandbox tried to reach. */
+  destination?: string;
+  network?: string;
+  actor?: string;
+  ref?: string;
+  eventID?: string;
+  incarnationID?: string;
+  /** Records lost at this point (a gap record). */
+  dropped?: number;
+}
+
+export interface AuditPage {
+  events: AuditEvent[];
+  /** Which nodes answered; `partial` is true when some could not. */
+  coverage: { answered: string[]; missing: string[]; partial: boolean };
+  /** Pass to `audit({ cursor })` for the next page. */
+  nextCursor?: string;
+}
+
+export interface AuditOptions {
+  /** Only this kind, e.g. "egress". */
+  kind?: string;
+  limit?: number;
+  cursor?: string;
+  incarnationID?: string;
+}
+
+/**
+ * Would a sandbox created with these egress fields reach `destination`?
+ * `destination` is "host", "host:port", "IP" or "IP:port"; a bare host is
+ * checked as the web ports.
+ */
+export interface NetworkPolicyCheckOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+  destination: string;
+}
+
+export interface NetworkPolicyCheckResult {
+  allowed: boolean;
+  /** The entry that decided; "" when the default verdict did. */
+  matchedRule: string;
+  /** "allow" or "deny": what happens to a destination no entry matches. */
+  defaultVerdict: string;
+  /** The first allow entry outside this deployment's ceiling, if any. */
+  outsideCeiling?: string;
+}
+
+/**
+ * A sandbox's whole egress policy, for `setNetworkPolicy`. It replaces the
+ * current policy: a field left out is cleared, so `{}` means open egress.
+ * The grammar is the create one (hostnames, `*.` wildcards, `host:port` and
+ * CIDRs in the allow list; CIDRs only in the deny list).
+ */
+export interface NetworkPolicyOptions {
+  networkBlockAll?: boolean;
+  networkAllowOut?: string[];
+  networkDenyOut?: string[];
+  egressProfiles?: string[];
+  networkEgressMode?: "enforce" | "learn";
+  /**
+   * Replaces the method and path rules. Adding an inspect rule to a
+   * container sandbox created without one is refused with 409: recreate it
+   * with the rule.
+   */
+  networkEgressRules?: EgressRule[];
+}
+
+/** The policy a sandbox enforces after `setNetworkPolicy`. */
+export interface NetworkPolicy {
+  networkBlockAll: boolean;
+  networkAllowOut: string[];
+  networkDenyOut: string[];
+  egressProfiles: string[];
+  /** `"enforce"` or `"learn"`. */
+  networkEgressMode: string;
+  networkEgressRules: EgressRule[];
+  /** Hostname entries in force: inline plus every profile's (at most 1024). */
+  effectiveHostnameCount: number;
+  /** "active", "held" or "unavailable" for hostname rules on a container. */
+  egressStatus?: string;
+}
+
+/**
+ * One method, path or program rule. Rules refine a host the allow list
+ * already admits: a request to a ruled host passes when some rule for that
+ * host admits its program, method and path, and gets a 403 otherwise. A host
+ * no rule names keeps its allow-list decision.
+ */
+export interface EgressRule {
+  /** An exact name or `*.` wildcard, without a port. */
+  host: string;
+  /**
+   * `[80]` by default, or `[443]` with `inspect`; only 80 and 443, except
+   * that a rule with only `binaries` may name any port the allow list opens.
+   */
+  ports?: number[];
+  /** Exact, upper case (`GET`, `POST`); empty allows any. */
+  methods?: string[];
+  /**
+   * Path globs: `*` within one segment, `**` as a whole segment for any
+   * number of them. Empty allows any path.
+   */
+  paths?: string[];
+  /**
+   * Terminate TLS on 443 with the node's CA so the rule can see requests.
+   * The request's Host must then equal the TLS server name.
+   */
+  inspect?: boolean;
+  /**
+   * Replace a header on the requests this rule allows with a secret from
+   * the sandbox's own `env`, which the sandbox itself only sees as a
+   * placeholder. Needs `inspect: true`.
+   */
+  inject?: EgressInject;
+  /**
+   * Limit the rule to connections opened by these executables: clean
+   * absolute paths inside the sandbox, at most 16. For an interpreter
+   * (python, node, a shell) the script it runs counts too, so
+   * `/usr/local/bin/pip` works. A rule with only `binaries` decides whole
+   * connections, on any port the allow list opens. Runc sandboxes only
+   * (docker and containerd); least privilege for trusted tooling, not a
+   * security boundary.
+   */
+  binaries?: string[];
+}
+
+/**
+ * A rule's credential injection. The sandbox's env holds
+ * `aerolvm-placeholder:<KEY>` in place of the value, and the egress gateway
+ * replaces `header` with the real value on each request the rule allows, so
+ * code in the sandbox never holds the secret.
+ */
+export interface EgressInject {
+  /**
+   * The header to replace, such as `Authorization`. It is replaced, never
+   * added to a body or URL. Headers that frame or route the request, such as
+   * `Host` or `Content-Length`, can't be injected.
+   */
+  header: string;
+  /**
+   * `"env:<KEY>"`: a key in the create's `env`, whose value is the whole
+   * header value (for example `Bearer ghp_...`). Rotating it means
+   * recreating the sandbox.
+   */
+  secretRef: string;
+}
+
+/**
+ * A named allowlist sandboxes reference through `egressProfiles`. Profiles
+ * belong to your account; `generation` goes up by one on every change.
+ */
+export interface EgressProfile {
+  name: string;
+  /** Hostnames, `*.` wildcards, `host:port` entries and CIDRs (at most 512 hostnames). */
+  allowOut: string[];
+  description?: string;
+  generation: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The body of `putEgressProfile`: a full replace. */
+export interface EgressProfileOptions {
+  allowOut: string[];
+  description?: string;
+}
+
+export interface ListEgressProfilesOptions {
+  cursor?: string;
+  limit?: number;
+}
+
+export interface EgressProfileList {
+  profiles: EgressProfile[];
+  /** Pass back as `cursor` for the next page; absent on the last one. */
+  nextCursor?: string;
+}
+
+/** One destination a learn-mode sandbox reached. */
+export interface NetworkLearnedEntry {
+  host: string;
+  /** Connection ports; empty when the name was only resolved. */
+  ports: number[];
+  firstSeen: string;
+  lastSeen: string;
+  hits: number;
+}
+
+/**
+ * What a sandbox reached in learn mode, and the allow list that would have
+ * allowed it: `suggestedAllowOut` when it fits 64 hostnames, otherwise
+ * `suggestedProfile` (a body for `putEgressProfile`).
+ */
+export interface NetworkLearned {
+  mode: string;
+  /** Recording stopped at its cap. */
+  truncated: boolean;
+  entries: NetworkLearnedEntry[];
+  cidrs: string[];
+  suggestedAllowOut: string[];
+  suggestedProfile?: EgressProfileOptions;
+}
+
+/** A referenced profile and the generation of it that is live on a sandbox. */
+export interface EgressProfileRef {
+  name: string;
+  generation: number;
 }
 
 export interface SetNetworkLimitsOptions {

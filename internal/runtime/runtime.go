@@ -13,6 +13,7 @@ package runtime
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -73,6 +74,34 @@ type Runtime interface {
 // ContainerRuntime extends Runtime with per-IP network rules and the in-container
 // toolbox port allowlist. Docker and Firecracker satisfy both; WASM satisfies
 // only Runtime and uses host-mediated sockets instead.
+// IPOwnerResolver is implemented by container runtimes that can report which
+// sandbox currently holds a bridge IP. Event-driven rule clears consult it so
+// a late stop or destroy event for an old owner never strips the rules of a
+// sandbox that has since been given the same IP — which would leave the new
+// sandbox unrestricted (plans/egress-domain-filtering.md P0-6). It catches the
+// window before the new owner's store row records the IP. An empty id means
+// no sandbox holds the IP (free or parked pool slots included).
+type IPOwnerResolver interface {
+	IPOwner(ctx context.Context, ip string) (sandboxID string, err error)
+}
+
+// EgressHolder is implemented by container runtimes that can install the
+// fail-closed egress hold: a comment-tagged DROP of its own that quota and
+// limits code never touch (plans/egress-domain-filtering.md CEO D16). Only a
+// successful gateway attach clears it.
+type EgressHolder interface {
+	ApplyEgressHold(containerIP string) error
+	ClearEgressHold(containerIP string) error
+}
+
+// EgressFloorSetter is implemented by container runtimes that can install
+// the operator's node-wide deny floor for every sandbox on their bridge
+// (plans/egress-domain-filtering.md §5.10 PC-2). It works without the
+// egress gateway, which carries its own copy of the floor.
+type EgressFloorSetter interface {
+	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
+}
+
 type ContainerRuntime interface {
 	Runtime
 

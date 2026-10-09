@@ -33,6 +33,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +64,10 @@ import (
 type Driver struct {
 	cfg    Config
 	logger *slog.Logger
+	// netRules is the per-guest-IP host firewall (egress Phase 4); nil
+	// keeps every network-rule method unimplemented.
+	netRules  NetRules
+	tapSubnet netip.Prefix
 	// pool is the per-host TAP+IP+vsock-CID allocator. Non-nil only when
 	// SetPool has been called from main.go. Unit tests that don't need
 	// pool semantics (Ping, ListManaged, Destroy(nil)) leave it nil and
@@ -731,6 +736,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			if rmErr := d.tapHost.Remove(context.Background(), slot.TapName); rmErr != nil {
 				d.logger.Warn("firecracker: tap remove after error failed",
 					"sandbox_id", allocID, "tap", slot.TapName, "error", rmErr)
+			}
+		}
+	}()
+	// Egress policy on the guest IP before the VM runs (Phase 4): it never
+	// runs unfiltered, and a failed create leaves no rule for the next
+	// sandbox on this slot.
+	if err := d.applyCreateEgress(slot.GuestIP, req); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: egress policy: %w", err)
+	}
+	defer func() {
+		if !released {
+			if cErr := d.clearGuestRules(slot.GuestIP, req.NetworkAllowOut, req.NetworkDenyOut); cErr != nil {
+				d.logger.Warn("firecracker: clear egress rules after error failed",
+					"sandbox_id", allocID, "guest_ip", slot.GuestIP, "error", cErr)
 			}
 		}
 	}()
@@ -1438,6 +1457,13 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
 		}
+		if slot != nil {
+			if err := d.clearGuestRules(slot.GuestIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut); err != nil {
+				d.logger.Warn("firecracker destroy: clear egress rules failed",
+					"sandbox_id", sandboxID, "guest_ip", slot.GuestIP, "error", err)
+				rememberErr(err)
+			}
+		}
 		if slot != nil && d.tapHost != nil {
 			if err := d.tapHost.Remove(ctx, slot.TapName); err != nil {
 				d.logger.Warn("firecracker destroy: tap remove failed",
@@ -1753,45 +1779,6 @@ func (d *Driver) RemoveImage(_ context.Context, _ string) error {
 // dial against the container IP.
 func (d *Driver) PushAllowedPorts(_ context.Context, _, _ string, _ []int) error {
 	return methodNotImplemented("PushAllowedPorts")
-}
-
-// ClearNetworkRules releases per-IP host-side rules attached to a
-// sandbox's guest IP. The Firecracker analogue of the Docker iptables
-// rules: a routed L3 setup with per-TAP egress allow/deny lists. Phase 1
-// uses a bridge with the same iptables shape as Docker for parity; later
-// phases may move to eBPF (see CubeVS reference in the plan).
-func (d *Driver) ClearNetworkRules(_ string) error {
-	return methodNotImplemented("ClearNetworkRules")
-}
-
-// ApplyNetworkBlockAll, ApplyNetworkBlockIngress, ClearNetworkBlockIngress,
-// ClearNetworkBlockEgress mirror the Docker driver's quota/block surface.
-// Implementations land alongside the TAP-side firewall in
-// internal/network/tap/ and the egress rule package the Firecracker driver
-// will own.
-
-func (d *Driver) ApplyNetworkBlockAll(_ string) error {
-	return methodNotImplemented("ApplyNetworkBlockAll")
-}
-
-func (d *Driver) ApplyEgressPolicy(_ string, _, _ []string) error {
-	return methodNotImplemented("ApplyEgressPolicy")
-}
-
-func (d *Driver) ClearEgressPolicy(_ string, _, _ []string) error {
-	return methodNotImplemented("ClearEgressPolicy")
-}
-
-func (d *Driver) ApplyNetworkBlockIngress(_ string) error {
-	return methodNotImplemented("ApplyNetworkBlockIngress")
-}
-
-func (d *Driver) ClearNetworkBlockIngress(_ string) error {
-	return methodNotImplemented("ClearNetworkBlockIngress")
-}
-
-func (d *Driver) ClearNetworkBlockEgress(_ string) error {
-	return methodNotImplemented("ClearNetworkBlockEgress")
 }
 
 // chrootFilePath returns the path to hand to the firecracker API for a host

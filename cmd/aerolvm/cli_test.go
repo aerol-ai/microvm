@@ -617,3 +617,28 @@ func TestNewAppDefaults(t *testing.T) {
 		restore()
 	}
 }
+
+// TestCreateAllowHost covers P2-3: --allow-host is repeatable and becomes
+// the create's allow list; it can't be combined with --block-network.
+func TestCreateAllowHost(t *testing.T) {
+	h := newHarness(t)
+	if code := h.run("create", "--name", "egress", "--allow-host", "pypi.org", "--allow-host", "*.pythonhosted.org"); code != exitOK {
+		t.Fatalf("create = %d %s", code, h.stderr.String())
+	}
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if got := s.LastCreate.NetworkAllowOut; len(got) != 2 || got[0] != "pypi.org" || got[1] != "*.pythonhosted.org" || s.LastCreate.NetworkBlockAll {
+			t.Fatalf("create request = %+v", s.LastCreate)
+		}
+	})
+	if code := h.run("create", "--block-network", "--allow-host", "pypi.org", "--json"); code != exitUsage || h.errorEnvelope().Code != "usage" {
+		t.Fatalf("--block-network with --allow-host = %d", code)
+	}
+	if code := h.run("create", "--name", "egress2", "--allow-host", "pypi.org, github.com:22"); code != exitOK {
+		t.Fatalf("comma list = %d %s", code, h.stderr.String())
+	}
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if got := s.LastCreate.NetworkAllowOut; len(got) != 2 || got[1] != "github.com:22" {
+			t.Fatalf("comma list = %v", got)
+		}
+	})
+}

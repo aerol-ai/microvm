@@ -132,6 +132,17 @@ func TestCreateIsolateSandboxValidation(t *testing.T) {
 			wantMsg: "image is required",
 		},
 		{
+			// P0-3/D15: hostnames are never deny entries on any runtime.
+			name:    "hostname_in_deny_rejected",
+			req:     models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "b.js", NetworkDenyOut: []string{"evil.com"}},
+			wantMsg: "evil.com",
+		},
+		{
+			name:    "public_suffix_wildcard_rejected",
+			req:     models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "b.js", NetworkAllowOut: []string{"*.com"}},
+			wantMsg: "*.com",
+		},
+		{
 			name:    "passivatable_durability_rejected",
 			req:     models.CreateSandboxRequest{Runtime: models.RuntimeIsolate, ModuleRef: "b.js", Durability: models.DurabilityPassivatable},
 			wantMsg: "nothing to passivate",

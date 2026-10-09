@@ -18,6 +18,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	apiv1 "github.com/aerol-ai/microvm/sdk/go/internal/apiclient/v1"
+	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
 // APIVersion selects which wire version of the sandbox daemon API to call.
@@ -657,6 +658,104 @@ func (c *Client) GetNetworkUsage(ctx context.Context, id string) (models.Network
 		return models.NetworkUsage{}, err
 	}
 	return response, nil
+}
+
+// CheckNetworkPolicy evaluates a policy against a destination without a
+// sandbox.
+func (c *Client) CheckNetworkPolicy(ctx context.Context, request models.NetworkPolicyCheckRequest) (models.NetworkPolicyCheckResponse, error) {
+	var response models.NetworkPolicyCheckResponse
+	err := c.doJSON(ctx, http.MethodPost, c.versionPrefix+"/network/policy/check", request, &response)
+	return response, err
+}
+
+// SetNetworkPolicy replaces a sandbox's egress policy and returns the
+// effective one.
+func (c *Client) SetNetworkPolicy(ctx context.Context, id string, request models.NetworkPolicyRequest) (models.NetworkPolicy, error) {
+	var response models.NetworkPolicy
+	err := c.doJSON(ctx, http.MethodPut, c.versionPrefix+"/sandboxes/"+id+"/network/policy", request, &response)
+	return response, err
+}
+
+// GetNetworkLearned reads a sandbox's learn-mode recording.
+func (c *Client) GetNetworkLearned(ctx context.Context, id string) (models.NetworkLearned, error) {
+	var response models.NetworkLearned
+	err := c.doJSON(ctx, http.MethodGet, c.versionPrefix+"/sandboxes/"+id+"/network/learned", nil, &response)
+	return response, err
+}
+
+func (c *Client) egressProfilePath(name string) string {
+	return c.versionPrefix + "/egress-profiles/" + url.PathEscape(name)
+}
+
+// PutEgressProfile creates or replaces a named egress profile.
+func (c *Client) PutEgressProfile(ctx context.Context, name string, request models.EgressProfileRequest) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodPut, c.egressProfilePath(name), request, &response)
+	return response, err
+}
+
+// GetEgressProfile reads one named egress profile.
+func (c *Client) GetEgressProfile(ctx context.Context, name string) (models.EgressProfile, error) {
+	var response models.EgressProfile
+	err := c.doJSON(ctx, http.MethodGet, c.egressProfilePath(name), nil, &response)
+	return response, err
+}
+
+// ListEgressProfiles reads one page of named egress profiles.
+func (c *Client) ListEgressProfiles(ctx context.Context, opts sdktypes.ListEgressProfilesOptions) (models.EgressProfileList, error) {
+	values := make(url.Values)
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	path := c.versionPrefix + "/egress-profiles"
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var response models.EgressProfileList
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return models.EgressProfileList{}, err
+	}
+	if response.Profiles == nil {
+		response.Profiles = []models.EgressProfile{}
+	}
+	return response, nil
+}
+
+// DeleteEgressProfile removes a named egress profile.
+func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
+}
+
+// GetAudit reads one page of a sandbox's audit log.
+func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
+	values := make(url.Values)
+	if opts.Kind != "" {
+		values.Set("kind", opts.Kind)
+	}
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.Cursor != "" {
+		values.Set("cursor", opts.Cursor)
+	}
+	if opts.IncarnationID != "" {
+		values.Set("incarnation_id", opts.IncarnationID)
+	}
+	path := c.versionPrefix + "/sandboxes/" + id + "/audit"
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var page sdktypes.AuditPage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &page); err != nil {
+		return sdktypes.AuditPage{}, err
+	}
+	if page.Events == nil {
+		page.Events = []sdktypes.AuditEvent{}
+	}
+	return page, nil
 }
 
 func (c *Client) SetNetworkLimits(ctx context.Context, id string, request models.UpdateNetworkLimitsRequest) (models.NetworkUsage, error) {

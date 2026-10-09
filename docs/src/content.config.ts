@@ -276,6 +276,24 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             href: '/network-isolation',
             label: 'Network Isolation',
             description: 'Block egress with host-level firewall rules on a per-sandbox basis.',
+          },
+          {
+            type: 'link',
+            href: '/egress-domain-filtering',
+            label: 'Egress Domain Filtering',
+            description: 'Let a sandbox reach only the hostnames you list, and see what it was refused.',
+          },
+          {
+            type: 'link',
+            href: '/egress-profiles-and-learn-mode',
+            label: 'Egress Profiles and Learn Mode',
+            description: 'Reuse named allow lists, learn one from a trusted run, and check a policy before creating.',
+          },
+          {
+            type: 'link',
+            href: '/egress-rules-and-inspection',
+            label: 'Egress Rules and Inspection',
+            description: 'Allow only some methods and paths on a host, over HTTP and over inspected HTTPS.',
           }
         ]
       },

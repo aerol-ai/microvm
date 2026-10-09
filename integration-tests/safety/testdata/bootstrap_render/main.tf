@@ -26,6 +26,9 @@ locals {
     pat_token = "x"
     cloudflare_api_token = "x"
     acme_email = "x"
+    acme_ca = "x"
+    acme_ca_root_pem = "x"
+    tls_issuer = "x"
     with_firecracker = false
     with_gvisor = false
     with_isolate = false
@@ -161,6 +164,18 @@ locals {
 }
 output "seed"   { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = true })) }
 output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false })) }
+
+# The public CAs: no internal CA configured. The TLS values arrive null, as a
+# key present with no value in cluster.yml (or the itest overlay) decodes,
+# and the template must render without the internal-CA flags, not fail.
+output "seed_public_ca" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed          = true
+    acme_ca          = null
+    acme_ca_root_pem = null
+    tls_issuer       = null
+  }))
+}
 
 # Same joiner, but with the KMS secret provider turned on, so the conditional
 # block and its interaction with the sandboxd_env override layer are both

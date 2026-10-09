@@ -497,6 +497,73 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// updateNetwork is E2B's PUT /sandboxes/{id}/network
+// (SandboxNetworkUpdateConfig): it replaces the sandbox's egress rules, and
+// an omitted field is cleared. The native policy changes first, through the
+// same live update as PUT /v1/.../network/policy; the E2B spelling GET echoes
+// is recorded after, and a retry of the same body converges both.
+func (h *handlers) updateNetwork(w http.ResponseWriter, r *http.Request) {
+	var req sandboxNetworkUpdateRequest
+	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+		WriteError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+	if err := unsupportedNetworkFields(req.EgressProxy, req.Rules); err != nil {
+		writeKnownError(w, err)
+		return
+	}
+	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			WriteError(w, http.StatusNotFound, "Sandbox not found")
+			return
+		}
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta, err := h.loadSandboxMeta(r.Context(), sandbox)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	// E2B can't express egress profiles, so the update keeps the sandbox's
+	// (D19).
+	blockAll, allow, deny := e2bEgressPolicy(req.AllowOut, req.DenyOut, req.AllowInternetAccess)
+	if _, err := h.deps.Service.UpdateNetworkLists(r.Context(), sandbox.ID, blockAll, allow, deny); err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	meta.NetworkAllowOut, meta.NetworkDenyOut = cloneStringSlice(req.AllowOut), cloneStringSlice(req.DenyOut)
+	if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// unsupportedNetworkFields refuses E2B network features this server doesn't
+// have. Silently dropping either would leave traffic untunneled or requests
+// untransformed while the caller believes otherwise.
+func unsupportedNetworkFields(egressProxy, rules json.RawMessage) error {
+	if rawPresent(egressProxy) {
+		return notImplemented("network.egressProxy is not supported by this server")
+	}
+	if rawPresent(rules) {
+		return notImplemented("network.rules is not supported by this server")
+	}
+	return nil
+}
+
+// rawPresent reports whether an optional JSON field carries a value: absent,
+// null and an empty object or list all mean "not set".
+func rawPresent(raw json.RawMessage) bool {
+	switch strings.TrimSpace(string(raw)) {
+	case "", "null", "{}", "[]":
+		return false
+	}
+	return true
+}
+
 func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	var req createSnapshotRequest
 	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
@@ -703,6 +770,9 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	allowPublicTraffic := (*bool)(nil)
 	maskRequestHost := ""
 	if req.Network != nil {
+		if err := unsupportedNetworkFields(req.Network.EgressProxy, req.Network.Rules); err != nil {
+			return models.CreateSandboxRequest{}, sandboxMeta{}, err
+		}
 		networkAllowOut = cloneStringSlice(req.Network.AllowOut)
 		networkDenyOut = cloneStringSlice(req.Network.DenyOut)
 		allowPublicTraffic = cloneBoolPtr(req.Network.AllowPublicTraffic)
@@ -721,27 +791,10 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 		secure = *req.Secure
 	}
 	allowInternetAccess := cloneBoolPtr(req.AllowInternetAccess)
-	networkBlockAll := false
-	if allowInternetAccess != nil && !*allowInternetAccess {
-		networkBlockAll = true
-	}
-	if len(networkDenyOut) == 1 && networkDenyOut[0] == "0.0.0.0/0" {
-		networkBlockAll = true
-		if allowInternetAccess == nil {
-			value := false
-			allowInternetAccess = &value
-		}
-	}
-
-	// Effective egress CIDR policy handed to the service. A full block is
-	// carried by NetworkBlockAll (the blanket DROP), so we must not also pass a
-	// 0.0.0.0/0 deny — the service rejects it and it would duplicate the block.
-	// allowOut/denyOut are mutually exclusive per the E2B schema.
-	egressAllowOut := networkAllowOut
-	egressDenyOut := networkDenyOut
-	if networkBlockAll {
-		egressAllowOut = nil
-		egressDenyOut = nil
+	networkBlockAll, egressAllowOut, egressDenyOut := e2bEgressPolicy(networkAllowOut, networkDenyOut, allowInternetAccess)
+	if networkBlockAll && allowInternetAccess == nil {
+		value := false
+		allowInternetAccess = &value
 	}
 
 	timeoutSeconds := defaultSandboxTimeout
@@ -775,12 +828,11 @@ func (h *handlers) translateCreateSandboxRequest(ctx context.Context, req create
 	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, h.deps.Service, templateID, metadata); err != nil {
 		return models.CreateSandboxRequest{}, sandboxMeta{}, err
 	} else if ok {
-		// WASM sandboxes are host-mediated with no container IP, so the
-		// DOCKER-USER egress rules cannot be enforced on them — reject rather
-		// than silently leave the workload unrestricted.
-		if len(egressAllowOut) > 0 || len(egressDenyOut) > 0 {
-			return models.CreateSandboxRequest{}, sandboxMeta{}, notImplemented("selective egress (network.allowOut / network.denyOut) is not supported for wasm sandboxes")
-		}
+		// WASM egress lists are enforced by the worker's mediator; the service
+		// owns that decision (and the 501 on builds without it), so the lists
+		// pass through like any other runtime's.
+		wasmReq.NetworkAllowOut = egressAllowOut
+		wasmReq.NetworkDenyOut = egressDenyOut
 		// WASM has no container filesystem, so a bind-mounted volume could
 		// never appear. Reject rather than silently drop it.
 		if len(platformVolumes) > 0 {
@@ -1056,6 +1108,24 @@ func lifecyclePayload(meta sandboxMeta) *sandboxLifecyclePayload {
 		return nil
 	}
 	return &sandboxLifecyclePayload{AutoResume: meta.AutoResume, OnTimeout: meta.OnTimeout}
+}
+
+// e2bEgressPolicy maps E2B's egress fields onto the native policy, the same
+// way for create and updateNetwork. allow_internet_access false, or denyOut
+// ["0.0.0.0/0"] with no allowOut (E2B's "no internet"), is block-all,
+// carried by the blanket DROP with no lists. Otherwise both lists pass
+// through: allowOut alone is an allowlist (stricter than E2B, D11), denyOut
+// alone a deny list, both together allow-wins (D4); allowOut plus denyOut
+// ["0.0.0.0/0"] is the portable allowlist spelling. Hostnames in allowOut
+// put a container sandbox in gateway mode.
+func e2bEgressPolicy(allowOut, denyOut []string, allowInternetAccess *bool) (blockAll bool, allow, deny []string) {
+	if allowInternetAccess != nil && !*allowInternetAccess {
+		return true, nil, nil
+	}
+	if len(allowOut) == 0 && len(denyOut) == 1 && denyOut[0] == "0.0.0.0/0" {
+		return true, nil, nil
+	}
+	return false, allowOut, denyOut
 }
 
 func networkPayload(meta sandboxMeta) *sandboxNetworkPayload {

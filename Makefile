@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
 	integration-cluster-hetero-obs integration-cluster-hetero-obs-only integration-obs-snapshot \
@@ -234,6 +234,13 @@ integration-single-wasm:
 integration-single-isolate:
 	integration-tests/run.sh single-node-isolate $(RUN_FLAGS)
 
+# Private-cloud egress (plans/egress-domain-filtering.md §5.10, P1-20): one
+# node with node-local stand-ins for a bank network (dnsmasq internal names,
+# an internal HTTP service, a squid upstream proxy) and the egress operator
+# file wired to them. Runs UC-186..189.
+integration-single-private-cloud:
+	integration-tests/run.sh single-node-private-cloud $(RUN_FLAGS)
+
 # Same box with the workerd jail ON (the daemon default): chroot + cgroup +
 # privilege drop + enforcing seccomp. Runs UC-103..105 against jailed groups
 # and UC-109, which inspects the workerd process over SSH. This is the gate for
@@ -328,6 +335,11 @@ integration-cluster-hetero:
 	# so --metal-on-demand is unnecessary here. Disruptive failover tests
 	# (UC-58b) run by default; use integration-cluster-hetero-safe to skip them.
 	integration-tests/run.sh cluster-hetero $(RUN_FLAGS)
+
+# cluster-hetero without the c5.metal worker (worker-z is a t3.medium): every
+# runtime but Firecracker, ~8 x t3.medium on-demand.
+integration-cluster-hetero-lite:
+	integration-tests/run.sh cluster-hetero-lite $(RUN_FLAGS)
 
 # Same as integration-cluster-hetero but skips node-kill / failover fault injection.
 integration-cluster-hetero-safe:

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"io"
 	"log/slog"
 	"os"
@@ -257,5 +258,28 @@ func TestMainIsolateJailShimDispatch(t *testing.T) {
 	main()
 	if exitCode != 125 {
 		t.Fatalf("shim failure exit = %d, want 125", exitCode)
+	}
+}
+
+func TestMainEgressGatewayDispatch(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", gatewayd.Subcommand}
+	origGW := runEgressGatewayCLI
+	t.Cleanup(func() { runEgressGatewayCLI = origGW })
+	origExit := osExit
+	t.Cleanup(func() { osExit = origExit })
+	for _, tc := range []struct {
+		err      error
+		wantCode int
+	}{{nil, -1}, {errors.New("gw boom"), 1}} {
+		called := false
+		runEgressGatewayCLI = func(context.Context, *slog.Logger) error { called = true; return tc.err }
+		code := -1
+		osExit = func(c int) { code = c }
+		main()
+		if !called || code != tc.wantCode {
+			t.Fatalf("err=%v: called=%v exit=%d want %d", tc.err, called, code, tc.wantCode)
+		}
 	}
 }

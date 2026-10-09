@@ -34,6 +34,16 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	if req.NetworkBytesInLimit < 0 || req.NetworkBytesOutLimit < 0 {
 		return nil, errors.New("network byte limits must be >= 0")
 	}
+	// The worker's mediator enforces allow/deny lists (hostnames, wildcards,
+	// host:port, CIDRs) from the first dial, so they use the same grammar and
+	// precedence as every other runtime (egress plan P1-6). A bad entry is a
+	// 400; deny-all alone folds into block-all.
+	if _, err := compileCreateEgress(&req); err != nil {
+		return nil, err
+	}
+	if len(req.NetworkEgressRules) > 0 {
+		return nil, unsupportedWasmEgressRules()
+	}
 	if strings.TrimSpace(req.TemplateID) != "" {
 		return nil, fmt.Errorf("runtime %q does not support template_id (see plans/wasm-runtime.md): %w",
 			req.Runtime, models.ErrRuntimeNotImplemented)
@@ -147,6 +157,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		sealedMounts = s.testSealedMountsOverride
 	}
 
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
@@ -181,6 +194,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		NetworkBlockAll:      req.NetworkBlockAll,
 		NetworkAllowOut:      req.NetworkAllowOut,
 		NetworkDenyOut:       req.NetworkDenyOut,
+		NetworkEgressMode:    req.NetworkEgressMode,
 		AllowPublicTraffic:   req.AllowPublicTraffic,
 		MaskRequestHost:      strings.TrimSpace(req.MaskRequestHost),
 		ToolboxEnabled:       true,

@@ -87,6 +87,10 @@ func TestManagerEnabledPaths(t *testing.T) {
 		t.Fatalf("iptables.New() error = %v", err)
 	}
 	mgr := &Manager{enabled: true, ipt: ipt}
+	// The raw go-iptables client can't bootstrap AEROLVM-INPUT (that lives on
+	// execBackend); mark it ready so the per-IP input rules go through the
+	// fake's -C/-I/-D like every other rule, and assert DOCKER-USER below.
+	mgr.inputReady.Store(true)
 
 	if err := mgr.BlockAllEgress("10.0.0.2"); err != nil {
 		t.Fatalf("BlockAllEgress() error = %v", err)
@@ -94,14 +98,14 @@ func TestManagerEnabledPaths(t *testing.T) {
 	if err := mgr.BlockAllEgress("10.0.0.2"); err != nil {
 		t.Fatalf("BlockAllEgress() duplicate error = %v", err)
 	}
-	if got := readStateFile(t, state); len(got) != 1 || got[0] != "filter|DOCKER-USER|-s 10.0.0.2 -j DROP" {
+	if got := dockerUserLines(readStateFile(t, state)); len(got) != 1 || got[0] != "filter|DOCKER-USER|-s 10.0.0.2 -j DROP" {
 		t.Fatalf("egress rules = %+v", got)
 	}
 
 	if err := mgr.BlockAllIngress("10.0.0.3"); err != nil {
 		t.Fatalf("BlockAllIngress() error = %v", err)
 	}
-	if got := readStateFile(t, state); len(got) != 2 || got[1] != "filter|DOCKER-USER|-d 10.0.0.3 -j DROP" {
+	if got := dockerUserLines(readStateFile(t, state)); len(got) != 2 || got[1] != "filter|DOCKER-USER|-d 10.0.0.3 -j DROP" {
 		t.Fatalf("rules after ingress = %+v", got)
 	}
 
@@ -186,6 +190,7 @@ type memBackend struct {
 	mu        sync.Mutex
 	rules     []string
 	chains    map[string]bool
+	inputJump bool
 	deleteErr error
 }
 
@@ -257,6 +262,20 @@ func (m *memBackend) EnsureForwardJump(userChain string) error {
 	if !slices.Contains(m.rules, key) {
 		m.rules = append(m.rules, key)
 	}
+	return nil
+}
+
+// EnsureInputChain records the chain and the INPUT jump. The static
+// established-return rule is tracked as a flag, not a rule, so per-IP rule
+// counts in tests stay about per-IP rules.
+func (m *memBackend) EnsureInputChain(chain string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.chains == nil {
+		m.chains = make(map[string]bool)
+	}
+	m.chains[chain] = true
+	m.inputJump = true
 	return nil
 }
 
@@ -379,10 +398,11 @@ func TestClearLoopExecNoRegression(t *testing.T) {
 	if err := mgr.ClearBlockAllEgress("10.0.0.7"); err != nil {
 		t.Fatal(err)
 	}
-	// Present rule: one successful Delete + one not-exist probe. Exists must
-	// never fire when ruleNotExist already recognizes the error.
-	if backend.deletes != 2 || backend.exists != 0 {
-		t.Fatalf("exec clear: deletes=%d exists=%d, want 2/0", backend.deletes, backend.exists)
+	// Present rules: one successful Delete + one not-exist probe each for the
+	// FORWARD drop and the AEROLVM-INPUT drop. Exists must never fire when
+	// ruleNotExist already recognizes the error.
+	if backend.deletes != 4 || backend.exists != 0 {
+		t.Fatalf("exec clear: deletes=%d exists=%d, want 4/0", backend.deletes, backend.exists)
 	}
 }
 
@@ -465,8 +485,8 @@ func TestApplyEgressPolicyAllowlist(t *testing.T) {
 	if err := mgr.ApplyEgressPolicy(ip, allow, nil); err != nil {
 		t.Fatalf("reapply: %v", err)
 	}
-	if len(backend.rules) != 3 {
-		t.Fatalf("rules = %v, want catch-all DROP + 2 ACCEPTs", backend.rules)
+	if len(backend.rules) != 6 {
+		t.Fatalf("rules = %v, want catch-all DROP + 2 ACCEPTs, and the same shape in AEROLVM-INPUT", backend.rules)
 	}
 	if ok, _ := backend.Exists("filter", "DOCKER-USER", "-s", ip, "-m", "comment", "--comment", egressPolicyComment, "-j", "DROP"); !ok {
 		t.Fatal("allowlist catch-all DROP missing")
@@ -757,8 +777,8 @@ func TestBlockAllEgressReportDistinguishesInsertFromNoop(t *testing.T) {
 			t.Fatalf("reapply %d reported inserted=true; want false (rule already present)", i)
 		}
 	}
-	if got := be.ruleCount(); got != 1 {
-		t.Fatalf("rule count = %d, want 1 (reapply must stay idempotent)", got)
+	if got := be.ruleCount(); got != 2 {
+		t.Fatalf("rule count = %d, want 2: FORWARD + INPUT drop (reapply must stay idempotent)", got)
 	}
 
 	// Simulate the drift the counter exists to catch: an out-of-band flush.
@@ -786,4 +806,16 @@ func TestBlockAllEgressReportDisabledAndEmptyIP(t *testing.T) {
 	if inserted, err := enabled.BlockAllEgressReport(""); err != nil || inserted {
 		t.Fatalf("empty IP = (%v, %v), want (false, nil)", inserted, err)
 	}
+}
+
+// dockerUserLines keeps only DOCKER-USER rules from a fake-iptables state dump,
+// so FORWARD-path assertions ignore the AEROLVM-INPUT rules (P0-5).
+func dockerUserLines(lines []string) []string {
+	var out []string
+	for _, l := range lines {
+		if strings.HasPrefix(l, "filter|DOCKER-USER|") {
+			out = append(out, l)
+		}
+	}
+	return out
 }

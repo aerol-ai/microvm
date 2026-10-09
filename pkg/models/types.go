@@ -215,6 +215,35 @@ func ValidRuntime(value string) (string, error) {
 	}
 }
 
+// RuntimeUsesEgressGateway reports whether hostname egress rules on this
+// runtime are enforced by the node's egress gateway. WASM and isolate filter
+// in their own host-side mediators; Firecracker guests reach the gateway
+// through their TAPs (plans/egress-domain-filtering.md Phase 4). Cluster
+// placement uses it to route gateway-mode creates only to nodes with a
+// ready gateway.
+func RuntimeUsesEgressGateway(runtime string) bool {
+	switch runtime {
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
+		return true
+	}
+	return false
+}
+
+// RuntimeMediatesEgress reports whether a runtime filters egress in its own
+// host-side mediator (WASM's worker, isolate's egress proxy) rather than the
+// node's egress gateway.
+func RuntimeMediatesEgress(runtime string) bool {
+	return runtime == RuntimeWasm || runtime == RuntimeIsolate
+}
+
+// CreateHasEgress reports whether a create sets any egress field. Cluster
+// placement sends such a mediated-runtime create only to peers that enforce
+// them (capacity Snapshot.MediatedEgress).
+func CreateHasEgress(req *CreateSandboxRequest) bool {
+	return req != nil && (req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 ||
+		req.NetworkEgressMode != "" || len(req.EgressProfiles) > 0 || len(req.NetworkEgressRules) > 0)
+}
+
 // ValidDurability normalizes and validates a durability class. Empty input
 // passes through so the caller can apply a runtime-specific default.
 func ValidDurability(value string) (string, error) {
@@ -593,16 +622,40 @@ type CreateSandboxRequest struct {
 	// Crossing the limit installs an egress DROP rule via the same primitive
 	// NetworkBlockAll uses.
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit,omitempty"`
-	// NetworkAllowOut is an egress allowlist of CIDRs: when non-empty the
-	// sandbox may reach only these destinations and everything else is
-	// dropped. Mutually exclusive with NetworkDenyOut. Enforced by the host
-	// firewall (EnableNetworkRules) and a no-op when network rules are off.
+	// NetworkAllowOut is an egress allowlist: CIDRs, hostnames, *.suffix
+	// wildcards and host:port entries (plans/egress-domain-filtering.md §5.1).
+	// Alone it allows only these destinations. With NetworkDenyOut the
+	// precedence is allow-wins: an allow match passes, then a deny match
+	// drops, then the default is accept; a deny of 0.0.0.0/0 makes it an
+	// allowlist. Hostnames need the egress gateway on container runtimes.
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
-	// NetworkDenyOut is an egress blocklist of CIDRs: the sandbox may reach
-	// anything except these destinations. Mutually exclusive with
-	// NetworkAllowOut. Blocking the entire space is expressed as
-	// NetworkBlockAll, not a denyOut of 0.0.0.0/0.
+	// NetworkDenyOut is an egress blocklist of CIDRs (never hostnames): alone,
+	// the sandbox may reach anything except these. A deny of 0.0.0.0/0 with
+	// no allow list is block-all and is stored as NetworkBlockAll.
 	NetworkDenyOut []string `json:"network_deny_out,omitempty"`
+	// EgressProfiles names egress profiles whose entries join
+	// NetworkAllowOut; the union is capped at 1024 hostnames. A profile
+	// update re-applies to every sandbox that references it
+	// (plans/egress-domain-filtering.md D21).
+	EgressProfiles []string `json:"egress_profiles,omitempty"`
+	// NetworkEgressMode is "enforce" (the default) or "learn". Learn mode
+	// allows all outbound traffic and records what the sandbox reaches, for
+	// GET /network/learned to turn into an allow list. It is open egress by
+	// design: trusted runs only. It needs empty lists, no profiles and no
+	// block-all (plans/egress-domain-filtering.md CEO D2).
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are method and path rules that refine hosts the
+	// allow list admits (plans/egress-domain-filtering.md §5.9, P3-1). An
+	// inspect rule makes the egress gateway terminate TLS on 443 with the
+	// node's CA, which the sandbox is given to trust; it has to be set at
+	// create.
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EgressWithheldEnv lists env keys the sandbox gets placeholders for
+	// instead of values (P3-2). sandboxd keeps it in the replicated spec, so
+	// a key an inject rule withheld at create stays withheld after the rule
+	// is removed: a recreate on another node must not hand the sandbox a
+	// credential it never had. A create may set it to withhold keys itself.
+	EgressWithheldEnv []string `json:"egress_withheld_env,omitempty"`
 	// AllowPublicTraffic controls whether the sandbox may be exposed to the
 	// public internet. On create, omitted (nil) defaults to private — no
 	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
@@ -780,12 +833,32 @@ type Sandbox struct {
 	// created or patched with. Zero = unlimited.
 	NetworkBytesInLimit  int64 `json:"network_bytes_in_limit"`
 	NetworkBytesOutLimit int64 `json:"network_bytes_out_limit"`
-	// NetworkAllowOut / NetworkDenyOut are the egress CIDR policy the sandbox
-	// was created with, persisted so the start and reconcile paths can
-	// reinstall the host-firewall rules after a restart (parity with
-	// NetworkBlockAll). Mutually exclusive; at most one is non-empty.
+	// NetworkAllowOut / NetworkDenyOut are the egress policy the sandbox was
+	// created with, persisted so the start and reconcile paths can reinstall
+	// the rules after a restart (parity with NetworkBlockAll). Both may be set:
+	// allow-wins precedence (plans/egress-domain-filtering.md D4).
 	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
 	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	// EgressProfiles are the profiles this sandbox references, and
+	// EgressProfilesApplied the generation of each that is live, so a caller
+	// can see when a profile update has reached it. On the stored row
+	// NetworkAllowOut is the effective list (inline entries plus every
+	// profile's), which is what enforcement reads; API responses show the
+	// inline list instead.
+	EgressProfiles        []string           `json:"egress_profiles,omitempty"`
+	EgressProfilesApplied []EgressProfileRef `json:"egress_profiles_applied,omitempty"`
+	// NetworkEgressMode is "learn" for a sandbox recording its egress, and
+	// empty (enforce) otherwise.
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules are the sandbox's method and path rules (P3-1).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EgressStatus is the hostname-egress state on GET for a sandbox whose
+	// policy needs the egress gateway: "active", "held" (attach failed or the
+	// stored policy is invalid; no egress until it attaches) or
+	// "unavailable" (the gateway is down or lost its table). Empty for every
+	// other sandbox, and on list responses (plans/egress-domain-filtering.md
+	// D16). Response-only: never stored.
+	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
 	// (treated as allowed); a non-nil false makes ExposePort refuse to install
 	// a public route. Persisted so the gate survives restarts.
@@ -897,6 +970,179 @@ type NetworkUsage struct {
 }
 
 // UpdateNetworkLimitsRequest is the body for PATCH /v1/sandboxes/{id}/network/limits.
+// NetworkPolicyRequest is PUT /v1/sandboxes/{id}/network/policy
+// (plans/egress-domain-filtering.md §5.8): a full replace of the sandbox's
+// egress policy, with the same fields and rules as create. Sending the same
+// body twice is a no-op.
+type NetworkPolicyRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" (empty means the same) or "learn".
+	NetworkEgressMode string `json:"network_egress_mode,omitempty"`
+	// NetworkEgressRules replaces the method and path rules. Adding an
+	// inspect rule needs a sandbox created with one (409 otherwise).
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+}
+
+// NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
+// means it is stored, replicated in a cluster, and live on a running
+// sandbox. EgressStatus is set for a container sandbox in gateway mode, as
+// on GET.
+type NetworkPolicy struct {
+	NetworkBlockAll bool     `json:"network_block_all"`
+	NetworkAllowOut []string `json:"network_allow_out"`
+	NetworkDenyOut  []string `json:"network_deny_out"`
+	EgressProfiles  []string `json:"egress_profiles"`
+	// NetworkEgressMode is "enforce" or "learn".
+	NetworkEgressMode  string       `json:"network_egress_mode"`
+	NetworkEgressRules []EgressRule `json:"network_egress_rules,omitempty"`
+	// EffectiveHostnameCount counts the hostname entries in force: inline
+	// plus every referenced profile's (at most 1024).
+	EffectiveHostnameCount int    `json:"effective_hostname_count"`
+	EgressStatus           string `json:"egress_status,omitempty"`
+}
+
+// EgressRule is one method and path rule (plans/egress-domain-filtering.md
+// §5.9, P3-1). Rules for one host are alternatives: a request to a ruled
+// host passes when some rule admits its method and path, and is refused
+// with 403 otherwise. A host no rule names keeps its allow-list decision.
+type EgressRule struct {
+	// Host is an exact name or "*." wildcard the allow list already admits.
+	Host string `json:"host"`
+	// Ports is [80] by default, or [443] with Inspect; only 80 and 443.
+	Ports []uint16 `json:"ports,omitempty"`
+	// Methods are exact, upper case; empty allows any.
+	Methods []string `json:"methods,omitempty"`
+	// Paths are globs: "*" within a segment, "**" as a whole segment for
+	// any number of them; empty allows any.
+	Paths []string `json:"paths,omitempty"`
+	// Inspect terminates TLS on 443 with the node's CA so requests can be
+	// checked, and makes the gateway require Host to equal the SNI.
+	Inspect bool `json:"inspect,omitempty"`
+	// Inject replaces a header on the requests this rule allows with a
+	// secret from the sandbox's own env, which the sandbox itself only
+	// sees as a placeholder (P3-2). Needs Inspect.
+	Inject *EgressInject `json:"inject,omitempty"`
+	// Binaries limits the rule to connections opened by these executables
+	// (absolute paths inside the sandbox; an interpreter's script counts),
+	// on runc sandboxes only (P3-3). A rule with only binaries decides
+	// whole connections, on any port the allow list opens.
+	Binaries []string `json:"binaries,omitempty"`
+}
+
+// EgressInject is a rule's credential injection (plans/egress-domain-
+// filtering.md §5.9, P3-2).
+type EgressInject struct {
+	// Header is replaced, never added to or substituted inside bodies.
+	Header string `json:"header"`
+	// SecretRef is "env:<KEY>": a key in the sandbox's env, withheld from
+	// the sandbox (it gets "aerolvm-placeholder:<KEY>") and handed to the
+	// egress gateway instead. Rotating it means recreating the sandbox.
+	SecretRef string `json:"secret_ref"`
+}
+
+// Egress modes (NetworkEgressMode).
+const (
+	NetworkEgressModeEnforce = "enforce"
+	NetworkEgressModeLearn   = "learn"
+)
+
+// NetworkLearned is GET /v1/sandboxes/{id}/network/learned: what a sandbox
+// reached while in learn mode, and the allow list that would have allowed
+// it. Exactly one of SuggestedAllowOut and SuggestedProfile holds the list:
+// the inline list when it fits 64 hostnames, a profile body otherwise.
+// Truncated means recording stopped at the cap.
+type NetworkLearned struct {
+	Mode              string                `json:"mode"`
+	Truncated         bool                  `json:"truncated"`
+	Entries           []NetworkLearnedEntry `json:"entries"`
+	CIDRs             []string              `json:"cidrs"`
+	SuggestedAllowOut []string              `json:"suggested_allow_out"`
+	SuggestedProfile  *EgressProfileRequest `json:"suggested_profile"`
+}
+
+// NetworkLearnedEntry is one destination a learn-mode sandbox reached.
+type NetworkLearnedEntry struct {
+	Host      string    `json:"host"`
+	Ports     []uint16  `json:"ports"`
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	Hits      uint64    `json:"hits"`
+}
+
+// EgressProfile is a named allowlist sandboxes reference by name
+// (plans/egress-domain-filtering.md D21). Profiles are owner-scoped like
+// sandbox names; Generation goes up by one on every change.
+type EgressProfile struct {
+	Name        string    `json:"name"`
+	AllowOut    []string  `json:"allow_out"`
+	Description string    `json:"description,omitempty"`
+	Generation  int64     `json:"generation"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// EgressProfileRequest is the body of PUT /v1/egress-profiles/{name}, a full
+// replace: the same body twice is a no-op.
+type EgressProfileRequest struct {
+	AllowOut    []string `json:"allow_out"`
+	Description string   `json:"description,omitempty"`
+}
+
+// EgressProfileList is one page of GET /v1/egress-profiles.
+type EgressProfileList struct {
+	Profiles   []EgressProfile `json:"profiles"`
+	NextCursor string          `json:"next_cursor,omitempty"`
+}
+
+// EgressProfileRef is a profile and the generation of it a sandbox has live.
+type EgressProfileRef struct {
+	Name       string `json:"name"`
+	Generation int64  `json:"generation"`
+}
+
+// ErrorCodeEgressSpecCommitFailed is returned (503) when a policy update
+// could not be committed to the cluster's replicated spec; nothing changed.
+const ErrorCodeEgressSpecCommitFailed = "spec_commit_failed"
+
+// ErrorCodeEgressApplyFailedHeld is returned (503) when a policy update is
+// stored but could not be made live; a container sandbox is held without
+// egress until a retry (the PUT is idempotent) or the reconcile pass
+// applies it.
+const ErrorCodeEgressApplyFailedHeld = "apply_failed_held"
+
+// ErrorCodeEgressProfileInUse is a profile DELETE while sandboxes reference it.
+const ErrorCodeEgressProfileInUse = "egress_profile_in_use"
+
+// ErrorCodeEgressProfileCapExceeded is a profile PUT that would push a
+// referencing sandbox past the 1024-hostname union cap.
+const ErrorCodeEgressProfileCapExceeded = "egress_profile_cap_exceeded"
+
+// NetworkPolicyCheckRequest is POST /v1/network/policy/check: would a sandbox
+// created with these egress fields reach Destination? Destination is "host",
+// "host:port", "IP" or "IP:port"; a bare host is checked as the web ports.
+// No sandbox is involved (plans/egress-domain-filtering.md P2-9, CEO D5).
+type NetworkPolicyCheckRequest struct {
+	NetworkBlockAll bool     `json:"network_block_all,omitempty"`
+	NetworkAllowOut []string `json:"network_allow_out,omitempty"`
+	NetworkDenyOut  []string `json:"network_deny_out,omitempty"`
+	Destination     string   `json:"destination"`
+}
+
+// NetworkPolicyCheckResponse answers a policy check. MatchedRule is the entry
+// that decided, "" when the default verdict did. The check does not resolve
+// DNS, so deny CIDRs that a hostname's address would hit at connect time are
+// not evaluated. OutsideCeiling names the first allow entry outside this
+// deployment's operator ceiling (a create with it would get 400).
+type NetworkPolicyCheckResponse struct {
+	Allowed        bool   `json:"allowed"`
+	MatchedRule    string `json:"matched_rule"`
+	DefaultVerdict string `json:"default_verdict"`
+	OutsideCeiling string `json:"outside_ceiling,omitempty"`
+}
+
 // Each field is a pointer so the handler can distinguish "leave alone" (nil)
 // from "set to unlimited" (pointer to zero). Negative values are rejected at
 // the service layer.
@@ -1096,6 +1342,18 @@ type ErrorResponse struct {
 // recovery is to re-create the artifact (re-upload the bundle, rebuild the
 // image), which yields a new node-bound ref.
 const ErrorCodeArtifactNodeUnavailable = "artifact_node_unavailable"
+
+// ErrorCodeEgressGatewayUnavailable is returned (503, with Retry-After) when
+// a sandbox with hostname egress rules can't be filtered right now: the
+// node's egress gateway is down, or in a cluster no node has a ready one
+// (plans/egress-domain-filtering.md G7, CEO D20). Retrying is the recovery.
+const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
+
+// ErrorCodeEgressOperatorConfigInvalid is returned (503) for every create
+// while the egress operator file is present but invalid at boot: the
+// deployment's default egress policy is unknown, so creates fail closed
+// (plans/egress-domain-filtering.md §5.10).
+const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming

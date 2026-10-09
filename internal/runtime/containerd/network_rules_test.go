@@ -1,7 +1,10 @@
 package containerd
 
 import (
+	"context"
 	"errors"
+	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
@@ -89,6 +92,9 @@ type netrulesMemBackend struct {
 	rules []string
 }
 
+// EnsureInputChain satisfies the netrules input bootstrap (P0-5).
+func (m *netrulesMemBackend) EnsureInputChain(string) error { return nil }
+
 func (m *netrulesMemBackend) Exists(table, chain string, spec ...string) (bool, error) {
 	key := table + "|" + chain
 	for _, s := range spec {
@@ -127,3 +133,25 @@ func (m *netrulesMemBackend) Delete(table, chain string, spec ...string) error {
 
 func (m *netrulesMemBackend) EnsureUserChain(string) error   { return nil }
 func (m *netrulesMemBackend) EnsureForwardJump(string) error { return nil }
+
+// floorMemBackend adds the floor chain operations (§5.10 PC-2).
+type floorMemBackend struct{ netrulesMemBackend }
+
+func (f *floorMemBackend) EnsureJumpChain(string, string) error { return nil }
+func (f *floorMemBackend) FlushChain(string) error              { f.rules = nil; return nil }
+
+func TestSetEgressFloorUsesTheCNISubnet(t *testing.T) {
+	be := &floorMemBackend{}
+	mgr := netrules.NewWithBackend(be)
+	mgr.SetBridgeSubnet("10.88.0.0/16")
+	d := New(Config{}, mgr, nil)
+	if err := d.SetEgressFloor(context.Background(), []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(be.rules) != 1 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") {
+		t.Fatalf("floor rules = %v", be.rules)
+	}
+	if err := New(Config{}, nil, nil).SetEgressFloor(context.Background(), nil); err != nil {
+		t.Fatal("no rules manager is a no-op")
+	}
+}

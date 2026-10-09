@@ -25,6 +25,14 @@ func TestWriteStoreAwareErrorCoverage95(t *testing.T) {
 		{name: "platform_volumes_disabled", err: models.ErrPlatformVolumesDisabled, wantStatus: http.StatusPreconditionFailed},
 		{name: "platform_volumes_unsupported_runtime", err: models.ErrPlatformVolumesUnsupportedRuntime, wantStatus: http.StatusBadRequest},
 		{name: "platform_volume_quota", err: models.ErrPlatformVolumeQuota, wantStatus: http.StatusConflict},
+		{name: "egress_operator_config_invalid", err: service.ErrEgressOperatorConfigInvalid, wantStatus: http.StatusServiceUnavailable},
+		{name: "egress_gateway_unavailable", err: service.ErrEgressGatewayUnavailable, wantStatus: http.StatusServiceUnavailable},
+		{name: "egress_spec_commit_failed", err: service.ErrEgressSpecCommitFailed, wantStatus: http.StatusServiceUnavailable},
+		{name: "egress_apply_failed_held", err: service.ErrEgressApplyFailedHeld, wantStatus: http.StatusServiceUnavailable},
+		{name: "egress_policy_busy", err: service.ErrEgressPolicyBusy, wantStatus: http.StatusConflict},
+		{name: "egress_profiles_conflict", err: service.ErrEgressProfilesConflict, wantStatus: http.StatusConflict},
+		{name: "egress_learn_conflict", err: service.ErrEgressLearnConflict, wantStatus: http.StatusConflict},
+		{name: "egress_selftest_failed", err: service.ErrEgressSelfTestFailed, wantStatus: http.StatusNotImplemented},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

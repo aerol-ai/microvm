@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 )
 
@@ -66,8 +67,12 @@ type Host struct {
 	started atomic.Bool
 
 	mu           sync.RWMutex
-	bundles      map[string]*jsbundle.Bundle // sandbox id → pinned bundle
-	egressPolicy map[string]EgressPolicy     // sandbox id → outbound policy
+	bundles      map[string]*jsbundle.Bundle     // sandbox id → pinned bundle
+	egressPolicy map[string]*egresspolicy.Policy // sandbox id → compiled outbound policy
+	egressRules  map[string]*egresspolicy.Rules  // sandbox id → method and path rules (P3-1)
+	// egressSecrets holds inject rules' values by sandbox id (P3-2), memory
+	// only.
+	egressSecrets map[string]map[string]string
 	// Egress slot allocation (§4): a sandbox with a non-block-all policy is
 	// assigned a slot; its dedicated egress listener (slotSrv[slot]) is bound
 	// lazily on assignment and torn down on Unload. Attribution is the socket,
@@ -87,6 +92,29 @@ type Host struct {
 
 	// egressObserver records host-mediated destinations (E3a). Guarded by mu.
 	egressObserver EgressObserver
+	// egressDenialObserver records refused requests (H5). Guarded by mu.
+	egressDenialObserver EgressDenialObserver
+	// learnObserver records learn-mode destinations (P2-7). Guarded by mu.
+	learnObserver LearnObserver
+}
+
+// SetLearnObserver installs (or clears) the learn-mode recording callback.
+func (h *Host) SetLearnObserver(obs LearnObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.learnObserver = obs
+	h.mu.Unlock()
+}
+
+func (h *Host) observeLearn(sandboxID, host string, port uint16) {
+	h.mu.RLock()
+	obs := h.learnObserver
+	h.mu.RUnlock()
+	if obs != nil && sandboxID != "" {
+		obs(sandboxID, host, port)
+	}
 }
 
 // SetEgressObserver installs (or clears) the async egress attribution callback.
@@ -96,6 +124,16 @@ func (h *Host) SetEgressObserver(obs EgressObserver) {
 	}
 	h.mu.Lock()
 	h.egressObserver = obs
+	h.mu.Unlock()
+}
+
+// SetEgressDenialObserver installs (or clears) the denial audit callback.
+func (h *Host) SetEgressDenialObserver(obs EgressDenialObserver) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.egressDenialObserver = obs
 	h.mu.Unlock()
 }
 
@@ -155,7 +193,7 @@ func NewHost(cfg HostConfig) (*Host, error) {
 		egressDenySock: filepath.Join(cfg.RunDir, egressDenySocketName),
 		egressSocks:    egressSocks,
 		bundles:        make(map[string]*jsbundle.Bundle),
-		egressPolicy:   make(map[string]EgressPolicy),
+		egressPolicy:   make(map[string]*egresspolicy.Policy),
 		slotByID:       make(map[string]int),
 		idBySlot:       make([]string, cfg.EgressPoolSize),
 		slotSrv:        make([]*http.Server, cfg.EgressPoolSize),
@@ -187,6 +225,8 @@ func (h *Host) Unload(id string) int {
 	h.mu.Lock()
 	delete(h.bundles, id)
 	delete(h.egressPolicy, id)
+	delete(h.egressRules, id)
+	delete(h.egressSecrets, id)
 	if slot, ok := h.slotByID[id]; ok {
 		h.freeSlotLocked(id, slot)
 	}

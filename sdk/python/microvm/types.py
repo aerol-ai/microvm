@@ -158,12 +158,25 @@ class CreateOptions(TypedDict, total=False):
     env: Dict[str, str]
     osUser: str
     networkBlockAll: bool
-    # Egress allowlist / blocklist of CIDRs enforced by the host firewall.
-    # networkAllowOut: sandbox may reach ONLY these; everything else is dropped.
-    # networkDenyOut: sandbox may reach anything EXCEPT these. The two are
-    # mutually exclusive; a full block is networkBlockAll, not a 0.0.0.0/0 deny.
+    # Egress policy. networkAllowOut takes CIDRs, hostnames, *.suffix wildcards
+    # and host:port entries; alone the sandbox may reach ONLY these.
+    # networkDenyOut takes CIDRs only; alone the sandbox may reach anything
+    # EXCEPT these. Both together: allow wins, then deny, then allow by default
+    # (a 0.0.0.0/0 deny makes it an allowlist). A full block is networkBlockAll.
     networkAllowOut: List[str]
     networkDenyOut: List[str]
+    # Named egress profiles whose entries join networkAllowOut (see
+    # put_egress_profile). A profile change reaches every sandbox using it.
+    egressProfiles: List[str]
+    # "learn" gives the sandbox open egress and records what it reaches, so
+    # learned() can suggest an allow list. Trusted runs only. Omitted is
+    # "enforce".
+    networkEgressMode: str
+    # Method and path rules that refine hosts the allow list already admits
+    # (at most 32). An inspect rule makes the egress gateway terminate TLS on
+    # 443 with the node's CA, which only a sandbox created with such a rule
+    # trusts, so set inspect rules here rather than adding them later.
+    networkEgressRules: List["EgressRule"]
     # Whether the sandbox may be exposed publicly. Omitted defaults to private
     # (no public URL, expose_port fails). True opts in; False permanently refuses.
     allowPublicTraffic: bool
@@ -430,6 +443,17 @@ class SandboxData(TypedDict, total=False):
     osUser: str
     env: Dict[str, str]
     networkBlockAll: bool
+    # Hostname-egress state on get (container runtimes): "active", "held" or
+    # "unavailable". Absent otherwise.
+    egressStatus: str
+    # Egress profiles this sandbox references, and the generation of each
+    # that is live on it.
+    egressProfiles: List[str]
+    egressProfilesApplied: List["EgressProfileRef"]
+    # "learn" while the sandbox records its egress; absent otherwise.
+    networkEgressMode: str
+    # Method and path rules on the sandbox's egress; absent when it has none.
+    networkEgressRules: List["EgressRule"]
     toolboxEnabled: bool
     sshPublicKey: str
     sshPrivateKey: str
@@ -464,6 +488,211 @@ class NetworkUsage(TypedDict, total=False):
     quotaExceededAt: str
     # Absent until the netstats poller has produced at least one sample.
     lastSampledAt: str
+
+
+class AuditEvent(TypedDict, total=False):
+    """One record from a sandbox's audit log (``sandbox.audit()``).
+
+    ``kind`` is ``"egress"`` for outbound connections and denials; a denial
+    has ``result`` ``"failure"`` and the policy ``reason``
+    (``"host_not_allowed"``, ``"sni_not_allowed"``, ...).
+    """
+
+    time: str
+    kind: str
+    result: str
+    reason: str
+    destination: str
+    network: str
+    actor: str
+    ref: str
+    eventID: str
+    incarnationID: str
+    dropped: int
+
+
+class AuditCoverage(TypedDict):
+    answered: List[str]
+    missing: List[str]
+    partial: bool
+
+
+class AuditPage(TypedDict, total=False):
+    events: List[AuditEvent]
+    coverage: AuditCoverage
+    # Pass to ``audit({"cursor": ...})`` for the next page.
+    nextCursor: str
+
+
+class AuditOptions(TypedDict, total=False):
+    kind: str
+    limit: int
+    cursor: str
+    incarnationID: str
+
+
+class NetworkPolicyCheckOptions(TypedDict, total=False):
+    """Would a sandbox created with these egress fields reach ``destination``?
+
+    ``destination`` is "host", "host:port", "IP" or "IP:port"; a bare host is
+    checked as the web ports.
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    destination: str
+
+
+class NetworkPolicyCheckResult(TypedDict, total=False):
+    allowed: bool
+    # The entry that decided; "" when the default verdict did.
+    matchedRule: str
+    # "allow" or "deny": what happens to a destination no entry matches.
+    defaultVerdict: str
+    # The first allow entry outside this deployment's ceiling, if any.
+    outsideCeiling: str
+
+
+class EgressProfileRef(TypedDict):
+    name: str
+    generation: int
+
+
+class EgressProfile(TypedDict, total=False):
+    """A named allowlist sandboxes reference through ``egressProfiles``.
+    Profiles belong to your account; ``generation`` goes up on every change."""
+
+    name: str
+    # Hostnames, *. wildcards, host:port entries and CIDRs (at most 512 hostnames).
+    allowOut: List[str]
+    description: str
+    generation: int
+    createdAt: str
+    updatedAt: str
+
+
+class EgressProfileOptions(TypedDict, total=False):
+    """The body of ``put_egress_profile``: a full replace."""
+
+    allowOut: List[str]
+    description: str
+
+
+class ListEgressProfilesOptions(TypedDict, total=False):
+    cursor: str
+    limit: int
+
+
+class EgressProfileList(TypedDict, total=False):
+    profiles: List[EgressProfile]
+    # Pass back as ``cursor`` for the next page; absent on the last one.
+    nextCursor: str
+
+
+class NetworkPolicyOptions(TypedDict, total=False):
+    """A sandbox's whole egress policy, for ``set_network_policy``.
+
+    It replaces the current policy: a key left out is cleared, so ``{}``
+    means open egress. The grammar is the create one (hostnames, ``*.``
+    wildcards, ``host:port`` and CIDRs in the allow list; CIDRs only in the
+    deny list).
+    """
+
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    egressProfiles: List[str]
+    networkEgressMode: str
+    # Replaces the method and path rules. Adding an inspect rule to a
+    # container sandbox created without one is refused with 409: recreate it
+    # with the rule.
+    networkEgressRules: List["EgressRule"]
+
+
+class NetworkPolicy(TypedDict, total=False):
+    networkBlockAll: bool
+    networkAllowOut: List[str]
+    networkDenyOut: List[str]
+    egressProfiles: List[str]
+    # "enforce" or "learn".
+    networkEgressMode: str
+    networkEgressRules: List["EgressRule"]
+    # Hostname entries in force: inline plus every profile's (at most 1024).
+    effectiveHostnameCount: int
+    # "active", "held" or "unavailable" for hostname rules on a container.
+    egressStatus: str
+
+
+class EgressRule(TypedDict, total=False):
+    """One method, path or program rule. Rules refine a host the allow list
+    already admits: a request to a ruled host passes when some rule for that
+    host admits its program, method and path, and gets a 403 otherwise. A
+    host no rule names keeps its allow-list decision."""
+
+    # An exact name or "*." wildcard, without a port. Required.
+    host: str
+    # [80] by default, or [443] with inspect; only 80 and 443, except that a
+    # rule with only binaries may name any port the allow list opens.
+    ports: List[int]
+    # Exact, upper case ("GET", "POST"); empty allows any.
+    methods: List[str]
+    # Path globs: "*" within one segment, "**" as a whole segment for any
+    # number of them. Empty allows any path.
+    paths: List[str]
+    # Terminate TLS on 443 with the node's CA so the rule can see requests.
+    # The request's Host must then equal the TLS server name.
+    inspect: bool
+    # Replace a header on the requests this rule allows with a secret from
+    # the sandbox's own env, which the sandbox itself only sees as a
+    # placeholder. Needs inspect.
+    inject: "EgressInject"
+    # Limit the rule to connections opened by these executables: clean
+    # absolute paths inside the sandbox, at most 16. For an interpreter
+    # (python, node, a shell) the script it runs counts too, so
+    # "/usr/local/bin/pip" works. A rule with only binaries decides whole
+    # connections, on any port the allow list opens. Runc sandboxes only
+    # (docker and containerd); least privilege for trusted tooling, not a
+    # security boundary.
+    binaries: List[str]
+
+
+class EgressInject(TypedDict):
+    """A rule's credential injection. The sandbox's env holds
+    ``aerolvm-placeholder:<KEY>`` in place of the value, and the egress
+    gateway replaces ``header`` with the real value on each request the rule
+    allows, so code in the sandbox never holds the secret."""
+
+    # The header to replace, such as "Authorization". It is replaced, never
+    # added to a body or URL. Headers that frame or route the request, such
+    # as Host or Content-Length, can't be injected.
+    header: str
+    # "env:<KEY>": a key in the create's env, whose value is the whole header
+    # value (for example "Bearer ghp_..."). Sent as secret_ref on the wire.
+    # Rotating it means recreating the sandbox.
+    secretRef: str
+
+
+class NetworkLearnedEntry(TypedDict, total=False):
+    host: str
+    # Connection ports; empty when the name was only resolved.
+    ports: List[int]
+    firstSeen: str
+    lastSeen: str
+    hits: int
+
+
+class NetworkLearned(TypedDict, total=False):
+    """What a sandbox reached in learn mode, and the allow list that would
+    have allowed it: ``suggestedAllowOut`` when it fits 64 hostnames,
+    otherwise ``suggestedProfile`` (a body for ``put_egress_profile``)."""
+
+    mode: str
+    truncated: bool
+    entries: List[NetworkLearnedEntry]
+    cidrs: List[str]
+    suggestedAllowOut: List[str]
+    suggestedProfile: "EgressProfileOptions"
 
 
 class SetNetworkLimitsOptions(TypedDict, total=False):

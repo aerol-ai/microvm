@@ -408,7 +408,7 @@ func TestIsolateIsRefused(t *testing.T) {
 func TestPinnedLazyCreateSingleFlight(t *testing.T) {
 	fake := agenttoolstest.New(t)
 	fake.CreateDelay = 50 * time.Millisecond
-	e := connect(t, fake, Options{Sandbox: "my-agent", CreateIfMissing: true, Image: "python:3.12"})
+	e := connect(t, fake, Options{Sandbox: "my-agent", CreateIfMissing: true, Image: "python:3.12", AllowHosts: []string{"pypi.org"}})
 	if fake.Count() != 0 {
 		t.Fatal("the pinned sandbox must not be created at startup")
 	}
@@ -424,7 +424,7 @@ func TestPinnedLazyCreateSingleFlight(t *testing.T) {
 	}
 	wg.Wait()
 	fake.Observe(func(s *agenttoolstest.Server) {
-		if s.CreatePosts != 1 || s.LastCreate.Image != "python:3.12" || s.LastCreate.Name != "my-agent" {
+		if s.CreatePosts != 1 || s.LastCreate.Image != "python:3.12" || s.LastCreate.Name != "my-agent" || len(s.LastCreate.NetworkAllowOut) != 1 {
 			t.Fatalf("POSTs = %d (%+v), want exactly 1", s.CreatePosts, s.LastCreate)
 		}
 	})
@@ -622,4 +622,18 @@ func TestInstructions(t *testing.T) {
 	if s := newEnv(t, Options{}).server.instructions(); !strings.Contains(s, "sandbox_create") {
 		t.Fatalf("unpinned instructions = %q", s)
 	}
+}
+
+// TestCreateAllowHosts covers P2-3: allow_hosts becomes the create's allow
+// list.
+func TestCreateAllowHosts(t *testing.T) {
+	e := newEnv(t, Options{MaxCreates: DefaultMaxCreates})
+	if r := e.call("sandbox_create", map[string]any{"name": "egress", "allow_hosts": []any{"pypi.org", "github.com:22"}}); r.isError {
+		t.Fatal(r.text)
+	}
+	e.fake.Observe(func(s *agenttoolstest.Server) {
+		if got := s.LastCreate.NetworkAllowOut; len(got) != 2 || got[0] != "pypi.org" || got[1] != "github.com:22" {
+			t.Fatalf("allow_hosts = %v", got)
+		}
+	})
 }

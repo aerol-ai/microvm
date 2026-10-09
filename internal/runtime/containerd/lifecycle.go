@@ -616,6 +616,10 @@ func buildMounts(cfg Config, hostFiles *sandboxHostFiles, hostMounts []mounts.Co
 		{Type: "bind", Source: hostFiles.Hostname, Destination: "/etc/hostname", Options: []string{"rbind", "ro"}},
 	}
 	for _, m := range hostMounts {
+		if m.Tmpfs {
+			mountsOut = append(mountsOut, specs.Mount{Type: "tmpfs", Source: "tmpfs", Destination: m.ContainerPath, Options: m.TmpfsOptions()})
+			continue
+		}
 		opt := []string{"rbind"}
 		if m.ReadOnly {
 			opt = append(opt, "ro")

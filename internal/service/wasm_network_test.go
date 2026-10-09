@@ -81,13 +81,13 @@ func TestSyncWasmNetworkPolicy(t *testing.T) {
 		NetworkBlockAll: false,
 	}
 
-	svc.syncWasmNetworkPolicy(sb, true, false)
+	svc.syncWasmNetworkPolicy(context.Background(), sb, true, false)
 	if sink.lastSandboxID != "sb-policy" || !sink.lastBlockIn || sink.lastBlockOut {
 		t.Fatalf("syncWasmNetworkPolicy failed: id=%s in=%v out=%v", sink.lastSandboxID, sink.lastBlockIn, sink.lastBlockOut)
 	}
 
 	sb.NetworkBlockAll = true
-	svc.syncWasmNetworkPolicy(sb, false, false)
+	svc.syncWasmNetworkPolicy(context.Background(), sb, false, false)
 	if !sink.lastBlockIn || !sink.lastBlockOut {
 		t.Fatalf("syncWasmNetworkPolicy failed on blockAll: in=%v out=%v", sink.lastBlockIn, sink.lastBlockOut)
 	}
@@ -112,8 +112,8 @@ func TestWasmNetworkNoOpBranches(t *testing.T) {
 
 	// Policy sync is inert for nil/non-WASM sandboxes and for runtimes that
 	// do not expose the policy sink.
-	svc.syncWasmNetworkPolicy(nil, true, true)
-	svc.syncWasmNetworkPolicy(&models.Sandbox{ID: "sb-docker", Runtime: models.RuntimeDocker}, true, true)
+	svc.syncWasmNetworkPolicy(context.Background(), nil, true, true)
+	svc.syncWasmNetworkPolicy(context.Background(), &models.Sandbox{ID: "sb-docker", Runtime: models.RuntimeDocker}, true, true)
 	svc.SetWasmRuntime(&recordingRuntime{})
-	svc.syncWasmNetworkPolicy(&models.Sandbox{ID: "sb-wasm", Runtime: models.RuntimeWasm}, true, true)
+	svc.syncWasmNetworkPolicy(context.Background(), &models.Sandbox{ID: "sb-wasm", Runtime: models.RuntimeWasm}, true, true)
 }

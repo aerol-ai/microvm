@@ -384,6 +384,8 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	d.mu.Unlock()
 
 	client := d.newWorkerClient(host.socket)
+	d.seedNetworkBlocks(sandboxID, req.NetworkBlockAll, req.NetworkBlockAll)
+	d.seedNetworkPolicy(sandboxID, req.NetworkAllowOut, req.NetworkDenyOut, req.NetworkEgressMode == models.NetworkEgressModeLearn)
 	caps := wasmengine.CapsFromResourceLimits(wasmengine.Capabilities{
 		Env:            req.Env,
 		Args:           wasmArgs(req),
@@ -393,6 +395,7 @@ func (d *Driver) createOnResidentHost(ctx context.Context, req models.CreateSand
 	if err := d.bindAuditCapability(sandboxID, &caps); err != nil {
 		return nil, err
 	}
+	d.bindNetworkBlocks(sandboxID, &caps)
 
 	instStart := time.Now()
 	if err := client.Instantiate(sandboxID, caps); err != nil {
@@ -466,6 +469,7 @@ func (d *Driver) migrateResidentToCold(ctx context.Context, inst *sandboxInstanc
 	if err := d.bindAuditCapability(inst.sandboxID, &caps); err != nil {
 		return err
 	}
+	d.bindNetworkBlocks(inst.sandboxID, &caps)
 	if err := client.Instantiate(inst.sandboxID, caps); err != nil {
 		_ = d.supervisor.Stop(inst.sandboxID)
 		return fmt.Errorf("cold instantiate: %w", err)

@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -233,24 +234,26 @@ func (s *Service) proxyL4WakeConn(ctx context.Context, id string, port int, down
 
 	_ = s.TouchSandbox(ctx, id)
 
-	if err := spliceConns(downstream, upstream, buffered); err != nil {
+	// No idle timeout: wake-proxied database connections legitimately sit
+	// idle for hours, and the active slot is held until both directions end.
+	if err := netsplice.Splice(downstream, upstream, buffered); err != nil {
 		s.logger.Warn("l4 wake splice failed", "sandbox_id", id, "port", port, "error", err)
 	}
 }
 
 // l4Limiters returns the wake proxy's pending and active limiters, created
 // on first use so a zero-value Service (as tests build it) works.
-func (s *Service) l4Limiters() (pending, active *connLimiter) {
+func (s *Service) l4Limiters() (pending, active *netsplice.Limiter) {
 	s.l4LimitersOnce.Do(func() {
-		s.l4Pending = newConnLimiter(s.l4WakeMaxPendingPerSandbox, s.l4WakeMaxPendingGlobal)
-		s.l4Active = newConnLimiter(s.l4WakeMaxActivePerSandbox, s.l4WakeMaxActiveGlobal)
+		s.l4Pending = netsplice.NewLimiter(s.l4WakeMaxPendingPerSandbox, s.l4WakeMaxPendingGlobal)
+		s.l4Active = netsplice.NewLimiter(s.l4WakeMaxActivePerSandbox, s.l4WakeMaxActiveGlobal)
 	})
 	return s.l4Pending, s.l4Active
 }
 
 func (s *Service) tryAcquireL4Pending(id string) (func(), bool) {
 	pending, _ := s.l4Limiters()
-	return pending.tryAcquire(id, nil, nil)
+	return pending.TryAcquire(id, nil, nil)
 }
 
 // tryAcquireL4Active admits one proxied connection. The first connection for
@@ -262,7 +265,7 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 		startTicker bool
 		generation  uint64
 	)
-	release, ok := active.tryAcquire(id, func(first bool) {
+	release, ok := active.TryAcquire(id, func(first bool) {
 		if !first {
 			return
 		}
@@ -292,7 +295,7 @@ func (s *Service) tryAcquireL4Active(id string) (func(), bool) {
 func (s *Service) l4ActivityGeneration(id string) uint64 {
 	_, active := s.l4Limiters()
 	var gen uint64
-	active.withLock(id, func(int) { gen = s.l4ActivityGenerations[id] })
+	active.WithLock(id, func(int) { gen = s.l4ActivityGenerations[id] })
 	return gen
 }
 
@@ -317,7 +320,7 @@ func (s *Service) touchDuringL4Activity(id string, generation uint64) {
 func (s *Service) l4ActivityStillActive(id string, generation uint64) bool {
 	_, active := s.l4Limiters()
 	var still bool
-	active.withLock(id, func(count int) {
+	active.WithLock(id, func(count int) {
 		still = count > 0 && s.l4ActivityGenerations[id] == generation
 	})
 	return still

@@ -300,29 +300,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 - **Depends on:** `SB_INGRESS_PROXY_ROUTING` defaulting to true (still
   false, see above), plus a soak of about one release cycle.
 
-## L4 splice drops the response after a client half-close
-
-- **What:** make `spliceConns` (`internal/service/l4proxy.go:143`) wait for
-  **both** directions, bounded by an idle timeout, instead of closing both
-  sides when the first direction ends (`<-done` at `:159`, then both closes
-  at `:160-161`).
-- **Why:** found while testing the 3A extraction (2026-09-28). A client that
-  sends its request, then half-closes its write side, never receives the
-  response. That affects netcat-style and some database and RPC clients.
-- **Where it applies:** the wake / WASM / isolate mediator path
-  (`proxyL4WakeConn`, `l4wake.go:236`), and, with the flag on, the REDIRECT
-  listener (`l4redirect.go:65`). The earlier note that this "matters more
-  once sandboxd owns raw TCP host ports" no longer holds: the shipped design
-  forwards raw TCP for started containers by kernel DNAT, so that traffic
-  never touches `spliceConns`.
-- **Pros:** correct TCP semantics for half-closing clients.
-- **Cons:** waiting for both sides needs an idle timeout, so a peer that
-  never closes cannot pin goroutines and capacity slots.
-- **Start:** the `<-done` in `spliceConns`. The contract is pinned by
-  `TestSpliceConnsWritesBufferedPrefixFirst`
-  (`internal/service/l4proxy_test.go:150`); change that test with the fix.
-- **Depends on:** nothing.
-
 ## Warm-adopted (`park-*`) destroys fall to reconcile (containerd)
 
 - **What:** restore prompt row deletion for a warm-adopted container, or
@@ -374,28 +351,31 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ## Audit Firecracker outbound NAT path (networking)
 
-- **What:** trace an FC sandbox's outbound connectivity on a live host
-  (`iptables -t nat -L`, `sysctl net.ipv4.ip_forward`) and either document
-  where NAT/forwarding comes from or file the gap as a bug.
-- **Why:** nothing in the repo sets it up. Re-checked 2026-10-06: TAP
-  `Ensure` (`internal/network/tap/host.go:139`) does link and address only,
-  and the Firecracker driver has no iptables or nft code. Every
-  `MASQUERADE` / `ip_forward` / `POSTROUTING` hit belongs to something else:
-  containerd CNI `ipMasq` (`internal/network/cni/conflist.go:85`), containerd
-  sysctls (`internal/network/hostnet/sysctl_linux.go:13`), and ingress→owner
-  DNAT (`internal/network/hostport/forwarder.go:161,208`). There are none in
-  `Terraform/`, `Ansible/`, `scripts/`, `packaging/` or `install.sh`.
-  Firecracker's network-rule methods are stubs (`driver.go:1759-1766`,
-  `methodNotImplemented`) and creates reject egress options
-  (`internal/service/service.go:2138-2144`).
-- **Caveat:** may be a non-issue if host provisioning outside the repo sets
-  it up. Thirty minutes on any FC bench host settles it.
-- **Blocks:** egress domain filtering's Firecracker phase (Phase 4 of
-  `plans/egress-domain-filtering.md`, on branch
-  `plans/egress-domain-filtering`, not yet on main).
-- **Start:** any FC node: `iptables -t nat -L POSTROUTING -n`,
-  `sysctl net.ipv4.ip_forward`, then the node bootstrap templates in
-  `Terraform/templates/`.
+- **What:** confirm on a live Firecracker host that a guest reaches the
+  internet and that block-all, CIDR lists and a hostname allowlist hold:
+  `iptables -t nat -S POSTROUTING | grep aerolvm-fc-masq`,
+  `iptables -S AEROLVM-FC`, `nft list set inet aerolvm_egress fqdn_src`,
+  `sysctl net.ipv4.conf.fctapN.rp_filter`.
+- **Why:** the audit confirmed the gap. Nothing in the daemon, `Terraform/`,
+  `Ansible/`, `scripts/`, `packaging/` or `install.sh` set up SNAT or
+  FORWARD accepts for the TAP subnet (`internal/network/hostport` is
+  ingress DNAT only), and dockerd's FORWARD DROP policy would drop guest
+  traffic anyway. Egress Phase 4 fixes it in-repo:
+  - `tap.EnsureNAT`: a `MASQUERADE` for `SB_FIRECRACKER_TAP_BASE_CIDR`,
+    comment `aerolvm-fc-masq`;
+  - the `AEROLVM-FC` netrules chain with FORWARD accepts for the subnet and
+    per-guest-IP block-all, CIDR lists and holds;
+  - strict `rp_filter` per TAP, wired at boot by
+    `pkg/daemon/firecracker_egress_wiring.go`;
+  - hostname filtering through the egress gateway, which serves the TAP pool
+    on wildcard listeners behind its input guard
+    (`setup/runbooks/egress-gateway.md` "Firecracker").
+- **Caveat:** proven only on a real kernel with veth stand-ins
+  (`internal/network/tap/fc_egress_kernel_test.go`,
+  `internal/egress/gatewayd/tappool_kernel_test.go`), not on a Firecracker
+  host. Integration UC-204 (`single-node-fc`) covers the hostname path.
+- **Start:** any FC bench host, or `make integration-single-fc` with UC-204.
+  Operator-run (metal).
 
 ## Shard the WASM resident net-host mutex (performance, P3)
 
@@ -580,6 +560,34 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
+
+### L4 splice drops the response after a client half-close — FIXED (egress P1-0)
+
+- **Was:** `spliceConns` (`internal/service/l4proxy.go`) closed both sides
+  as soon as the first direction ended. A client that sent its request and
+  then half-closed its write side never received the response
+  (netcat-style, some database and RPC clients). Found while testing the 3A
+  extraction (2026-09-28). It applied to the wake / WASM / isolate mediator
+  path and, with the flag on, the REDIRECT listener (`l4redirect.go:65`);
+  started containers' raw TCP goes by kernel DNAT and never touched it.
+- **Fix:** the splice and the connection limiter moved to
+  `internal/netsplice` (egress plan P1-0, D12/D17) as `netsplice.Splice`
+  (`splice.go:75`) and `netsplice.Limiter`. `Splice` waits for both
+  directions, forwards each EOF as a `CloseWrite`, and closes both conns
+  only when both are done, on a copy error, or on an optional idle timeout
+  (`WithIdleTimeout`). It still copies raw conn to raw conn, so splice(2)
+  applies. Both paths reach it through `proxyL4WakeConn`
+  (`internal/service/l4wake.go:239`).
+- **Tests:** `TestSpliceHalfCloseDeliversTheRest` (both directions),
+  `TestSpliceIdleTimeout`, `TestSpliceWithoutIdleTimeoutWaits` and
+  `TestSpliceWritesBufferedPrefixFirst` (the old
+  `TestSpliceConnsWritesBufferedPrefixFirst` contract) in
+  `internal/netsplice/splice_test.go`.
+- **Residual:** the L4 wake proxy passes no idle timeout, because
+  wake-proxied database connections legitimately sit idle for hours. A peer
+  that half-closes and whose other side never closes now holds its active
+  slot until it does, where the old code dropped it at once. The egress
+  proxy passes an idle timeout.
 
 ### Enterprise boot can fail its own witness check (audit) — FIXED
 
