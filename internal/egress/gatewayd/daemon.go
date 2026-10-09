@@ -257,14 +257,19 @@ func (d *Daemon) markDirty() {
 	}
 }
 
-// Serve runs the gateway until ctx ends: the UDS server on ln, plus the
-// heartbeat, flow reader and snapshot writer.
+// Serve runs the gateway until ctx ends or the UDS server on ln fails: the
+// server, plus the heartbeat, flow reader and snapshot writer.
 func (d *Daemon) Serve(ctx context.Context, ln net.Listener) error {
+	// The loops end with Serve, not only with ctx. On a server failure they
+	// would otherwise keep Serve waiting forever: a process that serves
+	// nothing, never exits, and so is never restarted.
+	loopCtx, stopLoops := context.WithCancel(ctx)
+	defer stopLoops()
 	var wg sync.WaitGroup
 	loops := []func(context.Context){d.heartbeatLoop, d.flowLoop, d.snapshotLoop}
 	for _, loop := range loops {
 		wg.Add(1)
-		go func(f func(context.Context)) { defer wg.Done(); f(ctx) }(loop)
+		go func(f func(context.Context)) { defer wg.Done(); f(loopCtx) }(loop)
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- d.srv.Serve(ln) }()
@@ -273,6 +278,7 @@ func (d *Daemon) Serve(ctx context.Context, ln net.Listener) error {
 	case <-ctx.Done():
 	case err = <-errc:
 	}
+	stopLoops()
 	_ = ln.Close()
 	d.srv.Close()
 	d.lns.Close()
@@ -768,11 +774,16 @@ func safeName(id string) string {
 	}, id)
 }
 
+// createTemp is os.CreateTemp. Tests substitute a file whose write or sync
+// fails, which a fresh temp file never does, and a forget that lands while a
+// recording is being written: neither may leave a recording in place.
+var createTemp = os.CreateTemp
+
 func writeFileAtomic(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	f, err := createTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
 	}
