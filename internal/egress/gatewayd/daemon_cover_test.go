@@ -116,23 +116,17 @@ func (l *failingListener) Close() error {
 	return nil
 }
 
-// TestServeReturnsServerError: a UDS server that stops on its own is
-// reported once the daemon's context ends, not swallowed.
+// TestServeReturnsServerError: a UDS server that stops on its own ends Serve
+// with its error, without waiting for the daemon's context.
 func TestServeReturnsServerError(t *testing.T) {
 	d := newIdleDaemon(t, t.TempDir(), egress.NewMemBackend())
 	ln := &failingListener{closed: make(chan struct{})}
+	// ctx stays live: a failed server must end Serve on its own, so the
+	// process exits and is restarted rather than idling with nothing served.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- d.Serve(ctx, ln) }()
-	// Serve closes the listener only after it stops waiting on the server,
-	// so cancelling now can't race the server's error.
-	select {
-	case <-ln.closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Serve never left the server wait")
-	}
-	cancel()
 	select {
 	case err := <-done:
 		if !errors.Is(err, errAccept) {

@@ -257,14 +257,19 @@ func (d *Daemon) markDirty() {
 	}
 }
 
-// Serve runs the gateway until ctx ends: the UDS server on ln, plus the
-// heartbeat, flow reader and snapshot writer.
+// Serve runs the gateway until ctx ends or the UDS server on ln fails: the
+// server, plus the heartbeat, flow reader and snapshot writer.
 func (d *Daemon) Serve(ctx context.Context, ln net.Listener) error {
+	// The loops end with Serve, not only with ctx. On a server failure they
+	// would otherwise keep Serve waiting forever: a process that serves
+	// nothing, never exits, and so is never restarted.
+	loopCtx, stopLoops := context.WithCancel(ctx)
+	defer stopLoops()
 	var wg sync.WaitGroup
 	loops := []func(context.Context){d.heartbeatLoop, d.flowLoop, d.snapshotLoop}
 	for _, loop := range loops {
 		wg.Add(1)
-		go func(f func(context.Context)) { defer wg.Done(); f(ctx) }(loop)
+		go func(f func(context.Context)) { defer wg.Done(); f(loopCtx) }(loop)
 	}
 	errc := make(chan error, 1)
 	go func() { errc <- d.srv.Serve(ln) }()
@@ -273,6 +278,7 @@ func (d *Daemon) Serve(ctx context.Context, ln net.Listener) error {
 	case <-ctx.Done():
 	case err = <-errc:
 	}
+	stopLoops()
 	_ = ln.Close()
 	d.srv.Close()
 	d.lns.Close()
