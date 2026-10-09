@@ -18,6 +18,13 @@ DNS_PROVIDER=""
 DNS_API_TOKEN=""
 ACME_EMAIL=""
 CADDY_BUILD_URL_BASE="https://caddyserver.com/api/download"
+# The stock Caddy package, which provides the caddy user, caddy.service and
+# /etc/caddy; install_custom_caddy then swaps in the plugin build. It comes
+# from Caddy's GitHub release, not the Cloudsmith apt repository: that
+# answers 402 Payment Required whenever Cloudsmith's bandwidth quota runs
+# out (2023, 2024, and from 2026-10-09), and then every install failed.
+CADDY_PACKAGE_VERSION="2.11.7"
+CADDY_PACKAGE_URL_BASE="https://github.com/caddyserver/caddy/releases/download"
 CADDY_BINARY_URL=""
 CADDY_BINARY_URL_EXPLICIT="false"
 WITH_GVISOR="false"
@@ -734,8 +741,60 @@ ensure_docker() {
 	fi
 }
 
+# drop_caddy_apt_source removes the Cloudsmith apt source earlier installers
+# added. While that repository answers 402, every apt-get update on the host
+# fails with it in place, so re-running this installer (an upgrade) failed
+# too. An apt upgrade from it would also replace the plugin build with stock
+# Caddy, losing layer4.
+drop_caddy_apt_source() {
+	rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+}
+
+# install_caddy_package installs the stock Caddy .deb from Caddy's GitHub
+# release, checked against the release's SHA-512 list. It is the same
+# package Cloudsmith served: its postinst creates the caddy user, and it
+# ships caddy.service and /etc/caddy, which the rest of this installer
+# builds on.
+install_caddy_package() {
+	local arch
+	case "$(uname -m)" in
+		x86_64|amd64)  arch="amd64" ;;
+		aarch64|arm64) arch="arm64" ;;
+		armv7l|armv7)  arch="armv7" ;;
+		armv6l|armv6)  arch="armv6" ;;
+		*)
+			echo "No Caddy package for architecture $(uname -m)" >&2
+			exit 1
+			;;
+	esac
+	local base="${CADDY_PACKAGE_URL_BASE}/v${CADDY_PACKAGE_VERSION}"
+	local asset="caddy_${CADDY_PACKAGE_VERSION}_linux_${arch}.deb"
+	local sums="caddy_${CADDY_PACKAGE_VERSION}_checksums.txt"
+	local tmp_dir
+	tmp_dir="$(mktemp -d)"
+	if ! curl_download "${base}/${asset}" -o "${tmp_dir}/${asset}" \
+		|| ! curl_download "${base}/${sums}" -o "${tmp_dir}/${sums}"; then
+		rm -rf "$tmp_dir"
+		echo "Failed to download the Caddy ${CADDY_PACKAGE_VERSION} package" >&2
+		exit 1
+	fi
+	if ! (
+		cd "$tmp_dir" \
+			&& awk -v name="$asset" '$2 == name { print }' "$sums" > selected-checksum.txt \
+			&& [[ "$(wc -l < selected-checksum.txt)" -eq 1 ]] \
+			&& sha512sum -c selected-checksum.txt
+	); then
+		rm -rf "$tmp_dir"
+		echo "Caddy package checksum verification failed; refusing to install it" >&2
+		exit 1
+	fi
+	apt-get install -y "${tmp_dir}/${asset}"
+	rm -rf "$tmp_dir"
+}
+
 install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
+		drop_caddy_apt_source
 		apt-get update
 		apt-get install -y build-essential ca-certificates curl gnupg lsb-release software-properties-common
 		# Mount tooling for the host-managed external storage feature.
@@ -764,11 +823,7 @@ install_packages() {
 		fi
 		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
-			apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
-			curl_download 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-			curl_download 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o /etc/apt/sources.list.d/caddy-stable.list
-			apt-get update
-			apt-get install -y caddy
+			install_caddy_package
 		fi
 		if [[ "$BUILD_FROM_SOURCE" == "true" ]] && ! command -v go >/dev/null 2>&1; then
 			apt-get install -y golang-go make
@@ -1158,7 +1213,7 @@ write_caddy_env() {
 	if [[ -z "$DNS_PROVIDER" && "$CADDY_STORAGE_S3" != "true" ]]; then
 		return
 	fi
-	# The stock Caddy debian unit from Cloudsmith does NOT load
+	# The stock Caddy debian unit does NOT load
 	# /etc/default/caddy as an EnvironmentFile, so writing it alone is not
 	# enough. write_caddy_systemd_dropin() installs a drop-in that wires it
 	# in. 0600 root:root is fine — Caddy receives the value via process env.
