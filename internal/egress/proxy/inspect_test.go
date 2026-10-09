@@ -41,13 +41,20 @@ type inspectRig struct {
 
 func newInspectRig(t *testing.T, cfg Config, rules ...egresspolicy.RuleSpec) *inspectRig {
 	t.Helper()
+	return newInspectRigOver(t, cfg, nil, rules...)
+}
+
+// newInspectRigOver is newInspectRig with the gateway read through wrap
+// (newRigOver).
+func newInspectRigOver(t *testing.T, cfg Config, wrap func(*egress.Gateway) Sources, rules ...egresspolicy.RuleSpec) *inspectRig {
+	t.Helper()
 	backend, roots := inspectBackend(t)
 	if cfg.UpstreamRoots == nil {
 		cfg.UpstreamRoots = roots
 	}
 	spec := allowSpec("api.example.com", "other.example.com")
 	spec.Rules = rules
-	r := newRig(t, 443, spec, cfg)
+	r := newRigOver(t, 443, spec, cfg, wrap)
 	for _, h := range []string{"api.example.com", "other.example.com"} {
 		r.dialer.resolve[h] = "151.101.0.1"
 		r.dialer.backend[h] = backend

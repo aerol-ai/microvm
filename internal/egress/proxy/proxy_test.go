@@ -69,6 +69,13 @@ func (r *rig) last() Decision {
 
 func newRig(t *testing.T, port uint16, spec egress.Spec, cfg Config) *rig {
 	t.Helper()
+	return newRigOver(t, port, spec, cfg, nil)
+}
+
+// newRigOver is newRig with the proxy reading the gateway through wrap; nil
+// reads it directly.
+func newRigOver(t *testing.T, port uint16, spec egress.Spec, cfg Config, wrap func(*egress.Gateway) Sources) *rig {
+	t.Helper()
 	gw := egress.New(egress.Options{Backend: egress.NewMemBackend()})
 	if err := gw.Bootstrap(); err != nil {
 		t.Fatal(err)
@@ -82,7 +89,11 @@ func newRig(t *testing.T, port uint16, spec egress.Spec, cfg Config) *rig {
 	cfg.OriginalDst = func(net.Conn) (netip.AddrPort, error) {
 		return netip.AddrPortFrom(netip.MustParseAddr("93.184.216.34"), port), nil
 	}
-	r.proxy = New(gw, func(d Decision) {
+	var src Sources = gw
+	if wrap != nil {
+		src = wrap(gw)
+	}
+	r.proxy = New(src, func(d Decision) {
 		r.mu.Lock()
 		r.decisions = append(r.decisions, d)
 		r.mu.Unlock()
