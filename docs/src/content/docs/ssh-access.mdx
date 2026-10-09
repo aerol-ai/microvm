@@ -6,6 +6,8 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
 
+To get a shell without handling keys, use [`aerolvm shell <sandbox>`](/cli#open-a-shell-in-a-sandbox). It authenticates with your API token and lands in the same `default` session as an SSH login.
+
 ## Key Provisioning
 
 The SSH private key is available immediately when the sandbox is created. Save it - it cannot be retrieved later.

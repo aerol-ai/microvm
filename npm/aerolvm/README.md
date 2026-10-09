@@ -1,11 +1,11 @@
 # @aerol-ai/aerolvm
 
 `aerolvm` drives [AerolVM](https://github.com/aerol-ai/microvm) sandboxes from a
-shell or an AI agent. The same binary is a CLI and an MCP server.
+terminal, a script or an AI agent. The same binary is a CLI and an MCP server.
 
 ```sh
 export SB_API_URL=https://sandbox.example.com SB_PAT_TOKEN=<token>
-npx -y @aerol-ai/aerolvm create --name build-box --image python:3.12
+npx -y @aerol-ai/aerolvm shell build-box     # an interactive shell in a sandbox
 npx -y @aerol-ai/aerolvm exec build-box -- python -V
 ```
 

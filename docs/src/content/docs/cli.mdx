@@ -1,11 +1,11 @@
 ---
 title: aerolvm CLI
-description: Drive sandboxes from a shell, a script, CI, or an AI coding agent with the aerolvm command.
+description: Open a shell in a sandbox, or drive sandboxes from a script, CI, or an AI coding agent, with the aerolvm command.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-`aerolvm` creates sandboxes, runs commands in them, copies files and exposes ports from a terminal. It is built for scripts and AI coding agents as much as for people: stdout carries only data, every command has a `--json` form, and retries are safe. The same binary is also an MCP server; see [MCP Server](/mcp).
+`aerolvm` opens a shell in a sandbox, runs commands in it, copies files and exposes ports from a terminal. It is built for scripts and AI coding agents as much as for people: stdout carries only data, every command has a `--json` form, and retries are safe. The same binary is also an MCP server; see [MCP Server](/mcp).
 
 It is a thin client over the same API the SDKs use, so it works against a local daemon, a single node or a cluster.
 
@@ -30,6 +30,20 @@ aerolvm health
 
 `SB_API_URL` defaults to `http://127.0.0.1:21212`, the [local setup](/getting-started/local-setup) address.
 
+## Open a shell in a sandbox
+
+```sh
+aerolvm shell build-box
+```
+
+You get a login shell inside the sandbox: bash, or `sh` when the image has no bash. Run `aerolvm shell` with no name to choose from your sandboxes. Any sandbox you can reach works, including ones your application created through an SDK; you don't need to create it from the CLI.
+
+- **The shell keeps running when you leave.** `Ctrl-]` detaches, and so does closing the terminal or losing the network. Run the same command again to get back in, with the shell's recent output on screen. `exit` or `Ctrl-D` ends the shell.
+- **One shared shell per name.** Two terminals on the same sandbox share its `default` shell, like tmux, and an [SSH login](/ssh-access) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
+- **It behaves like a local terminal.** Resizing the window resizes the remote terminal, so `vim`, `top` and `less` redraw to fit. The shell gets a `TERM` the image knows: your own when it is a common one, and `xterm-256color` otherwise.
+- A stopped sandbox is started first. WASM and isolate sandboxes have no shell.
+- `shell` needs a terminal. Scripts and agents use [`exec`](#running-commands).
+
 ## A first session
 
 ```sh
@@ -47,14 +61,15 @@ aerolvm destroy build-box
 
 | Command | What it does |
 |---|---|
-| `create` | Create a sandbox, or return the existing one with that name |
-| `list` | List sandboxes, one page at a time (`--tag`, `--limit`, `--page-token`) |
-| `get` | Show one sandbox |
+| `shell` | Open an interactive shell in a sandbox (`--new`, `--session`) |
 | `exec` | Run a command and stream its output |
-| `logs` | Print a background command's output (`--follow` to keep streaming) |
 | `cp` | Copy a file between this machine and a sandbox (`<sandbox>:<path>`; `-` is stdin or stdout) |
 | `ls` | List a directory in a sandbox |
+| `logs` | Print a background command's output (`--follow` to keep streaming) |
 | `expose` | Publish a sandbox port and print its URL (`--tcp` for raw TCP) |
+| `list` | List sandboxes, one page at a time (`--tag`, `--limit`, `--page-token`) |
+| `get` | Show one sandbox |
+| `create` | Create a sandbox, or return the existing one with that name |
 | `start` / `stop` | Start or stop sandboxes; stopping keeps the files |
 | `destroy` | Destroy sandboxes; one that is already gone counts as destroyed |
 | `snapshot` | Save a sandbox's filesystem as an image other sandboxes can start from |
@@ -92,7 +107,7 @@ The `code` field is stable and is the field to branch on. The common ones are `n
 | `1` | The command failed |
 | `2` | Bad usage: an unknown flag or a missing argument |
 
-`exec` exits with the remote command's own code instead. It exits with `128+n` when signal `n` killed the command, `124` when `--timeout` fired, and `125` when aerolvm itself failed before the command produced an exit code.
+`exec` and `shell` exit with the remote command's own code instead. They exit with `128+n` when signal `n` killed the command, and `125` when aerolvm itself failed before the command produced an exit code. `exec` exits with `124` when `--timeout` fired, and `shell` exits with `0` when you detach.
 
 ## Running commands
 
@@ -104,15 +119,15 @@ aerolvm exec build-box --cwd /app --env CI=1 --timeout 15m -- npm test
 ```
 
 - **Live output.** Output streams as it is produced. With `--json`, aerolvm waits for the command and prints `{"exit_code","stdout","stderr",...}`. Each stream keeps its first 4 KiB and last 12 KiB, and the result says how much was cut.
-- **Stdin.** aerolvm forwards stdin when it is not a terminal, so `echo hi | aerolvm exec box -- cat` works. Some agent harnesses leave stdin open and never close it. A command that reads stdin then waits until `--timeout`, so pass `--no-stdin` there. Pass `-i` to forward a terminal's stdin, and `-t` for an interactive terminal.
+- **Stdin.** aerolvm forwards stdin when it is not a terminal, so `echo hi | aerolvm exec box -- cat` works. Some agent harnesses leave stdin open and never close it. A command that reads stdin then waits until `--timeout`, so pass `--no-stdin` there. Pass `-i` to forward a terminal's stdin, and `-t` for an interactive terminal; `-it` does both, as in `docker exec`, so `aerolvm exec box -it -- htop` works. For a shell, use [`aerolvm shell`](#open-a-shell-in-a-sandbox): it survives a dropped connection, which an `exec` doesn't.
 - **Stopping.** `--timeout` and Ctrl-C both kill the remote command, not just the local client. If the connection drops, the sandbox kills the command too. See [When the connection drops](/exec-streaming#when-the-connection-drops).
 - **Background commands.** `--background` starts the command, prints a session ID, and returns. Read its output with `aerolvm logs <sandbox> <session-id> --follow`.
 - **Stopped sandboxes** start before the command runs.
 
 ### Runtime differences
 
-- **WASM sandboxes** have no streaming exec. `exec` runs the command buffered, without stdin, and prints the output when it finishes. `-i` and `-t` are refused.
-- **Isolate sandboxes** run a single `fetch` handler, with no shell and no filesystem. `exec`, `cp` and `ls` return `unsupported_runtime`; use the SDK's invoke call instead. See [Isolate Sandbox](/isolate-sandbox).
+- **WASM sandboxes** have no streaming exec. `exec` runs the command buffered, without stdin, and prints the output when it finishes. `-i`, `-t` and `shell` are refused.
+- **Isolate sandboxes** run a single `fetch` handler, with no shell and no filesystem. `shell`, `exec`, `cp` and `ls` return `unsupported_runtime`; use the SDK's invoke call instead. See [Isolate Sandbox](/isolate-sandbox).
 
 ## Limiting outbound network
 

@@ -118,7 +118,12 @@ This contract is the actual feature, so these rules are tested, not aspirational
 
 1. **Never interactive.** No prompts, pagers, spinners or confirmations.
    Destructive verbs take explicit sandbox refs, and there is no
-   `destroy --all`.
+   `destroy --all`. One exception, added after launch because people
+   reached for the CLI to get *into* a sandbox and found no way in:
+   `aerolvm shell` opens an interactive shell (a persistent PTY session)
+   and, with no sandbox named, asks which one. It refuses to run unless
+   stdin and stdout are both terminals, so no agent or script can reach the
+   prompt; they keep using `exec`.
 2. **stdout is data, stderr is everything else.** Progress, warnings and hints
    go to stderr. Colour only on a TTY, and `NO_COLOR` is honoured.
 3. **`--json` on every verb.** `AEROLVM_OUTPUT=json` makes it the default for a
