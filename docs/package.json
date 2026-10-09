@@ -26,14 +26,20 @@
   "devDependencies": {
     "prettier": "^3.9.9",
     "prettier-plugin-astro": "^1.1.0",
-    "wrangler": "4.146.0"
+    "wrangler": "4.149.0"
   },
   "optionalDependencies": {
     "@emnapi/core": "1.11.3",
     "@emnapi/runtime": "1.11.3"
   },
   "overrides": {
-    "http-cache-semantics": "$http-cache-semantics"
+    "http-cache-semantics": "$http-cache-semantics",
+    "mermaid": {
+      "katex": "^0.18.2"
+    },
+    "@expressive-code/core": {
+      "postcss-nested": "^7.0.2"
+    }
   },
   "engines": {
     "node": ">=22.12.0"
