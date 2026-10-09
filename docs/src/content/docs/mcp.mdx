@@ -24,7 +24,7 @@ Install `aerolvm` first ([Install](/cli#install)), or skip the install and let y
 
     Claude Code asks for your sandboxd URL and token when you enable the plugin. The token goes to your system's secure credential store, not to `settings.json`.
 
-    To register only the MCP server instead, run this in a shell where `SB_PAT_TOKEN` is set:
+    To register only the MCP server instead, run `aerolvm mcp config claude-code` and run what it prints. After [`aerolvm login`](/cli#install), that is `claude mcp add aerolvm -- aerolvm mcp`, with no token in it: the server reads your login. Without a login, run this in a shell where `SB_PAT_TOKEN` is set:
 
     ```sh
     claude mcp add aerolvm -e SB_API_URL=https://sandbox.example.com -e SB_PAT_TOKEN="$SB_PAT_TOKEN" -- aerolvm mcp
@@ -94,7 +94,7 @@ Install `aerolvm` first ([Install](/cli#install)), or skip the install and let y
     ```
   </TabItem>
   <TabItem label="Other clients">
-    Any MCP client that runs stdio servers can start it. Use the command `aerolvm` with the argument `mcp`, and set two environment variables:
+    Any MCP client that runs stdio servers can start it. Use the command `aerolvm` with the argument `mcp`. If you have run [`aerolvm login`](/cli#install) on this machine, that is all; otherwise set two environment variables:
 
     | Variable | Value |
     |---|---|
