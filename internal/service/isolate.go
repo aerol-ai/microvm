@@ -181,6 +181,9 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// freshly-spawned group if load fails (§11 empty-group rule), so the only
 	// thing to unwind here on a LATER failure is admission + the store row +
 	// the driver's own state (Destroy).
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	state, err := s.isolate.Create(ctx, req, sandboxID, "", nil)
 	if err != nil {
 		releaseAdmission()
