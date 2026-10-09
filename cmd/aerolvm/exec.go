@@ -30,7 +30,7 @@ func runExec(ctx context.Context, a *app, args []string) int {
 	fs.BoolVar(&noStdin, "no-stdin", false, "")
 	fs.BoolVar(&background, "background", false, "")
 	fs.IntVar(&maxOutput, "max-output-bytes", agenttools.DefaultMaxOutputBytes, "")
-	pos, rest, err := parseArgs(fs, args)
+	pos, rest, err := parseArgs(fs, expandShortFlags(args))
 	if err != nil {
 		a.flagError(c, "exec", err)
 		return execFailure
@@ -87,6 +87,9 @@ func runExec(ctx context.Context, a *app, args []string) int {
 	// automatic forward is skipped there and an explicit -i is refused by
 	// agenttools (D10).
 	forward := interactive || (!a.stdinIsTTY && !noStdin && !agenttools.IsWasm(sb))
+	if _, set := env["TERM"]; tty && !set {
+		env["TERM"] = a.remoteTerm()
+	}
 	req := agenttools.ExecRequest{
 		Command:        command,
 		Cwd:            cwd,
@@ -103,10 +106,16 @@ func runExec(ctx context.Context, a *app, args []string) int {
 		req.OnStdout = func(b []byte) { outMu.Lock(); _, _ = a.stdout.Write(b); outMu.Unlock() }
 		req.OnStderr = func(b []byte) { outMu.Lock(); _, _ = a.stderr.Write(b); outMu.Unlock() }
 	}
+	// SIGINT/SIGTERM cancel the exec; agenttools then sends KILL before it
+	// closes the stream (§5.5). In a raw terminal Ctrl-C is a byte for the
+	// remote PTY instead.
+	execCtx, received, stop := a.notifySignals(ctx)
+	defer stop()
 	if tty {
 		if cols, rows, ok := a.term.Size(); ok {
 			req.Cols, req.Rows = cols, rows
 		}
+		req.Resize = a.resizes(execCtx)
 		if forward {
 			restore, err := a.term.MakeRaw()
 			if err != nil {
@@ -115,12 +124,6 @@ func runExec(ctx context.Context, a *app, args []string) int {
 			defer restore()
 		}
 	}
-
-	// SIGINT/SIGTERM cancel the exec; agenttools then sends KILL before it
-	// closes the stream (§5.5). In a raw terminal Ctrl-C is a byte for the
-	// remote PTY instead.
-	execCtx, received, stop := a.notifySignals(ctx)
-	defer stop()
 	res, err := tools.Exec(execCtx, sb, req)
 	if err != nil {
 		if sig := received(); sig != nil {
@@ -140,6 +143,24 @@ func runExec(ctx context.Context, a *app, args []string) int {
 		return execFailure
 	}
 	return res.ExitCode
+}
+
+// expandShortFlags splits the combined "-it" / "-ti" into "-i" "-t". Go's
+// flag package reads "-it" as one unknown flag, and `docker exec -it` is
+// the habit people and agents bring. Words after "--" are left alone.
+func expandShortFlags(args []string) []string {
+	out := make([]string, 0, len(args)+1)
+	for i, arg := range args {
+		switch arg {
+		case "--":
+			return append(out, args[i:]...)
+		case "-it", "-ti":
+			out = append(out, "-i", "-t")
+		default:
+			out = append(out, arg)
+		}
+	}
+	return out
 }
 
 // shellCommand turns the words after "--" into the command line the

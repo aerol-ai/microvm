@@ -4,11 +4,11 @@ package main
 // examples per verb, and the JSON shape named. Keep it that way; agents read
 // `aerolvm <verb> --help` instead of docs.
 
-const overviewHead = `aerolvm drives AerolVM sandboxes from a shell or an AI agent.
+const overviewHead = `aerolvm drives AerolVM sandboxes from a terminal, a script or an AI agent.
 
 Usage: aerolvm <command> [flags] [args]
 
-Commands:
+Get a shell in a sandbox:  aerolvm shell <sandbox>
 `
 
 const overviewTail = `
@@ -24,10 +24,40 @@ Output: stdout is data, stderr is everything else. With --json, errors are
 {"error":{"code":"not_found","message":"...","http_status":404,"retryable":false}}
 on stderr.
 
-Exit codes: 0 ok, 1 error, 2 usage. exec returns the command's own code,
-128+n if a signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
+Exit codes: 0 ok, 1 error, 2 usage. exec and shell return the remote
+command's own code (128+n if a signal killed it) and 125 if aerolvm itself
+failed; exec returns 124 on --timeout.
 
 Run "aerolvm <command> --help" for a command's flags and examples.
+`
+
+const shellHelp = `Open an interactive shell in a sandbox.
+
+Usage: aerolvm shell [<sandbox>] [--session NAME | --new]
+
+You get a login shell (bash, or sh when the image has no bash). It keeps
+running when you leave without exiting: Ctrl-] detaches, and so does
+closing the terminal or losing the network. Run the same command again to
+get back in, with the shell's recent output. exit or Ctrl-D ends it.
+
+With no <sandbox>, aerolvm lists the sandboxes you can open a shell in and
+asks for a number. Everyone who opens the same session shares one shell,
+like tmux; an SSH login to the sandbox lands in the same "default" one.
+
+shell needs a terminal; scripts and agents use "aerolvm exec". WASM and
+isolate sandboxes have no shell. A stopped sandbox is started first.
+Exit code: the shell's own, 0 after a detach, 125 if aerolvm itself failed.
+
+Flags:
+  --session NAME   open the shell with this name, or start one under it,
+                   instead of the shared "default" shell
+  --new            start a separate shell; when you detach, aerolvm prints
+                   the --session name that reopens it
+
+Examples:
+  aerolvm shell build-box
+  aerolvm shell
+  aerolvm shell build-box --new
 `
 
 const createHelp = `Create a sandbox, or return the existing one with the same name.
@@ -92,6 +122,8 @@ One argument after -- runs as a shell command line ("make test | tail");
 several are quoted and joined. Exit code: the command's own, 128+n if a
 signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
 
+For an interactive shell, use "aerolvm shell" instead.
+
 Stdin is forwarded when it is not a terminal (echo x | aerolvm exec sb -- cat).
 Some agent harnesses leave stdin open forever; pass --no-stdin there or a
 command that reads stdin waits until --timeout. WASM sandboxes have no
@@ -103,7 +135,8 @@ Flags:
   --timeout D      kill the command after D (e.g. 10m) and exit 124
   -i               forward stdin even when it is a terminal
   --no-stdin       never forward stdin
-  -t               allocate a terminal (only when stdout is a terminal)
+  -t               allocate a terminal (only when stdout is a terminal);
+                   -it is -i and -t together, as in docker exec
   --background     start the command as a background session and print its
                    session ID; read its output with "aerolvm logs"
   --json           print {"exit_code","stdout","stderr",...} at the end
@@ -112,6 +145,7 @@ Flags:
 Examples:
   aerolvm exec build-box -- pytest -q
   aerolvm exec build-box --cwd /app --timeout 15m -- "npm ci && npm test"
+  aerolvm exec build-box -it -- htop
   aerolvm exec build-box --background -- npm run dev
 `
 

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,15 +54,35 @@ func (s *syncBuffer) Reset() {
 	s.b.Reset()
 }
 
-type fakeTerm struct{ rawCalls *int }
+// fakeTerm is a 120x40 terminal. size overrides that; resized delivers
+// resize notifications; rawCalls and restores count raw-mode switches.
+type fakeTerm struct {
+	rawCalls *int
+	restores *int
+	size     func() (int, int)
+	resized  chan struct{}
+}
 
-func (fakeTerm) Size() (int, int, bool) { return 120, 40, true }
+func (f fakeTerm) Size() (int, int, bool) {
+	if f.size != nil {
+		cols, rows := f.size()
+		return cols, rows, cols > 0
+	}
+	return 120, 40, true
+}
+
 func (f fakeTerm) MakeRaw() (func(), error) {
 	if f.rawCalls != nil {
 		*f.rawCalls++
 	}
-	return func() {}, nil
+	return func() {
+		if f.restores != nil {
+			*f.restores++
+		}
+	}, nil
 }
+
+func (f fakeTerm) NotifyResize() (<-chan struct{}, func()) { return f.resized, func() {} }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
@@ -127,7 +148,7 @@ func (h *harness) errorEnvelope() agenttools.Error {
 
 func TestHelpAndUsage(t *testing.T) {
 	h := newHarness(t)
-	if code := h.run(); code != exitUsage || !strings.Contains(h.stderr.String(), "Commands:") || h.stdout.String() != "" {
+	if code := h.run(); code != exitUsage || !strings.Contains(h.stderr.String(), "Work in a sandbox:") || h.stdout.String() != "" {
 		t.Fatalf("no args = %d, stderr %q", code, h.stderr.String())
 	}
 	if code := h.run("--help"); code != exitOK || !strings.Contains(h.stdout.String(), "exec") {
@@ -136,7 +157,7 @@ func TestHelpAndUsage(t *testing.T) {
 	if code := h.run("help", "exec"); code != exitOK || !strings.Contains(h.stdout.String(), "--no-stdin") {
 		t.Fatalf("help exec = %d", code)
 	}
-	if code := h.run("help", "nope"); code != exitOK || !strings.Contains(h.stdout.String(), "Commands:") {
+	if code := h.run("help", "nope"); code != exitOK || !strings.Contains(h.stdout.String(), "Work in a sandbox:") {
 		t.Fatalf("help nope = %d", code)
 	}
 	if code := h.run("bogus"); code != exitUsage || !strings.Contains(h.stderr.String(), `unknown command "bogus"`) {
@@ -369,6 +390,85 @@ func TestExecTTY(t *testing.T) {
 	h.app.stdin = strings.NewReader("")
 	if code := h.run("exec", "box", "-t", "-i", "--", "echo tty"); code != 0 || h.stdout.String() != "tty\n" || raw != 1 {
 		t.Fatalf("-t = %d %q raw %d", code, h.stdout.String(), raw)
+	}
+
+	// docker's -it works, and a remote terminal gets a TERM it knows.
+	h.env["TERM"] = "xterm-ghostty"
+	for _, combined := range []string{"-it", "-ti"} {
+		if code := h.run("exec", "box", combined, "--", "echo tty"); code != 0 || h.stdout.String() != "tty\n" {
+			t.Fatalf("%s = %d %q %q", combined, code, h.stdout.String(), h.stderr.String())
+		}
+	}
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if st := s.LastExecStart; !st.TTY || st.Cols != 120 || st.Rows != 40 || st.Env["TERM"] != "xterm-256color" {
+			t.Fatalf("exec start = %+v", st)
+		}
+	})
+	if code := h.run("exec", "box", "-it", "--env", "TERM=vt220", "--", "echo tty"); code != 0 {
+		t.Fatalf("explicit TERM = %d", code)
+	}
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if s.LastExecStart.Env["TERM"] != "vt220" {
+			t.Fatalf("an explicit --env TERM was overridden: %+v", s.LastExecStart.Env)
+		}
+	})
+	// No TTY, no TERM: a piped exec keeps the image's environment.
+	h.app.stdoutIsTTY = false
+	if code := h.run("exec", "box", "--", "echo plain"); code != 0 {
+		t.Fatalf("plain = %d", code)
+	}
+	h.fake.Observe(func(s *agenttoolstest.Server) {
+		if _, set := s.LastExecStart.Env["TERM"]; set {
+			t.Fatalf("a non-TTY exec got TERM: %+v", s.LastExecStart.Env)
+		}
+	})
+	// After "--", -it belongs to the remote command.
+	if code := h.run("exec", "box", "--", "echo", "-it"); code != 0 || h.stdout.String() != "-it\n" {
+		t.Fatalf("-it after -- = %d %q", code, h.stdout.String())
+	}
+}
+
+func TestExecTTYForwardsResizes(t *testing.T) {
+	h := newHarness(t)
+	h.fake.AddSandbox(models.Sandbox{Name: "box"})
+	var mu sync.Mutex
+	cols, rows := 120, 40
+	resized := make(chan struct{}, 1)
+	h.app.stdoutIsTTY = true
+	h.app.term = fakeTerm{resized: resized, size: func() (int, int) { mu.Lock(); defer mu.Unlock(); return cols, rows }}
+	keys := h.keyboard()
+	done := h.runAsync("exec", "box", "-it", "--", "cat")
+	waitFor(t, func() bool {
+		n := 0
+		h.fake.Observe(func(s *agenttoolstest.Server) { n = s.StreamDials })
+		return n == 1
+	})
+	mu.Lock()
+	cols, rows = 100, 30
+	mu.Unlock()
+	resized <- struct{}{}
+	var got []string
+	waitFor(t, func() bool {
+		h.fake.Observe(func(s *agenttoolstest.Server) { got = slices.Clone(s.Resizes) })
+		return slices.Equal(got, []string{"100x30"})
+	})
+	_ = keys.Close()
+	if code := h.wait(done); code != 0 {
+		t.Fatalf("exec = %d %q", code, h.stderr.String())
+	}
+}
+
+func TestExpandShortFlags(t *testing.T) {
+	for _, tc := range []struct{ in, want []string }{
+		{[]string{"box", "-it", "--", "bash"}, []string{"box", "-i", "-t", "--", "bash"}},
+		{[]string{"-ti", "box"}, []string{"-i", "-t", "box"}},
+		{[]string{"box", "--", "ls", "-it"}, []string{"box", "--", "ls", "-it"}},
+		{[]string{"box", "-i", "-t"}, []string{"box", "-i", "-t"}},
+		{nil, []string{}},
+	} {
+		if got := expandShortFlags(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("expandShortFlags(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 
