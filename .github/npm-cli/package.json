@@ -1,7 +1,7 @@
 {
   "name": "npm-cli-pin",
   "private": true,
-  "description": "Hash-pinned npm CLI for sdk publish. Node 22 ships npm older than 11.5.1, the first release that can do GitHub OIDC trusted publishing. npm 11.21.0 still vendors brace-expansion 5.0.9, ip-address 10.5.0, undici 6.28.0, and http-cache-semantics 4.2.0 inside its tarball; overrides cannot replace those inBundle copies. The direct dependencies below are the patched releases, and postinstall copies them over the bundle. The lockfile records those pins so dependency scanners see the tree CI actually runs. http-cache-semantics has no upstream release after 4.2.0 (GHSA-ch52-4w7c-c8xp). A prerelease does not satisfy make-fetch-happen's ^4.1.1, so the local patch is versioned 4.2.1 and the bundled lockfile entry records that.",
+  "description": "Hash-pinned npm CLI for sdk publish. Node 22 ships npm older than 11.5.1, the first release that can do GitHub OIDC trusted publishing. npm 11.21.0 still vendors brace-expansion 5.0.9, ip-address 10.5.0, undici 6.28.0, postcss-selector-parser 7.1.4 (GHSA-rj75-hqrm-r3gf), and http-cache-semantics 4.2.0 inside its tarball; overrides cannot replace those inBundle copies. The direct dependencies below are the patched releases, and postinstall copies them over the bundle. The lockfile records those pins so dependency scanners see the tree CI actually runs. http-cache-semantics has no upstream release after 4.2.0 (GHSA-ch52-4w7c-c8xp). A prerelease does not satisfy make-fetch-happen's ^4.1.1, so the local patch is versioned 4.2.1 and the bundled lockfile entry records that.",
   "scripts": {
     "postinstall": "node ./patch-bundled-deps.js"
   },
@@ -10,6 +10,7 @@
     "brace-expansion": "5.0.12",
     "http-cache-semantics": "file:../../third_party/http-cache-semantics",
     "ip-address": "10.7.3",
+    "postcss-selector-parser": "7.1.6",
     "undici": "6.28.1"
   },
   "overrides": {
