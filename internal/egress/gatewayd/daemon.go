@@ -768,11 +768,16 @@ func safeName(id string) string {
 	}, id)
 }
 
+// createTemp is os.CreateTemp. Tests substitute a file whose write or sync
+// fails, which a fresh temp file never does, and a forget that lands while a
+// recording is being written: neither may leave a recording in place.
+var createTemp = os.CreateTemp
+
 func writeFileAtomic(path string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	f, err := createTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err
 	}

@@ -92,3 +92,40 @@ func TestBridgeListenersTapPool(t *testing.T) {
 		t.Fatal("no binds recorded")
 	}
 }
+
+// TestBridgeListenersDNSBindFailures: a DNS socket that can't be bound fails
+// the bridge and closes what was already bound for it, so a retry can take
+// the port.
+func TestBridgeListenersDNSBindFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name, failNet, wantErr string
+	}{
+		{"udp", "udp", "dns udp"},
+		{"tcp", "tcp", "dns tcp"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dnsPort := freePort(t)
+			dnsAddr := net.JoinHostPort(lo.String(), strconv.Itoa(int(dnsPort)))
+			listen := func(network, addr string) (net.Listener, net.PacketConn, error) {
+				if network == tc.failNet && addr == dnsAddr {
+					return nil, nil, errors.New("address in use")
+				}
+				return listenFreebind(network, addr)
+			}
+			b := newBridgeListeners(dnsPort, freePort(t), dns.HandlerFunc(func(dns.ResponseWriter, *dns.Msg) {}),
+				func(net.Listener) {}, listen, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			defer b.Close()
+			if err := b.Set([]egress.Bridge{{Name: "lo", GatewayIP: lo}}); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Set = %v, want %q", err, tc.wantErr)
+			}
+			if len(b.Addrs()) != 0 {
+				t.Fatalf("half-bound: %v", b.Addrs())
+			}
+			pc, err := net.ListenPacket("udp4", dnsAddr)
+			if err != nil {
+				t.Fatalf("the DNS UDP socket must be released: %v", err)
+			}
+			_ = pc.Close()
+		})
+	}
+}
