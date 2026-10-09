@@ -240,6 +240,13 @@ func TestUpstreamDialer(t *testing.T) {
 	if _, err := op.UpstreamDialer(); err == nil {
 		t.Fatal("a missing auth_file must be refused")
 	}
+	// A 0700 directory passes the mode check but can't be read.
+	if err := os.Mkdir(auth, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := op.UpstreamDialer(); err == nil || !strings.Contains(err.Error(), "auth_file") {
+		t.Fatalf("an unreadable auth_file must be refused: %v", err)
+	}
 	if _, err := Parse([]byte("version: 1\nupstream_proxy: {url: \"http://p:3128\", no_proxy: [\"bad host!\"]}\n")); err == nil {
 		t.Fatal("a bad no_proxy entry must fail the load")
 	}

@@ -52,3 +52,23 @@ func TestEgressCABundle(t *testing.T) {
 		t.Fatal("an unwritable bundle path must fail")
 	}
 }
+
+// TestEgressCABundleTempUnwritable: when the temp file beside the bundle
+// can't be written, the old bundle is left alone and the error says why.
+func TestEgressCABundleTempUnwritable(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "egress-ca.pem")
+	if err := os.WriteFile(ca, []byte("NODE-CA\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(dir, "ca-bundle.pem")
+	if err := os.Mkdir(bundle+".tmp", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeEgressCABundle(ca, bundle, nil); err == nil || !strings.Contains(err.Error(), "egress CA bundle") {
+		t.Fatalf("unwritable temp file: %v", err)
+	}
+	if _, err := os.Stat(bundle); !os.IsNotExist(err) {
+		t.Fatalf("no bundle may appear: %v", err)
+	}
+}
