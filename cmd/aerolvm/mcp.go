@@ -74,9 +74,13 @@ func runMCP(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.optionError(c, err)
 	}
+	conn, err := a.connection()
+	if err != nil {
+		return a.fail(c, err, exitError)
+	}
 	cfg := agenttools.Config{
-		APIURL: a.getenv("SB_API_URL"),
-		Token:  a.getenv("SB_PAT_TOKEN"),
+		APIURL: conn.apiURL,
+		Token:  conn.token,
 		Source: agenttools.SourceMCP,
 		// stdout is the JSON-RPC channel: every notice goes to stderr.
 		Warn: func(s string) { a.note("aerolvm mcp: %s", s) },
@@ -144,17 +148,19 @@ func runMCPConfig(a *app, args []string) int {
 		return a.optionError(c, err)
 	}
 	serverArgs := append([]string{"mcp"}, explicitFlags(fs)...)
+	// After `aerolvm login` the server reads the saved login itself, so the
+	// client config needs no URL or token at all.
+	if conn, err := a.connection(); err == nil && conn.saved {
+		a.printMCPConfigForLogin(pos[0], serverArgs, conn)
+		return exitOK
+	}
 	apiURL := strings.TrimSpace(a.getenv("SB_API_URL"))
 	if apiURL == "" {
-		apiURL = "http://127.0.0.1:21212"
+		apiURL = defaultAPIURL
 	}
 	switch pos[0] {
 	case "claude-code":
-		quoted := make([]string, len(serverArgs))
-		for i, arg := range serverArgs {
-			quoted[i] = shellQuote(arg)
-		}
-		fmt.Fprintf(a.stdout, "claude mcp add aerolvm -e SB_API_URL=%s -e SB_PAT_TOKEN=\"$SB_PAT_TOKEN\" -- aerolvm %s\n", shellQuote(apiURL), strings.Join(quoted, " "))
+		fmt.Fprintf(a.stdout, "claude mcp add aerolvm -e SB_API_URL=%s -e SB_PAT_TOKEN=\"$SB_PAT_TOKEN\" -- aerolvm %s\n", shellQuote(apiURL), shellArgs(serverArgs))
 		a.note("run it in a shell where SB_PAT_TOKEN is set; the shell fills in the token")
 	case "claude-desktop":
 		a.printJSON(map[string]any{"mcpServers": map[string]any{"aerolvm": map[string]any{
@@ -179,6 +185,30 @@ func runMCPConfig(a *app, args []string) int {
 		a.note("add this to .vscode/mcp.json; VS Code asks for the token once and stores it securely")
 	}
 	return exitOK
+}
+
+// printMCPConfigForLogin prints a client's setup with no credentials in it:
+// the server finds the saved login on its own.
+func (a *app) printMCPConfigForLogin(client string, serverArgs []string, conn connection) {
+	server := map[string]any{"command": "aerolvm", "args": serverArgs}
+	switch client {
+	case "claude-code":
+		fmt.Fprintf(a.stdout, "claude mcp add aerolvm -- aerolvm %s\n", shellArgs(serverArgs))
+	case "claude-desktop", "cursor":
+		a.printJSON(map[string]any{"mcpServers": map[string]any{"aerolvm": server}})
+	case "vscode":
+		server["type"] = "stdio"
+		a.printJSON(map[string]any{"servers": map[string]any{"aerolvm": server}})
+	}
+	a.note("the server uses your aerolvm login (%s, saved in %s); nothing secret is in this config", conn.apiURL, conn.from)
+}
+
+func shellArgs(args []string) string {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		quoted[i] = shellQuote(arg)
+	}
+	return strings.Join(quoted, " ")
 }
 
 // explicitFlags renders the server flags the user set, in flag order, so the

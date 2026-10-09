@@ -241,14 +241,18 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.Requests = append(s.Requests, r.Method+" "+r.URL.Path)
 	s.mu.Unlock()
+	path := strings.TrimPrefix(r.URL.Path, "/v1")
+	// Like sandboxd, /health answers without a token (it is a liveness
+	// probe), so a passing health check proves nothing about the token.
+	if path == "/health" && r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": "fake"})
+		return
+	}
 	if r.Header.Get("Authorization") != "Bearer "+Token {
 		writeErr(w, http.StatusUnauthorized, "missing or invalid token")
 		return
 	}
-	path := strings.TrimPrefix(r.URL.Path, "/v1")
 	switch {
-	case path == "/health" && r.Method == http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "version": "fake"})
 	case path == "/sandboxes" && r.Method == http.MethodGet:
 		s.list(w, r)
 	case path == "/sandboxes" && r.Method == http.MethodPost:

@@ -19,8 +19,11 @@ import (
 func TestFakeSandboxLifecycleAndListFilters(t *testing.T) {
 	s := New(t)
 
-	if code, _ := do(t, s, http.MethodGet, "/v1/health", nil, ""); code != http.StatusUnauthorized {
+	if code, _ := do(t, s, http.MethodGet, "/v1/sandboxes", nil, ""); code != http.StatusUnauthorized {
 		t.Fatalf("missing token status = %d", code)
+	}
+	if code, _ := do(t, s, http.MethodGet, "/health", nil, ""); code != http.StatusOK {
+		t.Fatalf("health without a token = %d, want 200 like sandboxd", code)
 	}
 	if code, _ := do(t, s, http.MethodGet, "/v1/nope", nil, Token); code != http.StatusNotFound {
 		t.Fatalf("unknown route status = %d", code)

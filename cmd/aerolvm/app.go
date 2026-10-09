@@ -90,7 +90,9 @@ func (a *app) verbGroups() []verbGroup {
 			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
 		}},
 		{"Setup", []verb{
-			{"health", "Check that sandboxd is reachable", healthHelp, runHealth},
+			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
+			{"logout", "Forget the saved login", logoutHelp, runLogout},
+			{"health", "Check that sandboxd is reachable and the token works", healthHelp, runHealth},
 			{"version", "Print the aerolvm version", versionHelp, runVersion},
 			{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
 		}},
@@ -247,11 +249,23 @@ func (a *app) note(format string, args ...any) {
 	fmt.Fprintf(a.stderr, format+"\n", args...)
 }
 
-// tools builds the agenttools layer for a CLI verb.
+// tools builds the agenttools layer for a CLI verb, with the connection
+// from the environment or the saved login.
 func (a *app) tools(c *commonFlags) (*agenttools.Tools, error) {
+	conn, err := a.connection()
+	if err != nil {
+		return nil, err
+	}
+	return a.toolsFor(c, conn)
+}
+
+// toolsFor builds the agenttools layer for one sandboxd and token. Both are
+// always passed: the SDK falls back to the process environment for an empty
+// one, which would bypass connection's rules.
+func (a *app) toolsFor(c *commonFlags, conn connection) (*agenttools.Tools, error) {
 	cfg := agenttools.Config{
-		APIURL: a.getenv("SB_API_URL"),
-		Token:  a.getenv("SB_PAT_TOKEN"),
+		APIURL: conn.apiURL,
+		Token:  conn.token,
 		Source: agenttools.SourceCLI,
 		Warn:   func(s string) { a.note("aerolvm: %s", s) },
 	}

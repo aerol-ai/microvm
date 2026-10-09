@@ -20,6 +20,8 @@ type terminal interface {
 	// NotifyResize signals on changes each time the terminal is resized,
 	// until stop is called.
 	NotifyResize() (changes <-chan struct{}, stop func())
+	// ReadSecret reads a line from the terminal without echoing it.
+	ReadSecret() (string, error)
 }
 
 type osTerminal struct{}
@@ -39,6 +41,11 @@ func (osTerminal) MakeRaw() (func(), error) {
 		return nil, err
 	}
 	return func() { _ = term.Restore(fd, state) }, nil
+}
+
+func (osTerminal) ReadSecret() (string, error) {
+	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	return string(b), err
 }
 
 func isTerminal(f *os.File) bool {
