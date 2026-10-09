@@ -390,6 +390,9 @@ type Service struct {
 	egressRuleClears egressRuleClears
 	egressIPLocks    egressPolicyLocks
 	egressClears     egressClearLog
+	// createsInFlight is the sandbox IDs whose create is running, which the
+	// reconcile orphan sweep skips (create_inflight.go).
+	createsInFlight createsInFlight
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -2061,6 +2064,9 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 
 	// The driver installs the sandbox's rules before its row carries the
 	// address: settleEnforcedEgress checks for a clear in between.
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	clearGen := s.egressClears.now()
 	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
@@ -2420,6 +2426,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	clearGen := s.egressClears.now()
 	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
@@ -5536,6 +5545,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if strings.HasPrefix(sandboxID, "park-") {
 				continue
 			}
+			if !s.confirmedOrphan(ctx, sandboxID) {
+				continue
+			}
 			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
 				"runtime", runtimeName,
@@ -5620,6 +5632,29 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	s.emitReservedUsage(ctx, known)
 
 	return nil
+}
+
+// confirmedOrphan reports whether a runtime instance with no row in this
+// sweep's snapshot really has none. The rows were read before the runtime was
+// listed, so an instance may belong to a create that is still running (its
+// row comes after the instance) or that wrote its row since the snapshot.
+// The running check comes first: a create releases it only after writing its
+// row, so a release between the two checks still leaves a row to find. A
+// lookup error is not an orphan; the next sweep retries.
+func (s *Service) confirmedOrphan(ctx context.Context, sandboxID string) bool {
+	if s.createsInFlight.running(sandboxID) {
+		return false
+	}
+	switch _, err := s.store.Get(ctx, sandboxID); {
+	case err == nil:
+		return false
+	case !errors.Is(err, store.ErrNotFound):
+		if s.logger != nil {
+			s.logger.Warn("orphan runtime recheck failed", "sandbox_id", sandboxID, "error", err)
+		}
+		return false
+	}
+	return true
 }
 
 // maxSelfOwnedReconcilePages bounds one sweep's paging so a control plane that
@@ -5996,6 +6031,19 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		s.logger.Warn("caddy snapshot for zombie gc failed", "error", err)
 		return
 	}
+	// The caller read its rows before this snapshot, so a sandbox created or
+	// a port exposed since then has routes in the snapshot that its rows
+	// don't explain. Read the rows again, after it, and expect both sets'
+	// routes; without the second read the sweep can't tell a new route from a
+	// zombie, so it waits for the next pass.
+	if s.store != nil {
+		fresh, err := s.store.List(ctx)
+		if err != nil {
+			s.logger.Warn("zombie gc: sandbox list after the caddy snapshot failed; skipping this pass", "error", err)
+			return
+		}
+		sandboxes = append(append(make([]*models.Sandbox, 0, len(sandboxes)+len(fresh)), sandboxes...), fresh...)
+	}
 
 	expectedHTTP := make(map[string]struct{})
 	expectedTCPServers := make(map[string]struct{})
@@ -6054,6 +6102,10 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 		if _, ok := expectedHTTP[id]; ok {
 			continue
 		}
+		// A create installs its public route before it writes its row.
+		if s.createsInFlight.ownsRoute(id) {
+			continue
+		}
 		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil {
 			s.logger.Warn("zombie http route delete failed", "route_id", id, "error", err)
 			continue
@@ -6072,6 +6124,9 @@ func (s *Service) gcZombieCaddyEntries(ctx context.Context, sandboxes []*models.
 	}
 	for _, id := range snap.L4TLSRouteIDs {
 		if _, ok := expectedTLSRoutes[id]; ok {
+			continue
+		}
+		if s.createsInFlight.ownsRoute(id) {
 			continue
 		}
 		if err := s.publicRoutes().DeleteRouteByID(ctx, id); err != nil {

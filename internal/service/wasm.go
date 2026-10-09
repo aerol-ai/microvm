@@ -157,6 +157,9 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 		sealedMounts = s.testSealedMountsOverride
 	}
 
+	// The runtime instance exists before the row: reconcile's orphan sweep
+	// must not take it for a leak until this create has returned.
+	defer s.createsInFlight.begin(sandboxID)()
 	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
