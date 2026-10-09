@@ -17,6 +17,7 @@ const pins = {
   'brace-expansion': '5.0.12',
   'http-cache-semantics': '4.2.1',
   'ip-address': '10.7.3',
+  'postcss-selector-parser': '7.1.6',
   undici: '6.28.1',
 };
 
