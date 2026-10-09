@@ -104,6 +104,55 @@ func TestClientServerRoundTrip(t *testing.T) {
 	}
 }
 
+func TestClientAndNoopCoverTheLaterOps(t *testing.T) {
+	var forgotten, retained string
+	var controlled []netip.AddrPort
+	var inspected bool
+	c, _, _, _ := startServer(t, ServerHooks{
+		ForgetLearned: func(id string) error { forgotten = id; return nil },
+		RetainLearned: func(ids []string) error { retained = strings.Join(ids, ","); return nil },
+		NodeControl:   func(eps []netip.AddrPort) error { controlled = eps; return nil },
+		InspectCA:     func(ca InspectCA) error { inspected = ca.CertPEM != nil; return nil },
+	}, nil)
+	ctx := context.Background()
+	if err := c.ForgetLearned(ctx, "sb"); err != nil || forgotten != "sb" {
+		t.Fatalf("ForgetLearned: %v %q", err, forgotten)
+	}
+	if err := c.RetainLearned(ctx, nil); err != nil || retained != "" {
+		t.Fatalf("RetainLearned nil: %v %q", err, retained)
+	}
+	if err := c.RetainLearned(ctx, []string{"a", "b"}); err != nil || retained != "a,b" {
+		t.Fatalf("RetainLearned: %v %q", err, retained)
+	}
+	ep := netip.MustParseAddrPort("10.0.0.1:22")
+	if err := c.SetNodeControl(ctx, []netip.AddrPort{ep}); err != nil || len(controlled) != 1 {
+		t.Fatalf("SetNodeControl: %v %v", err, controlled)
+	}
+	if err := c.SetNodeControl(ctx, nil); err != nil || len(controlled) != 0 {
+		t.Fatalf("SetNodeControl nil: %v %v", err, controlled)
+	}
+	if err := c.SetInspectCA(ctx, InspectCA{CertPEM: []byte("cert")}); err != nil || !inspected {
+		t.Fatalf("SetInspectCA: %v", err)
+	}
+
+	noop := Noop{}
+	if _, err := noop.SyncToken(ctx); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Noop.SyncToken: %v", err)
+	}
+	if err := noop.SetNodeControl(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := noop.ForgetLearned(ctx, "sb"); err != nil {
+		t.Fatal(err)
+	}
+	if err := noop.RetainLearned(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := noop.SetInspectCA(ctx, InspectCA{}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Noop.SetInspectCA: %v", err)
+	}
+}
+
 func TestServerWithoutHooks(t *testing.T) {
 	c, _, be, _ := startServer(t, ServerHooks{}, nil)
 	ctx := context.Background()

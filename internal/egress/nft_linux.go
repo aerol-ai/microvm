@@ -124,7 +124,10 @@ func (d setDef) build(t *nftables.Table) *nftables.Set {
 	return s
 }
 
-func newConn() (*nftables.Conn, error) {
+// newConn opens one netlink connection per call. Tests replace it with a
+// connection whose TestDial never touches the kernel: the coverage run is
+// unprivileged, and the layout still has to be exercised there.
+var newConn = func() (*nftables.Conn, error) {
 	c, err := nftables.New()
 	if err != nil {
 		return nil, fmt.Errorf("nftables conn: %w", err)

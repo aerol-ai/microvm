@@ -14,8 +14,9 @@ import (
 )
 
 // operatorPoll is how often a changed operator file is noticed without a
-// SIGHUP; the same as sandboxd's.
-const operatorPoll = 10 * time.Second
+// SIGHUP; the same as sandboxd's. Tests shorten it so a reload is observable
+// without waiting out the production interval.
+var operatorPoll = 10 * time.Second
 
 // fromOperatorFile builds the dial guard and the upstream chain from path
 // (tests; the gateway itself watches the file, fromOperator).
