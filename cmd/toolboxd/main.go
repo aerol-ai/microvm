@@ -194,6 +194,7 @@ func main() {
 		RecordingDir:       envString("SB_RECORDING_DIR", "/var/lib/toolboxd/recordings"),
 		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
 		BufferBytes:        envInt("SB_SESSION_BUFFER_BYTES", 1<<20),
+		StartProcess:       startSessionProcess,
 	})
 	if err != nil {
 		logger.Warn("session manager init failed; sessions disabled", "error", err)
