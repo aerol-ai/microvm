@@ -281,7 +281,9 @@ func (f *Filter) allow(id string) bool {
 	defer f.limMu.Unlock()
 	e := f.limiters[id]
 	if e == nil {
-		e = &limiterEntry{lim: rate.NewLimiter(rate.Limit(f.cfg.QPS), f.cfg.Burst)}
+		// seen is set before the sweep: a zero time looks idle, and the
+		// sweep would drop this entry and so reset its bucket next query.
+		e = &limiterEntry{lim: rate.NewLimiter(rate.Limit(f.cfg.QPS), f.cfg.Burst), seen: now}
 		f.limiters[id] = e
 		if len(f.limiters)%256 == 0 {
 			f.sweepLimitersLocked(now)

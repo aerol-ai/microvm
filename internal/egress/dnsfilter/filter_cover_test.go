@@ -69,7 +69,8 @@ func TestLearnRaceWithPolicyChange(t *testing.T) {
 }
 
 // TestLimiterSweepRunsEvery256Sandboxes: the 256th distinct sandbox sweeps
-// limiters idle past limiterIdle.
+// limiters idle past limiterIdle, and keeps its own: the sandbox whose
+// first query triggered the sweep must not get a fresh bucket next query.
 func TestLimiterSweepRunsEvery256Sandboxes(t *testing.T) {
 	f := New(&fakeSources{}, nil, nil, Config{})
 	f.limiters["idle"] = &limiterEntry{lim: rate.NewLimiter(1, 1), seen: time.Now().Add(-limiterIdle - time.Minute)}
@@ -81,6 +82,14 @@ func TestLimiterSweepRunsEvery256Sandboxes(t *testing.T) {
 	}
 	if _, ok := f.limiters["sb-1"]; !ok {
 		t.Fatal("a live limiter was swept")
+	}
+	trigger := f.limiters["sb-255"]
+	if trigger == nil {
+		t.Fatal("the limiter whose creation ran the sweep was swept with it")
+	}
+	f.allow("sb-255")
+	if f.limiters["sb-255"] != trigger {
+		t.Fatal("the next query got a fresh limiter, resetting the bucket")
 	}
 }
 
