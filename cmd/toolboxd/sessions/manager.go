@@ -17,9 +17,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/creack/pty"
 )
+
+// writeLoginRestore writes the PATH restore as the first line of a
+// stdin-fed login shell. It is io.WriteString. A live pipe accepts this
+// short line, so tests replace it to reach the log-and-continue path
+// (the shell has already gone, and the pipe is closed).
+var writeLoginRestore = io.WriteString
 
 // Config controls Manager behavior. Defaults are sensible for an in-container
 // daemon; everything is overridable via toolboxd env vars.
@@ -192,11 +199,14 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 		name = "default"
 	}
 
+	// A login shell given a command (an E2B command is bash -l -c) puts the
+	// image's PATH back after /etc/profile resets it (cmd/toolboxd/loginshell).
+	argv = loginshell.Argv(argv)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
-	cmd.Env = mergeEnv(req.Env)
+	cmd.Env = append(mergeEnv(req.Env), loginshell.EnvFor(req.Env)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid:  req.PTY,
 		Setpgid: !req.PTY,
@@ -261,6 +271,14 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 			return nil, fmt.Errorf("start: %w", err)
 		}
 		s.stdin = stdin
+		// A login shell fed through stdin (a Daytona session) runs this
+		// before any command, once its profile is done. A terminal gets the
+		// same from the profile hook, without echoing a line to the user.
+		if loginshell.LoginWithoutCommand(argv) {
+			if _, err := writeLoginRestore(stdin, loginshell.Restore+"\n"); err != nil {
+				m.logger.Warn("login shell PATH restore not written", "session_id", id, "error", err)
+			}
+		}
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(2)
 		go s.runPump(stdout, StreamStdout)

@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/clonegen"
@@ -146,6 +147,7 @@ func main() {
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
 	scrubReadyEnv()
+	prepareLoginShells(logger, loginshell.ProfileDir)
 
 	startReaperFn(logger)
 	buildEgressCABundle(logger, systemTrustStores)
@@ -600,8 +602,10 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, shell, "-lc", req.Command)
-	cmd.Env = append(os.Environ(), envMapToSlice(req.Env)...)
+	// A login shell, so profile setup applies; the image's PATH, which
+	// /etc/profile resets, goes back in front before the command runs.
+	cmd := exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
+	cmd.Env = append(append(os.Environ(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
@@ -788,6 +792,18 @@ func (s *server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+// prepareLoginShells keeps the image's PATH in every login shell toolboxd
+// starts (cmd/toolboxd/loginshell): it records the PATH for children, and
+// installs the profile hook that terminals rely on. An image whose
+// profile.d toolboxd can't write (non-root, read-only root) still gets the
+// PATH in commands; only its interactive terminals keep the profile's.
+func prepareLoginShells(logger *slog.Logger, profileDir string) {
+	loginshell.Record()
+	if _, err := loginshell.InstallProfileHook(profileDir); err != nil {
+		logger.Info("login shell PATH hook not installed; terminals keep /etc/profile's PATH", "error", err)
+	}
 }
 
 func detectShell() (string, error) {

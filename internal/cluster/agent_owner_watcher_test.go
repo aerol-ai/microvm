@@ -385,12 +385,10 @@ func TestReassignStuckPlacementExcludesTheFailingWorker(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
-	idx := newGossipMemberIndex()
-	idx.replace([]Member{
+	seedGossipView(t, c, []Member{
 		recreateCandidate("stuck-worker", config.NodeRoleWorker, 100),
 		recreateCandidate("healthy-worker", config.NodeRoleWorker, 10),
 	})
-	c.gossip.setMemberIndex(idx)
 
 	p := placeFailoverPlacement(t, c, "sb-stuck-exclude", "stuck-worker")
 	if err := c.ReassignStuckPlacement(context.Background(), "stuck-worker", p.SandboxID, p.IncarnationID); err != nil {
@@ -416,9 +414,7 @@ func TestReassignStuckPlacementReportsWhenNoAlternateExists(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
-	idx := newGossipMemberIndex()
-	idx.replace([]Member{recreateCandidate("lonely-worker", config.NodeRoleWorker, 100)})
-	c.gossip.setMemberIndex(idx)
+	seedGossipView(t, c, []Member{recreateCandidate("lonely-worker", config.NodeRoleWorker, 100)})
 
 	p := placeFailoverPlacement(t, c, "sb-no-alternate", "lonely-worker")
 	err := c.ReassignStuckPlacement(context.Background(), "lonely-worker", p.SandboxID, p.IncarnationID)
@@ -440,12 +436,10 @@ func TestReassignStuckPlacementFencesOwnerThroughTheMutation(t *testing.T) {
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)
 
-	idx := newGossipMemberIndex()
-	idx.replace([]Member{
+	seedGossipView(t, c, []Member{
 		recreateCandidate("stuck-worker", config.NodeRoleWorker, 100),
 		recreateCandidate("healthy-worker", config.NodeRoleWorker, 10),
 	})
-	c.gossip.setMemberIndex(idx)
 
 	p := placeFailoverPlacement(t, c, "sb-already-moved", "stuck-worker")
 	// The placement moves on — same incarnation, new owner — before the
