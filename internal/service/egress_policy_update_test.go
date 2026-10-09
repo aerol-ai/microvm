@@ -299,16 +299,16 @@ func TestUpdateNetworkPolicyRejects(t *testing.T) {
 		}
 	}
 
-	svc.egressSelfTest = &egressSelfTest{kick: make(chan struct{}, 1)}
+	svc.egressSelfTest.Store(&egressSelfTest{kick: make(chan struct{}, 1)})
 	hostname := models.NetworkPolicyRequest{NetworkAllowOut: []string{"pypi.org"}}
 	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", hostname); !errors.Is(err, ErrEgressGatewayUnavailable) {
 		t.Fatalf("pending self-test: err = %v", err)
 	}
-	svc.egressSelfTest.failed.Store(true)
+	svc.egressSelfTest.Load().failed.Store(true)
 	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", hostname); !errors.Is(err, ErrEgressSelfTestFailed) {
 		t.Fatalf("failed self-test: err = %v", err)
 	}
-	svc.egressSelfTest = nil
+	svc.egressSelfTest.Store(nil)
 	svc.cfg.EgressFQDNEnabled = false
 	if _, err := svc.UpdateNetworkPolicy(ctx, "sb-pol", hostname); !errors.Is(err, ErrEgressGatewayRequired) {
 		t.Fatalf("no gateway: err = %v", err)

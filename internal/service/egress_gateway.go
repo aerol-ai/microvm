@@ -118,11 +118,16 @@ func (r *reasonCounts) snapshot() map[string]uint64 {
 	return out
 }
 
+// egressWiring is what SetEgressGateway publishes.
+type egressWiring struct {
+	api     egress.API
+	bridges func(context.Context) []egress.Bridge
+}
+
 // SetEgressGateway wires the gateway client and the bridge discovery. A nil
 // api leaves the feature off (Noop).
 func (s *Service) SetEgressGateway(api egress.API, bridges func(context.Context) []egress.Bridge) {
-	s.egressAPI = api
-	s.egressBridges = bridges
+	s.egressWired.Store(&egressWiring{api: api, bridges: bridges})
 	if api != nil {
 		activeEgressStats.Store(&s.egressStats)
 	}
@@ -132,8 +137,8 @@ func (s *Service) SetEgressGateway(api egress.API, bridges func(context.Context)
 // the daemon discovers and, when the Firecracker guests have a firewall,
 // the TAP pool (Phase 4). ok is false when nothing wires any (tests).
 func (s *Service) gatewayBridges(ctx context.Context) (bridges []egress.Bridge, ok bool) {
-	if s.egressBridges != nil {
-		bridges, ok = s.egressBridges(ctx), true
+	if w := s.egressWired.Load(); w != nil && w.bridges != nil {
+		bridges, ok = w.bridges(ctx), true
 	}
 	if fc, isFC := s.firecracker.(interface{ EgressTapSubnet() (netip.Prefix, bool) }); isFC {
 		if subnet, on := fc.EgressTapSubnet(); on {
@@ -143,12 +148,23 @@ func (s *Service) gatewayBridges(ctx context.Context) (bridges []egress.Bridge, 
 	return bridges, ok
 }
 
+// egressClient is the wired gateway client, nil until SetEgressGateway.
+func (s *Service) egressClient() egress.API {
+	if w := s.egressWired.Load(); w != nil {
+		return w.api
+	}
+	return nil
+}
+
 // egressGateway returns the client, or Noop when the feature is off.
 func (s *Service) egressGateway() egress.API {
-	if s == nil || s.egressAPI == nil || !s.cfg.EgressFQDNEnabled {
+	if s == nil || !s.cfg.EgressFQDNEnabled {
 		return egress.Noop{}
 	}
-	return s.egressAPI
+	if api := s.egressClient(); api != nil {
+		return api
+	}
+	return egress.Noop{}
 }
 
 // egressEnabled reports whether hostname filtering can run on this node:
@@ -156,7 +172,7 @@ func (s *Service) egressGateway() egress.API {
 // privileged sandboxes (they hold NET_RAW/NET_ADMIN and could step around
 // the gateway, CEO D18).
 func (s *Service) egressEnabled() bool {
-	return s != nil && s.egressAPI != nil && s.cfg.EgressFQDNEnabled && !s.cfg.ContainerPrivileged
+	return s != nil && s.egressClient() != nil && s.cfg.EgressFQDNEnabled && !s.cfg.ContainerPrivileged
 }
 
 // EnsureEgressGatewayReady connects to the gateway and pushes the node's full
@@ -936,7 +952,7 @@ func hasEgressConfig(sb *models.Sandbox) bool {
 // consumeEgressEvents streams gateway events into the audit log and metrics,
 // resubscribing with backoff while the gateway is away.
 func (s *Service) consumeEgressEvents(ctx context.Context) {
-	sub, ok := s.egressAPI.(interface {
+	sub, ok := s.egressClient().(interface {
 		Subscribe(context.Context) (<-chan egress.Event, error)
 	})
 	if !ok {

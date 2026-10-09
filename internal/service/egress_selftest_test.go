@@ -70,11 +70,11 @@ func TestSelfTestFailureRefusesGatewayMode(t *testing.T) {
 		t.Fatalf("a CIDR-only create must not need the gateway: %v", err)
 	}
 	// Retries back off while it keeps failing.
-	first := svc.egressSelfTest.backoff
-	svc.egressSelfTest.next = time.Now().Add(-time.Second)
+	first := svc.egressSelfTest.Load().backoff
+	svc.egressSelfTest.Load().next = time.Now().Add(-time.Second)
 	svc.retryEgressSelfTests(ctx, false)
-	if svc.egressSelfTest.backoff <= first {
-		t.Fatalf("backoff %v did not grow from %v", svc.egressSelfTest.backoff, first)
+	if svc.egressSelfTest.Load().backoff <= first {
+		t.Fatalf("backoff %v did not grow from %v", svc.egressSelfTest.Load().backoff, first)
 	}
 	// The operator fixes the host firewall; the next retry passes.
 	gw.mu.Lock()
@@ -87,7 +87,7 @@ func TestSelfTestFailureRefusesGatewayMode(t *testing.T) {
 	if _, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"pypi.org"}}); err != nil {
 		t.Fatal(err)
 	}
-	if !svc.egressSelfTest.next.IsZero() {
+	if !svc.egressSelfTest.Load().next.IsZero() {
 		t.Fatal("nothing left to retry once every bridge passed")
 	}
 	before := pn.setups
@@ -113,7 +113,7 @@ func TestSelfTestAbsentBridgeIsPending(t *testing.T) {
 	if svc.egressSelfTestFailed() || !svc.EgressGatewayReady() {
 		t.Fatal("an absent bridge must not mark the node unavailable")
 	}
-	if svc.egressSelfTest.next.IsZero() {
+	if svc.egressSelfTest.Load().next.IsZero() {
 		t.Fatal("an absent bridge must be re-tested")
 	}
 	svc.kickEgressSelfTest()
@@ -126,8 +126,8 @@ func TestSelfTestAbsentBridgeIsPending(t *testing.T) {
 	pn.absent = nil
 	pn.mu.Unlock()
 	svc.retryEgressSelfTests(ctx, true)
-	if !svc.egressSelfTest.next.IsZero() || svc.egressSelfTest.status["docker0"] != selfTestPassed {
-		t.Fatalf("bridge must pass once present: %+v", svc.egressSelfTest.status)
+	if !svc.egressSelfTest.Load().next.IsZero() || svc.egressSelfTest.Load().status["docker0"] != selfTestPassed {
+		t.Fatalf("bridge must pass once present: %+v", svc.egressSelfTest.Load().status)
 	}
 	svc.kickEgressSelfTest() // nothing pending: no-op
 	select {
@@ -149,7 +149,7 @@ func TestSelfTestGatewayOutageIsNotAVerdict(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.retryEgressSelfTests(ctx, false)
-	if svc.egressSelfTestFailed() || !svc.egressSelfTestPending() || !svc.egressSelfTest.retestAll {
+	if svc.egressSelfTestFailed() || !svc.egressSelfTestPending() || !svc.egressSelfTest.Load().retestAll {
 		t.Fatal("an outage is not a verdict; the re-test must stay requested")
 	}
 	gw.mu.Lock()

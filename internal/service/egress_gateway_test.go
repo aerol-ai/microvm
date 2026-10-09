@@ -584,3 +584,32 @@ func TestGetShowsEgressStatus(t *testing.T) {
 		t.Fatal("WASM filters in its mediator: no gateway status")
 	}
 }
+
+// TestEgressWiringRacesReadinessReads: in cluster mode the capacity loop
+// polls EgressGatewayReady from before the daemon wires the gateway and its
+// self-test (pkg/daemon's cluster tests under -race). Wiring must be safe
+// against those reads, and visible to them once done.
+func TestEgressWiringRacesReadinessReads(t *testing.T) {
+	svc, _, _ := newServiceRuntimeHarnessAtPath(t, filepath.Join(t.TempDir(), "state.db"), &recordingRuntime{})
+	svc.cfg.EgressFQDNEnabled = true
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			_ = svc.EgressGatewayReady()
+			_ = svc.egressSelfTestPending()
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+	svc.SetEgressGateway(newFakeGateway(), nil)
+	svc.SetEgressSelfTest(&fakeSelfTestNet{})
+	close(stop)
+	<-done
+	if !svc.egressEnabled() || !svc.egressSelfTestPending() {
+		t.Fatal("the wiring must be visible once set")
+	}
+}

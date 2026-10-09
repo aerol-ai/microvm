@@ -355,16 +355,17 @@ type Service struct {
 	l4ActivityGenerations map[string]uint64
 	l4ActivitySeq         uint64
 
-	// Egress gateway (plans/egress-domain-filtering.md §5.3). egressAPI is
-	// the UDS client to the separate egress-gateway process (nil = feature
-	// off; egressGateway() returns egress.Noop then). egressReady/egressMu
-	// are the EnsureLayer4Ready-shaped lazy bootstrap: connect, hand over the
-	// bridges, full Sync. egressBridges discovers the sandbox bridges
-	// (sandboxd has the docker socket; the gateway does not, S5).
-	egressAPI     egress.API
-	egressBridges func(context.Context) []egress.Bridge
-	egressMu      sync.Mutex
-	egressReady   atomic.Bool
+	// Egress gateway (plans/egress-domain-filtering.md §5.3). egressWired
+	// holds the UDS client to the separate egress-gateway process and the
+	// sandbox bridge discovery (sandboxd has the docker socket; the gateway
+	// does not, S5); nil = feature off, and egressGateway() returns
+	// egress.Noop then. It is atomic because in cluster mode the capacity
+	// loop already polls EgressGatewayReady when the daemon wires it.
+	// egressReady/egressMu are the EnsureLayer4Ready-shaped lazy bootstrap:
+	// connect, hand over the bridges, full Sync.
+	egressWired atomic.Pointer[egressWiring]
+	egressMu    sync.Mutex
+	egressReady atomic.Bool
 	// egressSyncMu makes a full Sync exclusive against attaches and detaches
 	// (shared), and egressInflight carries the attaches the store doesn't
 	// show yet into it (review finding 1).
@@ -417,8 +418,9 @@ type Service struct {
 	egressCAPushed atomic.Bool
 	egressSubOnce  sync.Once
 	egressStats    egressCounters
-	// egressSelfTest is the per-bridge self-test (T41); nil skips it.
-	egressSelfTest *egressSelfTest
+	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
+	// for the same reason as egressWired: readiness reads it.
+	egressSelfTest atomic.Pointer[egressSelfTest]
 	// egressOperatorWatcher holds the private-cloud operator file (§5.10);
 	// nil = no file, today's behavior.
 	egressOperatorWatcher *operator.Watcher

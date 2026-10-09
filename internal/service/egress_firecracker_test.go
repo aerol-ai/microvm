@@ -236,8 +236,8 @@ func TestFirecrackerGatewayEgressFailsClosed(t *testing.T) {
 	if _, err := svc.CreateSandbox(ctx, hostname); !errors.Is(err, ErrEgressGatewayUnavailable) {
 		t.Fatalf("self-test pending = %v, want 503", err)
 	}
-	svc.egressSelfTest.tested.Store(true)
-	svc.egressSelfTest.failed.Store(true)
+	svc.egressSelfTest.Load().tested.Store(true)
+	svc.egressSelfTest.Load().failed.Store(true)
 	if _, err := svc.CreateSandbox(ctx, hostname); !errors.Is(err, ErrEgressSelfTestFailed) {
 		t.Fatalf("self-test failed = %v", err)
 	}

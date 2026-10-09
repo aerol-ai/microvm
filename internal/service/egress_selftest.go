@@ -78,23 +78,25 @@ type egressSelfTest struct {
 // skips the self-test.
 func (s *Service) SetEgressSelfTest(pn egress.ProbeNet) {
 	if pn == nil {
-		s.egressSelfTest = nil
+		s.egressSelfTest.Store(nil)
 		return
 	}
 	st := &egressSelfTest{probe: pn, kick: make(chan struct{}, 1), status: map[string]selfTestStatus{}, lastErr: map[string]string{}}
-	s.egressSelfTest = st
+	s.egressSelfTest.Store(st)
 	activeEgressSelfTest.Store(st)
 }
 
 // egressSelfTestFailed reports whether some bridge failed its self-test.
 func (s *Service) egressSelfTestFailed() bool {
-	return s.egressSelfTest != nil && s.egressSelfTest.failed.Load()
+	st := s.egressSelfTest.Load()
+	return st != nil && st.failed.Load()
 }
 
 // egressSelfTestPending reports whether the first self-test round has not
 // finished yet, so whether the redirect works is still unknown.
 func (s *Service) egressSelfTestPending() bool {
-	return s.egressSelfTest != nil && !s.egressSelfTest.tested.Load()
+	st := s.egressSelfTest.Load()
+	return st != nil && !st.tested.Load()
 }
 
 // requestEgressSelfTests asks the supervisor to re-test every bridge. A
@@ -102,7 +104,7 @@ func (s *Service) egressSelfTestPending() bool {
 // the supervisor, never inline on a create that happened to trigger the
 // sync.
 func (s *Service) requestEgressSelfTests() {
-	st := s.egressSelfTest
+	st := s.egressSelfTest.Load()
 	if st == nil {
 		return
 	}
@@ -122,7 +124,7 @@ func (s *Service) requestEgressSelfTests() {
 // and is returned, leaving the bridge's state as it was. Callers hold
 // egressMu.
 func (s *Service) runEgressSelfTests(ctx context.Context, bridges []egress.Bridge, all bool) error {
-	st := s.egressSelfTest
+	st := s.egressSelfTest.Load()
 	if st == nil {
 		return nil
 	}
@@ -188,7 +190,7 @@ func (s *Service) runEgressSelfTests(ctx context.Context, bridges []egress.Bridg
 
 // recordSelfTest stores one bridge's verdict and logs transitions only.
 func (s *Service) recordSelfTest(bridge string, prev, next selfTestStatus, err error) {
-	st := s.egressSelfTest
+	st := s.egressSelfTest.Load()
 	st.mu.Lock()
 	st.status[bridge] = next
 	msg := ""
@@ -217,7 +219,7 @@ func (s *Service) recordSelfTest(bridge string, prev, next selfTestStatus, err e
 // it has listeners to test. A gateway outage mid-test keeps the request for
 // the next tick.
 func (s *Service) retryEgressSelfTests(ctx context.Context, force bool) {
-	st := s.egressSelfTest
+	st := s.egressSelfTest.Load()
 	if st == nil || !s.egressReady.Load() {
 		return
 	}
@@ -247,7 +249,7 @@ func (s *Service) retryEgressSelfTests(ctx context.Context, force bool) {
 // bridge is still untested; the attach path calls it, so a fresh containerd
 // node tests aerolvm0 right after its first sandbox creates it.
 func (s *Service) kickEgressSelfTest() {
-	st := s.egressSelfTest
+	st := s.egressSelfTest.Load()
 	if st == nil {
 		return
 	}
@@ -265,8 +267,8 @@ func (s *Service) kickEgressSelfTest() {
 
 // egressSelfTestKick is the supervisor's wake channel (nil without a test).
 func (s *Service) egressSelfTestKick() <-chan struct{} {
-	if s.egressSelfTest == nil {
-		return nil
+	if st := s.egressSelfTest.Load(); st != nil {
+		return st.kick
 	}
-	return s.egressSelfTest.kick
+	return nil
 }
