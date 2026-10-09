@@ -259,8 +259,12 @@ dump_node_diagnostics() {
 # boot. So without this step modules_dir is empty, the node advertises no wasm
 # inventory, and cluster placement (every scenario runs cluster-init, so even
 # single-node is a 1-member real cluster) rejects each wasm create with
-# ErrNoPlacementTarget. This mirrors what stage-wasm-modules.yml does, but reuses
-# the committed, digest-verified fixture bytes instead of re-downloading on-box.
+# ErrNoPlacementTarget. This mirrors what stage-wasm-modules.yml does: each node
+# downloads the modules itself and checks the digest pinned in modules.yml.
+# Pushing them from the operator's machine instead (about 65 MB per worker node)
+# took hours on a slow uplink: 2026-10-09, cluster-hetero-lite sat 26 min on one
+# 26 MB scp at 24 KB/s, with three more nodes to go. The verified local fixtures
+# are the fallback, for a node that cannot reach the module URL.
 stage_wasm_modules() {
   local fxdir="$1" config_cluster="$2" caps_domain="$3" targets="$4"
   local modules_dir
@@ -295,7 +299,7 @@ stage_wasm_modules() {
   n=$(yq -r '.standard_modules | length' "${fxdir}/modules.yml")
   [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || { echo "stage_wasm: no modules in ${fxdir}/modules.yml" >&2; return 1; }
 
-  local ip tgt i alias ref file
+  local ip tgt i alias ref digest file
   for ip in "${ips[@]}"; do
     tgt="ubuntu@${ip}"
     # Block until THIS node's user-data finished before touching its sandboxd.
@@ -316,12 +320,21 @@ stage_wasm_modules() {
     for i in $(seq 0 $((n - 1))); do
       alias=$(yq -r ".standard_modules[$i].alias" "${fxdir}/modules.yml")
       ref=$(yq -r ".standard_modules[$i].ref" "${fxdir}/modules.yml")
+      digest=$(yq -r ".standard_modules[$i].digest" "${fxdir}/modules.yml")
       # fetch.sh names each local file after the URL basename (sans query).
       file="${fxdir}/$(basename "${ref%\?*}")"
       # ubuntu can't write modules_dir directly; land in /tmp then sudo-install
       # under the reserved alias filename SB_WASM_STANDARD_MODULES expects.
-      if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm" \
-        || ! ssh "${SSH_OPTS[@]}" "$tgt" \
+      if ! ssh "${SSH_OPTS[@]}" "$tgt" \
+             "curl -fsSL --retry 3 --max-time 300 -o '/tmp/${alias}.wasm' '${ref}' \
+              && echo '${digest#sha256:}  /tmp/${alias}.wasm' | sha256sum -c --quiet -"; then
+        echo "stage_wasm: ${tgt} could not download ${alias}; copying the local fixture" >&2
+        if ! scp "${SSH_OPTS[@]}" "$file" "${tgt}:/tmp/${alias}.wasm"; then
+          echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
+          return 1
+        fi
+      fi
+      if ! ssh "${SSH_OPTS[@]}" "$tgt" \
              "sudo install -m 0644 '/tmp/${alias}.wasm' '${modules_dir}/${alias}.wasm' && rm -f '/tmp/${alias}.wasm'"; then
         echo "stage_wasm: staging ${alias} on ${tgt} failed" >&2
         return 1
