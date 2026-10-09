@@ -45,6 +45,9 @@ type ExecRequest struct {
 	// TTY requests a pseudo-terminal of Cols x Rows. Streaming path only.
 	TTY        bool
 	Cols, Rows int
+	// Resize delivers the local terminal's new size after a resize, so
+	// full-screen programs (vim, top) redraw to fit. Used only with TTY.
+	Resize <-chan TermSize
 	// MaxOutputBytes bounds the captured output per stream; zero means
 	// DefaultMaxOutputBytes.
 	MaxOutputBytes int
@@ -55,6 +58,9 @@ type ExecRequest struct {
 	// endpoint sets it: its in-process transport can't carry a WebSocket.
 	Buffered bool
 }
+
+// TermSize is a terminal size in character cells.
+type TermSize struct{ Cols, Rows int }
 
 // ExecResult is a finished command. ExitCode follows `docker exec`: the
 // command's own code, 128+n when a signal killed it, 124 on timeout.
@@ -138,6 +144,9 @@ func (t *Tools) execStream(ctx context.Context, sb *microvm.Sandbox, req ExecReq
 		return ExecResult{}, Classify(err)
 	}
 	forwardStdin(handle, req.Stdin)
+	if req.TTY && req.Resize != nil {
+		go ForwardResizes(streamCtx, req.Resize, handle.Resize)
+	}
 
 	type waitResult struct {
 		info sdktypes.ExecExitInfo
@@ -229,6 +238,25 @@ func forwardStdin(handle *microvm.ExecStreamHandle, r io.Reader) {
 			}
 		}
 	}()
+}
+
+// ForwardResizes sends each new terminal size to the remote PTY until ctx
+// ends or sizes closes. A failed send is dropped: it means the stream is
+// ending, and the end is reported by Wait.
+func ForwardResizes(ctx context.Context, sizes <-chan TermSize, resize func(cols, rows int) error) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case size, ok := <-sizes:
+			if !ok {
+				return
+			}
+			if size.Cols > 0 && size.Rows > 0 {
+				_ = resize(size.Cols, size.Rows)
+			}
+		}
+	}
 }
 
 func (t *Tools) execBuffered(ctx context.Context, sb *microvm.Sandbox, req ExecRequest) (ExecResult, error) {

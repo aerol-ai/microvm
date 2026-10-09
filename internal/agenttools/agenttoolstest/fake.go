@@ -33,6 +33,15 @@ const Token = "test-token"
 // exec stream without an exit message, like a connection lost mid-command.
 const DropStream = "\x00drop"
 
+// ExecStart is the first frame of a streaming exec.
+type ExecStart struct {
+	Command string            `json:"command"`
+	Env     map[string]string `json:"env"`
+	TTY     bool              `json:"tty"`
+	Cols    int               `json:"cols"`
+	Rows    int               `json:"rows"`
+}
+
 // Exec is a scripted command. It writes output with out(stream, bytes)
 // (stream 1 = stdout, 2 = stderr), reads stdin from in (closed at EOF), and
 // returns the exit code and signal. killed is closed when the client sends
@@ -104,6 +113,13 @@ type Server struct {
 	// DropAttach upgrades the session websocket and closes it before an
 	// exit message, so Wait returns an error instead of a code.
 	DropAttach bool
+	// FailAttach makes the session websocket handshake fail with 500.
+	FailAttach bool
+	// LiveAttach makes a session attach interactive, like a shell: it
+	// replays the log, then runs the exec function on the session's
+	// command with the client's stdin. A client "close" or a dropped
+	// connection detaches without an exit message, as toolboxd does.
+	LiveAttach bool
 	// ConflictAlways makes every create fail with 409 without creating
 	// anything (a conflict on something other than the name).
 	ConflictAlways bool
@@ -119,7 +135,11 @@ type Server struct {
 	CreatedIDs     []string
 	StreamDials    int
 	Signals        []string
+	Resizes        []string
+	LastExecStart  ExecStart
 	ExecCommands   []string
+	SessionCreates []models.CreateSessionRequest
+	Detaches       int
 	BufferedExecs  int
 	LastCreate     models.CreateSandboxRequest
 	StartCalls     int
@@ -656,14 +676,13 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	var start struct {
-		Command string `json:"command"`
-	}
+	var start ExecStart
 	if err := conn.ReadJSON(&start); err != nil {
 		return
 	}
 	s.mu.Lock()
 	s.StreamDials++
+	s.LastExecStart = start
 	s.ExecCommands = append(s.ExecCommands, start.Command)
 	exec := s.execFunc()
 	s.mu.Unlock()
@@ -686,16 +705,15 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 				}
 				continue
 			}
-			var ctrl struct {
-				Type   string `json:"type"`
-				Signal string `json:"signal"`
-			}
+			var ctrl control
 			if json.Unmarshal(data, &ctrl) != nil {
 				continue
 			}
 			switch ctrl.Type {
 			case "close":
 				_ = stdinW.Close()
+			case "resize":
+				s.recordResize(ctrl)
 			case "signal":
 				s.mu.Lock()
 				s.Signals = append(s.Signals, ctrl.Signal)
@@ -719,6 +737,21 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	_ = conn.WriteJSON(map[string]any{"type": "exit", "code": code, "signal": signal})
 	writeMu.Unlock()
+}
+
+// control is a JSON control frame a client sends on an exec or attach
+// stream.
+type control struct {
+	Type   string `json:"type"`
+	Signal string `json:"signal"`
+	Cols   int    `json:"cols"`
+	Rows   int    `json:"rows"`
+}
+
+func (s *Server) recordResize(ctrl control) {
+	s.mu.Lock()
+	s.Resizes = append(s.Resizes, fmt.Sprintf("%dx%d", ctrl.Cols, ctrl.Rows))
+	s.mu.Unlock()
 }
 
 func (s *Server) execFunc() Exec {
@@ -788,18 +821,22 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request, sb *Sandbox, r
 		return
 	}
 	switch {
+	case sid == "" && r.Method == http.MethodGet:
+		list := models.SessionList{Sessions: []models.Session{}}
+		for _, session := range sb.Sessions {
+			list.Sessions = append(list.Sessions, session.Session)
+		}
+		sort.Slice(list.Sessions, func(i, j int) bool { return list.Sessions[i].ID < list.Sessions[j].ID })
+		writeJSON(w, http.StatusOK, list)
 	case sid == "" && r.Method == http.MethodPost:
 		var req models.CreateSessionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeErr(w, http.StatusBadRequest, "invalid JSON body")
 			return
 		}
-		for _, existing := range sb.Sessions {
-			if existing.Name == req.Name {
-				writeJSON(w, http.StatusOK, existing.Session)
-				return
-			}
-		}
+		// Like toolboxd, a create always starts a new session, even when
+		// one with the name exists; callers that want reuse list first.
+		s.SessionCreates = append(s.SessionCreates, req)
 		id := fmt.Sprintf("ses-%d", len(sb.Sessions)+1)
 		status := models.SessionStatusRunning
 		exitCode := 0
@@ -809,7 +846,11 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request, sb *Sandbox, r
 			status = models.SessionStatusExited
 			exitCode, _ = strconv.Atoi(strings.TrimSpace(n))
 		}
-		session := &Session{Session: models.Session{ID: id, Name: req.Name, Argv: []string{"/bin/sh", "-c", req.Command}, Status: status, ExitCode: exitCode}}
+		argv := []string{"/bin/sh", "-c", req.Command}
+		if req.Command == "" {
+			argv = []string{"/bin/bash", "-l"}
+		}
+		session := &Session{Session: models.Session{ID: id, Name: req.Name, Argv: argv, PTY: req.PTY, Status: status, ExitCode: exitCode, CreatedAt: sessionEpoch.Add(time.Duration(len(sb.Sessions)) * time.Second)}}
 		session.Log = []byte("started " + req.Command + "\n")
 		sb.Sessions[id] = session
 		writeJSON(w, http.StatusCreated, session.Session)
@@ -853,6 +894,13 @@ func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sb *Sandb
 		writeErr(w, http.StatusNotFound, "session not found")
 		return
 	}
+	s.mu.Lock()
+	failAttach := s.FailAttach
+	s.mu.Unlock()
+	if failAttach {
+		writeErr(w, http.StatusInternalServerError, "attach failed")
+		return
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
@@ -863,8 +911,13 @@ func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sb *Sandb
 	ready := s.AttachReady
 	exitSignal := s.AttachExitSignal
 	drop := s.DropAttach
+	live := s.LiveAttach
 	s.mu.Unlock()
 	if drop {
+		return
+	}
+	if live {
+		s.liveAttach(conn, session, logCopy)
 		return
 	}
 	if hang {
@@ -884,6 +937,79 @@ func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sb *Sandb
 	_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{1}, logCopy...))
 	_ = conn.WriteJSON(map[string]any{"type": "exit", "code": 0, "signal": exitSignal})
 }
+
+// liveAttach runs an interactive attach (LiveAttach).
+func (s *Server) liveAttach(conn *websocket.Conn, session *Session, replay []byte) {
+	var writeMu sync.Mutex
+	out := func(stream byte, b []byte) {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{stream}, b...))
+	}
+	if len(replay) > 0 {
+		out(1, replay)
+	}
+	stdinR, stdinW := io.Pipe()
+	detached := make(chan struct{})
+	go func() {
+		defer close(detached)
+		defer stdinW.Close()
+		for {
+			msgType, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if msgType == websocket.BinaryMessage {
+				if _, err := stdinW.Write(data); err != nil {
+					return
+				}
+				continue
+			}
+			var ctrl control
+			if json.Unmarshal(data, &ctrl) != nil {
+				continue
+			}
+			switch ctrl.Type {
+			case "resize":
+				s.recordResize(ctrl)
+			case "signal":
+				s.mu.Lock()
+				s.Signals = append(s.Signals, ctrl.Signal)
+				s.mu.Unlock()
+			case "close":
+				s.mu.Lock()
+				s.Detaches++
+				s.mu.Unlock()
+				return
+			}
+		}
+	}()
+	s.mu.Lock()
+	exec := s.execFunc()
+	command := strings.Join(session.Argv[min(2, len(session.Argv)):], " ")
+	s.mu.Unlock()
+	code, signal := exec(command, stdinR, out, detached)
+	select {
+	case <-detached:
+		return // the session keeps running; nothing is reported
+	default:
+	}
+	writeMu.Lock()
+	_ = conn.WriteJSON(map[string]any{"type": "exit", "code": code, "signal": signal})
+	writeMu.Unlock()
+}
+
+// AddSession registers a session in a fake sandbox, as one started by
+// another client (an SSH login, an earlier `aerolvm shell`) would be.
+func (s *Server) AddSession(sandboxID string, session models.Session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sandboxes[sandboxID].Sessions[session.ID] = &Session{Session: session}
+}
+
+// sessionEpoch dates fake sessions; each one is a second newer than the
+// last, so "newest" is well defined.
+var sessionEpoch = time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 
 // AppendSessionLog adds output to a fake session's log.
 func (s *Server) AppendSessionLog(sandboxID, sessionID string, b []byte) {
