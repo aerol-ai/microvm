@@ -162,7 +162,7 @@ These shells are [terminal sessions](/sessions/), so the SDKs can see and manage
 
 Normal output is data. Progress, notes and errors go to the error stream (stderr).
 
-Add `--json` to a command, or set `AEROLVM_OUTPUT=json` once, to get one JSON document instead. `exec --json` waits for the command and prints its `exit_code`, `stdout` and `stderr`. Long output keeps its first 4 KB and last 12 KB.
+Add `--json` to any command, or set `AEROLVM_OUTPUT=json` once, to get one JSON document instead. `exec --json` waits for the command and prints its `exit_code`, `stdout` and `stderr`. Long output keeps its first 4 KB and last 12 KB.
 
 With `--json`, errors look like this:
 
@@ -205,90 +205,6 @@ Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`. Find them w
 
 `--debug` prints every API request and response status to stderr. The token is hidden.
 
-## Same thing from the SDK
-
-Steps 1, 2 and 5 of [your first sandbox](#your-first-sandbox) in each SDK: get or create a sandbox named `build-box`, run a command, and delete it.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox =
-      (await client.getByName("build-box")) ??
-      (await client.create({ name: "build-box", image: "python:3.12" }));
-
-    const result = await sandbox.exec("python -V");
-    console.log(result.exitCode, result.stdout);
-
-    await sandbox.destroy();
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.get_by_name("build-box") or client.create(
-        name="build-box",
-        image="python:3.12",
-    )
-
-    result = sandbox.exec("python -V")
-    print(result["exitCode"], result["stdout"])
-
-    sandbox.destroy()
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.GetByName(ctx, "build-box")
-    if errors.Is(err, microvm.ErrNotFound) {
-        sandbox, err = client.Create(ctx, sdktypes.CreateSandboxOptions{
-            Name:  "build-box",
-            Image: "python:3.12",
-        })
-    }
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    result, err := sandbox.ExecCommand(ctx, "python -V")
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println(result.ExitCode, result.Stdout)
-
-    _ = sandbox.Destroy(ctx)
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = match client.get_by_name("build-box")? {
-        Some(sandbox) => sandbox,
-        None => client.create(CreateOptions {
-            name: Some("build-box".into()),
-            image: "python:3.12".into(),
-            ..Default::default()
-        })?,
-    };
-
-    let result = sandbox.exec("python -V")?;
-    println!("{} {}", result.exit_code, result.stdout);
-
-    sandbox.destroy()?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.getByName("build-box").orElseGet(() -> {
-        CreateOptions options = new CreateOptions().setImage("python:3.12");
-        options.name = "build-box";
-        return client.create(options);
-    });
-
-    ExecResult result = sandbox.exec("python -V");
-    System.out.println(result.exitCode + " " + result.stdout);
-
-    sandbox.destroy();
-    ```
-  </TabItem>
-</Tabs>
 
 If two programs race to create the same name, both calls succeed. One creates the sandbox. The other gets HTTP 409 (Conflict) and should look the name up again. The CLI does that for you.
 
