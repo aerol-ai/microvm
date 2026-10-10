@@ -9,6 +9,25 @@ A GPU sandbox can use the graphics card (GPU) of the server it runs on. Use one 
 
 GPU sandboxes are normal container sandboxes (`runtime: "docker"`, the default). gVisor, Firecracker, WebAssembly and V8 isolate sandboxes cannot use a GPU. If you ask for a GPU together with `runtime: "gvisor"`, the create call fails with an error.
 
+## How it works
+
+```mermaid
+flowchart TB
+    Server["sandboxd<br/>(the AerolVM server)"] --> Count["GPU count<br/>(hands out each GPU once)"]
+    Server --> Engine["Container engine"]
+    Engine --> Hook["NVIDIA Container Toolkit<br/>or AMD ROCm devices"]
+    Hook --> Box
+    subgraph Box["Container sandbox"]
+        Code["Your CUDA or ROCm code"]
+    end
+    Box -- "the real device, passed through" --> GPU["The server's GPU"]
+```
+
+1. **A GPU sandbox is a normal [container](/container-sandbox/).**
+2. **The server counts its GPUs** and refuses requests beyond that number, so two sandboxes never get the same GPU by accident.
+3. **The container engine passes the real GPU device into the container.** For NVIDIA, the NVIDIA Container Toolkit also adds the driver libraries.
+4. **Programs inside see the actual GPU,** so CUDA and ROCm programs work as they do on the server itself.
+
 ## What the server needs
 
 | GPU maker | `vendor` value | What the server needs |

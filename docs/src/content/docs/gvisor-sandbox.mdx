@@ -11,6 +11,25 @@ Choose gVisor for code you do not trust, such as code written by an AI model. It
 
 gVisor works on any normal Linux server or cloud VM. It does not need bare-metal hardware.
 
+## How it works
+
+```mermaid
+flowchart TB
+    Server["sandboxd<br/>(the AerolVM server)"] --> Engine["Container engine<br/>(Docker or containerd)"]
+    Engine --> Runsc["runsc<br/>(gVisor, in place of runc)"]
+    Runsc --> Box
+    subgraph Box["gVisor sandbox"]
+        Code["Your code"] -- "system calls" --> Sentry["gVisor's own kernel<br/>(runs as a normal program)"]
+    end
+    Sentry -- "a few, filtered calls" --> Kernel["The server's Linux kernel"]
+```
+
+1. **The start is the same as a [container](/container-sandbox/).** The server asks the container engine to start your image.
+2. **The engine uses `runsc` in place of `runc`.** That is the only change.
+3. **gVisor runs its own kernel inside the sandbox,** as a normal program. Your code's system calls go to it, not to the server's kernel.
+4. **Only a few calls reach the real kernel.** gVisor answers most calls itself and passes on a small, filtered set. A kernel bug is much harder to reach.
+5. **toolboxd still runs inside,** so commands, files and terminals work as they do in a container.
+
 ## What the server needs
 
 The server operator installs gVisor with the `--with-gvisor` installer flag. The server's Linux must use cgroup v2 and systemd (cgroup v2 is how Linux limits a program's CPU and memory). Ubuntu 22.04 and newer have both by default. See [For server operators](#for-server-operators).

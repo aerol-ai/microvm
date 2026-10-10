@@ -11,9 +11,31 @@ The module reaches files, the clock and the network through WASI (the WebAssembl
 
 Choose WASM when you want sandboxes that start very fast and use little memory, and your code can be compiled to WebAssembly. With the server's default settings, creating a WASM sandbox took about 22 ms on the server (median) on our three-server test cluster. Most creates take 20 to 50 ms.
 
+## How it works
+
+```mermaid
+flowchart TB
+    Server["sandboxd<br/>(the AerolVM server)"] --> Driver["WASM driver"]
+    Driver --> Cache["Module cache"]
+    Driver --> Worker
+    subgraph Worker["Worker process (one per sandbox)"]
+        Runtime["wazero<br/>(WebAssembly runtime)"] --> Module["Your WASM module"]
+    end
+    Server -- "Unix socket: exec, files" --> Worker
+    Module -- "network calls" --> Mediated["The server makes the connection<br/>and applies your rules"]
+```
+
+1. **There is no container and no kernel of its own.** Your code is a WebAssembly module.
+2. **Each sandbox gets its own worker process,** which runs the module in the wazero WebAssembly runtime. The module can only do what that runtime allows. It makes no system calls of its own.
+3. **The server talks to the worker over a Unix socket,** a private channel between two programs on one machine. Commands and files go through it.
+4. **The server makes network connections for the module** (host-mediated), so it can apply your network rules to each one.
+5. **A `passivatable` sandbox can be saved to disk** as a checkpoint and brought back later. See [Keep the sandbox across server restarts](#keep-the-sandbox-across-server-restarts).
+
+For the details, see [WASM architecture](/wasm-architecture/).
+
 ## What the server needs
 
-WASM needs no special hardware. It is off by default: the server operator turns it on with `SB_ENABLE_WASM=true` (see [For server operators](#for-server-operators)). Until they do, a create fails with `runtime "wasm" requires SB_ENABLE_WASM=true`.
+WASM needs no special hardware. It is off by default: the server operator turns it on with `SB_ENABLE_WASM=true` (see [Turn on WebAssembly](/getting-started/installer-options/#turn-on-webassembly)). Until they do, a create fails with `runtime "wasm" requires SB_ENABLE_WASM=true`.
 
 ## Create a WASM sandbox
 
