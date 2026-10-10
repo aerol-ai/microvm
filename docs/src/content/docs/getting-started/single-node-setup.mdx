@@ -1,51 +1,89 @@
 ---
 title: Install on a server
-description: Install AerolVM on one Linux server with your own domain, HTTPS, and public web links for sandboxes.
+description: Put AerolVM on one cloud server with your own domain, so your apps can reach it and sandboxes get HTTPS links.
 ---
 
 import { Aside } from '@astrojs/starlight/components';
 
-This page installs AerolVM on one Linux server or VPS (a rented virtual server). Use it when people on the internet need to open a sandbox's web page, at a link like `https://<sandbox-id>-3000.sandbox.example.com`.
+This guide puts AerolVM on one Linux server in the cloud. When you finish, your apps can create sandboxes from anywhere. Each sandbox can also share a web page at its own link, such as `https://<sandbox-id>-3000.sandbox.example.com`.
 
-The installer also sets up HTTPS for you. It uses Caddy, a web server that gets the certificates and sends each link to the right sandbox. It also starts an SSH gateway, so you can [log in to sandboxes over SSH](/ssh-access/).
+It takes about 20 minutes. You copy and paste every command.
 
-## Before you start
+<Aside type="tip">
+Just want to try AerolVM? The [Quickstart](/quick-start/) runs it on your own computer in five minutes, with no server or domain.
+</Aside>
 
-- **A Linux server that uses `apt`,** such as Ubuntu or Debian, with a public IP address. You need `sudo`. The installer adds Docker if it is missing.
-- **A domain name managed by Cloudflare,** such as `sandbox.example.com`. Cloudflare is the only DNS provider (the service that maps names to IP addresses) the installer supports today.
-- **A secret token you pick.** It works like a password for your server.
+## What you need
+
+- **A Linux server with a public IP address.** Rent one from any cloud, such as AWS, DigitalOcean or Hetzner. Choose Ubuntu 22.04 or newer. Two CPUs and 4 GB of memory is enough to start.
+- **A domain name on Cloudflare,** such as `example.com`. AerolVM uses a part of it, such as `sandbox.example.com`. Cloudflare is the only domain service the installer works with today.
+- **A terminal on your computer,** to log in to the server.
+
+No domain yet? You can [try AerolVM on the server's IP address](/getting-started/installer-options/#try-it-without-a-domain) first. It has no HTTPS, so use it only for testing.
 
 ## Install the server
 
 ### Step 1: Point your domain at the server
 
-Add two DNS records in Cloudflare. The second one, with `*`, sends every subdomain to the same server.
+Find your server's public IP address in your cloud's dashboard. It looks like `203.0.113.42`.
 
-```text
-A     sandbox.example.com   -> <server-ip>
-A     *.sandbox.example.com -> <server-ip>
-```
+In Cloudflare, open your domain and go to **DNS** → **Records**. Add these two DNS records. They tell the internet which server a name belongs to.
 
-### Step 2: Open the firewall ports
+| Type | Name | IPv4 address | Proxy status |
+|---|---|---|---|
+| `A` | `sandbox` | Your server's IP | DNS only |
+| `A` | `*.sandbox` | Your server's IP | DNS only |
 
-Open these inbound TCP ports in your firewall or cloud security group:
+The first record is for the AerolVM API. The second one, with `*`, sends every sandbox link to the same server.
 
-| Port | What uses it | Open it? |
-|---|---|---|
-| `443` | The HTTPS API and sandbox web links | Yes |
-| `2220` | The SSH gateway | Yes, if you use [SSH access](/ssh-access/) |
-| `22000` to `23000` | Raw TCP ports you share from sandboxes | Only if you use [TCP ports](/tcp-ports/) |
-| `21212` | The AerolVM API. Caddy forwards HTTPS traffic to it. | No, keep it closed |
-| `2019` | Caddy's admin API. It listens on `127.0.0.1` only. | No, never |
+<Aside type="caution">
+Click the orange cloud so it turns gray and says **DNS only**. Through Cloudflare's proxy, sandbox links, SSH and TCP ports do not work.
+</Aside>
+
+### Step 2: Open the firewall
+
+In your cloud's firewall settings, allow incoming TCP traffic on these ports. AWS calls these settings a security group.
+
+| Port | Why |
+|---|---|
+| `443` | HTTPS for the AerolVM API and sandbox links. Always open it. |
+| `2220` | Optional. Lets you [log in to sandboxes over SSH](/ssh-access/). |
+| `22000` to `23000` | Optional. For [TCP ports](/tcp-ports/) you share from sandboxes, such as a database. |
+
+Keep port `22` open so you can log in to the server. Keep every other port closed.
 
 ### Step 3: Create a Cloudflare API token
 
-Caddy proves you own the domain by adding a DNS record through Cloudflare's API. In Cloudflare, create an API token for your domain's zone with these two permissions:
+The installer gets free HTTPS certificates from Let's Encrypt. To prove you own the domain, it adds a short-lived record to your DNS. This token lets it do that.
 
-- `Zone` → `Zone` → `Read`
-- `Zone` → `DNS` → `Edit`
+1. In Cloudflare, go to **My Profile** → **API Tokens** and click **Create Token**.
+2. Next to **Edit zone DNS**, click **Use template**.
+3. Under **Permissions**, click **Add more** and choose **Zone** → **Zone** → **Read**.
+4. Under **Zone Resources**, choose your domain.
+5. Click **Continue to summary**, then **Create Token**.
+6. Copy the token and keep it somewhere safe. Cloudflare shows it only once.
 
-### Step 4: Run the installer
+### Step 4: Log in to your server
+
+From your computer's terminal, connect to the server with SSH. Use the IP address from step 1:
+
+```bash
+ssh ubuntu@203.0.113.42
+```
+
+The user name depends on your cloud. It is `ubuntu` on AWS, and `root` on DigitalOcean and Hetzner. If your cloud gave you a key file, add `-i` and its path, such as `ssh -i my-key.pem ubuntu@203.0.113.42`.
+
+Run the next step on the server.
+
+### Step 5: Run the installer
+
+First, make a secret token for AerolVM. Your apps send it with every request, like a password.
+
+```bash
+openssl rand -hex 32
+```
+
+Copy the long line it prints. Then run the installer, with your own three values in place of the examples:
 
 ```bash
 curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
@@ -55,168 +93,64 @@ curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
     --dns-api-token your-cloudflare-api-token
 ```
 
-When `--domain` is set, `--dns-provider` and `--dns-api-token` are required. If you leave out `--pat-token`, the installer makes a random token and prints it once at the end.
+- `sandbox.example.com`: your domain from step 1.
+- `your-secret-pat`: the token you just made.
+- `your-cloudflare-api-token`: the token from step 3.
 
-Caddy then gets exactly two certificates from Let's Encrypt (a free certificate service): one for `sandbox.example.com` and one wildcard for `*.sandbox.example.com`. The wildcard covers every sandbox link. Caddy renews both on its own.
+The installer takes a few minutes. It adds Docker if the server does not have it. When it is done, it prints a summary that starts like this:
 
-### Step 5: Connect your code
+```text
+AerolVM installed
+PAT token: your-secret-pat
+Use header: Authorization: Bearer <PAT token>
+API URL: https://sandbox.example.com
+Health URL: https://sandbox.example.com/health
+```
 
-The API is now at `https://sandbox.example.com`. Point the SDK at it:
+The server starts again by itself if the machine restarts.
+
+### Step 6: Check that it works
+
+Open your health URL in a web browser:
+
+```text
+https://sandbox.example.com/health
+```
+
+You should see one line of text that starts with `{"status":"ok"`. If the page does not load yet, wait two minutes and try again. The server may still be getting its HTTPS certificate.
+
+### Step 7: Connect your code
+
+Go back to your own computer. Tell the SDK where your server is:
 
 ```bash
 export SB_API_URL=https://sandbox.example.com
 export SB_PAT_TOKEN=your-secret-pat
 ```
 
-See [SDK setup](/sdk-setup/) to install the SDK and check the connection.
+Now do [steps 3 and 4 of the Quickstart](/quick-start/#step-3-install-the-sdk-for-your-language). They install the SDK and run your first sandbox, now on your server.
 
-## How sandbox web links look
+## If something goes wrong
 
-Each sandbox can have a link of its own, and a link for each port you share:
-
-```text
-https://<sandbox-id>.sandbox.example.com
-https://<sandbox-id>-<port>.sandbox.example.com
-```
-
-New sandboxes are private. A link works only after you share a port. See [Share a web app](/preview/).
-
-## Installer options
-
-Add any of these to the command in step 4.
-
-| Option | What it does | Default |
-|---|---|---|
-| `--domain <domain>` | The base domain for the API and sandbox links. | None. Without it the server uses [IP mode](#try-it-without-a-domain). |
-| `--pat-token <token>` | The secret token your apps send with every request. | A random token, printed once |
-| `--dns-provider cloudflare` | The DNS provider Caddy uses to get certificates. | None. Required with `--domain`. |
-| `--dns-api-token <token>` | The Cloudflare API token from step 3. | None. Required with `--domain`. |
-| `--acme-email <email>` | Your email for Let's Encrypt. It warns you before a certificate expires or is revoked. | None, but we recommend it |
-| `--public-host <host-or-ip>` | The public address to use when you have no domain. | The server's first IP address |
-| `--version <tag>` | The release to install, such as `v0.6.4`. | `latest` |
-| `--idle-timeout-min <minutes>` | Stops running sandboxes after this many idle minutes. It skips sandboxes that set their own lifecycle. | `0` (off) |
-| `--node-name <name>` | A friendly name for this server, shown in the cluster table of the [dashboard](/dashboard/). | Empty |
-
-The flags for extra sandbox kinds and GPUs are in the next two sections. To see every option, run:
-
-```bash
-curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
-```
-
-## Add more kinds of sandbox
-
-A plain container is the default. You can add stronger walls between the sandbox and the server.
-
-| Kind | How to turn it on | Notes |
-|---|---|---|
-| Containers on Docker | On by default | Works with the most images. |
-| Containers on containerd | `--with-containerd-engine` | Runs containers through containerd (the engine Docker itself is built on) instead of Docker. Needs containerd's socket at `/run/containerd/containerd.sock`. |
-| [gVisor](/gvisor-sandbox/) | `--with-gvisor` | Adds a user-space kernel: a layer that handles the sandbox's requests to the operating system, so they never reach the server's kernel directly. |
-| [V8 isolate](/isolate-sandbox/) | `--with-isolate` | Installs Cloudflare's `workerd` and turns on JavaScript isolates. Off by default. |
-| [Firecracker](/firecracker-sandbox/) | No flag. Set it up by hand. | Each sandbox is a small virtual machine. Needs a bare-metal server. See [For server operators](#turn-on-firecracker). |
-| [WebAssembly (WASM)](/wasm-sandbox/) | No flag. Set `SB_ENABLE_WASM=true`. | Runs WASI modules (WebAssembly programs with file and clock access). See [For server operators](#turn-on-webassembly). |
-| Kata Containers | Not available | Create requests fail with `runtime not yet implemented on this build`. |
-
-For example, this installs the server with gVisor:
-
-```bash
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-    --domain sandbox.example.com \
-    --pat-token your-secret-pat \
-    --dns-provider cloudflare \
-    --dns-api-token your-cloudflare-api-token \
-    --with-gvisor
-```
-
-<Aside type="caution" title="gVisor limits">
-gVisor cannot run privileged containers, and it ignores the sandbox disk limit (`disk_gb`). It needs cgroup v2 (the Linux feature that limits CPU and memory) and systemd. Ubuntu 22.04 and newer have both. GPUs do not work with gVisor.
-</Aside>
-
-## Add GPU support
-
-Add the flag for your GPU to the command in step 4.
-
-| GPU | Installer flag | What you need first |
-|---|---|---|
-| NVIDIA | `--with-nvidia-gpu` | NVIDIA drivers, with a working `nvidia-smi`. The flag installs the NVIDIA Container Toolkit and restarts Docker. |
-| AMD | `--with-amd-gpu` | An `x86_64` server with the `amdgpu` kernel module loaded, so `/dev/kfd` exists. The flag installs AMD ROCm. |
-| Apple Silicon | No flag | Works only in a [local install on a Mac](/getting-started/local-setup/), through Docker Desktop. |
-
-A sandbox cannot use a GPU and gVisor at the same time. To create a sandbox with a GPU, see [GPU](/gpu-sandboxes/).
-
-## Try it without a domain
-
-You can install without `--domain` to try AerolVM on a bare IP address. The installer calls this IP mode.
-
-```bash
-curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
-    --public-host 203.0.113.42 \
-    --pat-token your-secret-pat
-```
-
-- The API is at `http://203.0.113.42:21212`. Open port `21212`, and port `80` for sandbox links.
-- Sandbox links use paths instead of subdomains: `http://203.0.113.42/<sandbox-id>/` and `http://203.0.113.42/<sandbox-id>/proxy/<port>/`.
-- [TLS ports](/tcp-vs-tls-ports/) (encrypted ports that share port `443`) need a domain. Use [TCP ports](/tcp-ports/) instead.
-
-<Aside type="caution">
-IP mode has no HTTPS. Your token and data cross the network unencrypted. Use it only for testing.
-</Aside>
-
-## When one server is not enough
-
-A [cluster](/cluster-setup/) spreads sandboxes across many servers. It sends each request to the server that runs the sandbox. If a server fails, sandboxes that ask for it are recreated on another one. See [Durability and failover](/durability/).
-
-## For server operators
-
-### What the installer sets up
-
-- Puts `sandboxd` (the server) and `toolboxd` (the helper inside each sandbox) in `/usr/local/bin`. Change the folder with `--install-prefix`.
-- Writes settings to `/etc/sandboxd/sandboxd.env`, readable only by root. After you edit it, run `sudo systemctl restart sandboxd`.
-- Keeps state in `/var/lib/sandboxd`.
-- Installs a custom Caddy build with TCP routing (`caddy-l4`) and the Cloudflare DNS plugin. Its config is `/etc/caddy/Caddyfile`. The Cloudflare token goes in `/etc/default/caddy`.
-- Registers the systemd services `sandboxd`, `caddy` and `aerolvm-egress-gateway`, which handles sandboxes' outbound traffic. If `sandboxd` crashes, systemd restarts it after 5 seconds, up to 10 times in 5 minutes.
-- Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds.
-- Installs the tools for [cloud storage](/external-storage/): `fuse3`, `sshfs`, `nfs-common`, `rclone` and `mount-s3`.
-
-In domain mode, `caddy-l4` holds port `443`. It reads the hostname that each client sends at the start of a TLS connection (SNI) and routes on it. Normal HTTPS sites run on `127.0.0.1:8443` behind it. This is why [TLS ports](/tcp-vs-tls-ports/) work without extra setup.
-
-The SSH gateway listens on `0.0.0.0:2220`. Change it with `SB_SSH_LISTEN_ADDR`.
-
-### What the extra flags change
-
-- `--with-gvisor` installs `runsc` and `containerd-shim-runsc-v1`, registers `runsc` in `/etc/docker/daemon.json`, and restarts Docker if that file changed. It also writes `SB_HOST_RUNTIMES=docker,gvisor`. Use `--runsc-path` to point at a `runsc` you already have.
-- `--with-containerd-engine` installs the CNI networking plugins (`bridge`, `host-local`, `loopback`) in `/opt/cni/bin` and writes `SB_CONTAINER_ENGINE=containerd`. Docker stays installed, so older sandboxes keep working.
-- `--with-isolate` installs `workerd`, Cloudflare's program for running JavaScript, to `/usr/local/bin/workerd`. The version is pinned and its checksum is checked. It writes `SB_ENABLE_ISOLATE=true` and creates a `sandboxd-isolate` system user and the jail folder `/srv/isolate-jail`, so each workerd process runs locked down. Use `--workerd-path` to point at a `workerd` you already have.
-
-### Turn on Firecracker
-
-There is no installer flag for Firecracker. The server needs `/dev/kvm`, which usually means a bare-metal machine. Then:
-
-1. Put the `firecracker` and `jailer` programs in `/usr/local/bin`.
-2. Put a guest Linux kernel at `/var/lib/sandboxd/firecracker/vmlinux`. Put its config next to it as `vmlinux.config`. The config must contain `CONFIG_VMGENID=y`.
-3. Install `skopeo` and `umoci`. They turn container images into virtual machine disks.
-4. Add `SB_ENABLE_FIRECRACKER=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`.
-
-If your files live elsewhere, settings such as `SB_FIRECRACKER_BINARY`, `SB_JAILER_BINARY` and `SB_FIRECRACKER_KERNEL` point to them. The [cluster setup](/cluster-setup/) does all of this for you with `with_firecracker = true`. Next, build images with [Firecracker templates](/firecracker-templates/).
-
-### Turn on WebAssembly
-
-Add `SB_ENABLE_WASM=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`. The server looks for modules in `/var/lib/sandboxd/wasm/modules` (change it with `SB_WASM_MODULES_DIR`). See [WASM modules](/wasm-modules/).
-
-### More installer options
-
-| Option | What it does |
+| What you see | What to do |
 |---|---|
-| `--acme-ca <url>` and `--acme-ca-root <pem>` | Get certificates from your own ACME server (the protocol Let's Encrypt uses) instead of Let's Encrypt. For private networks that cannot reach the internet. |
-| `--tls-issuer internal` | Caddy's own certificate authority signs every certificate. No DNS provider needed, but clients must trust Caddy's root certificate. For labs. |
-| `--caddy-storage-s3` and the `--caddy-storage-s3-*` options | Share certificates between several servers through an S3 bucket. |
-| `--ingress-proxy-routing` | Route sandbox links without writing a Caddy route for each sandbox. Off by default. |
-| `--build-from-source` | Build `sandboxd` and `toolboxd` from the current checkout instead of downloading them. |
+| The installer stops with `--domain requires --dns-provider and --dns-api-token` | Add `--dns-provider cloudflare` and `--dns-api-token` to the command. |
+| The health page does not load | Check that both DNS records point at the server's IP and say **DNS only**. Check that port `443` is open. |
+| The browser warns about the certificate | Wait two minutes. If it keeps happening, check the token permissions from step 3. |
+| The health page shows `"status":"degraded"` | Docker or Caddy (the web server the installer adds) is not working. Run `sudo systemctl status docker caddy` to see which one. |
+| Your code gets a `401` or `unauthorized` error | `SB_PAT_TOKEN` does not match the server's token. |
+| You lost your token | On the server, run `sudo grep SB_PAT_TOKEN /etc/sandboxd/sandboxd.env`. |
+
+To see what the server is doing, read its logs on the server:
+
+```bash
+sudo journalctl -u sandboxd -n 50
+sudo journalctl -u caddy -n 50
+```
 
 ## Next steps
 
-- [SDK setup](/sdk-setup/): connect your code to the new server.
-- [Create and manage sandboxes](/sandboxes/): start, stop and delete sandboxes.
-- [Share a web app](/preview/): give a sandbox a public link.
+- [Share a web app](/preview/): give a sandbox a public HTTPS link.
 - [SSH access](/ssh-access/): log in to a running sandbox.
+- [Installer options](/getting-started/installer-options/): add gVisor, V8 isolates or GPUs, and see what the installer changed.
 - [Cluster setup](/cluster-setup/): grow past one server.
