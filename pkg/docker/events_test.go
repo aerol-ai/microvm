@@ -57,8 +57,43 @@ func TestRawDockerEventNormalize(t *testing.T) {
 			wantSandbox: wantSandboxID,
 		},
 		{
+			// API v1.52 (Docker 29) dropped the legacy status, id and from
+			// fields; the container ID is only in Actor.ID (UC-206).
+			name: "api v1.52 die without legacy fields",
+			payload: `{
+				"Type": "container",
+				"Action": "die",
+				"Actor": {"ID": "` + containerID + `", "Attributes": {"name": "` + sandboxName + `", "exitCode": "3"}},
+				"scope": "local",
+				"time": 1700000002,
+				"timeNano": 1700000002000000000
+			}`,
+			wantOK:      true,
+			wantAction:  "die",
+			wantExit:    3,
+			wantSandbox: wantSandboxID,
+		},
+		{
+			name: "both shapes, as API v1.22..v1.51 send",
+			payload: `{
+				"status": "stop",
+				"id": "` + containerID + `",
+				"Action": "stop",
+				"Actor": {"ID": "` + containerID + `", "Attributes": {"name": "` + sandboxName + `"}},
+				"time": 1700000003
+			}`,
+			wantOK:      true,
+			wantAction:  "stop",
+			wantSandbox: wantSandboxID,
+		},
+		{
 			name:    "missing id",
 			payload: `{"status":"die"}`,
+			wantOK:  false,
+		},
+		{
+			name:    "api v1.52 frame without an Actor ID",
+			payload: `{"Type":"container","Action":"die","Actor":{"Attributes":{"name":"` + sandboxName + `"}}}`,
 			wantOK:  false,
 		},
 		{

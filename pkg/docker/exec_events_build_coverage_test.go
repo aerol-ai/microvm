@@ -259,6 +259,31 @@ func TestStreamEvents(t *testing.T) {
 		}
 	})
 
+	t.Run("docker_29_frames", func(t *testing.T) {
+		// API v1.52 frames, as Docker 29 streams them: no status, id or
+		// from; the container ID only in Actor.ID. Each must arrive.
+		body := `{"Type":"container","Action":"stop","Actor":{"ID":"c29","Attributes":{"name":"/sb-29"}},"scope":"local","time":1700000000,"timeNano":1700000000000000000}` + "\n" +
+			`{"Type":"container","Action":"die","Actor":{"ID":"c29","Attributes":{"name":"/sb-29","exitCode":"0"}},"scope":"local","time":1700000001,"timeNano":1700000001000000000}` + "\n"
+		c := &Client{streamClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return textResponse(http.StatusOK, body), nil
+		})}}
+		out := make(chan DockerEvent, 4)
+		if err := c.StreamEvents(context.Background(), out); err != nil {
+			t.Fatalf("StreamEvents() = %v", err)
+		}
+		close(out)
+		var got []string
+		for ev := range out {
+			if ev.SandboxID != "sb-29" || ev.ContainerID != "c29" {
+				t.Fatalf("unexpected event %+v", ev)
+			}
+			got = append(got, ev.Action)
+		}
+		if strings.Join(got, ",") != "stop,die" {
+			t.Fatalf("events = %v, want stop,die", got)
+		}
+	})
+
 	t.Run("decode_error", func(t *testing.T) {
 		c := &Client{streamClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return textResponse(http.StatusOK, `{not json`), nil
