@@ -72,19 +72,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/lifecycle', 'Lifecycle'),
       link('/sandbox-env', 'Secured Env variables'),
       link('/durability', 'Durability and failover'),
+      link('/exec-streaming', 'Run commands'),
+      link('/file-system', 'Handle Files'),
+      link('/sessions', 'Terminal sessions'),
       link('/sandbox-tags', 'Tags'),
       link('/ssh-access', 'SSH access'),
       
-    ],
-  },
-  {
-    type: 'group',
-    label: 'Run Code and Files',
-    category: NavigationCategory.RUN_CODE,
-    entries: [
-      link('/exec-streaming', 'Run commands'),
-      link('/file-system', 'Files'),
-      link('/sessions', 'Terminal sessions'),
     ],
   },
   {

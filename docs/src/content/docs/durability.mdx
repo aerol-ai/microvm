@@ -5,17 +5,17 @@ description: Keep a sandbox's data safe through restarts and failures, and choos
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Files a sandbox writes to its own disk last only as long as the sandbox. That covers `/tmp`, the working folder, and anywhere else that is not attached storage. If you delete the sandbox, its server crashes, or the cluster node running it dies, those files are gone.
+Files a sandbox writes to its own disk last only as long as the sandbox. That covers `/tmp`, the working folder, and anywhere else that is not attached storage. If you delete the sandbox, or the cluster node running it dies, those files are gone. A server restart keeps them for container and Firecracker sandboxes, but not for WebAssembly and V8 isolate sandboxes by default.
 
-To keep data, write it to [attached cloud storage](/external-storage/). Treat the sandbox itself as replaceable: if you lose one, create a new one and attach the same storage. Cloud workspaces such as GitHub Codespaces, Daytona and Coder work the same way.
+To keep data, write it to [attached cloud storage](/external-storage/). Treat the sandbox itself as replaceable: if you lose one, create a new one and attach the same storage.
 
 A cluster is a group of AerolVM servers. In a cluster, you can also ask for a sandbox to be rebuilt on a healthy node when its node dies.
 
 ## What survives, and what does not
 
-| What | You delete the sandbox | The server crashes (one server) | A cluster node dies |
+| What | You delete the sandbox | The server restarts or crashes (one server) | A cluster node dies |
 |---|---|---|---|
-| Files on the sandbox's own disk | Lost | Lost | Lost |
+| Files on the sandbox's own disk | Lost | Kept for container and Firecracker sandboxes. Lost for WebAssembly and V8 isolate sandboxes by default. | Lost |
 | Files on attached storage (S3, NFS, SSHFS, rclone) | Kept (they live outside the sandbox) | Kept | Kept. A new sandbox can attach them again. |
 | Sandbox ID | Gone. A new sandbox gets a new ID. | Kept if the server saved its record | Lost by default (`410 Gone`). With recreate: kept, if the rebuild works. |
 | Environment variables, image, CPU and memory | Gone | Restored on `start` | Lost by default. With recreate: restored from the cluster's copy. |
@@ -25,9 +25,80 @@ A cluster is a group of AerolVM servers. In a cluster, you can also ask for a sa
 | TCP host port number | Gone | Same server, same port | Lost by default. With recreate: the same port is reused when it is free. |
 | Public URL | Removed | Restored on `start` | Lost by default. With recreate: the URL stays the same and now points at the new node. |
 
+## The handoff: what happens when a node dies
+
+In a cluster, a sandbox created with [failover](#rebuild-sandboxes-when-a-cluster-node-dies) moves to a healthy node when its node dies. It keeps its identity: the same ID, the same public address, the same ports and the same environment variables. Your app keeps using the address it already has.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App as Your app
+    participant A as Node A (runs the sandbox)
+    participant R as Shared record (server nodes)
+    participant B as Node B (backup)
+    rect rgba(58, 161, 255, 0.10)
+        Note over App,B: Running on Node A
+        App->>A: create with env and failover: recreate
+        A->>R: where it runs and its settings, no secrets
+        A->>B: sealed copy of env and passwords
+        B-->>A: copy stored
+        A-->>App: sandbox ready
+    end
+    Note over A: Node A dies
+    rect rgba(40, 199, 111, 0.12)
+        Note over App,B: The handoff
+        R->>R: no word from Node A for 30 seconds
+        R->>B: Node B owns the sandbox now
+        B->>B: open sealed copy, rebuild
+        B->>R: same ID, same ports, same address
+        App->>B: next request, same address, now served by Node B
+    end
+```
+
+What moves with the sandbox:
+
+| | On Node A | After the handoff, on Node B |
+|---|---|---|
+| Sandbox ID | `sb-...` | The same |
+| Public URL | `https://<sandbox-id>-3000.<domain>` | The same, now pointing at Node B |
+| TCP ports | `<cluster-host>:22041` | The same port, when it is free on Node B |
+| Environment variables | Set at create | The same, from the sealed copy |
+| Image, CPU, memory, lifecycle timers | Set at create | The same, from the shared record |
+| Attached cloud storage | Mounted | Mounted again |
+| Running programs and memory | Running | Started fresh |
+| Files on the sandbox's own disk | Present | Gone. Keep files that matter on [attached storage](#keep-your-files-on-attached-storage). |
+
+<Aside>
+This is a rebuild, not a live migration. Node B starts the sandbox again from its image, so running programs and local files start over. Everything your app uses to reach and set up the sandbox stays the same.
+</Aside>
+
+### How long it takes
+
+- **The cluster waits 30 seconds first.** A node must be silent that long before anything moves, so a short network blip does not trigger a handoff. Operators can change this with `SB_DEAD_OWNER_GRACE`.
+- **Then the new node takes over within about 5 seconds** and rebuilds the sandbox. A rebuild takes as long as a normal create, or longer if the node must download the image first.
+- **If a rebuild keeps failing,** 5 times in a row (about 25 seconds), the cluster hands the sandbox to another node.
+- **Requests during the handoff fail.** A request that arrives while the sandbox is moving can get `503` with "Sandbox placement in flux". Retry it.
+
+### Where the environment variables are
+
+- **In the shared record: never.** Every node can read that record, so the cluster strips every secret from it first.
+- **On the node that runs the sandbox:** encrypted, and tied to that one sandbox.
+- **On backup nodes:** a sealed copy, only for sandboxes with failover. Two backups by default. The create waits until at least one backup confirms its copy.
+- **During a handoff:** the sandbox can only move to a node that holds a sealed copy, and only that new owner opens it.
+
+See [Environment variables in a cluster](/sandbox-env/#in-a-cluster) for how the values are encrypted and audited.
+
+### How the cluster keeps track
+
+- **A shared record on the server nodes** says which node runs each sandbox. It also holds the sandbox's settings without secrets, its exposed ports, and a pointer to its sealed secrets. A change goes through only when most server nodes agree, so every node gives the same answer.
+- **Nodes check on each other constantly.** That is how the cluster learns a node has died.
+- **The [dashboard](/dashboard/)** shows each sandbox's owner node and state. A sandbox without failover whose node died shows as `orphaned`.
+
 ## Keep your files on attached storage
 
 Attach storage at the folder you want to keep. The server, not the sandbox, connects the storage, so your storage passwords never enter the sandbox. The data lives on its own, apart from any one sandbox or server.
+
+Attached storage works with Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes cannot attach it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -175,7 +246,7 @@ If your app can live without the sandbox's own disk but needs the same ID and th
 
 `failover.policy` is `none` (the default) or `recreate`.
 
-The cluster keeps a copy of each sandbox's create request: image, environment variables, resources, attached storage, lifecycle and failover policy. It also keeps the sandbox's sealed (encrypted) registry and storage passwords, and every port you exposed. When a node with a recreate sandbox dies, the cluster hands that sandbox to a healthy worker node that fits it. That worker rebuilds the sandbox with the same ID and exposes the same ports again.
+The cluster keeps each sandbox's create request in its shared record, with every secret removed: image, resources, attached storage, lifecycle and failover policy, plus every port you exposed. The environment variables and the registry and storage passwords travel separately, as a sealed (encrypted) copy that only backup nodes can open. When a node with a recreate sandbox dies, the cluster hands that sandbox to a healthy node that holds a sealed copy. That node rebuilds the sandbox with the same ID and exposes the same ports again. See [The handoff](#the-handoff-what-happens-when-a-node-dies).
 
 Good to know:
 
@@ -288,9 +359,9 @@ Durability only covers server restarts. Keeping files (attached storage) and los
 ## Limits
 
 - **Rebuilding is opt-in.** When a node dies, its sandboxes return `410 Gone` and your app must create new ones. Only sandboxes created with `failover.policy = "recreate"` are rebuilt.
-- **New ports take a moment to reach every node.** Public URLs and TCP ports are shared across the cluster. But ingress nodes (the nodes that receive outside traffic) refresh their routes on a timer. Right after a new `exposePort`, a request can briefly get `404` or `502`.
+- **New ports take a moment to reach every node.** Public URLs and TCP ports are shared across the cluster. But ingress nodes (the nodes that receive outside traffic) refresh their routes on a timer, up to about every 5 seconds. Right after a new `exposePort`, a request can briefly fail. Retry it.
 - **The sandbox's own disk is never copied.** Treat anything outside attached storage as a cache. If you need it after a crash, write it to attached storage.
-- **One server works the same way.** A crash can lose the sandbox's own disk there too. Attach storage for anything that must survive.
+- **One server keeps files across a restart, not across a lost disk.** Container and Firecracker sandboxes come back with their files after a restart. If the machine's disk is lost, so are they. Attach storage for anything that must survive.
 
 ## A pattern that works
 
@@ -299,7 +370,7 @@ Durability only covers server restarts. Keeping files (attached storage) and los
 3. Treat everything else in the sandbox as scratch space.
 4. In a cluster, have your app create a new sandbox when it gets `410 Gone`. The new sandbox attaches the same storage and picks up where the old one stopped.
 
-This works the same on one server, in a cluster, and on every runtime. The create request describes the sandbox, the storage holds the data, and the sandbox itself can be replaced.
+This works the same on one server and in a cluster, for Docker, gVisor and WebAssembly sandboxes. The create request describes the sandbox, the storage holds the data, and the sandbox itself can be replaced.
 
 ## Next steps
 
