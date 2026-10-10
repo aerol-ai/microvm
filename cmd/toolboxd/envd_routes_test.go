@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -186,6 +187,29 @@ func TestEnvdProcessRoutes(t *testing.T) {
 			t.Fatalf("update status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 		}
 
+		// Connect has to be attached before SendInput. The command is
+		// `read line` and then it exits, and a finished process is removed,
+		// so Connect answers 404. Under -race the shell wins that race
+		// (same shape as the signal case below). The first response header
+		// means lookup succeeded and the stream is open.
+		connectReqBody, _ := json.Marshal(map[string]any{"process": map[string]any{"tag": "connectable"}})
+		connectRR := httptest.NewRecorder()
+		connectWriter := &headerSignalRecorder{ResponseRecorder: connectRR, attached: make(chan struct{})}
+		connectReq := httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Connect", bytes.NewReader(encodeConnectEnvelopeForTest(connectReqBody)))
+		connectReq.Header.Set("Authorization", "Bearer toolbox-token")
+		connectReq.Header.Set("Content-Type", "application/connect+json")
+		connectDone := make(chan struct{})
+		go func() {
+			defer close(connectDone)
+			h.ServeHTTP(connectWriter, connectReq)
+		}()
+		select {
+		case <-connectWriter.attached:
+		case <-connectDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("connect did not attach")
+		}
+
 		inputBody := map[string]any{
 			"process": map[string]any{"tag": "connectable"},
 			"input":   map[string]any{"stdin": base64.StdEncoding.EncodeToString([]byte("hello-from-input\n"))},
@@ -199,16 +223,15 @@ func TestEnvdProcessRoutes(t *testing.T) {
 			t.Fatalf("send input status = %d, want 200; body=%s", rr.Code, rr.Body.String())
 		}
 
-		connectReqBody, _ := json.Marshal(map[string]any{"process": map[string]any{"tag": "connectable"}})
-		rr = httptest.NewRecorder()
-		req = httptest.NewRequest(http.MethodPost, envdPrefix+"/process.Process/Connect", bytes.NewReader(encodeConnectEnvelopeForTest(connectReqBody)))
-		req.Header.Set("Authorization", "Bearer toolbox-token")
-		req.Header.Set("Content-Type", "application/connect+json")
-		h.ServeHTTP(rr, req)
-		if rr.Code != http.StatusOK {
-			t.Fatalf("connect status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+		select {
+		case <-connectDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("connect did not finish after input")
 		}
-		envelopes := decodeConnectEnvelopesForTest(t, rr.Body.Bytes())
+		if connectRR.Code != http.StatusOK {
+			t.Fatalf("connect status = %d, want 200; body=%s", connectRR.Code, connectRR.Body.String())
+		}
+		envelopes := decodeConnectEnvelopesForTest(t, connectRR.Body.Bytes())
 		if len(envelopes) < 2 {
 			t.Fatalf("connect envelopes len = %d, want >=2", len(envelopes))
 		}
@@ -294,6 +317,19 @@ func TestEnvdProcessRoutes(t *testing.T) {
 			t.Fatalf("compressed envelope status = %d, want 400; body=%s", rr.Code, rr.Body.String())
 		}
 	})
+}
+
+// headerSignalRecorder closes attached when the handler writes a status.
+// Connect writes 200 only after it has found the still-running process.
+type headerSignalRecorder struct {
+	*httptest.ResponseRecorder
+	attached chan struct{}
+	once     sync.Once
+}
+
+func (h *headerSignalRecorder) WriteHeader(code int) {
+	h.ResponseRecorder.WriteHeader(code)
+	h.once.Do(func() { close(h.attached) })
 }
 
 func waitForEnvdState(t *testing.T, srv *server, tag string) {
