@@ -43,9 +43,9 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link('/introduction', 'Introduction'),
       link('/quick-start', 'Quickstart'),
-      link('/getting-started', 'Choose a setup'),
-      link('/getting-started/local-setup', 'Install on your computer'),
-      link('/getting-started/single-node-setup', 'Install on a server'),
+      link('/getting-started/local-setup', 'Local Setup'),
+      link('/getting-started/single-node-setup', 'Single Node Cloud Setup'),
+      link('/getting-started/single-node-setup', 'Cluster Setup'),
       link('/comparison', 'AerolVM vs Daytona vs E2B'),
     ],
   },
