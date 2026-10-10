@@ -18,6 +18,11 @@ import (
 // unchanged). Use errors.As to read it.
 type APIError = apiclient.APIError
 
+// StreamError is a failure the toolbox reported on an exec or session
+// stream, such as a command that could not start, as opposed to the stream
+// dropping. Use errors.As to tell the two apart.
+type StreamError = apiclient.StreamError
+
 // Sentinels for errors.Is. ErrNotFound matches a 404 (and a GetByName miss),
 // ErrConflict a 409, and ErrNameLookupUnsupported a server that ignored
 // `?name=`.

@@ -39,6 +39,9 @@ type app struct {
 	// signal that cancelled it.
 	notifySignals func(context.Context) (context.Context, func() os.Signal, func())
 	newTools      func(agenttools.Config) (*agenttools.Tools, error)
+	// conn is the connection the command's tools use, so a refused token
+	// can be named in the error.
+	conn *connection
 }
 
 func newApp() *app {
@@ -218,7 +221,7 @@ func (a *app) flagError(c *commonFlags, verbName string, err error) int {
 // fail reports err and returns code. With --json the error envelope goes to
 // stderr: {"error":{"code","message","http_status","retryable","hint"}}.
 func (a *app) fail(c *commonFlags, err error, code int) int {
-	e := agenttools.Classify(err)
+	e := a.explainRefusal(agenttools.Classify(err))
 	if c != nil && c.json {
 		a.writeErrorJSON(e)
 	} else {
@@ -256,6 +259,7 @@ func (a *app) tools(c *commonFlags) (*agenttools.Tools, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.conn = &conn
 	return a.toolsFor(c, conn)
 }
 

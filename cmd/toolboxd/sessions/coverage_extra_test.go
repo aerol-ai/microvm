@@ -104,8 +104,8 @@ func TestBuildArgvAndDetectShell(t *testing.T) {
 		t.Fatalf("buildArgv(default) = %v, %v", argv, err)
 	}
 
-	if detectShell() == "" {
-		t.Fatal("detectShell returned empty")
+	if shell, err := detectShell(); err != nil || shell == "" {
+		t.Fatalf("detectShell = %q, %v", shell, err)
 	}
 }
 

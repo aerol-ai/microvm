@@ -118,7 +118,14 @@ func (s *server) handleExecStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command("/bin/sh", "-c", start.Command)
+	// Without this an image with no shell fails at start with "fork/exec
+	// /bin/sh: no such file or directory", which reads as a toolboxd fault.
+	shell, err := detectShell()
+	if err != nil {
+		writeStreamControl(conn, execStreamControlOut{Type: "error", Message: err.Error()})
+		return
+	}
+	cmd := exec.Command(shell, "-c", start.Command)
 	if start.Workdir != "" {
 		cmd.Dir = start.Workdir
 	}

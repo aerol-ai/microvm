@@ -240,6 +240,49 @@ func TestShellEndings(t *testing.T) {
 	})
 }
 
+// A dropped stream looks the same whether the network blinked or the
+// sandbox went away; the note says which, so nobody is told to reopen a
+// shell that no longer exists.
+func TestShellLostConnectionSaysWhatHappened(t *testing.T) {
+	oldWait, oldPoll := shellFateWait, shellFatePoll
+	shellFateWait, shellFatePoll = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { shellFateWait, shellFatePoll = oldWait, oldPoll })
+
+	for _, tc := range []struct {
+		name     string
+		onAttach func(s *agenttoolstest.Server, sandboxID, sessionID string)
+		want     string
+	}{
+		{"network blip", nil, "the shell keeps running. Reopen it with: aerolvm shell box"},
+		{"sandbox stopped", func(s *agenttoolstest.Server, id, _ string) { s.SetStatus(id, models.SandboxStatusStopped) },
+			"sandbox box was stopped, which ended its shell. Start it with a new shell: aerolvm shell box"},
+		{"sandbox destroyed", func(s *agenttoolstest.Server, id, _ string) { s.Remove(id) }, "sandbox box was destroyed, and its shell with it"},
+		{"destroy in progress", func(s *agenttoolstest.Server, id, _ string) { s.SetStatus(id, models.SandboxStatusDestroyed) }, "sandbox box was destroyed"},
+		{"sandbox failed", func(s *agenttoolstest.Server, id, _ string) { s.SetStatus(id, models.SandboxStatusError) }, "sandbox box is error, and its shell has ended"},
+		{"shell exited", func(s *agenttoolstest.Server, id, sid string) {
+			s.AddSession(id, models.Session{ID: sid, Name: agenttools.DefaultShellSession, PTY: true, Status: models.SessionStatusExited})
+		}, "the shell has ended. Open a new one with: aerolvm shell box"},
+		{"sandboxd can't say", func(s *agenttoolstest.Server, _, _ string) {
+			s.Observe(func(s *agenttoolstest.Server) { s.FailSessions = true })
+		}, "the shell may still be running. Reopen it with: aerolvm shell box"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _, _, restores := shellHarness(t)
+			h.fake.AddSandbox(models.Sandbox{Name: "box"})
+			h.fake.Observe(func(s *agenttoolstest.Server) {
+				s.DropAttach = true
+				if tc.onAttach != nil {
+					s.OnAttach = func(id, sid string) { tc.onAttach(h.fake, id, sid) }
+				}
+			})
+			code := h.wait(h.runAsync("shell", "box"))
+			if code != execFailure || !strings.Contains(h.stderr.String(), "lost the connection") || !strings.Contains(h.stderr.String(), tc.want) || *restores != 1 {
+				t.Fatalf("dropped = %d, restored %d, stderr %q; want %q", code, *restores, h.stderr.String(), tc.want)
+			}
+		})
+	}
+}
+
 func TestShellUsageAndFailures(t *testing.T) {
 	h, _, _, _ := shellHarness(t)
 	h.fake.AddSandbox(models.Sandbox{Name: "box"})

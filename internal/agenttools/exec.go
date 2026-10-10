@@ -3,6 +3,7 @@ package agenttools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -190,6 +191,13 @@ func (t *Tools) execStream(ctx context.Context, sb *microvm.Sandbox, req ExecReq
 	case w := <-done:
 		res := result()
 		if w.err != nil {
+			// The toolbox couldn't start the command (an image with no
+			// shell, say). The stream didn't drop, and repeating the call
+			// won't help.
+			var refused *microvm.StreamError
+			if errors.As(w.err, &refused) {
+				return res, &Error{Code: CodeInvalidArgument, Message: refused.Message, cause: w.err}
+			}
 			return res, &Error{
 				Code:      CodeUnavailable,
 				Message:   "the exec stream ended before the command exited (" + w.err.Error() + "); the sandbox stops a command whose stream drops",

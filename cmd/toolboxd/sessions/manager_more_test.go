@@ -83,8 +83,8 @@ func TestManagerHelpersAndSweepBranches(t *testing.T) {
 	if got := orDefault(7, 42); got != 7 {
 		t.Fatalf("orDefault(7) = %d, want 7", got)
 	}
-	if shell := detectShell(); shell == "" {
-		t.Fatal("detectShell returned empty string")
+	if shell, err := detectShell(); err != nil || shell == "" {
+		t.Fatalf("detectShell = %q, %v", shell, err)
 	}
 
 	sess, err := mgr.Create(context.Background(), models.CreateSessionRequest{Name: "live", Command: "sleep 5"})
@@ -205,8 +205,8 @@ func TestManagerCreateErrorAndFallbackBranches(t *testing.T) {
 	}
 
 	t.Setenv("PATH", "/definitely-not-a-real-path")
-	if got := detectShell(); got != "/bin/sh" {
-		t.Fatalf("detectShell fallback = %q, want /bin/sh", got)
+	if got, err := detectShell(); err != nil || got != "/bin/sh" {
+		t.Fatalf("detectShell fallback = %q, %v; want /bin/sh", got, err)
 	}
 }
 
