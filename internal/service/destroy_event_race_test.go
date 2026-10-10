@@ -76,3 +76,31 @@ func TestDestroyEventWaitsOutAnAPIDestroy(t *testing.T) {
 		t.Fatal("an out-of-band destroy was not handled")
 	}
 }
+
+// A store that fails while the event waits on the lock is an error to retry,
+// not a sandbox to forget.
+func TestDestroyEventReportsAStoreFailureAfterTheWait(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	const id = "sb-destroy-storefail"
+	seedSandbox(t, st, id, models.SandboxStatusStarted, 1, 512)
+
+	unlock := svc.destroyLocks.lock(id)
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: id, Action: "destroy", Time: time.Now().UTC()})
+	}()
+	time.Sleep(250 * time.Millisecond) // the event has read the row and waits
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "reload sandbox after the destroy wait") {
+			t.Fatalf("destroy event with a failed store = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the destroy event never returned")
+	}
+}

@@ -75,15 +75,18 @@ func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string, slot *TapSlot) 
 // upstream resolvers, as a container gets them. A container runtime mounts
 // one in; a VM has only what its image ships, and stock images (alpine)
 // ship none, so musl asked 127.0.0.1 and no lookup left the guest, not even
-// to the egress gateway's DNS redirect on the TAP (UC-204). A variable so
+// to the egress gateway's DNS redirect on the TAP (UC-204). Variables so
 // tests can stand in a host.
-var guestResolvConf = func() []byte {
-	body, err := resolvconf.Generate(resolvconf.HostPath)
-	if err != nil {
-		return []byte(resolvconf.Fallback)
+var (
+	hostResolvConfPath = resolvconf.HostPath
+	guestResolvConf    = func() []byte {
+		body, err := resolvconf.Generate(hostResolvConfPath)
+		if err != nil {
+			return []byte(resolvconf.Fallback)
+		}
+		return []byte(body)
 	}
-	return []byte(body)
-}
+)
 
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"

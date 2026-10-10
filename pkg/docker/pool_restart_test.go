@@ -193,6 +193,21 @@ func TestStartWithIdentityReadoptsAWarmPoolContainer(t *testing.T) {
 		}
 	})
 
+	t.Run("the engine refuses the start", func(t *testing.T) {
+		d := &restartDaemon{t: t, env: poolEnv, binds: poolBinds, ip: ip, inspectOK: true}
+		c := restartClient(t, d, dir, port)
+		inner := c.httpClient.Transport
+		c.httpClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path == "/containers/sb/start" {
+				return textResponse(http.StatusInternalServerError, "cannot start"), nil
+			}
+			return inner.RoundTrip(r)
+		})
+		if _, err := c.StartWithIdentity(context.Background(), "sb", "sb-1", "sandbox-token"); err == nil || !strings.Contains(err.Error(), "start container") {
+			t.Fatalf("StartWithIdentity = %v, want the start error", err)
+		}
+	})
+
 	t.Run("inspect fails", func(t *testing.T) {
 		d := &restartDaemon{t: t, ip: ip}
 		if _, err := restartClient(t, d, dir, port).StartWithIdentity(context.Background(), "sb", "sb-1", "sandbox-token"); err == nil {

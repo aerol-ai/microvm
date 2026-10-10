@@ -213,6 +213,14 @@ func TestColdBootInjectsTheHostResolvers(t *testing.T) {
 	if body := string(guestResolvConf()); !strings.Contains(body, "nameserver ") || strings.Contains(body, "nameserver 127.") {
 		t.Fatalf("guest resolv.conf = %q", body)
 	}
+
+	// A host file that can't be read still leaves the guest a resolver.
+	oldPath := hostResolvConfPath
+	t.Cleanup(func() { hostResolvConfPath = oldPath })
+	hostResolvConfPath = t.TempDir() // a directory: opens, then fails to read
+	if body := string(guestResolvConf()); body != "nameserver 8.8.8.8\n" {
+		t.Fatalf("guest resolv.conf from an unreadable host file = %q", body)
+	}
 }
 
 // TestToolboxdInitInstallsResolvConf runs the shim's name-resolution block

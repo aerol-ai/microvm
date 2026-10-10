@@ -121,7 +121,7 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("load sandbox: %w", err)
+			return fmt.Errorf("reload sandbox after the destroy wait: %w", err)
 		}
 		sandbox = current
 		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
