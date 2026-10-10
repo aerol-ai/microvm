@@ -4,16 +4,14 @@ on:
   push:
     branches:
       - main
-  # Only pull requests into main. A plain pull request into a feature
-  # branch runs nothing. A GitHub native stacked pull request still runs:
-  # GitHub builds its merge ref against main and merges the whole stack
-  # under main's ruleset, so every layer must post the required `changes`
-  # check. On those layers `paths` turns every suite off, and only the
-  # gate jobs run. `edited` is listed so a pull request retargeted to main
-  # gets its checks without a new push; a title or body edit also fires it.
+  # Every pull request, whatever its base. On a layer of a stack (base is
+  # another branch) `paths` turns every suite off, so only DCO,
+  # baseline-tests and the gate run. Before, a pull request into a feature
+  # branch ran nothing, and OpenSSF Scorecard's CI-Tests check counted it
+  # as merged untested (#626, merged into its parent's branch). `edited` is
+  # listed so a pull request retargeted to main gets its checks without a
+  # new push; a title or body edit also fires it.
   pull_request:
-    branches:
-      - main
     types: [opened, synchronize, reopened, edited]
   # The merge queue re-runs the required `changes` check on a temporary
   # merge commit. That event is merge_group, not pull_request, so without
