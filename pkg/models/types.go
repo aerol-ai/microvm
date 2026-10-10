@@ -1361,6 +1361,7 @@ const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 const (
 	FacadeDaytona = "daytona"
 	FacadeE2B     = "e2b"
+	FacadeRunloop = "runloop"
 )
 
 // SandboxCompatState carries facade-private state that has no native
@@ -1384,8 +1385,11 @@ type SnapshotAlias struct {
 	SnapshotName string
 	Facade       string
 	ExtraNames   []string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// StateJSON is facade-private state for the snapshot, opaque to the
+	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Idempotent-request states for request_idempotency.state. Pending means

@@ -335,6 +335,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			snapshot_name TEXT NOT NULL,
 			facade TEXT NOT NULL,
 			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			state_json TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
@@ -997,6 +998,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// apply left behind (PR #622 review 3 findings 3 and 4). Empty: what
 		// the stored policy installs.
 		`ALTER TABLE sandbox_egress ADD COLUMN installed_egress_json TEXT NOT NULL DEFAULT '';`,
+		// Facade-private attributes of a snapshot, opaque to the store the
+		// same way sandbox_compat_state.state_json is: the Runloop facade
+		// keeps a snapshot's name, metadata and commit message here, which
+		// have no native column. It lives on the alias row rather than the
+		// source sandbox's compat state because a snapshot outlives the
+		// sandbox it was taken from.
+		`ALTER TABLE snapshot_aliases ADD COLUMN state_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
@@ -3027,18 +3035,20 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 		createdAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(alias) DO UPDATE SET
 			snapshot_name = excluded.snapshot_name,
 			facade = excluded.facade,
 			extra_names_json = excluded.extra_names_json,
+			state_json = excluded.state_json,
 			updated_at = excluded.updated_at
 	`,
 		strings.TrimSpace(alias.Alias),
 		strings.TrimSpace(alias.SnapshotName),
 		strings.TrimSpace(alias.Facade),
 		extraNamesJSON,
+		alias.StateJSON,
 		createdAt,
 		now,
 	)
@@ -3052,7 +3062,7 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 // does not exist.
 func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+		SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 		FROM snapshot_aliases
 		WHERE alias = ?
 	`, strings.TrimSpace(alias))
@@ -3074,13 +3084,13 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	trimmed := strings.TrimSpace(facade)
 	if trimmed == "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 			FROM snapshot_aliases
 			ORDER BY created_at DESC, alias ASC
 		`)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 			FROM snapshot_aliases
 			WHERE facade = ?
 			ORDER BY created_at DESC, alias ASC
@@ -4763,6 +4773,7 @@ func scanSnapshotAlias(scanner interface {
 		&alias.SnapshotName,
 		&alias.Facade,
 		&extraNamesJSON,
+		&alias.StateJSON,
 		&alias.CreatedAt,
 		&alias.UpdatedAt,
 	)
