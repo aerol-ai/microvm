@@ -655,6 +655,8 @@ var Registry = []UseCase{
 	{ID: "UC-228", Title: "aerolvm snapshot, then create --image with the snapshot's name starts a sandbox with the files", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-229", Title: "aerolvm exec --background, logs and logs --follow to the exit code, ls --json, and expose of a background server", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-230", Title: "After aerolvm login, mcp config carries no credentials and the stdio MCP server runs on the login alone", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-231", Title: "aerolvm shell and exec -it get a real terminal (devpts, local size, resize, exit code) on every runtime the scenario runs: docker, gVisor, Firecracker", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-232", Title: "aerolvm shell says why it can't: the sandbox was stopped under it, the image has no shell (exec too, as a non-retryable invalid_argument), or the saved token was revoked", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

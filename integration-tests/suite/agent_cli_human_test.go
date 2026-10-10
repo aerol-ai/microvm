@@ -30,7 +30,7 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-// UC-217..230: the aerolvm CLI as a person uses it, against a live
+// UC-217..232: the aerolvm CLI as a person uses it, against a live
 // deployment: `shell` and `exec -it` in a real pseudo-terminal, `login` /
 // `logout` with a private config directory, and the remaining verbs (start,
 // stop, list, get, ls, logs, snapshot, health, version, mcp config). The CLI
@@ -232,11 +232,11 @@ func (tc *termCLI) wait() int {
 
 // createCLISandbox creates a sandbox through the CLI with the token env and
 // destroys it when the test ends.
-func createCLISandbox(t *testing.T, image string) string {
+func createCLISandbox(t *testing.T, image string, extra ...string) string {
 	t.Helper()
 	name := harness.UniqueName(sc, t)
 	destroyByNameOnCleanup(t, client(t), name)
-	mustCLI(t, tokenEnv(t), "create", "--name", name, "--image", image, "--destroy-if-idle", "1h")
+	mustCLI(t, tokenEnv(t), append([]string{"create", "--name", name, "--image", image, "--destroy-if-idle", "1h"}, extra...)...)
 	return name
 }
 
@@ -908,4 +908,103 @@ func TestAerolvmMCPOnLogin(t *testing.T) {
 		}
 		time.Sleep(3 * time.Second)
 	}
+}
+
+// UC-231 — `aerolvm shell` and `exec -it` get a real terminal on every
+// runtime the scenario runs. A terminal needs a devpts mount in the
+// sandbox: container runtimes get one from the OCI spec, while a
+// Firecracker guest gets only what toolboxd-init mounts.
+func TestAerolvmShellOnEveryRuntime(t *testing.T) {
+	harness.Require(t, sc, "UC-231")
+	runtimes := []string{"docker"}
+	if sc.Has(harness.CapGvisor) {
+		runtimes = append(runtimes, "gvisor")
+	}
+	if sc.Has(harness.CapFirecracker) {
+		runtimes = append(runtimes, "firecracker")
+	}
+	for _, rt := range runtimes {
+		t.Run(rt, func(t *testing.T) {
+			name := createCLISandbox(t, harness.DefaultImage, "--runtime", rt)
+			env := tokenEnv(t, "TERM=xterm-256color")
+
+			sh := startTermCLI(t, env, 30, 100, "shell", name)
+			sh.expect(`new shell in ` + regexp.QuoteMeta(name))
+			sh.run(`echo "S=$(stty size) on=$(tty)" ready-$((40+2))`, "ready-42")
+			if !regexp.MustCompile(`S=30 100 on=/dev/pts/\d+`).MatchString(sh.text()) {
+				t.Fatalf("%s: no terminal of the local size:\n%s", rt, sh.text())
+			}
+			sh.resize(40, 120)
+			time.Sleep(time.Second)
+			sh.run(`echo "S=$(stty size)" resized-$((40+3))`, "resized-43")
+			if !strings.Contains(sh.text(), "S=40 120") {
+				t.Fatalf("%s: window resize didn't reach the sandbox:\n%s", rt, sh.text())
+			}
+			sh.send("exit 3\r")
+			if code := sh.wait(); code != 3 {
+				t.Fatalf("%s: shell exit = %d, want 3\n%s", rt, code, sh.text())
+			}
+
+			ex := startTermCLI(t, env, 33, 111, "exec", name, "-it", "--", `echo "S=$(stty size) on=$(tty)"; exit 4`)
+			ex.expect(`S=33 111 on=/dev/pts/\d+`)
+			if code := ex.wait(); code != 4 {
+				t.Fatalf("%s: exec -it exit = %d, want 4\n%s", rt, code, ex.text())
+			}
+		})
+	}
+}
+
+// UC-232 — when a shell can't be had, aerolvm says why: the sandbox was
+// stopped under an attached shell, the image has no shell at all, or the
+// saved token was revoked since `aerolvm login`.
+func TestAerolvmShellSaysWhy(t *testing.T) {
+	harness.Require(t, sc, "UC-232")
+	env := tokenEnv(t, "TERM=xterm-256color")
+
+	t.Run("stopped under the shell", func(t *testing.T) {
+		name := createCLISandbox(t, harness.DefaultImage)
+		sh := startTermCLI(t, env, 30, 100, "shell", name)
+		sh.expect(`new shell in`)
+		sh.run(`echo up-$((40+2))`, "up-42")
+		mustCLI(t, tokenEnv(t), "stop", name)
+		sh.expect(`sandbox ` + regexp.QuoteMeta(name) + ` was stopped, which ended its shell`)
+		if code := sh.wait(); code != 125 {
+			t.Fatalf("shell after stop = %d\n%s", code, sh.text())
+		}
+		if strings.Contains(sh.text(), "keeps running") {
+			t.Fatalf("a stopped sandbox's shell was reported running:\n%s", sh.text())
+		}
+	})
+
+	t.Run("image without a shell", func(t *testing.T) {
+		name := createCLISandbox(t, "gcr.io/distroless/static-debian12")
+		const reason = "this sandbox's image has no shell: neither bash nor sh is installed"
+		sh := startTermCLI(t, env, 30, 100, "shell", name)
+		sh.expect(regexp.QuoteMeta(reason))
+		if code := sh.wait(); code != 125 {
+			t.Fatalf("shell in a distroless image = %d\n%s", code, sh.text())
+		}
+		r := runCLI(t, tokenEnv(t), nil, "exec", name, "--json", "--", "true")
+		if r.code != 125 || !strings.Contains(r.stderr, `"code":"invalid_argument"`) || !strings.Contains(r.stderr, reason) || !strings.Contains(r.stderr, `"retryable":false`) {
+			t.Fatalf("exec in a distroless image = %d %q", r.code, r.stderr)
+		}
+	})
+
+	t.Run("revoked saved token", func(t *testing.T) {
+		name := createCLISandbox(t, harness.DefaultImage)
+		env, path := loginEnv(t, "TERM=xterm-256color")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		saved := `{"api_url":"` + sc.BaseURL + `","token":"revoked-since-login"}`
+		if err := os.WriteFile(path, []byte(saved), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		sh := startTermCLI(t, env, 30, 100, "shell", name)
+		sh.expect(`refused the saved token`)
+		sh.expect(`sign in again: aerolvm login`)
+		if code := sh.wait(); code != 125 {
+			t.Fatalf("shell with a revoked token = %d\n%s", code, sh.text())
+		}
+	})
 }

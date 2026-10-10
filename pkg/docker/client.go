@@ -26,6 +26,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+
+	"github.com/distribution/reference"
 )
 
 // managedLabelKey is the Docker label every sandbox container we create
@@ -978,7 +980,22 @@ func (c *Client) ensureToolboxBinary() error {
 	return nil
 }
 
+// withDefaultTag adds ":latest" to a reference with neither a tag nor a
+// digest. Docker's POST /images/create pulls EVERY tag of the repository
+// when fromImage names none (the docker CLI adds :latest itself; the raw
+// API does not), so `--image gcr.io/distroless/static-debian12` pulled
+// hundreds of images one by one until the create timed out. A reference
+// the parser rejects is left for Docker to report.
+func withDefaultTag(imageRef string) string {
+	named, err := reference.ParseNormalizedNamed(imageRef)
+	if err != nil || !reference.IsNameOnly(named) {
+		return imageRef
+	}
+	return imageRef + ":latest"
+}
+
 func (c *Client) pullImage(ctx context.Context, imageRef string, auth *models.RegistryAuth) error {
+	imageRef = withDefaultTag(imageRef)
 	// Apply mirror rewrite first so the auth payload we build below can be
 	// keyed off the *upstream* host (the AOCR auth service wants the
 	// upstream's username/password wrapped inside an identity token, not the
