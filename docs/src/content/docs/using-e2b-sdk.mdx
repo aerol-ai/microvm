@@ -114,7 +114,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/advanced-network-rules/#allow-only-some-requests). |
 | `network.egressProxy` | Refused (HTTP 501). |
 | Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
-| Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Share a web app](/preview/). |
+| Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/). |
 | Traffic access tokens, metrics and logs | Not supported. |
 | Volumes on WebAssembly sandboxes | Refused (HTTP 501), because they have no container file system. |
 

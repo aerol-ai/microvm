@@ -251,7 +251,7 @@ The log comes a page at a time. Pass `nextCursor` back as `cursor` to read older
 
 Inbound traffic is a separate choice, and the default is private. A private sandbox has no public address. You can still run commands, copy files and connect over SSH, because those go through the server directly.
 
-To make an app in the sandbox public, share its port with `exposePort`. See [Share a web app](/preview/). Blocking outbound traffic does not close a port you shared: people can still reach that app.
+To make an app in the sandbox public, share its port with `exposePort`. See [Public URLs](/public-urls/). Blocking outbound traffic does not close a port you shared: people can still reach that app.
 
 For more, such as making a sandbox public from the start, see [More about inbound traffic](/advanced-network-rules/#more-about-inbound-traffic).
 
@@ -275,5 +275,5 @@ Some servers cannot check names. A create that lists names on one of them gets `
 ## Next steps
 
 - [Advanced network rules](/advanced-network-rules/): IP address lists, reusable allow lists, learn mode, and rules for single requests.
-- [Share a web app](/preview/): share a port and get a public link.
+- [Public URLs](/public-urls/): share a port and get a public link.
 - [Usage and limits](/network-usage/): count or cap the bytes a sandbox sends and receives.

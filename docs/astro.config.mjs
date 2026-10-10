@@ -28,6 +28,9 @@ export default defineConfig({
     '/egress-domain-filtering': '/network-access',
     '/egress-profiles-and-learn-mode': '/advanced-network-rules',
     '/egress-rules-and-inspection': '/advanced-network-rules',
+    // preview.mdx and port-allowlist.mdx were merged into public-urls.mdx.
+    '/preview': '/public-urls',
+    '/port-allowlist': '/public-urls',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into
