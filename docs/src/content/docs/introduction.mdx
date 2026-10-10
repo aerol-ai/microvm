@@ -1,32 +1,49 @@
 ---
 title: Introduction
-description: Safe, fast sandboxes for code you do not trust, on servers you run yourself.
+description: A self-hosted sandbox server for code you do not trust.
 ---
 
 import { CardGrid, LinkCard, Tabs, TabItem } from '@astrojs/starlight/components';
 
-AerolVM gives your program a separate, locked-down computer to run code in. We call each one a **sandbox**. A sandbox has its own files, its own network and its own share of CPU and memory. Code inside it cannot touch your real machine or other sandboxes.
+AerolVM is a self-hosted sandbox server for code you do not trust: AI agents, user code, plugins, package installs, CI jobs, dev environments, scrapers and automation.
 
-You run the AerolVM server yourself: on your laptop, on one Linux server, or on a group of servers. Your app talks to it through an SDK in TypeScript, Python, Go, Rust or Java. You can also use the `aerolvm` command-line tool.
+A sandbox is a short-lived Linux machine with its own files, its own network and its own CPU and memory limits. Code inside it cannot read or change your app, your server's files or another sandbox's files.
 
-AerolVM is open source under the MIT license.
+Your app asks the AerolVM server for a sandbox through an SDK in TypeScript, Python, Go, Rust or Java, or through the `aerolvm` command-line tool. It runs commands, moves files in and out, and deletes the sandbox when it is done. Sandboxes start from the Docker images you already use.
+
+You run the server yourself: on your laptop, on one Linux server, or on a cluster of servers.
 
 ## Why AerolVM
 
-- **Safe by default.** Each sandbox is walled off from your machine and from the others. A new sandbox has no public web address until you ask for one.
-- **Fast.** Once the image is on the server, most sandboxes start in well under a second. The lightest kinds start in tens of milliseconds.
-- **Choose how strong the wall is.** Pick a plain container, a gVisor container with its own kernel layer, a Firecracker virtual machine, a WebAssembly module, or a V8 JavaScript isolate.
-- **You own it.** Run it on your own hardware. Add more servers when you need them. If a server fails, you can have its sandboxes recreated on a healthy one.
-- **Bring your existing code.** Apps written for the Daytona or E2B SDKs can point at AerolVM with small changes.
-- **Control the network.** Block the internet, or allow only the websites you list, such as `pypi.org`.
+- **Choose how strong the wall is.** Five execution environments, from a plain container to a small virtual machine. See [Where your code runs](#where-your-code-runs).
+- **Private until you open it.** A new sandbox has no public web address. Open a port when you want a preview link.
+- **You decide what it can reach.** Block the internet, or allow only the sites you list, such as `pypi.org`.
+- **Fast enough to create from code.** Once the image is on the server, most sandboxes start in under a second. The lightest start in tens of milliseconds.
+- **One server or many.** Start on your laptop, then move to one Linux server or a cluster. If a server fails, its sandboxes can be recreated on a healthy one.
+- **Works with Daytona and E2B code.** Apps written for the Daytona or E2B SDKs can point at AerolVM with small changes.
+- **Open source.** MIT licensed. Your code and data stay on your own machines.
+
+## Where your code runs
+
+Each sandbox runs in one of five execution environments. You pick it with the `runtime` option when you create the sandbox. If you leave it out, you get a container.
+
+| Environment | `runtime` | What it is | Good for | Server needs |
+|---|---|---|---|---|
+| [Container](/sandboxes/) | `docker` (default) | A normal Linux container, run by Docker or containerd. It shares the server's kernel. | Most work: scripts, builds, agents, dev environments | Nothing extra. Works on macOS and Linux. |
+| [gVisor](/gvisor-sandbox/) | `gvisor` | A container with an extra kernel layer that checks every request the code makes to the real kernel. | Untrusted code that still needs a full Linux system | Linux, installed with `--with-gvisor` |
+| [Firecracker](/firecracker-sandbox/) | `firecracker` | A microVM: a small virtual machine that boots its own Linux kernel. | The riskiest code. This is the strongest wall. | Linux with KVM (`/dev/kvm`) and `SB_ENABLE_FIRECRACKER=true` |
+| [WebAssembly](/wasm-sandbox/) | `wasm` | One compiled WebAssembly program, with no Linux system inside. | Small jobs that must start fast | `SB_ENABLE_WASM=true` |
+| [V8 isolate](/isolate-sandbox/) | `isolate` | A JavaScript or TypeScript web handler running in V8, the engine inside Chrome. | Tiny web handlers that must start in milliseconds | Installed with `--with-isolate` |
 
 ## What people build with it
 
 - **AI agents.** Give a coding agent its own machine to install packages, run tests and edit files.
-- **Running user code.** Run scripts, notebooks or plugins that your users submit, away from your servers.
-- **CI and builds.** Run each test job in a fresh sandbox and throw it away afterward.
+- **Running user code.** Run the scripts, notebooks and plugins your users submit, away from your servers.
+- **Package installs.** Run `pip install` or `npm install` on code you have not read. A bad package only harms a sandbox you throw away.
+- **CI and builds.** Give every test job a fresh sandbox and throw it away afterward.
 - **Dev environments.** Hand out short-lived Linux machines with SSH, a terminal and a preview link.
-- **Data jobs.** Attach cloud storage, process files and save the results.
+- **Scrapers and automation.** Run scripts and browsers on the open web, and limit which sites they can reach.
+- **Data jobs.** Attach cloud storage, process files and keep the results.
 
 ## A minimal example
 
@@ -108,7 +125,7 @@ This creates a sandbox, runs one line of Python inside it, prints the answer and
   </TabItem>
 </Tabs>
 
-The SDK classes are named `MicroVM` and `MicroVMClient`, after the project's GitHub repository, `aerol-ai/microvm`. They are the AerolVM SDK.
+The client class is called `MicroVM` (`MicroVMClient` in Java) after the project's GitHub repository, `aerol-ai/microvm`. It is the AerolVM SDK.
 
 ## How it fits together
 
@@ -120,7 +137,7 @@ flowchart LR
     Server --> S3["Sandbox"]
 ```
 
-Your app never runs untrusted code itself. It asks the AerolVM server to create a sandbox, then sends commands and files to it. The server starts the sandbox, passes your commands in, and sends the results back.
+Your app never runs the risky code itself. It sends requests to the AerolVM server. The server starts the sandbox, runs your commands inside it and sends back the output.
 
 ## Next steps
 
