@@ -324,13 +324,22 @@ func TestListManaged(t *testing.T) {
 					{"Id": "inspect-fails", "Labels": map[string]string{managedLabelKey: "true"}},
 					// Warm-pool park: managed label + park label. Must not
 					// appear in ListManaged or reconcile will destroy it.
-					{"Id": "parked", "Labels": map[string]string{
+					{"Id": "parked", "Names": []string{"/park-d316b60bc106a6f6"}, "Labels": map[string]string{
+						managedLabelKey:  "true",
+						poolParkLabelKey: poolParkLabelValue,
+					}},
+					// Adopted from the pool: Docker can't drop the park label,
+					// but adoption renamed it to its sandbox ID. A sandbox, so
+					// reconcile must see it.
+					{"Id": "adopted", "Names": []string{"/sb-adopted"}, "Labels": map[string]string{
 						managedLabelKey:  "true",
 						poolParkLabelKey: poolParkLabelValue,
 					}},
 				}), nil
 			case r.URL.Path == "/containers/managed/json":
 				return textResponse(http.StatusOK, inspectBody("managed", "/sb-managed", "172.17.0.2", true, "running", 1)), nil
+			case r.URL.Path == "/containers/adopted/json":
+				return textResponse(http.StatusOK, inspectBody("adopted", "/sb-adopted", "172.17.0.3", true, "running", 2)), nil
 			case r.URL.Path == "/containers/inspect-fails/json":
 				return textResponse(http.StatusInternalServerError, "boom"), nil
 			case r.URL.Path == "/containers/parked/json":
@@ -345,11 +354,14 @@ func TestListManaged(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ListManaged() = %v", err)
 		}
-		if len(result) != 1 {
-			t.Fatalf("ListManaged() returned %d entries, want 1", len(result))
+		if len(result) != 2 {
+			t.Fatalf("ListManaged() returned %d entries, want 2", len(result))
 		}
 		if _, ok := result["sb-managed"]; !ok {
 			t.Fatalf("ListManaged() missing sb-managed: %+v", result)
+		}
+		if _, ok := result["sb-adopted"]; !ok {
+			t.Fatalf("ListManaged() missing the pool-adopted sandbox: %+v", result)
 		}
 		if _, ok := result["park-d316b60bc106a6f6"]; ok {
 			t.Fatal("ListManaged() must exclude parked containers")

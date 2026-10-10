@@ -374,6 +374,12 @@ type Service struct {
 	// egressHoldLocks serializes each sandbox's hold record with the
 	// enforcement derived from it (egress_blocks.go).
 	egressHoldLocks egressPolicyLocks
+	// destroyLocks serializes an API destroy with the runtime's destroy
+	// event for the same sandbox. Removing the container fires the event
+	// while DestroySandbox is still finalizing; unserialized, the event
+	// handler raced it through the cluster placement delete and failed on
+	// the placement the API path had just removed, once per destroy.
+	destroyLocks egressPolicyLocks
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
@@ -3153,7 +3159,11 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 	if state == nil {
-		state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		if is, ok := runtime.AsIdentityStarter(rt); ok {
+			state, err = is.StartWithIdentity(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken)
+		} else {
+			state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		}
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()
@@ -3244,6 +3254,8 @@ func (s *Service) StopSandbox(ctx context.Context, id string) (*models.Sandbox, 
 }
 
 func (s *Service) DestroySandbox(ctx context.Context, id string) error {
+	unlock := s.destroyLocks.lock(id)
+	defer unlock()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return err

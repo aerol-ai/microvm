@@ -18,7 +18,9 @@ func TestBuildEnvIncludesToolboxContractAndUserEnv(t *testing.T) {
 	if !slices.IsSorted(env) {
 		t.Fatalf("env not sorted: %v", env)
 	}
-	want := []string{"SB_TOOLBOX_PORT=2280", "SB_TOOLBOX_TOKEN=tok-123", "SB_SANDBOX_ID=sb-1", "FOO=bar", "BAZ=qux"}
+	// SB_POOL_PARKED= overrides a parked flag inherited from a snapshot of a
+	// Docker warm-pool container, which would otherwise park this sandbox.
+	want := []string{"SB_TOOLBOX_PORT=2280", "SB_TOOLBOX_TOKEN=tok-123", "SB_SANDBOX_ID=sb-1", "SB_POOL_PARKED=", "FOO=bar", "BAZ=qux"}
 	for _, w := range want {
 		if !slices.Contains(env, w) {
 			t.Fatalf("env missing %q: %v", w, env)

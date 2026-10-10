@@ -416,11 +416,15 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		workingDir = "/"
 	}
 
-	envValues := make([]string, 0, len(req.Env)+4)
+	envValues := make([]string, 0, len(req.Env)+5)
 	envValues = append(envValues,
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", c.toolboxPort),
 		"SB_TOOLBOX_TOKEN="+toolboxToken,
 		"SB_SANDBOX_ID="+sandboxID,
+		// A snapshot of a warm-pool container carries its parked flag in the
+		// image config; a sandbox created from it would boot parked and wait
+		// forever for an adopt. Docker lets the container's env win.
+		poolParkedEnv+"=",
 	)
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)
@@ -723,6 +727,81 @@ func (c *Client) Start(ctx context.Context, containerRef string) (*SandboxRuntim
 	return c.waitForRuntime(ctx, containerRef)
 }
 
+// StartWithIdentity starts a stopped sandbox's container. One adopted from
+// the warm pool still carries the pool's env (SB_POOL_PARKED=1, its slot's
+// bootstrap token and park nonce, the bind to its slot's park socket), since
+// Docker keeps a container's env across stop and start. Its toolboxd boots
+// parked, holds the user's command back and answers nothing but /health, so
+// a plain Start would pass its health poll and hand out a sandbox whose every
+// call is 503 "sandbox not adopted". It is adopted again over its slot's
+// socket with the sandbox's own identity, exactly as at create.
+func (c *Client) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*SandboxRuntime, error) {
+	inspect, err := c.inspectContainer(ctx, containerRef)
+	if err != nil {
+		return nil, fmt.Errorf("inspect container: %w", err)
+	}
+	pl, err := c.parkedResumeListener(inspect)
+	if err != nil {
+		return nil, err
+	}
+	if pl == nil {
+		return c.Start(ctx, containerRef)
+	}
+	defer func() { _ = pl.Close() }()
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/start", nil, nil, nil, nil); err != nil {
+		return nil, fmt.Errorf("start container: %w", err)
+	}
+	if err := c.readopt(ctx, pl, sandboxID, toolboxToken); err != nil {
+		// A container that can't be adopted serves nothing; don't leave it
+		// running parked behind a start that reported failure.
+		_ = c.Stop(ctx, containerRef)
+		return nil, fmt.Errorf("re-adopt warm-pool container: %w", err)
+	}
+	return c.waitForRuntime(ctx, containerRef)
+}
+
+func (c *Client) readopt(ctx context.Context, pl *ParkedListener, sandboxID, toolboxToken string) error {
+	waitCtx, cancel := context.WithTimeout(ctx, c.toolboxWaitTimeout)
+	defer cancel()
+	if err := pl.WaitParked(waitCtx); err != nil {
+		return err
+	}
+	nonce, err := mintReadyNonce()
+	if err != nil {
+		return err
+	}
+	return pl.Adopt(waitCtx, sandboxID, toolboxToken, nonce)
+}
+
+// parkedResumeListener returns a listener for the parked hello of a container
+// adopted from the warm pool, or nil for any other container. The hello must
+// carry the bootstrap token and park nonce in the container's env, and it
+// arrives on whatever host socket the container's ready-socket bind names,
+// which has to be one of ours.
+func (c *Client) parkedResumeListener(inspect containerInspect) (*ParkedListener, error) {
+	env := map[string]string{}
+	for _, kv := range inspect.Config.Env {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	if env[poolParkedEnv] != "1" {
+		return nil, nil
+	}
+	source := ""
+	for _, bind := range inspect.HostConfig.Binds {
+		if src, ok := readySocketSourceFromBind(bind); ok {
+			source = src
+			break
+		}
+	}
+	if source == "" || !c.readySocketPathOwnedByDir(source) {
+		return nil, fmt.Errorf("warm-pool container %s has no park socket under %s to be adopted over", inspect.ID, c.readyDir)
+	}
+	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
+	return NewParkedListener(filepath.Dir(source), slotID, env["SB_TOOLBOX_TOKEN"], env[readyNonceEnv])
+}
+
 func (c *Client) Stop(ctx context.Context, containerRef string) error {
 	return c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(containerRef)+"/stop", queryValues(map[string]string{"t": "10"}), nil, nil, nil)
 }
@@ -842,6 +921,10 @@ func (c *Client) CreateSnapshot(ctx context.Context, containerRef, imageRef stri
 	if tag != "" {
 		query.Set("tag", tag)
 	}
+	// The commit copies the container's env into the image. Drop the warm
+	// pool's parked flag so a sandbox made from the snapshot, on any node or
+	// engine, doesn't boot parked.
+	query.Add("changes", "ENV "+poolParkedEnv+"=")
 
 	var response struct {
 		ID string `json:"Id"`
@@ -943,8 +1026,9 @@ func (c *Client) ListManaged(ctx context.Context) (map[string]*SandboxRuntime, e
 		// Warm-pool parked containers carry aerolvm.managed=true (so the
 		// boot purge / events filter can find them) but they are not
 		// sandboxes — they have no DB row. Exclude them here so Reconcile's
-		// orphan pass does not destroy live park inventory.
-		if isParkedContainerLabels(summary.Labels) {
+		// orphan pass does not destroy live park inventory. Adopted ones keep
+		// the label but are sandboxes, so they stay (isParkedContainer).
+		if isParkedContainer(summary) {
 			continue
 		}
 		inspect, err := c.inspectContainer(ctx, summary.ID)
@@ -1626,8 +1710,11 @@ type imageInspect struct {
 }
 
 type containerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Env []string `json:"Env"`
+	} `json:"Config"`
 	State *struct {
 		Running bool   `json:"Running"`
 		Status  string `json:"Status"`

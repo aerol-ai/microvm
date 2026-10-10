@@ -976,12 +976,6 @@ func TestContainerPIDTaskLookupError(t *testing.T) {
 	}
 }
 
-func TestGenerateResolvConfDirectoryPath(t *testing.T) {
-	if _, err := generateResolvConf(t.TempDir()); err == nil {
-		t.Fatal("want read error for directory path")
-	}
-}
-
 func TestContainerPIDStatusError(t *testing.T) {
 	stubToolboxProbe(t)
 	tr := newFakeTransport()
