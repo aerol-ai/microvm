@@ -1,5 +1,5 @@
 ---
-title: Snapshots
+title: Create Snapshots
 description: Save a sandbox's files and installed software as a named image, then start new sandboxes from it.
 ---
 
@@ -19,7 +19,7 @@ There are three ways to make a snapshot:
 - **Name an existing image.** `registerSnapshot` with `image` gives an image from a registry, like `python:3.12-slim`, a short name everyone can use.
 - **Build from a Dockerfile.** `registerSnapshot` with `dockerfileContent` has the server build the image for you.
 
-Either way, you use a snapshot by passing its name as the `image` when you create a sandbox.
+Either way, you use a snapshot by passing its name as the `image` when you create a sandbox. See [Use a snapshot](#use-a-snapshot).
 
 ## Save a running sandbox as a snapshot
 
@@ -86,44 +86,11 @@ Set up a sandbox the way you want it, then save it. The original sandbox keeps r
 
 Snapshot names are unique across the whole server. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
 
-## Start a sandbox from a snapshot
+## Use a snapshot
 
-Pass the snapshot's name where you would normally pass an image.
+Pass the snapshot's name as the `image` when you create a sandbox. [Images and snapshots](/images-and-snapshots/#start-from-a-snapshot) shows the code in each SDK.
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({ image: "py-ready" });
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create(image="py-ready")
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image: "py-ready".into(),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
-    ```
-  </TabItem>
-</Tabs>
-
-The server swaps the name for the real image before it creates the sandbox. If a name could also be an image from a registry, the snapshot wins. That rarely happens, because snapshot names are short words, not registry paths. Afterward, the sandbox's `image` field shows the real image, not the snapshot name.
-
-The new sandbox does not copy the snapshot's CPU, memory or disk hints. It gets the normal defaults unless you set `cpu`, `memoryMB` and `diskGB` yourself.
+The server swaps the name for the real image before it creates the sandbox. If a name could also be an image from a registry, the snapshot wins. Afterward, the sandbox's `image` field shows the real image, not the snapshot name.
 
 ## Give an existing image a snapshot name
 
@@ -318,6 +285,7 @@ A failed push does no harm: the snapshot still works on the node that made it. S
 
 ## Next steps
 
+- [Images and snapshots](/images-and-snapshots/): every way a sandbox can start, and how to start from a snapshot.
 - [CPU, memory and disk](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk): set CPU and memory on sandboxes made from a snapshot.
 - [Firecracker templates](/firecracker-templates/): the Firecracker way to start from a prepared image.
 - [Attach cloud storage](/external-storage/): keep data that should outlive any one sandbox.
