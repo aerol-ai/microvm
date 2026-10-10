@@ -69,11 +69,11 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/sandboxes', 'Create and Manage'),
       link('/ghost-sandboxes', 'Ghost Mode'),
       link('/images-and-snapshots', 'Images and Snapshots'),
+      link('/snapshots', 'Create Snapshots'),
       link('/lifecycle', 'Lifecycle'),
       link('/ssh-access', 'SSH access'),
       link('/sandbox-env', 'Environment variables'),
       link('/sandbox-tags', 'Tags'),
-      link('/snapshots', 'Snapshots'),
       
       link('/durability', 'Durability and failover'),
     ],

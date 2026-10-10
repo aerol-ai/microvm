@@ -1,23 +1,30 @@
 ---
 title: Images and Snapshots
-description: "Choose what a sandbox starts from: a public image, an image from a private registry, or a snapshot of another sandbox."
+description: "Choose what a sandbox starts from: an image, a snapshot of another sandbox, or a Firecracker template."
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every container and Firecracker sandbox starts from an image. An image is a packaged Linux system with its programs already installed, such as `ubuntu:22.04` or `python:3.12-slim`. A snapshot is an image you made yourself, from a sandbox you already set up.
+Every sandbox starts from something you name when you create it. Usually that is an image: a packaged Linux system with programs already installed, such as `ubuntu:22.04` or `python:3.12-slim`.
 
-New to sandboxes? Start with [Create and manage](/sandboxes/) first.
+Once you have set up a sandbox the way you like, you can save it and start new ones from that copy. For container sandboxes the saved copy is a snapshot. For Firecracker it is a template.
 
-## Choose an image
+What a sandbox can start from depends on its kind:
 
-`image` is the one option every container and Firecracker sandbox needs. Any image name works, such as `ubuntu:22.04`, `python:3.12-slim` or `ghcr.io/your-org/app:1.4`. The server downloads (pulls) the image the first time you use it. Later creates reuse the copy it already has, so they start much faster.
+| Kind of sandbox | Starts from | To reuse a sandbox you set up |
+|---|---|---|
+| Container (the default) | An image | Save it as a [snapshot](#start-from-a-snapshot) |
+| [Firecracker](/firecracker-sandbox/) | An image | Build a [Firecracker template](#firecracker-use-a-template) |
+| [WebAssembly](/wasm-sandbox/) | A WebAssembly module | See [WebAssembly](/wasm-sandbox/) |
+| [V8 isolate](/isolate-sandbox/) | JavaScript code | Not available |
 
-WebAssembly and V8 isolate sandboxes use a module instead of an image. See [WebAssembly (WASM)](/wasm-sandbox/) and [V8 isolate](/isolate-sandbox/).
+## Start from an image
+
+Pass any image name as `image`, such as `python:3.12-slim` or `ghcr.io/your-org/app:1.4`. The server downloads the image the first time. Later creates reuse its copy, so they start much faster. See [Create a sandbox](/sandboxes/#create-a-sandbox) for a full example.
 
 ### Use an image from a private registry
 
-A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`. If yours needs a login, pass it in `registry`. The server uses it to pull the image.
+A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`. If yours needs a login, pass it in `registry`:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -85,9 +92,108 @@ A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`
   </TabItem>
 </Tabs>
 
-### Choose what runs when the sandbox starts
+This works for container sandboxes. The server uses the login only to download the image, and keeps the password encrypted.
 
-When a container sandbox starts, it runs the image's own start command in the background. That is the `ENTRYPOINT` and `CMD` from the image's Dockerfile. To run something else, pass `containerCommand`.
+## Start from a snapshot
+
+A snapshot is a saved copy of a container sandbox's files. Install your tools once, save the sandbox as a snapshot, then start new sandboxes from it with everything in place. To make one, see [Create snapshots](/snapshots/).
+
+To use it, pass the snapshot's name where you would pass an image:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "py-ready" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="py-ready")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "py-ready".into(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
+    ```
+  </TabItem>
+</Tabs>
+
+The new sandbox does not copy the old one's CPU, memory or disk. Set them yourself if you need more than the [defaults](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk).
+
+## Firecracker: use a template
+
+A Firecracker sandbox also starts from a normal image. But the server must turn that image into a virtual machine disk first, which takes 10 to 60 seconds on every create.
+
+Snapshots do not work for Firecracker. Use a template instead. A template is built once from an image, and holds the disk plus a paused copy of the booted machine. Sandboxes made from it start in under 100 ms.
+
+Pass the template's ID, along with the image it was built from:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "python:3.11",
+      runtime: "firecracker",
+      templateId: "py311",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="python:3.11",
+        runtime="firecracker",
+        templateId="py311",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "python:3.11",
+        Runtime:    sdktypes.RuntimeFirecracker,
+        TemplateID: "py311",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.11".into(),
+        runtime: Some("firecracker".into()),
+        template_id: Some("py311".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.11")
+        .setRuntime("firecracker")
+        .setTemplateId("py311"));
+    ```
+  </TabItem>
+</Tabs>
+
+Building a template needs the server's operator token. See [Firecracker templates](/firecracker-templates/) to build, list and rebuild them.
+
+## Change what runs at start
+
+A container sandbox runs its image's own start command when it starts: the `ENTRYPOINT` and `CMD` from the image's Dockerfile. To run something else, pass `containerCommand`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -134,51 +240,11 @@ When a container sandbox starts, it runs the image's own start command in the ba
   </TabItem>
 </Tabs>
 
-You do not need a start command to use a sandbox. You can run everything with [Run commands](/exec-streaming/) or [Terminal sessions](/sessions/). The sandbox stays up even if the start command exits.
-
-## Start from a snapshot
-
-A snapshot is a saved copy of a sandbox's files. Install your tools once, save the sandbox as a snapshot, and start new sandboxes from it with everything already in place. To make one, see [Snapshots](/snapshots/).
-
-To use a snapshot, pass its name where you would normally pass an image:
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({ image: "py-ready" });
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create(image="py-ready")
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image: "py-ready".into(),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
-    ```
-  </TabItem>
-</Tabs>
-
-- **A snapshot name wins over a registry image** with the same name. Snapshot names are short words, so this rarely matters.
-- **CPU, memory and disk are not copied.** The new sandbox gets the normal defaults unless you set them. See [CPU, memory and disk](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk).
+You do not need a start command. You can run everything later with [Run commands](/exec-streaming/). The sandbox stays up even if the start command exits.
 
 ## Next steps
 
-- [Snapshots](/snapshots/): save a sandbox, build a snapshot from a Dockerfile, and share it across a cluster.
+- [Create snapshots](/snapshots/): save a sandbox, name an existing image, build from a Dockerfile, and share snapshots across a cluster.
+- [Firecracker templates](/firecracker-templates/): build a template so Firecracker sandboxes start in milliseconds.
 - [Lifecycle](/lifecycle/): stop or delete a sandbox automatically.
 - [Environment variables](/sandbox-env/): pass settings and secrets to a sandbox.
-- [Create and manage](/sandboxes/): stop, start, resize and delete sandboxes.
