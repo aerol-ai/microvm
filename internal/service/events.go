@@ -112,6 +112,18 @@ func (s *Service) handleDockerEvent(ctx context.Context, event docker.DockerEven
 		s.emitLifecycleStopUsage(ctx, sandbox, time.Now(), false)
 		return nil
 	case "destroy":
+		// Wait out an API destroy of the same sandbox (its container removal
+		// is what fired this event), then act only if the row survived it.
+		unlock := s.destroyLocks.lock(sandbox.ID)
+		defer unlock()
+		current, err := s.store.Get(ctx, sandbox.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load sandbox: %w", err)
+		}
+		sandbox = current
 		if err := s.handleDestroyEvent(ctx, sandbox); err != nil {
 			return err
 		}
