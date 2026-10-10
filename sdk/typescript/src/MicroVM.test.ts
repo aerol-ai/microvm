@@ -77,6 +77,54 @@ test("MicroVM create returns SSH key material", async () => {
   assert.deepEqual(sandbox.lifecycle, {});
 });
 
+test("Sandbox exec accepts a plain command string", async () => {
+  const execBodies: unknown[] = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com/",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname.endsWith("/toolbox/process/execute")) {
+        execBodies.push(await request.json());
+        return new Response(JSON.stringify({ stdout: "hello\n", stderr: "", exit_code: 0, duration_ms: 3 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({
+        id: "sb-exec",
+        image: "ubuntu:22.04",
+        status: "started",
+        public_url: "",
+        cpu: 1,
+        memory_mb: 512,
+        disk_gb: 1,
+        os_user: "root",
+        network_block_all: false,
+        toolbox_enabled: true,
+        exposed_ports: [],
+        created_at: "2026-05-07T10:00:00Z",
+        updated_at: "2026-05-07T10:00:00Z",
+        last_active_at: "2026-05-07T10:00:00Z",
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const sandbox = await sdk.create({ image: "ubuntu:22.04" });
+  const result = await sandbox.exec("echo hello");
+  await sandbox.exec({ command: "echo hello", workDir: "/tmp" });
+
+  assert.equal(result.stdout, "hello\n");
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(execBodies, [
+    { command: "echo hello" },
+    { command: "echo hello", workdir: "/tmp" },
+  ]);
+});
+
 test("MicroVM updateLifecycle returns wrapped sandboxes", async () => {
   const seen: Array<{ method: string; url: string; body: unknown }> = [];
   const sdk = new MicroVM({

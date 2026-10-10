@@ -656,11 +656,11 @@ type CreateSandboxRequest struct {
 	// is removed: a recreate on another node must not hand the sandbox a
 	// credential it never had. A create may set it to withhold keys itself.
 	EgressWithheldEnv []string `json:"egress_withheld_env,omitempty"`
-	// AllowPublicTraffic controls whether the sandbox may be exposed to the
-	// public internet. On create, omitted (nil) defaults to private — no
-	// <id>.<domain> ingress route and empty public_url. Pass an explicit true
-	// to opt in at create time, or call expose_port later (which flips the
-	// sandbox public as the opt-in lever). False always refuses exposure.
+	// AllowPublicTraffic controls whether the sandbox is public from boot. On
+	// create, omitted (nil) and false both mean private — no <id>.<domain>
+	// ingress route and empty public_url. Pass true to be public from boot.
+	// A later expose_port is itself the opt-in: it flips a private sandbox
+	// public whether this was omitted or false (enableSandboxPublicTraffic).
 	// The sandbox stays reachable via the platform's own paths (toolbox
 	// exec/file proxy, SSH gateway), which do not route through the public
 	// ingress.
@@ -859,9 +859,10 @@ type Sandbox struct {
 	// other sandbox, and on list responses (plans/egress-domain-filtering.md
 	// D16). Response-only: never stored.
 	EgressStatus string `json:"egress_status,omitempty"`
-	// AllowPublicTraffic mirrors the create-time flag. Nil means "not set"
-	// (treated as allowed); a non-nil false makes ExposePort refuse to install
-	// a public route. Persisted so the gate survives restarts.
+	// AllowPublicTraffic is whether the sandbox currently has a public route:
+	// only true is public. It starts as the create-time flag and the first
+	// ExposePort sets it to true (enableSandboxPublicTraffic), so nil and
+	// false behave the same. Persisted so the state survives restarts.
 	AllowPublicTraffic *bool `json:"allow_public_traffic,omitempty"`
 	// MaskRequestHost mirrors the create-time flag: the value the ingress layer
 	// rewrites the upstream Host header to for exposed HTTP ports. Persisted so
