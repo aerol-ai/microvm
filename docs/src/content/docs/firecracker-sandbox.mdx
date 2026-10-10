@@ -211,17 +211,6 @@ This sandbox gets 2 CPU cores and 1 GB of memory. It stops after 30 idle minutes
 - **No resizing yet.** Changing CPU or memory on a running Firecracker sandbox fails with `not yet implemented`. Create a new sandbox with the size you need.
 - **No GPU.** Firecracker VMs cannot use the server's GPU.
 
-## For server operators
-
-Turn Firecracker on with `SB_ENABLE_FIRECRACKER=true` in the server's environment file. The install script has no flag for it. Before you restart the server, put these files in place:
-
-| Setting | What it points to | Default |
-|---|---|---|
-| `SB_FIRECRACKER_BINARY` | The `firecracker` program. | `/usr/local/bin/firecracker` |
-| `SB_FIRECRACKER_KERNEL` | The Linux kernel the VMs boot. A `<kernel>.config` file with `CONFIG_VMGENID=y` must sit next to it. | `/var/lib/sandboxd/firecracker/vmlinux` |
-| `SB_FIRECRACKER_USE_JAILER` | Run each VM under Firecracker's `jailer`, which locks the VM process into its own folder and user. | `true` |
-| `SB_FIRECRACKER_SKOPEO_BIN`, `SB_FIRECRACKER_UMOCI_BIN`, `SB_FIRECRACKER_MKFS_BIN` | The tools that turn a container image into a VM disk. | `/usr/bin/skopeo`, `/usr/bin/umoci`, `/sbin/mkfs.ext4` |
-
 On a cluster, set `with_firecracker = true` and a bare-metal `instance_type` on each worker, and add a `firecracker` block with download links for the binaries and kernel. See [Cluster setup](/cluster-setup/).
 
 For how the VMs, snapshots and networking work inside, see [Firecracker architecture](/firecracker-architecture/).

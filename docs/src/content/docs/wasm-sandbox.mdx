@@ -193,20 +193,6 @@ If you leave out `memoryMB`, the sandbox gets the server's WASM default, 256 MB 
 - **Allow and block lists work; method and path rules do not.** You can block the internet or allow only some hosts. The finer method and path rules from [Rules and inspection](/egress-rules-and-inspection/) are rejected.
 - **HTTP only for public ports.** You can share a web server the module runs, but not raw TCP ports or TLS (encrypted TCP) ports. See [WASM networking](/wasm-networking/).
 
-## For server operators
-
-Turn WASM on with `SB_ENABLE_WASM=true` in the server's environment file. On a cluster, set `wasm.enabled: true` in `config/cluster.yml`, and WASM sandboxes run on the worker servers. There is no install script flag.
-
-| Setting | What it does | Default |
-|---|---|---|
-| `SB_ENABLE_WASM` | Turns the WASM runtime on. | `false` |
-| `SB_WASM_STANDARD_MODULES` | The standard module names, as `alias=file.wasm,...`. Stage the files with the `stage-wasm-modules` Ansible playbook. | Empty |
-| `SB_WASM_DEFAULT_MEMORY_MB` | Memory for a WASM sandbox that does not ask for any. | `256` |
-| `SB_WASM_RESIDENT_HOST_ENABLED` | Keep compiled modules loaded in a long-running worker, so creates skip the slow compile step. | `true` |
-| `SB_WASM_POOL_ENABLED` | Keep started workers ready for each module. See [WASM modules](/wasm-modules/). | `true` |
-| `SB_WASM_CHECKPOINT_INTERVAL` | Also save `passivatable` sandboxes on a timer, not only at shutdown. | `0` (off) |
-| `SB_WASM_MAX_INSTANCES` | The most WASM sandboxes one server will run. | `0` (no limit) |
-
 For how workers and checkpoints work inside, see [WASM architecture](/wasm-architecture/).
 
 ## Next steps
