@@ -271,7 +271,7 @@ This only changes web (HTTP) ports. TCP and TLS ports have no `Host` header, so 
 - **Listen on all addresses.** Start your server on `0.0.0.0`, not only `localhost` or `127.0.0.1`. The public URL connects to the sandbox's network address. For Vite, run `vite --host`.
 - **You can expose a port before the server starts.** The URL returns an error (usually `502 Bad Gateway`) until something listens on the port.
 - **Stop and start keep your ports.** When a stopped sandbox starts again, its exposed ports come back with the same URLs. A stopped sandbox does not answer, unless it is a [ghost sandbox](/ghost-sandboxes/) that wakes on traffic.
-- **Blocking the internet does not block your URL.** `networkBlockAll` only stops traffic going out of the sandbox. See [Block or allow the internet](/network-isolation/).
+- **Blocking the internet does not block your URL.** `networkBlockAll` only stops traffic going out of the sandbox. See [Block or allow the internet](/network-access/).
 - **One protocol per port.** A port exposed for the web cannot also be a TCP or TLS port. Unexpose it first. See [TCP and TLS ports](/tcp-ports/).
 - **WASM and V8 isolate sandboxes** support web (HTTP) ports only.
 

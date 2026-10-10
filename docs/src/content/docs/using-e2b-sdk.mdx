@@ -86,7 +86,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | Metadata | Works. It is saved as the sandbox's AerolVM [tags](/sandbox-tags/). |
 | Environment variables (`envs`) | Works. |
 | `allowInternetAccess: false` | Works. The sandbox gets no outbound internet. |
-| `network.allowOut` and `network.denyOut`, on create and with `updateNetwork` | Works, with host names and `*.` wildcards. One case is stricter than on E2B; see [Allow only some websites](/egress-domain-filtering/#from-the-e2b-sdk). |
+| `network.allowOut` and `network.denyOut`, on create and with `updateNetwork` | Works, with host names and `*.` wildcards. One case is stricter than on E2B; see [Allow only some websites](/advanced-network-rules/#from-the-e2b-sdk). |
 | `network.allowPublicTraffic` and `network.maskRequestHost` | Works. |
 | Volumes (`volumeMounts`) | Works when your operator has turned on [platform volumes](/platform-volumes/). They attach read-write. |
 
@@ -111,7 +111,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 | E2B feature | What happens |
 |---|---|
 | Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/images-and-snapshots/#snapshots) as the template. |
-| `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/egress-rules-and-inspection/). |
+| `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/advanced-network-rules/#allow-only-some-requests). |
 | `network.egressProxy` | Refused (HTTP 501). |
 | Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
 | Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Share a web app](/preview/). |
@@ -150,5 +150,5 @@ Set the metadata key `aerolvm.serverless` to `"true"` to make it a [ghost sandbo
 
 - [Use the Daytona SDK](/using-daytona-sdk/): the same idea for Daytona code.
 - [SDK setup](/sdk-setup/): switch to an AerolVM SDK to use every feature.
-- [Allow only some websites](/egress-domain-filtering/): how `allowOut` and `denyOut` are applied.
+- [Allow only some websites](/network-access/#allow-only-some-websites): how `allowOut` and `denyOut` are applied.
 - [AerolVM vs Daytona vs E2B](/comparison/): how the three compare.

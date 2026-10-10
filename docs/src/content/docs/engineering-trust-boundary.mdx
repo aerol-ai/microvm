@@ -200,7 +200,7 @@ Docker accepts its own bridge traffic early, which would skip any rule simply ad
 
 It also saves a quota-exceeded flag on the sandbox (`MarkNetworkQuotaExceeded`, called from `internal/service/netstats.go`). So reconcile, the repair loop, re-applies the block after a restart. The metrics are published through expvar, Go's built-in metrics endpoint. They include `aerolvm_netstats_poll_total`, `aerolvm_netstats_samples_total` and counters for dropped samples (`pkg/docker/netstats/metrics.go`).
 
-Both tools do nothing until rules or limits are set. A sandbox with no `network_block_all` and no egress rules can reach everywhere the host can. [Block or allow the internet](/network-isolation/) and [Usage and limits](/network-usage/) cover the defaults. The trust-boundary point is that the enforcement, when present, lives on the host.
+Both tools do nothing until rules or limits are set. A sandbox with no `network_block_all` and no egress rules can reach everywhere the host can. [Block or allow the internet](/network-access/) and [Usage and limits](/network-usage/) cover the defaults. The trust-boundary point is that the enforcement, when present, lives on the host.
 
 > **Invariant.** Where rules and quotas are installed, they live in a host firewall chain, and code in the sandbox cannot remove them. The kernel keeps the byte counters for each network namespace, and they cannot be written from inside the container. So a sandbox cannot under-report its traffic to escape a quota.
 
@@ -360,7 +360,7 @@ Every example below does the same thing. The credentials in the `mounts` array a
 ## Next steps
 
 - [Attach cloud storage](/external-storage/): the mount API and the storage backends it supports.
-- [Block or allow the internet](/network-isolation/): set network rules for a sandbox.
+- [Block or allow the internet](/network-access/): set network rules for a sandbox.
 - [Usage and limits](/network-usage/): byte quotas built on `pkg/docker/netstats`.
 - [Secrets providers](/cluster-secrets/): seal cluster secrets with a local key or AWS KMS.
 - [Safe retries (idempotency)](/engineering-idempotency/): why the sealed columns live in a single-writer SQLite store.

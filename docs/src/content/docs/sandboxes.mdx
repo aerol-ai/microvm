@@ -76,7 +76,7 @@ The sandbox is running when the call returns. It gets 1 CPU, 1024 MB of memory a
 The create result also holds the sandbox's SSH private key: `sshPrivateKey` (Go `SSHPrivateKey`, Rust `ssh_private_key`). Only create returns it. Save it now if you plan to use [SSH access](/ssh-access/).
 
 <Aside>
-A new sandbox is private. It has no public web address. To share a web app running inside it, call `exposePort`, or set `allowPublicTraffic: true` when you create it. See [Block or allow the internet](/network-isolation/).
+A new sandbox is private. It has no public web address. To share a web app running inside it, call `exposePort`, or set `allowPublicTraffic: true` when you create it. See [Block or allow the internet](/network-access/).
 </Aside>
 
 The rest of this page assumes you already have a `client` and a `sandbox` from the step above.

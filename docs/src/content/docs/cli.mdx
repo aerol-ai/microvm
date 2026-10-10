@@ -81,7 +81,7 @@ aerolvm exec build-box --background -- python -m http.server 8000
 aerolvm expose build-box 8000
 ```
 
-`--background` starts the server and returns right away. `expose` prints a public web address for port 8000. Sandboxes are [private](/network-isolation/) until you expose a port.
+`--background` starts the server and returns right away. `expose` prints a public web address for port 8000. Sandboxes are [private](/network-access/) until you expose a port.
 
 Public addresses need a [server install](/getting-started/single-node-setup/). On a local install, `expose` still prints an address, but nothing answers there.
 
@@ -131,7 +131,7 @@ A new sandbox can reach the internet. To allow only some sites, list them when y
 aerolvm create --name build-box --image python:3.12 --allow-host pypi.org --allow-host '*.pythonhosted.org'
 ```
 
-Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:port`, or a range of IP addresses such as `10.0.0.0/8`. To turn the internet off completely, use `--block-network` instead. To change the list later, use an SDK. [Allow only some websites](/egress-domain-filtering/) has the details.
+Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:port`, or a range of IP addresses such as `10.0.0.0/8`. To turn the internet off completely, use `--block-network` instead. To change the list later, use an SDK. [Allow only some websites](/network-access/#allow-only-some-websites) has the details.
 
 ## Reference
 

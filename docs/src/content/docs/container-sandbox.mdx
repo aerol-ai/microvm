@@ -40,7 +40,7 @@ flowchart TB
 | Part | What the sandbox gets |
 |---|---|
 | Files | Its own file system, built from the image. Other sandboxes and the server's files are out of reach. |
-| Network | Its own network stack. Nothing from outside reaches it until you share a port. Sandboxes on one server share a private network, so use [network rules](/network-isolation/) to limit what each can reach. |
+| Network | Its own network stack. Nothing from outside reaches it until you share a port. Sandboxes on one server share a private network, so use [network rules](/network-access/) to limit what each can reach. |
 | Processes | Its own process list. It cannot see programs outside the sandbox. |
 | CPU and memory | Hard limits. CPU can be a fraction of a core. Memory is a hard cap, with no extra swap. |
 | Kernel | **Shared** with the server. This is the one thing a container does not wall off. |

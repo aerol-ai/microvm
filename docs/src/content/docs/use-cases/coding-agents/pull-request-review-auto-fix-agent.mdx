@@ -338,7 +338,7 @@ Claude Code's output streams to your terminal. When it is done, the script print
 ## Good to know
 
 - `--dangerously-skip-permissions` lets Claude Code run commands without asking you first. It also has your GitHub token, so give it a token with only the access it needs.
-- The checked-out code runs inside the sandbox. A pull request from a stranger can't reach your machine, but it can reach the internet unless you [block it](/network-isolation/).
+- The checked-out code runs inside the sandbox. A pull request from a stranger can't reach your machine, but it can reach the internet unless you [block it](/network-access/).
 - Lifecycle times are in nanoseconds. `45 * 60 * 1_000_000_000` is 45 minutes.
 - Setup steps use `execStream`, not `exec`. In Node.js, one `exec` call can wait only about 5 minutes for its answer, because Node's built-in `fetch` stops waiting after that.
 
