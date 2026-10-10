@@ -367,7 +367,6 @@ To keep data next to an image, write it to [attached cloud storage](/external-st
 
 - **One base image per kind of work.** Register `py-base`, `node-base` or `cuda-base` once when you deploy. Then create every sandbox from it. It is faster than running `apt-get install` in each sandbox, and you update versions in one place.
 - **A shared starting point.** Set up a sandbox once (clone a repo, build it, load test data), then save it. Start one sandbox per user from that snapshot. Each user gets a fresh copy of the same starting point.
-- **Snapshots that survive a failed server.** In a cluster, combine snapshot pushing with `failover.policy = "recreate"`. See [Share snapshots across a cluster](#share-snapshots-across-a-cluster).
 
 ## Firecracker: use a template
 

@@ -301,44 +301,9 @@ Durability only covers server restarts. Keeping files (attached storage) and los
 
 This works the same on one server, in a cluster, and on every runtime. The create request describes the sandbox, the storage holds the data, and the sandbox itself can be replaced.
 
-## For server operators
-
-### What happens when a node dies
-
-When `SB_ENABLE_CLUSTER=true` and a node dies:
-
-1. After `SB_DEAD_OWNER_GRACE` (default 30 seconds), the leader node unassigns every sandbox the dead node owned. It also removes the node from the Raft configuration (the list of nodes that vote on cluster state).
-2. Any further call for a default sandbox from that node returns `410 Gone`.
-3. Sandboxes created with `failover.policy = "recreate"` are handed to a healthy worker and rebuilt.
-
-### Keep cluster traffic private
-
-Cluster nodes talk to each other in three ways:
-
-| Channel | What it carries | Setting and default |
-|---|---|---|
-| Gossip | How nodes find each other and share their role (SWIM membership). | `SB_GOSSIP_BIND_ADDR`, default `0.0.0.0:7001` |
-| Capacity heartbeats | Each worker's free capacity, used to place new sandboxes. Requires a login. | `GET /v1/capacity` on the API port |
-| Raft | Agreement on which node runs which sandbox. | `SB_RAFT_BIND_ADDR`, default `0.0.0.0:7000` |
-
-A node that joins through gossip (the way nodes find each other) becomes a Raft voter until there are `SB_CLUSTER_MAX_AUTO_VOTERS` voters (default 5). After that, new nodes join as non-voters.
-
-Two settings protect these channels, and cluster mode requires both:
-
-- **`SB_GOSSIP_SECRET_KEY`** is a base64-encoded 16, 24 or 32-byte key (AES-128, 192 or 256). Every node needs the same key. A node without it cannot join. The server refuses to start in cluster mode without the key, unless you set `SB_CLUSTER_INSECURE_GOSSIP=true`. Use that only on a fully isolated test network.
-- **`SB_CLUSTER_TLS_DIR`** holds the cluster's certificates. Raft and internal cluster requests use mutual TLS (both sides prove who they are) with these certificates.
-
-Generate the gossip key once and copy it to every node:
-
-```bash
-openssl rand -base64 32
-```
-
-Even so, keep these ports on a private network you control, such as VPC peering, a WireGuard mesh or a dedicated cluster subnet. Never expose them to the public internet. See [Glossary](/cluster-glossary/) for every cluster setting.
-
 ## Next steps
 
 - [Attach cloud storage](/external-storage/): every storage type and its options.
-- [Share snapshots across a cluster](/images-and-snapshots/#share-snapshots-across-a-cluster): so recreate can use them.
+- [Images and snapshots](/images-and-snapshots/#snapshots): save a set-up sandbox as a snapshot to start new ones from.
 - [Cluster setup](/cluster-setup/): build a cluster with failover.
 - [Placement and failover](/engineering-placement-failover/): the deep dive on how the cluster picks and replaces nodes.
