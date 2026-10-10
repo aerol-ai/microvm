@@ -35,6 +35,25 @@ func isParkedSandboxID(id string) bool {
 	return strings.HasPrefix(strings.TrimSpace(id), "park-")
 }
 
+// isParkedContainer reports whether a listed container is warm-pool
+// inventory: park-labelled AND still named park-<hex>. The label alone is
+// not enough. Docker can't change a container's labels, so an adopted
+// container keeps the park label for life; adoption renames it to its
+// sandbox ID, and the name is what tells a live sandbox from a parked slot.
+// Going by the label alone, the boot purge destroyed live sandboxes on every
+// sandboxd restart (UC-212) and reconcile never saw them.
+func isParkedContainer(summary containerSummary) bool {
+	if !isParkedContainerLabels(summary.Labels) {
+		return false
+	}
+	for _, name := range summary.Names {
+		if isParkedSandboxID(strings.TrimPrefix(name, "/")) {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrSandboxContainerExists is returned when adopt-time rename finds the
 // sandbox name already taken — signals the §6 duplicate-create protocol.
 var ErrSandboxContainerExists = errors.New("docker: sandbox container name already exists")
@@ -537,7 +556,9 @@ func (c *Client) ListParkedContainers(ctx context.Context) ([]containerSummary, 
 	return containers, nil
 }
 
-// PurgeParkedContainers destroys all park-labeled containers and clears rules.
+// PurgeParkedContainers destroys the park inventory a previous run left and
+// clears its rules. Adopted containers carry the park label too and are live
+// sandboxes; isParkedContainer leaves them alone.
 func (c *Client) PurgeParkedContainers(ctx context.Context) (int, error) {
 	containers, err := c.ListParkedContainers(ctx)
 	if err != nil {
@@ -545,6 +566,9 @@ func (c *Client) PurgeParkedContainers(ctx context.Context) (int, error) {
 	}
 	purged := 0
 	for _, summary := range containers {
+		if !isParkedContainer(summary) {
+			continue
+		}
 		inspect, ierr := c.inspectContainer(ctx, summary.ID)
 		if ierr == nil {
 			if ip := getContainerIP(inspect, c.network); ip != "" {

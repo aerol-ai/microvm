@@ -3153,7 +3153,11 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		}
 	}
 	if state == nil {
-		state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		if is, ok := runtime.AsIdentityStarter(rt); ok {
+			state, err = is.StartWithIdentity(ctx, s.runtimeRef(sandbox), sandbox.ID, sandbox.ToolboxToken)
+		} else {
+			state, err = rt.Start(ctx, s.runtimeRef(sandbox))
+		}
 		if err != nil {
 			_ = s.mounts.UnmountAll(id)
 			releaseAdmission()

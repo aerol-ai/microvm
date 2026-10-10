@@ -417,8 +417,12 @@ func slogDefault() *slog.Logger {
 func TestListAndPurgeParkedContainers(t *testing.T) {
 	d := &poolFakeDaemon{t: t}
 	var listQuery url.Values
+	// Both carry the park label (the list filters on it); only park-c1 is
+	// still parked. c-adopted was renamed to its sandbox at adoption and is a
+	// live sandbox the boot purge must keep (UC-212).
 	d.listJSON = func() *http.Response {
-		return textResponse(http.StatusOK, `[{"Id":"park-c1"}]`)
+		return textResponse(http.StatusOK, `[{"Id":"park-c1","Names":["/park-c1"],"Labels":{"aerol.pool":"park"}},`+
+			`{"Id":"c-adopted","Names":["/sb-adopted"],"Labels":{"aerol.pool":"park"}}]`)
 	}
 	c := newPoolClient(t, d, func(c *Client) {
 		inner := c.httpClient.Transport

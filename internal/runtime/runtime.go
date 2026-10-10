@@ -196,3 +196,19 @@ func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
 	a, ok := rt.(ToolboxAddresser)
 	return a, ok
 }
+
+// IdentityStarter is a Runtime whose start must hand the container its
+// sandbox identity again. A Docker container adopted from the warm pool keeps
+// the pool's parked env for life (Docker can't change a container's env), so
+// after every stop its toolboxd boots parked and serves nothing until it is
+// adopted again with the sandbox's ID and toolbox token.
+type IdentityStarter interface {
+	StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error)
+}
+
+// AsIdentityStarter returns the identity-aware start when rt implements it.
+// Callers fall back to Start when this returns false.
+func AsIdentityStarter(rt Runtime) (IdentityStarter, bool) {
+	s, ok := rt.(IdentityStarter)
+	return s, ok
+}
