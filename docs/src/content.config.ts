@@ -100,10 +100,8 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     label: 'Networking',
     category: NavigationCategory.NETWORKING,
     entries: [
-      link('/network-isolation', 'Block or allow the internet'),
-      link('/egress-domain-filtering', 'Allow only some websites'),
-      link('/egress-profiles-and-learn-mode', 'Reusable allow lists'),
-      link('/egress-rules-and-inspection', 'Rules and inspection'),
+      link('/network-access', 'Network Access'),
+      link('/advanced-network-rules', 'Advanced Network Rules'),
       link('/network-usage', 'Usage and limits'),
       link('/preview', 'Share a web app'),
       link('/port-allowlist', 'Port allowlist'),

@@ -134,7 +134,7 @@ The tools come in three sets. Only `core` is on by default.
 
 Add `--toolsets` to the `aerolvm mcp` command to choose sets, such as `--toolsets core,files` or `--toolsets all`. Add `--read-only` to offer only tools that change nothing.
 
-The agent can also limit where a new sandbox may connect, with the `allow_hosts` argument of `sandbox_create`. See [Allow only some websites](/egress-domain-filtering/).
+The agent can also limit where a new sandbox may connect, with the `allow_hosts` argument of `sandbox_create`. See [Allow only some websites](/network-access/#allow-only-some-websites).
 
 ## Keep the agent in one sandbox
 
@@ -238,6 +238,6 @@ The server counts tool calls by tool and result in the `aerolvm_mcp_tool_calls_t
 ## Next steps
 
 - [aerolvm CLI](/cli/): the same program, used by hand from your terminal.
-- [Allow only some websites](/egress-domain-filtering/): limit where an agent's sandbox can connect.
+- [Allow only some websites](/network-access/#allow-only-some-websites): limit where an agent's sandbox can connect.
 - [Create and manage sandboxes](/sandboxes/): set idle timers like the ones MCP uses.
 - [Run commands](/exec-streaming/): what `exec` does under the hood.

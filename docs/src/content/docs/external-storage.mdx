@@ -233,7 +233,7 @@ The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server it
 - **Up to 8 mounts per sandbox.** [Platform volumes](/platform-volumes/) count toward the same 8.
 - **Credentials can have up to 32 keys and 4 KB in total** for each mount.
 - **Some folders are off limits** as a `target`: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/boot`, `/run` and `/var/run`. So is the folder where the server puts its own helper program inside the sandbox.
-- **Outbound network rules do not cover mounts.** [Block or allow the internet](/network-isolation/) controls traffic from inside the sandbox. The mount runs on the server, so it can still reach the storage.
+- **Outbound network rules do not cover mounts.** [Block or allow the internet](/network-access/) controls traffic from inside the sandbox. The mount runs on the server, so it can still reach the storage.
 - **Which sandboxes support mounts:** Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes refuse them.
 - **An SSH server's host key is trusted on first use.** The server accepts the storage server's key the first time it connects.
 
@@ -252,4 +252,4 @@ The server needs these programs installed to mount each type: `fuse3`, `sshfs`, 
 - [Platform volumes](/platform-volumes/): named storage your operator sets up, so you pass only a name.
 - [Files](/file-system/): copy single files in and out.
 - [Snapshots](/images-and-snapshots/#snapshots): save a whole sandbox's files as an image.
-- [Block or allow the internet](/network-isolation/): limit what code in the sandbox can reach.
+- [Block or allow the internet](/network-access/): limit what code in the sandbox can reach.

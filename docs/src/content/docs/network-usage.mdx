@@ -9,7 +9,7 @@ Every sandbox counts the bytes it receives and the bytes it sends. You can also 
 
 Use caps when a sandbox needs the internet but should not use too much of it, such as an agent that downloads files. You set caps at create, read the counters at any time, and raise or remove a cap while the sandbox runs.
 
-To control *where* a sandbox can connect instead of *how much*, see [Block or allow the internet](/network-isolation/) and [Allow only some websites](/egress-domain-filtering/).
+To control *where* a sandbox can connect instead of *how much*, see [Block or allow the internet](/network-access/) and [Allow only some websites](/network-access/#allow-only-some-websites).
 
 ## Create a sandbox with caps
 
@@ -203,7 +203,7 @@ If the new cap is above the current count, traffic flows again at once. If it is
 - **Caps are checked on each reading.** The server reads the counters every 10 seconds by default. A fast transfer can go past a cap before the block starts.
 - **Received bytes are counted after they arrive.** A cap stops further traffic. It cannot undo bytes the sandbox already received.
 - **A cap does not undo block-all.** Raising or removing the sent-bytes cap never lifts `networkBlockAll`. Both use the same block.
-- **IPv4 only.** The counters and caps cover IPv4 traffic, as with [Block or allow the internet](/network-isolation/).
+- **IPv4 only.** The counters and caps cover IPv4 traffic, as with [Block or allow the internet](/network-access/).
 - **Linux servers only.** On Docker sandboxes the block is applied by the server's firewall, which runs only on Linux.
 - **Not on Firecracker yet.** A Firecracker sandbox refuses byte caps with `501`, at create and with `setNetworkLimits`.
 
@@ -215,5 +215,5 @@ If the new cap is above the current count, traffic flows again at once. If it is
 
 ## Next steps
 
-- [Block or allow the internet](/network-isolation/): turn outbound traffic off, or limit it to IP address ranges.
-- [Allow only some websites](/egress-domain-filtering/): let a sandbox reach only the sites you name.
+- [Block or allow the internet](/network-access/): turn outbound traffic off, or limit it to IP address ranges.
+- [Allow only some websites](/network-access/#allow-only-some-websites): let a sandbox reach only the sites you name.

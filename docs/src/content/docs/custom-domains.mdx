@@ -273,7 +273,7 @@ In this version, the server sets every new domain to `pending_dns` and does not 
 
 ## For server operators
 
-Turn the feature on with `SB_ENABLE_CUSTOM_DOMAINS=true`. It requires `SB_DOMAIN`: the server refuses to start with custom domains on and no domain. The server must be reachable on ports 80 and 443 at the address users point their DNS at, so Let's Encrypt can reach it. For a network with no internet access, issue certificates from your own certificate authority instead. See [Certificates without the internet](/egress-domain-filtering/#certificates-without-the-internet).
+Turn the feature on with `SB_ENABLE_CUSTOM_DOMAINS=true`. It requires `SB_DOMAIN`: the server refuses to start with custom domains on and no domain. The server must be reachable on ports 80 and 443 at the address users point their DNS at, so Let's Encrypt can reach it. For a network with no internet access, issue certificates from your own certificate authority instead. See [Certificates without the internet](/advanced-network-rules/#certificates-without-the-internet).
 
 | Setting | What it does | Default |
 |---|---|---|

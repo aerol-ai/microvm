@@ -105,7 +105,7 @@ These calls fail. Most return HTTP 404 or 501, so your code gets an error rather
 | `codeInterpreter` (Daytona's stateful notebook-style runner) | Not supported (HTTP 501). Use `process.codeRun` or `process.executeCommand`. |
 | `sandbox.archive()` | Not supported (no such route). |
 | The auto-archive timer | Saved and returned, but nothing is ever archived. |
-| `networkAllowList` on create | Refused (HTTP 400). Use AerolVM's [allow lists](/egress-domain-filtering/) instead. |
+| `networkAllowList` on create | Refused (HTTP 400). Use AerolVM's [allow lists](/network-access/#allow-only-some-websites) instead. |
 | GPUs on create | Refused (HTTP 400). |
 | Regions and `target` | `target` is saved and returned, but it does not choose where the sandbox runs. There is no regions list. |
 | Volumes on WebAssembly sandboxes | Refused, because they have no container file system. |

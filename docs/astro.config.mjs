@@ -23,6 +23,11 @@ export default defineConfig({
     '/snapshots': '/images-and-snapshots',
     // serverless.mdx was renamed to ghost-sandboxes.mdx.
     '/serverless': '/ghost-sandboxes',
+    // The four networking pages were merged into network-access and advanced-network-rules.
+    '/network-isolation': '/network-access',
+    '/egress-domain-filtering': '/network-access',
+    '/egress-profiles-and-learn-mode': '/advanced-network-rules',
+    '/egress-rules-and-inspection': '/advanced-network-rules',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

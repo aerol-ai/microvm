@@ -90,7 +90,7 @@ Set `serverless: true` in the sandbox's lifecycle, together with `stopIfIdleFor`
   </TabItem>
 </Tabs>
 
-A sandbox wakes up through its **public** addresses, so it must be public. A new sandbox is private, but `exposePort` makes it public for you, so the example above needs nothing more. Only a serverless sandbox that never exposes a port needs `allowPublicTraffic: true` at create to wake through its main URL. See [Block or allow the internet](/network-isolation/).
+A sandbox wakes up through its **public** addresses, so it must be public. A new sandbox is private, but `exposePort` makes it public for you, so the example above needs nothing more. Only a serverless sandbox that never exposes a port needs `allowPublicTraffic: true` at create to wake through its main URL. See [Block or allow the internet](/network-access/).
 
 ## What happens while it sleeps
 

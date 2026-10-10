@@ -212,7 +212,7 @@ If you leave out `memoryMB`, the sandbox gets the server's WASM default, 256 MB 
 ## Good to know
 
 - **No GPU, no templates.** WASM sandboxes reject `gpus` and `template_id`.
-- **Allow and block lists work; method and path rules do not.** You can block the internet or allow only some hosts. The finer method and path rules from [Rules and inspection](/egress-rules-and-inspection/) are rejected.
+- **Allow and block lists work; method and path rules do not.** You can block the internet or allow only some hosts. The finer method and path rules from [Rules and inspection](/advanced-network-rules/#allow-only-some-requests) are rejected.
 - **HTTP only for public ports.** You can share a web server the module runs, but not raw TCP ports or TLS (encrypted TCP) ports. See [WASM networking](/wasm-networking/).
 
 For how workers and checkpoints work inside, see [WASM architecture](/wasm-architecture/).
