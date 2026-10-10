@@ -1,223 +1,186 @@
 ---
-title: Snapshot Clone Correctness
-description: Cloning a running operating system from one memory snapshot is fast because of CoW, but the hard part is correctness. The control-channel, determinism, CID-selection, integrity, and accounting invariants AerolVM holds when many sandboxes resume from a single snapshot.
+title: Correct snapshot clones
+description: Five ways a cloned Firecracker snapshot can go wrong, and the rule AerolVM keeps to make each clone safe and unique.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Firecracker sandboxes can resume from a captured snapshot in a fraction of a
-cold boot by sharing one memory image. `LoadSnapshot` mmaps the template's
-`snapshot.memory` with `MAP_PRIVATE`; the kernel's CoW handler allocates a
-private anonymous page on each clone's first write, leaving the file untouched.
-[Snapshot restore and the warm-VMM pool](/firecracker-hydration) covers the
-sharing mechanics and the warm-pool wiring;
-[Firecracker Architecture](/firecracker-architecture) covers the boot pipeline.
+A Firecracker sandbox can start from a snapshot instead of booting from scratch. A **snapshot** is a saved copy of a running virtual machine: its memory, its CPU state and its devices. Starting many sandboxes from one snapshot is fast. Making each copy correct is the hard part, and this page explains how AerolVM does it.
 
-**A snapshot is a frozen instant of a *running* operating system, and resuming
-many copies of one running OS creates hazards that do not exist for a freshly
-booted kernel.** Two clones drawn from the same memory image are, bit-for-bit,
-the same machine: same RNG pool, same wall clock, same in-flight kernel state.
-Each clone must end up with unique entropy, the current wall clock, its own
-per-clone network identity, and its own per-clone memory deltas. AerolVM
-resolves five distinct hazards; each one has a single load-bearing invariant.
-This page is Firecracker-only; container-runtime checkpointing has different
-semantics and is out of scope.
+**In short:**
 
-The whole snapshot/resume sequence lives in
-`internal/runtime/firecracker/driver.go`, in `Create` Steps 6–8b, with the warm
-path in `warmspawn.go` and capture in `snapshot.go`. Function and field names
-below are real and grep-able.
+- Every clone of a snapshot starts as the exact same machine: same random-number state, same clock, same network identity.
+- AerolVM handles five separate hazards. For each one it keeps a single rule that must always hold.
+- The host talks to each clone over vsock, a direct host-to-VM channel that skips the network. It survives a snapshot; TCP does not.
+- Right after a clone wakes up, the host resets its clock and network settings and has its kernel reseed its random-number generator.
+- The host checks the snapshot file for damage before using it, and counts the memory clones really use.
+
+## How clones share one snapshot
+
+This section shows the basic trick that makes clones fast. Firecracker's `LoadSnapshot` call maps the template's `snapshot.memory` file into each clone with `MAP_PRIVATE`. (A **template** is a prepared disk image plus its snapshot. **Mapping** a file makes it look like memory, and the kernel reads pages from the file when they are needed.)
+
+With `MAP_PRIVATE`, all clones read the same pages. When a clone first writes to a page, the kernel's **copy-on-write** (CoW) handler gives that clone its own private copy. The file itself is never changed.
+
+[Firecracker snapshot restore](/firecracker-hydration/) covers the sharing and the warm pool in detail. [Firecracker architecture](/firecracker-architecture/) covers the boot steps.
+
+## Why a snapshot is risky to copy
+
+This section explains what makes clones different from freshly booted machines. **A snapshot is a frozen moment of a *running* operating system, and copying a running system creates hazards that a fresh boot never has.** Two clones of one memory image are the same machine, bit for bit. They share the same random-number pool, the same wall clock and the same half-finished kernel work.
+
+Each clone must end up with its own randomness, the current time, its own network identity and its own memory changes. AerolVM handles five separate hazards. For each one it keeps a single **invariant**: a rule that must always be true.
+
+This page covers Firecracker only. Container checkpoints work differently and are out of scope.
+
+The whole snapshot and resume sequence lives in `internal/runtime/firecracker/driver.go`, in steps 6 to 8b of `Create`. The warm path is in `warmspawn.go`, and snapshot capture is in `snapshot.go`. Every function and field name on this page is real, so you can search the code for it.
 
 ## Hazard 1: the control channel must survive resume
 
-The host talks to the in-guest `toolboxd` agent over a channel. The obvious
-choice, TCP over the sandbox's TAP interface, is wrong for a *restored* guest.
+This hazard is about how the host talks to the agent inside a clone. The host sends commands to `toolboxd`, a small agent that runs inside the guest. (The **guest** is the operating system inside the virtual machine; the **host** is the server running it.)
 
-A snapshot freezes guest kernel memory, including the TCP/IP stack's connection
-state: sequence numbers, window sizes, the socket table, ARP entries. When a
-clone resumes, all of that is restored verbatim, but it describes connections
-to a host endpoint that no longer exists. The template's host-side TAP is
-removed *after* `CreateSnapshot` and after the build VMM shuts down
-(`internal/runtime/firecracker/snapshot.go:296` writes the snapshot,
-`:314` shuts the VMM, `:325` removes the TAP). Each clone then gets a fresh
-per-sandbox TAP PATCHed on *before* Resume, inside `configureVMMForLoad`
-(`internal/runtime/firecracker/driver.go:910` →
-`client.PatchNetworkInterface`). Any TCP connection state baked into the
-snapshot now points at a dead peer with stale sequence numbers and will sit
-half-open until it times out. The same applies to any guest-initiated outbound
-TCP connection that was open at capture; `pre_snapshot`
-(`internal/runtime/firecracker/snapshot.go:281`,
-`cmd/toolboxd/vsock.go:220`) flushes session recordings today but does not
-quiesce guest-side outbound sockets, so any such connections in the template
-resume broken.
+The obvious channel is TCP over the sandbox's TAP interface, a virtual network cable between host and guest. That choice is wrong for a guest restored from a snapshot.
 
-AerolVM uses **virtio-vsock**, not TCP, for the host↔guest control channel. The
-rationale is stated directly in `pkg/firecracker/client.go` on `PutVsock`:
+A snapshot freezes the guest kernel's memory, including the state of its TCP/IP network stack. That means sequence numbers, window sizes, the socket table and ARP entries (the table that maps IP addresses to network cards). When a clone resumes, all of it comes back exactly as it was. But it describes connections to a host endpoint that no longer exists.
 
-> Vsock is the snapshot-safe host↔guest channel; TCP over the TAP would tear on
-> resume.
+Here is the order in `snapshot.go`. It writes the snapshot, shuts down the build VMM, then removes the template's host-side TAP. (A **VMM**, or virtual machine monitor, is the Firecracker process that runs one virtual machine.)
 
-AerolVM keeps no vsock connection open across the snapshot boundary. The only
-vsock state in the snapshot is the guest-side listener bound to `(guest_CID,
-1024)`, and a listener is restartable: the host dials fresh after
-`Action(Resume)` (`vsockHandshake` in `driver.go`), the guest accepts, and the
-channel is live. A vsock *connection* that was open across the boundary would
-tear the same as TCP; the snapshot-safe property is about the listener, not
-about all vsock state.
+Each clone then gets a fresh per-sandbox TAP before it resumes. `configureVMMForLoad` in `driver.go` attaches it inside the `LoadSnapshot` call itself, with a network override (`NetworkOverrides`) that names this sandbox's TAP. Any TCP connection state baked into the snapshot now points at a dead peer with stale sequence numbers. It stays half-open until it times out.
 
-> **Invariant.** The host↔guest control channel carries no connection state
-> across the snapshot boundary. Every host↔guest exchange on a restored clone
-> begins with a fresh vsock dial against a listener whose validity does not
-> depend on any host endpoint that existed at capture time.
+The same applies to any outbound TCP connection the guest had open at capture. The `pre_snapshot` step (in `snapshot.go` and `cmd/toolboxd/vsock.go`) flushes session recordings today. It does not close the guest's outbound sockets, so any such connections in the template resume broken.
 
-## Hazard 2: determinism: identical entropy and a frozen clock
+AerolVM uses **virtio-vsock** (vsock for short) for the control channel, not TCP. Vsock is a socket that runs straight between the host and one virtual machine, without using the network. Each virtual machine has a vsock address called a **CID** (context ID). The reason for vsock is stated in `pkg/firecracker/client.go`, on `PutVsock`:
 
-Hazard 2 is the one with security consequences.
+> Vsock is the snapshot-safe host↔guest channel; TCP over the TAP would tear on resume.
 
-A snapshot captures the kernel's entropy pool (Linux's ChaCha-based DRBG state
-inside `random.c`). Restore that snapshot into N clones and **every clone's
-`getrandom(2)` returns the same bytes in the same order**, until something new
-is mixed in. Two sandboxes that each generate a "random" TLS session key, a
-UUID, an SSH host key, or a nonce will generate the *same* secret. For a
-platform running untrusted multi-tenant code, identical entropy across tenants
-is a security defect.
+AerolVM keeps no vsock connection open across the snapshot. The only vsock state in the snapshot is the guest's listener on `(guest_CID, 1024)`, and a listener can restart. After the VM resumes, the host dials fresh (`vsockHandshake` in `driver.go`), the guest accepts, and the channel is live.
 
-The wall clock is the parallel hazard. The snapshot freezes `CLOCK_REALTIME` at
-capture time. A clone resumed an hour (or a week) later wakes up believing the
-time is whatever it was when the template was built. Logs are misdated, TLS
-handshakes that check `notBefore`/`notAfter` fail, and any code that diffs
-"now" against a stored timestamp sees a clock that has jumped backwards.
+A vsock *connection* left open across the snapshot would break just like TCP. So the safe part is the listener, not all vsock state.
 
-Neither can be fixed before resume: `getrandom` and `clock_settime` both need
-the kernel running. So AerolVM fixes it immediately *after*, in `driver.go`
-**Step 8b (`post_resume`)**. Once the vsock handshake confirms the agent is up,
-the host sends a `post_resume` op carrying the current host wall clock:
+> **Invariant.** The host-to-guest control channel carries no connection state across the snapshot. Every exchange with a restored clone starts with a fresh vsock dial. The listener it dials does not depend on any host endpoint that existed at capture time.
+
+## Hazard 2: identical randomness and a frozen clock
+
+This hazard is the one with security consequences. A snapshot captures the kernel's **entropy pool**: the store of unpredictable bits the kernel uses to make random numbers. In Linux this is the ChaCha-based random generator state in `random.c`.
+
+Restore that snapshot into many clones, and **every clone's `getrandom(2)` returns the same bytes in the same order**. This lasts until something new is mixed in.
+
+So two sandboxes that each make a "random" TLS session key, UUID, SSH host key or nonce will make the *same* secret. (A **nonce** is a number meant to be used only once. **TLS** is the encryption behind HTTPS.) AerolVM runs untrusted code for many **tenants** (customers or accounts). Identical randomness across tenants is a security bug.
+
+The wall clock is the matching hazard. The snapshot freezes `CLOCK_REALTIME` (the kernel's wall clock) at capture time. A clone resumed an hour or a week later believes it is still the moment the template was built.
+
+Logs carry the wrong date. TLS checks of a certificate's `notBefore` and `notAfter` dates fail. Any code that compares "now" with a stored timestamp sees the clock jump backwards.
+
+Neither problem can be fixed before resume, because `getrandom` and `clock_settime` both need the kernel running. So AerolVM fixes both right *after* resume, in **step 8b (`post_resume`)** of `Create` in `driver.go`. Once the vsock handshake confirms the agent is up, the host sends a `post_resume` message.
+
+The message runs on every boot path, cold boots included. It carries the host's current wall clock. When the sandbox's TAP slot has an address, it also carries the guest's network settings (`postResumeData` in `driver.go`). Here is the current code, shortened to the relevant lines:
 
 ```go
-// Step 8b: post-resume quiesce signal (snapshot-load path only).
-// The clone resumed with the template's RNG entropy pool and
-// wall clock. Both are observably wrong: two clones would draw the
-// same getrandom bytes, and logs and TLS handshakes show a backwards
-// time jump. Tell the in-guest toolboxd to reseed the kernel
-// RNG and set CLOCK_REALTIME from the host now.
+// Step 8b: post-boot/post-resume quiesce signal. Snapshot clones
+// resumed with the template's RNG entropy pool and wall clock, so
+// toolboxd reseeds and sets CLOCK_REALTIME. Cold boots do not need
+// the entropy fix, but the same message also re-applies the static
+// TAP address after toolboxd is definitely running, which closes
+// the boot-time race where PID 1 starts before the virtio-net
+// device is fully visible.
 postCtx, cancel := context.WithTimeout(ctx, d.cfg.PostResumeTimeout)
-err := d.sendVsockOp(postCtx, handshakeCID, "post_resume", map[string]any{
-    "wallclock_unix_ns": time.Now().UnixNano(),
-})
+postErr := d.sendVsockOp(postCtx, vsockPath, handshakeCID, "post_resume", postResumeData(slot))
+cancel()
 ```
 
-The in-guest agent handles this in `cmd/toolboxd/vsock.go:233`
-(`OnPostResume`), which calls into `cmd/toolboxd/quiesce_linux.go`:
-`SetWallclock` (`quiesce_linux.go:78`) issues `clock_settime(CLOCK_REALTIME,
-host_now)`, and `ReseedRandom` (`quiesce_linux.go:41`) reads 32 bytes from the
-host-attached virtio-rng device via `/dev/random` and writes them back into
-`/dev/random` with the `RNDADDENTROPY` ioctl, crediting 256 bits so the next
-`getrandom` reseeds the CSPRNG. Cold-boot skips this entirely: a freshly
-initialized kernel has nothing stale to resync.
+```go
+func postResumeData(slot *TapSlot) map[string]any {
+    data := map[string]any{
+        "wallclock_unix_ns": time.Now().UnixNano(),
+    }
+    if network := toolboxNetworkPayload(slot); network != nil {
+        data["network"] = network
+    }
+    return data
+}
+```
 
-There is a window between `Action(Resume)` and the `post_resume` ack during
-which the guest is running with template entropy and the template's wall clock.
-On a slow host that window is hundreds of milliseconds. Anything that runs
-inside the guest during that window (init scripts, systemd units, the
-toolboxd's own startup) draws stale entropy and reads a stale clock. Code that
-derives long-lived secrets at boot must not run before the `post_resume`
-ack; the templates AerolVM ships defer key generation until the agent signals
-quiesce-complete.
+The `network` block holds the guest IP, gateway, netmask and prefix length from the sandbox's TAP slot. The agent handles the message in `OnPostResume` (`cmd/toolboxd/vsock.go`). It does four things, in this order:
+
+1. **Set the clock.** `SetWallclock` (in `cmd/toolboxd/quiesce_linux.go`) calls `clock_settime(CLOCK_REALTIME, host_now)`.
+2. **Apply the network settings.** If the message has a `network` block, `ConfigureNetwork` sets the guest's address and default route with `ip`.
+3. **Force a reseed.** `ReseedRandom` reads 32 bytes from Go's `crypto/rand` and writes them into `/dev/random` with the `RNDADDENTROPY` ioctl, crediting 256 bits. It then calls `RNDRESEEDCRNG`, which makes the kernel's **CSPRNG** (cryptographically secure random-number generator) reseed at once.
+4. **Mark the clone.** It changes the **clone-generation token** in `/run/aerolvm/clone-generation`, even if the reseed failed, and logs `vsock: post_resume complete`.
+
+An **ioctl** is a system call that sends a special command to a device. Kernels older than 5.10 lack `RNDRESEEDCRNG`. There the agent skips that call, and the kernel reseeds on its own schedule.
+
+No randomness comes from the host. AerolVM attaches no virtio-rng device (a virtual device that passes random bytes from the host), and `crypto/rand` reads the guest kernel's own generator. So this step forces a reseed, but brings in nothing from outside the clone. The handler's own code comment names vmgenid, covered below, as the real backstop.
+
+On a cold boot the same message runs. A freshly started kernel has no stale randomness or clock, so there it mainly re-applies the network address once the agent is running.
+
+There is a gap between the resume call and the `post_resume` reply. (AerolVM resumes a VM with `PatchVM`, Firecracker's `PATCH /vm` with state `Resumed`.) During the gap, the guest runs with the template's randomness and the template's clock. On a slow host this gap lasts hundreds of milliseconds.
+
+Anything that runs in the guest during the gap draws stale randomness and reads a stale clock. That includes init scripts, systemd units and toolboxd's own startup. Code that makes long-lived secrets at boot must not run before `post_resume` has finished. Inside the guest, the sign that it has finished is the change in the clone-generation token.
+
+The templates AerolVM ships put off key generation until `post_resume` has finished.
 
 ```mermaid
 sequenceDiagram
     participant H as Host driver.go
     participant FC as Firecracker VMM
     participant G as Guest toolboxd
-    H->>FC: LoadSnapshot -- ResumeVM=false -- EnableDiffSnapshots
-    H->>FC: PatchDrive / PatchNetworkInterface -- per-sandbox TAP plus overlay
-    H->>FC: Action Resume
+    H->>FC: LoadSnapshot -- ResumeVM=false -- NetworkOverrides to per-sandbox TAP
+    H->>FC: PatchDrive -- per-sandbox rootfs plus overlay
+    H->>FC: PATCH /vm state=Resumed
     Note over FC,G: clone now running with TEMPLATE entropy plus frozen clock
     H->>G: vsock dial handshakeCID 1024 -- op=ping
     G-->>H: ok=true
-    H->>G: op=post_resume -- wallclock_unix_ns
-    G->>G: reseed kernel RNG
+    H->>G: op=post_resume -- wallclock_unix_ns plus network
     G->>G: set CLOCK_REALTIME from host
+    G->>G: apply network settings
+    G->>G: RNDADDENTROPY then RNDRESEEDCRNG
+    G->>G: change clone-generation token
     G-->>H: ack -- best-effort -- discarded
 ```
 
-### Why best-effort and not fatal
+### Why a failed reset does not stop the create
 
-Step 8b logs a warning and continues on failure; it does not abort the create.
-This is a deliberate trade-off, not laxness. The failure mode of a missed
-`post_resume` is stale entropy and a wrong clock: degraded, observable,
-recoverable. The failure mode of treating it as fatal would be *a destroyed
-sandbox that was otherwise healthy*. A clone whose vCPUs are ticking and whose
-agent answered the ping is a working sandbox; refusing to hand it back because a
-follow-up resync op timed out trades a soft problem for a hard one. The reseed
-is bounded by `PostResumeTimeout` so a hung guest cannot stall the create path
-indefinitely.
+This section explains why step 8b only warns when it fails. It logs a warning and goes on; it does not cancel the create. The agent also replies OK when one of its own steps fails, and logs that step as a warning. This is a deliberate trade-off, not carelessness.
 
-> **Invariant.** A resumed clone is never *silently* handed back sharing the
-> template's entropy or clock: on the happy path it is reseeded before first
-> use, and on the failure path the divergence is logged, never swallowed. A
-> reseed failure does not destroy the sandbox. The warning log is load-bearing;
-> an operator watching for entropy-divergence regressions greps that signal.
+A missed `post_resume` leaves stale randomness and a wrong clock. That state is degraded, but you can see it and recover from it. Treating it as fatal would instead destroy a sandbox that was otherwise healthy.
 
-### Closing the entropy window: vmgenid
+A clone whose virtual CPUs (vCPUs) are running and whose agent answered the ping is a working sandbox. Refusing to return it because a follow-up step timed out trades a soft problem for a hard one. The reset is bounded by `PostResumeTimeout`, so a hung guest cannot stall the create path forever.
 
-`post_resume` is **reactive**: it runs after `Action(Resume)`, so the guest is
-already executing with template entropy for the few hundred milliseconds until
-the reseed lands. The robust complement is **synchronous, in-kernel, and needs
-no host round-trip**: Firecracker's **VM Generation ID** (vmgenid).
+> **Invariant.** A resumed clone is never *silently* returned with the template's randomness or clock. On the normal path it is reseeded before first use. On the failure path the mismatch is logged, never hidden.
+>
+> A reseed failure does not destroy the sandbox.
+>
+> The warning log is load-bearing. Operators who watch for clones that share randomness search the logs for it.
 
-vmgenid is a 128-bit value Firecracker regenerates on every snapshot restore and
-exposes to the guest through an ACPI device. A guest kernel built with
-`CONFIG_VMGENID` watches that device and, the instant it observes the value
-change on resume, reseeds the kernel CSPRNG from inside the resume path —
-*before* userspace is scheduled again. Code that runs in the window
-`post_resume` cannot reach (early init, systemd units, toolboxd's own startup)
-therefore still draws post-clone entropy. The two mechanisms compose as
-defense-in-depth: vmgenid covers the kernel CSPRNG with zero window, and
-`post_resume` still does the work vmgenid does *not* — it resyncs
-`CLOCK_REALTIME` (vmgenid is entropy-only) and credits additional host entropy
-via `RNDADDENTROPY` + `RNDRESEEDCRNG`.
+### Closing the randomness gap with vmgenid
 
-This only fires when the deployment supplies the pieces, and AerolVM controls
-only one of them in code:
+This section covers a second, faster fix for the gap. `post_resume` is **reactive**: it runs after the VM resumes. So the guest has already run with template randomness for a few hundred milliseconds when the reseed lands.
 
-- **Kernel command line (in code).** vmgenid is surfaced over ACPI, so ACPI must
-  stay enabled. `baseBootArgs`
-  (`internal/runtime/firecracker/driver.go`) deliberately omits `acpi=off`;
-  `pci=off` is unrelated and safe. A regression test
-  (`bootargs_test.go`) fails the build if a future edit reintroduces
-  `acpi=off` and silently disables the pre-userspace reseed.
-- **Guest kernel (operator artifact).** The kernel image
-  (`SB_FIRECRACKER_KERNEL`) must be built with `CONFIG_VMGENID=y`. The repo does
-  not build the kernel; verify this at template-build / deploy time.
-- **Firecracker binary (operator artifact).** vmgenid support landed in
-  Firecracker v1.8; `SB_FIRECRACKER_BINARY` must be at least that. On a binary
-  that predates it, the guest never sees a generation-ID change and silently
-  falls back to `post_resume`-only behavior — correct on the happy path, but
-  with the window restored.
+The stronger partner works inside the kernel, at the moment of resume, and needs no message from the host. It is Firecracker's **VM Generation ID** (vmgenid).
 
-vmgenid reseeds the **kernel** CSPRNG. A userspace PRNG already seeded inside a
-long-lived process baked into the template (a preloaded `python` that did
-`import numpy`) is in that process's own heap and is not reached by either
-mechanism; closing that gap needs the clone-generation signal documented in
-[Randomness in Cloned Sandboxes](/randomness-in-cloned-sandboxes).
+vmgenid is a 128-bit value that Firecracker changes on every snapshot restore. It shows the value to the guest through an **ACPI** device. (ACPI is the standard way a machine describes its hardware to the operating system.) A guest kernel built with `CONFIG_VMGENID` watches that device.
+
+The moment the kernel sees the value change on resume, it reseeds its CSPRNG inside the resume path. This happens *before* any user program runs again. So code that runs in the gap `post_resume` cannot reach (early init, systemd units, toolboxd's own startup) still gets fresh randomness.
+
+The two fixes stack as layers of defense. vmgenid reseeds the kernel CSPRNG with no gap at all. `post_resume` still does what vmgenid does *not*. It resets `CLOCK_REALTIME` (vmgenid handles randomness only), applies the network settings, and forces one more kernel reseed with `RNDADDENTROPY` and `RNDRESEEDCRNG`.
+
+vmgenid only works when the deployment supplies three pieces. AerolVM controls only one of them in code:
+
+- **Kernel command line (in code).** On x86 hosts vmgenid reaches the guest over ACPI, so ACPI must stay on. The x86 boot arguments (`baseBootArgsAMD64` in `driver.go`) deliberately leave out `acpi=off`, while `pci=off` is unrelated and safe. On Arm hosts Firecracker has no ACPI and delivers vmgenid through the device tree instead. A regression test fails the build if a later edit adds `acpi=off` back. That edit would quietly turn off the early reseed.
+- **Guest kernel (a file the operator supplies).** The kernel image (`SB_FIRECRACKER_KERNEL`) must be built with `CONFIG_VMGENID=y`. The repository does not build the kernel, so check this when you build templates or deploy.
+- **Firecracker binary (a file the operator supplies).** vmgenid support arrived in Firecracker v1.8, so `SB_FIRECRACKER_BINARY` must be that version or newer. With an older binary, the guest never sees a generation-ID change. It quietly falls back to `post_resume` only: correct on the normal path, but with the gap back.
+
+vmgenid reseeds the **kernel** CSPRNG only. A program can also keep its own **PRNG** (pseudo-random number generator) in its own memory. Picture a long-lived process baked into the template, such as a preloaded `python` that ran `import numpy`.
+
+That process seeded its PRNG before the snapshot, and neither fix reaches it. Closing that gap needs the clone-generation signal described in [Randomness in clones](/randomness-in-cloned-sandboxes/).
 
 ## Hazard 3: dial the guest's CID, not the slot's
 
-The vsock handshake hinges on dialing the right CID, and the snapshot path makes
-this a live hazard rather than a constant.
+This hazard is about which vsock address the host dials. The handshake only works if the host dials the right CID, and on the snapshot path that number changes.
 
-Every cold-boot sandbox gets a vsock CID from the per-host pool (`slot.VsockCID`)
-and the guest is configured with exactly that CID via `PutVsock`. The host dials
-it. Simple.
+Every cold-boot sandbox gets a vsock CID from a per-host pool (`slot.VsockCID`). (A **slot** is one entry in that pool: a TAP device, IP addresses and a CID.) `PutVsock` sets the guest up with exactly that CID, and the host dials it. Simple.
 
-The snapshot/warm path is different. The guest's CID was **baked into the
-snapshot state at template-build time** (`snapshot.go` configures `PutVsock`
-with `req.GuestCID`, the template's reserved CID, *not* the transient build
-slot's CID). When a clone resumes, the listener inside it is bound to *that*
-template CID. The per-sandbox `slot.VsockCID` allocated for this create is used
-only to derive the TAP/MAC and is irrelevant to vsock. `driver.go` selects the
-handshake CID accordingly:
+The snapshot and warm paths are different. The guest's CID was **baked into the snapshot when the template was built**. `snapshot.go` calls `PutVsock` with `req.GuestCID`, the template's reserved CID. It does *not* use the CID of the temporary build slot.
+
+When a clone resumes, its listener is bound to *that* template CID. On this path vsock ignores the `slot.VsockCID` picked for this create. `driver.go` picks the handshake CID to match:
 
 ```go
 handshakeCID := slot.VsockCID
@@ -226,13 +189,9 @@ if snapshotLoadPath {
 }
 ```
 
-Get this wrong and there is no error. There is a hang. Dialing the slot CID
-against a guest listening on the template CID races a listener that will never
-accept, and `vsockHandshake` retries on connection-refused until it burns the
-full deadline. The same `handshakeCID` is then reused for the `post_resume`
-send, so a CID mismatch would also silently strand Hazard 2's fix. The driver
-logs both CIDs (`template_cid`, `unused_slot_cid`) on the snapshot-load path so
-a mismatch is greppable.
+Get this wrong and you get no error. You get a hang. The host dials the slot CID while the guest listens on the template CID, so nothing ever accepts.
+
+`vsockHandshake` retries on "connection refused" until it uses up the whole deadline. The same `handshakeCID` is then reused for the `post_resume` send, so a wrong CID would also quietly skip the Hazard 2 fix. On the snapshot path the driver logs both CIDs (`template_cid`, `unused_slot_cid`), so you can search the logs for a mismatch.
 
 ```mermaid
 graph TD
@@ -244,218 +203,132 @@ graph TD
     DIAL --> POST["reuse handshakeCID for post_resume"]
 ```
 
-> **Invariant.** On the snapshot/warm path the host dials the CID encoded in the
-> snapshot state, never the per-sandbox slot CID. The slot CID names the
-> network identity; the snapshot CID names the agent. They are different
-> numbers and conflating them deadlocks the handshake.
+> **Invariant.** On the snapshot and warm paths the host dials the CID stored in the snapshot, never the per-sandbox slot CID. The slot CID names the network identity; the snapshot CID names the agent. They are different numbers, and mixing them up deadlocks the handshake.
 
-## Hazard 4: verify integrity before the kernel faults on it
+## Hazard 4: check the snapshot before the kernel touches it
 
-A snapshot memory file can be several GiB. Firecracker does not read it eagerly;
-`LoadSnapshot` mmaps it, and pages fault in lazily as the guest touches them.
-That laziness interacts badly with corruption: a single flipped bit in
-`snapshot.memory` does not surface at load time. It surfaces minutes later,
-deep in a running guest, when some code path finally faults the bad page in. By
-then the failure is unattributable and the sandbox has already been handed to a
-tenant.
+This hazard is about a damaged snapshot file. A snapshot memory file can be several GiB, and Firecracker does not read it all at load time.
 
-AerolVM closes this window by verifying the snapshot **on the host, before the
-mmap**. `configureVMMForLoad` re-hashes `snapshot.memory` and `snapshot.state`
-with streaming SHA-256 and compares against the checksum captured at build time,
-*before* issuing the `LoadSnapshot` REST call:
+`LoadSnapshot` maps the file, and pages **fault in** lazily: the kernel loads each page from the file the first time the guest touches it. That laziness hides corruption. A single flipped bit in `snapshot.memory` does not show up at load time.
+
+It shows up minutes later, deep in a running guest, when some code finally touches the bad page. By then you cannot tell what caused the failure, and the sandbox already belongs to a tenant.
+
+AerolVM closes this window by checking the snapshot **on the host, before mapping it**. `configureVMMForLoad` calls `verifySnapshotForLoad`, which hashes `snapshot.memory` and `snapshot.state` with streaming SHA-256. It compares the result with the checksum saved at build time, *before* it makes the `LoadSnapshot` call:
 
 ```go
 if d.cfg.SnapshotVerifyOnLoad && snap.SnapshotChecksum != "" {
-    if err := verifySnapshotChecksum(snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum); err != nil {
+    err := d.verifySnapshotForLoad(snap.TemplateID, snap.SnapshotMemoryPath, snap.SnapshotStatePath, snap.SnapshotChecksum)
+    if err != nil {
         return fmt.Errorf("firecracker runtime: snapshot integrity: %w", err)
     }
 }
 ```
 
-The checksum is produced once at capture (`snapshot.go` → `hashFile` /
-`formatSnapshotChecksum`, stored as `sha256:<hex>|sha256:<hex>`) and streamed so
-a multi-GiB memory file verifies in constant memory rather than OOMing on a
-one-shot read. A mismatch wraps `models.ErrSnapshotCorrupt`, which the warm path
-(`warmspawn.go`) escalates to mark the template UNHEALTHY and trigger a rebuild
-- otherwise the refill loop would spin forever re-loading the same rotten
-snapshot. The gate is `SnapshotVerifyOnLoad`, default on; it exists as a knob
-only so operators benchmarking raw load latency on a known-good snapshot can
-measure the mmap cost without the hash scan.
+The checksum is made once at capture (`hashFile` and `formatSnapshotChecksum` in `snapshot.go`). It is stored as `sha256:<hex>|sha256:<hex>`. Hashing streams the file, so even a multi-GiB memory file is checked with a fixed amount of memory. Reading it in one go could run out of memory.
 
-Verification re-reads the whole memory file on every load, duplicating the
-capture-time scan. The alternative is a corrupt page faulting into a
-tenant-facing guest minutes later.
+A mismatch wraps `models.ErrSnapshotCorrupt`. The warm path (`warmspawn.go`) then marks the template UNHEALTHY and triggers a rebuild. Otherwise the refill loop would spin forever, loading the same bad snapshot again.
 
-> **Invariant.** A corrupt snapshot fails before it is mapped, not after it is
-> running. Integrity is a host-side precondition of `LoadSnapshot`, never a
-> guest-side surprise.
+The switch is `SnapshotVerifyOnLoad`, and it is on by default. It exists only for operators who benchmark raw load speed on a known-good snapshot. They can measure the mapping cost without the hash scan.
 
-## Hazard 5: capacity accounting under shared memory
+By default the full scan does not run on every load. With `SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE=once`, the server checks a snapshot once per server start and per file identity, then caches the result (`snapshot_verify_cache.go`). The file identity is its device, inode, size and modification time.
 
-CoW makes the nominal memory model wrong. Admission reserves the full
-`memoryMB` per sandbox even though the actual RSS of a freshly-resumed clone is
-roughly `(template_dirty_pages + clone_dirty_pages_since_resume) × 4 KiB`,
-orders of magnitude smaller for short-lived sandboxes. `memoryMB` is the
-configured cap Firecracker hands to `KVM_SET_USER_MEMORY_REGION`; the host
-kernel grows RSS on first touch, not upfront. Ten clones of one 512 MiB
-template do **not** consume 5 GiB of distinct resident memory: they share the
-read-only base and each adds only its dirty delta. Reserving against `memoryMB`
-overstates the real footprint, often by an order of magnitude, and a host that
-*could* pack many clones refuses admission as if each clone were a full
-independent VM.
+Set the mode to `always` to re-hash on every create, which repeats the scan done at capture each time. Either way, the other choice is a corrupt page faulting into a tenant's guest minutes later.
 
-The fix is to measure resident reality. `internal/runtime/firecracker/rss_sampler.go`
-samples per-VMM RSS from `/proc/<pid>/statm` on a fixed interval and exposes
-the host aggregate via a single atomic load (`TotalRSSMB`), structured so
-admission can read it without contending on the sampler's lock.
+> **Invariant.** A corrupt snapshot fails before it is mapped, not after it is running. Integrity is a host-side precondition of `LoadSnapshot`, never a surprise inside the guest.
 
-This is wired end to end. `Driver.Create` calls `d.rssRegister(allocID,
-handle.Pid())` after the VMM is healthy
-(`internal/runtime/firecracker/driver.go:769`), `Destroy` calls
-`d.rssUnregister(sandboxID)` (`driver.go:1136`), and
-`pkg/daemon/daemon.go:331` constructs the sampler and injects it with
-`fcDriver.SetRSSSampler(rssSampler)`. The capacity admitter holds the sampler
-through the `RSSSource` interface (`pkg/capacity/capacity.go:194`) and consults
-`TotalRSSMB()` from `admit` (`capacity.go:388`, `:479`) and the effective-memory
-watermark check (`capacity.go:572`). The header comment in `rss_sampler.go`
-that says "no callers in the daemon" is stale relative to the code; the wiring
-above is the current state.
+## Hazard 5: counting memory when clones share it
 
-Until the first sample window completes, `Ready()` returns false so admission
-falls back to nominal accounting rather than reading the sampler's pre-tick
-zero as "host empty". On docker-only hosts the sampler is `nil` and the
-watermark check is gated on `rss != nil` (`pkg/daemon/daemon.go:222-229`
-materialises the interface as a true nil to keep that gate honest).
+This hazard is about how the host decides whether it has room for one more sandbox. Copy-on-write makes the simple memory count wrong.
 
-> **Invariant.** Admission counts resident reality, not the sum of
-> reservations, once the sampler's first window has completed; before that and
-> on hosts without firecracker, admission falls back to nominal accounting.
+**Admission** is the check that decides whether a host can take a new sandbox. It reserves the full `memoryMB` for each sandbox. But a freshly resumed clone really uses about `(template_dirty_pages + clone_dirty_pages_since_resume) × 4 KiB`. (A **dirty page** is a memory page that has been written to.) For short-lived sandboxes that is orders of magnitude smaller.
+
+`memoryMB` is the cap Firecracker passes to `KVM_SET_USER_MEMORY_REGION`. The host kernel grows a VM's **RSS** (resident set size: the physical memory it really holds) on first touch, not up front.
+
+So ten clones of one 512 MiB template do **not** use 5 GiB of separate memory. They share the read-only base, and each adds only its own dirty pages.
+
+Reserving against `memoryMB` overstates the real footprint, often by ten times or more. A host that *could* fit many clones then turns them away, as if each were a full, separate virtual machine.
+
+The fix is to measure what is really in memory. `internal/runtime/firecracker/rss_sampler.go` reads each VMM's RSS from `/proc/<pid>/statm` on a fixed interval. It publishes the host total through a single atomic load (`TotalRSSMB`), so admission can read it without waiting on the sampler's lock.
+
+This is wired end to end. `Driver.Create` calls `d.rssRegister(allocID, handle.Pid())` once the VMM is healthy, and `Destroy` calls `d.rssUnregister(sandboxID)`. `pkg/daemon/daemon.go` builds the sampler and hands it over with `fcDriver.SetRSSSampler(rssSampler)`.
+
+The capacity admitter holds the sampler through the `RSSSource` interface (`pkg/capacity/capacity.go`). It reads `TotalRSSMB()` in `admit` and in the effective-memory watermark check. The header comment in `rss_sampler.go` says the sampler has "no callers in the daemon" (the daemon is the AerolVM server process). That comment is out of date; the wiring above is how the code works today.
+
+Until the first sample window finishes, `Ready()` returns false. Admission then falls back to the reserved numbers, instead of reading the sampler's starting zero as "host empty".
+
+On Docker-only hosts the sampler is `nil`, and the watermark check only runs when `rss != nil`. `pkg/daemon/daemon.go` turns the interface into a true nil to keep that check honest.
+
+> **Invariant.** Once the sampler's first window has finished, admission counts the memory clones really use, not the sum of reservations. Before that, and on hosts without Firecracker, admission falls back to the reserved numbers.
 
 ## Known gaps
 
-A snapshot-systems-literate reader will look for these. None of them are fixed
-today; we name them so an operator can decide whether they matter for a given
-workload.
+This section lists what is not fixed today. A reader who knows snapshot systems will look for these. We name them so an operator can decide whether they matter for a given workload.
 
-- **Secrets in `snapshot.memory` on disk.** Captured guest memory sits on the
-  host filesystem as a regular file. Anything in guest RAM at capture time
-  (TLS session keys, SSH host keys, env vars, decrypted credentials) is in
-  that file, readable by anything with host filesystem access. Treat the
-  template build as the security boundary; do not bake long-lived secrets into
-  templates that ship to disk.
-- **`CLOCK_MONOTONIC` is not corrected.** `post_resume` sets `CLOCK_REALTIME`
-  only. From inside the guest, `CLOCK_MONOTONIC` appears to skip the time the
-  snapshot spent on disk. Code that diffs monotonic timestamps across the
-  snapshot boundary will see implausibly small intervals. Pending
-  `timerfd`/`setitimer`/`hrtimer` state carries stale relative offsets for the
-  same reason.
-- **TSC / kvm-clock.** The host TSC moved on while the snapshot was on disk.
-  Firecracker's clock sync on restore is the upstream default; AerolVM does
-  not intervene.
-- **Entropy window.** Between `Action(Resume)` and the `post_resume` ack, the
-  guest is running with template entropy. Code that runs in that window
-  (early init, systemd units, the toolboxd's own startup) draws stale
-  entropy. Quantified in Hazard 2. **Closed when the deployment supports
-  vmgenid** (Firecracker ≥ v1.8 + a guest kernel with `CONFIG_VMGENID`), which
-  reseeds the kernel CSPRNG in-kernel before userspace runs — see "Closing the
-  entropy window" in Hazard 2. Without that kernel/binary support the window
-  stands.
-- **In-flight guest TCP.** `pre_snapshot` does not quiesce guest-side outbound
-  sockets; connections that were open at capture resume broken.
-- **KASLR is not re-randomized across restore.** Every clone has the same
-  kernel layout as the template. A tenant who can probe kernel addresses
-  inside one clone learns the layout of every other clone resumed from the
-  same template.
-- **Kernel page cache vs. PATCHed rootfs.** The snapshot captured a populated
-  page cache backed by the template rootfs. After `PatchDrive` points
-  `/dev/vda` at the per-clone rootfs (`linkOrCopyRootfs`,
-  `internal/runtime/firecracker/driver.go:566` / `:1389`), the page cache only
-  matches the backing store because `linkOrCopyRootfs` preserves byte-for-byte
-  equality with the template. Any future change to that path that breaks
-  equality would introduce a silent data-corruption hazard.
-- **Guest PIDs collide across clones.** PIDs inside the snapshot are reused by
-  every clone. A monitoring agent that tags metrics with guest PIDs will see
-  collisions across tenants.
+- **Secrets in `snapshot.memory` on disk.** Captured guest memory sits on the host disk as a normal file. Anything in guest memory at capture time is in that file: TLS session keys, SSH host keys, environment variables, decrypted credentials. Anyone with access to the host's files can read it. Treat the template build as the security boundary, and do not bake long-lived secrets into templates that are saved to disk.
+- **`CLOCK_MONOTONIC` is not corrected.** `post_resume` sets `CLOCK_REALTIME` only. `CLOCK_MONOTONIC` is a clock that only counts forward, used to measure intervals. Inside the guest, it seems to skip the time the snapshot spent on disk. Code that compares monotonic timestamps across the snapshot will see intervals that are too short. Pending `timerfd`, `setitimer` and `hrtimer` timers carry stale offsets for the same reason.
+- **TSC and kvm-clock.** The host's TSC (the CPU's cycle counter) moved on while the snapshot sat on disk. Firecracker uses its default clock sync on restore, and AerolVM does not step in.
+- **Randomness gap.** Between the resume call and the `post_resume` reply, the guest runs with template randomness. Code in that gap (early init, systemd units, toolboxd's own startup) gets stale randomness, as Hazard 2 explains. **The gap closes when the deployment supports vmgenid**: Firecracker v1.8 or newer, plus a guest kernel with `CONFIG_VMGENID`. vmgenid reseeds the kernel CSPRNG before user programs run (see "Closing the randomness gap" in Hazard 2). Without that support, the gap remains.
+- **Open guest TCP connections.** `pre_snapshot` does not close the guest's outbound sockets. Connections that were open at capture resume broken.
+- **KASLR is not redone on restore.** KASLR (kernel address space layout randomization) places the kernel at a random memory address on each boot. Every clone has the same kernel layout as its template. A tenant who can probe kernel addresses in one clone learns the layout of every clone from that template.
+- **Kernel page cache and the swapped-in rootfs.** The **page cache** is the kernel's in-memory copy of file data. The snapshot captured a full page cache backed by the template's **rootfs** (the disk image that holds the guest's root file system). After `PatchDrive` points `/dev/vda` at the clone's own rootfs (`linkOrCopyRootfs` in `driver.go`), the cache still matches. It matches only because `linkOrCopyRootfs` keeps the file byte-for-byte equal to the template's. A future change that breaks that equality would cause silent data corruption.
+- **Guest PIDs repeat across clones.** Every clone reuses the process IDs inside the snapshot. A monitoring agent that tags metrics with guest PIDs will see the same PIDs from different tenants.
 
-## What this buys you
+## What this means in your code
 
-From the SDK, the correctness work is invisible. You create a sandbox from a
-Firecracker template and get back a guest with its own entropy, the correct
-wall clock, a live control channel, a verified memory image, and honest
-capacity accounting once the sampler's first window completes. The create
-shape below mirrors [Firecracker Sandbox](/firecracker-sandbox); the only
-addition is a `template_id` to take the snapshot/resume path.
+This section shows what all this looks like from the SDK: nothing. You create a sandbox from a Firecracker template. You get back a guest with its own randomness, the right wall clock and a live control channel. Its memory image has been checked, and memory accounting is honest once the sampler's first window completes.
+
+The create call matches the one in [Firecracker](/firecracker-sandbox/). The only extra field is the template id, which takes the snapshot path. Every SDK can set it: `templateId` in TypeScript and Python, `TemplateID` in Go, `template_id` in Rust and `setTemplateId` in Java. Without it, the sandbox cold-boots, and a fresh kernel has nothing stale to fix.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    const client = new MicroVM({
-      apiUrl: process.env.SB_API_URL,
-      patToken: process.env.SB_PAT_TOKEN,
-    })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    // template_id takes the snapshot-load path: LoadSnapshot + Resume,
-    // then the host reseeds entropy and the clock over vsock.
+    // The template id takes the snapshot path.
     const sandbox = await client.create({
-      templateId: 'tpl-python-3.12',
-      runtime: 'firecracker',
+      image: "python:3.12-slim",
+      runtime: "firecracker",
+      templateId: "tpl-python-3.12",
       cpu: 1,
       memoryMB: 512,
-    })
+    });
 
-    console.log(sandbox.id)
-    console.log(sandbox.publicURL)
+    console.log(sandbox.id);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     from microvm import MicroVM
 
-    client = MicroVM(
-        api_url='https://sandbox.example.com',
-        pat_token='your-token',
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    # The template id takes the snapshot path.
+    sandbox = client.create(
+        image="python:3.12-slim",
+        runtime="firecracker",
+        templateId="tpl-python-3.12",
+        cpu=1,
+        memory_mb=512,
     )
 
-    # template_id takes the snapshot-load path: LoadSnapshot + Resume,
-    # then the host reseeds entropy and the clock over vsock.
-    sandbox = client.create({
-        'templateId': 'tpl-python-3.12',
-        'runtime': 'firecracker',
-        'cpu': 1.0,
-        'memoryMB': 512,
-    })
-
     print(sandbox.id)
-    print(sandbox.publicURL)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    import (
-        "context"
-        "fmt"
-        "log"
-        "os"
-
-        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
-        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
-    )
-
-    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
-        APIUrl:   os.Getenv("SB_API_URL"),
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
-    })
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
     if err != nil {
         log.Fatal(err)
     }
 
-    // TemplateID takes the snapshot-load path: LoadSnapshot + Resume,
-    // then the host reseeds entropy and the clock over vsock.
-    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
-        TemplateID: "tpl-python-3.12",
+    // TemplateID takes the snapshot path: LoadSnapshot and Resume, then
+    // the host resets the clock and reseeds randomness over vsock.
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "python:3.12-slim",
         Runtime:    sdktypes.RuntimeFirecracker,
+        TemplateID: "tpl-python-3.12",
         CPU:        1,
         MemoryMB:   512,
     })
@@ -463,56 +336,48 @@ addition is a `template_id` to take the snapshot/resume path.
         log.Fatal(err)
     }
 
-    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.ID)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     use aerolvm_sdk::{Client, CreateOptions};
 
-    let client = Client::new(
-        Some("https://sandbox.example.com"),
-        Some("your-token"),
-    )?;
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
 
-    // template_id takes the snapshot-load path: LoadSnapshot + Resume,
-    // then the host reseeds entropy and the clock over vsock.
+    // The template id takes the snapshot path.
     let sandbox = client.create(CreateOptions {
-        template_id: Some("tpl-python-3.12".to_string()),
-        runtime:     Some("firecracker".to_string()),
-        cpu:         Some(1),
-        memory_mb:   Some(512),
+        image: "python:3.12-slim".into(),
+        runtime: Some("firecracker".into()),
+        template_id: Some("tpl-python-3.12".into()),
+        cpu: Some(1),
+        memory_mb: Some(512),
         ..Default::default()
     })?;
 
-    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    println!("{}", sandbox.data.id);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.MicroVMClient;
-    import ai.aerol.microvm.MicroVMConfig;
-    import ai.aerol.microvm.Sandbox;
-    import ai.aerol.microvm.model.CreateOptions;
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    MicroVMClient client = new MicroVMClient(
-        new MicroVMConfig()
-            .setApiUrl("https://sandbox.example.com")
-            .setPatToken(System.getenv("SB_PAT_TOKEN"))
-    );
+    // The template id takes the snapshot path.
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setRuntime("firecracker")
+        .setTemplateId("tpl-python-3.12")
+        .setCpu(1.0)
+        .setMemoryMb(512));
 
-    // templateId takes the snapshot-load path: LoadSnapshot + Resume,
-    // then the host reseeds entropy and the clock over vsock.
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setTemplateId("tpl-python-3.12")
-            .setRuntime("firecracker")
-            .setCpu(1.0)
-            .setMemoryMb(512)
-    );
-
-    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    System.out.println(sandbox.id);
     ```
   </TabItem>
 </Tabs>
 
+## Next steps
+
+- [The frozen-kernel problem](/engineering-frozen-kernel-problem/): the story of how these hazards were found, and the fixes that failed.
+- [Firecracker snapshot restore](/firecracker-hydration/): how clones share memory and how the warm pool works.
+- [Randomness in clones](/randomness-in-cloned-sandboxes/): reseed randomness inside your own long-running programs.
+- [Firecracker templates](/firecracker-templates/): build the templates that clones start from.

@@ -1,129 +1,163 @@
 ---
-title: SSH Access
+title: SSH access
+description: Log in to a sandbox with any SSH client, using the private key the server gives you when you create the sandbox.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-AerolVM runs an SSH gateway on port `2220` (configurable via `SB_SSH_LISTEN_ADDR`). Each sandbox is provisioned with a unique Ed25519 key pair on creation. The private key is returned **only** in the create response and is not stored by the server.
+You can log in to a sandbox with SSH (Secure Shell), the standard tool for opening a shell on another computer. When you create a sandbox, the server makes a new key pair just for it. You get the private key once, in the create response, and use it with `ssh`.
 
-To get a shell without handling keys, use [`aerolvm shell <sandbox>`](/cli#open-a-shell-in-a-sandbox). It authenticates with your API token and lands in the same `default` session as an SSH login.
+<Aside type="tip">
+Don't want to handle keys? Run [`aerolvm shell <sandbox>`](/cli/#open-a-shell-in-a-sandbox). It signs in with your API token and opens the same shell an SSH login does.
+</Aside>
 
-## Key Provisioning
+## Save the key when you create the sandbox
 
-The SSH private key is available immediately when the sandbox is created. Save it - it cannot be retrieved later.
+The private key is in the result of `create`, and only there. The server does not store it, so it cannot give it to you again. Save it right away.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.create({ image: 'ubuntu:22.04' })
+    import { writeFileSync } from "node:fs";
 
-    const privateKey = sandbox.sshPrivateKey  // save this immediately
-    const publicKey  = sandbox.sshPublicKey   // available later via get()
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
 
-    console.log(privateKey)
+    // Only set on create: save it now.
+    writeFileSync("sandbox_key", sandbox.sshPrivateKey ?? "");
+    console.log(sandbox.id); // you log in with this ID
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({'image': 'ubuntu:22.04'})
+    sandbox = client.create(image="ubuntu:22.04")
 
-    private_key = sandbox.sshPrivateKey  # save - only returned on create
-    public_key  = sandbox.sshPublicKey
+    # Only set on create: save it now.
+    with open("sandbox_key", "w") as f:
+        f.write(sandbox.sshPrivateKey)
+    print(sandbox.id)  # you log in with this ID
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
-    })
-    if err != nil { log.Fatal(err) }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    privateKey := sandbox.SSHPrivateKey  // save - only returned by Create()
-    publicKey  := sandbox.SSHPublicKey
+    // Only set by Create: save it now.
+    if err := os.WriteFile("sandbox_key", []byte(sandbox.SSHPrivateKey), 0o600); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.ID) // you log in with this ID
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
+        image: "ubuntu:22.04".into(),
         ..Default::default()
     })?;
 
-    let private_key = &sandbox.ssh_private_key; // save - only returned by create()
-    let public_key  = &sandbox.data.ssh_public_key;
+    // Only set on create: save it now.
+    let key = sandbox.ssh_private_key.clone().unwrap_or_default();
+    std::fs::write("sandbox_key", key).expect("could not save the key");
+    println!("{}", sandbox.data.id); // you log in with this ID
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    import java.nio.file.Files;
+    import java.nio.file.Path;
+
     Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
 
-    String privateKey = sandbox.sshPrivateKey;  // save - only returned by create()
-    String publicKey  = sandbox.sshPublicKey;
+    // Only set on create: save it now.
+    Files.writeString(Path.of("sandbox_key"), sandbox.sshPrivateKey);
+    System.out.println(sandbox.id); // you log in with this ID
     ```
   </TabItem>
 </Tabs>
 
-## Connecting
+The matching public key stays on the sandbox as `sshPublicKey` (Go `SSHPublicKey`, Rust `data.ssh_public_key`). You can read it later with `get`.
 
-The SSH username encodes the sandbox ID and an optional session name:
+<Aside type="caution">
+Anyone with the private key can log in to the sandbox. Keep it as safe as your API token.
+</Aside>
 
-| Username format | Behavior |
+## Log in
+
+Make the key file readable only by you, or `ssh` refuses to use it. Then connect to port `2220` on your AerolVM server. The user name is the sandbox ID.
+
+```bash
+chmod 600 sandbox_key
+ssh -i sandbox_key -p 2220 sb-0123456789abcdef@sandbox.example.com
+```
+
+On a local install, the host is `127.0.0.1`. Use the sandbox's ID, such as `sb-0123456789abcdef`. Its name does not work as an SSH user name.
+
+## Run one command
+
+Put the command at the end, as with any SSH server. You get its output, and `ssh` exits with the command's exit code.
+
+```bash
+ssh -i sandbox_key -p 2220 sb-0123456789abcdef@sandbox.example.com 'python3 --version'
+```
+
+## Open a named shell
+
+A plain login opens the sandbox's shared shell, named `default`. It keeps running when you disconnect, and the next login lands back in it. [`aerolvm shell`](/cli/) opens the same one.
+
+To get a separate shell, add `+` and a name to the user name:
+
+| User name | What you get |
 |---|---|
-| `<sandbox-id>` | Attach to the default session |
-| `<sandbox-id>+<name>` | Attach to the named session |
+| `<sandbox-id>` | The shared `default` shell |
+| `<sandbox-id>+<name>` | The shell with that name, started if it is not running |
 
 ```bash
-# Save the private key from the create response
-echo "$SSH_PRIVATE_KEY" > ~/.ssh/sandbox_key
-chmod 600 ~/.ssh/sandbox_key
-
-# Connect to the default session
-ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123@<host>
-
-# Connect to a named session
-ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123+myshell@<host>
+ssh -i sandbox_key -p 2220 sb-0123456789abcdef+build@sandbox.example.com
 ```
 
-## Cluster mode
+These shells are [terminal sessions](/sessions/), so you can also read and manage them from the SDK.
 
-In a multi-node cluster a sandbox is owned by exactly one node, but the leased
-SSH domain load-balances connections across every ingress node. You connect the
-same way regardless of which node owns your sandbox:
+## Good to know
 
-```bash
-ssh -i ~/.ssh/sandbox_key -p 2220 sandbox_abc123@<leased-domain>
-```
+- **The sandbox must be running.** A stopped sandbox refuses the login.
+- **Each sandbox accepts only its own key.** There is no shared login for all sandboxes on a server.
+- **No file copy or port forwarding over SSH.** `sftp` and the default `scp` do not work, and neither does `ssh -L`. Copy files with the [Files](/file-system/) calls or `aerolvm cp`, and share ports with [Share a web app](/preview/).
 
-If your connection lands on a node that does not own the sandbox, the gateway
-authenticates you against the owner's authoritative key and bridges the session
-to the owner over the cluster's internal mTLS channel. Only your sandbox's
-*public* key and the session bytes cross between nodes; the per-sandbox toolbox
-token never leaves the owner. Key revocation is honored immediately — the
-authorized key is re-fetched from the owner on every connection, not cached.
+## For server operators
 
-### Stable host identity
+The SSH gateway is the part of the server that accepts SSH logins and passes them to sandboxes. It is on by default.
 
-By default each node generates its own SSH host key, so as the leased domain
-rotates you across nodes your client may warn that the host key changed. To give
-clients one stable identity, distribute the **same** host key to every
-ingress-bearing node:
-
-- **Terraform:** set the `ssh_host_key_pem` variable (sensitive) to a shared
-  OpenSSH ed25519 private key; bootstrap writes it to `SB_SSH_HOST_KEY_PATH` on
-  every node.
-- **Ansible:** set `ssh.host_key` in `config/secrets.yml` (or point
-  `sandboxd_ssh_host_key_src` at a control-node file); `configure-ops.yml`
-  installs it.
-
-Leave both unset to keep per-node keys.
-
-## Configuration
-
-| Environment Variable | Default | Description |
+| Variable | What it does | Default |
 |---|---|---|
-| `SB_ENABLE_SSH_GATEWAY` | `true` | Enable or disable the SSH gateway. |
-| `SB_SSH_LISTEN_ADDR` | `0.0.0.0:2220` | Address and port for the SSH server. |
-| `SB_SSH_HOST_KEY_PATH` | `/var/lib/aerolvm/ssh_host_ed25519_key` | Host key path. Generated on first start if absent. In cluster mode, point every node at a shared key for a stable host identity. |
+| `SB_ENABLE_SSH_GATEWAY` | Turns the SSH gateway on or off. | `true` |
+| `SB_SSH_LISTEN_ADDR` | The address and port the gateway listens on. | `0.0.0.0:2220` |
+| `SB_SSH_HOST_KEY_PATH` | Where the server's own host key is kept. It is created on first start if missing. | `/var/lib/aerolvm/ssh_host_ed25519_key` |
 
+### SSH in a cluster
 
-Each sandbox accepts exactly one authorized key. There is no shared host-level access.
+In a cluster, one server runs each sandbox, but SSH logins arrive at any ingress node (a server that takes outside traffic). Users connect the same way no matter which server runs their sandbox:
+
+```bash
+ssh -i sandbox_key -p 2220 sb-0123456789abcdef@sandbox.example.com
+```
+
+When a login reaches a server that does not run the sandbox, that server checks the key against the server that does. It then passes the session there over the cluster's private, encrypted channel. Only the sandbox's public key and the session itself cross between servers. The key is checked on every login and never cached, so a changed key takes effect at once.
+
+### Give every node the same host key
+
+By default each server makes its own host key. Users who land on different servers may then see a warning that the host key changed. To avoid it, give every ingress node the same host key:
+
+- **Terraform:** set the `ssh_host_key_pem` variable (marked sensitive) to a shared OpenSSH ed25519 private key. Setup writes it to `SB_SSH_HOST_KEY_PATH` on every node.
+- **Ansible:** set `ssh.host_key` in `config/secrets.yml`, or point `sandboxd_ssh_host_key_src` at a file on the control machine. The `configure-ops.yml` playbook installs it.
+
+Leave both unset to keep a separate key per node.
+
+## Next steps
+
+- [Terminal sessions](/sessions/): manage the same shells from code.
+- [aerolvm CLI](/cli/): open a shell without handling keys.
+- [Files](/file-system/): copy files in and out.
+- [Cluster setup](/cluster-setup/): run AerolVM on several servers.

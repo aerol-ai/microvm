@@ -1,19 +1,15 @@
 ---
-title: Egress Profiles and Learn Mode
-description: Name an allow list once and use it from many sandboxes, start from built-in lists for common registries or your operator's org lists, learn an allow list from a trusted run, and check a policy before you create anything.
+title: Reusable allow lists
+description: Save an allow list once and use it in many sandboxes, use built-in lists, learn one from a trusted run, and test a policy.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-When many sandboxes need the same outbound access, such as a package mirror,
-a source host and an internal API, writing the list into every create gets
-out of date fast. An **egress profile** is a named allow list you keep once.
-Sandboxes reference it by name, and when you change it, every sandbox that
-uses it picks up the change. Profiles use the same entries as
-[Egress Domain Filtering](/egress-domain-filtering): hostnames, `*.` wildcards,
-`host:port` and CIDRs.
+Many sandboxes often need the same outbound access, such as a package mirror, a code host and an internal API. Copying that list into every create gets out of date fast. A **profile** is a named allow list you keep in one place. Sandboxes use it by name, and when you change it, every sandbox that uses it gets the change.
 
----
+This page also covers two helpers. **Learn mode** records what a trusted run connects to and suggests a list. **Policy check** tests a list without creating a sandbox.
+
+Profiles hold the same entries as [Allow only some websites](/egress-domain-filtering/): names, `*.` wildcards, `host:port` and IP address ranges. If allow lists are new to you, start there.
 
 ## Create a profile and use it
 
@@ -92,29 +88,21 @@ uses it picks up the change. Profiles use the same entries as
   </TabItem>
 </Tabs>
 
-A sandbox's allowed destinations are its own `networkAllowOut` entries plus
-those of every profile it references. A profile is a full replace: sending the
-same body again changes nothing, so it is safe to retry.
+The sandbox can reach its own `networkAllowOut` entries plus the entries of every profile it uses. Putting a profile replaces all of it. Sending the same body again changes nothing, so it is safe to retry.
 
-- **Names** are lower-case letters, digits, `.`, `_` and `-`, up to 63
-  characters, and belong to your account like sandbox names.
-- **Limits.** A profile holds up to 512 hostname entries, and a sandbox
-  references up to 16 profiles. A sandbox's own entries and all its profiles
-  together hold at most 1024 hostname entries, counted per list.
-- **Profiles and block-all don't mix.** `networkBlockAll` with
-  `egressProfiles` is refused.
-- **Narrower than a host.** To allow only some methods or paths on a host a
-  profile allows, add [egress rules](/egress-rules-and-inspection) to the
-  sandbox. If a profile change later drops that host, its rules stop
-  mattering: the host is refused anyway.
+| Rule | Detail |
+|---|---|
+| Profile names | Lower-case letters, digits, `.`, `_` and `-`, up to 63 characters, starting with a letter or digit. They belong to your account, like sandbox names. |
+| Size of one profile | Up to 512 names. |
+| Profiles per sandbox | Up to 16. |
+| Total per sandbox | At most 1024 names across the sandbox's own list and all its profiles. Each list counts on its own, so a name in two lists can count twice. |
+| Block-all | `networkBlockAll` together with `egressProfiles` is refused. |
 
----
+To allow only some methods or paths on a site a profile allows, add [rules](/egress-rules-and-inspection/) to the sandbox. If a later profile change drops that site, its rules stop mattering: the site is refused anyway.
 
 ## Change a profile
 
-Put the profile again with its new entries. Each change raises its
-`generation`, and each sandbox reports the generation it has live in
-`egressProfilesApplied`, so you can tell when a change has reached it.
+Put the profile again with its new entries. Each change raises its `generation` number. Each sandbox reports the generation it is using in `egressProfilesApplied`, so you can tell when a change has reached it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -170,29 +158,17 @@ Put the profile again with its new entries. Each change raises its
   </TabItem>
 </Tabs>
 
-- **When it applies.** The node you sent the change to applies it to its
-  sandboxes at once. In a cluster, every other node applies it to its own
-  sandboxes within about 30 seconds. Connections the narrowed profile no
-  longer allows are closed.
-- **Refused changes.** A change that would push some sandbox that uses the
-  profile past the 1024-entry limit is refused with `409`
-  (`egress_profile_cap_exceeded`), naming the sandboxes. Nothing changes.
-- **When a sandbox can't take it.** If a change can't be applied to one
-  sandbox, that sandbox is shut (`egressStatus: "held"`) rather than left on
-  the old list, and the change is retried every 10 seconds.
+- **When it applies.** The server you sent the change to applies it to its sandboxes at once. In a cluster, every other server applies it to its own sandboxes within about 30 seconds. Connections the narrower profile no longer allows are closed.
+- **Changes that are refused.** A change that would push some sandbox past the 1024-name total is refused with `409` (`egress_profile_cap_exceeded`). The error names those sandboxes, and nothing changes.
+- **When one sandbox cannot take it.** That sandbox is shut off from the internet (`egressStatus: "held"`) rather than left on the old list. The change is retried every 10 seconds.
 
-To change which profiles a running sandbox uses, call
-[`setNetworkPolicy`](/egress-domain-filtering#change-the-policy-of-a-running-sandbox)
-with `egressProfiles`.
+To change which profiles a running sandbox uses, call `setNetworkPolicy` with `egressProfiles`. See [Change the policy of a running sandbox](/egress-domain-filtering/#change-the-policy-of-a-running-sandbox).
 
----
+## List and delete profiles
 
-## List and delete
+`listEgressProfiles` returns your profiles a page at a time, sorted by name. Pass `nextCursor` back as `cursor` for the next page.
 
-`listEgressProfiles` returns your profiles a page at a time, by name; pass
-`nextCursor` back as `cursor` for the next page. `deleteEgressProfile` refuses
-with `409` (`egress_profile_in_use`) while any sandbox still references the
-profile; deleting one that is already gone succeeds.
+`deleteEgressProfile` is refused with `409` (`egress_profile_in_use`) while any sandbox still uses the profile. Deleting a profile that is already gone succeeds.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -245,24 +221,20 @@ profile; deleting one that is already gone succeeds.
   </TabItem>
 </Tabs>
 
----
-
 ## Built-in profiles
 
-AerolVM ships allow lists for common package registries and source hosts.
-Reference one as `builtin:<name>` anywhere you would use your own profile, on
-its own or next to yours.
+AerolVM comes with allow lists for common package registries and code hosts. Use one as `builtin:<name>` anywhere you would use your own profile, alone or next to yours.
 
 | Name | Covers |
 |---|---|
 | `builtin:pypi` | pip: `pypi.org` and `files.pythonhosted.org` |
-| `builtin:npm` | npm and Yarn registries |
-| `builtin:github` | `github.com`, its API, raw files, release downloads, `git` over SSH and `ghcr.io` |
+| `builtin:npm` | the npm and Yarn registries |
+| `builtin:github` | `github.com`, its API, raw files, release downloads, `git` over SSH, and `ghcr.io` |
 | `builtin:huggingface` | `huggingface.co` and its download hosts |
 | `builtin:golang-proxy` | the Go module proxy and checksum database |
 | `builtin:crates` | `crates.io` and its download host |
 | `builtin:apt-ubuntu` | the Ubuntu archive and security mirrors |
-| `builtin:docker-hub` | Docker Hub's registry, token service and blob download hosts (Cloudflare, R2, and Docker's S3 bucket in `us-east-1`), for tools like `crane`. On AWS, Docker Hub serves blobs from its bucket in the client's region; outside `us-east-1`, add that bucket's host inline |
+| `builtin:docker-hub` | Docker Hub's registry, token service and download hosts (Cloudflare, R2, and Docker's S3 bucket in `us-east-1`), for tools like `crane`. On AWS, Docker Hub serves downloads from its bucket in your region. Outside `us-east-1`, add that bucket's host to your own list. |
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -335,33 +307,15 @@ its own or next to yours.
   </TabItem>
 </Tabs>
 
-- **Pinned at create.** `builtin:pypi` is stored as
-  `builtin:pypi@<YYYYMMDD>`, the date of the list the node had when the
-  sandbox was created. Upgrading AerolVM never changes what a running sandbox
-  can reach. To move a sandbox to the newest list, call `setNetworkPolicy` with
-  the bare name again. You can also ask for a dated version yourself.
-- **Read-only.** You can read a built-in with `getEgressProfile` (the bare name
-  gives the newest version), but not change or delete it. A built-in counts
-  toward the 16-profile and 1024-entry limits like any other profile.
-- **During an upgrade.** If a sandbox pinned to a list newer than a node has
-  moves to that node, for example after a failover in the middle of a rolling
-  upgrade, it runs with all outbound traffic blocked and
-  `egressStatus: "unavailable"` until it is on a node that has that version.
-  A new create asking for such a version on an older node gets `503`; retry it.
-- **Missing a host?** The lists are maintained by hand. If a tool needs a host
-  a list lacks, add the host to `networkAllowOut` next to the built-in.
-- **Switched off.** Your operator can turn built-ins off. Then a create or
-  policy change that names one gets `400` "built-in profiles disabled on this
-  deployment", and sandboxes that already use one keep it.
-
----
+- **Fixed when you create the sandbox.** `builtin:pypi` is saved as `builtin:pypi@<YYYYMMDD>`, the date of the list the server had at create. Upgrading AerolVM never changes what a running sandbox can reach. To move a sandbox to the newest list, call `setNetworkPolicy` with the plain name again. You can also ask for a dated version yourself.
+- **Read-only.** You can read a built-in list with `getEgressProfile` (the plain name gives the newest version). You cannot change or delete it. It counts toward the 16-profile and 1024-name limits like any other profile.
+- **During an upgrade.** A sandbox can be pinned to a list newer than its server has. This can happen after a failover in the middle of a rolling upgrade. That sandbox gets no outbound traffic and shows `egressStatus: "unavailable"` until it runs on a server with that version. A new create that asks for such a version on an older server gets `503`. Retry it.
+- **Missing a host?** The lists are kept up by hand. If a tool needs a host that a list lacks, add it to `networkAllowOut` next to the built-in list.
+- **Turned off.** Your operator can turn built-in lists off. Then a create or policy change that names one gets `400` "built-in profiles disabled on this deployment". Sandboxes that already use one keep it.
 
 ## Org profiles
 
-On a private network, your operator can publish allow lists for everyone on
-the deployment, such as the bank's package mirrors, as `org:<name>` profiles.
-Every account can read them and reference them like its own; only the
-operator can change them.
+On a private network, your operator can publish allow lists for everyone on the deployment as `org:<name>` profiles. An example is the company's package mirrors. Every account can read them and use them like its own. Only the operator can change them.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -426,27 +380,15 @@ operator can change them.
   </TabItem>
 </Tabs>
 
-- **Not pinned.** Unlike built-ins, a sandbox follows its org profiles: when
-  the operator edits one, every sandbox that uses it picks up the change
-  within about 10 seconds, and `generation` changes.
-- **The default policy.** When the operator's default policy names org
-  profiles, a sandbox created without any egress settings references them, so
-  it follows edits too.
-- **When one goes away.** If the operator removes an org profile a sandbox
-  uses, or grows it so the sandbox would pass the 1024-entry limit, that
-  sandbox is shut (`egressStatus: "held"`) until the operator fixes it.
-- **Unknown names** are refused with `400` at create and in
-  `setNetworkPolicy`. Org profiles don't appear in `listEgressProfiles`; your
-  operator publishes their names.
-
----
+- **Not fixed at create.** Unlike built-in lists, a sandbox follows its org profiles. When the operator edits one, every sandbox that uses it gets the change within about 10 seconds, and `generation` changes.
+- **The default policy.** The operator's default policy may name org profiles. Then a sandbox created with no outbound settings uses them, so it follows edits too.
+- **When one goes away.** The operator might remove an org profile a sandbox uses, or grow it past the 1024-name total for that sandbox. Then the sandbox is shut off (`egressStatus: "held"`) until the operator fixes it.
+- **Unknown names** are refused with `400`, at create and in `setNetworkPolicy`.
+- **Not in the list.** Org profiles do not appear in `listEgressProfiles`. Your operator tells you their names.
 
 ## Learn an allow list
 
-Writing an allow list for a workload you didn't write is guesswork. **Learn
-mode** gives a sandbox open egress for one trusted run and records every
-destination it reaches. Read the recording and it comes with the allow list
-that would have allowed that run, ready to lock the sandbox down.
+Writing an allow list for code you did not write is guesswork. **Learn mode** gives a sandbox full internet access for one trusted run and records every destination it reaches. When you read the recording, it comes with the allow list that would have allowed that run. You can then use it to lock the sandbox down.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -521,35 +463,20 @@ that would have allowed that run, ready to lock the sandbox down.
   </TabItem>
 </Tabs>
 
-- **Trusted runs only.** A learn-mode sandbox can reach anything, so use it
-  for code you trust and switch it to enforce before untrusted code runs.
-  Every connection it makes is written to the
-  [audit log](/egress-domain-filtering#see-what-was-refused) with reason
-  `learn_mode`.
-- **Rules.** Learn mode takes no allow or deny lists, no profiles and no
-  block-all; it is never a default.
-- **The suggestion.** Three or more names under one domain collapse to
-  `*.domain` (never a public suffix), non-web ports stay as `host:port`, and
-  addresses reached without a DNS name become single-address CIDRs. When the
-  suggestion holds more than 64 hostnames it comes back as
-  `suggestedProfile`, a body for `putEgressProfile`, instead of
-  `suggestedAllowOut`.
-- **Limits.** A recording holds up to 1024 destinations; past that,
-  `truncated` is true and new destinations aren't recorded.
-- **How long it lasts.** A recording stays readable after the sandbox
-  switches to enforce, and goes when the sandbox is destroyed. It isn't
-  replicated, so a sandbox recreated on another node after a failure starts
-  a new one. A WASM sandbox's recording lives in its running worker and goes
-  when it stops.
+<Aside type="caution">
+A sandbox in learn mode can reach anything. Use it only for code you trust. Switch the sandbox to an allow list, as above, before any untrusted code runs.
+</Aside>
 
----
+- **Every connection is logged.** Each one goes into the [audit log](/egress-domain-filtering/#see-what-was-refused) with the reason `learn_mode`.
+- **No lists with it.** Learn mode takes no allow or deny lists, no profiles and no block-all. It is never a default.
+- **How the suggestion is built.** Three or more names under one domain become `*.domain` (never a public suffix such as `*.com`). Ports other than the web ports stay as `host:port`. Addresses reached without a name become single-address ranges.
+- **Large suggestions.** If the suggestion holds more than 64 names, it comes back as `suggestedProfile` instead of `suggestedAllowOut`. That is a ready body for `putEgressProfile`.
+- **Size limit.** A recording holds up to 1024 destinations. Past that, `truncated` is `true` and new destinations are not recorded.
+- **How long it lasts.** A recording stays readable after the sandbox switches to an allow list. It goes away when the sandbox is destroyed. It is not copied to other servers, so a sandbox recreated on another server after a failure starts a new recording. A WASM sandbox's recording lives in its running worker and goes away when it stops.
 
 ## Check a policy before you use it
 
-`checkNetworkPolicy` answers whether a sandbox created with some egress fields
-would reach a destination, using the same matcher the filter enforces. No
-sandbox is created. The destination is a host, `host:port`, an IP or
-`IP:port`; a bare host is checked on the web ports.
+`checkNetworkPolicy` tells you whether a sandbox created with some outbound settings would reach a destination. It uses the same matching the filter uses, and it creates no sandbox. The destination is a host, `host:port`, an IP address, or `IP:port`. A plain host is checked on the web ports (80 and 443).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -602,18 +529,27 @@ sandbox is created. The destination is a host, `host:port`, an IP or
   </TabItem>
 </Tabs>
 
-The answer also gives `defaultVerdict`, what happens to a destination no entry
-matches, and `outsideCeiling` when an entry falls outside the limits your
-operator set, which is why such a create would be refused. The check doesn't
-resolve DNS, so a deny CIDR that a hostname's address would hit is only
-caught when the sandbox connects.
+| Field | What it tells you |
+|---|---|
+| `allowed` | Whether the destination would be reached. |
+| `matchedRule` | The entry that decided. Empty when no entry matched. |
+| `defaultVerdict` | What happens to a destination that no entry matches: `allow` or `deny`. |
+| `outsideCeiling` | An entry that falls outside the limits your operator set. A create with it would be refused. |
 
----
+The check does not look up names. So a deny range that a name's address falls into is only caught when the sandbox connects.
 
-## Limitations
+## Limits
 
-- **Learn mode and the E2B SDK.** `updateNetwork` keeps a sandbox in learn
-  mode; setting lists on a learn-mode sandbox from the E2B SDK is refused with
-  `409`. Switch it with `setNetworkPolicy`.
-- **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
-  sandbox's profiles, since the E2B API has no way to name them.
+- **E2B SDK and profiles.** `updateNetwork` from the [E2B SDK](/using-e2b-sdk/) keeps a sandbox's profiles, since the E2B API has no way to name them.
+- **E2B SDK and learn mode.** `updateNetwork` keeps a sandbox in learn mode. Setting lists on a learn-mode sandbox from the E2B SDK is refused with `409`. Switch it with `setNetworkPolicy` instead.
+
+## For server operators
+
+- **Org profiles, the default policy and turning off built-in lists** are set in the private-network policy file. See [Private networks](/egress-domain-filtering/#private-networks).
+- **`SB_EGRESS_PROFILE_APPLY_QPS`** (default `50`) caps how many sandboxes per second one server updates after a profile changes. This keeps one edit from flooding the filter and the firewall.
+
+## Next steps
+
+- [Allow only some websites](/egress-domain-filtering/): how allow lists work and what a refusal looks like.
+- [Rules and inspection](/egress-rules-and-inspection/): allow only some methods and paths on a site.
+- [Block or allow the internet](/network-isolation/): block everything, or use IP address ranges.

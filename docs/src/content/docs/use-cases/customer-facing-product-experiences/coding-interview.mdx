@@ -1,14 +1,16 @@
 ---
-title: Coding Interview Platform
-description: Deploy a full coding interview app inside AerolVM that spins up per-language sandboxes to compile and run candidate code in 10 languages.
+title: Coding interview platform
+description: Host a web code editor in a sandbox that runs each candidate's answer in its own throwaway sandbox, in 10 languages.
 ---
 
-## What you are building
+import { Aside } from '@astrojs/starlight/components';
+
+In this tutorial you put a coding interview app online. A candidate writes code in the browser, picks a language and clicks **Run Code**. The app runs that code in a brand-new sandbox, shows the output and deletes the sandbox.
 
 <div style="max-width: 980px; margin: 0 auto 32px;">
   <img
     src="/coding-agent.png"
-    alt="Coding agent illustration"
+    alt="The interview app: a code editor on the left, a terminal on the right, and a language menu with a Run Code button"
     width="1200"
     height="700"
     loading="lazy"
@@ -16,29 +18,43 @@ description: Deploy a full coding interview app inside AerolVM that spins up per
   />
 </div>
 
-A multi-language coding interview platform where the **entire web app** runs inside an AerolVM sandbox. When a candidate submits code, the app creates a short-lived, per-execution sandbox with the correct language runtime (Python, Rust, Go, Java, etc.), uploads the code, executes it, and returns the result - all from inside the parent sandbox.
+Every answer runs alone, so one candidate's code can never see or break another's. If the code crashes or loops forever, only its own sandbox is affected.
 
-## Why AerolVM fits
+## How it works
 
-- **Nested sandboxes** - the interview app itself runs in a sandbox, and each code execution spins up an ephemeral child sandbox with the correct language image. No Docker-in-Docker needed.
-- **Per-execution isolation** - every submission runs in a fresh container that is destroyed immediately after, so candidates can never interfere with each other.
-- **Multi-language from one image** - the app image is Node-based; language runtimes are pulled on-demand via standard Docker images (`rust:1.75-slim`, `golang:1.21-alpine`, etc.).
-- **Instant cleanup** - child sandboxes are destroyed in the `finally` block, so resources are reclaimed even if execution fails.
+The system has two parts:
 
-## Architecture
+1. **A host script, `index.ts`.** It runs on your computer. It starts the interview app in a sandbox, waits for it to be ready and prints its public link.
+2. **The interview app, `server.ts`.** It runs inside that sandbox. It serves the code editor page. When a candidate clicks **Run Code**, it creates a second, short-lived sandbox for that one run.
 
-The system has two layers:
+So sandboxes create other sandboxes. The app does this with the same SDK you use, through the AerolVM server's API.
 
-1. **Host script (`index.ts`)** - runs on your machine, creates the parent sandbox from a pre-built Docker image, waits for the Express server to become healthy, and exposes port 3000.
-2. **Interview app (`server.ts`)** - runs inside the parent sandbox, serves the Monaco-editor frontend, and handles `POST /execute` by creating ephemeral child sandboxes for each code run.
+## What you need
 
-## Copy-paste TypeScript scripts
+- **An AerolVM server.** For a link that candidates can open, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), the link works only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **`SANDBOX_API_URL`**: the address of your AerolVM server as seen from inside a sandbox. See the caution below.
+- **Node.js 20 or newer.**
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/edtech-coding-interviews](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/edtech-coding-interviews)
+<Aside type="caution">
+Inside a sandbox, `127.0.0.1` means the sandbox itself, not your AerolVM server. If the app gets `http://127.0.0.1:21212`, every **Run Code** click fails. Set `SANDBOX_API_URL` to an address that works from inside a sandbox:
 
-### Host script - `index.ts`
+- On a server with a domain, use its public address: `https://<your-domain>`.
+- On a Mac local install, `http://host.docker.internal:21212` worked in our tests.
+</Aside>
 
-This script deploys the interview app container into an AerolVM sandbox and returns the public URL.
+### Step 1: Set up a project
+
+```bash
+mkdir coding-interview && cd coding-interview
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Save the host script
+
+Save this as `index.ts`. It starts the app from a ready-made image, `ghcr.io/aerol-ai/aerolvm-examples-interview-app:latest`. The app's own code is in the [examples repository](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/edtech-coding-interviews).
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -47,6 +63,9 @@ import { setTimeout as delay } from "node:timers/promises";
 
 const patToken = process.env.SB_PAT_TOKEN;
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
+// The app calls the AerolVM API from inside its sandbox, where 127.0.0.1 is
+// the sandbox itself. SANDBOX_API_URL is the server's address as seen from there.
+const sandboxApiUrl = process.env.SANDBOX_API_URL ?? apiUrl;
 const imageName =
   process.env.IMAGE_NAME ??
   "ghcr.io/aerol-ai/aerolvm-examples-interview-app:latest";
@@ -66,7 +85,7 @@ async function main() {
     memoryMB: 1024,
     env: {
       SB_PAT_TOKEN: patToken!,
-      SB_API_URL: apiUrl,
+      SB_API_URL: sandboxApiUrl,
       PORT: "3000",
     },
   });
@@ -100,15 +119,68 @@ main().catch((error) => {
 });
 ```
 
+### Step 3: Run it
 
-## Product outputs
+```bash
+export SANDBOX_API_URL=https://<your-domain>
+npx tsx index.ts
+```
 
-- `interview-app-deployment.json` with the sandbox ID and the public app URL.
-- A live web app with a Monaco code editor supporting 10 languages.
-- Each "Run Code" click creates an isolated, ephemeral sandbox - automatically destroyed after execution.
+You should see:
 
-## Related docs
+```text
+Sandbox created: sb-...
+Interview App is live at: https://<sandbox-id>-3000.<your-domain>
+```
 
-- [Exec](/exec/)
-- [File System](/file-system/)
-- [Preview](/preview/)
+The script also writes `interview-app-deployment.json` with the sandbox ID and the link.
+
+### Step 4: Try it
+
+1. Open the link in your browser.
+2. Pick a language from the menu.
+3. Write some code, or keep the sample, and click **Run Code**.
+
+The output appears in the terminal panel. By then, the sandbox that ran it is already gone.
+
+## What happens on each Run Code click
+
+The app follows the same five steps for every run:
+
+1. It creates a sandbox from the image for the chosen language, with half a CPU core and 512 MB of memory.
+2. It uploads the candidate's code as a file, such as `/workspace/main.py`.
+3. It runs the language's command, for example `python3 /workspace/main.py`.
+4. It sends the output, errors and exit code back to the browser.
+5. It deletes the sandbox, even when the run fails. As a backup, the sandbox also deletes itself after 5 idle minutes.
+
+The app supports these 10 languages. Each one is a standard public image, which the server downloads the first time it is used.
+
+| Language | Image |
+|---|---|
+| Python | `python:3.11-slim` |
+| JavaScript | `node:20-slim` |
+| Rust | `rust:1.75-slim` |
+| Go | `golang:1.21-alpine` |
+| C++ | `gcc:13` |
+| Java | `openjdk:21-slim` |
+| Ruby | `ruby:3.2-slim` |
+| PHP | `php:8.2-cli` |
+| Bash | `alpine:3.19` |
+| Perl | `perl:5.38-slim` |
+
+## Clean up
+
+The app sandbox keeps running until you delete it. Find its ID in `interview-app-deployment.json`, then run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/). You can also call `sandbox.destroy()` from your code.
+
+## Good to know
+
+- **The app sandbox holds your token.** It needs `SB_PAT_TOKEN` to create sandboxes. Candidate code never runs there. It runs only in the short-lived sandboxes, which get no token.
+- **The first run of each language is slow.** The server has to download that language's image once. Later runs reuse it.
+- **To change the app,** build your own image from the `interview-app` folder in the examples repository. Then set `IMAGE_NAME` to your image before you run the host script.
+
+## Next steps
+
+- [Run commands](/exec-streaming/): run programs and read their output and exit codes.
+- [Files](/file-system/): upload code and download results.
+- [Share a web app](/preview/): how public links work.
+- [Block or allow the internet](/network-isolation/): stop candidate code from reaching the internet.

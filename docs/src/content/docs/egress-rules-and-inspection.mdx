@@ -1,29 +1,26 @@
 ---
-title: Egress Rules and Inspection
-description: Allow only some methods, paths or programs on an allowed host, over plain HTTP as it is and over HTTPS by checking requests through a per-node CA the sandbox trusts.
+title: Rules and inspection
+description: Allow only some requests or programs on an allowed website, check HTTPS requests, and keep API keys out of the sandbox.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-[Egress Domain Filtering](/egress-domain-filtering) decides by hostname: once
-`api.github.com` is allowed, a sandbox can call any endpoint on it, including
-ones that write. **Egress rules** narrow an allowed host to the requests you
-expect, by method and path, such as `GET /repos/acme/**` and nothing else. On
-plain HTTP the egress gateway already reads every request. For HTTPS, an
-**inspect** rule makes the gateway terminate TLS with a certificate authority
-(CA) that belongs to the node, check each request, and open its own TLS
-connection to the real host. Only a sandbox created with an inspect rule
-trusts that CA. An inspect rule can also **inject** a credential, such as an
-API token, that the sandbox itself never holds, and any rule can be limited to
-the **programs** allowed to use it.
+An allow list decides by website name. Once `api.github.com` is allowed, a sandbox can call any endpoint on it, including ones that change data. **Rules** narrow an allowed site down to the requests you expect, such as `GET /repos/acme/**` and nothing else.
 
----
+Rules sit on top of an allow list from [Allow only some websites](/egress-domain-filtering/) or [Reusable allow lists](/egress-profiles-and-learn-mode/). They can only narrow it. A site must be allowed there before a rule can name it.
 
-## Allow some paths on a plain-HTTP host
+## Pick what you need
 
-Debian's package mirror is served over plain HTTP, so a rule on port 80 needs
-no extra setup. This sandbox can fetch packages and nothing else from
-`deb.debian.org`:
+| You want to | Use | Jump to |
+|---|---|---|
+| Allow only some methods and paths on a plain HTTP site | A rule with `methods` and `paths` | [Allow some paths on a plain HTTP site](#allow-some-paths-on-a-plain-http-site) |
+| Do the same for an HTTPS site | The same rule with `inspect: true` | [Check HTTPS requests too](#check-https-requests-too) |
+| Let the sandbox use an API key it can never read | A rule with `inject` | [Keep an API key out of the sandbox](#keep-an-api-key-out-of-the-sandbox) |
+| Let only some programs, such as `pip` or `ssh`, reach a site | A rule with `binaries` | [Let only some programs connect](#let-only-some-programs-connect) |
+
+## Allow some paths on a plain HTTP site
+
+Debian's package mirror uses plain HTTP, so a rule on port 80 needs no extra setup. This sandbox can download packages from `deb.debian.org` and do nothing else there:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -91,20 +88,21 @@ no extra setup. This sandbox can fetch packages and nothing else from
   </TabItem>
 </Tabs>
 
-`apt-get update` and `apt-get install` work as before. A `POST`, or a `GET` for
-any other path on `deb.debian.org`, gets a `403` whose body says what was
-refused, for example `aerolvm egress policy: GET /admin on deb.debian.org is
-not allowed by network_egress_rules`.
+`apt-get update` and `apt-get install` work as before. A `POST`, or a `GET` for any other path on `deb.debian.org`, gets a `403`. The response body says what was refused:
 
-A rule on port 80 doesn't touch HTTPS to the same host: without an inspect
-rule, HTTPS is still decided by the hostname alone.
+```text
+aerolvm egress policy: GET /admin on deb.debian.org is not allowed by network_egress_rules
+```
 
----
+A rule on port 80 does not touch HTTPS to the same site. Without an inspect rule, HTTPS is still decided by the name alone.
 
-## Inspect HTTPS
+## Check HTTPS requests too
 
-A rule on port 443 needs `inspect: true`. This sandbox may read the `acme`
-organization's repositories through the GitHub API and do nothing else there:
+HTTPS is encrypted, so the filter cannot see a request's method or path. An **inspect rule** (`inspect: true`) lets it look. The server's filter service decrypts the sandbox's HTTPS connection, checks each request, and sends it on over its own HTTPS connection to the real site. A company proxy that inspects HTTPS works the same way.
+
+To do this, the filter shows the sandbox a certificate signed by the server's own certificate authority (CA). A CA is a service that vouches for site certificates. Only a sandbox created with an inspect rule trusts this CA.
+
+A rule on port 443 needs `inspect: true`. This sandbox may read the `acme` organization's repositories through the GitHub API, and do nothing else there:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -175,67 +173,58 @@ organization's repositories through the GitHub API and do nothing else there:
   </TabItem>
 </Tabs>
 
-Inside the sandbox, `GET https://api.github.com/repos/acme/widgets` works the
-ordinary way: the client sees a certificate for `api.github.com`, issued by the
-node's CA, which the sandbox trusts. A `POST` to the same URL, or a `GET` of
-`https://api.github.com/users/octocat`, gets a `403` from the gateway. Other
-allowed hosts are unaffected; their HTTPS still passes through unopened.
+Inside the sandbox, `GET https://api.github.com/repos/acme/widgets` works the usual way. The program sees a certificate for `api.github.com`, signed by the server's CA, which the sandbox trusts. A `POST` to the same URL, or a `GET` of `https://api.github.com/users/octocat`, gets a `403` from the filter.
 
-### How a rule matches
+Other allowed sites are not affected. Their HTTPS still passes through without being opened.
 
-| Field | Meaning |
-|---|---|
-| `host` | An exact name or `*.` wildcard, without a port. The allow list (`networkAllowOut` or a [profile](/egress-profiles-and-learn-mode)) must already allow it; a rule for a host that isn't allowed is refused with `400`. |
-| `ports` | `[80]` by default, or `[443]` with `inspect`. Only 80 and 443, and a rule on 443 needs `inspect: true`, except for a rule with only `binaries`: it may name any port the allow list opens, and 443 without `inspect`. |
-| `methods` | Exact and upper case, like `GET` or `HEAD`. Empty allows any method. |
-| `paths` | Globs on the request path. Empty allows any path. |
-| `inspect` | Terminate TLS on 443 so the rule can see each request. |
-| `inject` | `{header, secretRef}`: set `header` on the requests the rule allows to the value of the env key `secretRef` names (`env:<KEY>`). Needs `inspect`. See [Inject a credential](#inject-a-credential). |
-| `binaries` | Absolute paths, inside the sandbox, of the programs that may use the rule. Empty allows any program. Docker and containerd sandboxes on runc only. See [Limit a rule to programs](#limit-a-rule-to-programs). |
+<Aside type="tip">
+Set inspect rules when you create the sandbox. A Docker, containerd or gVisor sandbox created without one cannot add one later. (containerd is another container engine, like Docker.) If you may want inspection later, start with an inspect rule.
+</Aside>
 
-In paths, `*` matches any characters within one segment, and `**`, written as
-a whole segment, matches any number of segments, none included:
+## How a rule matches
 
-| Pattern | Matches | Doesn't match |
+| Field | What it does | Default |
+|---|---|---|
+| `host` | An exact name or a `*.` wildcard, without a port. The allow list (`networkAllowOut` or a [profile](/egress-profiles-and-learn-mode/)) must already allow it, or the create is refused with `400`. | Required |
+| `ports` | The ports the rule covers: 80, or 443 with `inspect: true`. A rule with only `binaries` is the exception: it may name any port the allow list opens, and 443 without `inspect`. | `[80]`, or `[443]` with `inspect` |
+| `methods` | HTTP methods, exact and upper case, like `GET` or `HEAD`. | Any method |
+| `paths` | Path patterns. See the next table. | Any path |
+| `inspect` | Decrypt HTTPS on port 443 so the rule can see each request. | `false` |
+| `inject` | `{header, secretRef}`. Sets `header` on the requests the rule allows, from the env key that `secretRef` names (`env:<KEY>`). Needs `inspect`. See [Keep an API key out of the sandbox](#keep-an-api-key-out-of-the-sandbox). | None |
+| `binaries` | Absolute paths, inside the sandbox, of the programs that may use the rule. Docker and containerd sandboxes on runc only. See [Let only some programs connect](#let-only-some-programs-connect). | Any program |
+
+The names differ a little by SDK. Go uses `Host`, `Ports`, `Inject` with `Header` and `SecretRef`, and so on. Rust uses `secret_ref`. Java uses setters such as `setHost` and `setSecretRef`.
+
+### Path patterns
+
+A path is split into segments, the parts between slashes. `*` matches any characters inside one segment. `**`, written as a whole segment, matches any number of segments, including none.
+
+| Pattern | Matches | Does not match |
 |---|---|---|
 | `/repos/acme/*` | `/repos/acme/widgets` | `/repos/acme`, `/repos/acme/widgets/issues` |
 | `/repos/acme/**` | `/repos/acme`, `/repos/acme/widgets/issues/1` | `/repos/other/widgets` |
 | `/v1/*.json` | `/v1/index.json` | `/v1/a/index.json` |
 | `/files/**/raw` | `/files/raw`, `/files/a/b/raw` | `/files/a/b` |
 
-- **Rules are alternatives.** A request passes when any rule for its host and
-  port admits both its method and its path (and its program, for a rule with
-  `binaries`). A request no rule admits gets a `403`. A host no rule names
-  keeps its allow-list decision.
-- **Paths only.** Rules match the path, not the query string, and a rule's
-  path can't hold `?`, `#`, `%` or spaces.
-- **No ambiguous paths.** On a ruled host, a path with `.` or `..` segments,
-  empty segments (`//`), an encoded slash (`%2F`, `%5C`) or a backslash is
-  refused with `403` (`path_not_canonical`), since a server could read it as
-  another path. That is what keeps `/repos/acme/../../admin` from passing as
-  `/repos/acme/**`. One trailing slash is fine.
-- **Limits.** Up to 32 rules, each with up to 16 methods, 32 paths and 16
-  binaries of at most 256 bytes.
-- **An allow list to refine.** Rules need hostname entries, so they're refused
-  with `400` alongside `networkBlockAll` or learn mode.
-- **Audit.** Refusals are written to the sandbox's
-  [audit log](/egress-domain-filtering#see-what-was-refused) with reason
-  `rule_denied` or `path_not_canonical`, or `binary_not_allowed` or
-  `binary_unknown` for a rule with `binaries`.
+### How rules work together
 
----
+- **Rules are alternatives.** A request passes when any rule for its host and port allows both its method and its path. A rule with `binaries` must also allow its program. A request that no rule allows gets a `403`. A site that no rule names keeps its allow-list decision.
+- **Paths only.** Rules match the path, not the query string after `?`. A rule's path cannot contain `?`, `#`, `%` or spaces.
+- **No tricky paths.** On a site with rules, some paths are refused with `403` (`path_not_canonical`), because a server could read them as a different path. These are `.` or `..` segments, empty segments (`//`), an encoded slash (`%2F` or `%5C`), and a backslash. This stops `/repos/acme/../../admin` from passing as `/repos/acme/**`. One trailing slash is fine.
+- **Size limits.** Up to 32 rules. Each rule takes up to 16 methods, 32 paths and 16 programs, and each path or program path is at most 256 bytes.
+- **An allow list to narrow.** Rules need website names to narrow. So they are refused with `400` next to `networkBlockAll` or learn mode.
+- **Refusals are logged.** Each one goes into the sandbox's [audit log](/egress-domain-filtering/#see-what-was-refused). The reason is `rule_denied` or `path_not_canonical`. For a rule with `binaries`, it is `binary_not_allowed` or `binary_unknown`.
 
 ## What the sandbox trusts
 
-Only a sandbox **created** with at least one inspect rule trusts the node's CA.
-It gets the CA and a bundle that adds it to the image's own trust store:
+Only a sandbox **created** with at least one inspect rule trusts the server's CA. It gets two files:
 
 | Path | What it holds |
 |---|---|
-| `/etc/aerolvm/egress-ca.pem` | The node's CA certificate, read-only |
-| `/run/aerolvm/ca-bundle.pem` | The image's trust store plus the CA, written when the sandbox starts, before your command or any exec runs |
+| `/etc/aerolvm/egress-ca.pem` | The server's CA certificate, read-only. |
+| `/run/aerolvm/ca-bundle.pem` | A CA bundle: one file that lists every CA a program should trust. It holds the image's usual list plus the server's CA. It is written when the sandbox starts, before your command or any exec runs. |
 
-Its environment points common TLS clients at them:
+The sandbox's environment points common HTTPS clients at those files:
 
 | Variable | Points at | Read by |
 |---|---|---|
@@ -244,52 +233,34 @@ Its environment points common TLS clients at them:
 | `PIP_CERT` | the bundle | pip |
 | `CURL_CA_BUNDLE` | the bundle | curl |
 | `NODE_EXTRA_CA_CERTS` | the CA | Node.js, which adds it to its built-in list |
-| `AEROLVM_EGRESS_CA`, `AEROLVM_EGRESS_CA_BUNDLE` | the CA, the bundle | your own tooling |
+| `AEROLVM_EGRESS_CA`, `AEROLVM_EGRESS_CA_BUNDLE` | the CA, the bundle | your own tools |
 
-- **Your settings win.** A variable the create sets itself is left alone, so
-  you can point a client at a bundle of your own. Include the CA in it.
-- **The system store is unchanged.** A client that ignores these variables and
-  reads the image's default trust store won't trust the CA; point it at the
-  bundle.
-- **One CA per node.** sandboxd creates it the first time a sandbox on the node
-  asks for inspection and keeps its key sealed on disk. The gateway holds the
-  key in memory only and issues each host a certificate that lasts 24 hours.
-- **Nothing else trusts it.** Sandboxes created without an inspect rule don't
-  get the CA.
+- **Your settings win.** If the create sets one of these variables itself, it is left alone. So you can point a client at a bundle of your own. Include the server's CA in it.
+- **The system list does not change.** A program that ignores these variables and reads the image's default list will not trust the CA. Point it at the bundle.
+- **One CA per server.** sandboxd creates it the first time a sandbox on the server asks for inspection. It keeps the CA's private key sealed on disk. The filter holds the key in memory only and gives each site a certificate that lasts 24 hours.
+- **Nothing else trusts it.** Sandboxes created without an inspect rule do not get the CA.
 
----
+## Extra checks on inspected HTTPS
 
-## Host must match, and bodies are capped
+On an inspected connection, the filter checks every request, not just the first one:
 
-On an inspected connection the gateway checks every request, not only the
-first:
+| Check | What happens |
+|---|---|
+| The host must match | Each request's `Host` header must equal the site name the program sent when it opened HTTPS. Anything else gets `421` (`host_mismatch`). This blocks domain fronting, a trick where a connection to an allowed site carries requests for another site on the same CDN. |
+| Request bodies have a size limit | A request body over the limit gets `413` (`body_too_large`). The default limit is 256 MiB, and your operator can change it. |
+| Each request meets the current policy | HTTP/1.1 keep-alive and HTTP/2 both work. Each request is checked against the policy at that moment, so a `setNetworkPolicy` change reaches connections that are already open. |
+| The real site is verified | The filter checks the real site's certificate against the server's trusted list. It goes through your operator's outbound proxy when there is one. |
+| Never let through unchecked | If the filter does not have the server's CA, the connection fails with an `access_denied` alert (`inspect_unavailable`). It is never passed through unchecked. |
 
-- **Host must match.** Each request's `Host` must equal the name the client
-  sent when it opened TLS. Anything else gets `421` (`host_mismatch`). This
-  closes domain fronting: a connection to an allowed name can't carry requests
-  for another site behind the same CDN.
-- **Bodies are capped.** A request body over your operator's limit gets `413`
-  (`body_too_large`). The default is 256 MiB, set by
-  `SB_EGRESS_INSPECT_MAX_BODY_BYTES`.
-- **Current policy.** HTTP/1.1 keep-alive and HTTP/2 both work, and each
-  request is checked against the policy in force at that moment, so a
-  `setNetworkPolicy` change reaches connections that are already open.
-- **Verified upstream.** The gateway's own connection to the real host is
-  checked against the node's trust store, and goes through your operator's
-  upstream proxy when there is one.
-- **Never unchecked.** If the gateway doesn't have the node's CA, the
-  handshake fails with a TLS `access_denied` alert (`inspect_unavailable`)
-  rather than letting the connection through unchecked.
+## Keep an API key out of the sandbox
 
----
+Anything a sandbox can read, a hijacked agent can send somewhere else. An `inject` rule keeps a key out of the sandbox completely:
 
-## Inject a credential
+1. You pass the key in the create's `env`, as usual, and name it in the rule.
+2. The sandbox only ever sees a placeholder.
+3. The filter puts the real value on the requests the rule allows.
 
-Anything a sandbox can read, a hijacked agent can send somewhere else. An
-`inject` rule keeps a credential out of the sandbox: you pass it in the
-create's `env` as usual and name it in the rule, the sandbox only ever sees a
-placeholder, and the egress gateway puts the real value on the requests the
-rule allows. This sandbox can call the GitHub API with a token it can't leak:
+This sandbox can call the GitHub API with a token it cannot leak:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -382,54 +353,29 @@ rule allows. This sandbox can call the GitHub API with a token it can't leak:
   </TabItem>
 </Tabs>
 
-Inside the sandbox, `GITHUB_TOKEN` holds `aerolvm-placeholder:GITHUB_TOKEN`.
-Code there sends its requests the ordinary way, for example with
-`Authorization: $GITHUB_TOKEN`, and `api.github.com` receives
-`Authorization: Bearer ghp_...`.
+Inside the sandbox, `GITHUB_TOKEN` holds `aerolvm-placeholder:GITHUB_TOKEN`. Code there sends its requests the usual way, for example with `Authorization: $GITHUB_TOKEN`. `api.github.com` receives `Authorization: Bearer ghp_...`.
 
-- **The value is the whole header.** The gateway replaces the header, it
-  doesn't fill in part of it, so put the scheme in the env value
-  (`Bearer ghp_...`, `token ghp_...`). Whatever the sandbox sends in that
-  header, or nothing at all, the host receives the real value.
-- **Headers only.** The value is only ever set as the header the rule names,
-  never written into a body, a URL or another header. A placeholder the
-  sandbox puts anywhere else reaches the host as a placeholder.
-- **Only on requests the rule allows.** The header is set on the requests this
-  rule admits by host, method and path, and nowhere else. A request to another
-  host carries what the sandbox sent, which at most is the placeholder.
-- **The sandbox never holds it.** Docker, containerd and gVisor sandboxes get
-  the placeholder in their environment. The node's egress gateway gets the
-  value, keeps it in memory and never writes it to its disk. A hijacked agent
-  can't send a key it never had to anyone.
-- **Never sent with the placeholder.** If the gateway doesn't have the value,
-  the request is refused with `403` (`secret_missing`) rather than sent
-  without it.
-- **What a rule needs.** `inspect: true`, since the credential is only added
-  inside the gateway's own TLS; an `inject` rule on port 80 is refused with
-  `400`. `secretRef` is `env:<KEY>`, and the key must be in the create's `env`
-  (`400` otherwise).
-- **Headers you can't inject.** Headers that frame or route a request are
-  refused with `400`: `Host`, `Content-Length`, `Transfer-Encoding`,
-  `Connection`, `Upgrade`, `TE`, `Trailer`, `Keep-Alive`,
-  `Proxy-Authorization` and `Proxy-Connection`.
-- **Audit names, not values.** The [audit log](/egress-domain-filtering#see-what-was-refused)
-  names an inject rule with its header and reference, such as
-  `rules[0] api.github.com (inject Authorization from env:GITHUB_TOKEN)`,
-  never with the value.
-- **Rotating means recreating.** A sandbox's env can't be changed after create,
-  so to use a new token, recreate the sandbox with it.
-- **Isolate.** An isolate sandbox never sees its env, so nothing is replaced
-  with a placeholder. Its egress proxy sets the header from the sandbox's
-  sealed env, with the same `secret_missing` refusal.
+What the rule does with the key:
 
----
+- **The value is the whole header.** The filter replaces the header. It does not fill in part of it. So put the scheme in the env value, as in `Bearer ghp_...` or `token ghp_...`. Whatever the sandbox sends in that header, or if it sends nothing, the site receives the real value.
+- **Headers only.** The value is only ever set as the header the rule names. It is never written into a body, a URL or another header. A placeholder the sandbox puts anywhere else reaches the site as a placeholder.
+- **Only on requests the rule allows.** The header is set only on requests that match this rule's host, method and path. A request to another site carries what the sandbox sent, which is at most the placeholder.
+- **The sandbox never holds it.** Docker, containerd and gVisor sandboxes get the placeholder in their environment. The filter keeps the real value in memory and never writes it to its disk. A hijacked agent cannot send a key it never had.
+- **Never sent with the placeholder.** If the filter does not have the value, the request is refused with `403` (`secret_missing`). It is not sent without the key.
+- **The audit log shows names, not values.** The [audit log](/egress-domain-filtering/#see-what-was-refused) names an inject rule by its header and reference, such as `rules[0] api.github.com (inject Authorization from env:GITHUB_TOKEN)`. It never shows the value.
+- **A new key means a new sandbox.** A sandbox's env cannot change after create. To use a new token, recreate the sandbox with it.
 
-## Limit a rule to programs
+What the rule needs:
 
-A rule's `binaries` names the programs in the sandbox that may use it. This
-sandbox lets ssh, which git runs for SSH remotes, reach `github.com` on port
-22, and pip reach `pypi.org` over HTTPS. No other program in the sandbox can
-make either connection:
+- **`inspect: true`.** The key is only added inside the filter's own HTTPS connection. An `inject` rule on port 80 is refused with `400`.
+- **A key in `env`.** `secretRef` is `env:<KEY>`, and that key must be in the create's `env` (`400` otherwise).
+- **A header you are allowed to set.** Headers that frame or route a request are refused with `400`: `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`, `Keep-Alive`, `Proxy-Authorization` and `Proxy-Connection`.
+
+On a V8 isolate sandbox, the code never sees its env at all, so nothing is replaced with a placeholder. The isolate's outbound proxy sets the header from the sandbox's sealed env. A missing value gets the same `secret_missing` refusal.
+
+## Let only some programs connect
+
+A rule's `binaries` field names the programs in the sandbox that may use it. This sandbox lets `ssh` reach `github.com` on port 22, which git uses for SSH remotes. It lets `pip` reach `pypi.org` over HTTPS. No other program in the sandbox can make either connection:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -503,60 +449,34 @@ make either connection:
   </TabItem>
 </Tabs>
 
-Inside the sandbox, `git clone git@github.com:acme/widgets.git` connects, and
-pip reads the package index on `pypi.org`. `curl https://pypi.org/simple/`, or
-a Python script opening its own connection to either host, is refused. pip
-downloads packages from `files.pythonhosted.org`, so a sandbox that installs
-them allows and rules that host the same way.
+Inside the sandbox, `git clone git@github.com:acme/widgets.git` connects, and pip reads the package index on `pypi.org`. `curl https://pypi.org/simple/` is refused. So is a Python script that opens its own connection to either site.
 
-- **Paths inside the sandbox.** Each entry is a clean absolute path, such as
-  `/usr/bin/ssh`, at most 16 per rule. The gateway compares the program with
-  the file at that path in the sandbox by device and inode, so a copy of it
-  elsewhere doesn't count.
-- **The program that opens the connection.** What counts is the process that
-  holds the connection, not the one that started it. git runs `ssh` for SSH
-  remotes and `git-remote-https` for HTTPS ones, so a rule for git's traffic
-  names those, and admits any use of them, not only git's. A child that a
-  listed program starts isn't admitted for it.
-- **Interpreted programs by their script.** For an interpreter (python, node,
-  ruby, perl, php, a shell or busybox), the script it runs counts too, when
-  it's started with the script's absolute path, as a `#!` script is. That's
-  how `/usr/local/bin/pip`, a Python script, works. `python -m pip` runs as
-  `python`, so it isn't admitted.
-- **Whole connections, on any port.** A rule with only `binaries` (no
-  `methods`, `paths` or `inject`, and no `inspect`) decides whole connections,
-  so it may be on any port the allow list opens, such as `github.com:22`, and
-  on 443 without inspection. Set its `ports`: without them a rule covers port
-  80. A rule covers only its own ports, so the `pypi.org` rule above leaves
-  port 80 to the allow list.
-- **With methods and paths.** Combined with `methods` and `paths` (and
-  `inspect` on 443), the request rules apply only to the listed programs.
-  Rules for one host are alternatives, so a request passes if any rule admits
-  both its program and its method and path.
-- **Refused, never let through.** A connection from a program that no rule for
-  its host and port admits is refused: on 443 with a TLS `access_denied` alert,
-  on 80 with a `403` that names `network_egress_rules` binaries, and on other
-  ports with an immediate TCP reset. The audit reason is `binary_not_allowed`,
-  or `binary_unknown` when the gateway couldn't trace the connection to a
-  program, which it then refuses rather than allow.
-- **TCP only.** UDP to a host and port that a rule with `binaries` covers is
-  refused.
-- **Docker and containerd on runc.** The gateway traces each connection to its
-  program from the node, which gVisor's own network stack hides. gVisor,
-  Firecracker, WASM and isolate sandboxes refuse `binaries` with `501`. The
-  node needs cgroup v2, which is your operator's concern: without it, covered
-  connections are refused with `binary_unknown`.
-- **Least privilege, not a boundary.** Per-binary rules keep trusted tooling to
-  the hosts it needs, but they don't contain a hostile process: root in the
-  sandbox can replace a listed binary, and code that controls an interpreter's
-  environment, such as `PYTHONPATH`, runs under the script's name.
+pip downloads the packages themselves from `files.pythonhosted.org`. A sandbox that installs packages allows that site too, with the same kind of rule.
 
----
+How the filter decides which program it is:
+
+- **By the file at the path.** Each entry is a clean absolute path inside the sandbox, such as `/usr/bin/ssh`. The filter compares the program with the file at that path by its identity on disk (device and inode number). A copy of the program somewhere else does not count.
+- **The program that holds the connection.** What counts is the process that holds the connection, not the one that started it. git runs `ssh` for SSH remotes and `git-remote-https` for HTTPS ones. So a rule for git's traffic names those, and it allows any use of them, not only git's. A child that a listed program starts is not allowed on its behalf.
+- **Scripts count for interpreters.** For an interpreter (python, node, ruby, perl, php, a shell or busybox), the script it runs counts too. This works when the script is started by its absolute path, as a `#!` script is. That is how `/usr/local/bin/pip`, a Python script, works. `python -m pip` runs as `python`, so a `pip` rule does not allow it.
+
+How program rules combine with the rest:
+
+- **Whole connections, on any port.** A rule with only `binaries` decides whole connections. It has no `methods`, `paths`, `inject` or `inspect`. So it can name any port the allow list opens, such as `github.com:22`, and 443 without inspection.
+- **Set the ports.** Without `ports`, a rule covers port 80 only. A rule covers only its own ports, so the `pypi.org` rule above leaves port 80 to the allow list.
+- **With methods and paths.** A rule that also has `methods` and `paths` (and `inspect` on 443) applies its request checks only to the listed programs. Rules for one site are alternatives, so a request passes if any rule allows both its program and its method and path.
+- **Refused, never let through.** A connection from a program that no rule for its site and port allows is refused. On 443 it gets an `access_denied` alert. On 80 it gets a `403` that names `network_egress_rules` binaries. On other ports the connection is closed at once.
+- **Audit reasons.** The reason is `binary_not_allowed`. It is `binary_unknown` when the filter could not trace the connection to a program, which it then refuses.
+- **TCP only.** UDP traffic to a site and port that a program rule covers is refused.
+
+<Aside type="caution">
+Program rules keep trusted tools to the sites they need. They do not contain a hostile process. Root in the sandbox can replace a listed program. Code that controls an interpreter's environment, such as `PYTHONPATH`, runs under the script's name.
+</Aside>
+
+Program rules work only on Docker and containerd sandboxes that use runc, the standard container runner. Other sandbox types refuse `binaries` with `501`. See [Which sandbox types support it](#which-sandbox-types-support-it).
 
 ## Change rules on a running sandbox
 
-`setNetworkPolicy` replaces the rules along with the rest of the policy. This
-adds a second rule so the sandbox can also open issues:
+`setNetworkPolicy` replaces the rules along with the rest of the outbound policy. This call adds a second rule, so the sandbox can also open issues:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -601,6 +521,7 @@ adds a second rule so the sandbox can also open issues:
         paths: vec![path.to_string()],
         ..Default::default()
     };
+    // set_network_policy updates the sandbox value, so declare it with `let mut sandbox`.
     sandbox.set_network_policy(NetworkPolicyOptions {
         network_allow_out: vec!["api.github.com".to_string()],
         network_egress_rules: vec![rule("GET", "/repos/acme/**"), rule("POST", "/repos/acme/*/issues")],
@@ -621,56 +542,41 @@ adds a second rule so the sandbox can also open issues:
   </TabItem>
 </Tabs>
 
-- **A full replace.** Rules you leave out are removed, as with every field of
-  `setNetworkPolicy`, and a policy with no rules leaves each host to the allow
-  list. The sandbox's `networkEgressRules` reflects the new list.
-- **Inspection starts at create.** Trusting the CA is set up when the sandbox
-  is created. Adding an inspect rule to a Docker, containerd or gVisor sandbox
-  created without one is refused with `409` "recreate the sandbox with inspect
-  rules". A sandbox created with one can add, change and remove inspect rules
-  freely, and keeps trusting the CA. If you may want inspection later, start
-  with an inspect rule.
-- **Injected keys are chosen at create.** On Docker, containerd and gVisor, a
-  later policy can inject only keys that an inject rule named at create, since
-  only those were kept out of the sandbox. Injecting any other key is refused
-  with `409` "recreate the sandbox with this inject rule": the sandbox already
-  holds that value in clear, so injecting it would protect nothing. On isolate,
-  any key in the sandbox's env can be injected (`400` if it isn't there).
+- **A full replace.** Rules you leave out are removed, as with every field of `setNetworkPolicy`. A policy with no rules leaves each site to the allow list. The sandbox's `networkEgressRules` shows the new list.
+- **Inspection starts at create.** Trusting the CA is set up when the sandbox is created. On a Docker, containerd or gVisor sandbox created without an inspect rule, adding one is refused with `409` "recreate the sandbox with inspect rules". A sandbox created with one can add, change and remove inspect rules freely, and keeps trusting the CA.
+- **Injected keys are chosen at create.** On Docker, containerd and gVisor, a later policy can inject only keys that an inject rule named at create. Only those keys were kept out of the sandbox. Any other key is refused with `409` "recreate the sandbox with this inject rule". The sandbox already holds that value in plain form, so injecting it would protect nothing. On a V8 isolate, any key in the sandbox's env can be injected (`400` if it is not there).
 - **Safe to retry.** Sending the same policy again changes nothing.
 
----
+## Which sandbox types support it
 
-## Runtimes
-
-| Runtime | Egress rules | `binaries` |
+| Runtime (kind of sandbox) | Method, path, inspect and inject rules | `binaries` |
 |---|---|---|
-| Docker, containerd | enforced by the node's egress gateway; inspect rules terminate TLS with the node's CA, and inject rules leave a placeholder in the sandbox's env | supported on runc, with cgroup v2 on the node |
-| gVisor | as on Docker and containerd | refused with `501`: gVisor's network stack hides which program opened a connection |
-| Isolate | every rule, inspect and inject included, with no CA: the isolate's egress proxy already sees each request in plain text, and the sandbox never sees its env | refused with `501` |
-| WASM | not supported: rules are refused with `501` | refused with `501` |
-| Firecracker | not supported: rules are refused with `501` | refused with `501` |
+| Docker, containerd | Yes, through the server's filter service. Inspect rules use the server's CA. Inject rules leave a placeholder in the sandbox's env. | Yes, on runc |
+| gVisor | Yes, as on Docker and containerd | No (`501`). The filter traces each connection to its program from outside the sandbox, and gVisor's own network layer hides that. |
+| V8 isolate | Yes, all of them, with no CA. The isolate's outbound proxy already sees each request in plain form, and the sandbox never sees its env. | No (`501`) |
+| WASM | No (`501`) | No (`501`) |
+| Firecracker | No (`501`) | No (`501`) |
 
----
+## Limits
 
-## Limitations
+- **Inspected traffic is decrypted on the server.** The filter decrypts each inspected request and response in memory to check it, then encrypts it again. Any password or key the sandbox sends to an inspected site is visible to the server at that moment. An injected key is held by the server's filter for the sandbox's whole life. Inspect only the sites you need to.
+- **Java's trusted list is not covered.** The JVM ignores the variables above. A Java client fails to connect to an inspected site until you import `/etc/aerolvm/egress-ca.pem` into the trust store it uses.
+- **Certificate pinning.** Some programs accept only one specific certificate for a site. They reject the filter's certificate, so those sites cannot be inspected.
+- **The 4 KB cluster limit.** In a cluster, each sandbox's settings are copied to other servers so it can be recreated after a failure. That copy is limited to 4 KB, and rules count toward it with the rest of the policy. A long rule list can push a create over it. A failover keeps the rules, and a sandbox recreated on another server trusts that server's CA.
+- **Methods and paths on ports 80 and 443 only.** Method, path and inject rules work on HTTP over ports 80 and 443. A rule with only `binaries` works on any TCP port the allow list opens. No rule applies to UDP.
+- **E2B SDK.** `updateNetwork` from the [E2B SDK](/using-e2b-sdk/) keeps a sandbox's rules, since the E2B API has no way to name them.
 
-- **Inspected traffic is decrypted on the node.** The gateway decrypts each
-  inspected request and response in memory to check it, then encrypts it again
-  for the real host or the sandbox. Credentials the sandbox sends to an
-  inspected host are visible to the node in that moment, and an injected
-  credential is held by the node's gateway for the sandbox's life. Inspect
-  only the hosts you need to.
-- **Java's trust store isn't covered.** The JVM ignores the variables above, so
-  a Java client fails the handshake with an inspected host until you import
-  `/etc/aerolvm/egress-ca.pem` into the trust store it uses.
-- **Certificate pinning.** A client that pins a server's certificate or key
-  rejects the gateway's certificate, so its hosts can't be inspected.
-- **The 4 KB cluster cap.** In a cluster, rules travel with the sandbox's
-  replicated spec and count toward its 4 KB inline limit along with the rest of
-  the policy, so a long rule list can push a create over it. A failover keeps
-  the rules, and a sandbox recreated on another node trusts that node's CA.
-- **Methods and paths on 80 and 443 only.** Method, path and inject rules are
-  HTTP on ports 80 and 443. A rule with only `binaries` works on any TCP port
-  the allow list opens; no rule applies to UDP.
-- **E2B SDK.** `updateNetwork` from the [E2B facade](/using-e2b-sdk) keeps a
-  sandbox's rules, since the E2B API has no way to name them.
+## For server operators
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_EGRESS_INSPECT_MAX_BODY_BYTES` | The largest request body the filter service accepts on an inspected connection. Larger bodies get `413`. Set it in the filter service's environment. | 256 MiB |
+| `SB_EGRESS_PROCID_SOCKET` | Where sandboxd answers the filter's "which program is this?" lookups for `binaries` rules. Empty turns those lookups off, and connections that a program rule covers are refused. | `/run/aerolvm/egress-procid.sock` |
+
+Program rules need cgroup v2 on the server (cgroups are the Linux feature that groups a sandbox's processes). Without it, connections that a program rule covers are refused with `binary_unknown`.
+
+## Next steps
+
+- [Allow only some websites](/egress-domain-filtering/): the allow list that rules narrow, and how to read refusals.
+- [Reusable allow lists](/egress-profiles-and-learn-mode/): share one allow list across many sandboxes.
+- [Environment variables](/sandbox-env/): how `env` works, including the keys an inject rule uses.

@@ -1,6 +1,28 @@
 ---
+import EditLink from './EditLink.astro'
+import Pagination from './Pagination.astro'
 import ThemeSelect from './ThemeSelect.astro'
+
+// Starlight's own Footer renders the edit link and prev/next pagination;
+// overriding Footer drops both, so this component renders them itself.
+const route = Astro.locals.starlightRoute
+const title = route?.entry?.data?.title ?? 'docs page'
+const issueUrl = new URL('https://github.com/aerol-ai/microvm/issues/new')
+issueUrl.searchParams.set('title', `Docs: ${title}`)
+issueUrl.searchParams.set('body', `Page: ${Astro.url.pathname}\n\nWhat was wrong or hard to follow?\n`)
 ---
+
+<div class="docs-footer__page-actions">
+  <EditLink />
+  <a class="report-link" href={issueUrl.toString()} target="_blank" rel="noreferrer">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Zm0 5v5m0 3h.01" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"></path>
+    </svg>
+    Report a problem with this page
+  </a>
+</div>
+
+<Pagination />
 
 <footer class="docs-footer__container">
   <div class="docs-footer__container__support-links">
@@ -31,6 +53,33 @@ import ThemeSelect from './ThemeSelect.astro'
 </footer>
 
 <style>
+  .docs-footer__page-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 24px;
+    margin-top: 48px;
+  }
+
+  /* Matches EditLink so the two actions read as one row. */
+  .report-link {
+    display: flex;
+    gap: 8px;
+    font-family: var(--font-sans);
+    font-weight: 500;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--primary-text-color);
+  }
+
+  .report-link:hover {
+    opacity: 0.6;
+  }
+
+  .report-link svg {
+    width: 1rem;
+    height: 1rem;
+  }
+
   .footer-selects {
     display: flex;
     gap: 8px;

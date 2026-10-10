@@ -1,165 +1,223 @@
 ---
-title: Port Allowlist
+title: Port allowlist
+description: How sandbox ports stay closed to the internet until you expose them, and the two URLs that reach an open port.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Sandboxes default to **closed** for public proxy access. A port inside a sandbox is only reachable from the public internet after an explicit `exposePort` call. This prevents unauthenticated access to databases, debug endpoints, or accidental listeners.
+A port is a number that tells the sandbox which program gets the traffic. Every port in a sandbox starts **closed** to the public internet. A port opens only when you call `exposePort` for it.
 
-## Port Access URLs
+The server keeps a list of the ports you exposed for each sandbox. This list is the **port allowlist**. Traffic to any port that is not on the list is refused. This stops a database, a debug tool or a forgotten test server from being open to anyone by accident.
 
-Once a port is exposed, it is reachable via two equivalent URLs:
+<Aside type="note">
+Public URLs need a server install that runs the web proxy. On a local install, `exposePort` adds the port to the list but nothing answers at the URL. See [Share a web app](/preview/).
+</Aside>
 
-**1. Dedicated port URL** - returned directly by `exposePort`:
-```
-https://<sandbox-id>-<port>.<domain>
-```
+## Open a port
 
-**2. Proxy path** - constructed from the sandbox's main public URL:
-```
-https://<sandbox-id>.<domain>/proxy/<port>/
-```
-
-Both URLs become active after `exposePort` and return 403 before it. The dedicated URL is the cleaner base URL for web apps and APIs. The proxy path is always available in both domain mode and IP-only mode.
-
-## Expose a Port
+This creates a public sandbox, exposes port 3000, and prints both URLs that now reach it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.create({ image: 'ubuntu:22.04', allowPublicTraffic: true })
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      allowPublicTraffic: true,
+    });
+    await sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &");
 
-    // Before exposing - 403
-    await fetch(`${sandbox.publicURL}/proxy/21212/`)
-
-    // Expose the port - returns the discriminated ExposeResult
-    const exposure = await sandbox.exposePort(21212)
-    // exposure.url → "https://<sandbox-id>-21212.sandbox.example.com"
-
-    // Both URLs now reach the service
-    await fetch(exposure.url)                         // 200 - dedicated URL
-    await fetch(`${sandbox.publicURL}/proxy/21212/`)  // 200 - proxy path
+    const exposure = await sandbox.exposePort(3000);
+    console.log(exposure.url);                        // port URL
+    console.log(`${sandbox.publicURL}/proxy/3000/`);  // proxy path
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({'image': 'ubuntu:22.04', 'allowPublicTraffic': True})
+    sandbox = client.create(image="python:3.12-slim", allow_public_traffic=True)
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &")
 
-    # Before exposing - 403
-    # GET sandbox['publicURL'] + '/proxy/21212/'
-
-    exposure = sandbox.expose_port(21212)
-    # exposure.url → 'https://<sandbox-id>-21212.sandbox.example.com'
-
-    # Both URLs now reach the service
-    # GET exposure.url                                  # dedicated URL
-    # GET sandbox['publicURL'] + '/proxy/21212/'        # proxy path
+    exposure = sandbox.expose_port(3000)
+    print(exposure.url)                        # port URL
+    print(f"{sandbox.publicURL}/proxy/3000/")  # proxy path
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     public := true
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image:              "ubuntu:22.04",
+        Image:              "python:3.12-slim",
         AllowPublicTraffic: &public,
     })
-    if err != nil { log.Fatal(err) }
+    if err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExecCommand(ctx, "nohup python3 -m http.server 3000 > /dev/null 2>&1 &"); err != nil {
+        log.Fatal(err)
+    }
 
-    // Before exposing - 403
-    // GET sandbox.PublicURL + "/proxy/21212/"
-
-    exposure, err := sandbox.ExposePort(ctx, 21212)
-    if err != nil { log.Fatal(err) }
-    // exposure.PublicURL → "https://<sandbox-id>-21212.sandbox.example.com"
-
-    // Both URLs now reach the service
-    fmt.Println(exposure.PublicURL)                  // dedicated URL
-    fmt.Println(sandbox.PublicURL + "/proxy/21212/") // proxy path
+    exposure, err := sandbox.ExposePort(ctx, 3000)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(exposure.PublicURL)                  // port URL
+    fmt.Println(sandbox.PublicURL + "/proxy/3000/")  // proxy path
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
+        image: "python:3.12-slim".into(),
         allow_public_traffic: Some(true),
         ..Default::default()
     })?;
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &")?;
 
-    // Before exposing - 403
-    // GET sandbox.data.public_url + "/proxy/21212/"
-
-    let exposure = sandbox.expose_port(21212, ExposeOptions::default())?;
-    if let ExposeResult::Http { url } = &exposure {
-        // url → "https://<sandbox-id>-21212.sandbox.example.com"
-        println!("{}", url);                                          // dedicated URL
+    if let ExposeResult::Http { url } = sandbox.expose_port(3000, ExposeOptions::default())? {
+        println!("{}", url);                                  // port URL
     }
-    println!("{}/proxy/21212/", sandbox.data.public_url);             // proxy path
+    println!("{}/proxy/3000/", sandbox.data.public_url);      // proxy path
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     Sandbox sandbox = client.create(
         new CreateOptions()
-            .setImage("ubuntu:22.04")
+            .setImage("python:3.12-slim")
             .setAllowPublicTraffic(true)
     );
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &");
 
-    // Before exposing - 403
-    // GET sandbox.publicUrl + "/proxy/21212/"
-
-    ExposeResult exposure = sandbox.exposePort(21212);
-    // exposure.url → "https://<sandbox-id>-21212.sandbox.example.com"
-
-    // Both URLs now reach the service
-    System.out.println(exposure.url);                          // dedicated URL
-    System.out.println(sandbox.publicUrl + "/proxy/21212/");   // proxy path
+    ExposeResult exposure = sandbox.exposePort(3000);
+    System.out.println(exposure.url);                          // port URL
+    System.out.println(sandbox.publicUrl + "/proxy/3000/");    // proxy path
     ```
   </TabItem>
 </Tabs>
 
-## Unexpose a Port
+On a server with a domain, the output looks like this:
 
-Removes the port from the allowlist and tears down its public route. Both URLs return 403 again immediately.
+```text
+https://sb-9f2c41d07a3e5b86-3000.sandbox.example.com
+https://sb-9f2c41d07a3e5b86.sandbox.example.com/proxy/3000/
+```
+
+This example creates the sandbox with `allowPublicTraffic: true` so that `publicURL` is set from the start. Without it, the first `exposePort` call makes the sandbox public. The copy of the sandbox in your code still has an empty `publicURL` until you call `refresh()`.
+
+## The two URLs for an open port
+
+| URL | Looks like | When to use it |
+|---|---|---|
+| Port URL | `https://<sandbox-id>-<port>.<domain>` | The usual choice for web apps and APIs. `exposePort` returns it. |
+| Proxy path | `https://<sandbox-id>.<domain>/proxy/<port>/` | When you want every port under the sandbox's main URL. |
+
+On a server without a domain, there is only the path form: `http://<server-ip>/<sandbox-id>/proxy/<port>/`. That is the URL `exposePort` returns there, so you do not need to build it yourself.
+
+Before you expose a port, both URLs refuse the request with an error such as `403` or `404`.
+
+## Close a port
+
+`unexposePort` takes the port off the allowlist and removes its public URL. Both URLs refuse requests again right away. Calling it for a port that is not open does nothing.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.unexposePort(21212)
-    await fetch(`${sandbox.publicURL}/proxy/21212/`) // 403
+    await sandbox.unexposePort(3000);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.unexpose_port(21212)
-    # GET sandbox['publicURL'] + '/proxy/21212/'  → 403
+    sandbox.unexpose_port(3000)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    if err := sandbox.UnexposePort(ctx, 21212); err != nil { log.Fatal(err) }
-    // GET sandbox.PublicURL + "/proxy/21212/"  → 403
+    if err := sandbox.UnexposePort(ctx, 3000); err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.unexpose_port(21212)?;
-    // GET sandbox.data.public_url + "/proxy/21212/"  → 403
+    sandbox.unexpose_port(3000)?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.unexposePort(21212);
-    // GET sandbox.publicUrl + "/proxy/21212/"  → 403
+    sandbox.unexposePort(3000);
     ```
   </TabItem>
 </Tabs>
 
-## How it works
+## What happens when a sandbox restarts
 
-The allowlist is maintained server-side. Every `exposePort` and `unexposePort` call updates the allowlist and creates or removes the corresponding Caddy route. When a sandbox stops and restarts, the allowlist is restored automatically so previously exposed ports become reachable again without any extra calls.
+The server saves the allowlist. When you stop a sandbox and start it again, the same ports open again with the same URLs. You do not need to call `exposePort` again.
 
-## Diagnosing 403 responses
+## If a URL returns 403 or 404
 
-1. Confirm the port appears in `exposed_ports` on `GET /v1/sandboxes/<id>`.
-2. Check that `exposePort` completed without error.
-3. Verify the sandbox is in `running` state - stopped sandboxes do not serve traffic.
+1. **Check that the port is on the list.** Refresh the sandbox and look at its exposed ports (code below).
+2. **Check that `exposePort` succeeded.** It throws an error if it could not open the port.
+3. **Check that the sandbox is running.** Its status must be `started`. A stopped sandbox does not answer, unless it is a [serverless sandbox](/serverless/) that wakes on traffic.
+
+If the URL returns `502 Bad Gateway` instead, the port is open but nothing in the sandbox is listening on it. Check that your server is running and listens on `0.0.0.0`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.refresh();
+    console.log(sandbox.status);
+    for (const p of sandbox.exposedPorts ?? []) {
+      console.log(p.port, p.publicURL);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.refresh()
+    print(sandbox.status)
+    for p in sandbox.to_dict().get("exposedPorts", []):
+        print(p["port"], p["publicURL"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.Refresh(ctx); err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.Status)
+    for _, p := range sandbox.ExposedPorts {
+        fmt.Println(p.Port, p.PublicURL)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.refresh()?; // needs `let mut sandbox`
+    println!("{}", sandbox.data.status);
+    for p in sandbox.data.exposed_ports.iter().flatten() {
+        println!("{} {}", p.port, p.public_url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.refresh();
+    System.out.println(sandbox.status);
+    if (sandbox.exposedPorts != null) {
+        for (ExposedPort p : sandbox.exposedPorts) {
+            System.out.println(p.port + " " + p.publicUrl);
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## For server operators
+
+The allowlist lives on the server, in the sandbox database. Each `exposePort` and `unexposePort` call updates the list and adds or removes the matching route in Caddy (the web proxy in front of the server). The server also pushes the list to the sandbox's built-in helper program, which serves the proxy path and refuses ports that are not on it. When a sandbox starts again, the server puts its routes and its list back.
+
+## Next steps
+
+- [Share a web app](/preview/): the full guide to public URLs.
+- [TCP and TLS ports](/tcp-ports/): open a database or another service that is not a website.
+- [Custom domains](/custom-domains/): put a sandbox on your own domain name.
+- [Block or allow the internet](/network-isolation/): control traffic going out of the sandbox.

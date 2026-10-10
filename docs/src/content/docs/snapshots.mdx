@@ -1,46 +1,47 @@
 ---
 title: Snapshots
+description: Save a sandbox's files and installed software as a named image, then start new sandboxes from it.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-**Snapshots are a Docker sandbox feature.** They let you save a Docker container's state as a named image and spin up new sandboxes from it. The sandbox you get back runs on the standard Docker runtime - same as `create({ image: 'ubuntu:22.04' })`, just with your pre-built image instead.
+A snapshot is a saved copy of a sandbox's files and installed software, stored as an image with a short name. You start new sandboxes from it the same way you start them from `ubuntu:22.04`. Use snapshots to skip slow setup steps, like installing packages, every time you create a sandbox.
 
-:::note[Using Firecracker?]
-If you are creating sandboxes with `runtime: "firecracker"`, snapshots are not what you want. Firecracker uses [Firecracker Templates](/firecracker-templates) instead - a separate concept that pre-builds a microVM rootfs and captures a paused VM memory state to enable sub-100ms boots. The two features are for different runtimes and are not interchangeable.
-:::
+Snapshots work with standard container sandboxes, the default kind. V8 isolate sandboxes do not support them.
 
-A snapshot is a named, reusable image you can launch sandboxes from. AerolVM gives you three ways to make one and a single way to use it.
+<Aside title="Using Firecracker?">
+Firecracker sandboxes use [Firecracker templates](/firecracker-templates/) instead. A template builds the virtual machine's disk ahead of time and saves a paused copy of its memory. New sandboxes then start in under 100 ms. Templates and snapshots are separate features and cannot stand in for each other.
+</Aside>
 
-- **Capture a running sandbox** - `createSnapshot` commits the live container (writable layer + installed packages + entrypoint metadata) into a Docker image and persists a row pointing at it. Useful for "save where I am, give it a name, let me spin clones of this state".
-- **Register a pre-built image** - `registerSnapshot` with `image` records a snapshot row that points at a registry reference (e.g. `python:3.12-slim`) so the rest of your fleet can address it by a short name.
-- **Build from a Dockerfile** - `registerSnapshot` with `dockerfileContent` (or the `registerSnapshotFromImage` helper that compiles an `Image` builder) hands the daemon a Dockerfile, builds it on the host, and stores the resulting content-addressed tag as the snapshot's image.
+There are three ways to make a snapshot:
 
-In all three cases you launch a sandbox from the snapshot by passing its name to `create` as the `image` argument - the server resolves the name to the underlying image at create time.
+- **Save a running sandbox.** `createSnapshot` saves the sandbox's files and installed packages as a new image.
+- **Name an existing image.** `registerSnapshot` with `image` gives an image from a registry, like `python:3.12-slim`, a short name everyone can use.
+- **Build from a Dockerfile.** `registerSnapshot` with `dockerfileContent` has the server build the image for you.
 
-## Capture a running sandbox
+Either way, you use a snapshot by passing its name as the `image` when you create a sandbox.
 
-The container's writable layer is committed into a new image and a snapshot row is persisted with that image. The original container keeps running; the snapshot is independent.
+## Save a running sandbox as a snapshot
+
+Set up a sandbox the way you want it, then save it. The original sandbox keeps running, and the snapshot does not depend on it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.create({ image: 'ubuntu:22.04' });
-    await sandbox.exec(['apt-get', 'update']);
-    await sandbox.exec(['apt-get', 'install', '-y', 'python3-pip']);
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    await sandbox.exec("apt-get update && apt-get install -y python3-pip");
 
-    const snapshot = await client.createSnapshot(sandbox.id, 'py-ready');
+    const snapshot = await sandbox.createSnapshot("py-ready");
     console.log(snapshot.name, snapshot.image);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({'image': 'ubuntu:22.04'})
-    sandbox.exec(['apt-get', 'update'])
-    sandbox.exec(['apt-get', 'install', '-y', 'python3-pip'])
+    sandbox = client.create(image="ubuntu:22.04")
+    sandbox.exec("apt-get update && apt-get install -y python3-pip")
 
-    snapshot = sandbox.create_snapshot('py-ready')
-    print(snapshot['name'], snapshot['image'])
+    snapshot = sandbox.create_snapshot("py-ready")
+    print(snapshot["name"], snapshot["image"])
     ```
   </TabItem>
   <TabItem label="Go">
@@ -49,14 +50,11 @@ The container's writable layer is committed into a new image and a snapshot row 
     if err != nil {
         log.Fatal(err)
     }
-    if _, err := sandbox.Exec(ctx, []string{"apt-get", "update"}); err != nil {
-        log.Fatal(err)
-    }
-    if _, err := sandbox.Exec(ctx, []string{"apt-get", "install", "-y", "python3-pip"}); err != nil {
+    if _, err := sandbox.ExecCommand(ctx, "apt-get update && apt-get install -y python3-pip"); err != nil {
         log.Fatal(err)
     }
 
-    snapshot, err := client.CreateSnapshot(ctx, sandbox.ID(), "py-ready")
+    snapshot, err := sandbox.CreateSnapshot(ctx, "py-ready")
     if err != nil {
         log.Fatal(err)
     }
@@ -66,54 +64,91 @@ The container's writable layer is committed into a new image and a snapshot row 
   <TabItem label="Rust">
     ```rust
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
+        image: "ubuntu:22.04".into(),
         ..Default::default()
     })?;
-    sandbox.exec(&["apt-get", "update"])?;
-    sandbox.exec(&["apt-get", "install", "-y", "python3-pip"])?;
+    sandbox.exec("apt-get update && apt-get install -y python3-pip")?;
 
-    let snapshot = client.create_snapshot(&sandbox.id, "py-ready")?;
+    let snapshot = sandbox.create_snapshot("py-ready")?;
     println!("{} {}", snapshot.name, snapshot.image);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
-    sandbox.exec(List.of("apt-get", "update"));
-    sandbox.exec(List.of("apt-get", "install", "-y", "python3-pip"));
+    sandbox.exec("apt-get update && apt-get install -y python3-pip");
 
-    SandboxSnapshot snapshot = client.createSnapshot(sandbox.getId(), "py-ready");
-    System.out.println(snapshot.getName() + " " + snapshot.getImage());
+    SandboxSnapshot snapshot = sandbox.createSnapshot("py-ready");
+    System.out.println(snapshot.name + " " + snapshot.image);
     ```
   </TabItem>
 </Tabs>
 
-Snapshot names are globally unique within a deployment and become the address you pass to `create` later. Calling `createSnapshot` twice with the same name on different sandboxes is rejected - pick a versioned name (`py-ready-2026-05`) if you re-snapshot after changes.
+Snapshot names are unique across the whole server. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
 
-## Register a snapshot from an image
+## Start a sandbox from a snapshot
 
-When the image already exists in a registry, skip the build/commit step and just record a row that points at it. The image is **not** pulled until the first sandbox that references it gets created.
+Pass the snapshot's name where you would normally pass an image.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "py-ready" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="py-ready")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "py-ready".into(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
+    ```
+  </TabItem>
+</Tabs>
+
+The server swaps the name for the real image before it creates the sandbox. If a name could also be an image from a registry, the snapshot wins. That rarely happens, because snapshot names are short words, not registry paths. Afterward, the sandbox's `image` field shows the real image, not the snapshot name.
+
+The new sandbox does not copy the snapshot's CPU, memory or disk hints. It gets the normal defaults unless you set `cpu`, `memoryMB` and `diskGB` yourself.
+
+## Give an existing image a snapshot name
+
+If the image is already in a registry, you do not need to build or save anything. `registerSnapshot` just records a name that points at it. The server does not download the image until the first sandbox uses it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     await client.registerSnapshot({
-      name:    'py-base',
-      image:   'python:3.12-slim',
-      cpu:     2,
+      name: "py-base",
+      image: "python:3.12-slim",
+      cpu: 2,
       memoryMB: 4096,
-      diskGB:   10,
+      diskGB: 10,
     });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     client.register_snapshot({
-        'name':     'py-base',
-        'image':    'python:3.12-slim',
-        'cpu':      2,
-        'memoryMB': 4096,
-        'diskGB':   10,
+        "name": "py-base",
+        "image": "python:3.12-slim",
+        "cpu": 2,
+        "memoryMB": 4096,
+        "diskGB": 10,
     })
     ```
   </TabItem>
@@ -132,56 +167,58 @@ When the image already exists in a registry, skip the build/commit step and just
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::RegisterSnapshotOptions;
+
     client.register_snapshot(RegisterSnapshotOptions {
-        name:     "py-base".to_string(),
-        image:    Some("python:3.12-slim".to_string()),
-        cpu:      Some(2.0),
+        name: "py-base".into(),
+        image: Some("python:3.12-slim".into()),
+        cpu: Some(2.0),
         memory_mb: Some(4096),
-        disk_gb:  Some(10),
+        disk_gb: Some(10),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    client.registerSnapshot(
-        new RegisterSnapshotOptions()
-            .setName("py-base")
-            .setImage("python:3.12-slim")
-            .setCpu(2)
-            .setMemoryMb(4096)
-            .setDiskGb(10)
-    );
+    client.registerSnapshot(new RegisterSnapshotOptions()
+        .setName("py-base")
+        .setImage("python:3.12-slim")
+        .setCpu(2.0)
+        .setMemoryMb(4096)
+        .setDiskGb(10));
     ```
   </TabItem>
 </Tabs>
 
-The resource hints (`cpu`, `memoryMB`, `diskGB`) are surfaced back when the snapshot is referenced - useful for client UIs that want to render reasonable defaults without hard-coding them.
+The `cpu`, `memoryMB` and `diskGB` values are hints. The server stores them and returns them with the snapshot, so your own app can show sensible defaults. They are not applied to new sandboxes.
+
+Registering the same name with the same image again is safe and returns the existing snapshot. The same name with a different image fails with `snapshot name already in use`.
 
 ## Build a snapshot from a Dockerfile
 
-For images that don't exist in a registry yet, hand the daemon a Dockerfile. The build runs on the host using the configured image builder; the resulting content-addressed tag is what the snapshot row points at.
+If the image does not exist yet, send a Dockerfile. The server builds it and points the snapshot at the result.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     await client.registerSnapshot({
-      name: 'data-tools',
-      dockerfileContent: `
-        FROM python:3.12-slim
-        RUN pip install --no-cache-dir pandas duckdb polars
-      `.trim(),
+      name: "data-tools",
+      dockerfileContent: [
+        "FROM python:3.12-slim",
+        "RUN pip install --no-cache-dir pandas duckdb polars",
+      ].join("\n"),
     });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     client.register_snapshot({
-        'name': 'data-tools',
-        'dockerfileContent': """
-            FROM python:3.12-slim
-            RUN pip install --no-cache-dir pandas duckdb polars
-        """.strip(),
+        "name": "data-tools",
+        "dockerfileContent": (
+            "FROM python:3.12-slim\n"
+            "RUN pip install --no-cache-dir pandas duckdb polars"
+        ),
     })
     ```
   </TabItem>
@@ -189,8 +226,8 @@ For images that don't exist in a registry yet, hand the daemon a Dockerfile. The
     ```go
     if _, err := client.RegisterSnapshot(ctx, sdktypes.RegisterSnapshotOptions{
         Name: "data-tools",
-        DockerfileContent: `FROM python:3.12-slim
-RUN pip install --no-cache-dir pandas duckdb polars`,
+        DockerfileContent: "FROM python:3.12-slim\n" +
+            "RUN pip install --no-cache-dir pandas duckdb polars",
     }); err != nil {
         log.Fatal(err)
     }
@@ -199,9 +236,9 @@ RUN pip install --no-cache-dir pandas duckdb polars`,
   <TabItem label="Rust">
     ```rust
     client.register_snapshot(RegisterSnapshotOptions {
-        name: "data-tools".to_string(),
+        name: "data-tools".into(),
         dockerfile_content: Some(
-            "FROM python:3.12-slim\nRUN pip install --no-cache-dir pandas duckdb polars".to_string(),
+            "FROM python:3.12-slim\nRUN pip install --no-cache-dir pandas duckdb polars".into(),
         ),
         ..Default::default()
     })?;
@@ -209,98 +246,79 @@ RUN pip install --no-cache-dir pandas duckdb polars`,
   </TabItem>
   <TabItem label="Java">
     ```java
-    client.registerSnapshot(
-        new RegisterSnapshotOptions()
-            .setName("data-tools")
-            .setDockerfileContent(
-                "FROM python:3.12-slim\n" +
-                "RUN pip install --no-cache-dir pandas duckdb polars"
-            )
-    );
+    client.registerSnapshot(new RegisterSnapshotOptions()
+        .setName("data-tools")
+        .setDockerfileContent(
+            "FROM python:3.12-slim\n" +
+            "RUN pip install --no-cache-dir pandas duckdb polars"));
     ```
   </TabItem>
 </Tabs>
 
-A single-line `FROM` is a fast-path: the daemon notices the Dockerfile only pins a base image and registers it without running a build. Multi-step Dockerfiles go through the full build pipeline and are content-hashed, so an identical Dockerfile re-registered later hits the build cache.
+Good to know:
 
-`image` and `dockerfileContent` are mutually exclusive - pass exactly one.
+- **Pass one or the other.** `image` and `dockerfileContent` cannot be used together.
+- **A lone `FROM` line is fast.** If the Dockerfile only names a base image, the server registers that image without running a build.
+- **Builds are cached.** The server names the built image after a hash of the Dockerfile. Registering the same Dockerfile again reuses the earlier build.
+- **There is a builder helper.** Each SDK can also turn its `Image` builder object into a Dockerfile for you, with `registerSnapshotFromImage` (Python `register_snapshot_from_image`, Go `RegisterSnapshotFromImage`, Rust `register_snapshot_from_image`).
 
-## Launch a sandbox from a snapshot
+## What a snapshot keeps
 
-Once a snapshot exists, pass its name where you would normally pass an image. The server resolves the name to the underlying image, inherits the snapshot's resource hints if you don't override them, and runs the create through the same path it would for a bare image reference.
+A snapshot saves the sandbox's image, not the running state around it.
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({
-      image: 'py-ready',
-    });
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create({'image': 'py-ready'})
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image: "py-ready".to_string(),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
-    ```
-  </TabItem>
-</Tabs>
-
-Snapshot resolution happens server-side, so the snapshot name and a registry reference are interchangeable in `image`. If `py-ready` is also a valid image reference (it usually isn't - snapshot names are short identifiers, not registry paths), the snapshot wins.
-
-## Snapshot distribution in cluster mode
-
-On a single-node deployment, a snapshot lives only on the host that created it - which is fine, because that host runs every sandbox. In cluster mode, a snapshot taken on one node is invisible to the others by default: the local commit produced an image only the originating node holds. Without help, a sandbox launched from that snapshot can only land on the node where the snapshot was taken, and a host failure takes the snapshot with it.
-
-AerolVM ships an optional background push that promotes a snapshot from "local only" to a cluster-distributable AOCR (Aerol OCI Registry) reference. When enabled, the snapshot create path does not change: the API still returns immediately with the local row, and a reconciler pushes the image in the background. Once the push completes, the row's distribution metadata flips to `aocr` and any node in the cluster can pull the image when scheduling a sandbox from it. Combined with `failover.policy = "recreate"` (see [Durability and Failover](/durability)), this makes snapshot-backed sandboxes survive owner-node death.
-
-Operators enable it at the daemon level - there is no SDK toggle, because the choice is operational, not per-call:
-
-| Env var | Purpose |
+| Saved | Not saved |
 |---|---|
-| `SB_SNAPSHOT_PUSH_ENABLED` | Gates the entire feature. When `false` (default), snapshots stay local-only and behave as they always have. |
-| `SB_AUTO_IMPORT_CLUSTER_ID` | Tenant namespace under AOCR (`cluster/<id>/snapshots/<name>:latest`). Reused from the auto-import setup. |
-| `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | File holding the bearer token used as the registry password. Re-read on every push, so rotation is just a file write. |
-| `SB_MIRROR_PUSH_HOST` | Push destination (e.g. `aocr.aerol.ai`). Falls back to `SB_IMAGE_DISTRIBUTION_AOCR_HOST` when unset. |
-| `SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL` | Reconciler tick. Default `5m`. |
-| `SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT` | Per-tick fan-out cap. Default `2`. |
-| `SB_SNAPSHOT_PUSH_TAG_SUFFIX` | Optional AOCR retention suffix appended to the pushed tag (`latest<suffix>`), e.g. `--ttl-7d` or `--idle-30d`. Empty (default) pushes a plain `latest` tag the reaper keeps indefinitely — correct for durable failover snapshots. Ephemeral clusters set a short TTL so their snapshots auto-reap. Push and pull use the same suffix. |
+| Files and installed packages | Attached cloud storage (it lives outside the sandbox; see [Attach cloud storage](/external-storage/)) |
+| The image's start command and working folder | Running programs, open terminal sessions, anything in memory |
+| The OS user and the image's own environment variables | Network rules, exposed ports and public URLs |
+| Environment variables set with `env` at create time | |
+| CPU, memory and disk hints, when you set them | |
 
-Each snapshot row carries a `pushState` field you can read back to watch the lifecycle: `active` (no push needed, or push complete), `pending` / `pushing` (queued for the reconciler), or `error` (last push attempt failed; the reconciler will retry on the next tick and the `pushError` field will explain why).
+<Aside type="caution">
+Saving a sandbox also saves the environment variables you passed in `env`. A sandbox started from that snapshot can read them, even though its own `env` is empty. We confirmed this on a server that runs containers on Docker. Do not snapshot a sandbox whose `env` holds secrets you would not share with every user of the snapshot.
+</Aside>
 
-A snapshot that fails to push is still usable on the originating node - push failure is non-fatal. Pre-existing snapshot rows from before the feature was enabled remain `active`; no backfill push is implied.
+To keep data next to an image, write it to [attached cloud storage](/external-storage/) instead. Declare the same storage when you create the new sandbox. The data then lives on its own, apart from any one sandbox.
 
-## What goes into a snapshot
+## Ideas for using snapshots
 
-A snapshot captures the container image, not the runtime state around it. Specifically:
+- **One base image per kind of work.** Register `py-base`, `node-base` or `cuda-base` once when you deploy. Then create every sandbox from it. It is faster than running `apt-get install` in each sandbox, and you update versions in one place.
+- **A shared starting point.** Set up a sandbox once (clone a repo, build it, load test data), then save it. Start one sandbox per user from that snapshot. Each user gets a fresh copy of the same starting point.
+- **Snapshots that survive a failed server.** In a cluster, combine snapshot pushing with `failover.policy = "recreate"`. See [Share snapshots across a cluster](#share-snapshots-across-a-cluster) below.
 
-| Captured | Not captured |
+## For server operators
+
+### Share snapshots across a cluster
+
+On a single server, a snapshot lives on that server, which runs every sandbox. In a cluster, a saved snapshot exists only on the node that made it. Without help, sandboxes from that snapshot can only run on that node, and if the node fails, the snapshot is gone.
+
+AerolVM can push snapshots in the background to AOCR (the Aerol OCI Registry, a shared image store) so any node can pull them. Turning this on does not slow down `createSnapshot`. The call still returns right away, and a background job pushes the image. Once the push finishes, any node can start sandboxes from it. Together with `failover.policy = "recreate"` (see [Durability and failover](/durability/)), sandboxes made from snapshots survive the loss of their node. Without the push, that recreate is refused, because no other node can reach the image.
+
+You turn this on for the whole server. There is no SDK option, because it is an operations choice, not a per-call one.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_SNAPSHOT_PUSH_ENABLED` | Turns the whole feature on. When `false`, snapshots stay on their own node, as before. | `false` |
+| `SB_AUTO_IMPORT_CLUSTER_ID` | Your cluster's folder in AOCR (`cluster/<id>/snapshots/<name>:latest`). Shared with the auto-import setup. Required when push is on. | None |
+| `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | File holding the token used as the registry password. Read again on every push, so you rotate it by writing the file. Required when push is on. | None |
+| `SB_MIRROR_PUSH_HOST` | Where to push, for example `aocr.aerol.ai`. | `SB_IMAGE_DISTRIBUTION_AOCR_HOST` |
+| `SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL` | How often the background job runs. | `5m` |
+| `SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT` | How many pushes one run may start. | `2` |
+| `SB_SNAPSHOT_PUSH_TAG_SUFFIX` | Optional retention suffix added to the pushed tag (`latest<suffix>`), like `--ttl-7d` or `--idle-30d`. Empty pushes a plain `latest` tag that AOCR keeps forever, which is right for failover snapshots. Short-lived clusters can set a short TTL so their snapshots clean themselves up. Push and pull use the same suffix. | Empty |
+
+The server tracks a push state for each snapshot (`push_state` in the API, `PushState` in the Go SDK):
+
+| Push state | What it means |
 |---|---|
-| Container writable layer (files, installed packages) | Mounted volumes (they live outside the container by design - see [Volumes](/external-storage)) |
-| Image entrypoint and default working directory | Running processes, open sessions, in-memory state |
-| OS user, env vars baked at image build time | Sandbox-level env vars set at create time (`env`), unless the snapshot's `entrypoint` reads them at start |
-| Resource hints (cpu, memoryMB, diskGB) when provided | Network/firewall rules, exposed ports, public URLs |
+| `active` | No push was needed, or the push finished. |
+| `pending`, `pushing` | Waiting for, or in, the background job. |
+| `error` | The last push failed. `push_error` says why, and the job tries again next run. |
 
-If you need to ship state alongside the image, write it under a [mount target](/external-storage) before snapshotting - the mount stays declared on the new sandbox the next time you `create`, and the data lives independently of any single container.
+A failed push does no harm: the snapshot still works on the node that made it. Snapshots made before you turned the feature on stay `active`; the server does not push them after the fact.
 
-## Common patterns
+## Next steps
 
-- **Golden base image per workload.** Register a `py-base` / `node-base` / `cuda-base` snapshot once during deploy, then `create({ image: 'py-base' })` everywhere. Faster than re-running `apt-get install` per sandbox, and centralizes the version bump.
-- **User-bound fork point.** Snapshot a sandbox after a setup step (clone, build, seed), then spin per-user sandboxes from that snapshot. Each user gets a fresh writable layer rooted at the same baseline.
-- **Failover-ready snapshots in cluster mode.** Combine `SB_SNAPSHOT_PUSH_ENABLED=true` with `failover.policy = "recreate"` on the sandbox. When the owner dies, the cluster recreates the sandbox on a surviving node from the AOCR-distributed snapshot image - without it, the recreate is rejected because the local image is unreachable.
+- [Images, resources and lifecycle](/environment/): set CPU and memory on sandboxes made from a snapshot.
+- [Firecracker templates](/firecracker-templates/): the Firecracker way to start from a prepared image.
+- [Attach cloud storage](/external-storage/): keep data that should outlive any one sandbox.
+- [Durability and failover](/durability/): recreate sandboxes when a cluster node fails.

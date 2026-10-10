@@ -1,249 +1,293 @@
 ---
-title: Isolate Sandbox
-description: Deploy a JS/TS fetch handler as a V8 isolate — no image, no registry, host-mediated HTTP with per-sandbox egress.
+title: V8 isolate sandboxes
+description: Run a JavaScript or TypeScript fetch handler as a sandbox that starts in milliseconds, with no image and strict outbound rules.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Isolate sandboxes run a JavaScript/TypeScript `fetch` handler inside a V8
-isolate (Cloudflare's `workerd` engine). Push a bundle, get an HTTP entrypoint
-with capability-scoped egress — no Dockerfile, no container image, no shell or
-filesystem. This is the Workers-model tier that complements Firecracker
-microVMs and WASM modules.
+A V8 isolate sandbox runs a small piece of JavaScript or TypeScript that answers web requests. V8 is the JavaScript engine inside Chrome and Node.js. An isolate is a walled-off space inside V8 with its own memory, so many isolates can share one process safely. AerolVM runs them with workerd, Cloudflare's open-source engine for Cloudflare Workers.
 
-Requires `SB_ENABLE_ISOLATE=true` and a pinned `workerd` binary on the host
-(`install.sh --with-isolate`, or Terraform `with_isolate = true` /
-`default_with_isolate = true`). Off by default.
+Your code is a fetch handler: a function that gets a web request and returns a response. There is no Dockerfile, no container image, no shell and no file system. You upload the code, then create sandboxes from it.
 
-## Create latency
+Choose an isolate for small tools that answer HTTP requests, such as AI-written helpers or webhook transforms. They start in a few milliseconds and you control exactly which websites they can call. For code that needs a shell, files or other programs, use a [container](/sandboxes/) or [WebAssembly](/wasm-sandbox/) sandbox instead.
 
-Warm create (bundle already uploaded, tenant group already running) is the
-steady-state path. Live UC-94 on `single-node-isolate` (`t3.medium`, jail off,
-10 samples, 0 failures):
+## How fast it starts
 
-| Metric | p50 | p90 | p99 |
+These numbers are for a warm create: the code is already uploaded and its workerd process is already running. We measured them on our test server (an AWS `t3.medium`, jail off, 10 creates, no failures).
+
+| Measured where | Median | 90th percentile | 99th percentile |
 |---|---|---|---|
-| **Server create** | **4ms** | 6ms | 19ms |
-| Client API round-trip | 266ms | 269ms | 289ms |
+| **On the server** | **4 ms** | 6 ms | 19 ms |
+| From a laptop, round trip | 266 ms | 269 ms | 289 ms |
 
-The API figure includes laptop → region WAN; quote **server** latency for
-create cost. Cold first-create for a tenant also pays one workerd group spawn;
-subsequent creates in that tenant inject into the resident group.
+The laptop numbers include network travel time to the cloud region, so use the server numbers for the cost of a create. The first create for a tenant (one customer or account) also starts that tenant's workerd process. Later creates for the same tenant reuse it.
 
-## Create an isolate sandbox
+## What the server needs
 
-Pass `runtime: "isolate"` and a `module_ref` pointing at a JS/TS bundle.
-Isolates default to `durability: "ephemeral"`; `passivatable` is rejected and
-`durable` is not yet enabled.
+Isolates are off by default. The server operator installs workerd with the `--with-isolate` installer flag, which also sets `SB_ENABLE_ISOLATE=true`. On a cluster, set `with_isolate = true` on a worker in Terraform, or `default_with_isolate = true` for all of them. Until isolates are on, a create fails with `runtime "isolate" requires SB_ENABLE_ISOLATE=true`.
 
-Upload the bundle once with `POST /v1/js-bundles` (experimental catalogue),
-then create with the `module_ref` field of the upload response. Use that field
-as-is: on a cluster it names the worker holding the bundle
-(`node:<worker>:sha256:…`), and a create that passes the bare digest or the
-bundle name is refused there (see [Cluster mode](#cluster-mode)). On a single
-node the same field is `sha256:<digest>`, and the bundle name and an
-operator-only `file://` path also work. Same-tenant sandboxes share one workerd
-group process (server-authorized `tenant_id`); the group key is never
-client-chosen for forced co-residency.
+## Step 1: Write a fetch handler
+
+A handler is an ES module whose default export has a `fetch` function:
+
+```js
+// main.js
+export default {
+  async fetch(request) {
+    return new Response("Hello from an isolate");
+  },
+};
+```
+
+## Step 2: Upload it as a bundle
+
+A bundle is your handler code plus its settings. Upload it once to the server's bundle catalogue with the `POST /v1/js-bundles` API. The SDKs do not have a method for this yet, and the API is experimental.
+
+| Field | What it holds | Default |
+|---|---|---|
+| `source` | The code of a one-file bundle. | None |
+| `main_module` | The name of the file that holds the handler. | `main.js` |
+| `modules` | For a bundle with several files: a map from file name to code. | None |
+| `name` | A short name you can use on create instead of the digest. It belongs to your account. | None |
+| `compatibility_date` | Which workerd behavior to use. | The server's pinned date |
+
+Set exactly one of `source` or `modules`. Uploading the same code again returns the same bundle, and reusing a `name` points it at the new code.
+
+The response's `module_ref` field is what you pass when you create a sandbox. Use it exactly as returned. On one server it looks like `sha256:<digest>`, where the digest is a hash that names the exact code. In a cluster it also names the worker that holds the bundle. There, a bare digest or a bundle name is refused (see [In a cluster](#in-a-cluster)).
+
+On a single server, the bundle `name` also works. An operator token can also point at a `.js`, `.mjs` or `.ts` file on the server with a `file://` path.
+
+## Step 3: Create a sandbox and call it
+
+Set `runtime: "isolate"` and pass the bundle's `module_ref` as `moduleRef`. Then `exec` calls your handler: the command is the URL path, and `stdout` is the response body.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    const client = new MicroVM({
-      apiUrl: process.env.SB_API_URL,
-      patToken: process.env.SB_PAT_TOKEN,
-    })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+    const bundleRef = "sha256:..."; // the module_ref from your upload
 
     const sandbox = await client.create({
-      moduleRef: 'sha256:…', // the module_ref from POST /v1/js-bundles
-      runtime: 'isolate',
-      memoryMB: 128,
-      networkAllowOut: ['api.example.com'],
-    })
+      image: bundleRef, // the TypeScript SDK requires image: use the bundle reference
+      moduleRef: bundleRef,
+      runtime: "isolate",
+    });
+    const result = await sandbox.exec("/"); // sends GET / to your handler
+    console.log(result.stdout); // Hello from an isolate
 
-    console.log(sandbox.id)
+    await sandbox.destroy();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     from microvm import MicroVM
 
-    client = MicroVM(
-        api_url='https://sandbox.example.com',
-        pat_token='your-token',
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+    bundle_ref = "sha256:..."  # the module_ref from your upload
+
+    sandbox = client.create(
+        image=bundle_ref,  # the Python SDK requires image: use the bundle reference
+        module_ref=bundle_ref,
+        runtime="isolate",
     )
+    result = sandbox.exec("/")  # sends GET / to your handler
+    print(result["stdout"])  # Hello from an isolate
 
-    sandbox = client.create({
-        'module_ref': 'sha256:…',
-        'runtime': 'isolate',
-        'memoryMB': 128,
-        'network_allow_out': ['api.example.com'],
-    })
-
-    print(sandbox.id)
+    sandbox.destroy()
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    import (
-        "context"
-        "fmt"
-        "log"
-        "os"
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+    bundleRef := "sha256:..." // the module_ref from your upload
 
-        microvm  "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
-        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
-    )
-
-    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
-        APIUrl:   os.Getenv("SB_API_URL"),
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef: bundleRef,
+        Runtime:   sdktypes.RuntimeIsolate,
     })
     if err != nil {
         log.Fatal(err)
     }
+    defer sandbox.Destroy(ctx)
 
-    sb, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
-        ModuleRef:       "sha256:…",
-        Runtime:         sdktypes.RuntimeIsolate,
-        MemoryMB:        128,
-        NetworkAllowOut: []string{"api.example.com"},
-    })
+    result, err := sandbox.ExecCommand(ctx, "/") // sends GET / to your handler
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println(sb.ID)
+    fmt.Print(result.Stdout) // Hello from an isolate
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     use aerolvm_sdk::{Client, CreateOptions};
 
-    #[tokio::main]
-    async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let client = Client::new(
-            Some("https://sandbox.example.com"),
-            Some("your-token"),
-        )?;
-        let sandbox = client
-            .create(CreateOptions {
-                module_ref: Some("sha256:…".into()),
-                runtime: Some("isolate".into()),
-                memory_mb: Some(128),
-                network_allow_out: Some(vec!["api.example.com".into()]),
-                ..Default::default()
-            })
-            .await?;
-        println!("{}", sandbox.id);
-        Ok(())
-    }
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+    let bundle_ref = "sha256:..."; // the module_ref from your upload
+
+    let sandbox = client.create(CreateOptions {
+        module_ref: Some(bundle_ref.into()),
+        runtime: Some("isolate".into()),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("/")?; // sends GET / to your handler
+    print!("{}", result.stdout); // Hello from an isolate
+
+    sandbox.destroy()?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.MicroVMClient;
-    import ai.aerol.microvm.model.CreateOptions;
-    import ai.aerol.microvm.model.Sandbox;
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+    String bundleRef = "sha256:..."; // the module_ref from your upload
 
-    MicroVMClient client = new MicroVMClient.Builder()
-        .apiUrl("https://sandbox.example.com")
-        .patToken("your-token")
-        .build();
+    Sandbox sandbox = client.create(
+        new CreateOptions().setModuleRef(bundleRef).setRuntime("isolate")
+    );
+    ExecResult result = sandbox.exec("/"); // sends GET / to your handler
+    System.out.print(result.stdout); // Hello from an isolate
 
-    Sandbox sandbox = client.create(new CreateOptions()
-        .setModuleRef("sha256:…")
-        .setRuntime("isolate")
-        .setMemoryMb(128)
-        .setNetworkAllowOut(java.util.List.of("api.example.com")));
-
-    System.out.println(sandbox.id);
+    sandbox.destroy();
     ```
   </TabItem>
 </Tabs>
 
-## Per-sandbox egress
+`exec` sends a `GET` request by default. To use another method, set the `METHOD` environment variable on the exec request, for example `METHOD=POST`. If the handler answers with status 400 or higher, the exit code is 1.
 
-Outbound `fetch` is host-mediated. Each sandbox binds a dedicated egress slot
-in the workerd group config — attribution is structural (which static egress
-service the worker can reach), not a forgeable header. Within one tenant group
-you can mix:
+To give the handler a public URL, call `exposePort`. Isolates support HTTP only, not raw TCP or TLS (encrypted TCP) ports. See [Share a web app](/preview/).
 
-- `networkAllowOut: ['api.example.com']` — only listed hosts
-- `networkBlockAll: true` — fail-closed deny (same as an empty allowlist with no opens)
-- allow-all with SSRF guards still blocking link-local / EC2 metadata / loopback
+## Control outbound requests
 
-`SB_ISOLATE_EGRESS_POOL_SIZE` (default 64) caps concurrently egressing sandboxes
-per group. Pool exhaustion binds a deny service and logs spill — never silent
-open egress.
+When your handler calls `fetch()` to reach another website, the AerolVM server makes that request for it. You choose what it may reach when you create the sandbox:
 
-Public HTTP ingress is opt-in with `exposePort` (HTTP only — the TCP host-port
-pool is never walked for isolates).
+| Option | What the handler can reach |
+|---|---|
+| `networkAllowOut: ["api.example.com"]` | Only the hosts you list. |
+| `networkBlockAll: true` | Nothing. Every outbound request fails. |
+| Neither | Any public host. The server still blocks link-local addresses, the cloud metadata service (such as AWS EC2's) and loopback (the server itself). |
 
-## Cluster mode
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: bundleRef,
+      moduleRef: bundleRef,
+      runtime: "isolate",
+      memoryMB: 128,
+      networkAllowOut: ["api.example.com"],
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image=bundle_ref,
+        module_ref=bundle_ref,
+        runtime="isolate",
+        memory_mb=128,
+        network_allow_out=["api.example.com"],
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef:       bundleRef,
+        Runtime:         sdktypes.RuntimeIsolate,
+        MemoryMB:        128,
+        NetworkAllowOut: []string{"api.example.com"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        module_ref: Some(bundle_ref.into()),
+        runtime: Some("isolate".into()),
+        memory_mb: Some(128),
+        network_allow_out: Some(vec!["api.example.com".into()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setModuleRef(bundleRef)
+            .setRuntime("isolate")
+            .setMemoryMb(128)
+            .setNetworkAllowOut(List.of("api.example.com"))
+    );
+    ```
+  </TabItem>
+</Tabs>
 
-A bundle is stored on **one** isolate-capable worker: the one placement chose
-for the upload. Its `module_ref` carries that worker's identity, so a create
-that references it is placed on that worker in O(1), with no fleet probe and
-no replication. Two consequences follow:
+Sandboxes of one tenant can each use different rules, even though they share one workerd process. Each sandbox gets its own outbound channel in that process. The server knows which sandbox made a request by the channel it came through, not by a header the code could fake.
 
-- **Listing is cluster-wide.** `GET /v1/js-bundles` from any node returns the
-  union of every isolate worker's catalogue (deduplicated by digest, scoped to
-  the caller's tenant). The list is coalesced on the Raft leader and cached for
-  two seconds. When a worker that may hold bundles did not answer, the response
-  carries `X-Aerol-Partial: true` and `X-Aerol-Missing-JSBundle-Peers: <n>`
-  rather than silently omitting its bundles.
-- **Bundles are single-copy.** If the worker holding a bundle leaves the
-  cluster, every create, get, or delete referencing that `module_ref` returns
-  `503` with `"code": "artifact_node_unavailable"`. Waiting will not bring it
-  back: the client keeps the source, and the recovery is to upload the bundle
-  again and use the new `module_ref`. SDKs should treat that code as
-  "re-upload, then retry", not as a transient error.
+Each workerd process has a fixed number of these channels (64 by default). If they are all in use, a new sandbox gets a channel that blocks everything, and the server logs it. Outbound access is never silently opened.
 
-Registry-backed durable bundles (upload once, pull on any worker, unpinned
-placement) are the planned follow-up for the GA tier; see
-`plans/isolate-runtime.md`, "Bundle durability".
+## Share a process with your tenant
 
-## Residual limits
+Sandboxes with the same tenant share one workerd process. Different tenants never share one. The server decides which tenant a sandbox belongs to. The `tenantId` create option (`tenant_id` in Python and Rust, `TenantID` in Go, `setTenantId` in Java) is checked against what your token may use. If you leave it out, the server uses your token's identity. You cannot pick a value that puts your code in another tenant's process.
 
-Isolates have **no shell, no filesystem, and no arbitrary binary**. Toolbox
-`exec` invokes the `fetch` handler; other toolbox verbs return 501. Platform
-volumes and OCI images are rejected. SSH is not available.
+## In a cluster
 
-## The jail
+A bundle is stored on **one** worker: the one AerolVM picked when you uploaded it. Its `module_ref` carries that worker's name (`node:<worker>:sha256:...`). A create that uses it goes straight to that worker, with no search across the cluster and no copying.
 
-Isolates share one `workerd` process per tenant group, so that process
-boundary is the cross-tenant boundary. With `SB_ISOLATE_USE_JAIL=true` (the
-default) each group process runs as a dedicated non-root user, inside a chroot
-holding only workerd, its libraries, a few `/dev` nodes and its own socket
-directory, in its own cgroup v2 with the group's CPU and memory caps, with
-`no_new_privs` set and an enforcing seccomp allowlist installed before workerd
-starts. The daemon builds the chroot base at boot and refuses to start if it
-cannot, so a jail that cannot be realized is never discovered by a tenant's
-create. Enterprise mode requires the jail with `SB_ISOLATE_SECCOMP_MODE=enforce`.
-Operator details, the audit-mode procedure for new workerd builds, and the
-list of what the jail does not do are in `setup/runbooks/isolate-jail.md`.
+- **Listing shows every bundle.** Listing bundles from any server returns your bundles from every isolate worker, with no duplicates. The cluster leader (the server the cluster elected to coordinate) builds the list and caches it for two seconds. If a worker that may hold bundles did not answer, the response says so with the headers `X-Aerol-Partial: true` and `X-Aerol-Missing-JSBundle-Peers: <n>`. It does not quietly leave those bundles out.
+- **A bundle has one copy.** If its worker leaves the cluster, any create, get or delete that uses its `module_ref` fails with `503` and `"code": "artifact_node_unavailable"`. Waiting does not help. Upload the bundle again and use the new `module_ref`.
 
-## Operator setup
+Bundles stored in a registry, so that any worker can fetch them, are planned.
 
-| Knob | Default | Purpose |
+## Good to know
+
+- **No shell, no files, no programs.** `exec` only calls your fetch handler. The other toolbox calls (the toolbox is the helper the SDK talks to for files, sessions and processes) return `501 Not Implemented`. SSH is not available.
+- **No images or storage.** Container images, mounts and platform volumes are rejected.
+- **Lost on restart.** Isolates use `durability: "ephemeral"` by default. `passivatable` is rejected because there is nothing to save: the bundle is the whole sandbox. `durable` is not available yet.
+- **No GPU, no templates.** `gpus` and `template_id` are rejected.
+
+## For server operators
+
+### Install
+
+Add `--with-isolate` to the install command (see [Install on a server](/getting-started/single-node-setup/)). The installer downloads a pinned version of workerd to `/usr/local/bin/workerd`, checks it against SHA-256 hashes built into the script, and writes `SB_ENABLE_ISOLATE=true`. It also creates the `sandboxd-isolate` system user that the jail runs workerd as. Use `--workerd-path /path/to/workerd` to use a workerd you installed yourself.
+
+On a cluster, set `with_isolate = true` on the workers (or `default_with_isolate = true`). To upgrade the pinned workerd, follow `setup/runbooks/isolate-workerd-upgrade.md` in the repository.
+
+### The jail
+
+All sandboxes of a tenant share one workerd process, so that process boundary is what keeps tenants apart. With `SB_ISOLATE_USE_JAIL=true` (the default), each workerd process:
+
+- runs as its own non-root user;
+- runs in a chroot, a folder that looks like the whole file system to the process. It holds only workerd, its libraries, a few `/dev` device files and the process's own socket folder;
+- runs in its own cgroup v2 (a Linux control group) with the tenant group's CPU and memory limits;
+- has `no_new_privs` set, so it can never gain more rights;
+- has an enforcing seccomp allow list (the system calls it may make) installed before workerd starts.
+
+The server builds the base chroot folder when it starts and refuses to start if it cannot. A broken jail is found at boot, not by a tenant's create. Enterprise mode requires the jail with `SB_ISOLATE_SECCOMP_MODE=enforce`. The jail is tested on real servers, including a check of the running, confined workerd process. More detail, the audit-mode steps for a new workerd build, and what the jail does not cover are in `setup/runbooks/isolate-jail.md` in the repository.
+
+### Settings
+
+| Setting | What it does | Default |
 |---|---|---|
-| `SB_ENABLE_ISOLATE` | `false` | Advertise + accept `runtime: "isolate"` |
-| `SB_ISOLATE_WORKERD_PATH` | install path | Pinned workerd binary |
-| `SB_ISOLATE_GROUP_GRANULARITY` | `per-tenant` | Or `per-sandbox` for stronger isolation / lower density |
-| `SB_ISOLATE_EGRESS_POOL_SIZE` | `64` | Concurrent egress slots per group |
-| `SB_ISOLATE_USE_JAIL` | `true` | Jail every group process (chroot + cgroup + privilege drop + seccomp). `false` runs workerd unconfined as the daemon user — never in enterprise mode |
-| `SB_ISOLATE_SECCOMP_MODE` | `enforce` | `audit` logs unlisted syscalls instead of killing (bring-up for a new workerd build); `off` installs no filter (diagnosis only) |
-| `SB_ISOLATE_JAIL_UID` / `_GID` | installer-set | The `sandboxd-isolate` system user `install.sh --with-isolate` creates; the code default `1000` is the first login user on most images, so set these |
-| `SB_ISOLATE_JAIL_CHROOT_BASE` | `/srv/isolate-jail` | Parent of the shared base tree and the per-group roots |
-| `SB_ISOLATE_JAIL_CGROUP_ROOT` | `/sys/fs/cgroup/aerolvm-isolate` | Parent cgroup (v2) for the per-group cgroups |
+| `SB_ENABLE_ISOLATE` | Accept `runtime: "isolate"` and report it to the cluster. | `false` |
+| `SB_ISOLATE_WORKERD_PATH` | The pinned workerd program. | `/usr/local/bin/workerd` |
+| `SB_ISOLATE_GROUP_GRANULARITY` | `per-tenant` shares one process per tenant. `per-sandbox` gives each sandbox its own process: stronger walls, fewer sandboxes per server. | `per-tenant` |
+| `SB_ISOLATE_EGRESS_POOL_SIZE` | Outbound channels per workerd process. | `64` |
+| `SB_ISOLATE_USE_JAIL` | Jail every workerd process (chroot, cgroup, dropped rights, seccomp). `false` runs workerd unconfined as the server's user. Never allowed in enterprise mode. | `true` |
+| `SB_ISOLATE_SECCOMP_MODE` | `enforce` stops a process that makes a system call not on the list. `audit` only logs it, for trying a new workerd build. `off` installs no filter, for debugging only. | `enforce` |
+| `SB_ISOLATE_JAIL_UID` / `SB_ISOLATE_JAIL_GID` | The user and group workerd runs as. The installer sets them to the `sandboxd-isolate` user. Set them yourself otherwise: the built-in `1000` is the first login user on most systems. | Set by the installer |
+| `SB_ISOLATE_JAIL_CHROOT_BASE` | Parent folder of the shared base tree and each process's chroot. | `/srv/isolate-jail` |
+| `SB_ISOLATE_JAIL_CGROUP_ROOT` | Parent cgroup (v2) for each process's cgroup. | `/sys/fs/cgroup/aerolvm-isolate` |
 
-Installer: `install.sh --with-isolate`. Cluster Terraform:
-`with_isolate = true` on workers (or `default_with_isolate`). Operators upgrade
-the pinned workerd via `setup/runbooks/isolate-workerd-upgrade.md`.
+## Next steps
 
-Live coverage: `make integration-single-isolate-jail` (UC-103/104/105 against
-jailed groups, plus UC-109 inspecting the confined workerd process),
-`make integration-single-isolate` (UC-103/104/105, jail off) and
-`make integration-benchmark-isolate` (UC-94 create latency).
+- [WebAssembly (WASM)](/wasm-sandbox/): run compiled programs that need files or arguments.
+- [Allow only some websites](/egress-domain-filtering/): more about outbound allow lists.
+- [Share a web app](/preview/): give a handler a public URL.
+- [Cluster setup](/cluster-setup/): add isolate workers to a cluster.

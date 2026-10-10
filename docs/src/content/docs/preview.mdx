@@ -1,63 +1,193 @@
 ---
-title: Preview
+title: Share a web app
+description: Give a web server inside a sandbox a public URL that anyone can open in a browser.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every sandbox+port can get a public URL that routes to the sandbox's API endpoint.
+A sandbox can run a web server, such as a Node app, a Python API or a dev server. To let people open it in a browser, you **expose a port**. A port is a number that tells the sandbox which program gets the traffic. Web servers often use `3000` or `8080`.
 
-:::note
-Sandboxes are **private by default** — no public URL exists until you opt in. Calling `exposePort` is the opt-in: the first call on a private sandbox flips it to public, installs the sandbox's `<sandbox-id>.<domain>` route, and then publishes the port. To have the sandbox URL live from boot instead, create with `allowPublicTraffic: true` — see [Network Isolation](/network-isolation/) for the flag in all five SDKs.
-:::
+Exposing a port gives it a **public URL**: a web address anyone on the internet can open. Use this to share a preview of an app, a demo, or a web tool your agent built.
 
-## Expose a Port
+Sandboxes are **private by default**. A new sandbox has no public URL at all. It gets one the first time you call `exposePort`, or right away if you create it with `allowPublicTraffic: true`.
 
-Services running inside the sandbox are not reachable publicly by default. Call `exposePort` to add a port to the allowlist and create a public route for it.
+<Aside type="caution" title="Public URLs need a server install">
+Public URLs only work on a server install that runs the web proxy, set up as in [Install on a server](/getting-started/single-node-setup/). A local install ([Install on your computer](/getting-started/local-setup/)) does not run it. There, `exposePort` still returns a URL, but nothing answers at that address. To test a web server locally, call it from inside the sandbox instead, for example `curl -s http://localhost:3000` with [Run commands](/exec-streaming/) (the image needs `curl`).
+</Aside>
+
+## Share a port
+
+This starts a small web server on port 3000 inside the sandbox, then exposes that port.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const exposure = await sandbox.exposePort(3000)
-    console.log(exposure.url) // https://<sandbox-id>-3000.sandbox.example.com
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM();
+    const sandbox = await client.create({ image: "python:3.12-slim" });
+
+    // Start a web server on port 3000 and leave it running in the background.
+    await sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &");
+
+    const exposure = await sandbox.exposePort(3000);
+    console.log(exposure.url);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
+    from microvm import MicroVM
+
+    client = MicroVM()
+    sandbox = client.create(image="python:3.12-slim")
+
+    # Start a web server on port 3000 and leave it running in the background.
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &")
+
     exposure = sandbox.expose_port(3000)
     print(exposure.url)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12-slim"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Start a web server on port 3000 and leave it running in the background.
+    if _, err := sandbox.ExecCommand(ctx, "nohup python3 -m http.server 3000 > /dev/null 2>&1 &"); err != nil {
+        log.Fatal(err)
+    }
+
     exposure, err := sandbox.ExposePort(ctx, 3000)
-    if err != nil { log.Fatal(err) }
+    if err != nil {
+        log.Fatal(err)
+    }
     fmt.Println(exposure.PublicURL)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let exposure = sandbox.expose_port(3000, ExposeOptions::default())?;
-    if let ExposeResult::Http { url } = exposure {
+    use aerolvm_sdk::{Client, CreateOptions, ExposeOptions, ExposeResult};
+
+    let client = Client::new(None, None)?;
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        ..Default::default()
+    })?;
+
+    // Start a web server on port 3000 and leave it running in the background.
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &")?;
+
+    if let ExposeResult::Http { url } = sandbox.expose_port(3000, ExposeOptions::default())? {
         println!("{}", url);
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    MicroVMClient client = new MicroVMClient();
+    Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12-slim"));
+
+    // Start a web server on port 3000 and leave it running in the background.
+    sandbox.exec("nohup python3 -m http.server 3000 > /dev/null 2>&1 &");
+
     ExposeResult exposure = sandbox.exposePort(3000);
     System.out.println(exposure.url);
     ```
   </TabItem>
 </Tabs>
 
-## Unexpose a Port
+On a server with a domain, you see something like this. Open it in a browser to see the server's file listing.
 
-Remove the public route and the port from the allowlist.
+```text
+https://sb-9f2c41d07a3e5b86-3000.sandbox.example.com
+```
+
+The URL keeps working until you unexpose the port or delete the sandbox. Calling `exposePort` again for the same port is safe: it returns the same URL.
+
+## What the URL looks like
+
+The URL depends on how the server was installed.
+
+| Server setup | Port URL | Uses HTTPS? |
+|---|---|---|
+| With a domain | `https://<sandbox-id>-<port>.<domain>` | Yes |
+| Without a domain (IP address only) | `http://<server-ip>/<sandbox-id>/proxy/<port>/` | No, plain HTTP |
+| Local install | A URL is returned, but it does not work | No |
+
+With a domain, every sandbox port gets its own web address under the server's domain. HTTPS means the traffic is encrypted with TLS (the encryption behind `https://`), so browsers show the lock icon.
+
+Without a domain, your app is served under a path instead. Pages that load files from absolute paths, such as `/app.js`, may not load there. A domain avoids this.
+
+## Make a sandbox public from the start
+
+By default, the sandbox becomes public on your first `exposePort` call. To have its main URL live as soon as it starts, set `allowPublicTraffic: true` when you create it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.unexposePort(3000)
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      allowPublicTraffic: true,
+    });
+    console.log(sandbox.publicURL); // https://<sandbox-id>.<domain>
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="python:3.12-slim", allow_public_traffic=True)
+    print(sandbox.publicURL)  # https://<sandbox-id>.<domain>
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    public := true
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:              "python:3.12-slim",
+        AllowPublicTraffic: &public,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.PublicURL) // https://<sandbox-id>.<domain>
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        allow_public_traffic: Some(true),
+        ..Default::default()
+    })?;
+    println!("{}", sandbox.data.public_url); // https://<sandbox-id>.<domain>
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12-slim")
+            .setAllowPublicTraffic(true)
+    );
+    System.out.println(sandbox.publicUrl); // https://<sandbox-id>.<domain>
+    ```
+  </TabItem>
+</Tabs>
+
+The main URL (`publicURL`) points at the sandbox's built-in helper program, not at your app. Your app lives at the port URL that `exposePort` returns. Ports still stay closed until you expose them, as explained in [Port allowlist](/port-allowlist/).
+
+A sandbox you leave private still works for everything else: running commands, files and SSH all go through the AerolVM server, not the public URL.
+
+## Stop sharing a port
+
+`unexposePort` removes the public URL for that port. Calling it for a port that is not exposed does nothing.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.unexposePort(3000);
     ```
   </TabItem>
   <TabItem label="Python">
@@ -67,7 +197,9 @@ Remove the public route and the port from the allowlist.
   </TabItem>
   <TabItem label="Go">
     ```go
-    err := sandbox.UnexposePort(ctx, 3000)
+    if err := sandbox.UnexposePort(ctx, 3000); err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -82,11 +214,81 @@ Remove the public route and the port from the allowlist.
   </TabItem>
 </Tabs>
 
-See [Port Allowlist](/port-allowlist) for full details on how port access control works.
+Once a sandbox is public, it stays public. Unexposing every port closes those ports, but the sandbox's main URL keeps working.
 
-## TLS
+## Fix "host not allowed" errors
 
-TLS certificates are issued automatically:
+Your app sees the public address (for example `sb-9f2c41d07a3e5b86-3000.sandbox.example.com`) in each request's `Host` header. Some dev servers reject names they do not know. Vite says "Blocked request. This host is not allowed." webpack-dev-server, Django (`ALLOWED_HOSTS`) and Rails do the same.
 
-- **Domain mode** (`SB_DOMAIN` set): Caddy issues a single wildcard certificate covering `<domain>` and `*.<domain>` via DNS-01 (Cloudflare). The installer requires `--dns-provider` whenever `--domain` is set - see [Server Setup](/getting-started).
-- **IP mode** (no `SB_DOMAIN`): Routes are HTTP-only, no TLS.
+Set `maskRequestHost` when you create the sandbox. The server then replaces the `Host` header with a value your app accepts, such as `localhost`. The public URL does not change.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "node:22",
+      maskRequestHost: "localhost",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="node:22", mask_request_host="localhost")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "node:22",
+        MaskRequestHost: "localhost",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "node:22".into(),
+        mask_request_host: Some("localhost".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("node:22")
+            .setMaskRequestHost("localhost")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+This only changes web (HTTP) ports. TCP and TLS ports have no `Host` header, so it has no effect on them.
+
+## Good to know
+
+- **Listen on all addresses.** Start your server on `0.0.0.0`, not only `localhost` or `127.0.0.1`. The public URL connects to the sandbox's network address. For Vite, run `vite --host`.
+- **You can expose a port before the server starts.** The URL returns an error (usually `502 Bad Gateway`) until something listens on the port.
+- **Stop and start keep your ports.** When a stopped sandbox starts again, its exposed ports come back with the same URLs. A stopped sandbox does not answer, unless it is a [serverless sandbox](/serverless/) that wakes on traffic.
+- **Blocking the internet does not block your URL.** `networkBlockAll` only stops traffic going out of the sandbox. See [Block or allow the internet](/network-isolation/).
+- **One protocol per port.** A port exposed for the web cannot also be a TCP or TLS port. Unexpose it first. See [TCP and TLS ports](/tcp-ports/).
+- **WASM and V8 isolate sandboxes** support web (HTTP) ports only.
+
+## For server operators
+
+Public URLs are served by Caddy, the web proxy that the installer sets up next to the AerolVM server. Domain mode needs two DNS records (entries at your domain provider that map a name to your server's address): one for `<domain>` and one for `*.<domain>`. See [Install on a server](/getting-started/single-node-setup/).
+
+How Caddy handles certificates depends on the install:
+
+- **Domain mode** (`SB_DOMAIN` set). Caddy gets one wildcard certificate that covers `<domain>` and `*.<domain>`. A certificate is the file that proves to browsers the site is really yours. A wildcard domain such as `*.sandbox.example.com` covers every name under it, so every sandbox URL shares that one certificate. Caddy gets it from Let's Encrypt with a DNS-01 check: it proves you own the domain by adding a short-lived DNS record through Cloudflare. That is why the installer requires `--dns-provider` and `--dns-api-token` whenever you pass `--domain`.
+- **IP mode** (no `SB_DOMAIN`). Routes are plain HTTP, with no TLS.
+- **Local install** (`--local`). The installer sets `SB_ENABLE_CADDY=false`, so no public routes are created at all.
+
+## Next steps
+
+- [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.
+- [Custom domains](/custom-domains/): serve a sandbox on your own domain, such as `app.acme.com`.
+- [TCP and TLS ports](/tcp-ports/): share a database or another service that is not a website.
+- [Serverless sandboxes](/serverless/): stop idle sandboxes and wake them on the next visit.
+- [Install on a server](/getting-started/single-node-setup/): set up a domain so public URLs work.

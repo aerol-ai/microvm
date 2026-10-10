@@ -1,0 +1,147 @@
+---
+title: Install on a server
+description: Put AerolVM on one cloud server with your own domain, so your apps can reach it and sandboxes get HTTPS links.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This guide puts AerolVM on one Linux server in the cloud. When you finish, your apps can create sandboxes from anywhere. Each sandbox can also share a web page at its own link, such as `https://<sandbox-id>-3000.sandbox.example.com`.
+
+It takes about 20 minutes. You copy and paste every command.
+
+<Aside type="tip">
+Just want to try AerolVM? The [Quickstart](/quick-start/) runs it on your own computer in five minutes, with no server or domain.
+</Aside>
+
+## What you need
+
+- **A Linux server with a public IP address.** Rent one from any cloud, such as AWS, DigitalOcean or Hetzner. Choose Ubuntu 22.04 or newer. Two CPUs and 4 GB of memory is enough to start.
+- **A domain name on Cloudflare,** such as `example.com`. AerolVM uses a part of it, such as `sandbox.example.com`. Cloudflare is the only domain service the installer works with today.
+- **A terminal on your computer,** to log in to the server.
+
+No domain yet? You can [try AerolVM on the server's IP address](/getting-started/installer-options/#try-it-without-a-domain) first. It has no HTTPS, so use it only for testing.
+
+## Install the server
+
+### Step 1: Point your domain at the server
+
+Find your server's public IP address in your cloud's dashboard. It looks like `203.0.113.42`.
+
+In Cloudflare, open your domain and go to **DNS** → **Records**. Add these two DNS records. They tell the internet which server a name belongs to.
+
+| Type | Name | IPv4 address | Proxy status |
+|---|---|---|---|
+| `A` | `sandbox` | Your server's IP | DNS only |
+| `A` | `*.sandbox` | Your server's IP | DNS only |
+
+The first record is for the AerolVM API. The second one, with `*`, sends every sandbox link to the same server.
+
+<Aside type="caution">
+Click the orange cloud so it turns gray and says **DNS only**. Through Cloudflare's proxy, sandbox links, SSH and TCP ports do not work.
+</Aside>
+
+### Step 2: Open the firewall
+
+In your cloud's firewall settings, allow incoming TCP traffic on these ports. AWS calls these settings a security group.
+
+| Port | Why |
+|---|---|
+| `443` | HTTPS for the AerolVM API and sandbox links. Always open it. |
+| `2220` | Optional. Lets you [log in to sandboxes over SSH](/ssh-access/). |
+| `22000` to `23000` | Optional. For [TCP ports](/tcp-ports/) you share from sandboxes, such as a database. |
+
+Keep port `22` open so you can log in to the server. Keep every other port closed.
+
+### Step 3: Create a Cloudflare API token
+
+The installer gets free HTTPS certificates from Let's Encrypt. To prove you own the domain, it adds a short-lived record to your DNS. This token lets it do that.
+
+1. In Cloudflare, go to **My Profile** → **API Tokens** and click **Create Token**.
+2. Next to **Edit zone DNS**, click **Use template**.
+3. Under **Permissions**, click **Add more** and choose **Zone** → **Zone** → **Read**.
+4. Under **Zone Resources**, choose your domain.
+5. Click **Continue to summary**, then **Create Token**.
+6. Copy the token and keep it somewhere safe. Cloudflare shows it only once.
+
+### Step 4: Log in to your server
+
+From your computer's terminal, connect to the server with SSH. Use the IP address from step 1:
+
+```bash
+ssh ubuntu@203.0.113.42
+```
+
+The user name depends on your cloud. It is `ubuntu` on AWS, and `root` on DigitalOcean and Hetzner. If your cloud gave you a key file, add `-i` and its path, such as `ssh -i my-key.pem ubuntu@203.0.113.42`.
+
+Run the next step on the server.
+
+### Step 5: Run the installer
+
+First, make a secret token for AerolVM. Your apps send it with every request, like a password.
+
+```bash
+openssl rand -hex 32
+```
+
+Copy the long line it prints. Then run the installer, with your own three values in place of the examples:
+
+```bash
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
+    --domain sandbox.example.com \
+    --pat-token your-secret-pat \
+    --dns-provider cloudflare \
+    --dns-api-token your-cloudflare-api-token
+```
+
+- `sandbox.example.com`: your domain from step 1.
+- `your-secret-pat`: the token you just made.
+- `your-cloudflare-api-token`: the token from step 3.
+
+The installer takes a few minutes. It adds Docker if the server does not have it. When it is done, it prints a summary that starts like this:
+
+```text
+AerolVM installed
+PAT token: your-secret-pat
+Use header: Authorization: Bearer <PAT token>
+API URL: https://sandbox.example.com
+Health URL: https://sandbox.example.com/health
+```
+
+The server starts again by itself if the machine restarts.
+
+### Step 6: Check that it works
+
+Open your health URL in a web browser:
+
+```text
+https://sandbox.example.com/health
+```
+
+You should see one line of text that starts with `{"status":"ok"`. If the page does not load yet, wait two minutes and try again. The server may still be getting its HTTPS certificate.
+
+### Step 7: Connect your code
+
+Go back to your own computer. Tell the SDK where your server is:
+
+```bash
+export SB_API_URL=https://sandbox.example.com
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+Now do [steps 3 and 4 of the Quickstart](/quick-start/#step-3-install-the-sdk-for-your-language). They install the SDK and run your first sandbox, now on your server.
+
+## If something goes wrong
+
+To see what the server is doing, read its logs on the server:
+
+```bash
+sudo journalctl -u sandboxd -n 50
+sudo journalctl -u caddy -n 50
+```
+
+## Next steps
+
+- [Share a web app](/preview/): give a sandbox a public HTTPS link.
+- [SSH access](/ssh-access/): log in to a running sandbox.
+- [Installer options](/getting-started/installer-options/): add gVisor, V8 isolates or GPUs, and see what the installer changed.
+- [Cluster setup](/cluster-setup/): grow past one server.

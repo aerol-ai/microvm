@@ -1,67 +1,53 @@
 ---
-title: External Storage
+title: Attach cloud storage
+description: Mount your own S3 bucket, NFS share, SSH server or rclone remote into a sandbox, without putting credentials inside it.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Sandboxes are ephemeral by design. If you need durable workspace state across sandbox lifecycles, mount your own cloud or network storage into the sandbox.
+A sandbox's own disk is deleted with the sandbox. To keep data longer, or to work on data that already lives somewhere else, attach your own storage. The storage then shows up as a normal folder inside the sandbox.
 
-The platform handles mounting on the host and bind-mounts the result into your sandbox. Your image needs no special mount tooling, and credentials never enter the sandbox.
+The server does the mounting on its own machine (mounting means connecting storage so it appears as a folder). It then passes the folder into the sandbox. Your image needs no extra tools, and your credentials never enter the sandbox.
 
-## How it works
+## Attach an S3 bucket
 
-1. Declare mounts in the create request. The platform validates the spec and stores credentials encrypted at rest.
-2. At sandbox start, the platform establishes the mount on the host and makes it available inside the sandbox at the path you specified.
-3. On `Stop`, the mount is torn down. On `Start`, it is re-established. After a host reboot, mounts are restored automatically on the next sandbox start.
-
-## Supported mount types
-
-| Type | Source format | Host binary used | Credentials field |
-|---|---|---|---|
-| `s3` | `s3://bucket[/prefix]` or `bucket` | `mount-s3` | `access_key_id`, `secret_access_key`, `session_token` |
-| `nfs` | `host:/exports/path` | `mount.nfs` | none |
-| `sshfs` | `user@host:/path` | `sshfs` | `private_key_pem` |
-| `rclone` | `remote:path` | `rclone mount` | `rclone_conf` |
-
-Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 KiB total payload.
-
-## Mount an S3 Bucket
+Add a mount to the create call. This puts the `prefix` folder of `my-bucket` at `/workspace` inside the sandbox.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
+      image: "ubuntu:22.04",
       mounts: [
         {
-          type:   's3',
-          target: '/workspace',
-          source: 's3://my-bucket/prefix',
+          type: "s3",
+          source: "s3://my-bucket/prefix",
+          target: "/workspace",
           credentials: {
-            access_key_id:     'AKIA...',
-            secret_access_key: 'secret...',
+            access_key_id: "AKIA...",
+            secret_access_key: "your-secret-key",
           },
         },
       ],
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'mounts': [
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        mounts=[
             {
-                'type':   's3',
-                'target': '/workspace',
-                'source': 's3://my-bucket/prefix',
-                'credentials': {
-                    'access_key_id':     'AKIA...',
-                    'secret_access_key': 'secret...',
+                "type": "s3",
+                "source": "s3://my-bucket/prefix",
+                "target": "/workspace",
+                "credentials": {
+                    "access_key_id": "AKIA...",
+                    "secret_access_key": "your-secret-key",
                 },
             },
         ],
-    })
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -70,33 +56,38 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
         Image: "ubuntu:22.04",
         Mounts: []sdktypes.MountSpec{
             {
-                Type:   "s3",
-                Target: "/workspace",
+                Type:   sdktypes.MountTypeS3,
                 Source: "s3://my-bucket/prefix",
+                Target: "/workspace",
                 Credentials: map[string]string{
                     "access_key_id":     "AKIA...",
-                    "secret_access_key": "secret...",
+                    "secret_access_key": "your-secret-key",
                 },
             },
         },
     })
+    if err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{MountSpec, MountType};
     use std::collections::HashMap;
 
-    let mut creds = HashMap::new();
-    creds.insert("access_key_id".to_string(), "AKIA...".to_string());
-    creds.insert("secret_access_key".to_string(), "secret...".to_string());
-
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        mounts: Some(vec![aerolvm_sdk::MountSpec {
-            type_:       "s3".to_string(),
-            target:      "/workspace".to_string(),
-            source:      "s3://my-bucket/prefix".to_string(),
-            credentials: Some(creds),
+        image: "ubuntu:22.04".into(),
+        mounts: Some(vec![MountSpec {
+            mount_type: MountType::S3,
+            source: "s3://my-bucket/prefix".into(),
+            target: "/workspace".into(),
+            options: None,
+            credentials: Some(HashMap::from([
+                ("access_key_id".to_string(), "AKIA...".to_string()),
+                ("secret_access_key".to_string(), "your-secret-key".to_string()),
+            ])),
+            read_only: None,
         }]),
         ..Default::default()
     })?;
@@ -104,49 +95,74 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.model.MountSpec;
-    import java.util.List;
-    import java.util.Map;
-
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setMounts(List.of(
-                new MountSpec()
-                    .setType("s3")
-                    .setTarget("/workspace")
-                    .setSource("s3://my-bucket/prefix")
-                    .setCredentials(Map.of(
-                        "access_key_id",     "AKIA...",
-                        "secret_access_key", "secret..."
-                    ))
-            ))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setMounts(List.of(new MountSpec()
+            .setType("s3")
+            .setSource("s3://my-bucket/prefix")
+            .setTarget("/workspace")
+            .setCredentials(Map.of(
+                "access_key_id", "AKIA...",
+                "secret_access_key", "your-secret-key")))));
     ```
   </TabItem>
 </Tabs>
 
-## Mount NFS
+Files your code writes to `/workspace` go straight to the bucket. They stay there after the sandbox is deleted. If the mount fails, the create call fails, so you never get a sandbox with a missing folder.
+
+## Kinds of storage you can attach
+
+| Type | What it is | `source` looks like | Credentials |
+|---|---|---|---|
+| `s3` | An Amazon S3 bucket, or any S3-compatible store | `s3://bucket/prefix` or just `bucket` | `access_key_id`, `secret_access_key`, `session_token` (all optional) |
+| `nfs` | A shared folder on your network (NFS) | `host:/exports/path` | None |
+| `sshfs` | A folder on any server you can reach with SSH | `user@host:/path` | `private_key_pem` (required) |
+| `rclone` | Any storage that rclone supports, such as Google Drive or Azure | `remote:path` | `rclone_conf` (the text of an `rclone.conf` file) |
+
+## Mount fields
+
+| Field | What it does | Default |
+|---|---|---|
+| `type` | One of `s3`, `nfs`, `sshfs` or `rclone`. | Required |
+| `source` | Where the storage is. See the table above. | Required |
+| `target` | The folder inside the sandbox. It must be a full path, such as `/data`. | Required |
+| `credentials` | Secrets for the storage. They are encrypted and never shown again. | None |
+| `options` | Extra settings for each type. See below. | None |
+| `readOnly` | Attach the storage so the sandbox can read but not change it. | `false` |
+
+Go spells these `Type`, `Source`, `Target`, `Credentials`, `Options` and `ReadOnly`. Rust uses `mount_type` (with `MountType::S3` and so on) and `read_only`. Java has a setter for each one.
+
+### Options for each type
+
+| Type | Option | What it does |
+|---|---|---|
+| `s3` | `region` | The bucket's region, such as `us-east-1`. |
+| `s3` | `endpoint` | The address of an S3-compatible store, such as MinIO or Cloudflare R2. |
+| `s3` | `extra_args` | More `mount-s3` flags, separated by spaces. |
+| `nfs` | `opts` | NFS mount options, separated by commas. The default is `rw`. |
+| `rclone` | `vfs_cache_mode` | rclone's file cache mode. The default is `writes`. |
+
+With no S3 credentials, the server uses its own AWS access, such as a cloud machine role, if it has one.
+
+## Attach a network share, read-only
+
+This attaches an NFS share at `/data`. Code in the sandbox can read it but cannot change it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      mounts: [
-        { type: 'nfs', target: '/data', source: '10.0.0.1:/exports/data' },
-      ],
-    })
+      image: "ubuntu:22.04",
+      mounts: [{ type: "nfs", source: "10.0.0.1:/exports/data", target: "/data", readOnly: true }],
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'mounts': [
-            {'type': 'nfs', 'target': '/data', 'source': '10.0.0.1:/exports/data'},
-        ],
-    })
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        mounts=[{"type": "nfs", "source": "10.0.0.1:/exports/data", "target": "/data", "readOnly": True}],
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -154,20 +170,27 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
         Image: "ubuntu:22.04",
         Mounts: []sdktypes.MountSpec{
-            {Type: "nfs", Target: "/data", Source: "10.0.0.1:/exports/data"},
+            {Type: sdktypes.MountTypeNFS, Source: "10.0.0.1:/exports/data", Target: "/data", ReadOnly: true},
         },
     })
+    if err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{MountSpec, MountType};
+
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        mounts: Some(vec![aerolvm_sdk::MountSpec {
-            type_:       "nfs".to_string(),
-            target:      "/data".to_string(),
-            source:      "10.0.0.1:/exports/data".to_string(),
+        image: "ubuntu:22.04".into(),
+        mounts: Some(vec![MountSpec {
+            mount_type: MountType::Nfs,
+            source: "10.0.0.1:/exports/data".into(),
+            target: "/data".into(),
+            options: None,
             credentials: None,
+            read_only: Some(true),
         }]),
         ..Default::default()
     })?;
@@ -175,28 +198,58 @@ Up to 8 mounts per sandbox are supported, with up to 32 credential keys and 4 Ki
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setMounts(List.of(
-                new MountSpec().setType("nfs").setTarget("/data").setSource("10.0.0.1:/exports/data")
-            ))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setMounts(List.of(new MountSpec()
+            .setType("nfs")
+            .setSource("10.0.0.1:/exports/data")
+            .setTarget("/data")
+            .setReadOnly(true))));
     ```
   </TabItem>
 </Tabs>
 
-## Security Model
+## What happens when the sandbox stops
 
-- Credentials never enter the sandbox.
-- Credentials are encrypted at rest with AES-256-GCM.
-- Read APIs return `has_credentials: true` but never the actual values.
-- Mount fields (`source`, NFS `options.opts`, S3 `options.extra_args`, etc.) are passed verbatim to host-side mount tools (`mount`, `mount-s3`, `sshfs`, `rclone`) running as the daemon user, outside the sandbox isolation boundary. The platform assumes PAT holders are host operators.
-- `source` and `options` are **not secrets**. Read APIs return them, and in cluster mode they are replicated in the clear into the Raft placement spec and the recovery store so another node can re-run the mount. Only `credentials` is sealed and never replicated unencrypted, so every credential belongs there. A create request is rejected when a name that means credential appears in `options` (a key, an `extra_args` flag such as `--s3-secret-access-key`, or an NFS `opts` entry) or as an rclone connection-string parameter in `source` (for example `:s3,secret_access_key=...:bucket`); the error names the field to use instead.
+- **Stop** disconnects the storage. **Start** connects it again.
+- **After the server restarts**, the storage is connected again the next time the sandbox starts.
+- **If the mount program crashes**, the server restarts it once. If it crashes twice within 30 seconds, the server gives up and removes the mount.
+- **Delete** disconnects the storage. Your data stays in the bucket or share.
 
-## Operational Notes
+## Keeping credentials safe
 
-- Mounts are established at `Create` and re-established at `Start`.
-- A failed mount is retried once before being disabled.
-- Host requirements include `fuse3`, `sshfs`, `nfs-common`, `rclone`, and AWS `mountpoint-s3`.
-- Network egress blocking applies inside the sandbox, not to the host mount process.
+- Credentials never enter the sandbox. Only the server's mount program sees them.
+- They are stored encrypted (AES-256-GCM).
+- Reading a sandbox's mounts back with `client.mounts(id)` (Go: `client.Mounts(ctx, id)`) shows `hasCredentials: true`, never the values. Rust calls the field `has_credentials`.
+- `source` and `options` are **not** secret. Reading the mounts back shows them. In a cluster, they are also copied as plain text to other servers, so another server can mount the storage if this one fails.
+- So every secret belongs in `credentials`. The server refuses a create that puts a secret-like name in `options` or `source`. Examples are an `extra_args` flag like `--s3-secret-access-key`, or an rclone source like `:s3,secret_access_key=...:bucket`. The error names the field to use instead.
+
+<Aside type="caution" title="Anyone with an API token is trusted with the server">
+The mount programs (`mount-s3`, `mount`, `sshfs`, `rclone`) run on the server itself, outside every sandbox, as the server's own user. They receive your `source` and `options` as given. The server refuses a `source` that a mount program could mistake for one of its own options. Still, give API tokens only to people you would trust to run the server.
+</Aside>
+
+## Good to know
+
+- **Up to 8 mounts per sandbox.** [Platform volumes](/platform-volumes/) count toward the same 8.
+- **Credentials can have up to 32 keys and 4 KB in total** for each mount.
+- **Some folders are off limits** as a `target`: `/`, `/proc`, `/sys`, `/dev`, `/etc`, `/usr`, `/bin`, `/sbin`, `/lib`, `/lib32`, `/lib64`, `/boot`, `/run` and `/var/run`. So is the folder where the server puts its own helper program inside the sandbox.
+- **Outbound network rules do not cover mounts.** [Block or allow the internet](/network-isolation/) controls traffic from inside the sandbox. The mount runs on the server, so it can still reach the storage.
+- **Which sandboxes support mounts:** Docker, gVisor and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes refuse them.
+- **An SSH server's host key is trusted on first use.** The server accepts the storage server's key the first time it connects.
+
+## For server operators
+
+The server needs these programs installed to mount each type: `fuse3`, `sshfs`, `nfs-common`, `rclone` and AWS `mountpoint-s3` (the `mount-s3` command).
+
+| Variable | What it does | Default |
+|---|---|---|
+| `SB_MOUNTS_ROOT` | Where the server mounts storage before passing it into sandboxes. | `/var/lib/sandboxd/mounts` |
+| `SB_MOUNTS_CRED_DIR` | Where the server writes credential files while a mount runs. | `/run/sandboxd` |
+| `SB_MOUNT_WAIT_TIMEOUT` | How long create waits for a mount to become ready. | `30s` |
+
+## Next steps
+
+- [Platform volumes](/platform-volumes/): named storage your operator sets up, so you pass only a name.
+- [Files](/file-system/): copy single files in and out.
+- [Snapshots](/snapshots/): save a whole sandbox's files as an image.
+- [Block or allow the internet](/network-isolation/): limit what code in the sandbox can reach.

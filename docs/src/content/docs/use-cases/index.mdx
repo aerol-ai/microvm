@@ -1,35 +1,64 @@
 ---
-title: Use Cases
+title: Use cases
+description: Step-by-step projects you can copy and run to see what AerolVM sandboxes are good for.
 ---
 
-This section is intentionally separate from the root docs navigation. It starts with the two highest-priority categories from the planning matrix and keeps only the five highest-rated use cases inside each category.
+Each page in this section is a small project you can copy and run. It shows one real job that a sandbox does well. A sandbox is a separate, locked-down computer that AerolVM starts for your code.
 
-The selection criteria come from the internal planning work in `plans/use-cases-plan.md` and the condensed implementation outline in `plans/use-cases-plan-empty.md`.
+Every project gives you a full script, what you need before you start, and how to try it. The examples are in TypeScript. Every SDK has the same calls, so you can port them to Python, Go, Rust or Java. See [SDK setup](/sdk-setup/).
 
-## What is in this section
+## Coding agents
 
-| Category | Why it is here first | Selected subcategories |
+A coding agent is an AI program that reads code, edits it and runs commands. These projects run Claude Code, Anthropic's coding agent, on a real GitHub repository inside a sandbox.
+
+| Project | What it builds |
+|---|---|
+| [Generate an architecture diagram](/use-cases/coding-agents/claude-code-repository-architecture-agent/) | Claude Code reads a repository and writes `arch.md` with a diagram of how it fits together. |
+| [Make a code change and open a pull request](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | Claude Code makes a change you describe in plain words, tests it and opens a pull request. |
+| [Review a pull request](/use-cases/coding-agents/pull-request-review-auto-fix-agent/) | Claude Code reviews a pull request, posts the review on GitHub and saves any small fixes. |
+| [Write 500 tests](/use-cases/coding-agents/test-writing-failure-reproduction-agent/) | Claude Code writes tests, the script counts how many are real, and the run fails below 90%. |
+| [Find and fix security problems](/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent/) | Scanners find known security problems in a repository, Claude Code fixes them and opens a pull request. |
+
+## Products for your users
+
+In these projects the sandbox is part of what your users see, not just a tool for your team.
+
+| Project | What it builds |
+|---|---|
+| [AI app hosting](/use-cases/customer-facing-product-experiences/ai-app-hosting/) | Builds a website from its repository and gives it a live preview link. |
+| [Burner VPN proxy](/use-cases/customer-facing-product-experiences/secure-burner-vpn/) | Runs a web dashboard and a SOCKS5 proxy (a relay for browser traffic) in one sandbox. |
+| [gVisor isolation demo](/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security/) | Runs the same low-level system tests in a plain container and in gVisor, and compares what each allows. |
+| [Your own Postgres](/use-cases/customer-facing-product-experiences/spawn-postgres/) | Runs a private Postgres database in a sandbox with a web admin page. |
+| [Your own Redis](/use-cases/customer-facing-product-experiences/create-upstash-redis/) | Runs a private Redis server in a sandbox with a web admin page. |
+| [Coding interview platform](/use-cases/customer-facing-product-experiences/coding-interview/) | Compiles and runs a candidate's code in 10 languages, each in its own sandbox. |
+| [Burner browser](/use-cases/customer-facing-product-experiences/secure-burner-browser/) | Streams a throwaway Chromium desktop from a sandbox into the user's browser. |
+
+## Data processing and ML
+
+These projects use a sandbox as a throwaway worker for data jobs and machine learning.
+
+| Project | What it builds |
+|---|---|
+| [Kaggle dataset to Parquet](/use-cases/data-processing-ml/kaggle-to-parquet/) | Downloads a dataset, cleans it with Polars and saves a smaller Parquet file. |
+| [SQL on Kaggle with DuckDB](/use-cases/data-processing-ml/duckdb-dataset-explorer/) | Loads a dataset into DuckDB and lets you send SQL queries to it over the web. |
+| [Hyperparameter tuning farm](/use-cases/data-processing-ml/hyperparameter-tuning-farm/) | Trains the same model with different settings in several sandboxes at once. |
+| [Headless Jupyter notebook](/use-cases/data-processing-ml/headless-jupyter-notebook/) | Starts JupyterLab in a sandbox and gives you a link to open it in your browser. |
+
+## SDK calls these projects use
+
+| Call | What it does | Learn more |
 |---|---|---|
-| [Coding Agents & Autonomous Engineering](/use-cases/coding-agents/) | It is the highest-priority category in the plan and maps directly to AerolVM's strongest primitives: streamed execution, files, sessions, and isolation. | Claude Code repository architecture agent, Claude Code GitHub PR review agent, write 500 test cases, security vulnerability remediation agent, zero-shot code execution agent |
-| [Customer-Facing Product Experiences](/use-cases/customer-facing-product-experiences/) | It is the second-highest category in the plan and shows how AerolVM becomes part of the end-user product, not just internal infrastructure. | Embedded code runner, deploy your own Postgres, interactive tutorial backend, AI app hosting, one-click user sandbox |
+| `create`, `destroy` | Start a sandbox and delete it. | [Create and manage](/sandboxes/) |
+| `start`, `stop`, `updateLifecycle` | Pause a sandbox, start it again, or change when it stops or deletes itself. | [Images, resources and lifecycle](/environment/) |
+| `exec` | Run a command and wait for its output. | [Run commands](/exec-streaming/) |
+| `execStream` | Run a command and see its output as it happens. | [Run commands](/exec-streaming/) |
+| `createSession`, `attachSession`, `sessionLog`, `sessionRecording` | Run a long job that keeps going if your connection drops, and read its output later. | [Terminal sessions](/sessions/) |
+| `uploadFile`, `downloadFile` | Copy code, prompts and results in and out. | [Files](/file-system/) |
+| `exposePort` | Give a web app in the sandbox a link you can open. | [Share a web app](/preview/) |
+| `networkBlockAll`, `runtime: "gvisor"` | Cut off the internet, or add a stronger wall around untrusted code. | [Block or allow the internet](/network-isolation/), [gVisor](/gvisor-sandbox/) |
 
-## Why this structure matches the request
+## Next steps
 
-- The `Use Cases` button lives in the header and points into its own docs section.
-- The use-case pages have a separate left-hand navigation tree with categories and subcategories.
-- The root docs sidebar no longer lists `Use Cases` as part of the main introduction pages.
-- Every topic page includes an AerolVM SDK walkthrough grounded in the current TypeScript SDK.
-
-## Start Here
-
-- Go to [Coding Agents & Autonomous Engineering](/use-cases/coding-agents/) for agent-first workflows.
-- Go to [Customer-Facing Product Experiences](/use-cases/customer-facing-product-experiences/) for product-facing runtime patterns.
-
-## AerolVM building blocks used throughout
-
-- `create`, `start`, `stop`, `destroy`, and `updateLifecycle` for sandbox lifecycle control.
-- `exec` and `execStream` for one-shot commands and long-running streamed processes.
-- `createSession`, `attachSession`, `sessionLog`, and `sessionRecording` for persistent work.
-- `uploadFile` and `downloadFile` for source code, prompts, patches, and artifacts.
-- `exposePort` for live app and API previews.
-- `networkBlockAll` and `runtime: "gvisor"` for higher-trust execution boundaries.
+- [Quickstart](/quick-start/): install AerolVM and run your first sandbox.
+- [SDK setup](/sdk-setup/): connect the TypeScript SDK to your server.
+- [Coding agents](/use-cases/coding-agents/): start with the agent projects.

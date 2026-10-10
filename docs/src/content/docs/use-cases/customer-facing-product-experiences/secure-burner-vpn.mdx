@@ -1,47 +1,43 @@
 ---
-title: Secure burner VPN proxy
-description: Run a browser-facing dashboard and a native SOCKS5 proxy inside one AerolVM sandbox so users can browse through isolated egress without installing a Chrome extension.
+title: Burner VPN proxy
+description: Run a throwaway proxy in a sandbox so Chrome's web traffic leaves from the sandbox, not the user's computer.
 ---
 
-This workflow turns AerolVM into a browser-scoped outbound tunnel. A user clicks a button in your product, you create one sandbox, and the sandbox exposes two surfaces:
+import { Aside } from '@astrojs/starlight/components';
 
-- an HTTP dashboard that explains how to connect and shows live stats, and
-- a raw TCP SOCKS5 endpoint that Chrome can use as its proxy.
+In this tutorial you give a user a throwaway proxy for their browser. A user clicks a button in your product, and you create one sandbox for them. They point Chrome at it, and every page they open is fetched by the sandbox instead of their own computer. When they are done, you delete the sandbox and the proxy is gone.
 
-It is not a kernel-level device VPN. It is a disposable browser proxy that feels like a burner VPN session: the browser traffic exits from the sandbox instead of the user's laptop, and the whole environment can be destroyed when the session ends.
+It works like a burner VPN for one browser window. It is not a full VPN: only the Chrome window you start with the proxy setting uses it. Other apps on the computer are not affected.
 
-## Reference TypeScript example
+## How it works
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/burner-vpn](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/burner-vpn)
+The sandbox runs one small Node.js app, from a ready-made image, that does two jobs:
 
-The reference example:
+| Job | Port in the sandbox | Public address |
+|---|---|---|
+| A dashboard web page with connection steps and live traffic numbers | 3000 | `https://...` link |
+| A SOCKS5 proxy, a standard proxy type that browsers support | 1080 | `tcp://<host>:<port>` |
 
-- creates a sandbox from a pre-built image containing the dashboard and SOCKS5 server,
-- waits for the dashboard to become healthy on port 3000,
-- exposes the dashboard over HTTP and the SOCKS5 proxy over raw TCP,
-- uploads `runtime-config.json` back into the sandbox after the public endpoints are known, and
-- writes `burner-vpn-deployment.json` with the sandbox ID, dashboard URL, SOCKS5 endpoint, and ready-to-run Chrome command.
+A host script on your computer creates the sandbox, waits for the dashboard, and shares both ports. Then it writes the proxy address back into the sandbox, so the dashboard can show it.
 
-## Why AerolVM fits
+## What you need
 
-- **One sandbox, two surfaces** - the dashboard and the proxy live in the same isolated environment.
-- **Raw TCP exposure** - `exposePort(..., { protocol: 'tcp' })` lets you publish a real SOCKS5 endpoint, not just HTTP.
-- **Disposable egress** - every user or browsing session can get its own short-lived outbound path.
-- **Host isolation** - risky browsing traffic leaves from the sandbox rather than the user's local machine.
-- **Simple teardown** - destroying the sandbox removes the proxy, the dashboard, and the network path in one step.
+- **An AerolVM server.** For addresses that other people can reach, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), the addresses work only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/). The script also reads them from a `.env` file.
+- **Node.js 20 or newer**, and Google Chrome.
 
-## Architecture
+### Step 1: Set up a project
 
-The system has two parts:
+```bash
+mkdir burner-vpn && cd burner-vpn
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk dotenv
+```
 
-1. **Host script (`index.ts`)** - runs on your machine or backend, creates the sandbox, health-checks the dashboard, exposes ports 3000 and 1080, then writes runtime metadata back into the sandbox.
-2. **Sandbox app (`server.ts`)** - runs inside the sandbox, serves the dashboard UI, exposes `/api/runtime-config` and `/api/stats/stream`, and implements a no-auth SOCKS5 CONNECT proxy using Node's `net` module.
+### Step 2: Save the script
 
-The dashboard is not just marketing UI. It is the control surface that tells the user exactly which SOCKS5 endpoint to use and shows live connection counters and traffic volume after they connect.
-
-## Copy-paste TypeScript host script
-
-This script provisions the burner VPN sandbox, exposes both ports, and writes a deployment file your product can store or return to the user.
+Save this as `index.ts`. The [examples repository](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/burner-vpn) has the same script and the app that runs inside the sandbox (`vpn-app/server.ts`).
 
 ```ts
 import { MicroVM } from '@aerol-ai/aerolvm-sdk'
@@ -123,8 +119,11 @@ async function main() {
   const socksProxyHost = socksUrl.hostname
   const socksProxyPort = Number.parseInt(socksUrl.port, 10)
   const socksProxyEndpoint = `${socksProxyHost}:${socksProxyPort}`
+  // A separate profile makes Chrome start a new browser that uses the proxy.
+  // Without it, an already-open Chrome takes over and ignores these flags.
   const chromeLaunchCommand =
-    `open -na "Google Chrome" --args --proxy-server="socks5://${socksProxyEndpoint}" ` +
+    `open -na "Google Chrome" --args --user-data-dir=/tmp/burner-vpn-profile ` +
+    `--proxy-server="socks5://${socksProxyEndpoint}" ` +
     `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE ${socksProxyHost}"`
 
   const runtimeConfig = {
@@ -165,37 +164,68 @@ main().catch((error) => {
 })
 ```
 
-## Chrome connection flow
+What the script does, in order:
 
-1. Run the host script to create the sandbox and expose both ports.
-2. Read `burner-vpn-deployment.json` or open the dashboard URL.
-3. Launch Chrome with the generated command:
+1. Creates a sandbox from the ready-made image, with 1 CPU core and 1 GB of memory.
+2. Checks the dashboard every second, up to 20 times, until it answers.
+3. Shares port 3000 as an HTTPS link and port 1080 as a raw TCP address. `withRetry` tries each call again, up to 5 times, if it fails.
+4. Builds the Chrome command and uploads the settings to `/app/public/runtime-config.json`, where the dashboard reads them.
+5. Saves everything to `burner-vpn-deployment.json` and prints it.
 
-   ```bash
-   open -na "Google Chrome" --args --proxy-server="socks5://HOST:PORT" --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE HOST"
-   ```
+### Step 3: Run it
 
-4. Browse in that Chrome window. Requests now egress from the sandbox-backed SOCKS5 proxy.
+```bash
+npx tsx index.ts
+```
 
-## Important browser limitation
+You should see:
 
-Chrome supports SOCKSv5, but it does not support SOCKSv5 username/password authentication. That is why the reference example intentionally runs the proxy in `authMode: 'none'`.
+```text
+Dashboard URL: https://<sandbox-id>-3000.<your-domain>
+SOCKS5 endpoint: <host>:<port>
+Chrome launch command: open -na "Google Chrome" --args --user-data-dir=/tmp/burner-vpn-profile --proxy-server="socks5://<host>:<port>" --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE <host>"
+```
 
-If you need authenticated proxy credentials inside Chrome, use an HTTP or HTTPS proxy design instead of SOCKS5.
+### Step 4: Start Chrome through the proxy
 
-## Product outputs
+Copy the Chrome command the script printed and run it. On macOS it looks like this, with your own host and port:
 
-- `burner-vpn-deployment.json` containing the sandbox ID, dashboard URL, SOCKS5 endpoint, and Chrome launch command.
-- A live dashboard that tells the user how to connect and streams proxy stats over Server-Sent Events.
-- A public SOCKS5 endpoint backed by a single AerolVM sandbox.
+```bash
+open -na "Google Chrome" --args --user-data-dir=/tmp/burner-vpn-profile --proxy-server="socks5://HOST:PORT" --host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE HOST"
+```
 
-## Security posture
+What each setting does:
 
-This pattern is strong for browser isolation and disposable outbound access, but the exact security level still depends on your sandbox image, runtime policy, idle timeouts, and whether the Chrome instance itself is isolated in a separate profile or device. The right claim is "sandbox-isolated burner proxy," not "perfect VPN."
+- `--user-data-dir` starts a separate Chrome, with its own empty profile, so your normal browsing is not mixed in.
+- `--proxy-server` sends that window's traffic through the sandbox's SOCKS5 proxy.
+- `--host-resolver-rules` stops Chrome from looking up website names on your own computer. So those lookups also go through the proxy.
 
-## Related docs
+On Windows or Linux, start Chrome from a terminal with the same three settings.
 
-- [Preview](/preview/)
-- [File System](/file-system/)
-- [Secure burner browser](/use-cases/customer-facing-product-experiences/secure-burner-browser/)
-- [gVisor kernel isolation security](/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security/)
+### Step 5: Try it
+
+Browse in the new Chrome window. Sites now see the server's internet address, not yours. Open the dashboard link to see how many connections are open and how much data has passed through.
+
+## Clean up
+
+This script sets no idle time, so the sandbox runs until you delete it. Find its ID in `burner-vpn-deployment.json`, then run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/). To have it deleted automatically, add a `lifecycle` setting to `client.create()`. See [Images, resources and lifecycle](/environment/).
+
+## Good to know
+
+<Aside type="caution">
+The proxy has no password. Anyone who finds its address and port can send their traffic through your server. Give each user their own sandbox, and delete it as soon as they are done.
+</Aside>
+
+- **Why no password?** Chrome supports SOCKS5 proxies, but not SOCKS5 user names and passwords. So the example runs the proxy with `authMode: 'none'`. If you need a password, build an HTTP or HTTPS proxy instead.
+- **How safe is it?** It keeps risky browsing traffic off the user's computer, and you can throw it away. How strong it is still depends on your image, your sandbox settings and your idle times. Call it a sandbox-isolated burner proxy, not a perfect VPN.
+
+## For server operators
+
+The SOCKS5 address uses a port from the server's TCP port pool, `22000` to `23000` by default. The firewall must allow inbound traffic on that range. The installer does not open it for you. See [TCP and TLS ports](/tcp-ports/).
+
+## Next steps
+
+- [TCP and TLS ports](/tcp-ports/): how raw TCP addresses work.
+- [Share a web app](/preview/): how HTTPS links work.
+- [Burner browser](/use-cases/customer-facing-product-experiences/secure-burner-browser/): run the whole browser in a sandbox instead.
+- [gVisor kernel probe](/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security/): see what code in a sandbox can learn about your server.

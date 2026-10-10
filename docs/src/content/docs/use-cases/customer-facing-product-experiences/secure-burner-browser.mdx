@@ -1,29 +1,113 @@
 ---
-title: Secure burner browser
-description: Launch a disposable Chromium desktop inside an AerolVM sandbox and stream it into the user's browser over noVNC.
+title: Burner browser
+description: Start a throwaway Chromium browser in a sandbox and show it inside your user's own browser tab.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-This workflow launches a lightweight Linux desktop in an AerolVM sandbox, opens Chromium inside it, and publishes the UI over noVNC. Instead of handing a user your local browser or a long-lived shared VM, you give them a disposable browser session that can be created per click and destroyed on idle.
+In this tutorial you start a Chromium browser inside a sandbox and let a user drive it from a normal web page. Your user clicks a link, sees a browser window in their tab, and browses the web with it. When they are done, you delete the sandbox and everything they did is gone.
 
-It is the browser-isolation version of a preview URL: the product surface is not just a web app running in the sandbox, but a full remote browser running inside the sandbox.
+This is called browser isolation. Risky pages, downloads and tracking all stay inside the sandbox, never on the user's computer or your servers.
 
-## Reference TypeScript example
+## How it works
 
-Code URL: [https://github.com/aerol-ai/aerovm-examples/tree/main/customer-facing/secure-burner-browser](https://github.com/aerol-ai/aerovm-examples/tree/main/customer-facing/secure-burner-browser)
+The sandbox runs a small Linux desktop. Each part has one job:
 
-The reference example:
+| Part | What it does |
+|---|---|
+| Xvfb | A fake screen in memory, since the sandbox has no monitor |
+| Openbox | A simple window manager that draws the browser window |
+| Chromium | The browser itself (the open-source base of Google Chrome) |
+| x11vnc | Shares the fake screen using VNC, a standard remote-desktop protocol |
+| websockify and noVNC | Turn that VNC stream into a web page on port 6080 |
 
-- creates a sandbox with a keepalive container command so setup can happen incrementally,
-- uploads a bootstrap script that installs `chromium`, `xvfb`, `x11vnc`, `novnc`, and `websockify`,
-- reserves port `6080` with `exposePort`,
-- starts a long-running session that launches the desktop and browser, and
-- writes `secure-burner-browser.json` with the sandbox ID, session ID, preview URL, and start URL.
+You share port 6080 with `exposePort`. The user opens the link and sees the desktop.
 
-## 1. Create the sandbox
+## What you need
 
-The desktop stack is easiest to bootstrap as `root` in a Debian-based image.
+- **An AerolVM server.** For a link that other people can open, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), the link works only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **An SDK** for your language. See [SDK setup](/sdk-setup/).
+
+The steps below show each call in all five languages. The [examples repository](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/secure-burner-browser) has the whole thing as one TypeScript program, `index.ts`. It also waits for each part to be ready and writes `secure-burner-browser.json` with the IDs and links.
+
+### Step 1: Save the setup script
+
+Save this as `bootstrap.sh` on your computer. It runs inside the sandbox. It installs the desktop parts and writes a second script, `run-browser-isolation.sh`, that starts them.
+
+```sh
+#!/bin/sh
+set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends \
+  ca-certificates \
+  chromium \
+  novnc \
+  openbox \
+  websockify \
+  x11-utils \
+  x11vnc \
+  xvfb
+rm -rf /var/lib/apt/lists/*
+mkdir -p /workspace/browser-isolation/logs /workspace/browser-isolation/profile
+cat > /workspace/browser-isolation/run-browser-isolation.sh <<'EOF'
+#!/bin/sh
+set -eu
+WORKDIR=/workspace/browser-isolation
+PORT="${NOVNC_PORT:-6080}"
+DISPLAY_NUM="${DISPLAY_NUM:-99}"
+SCREEN_GEOMETRY="${SCREEN_GEOMETRY:-1440x900x24}"
+WINDOW_SIZE="${WINDOW_SIZE:-1440,900}"
+START_URL="${START_URL:-about:blank}"
+export DISPLAY=":${DISPLAY_NUM}"
+LOGDIR="${WORKDIR}/logs"
+PROFILE_DIR="${WORKDIR}/profile"
+mkdir -p "${LOGDIR}" "${PROFILE_DIR}"
+
+cleanup() {
+  kill "${WEBSOCKIFY_PID:-}" "${X11VNC_PID:-}" "${CHROMIUM_PID:-}" "${OPENBOX_PID:-}" "${XVFB_PID:-}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+Xvfb "${DISPLAY}" -screen 0 "${SCREEN_GEOMETRY}" >"${LOGDIR}/xvfb.log" 2>&1 &
+XVFB_PID=$!
+
+for _ in $(seq 1 30); do
+  if xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
+  echo 'Xvfb did not become ready in time' >&2
+  exit 1
+fi
+
+openbox >"${LOGDIR}/openbox.log" 2>&1 &
+OPENBOX_PID=$!
+
+chromium --no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check --user-data-dir="${PROFILE_DIR}" --window-size="${WINDOW_SIZE}" "${START_URL}" >"${LOGDIR}/chromium.log" 2>&1 &
+CHROMIUM_PID=$!
+
+x11vnc -display "${DISPLAY}" -forever -shared -nopw -rfbport 5900 -listen 0.0.0.0 >"${LOGDIR}/x11vnc.log" 2>&1 &
+X11VNC_PID=$!
+
+echo "noVNC listening on http://0.0.0.0:${PORT}/vnc.html"
+websockify --web=/usr/share/novnc/ 0.0.0.0:"${PORT}" localhost:5900 >"${LOGDIR}/websockify.log" 2>&1 &
+WEBSOCKIFY_PID=$!
+wait "${WEBSOCKIFY_PID}"
+EOF
+chmod +x /workspace/browser-isolation/run-browser-isolation.sh
+echo 'browser isolation bootstrap complete'
+```
+
+You can change the screen size and the first page with the `SCREEN_GEOMETRY`, `WINDOW_SIZE` and `START_URL` settings. Step 6 sets `START_URL`.
+
+### Step 2: Create the sandbox
+
+The desktop is easiest to install as `root` on a Debian image. The `containerCommand` keeps the sandbox running with nothing else in it, so you can set it up step by step.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -67,7 +151,7 @@ The desktop stack is easiest to bootstrap as `root` in a Debian-based image.
     let sandbox = client.create(CreateOptions {
         image:             "debian:bookworm".to_string(),
         os_user:           Some("root".to_string()),
-        cpu:               Some(1.0),
+        cpu:               Some(1),
         memory_mb:         Some(2048),
         disk_gb:           Some(8),
         container_command: Some(vec![
@@ -85,22 +169,25 @@ The desktop stack is easiest to bootstrap as `root` in a Debian-based image.
         new CreateOptions()
             .setImage("debian:bookworm")
             .setOsUser("root")
-            .setCpu(1)
-            .setMemoryMB(2048)
-            .setDiskGB(8)
+            .setCpu(1.0)
+            .setMemoryMb(2048)
+            .setDiskGb(8)
             .setContainerCommand(List.of("sh", "-lc", "trap : TERM INT; while true; do sleep 3600; done"))
     );
     ```
   </TabItem>
 </Tabs>
 
-## 2. Upload the bootstrap script
+### Step 3: Upload the setup script
 
-The reference example uploads a shell script that installs the desktop components and writes a `run-browser-isolation.sh` launcher inside the sandbox.
+This reads `bootstrap.sh` from your computer and copies it into the sandbox. The folder is created for you.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
+    import { readFile } from 'node:fs/promises'
+
+    const bootstrapScript = await readFile('bootstrap.sh', 'utf8')
     await sandbox.uploadFile(
       '/workspace/browser-isolation/bootstrap.sh',
       Buffer.from(bootstrapScript),
@@ -109,6 +196,9 @@ The reference example uploads a shell script that installs the desktop component
   </TabItem>
   <TabItem label="Python">
     ```python
+    with open('bootstrap.sh', encoding='utf-8') as f:
+        bootstrap_script = f.read()
+
     sandbox.upload_file(
         '/workspace/browser-isolation/bootstrap.sh',
         bootstrap_script.encode('utf-8'),
@@ -117,30 +207,95 @@ The reference example uploads a shell script that installs the desktop component
   </TabItem>
   <TabItem label="Go">
     ```go
-    err := sandbox.UploadFile(ctx, "/workspace/browser-isolation/bootstrap.sh", []byte(bootstrapScript))
+    bootstrapScript, err := os.ReadFile("bootstrap.sh")
+    if err != nil { log.Fatal(err) }
+
+    err = sandbox.UploadFile(ctx, "/workspace/browser-isolation/bootstrap.sh", bootstrapScript)
+    if err != nil { log.Fatal(err) }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    let bootstrap_script = std::fs::read("bootstrap.sh").expect("read bootstrap.sh");
+
     sandbox.upload_file(
         "/workspace/browser-isolation/bootstrap.sh",
-        bootstrap_script.as_bytes(),
+        bootstrap_script,
     )?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
+    byte[] bootstrapScript = Files.readAllBytes(Path.of("bootstrap.sh"));
+
     sandbox.uploadFile(
         "/workspace/browser-isolation/bootstrap.sh",
-        bootstrapScript.getBytes()
+        bootstrapScript
     );
     ```
   </TabItem>
 </Tabs>
 
-## 3. Reserve the noVNC preview URL
+### Step 4: Run the setup script
 
-The desktop UI is just another exposed HTTP port. The noVNC page itself is served from `vnc.html` on that exposed base URL.
+Installing Chromium takes a minute or more, so this allows up to 10 minutes. Without `timeoutSeconds`, a command stops after 5 minutes.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const setup = await sandbox.exec({
+      command: 'sh /workspace/browser-isolation/bootstrap.sh',
+      timeoutSeconds: 600,
+    })
+    console.log(setup.exitCode, setup.stdout)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    setup = sandbox.exec({
+        'command': 'sh /workspace/browser-isolation/bootstrap.sh',
+        'timeoutSeconds': 600,
+    })
+    print(setup['exitCode'], setup['stdout'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    setup, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "sh /workspace/browser-isolation/bootstrap.sh",
+        TimeoutSeconds: 600,
+    })
+    if err != nil { log.Fatal(err) }
+    fmt.Println(setup.ExitCode, setup.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let setup = sandbox.exec(aerolvm_sdk::ExecRequest {
+        command:         "sh /workspace/browser-isolation/bootstrap.sh".to_string(),
+        timeout_seconds: Some(600),
+        ..Default::default()
+    })?;
+    println!("{} {}", setup.exit_code, setup.stdout);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult setup = sandbox.exec(
+        new ExecRequest()
+            .setCommand("sh /workspace/browser-isolation/bootstrap.sh")
+            .setTimeoutSeconds(600)
+    );
+    System.out.println(setup.exitCode + " " + setup.stdout);
+    ```
+  </TabItem>
+</Tabs>
+
+An exit code of `0` and the line `browser isolation bootstrap complete` mean it worked.
+
+### Step 5: Share port 6080
+
+The desktop page is served on port 6080, so give that port a public link.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -178,11 +333,9 @@ The desktop UI is just another exposed HTTP port. The noVNC page itself is serve
   </TabItem>
 </Tabs>
 
-The browser entry point is the exposed base URL plus `vnc.html?autoconnect=1&resize=remote&reconnect=1`.
+### Step 6: Start the desktop in a session
 
-## 4. Keep the desktop alive as a session
-
-The actual browser desktop should run as a session, not a one-shot exec. That gives you a stable process to reconnect to while the noVNC server keeps serving frames.
+Start the desktop as a session, not a one-time command. A session keeps running after your code moves on, and you can reconnect to it later. `START_URL` is the first page the browser opens.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -216,7 +369,7 @@ The actual browser desktop should run as a session, not a one-shot exec. That gi
     session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
         Name:    "secure-burner-browser",
         Command: "./run-browser-isolation.sh",
-        Workdir: "/workspace/browser-isolation",
+        WorkDir: "/workspace/browser-isolation",
         Env: map[string]string{
             "NOVNC_PORT": "6080",
             "START_URL":  "https://example.com",
@@ -254,24 +407,35 @@ The actual browser desktop should run as a session, not a one-shot exec. That gi
   </TabItem>
 </Tabs>
 
-## What the example gives you
+### Step 7: Open the browser
 
-- A disposable Chromium instance running inside an isolated sandbox.
-- A browser-facing preview URL that opens straight into noVNC.
-- A long-running session ID you can track, stop, or destroy from your control plane.
-- A JSON artifact with the URLs and IDs your product backend needs to persist.
+Add `vnc.html?autoconnect=1&resize=remote&reconnect=1` to the end of the link from step 5. Put a `/` between them if the link does not already end in one. For example:
 
-## Operational notes
+```text
+https://<sandbox-id>-6080.<your-domain>/vnc.html?autoconnect=1&resize=remote&reconnect=1
+```
 
-- The current reference implementation uses noVNC, not WebRTC. It is a good fit for browser isolation and remote desktop previews, but not the final word on lowest-possible streaming latency.
-- The returned preview URL is the user-facing surface. Put your own auth and tenancy checks in front of it before exposing it to end users.
-- The example defaults to the Docker runtime for maximum compatibility with the desktop stack. If you want a tighter kernel boundary, validate your chosen browser image and X/VNC stack on `runtime: "gvisor"` before switching production traffic.
-- This pattern needs outbound network access because Chromium is meant to browse the public web.
+Open it in your browser. After a few seconds you see Chromium showing `https://example.com`. Click and type in it like any browser.
 
-## Related docs
+## Clean up
 
-- [Preview](/preview/)
-- [Sessions](/sessions/)
-- [Process & Code Execution](/exec-streaming/)
-- [File System](/file-system/)
-- [Create Sandbox](/sandboxes/)
+Delete the sandbox when the user is done with `sandbox.destroy()`, or run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/). The full `index.ts` program also sets `lifecycle` so the sandbox stops after 15 idle minutes and deletes itself after 20.
+
+## Good to know
+
+<Aside type="caution">
+The desktop has no password. Anyone with the link can see and control the browser. Put your own sign-in and access checks in front of the link before you give it to users.
+</Aside>
+
+- **The sandbox is the wall, not Chromium.** The script starts Chromium with `--no-sandbox`, which turns off Chromium's own sandbox. The AerolVM sandbox keeps the browser away from your machine instead.
+- **It needs the internet.** The browser is meant to visit public websites, so do not block outbound traffic for this sandbox.
+- **It uses VNC, not video streaming.** noVNC works well for browsing and remote desktops. It is not the fastest possible way to stream a screen.
+- **gVisor may work, but test first.** The example uses the default container setup because the desktop parts are known to work there. For a stronger wall, test your image and desktop under `runtime: "gvisor"` before you switch real users to it. The full `index.ts` program reads `SANDBOX_RUNTIME=gvisor` to try this.
+
+## Next steps
+
+- [Share a web app](/preview/): how public links work, and how to remove one.
+- [Terminal sessions](/sessions/): reconnect to the desktop session and read its output.
+- [Run commands](/exec-streaming/): more on `exec` and its options.
+- [Files](/file-system/): upload and download files.
+- [gVisor](/gvisor-sandbox/): an extra wall between the browser and your server.

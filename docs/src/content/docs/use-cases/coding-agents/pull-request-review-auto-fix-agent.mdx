@@ -1,45 +1,65 @@
 ---
-title: GitHub PR Review And Auto-Fix
-
-description: Run Claude Code headlessly inside an AerolVM sandbox, check out a real GitHub PR from its URL, post a review with gh, and export any safe follow-up fixes.
+title: Review a pull request
+description: Have Claude Code review a GitHub pull request in a sandbox, post the review on GitHub, and save any small fixes as a patch.
 ---
 
+In this project you give a script the link to a GitHub pull request. Claude Code checks out the branch, reads the change and the code around it, and writes a review. The script posts the review on the pull request and saves any small fixes Claude made as a patch (a file listing every changed line).
 
-This workflow is the AerolVM version of a real GitHub coding-agent review loop. It works similarly as Github PR review agent or CodeRabbit PR Review agent.
+It works like review bots such as CodeRabbit, but it runs on your own AerolVM server. Each review gets a fresh sandbox, so the code under review never runs on your machine.
 
+## What you need
 
-## Copy-paste TypeScript script
+- An AerolVM server and Node.js 22 or newer. See [Quickstart](/quick-start/).
+- These environment variables:
 
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key. | None. You must set it. |
+| `GITHUB_TOKEN` | A GitHub token that can read the repository and comment on pull requests. | None. You must set it. |
+| `GITHUB_PR_URL` | The pull request to review, for example `https://github.com/owner/repo/pull/123`. | None. You must set it. |
+| `ANTHROPIC_MODEL` | The Claude model to use. | `claude-sonnet-4-6` |
+| `REVIEW_VALIDATION_COMMAND` | A command to run after any fixes, such as `npm test`. | Empty. Claude picks a check that fits the repository. |
+| `POST_REVIEW_TO_GITHUB` | Set to `false` to save the review without posting it. | `true` |
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir pr-review-agent && cd pr-review-agent
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Set your keys
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export ANTHROPIC_API_KEY=your-anthropic-key
+export GITHUB_TOKEN=your-github-token
+export GITHUB_PR_URL=https://github.com/owner/repo/pull/123
+```
+
+### Step 3: Save the script
+
+Save this as `pr-review-agent.ts`.
 
 ```ts
-import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { MicroVM, type Sandbox } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
-const patToken = process.env.SB_PAT_TOKEN;
-const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-const githubToken = process.env.GITHUB_TOKEN;
-const githubPrURL = process.env.GITHUB_PR_URL;
+const patToken = requireEnv("SB_PAT_TOKEN");
+const anthropicApiKey = requireEnv("ANTHROPIC_API_KEY");
+const githubToken = requireEnv("GITHUB_TOKEN");
+const githubPrURL = requireEnv("GITHUB_PR_URL");
 const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 const reviewValidationCommand = process.env.REVIEW_VALIDATION_COMMAND ?? "";
 const postReviewToGitHub =
   (process.env.POST_REVIEW_TO_GITHUB ?? "true").toLowerCase() !== "false";
-
-if (!patToken) {
-  throw new Error("Set SB_PAT_TOKEN before running this example.");
-}
-
-if (!anthropicApiKey) {
-  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
-}
-
-if (!githubToken) {
-  throw new Error("Set GITHUB_TOKEN before running this example.");
-}
-
-if (!githubPrURL) {
-  throw new Error("Set GITHUB_PR_URL before running this example.");
-}
 
 const pr = parseGitHubPullRequest(githubPrURL);
 
@@ -121,6 +141,30 @@ const runClaudeReviewCommand = [
   postReviewCommand,
 ].join(" && ");
 
+// Reads a required environment variable, or stops with a clear message.
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Set ${name} before running this example.`);
+  }
+  return value;
+}
+
+// Runs a command in the sandbox and shows its output as it happens.
+// Stops the script if the command fails.
+async function run(sandbox: Sandbox, command: string) {
+  const handle = sandbox.execStream({
+    command,
+    onStdout: (chunk) => process.stdout.write(chunk),
+    onStderr: (chunk) => process.stderr.write(chunk),
+    onError: (message) => process.stderr.write(`${message}\n`),
+  });
+  const exit = await handle.done;
+  if (exit.code !== 0) {
+    throw new Error(`Command failed (exit ${exit.code}): ${command}`);
+  }
+}
+
 async function main() {
   const client = new MicroVM({ apiUrl, patToken });
   const sandbox = await client.create({
@@ -137,20 +181,13 @@ async function main() {
       REVIEW_VALIDATION_COMMAND: reviewValidationCommand,
     },
     lifecycle: {
-      destroyIfIdleFor: 45 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 45 * 60 * 1_000_000_000, // 45 minutes, in nanoseconds
     },
   });
 
   try {
-    await sandbox.exec({
-      command: installToolsCommand,
-      timeoutSeconds: 900,
-    });
-
-    await sandbox.exec({
-      command: cloneAndCheckoutCommand,
-      timeoutSeconds: 900,
-    });
+    await run(sandbox, installToolsCommand);
+    await run(sandbox, cloneAndCheckoutCommand);
 
     await sandbox.uploadFile(
       "/workspace/repo/.claude/settings.json",
@@ -265,29 +302,49 @@ function parseGitHubPullRequest(prURL: string) {
 }
 ```
 
-## Deliverables
+### Step 4: Run it
 
-- `pull-request-review.md` with the exact review body that Claude wrote and GitHub received.
-- `pull-request-auto-fix.patch` with any narrow, safe edits Claude made while reviewing.
-- `pull-request-review.log` with the full streamed Claude Code session.
+```bash
+npx tsx pr-review-agent.ts
+```
 
-## What gets posted back to GitHub
+Claude Code's output streams to your terminal. When it is done, the script prints the review and saves three files in your folder.
 
-- The workflow posts `pr-review.md` with `gh pr review --comment --body-file` when `POST_REVIEW_TO_GITHUB` is `true`.
-- The checked-out PR branch is modified only when Claude finds a small, high-confidence fix that is worth applying.
-- No commit or push happens automatically; the patch is exported for a human to inspect first.
+## What the script does
 
-## AerolVM primitives used
+1. **Creates a sandbox** with half a CPU core, 2 GB of memory and 16 GB of disk. A lifecycle rule deletes it after 45 idle minutes, in case your script stops early.
+2. **Installs the tools:** Git, the GitHub command-line tool `gh`, and Claude Code. You see the install output live. If a setup command fails, the script stops.
+3. **Clones the repository and checks out the pull request** with `gh pr checkout`. The clone uses `--filter=blob:none`, so Git downloads file contents only when it needs them.
+4. **Uploads the instructions.** One file holds the review rules. Another holds the task for this pull request.
+5. **Starts the review in a session.** A session is a process that keeps running inside the sandbox even if your connection drops. It saves the pull request details and diff, then runs Claude Code.
+6. **Claude Code writes `pr-review.md`** with five sections: Verdict, Summary, Findings, Applied fixes and Validation. Each finding is labeled high, medium or low.
+7. **The session posts the review** with `gh pr review --comment`, unless `POST_REVIEW_TO_GITHUB` is `false`.
+8. **The script downloads the review, the patch and the full log**, then deletes the sandbox.
 
-- `create`
-- `exec`
-- `createSession`, `attachSession`, and `sessionLog`
-- `uploadFile` and `downloadFile`
-- lifecycle policies on sandbox creation
+## What gets posted to GitHub
 
-## Related docs
+- The review is posted as a comment on the pull request when `POST_REVIEW_TO_GITHUB` is `true`.
+- Claude Code edits the branch only for small fixes it is very sure about.
+- Nothing is committed or pushed. The patch is saved so a person can check it first.
 
-- [Sessions](/sessions/)
-- [Process & Code Execution](/exec-streaming/)
-- [File System](/file-system/)
-- [Environment](/environment/)
+## What you get
+
+| File | What is in it |
+|---|---|
+| `pull-request-review.md` | The exact review Claude wrote, and that GitHub received. |
+| `pull-request-auto-fix.patch` | Any small fixes Claude made while reviewing. |
+| `pull-request-review.log` | The full output of the Claude Code session. |
+
+## Good to know
+
+- `--dangerously-skip-permissions` lets Claude Code run commands without asking you first. It also has your GitHub token, so give it a token with only the access it needs.
+- The checked-out code runs inside the sandbox. A pull request from a stranger can't reach your machine, but it can reach the internet unless you [block it](/network-isolation/).
+- Lifecycle times are in nanoseconds. `45 * 60 * 1_000_000_000` is 45 minutes.
+- Setup steps use `execStream`, not `exec`. In Node.js, one `exec` call can wait only about 5 minutes for its answer, because Node's built-in `fetch` stops waiting after that.
+
+## Next steps
+
+- [Terminal sessions](/sessions/): attach to a session, replay its output and read its log.
+- [Run commands](/exec-streaming/): how `exec` and `execStream` work.
+- [Files](/file-system/): upload and download files.
+- [Make a code change and open a pull request](/use-cases/coding-agents/large-scale-refactor-migration-agent/): let the agent push its own branch.

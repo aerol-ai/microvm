@@ -1,42 +1,47 @@
 ---
-title: GPU Sandboxes
+title: GPU sandboxes
+description: Give a sandbox the server's NVIDIA, AMD or Apple GPU for machine learning and other GPU work.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-GPU sandboxes give each container direct, dedicated access to host GPU hardware. Unlike most competing platforms (E2B, Daytona), AerolVM passes the full GPU through to the container - no shared tenancy, no synthetic limits.
+A GPU sandbox can use the graphics card (GPU) of the server it runs on. Use one for machine learning, CUDA or ROCm programs, or video work. The GPU is passed straight through, so programs in the sandbox see the real device.
 
-GPU access requires `runtime: "docker"` (the default). It is **not compatible with gVisor** - the API returns an error if both `gpus` and `runtime: "gvisor"` are set in the same request.
+GPU sandboxes are normal container sandboxes (`runtime: "docker"`, the default). gVisor, Firecracker, WebAssembly and V8 isolate sandboxes cannot use a GPU. If you ask for a GPU together with `runtime: "gvisor"`, the create call fails with an error.
 
-See [Server Setup](/getting-started#gpu-support) for host installation (`--with-nvidia-gpu` / `--with-amd-gpu` installer flags).
+## What the server needs
 
-## Vendors
+| GPU maker | `vendor` value | What the server needs |
+|---|---|---|
+| NVIDIA | `nvidia` | NVIDIA drivers (`nvidia-smi` works) and the NVIDIA Container Toolkit. The installer adds the toolkit with `--with-nvidia-gpu`. |
+| AMD | `amd` | AMD ROCm, with the `amdgpu` kernel module loaded. The installer adds ROCm with `--with-amd-gpu`. x86_64 servers only. |
+| Apple | `apple` | Docker Desktop on a Mac. It uses Docker Desktop's experimental Metal support. No installer flag. |
 
-| Vendor | Host requirement |
-|---|---|
-| `nvidia` | `nvidia-container-toolkit` installed + NVIDIA drivers present. Install with `--with-nvidia-gpu`. |
-| `amd` | AMD ROCm installed + `amdgpu` kernel module loaded. Install with `--with-amd-gpu`. x86_64 only. |
-| `apple` | Docker Desktop on macOS. No setup needed - Metal GPU support is built into Docker Desktop. |
+The server must also be told how many GPUs it has. Until it is, every GPU request fails with `host has no GPUs`. See [For server operators](#for-server-operators).
 
-## NVIDIA
+<Aside type="caution" title="Use a recent SDK">
+SDK versions 0.6.4 and older drop the GPU request in TypeScript and Python, so the sandbox starts without a GPU, and the Rust SDK does not export the GPU types. Use a newer SDK release.
+</Aside>
 
-Allocate one GPU:
+## Create a sandbox with one GPU
+
+This asks for one NVIDIA GPU. When you leave out `count`, you get one GPU.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-      gpus: { vendor: 'nvidia', count: 1 },
-    })
+      image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+      gpus: { vendor: "nvidia", count: 1 },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-        'gpus': {'vendor': 'nvidia', 'count': 1},
-    })
+    sandbox = client.create(
+        image="nvidia/cuda:12.2.0-base-ubuntu22.04",
+        gpus={"vendor": "nvidia", "count": 1},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -52,8 +57,10 @@ Allocate one GPU:
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, GPUOptions, GPUVendor};
+
     let sandbox = client.create(CreateOptions {
-        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".into(),
         gpus: Some(GPUOptions {
             vendor: GPUVendor::Nvidia,
             count: Some(1),
@@ -74,23 +81,35 @@ Allocate one GPU:
   </TabItem>
 </Tabs>
 
-Request all GPUs on the host (`count: -1`):
+## GPU options
+
+| Option | What it does | Default |
+|---|---|---|
+| `vendor` | The GPU maker: `nvidia`, `amd` or `apple`. Required. | None |
+| `count` | How many GPUs to give the sandbox. `-1` means every GPU on the server. Ignored for AMD. | `1` |
+| `deviceIDs` | Pick exact GPUs by index (`"0"`, `"1"`) or UUID (`"GPU-abc123..."`). NVIDIA only. | The server picks |
+
+The field is `deviceIDs` in TypeScript and Python, `DeviceIDs` in Go, `device_ids` in Rust and `setDeviceIds` in Java.
+
+## Use every GPU on the server
+
+Set `count` to `-1`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-      gpus: { vendor: 'nvidia', count: -1 },
-    })
+      image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+      gpus: { vendor: "nvidia", count: -1 },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-        'gpus': {'vendor': 'nvidia', 'count': -1},
-    })
+    sandbox = client.create(
+        image="nvidia/cuda:12.2.0-base-ubuntu22.04",
+        gpus={"vendor": "nvidia", "count": -1},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -106,8 +125,10 @@ Request all GPUs on the host (`count: -1`):
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, GPUOptions, GPUVendor};
+
     let sandbox = client.create(CreateOptions {
-        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".into(),
         gpus: Some(GPUOptions {
             vendor: GPUVendor::Nvidia,
             count: Some(-1),
@@ -128,31 +149,25 @@ Request all GPUs on the host (`count: -1`):
   </TabItem>
 </Tabs>
 
-Pin specific GPUs by device index or UUID:
+## Pick exact GPUs
+
+List the GPUs you want by index or UUID. Run `nvidia-smi -L` on the server to see the UUIDs.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-      gpus: {
-        vendor: 'nvidia',
-        count: 2,
-        deviceIDs: ['GPU-abc123', 'GPU-def456'],
-      },
-    })
+      image: "nvidia/cuda:12.2.0-base-ubuntu22.04",
+      gpus: { vendor: "nvidia", count: 2, deviceIDs: ["GPU-abc123", "GPU-def456"] },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'nvidia/cuda:12.2.0-base-ubuntu22.04',
-        'gpus': {
-            'vendor': 'nvidia',
-            'count': 2,
-            'deviceIDs': ['GPU-abc123', 'GPU-def456'],
-        },
-    })
+    sandbox = client.create(
+        image="nvidia/cuda:12.2.0-base-ubuntu22.04",
+        gpus={"vendor": "nvidia", "count": 2, "deviceIDs": ["GPU-abc123", "GPU-def456"]},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -169,12 +184,14 @@ Pin specific GPUs by device index or UUID:
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, GPUOptions, GPUVendor};
+
     let sandbox = client.create(CreateOptions {
-        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".to_string(),
+        image: "nvidia/cuda:12.2.0-base-ubuntu22.04".into(),
         gpus: Some(GPUOptions {
             vendor: GPUVendor::Nvidia,
             count: Some(2),
-            device_ids: Some(vec!["GPU-abc123".to_string(), "GPU-def456".to_string()]),
+            device_ids: Some(vec!["GPU-abc123".into(), "GPU-def456".into()]),
         }),
         ..Default::default()
     })?;
@@ -194,39 +211,41 @@ Pin specific GPUs by device index or UUID:
   </TabItem>
 </Tabs>
 
-## AMD
+## Use an AMD GPU
 
-All AMD GPUs on the host are exposed via `/dev/kfd` (compute) and `/dev/dri` (render nodes). The `count` and `deviceIDs` fields are ignored for AMD.
+An AMD sandbox gets every AMD GPU on the server. It sees them through the `/dev/kfd` (compute) and `/dev/dri` (graphics) device files. `count` and `deviceIDs` are ignored.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'rocm/rocm-terminal',
-      gpus: { vendor: 'amd' },
-    })
+      image: "rocm/rocm-terminal",
+      gpus: { vendor: "amd" },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'rocm/rocm-terminal',
-        'gpus': {'vendor': 'amd'},
-    })
+    sandbox = client.create(
+        image="rocm/rocm-terminal",
+        gpus={"vendor": "amd"},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
         Image: "rocm/rocm-terminal",
-        GPUs: &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorAMD},
+        GPUs:  &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorAMD},
     })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, GPUOptions, GPUVendor};
+
     let sandbox = client.create(CreateOptions {
-        image: "rocm/rocm-terminal".to_string(),
+        image: "rocm/rocm-terminal".into(),
         gpus: Some(GPUOptions {
             vendor: GPUVendor::Amd,
             count: None,
@@ -247,39 +266,41 @@ All AMD GPUs on the host are exposed via `/dev/kfd` (compute) and `/dev/dri` (re
   </TabItem>
 </Tabs>
 
-## Apple Silicon
+## Use an Apple GPU
 
-Requires Docker Desktop on macOS. Metal GPU support is built into Docker Desktop - no additional host setup.
+This works only when the AerolVM server runs on a Mac with Docker Desktop. On a Linux server, Docker rejects the request when it creates the container.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      gpus: { vendor: 'apple' },
-    })
+      image: "ubuntu:22.04",
+      gpus: { vendor: "apple" },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'gpus': {'vendor': 'apple'},
-    })
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        gpus={"vendor": "apple"},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
         Image: "ubuntu:22.04",
-        GPUs: &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorApple},
+        GPUs:  &sdktypes.GPURequest{Vendor: sdktypes.GPUVendorApple},
     })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, GPUOptions, GPUVendor};
+
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
+        image: "ubuntu:22.04".into(),
         gpus: Some(GPUOptions {
             vendor: GPUVendor::Apple,
             count: None,
@@ -299,3 +320,40 @@ Requires Docker Desktop on macOS. Metal GPU support is built into Docker Desktop
     ```
   </TabItem>
 </Tabs>
+
+## If something goes wrong
+
+| What you see | What it means |
+|---|---|
+| `host has no GPUs` | The server was not told it has GPUs. Ask the operator to set `SB_HOST_GPU_COUNT`. |
+| `gpu reservation exceeded` | Other sandboxes already hold all the server's GPUs. Delete one, or ask for fewer. |
+| `gpu vendor mismatch` | You asked for one maker's GPU, but the server has another. |
+| `GPU access is not supported with the "gvisor" runtime` | Remove `runtime: "gvisor"`, or drop the GPU request. |
+| `runtime "wasm" does not yet support GPUs` (or `firecracker`, `isolate`) | Firecracker, WebAssembly and V8 isolate sandboxes cannot use a GPU. |
+
+## For server operators
+
+Install the GPU software when you install the server. Add `--with-nvidia-gpu` or `--with-amd-gpu` to the install command (see [Install on a server](/getting-started/single-node-setup/)). On a cluster, set `with_nvidia_gpu = true` or `with_amd_gpu = true` on the worker in `terraform.tfvars` (see [Cluster setup](/cluster-setup/)).
+
+- `--with-nvidia-gpu` installs the NVIDIA Container Toolkit and connects it to Docker. The NVIDIA drivers must already be installed.
+- `--with-amd-gpu` installs ROCm from AMD's package repository. The `amdgpu` kernel module must already be loaded, so `/dev/kfd` exists.
+
+Then tell AerolVM about the GPUs. The server counts every GPU it hands out and refuses requests beyond that number.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_HOST_GPU_COUNT` | How many GPUs this server can hand out. `0` means none, so every GPU request fails. | `0` |
+| `SB_HOST_GPU_VENDOR` | The GPU maker on this server (`nvidia`, `amd` or `apple`). Requests for another maker fail. | Empty (any maker) |
+
+In a cluster, AerolVM uses these values to send GPU sandboxes only to servers that have a matching GPU.
+
+<Aside type="caution">
+GPU passthrough is built into the Docker engine only. AerolVM can also run containers through containerd, another container engine (`SB_CONTAINER_ENGINE=containerd`), but that engine does not attach GPUs to the sandbox. Run GPU servers with the Docker engine, which is the installer's default.
+</Aside>
+
+## Next steps
+
+- [Create and manage sandboxes](/sandboxes/): every other create option.
+- [Images, resources and lifecycle](/environment/): pick CPU, memory and auto-stop timers.
+- [Run commands](/exec-streaming/): run your GPU program and stream its output.
+- [Cluster setup](/cluster-setup/): add GPU workers to a cluster.

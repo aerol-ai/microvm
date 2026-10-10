@@ -18,7 +18,7 @@ export default defineConfig({
   base: process.env.PUBLIC_BASE_PATH || '/',
   outDir: './dist',
   redirects: {
-    '/': '/getting-started',
+    '/': '/introduction',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into
@@ -38,9 +38,10 @@ export default defineConfig({
           href: 'https://github.com/aerol-ai/microvm',
         },
       ],
+      // Starlight appends the file path from the project root
+      // (src/content/docs/...), so the base stops at the docs/ folder.
       editLink: {
-        baseUrl:
-          'https://github.com/aerol-ai/microvm/blob/main/docs/src/content/docs/',
+        baseUrl: 'https://github.com/aerol-ai/microvm/blob/main/docs/',
       },
       tableOfContents: {
         minHeadingLevel: 2,

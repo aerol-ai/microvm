@@ -1,26 +1,27 @@
 ---
-title: Engine, Chassis, Runtime
-description: "'Firecracker vs Cloud Hypervisor vs Kata' is the wrong question — they don't sit at the same layer. Firecracker and Cloud Hypervisor are VMMs; Kata and gVisor are OCI runtimes. AerolVM never adopted an OCI runtime — it hand-rolled its own micro-Kata directly on top of the Firecracker VMM, and that choice is exactly what makes the warm-pool fast boot possible and a second engine cheap to add."
+title: Engine, chassis, runtime
+description: Why Firecracker, Cloud Hypervisor, Kata and gVisor sit at different layers, and why AerolVM drives Firecracker itself.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The most common question we get about the sandbox runtime is some variation of
-"why Firecracker and not Kata?" or "should we switch to Cloud Hypervisor?" Both
-questions contain the same hidden assumption: that Firecracker, Cloud
-Hypervisor, and Kata are three interchangeable options at the same layer of the
-stack, and picking one means not picking the others.
+We often hear two questions about the sandbox runtime (the software that runs sandboxes). One is "why Firecracker and not Kata?" The other is "should we switch to Cloud Hypervisor?" Both hide the same assumption: that Firecracker, Cloud Hypervisor and Kata are three swappable options at the same layer, where picking one rules out the others.
 
-They are not at the same layer. **Firecracker and Cloud Hypervisor are engines.
-Kata is a chassis you drop an engine into.** Asking "Firecracker or Kata" is
-like asking "a V8 or a sedan" — the sedan *has* a V8. This page lays out the
-layer cake, shows exactly where AerolVM's five runtimes sit in it, and explains
-why AerolVM ended up writing its own chassis instead of adopting one off the
-shelf.
+They are not at the same layer. **Firecracker and Cloud Hypervisor are engines, and Kata is a chassis you drop an engine into.** Asking "Firecracker or Kata?" is like asking "a V8 engine or a sedan?" The sedan *has* a V8.
 
-## The layer cake
+This page lays out the layers and shows where AerolVM's five runtimes sit in them. It also explains why AerolVM built its own chassis instead of using one off the shelf.
 
-Four layers, bottom to top:
+**In short:**
+
+- Firecracker and Cloud Hypervisor are VMMs: programs that run virtual machines. Kata and gVisor are container runtimes, one layer up.
+- Kata can run *on top of* Firecracker, so "Firecracker or Kata?" compares two different layers.
+- AerolVM skips Kata and drives Firecracker directly, because its fast start depends on Firecracker's snapshot API (for saving and restoring a running VM).
+- That choice makes a second engine, such as Cloud Hypervisor, a contained change instead of a rewrite.
+- Choosing isolation is two decisions: first the layer, then (for a virtual machine) the engine.
+
+## The layers
+
+The stack has four layers. From the bottom up:
 
 ```
   AerolVM service layer  (internal/service)                ← orchestration
@@ -37,30 +38,24 @@ Four layers, bottom to top:
                                    KVM                       ← kernel CPU virtualization
 ```
 
-- **KVM** is the Linux kernel's CPU-virtualization primitive. Everything with a
-  real VM sits on it.
-- **A VMM (Virtual Machine Monitor)** is the userspace process that creates the
-  VM, emulates its devices, and boots its kernel. **Firecracker and Cloud
-  Hypervisor live here, and they are peers.** Both are minimal Rust VMMs built
-  on the shared `rust-vmm` crates; both are driven by a REST API over a Unix
-  socket. Cloud Hypervisor even began from Firecracker's rust-vmm components.
-- **An OCI runtime** answers a different question: *given an OCI container, how
-  do I isolate it?* `runc` uses Linux namespaces. **gVisor** (`runsc`) uses a
-  userspace kernel that intercepts guest syscalls. **Kata** boots the container
-  inside a *real VM* — using a VMM underneath. Kata's hypervisor is a config
-  knob: Firecracker, Cloud Hypervisor, or QEMU.
-- **Orchestration** is whatever drives the OCI runtime — Docker, containerd,
-  Kubernetes, or in AerolVM's case the service layer.
+- **KVM** is the Linux kernel's built-in support for running virtual machines on the real CPU. Everything with a real VM sits on it.
+- **A VMM (virtual machine monitor)**, often called a hypervisor, is the program that creates the VM, emulates its devices and boots its kernel. It runs as a normal program, outside the kernel. **Firecracker and Cloud Hypervisor live here, and they are peers.**
+- **An OCI runtime** answers a different question: *given a container, how do you isolate it?* (OCI is the open standard for container images and the tools that run them.)
+- **Orchestration** is whatever drives the OCI runtime: Docker, containerd (the container engine Docker is built on), Kubernetes, or in AerolVM's case the service layer.
 
-The punchline sits between the middle two layers: **Kata does not compete with
-Firecracker. Kata runs *on top of* Firecracker.** The moment you internalize
-that, "Firecracker vs Kata" dissolves — they're answering questions one layer
-apart.
+Firecracker and Cloud Hypervisor are both small VMMs written in Rust, built on the shared `rust-vmm` libraries. Both are controlled through a REST API over a Unix socket (a local, file-like network connection). Cloud Hypervisor even started from Firecracker's rust-vmm parts.
 
-## Where AerolVM's five runtimes actually sit
+The three OCI runtimes isolate a container in three different ways:
 
-AerolVM ships five runtimes today. They do not line up in a single row —
-they're spread across two different layers:
+- `runc` uses Linux namespaces: kernel features that give a process its own view of files, network and other processes.
+- **gVisor** (`runsc`) uses a kernel written as a normal program. It catches the container's syscalls (the requests a program makes to the kernel) before they reach the real kernel.
+- **Kata** boots the container inside a *real VM*, using a VMM underneath. Kata's VMM is a setting: Firecracker, Cloud Hypervisor or QEMU.
+
+The key point sits between the middle two layers: **Kata does not compete with Firecracker. Kata runs *on top of* Firecracker.** Once you see that, "Firecracker vs Kata" falls apart. The two answer questions one layer apart.
+
+## Where AerolVM's five runtimes sit
+
+AerolVM ships five runtimes today, and they do not line up in one row. They are spread across two different layers:
 
 | Runtime | Layer | Isolation mechanism |
 |---|---|---|
@@ -70,71 +65,55 @@ they're spread across two different layers:
 | **WASM** (`runtime: "wasm"`) | Language VM / sandboxed bytecode | Host-mediated WASI workers (optional resident host) |
 | **Isolate** (`runtime: "isolate"`) | Language VM (V8 / workerd) | Per-tenant workerd group + host-mediated egress; off by default |
 
-The API still says `runtime: "docker"` for OCI sandboxes; production nodes
-realize them with the native **containerd** driver (`SB_CONTAINER_ENGINE=containerd`).
-gVisor is a drop-in OCI runtime beside that path. WASM and isolate are off the
-OCI diagram: they isolate at the language-VM layer, not the container layer, so
-they trade syscall compatibility for density and create latency (see
-[WASM Architecture](/wasm-architecture/) and [Isolate Sandbox](/isolate-sandbox/)).
+A few terms in that table:
 
-Firecracker is the interesting one. There is no off-the-shelf OCI runtime in
-that row, because **we wrote it ourselves.**
+- **cgroups** are kernel limits on how much CPU and memory a group of processes may use.
+- **WASI** is the system interface WebAssembly programs use to read files and talk to the outside world.
+- **workerd** is Cloudflare's open-source engine for running JavaScript in V8 isolates.
+- **Host-mediated** means the host does the work on the sandbox's behalf. **Egress** means outbound network traffic.
+
+The API still says `runtime: "docker"` for OCI sandboxes. On servers, AerolVM runs them with its own **containerd** driver (`SB_CONTAINER_ENGINE=containerd`), which talks to containerd without going through Docker. gVisor plugs in beside that path as another OCI runtime.
+
+WASM and isolate sit off the OCI diagram entirely. They isolate at the language-VM layer, not the container layer. They give up full syscall compatibility in exchange for packing more sandboxes per server and faster creates (see [WASM architecture](/wasm-architecture/) and [V8 isolate](/isolate-sandbox/)).
+
+Firecracker is the interesting row. There is no off-the-shelf OCI runtime in it, because **we wrote it ourselves.**
 
 ## We built our own Kata
 
-We did not set out to build Kata. But `internal/runtime/firecracker` *is* an
-OCI-runtime-equivalent — a bespoke, minimal Kata specialized for one engine.
-Everything Kata would have given us off the shelf, we hand-rolled directly
-against the Firecracker VMM:
+AerolVM ended up writing its own small Kata for one engine. We did not set out to do that. But `internal/runtime/firecracker` *is* an OCI-runtime equivalent: a custom, minimal Kata built for Firecracker alone. Everything Kata would have given us, we wrote directly against the Firecracker VMM:
 
 | What we built | Where | The job it does |
 |---|---|---|
-| VMM REST client | `pkg/firecracker/client.go` | One client per VMM socket; one Go method per Firecracker resource (machine-config, boot-source, drives, net, vsock, actions, snapshot) |
-| Runtime driver | `internal/runtime/firecracker/driver.go` | The `runtime.Runtime` surface — Create/Start/Stop/Destroy. **This is literally our Kata.** |
-| Process supervisor | `internal/runtime/firecracker/vmm.go` | Spawn the `firecracker` binary, wait for its API socket, SIGTERM→SIGKILL teardown, capture a stderr tail for post-mortems |
-| Jailer wrap | `internal/runtime/firecracker/jailer.go` | chroot + cgroups + drop-privilege isolation around the VMM process |
-| Image → bootable rootfs | `pkg/oci/builder.go` | Turn `docker://python:3.11` into a `rootfs.ext4` via skopeo → umoci → mkfs.ext4 |
-| Host networking | `internal/network/tap/` | TAP device + IPv4 slot + vsock CID allocator, one per VM |
-| Snapshot capture + warm pool | `internal/runtime/firecracker/snapshot.go`, `warmspawn.go`, `internal/pool/vmm/` | Pre-boot VMMs from a template snapshot, leave them paused, and hand one to a create call for a sub-100ms boot |
+| VMM REST client | `pkg/firecracker/client.go` | One client per VMM socket; one Go method per Firecracker resource (machine config, boot source, drives, network, vsock, actions, snapshot) |
+| Runtime driver | `internal/runtime/firecracker/driver.go` | The `runtime.Runtime` interface: Create, Start, Stop, Destroy. **This is our Kata.** |
+| Process supervisor | `internal/runtime/firecracker/vmm.go` | Starts the `firecracker` program, waits for its API socket, stops it (SIGTERM, then SIGKILL), and keeps the end of its error log for debugging |
+| Jailer wrapper | `internal/runtime/firecracker/jailer.go` | Locks the VMM process into its own folder (chroot), caps its resources (cgroups) and drops its privileges |
+| Image to bootable disk | `pkg/oci/builder.go` | Turns `docker://python:3.11` into a `rootfs.ext4` disk image, using skopeo, umoci and mkfs.ext4 |
+| Host networking | `internal/network/tap/` | Hands out a TAP device (virtual network card), an IPv4 slot and a vsock CID (host-to-VM socket address), one set per VM |
+| Snapshot capture + warm pool | `internal/runtime/firecracker/snapshot.go`, `warmspawn.go`, `internal/pool/vmm/` | Boots VMMs ahead of time from a template snapshot, leaves them paused, and hands one to a create call for a boot under 100 ms |
 
-Every row except the last is something Kata provides. So why not just use Kata
-and delete most of that table?
+Kata provides every row except the last. So why not use Kata and delete most of that table?
 
 ## Why we drive the VMM directly
 
-Because of the last row.
+The answer is the last row of that table. AerolVM's fast start comes from loading snapshots. (A snapshot is a saved copy of a VM's memory and device state.)
 
-AerolVM's fast-boot story is snapshot-load: a warm pool of VMMs that were
-already booted from a template snapshot and left **paused**, so a create call
-claims one, PATCHes per-sandbox state onto it, and resumes it — skipping the
-kernel boot entirely. That path lives in
-[`warmspawn.go`](/firecracker-hydration/) and the [warm pool](/snapshots/), and
-it is only possible because we speak the Firecracker snapshot API directly.
+A warm pool holds VMMs that already booted from a template snapshot and were left **paused**. A create call claims one, sends it the new sandbox's settings with a PATCH request, and resumes it. That skips the kernel boot entirely. The code lives in [`warmspawn.go`](/firecracker-hydration/) and the [warm pool](/snapshots/), and it only works because AerolVM speaks the Firecracker snapshot API directly.
 
-Kata abstracts the VMM away on purpose — that is its whole value. But that
-abstraction is exactly what would hide the paused-resume snapshot mechanics our
-warm pool is built on. Adopting Kata would mean trading our differentiator for
-the containerd/Kubernetes ecosystem. That is a strategic pivot toward the
-Kubernetes world, not a capability upgrade — and it is a very different decision
-from swapping the engine underneath. The correctness invariants that make this
-safe (every clone must be unique before its vCPUs run guest code) are their own
-deep dive: see [The Frozen-Kernel Problem](/engineering-frozen-kernel-problem/)
-and [Snapshot Clone Correctness](/engineering-snapshot-correctness/).
+Kata hides the VMM on purpose; that is its whole value. But that hiding would also bury the pause-and-resume snapshot steps our warm pool is built on. Adopting Kata would trade our main advantage for the containerd and Kubernetes ecosystem.
+
+That would be a strategic turn toward the Kubernetes world, not a capability upgrade. It is also a very different decision from swapping the engine underneath. The rule that keeps snapshot clones safe has its own deep dives: every clone must be unique before its virtual CPUs run guest code. See [The frozen-kernel problem](/engineering-frozen-kernel-problem/) and [Correct snapshot clones](/engineering-snapshot-correctness/).
 
 ## Firecracker vs Cloud Hypervisor: swapping the engine
 
-Now the *sibling* comparison — the one that genuinely is same-layer. Both are
-minimal Rust VMMs on `rust-vmm` + KVM, both driven by REST over a Unix socket.
-They differ in philosophy: Firecracker optimizes for **minimal attack surface
-and density**; Cloud Hypervisor keeps the fast-boot core but **adds back the
-devices real workloads need.**
+This is the comparison that really is between two things at the same layer. Both are small Rust VMMs on `rust-vmm` and KVM, and both are driven by REST over a Unix socket. They differ in philosophy: Firecracker aims for **the smallest attack surface and the most VMs per server**. Cloud Hypervisor keeps the fast-boot core but **adds back the devices real workloads need.**
 
 | | **Firecracker** | **Cloud Hypervisor** |
 |---|---|---|
 | Origin | AWS (powers Lambda, Fargate) | Intel-founded, now community |
 | Design goal | Smallest surface, max density | More capable, modern workloads |
 | Device model | virtio over MMIO, minimal set | Full PCI/PCIe |
-| VFIO passthrough | No | **Yes — GPU / NIC passthrough** |
+| VFIO passthrough | No | **Yes: GPU / NIC passthrough** |
 | Hotplug (CPU/mem/PCI) | Essentially none | Yes |
 | Confidential compute | No | **AMD SEV-SNP, Intel TDX** |
 | Firmware / boot | Direct `vmlinux` boot | UEFI + ACPI (boots more OSes, incl. Windows) |
@@ -143,23 +122,17 @@ devices real workloads need.**
 | Memory overhead | ~5 MiB/microVM | Slightly higher, still small |
 | Snapshots | First-class (our warm pool) | Supported |
 
-The strategic reading: reach for Cloud Hypervisor when you need something
-Firecracker structurally *cannot* do — **GPU passthrough** for inference
-sandboxes, **confidential VMs (SEV-SNP / TDX)** for the "the host operator
-cannot read guest memory" tier, or bigger, longer-lived VMs with hotplug.
+Some of those rows need a word of explanation:
 
-And here is the payoff of having built our own chassis: **adding Cloud
-Hypervisor is swapping the engine, not the car.** A second
-`pkg/cloudhypervisor/client.go` mirrors `pkg/firecracker/client.go` (same
-HTTP-over-Unix-socket shape), and a second driver reuses everything else we
-already own — `pkg/oci`, `internal/network/tap`, the process-supervisor
-pattern, even the warm-pool seam. Because Cloud Hypervisor also supports
-snapshots, the fast-boot trick carries over intact.
+- **Passthrough** (VFIO) hands a real device, such as a GPU, straight to the VM.
+- **Hotplug** adds CPUs, memory or devices to a VM while it runs.
+- **Confidential computing** (SEV-SNP or TDX) encrypts the VM's memory so even the host operator cannot read it.
 
-Critically, none of this touches the SDK. Runtime selection is one string in
-the create call — the same field that already distinguishes Docker, gVisor,
-Firecracker, WASM, and isolate. A new engine slots in behind it without changing
-a line of client code:
+Reach for Cloud Hypervisor when you need something Firecracker *cannot* do by design. That means **GPU passthrough** for inference sandboxes, or **confidential VMs** for a tier where the host operator cannot read guest memory. It also covers bigger, longer-lived VMs that need hotplug.
+
+Here is the payoff of building our own chassis: **adding Cloud Hypervisor means swapping the engine, not the car.** A new `pkg/cloudhypervisor/client.go` would mirror `pkg/firecracker/client.go`, since both speak HTTP over a Unix socket. A second driver would reuse everything else we already own: `pkg/oci`, `internal/network/tap`, the process-supervisor pattern, even the warm-pool hook. Cloud Hypervisor also supports snapshots, so the fast-boot trick carries over intact.
+
+None of this touches the SDK. You choose the runtime with one string in the create call, the same field that already picks Docker, gVisor, Firecracker, WASM or isolate. A new engine fits in behind that field without changing a line of client code:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -249,7 +222,7 @@ a line of client code:
         memory_mb: Some(8192),
         ..Default::default()
     })?;
-    println!("created {} on the firecracker VMM", sbx.id);
+    println!("created {} on the firecracker VMM", sbx.data.id);
     ```
   </TabItem>
   <TabItem label="Java">
@@ -265,37 +238,37 @@ a line of client code:
             .setPatToken(System.getenv("SB_PAT_TOKEN"))
     );
 
-    Sandbox sbx = client.create(
-        new CreateOptions()
-            .setName("gpu-inference")
-            .setImage("pytorch/pytorch:latest")
-            .setRuntime("firecracker")
-            .setCpu(4.0)
-            .setMemoryMb(8192)
-    );
-    System.out.println("created " + sbx.getId() + " on the firecracker VMM");
+    CreateOptions options = new CreateOptions()
+        .setImage("pytorch/pytorch:latest")
+        .setRuntime("firecracker")
+        .setCpu(4.0)
+        .setMemoryMb(8192);
+    options.name = "gpu-inference"; // name is a public field; there is no setter
+
+    Sandbox sbx = client.create(options);
+    System.out.println("created " + sbx.id + " on the firecracker VMM");
     ```
   </TabItem>
 </Tabs>
 
 ## Picking a layer, then an engine
 
-The whole point of the layer cake is that isolation is *two* decisions, not
-one. First pick how strongly you want to isolate — which layer. Then, if that
-layer is a VM, pick which engine.
+The point of the layers is that isolation is *two* decisions, not one. First pick how strongly you want to isolate, which means picking a layer. Then, if that layer is a VM, pick the engine.
 
 | You want | Pick this layer | Notes |
 |---|---|---|
-| Max compatibility, lowest overhead, trusted-ish code | `runc` via containerd (`runtime: "docker"`) | Namespaces. Default OCI engine (~189ms server create on live UC-94). |
+| Max compatibility, lowest overhead, trusted-ish code | `runc` via containerd (`runtime: "docker"`) | Namespaces. Default OCI engine (~189 ms server-side create on our test servers). |
 | Untrusted code, container UX, no VM cost | gVisor (`runsc`) | Userspace kernel. Strong boundary, some syscall-compat gaps. |
-| Hardware-VM isolation with ~34ms warm boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
+| Hardware-VM isolation with ~34 ms warm boot | Firecracker | Our hand-rolled driver + snapshot warm pool. Default microVM. |
 | GPU passthrough / confidential VMs / hotplug | Cloud Hypervisor *(candidate engine)* | Same layer as Firecracker; swap the engine, reuse the chassis. |
-| Smallest possible footprint, WASI modules | WASM | Language-VM layer; resident host ~22ms warm create. |
-| JS/TS `fetch` handlers, Workers density | Isolate (V8 / workerd) | Language-VM layer; ~4ms warm server create; off by default. |
+| Smallest possible footprint, WASI modules | WASM | Language-VM layer; resident host ~22 ms warm create. |
+| JS/TS `fetch` handlers, Workers density | Isolate (V8 / workerd) | Language-VM layer; ~4 ms warm server create; off by default. |
 
-The mental model to walk away with: **Firecracker and Cloud Hypervisor are
-engines; Docker/gVisor/Kata are chassis; AerolVM built its own chassis so it
-could drive the engine directly and keep the snapshot warm pool.** That single
-architectural choice is what makes adding a second VMM a contained change
-instead of a rewrite — and why "should we use Kata?" and "should we add Cloud
-Hypervisor?" are not the same question at all.
+The model to take away: **Firecracker and Cloud Hypervisor are engines; Docker, gVisor and Kata are chassis.** AerolVM built its own chassis so it could drive the engine directly and keep the snapshot warm pool. That one design choice makes a second VMM a contained change instead of a rewrite. It is also why "should we use Kata?" and "should we add Cloud Hypervisor?" are not the same question at all.
+
+## Next steps
+
+- [Firecracker](/firecracker-sandbox/): run a sandbox as a microVM (a small, fast virtual machine).
+- [gVisor](/gvisor-sandbox/): add a kernel layer between a container and the host.
+- [Firecracker snapshot restore](/firecracker-hydration/): how the warm pool restores paused VMs.
+- [The frozen-kernel problem](/engineering-frozen-kernel-problem/): why every clone must be made unique before it runs.

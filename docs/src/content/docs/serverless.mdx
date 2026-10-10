@@ -1,62 +1,47 @@
 ---
 title: Serverless Sandboxes
+description: Let a sandbox stop when nobody uses it and start again by itself when the next request arrives.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A serverless sandbox auto-stops when it goes idle and is transparently restarted on the next inbound HTTP, TCP, or TLS-SNI connection to one of its exposed ports. Long-lived sandboxes that only serve occasional traffic - preview deployments, per-user code environments, model endpoints - stop consuming CPU and memory between requests without losing their disk state or public URL.
+A serverless sandbox stops by itself when it sits idle. When the next request reaches one of its public ports, the server starts it again, then passes the request through. The request can be web traffic (HTTP), a raw TCP connection, or a TLS connection (encrypted TCP). The sandbox keeps its files and its public URL the whole time.
 
-### Key Capabilities
+Use this for sandboxes that serve traffic only now and then, such as preview sites, per-user coding spaces or model endpoints. While they sleep, they use no CPU or memory.
 
-Because of scale-to-zero, serverless sandboxes enable you to build:
-- **Massive density hosting**: Run thousands of isolated workspaces or container instances on a single physical node by reclaiming CPU and memory from idle environments.
-- **Vercel-style deployment platforms**: Spin up instant-on web applications or frontend preview deployments that automatically sleep and wake up dynamically upon client requests.
-- **Neon-style serverless databases**: Provision dedicated database instances (e.g. Postgres, Redis) per tenant that scale to zero when inactive and resume instantly when queries arrive.
-- **On-demand interactive environments**: Deploy coding interview platforms, tutorials, web playgrounds, or secure burner browsers that only consume active resources.
+## What you can build with it
 
-Check the [usecase](/use-cases/customer-facing-product-experiences/spawn-postgres) sections to learn more.
+- **Many sandboxes on one server.** Idle sandboxes give back their CPU and memory, so one server can hold thousands of mostly idle workspaces.
+- **Preview deployments.** Each branch or customer gets a web app that sleeps when unused and wakes on the next visit.
+- **A database per customer.** Run a Postgres or Redis sandbox per customer that sleeps when idle and wakes when a query arrives. [Your own Postgres](/use-cases/customer-facing-product-experiences/spawn-postgres/) shows how to run the database.
+- **On-demand practice spaces.** Coding interviews, tutorials, web playgrounds and throwaway browsers that only use resources while someone is on them.
 
-## What it does
+## Turn it on
 
-Set `serverless: true` on the sandbox's lifecycle alongside `stopIfIdleFor`. When the idle timer fires, the sandbox stops, but its exposed-port routes stay alive in a wake-aware shape and `wake_armed` is set in the store. The next inbound HTTP request or L4 connection through its public endpoint drives a cold start, then traffic is proxied to the started container.
-
-| Aspect | Behavior |
-|---|---|
-| Idle trigger | `stopIfIdleFor` (required) - sandboxes stopped by lifecycle / age / involuntary exit re-arm for wake. |
-| Manual stop | Calling stop explicitly clears `wake_armed`. The sandbox stays down until you start it again. |
-| Cold-start latency | Hundreds of milliseconds to a few seconds, dominated by container start. |
-| Cold-start timeout | 15s. After that, the ingress handler returns `503 Retry-After: 2`. |
-| Request body cap | 8 MiB. Larger requests during cold start are rejected with `413`. |
-| Protocols woken | HTTP, TCP, and TLS-SNI exposures. HTTP requests are buffered during cold start up to the body cap; TCP/TLS connections wait for wake and then stream bytes. |
-
-The sandbox keeps its ID, public URL, environment, mounts, and disk across stop / wake cycles. Memory and in-process state do not survive - a serverless sandbox is more like a fast scale-to-zero container than a snapshot resume.
-
-## Enable per-sandbox
-
-`stopIfIdleFor` is required when `serverless: true`. The server rejects the request otherwise. Serverless wake rides the sandbox's **public** endpoints — a fully private sandbox has no routes to wake through. Calling `exposePort` (as below) opts the sandbox into public traffic automatically, so the usual create → expose flow needs no extra flag; only a serverless sandbox that never exposes a port would need `allowPublicTraffic: true` at create to be wakeable via its root URL. See [Network Isolation](/network-isolation/).
+Set `serverless: true` in the sandbox's lifecycle, together with `stopIfIdleFor`. The idle time is required: the server rejects `serverless` without it. Times are in nanoseconds; five minutes is `5 * 60 * 1_000_000_000`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ghcr.io/me/my-http-app:latest',
+      image: "ghcr.io/me/my-http-app:latest",
       lifecycle: {
         stopIfIdleFor: 5 * 60 * 1_000_000_000, // 5 minutes
         serverless: true,
       },
-    })
-    await sandbox.exposePort(8080)
+    });
+    await sandbox.exposePort(8080);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ghcr.io/me/my-http-app:latest',
-        'lifecycle': {
-            'stopIfIdleFor': 5 * 60 * 1_000_000_000,
-            'serverless': True,
+    sandbox = client.create(
+        image="ghcr.io/me/my-http-app:latest",
+        lifecycle={
+            "stopIfIdleFor": 5 * 60 * 1_000_000_000,  # 5 minutes
+            "serverless": True,
         },
-    })
+    )
     sandbox.expose_port(8080)
     ```
   </TabItem>
@@ -70,42 +55,63 @@ The sandbox keeps its ID, public URL, environment, mounts, and disk across stop 
         },
     })
     if err != nil {
-        return err
+        log.Fatal(err)
     }
-    _, err = sandbox.ExposePort(ctx, 8080)
+    if _, err := sandbox.ExposePort(ctx, 8080); err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, ExposeOptions, Lifecycle};
+
     let sandbox = client.create(CreateOptions {
-        image: "ghcr.io/me/my-http-app:latest".to_string(),
+        image: "ghcr.io/me/my-http-app:latest".into(),
         lifecycle: Some(Lifecycle {
-            stop_if_idle_for: 300_000_000_000,
+            stop_if_idle_for: 5 * 60 * 1_000_000_000, // 5 minutes
             serverless: true,
             ..Default::default()
         }),
         ..Default::default()
     })?;
-    sandbox.expose_port(8080)?;
+    sandbox.expose_port(8080, ExposeOptions::http())?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ghcr.io/me/my-http-app:latest")
-            .setLifecycle(new Lifecycle()
-                .setStopIfIdleFor(300_000_000_000L)
-                .setServerless(Boolean.TRUE))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ghcr.io/me/my-http-app:latest")
+        .setLifecycle(new Lifecycle()
+            .setStopIfIdleFor(5L * 60 * 1_000_000_000) // 5 minutes
+            .setServerless(true)));
     sandbox.exposePort(8080);
     ```
   </TabItem>
 </Tabs>
 
-## Update an existing sandbox
+A sandbox wakes up through its **public** addresses, so it must be public. A new sandbox is private, but `exposePort` makes it public for you, so the example above needs nothing more. Only a serverless sandbox that never exposes a port needs `allowPublicTraffic: true` at create to wake through its main URL. See [Block or allow the internet](/network-isolation/).
 
-The lifecycle update endpoint accepts the same field. Toggle `serverless` on or off on a running sandbox; the new policy takes effect at the next idle-window evaluation.
+## What happens while it sleeps
+
+When the idle timer runs out, the sandbox stops. Its public routes stay in place in a "wake on request" form. The next request starts the sandbox, then goes through to it.
+
+| Topic | What happens |
+|---|---|
+| What stops it | The `stopIfIdleFor` timer. A stop caused by another lifecycle timer, or by the sandbox exiting on its own, also leaves it ready to wake. |
+| A stop you make yourself | Turns wake off. The sandbox stays down until you start it. See [Take a sandbox out of service](#take-a-sandbox-out-of-service). |
+| Wake-up time | From a few hundred milliseconds to a few seconds. Most of it is the container starting. |
+| Wake-up limit | 15 seconds. After that, the server answers `503` with `Retry-After: 2` (try again in 2 seconds). |
+| Request size during wake-up | Up to 8 MiB. A bigger request that arrives while the sandbox wakes gets `413`. |
+| What can wake it | HTTP, TCP and TLS ports. HTTP requests wait in a buffer, up to the size limit. TCP and TLS connections wait for the sandbox, then pass bytes through. |
+
+The sandbox keeps its ID, public URL, environment variables, attached storage and files across each sleep. Memory and running programs do not survive. Think of it as a container that stops and starts quickly, not one that is frozen and thawed.
+
+## Turn it on or off for a sandbox you already have
+
+`updateLifecycle` takes the same `serverless` field. The change applies the next time the server checks for idle sandboxes.
+
+`updateLifecycle` replaces all the timers at once. Send `stopIfIdleFor` along with `serverless`, plus any other timers you want to keep.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -113,14 +119,14 @@ The lifecycle update endpoint accepts the same field. Toggle `serverless` on or 
     await sandbox.updateLifecycle({
       stopIfIdleFor: 5 * 60 * 1_000_000_000,
       serverless: true,
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     sandbox.update_lifecycle({
-        'stopIfIdleFor': 5 * 60 * 1_000_000_000,
-        'serverless': True,
+        "stopIfIdleFor": 5 * 60 * 1_000_000_000,
+        "serverless": True,
     })
     ```
   </TabItem>
@@ -135,7 +141,7 @@ The lifecycle update endpoint accepts the same field. Toggle `serverless` on or 
   <TabItem label="Rust">
     ```rust
     client.update_lifecycle(&sandbox.data.id, Lifecycle {
-        stop_if_idle_for: 300_000_000_000,
+        stop_if_idle_for: 5 * 60 * 1_000_000_000,
         serverless: true,
         ..Default::default()
     })?;
@@ -144,12 +150,34 @@ The lifecycle update endpoint accepts the same field. Toggle `serverless` on or 
   <TabItem label="Java">
     ```java
     client.updateLifecycle(sandbox.id, new Lifecycle()
-        .setStopIfIdleFor(300_000_000_000L)
-        .setServerless(Boolean.TRUE));
+        .setStopIfIdleFor(5L * 60 * 1_000_000_000)
+        .setServerless(true));
     ```
   </TabItem>
 </Tabs>
 
-## Manual stop blocks wake
+## Take a sandbox out of service
 
-Stopping the sandbox through the API is treated as an operator decision - `wake_armed` is cleared and exposed endpoints fail until the sandbox is explicitly started again. Only lifecycle-driven stops (idle timer, age, involuntary container exit) re-arm wake. Use this to take a serverless sandbox out of rotation without destroying it.
+When you call `stop` yourself, the server treats it as your decision. Wake turns off, and requests to the sandbox's public addresses fail (HTTP 409) until you call `start`. Only stops caused by the lifecycle (an idle timer, an age timer, or the sandbox exiting on its own) leave wake on.
+
+Use this to take a serverless sandbox out of service without deleting it.
+
+<Aside type="caution">
+A manual stop is easy to forget. If a serverless sandbox stops answering, check whether someone stopped it by hand.
+</Aside>
+
+## For server operators
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_ENABLE_SERVERLESS` | Turns wake on for this server. When `false`, the API still accepts `serverless: true`, but sandboxes never wake on their own. | `true` |
+| `SB_HTTP_WAKE_MAX_BUFFER` | The most request body, in bytes, the server holds while a sandbox wakes. | `8388608` (8 MiB) |
+
+Inside the server, a sandbox that may wake is marked `wake_armed` in its database row. A manual stop clears the mark; a lifecycle stop sets it.
+
+## Next steps
+
+- [Images, resources and lifecycle](/environment/): every lifecycle timer and its rules.
+- [Share a web app](/preview/): give a sandbox port a public URL.
+- [TCP and TLS ports](/tcp-ports/): wake sandboxes that serve databases and other TCP services.
+- [Your own Postgres](/use-cases/customer-facing-product-experiences/spawn-postgres/): run a dedicated database in a sandbox.

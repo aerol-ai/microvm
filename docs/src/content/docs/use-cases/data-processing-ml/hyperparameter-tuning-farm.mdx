@@ -1,29 +1,44 @@
 ---
-title: Hyperparameter Tuning Farm
-description: Spin up multiple concurrent sandboxes to test different model configurations in parallel.
+title: Hyperparameter tuning farm
+description: Train the same model with different settings in several sandboxes at the same time, then compare the scores.
 ---
 
-This pattern demonstrates the true power of AerolVM: horizontal scaling. By spinning up multiple sandboxes, you can benchmark different hyperparameters (like learning rates or model architectures) across a fleet of isolated workers simultaneously.
+Hyperparameters are the settings you pick before you train a model, such as how many trees a random forest uses. Finding good ones means training many times and comparing the scores. This project runs each try in its own sandbox, all at the same time.
 
-## Parallel Tuning Benefits
+## Why use sandboxes for this
 
-- **Speed:** Reduce total tuning time from hours to minutes by running jobs in parallel.
-- **Isolation:** A crash in one training job doesn't affect the others.
-- **Resource Management:** Each sandbox gets its own dedicated CPU and RAM, preventing resource contention.
+- **Faster.** The jobs run side by side. If your server has room for all of them, the whole search takes about as long as the slowest single job.
+- **Separate.** If one training job crashes, the others keep going.
+- **Fair.** Each sandbox has its own CPU and memory limits, so one job can't use more than its share.
 
-## Copy-paste TypeScript script
+## What you need
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/hyperparameter-tuning-farm](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/hyperparameter-tuning-farm)
+- An AerolVM server and Node.js 18 or newer. See [Quickstart](/quick-start/).
+- `SB_PAT_TOKEN` set to your AerolVM token, and `SB_API_URL` if your server is not at `http://127.0.0.1:21212`.
 
-This script creates 3 concurrent sandboxes, each training a Scikit-Learn model with a different `n_estimators` value.
+The full project is also on GitHub: [hyperparameter-tuning-farm](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/hyperparameter-tuning-farm).
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir tuning-farm && cd tuning-farm
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+### Step 2: Save the script
+
+Save this as `tuning-farm.ts`. It starts 3 sandboxes. Each one trains a scikit-learn random forest with a different `n_estimators` (number of trees) and reports its accuracy.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
-
-
 
 const trainingScript = `
 import os
@@ -35,7 +50,8 @@ from sklearn.model_selection import cross_val_score
 n_estimators = int(os.environ.get("N_ESTIMATORS", 10))
 print(f"Training RandomForest with n_estimators={n_estimators}...")
 
-X, y = make_classification(n_samples=1000, n_features=20)
+# A fixed random_state gives every sandbox the same data, so the scores compare fairly.
+X, y = make_classification(n_samples=1000, n_features=20, random_state=42)
 clf = RandomForestClassifier(n_estimators=n_estimators)
 scores = cross_val_score(clf, X, y, cv=5)
 
@@ -52,32 +68,33 @@ async function trainModel(client: MicroVM, nEstimators: number) {
   });
   console.log(`[Job n_estimators=${nEstimators}] Sandbox created: ${sandbox.id}`);
 
-  console.log(`[Job n_estimators=${nEstimators}] Installing scikit-learn...`);
-  await sandbox.exec("pip install scikit-learn");
+  try {
+    console.log(`[Job n_estimators=${nEstimators}] Installing scikit-learn...`);
+    await sandbox.exec("pip install scikit-learn");
 
-  console.log(`[Job n_estimators=${nEstimators}] Uploading training script...`);
-  await sandbox.uploadFile("/train.py", trainingScript);
-  
-  console.log(`[Job n_estimators=${nEstimators}] Running training script...`);
-  const result = await sandbox.exec("python3 /train.py");
-  console.log(`[Job n_estimators=${nEstimators}] Script finished (exit code: ${result.exitCode})`);
-  
-  const output = result.stdout.split("RESULT: ")[1]?.trim();
-  
-  console.log(`[Job n_estimators=${nEstimators}] Destroying sandbox...`);
-  await sandbox.destroy();
-  console.log(`[Job n_estimators=${nEstimators}] Sandbox destroyed.`);
-  return { nEstimators, output };
+    console.log(`[Job n_estimators=${nEstimators}] Uploading training script...`);
+    await sandbox.uploadFile("/train.py", trainingScript);
+
+    console.log(`[Job n_estimators=${nEstimators}] Running training script...`);
+    const result = await sandbox.exec("python3 /train.py");
+    console.log(`[Job n_estimators=${nEstimators}] Script finished (exit code: ${result.exitCode})`);
+
+    const output = result.stdout.split("RESULT: ")[1]?.trim();
+    return { nEstimators, output };
+  } finally {
+    // Delete the sandbox even if a step above failed.
+    await sandbox.destroy();
+    console.log(`[Job n_estimators=${nEstimators}] Sandbox destroyed.`);
+  }
 }
 
 async function main() {
   if (!patToken) throw new Error("Set SB_PAT_TOKEN.");
-  console.log("Initializing AerolVM client...");
   const client = new MicroVM({ apiUrl, patToken });
   const hyperparams = [10, 50, 100];
 
   console.log(`Spinning up ${hyperparams.length} parallel training jobs...`);
-  
+
   const jobs = hyperparams.map(val => trainModel(client, val));
   const results = await Promise.all(jobs);
 
@@ -88,8 +105,40 @@ async function main() {
 main().catch(console.error);
 ```
 
-## Related docs
-- [Creating Sandboxes](/environment/)
-- [Executions](/executions/)
-- [Lifecycle](/lifecycle/)
----
+### Step 3: Run it
+
+```bash
+npx tsx tuning-farm.ts
+```
+
+The log lines from the three jobs mix together, because they run at the same time. At the end you see a table like this one, from a run on our test server. Your numbers may differ a little, because the forest itself uses randomness.
+
+```text
+All training jobs completed successfully! Results:
+┌─────────┬─────────────┬───────────────────┐
+│ (index) │ nEstimators │ output            │
+├─────────┼─────────────┼───────────────────┤
+│ 0       │ 10          │ 'accuracy=0.8820' │
+│ 1       │ 50          │ 'accuracy=0.8890' │
+│ 2       │ 100         │ 'accuracy=0.8940' │
+└─────────┴─────────────┴───────────────────┘
+```
+
+## What the script does
+
+1. **Starts one job per setting.** `hyperparams` holds the values to try: 10, 50 and 100 trees. `Promise.all` runs the jobs at the same time and waits for all of them.
+2. **Each job creates its own sandbox** from `python:3.11-bookworm` with 1 CPU core and 1 GB of memory. Its setting goes in as the `N_ESTIMATORS` environment variable.
+3. **Installs scikit-learn and uploads the training program** to `/train.py`.
+4. **Trains and scores the model.** The program makes a practice dataset, the same one in every sandbox. It trains with 5-fold cross-validation (it trains and tests 5 times on different slices of the data) and prints the average accuracy.
+5. **Reads the score** from the line that starts with `RESULT:`, then deletes the sandbox.
+
+## Try more settings
+
+Add values to `hyperparams`, for example `[10, 50, 100, 200, 400]`. Each new value adds one sandbox, so make sure your server has room for all of them at once. To tune a different setting, pass it in `env` and read it in the Python program with `os.environ`.
+
+## Next steps
+
+- [Create and manage sandboxes](/sandboxes/): every option for `create`.
+- [Run commands](/exec-streaming/): run programs and read their output and exit codes.
+- [Images, resources and lifecycle](/environment/): give each sandbox more CPU or memory.
+- [Kaggle dataset to Parquet](/use-cases/data-processing-ml/kaggle-to-parquet/): another data job that runs in a throwaway sandbox.

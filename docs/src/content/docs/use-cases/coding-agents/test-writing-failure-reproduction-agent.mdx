@@ -1,21 +1,66 @@
 ---
-title: Write Test Cases Agent
-description: Clone a GitHub repository, run Claude Code inside an AerolVM sandbox, generate 500 test cases, validate that at least 90% of the target was actually written, and optionally open a pull request.
+title: Write 500 tests
+description: Have Claude Code write a large batch of tests for a repository in a sandbox, check how many are real, and open a pull request.
 ---
 
-This workflow takes a GitHub repository URL, a GitHub token, and an Anthropic key and writes 500 test cases. It asks Claude to write 500 real test cases, verifies how many test cases were actually added, runs the repository validation command, and optionally opens a pull request with the generated tests.
+In this project Claude Code writes 500 new tests for a GitHub repository. The script does not just trust it: it counts how many of the listed tests really exist in the code, and the run fails if fewer than 90% are there. Then it runs the test suite and opens a pull request with the new tests.
 
-## Copy-paste TypeScript script
+Use it to raise test coverage quickly, with a hard number you can check. All the installs and test runs happen in a sandbox, not on your machine.
+
+## What you need
+
+- An AerolVM server and Node.js 22 or newer. See [Quickstart](/quick-start/).
+- These environment variables:
+
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key. | None. You must set it. |
+| `GITHUB_TOKEN` | A GitHub token that can read the repository, push a branch and open pull requests. | None. You must set it. |
+| `GITHUB_REPO_URL` | The repository, as `https://github.com/owner/repo` or `git@github.com:owner/repo.git`. | None. You must set it. |
+| `ANTHROPIC_MODEL` | The Claude model to use. | `claude-sonnet-4-6` |
+| `SANDBOX_IMAGE` | The image the sandbox starts from. | `node:22-bookworm` |
+| `TARGET_TEST_COUNT` | How many tests to ask for. | `500` |
+| `MIN_COMPLETION_RATIO` | The share of tests that must really exist, from 0 to 1. | `0.9` (90%) |
+| `TEST_GENERATION_SCOPE` | What the tests should cover, in plain words. | The main code paths, edge cases, regressions and error handling. |
+| `TEST_VALIDATION_COMMAND` | The command that runs the tests, such as `npm test`. | Empty. The script picks one from the project files. |
+| `POST_PULL_REQUEST` | Set to `false` to push the branch without opening a pull request. | `true` |
+| `TEST_CASE_BRANCH_NAME` | The branch the tests go on. | `claude/write-500-tests-` plus today's date |
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir test-agent && cd test-agent
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Set your keys
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export ANTHROPIC_API_KEY=your-anthropic-key
+export GITHUB_TOKEN=your-github-token
+export GITHUB_REPO_URL=https://github.com/owner/repo
+```
+
+### Step 3: Save the script
+
+Save this as `test-agent.ts`. The shell scripts inside it are uploaded to the sandbox and run there.
 
 ```ts
-import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { MicroVM, type Sandbox } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
-const patToken = process.env.SB_PAT_TOKEN;
-const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-const githubToken = process.env.GITHUB_TOKEN;
-const githubRepoURL = process.env.GITHUB_REPO_URL;
+const patToken = requireEnv("SB_PAT_TOKEN");
+const anthropicApiKey = requireEnv("ANTHROPIC_API_KEY");
+const githubToken = requireEnv("GITHUB_TOKEN");
+const githubRepoURL = requireEnv("GITHUB_REPO_URL");
 const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 const sandboxImage = process.env.SANDBOX_IMAGE ?? "node:22-bookworm";
 const targetTestCount = Number(process.env.TARGET_TEST_COUNT ?? "500");
@@ -26,22 +71,6 @@ const testGenerationScope =
   "Cover the highest-signal production paths, edge cases, regressions, and error handling paths in this repository.";
 const postPullRequest =
   (process.env.POST_PULL_REQUEST ?? "true").toLowerCase() !== "false";
-
-if (!patToken) {
-  throw new Error("Set SB_PAT_TOKEN before running this example.");
-}
-
-if (!anthropicApiKey) {
-  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
-}
-
-if (!githubToken) {
-  throw new Error("Set GITHUB_TOKEN before running this example.");
-}
-
-if (!githubRepoURL) {
-  throw new Error("Set GITHUB_REPO_URL before running this example.");
-}
 
 if (!Number.isInteger(targetTestCount) || targetTestCount <= 0) {
   throw new Error("TARGET_TEST_COUNT must be a positive integer.");
@@ -57,15 +86,6 @@ const testCaseBranchName =
   process.env.TEST_CASE_BRANCH_NAME ??
   `claude/write-${targetTestCount}-tests-${new Date().toISOString().slice(0, 10)}`;
 const sessionName = testCaseBranchName.replace(/[^a-zA-Z0-9._-]/g, "-");
-
-const claudeSettings = JSON.stringify(
-  {
-    $schema: "https://json.schemastore.org/claude-code-settings.json",
-    model: anthropicModel,
-  },
-  null,
-  2,
-);
 
 const claudeProjectMemory = `# Claude Code bulk test generation instructions
 
@@ -121,7 +141,7 @@ Requirements:
 const installTestGenerationToolingScript = `#!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="${1:-/workspace/repo}"
+repo_dir="\${1:-/workspace/repo}"
 cd "$repo_dir"
 
 packages=(git gh curl ca-certificates jq ripgrep python3)
@@ -130,22 +150,29 @@ if [[ -f requirements.txt || -f pyproject.toml ]]; then
   packages+=(python3-pip python3-venv)
 fi
 
-if [[ -f go.mod ]] && ! command -v go >/dev/null 2>&1; then
-  packages+=(golang-go)
+if [[ -f Cargo.toml ]]; then
+  packages+=(pkg-config libssl-dev)
 fi
 
-if [[ -f Cargo.toml ]] && ! command -v cargo >/dev/null 2>&1; then
-  packages+=(cargo rustc pkg-config libssl-dev)
-fi
-
-if [[ ( -f pom.xml || -f build.gradle || -f build.gradle.kts ) && ! command -v javac >/dev/null 2>&1 ]]; then
-  packages+=(openjdk-21-jdk maven)
+if [[ -f pom.xml || -f build.gradle || -f build.gradle.kts ]] && ! command -v javac >/dev/null 2>&1; then
+  packages+=(openjdk-17-jdk maven)
 fi
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"
+DEBIAN_FRONTEND=noninteractive apt-get install -y "\${packages[@]}"
 
-export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+arch="$(dpkg --print-architecture)"
+export PATH="$HOME/.local/bin:$PATH:/usr/local/go/bin:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+
+# Debian's Go and Rust are too old for many projects, so install current releases.
+if [[ -f go.mod ]] && ! command -v go >/dev/null 2>&1; then
+  go_version="$(curl -fsSL 'https://go.dev/VERSION?m=text' | head -n 1)"
+  curl -fsSL "https://go.dev/dl/$go_version.linux-$arch.tar.gz" | tar -C /usr/local -xz
+fi
+
+if [[ -f Cargo.toml ]] && ! command -v cargo >/dev/null 2>&1; then
+  curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+fi
 
 curl -fsSL https://claude.ai/install.sh | bash
 
@@ -160,9 +187,9 @@ gh --version
 const prepareRepositoryScript = `#!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="${1:-/workspace/repo}"
+repo_dir="\${1:-/workspace/repo}"
 
-export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+export PATH="$HOME/.local/bin:$PATH:/usr/local/go/bin:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
 cd "$repo_dir"
 
 if [[ -f package-lock.json ]]; then
@@ -200,13 +227,13 @@ fi
 const validateRepositoryScript = `#!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="${1:-/workspace/repo}"
-out_file="${2:-/workspace/out/repository-validation.log}"
+repo_dir="\${1:-/workspace/repo}"
+out_file="\${2:-/workspace/out/repository-validation.log}"
 
-export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+export PATH="$HOME/.local/bin:$PATH:/usr/local/go/bin:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
 cd "$repo_dir"
 
-if [[ -n "${TEST_VALIDATION_COMMAND:-}" ]]; then
+if [[ -n "\${TEST_VALIDATION_COMMAND:-}" ]]; then
   bash -lc "$TEST_VALIDATION_COMMAND" > "$out_file" 2>&1
 elif [[ -f package.json ]]; then
   npm run test --if-present > "$out_file" 2>&1
@@ -229,8 +256,8 @@ fi
 const validateGeneratedTestsScript = `#!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="${1:-/workspace/repo}"
-out_dir="${2:-/workspace/out}"
+repo_dir="\${1:-/workspace/repo}"
+out_dir="\${2:-/workspace/out}"
 manifest="$repo_dir/test-case-manifest.json"
 
 mkdir -p "$out_dir"
@@ -277,7 +304,7 @@ jq -n \
   }' > "$out_dir/test-generation-validation.json"
 
 if (( validated_tests < MINIMUM_VALIDATED_TESTS )); then
-  echo "validated test count ${validated_tests} is below required threshold ${MINIMUM_VALIDATED_TESTS}" >&2
+  echo "validated test count \${validated_tests} is below required threshold \${MINIMUM_VALIDATED_TESTS}" >&2
   exit 1
 fi
 `;
@@ -285,10 +312,10 @@ fi
 const runBulkTestGenerationScript = `#!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="${1:-/workspace/repo}"
-out_dir="${2:-/workspace/out}"
+repo_dir="\${1:-/workspace/repo}"
+out_dir="\${2:-/workspace/out}"
 
-export PATH="$HOME/.local/bin:$PATH:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
+export PATH="$HOME/.local/bin:$PATH:/usr/local/go/bin:/usr/local/bin:/root/go/bin:/root/.cargo/bin"
 cd "$repo_dir"
 
 bash /workspace/tools/prepare-repository.sh "$repo_dir"
@@ -307,6 +334,10 @@ test -f bulk-test-generation-pr-body.md
 bash /workspace/tools/validate-generated-tests.sh "$repo_dir" "$out_dir"
 bash /workspace/tools/validate-repository.sh "$repo_dir" "$out_dir/repository-validation.log"
 
+# Keep the manifest and Claude's report files out of the commit.
+printf '%s\n' test-case-manifest.json bulk-test-generation-summary.md bulk-test-generation-pr-title.txt bulk-test-generation-pr-body.md >> .git/info/exclude
+
+# Stop here if Claude changed nothing, instead of opening an empty pull request.
 git status --porcelain > "$out_dir/git-status.txt"
 test -s "$out_dir/git-status.txt"
 
@@ -332,6 +363,30 @@ fi
 git diff HEAD~1 HEAD --binary > "$out_dir/bulk-test-generation.patch"
 `;
 
+// Reads a required environment variable, or stops with a clear message.
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Set ${name} before running this example.`);
+  }
+  return value;
+}
+
+// Runs a command in the sandbox and shows its output as it happens.
+// Stops the script if the command fails.
+async function run(sandbox: Sandbox, command: string) {
+  const handle = sandbox.execStream({
+    command,
+    onStdout: (chunk) => process.stdout.write(chunk),
+    onStderr: (chunk) => process.stderr.write(chunk),
+    onError: (message) => process.stderr.write(`${message}\n`),
+  });
+  const exit = await handle.done;
+  if (exit.code !== 0) {
+    throw new Error(`Command failed (exit ${exit.code}): ${command}`);
+  }
+}
+
 async function main() {
   const client = new MicroVM({ apiUrl, patToken });
   const sandbox = await client.create({
@@ -353,7 +408,7 @@ async function main() {
       TEST_VALIDATION_COMMAND: testValidationCommand,
     },
     lifecycle: {
-      destroyIfIdleFor: 60 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 60 * 60 * 1_000_000_000, // 60 minutes, in nanoseconds
     },
   });
 
@@ -391,29 +446,20 @@ async function main() {
       ),
     ]);
 
-    await sandbox.exec({
-      command: [
+    await run(
+      sandbox,
+      [
+        // gh is needed to clone, so install it before the rest of the tools.
+        "apt-get update",
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y gh",
         "chmod +x /workspace/tools/*.sh",
         "gh auth setup-git",
         "gh auth status -h github.com",
         `gh repo clone ${repo.repoSlug} /workspace/repo -- --filter=blob:none`,
         "bash /workspace/tools/install-test-generation-tooling.sh /workspace/repo",
         `cd /workspace/repo && git checkout -b ${shellQuote(testCaseBranchName)}`,
-        "mkdir -p /workspace/repo/.claude /workspace/repo/.aerolvm-test-generation",
       ].join(" && "),
-      timeoutSeconds: 1800,
-    });
-
-    await Promise.all([
-      sandbox.uploadFile(
-        "/workspace/repo/.claude/settings.json",
-        claudeSettings,
-      ),
-      sandbox.uploadFile(
-        "/workspace/repo/CLAUDE.md",
-        claudeProjectMemory,
-      ),
-    ]);
+    );
 
     const session = await sandbox.createSession({
       name: sessionName,
@@ -550,19 +596,63 @@ function shellQuote(value: string) {
 }
 ```
 
-## What gets exported
+### Step 4: Run it
 
-- `write-500-test-cases-summary.md` with the generation scope, what Claude wrote, and the residual gaps.
-- `write-500-test-cases-manifest.json` with the declared list of generated tests.
-- `write-500-test-cases-validation.json` with the validated test count and completion ratio.
-- `write-500-test-cases.patch` with the exact Git diff.
-- `write-500-test-cases-pr-url.txt` with the created pull request URL.
-- `write-500-test-cases-repository-validation.log` with the repository test or validation output.
-- `write-500-test-cases.log` with the full Claude Code session log.
+```bash
+npx tsx test-agent.ts
+```
 
-## Related docs
+The install output streams to your terminal, then Claude Code's work. Writing 500 tests takes a while. When it is done, the script prints the summary and saves seven files in your folder.
 
-- [Process & Code Execution](/exec-streaming/)
-- [File System](/file-system/)
-- [Sessions](/sessions/)
-- [Environment](/environment/)
+## What the script does
+
+1. **Creates a sandbox** with 2 CPU cores, 4 GB of memory and 20 GB of disk. A lifecycle rule deletes it after 60 idle minutes, in case your script stops early.
+2. **Uploads five shell scripts and two prompt files.** The scripts install tools, install the project's packages, count the tests, run the test suite and run the whole job.
+3. **Clones the repository**, installs Git tools and Claude Code, and creates the branch. It also installs Go, Rust, Java, or Python with `pytest`, when the project needs them.
+4. **Starts the job in a session.** A session is a process that keeps running inside the sandbox even if your connection drops. The script attaches to it to stream the output.
+5. **Installs the project's own packages**, for example with `npm ci` or `pip install`.
+6. **Claude Code writes the tests.** It also writes `test-case-manifest.json`, a list of every new test with its file and name, plus a summary and the pull request text.
+7. **The script counts the real tests.** For each entry in the list, it checks that the file exists and that the test name appears in it. With the defaults, the run fails if fewer than 450 of the 500 are found.
+8. **Runs the test suite** (see the table below). If it fails, the script stops before it commits anything.
+9. **Commits, pushes and opens the pull request.** The list and the report files stay out of the commit.
+10. **Downloads the results** and deletes the sandbox, even if a step failed.
+
+### Which test command runs
+
+The first match wins.
+
+| If | Command |
+|---|---|
+| `TEST_VALIDATION_COMMAND` is set | That command. |
+| The repository has `package.json` | `npm run test --if-present` |
+| It has `requirements.txt` or `pyproject.toml` | `python3 -m pytest` |
+| It has `go.mod` | `go test ./...` |
+| It has `Cargo.toml` | `cargo test` |
+| It has `pom.xml` | `mvn test` |
+| It has `gradlew` | `./gradlew test` |
+
+## What you get
+
+| File | What is in it |
+|---|---|
+| `write-500-test-cases-summary.md` | What the tests cover, what Claude wrote, and the gaps that are left. |
+| `write-500-test-cases-manifest.json` | The list of new tests Claude says it wrote. |
+| `write-500-test-cases-validation.json` | How many tests were found in the code, and the share of the target. |
+| `write-500-test-cases.patch` | The exact changes in the commit. |
+| `write-500-test-cases-pr-url.txt` | The link to the new pull request. |
+| `write-500-test-cases-repository-validation.log` | The output of the test suite. |
+| `write-500-test-cases.log` | The full output of the session, including Claude Code. |
+
+## Good to know
+
+- The count checks that each test name appears in its file. It does not prove that each test is useful. Review the pull request as you would any other.
+- To ask for fewer tests, set `TARGET_TEST_COUNT`. The minimum is always `TARGET_TEST_COUNT` times `MIN_COMPLETION_RATIO`, rounded up.
+- Setup can take a long time on big projects. That is why the script uses `execStream` and a session, not `exec`: in Node.js, one `exec` call can wait only about 5 minutes for its answer.
+- Claude Code runs with `--dangerously-skip-permissions` and has your GitHub token. Use a token that can reach only this repository.
+
+## Next steps
+
+- [Terminal sessions](/sessions/): attach to a session, replay its output and read its log.
+- [Run commands](/exec-streaming/): how `exec` and `execStream` work.
+- [Files](/file-system/): upload and download files.
+- [Images, resources and lifecycle](/environment/): give the sandbox more CPU, memory or disk.

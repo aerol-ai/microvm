@@ -1,11 +1,17 @@
 ---
-title: Using E2B SDK
-description: Point the official E2B SDK at AerolVM's /e2b compatibility facade.
+title: Use the E2B SDK
+description: Point the official E2B SDK at your AerolVM server, and see exactly which E2B features work there and which do not.
 ---
 
-AerolVM exposes an E2B-compatible control plane under `/e2b` and a runtime proxy under `/e2b/runtime`, so existing E2B SDK code can point at an AerolVM server without switching SDKs. The main change is configuring both E2B endpoints to use AerolVM's path-based routes.
+import { Aside } from '@astrojs/starlight/components';
 
-## Required environment
+AerolVM answers the same API calls as E2B, under two paths of your server. `/e2b` handles sandboxes: create, list, pause and so on. `/e2b/runtime` handles what happens inside a sandbox: commands and files. So code written for the E2B SDK can run on AerolVM after you change three settings.
+
+This layer translates E2B's calls into AerolVM's own. Your sandboxes are normal AerolVM sandboxes, so the AerolVM SDKs and the [CLI](/cli/) can see them too.
+
+## Point the E2B SDK at your server
+
+Set these three variables before your code runs:
 
 ```bash
 export E2B_API_URL=https://sandbox.example.com/e2b
@@ -13,53 +19,142 @@ export E2B_SANDBOX_URL=https://sandbox.example.com/e2b/runtime
 export E2B_API_KEY="$SB_PAT_TOKEN"
 ```
 
-`E2B_SANDBOX_URL` is required for AerolVM compatibility mode. Without it, the E2B SDK tries to build runtime URLs like `https://49983-<sandbox>.<domain>`, which do not match AerolVM's path-based runtime gateway.
+| Variable | What it is |
+|---|---|
+| `E2B_API_URL` | Your server's address with `/e2b` on the end. |
+| `E2B_SANDBOX_URL` | Your server's address with `/e2b/runtime` on the end. |
+| `E2B_API_KEY` | Your AerolVM API token. |
 
-## JavaScript / TypeScript
+<Aside type="caution">
+Do not skip `E2B_SANDBOX_URL`. Without it, the E2B SDK builds addresses like `https://49983-<sandbox>.<domain>` to reach each sandbox. AerolVM does not serve those, so every command and file call fails.
+</Aside>
+
+## Use E2B SDK 2.50.0 or older
+
+E2B SDK 2.51.0 and newer create sandboxes through a newer API call that AerolVM does not answer yet. With those versions, `Sandbox.create` fails with HTTP 405 (Method Not Allowed). This is true in both JavaScript and Python. Install version 2.50.0 until AerolVM supports the newer call.
+
+## Run your first command
+
+In JavaScript or TypeScript:
 
 ```bash
-npm install e2b
+npm install e2b@2.50.0
 ```
 
 ```ts
-import { Sandbox } from 'e2b'
+import { Sandbox } from "e2b";
 
-const sandbox = await Sandbox.create({ template: 'base' })
-const result = await sandbox.commands.run('echo "Hello from E2B on AerolVM"')
+const sandbox = await Sandbox.create();
+const result = await sandbox.commands.run('echo "Hello from E2B on AerolVM"');
 
-console.log(result.stdout)
-await sandbox.kill()
+console.log(result.stdout);
+await sandbox.kill();
 ```
 
-## Python
+In Python:
 
 ```bash
-pip install e2b
+pip install "e2b==2.50.0"
 ```
 
 ```python
 from e2b import Sandbox
 
-sandbox = Sandbox.create(template="base")
+sandbox = Sandbox.create()
 result = sandbox.commands.run("echo 'Hello from E2B on AerolVM'")
 
 print(result.stdout)
 sandbox.kill()
 ```
 
-## What works today
+```text
+Hello from E2B on AerolVM
+```
 
-- Create, list, fetch, connect, pause, timeout-update, and delete sandboxes.
-- Execute commands and use file APIs through the `/e2b/runtime` proxy.
-- Create, list, and delete snapshots/templates through the compatibility layer.
-- Preserve common E2B lifecycle metadata such as timeout and pause-on-idle settings.
-- Egress rules: `network.allowOut` and `network.denyOut` on create, and `updateNetwork` on a running sandbox, with hostnames and `*.` wildcards. See [Egress Domain Filtering](/egress-domain-filtering#from-the-e2b-sdk) for the one place the reading is stricter than E2B's.
+We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks for its default template, `base`. On AerolVM that starts an `ubuntu:22.04` sandbox. See [Templates](#templates) for others.
 
-## Current gaps
+## What works
 
-- Template builds are not part of the current facade; use AerolVM images or snapshots instead.
-- Volume mounts are not implemented in the E2B facade yet.
-- Traffic access tokens, metrics, logs, and E2B-style public-host routing are not part of this compatibility surface.
-- `network.rules` (request transforms) and `network.egressProxy` are refused with `501`.
+### Sandboxes
 
-If you already have E2B code in production, migration is usually an environment change rather than an SDK rewrite: set `E2B_API_URL`, `E2B_SANDBOX_URL`, and `E2B_API_KEY` to your AerolVM deployment and keep the same client code.
+| E2B feature | On AerolVM |
+|---|---|
+| Create, list, get info, connect, kill | Works. |
+| Time limit (`timeoutMs`) and changing it later (`setTimeout`) | Works. The default is 5 minutes, as on E2B. When time runs out the sandbox is deleted, or paused if you asked for that. |
+| Pause, and auto-pause when time runs out | Works, with one difference: see [Pausing stops programs](#pausing-stops-programs). |
+| `connect` to a paused sandbox | Works. It starts the sandbox again. |
+| Metadata | Works. It is saved as the sandbox's AerolVM [tags](/sandbox-tags/). |
+| Environment variables (`envs`) | Works. |
+| `allowInternetAccess: false` | Works. The sandbox gets no outbound internet. |
+| `network.allowOut` and `network.denyOut`, on create and with `updateNetwork` | Works, with host names and `*.` wildcards. One case is stricter than on E2B; see [Allow only some websites](/egress-domain-filtering/#from-the-e2b-sdk). |
+| `network.allowPublicTraffic` and `network.maskRequestHost` | Works. |
+| Volumes (`volumeMounts`) | Works when your operator has turned on [platform volumes](/platform-volumes/). They attach read-write. |
+
+### Inside the sandbox
+
+| E2B feature | On AerolVM |
+|---|---|
+| Commands: run, run in the background, list, send input, kill, reconnect | Works. |
+| Terminals (`sandbox.pty`) | Works. |
+| Files: read, write, list, get info, make a folder, rename, remove, watch a folder | Works. |
+
+### Snapshots and templates
+
+| E2B feature | On AerolVM |
+|---|---|
+| Take a snapshot of a sandbox | Works. |
+| List snapshots, delete a template | Works. |
+| Start a sandbox from a snapshot | Works: pass the snapshot's name or ID as the template. |
+
+## What does not work
+
+| E2B feature | What happens |
+|---|---|
+| Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/snapshots/) as the template. |
+| `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/egress-rules-and-inspection/). |
+| `network.egressProxy` | Refused (HTTP 501). |
+| Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
+| Public addresses for a port (`getHost`) | Not supported: AerolVM does not serve the addresses the SDK builds. To share a port, use the AerolVM SDK's `exposePort`; see [Share a web app](/preview/). |
+| Traffic access tokens, metrics and logs | Not supported. |
+| Volumes on WebAssembly sandboxes | Refused (HTTP 501), because they have no container file system. |
+
+## Templates
+
+A template is what E2B starts a sandbox from. On AerolVM the template can be:
+
+- **`base`**, which starts `ubuntu:22.04`.
+- **A name your operator has mapped to an image**, with `SB_E2B_TEMPLATE_MAP_JSON`.
+- **An AerolVM [snapshot](/snapshots/)** (a saved copy of a sandbox's files), by its name or ID.
+- **The ID of a registered [WASM module](/wasm-modules/)**, which starts a WebAssembly sandbox. You can also set the metadata keys `runtime` to `wasm` and `module_ref` to the module.
+
+Any other template name is refused with HTTP 400.
+
+## Pausing stops programs
+
+On E2B, pausing keeps a sandbox's memory, so running programs carry on after you resume. On AerolVM, pausing stops the sandbox. Its files are kept, but running programs end. `connect` starts the sandbox again, and you start your programs again.
+
+## Public by default
+
+E2B sandboxes can be reached from the internet, so AerolVM's E2B layer makes them public by default too. Set `network.allowPublicTraffic` to `false` to keep a sandbox private. Sandboxes created with the AerolVM SDKs are private by default.
+
+## Wake on request
+
+Set the metadata key `aerolvm.serverless` to `"true"` to make the sandbox [serverless](/serverless/). It then stops when its time runs out, and an incoming web request starts it again.
+
+## Good to know
+
+- **Moving from E2B** is usually a change of settings, not of code. Set `E2B_API_URL`, `E2B_SANDBOX_URL` and `E2B_API_KEY`, and keep your code.
+- **Your sandboxes are shared across APIs.** A sandbox made with the E2B SDK is a normal AerolVM sandbox. E2B metadata and AerolVM tags are the same data.
+
+## For server operators
+
+| Variable | What it does | Default |
+|---|---|---|
+| `SB_E2B_TEMPLATE_MAP_JSON` | Extra template names, as JSON mapping each name to an image, such as `{"python": "python:3.12"}`. | Only `base`, mapped to `ubuntu:22.04` |
+
+## Next steps
+
+- [Use the Daytona SDK](/using-daytona-sdk/): the same idea for Daytona code.
+- [SDK setup](/sdk-setup/): switch to an AerolVM SDK to use every feature.
+- [Allow only some websites](/egress-domain-filtering/): how `allowOut` and `denyOut` are applied.
+- [AerolVM vs Daytona vs E2B](/comparison/): how the three compare.

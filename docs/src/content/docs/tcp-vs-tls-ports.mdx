@@ -1,101 +1,92 @@
 ---
-title: TCP vs TLS Ports
-description: When to use protocol "tcp" vs "tls" on exposePort - mental model, trade-offs, and a workload-by-workload picker.
+title: TCP or TLS?
+description: Choose between a raw TCP port and a TLS address when you share a database or another non-web service.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-`exposePort(port, { protocol: "tcp" })` and `exposePort(port, { protocol: "tls" })` both publish a sandbox-internal port through caddy-l4, but they listen and route very differently. This page is a deeper explainer of the two modes - when to pick each, what they cost, and why the API gives you a choice.
+`exposePort(port, { protocol: "tcp" })` and `exposePort(port, { protocol: "tls" })` both share a non-web service from a sandbox. They connect clients in very different ways. This page explains both, so you can pick the right one.
 
-For the API surface itself, see [TCP & TLS Ports](/tcp-ports/).
+For how to call them, see [TCP and TLS ports](/tcp-ports/).
 
-## Mental model
+## The short answer
 
-### Raw TCP - `protocol: "tcp"`
+- **Use TCP** for plain database and wire protocols: Postgres, Redis, MySQL, MongoDB, SSH, game servers. It works for any service that uses TCP (the basic way programs send bytes over a network). Use it too when your service needs the client's own TLS handshake (TLS is the encryption behind `https://`), for example to check client certificates.
+- **Use TLS** when you want a `tls://` address on port 443 with a real certificate. Your client must start with TLS right away, and your service speaks plain TCP.
 
-caddy-l4 binds **one host port from the configured `[22000, 23000]` pool** per exposure and forwards bytes 1:1 into the container.
+On a server with a domain, TLS is a good default when your client supports it. Use TCP if your client does not send SNI (explained below), if your service needs the original handshake, or if the server has no domain.
 
-```
-client ──► public-host:37412 (caddy-l4)  ──► container:5432
-                       ▲                            ▲
-                bytes go through unchanged
-```
+## How a TCP port works
 
-- URL shape: `tcp://<public-host>:<host-port>`
-- Result also carries `host` and `hostPort` as separate fields, so you can build a DSN without parsing the URL.
-- The proxy is **protocol-agnostic** - it doesn't read the bytes, just shovels them.
-- One TCP exposure consumes one host port in the pool, and one inbound firewall rule on that port.
-- Works for **any** TCP protocol, regardless of whether it speaks TLS.
+The server opens one of its own ports for each exposure, called the **host port**. It comes from a pool, `22000` to `23000` by default. Every byte that arrives there goes to the port inside the sandbox, unchanged.
 
-### TLS-SNI - `protocol: "tls"`
-
-caddy-l4 binds **one shared port** (typically `:443`), reads the SNI extension from the ClientHello to pick a route, and **terminates TLS at the edge** using the wildcard certificate Caddy already manages for `*.<domain>`. After termination, plaintext bytes are forwarded to the container on its native port.
-
-```
-client ──TLS──► public-host:443 (caddy-l4)
-                       │
-                       │ terminate TLS using the wildcard cert
-                       │ Caddy auto-issued for *.<domain>
-                       ▼
-                ┌────────────┐
-                │ SNI=        │
-                │  abc-5432.. │ ──plaintext──► sandbox abc, container:5432
-                │  xyz-6379.. │ ──plaintext──► sandbox xyz, container:6379
-                └────────────┘
-        many backends, one shared port, one wildcard cert
+```mermaid
+flowchart LR
+    C["Client"] -->|"bytes"| H["Server, host port 22417"]
+    H -->|"same bytes, unchanged"| S["Sandbox, port 5432"]
 ```
 
-- URL shape: `tls://<id>-<port>.<domain>:<l4-port>`
-- TLS is **terminated at caddy-l4** using Caddy's existing wildcard cert. The container speaks **plaintext TCP** - it does not need to hold a cert, manage renewals, or know anything about TLS.
-- Many exposures share the same listener and the same cert - no host-port pool burn, no per-service firewall hole, no cert provisioning per sandbox.
-- Caddy's private key never leaves the host. Containers see only the decrypted bytes.
-- Requires the client to send SNI. If your client does not send SNI (very rare in 2026 - basically only ancient legacy clients), use `protocol: "tcp"` instead.
-- **Not for mTLS / client-cert auth / custom ALPN selection by the backend.** Those need access to the original TLS handshake and require raw TCP - see the trade-offs section.
+- The address looks like `tcp://<host>:<host-port>`.
+- The result also has `host` and `hostPort` as separate fields, so you can build a connection string without parsing the URL.
+- The server does not read the bytes. It only passes them along.
+- Each TCP port uses one host port from the pool and one opening in the server's firewall.
+- It works for **any** TCP protocol, with or without TLS.
 
-## Workload picker
+## How a TLS port works
 
-| Workload | Recommended mode | Why |
+All TLS ports share one port on the server, usually `443`. A client starting a TLS connection first says which name it wants. This is called **SNI** (Server Name Indication). The server reads that name and picks the right sandbox.
+
+The server then ends the TLS connection itself, using the wildcard certificate it already has for `*.<domain>`. A wildcard certificate covers every name under the domain. The server sends the decrypted bytes to the sandbox on its normal port.
+
+```mermaid
+flowchart LR
+    C["Client"] -->|"TLS to sb-abc-5432.domain:443"| E["Server, shared port 443"]
+    E -->|"decrypts with the wildcard certificate"| R{"Which name?"}
+    R -->|"sb-abc-5432"| A["Sandbox abc, port 5432, plain bytes"]
+    R -->|"sb-xyz-6379"| B["Sandbox xyz, port 6379, plain bytes"]
+```
+
+- The address looks like `tls://<sandbox-id>-<port>.<domain>:443`.
+- Your service speaks **plain TCP**. It does not need a certificate, renewals, or any TLS setup.
+- Many TLS ports share the same server port and the same certificate. They use no host ports and need no extra firewall openings.
+- The certificate's private key never leaves the server. Sandboxes only see decrypted bytes.
+- The client must send SNI. Almost every modern client does. If yours does not, use TCP.
+- The client must start with TLS right away. Protocols that start in plain text and switch to TLS later, such as MySQL and default Postgres, need TCP.
+- **No client certificates (mutual TLS) and no custom protocol negotiation (ALPN) reach your service.** Those need the original TLS handshake, so use TCP for them.
+
+## Pick by service
+
+| Service | Pick | Why |
 |---|---|---|
-| Postgres (plaintext) | **TCP** | Default Postgres setups are plaintext; simplest and works with any client. |
-| Postgres (TLS) | **TLS-SNI** | libpq has sent SNI since v17. Saves a firewall hole; reuses `:443`. |
-| Redis | **TCP** | Redis TLS support is rarely deployed; plain TCP dominates. |
-| MySQL / MariaDB | **TCP** | Most clients skip TLS for ephemeral test data. |
-| MongoDB | **TCP** | Plain mongo wire protocol over TCP is the default. |
-| MQTT broker | TCP for `mqtt://`, **TLS-SNI** for `mqtts://` | Match the client's URI scheme. |
-| gRPC plaintext / h2c | **TCP** | No TLS, no SNI, just bytes. |
-| gRPC over TLS | **TLS-SNI** | gRPC clients send SNI; backend holds the cert. |
-| HTTPS-shaped TCP behind a CDN | **TLS-SNI** | Looks identical to a normal HTTPS service from outside. |
-| SSH bastion / Git server | **TCP** | SSH does not speak SNI. TLS-SNI cannot route it. |
-| Dedicated game server | **TCP** | Game protocols are bespoke. |
-| Custom binary protocol (no TLS) | **TCP** | Same reason as game servers. |
+| Postgres | **TCP** | Works with any client, with or without TLS. |
+| Postgres with TLS from the first byte | **TLS**, test first | Postgres 17 and newer clients can start with TLS (`sslnegotiation=direct`) and send SNI. Test it with your client before you rely on it. |
+| Redis | **TCP** | Most Redis setups use plain TCP. |
+| MySQL or MariaDB | **TCP** | The connection starts in plain text, so a TLS port cannot route it. |
+| MongoDB | **TCP** | Plain MongoDB over TCP is the default. |
+| MQTT broker | **TCP** for `mqtt://`, **TLS** for `mqtts://` | Match the client's address scheme. |
+| gRPC without TLS | **TCP** | No TLS and no SNI, just bytes. |
+| gRPC over TLS | **TLS**, test first | gRPC clients start with TLS and send SNI. Some gRPC clients also require protocol negotiation (ALPN), which this mode does not pass through. |
+| SSH server or Git server | **TCP** | SSH does not use SNI, so a TLS port cannot route it. |
+| Game server | **TCP** | Game protocols are custom. |
+| Custom protocol without TLS | **TCP** | Same reason as game servers. |
 
-## Trade-offs
+## Examples
 
-### Pick TCP when
-
-- The protocol does not speak TLS, **or**
-- You don't want the sandbox to manage a TLS certificate, **or**
-- The client expects a `<host>:<port>` connection string (`psql`, `redis-cli`, `mongosh`).
-
-You pay: one host port + one firewall rule per exposure, and a random high port number visible in the URL.
+A TCP port. Pick this when the protocol has no TLS, or the sandbox should not deal with certificates. It also suits clients that want a `host:port` connection string (`psql`, `redis-cli`, `mongosh`). The cost: one host port and one firewall opening per exposure, and a high port number in the address.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const exposure = await sandbox.exposePort(5432, { protocol: "tcp" });
     if (exposure.protocol === "tcp") {
-      // exposure.url      === "tcp://203.0.113.10:37412"
-      // exposure.host     === "203.0.113.10"
-      // exposure.hostPort === 37412
+      console.log(exposure.host, exposure.hostPort); // sandbox.example.com 22417
     }
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     exposure = sandbox.expose_port(5432, protocol="tcp")
-    # exposure.url       == "tcp://203.0.113.10:37412"
-    # exposure.host      == "203.0.113.10"
-    # exposure.host_port == 37412
+    print(exposure.host, exposure.host_port)  # sandbox.example.com 22417
     ```
   </TabItem>
   <TabItem label="Go">
@@ -104,48 +95,37 @@ You pay: one host port + one firewall rule per exposure, and a random high port 
     if err != nil {
         log.Fatal(err)
     }
-    // exposure.PublicURL == "tcp://203.0.113.10:37412"
-    // exposure.Host == "203.0.113.10"
-    // exposure.HostPort == 37412
+    fmt.Println(exposure.Host, exposure.HostPort) // sandbox.example.com 22417
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let exposure = sandbox.expose_port(5432, ExposeOptions::tcp())?;
-    if let ExposeResult::Tcp { url, host, host_port } = exposure {
-        // url == "tcp://203.0.113.10:37412"
+    if let ExposeResult::Tcp { host, host_port, .. } = sandbox.expose_port(5432, ExposeOptions::tcp())? {
+        println!("{} {}", host, host_port); // sandbox.example.com 22417
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     ExposeResult exposure = sandbox.exposePort(5432, ExposeOptions.tcp());
-    // exposure.url      equals "tcp://203.0.113.10:37412"
-    // exposure.host     equals "203.0.113.10"
-    // exposure.hostPort equals 37412
+    System.out.println(exposure.host + " " + exposure.hostPort); // sandbox.example.com 22417
     ```
   </TabItem>
 </Tabs>
 
-### Pick TLS-SNI when
-
-- The client sends SNI (libpq, browsers, gRPC, modern Mongo / Redis / MySQL drivers all do), **and**
-- The backend speaks plain TCP and you want clients to see TLS, **and**
-- You want many backends sharing `:443` so the URL looks like a normal HTTPS service.
-
-You pay: only what you give up by terminating at the edge - mTLS, custom ALPN, and HTTP/2 client-cert auth no longer reach the backend. You save: no per-sandbox cert management, no host-port pool burn, no per-service firewall rule, no awkward high-port suffix in the URL.
+A TLS port. Pick this when the client sends SNI, the service speaks plain TCP, and you want many services sharing port 443. You give up client certificates and custom protocol negotiation. You save certificate work in the sandbox, host ports, firewall openings, and the odd port number in the address.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const exposure = await sandbox.exposePort(5432, { protocol: "tls" });
-    // exposure.url === "tls://abc-5432.sandbox.example.com:443"
+    console.log(exposure.url); // tls://sb-9f2c41d07a3e5b86-5432.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     exposure = sandbox.expose_port(5432, protocol="tls")
-    # exposure.url == "tls://abc-5432.sandbox.example.com:443"
+    print(exposure.url)  # tls://sb-9f2c41d07a3e5b86-5432.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Go">
@@ -154,52 +134,41 @@ You pay: only what you give up by terminating at the edge - mTLS, custom ALPN, a
     if err != nil {
         log.Fatal(err)
     }
+    fmt.Println(exposure.PublicURL) // tls://sb-9f2c41d07a3e5b86-5432.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let exposure = sandbox.expose_port(5432, ExposeOptions::tls())?;
-    if let ExposeResult::Tls { url } = exposure {
-        // url == "tls://abc-5432.sandbox.example.com:443"
+    if let ExposeResult::Tls { url } = sandbox.expose_port(5432, ExposeOptions::tls())? {
+        println!("{}", url); // tls://sb-9f2c41d07a3e5b86-5432.sandbox.example.com:443
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     ExposeResult exposure = sandbox.exposePort(5432, ExposeOptions.tls());
-    // exposure.url equals "tls://abc-5432.sandbox.example.com:443"
+    System.out.println(exposure.url); // tls://sb-9f2c41d07a3e5b86-5432.sandbox.example.com:443
     ```
   </TabItem>
 </Tabs>
 
-## Side-by-side cheat sheet
+## Side by side
 
 | | `protocol: "tcp"` | `protocol: "tls"` |
 |---|---|---|
-| Listener | Per-exposure host port from `[22000, 23000]` | Shared, default `:443` |
-| URL shape | `tcp://<host>:<host-port>` | `tls://<id>-<port>.<domain>:<l4-port>` |
+| Server port | One host port per exposure, from `22000` to `23000` | One shared port, `443` by default |
+| Address | `tcp://<host>:<host-port>` | `tls://<sandbox-id>-<port>.<domain>:443` |
 | Result fields | `url`, `host`, `hostPort` | `url` |
-| Reads bytes? | No | Yes - terminates the TLS handshake |
-| Terminates TLS? | n/a | **Yes**, at caddy-l4 (using Caddy's wildcard) |
-| Cert held by | n/a | Caddy on the host (private key never enters the container) |
-| Backend speaks | Whatever it likes | **Plaintext TCP** |
-| Supports mTLS / client certs? | n/a | **No** (terminator strips them) |
-| Client must send SNI? | No | **Yes** |
-| Needs `--domain`? | No | **Yes** |
-| Needs `--dns-provider`? | No | **Yes** - required by the installer whenever `--domain` is set |
-| Firewall holes per exposure | 1 | 0 (shared listener) |
-| Multiplexing model | One server per host port | One server, many SNI routes |
+| Server reads the traffic? | No | Yes, it decrypts it |
+| Who holds the certificate | Not needed by AerolVM | The server (the key never enters the sandbox) |
+| Your service speaks | Anything | Plain TCP |
+| Client certificates (mutual TLS) | Pass through to your service | Not supported |
+| Client must send SNI? | No | Yes |
+| Server needs a domain? | No | Yes |
+| Firewall openings per exposure | 1 | 0 (shared port) |
 
-## A useful rule of thumb
+## Next steps
 
-> **TCP** is the answer for plain wire-protocol endpoints, and the only answer for protocols that need the original TLS handshake to reach the backend (mTLS, custom ALPN, HTTP/2 client-cert auth).
->
-> **TLS-SNI** is the answer for "I want a `tls://` URL on `:443` with a real cert, and my backend just speaks plain TCP."
-
-If you're picking between them and not sure, default to **TLS-SNI** in domain mode - it gives you the friendly URL, the real cert, and zero per-firewall ports. Fall back to **TCP** if your client doesn't send SNI, your backend needs the raw handshake, or you're running in IP/path mode without `--domain`.
-
-## Related docs
-
-- [TCP & TLS Ports](/tcp-ports/) - the API surface, host-port pool, and reconcile guarantees.
-- [Preview](/preview/) - HTTPS-shaped exposures via Caddy's HTTP reverse proxy.
-- [Port Allowlist](/port-allowlist/) - explicit exposure before public traffic is accepted.
+- [TCP and TLS ports](/tcp-ports/): how to expose, unexpose and switch ports, plus the server settings.
+- [Share a web app](/preview/): web URLs for websites and APIs.
+- [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.

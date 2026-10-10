@@ -1,169 +1,224 @@
 ---
-title: File System
+title: Files
+description: Copy files from your app into a sandbox, and read the files a sandbox writes back into your app.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Transfer files between your application and the sandbox using the sandbox API. All file operations use the same bearer token as the rest of the API.
+A sandbox has its own disk, separate from the machine your app runs on. To give it input, you upload a file to a path inside the sandbox. To get results, you download a file from a path. Both calls use the same token as the rest of the SDK.
 
-## Upload
-
-Send a file into the sandbox. Parent directories are created automatically if they do not exist.
+## Copy a file into a sandbox
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const content = Buffer.from('print("hello")')
-    await sandbox.uploadFile('/workspace/hello.py', content)
+    await sandbox.uploadFile("/workspace/hello.py", 'print("hello")');
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    content = b'print("hello")'
-    sandbox.upload_file('/workspace/hello.py', content)
+    sandbox.upload_file("/workspace/hello.py", b'print("hello")')
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    content := []byte(`print("hello")`)
-    err := sandbox.UploadFile(ctx, "/workspace/hello.py", content)
+    err := sandbox.UploadFile(ctx, "/workspace/hello.py", []byte(`print("hello")`))
+    if err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let content = b"print(\"hello\")";
-    sandbox.upload_file("/workspace/hello.py", content)?;
+    sandbox.upload_file("/workspace/hello.py", b"print(\"hello\")".to_vec())?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    byte[] content = "print(\"hello\")".getBytes();
-    sandbox.uploadFile("/workspace/hello.py", content);
+    sandbox.uploadFile("/workspace/hello.py", "print(\"hello\")".getBytes(StandardCharsets.UTF_8));
     ```
   </TabItem>
 </Tabs>
 
-## Download
+- Missing folders in the path are created for you. Here, `/workspace` does not need to exist yet.
+- If a file is already at that path, it is replaced.
+- In TypeScript you can pass a string, a `Uint8Array`, an `ArrayBuffer` or a `Blob`. The other SDKs take bytes.
 
-Retrieve a file from the sandbox. The response is the raw file bytes.
+## Read a file from a sandbox
+
+You get the file's raw bytes. Turn them into text when the file is text.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const bytes = await sandbox.downloadFile('/workspace/output.txt')
-    console.log(bytes.toString())
+    const bytes = await sandbox.downloadFile("/workspace/output.txt");
+    console.log(new TextDecoder().decode(bytes));
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    data = sandbox.download_file('/workspace/output.txt')
+    data = sandbox.download_file("/workspace/output.txt")
     print(data.decode())
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     data, err := sandbox.DownloadFile(ctx, "/workspace/output.txt")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(string(data))
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let data = sandbox.download_file("/workspace/output.txt")?;
+    println!("{}", String::from_utf8_lossy(&data));
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     byte[] data = sandbox.downloadFile("/workspace/output.txt");
-    System.out.println(new String(data));
+    System.out.println(new String(data, StandardCharsets.UTF_8));
     ```
   </TabItem>
 </Tabs>
 
-## Common Patterns
+If the file does not exist, the call fails with a "not found" error (HTTP 404). Asking for a folder instead of a file also fails.
 
-### Upload and run a script
+## Upload a script and run it
+
+A common pattern: send your code in as a file, then run it with [`exec`](/exec-streaming/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.uploadFile('/run.sh', Buffer.from('#!/bin/bash\necho hello'))
-    const result = await sandbox.exec({ command: 'bash /run.sh' })
-    console.log(result.stdout)
+    await sandbox.uploadFile("/workspace/run.sh", "#!/bin/sh\necho hello from a script");
+    const result = await sandbox.exec("sh /workspace/run.sh");
+    console.log(result.stdout); // hello from a script
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.upload_file('/run.sh', b'#!/bin/bash\necho hello')
-    result = sandbox.exec_command('bash /run.sh')
-    print(result['stdout'])
+    sandbox.upload_file("/workspace/run.sh", b"#!/bin/sh\necho hello from a script")
+    result = sandbox.exec("sh /workspace/run.sh")
+    print(result["stdout"])  # hello from a script
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    _ = sandbox.UploadFile(ctx, "/run.sh", []byte("#!/bin/bash\necho hello"))
-    result, err := sandbox.ExecCommand(ctx, "bash /run.sh")
-    fmt.Println(result.Stdout)
+    err := sandbox.UploadFile(ctx, "/workspace/run.sh", []byte("#!/bin/sh\necho hello from a script"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    result, err := sandbox.ExecCommand(ctx, "sh /workspace/run.sh")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout) // hello from a script
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.upload_file("/run.sh", b"#!/bin/bash\necho hello")?;
-    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
-        command: "bash /run.sh".to_string(),
-        ..Default::default()
-    })?;
-    println!("{}", result.stdout);
+    sandbox.upload_file("/workspace/run.sh", b"#!/bin/sh\necho hello from a script".to_vec())?;
+    let result = sandbox.exec("sh /workspace/run.sh")?;
+    print!("{}", result.stdout); // hello from a script
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.uploadFile("/run.sh", "#!/bin/bash\necho hello".getBytes());
-    ExecResult result = sandbox.exec(new ExecOptions().setCommand("bash /run.sh"));
-    System.out.println(result.stdout);
+    sandbox.uploadFile("/workspace/run.sh",
+        "#!/bin/sh\necho hello from a script".getBytes(StandardCharsets.UTF_8));
+    ExecResult result = sandbox.exec("sh /workspace/run.sh");
+    System.out.print(result.stdout); // hello from a script
     ```
   </TabItem>
 </Tabs>
 
-### Retrieve generated output
+## Get back what your code wrote
+
+Run a command that writes a file, then download it. Here Python in the sandbox writes JSON, and your app reads it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.exec({ command: 'python3 -c "import json; json.dump({\'x\': 1}, open(\'/out.json\', \'w\'))"' })
-    const bytes = await sandbox.downloadFile('/out.json')
-    const data  = JSON.parse(bytes.toString())
+    await sandbox.exec(`python3 -c "import json; json.dump({'x': 1}, open('/tmp/out.json', 'w'))"`);
+    const bytes = await sandbox.downloadFile("/tmp/out.json");
+    const data = JSON.parse(new TextDecoder().decode(bytes));
+    console.log(data.x); // 1
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.exec_command("python3 -c \"import json; json.dump({'x': 1}, open('/out.json', 'w'))\"")
-    data = sandbox.download_file('/out.json')
     import json
-    print(json.loads(data))
+
+    sandbox.exec("python3 -c \"import json; json.dump({'x': 1}, open('/tmp/out.json', 'w'))\"")
+    data = json.loads(sandbox.download_file("/tmp/out.json"))
+    print(data["x"])  # 1
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    sandbox.ExecCommand(ctx, `python3 -c "import json; json.dump({'x': 1}, open('/out.json', 'w'))"`)
-    data, _ := sandbox.DownloadFile(ctx, "/out.json")
+    _, err := sandbox.ExecCommand(ctx, `python3 -c "import json; json.dump({'x': 1}, open('/tmp/out.json', 'w'))"`)
+    if err != nil {
+        log.Fatal(err)
+    }
+    data, err := sandbox.DownloadFile(ctx, "/tmp/out.json")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(string(data)) // {"x": 1}
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.exec(aerolvm_sdk::ExecRequest {
-        command: r#"python3 -c "import json; json.dump({'x': 1}, open('/out.json', 'w'))""#.to_string(),
-        ..Default::default()
-    })?;
-    let data = sandbox.download_file("/out.json")?;
+    sandbox.exec(r#"python3 -c "import json; json.dump({'x': 1}, open('/tmp/out.json', 'w'))""#)?;
+    let data = sandbox.download_file("/tmp/out.json")?;
+    println!("{}", String::from_utf8_lossy(&data)); // {"x": 1}
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.exec(new ExecOptions().setCommand("python3 -c \"import json; json.dump({'x': 1}, open('/out.json', 'w'))\""));
-    byte[] data = sandbox.downloadFile("/out.json");
+    sandbox.exec("python3 -c \"import json; json.dump({'x': 1}, open('/tmp/out.json', 'w'))\"");
+    byte[] data = sandbox.downloadFile("/tmp/out.json");
+    System.out.println(new String(data, StandardCharsets.UTF_8)); // {"x": 1}
     ```
   </TabItem>
 </Tabs>
 
-## Limits
+## Copy a whole folder
 
-File uploads are limited to 256 MB by default. For larger transfers, use [External Storage](/external-storage) to mount an S3 bucket or NFS share directly into the sandbox.
+Upload and download work on one file at a time. To move a folder, pack it into one file with `tar` inside the sandbox, then download that file:
+
+```bash
+tar czf /tmp/results.tar.gz -C /workspace results
+```
+
+Run that line with `exec`, then download `/tmp/results.tar.gz`. To send a folder in, do the reverse: upload a `.tar.gz` file, then unpack it with `tar xzf`.
+
+## Move big files without filling memory
+
+Most SDK calls hold the whole file in memory while they copy it. The Go SDK also has streaming versions that copy a file piece by piece:
+
+- `UploadFileStream(ctx, path, reader)` reads from any `io.Reader`, such as an open file.
+- `DownloadFileStream(ctx, path)` returns an `io.ReadCloser`. You must close it. Closing it early stops the download, so reading only the start of a big file is cheap.
+
+## Good to know
+
+- **Use full paths** that start with `/`.
+- **One upload can be up to 256 MB.** For bigger data, [attach cloud storage](/external-storage/) or a [platform volume](/platform-volumes/) instead.
+- **The sandbox must be running.** Start a stopped sandbox before you copy files.
+- **Uploaded files belong to `root`** and everyone can read them (`rw-r--r--`). If a program running as another user must change a file, fix its owner with `chown` through `exec`.
+- **There is no SDK call to list a folder.** Run `ls` with `exec`, or use `aerolvm ls` from the [CLI](/cli/).
+- **V8 isolate sandboxes have no files.** See [V8 isolate](/isolate-sandbox/).
+
+<Aside type="tip">
+From a terminal, `aerolvm cp ./data.csv my-box:/work/data.csv` copies a file in, and `aerolvm cp my-box:/work/report.html .` copies one out. See the [aerolvm CLI](/cli/).
+</Aside>
+
+## Next steps
+
+- [Run commands](/exec-streaming/): run the code you uploaded.
+- [Attach cloud storage](/external-storage/): mount an S3 bucket or network share for large or lasting data.
+- [Platform volumes](/platform-volumes/): keep files after a sandbox is deleted.
+- [Snapshots](/snapshots/): save a sandbox's files as an image to start new sandboxes from.

@@ -1,22 +1,27 @@
 ---
-title: Network Usage
+title: Usage and limits
+description: Count the bytes a sandbox sends and receives, cap them, and raise or remove a cap while it runs.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Every sandbox has a per-direction byte counter and an optional cap. You can set the cap at create time, read live counters, and raise or lift the cap while the sandbox is running.
+Every sandbox counts the bytes it receives and the bytes it sends. You can also give each direction a cap. When a sandbox reaches a cap, traffic in that direction stops until you raise it.
 
-## Create a sandbox with limits
+Use caps when a sandbox needs the internet but should not use too much of it, such as an agent that downloads files. You set caps at create, read the counters at any time, and raise or remove a cap while the sandbox runs.
 
-Caps are optional fields on the create request. Either or both can be set; omit a field (or pass `0`) to leave it unlimited.
+To control *where* a sandbox can connect instead of *how much*, see [Block or allow the internet](/network-isolation/) and [Allow only some websites](/egress-domain-filtering/).
+
+## Create a sandbox with caps
+
+Both caps are optional. Leave one out, or pass `0`, to keep that direction unlimited. This sandbox can receive 1 GiB and send 5 GiB:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
       image: 'ubuntu:22.04',
-      networkBytesInLimit:  1 * 1024 * 1024 * 1024, // 1 GiB ingress
-      networkBytesOutLimit: 5 * 1024 * 1024 * 1024, // 5 GiB egress
+      networkBytesInLimit:  1 * 1024 * 1024 * 1024, // 1 GiB received
+      networkBytesOutLimit: 5 * 1024 * 1024 * 1024, // 5 GiB sent
     })
     ```
   </TabItem>
@@ -62,9 +67,14 @@ Caps are optional fields on the create request. Either or both can be set; omit 
   </TabItem>
 </Tabs>
 
-## Read current usage
+| Option | What it does | Default |
+|---|---|---|
+| `networkBytesInLimit` | The most bytes the sandbox may receive in its lifetime. | `0` (unlimited) |
+| `networkBytesOutLimit` | The most bytes the sandbox may send in its lifetime. | `0` (unlimited) |
 
-`getNetworkUsage` returns the latest cumulative counters, the active caps, and whether the quota has been exceeded.
+## Read the counters
+
+`getNetworkUsage` returns the counters, the caps, and whether a cap has been reached.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -104,29 +114,29 @@ Caps are optional fields on the create request. Either or both can be set; omit 
   </TabItem>
 </Tabs>
 
-The response shape:
+The fields below use the TypeScript, Python and Java names. Go capitalizes them (`BytesIn`), and Rust uses snake case (`bytes_in`).
 
-| Field | Meaning |
+| Field | What it means |
 |---|---|
-| `bytes_in` / `bytes_out` | Cumulative ingress / egress in bytes since the sandbox was created. |
-| `bytes_in_limit` / `bytes_out_limit` | Active cap. `0` means unlimited. |
-| `quota_exceeded` | `true` if either direction has hit its cap. The drop rule is installed while this is true. |
-| `quota_exceeded_at` | RFC 3339 timestamp of when the quota was first hit. Cleared when the cap is raised. |
-| `last_sampled_at` | RFC 3339 timestamp of the last counter sample. **Absent until the netstats poller has produced at least one sample** - typically up to one poll interval after a sandbox starts. |
+| `bytesIn` / `bytesOut` | Total bytes received and sent since the sandbox was created. |
+| `bytesInLimit` / `bytesOutLimit` | The current caps. `0` means unlimited. |
+| `quotaExceeded` | `true` once either direction reaches its cap. While it is `true`, traffic in the capped direction is dropped. |
+| `quotaExceededAt` | When a cap was first reached, as an RFC 3339 time (like `2026-10-10T14:03:00Z`). Cleared when you raise the cap. |
+| `lastSampledAt` | When the server last read the counters. Missing until the first reading, which can take up to one sampling period (10 seconds by default) after the server starts. |
 
-## Raise or lift the limits at runtime
+## Raise or remove a cap while it runs
 
-`setNetworkLimits` is a PATCH - only the fields you set are changed. Pass `0` to lift a cap (back to unlimited), or a higher number to raise it. Omit a field to leave it alone.
+`setNetworkLimits` changes only the caps you pass. Pass a higher number to raise a cap, or `0` to remove it. Leave a cap out to keep it as it is.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    // Raise the egress cap to 20 GiB; leave ingress alone.
+    // Raise the sent-bytes cap to 20 GiB; leave the received cap alone.
     const usage = await sandbox.setNetworkLimits({
       networkBytesOutLimit: 20 * 1024 * 1024 * 1024,
     })
 
-    // Lift the ingress cap entirely (0 = unlimited).
+    // Remove the received-bytes cap (0 = unlimited).
     await sandbox.setNetworkLimits({ networkBytesInLimit: 0 })
     ```
   </TabItem>
@@ -186,4 +196,24 @@ The response shape:
   </TabItem>
 </Tabs>
 
-When the new cap is above current usage, the per-IP drop is removed immediately and traffic flows again. When the new cap is still below usage, the drop stays in place until usage falls back under the limit (which only happens when you raise it further or destroy the sandbox).
+If the new cap is above the current count, traffic flows again at once. If it is still below, the block stays. The counters never go down, so the block lasts until you raise the cap above the count or destroy the sandbox.
+
+## Good to know
+
+- **Caps are checked on each reading.** The server reads the counters every 10 seconds by default. A fast transfer can go past a cap before the block starts.
+- **Received bytes are counted after they arrive.** A cap stops further traffic. It cannot undo bytes the sandbox already received.
+- **A cap does not undo block-all.** Raising or removing the sent-bytes cap never lifts `networkBlockAll`. Both use the same block.
+- **IPv4 only.** The counters and caps cover IPv4 traffic, as with [Block or allow the internet](/network-isolation/).
+- **Linux servers only.** On Docker sandboxes the block is applied by the server's firewall, which runs only on Linux.
+- **Not on Firecracker yet.** A Firecracker sandbox refuses byte caps with `501`, at create and with `setNetworkLimits`.
+
+## For server operators
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_NETSTATS_POLL_INTERVAL` | How often the server reads every sandbox's byte counters and checks the caps. | `10s` |
+
+## Next steps
+
+- [Block or allow the internet](/network-isolation/): turn outbound traffic off, or limit it to IP address ranges.
+- [Allow only some websites](/egress-domain-filtering/): let a sandbox reach only the sites you name.
