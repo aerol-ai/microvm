@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -116,7 +117,8 @@ func TestListDevboxesInClusterMode(t *testing.T) {
 	if len(page.Devboxes) != 1 || page.Devboxes[0].ID != first || !page.HasMore {
 		t.Fatalf("cold page = %+v", page)
 	}
-	if got := stripListPaging("limit=2&starting_after=x&include_total_count=true&status=running&nextToken=1"); got != "status=running" {
+	q, _ := url.ParseQuery("limit=2&starting_after=x&include_total_count=true&status=running&nextToken=1")
+	if got := stripListPaging(q); got != "status=running" {
 		t.Fatalf("stripListPaging = %q", got)
 	}
 }

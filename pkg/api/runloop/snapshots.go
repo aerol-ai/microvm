@@ -44,6 +44,12 @@ type snapshotBlob struct {
 	CommitMessage string            `json:"commit_message,omitempty"`
 }
 
+// encode marshals the blob; strings and a string map cannot fail to.
+func (b snapshotBlob) encode() string {
+	encoded, _ := json.Marshal(b)
+	return string(encoded)
+}
+
 type snapshotMeta struct {
 	owner    string
 	devboxID string
@@ -205,14 +211,9 @@ func (h *handlers) writeSnapshotFlight(w http.ResponseWriter, r *http.Request, f
 // startSnapshot claims the snapshot for this request's retry-stable id and
 // starts it in the background when this is the first attempt.
 func (h *handlers) startSnapshot(w http.ResponseWriter, r *http.Request, devboxID string) (*flight[snapshotMeta, *models.SandboxSnapshot], bool) {
-	raw, err := readJSONBody(w, r)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid JSON body")
-		return nil, false
-	}
 	var req snapshotRequest
-	if err := decodeJSONBytes(raw, &req); err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid JSON body")
+	raw, ok := readBody(w, r, &req)
+	if !ok {
 		return nil, false
 	}
 	if _, err := h.deps.Service.GetSandbox(r.Context(), devboxID); err != nil {
@@ -246,15 +247,12 @@ func (h *handlers) runSnapshot(ctx context.Context, devboxID, id string, blob sn
 	if err != nil {
 		return nil, err
 	}
-	stateJSON, err := json.Marshal(blob)
-	if err == nil {
-		err = h.deps.Service.UpsertSnapshotAlias(ctx, models.SnapshotAlias{
-			Alias:        id,
-			SnapshotName: snapshot.Name,
-			Facade:       models.FacadeRunloop,
-			StateJSON:    string(stateJSON),
-		})
-	}
+	err = h.deps.Service.UpsertSnapshotAlias(ctx, models.SnapshotAlias{
+		Alias:        id,
+		SnapshotName: snapshot.Name,
+		Facade:       models.FacadeRunloop,
+		StateJSON:    blob.encode(),
+	})
 	if err != nil {
 		if created {
 			if deleteErr := h.deps.Service.DeleteSnapshot(context.WithoutCancel(ctx), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
@@ -321,7 +319,7 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	views := make([]snapshotView, 0, len(snapshots))
 	for _, snapshot := range snapshots {
-		if snapshot == nil || (devboxFilter != "" && snapshot.SourceSandboxID != devboxFilter) {
+		if devboxFilter != "" && snapshot.SourceSandboxID != devboxFilter {
 			continue
 		}
 		var alias *models.SnapshotAlias
@@ -423,16 +421,11 @@ func (h *handlers) updateSnapshot(w http.ResponseWriter, r *http.Request, id str
 	if req.Metadata != nil {
 		blob.Metadata = cloneStringMap(req.Metadata)
 	}
-	stateJSON, err := json.Marshal(blob)
-	if err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
 	// A snapshot taken outside this facade gets its first runloop alias
 	// here, under its snx- id — never under the id the caller passed,
 	// which may be another facade's alias row that this upsert would
 	// otherwise take over.
-	updated := models.SnapshotAlias{Alias: snapshotIDForName(snapshot.Name), SnapshotName: snapshot.Name, Facade: models.FacadeRunloop, StateJSON: string(stateJSON)}
+	updated := models.SnapshotAlias{Alias: snapshotIDForName(snapshot.Name), SnapshotName: snapshot.Name, Facade: models.FacadeRunloop, StateJSON: blob.encode()}
 	if alias != nil {
 		updated.Alias, updated.ExtraNames, updated.CreatedAt = alias.Alias, alias.ExtraNames, alias.CreatedAt
 	}

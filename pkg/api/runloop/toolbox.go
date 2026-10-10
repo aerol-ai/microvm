@@ -57,10 +57,9 @@ func (h *handlers) toolboxCall(ctx context.Context, devboxID, method, path strin
 	headers.Set("Accept", "application/json")
 	var reader io.Reader
 	if body != nil {
-		payload, err := json.Marshal(body)
-		if err != nil {
-			return 0, err
-		}
+		// Every body here is plain strings, bools and string maps, which
+		// json.Marshal cannot fail on.
+		payload, _ := json.Marshal(body)
 		reader = bytes.NewReader(payload)
 		headers.Set("Content-Type", "application/json")
 	}

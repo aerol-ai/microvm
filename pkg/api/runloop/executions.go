@@ -31,10 +31,6 @@ const (
 	ephemeralPrefix = "rlx-"
 	shellPrefix     = "rls-"
 
-	// execWaitMax is Runloop's cap on an execution wait_for_status hold
-	// and on execute's optimistic_timeout.
-	execWaitMax = 25 * time.Second
-
 	defaultLastN = 100
 
 	// maxCapturedStream keeps the tail of each captured stream. The toolbox
@@ -50,9 +46,19 @@ const (
 
 	// killedExitStatus reports an execution ended by kill: 128 + SIGKILL.
 	killedExitStatus = 137
+)
 
+// Holds and limits that tests shorten.
+var (
+	// execWaitMax is Runloop's cap on an execution wait_for_status hold
+	// and on execute's optimistic_timeout.
+	execWaitMax = 25 * time.Second
+	// watchMaxErrors is how many consecutive toolbox failures a watcher
+	// tolerates before leaving the session for a reader to clean up.
 	watchMaxErrors = 30
-	sseHeartbeat   = 15 * time.Second
+	// sseHeartbeat keeps an idle output stream inside the SDK's 30s read
+	// timeout.
+	sseHeartbeat = 15 * time.Second
 )
 
 // execRef addresses one execution inside the toolbox.
@@ -349,9 +355,6 @@ func (h *handlers) executeSync(w http.ResponseWriter, r *http.Request, devboxID 
 			})
 			return
 		}
-		if r.Context().Err() != nil {
-			return
-		}
 	}
 }
 
@@ -454,11 +457,9 @@ func (h *handlers) awaitSubmitted(ctx context.Context, devboxID, session string)
 	for {
 		sess, err := h.getSession(ctx, devboxID, session)
 		if err != nil {
-			if isToolboxNotFound(err) {
-				// Captured and cleaned up between our claim and this read.
-				if _, ok := h.execs.result(resultKey(devboxID, session)); ok {
-					return nil
-				}
+			// Captured and cleaned up between our claim and this read.
+			if _, ok := h.execs.result(resultKey(devboxID, session)); ok {
+				return nil
 			}
 			return err
 		}
@@ -487,6 +488,7 @@ func (h *handlers) startWatcher(ctx context.Context, devboxID string, ref execRe
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
+	maxErrors := watchMaxErrors // read once: the goroutine outlives this call
 	go func() {
 		defer h.execs.unwatch(rkey)
 		backoff := 100 * time.Millisecond
@@ -500,7 +502,7 @@ func (h *handlers) startWatcher(ctx context.Context, devboxID string, ref execRe
 				if isToolboxNotFound(err) {
 					return
 				}
-				if failures++; failures >= watchMaxErrors {
+				if failures++; failures >= maxErrors {
 					if h.deps.Logger != nil {
 						h.deps.Logger.Warn("runloop execution watcher giving up", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
 					}
@@ -538,15 +540,26 @@ func stateFromResult(ref execRef, res *execResult) execState {
 // execution is captured and its session deleted here, whichever caller
 // sees it first — the watcher normally, or any reader after a restart
 // lost the watcher.
+//
+// Readers race the cleanup: a reader can see the session and the finished
+// command, then lose the session to the watcher (capture first, delete
+// second) before its logs read. Any failure is therefore re-checked
+// against the capture, whatever step of the read it came from.
 func (h *handlers) liveState(ctx context.Context, devboxID string, ref execRef) (execState, error) {
-	rkey := resultKey(devboxID, ref.id())
+	state, err := h.readLiveState(ctx, devboxID, ref)
+	if err != nil {
+		if res, ok := h.execs.result(resultKey(devboxID, ref.id())); ok {
+			return stateFromResult(ref, res), nil
+		}
+	}
+	return state, err
+}
+
+func (h *handlers) readLiveState(ctx context.Context, devboxID string, ref execRef) (execState, error) {
 	cid := ref.command
 	if cid == "" {
 		sess, err := h.getSession(ctx, devboxID, ref.session)
 		if err != nil {
-			if res, ok := h.execs.result(rkey); ok {
-				return stateFromResult(ref, res), nil
-			}
 			return execState{}, err
 		}
 		if len(sess.Commands) == 0 {
@@ -556,9 +569,6 @@ func (h *handlers) liveState(ctx context.Context, devboxID string, ref execRef) 
 	}
 	cmd, err := h.getCommand(ctx, devboxID, ref.session, cid)
 	if err != nil {
-		if res, ok := h.execs.result(rkey); ok {
-			return stateFromResult(ref, res), nil
-		}
 		return execState{}, err
 	}
 	if cmd.ExitCode == nil {
@@ -576,7 +586,7 @@ func (h *handlers) liveState(ctx context.Context, devboxID string, ref execRef) 
 	}
 	if ref.command == "" {
 		res := h.execs.record(&execResult{
-			key: rkey, stdout: stdout, stderr: stderr,
+			key: resultKey(devboxID, ref.id()), stdout: stdout, stderr: stderr,
 			stdoutCut: stdoutCut, stderrCut: stderrCut, exit: state.exit,
 		})
 		if err := h.deleteSession(ctx, devboxID, ref.session); err != nil && h.deps.Logger != nil {

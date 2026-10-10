@@ -63,14 +63,9 @@ func (h *handlers) createAndAwaitRunning(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
-	raw, err := readJSONBody(w, r)
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
 	var req createDevboxRequest
-	if err := decodeJSONBytes(raw, &req); err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid JSON body")
+	raw, ok := readBody(w, r, &req)
+	if !ok {
 		return
 	}
 	serviceReq, blob, err := h.translateCreate(r.Context(), req)
@@ -79,18 +74,15 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Derive the id from the retry-stable request id, or mint a fresh one.
-	// A forwarded create re-derives the same id on the target (same
-	// header, body and caller); Prepare's reservation id is authoritative
-	// either way. The cluster id header is deliberately not read here: in
-	// single-node mode nothing authenticates it, and a caller must not
-	// pick its own devbox id.
-	var id string
+	// Derive the id from the retry-stable request id, or mint a fresh one
+	// (the same sb-<16 hex> shape the service generates). A forwarded
+	// create re-derives the same id on the target (same header, body and
+	// caller); Prepare's reservation id is authoritative either way. The
+	// cluster id header is deliberately not read here: in single-node mode
+	// nothing authenticates it, and a caller must not pick its own id.
+	id := "sb-" + randomHex()
 	if requestID := strings.TrimSpace(r.Header.Get("X-Request-Id")); requestID != "" {
 		id = devboxIDForRequest(service.OwnerRefForCreate(r.Context()), requestID, raw)
-	} else if id, err = service.GenerateSandboxID(); err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
 	}
 
 	// Retry of a create that already finished: answer from the row.
@@ -284,14 +276,20 @@ func trimPtr(value *string) string {
 	return strings.TrimSpace(*value)
 }
 
-// readJSONBody reads the capped request body. The TS SDK sends
+// readBody reads the capped request body into dst and returns the raw
+// bytes for callers that hash or replay them. The TS SDK sends
 // Content-Type: application/json with no body on every bodiless POST, so
 // an empty body is a valid empty object here.
-func readJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
-	if r.Body == nil {
-		return nil, nil
+func readBody(w http.ResponseWriter, r *http.Request, dst any) ([]byte, bool) {
+	raw, err := apihttp.ReadJSONBody(w, r)
+	if err == nil {
+		err = decodeJSONBytes(raw, dst)
 	}
-	return apihttp.ReadJSONBody(w, r)
+	if err != nil {
+		WriteError(w, http.StatusBadRequest, "invalid JSON body")
+		return nil, false
+	}
+	return raw, true
 }
 
 func decodeJSONBytes(raw []byte, dst any) error {
@@ -308,15 +306,8 @@ func decodeJSONBytes(raw []byte, dst any) error {
 	return nil
 }
 
-// decodeBody reads and decodes an optional JSON body in one step.
+// decodeBody is readBody for callers that only need the decoded value.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	raw, err := readJSONBody(w, r)
-	if err == nil {
-		err = decodeJSONBytes(raw, dst)
-	}
-	if err != nil {
-		WriteError(w, http.StatusBadRequest, "invalid JSON body")
-		return false
-	}
-	return true
+	_, ok := readBody(w, r, dst)
+	return ok
 }

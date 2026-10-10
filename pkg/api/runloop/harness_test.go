@@ -40,6 +40,9 @@ type fakeRuntime struct {
 	lastReq     models.CreateSandboxRequest
 
 	blockSnapshot chan struct{}
+	errStart      error
+	errStop       error
+	errDestroy    error
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -66,6 +69,9 @@ func (f *fakeRuntime) Create(_ context.Context, req models.CreateSandboxRequest,
 func (f *fakeRuntime) Start(_ context.Context, ref string) (*models.SandboxRuntimeState, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errStart != nil {
+		return nil, f.errStart
+	}
 	state, ok := f.lookup(ref)
 	if !ok {
 		return nil, fmt.Errorf("sandbox %q not found", ref)
@@ -78,6 +84,9 @@ func (f *fakeRuntime) Start(_ context.Context, ref string) (*models.SandboxRunti
 func (f *fakeRuntime) Stop(_ context.Context, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errStop != nil {
+		return f.errStop
+	}
 	state, ok := f.lookup(ref)
 	if !ok {
 		return fmt.Errorf("sandbox %q not found", ref)
@@ -89,6 +98,9 @@ func (f *fakeRuntime) Stop(_ context.Context, ref string) error {
 func (f *fakeRuntime) Destroy(_ context.Context, sandbox *models.Sandbox) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.errDestroy != nil {
+		return f.errDestroy
+	}
 	if sandbox != nil {
 		delete(f.states, sandbox.ID)
 	}
@@ -167,6 +179,12 @@ type fakeToolbox struct {
 	inputs   []string
 	failNext map[string]int // path → status to fail the next request with
 	execs    int
+
+	// Persistent faults, matched by path suffix until cleared.
+	failSuffix map[string]int
+	badJSON    map[string]bool
+	home       string // $HOME the one-shot exec reports; "" = /home/user
+	badCmdID   bool   // exec answers a non-hex command id
 }
 
 type fakeSession struct {
@@ -183,11 +201,26 @@ type fakeCommand struct {
 
 func newFakeToolbox() *fakeToolbox {
 	return &fakeToolbox{
-		sessions: make(map[string]*fakeSession),
-		files:    make(map[string][]byte),
-		release:  make(map[string]chan struct{}),
-		failNext: make(map[string]int),
+		sessions:   make(map[string]*fakeSession),
+		files:      make(map[string][]byte),
+		release:    make(map[string]chan struct{}),
+		failNext:   make(map[string]int),
+		failSuffix: make(map[string]int),
+		badJSON:    make(map[string]bool),
 	}
+}
+
+func (f *fakeToolbox) failAlways(suffix string, status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failSuffix[suffix] = status
+}
+
+func (f *fakeToolbox) clearFaults() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failSuffix = make(map[string]int)
+	f.badJSON = make(map[string]bool)
 }
 
 // script decides a command's result.
@@ -251,6 +284,28 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"injected failure"}`, status)
 		return
 	}
+	for suffix, status := range f.failSuffix {
+		// "DELETE /x" fails only that method; "/x" fails every method.
+		if method, path, ok := strings.Cut(suffix, " "); ok {
+			if method != r.Method {
+				continue
+			}
+			suffix = path
+		}
+		if strings.HasSuffix(r.URL.Path, suffix) {
+			f.mu.Unlock()
+			w.WriteHeader(status) // empty body: exercises the status-text fallback
+			return
+		}
+	}
+	for suffix := range f.badJSON {
+		if strings.HasSuffix(r.URL.Path, suffix) {
+			f.mu.Unlock()
+			_, _ = io.WriteString(w, "{not json")
+			return
+		}
+	}
+	home := f.home
 	f.mu.Unlock()
 
 	path := r.URL.Path
@@ -260,7 +315,10 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/process/execute":
 		var req models.ExecRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		writeJSON(w, http.StatusOK, models.ExecResult{Stdout: "/home/user", ExitCode: 0})
+		if home == "" {
+			home = "/home/user"
+		}
+		writeJSON(w, http.StatusOK, models.ExecResult{Stdout: home, ExitCode: 0})
 	case path == "/process/session" && r.Method == http.MethodPost:
 		var req struct {
 			SessionID string `json:"sessionId"`
@@ -343,6 +401,7 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 		f.execs++
 		cmd := &fakeCommand{id: fmt.Sprintf("%016x", f.cmdSeq), command: req.Command}
 		sess.commands = append(sess.commands, cmd)
+		badCmdID := f.badCmdID
 		var wait chan struct{}
 		if strings.HasPrefix(req.Command, "block") {
 			wait = f.release[req.Command]
@@ -362,6 +421,10 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 			go func() { <-wait; finish() }()
 		} else {
 			finish()
+		}
+		if badCmdID {
+			writeJSON(w, http.StatusOK, map[string]string{"cmdId": "not-hex"})
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"cmdId": cmd.id})
 	case strings.HasPrefix(action, "command/"):

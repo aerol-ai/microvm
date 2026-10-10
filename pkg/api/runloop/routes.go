@@ -65,15 +65,11 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 
 func (h *handlers) route(w http.ResponseWriter, r *http.Request) {
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, devboxesPath), "/")
+	// ServeMux has already redirected any non-clean path, so no segment
+	// here is empty.
 	var segs []string
 	if rest != "" {
 		segs = strings.Split(rest, "/")
-	}
-	for _, seg := range segs {
-		if seg == "" {
-			WriteError(w, http.StatusNotFound, "not found")
-			return
-		}
 	}
 
 	switch {

@@ -168,13 +168,8 @@ func writeWaitTimeout(w http.ResponseWriter) {
 // sleepUntil waits for the next poll, a signal, or the deadline. It
 // reports false when the request context ended.
 func sleepUntil(ctx context.Context, deadline time.Time, interval time.Duration, signal <-chan struct{}) bool {
-	wait := time.Until(deadline)
-	if wait > interval {
-		wait = interval
-	}
-	if wait < 0 {
-		wait = 0
-	}
+	// A deadline already past makes the timer fire at once.
+	wait := min(time.Until(deadline), interval)
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
@@ -220,9 +215,6 @@ func (h *handlers) listDevboxes(w http.ResponseWriter, r *http.Request) {
 	}
 	local := make([]devboxView, 0, len(sandboxes))
 	for _, sandbox := range sandboxes {
-		if sandbox == nil {
-			continue
-		}
 		if peerIDs != nil {
 			if _, ok := peerIDs[sandbox.ID]; !ok {
 				continue
@@ -293,7 +285,7 @@ func (h *handlers) listClusterDevboxes(w http.ResponseWriter, r *http.Request, c
 	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(v devboxView) string { return v.ID }, clusterlist.Options{
 		OwnerRef:   ownerRef,
 		AuthHeader: r.Header.Get("Authorization"),
-		RawQuery:   stripListPaging(r.URL.RawQuery),
+		RawQuery:   stripListPaging(r.URL.Query()),
 		Path:       devboxesPath,
 		Transport:  clusterlist.TransportFromCluster(c),
 		SelfNodeID: c.SelfNodeID(),
@@ -326,14 +318,9 @@ func (h *handlers) listClusterDevboxes(w http.ResponseWriter, r *http.Request, c
 // clusterClient returns the cluster client when this node is a real
 // cluster member; nil in single-node mode.
 func (h *handlers) clusterClient() cluster.Client {
-	if h.deps.Service == nil {
-		return nil
-	}
 	c := h.deps.Service.Cluster()
-	if c == nil {
-		return nil
-	}
-	if _, ok := c.(*cluster.Noop); ok {
+	switch c.(type) {
+	case nil, *cluster.Noop:
 		return nil
 	}
 	return c
@@ -341,13 +328,14 @@ func (h *handlers) clusterClient() cluster.Client {
 
 // stripListPaging drops the paging keys so each peer returns its whole
 // slice of the placement page; the ingress pages once after the merge.
-func stripListPaging(rawQuery string) string {
-	vals, err := url.ParseQuery(rawQuery)
-	if err != nil {
-		return ""
-	}
-	for _, key := range []string{"limit", "starting_after", "include_total_count"} {
-		vals.Del(key)
+func stripListPaging(query url.Values) string {
+	vals := url.Values{}
+	for key, values := range query {
+		switch key {
+		case "limit", "starting_after", "include_total_count":
+		default:
+			vals[key] = values
+		}
 	}
 	return clusterlist.StripFacadePagination(vals.Encode())
 }

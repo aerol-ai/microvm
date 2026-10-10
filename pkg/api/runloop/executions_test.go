@@ -2,6 +2,7 @@ package runloop
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -287,6 +288,30 @@ func deref(s *string) string {
 		return "<nil>"
 	}
 	return *s
+}
+
+// TestLiveStateFallsBackWhenWatcherCleansUp pins the race the go-race CI job
+// hit: a reader sees the session and the finished command, then the
+// watcher captures the result and deletes the session before the reader's
+// logs read, which 404s. The reader must answer from the capture.
+func TestLiveStateFallsBackWhenWatcherCleansUp(t *testing.T) {
+	env := newTestEnv(t)
+	devbox := env.mustCreate(t, "")
+	ref := execRef{session: ephemeralPrefix + "0123456789abcdef"}
+	exit := int32(0)
+	env.toolbox.mu.Lock()
+	env.toolbox.sessions[ref.session] = &fakeSession{commands: []*fakeCommand{{id: "00000000000000aa", command: "echo raced", exitCode: &exit, stdout: "raced\n"}}}
+	env.toolbox.mu.Unlock()
+	env.h.execs.record(&execResult{key: resultKey(devbox.ID, ref.id()), stdout: "raced\n"})
+	env.toolbox.setFailNext("/process/session/"+ref.session+"/command/00000000000000aa/logs", http.StatusNotFound)
+
+	state, err := env.h.liveState(context.Background(), devbox.ID, ref)
+	if err != nil {
+		t.Fatalf("liveState after cleanup race: %v", err)
+	}
+	if !state.completed || state.stdout != "raced\n" {
+		t.Fatalf("state = %+v", state)
+	}
 }
 
 func TestTailLines(t *testing.T) {
