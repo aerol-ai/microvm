@@ -63,6 +63,20 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   },
   {
     type: 'group',
+    label: 'Runtimes',
+    category: NavigationCategory.RUNTIMES,
+    entries: [
+      link('/container-sandbox', 'Containers (Docker)'),
+      link('/gpu-sandboxes', 'GPU'),
+      link('/gvisor-sandbox', 'gVisor'),
+      link('/firecracker-sandbox', 'Firecracker'),
+      link('/wasm-sandbox', 'WebAssembly (WASM)'),
+      // link('/wasm-networking', 'WASM networking'),
+      link('/isolate-sandbox', 'V8 isolate'),
+    ],
+  },
+  {
+    type: 'group',
     label: 'Sandboxes',
     category: NavigationCategory.SANDBOXES,
     entries: [
@@ -80,20 +94,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       
     ],
   },
-  {
-    type: 'group',
-    label: 'Runtimes',
-    category: NavigationCategory.RUNTIMES,
-    entries: [
-      link('/container-sandbox', 'Containers (Docker)'),
-      link('/gpu-sandboxes', 'GPU'),
-      link('/gvisor-sandbox', 'gVisor'),
-      link('/firecracker-sandbox', 'Firecracker'),
-      link('/wasm-sandbox', 'WebAssembly (WASM)'),
-      // link('/wasm-networking', 'WASM networking'),
-      link('/isolate-sandbox', 'V8 isolate'),
-    ],
-  },
+  
   {
     type: 'group',
     label: 'Networking',
