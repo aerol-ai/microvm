@@ -58,6 +58,31 @@
     text-decoration-color: var(--hover-color);
   }
 
+  // Links inside Starlight <Steps> and <Aside> blocks are nested one level
+  // deeper, so the direct-child rules above miss them.
+  > .sl-steps a,
+  > aside a {
+    color: var(--primary-text-color);
+    font-weight: 500;
+    text-decoration: underline;
+    text-decoration-color: var(--active-state-color);
+    text-underline-offset: 3px;
+
+    &:hover {
+      text-decoration-color: var(--hover-color);
+    }
+  }
+
+  // Each step holds paragraphs, code blocks and tabs; without this they sit
+  // flush against each other.
+  > .sl-steps > li > * + * {
+    margin-top: 14px;
+  }
+
+  > .sl-steps > li {
+    padding-bottom: 12px;
+  }
+
   p > code,
   li code,
   strong > code,

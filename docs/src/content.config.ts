@@ -18,589 +18,200 @@ export const collections = {
 
 export enum NavigationCategory {
   OVERVIEW,
-  SANDBOX,
-  TOOLBOX,
-  ACCESS,
+  SANDBOXES,
+  RUN_CODE,
+  RUNTIMES,
+  NETWORKING,
+  STORAGE,
   SDKS,
-  FEATURES,
-  ENGINEERING,
   OPERATIONS,
+  ENGINEERING,
   USE_CASES,
 }
 
+const link = (href: string, label: string) => ({ type: 'link' as const, href, label })
+
+// Every docs page appears exactly once, in reading order: pagination walks
+// this list, so "Next" on one page is the next thing a newcomer should read.
+// Keep it two levels deep (group -> page); deeper nesting is what made the old
+// sidebar hard to scan.
 const getDocsSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
-    label: 'Introduction',
+    label: 'Getting Started',
     category: NavigationCategory.OVERVIEW,
-    homePageHref: '/',
     entries: [
-      {
-        type: 'link',
-        href: '/quick-start',
-        label: 'Quick Start',
-        description: 'Spin up a sandbox and run a command in under five minutes.',
-      },
-      {
-        type: 'link',
-        href: '/comparison',
-        label: 'AerolVM vs Daytona vs e2b',
-        description: 'How AerolVM compares to e2b and Daytona, and why we built it.',
-      },
-      {
-        type: 'group',
-        label: 'Server Setup',
-        homePageHref: '/getting-started',
-        entries: [
-          {
-            type: 'link',
-            href: '/getting-started/local-setup',
-            label: 'Local Setup',
-            description: 'Run AerolVM directly on your Mac or Linux machine for local development.',
-          },
-          {
-            type: 'link',
-            href: '/getting-started/single-node-setup',
-            label: 'Single-Node Setup',
-            description: 'Install AerolVM on one Linux host with domain, TLS, SSH, and optional GPU support.',
-          },
-          {
-            type: 'group',
-            label: 'Cluster',
-            homePageHref: '/cluster-setup',
-            entries: [
-              {
-                type: 'link',
-                href: '/cluster-setup',
-                label: 'Setup',
-                description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
-              },
-              {
-                type: 'link',
-                href: '/cluster-ingress',
-                label: 'Ingress',
-                description: 'Split a cluster into server / worker / ingress roles and front it with a single LB endpoint.',
-              },
-              {
-                type: 'link',
-                href: '/cluster-glossary',
-                label: 'Glossary',
-                description: 'Environment variables, node roles, and quorum reference for AerolVM clusters.',
-              },
-              {
-                type: 'link',
-                href: '/cluster-secrets',
-                label: 'Secrets Providers',
-                description: 'Local vs AWS KMS for sealed cluster credentials, fan-out, and generation-fenced recipient repair.',
-              },
-            ],
-          },
-        ],
-      },
-
-      {
-        type: 'group',
-        label: 'SDK Setup',
-        homePageHref: '/sdk-setup',
-        entries: [
-          {
-            type: 'link',
-            href: '/sdk-setup',
-            label: 'Using AerolVM SDK',
-            description: 'Point the official AerolVM SDK facade.',
-          },
-          {
-            type: 'link',
-            href: '/using-daytona-sdk',
-            label: 'Using Daytona SDK',
-            description: 'Point the official Daytona SDK at AerolVM\'s /daytona compatibility facade.',
-          },
-          {
-            type: 'link',
-            href: '/using-e2b-sdk',
-            label: 'Using E2B SDK',
-            description: 'Point the official E2B SDK at AerolVM\'s /e2b compatibility facade.',
-          },
-        ],
-      },
-      {
-        type: 'group',
-        label: 'CLI & MCP',
-        homePageHref: '/cli',
-        entries: [
-          {
-            type: 'link',
-            href: '/cli',
-            label: 'aerolvm CLI',
-            description: 'Drive sandboxes from a shell, a script, CI, or an AI coding agent.',
-          },
-          {
-            type: 'link',
-            href: '/mcp',
-            label: 'MCP Server',
-            description: 'Give Claude Code, Claude Desktop, Cursor, VS Code and other MCP clients their own sandboxes.',
-          },
-        ],
-      },
+      link('/introduction', 'Introduction'),
+      link('/quick-start', 'Quickstart'),
+      link('/getting-started', 'Choose a setup'),
+      link('/getting-started/local-setup', 'Install on your computer'),
+      link('/getting-started/single-node-setup', 'Install on a server'),
+      link('/comparison', 'AerolVM vs Daytona vs E2B'),
     ],
   },
   {
     type: 'group',
-    label: 'Sandbox',
-    category: NavigationCategory.SANDBOX,
-    homePageHref: '/',
+    label: 'Sandboxes',
+    category: NavigationCategory.SANDBOXES,
     entries: [
-      {
-        type: 'group',
-        label: 'Create Sandbox',
-        homePageHref: '/sandboxes',
-        entries: [
-          {
-            type: 'link',
-            href: '/sandboxes',
-            label: 'Docker',
-            description: 'Create, manage, and resize standard Docker sandboxes.',
-          },
-          {
-            type: 'link',
-            href: '/gpu-sandboxes',
-            label: 'GPU',
-            description: 'Attach NVIDIA, AMD, or Apple Silicon GPUs to a sandbox.',
-          },
-          {
-            type: 'link',
-            href: '/firecracker-sandbox',
-            label: 'Firecracker',
-            description: 'Full microVM isolation with sub-100ms boot times.',
-          },
-          {
-            type: 'link',
-            label: 'WASM',
-            href: '/wasm-sandbox',
-          },
-          {
-            type: 'link',
-            href: '/isolate-sandbox',
-            label: 'Isolate',
-            description: 'V8 isolate sandboxes — push a JS/TS fetch handler, no image.',
-          },
-          {
-            type: 'link',
-            href: '/gvisor-sandbox',
-            label: 'gVisor',
-            description: 'User-space kernel isolation for untrusted code.',
-          },
-        ],
-      },
-      {
-        type: 'group',
-        homePageHref: '/snapshots',
-        label: 'Snapshots',
-        entries: [
-          {
-            type: 'link',
-            href: '/snapshots',
-            label: 'Snapshots',
-            description: 'Capture a running sandbox or register an image as a named, reusable template.',
-          },
-          {
-            type: 'link',
-            href: '/firecracker-templates',
-            label: 'Firecracker Templates',
-            description: 'Register OCI images as Firecracker rootfs templates for sub-100ms cold starts; rebuild on demand.',
-          },
-          {
-            type: 'link',
-            href: '/randomness-in-cloned-sandboxes',
-            label: 'Randomness in Clones',
-            description: 'Why snapshot clones can share random-number state, what AerolVM reseeds automatically, and how to reseed your own long-lived processes.',
-          },
-        ]
-      },
-      {
-        type: 'link',
-        href: '/environment',
-        label: 'Lifecycle + Environment',
-        description: 'Docker image, env vars, resource limits, and idle lifecycle.',
-      },
-      {
-        type: 'link',
-        href: '/external-storage',
-        label: 'Attach Volumes',
-        description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
-      },
-      {
-        type: 'link',
-        href: '/platform-volumes',
-        label: 'Platform Volumes',
-        description: 'Named, operator-backed persistent volumes referenced by name.',
-      },
-      {
-        type: 'group',
-        homePageHref: '/preview',
-        label: 'Preview Publicly',
-        entries: [
-          {
-            type: 'link',
-            href: '/preview',
-            label: 'Preview',
-            description: 'Expose container ports publicly over HTTPS through Caddy routes.',
-          },
-          {
-            type: 'link',
-            href: '/port-allowlist',
-            label: 'Port Allowlist',
-            description: 'Require explicit exposure before public traffic reaches a sandbox port.',
-          },
-          {
-            type: 'link',
-            href: '/custom-domains',
-            label: 'Custom Domains',
-            description: 'Attach arbitrary public hostnames to a sandbox with automatic per-host HTTPS via ACME.',
-          },
-        ]
-      },
-      {
-        type: 'group',
-        homePageHref: '/network-usage',
-        label: 'Network Usage',
-        entries: [
-          {
-            type: 'link',
-            href: '/network-usage',
-            label: 'Network Usage & Quotas',
-            description: 'Per-sandbox ingress / egress byte counters with optional caps that drop traffic when exceeded.',
-          },
-          {
-            type: 'link',
-            href: '/network-isolation',
-            label: 'Network Isolation',
-            description: 'Block egress with host-level firewall rules on a per-sandbox basis.',
-          },
-          {
-            type: 'link',
-            href: '/egress-domain-filtering',
-            label: 'Egress Domain Filtering',
-            description: 'Let a sandbox reach only the hostnames you list, and see what it was refused.',
-          },
-          {
-            type: 'link',
-            href: '/egress-profiles-and-learn-mode',
-            label: 'Egress Profiles and Learn Mode',
-            description: 'Reuse named allow lists, learn one from a trusted run, and check a policy before creating.',
-          },
-          {
-            type: 'link',
-            href: '/egress-rules-and-inspection',
-            label: 'Egress Rules and Inspection',
-            description: 'Allow only some methods and paths on a host, over HTTP and over inspected HTTPS.',
-          }
-        ]
-      },
-      {
-        type: 'link',
-        href: '/serverless',
-        label: 'Serverless',
-        description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
-      },
-      // {
-      //   type: 'link',
-      //   href: '/reconcile',
-      //   label: 'Reconcile',
-      //   description: 'Sync the sandbox database with live container state. Fix capacity errors after a host restart.',
-      // },
-
-      {
-        type: 'link',
-        href: '/sandbox-tags',
-        label: 'Filter Sandbox Tags',
-        description: 'Filter list responses by tag with AND semantics for multi-tenant control planes.',
-      },
-      {
-        type: 'link',
-        href: '/sandbox-env',
-        label: 'Sandbox Environment Variables',
-        description: 'Env is omitted from get/list by default; opt in with include_env across all five SDKs.',
-      },
+      link('/sandboxes', 'Create and manage'),
+      link('/environment', 'Images, resources and lifecycle'),
+      link('/sandbox-env', 'Environment variables'),
+      link('/sandbox-tags', 'Tags'),
+      link('/snapshots', 'Snapshots'),
+      link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
+      link('/serverless', 'Serverless sandboxes'),
+      link('/durability', 'Durability and failover'),
     ],
   },
   {
     type: 'group',
-    label: 'Toolbox',
-    category: NavigationCategory.TOOLBOX,
-    homePageHref: '/',
+    label: 'Run Code and Files',
+    category: NavigationCategory.RUN_CODE,
     entries: [
-      {
-        type: 'link',
-        href: '/file-system',
-        label: 'File System',
-        description: 'Upload and download files into and out of the sandbox.',
-      },
-      {
-        type: 'link',
-        href: '/exec-streaming',
-        label: 'Process & Code Execution',
-        description: 'Live stdout, stderr, PTY sessions, and interactive process control.',
-      },
-      {
-        type: 'link',
-        href: '/sessions',
-        label: 'Sessions',
-        description: 'Persistent PTY sessions that survive reconnects with output replay.',
-      },
-      {
-        type: 'link',
-        href: '/ssh-access',
-        label: 'SSH Access',
-        description: 'Connect over SSH using per-sandbox Ed25519 keys via the gateway.',
-      },
+      link('/exec-streaming', 'Run commands'),
+      link('/file-system', 'Files'),
+      link('/sessions', 'Terminal sessions'),
+      link('/ssh-access', 'SSH access'),
     ],
   },
   {
     type: 'group',
-    label: 'Important Features',
-    category: NavigationCategory.FEATURES,
-    homePageHref: '/',
+    label: 'Runtimes',
+    category: NavigationCategory.RUNTIMES,
     entries: [
-      {
-        type: 'link',
-        href: '/serverless',
-        label: 'Serverless',
-        description: 'Auto-stop sandboxes on idle and wake them on the next inbound HTTP request.',
-      },
-      {
-        type: 'link',
-        href: '/durability',
-        label: 'Durability & Failover',
-        description: 'What survives host crashes and cluster-mode owner failover, and how to make workspace state durable.',
-      },
-      {
-        type: 'link',
-        href: '/exec-streaming',
-        label: 'Streaming Exec',
-        description: 'Live stdout, stderr, PTY sessions, and interactive process control.',
-      },
-      {
-        type: 'link',
-        href: '/external-storage',
-        label: 'External Storage',
-        description: 'Mount S3, NFS, SSHFS, and rclone-backed storage into sandboxes.',
-      },
-      {
-        type: 'link',
-        href: '/tcp-ports',
-        label: 'TCP & TLS Ports',
-        description: 'Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo) via caddy-l4.',
-      },
+      link('/gpu-sandboxes', 'GPU'),
+      link('/gvisor-sandbox', 'gVisor'),
+      link('/firecracker-sandbox', 'Firecracker'),
+      link('/firecracker-templates', 'Firecracker templates'),
+      link('/wasm-sandbox', 'WebAssembly (WASM)'),
+      link('/wasm-modules', 'WASM modules'),
+      link('/wasm-networking', 'WASM networking'),
+      link('/isolate-sandbox', 'V8 isolate'),
     ],
   },
   {
     type: 'group',
-    label: 'Operations',
+    label: 'Networking',
+    category: NavigationCategory.NETWORKING,
+    entries: [
+      link('/network-isolation', 'Block or allow the internet'),
+      link('/egress-domain-filtering', 'Allow only some websites'),
+      link('/egress-profiles-and-learn-mode', 'Reusable allow lists'),
+      link('/egress-rules-and-inspection', 'Rules and inspection'),
+      link('/network-usage', 'Usage and limits'),
+      link('/preview', 'Share a web app'),
+      link('/port-allowlist', 'Port allowlist'),
+      link('/custom-domains', 'Custom domains'),
+      link('/tcp-ports', 'TCP and TLS ports'),
+      link('/tcp-vs-tls-ports', 'TCP or TLS?'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Storage',
+    category: NavigationCategory.STORAGE,
+    entries: [
+      link('/external-storage', 'Attach cloud storage'),
+      link('/platform-volumes', 'Platform volumes'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'SDKs and Tools',
+    category: NavigationCategory.SDKS,
+    entries: [
+      link('/sdk-setup', 'SDK setup'),
+      link('/cli', 'aerolvm CLI'),
+      link('/mcp', 'MCP server'),
+      link('/using-daytona-sdk', 'Use the Daytona SDK'),
+      link('/using-e2b-sdk', 'Use the E2B SDK'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Run a Cluster',
     category: NavigationCategory.OPERATIONS,
-    homePageHref: '/',
     entries: [
-      {
-        type: 'link',
-        href: '/dashboard',
-        label: 'Dashboard',
-        description: 'Built-in operator dashboard for cluster, capacity, placements, and metrics - sign in with your PAT.',
-      },
+      link('/cluster-setup', 'Cluster setup'),
+      link('/cluster-ingress', 'Ingress nodes'),
+      link('/cluster-secrets', 'Secrets providers'),
+      link('/cluster-glossary', 'Glossary'),
+      link('/dashboard', 'Dashboard'),
+      link('/reconcile', 'Reconcile'),
+      link('/operational-runbooks', 'Runbooks'),
     ],
   },
   {
     type: 'group',
-    label: 'Engineering',
+    label: 'Deep Dives',
     category: NavigationCategory.ENGINEERING,
-    homePageHref: '/',
     entries: [
-      {
-        type: 'link',
-        href: '/engineering-distributed-sandbox-runtime',
-        label: 'The Sandbox Runtime Nobody Built',
-        description: 'Every self-hostable sandbox is single-node. Every multi-node sandbox is managed. AerolVM is one Go binary that runs as both, with raw TCP ingress and HA stateful sandboxes that survive host death.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-runtime-layers',
-        label: 'Engine, Chassis, Runtime',
-        description: 'Firecracker and Cloud Hypervisor are VMMs; Kata and gVisor are OCI runtimes. AerolVM hand-rolled its own micro-Kata directly on the Firecracker VMM, which is what makes the snapshot warm pool possible and a second engine cheap to add.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-idempotency',
-        label: 'Idempotency on a Single Writer',
-        description: 'Partial unique indexes + request_idempotency replay + a one-writer SQLite core. Making concurrent-duplicate races structurally unrepresentable.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-placement-failover',
-        label: 'Placement & Failover',
-        description: 'Raft FSM with two-stage reservations, SWIM gossip + pulled capacity, power-of-two placement, owner-sharded forwarding, dead-owner orphan/reclaim, and the Noop single-node degradation.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-trust-boundary',
-        label: 'Host-Mediated Trust Boundary',
-        description: 'AES-256-GCM sealed credentials whose key never leaves the package, mount tools that execute on the host, cross-tenant isolation via the kernel mount namespace, and host-enforced network chokepoints.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-snapshot-correctness',
-        label: 'Snapshot Clone Correctness',
-        description: 'Five hazards when many sandboxes resume from one snapshot: vsock-safe control channel, post-resume RNG/clock reseed, template-CID handshake, mmap-time integrity verification, CoW-aware capacity accounting.',
-      },
-      {
-        type: 'link',
-        href: '/engineering-frozen-kernel-problem',
-        label: 'The Frozen-Kernel Problem',
-        description: 'Two clones of one snapshot are the same machine — same RNG pool, same wall clock, same network identity. The paused-resume + vsock + post-resume reseed architecture that makes them unique before any guest code runs.',
-      },
-      {
-        type: 'link',
-        href: '/firecracker-architecture',
-        label: 'Firecracker Architecture',
-        description: 'Components, the jailer-isolated microVM anatomy, and the Create boot path step by step.',
-      },
-      {
-        type: 'link',
-        href: '/firecracker-hydration',
-        label: 'Hydration & Operational Fold',
-        description: 'Warm-VMM pool, snapshot restore with lazy load, the warm-slot state machine, and node-level resource sharing.',
-      },
+      link('/engineering-distributed-sandbox-runtime', 'Why AerolVM exists'),
+      link('/engineering-runtime-layers', 'Engine, chassis, runtime'),
+      link('/engineering-idempotency', 'Safe retries (idempotency)'),
+      link('/engineering-placement-failover', 'Placement and failover'),
+      link('/engineering-trust-boundary', 'Where secrets live'),
+      link('/engineering-snapshot-correctness', 'Correct snapshot clones'),
+      link('/engineering-frozen-kernel-problem', 'The frozen-kernel problem'),
+      link('/firecracker-architecture', 'Firecracker architecture'),
+      link('/firecracker-hydration', 'Firecracker snapshot restore'),
+      link('/wasm-architecture', 'WASM architecture'),
     ],
   },
-  
 ]
 
+const ucp = '/use-cases/customer-facing-product-experiences'
+const uca = '/use-cases/coding-agents'
+const ucd = '/use-cases/data-processing-ml'
+
+// Same two-level shape as the docs sidebar. Labels match each page's title.
+// one-click-user-sandbox stays out of the sidebar, as it was before; the
+// Customer-Facing Products overview still links to it.
 const getUseCasesSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
     label: 'Use Cases',
     category: NavigationCategory.USE_CASES,
+    entries: [link('/use-cases', 'All use cases')],
+  },
+  {
+    type: 'group',
+    label: 'Customer-Facing Products',
+    category: NavigationCategory.USE_CASES,
     entries: [
-      {
-        type: 'group',
-        label: 'Customer-Facing Product Experiences',
-        entries: [
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/ai-app-hosting',
-            label: 'Live preview URLs for Web apps',
-            description: 'Clone, build, and host a Bun website inside a disposable sandbox.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/secure-burner-vpn',
-            label: 'Impossible to Trace Burner VPN',
-            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/gvisor-kernel-isolation-security',
-            label: 'gVisor kernel secure sandbox',
-            description: 'Compare privileged-operation probes across Docker and gVisor runtimes to show how gVisor reduces direct host-kernel exposure.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/spawn-postgres',
-            label: 'Deploy your own Supabase',
-            description: 'Run a dedicated Postgres instance in a sandbox and expose an HTTP admin surface on a public URL.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/create-upstash-redis',
-            label: 'Create your own Upstash Redis',
-            description: 'Run a dedicated Redis instance in a sandbox and expose an HTTP admin surface on a public URL.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/coding-interview',
-            label: 'Create Coding Interview Platform',
-            description: 'Back tutorials and labs with per-user sandboxes and persistent shells.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/customer-facing-product-experiences/secure-burner-browser',
-            label: 'Secure Burner Browser',
-            description: 'Launch a disposable Chromium desktop in a sandbox and stream it into the browser over noVNC.',
-          },
-          // {
-          //   type: 'link',
-          //   href: '/use-cases/customer-facing-product-experiences/one-click-user-sandbox',
-          //   label: 'One-click user sandbox per workspace',
-          //   description: 'Provision an isolated sandbox as part of each product workspace.',
-          // },
-        ],
-      },
-      {
-        type: 'group',
-        label: 'AI Coding Agents & Harness Engineering',
-        entries: [
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/claude-code-repository-architecture-agent',
-            label: 'Generate architecture diagram',
-            description: 'Clone a real repository, run Claude headlessly, and generate arch.md.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/large-scale-refactor-migration-agent',
-            label: 'Zero-shot code execution agent',
-            description: 'Take a repository URL plus a code-change prompt, run Claude inside the repo, and raise a PR automatically.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/pull-request-review-auto-fix-agent',
-            label: 'GitHub PR review agent',
-            description: 'Check out a real PR from its URL, post a GitHub review, and export any safe fixes.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/test-writing-failure-reproduction-agent',
-            label: 'Write 500 test cases',
-            description: 'Clone a repository, have Claude generate 500 tests, and fail the run below a 90% completion threshold.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent',
-            label: 'Security vulnerability and Fix agent',
-            description: 'Scan CVEs across repository types, apply safe fixes with Claude, and raise a PR automatically.',
-          },
-
-        ],
-      },
-
-      {
-        type: 'group',
-        label: 'Data Processing & ML',
-        entries: [
-          {
-            type: 'link',
-            href: '/use-cases/data-processing-ml/kaggle-to-parquet',
-            label: 'Kaggle Dataset to Parquet',
-            description: 'Download a large dataset from Kaggle, process it using Polars inside an AerolVM sandbox, and export the optimized Parquet file.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/data-processing-ml/duckdb-dataset-explorer',
-            label: 'SQL on Kaggle with DuckDB',
-            description: 'Launch a DuckDB instance inside a sandbox to run SQL queries directly on Kaggle datasets without a traditional database setup.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/data-processing-ml/hyperparameter-tuning-farm',
-            label: 'Hyperparameter Tuning Farm',
-            description: 'Spin up multiple concurrent sandboxes to test different model configurations in parallel.',
-          },
-          {
-            type: 'link',
-            href: '/use-cases/data-processing-ml/headless-jupyter-notebook',
-            label: 'Headless Jupyter Notebook',
-            description: 'Spin up a full JupyterLab environment in a sandbox and access it via a public URL.',
-          },
-        ],
-      },
+      link(ucp, 'Overview'),
+      link(`${ucp}/ai-app-hosting`, 'Host a web app from GitHub'),
+      link(`${ucp}/coding-interview`, 'Coding interview platform'),
+      link(`${ucp}/spawn-postgres`, 'Your own Postgres'),
+      link(`${ucp}/create-upstash-redis`, 'Your own Upstash-style Redis'),
+      link(`${ucp}/secure-burner-browser`, 'Burner browser'),
+      link(`${ucp}/secure-burner-vpn`, 'Burner VPN proxy'),
+      link(`${ucp}/gvisor-kernel-isolation-security`, 'gVisor kernel probe'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Coding Agents',
+    category: NavigationCategory.USE_CASES,
+    entries: [
+      link(uca, 'Overview'),
+      link(`${uca}/claude-code-repository-architecture-agent`, 'Generate an architecture diagram'),
+      link(`${uca}/large-scale-refactor-migration-agent`, 'Make a code change and open a PR'),
+      link(`${uca}/pull-request-review-auto-fix-agent`, 'Review a pull request'),
+      link(`${uca}/test-writing-failure-reproduction-agent`, 'Write 500 tests'),
+      link(`${uca}/claude-code-security-vulnerability-remediation-agent`, 'Find and fix security problems'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Data and ML',
+    category: NavigationCategory.USE_CASES,
+    entries: [
+      link(`${ucd}/kaggle-to-parquet`, 'Kaggle dataset to Parquet'),
+      link(`${ucd}/duckdb-dataset-explorer`, 'SQL on Kaggle with DuckDB'),
+      link(`${ucd}/hyperparameter-tuning-farm`, 'Hyperparameter tuning farm'),
+      link(`${ucd}/headless-jupyter-notebook`, 'Headless Jupyter notebook'),
     ],
   },
 ]
