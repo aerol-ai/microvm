@@ -478,26 +478,6 @@ A container sandbox runs its image's own start command when it starts: the `ENTR
 
 You do not need a start command. You can run everything later with [Run commands](/exec-streaming/). The sandbox stays up even if the start command exits.
 
-## For server operators
-
-### Share snapshots across a cluster
-
-On a single server, a snapshot lives on that server, which runs every sandbox. In a cluster, a saved snapshot exists only on the node that made it. Without help, sandboxes from that snapshot can only run on that node, and if the node fails, the snapshot is gone.
-
-AerolVM can push snapshots in the background to AOCR (the Aerol OCI Registry, a shared image store) so any node can pull them. Turning this on does not slow down `createSnapshot`. The call still returns right away, and a background job pushes the image. Once the push finishes, any node can start sandboxes from it. Together with `failover.policy = "recreate"` (see [Durability and failover](/durability/)), sandboxes made from snapshots survive the loss of their node. Without the push, that recreate is refused, because no other node can reach the image.
-
-You turn this on for the whole server. There is no SDK option, because it is an operations choice, not a per-call one.
-
-| Setting | What it does | Default |
-|---|---|---|
-| `SB_SNAPSHOT_PUSH_ENABLED` | Turns the whole feature on. When `false`, snapshots stay on their own node, as before. | `false` |
-| `SB_AUTO_IMPORT_CLUSTER_ID` | Your cluster's folder in AOCR (`cluster/<id>/snapshots/<name>:latest`). Shared with the auto-import setup. Required when push is on. | None |
-| `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | File holding the token used as the registry password. Read again on every push, so you rotate it by writing the file. Required when push is on. | None |
-| `SB_MIRROR_PUSH_HOST` | Where to push, for example `aocr.aerol.ai`. | `SB_IMAGE_DISTRIBUTION_AOCR_HOST` |
-| `SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL` | How often the background job runs. | `5m` |
-| `SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT` | How many pushes one run may start. | `2` |
-| `SB_SNAPSHOT_PUSH_TAG_SUFFIX` | Optional retention suffix added to the pushed tag (`latest<suffix>`), like `--ttl-7d` or `--idle-30d`. Empty pushes a plain `latest` tag that AOCR keeps forever, which is right for failover snapshots. Short-lived clusters can set a short TTL so their snapshots clean themselves up. Push and pull use the same suffix. | Empty |
-
 The server tracks a push state for each snapshot (`push_state` in the API, `PushState` in the Go SDK):
 
 | Push state | What it means |
