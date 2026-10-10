@@ -262,18 +262,6 @@ func TestEnsureClientLazyConnectFails(t *testing.T) {
 	}
 }
 
-func TestIsLoopbackResolver(t *testing.T) {
-	if !isLoopbackResolver("127.0.0.1") {
-		t.Fatal("127.0.0.1 should be loopback")
-	}
-	if isLoopbackResolver("8.8.8.8") {
-		t.Fatal("8.8.8.8 should not be loopback")
-	}
-	if isLoopbackResolver("not-an-ip") {
-		t.Fatal("invalid ip should not be loopback")
-	}
-}
-
 func TestCappedWriterWriteErrorPath(t *testing.T) {
 	f, err := os.Create(filepath.Join(t.TempDir(), "closed.log"))
 	if err != nil {

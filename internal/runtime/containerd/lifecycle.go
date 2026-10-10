@@ -600,6 +600,10 @@ func buildEnv(req models.CreateSandboxRequest, sandboxID, toolboxToken string, t
 		fmt.Sprintf("SB_TOOLBOX_PORT=%d", toolboxPort),
 		"SB_TOOLBOX_TOKEN=" + toolboxToken,
 		"SB_SANDBOX_ID=" + sandboxID,
+		// A snapshot taken of a Docker warm-pool container carries its parked
+		// flag in the image config; without this a sandbox created from it
+		// boots parked and never serves.
+		"SB_POOL_PARKED=",
 	}
 	for key, value := range req.Env {
 		envValues = append(envValues, key+"="+value)
