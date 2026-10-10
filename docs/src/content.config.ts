@@ -68,7 +68,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link('/sandboxes', 'Create and Manage'),
       link('/ghost-sandboxes', 'Ghost Mode'),
-      link('/environment', 'Images and snapshots'),
+      link('/images-and-snapshots', 'Images and snapshots'),
       link('/lifecycle', 'Lifecycle'),
       link('/ssh-access', 'SSH access'),
       link('/sandbox-env', 'Environment variables'),
