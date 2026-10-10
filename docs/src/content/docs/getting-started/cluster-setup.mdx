@@ -42,6 +42,15 @@ One server is enough for development and light production use. You need a cluste
 - **Internal calls stay internal.** Node-to-node requests use their own listener and are refused on the public one.
 - **Stricter production rules.** Enterprise mode turns on extra checks, such as two backups for every secret and no insecure shortcuts.
 
+### Auditability
+
+- **Every secret open is recorded.** Each time a sandbox's environment variables, registry password or storage credentials are opened, the node writes a record. It says which sandbox, which tenant, which node, and whether it worked.
+- **Refused traffic is recorded.** Each outbound connection the network filter refuses is logged with its destination and the reason. The destinations of allowed traffic can be recorded too.
+- **Records cannot be quietly changed.** Each record carries a fingerprint (hash) of the one before it, so editing or deleting a record breaks the chain. The server can check the whole chain on demand, and an alert fires when it breaks.
+- **History from any node.** `sandbox.audit()` in every SDK reads a sandbox's history, whichever node it ran on.
+- **Shipped to your own systems.** Each node can send its audit log to a file, a webhook or an S3 bucket. If your system is down, nothing is dropped: the node keeps the records, retries, and fires an alert when it falls behind.
+- **Gaps are visible.** If a burst overflows the buffer, the log writes a marker with the number of missed events instead of losing them silently.
+
 ### Observability
 
 - **One dashboard for the whole cluster.** The [dashboard](/dashboard/) shows every node and every sandbox, from whichever node you open. You can drain a node from it.
@@ -90,29 +99,44 @@ flowchart TB
     App["Your app and visitors"] --> Entry["One address<br/>(load balancer or DNS)"]
     Entry --> I1
     Entry --> I2
-    subgraph Ingress["Ingress nodes: take public traffic"]
-        I1["Ingress"]
-        I2["Ingress"]
+    subgraph Cluster["AerolVM cluster: nodes talk over mutual TLS"]
+        subgraph Ingress["Ingress nodes: take public traffic"]
+            I1["Ingress"]
+            I2["Ingress"]
+        end
+        subgraph Workers["Worker nodes: run the sandboxes"]
+            W1["Containers, gVisor, WASM<br/>(small cloud machines)"]
+            W2["Firecracker<br/>(bare metal)"]
+            W3["GPU sandboxes<br/>(GPU machines)"]
+        end
+        subgraph Servers["Server nodes: vote on where each sandbox runs"]
+            S1["Server"] --- S2["Server"] --- S3["Server"]
+        end
     end
     I1 --> W1
     I1 --> W2
     I2 --> W2
     I2 --> W3
-    subgraph Workers["Worker nodes: run the sandboxes"]
-        W1["Containers, gVisor, WASM<br/>(small cloud machines)"]
-        W2["Firecracker<br/>(bare metal)"]
-        W3["GPU sandboxes<br/>(GPU machines)"]
-    end
-    subgraph Servers["Server nodes: vote on where each sandbox runs"]
-        S1["Server"] --- S2["Server"] --- S3["Server"]
-    end
-    Workers -. "free room" .-> Servers
     Servers -. "where each sandbox runs" .-> Ingress
+    subgraph Yours["Your systems"]
+        KMS["AWS KMS<br/>keys for sealed secrets"]
+        Audit["Audit store<br/>S3, webhook or file"]
+        Obs["Monitoring<br/>Prometheus, Grafana, OpenTelemetry"]
+    end
+    Workers -. "secret keys" .-> KMS
+    Workers -- "hash-chained audit records" --> Audit
+    Cluster -- "metrics, traces, alerts" --> Obs
 ```
 
 - **Server nodes (3, 5 or at most 7)** vote on every change and keep the record of which worker runs which sandbox. They do little work, so small machines are enough.
 - **Worker nodes** run the sandboxes. Add as many as you need. They can differ: small cloud machines for containers, gVisor and WASM, bare-metal servers for Firecracker, and GPU machines. Each worker reports which runtimes it can run, so a sandbox only lands on a worker that fits it.
 - **Ingress nodes (2 to 10)** take public traffic and send it to the right worker. Only they hold the public route table. Past 10, they need a router in front that knows which ingress node holds which sandbox.
+
+The cluster also connects to systems you already run:
+
+- **AWS KMS** holds the keys for sealed secrets, so AWS permissions decide which workers can open them. It is optional. Without it, the nodes keep the keys themselves.
+- **Your audit store** receives every node's hash-chained audit records, in an S3 bucket, through a webhook, or in a file.
+- **Your monitoring** gets Prometheus metrics and OpenTelemetry traces from every node. Grafana dashboards and alerts come ready-made.
 
 The number of voters stays at 3 or 5, however many workers join. We test hetero mode on eight nodes: three servers, one ingress node and four workers. One of the workers is a bare-metal machine for Firecracker.
 
