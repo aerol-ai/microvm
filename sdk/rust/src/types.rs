@@ -205,9 +205,10 @@ pub struct CreateOptions {
     /// rule trusts, so set inspect rules here rather than adding them later.
     #[serde(rename = "network_egress_rules", skip_serializing_if = "Option::is_none")]
     pub network_egress_rules: Option<Vec<EgressRule>>,
-    /// Whether the sandbox may be exposed publicly. `None`/`Some(true)` allow
-    /// it; `Some(false)` makes `expose_port` fail — the sandbox stays reachable
-    /// only via the toolbox proxy and SSH gateway.
+    /// Public exposure at create. `None` or `Some(false)` creates the sandbox
+    /// private (no public URL; reachable through the toolbox proxy and SSH
+    /// gateway); `Some(true)` makes it public from boot. Either way, the first
+    /// `expose_port` makes the sandbox public.
     #[serde(rename = "allow_public_traffic", skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,
     /// Rewrite the upstream `Host` header on ingress to exposed HTTP ports to
@@ -256,6 +257,12 @@ pub struct CreateOptions {
     /// API today. Not compatible with `gpus`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Firecracker template id from [`Client::create_template`](crate::Client::create_template).
+    /// Requires `runtime = "firecracker"` and `image`; the sandbox boots the
+    /// template's prepared rootfs instead of building one per create, so the
+    /// template must be ready. Other runtimes ignore it.
+    #[serde(rename = "template_id", skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
     /// Attach GPU resources to the sandbox. Omit for CPU-only workloads.
     /// Not compatible with `runtime = "gvisor"`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -667,6 +674,20 @@ pub struct ExecRequest {
     pub env: Option<std::collections::HashMap<String, String>>,
     #[serde(rename = "timeout_seconds", skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+}
+
+// A plain string is a shell command with default options, so
+// `sandbox.exec("echo hello")` reads the same as exec(string) in the other SDKs.
+impl From<&str> for ExecRequest {
+    fn from(command: &str) -> Self {
+        ExecRequest { command: command.to_string(), ..Default::default() }
+    }
+}
+
+impl From<String> for ExecRequest {
+    fn from(command: String) -> Self {
+        ExecRequest { command, ..Default::default() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

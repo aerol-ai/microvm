@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createServer, type RequestListener } from "node:http";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 
 import { APIClient, SandboxResource } from "./client.js";
 import { Image } from "../Image.js";
-import type { Sandbox } from "../types.js";
+import type { CreateOptions, Sandbox } from "../types.js";
 
 test("internal client uses config object and auth header", async () => {
   let seenAuthorization = "";
@@ -1190,6 +1192,45 @@ test("internal client create forwards customDomains as snake_case", async () => 
   assert.deepEqual(body?.custom_domains, ["api.acme.com", "www.acme.com"]);
 });
 
+test("internal client create sends gpus and template_id in the wire shape", async () => {
+  const cases: Array<{ name: string; options: Partial<CreateOptions>; want: Record<string, unknown> }> = [
+    {
+      name: "nvidia with count and device ids",
+      options: { gpus: { vendor: "nvidia", count: 2, deviceIDs: ["0", "GPU-abc123"] } },
+      want: { gpus: { vendor: "nvidia", count: 2, device_ids: ["0", "GPU-abc123"] } },
+    },
+    {
+      name: "vendor only leaves count and device_ids out",
+      options: { gpus: { vendor: "amd" } },
+      want: { gpus: { vendor: "amd" } },
+    },
+    {
+      name: "firecracker template",
+      options: { runtime: "firecracker", templateId: "py311" },
+      want: { runtime: "firecracker", template_id: "py311" },
+    },
+    {
+      name: "neither set stays omitted",
+      options: {},
+      want: {},
+    },
+  ];
+
+  for (const tc of cases) {
+    let body: Record<string, unknown> | undefined;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      fetch: async (input, init) => {
+        body = (await new Request(input, init).json()) as Record<string, unknown>;
+        return jsonResponse(apiSandbox("sb-create-fields"));
+      },
+    });
+    await client.create({ image: "python:3.11", ...tc.options });
+    assert.deepEqual(body, { image: "python:3.11", ...tc.want }, tc.name);
+  }
+});
+
 test("internal client ingressDNS GETs and returns target verbatim", async () => {
   let seenRequest: Request | undefined;
   const client = new APIClient({
@@ -1367,6 +1408,182 @@ test("internal client retries 421 Misdirected Request", async () => {
   assert.equal(calls, 2);
   assert.ok(sandbox instanceof SandboxResource);
 });
+
+// A re-sent exec runs the caller's command again (the Rust SDK once ran a 40 s
+// command 4 times), so exec must not retry once the request may have arrived.
+test("internal client exec is not re-sent after the server read it", async () => {
+  const seen: string[] = [];
+  await withServer((req) => {
+    seen.push(`${req.method} ${req.url}`);
+    req.resume();
+    // Read the whole request, then hang up without answering: the command
+    // may be running, and the client cannot know.
+    req.on("end", () => req.socket.destroy());
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "sleep 40" }), TypeError);
+    assert.equal(attempts, 1);
+  });
+  assert.deepEqual(seen, ["POST /v1/sandboxes/sb-exec/toolbox/process/execute"]);
+});
+
+test("internal client exec retries a refused connection", async () => {
+  // Grab a free port, then close it so the connect is refused.
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  await new Promise((resolve) => server.close(resolve));
+
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: `http://127.0.0.1:${port}`,
+    patToken: "pat-token",
+    retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+    fetch: (input, init) => {
+      attempts++;
+      return fetch(input, init);
+    },
+  });
+  await assert.rejects(client.exec("sb-exec", { command: "true" }), TypeError);
+  assert.equal(attempts, 3);
+});
+
+test("internal client get still retries a connection closed after the request was read", async () => {
+  let served = 0;
+  await withServer((req, res) => {
+    served++;
+    req.resume();
+    if (served === 1) {
+      req.on("end", () => req.socket.destroy());
+      return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(apiSandbox("sb-get-retry")));
+  }, async (baseURL) => {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL,
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: (input, init) => {
+        attempts++;
+        return fetch(input, init);
+      },
+    });
+    const sandbox = await client.get("sb-get-retry");
+    assert.equal(sandbox.id, "sb-get-retry");
+    assert.equal(attempts, 2);
+  });
+  assert.equal(served, 2);
+});
+
+test("internal client exec retries only transport errors that prove the request was never sent", async () => {
+  const errno = (code: string, syscall?: string, message = code): NodeJS.ErrnoException =>
+    Object.assign(new Error(message), { code, syscall });
+  // Shape every error the way undici's fetch does: a TypeError whose cause
+  // carries the Node / undici code.
+  const fetchFailed = (cause: unknown) => new TypeError("fetch failed", { cause });
+  const cases: Array<{ name: string; error: unknown; retried: boolean }> = [
+    { name: "connection refused", error: fetchFailed(errno("ECONNREFUSED", "connect")), retried: true },
+    {
+      name: "connection refused on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ECONNREFUSED", "connect"), errno("ECONNREFUSED", "connect")]),
+        { code: "ECONNREFUSED" },
+      )),
+      retried: true,
+    },
+    { name: "DNS lookup failed transiently", error: fetchFailed(errno("EAI_AGAIN", "getaddrinfo")), retried: true },
+    { name: "undici connect timeout", error: fetchFailed(errno("UND_ERR_CONNECT_TIMEOUT")), retried: true },
+    { name: "TCP connect timed out", error: fetchFailed(errno("ETIMEDOUT", "connect")), retried: true },
+    {
+      name: "TCP connect timed out on every address",
+      error: fetchFailed(Object.assign(
+        new AggregateError([errno("ETIMEDOUT", "connect"), errno("ETIMEDOUT", "connect")]),
+        { code: "ETIMEDOUT" },
+      )),
+      retried: true,
+    },
+    { name: "open socket timed out", error: fetchFailed(errno("ETIMEDOUT", "read")), retried: false },
+    { name: "ETIMEDOUT with no syscall", error: fetchFailed(errno("ETIMEDOUT")), retried: false },
+    { name: "headers timeout", error: fetchFailed(errno("UND_ERR_HEADERS_TIMEOUT")), retried: false },
+    { name: "body timeout", error: fetchFailed(errno("UND_ERR_BODY_TIMEOUT")), retried: false },
+    { name: "connection reset", error: fetchFailed(errno("ECONNRESET", "read")), retried: false },
+    { name: "broken pipe", error: fetchFailed(errno("EPIPE", "write")), retried: false },
+    { name: "other side closed", error: fetchFailed(errno("UND_ERR_SOCKET", undefined, "other side closed")), retried: false },
+    { name: "socket hang up", error: fetchFailed(new Error("socket hang up")), retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        throw tc.error;
+      },
+    });
+    await assert.rejects(client.exec("sb-exec", { command: "true" }), (err) => err === tc.error, tc.name);
+    assert.equal(attempts, tc.retried ? 3 : 1, tc.name);
+  }
+});
+
+test("internal client exec retries 429 and 503 but surfaces other gateway statuses", async () => {
+  const cases: Array<{ status: number; retried: boolean }> = [
+    { status: 429, retried: true },
+    { status: 503, retried: true },
+    { status: 421, retried: false },
+    { status: 502, retried: false },
+    { status: 504, retried: false },
+  ];
+
+  for (const tc of cases) {
+    let attempts = 0;
+    const client = new APIClient({
+      baseURL: "https://api.example.com",
+      patToken: "pat-token",
+      retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 1 },
+      fetch: async () => {
+        attempts++;
+        if (attempts === 1) {
+          return jsonResponse({ error: `status ${tc.status}` }, tc.status);
+        }
+        return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+      },
+    });
+    const run = client.exec("sb-exec", { command: "echo ok" });
+    if (tc.retried) {
+      assert.equal((await run).stdout, "ok\n", `status ${tc.status}`);
+      assert.equal(attempts, 2, `status ${tc.status}`);
+    } else {
+      await assert.rejects(run, { message: `status ${tc.status}` });
+      assert.equal(attempts, 1, `status ${tc.status}`);
+    }
+  }
+});
+
+async function withServer(handler: RequestListener, fn: (baseURL: string) => Promise<void>): Promise<void> {
+  const server = createServer(handler);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  try {
+    await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
 
 test("internal client getAudit sends filters and maps the page", async () => {
   let seenRequest: Request | undefined;

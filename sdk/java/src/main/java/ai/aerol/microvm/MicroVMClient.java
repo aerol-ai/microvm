@@ -694,8 +694,16 @@ public class MicroVMClient {
         return doJson("PUT", sandboxPath(sandboxId) + "/network/policy", body, NetworkPolicy.class);
     }
 
+    /**
+     * Runs a command and waits for it to finish. Unlike every other call, a
+     * transport failure is retried only when the request provably never left
+     * the client (refused or timed-out connect, failed name lookup), or on
+     * HTTP 429/503: re-sending after the server may have received it would
+     * run the command a second time. Any other failure is thrown to the
+     * caller, who knows whether the command is safe to repeat.
+     */
     public ExecResult exec(String sandboxId, ExecRequest request) {
-        return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class);
+        return doJson("POST", sandboxPath(sandboxId) + "/toolbox/process/execute", request, ExecResult.class, RetryMode.UNSENT_ONLY);
     }
 
     public void uploadFile(String sandboxId, String targetPath, byte[] data) {
@@ -1109,6 +1117,8 @@ public class MicroVMClient {
             return copy;
         }
         copy.image = source.image;
+        copy.name = source.name;
+        copy.tags = source.tags;
         copy.cpu = source.cpu;
         copy.memoryMb = source.memoryMb;
         copy.diskGb = source.diskGb;
@@ -1117,6 +1127,9 @@ public class MicroVMClient {
         copy.networkBlockAll = source.networkBlockAll;
         copy.networkAllowOut = source.networkAllowOut;
         copy.networkDenyOut = source.networkDenyOut;
+        copy.egressProfiles = source.egressProfiles;
+        copy.networkEgressMode = source.networkEgressMode;
+        copy.networkEgressRules = source.networkEgressRules;
         copy.allowPublicTraffic = source.allowPublicTraffic;
         copy.maskRequestHost = source.maskRequestHost;
         copy.networkBytesInLimit = source.networkBytesInLimit;
@@ -1124,6 +1137,7 @@ public class MicroVMClient {
         copy.registry = source.registry;
         copy.containerCommand = source.containerCommand;
         copy.mounts = source.mounts;
+        copy.platformVolumes = source.platformVolumes;
         copy.lifecycle = source.lifecycle;
         copy.failover = source.failover;
         copy.runtime = source.runtime;
@@ -1132,6 +1146,7 @@ public class MicroVMClient {
         copy.tenantId = source.tenantId;
         copy.gpus = source.gpus;
         copy.customDomains = source.customDomains;
+        copy.templateId = source.templateId;
         return copy;
     }
 
@@ -1154,7 +1169,11 @@ public class MicroVMClient {
     }
 
     private <T> T doJson(String method, String path, Object payload, Class<T> responseType) {
-        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload);
+        return doJson(method, path, payload, responseType, RetryMode.IDEMPOTENT);
+    }
+
+    private <T> T doJson(String method, String path, Object payload, Class<T> responseType, RetryMode retryMode) {
+        HttpResponse<byte[]> response = sendJsonRequest(method, path, payload, retryMode);
         ensureSuccess(response);
         if (responseType == null || response.statusCode() == 204 || response.body().length == 0) {
             return null;
@@ -1168,11 +1187,15 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload) {
+        return sendJsonRequest(method, path, payload, RetryMode.IDEMPOTENT);
+    }
+
+    private HttpResponse<byte[]> sendJsonRequest(String method, String path, Object payload, RetryMode retryMode) {
         if (payload == null) {
-            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null);
+            return sendRequest(method, path, HttpRequest.BodyPublishers.noBody(), null, null, retryMode);
         }
         byte[] body = JsonSupport.writeBytes(payload);
-        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json");
+        return sendRequest(method, path, HttpRequest.BodyPublishers.ofByteArray(body), "application/json", null, retryMode);
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType) {
@@ -1180,6 +1203,10 @@ public class MicroVMClient {
     }
 
     private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders) {
+        return sendRequest(method, path, bodyPublisher, contentType, extraHeaders, RetryMode.IDEMPOTENT);
+    }
+
+    private HttpResponse<byte[]> sendRequest(String method, String path, HttpRequest.BodyPublisher bodyPublisher, String contentType, Map<String, String> extraHeaders, RetryMode retryMode) {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
@@ -1200,18 +1227,17 @@ public class MicroVMClient {
 
             try {
                 HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
-                int status = response.statusCode();
-                // 421: misdirected (connection coalescing or a stale route); the
-                // server closed the connection, so the retry reconnects.
-                if ((status == 421 || status == 429 || status == 502 || status == 503 || status == 504) && attempt < maxRetries) {
+                if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
                 } else {
                     return response;
                 }
-            } catch (IOException | InterruptedException ex) {
-                if (ex instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                    throw new MicroVMException("request interrupted", ex);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                throw new MicroVMException("request interrupted", ex);
+            } catch (IOException ex) {
+                if (!retryMode.retriesTransportFailure(ex)) {
+                    throw new MicroVMException("request failed and was not retried because the server may already have received it", ex);
                 }
                 lastException = ex;
                 if (attempt >= maxRetries) {
@@ -1347,6 +1373,65 @@ public class MicroVMClient {
         output.write("\r\n".getBytes(StandardCharsets.UTF_8));
         output.write(data);
         output.write("\r\n".getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * What {@code sendRequest} may re-send after a failure. A transport error
+     * does not mean the request never reached the server: a read timeout,
+     * reset or EOF can arrive after the server received the body and started
+     * the work.
+     */
+    enum RetryMode {
+        /**
+         * The default. The daemon designs these endpoints so a re-sent request
+         * is harmless, so any transport failure is retried, as are 421
+         * (misdirected: connection coalescing or a stale route; the server
+         * closed the connection, so the retry reconnects), 429, 502, 503 and
+         * 504.
+         */
+        IDEMPOTENT {
+            @Override
+            boolean retriesStatus(int status) {
+                return status == 421 || status == 429 || status == 502 || status == 503 || status == 504;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                return true;
+            }
+        },
+        /**
+         * For requests whose re-send repeats a side effect (exec runs the
+         * command again). 429 and 503 are the daemon refusing before it starts
+         * the work. 502 and 504 come from a proxy that may have handed the
+         * request upstream before failing, and 421 does not prove the work did
+         * not start either, so they surface. Of transport failures, only
+         * connect-phase ones are retried.
+         */
+        UNSENT_ONLY {
+            @Override
+            boolean retriesStatus(int status) {
+                return status == 429 || status == 503;
+            }
+
+            @Override
+            boolean retriesTransportFailure(IOException error) {
+                // java.net.http reports every connect-phase failure (refused,
+                // unresolvable host, no route) as ConnectException and a connect
+                // timeout as HttpConnectTimeoutException; neither is ever thrown
+                // once the request is on the wire. The other two cover a
+                // caller-supplied HttpClient that surfaces the raw cause. A plain
+                // HttpTimeoutException is the response timeout, so it is not here.
+                return error instanceof java.net.ConnectException
+                    || error instanceof java.net.http.HttpConnectTimeoutException
+                    || error instanceof java.net.UnknownHostException
+                    || error instanceof java.net.NoRouteToHostException;
+            }
+        };
+
+        abstract boolean retriesStatus(int status);
+
+        abstract boolean retriesTransportFailure(IOException error);
     }
 
     private static final class MountListResponse {

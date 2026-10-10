@@ -33,6 +33,7 @@ import type {
   ExposeProtocol,
   ExposeResult,
   Failover,
+  GPUOptions,
   HealthStatus,
   IngressTarget,
   Lifecycle,
@@ -129,8 +130,10 @@ export interface APIClientConfig {
   apiVersion?: APIVersion;
   /**
    * Retry policy for transient transport errors (socket closed, connection
-   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). Pass
-   * `{ maxRetries: 0 }` to disable retry entirely.
+   * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). `exec`
+   * is narrower: it retries only failures that prove the command never
+   * reached the server (connection refused, connect timeout, DNS) and HTTP
+   * 429/503. Pass `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
 }
@@ -403,6 +406,24 @@ interface ApiNetworkUsage {
 // re-routes it (plans/ingress-proxy-routing.md, review 2A).
 const RETRYABLE_STATUS_CODES = new Set([421, 429, 502, 503, 504]);
 
+// The subset a non-idempotent request (exec) may retry: 429 and 503 are the
+// server turning the request away before doing any work. 421, 502 and 504 come
+// from forwarding/proxy hops, and the status alone can't prove that no hop
+// already handed the command to the sandbox, so exec surfaces them.
+const REFUSED_STATUS_CODES = new Set([429, 503]);
+
+/** Per-call options for {@link APIClient.request}. */
+interface RequestOptions {
+  /**
+   * `false` for a request the server must not receive twice: re-sending an
+   * exec runs the caller's command again. Only failures that prove the
+   * request never left the client, plus 429/503, are then retried. Defaults
+   * to `true` because the daemon designs every other endpoint for idempotent
+   * retry.
+   */
+  idempotent?: boolean;
+}
+
 /** Default retry settings when the caller doesn't supply a RetryConfig. */
 const DEFAULT_RETRY: Required<RetryConfig> = {
   maxRetries: 3,
@@ -414,7 +435,9 @@ const DEFAULT_RETRY: Required<RetryConfig> = {
  * Returns `true` when the thrown `error` looks like a transport-level failure
  * that vanishes on retry (connection reset, socket closed by peer, DNS
  * blip). `undici` and Node core use several `cause.code` values; we check
- * the full cause chain.
+ * the full cause chain. A reset, EPIPE, read/headers/body timeout or "other
+ * side closed" can fire after the server already received the request, so
+ * this classification is only safe for idempotent requests.
  */
 function isTransientTransportError(error: unknown): boolean {
   const codes = new Set([
@@ -440,6 +463,48 @@ function isTransientTransportError(error: unknown): boolean {
     }
   }
   return false;
+}
+
+/**
+ * Returns `true` only for transport failures that prove the request never
+ * left the client: the connection was refused, did not open before the
+ * connect timeout, or the host name did not resolve (transiently; ENOTFOUND
+ * is not retried for any request). Any other code in the cause chain means
+ * bytes may have reached the server, so the answer is `false`.
+ */
+function isUnsentTransportError(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth++) {
+    const err = current as NodeJS.ErrnoException;
+    switch (err.code) {
+      case undefined:
+        break;
+      case "ECONNREFUSED":
+      case "EAI_AGAIN":
+      case "UND_ERR_CONNECT_TIMEOUT":
+        return true;
+      case "ETIMEDOUT":
+        // Node uses ETIMEDOUT both for a connect that never completed and for
+        // an open socket that stopped answering; only the first is unsent.
+        return failedWhileConnecting(err);
+      default:
+        return false;
+    }
+    current = err.cause;
+  }
+  return false;
+}
+
+function failedWhileConnecting(err: NodeJS.ErrnoException): boolean {
+  if (err.syscall === "connect") return true;
+  // With autoSelectFamily (Node's default), a host with several addresses
+  // fails with an AggregateError holding one error per connect attempt and no
+  // syscall of its own.
+  return (
+    err instanceof AggregateError &&
+    err.errors.length > 0 &&
+    err.errors.every((inner) => (inner as NodeJS.ErrnoException | undefined)?.syscall === "connect")
+  );
 }
 
 /**
@@ -705,7 +770,13 @@ export class APIClient {
   }
 
   async exec(id: string, request: ExecRequest): Promise<ExecResult> {
-    const response = await this.doJSON<ApiExecResult>("POST", `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`, toApiExecRequest(request));
+    // Not idempotent: a re-sent exec runs the caller's command a second time.
+    const response = await this.doJSON<ApiExecResult>(
+      "POST",
+      `${this.versionPrefix}/sandboxes/${id}/toolbox/process/execute`,
+      toApiExecRequest(request),
+      { idempotent: false },
+    );
     return fromApiExecResult(response);
   }
 
@@ -1091,7 +1162,7 @@ export class APIClient {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
 
-  private async doJSON<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async doJSON<T>(method: string, path: string, body?: unknown, options?: RequestOptions): Promise<T> {
     const init: RequestInit = {};
     if (body !== undefined) {
       init.body = JSON.stringify(body);
@@ -1100,7 +1171,7 @@ export class APIClient {
       };
     }
 
-    const response = await this.request(method, path, init);
+    const response = await this.request(method, path, init, options);
     if (!response.ok) {
       throw await decodeError(response);
     }
@@ -1121,15 +1192,19 @@ export class APIClient {
   /**
    * Low-level HTTP request with automatic retry for transient failures.
    *
-   * Transport-level errors (socket closed, connection reset, DNS blip) are
-   * always retried regardless of HTTP method — the request never reached the
-   * server so there is no idempotency concern.
+   * Transport-level errors (socket closed, connection reset, timeouts, DNS
+   * blip) and HTTP 421/429/502/503/504 are retried regardless of HTTP method.
+   * Several of those failures can happen after the server received the
+   * request, so a retry may deliver it twice; that is safe only because every
+   * mutating endpoint in the daemon is designed for idempotent retry (e.g.
+   * INSERT OR IGNORE + disambiguation).
    *
-   * HTTP-level retryable codes (421, 429, 502, 503, 504) are retried for ALL
-   * methods because every mutating endpoint in the daemon is already
-   * designed for idempotent retry (e.g. INSERT OR IGNORE + disambiguation).
+   * A request passed `{ idempotent: false }` (exec) retries only transport
+   * failures that prove the request never left the client and HTTP 429/503;
+   * everything else is surfaced to the caller rather than risk running the
+   * command twice.
    */
-  private async request(method: string, path: string, init: RequestInit = {}): Promise<Response> {
+  private async request(method: string, path: string, init: RequestInit = {}, options: RequestOptions = {}): Promise<Response> {
     const headers = new Headers(init.headers);
     if (this.patToken !== "") {
       headers.set("Authorization", `Bearer ${this.patToken}`);
@@ -1138,6 +1213,9 @@ export class APIClient {
     const url = `${this.baseURL}${path}`;
     const requestInit: RequestInit = { ...init, method, headers };
     const { maxRetries, baseDelayMs, maxDelayMs } = this.retryConfig;
+    const idempotent = options.idempotent ?? true;
+    const retryableStatusCodes = idempotent ? RETRYABLE_STATUS_CODES : REFUSED_STATUS_CODES;
+    const isRetryableError = idempotent ? isTransientTransportError : isUnsentTransportError;
 
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1145,7 +1223,7 @@ export class APIClient {
         const response = await this.fetchFn(url, requestInit);
 
         // Retry on transient HTTP status codes.
-        if (RETRYABLE_STATUS_CODES.has(response.status) && attempt < maxRetries) {
+        if (retryableStatusCodes.has(response.status) && attempt < maxRetries) {
           const delay = Math.min(baseDelayMs * 2 ** attempt, maxDelayMs);
           await jitteredDelay(delay);
           continue;
@@ -1156,7 +1234,7 @@ export class APIClient {
         lastError = error;
 
         // Only retry transport-level failures; anything else propagates.
-        if (!isTransientTransportError(error) || attempt >= maxRetries) {
+        if (!isRetryableError(error) || attempt >= maxRetries) {
           throw error;
         }
 
@@ -1424,6 +1502,16 @@ function toApiCreateOptions(options: CreateOptions): Record<string, unknown> {
     module_ref: options.moduleRef,
     tenant_id: options.tenantId,
     custom_domains: options.customDomains,
+    gpus: options.gpus ? toApiGPUOptions(options.gpus) : undefined,
+    template_id: options.templateId,
+  };
+}
+
+function toApiGPUOptions(gpus: GPUOptions): Record<string, unknown> {
+  return {
+    vendor: gpus.vendor,
+    count: gpus.count,
+    device_ids: gpus.deviceIDs,
   };
 }
 
