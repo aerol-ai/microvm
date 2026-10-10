@@ -21,6 +21,10 @@ func (errTerm) Size() (int, int, bool) { return 80, 24, true }
 func (errTerm) MakeRaw() (func(), error) {
 	return nil, errors.New("terminal refused raw mode")
 }
+func (errTerm) NotifyResize() (<-chan struct{}, func()) { return nil, func() {} }
+func (errTerm) ReadSecret() (string, error) {
+	return "", errors.New("terminal refused to read")
+}
 
 func TestCLIUncoveredBranches(t *testing.T) {
 	h := newHarness(t)

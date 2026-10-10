@@ -19,8 +19,11 @@ import (
 func TestFakeSandboxLifecycleAndListFilters(t *testing.T) {
 	s := New(t)
 
-	if code, _ := do(t, s, http.MethodGet, "/v1/health", nil, ""); code != http.StatusUnauthorized {
+	if code, _ := do(t, s, http.MethodGet, "/v1/sandboxes", nil, ""); code != http.StatusUnauthorized {
 		t.Fatalf("missing token status = %d", code)
+	}
+	if code, _ := do(t, s, http.MethodGet, "/health", nil, ""); code != http.StatusOK {
+		t.Fatalf("health without a token = %d, want 200 like sandboxd", code)
 	}
 	if code, _ := do(t, s, http.MethodGet, "/v1/nope", nil, Token); code != http.StatusNotFound {
 		t.Fatalf("unknown route status = %d", code)
@@ -299,7 +302,12 @@ func TestFakeToolboxFilesAndExec(t *testing.T) {
 	stream(t, s, docker.ID, "echo hi", nil, nil)
 	stream(t, s, docker.ID, "stderr oops", nil, nil)
 	stream(t, s, docker.ID, "exit 2", nil, nil)
-	stream(t, s, docker.ID, "cat", []wsMsg{{bin: []byte("piped")}}, []string{"close"})
+	stream(t, s, docker.ID, "cat", []wsMsg{{bin: []byte("piped")}}, []string{`{"type":"resize","cols":90,"rows":20}`, "close"})
+	s.Observe(func(s *Server) {
+		if len(s.Resizes) != 1 || s.Resizes[0] != "90x20" {
+			t.Fatalf("exec stream resizes = %v", s.Resizes)
+		}
+	})
 	stream(t, s, docker.ID, "yes 5000", nil, nil)
 	stream(t, s, docker.ID, "other", nil, nil)
 	stream(t, s, docker.ID, "sleep", nil, []string{`{"type":"signal","signal":"TERM"}`, `{"type":"signal","signal":"KILL"}`})
@@ -345,8 +353,17 @@ func TestFakeSessions(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &session); err != nil {
 		t.Fatal(err)
 	}
-	if code, body = doJSON(t, s, http.MethodPost, base, models.CreateSessionRequest{Name: "dev", Command: "other"}); code != http.StatusOK || !strings.Contains(body, session.ID) {
-		t.Fatalf("duplicate session = %d %s", code, body)
+	// A second create with the name starts another session, as toolboxd
+	// does; the list shows both, oldest first.
+	if code, body = doJSON(t, s, http.MethodPost, base, models.CreateSessionRequest{Name: "dev", PTY: true}); code != http.StatusCreated || strings.Contains(body, `"id":"`+session.ID+`"`) || !strings.Contains(body, `"pty":true`) || !strings.Contains(body, "bash") {
+		t.Fatalf("second session = %d %s", code, body)
+	}
+	var list models.SessionList
+	if code, body = do(t, s, http.MethodGet, base, nil, Token); code != http.StatusOK || json.Unmarshal([]byte(body), &list) != nil || len(list.Sessions) != 2 || list.Sessions[0].ID != session.ID {
+		t.Fatalf("list sessions = %d %s", code, body)
+	}
+	if len(s.SessionCreates) != 2 || s.SessionCreates[1].Name != "dev" {
+		t.Fatalf("SessionCreates = %+v", s.SessionCreates)
 	}
 	if code, _ = do(t, s, http.MethodGet, base+"/missing", nil, Token); code != http.StatusNotFound {
 		t.Fatalf("missing session = %d", code)
@@ -623,4 +640,70 @@ func doJSON(t *testing.T, s *Server, method, path string, v any) (int, string) {
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, string(out)
+}
+
+func TestFakeLiveAttach(t *testing.T) {
+	s := New(t)
+	sb := s.AddSandbox(models.Sandbox{Name: "box"})
+	s.AddSession(sb.ID, models.Session{ID: "ses-sh", Name: "default", PTY: true, Argv: []string{"/bin/bash", "-l"}, Status: models.SessionStatusRunning})
+	s.Observe(func(s *Server) {
+		s.LiveAttach = true
+		s.ExecFunc = func(cmd string, in io.Reader, out func(byte, []byte), _ <-chan struct{}) (int, string) {
+			buf := make([]byte, 64)
+			n, err := in.Read(buf)
+			if err != nil {
+				return 0, "" // stdin closed: the client detached
+			}
+			out(1, buf[:n])
+			return 2, ""
+		}
+	})
+	s.AppendSessionLog(sb.ID, "ses-sh", []byte("earlier output"))
+	attach := func() *websocket.Conn {
+		t.Helper()
+		wsURL := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/sandboxes/" + sb.ID + "/sessions/ses-sh/attach"
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + Token}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, msg, err := conn.ReadMessage(); err != nil || string(msg[1:]) != "earlier output" {
+			t.Fatalf("replay = %q %v", msg, err)
+		}
+		return conn
+	}
+
+	// Typing: resize and signal frames are recorded, stdin reaches the
+	// command, and its exit is reported.
+	conn := attach()
+	for _, ctrl := range []string{`{"type":"resize","cols":80,"rows":24}`, `{"type":"signal","signal":"INT"}`, "not-json"} {
+		_ = conn.WriteMessage(websocket.TextMessage, []byte(ctrl))
+	}
+	_ = conn.WriteMessage(websocket.BinaryMessage, []byte("ls\n"))
+	if _, msg, err := conn.ReadMessage(); err != nil || string(msg) != "\x01ls\n" {
+		t.Fatalf("echo = %q %v", msg, err)
+	}
+	if _, msg, err := conn.ReadMessage(); err != nil || !bytes.Contains(msg, []byte(`"code":2`)) {
+		t.Fatalf("exit = %q %v", msg, err)
+	}
+	conn.Close()
+
+	// Detaching: no exit message, and the detach is counted.
+	conn = attach()
+	_ = conn.WriteJSON(map[string]string{"type": "close"})
+	if _, msg, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("a detach was answered with %q", msg)
+	}
+	conn.Close()
+	s.Observe(func(s *Server) {
+		if s.Detaches != 1 || len(s.Resizes) != 1 || s.Resizes[0] != "80x24" || len(s.Signals) != 1 || s.Signals[0] != "INT" {
+			t.Fatalf("detaches %d resizes %v signals %v", s.Detaches, s.Resizes, s.Signals)
+		}
+	})
+
+	s.Observe(func(s *Server) { s.FailAttach = true })
+	wsURL := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/sandboxes/" + sb.ID + "/sessions/ses-sh/attach"
+	if _, resp, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + Token}}); err == nil || resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("FailAttach handshake = %v", err)
+	}
 }

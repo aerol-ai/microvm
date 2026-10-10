@@ -163,7 +163,7 @@ func (h *ExecStreamHandle) readLoop(options ExecStreamOptions) {
 				if message.Message == "" {
 					message.Message = "stream error"
 				}
-				h.finish(ExecExitInfo{}, errors.New(message.Message))
+				h.finish(ExecExitInfo{}, &StreamError{Message: message.Message})
 				_ = h.conn.Close()
 				return
 			}

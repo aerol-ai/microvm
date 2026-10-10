@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -149,5 +150,36 @@ func TestToolboxNetworkPayload(t *testing.T) {
 	payload := toolboxNetworkPayload(slot)
 	if payload["guest_ip"] != "172.16.0.6" || payload["gateway_ip"] != "172.16.0.5" || payload["netmask"] != "255.255.255.252" || payload["prefix_len"] != 30 {
 		t.Fatalf("toolboxNetworkPayload = %+v", payload)
+	}
+}
+
+// TestToolboxdInitMountsDevpts guards terminals in Firecracker guests.
+// Nothing but this shim mounts devpts in a VM, and without it opening
+// /dev/ptmx fails with ENODEV: no `aerolvm shell`, `exec -t` or SSH (UC-231).
+// The mount must follow the devtmpfs mount on /dev, which would hide it,
+// and precede the exec of toolboxd.
+func TestToolboxdInitMountsDevpts(t *testing.T) {
+	script := string(toolboxdInitScript)
+	at := func(needle string) int {
+		t.Helper()
+		i := strings.Index(script, needle)
+		if i < 0 {
+			t.Fatalf("toolboxd-init.sh has no %q", needle)
+		}
+		return i
+	}
+	dev := at("mount -t devtmpfs dev  /dev")
+	pts := at("mount -t devpts -o newinstance,ptmxmode=0666,mode=0620,gid=5 devpts /dev/pts")
+	mkdir := at("mkdir -p /dev/pts")
+	agent := at("exec /usr/local/bin/toolboxd")
+	if !(dev < mkdir && mkdir < pts && pts < agent) {
+		t.Fatalf("toolboxd-init.sh order: devtmpfs@%d mkdir@%d devpts@%d exec@%d", dev, mkdir, pts, agent)
+	}
+	if sh, err := exec.LookPath("sh"); err == nil {
+		cmd := exec.Command(sh, "-n")
+		cmd.Stdin = strings.NewReader(script)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("toolboxd-init.sh doesn't parse: %v\n%s", err, out)
+		}
 	}
 }

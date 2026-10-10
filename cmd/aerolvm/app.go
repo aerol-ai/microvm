@@ -39,6 +39,9 @@ type app struct {
 	// signal that cancelled it.
 	notifySignals func(context.Context) (context.Context, func() os.Signal, func())
 	newTools      func(agenttools.Config) (*agenttools.Tools, error)
+	// conn is the connection the command's tools use, so a refused token
+	// can be named in the error.
+	conn *connection
 }
 
 func newApp() *app {
@@ -62,24 +65,49 @@ type verb struct {
 	run     func(ctx context.Context, a *app, args []string) int
 }
 
-func (a *app) verbs() []verb {
-	return []verb{
-		{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
-		{"list", "List sandboxes", listHelp, runList},
-		{"get", "Show one sandbox", getHelp, runGet},
-		{"exec", "Run a command in a sandbox", execHelp, runExec},
-		{"logs", "Print a background command's output", logsHelp, runLogs},
-		{"cp", "Copy a file between this machine and a sandbox", cpHelp, runCp},
-		{"ls", "List a directory in a sandbox", lsHelp, runLs},
-		{"expose", "Publish a sandbox port and print its URL", exposeHelp, runExpose},
-		{"start", "Start stopped sandboxes", startHelp, runStart},
-		{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},
-		{"destroy", "Destroy sandboxes", destroyHelp, runDestroy},
-		{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
-		{"health", "Check that sandboxd is reachable", healthHelp, runHealth},
-		{"version", "Print the aerolvm version", versionHelp, runVersion},
-		{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
+// verbGroup is a heading in the overview.
+type verbGroup struct {
+	title string
+	verbs []verb
+}
+
+// verbGroups orders the overview by what people open the CLI for: getting
+// into a sandbox they already have comes first, managing sandboxes second.
+func (a *app) verbGroups() []verbGroup {
+	return []verbGroup{
+		{"Work in a sandbox", []verb{
+			{"shell", "Open an interactive shell in a sandbox", shellHelp, runShell},
+			{"exec", "Run a command in a sandbox", execHelp, runExec},
+			{"cp", "Copy a file between this machine and a sandbox", cpHelp, runCp},
+			{"ls", "List a directory in a sandbox", lsHelp, runLs},
+			{"logs", "Print a background command's output", logsHelp, runLogs},
+			{"expose", "Publish a sandbox port and print its URL", exposeHelp, runExpose},
+		}},
+		{"Manage sandboxes", []verb{
+			{"list", "List sandboxes", listHelp, runList},
+			{"get", "Show one sandbox", getHelp, runGet},
+			{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
+			{"start", "Start stopped sandboxes", startHelp, runStart},
+			{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},
+			{"destroy", "Destroy sandboxes", destroyHelp, runDestroy},
+			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
+		}},
+		{"Setup", []verb{
+			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
+			{"logout", "Forget the saved login", logoutHelp, runLogout},
+			{"health", "Check that sandboxd is reachable and the token works", healthHelp, runHealth},
+			{"version", "Print the aerolvm version", versionHelp, runVersion},
+			{"mcp", "Run the MCP server over stdio, or print client setup", mcpHelp, runMCP},
+		}},
 	}
+}
+
+func (a *app) verbs() []verb {
+	var all []verb
+	for _, g := range a.verbGroups() {
+		all = append(all, g.verbs...)
+	}
+	return all
 }
 
 func (a *app) run(ctx context.Context, args []string) int {
@@ -123,8 +151,11 @@ func (a *app) run(ctx context.Context, args []string) int {
 func (a *app) overview() string {
 	var b strings.Builder
 	b.WriteString(overviewHead)
-	for _, v := range a.verbs() {
-		fmt.Fprintf(&b, "  %-9s %s\n", v.name, v.summary)
+	for _, g := range a.verbGroups() {
+		fmt.Fprintf(&b, "\n%s:\n", g.title)
+		for _, v := range g.verbs {
+			fmt.Fprintf(&b, "  %-9s %s\n", v.name, v.summary)
+		}
 	}
 	b.WriteString(overviewTail)
 	return b.String()
@@ -190,7 +221,7 @@ func (a *app) flagError(c *commonFlags, verbName string, err error) int {
 // fail reports err and returns code. With --json the error envelope goes to
 // stderr: {"error":{"code","message","http_status","retryable","hint"}}.
 func (a *app) fail(c *commonFlags, err error, code int) int {
-	e := agenttools.Classify(err)
+	e := a.explainRefusal(agenttools.Classify(err))
 	if c != nil && c.json {
 		a.writeErrorJSON(e)
 	} else {
@@ -221,11 +252,24 @@ func (a *app) note(format string, args ...any) {
 	fmt.Fprintf(a.stderr, format+"\n", args...)
 }
 
-// tools builds the agenttools layer for a CLI verb.
+// tools builds the agenttools layer for a CLI verb, with the connection
+// from the environment or the saved login.
 func (a *app) tools(c *commonFlags) (*agenttools.Tools, error) {
+	conn, err := a.connection()
+	if err != nil {
+		return nil, err
+	}
+	a.conn = &conn
+	return a.toolsFor(c, conn)
+}
+
+// toolsFor builds the agenttools layer for one sandboxd and token. Both are
+// always passed: the SDK falls back to the process environment for an empty
+// one, which would bypass connection's rules.
+func (a *app) toolsFor(c *commonFlags, conn connection) (*agenttools.Tools, error) {
 	cfg := agenttools.Config{
-		APIURL: a.getenv("SB_API_URL"),
-		Token:  a.getenv("SB_PAT_TOKEN"),
+		APIURL: conn.apiURL,
+		Token:  conn.token,
 		Source: agenttools.SourceCLI,
 		Warn:   func(s string) { a.note("aerolvm: %s", s) },
 	}

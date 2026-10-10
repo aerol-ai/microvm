@@ -135,6 +135,20 @@ func TestExecStreamDropIsAnError(t *testing.T) {
 	}
 }
 
+// A command the toolbox can't start is the toolbox's answer, not a dropped
+// stream: its reason as given, and not worth retrying.
+func TestExecStartRefusalIsNotADrop(t *testing.T) {
+	tools, fake, _ := newTestTools(t, SourceCLI)
+	fake.AddSandbox(models.Sandbox{Name: "box"})
+	fake.ExecStartError = "this sandbox's image has no shell: neither bash nor sh is installed"
+	sb := resolveTarget(t, tools, "box")
+	_, err := tools.Exec(context.Background(), sb, ExecRequest{Command: "true"})
+	e := Classify(err)
+	if e == nil || e.Code != CodeInvalidArgument || e.Retryable || e.Message != fake.ExecStartError {
+		t.Fatalf("refused start = %+v", e)
+	}
+}
+
 // TestExecWasmBuffered pins D10: WASM sandboxes use buffered exec with no
 // WebSocket, refuse a response over 4 MiB, and refuse -i/-t clearly.
 func TestExecWasmBuffered(t *testing.T) {

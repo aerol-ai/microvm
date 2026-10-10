@@ -118,7 +118,13 @@ This contract is the actual feature, so these rules are tested, not aspirational
 
 1. **Never interactive.** No prompts, pagers, spinners or confirmations.
    Destructive verbs take explicit sandbox refs, and there is no
-   `destroy --all`.
+   `destroy --all`. One exception, added after launch because people
+   reached for the CLI to get *into* a sandbox and found no way in:
+   `aerolvm shell` opens an interactive shell (a persistent PTY session)
+   and, with no sandbox named, asks which one. It refuses to run unless
+   stdin and stdout are both terminals, so no agent or script can reach the
+   prompt; they keep using `exec`. `aerolvm login` asks for the URL and
+   token only on a terminal; a script passes the URL and `--token-stdin`.
 2. **stdout is data, stderr is everything else.** Progress, warnings and hints
    go to stderr. Colour only on a TTY, and `NO_COLOR` is honoured.
 3. **`--json` on every verb.** `AEROLVM_OUTPUT=json` makes it the default for a
@@ -173,6 +179,14 @@ aerolvm mcp     [...]              # Phase 2
 Auth and endpoint use the same `SB_API_URL` / `SB_PAT_TOKEN` as all five SDKs.
 A config file and `aerolvm login` wait for Phase 3, because an env var is
 already the natural interface for an agent.
+
+*Update (built early, with `aerolvm shell`):* people reaching for a shell had
+to export both variables in every terminal, so `aerolvm login [<url>]` landed
+ahead of Phase 3, without profiles. It verifies the token with one
+authenticated read (`/health` takes no token) and saves one URL + token to
+`~/.config/aerolvm/config.json` (0600). `SB_PAT_TOKEN` still wins, and the
+saved token is only sent to the URL it was saved for. `aerolvm logout`
+forgets it locally. `aerolvm health` now also proves the token works.
 
 Operator verbs (templates, WASM module push, cluster drain, audit) are
 deliberately absent. They are not agent operations, and a later

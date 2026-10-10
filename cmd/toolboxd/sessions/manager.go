@@ -41,6 +41,14 @@ type Config struct {
 	SweepInterval time.Duration
 	// BufferBytes is the per-session replay buffer size. Default 1 MiB.
 	BufferBytes int
+	// StartProcess starts a session's command (start is cmd.Start, or a PTY
+	// start that calls it) and returns how to wait for its exit. toolboxd is
+	// PID 1 and reaps orphans with wait4(-1), which can take a session's own
+	// exit status before cmd.Wait does; it passes its child table here so
+	// the status reaches the session instead of reading as exit 0. Nil means
+	// start, then cmd.Wait: right for a host that reaps nothing (the WASM
+	// tool host).
+	StartProcess func(cmd *exec.Cmd, start func() error) (wait func() (code int, signal string), err error)
 }
 
 // Manager owns every Session running in the container.
@@ -239,13 +247,19 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 	}
 
 	if req.PTY {
-		ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+		var ptmx *os.File
+		wait, err := m.startProcess(cmd, func() error {
+			var err error
+			ptmx, err = pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)})
+			return err
+		})
 		if err != nil {
 			s.failed = true
 			_ = s.recorder.Close()
 			return nil, fmt.Errorf("start pty: %w", err)
 		}
 		s.ptmx = ptmx
+		s.wait = wait
 		s.startedAt = time.Now().UTC()
 		s.pumpWG.Add(1)
 		go s.runPump(ptmx, StreamStdout)
@@ -264,12 +278,14 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 			_ = stdin.Close()
 			return nil, fmt.Errorf("stderr pipe: %w", err)
 		}
-		if err := cmd.Start(); err != nil {
+		wait, err := m.startProcess(cmd, cmd.Start)
+		if err != nil {
 			_ = stdin.Close()
 			s.failed = true
 			_ = s.recorder.Close()
 			return nil, fmt.Errorf("start: %w", err)
 		}
+		s.wait = wait
 		s.stdin = stdin
 		// A login shell fed through stdin (a Daytona session) runs this
 		// before any command, once its profile is done. A terminal gets the
@@ -319,6 +335,18 @@ func (m *Manager) Create(ctx context.Context, req models.CreateSessionRequest) (
 
 // Delete removes a session record. If it's still running, signal it first.
 // Always best-effort — does not block on the process actually exiting.
+// startProcess starts cmd through Config.StartProcess, or plainly when it
+// is nil.
+func (m *Manager) startProcess(cmd *exec.Cmd, start func() error) (func() (int, string), error) {
+	if m.cfg.StartProcess != nil {
+		return m.cfg.StartProcess(cmd, start)
+	}
+	if err := start(); err != nil {
+		return nil, err
+	}
+	return func() (int, string) { return waitProcess(cmd) }, nil
+}
+
 func (m *Manager) Delete(id string) error {
 	m.mu.Lock()
 	s, ok := m.byID[id]
@@ -420,30 +448,45 @@ func orDefault(v, fallback int) int {
 	return v
 }
 
+// ErrNoShell is returned for a shell or a command string in an image with
+// neither bash nor sh (distroless, scratch). Without it the session fails
+// later as "fork/exec /bin/sh: no such file or directory", which reads as a
+// toolboxd fault rather than a property of the image.
+var ErrNoShell = errors.New("this sandbox's image has no shell: neither bash nor sh is installed")
+
+// lookPath and statPath are the filesystem lookups detectShell makes,
+// variables so tests can stand in an image without a shell.
+var (
+	lookPath = exec.LookPath
+	statPath = os.Stat
+)
+
 // buildArgv resolves the final argv from a CreateSessionRequest. If both
 // Argv and Command are empty, defaults to a login shell.
 func buildArgv(req models.CreateSessionRequest) ([]string, error) {
 	if len(req.Argv) > 0 {
 		return append([]string{}, req.Argv...), nil
 	}
-	if cmd := strings.TrimSpace(req.Command); cmd != "" {
-		shell := detectShell()
-		return []string{shell, "-c", cmd}, nil
+	shell, err := detectShell()
+	if err != nil {
+		return nil, err
 	}
-	// Default: a login shell. Prefer bash, fall back to sh.
-	shell := detectShell()
-	if filepath.Base(shell) == "bash" {
-		return []string{shell, "-l"}, nil
+	if cmd := strings.TrimSpace(req.Command); cmd != "" {
+		return []string{shell, "-c", cmd}, nil
 	}
 	return []string{shell, "-l"}, nil
 }
 
-func detectShell() string {
-	if path, err := exec.LookPath("bash"); err == nil {
-		return path
+// detectShell prefers bash, falls back to sh on PATH, then to /bin/sh for
+// a toolboxd started with a PATH that misses it.
+func detectShell() (string, error) {
+	for _, name := range []string{"bash", "sh"} {
+		if path, err := lookPath(name); err == nil {
+			return path, nil
+		}
 	}
-	if path, err := exec.LookPath("sh"); err == nil {
-		return path
+	if _, err := statPath("/bin/sh"); err == nil {
+		return "/bin/sh", nil
 	}
-	return "/bin/sh"
+	return "", ErrNoShell
 }

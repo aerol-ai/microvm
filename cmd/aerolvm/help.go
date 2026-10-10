@@ -4,30 +4,61 @@ package main
 // examples per verb, and the JSON shape named. Keep it that way; agents read
 // `aerolvm <verb> --help` instead of docs.
 
-const overviewHead = `aerolvm drives AerolVM sandboxes from a shell or an AI agent.
+const overviewHead = `aerolvm drives AerolVM sandboxes from a terminal, a script or an AI agent.
 
 Usage: aerolvm <command> [flags] [args]
 
-Commands:
+Sign in once:              aerolvm login
+Get a shell in a sandbox:  aerolvm shell <sandbox>
 `
 
 const overviewTail = `
 Sandboxes are addressed as <id-or-name>: sb-<16 hex> is an ID, anything else
 is a name (names are unique per account).
 
-Environment:
-  SB_API_URL       sandboxd URL (default http://127.0.0.1:21212)
-  SB_PAT_TOKEN     API token (required)
+Environment (both override "aerolvm login"):
+  SB_API_URL       sandboxd URL (default: your login, else http://127.0.0.1:21212)
+  SB_PAT_TOKEN     API token (required unless you ran "aerolvm login")
   AEROLVM_OUTPUT   set to "json" to make --json the default
 
 Output: stdout is data, stderr is everything else. With --json, errors are
 {"error":{"code":"not_found","message":"...","http_status":404,"retryable":false}}
 on stderr.
 
-Exit codes: 0 ok, 1 error, 2 usage. exec returns the command's own code,
-128+n if a signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
+Exit codes: 0 ok, 1 error, 2 usage. exec and shell return the remote
+command's own code (128+n if a signal killed it) and 125 if aerolvm itself
+failed; exec returns 124 on --timeout.
 
 Run "aerolvm <command> --help" for a command's flags and examples.
+`
+
+const shellHelp = `Open an interactive shell in a sandbox.
+
+Usage: aerolvm shell [<sandbox>] [--session NAME | --new]
+
+You get a login shell (bash, or sh when the image has no bash). It keeps
+running when you leave without exiting: Ctrl-] detaches, and so does
+closing the terminal or losing the network. Run the same command again to
+get back in, with the shell's recent output. exit or Ctrl-D ends it.
+
+With no <sandbox>, aerolvm lists the sandboxes you can open a shell in and
+asks for a number. Everyone who opens the same session shares one shell,
+like tmux; an SSH login to the sandbox lands in the same "default" one.
+
+shell needs a terminal; scripts and agents use "aerolvm exec". WASM and
+isolate sandboxes have no shell. A stopped sandbox is started first.
+Exit code: the shell's own, 0 after a detach, 125 if aerolvm itself failed.
+
+Flags:
+  --session NAME   open the shell with this name, or start one under it,
+                   instead of the shared "default" shell
+  --new            start a separate shell; when you detach, aerolvm prints
+                   the --session name that reopens it
+
+Examples:
+  aerolvm shell build-box
+  aerolvm shell
+  aerolvm shell build-box --new
 `
 
 const createHelp = `Create a sandbox, or return the existing one with the same name.
@@ -92,6 +123,8 @@ One argument after -- runs as a shell command line ("make test | tail");
 several are quoted and joined. Exit code: the command's own, 128+n if a
 signal killed it, 124 on --timeout, 125 if aerolvm itself failed.
 
+For an interactive shell, use "aerolvm shell" instead.
+
 Stdin is forwarded when it is not a terminal (echo x | aerolvm exec sb -- cat).
 Some agent harnesses leave stdin open forever; pass --no-stdin there or a
 command that reads stdin waits until --timeout. WASM sandboxes have no
@@ -103,7 +136,8 @@ Flags:
   --timeout D      kill the command after D (e.g. 10m) and exit 124
   -i               forward stdin even when it is a terminal
   --no-stdin       never forward stdin
-  -t               allocate a terminal (only when stdout is a terminal)
+  -t               allocate a terminal (only when stdout is a terminal);
+                   -it is -i and -t together, as in docker exec
   --background     start the command as a background session and print its
                    session ID; read its output with "aerolvm logs"
   --json           print {"exit_code","stdout","stderr",...} at the end
@@ -112,6 +146,7 @@ Flags:
 Examples:
   aerolvm exec build-box -- pytest -q
   aerolvm exec build-box --cwd /app --timeout 15m -- "npm ci && npm test"
+  aerolvm exec build-box -it -- htop
   aerolvm exec build-box --background -- npm run dev
 `
 
@@ -191,6 +226,40 @@ Example:
 const healthHelp = `Check that sandboxd is reachable and the token works.
 
 Usage: aerolvm health [--json]
+
+Says which credentials it used: SB_PAT_TOKEN or the saved login.
+`
+
+const loginHelp = `Save the sandboxd URL and API token, so commands work without
+SB_API_URL and SB_PAT_TOKEN.
+
+Usage: aerolvm login [<url>] [--token-stdin]
+
+Asks for the URL (default: SB_API_URL, your last login, or the local
+setup's http://127.0.0.1:21212), then the token, with typing hidden. The
+token is checked against sandboxd before it is saved, readable only by you,
+in ~/.config/aerolvm/config.json ($XDG_CONFIG_HOME/aerolvm when set,
+%AppData%\aerolvm on Windows). A bare host gets https://, or http:// for
+localhost. Logging in again replaces the saved login.
+
+The token is the SB_PAT_TOKEN sandboxd runs with; the local setup prints it
+when it installs. SB_PAT_TOKEN in the environment still wins over the login,
+and the saved token is only ever sent to the URL it was saved for.
+
+Flags:
+  --token-stdin   read the token from stdin instead of asking (scripts, CI)
+  --json          print {"api_url","config_path","server_version"}
+
+Examples:
+  aerolvm login
+  aerolvm login https://sandbox.example.com
+  aerolvm login https://sandbox.example.com --token-stdin < token.txt
+`
+
+const logoutHelp = `Forget the saved login. The token only leaves this machine; it keeps
+working on sandboxd until an operator revokes it.
+
+Usage: aerolvm logout [--json]
 `
 
 const versionHelp = `Print the aerolvm version.

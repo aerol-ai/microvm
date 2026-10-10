@@ -241,7 +241,7 @@ func (h *SessionAttachHandle) readLoop(options SessionAttachOptions) {
 				if message.Message == "" {
 					message.Message = "session error"
 				}
-				h.finish(0, "", errors.New(message.Message))
+				h.finish(0, "", &StreamError{Message: message.Message})
 				_ = h.conn.Close()
 				return
 			}
