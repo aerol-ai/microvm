@@ -98,7 +98,7 @@ Kata provides every row except the last. So why not use Kata and delete most of 
 
 The answer is the last row of that table. AerolVM's fast start comes from loading snapshots. (A snapshot is a saved copy of a VM's memory and device state.)
 
-A warm pool holds VMMs that already booted from a template snapshot and were left **paused**. A create call claims one, sends it the new sandbox's settings with a PATCH request, and resumes it. That skips the kernel boot entirely. The code lives in [`warmspawn.go`](/firecracker-hydration/) and the [warm pool](/snapshots/), and it only works because AerolVM speaks the Firecracker snapshot API directly.
+A warm pool holds VMMs that already booted from a template snapshot and were left **paused**. A create call claims one, sends it the new sandbox's settings with a PATCH request, and resumes it. That skips the kernel boot entirely. The code lives in [`warmspawn.go`](/firecracker-hydration/) and the [warm pool](/firecracker-hydration/), and it only works because AerolVM speaks the Firecracker snapshot API directly.
 
 Kata hides the VMM on purpose; that is its whole value. But that hiding would also bury the pause-and-resume snapshot steps our warm pool is built on. Adopting Kata would trade our main advantage for the containerd and Kubernetes ecosystem.
 

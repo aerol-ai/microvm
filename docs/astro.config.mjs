@@ -19,6 +19,10 @@ export default defineConfig({
   outDir: './dist',
   redirects: {
     '/': '/introduction',
+    // snapshots.mdx was merged into images-and-snapshots.mdx; keep old links working.
+    '/snapshots': '/images-and-snapshots',
+    // serverless.mdx was renamed to ghost-sandboxes.mdx.
+    '/serverless': '/ghost-sandboxes',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

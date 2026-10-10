@@ -10,7 +10,7 @@ A template is a [Firecracker](/firecracker-sandbox/) sandbox prepared ahead of t
 Without a template, every Firecracker create builds the disk from the image again, which takes 10 to 60 seconds. With a template, a new sandbox copies the snapshot and resumes it. It skips the build and the kernel boot, and starts in under 100 ms.
 
 <Aside type="note" title="Not using Firecracker?">
-Templates only apply to `runtime: "firecracker"`. To save and reuse a normal container sandbox, use [Snapshots](/snapshots/) instead. A snapshot turns a running sandbox into a named image you can start copies from.
+Templates only apply to `runtime: "firecracker"`. To save and reuse a normal container sandbox, use [Snapshots](/images-and-snapshots/#snapshots) instead. A snapshot turns a running sandbox into a named image you can start copies from.
 </Aside>
 
 Use templates when you want:
@@ -315,7 +315,7 @@ The template must be `ready`, `ready_no_snapshot` or `unhealthy`. The last two s
 A rebuild makes a new snapshot from the disk the template already has. Rebuild when:
 
 - the snapshot is damaged and you want it fixed before the next create;
-- the server's kernel or toolbox (the helper program inside each sandbox) was upgraded. A rebuild picks up the change without waiting for the optional [scheduled rebuild](#rebuild-templates-on-a-schedule).
+- the server's kernel or toolbox (the helper program inside each sandbox) was upgraded. A rebuild picks up the change.
 
 It is safe to call many times at once. Parallel calls for the same `ready` template start only one rebuild. The call returns the template with status `unhealthy`. Wait for it to become `ready` again.
 
@@ -409,6 +409,6 @@ Deleting removes the disk and snapshot files. If any sandbox still uses the temp
 ## Next steps
 
 - [Firecracker](/firecracker-sandbox/): what Firecracker sandboxes are and what the server needs.
-- [Snapshots](/snapshots/): save and reuse normal container sandboxes.
+- [Snapshots](/images-and-snapshots/#snapshots): save and reuse normal container sandboxes.
 - [Firecracker snapshot restore](/firecracker-hydration/): how a sandbox resumes from a template's snapshot.
 - [Cluster setup](/cluster-setup/): add Firecracker workers to a cluster.

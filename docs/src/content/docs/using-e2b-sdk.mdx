@@ -110,7 +110,7 @@ We checked both examples with E2B SDK 2.50.0. With no template, the E2B SDK asks
 
 | E2B feature | What happens |
 |---|---|
-| Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/snapshots/) as the template. |
+| Building templates (E2B's template build tools) | Not supported. Use a container image or an AerolVM [snapshot](/images-and-snapshots/#snapshots) as the template. |
 | `network.rules` (changing requests on the way out) | Refused (HTTP 501). AerolVM has its own [rules and inspection](/egress-rules-and-inspection/). |
 | `network.egressProxy` | Refused (HTTP 501). |
 | Starting MCP servers inside the sandbox (the `mcp` create option) | Refused (HTTP 501). |
@@ -124,7 +124,7 @@ A template is what E2B starts a sandbox from. On AerolVM the template can be:
 
 - **`base`**, which starts `ubuntu:22.04`.
 - **A name your operator has mapped to an image**, with `SB_E2B_TEMPLATE_MAP_JSON`.
-- **An AerolVM [snapshot](/snapshots/)** (a saved copy of a sandbox's files), by its name or ID.
+- **An AerolVM [snapshot](/images-and-snapshots/#snapshots)** (a saved copy of a sandbox's files), by its name or ID.
 - **The ID of a registered [WASM module](/wasm-modules/)**, which starts a WebAssembly sandbox. You can also set the metadata keys `runtime` to `wasm` and `module_ref` to the module.
 
 Any other template name is refused with HTTP 400.
@@ -139,7 +139,7 @@ E2B sandboxes can be reached from the internet, so AerolVM's E2B layer makes the
 
 ## Wake on request
 
-Set the metadata key `aerolvm.serverless` to `"true"` to make the sandbox [serverless](/serverless/). It then stops when its time runs out, and an incoming web request starts it again.
+Set the metadata key `aerolvm.serverless` to `"true"` to make it a [ghost sandbox](/ghost-sandboxes/). It then stops when its time runs out, and an incoming web request starts it again.
 
 ## Good to know
 

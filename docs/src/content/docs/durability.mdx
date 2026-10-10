@@ -179,7 +179,7 @@ The cluster keeps a copy of each sandbox's create request: image, environment va
 
 Good to know:
 
-- **The image must be reachable from every node.** Recreate is refused for an image that exists on only one node. Examples are a local build, or a [snapshot](/snapshots/) (a saved copy of a sandbox) that was not shared.
+- **The image must be reachable from every node.** Recreate is refused for an image that exists on only one node. Examples are a local build, or a [snapshot](/images-and-snapshots/#snapshots) (a saved copy of a sandbox) that was not shared.
 - **The sandbox's own disk is still lost.** Put data you need on attached storage.
 
 ### Expose a port again by hand
@@ -339,6 +339,6 @@ Even so, keep these ports on a private network you control, such as VPC peering,
 ## Next steps
 
 - [Attach cloud storage](/external-storage/): every storage type and its options.
-- [Snapshots](/snapshots/): share snapshots across a cluster so recreate can use them.
+- [Share snapshots across a cluster](/images-and-snapshots/#share-snapshots-across-a-cluster): so recreate can use them.
 - [Cluster setup](/cluster-setup/): build a cluster with failover.
 - [Placement and failover](/engineering-placement-failover/): the deep dive on how the cluster picks and replaces nodes.
