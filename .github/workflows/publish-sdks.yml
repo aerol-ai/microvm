@@ -137,22 +137,16 @@ jobs:
         with:
           ref: refs/heads/main
 
+      # No registry-url: setup-node would write an _authToken line into
+      # .npmrc, and any _authToken makes npm skip OIDC trusted publishing
+      # (actions/setup-node#1551). Publish then sends the classic token,
+      # and npm answers EOTP because this job cannot enter an authenticator code.
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
-          registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: sdk/typescript/package-lock.json
-
-      - name: Verify npm token is configured
-        run: |
-          if [[ -z "${NPM_TOKEN:-}" ]]; then
-            echo "::error::Missing repository secret NPM_TOKEN"
-            exit 1
-          fi
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify package version matches requested SDK version
         run: |
@@ -162,40 +156,6 @@ jobs:
             echo "::error::sdk/typescript/package.json version $package_version does not match requested SDK version $release_version"
             exit 1
           fi
-
-      - name: Verify npm token can publish requested package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          publish_user="$(npm whoami)"
-          package_name="$(node -p "require('./package.json').name")"
-
-          if [[ "$package_name" != @*/* ]]; then
-            exit 0
-          fi
-
-          scope="${package_name#@}"
-          scope="${scope%%/*}"
-
-          if [[ "$publish_user" == "$scope" ]]; then
-            exit 0
-          fi
-
-          org_membership_json="$(npm org ls "$scope" "$publish_user" --json 2>/dev/null || true)"
-          publish_role="$(node -e "const raw = process.argv[1]; if (!raw) process.exit(0); const data = JSON.parse(raw); const entries = Object.entries(data); if (entries.length !== 1) process.exit(0); process.stdout.write(String(entries[0][1] ?? ''));" "$org_membership_json")"
-
-          if [[ -z "$publish_role" ]]; then
-            echo "::error::NPM_TOKEN authenticates as $publish_user, but that account cannot publish the scoped package $package_name. Use an npm token from the $scope scope owner or an npm org member with developer, admin, or owner access."
-            exit 1
-          fi
-
-          case "$publish_role" in
-            developer|admin|owner) ;;
-            *)
-              echo "::error::NPM_TOKEN authenticates as $publish_user, but its npm org role in $scope is '$publish_role'. Publishing $package_name requires developer, admin, or owner access."
-              exit 1
-              ;;
-          esac
 
       - name: Check whether package version is already published
         id: npm_publish_state
@@ -226,21 +186,18 @@ jobs:
       - name: Publish package
         if: steps.npm_publish_state.outputs.already_published != 'true'
         run: |
-          # Publish through GitHub OIDC trusted publishing. NPM_TOKEN is a
-          # classic credential, and npm publish 2FA rejects it with EOTP
-          # because the job cannot enter an authenticator code.
+          # Publish through GitHub OIDC trusted publishing. A classic npm
+          # token cannot satisfy publish 2FA, so the registry returns EOTP.
           #
-          # Two things otherwise keep the CLI on that token path:
-          # - Node 22 ships npm older than 11.5.1, the first release that
-          #   exchanges ACTIONS_ID_TOKEN_REQUEST_*. Install 11.21.0 from the
-          #   lockfile in .github/npm-cli. `npm ci` checks those integrity hashes
-          #   and its postinstall replaces the vulnerable bundled copies of
-          #   brace-expansion, http-cache-semantics, ip-address, and undici.
-          # - setup-node's registry-url writes
-          #   //registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}
-          #   into $NPM_CONFIG_USERCONFIG. Any _authToken entry, including
-          #   one that expands empty, makes npm skip OIDC and send the
-          #   classic token (actions/setup-node#1551).
+          # Node 22 ships npm older than 11.5.1, the first release that
+          # exchanges ACTIONS_ID_TOKEN_REQUEST_*. Install 11.21.0 from the
+          # lockfile in .github/npm-cli. `npm ci` checks those integrity hashes
+          # and its postinstall replaces the vulnerable bundled copies of
+          # brace-expansion, http-cache-semantics, ip-address, and undici.
+          #
+          # Refuse to publish if a classic token is still configured. Any
+          # _authToken entry, including one that expands empty, makes npm
+          # skip OIDC (actions/setup-node#1551).
           npm ci --prefix "$GITHUB_WORKSPACE/.github/npm-cli"
           npm_bin="$GITHUB_WORKSPACE/.github/npm-cli/node_modules/.bin/npm"
           npmrc="${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}"
