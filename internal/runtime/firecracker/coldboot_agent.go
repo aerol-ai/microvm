@@ -6,6 +6,8 @@ import (
 	"net"
 	"runtime"
 	"strings"
+
+	"github.com/aerol-ai/microvm/internal/runtime/resolvconf"
 )
 
 // toolboxdInitScript is the PID-1 shim baked into every cold-boot rootfs.
@@ -23,6 +25,11 @@ const (
 	guestToolboxPath = "/usr/local/bin/toolboxd"
 	guestInitPath    = "/usr/local/bin/toolboxd-init"
 	guestEnvPath     = "/etc/toolboxd.env"
+	// guestResolvPath is where the host's resolvers are injected for
+	// toolboxd-init to install as /etc/resolv.conf. Not injected there
+	// directly: the rootfs builder refuses a destination that is a symlink,
+	// which /etc/resolv.conf is in some images.
+	guestResolvPath = "/etc/toolboxd.resolv.conf"
 
 	// guestToolboxPort is the in-guest HTTP port toolboxd listens on
 	// (toolboxd's SB_TOOLBOX_PORT default, cmd/toolboxd/main.go). The host
@@ -60,7 +67,22 @@ func coldBootInjectFiles(toolboxBinaryPath, toolboxToken string, slot *TapSlot) 
 		{HostPath: toolboxBinaryPath, GuestPath: guestToolboxPath, Mode: 0o755},
 		{Content: toolboxdInitScript, GuestPath: guestInitPath, Mode: 0o755},
 		{Content: []byte(env), GuestPath: guestEnvPath, Mode: 0o600},
+		{Content: guestResolvConf(), GuestPath: guestResolvPath, Mode: 0o644},
 	}
+}
+
+// guestResolvConf is the resolver configuration a guest gets: the host's
+// upstream resolvers, as a container gets them. A container runtime mounts
+// one in; a VM has only what its image ships, and stock images (alpine)
+// ship none, so musl asked 127.0.0.1 and no lookup left the guest, not even
+// to the egress gateway's DNS redirect on the TAP (UC-204). A variable so
+// tests can stand in a host.
+var guestResolvConf = func() []byte {
+	body, err := resolvconf.Generate(resolvconf.HostPath)
+	if err != nil {
+		return []byte(resolvconf.Fallback)
+	}
+	return []byte(body)
 }
 
 func shellSingleQuote(s string) string {

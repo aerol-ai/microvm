@@ -95,4 +95,16 @@ configure_network() {
 
 configure_network
 
+# Name resolution. A container runtime mounts a resolv.conf in; here the
+# host's resolvers are injected beside it and installed now, replacing the
+# image's (stock images often ship none, and musl then asks 127.0.0.1, so no
+# lookup ever leaves the guest). rm first: the image's may be a symlink.
+# Copied with shell builtins only; the image may lack cp.
+if [ -f /etc/toolboxd.resolv.conf ]; then
+	rm -f /etc/resolv.conf
+	while IFS= read -r line || [ -n "$line" ]; do
+		printf '%s\n' "$line"
+	done < /etc/toolboxd.resolv.conf > /etc/resolv.conf
+fi
+
 exec /usr/local/bin/toolboxd

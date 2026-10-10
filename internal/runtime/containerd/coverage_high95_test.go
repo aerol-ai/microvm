@@ -2640,12 +2640,6 @@ func TestPrepareSandboxHostFilesHostnameWriteFail(t *testing.T) {
 	}
 }
 
-func TestIsLoopbackResolverInvalidIP(t *testing.T) {
-	if isLoopbackResolver("not-an-ip") {
-		t.Fatal("invalid IP must not be treated as loopback")
-	}
-}
-
 func TestLivePushNilDriver(t *testing.T) {
 	p := &RegistryPusher{driver: nil}
 	if _, err := p.livePush(context.Background(), "a", "b", models.RegistryAuth{}); err == nil {

@@ -354,18 +354,6 @@ func TestEnsureRunscConfigWriteFailPush95(t *testing.T) {
 	}
 }
 
-func TestGenerateResolvConfShortLinePush95(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "resolv.conf")
-	if err := os.WriteFile(path, []byte("nameserver\nnameserver 1.1.1.1\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	body, err := generateResolvConf(path)
-	if err != nil || !strings.Contains(body, "1.1.1.1") {
-		t.Fatalf("body=%q err=%v", body, err)
-	}
-}
-
 func TestLeasesServiceFnNilPush95(t *testing.T) {
 	if leasesServiceFn(nil) != nil {
 		t.Fatal("nil client")
