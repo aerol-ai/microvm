@@ -7,7 +7,7 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 A sandbox is a separate, locked-down place to run code. Most sandboxes have their own files, their own network and their own share of CPU, memory and disk. You create one with a single SDK call, use it, and delete it when you are done.
 
-This page covers the everyday tasks: create, name, find, stop, start, resize and delete. The [Images, resources and lifecycle](/environment/) page lists every option in more detail.
+This page covers the everyday tasks: create, name, find, stop, start, resize and delete. [Images and snapshots](/environment/) and [Lifecycle](/lifecycle/) cover those options in more detail.
 
 ## Create a sandbox
 
@@ -83,7 +83,15 @@ The rest of this page assumes you already have a `client` and a `sandbox` from t
 
 ## Give the sandbox more CPU, memory or disk
 
-Set `cpu`, `memoryMB` and `diskGB` when you create the sandbox. CPU can be a fraction, like `0.5` for half a core.
+Set these when you create the sandbox. Each one you leave out gets its default.
+
+| Option | What it does | Default |
+|---|---|---|
+| `cpu` | How many CPU cores the sandbox may use. Fractions work, like `0.5`. | `1` |
+| `memoryMB` | The most memory the sandbox may use, in megabytes. | `1024` |
+| `diskGB` | The most disk space the sandbox may write, in gigabytes. | `10` |
+
+The names change a little by language, as the examples show. Python also accepts `memoryMB` and `diskGB`. Rust takes whole cores only.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -134,6 +142,10 @@ Set `cpu`, `memoryMB` and `diskGB` when you create the sandbox. CPU can be a fra
 </Tabs>
 
 You can change CPU and memory later without a restart. See [Change CPU or memory](#change-cpu-or-memory).
+
+<Aside type="caution">
+The disk limit is only enforced when the server runs containers on Docker. Servers that use containerd (another container engine), and gVisor sandboxes, record the value but do not enforce it.
+</Aside>
 
 ## Give the sandbox a name
 
@@ -305,7 +317,7 @@ The SDKs measure these times in nanoseconds (billionths of a second). One hour i
   </TabItem>
 </Tabs>
 
-There are four timers in all, and you can change them later. See [Stop or delete a sandbox automatically](/environment/#stop-or-delete-a-sandbox-automatically).
+There are four timers in all, and you can change them later. See [Lifecycle](/lifecycle/).
 
 ## Pick a runtime
 
@@ -632,7 +644,8 @@ WebAssembly sandboxes have a few extra states, such as `passivated` (saved to di
 
 ## Next steps
 
-- [Images, resources and lifecycle](/environment/): every create option and its default.
+- [Images and snapshots](/environment/): choose what a sandbox starts from.
+- [Lifecycle](/lifecycle/): every timer that stops or deletes a sandbox.
 - [Run commands](/exec-streaming/): run programs and stream their output.
 - [Files](/file-system/): copy files into and out of a sandbox.
 - [Tags](/sandbox-tags/): label sandboxes and list only the ones you want.
