@@ -1,232 +1,229 @@
 ---
 title: Randomness in Cloned Sandboxes
+description: Make sure Firecracker sandboxes cloned from one template do not hand out the same random numbers.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-When a Firecracker sandbox boots from a snapshot template, AerolVM clones the **entire memory image** of the template VM. That is what makes clones start in milliseconds — but it also means every clone begins life with an identical copy of the template's random-number generator state. Two clones that draw "random" bytes after resuming can produce the **same** values: duplicate UUIDs, duplicate session tokens, duplicate cryptographic nonces or keys.
+A [Firecracker template](/firecracker-templates/) can save a paused copy of a running virtual machine's memory. New Firecracker sandboxes then start from a copy of that memory, which is why they start in milliseconds. We call each one a clone.
 
-This page explains what AerolVM handles for you automatically, where a gap remains, and how to close it for your own long-lived processes.
+There is a catch. Every clone starts with the same copy of the template's random number state. Two clones that ask for "random" values right after they start could get the **same** ones. That means repeated IDs, repeated session tokens, or repeated encryption keys.
 
-## Two layers of randomness
+This page shows what AerolVM fixes for you, the one case it cannot fix, and how to handle that case in your own code.
 
-A running Linux VM has random state at two layers, and they are reseeded differently:
+## Two kinds of random number source
 
-| Layer | Example | Frozen into the snapshot? | Reseeded by AerolVM? |
+A Linux machine keeps random state in two places, and AerolVM handles them differently:
+
+| Source | Examples | Copied into the clone? | Fixed by AerolVM? |
 |---|---|---|---|
-| **Kernel CSPRNG** | `getrandom()`, `/dev/urandom`, `crypto/rand`, OpenSSL, `secrets`, `SecureRandom` | Yes | **Yes — automatically on every resume** |
-| **Userspace PRNG** | Python `random`/`numpy`, Go `math/rand`, `java.util.Random` inside a long-lived process | Yes | No — your process must reseed itself |
+| **The kernel's secure source** (inside the operating system) | `getrandom()`, `/dev/urandom`, Go `crypto/rand`, OpenSSL, Python `secrets`, Java `SecureRandom` | Yes | **Yes, on every clone start** |
+| **A generator inside your program** that lives a long time | Python `random` or `numpy` in a process that keeps running, Go `math/rand`, `java.util.Random` | Yes | No. Your program must reseed it. |
 
-## What AerolVM does automatically
+## What AerolVM does for you
 
-On every resume-from-snapshot, the in-guest agent force-reseeds the **kernel** CSPRNG from fresh host entropy. The reseed completes before any process you newly start through the SDK runs, which means:
+Each time a clone starts, a small helper program inside the sandbox (the toolbox) gives the kernel fresh random data from the host. This happens before any program you start through the SDK runs. So:
 
-- Any process you start **after** the clone resumes (for example, each `exec` or code-run invocation spawns a fresh interpreter) seeds from the freshly-reseeded kernel and is already clone-distinct.
-- Anything that reads the OS CSPRNG per call — `crypto/rand`, Python's `secrets`, Node's `crypto`/WebCrypto, Java's `SecureRandom` — is safe with no action on your part.
+- **New programs are safe.** Any program you start after the clone begins gets the fresh kernel state. Each `exec` starts a new program, so each one is already different from other clones.
+- **Secure random calls are safe.** Code that asks the kernel each time, like Go `crypto/rand`, Python `secrets`, Node `crypto` and WebCrypto, or Java `SecureRandom`, needs nothing from you.
 
-In short: **fresh processes and crypto RNGs are handled for you.**
+There is one timing gap. A program that was **already running inside the template** may get to run for a moment before the reseed lands. The deep dive [Correct snapshot clones](/engineering-snapshot-correctness/) explains that gap and how Firecracker's VM generation ID closes it where it is available. It is the same long-running-program case described next.
 
-The one timing caveat is for a process *already running inside the template* when the clone resumes: it can be scheduled in the brief window before the agent's reseed lands. The engineering deep-dive covers that window and how Firecracker's vmgenid closes it where available — see [Snapshot Clone Correctness](/engineering-snapshot-correctness). It is the same long-lived-process case described next.
+## The gap: long-running programs with their own generator
 
-## The remaining gap: long-lived userspace PRNGs
+AerolVM cannot fix a long-running program that was already started inside the template and keeps a random generator in its own memory. A common example is a Python interpreter that was started in the template and already ran `import numpy`. Its `random` and `numpy` state was saved with the template. The kernel reseed does not reach into that program's memory. So every clone of that template would produce the same `random` and `numpy` numbers.
 
-The one case AerolVM cannot fix from outside is a **long-lived process baked into the template snapshot** that holds a userspace PRNG in its own memory — for example, a preloaded Python interpreter that already did `import numpy`. The interpreter's `random`/`numpy` seed is frozen into the snapshot, and the kernel reseed does not reach into another process's heap. Every clone of that template would then draw the same `random`/`numpy` sequence.
+To let such a program notice that it is a clone, the toolbox publishes a **clone-generation token**. The token changes every time a clone starts. A program can read it from the file `/run/aerolvm/clone-generation` (fast, local, no login needed), or you can read it with the SDK.
 
-The agent publishes a **clone-generation token** so such a process can detect the clone and reseed itself. The token changes on every resume. Read it either from the well-known file `/run/aerolvm/clone-generation` (fast, local, no auth) or via the SDK.
+## Check for a clone from the SDK
 
-## Detect a clone from the SDK
-
-`cloneGeneration()` returns the current token and the time of the last resume. Poll it to detect that a sandbox has been cloned or migrated — for example, to re-run setup. (This is a read-only signal; it does not reseed a process inside the guest.)
+`cloneGeneration` returns the current token and the time of the last clone start. If the token changes, the sandbox was cloned or moved. Use it, for example, to run setup again. It only reads the token. It does not reseed anything inside the sandbox.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
+    ```ts
+    const gen = await client.cloneGeneration(sandboxID);
+    console.log(gen.generation, gen.resumedAt);
 
-```ts
-const gen = await vm.cloneGeneration(sandboxID);
-console.log(gen.generation, gen.resumedAt);
-// or, from a Sandbox handle:
-const g = await sandbox.cloneGeneration();
-```
-
+    // or, from a sandbox object:
+    const g = await sandbox.cloneGeneration();
+    ```
   </TabItem>
   <TabItem label="Python">
+    ```python
+    gen = client.clone_generation(sandbox_id)
+    print(gen.generation, gen.resumedAt)
 
-```python
-gen = client.clone_generation(sandbox_id)
-print(gen.generation, gen.resumedAt)
-# or, from a Sandbox handle:
-g = sandbox.clone_generation()
-```
-
+    # or, from a sandbox object:
+    g = sandbox.clone_generation()
+    ```
   </TabItem>
   <TabItem label="Go">
+    ```go
+    gen, err := client.CloneGeneration(ctx, sandboxID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(gen.Generation, gen.ResumedAt)
 
-```go
-gen, err := client.CloneGeneration(ctx, sandboxID)
-if err != nil {
-    return err
-}
-fmt.Println(gen.Generation, gen.ResumedAt)
-// or, from a *Sandbox handle:
-g, err := sandbox.CloneGeneration(ctx)
-```
-
+    // or, from a sandbox object:
+    g, err := sandbox.CloneGeneration(ctx)
+    ```
   </TabItem>
   <TabItem label="Rust">
+    ```rust
+    let gen = client.clone_generation(&sandbox_id)?;
+    println!("{} {}", gen.generation, gen.resumed_at);
 
-```rust
-let gen = client.clone_generation(&sandbox_id)?;
-println!("{} {}", gen.generation, gen.resumed_at);
-// or, from a Sandbox handle:
-let g = sandbox.clone_generation()?;
-```
-
+    // or, from a sandbox object:
+    let g = sandbox.clone_generation()?;
+    ```
   </TabItem>
   <TabItem label="Java">
+    ```java
+    CloneGeneration gen = client.cloneGeneration(sandboxId);
+    System.out.println(gen.generation + " " + gen.resumedAt);
 
-```java
-CloneGeneration gen = client.cloneGeneration(sandboxId);
-System.out.println(gen.generation + " " + gen.resumedAt);
-// or, from a Sandbox handle:
-CloneGeneration g = sandbox.cloneGeneration();
-```
-
+    // or, from a sandbox object:
+    CloneGeneration g = sandbox.cloneGeneration();
+    ```
   </TabItem>
 </Tabs>
 
-## Reseed your own process inside the guest
+`resumedAt` is the host's clock at the last clone start, in Unix nanoseconds. It is `0` if the sandbox was never cloned.
 
-If your template keeps a long-lived process alive across the snapshot, have **that process** read the clone-generation token and reseed its userspace PRNG when the token changes. The snippets below run *inside* the sandbox, in the language of your workload. Crypto RNGs are already safe (see above) — reseed only the userspace, non-crypto generators you control.
+## Reseed your own program inside the sandbox
+
+If your template keeps a program running, have **that program** read the token and reseed its own generator when the token changes. The code below runs **inside** the sandbox, in the language of that program. Secure random calls are already safe, so only reseed the plain generators you control.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
+    ```ts
+    import { readFileSync } from "node:fs";
 
-```ts
-import { readFileSync } from "node:fs";
+    // Node's Math.random() cannot be reseeded (it is internal to V8).
+    // Node crypto and WebCrypto are already safe after the kernel reseed.
+    // Use this hook to reseed any seeded generator library you use.
+    let lastGen: string | undefined;
 
-// Node's Math.random() cannot be reseeded (V8 internal), and crypto /
-// WebCrypto read the OS CSPRNG directly — already safe after the kernel
-// reseed. Use this hook to reseed any third-party seeded PRNG you hold.
-let lastGen: string | undefined;
-
-export function reseedIfCloned(reseed: () => void): void {
-  let gen: string;
-  try {
-    gen = readFileSync("/run/aerolvm/clone-generation", "utf8").trim();
-  } catch {
-    return; // file absent: nothing to do
-  }
-  if (gen === lastGen) return;
-  lastGen = gen;
-  reseed(); // e.g. seedrandom(crypto.randomBytes(16).toString("hex"))
-}
-```
-
+    export function reseedIfCloned(reseed: () => void): void {
+      let gen: string;
+      try {
+        gen = readFileSync("/run/aerolvm/clone-generation", "utf8").trim();
+      } catch {
+        return; // no file: nothing to do
+      }
+      if (gen === lastGen) return;
+      lastGen = gen;
+      reseed(); // for example: seedrandom(crypto.randomBytes(16).toString("hex"))
+    }
+    ```
   </TabItem>
   <TabItem label="Python">
+    ```python
+    import os
+    import random
 
-```python
-import os
-import random
+    _GEN_FILE = "/run/aerolvm/clone-generation"
+    _last_gen = None
 
-_GEN_FILE = "/run/aerolvm/clone-generation"
-_last_gen = None
-
-def reseed_if_cloned() -> None:
-    global _last_gen
-    try:
-        gen = open(_GEN_FILE).read().strip()
-    except OSError:
-        return  # file absent: nothing to do
-    if gen == _last_gen:
-        return
-    _last_gen = gen
-    random.seed(os.urandom(2500))  # reseed the stdlib Mersenne Twister
-    try:
-        import numpy as np
-        np.random.seed(int.from_bytes(os.urandom(4), "little"))
-    except ImportError:
-        pass
-```
-
+    def reseed_if_cloned() -> None:
+        global _last_gen
+        try:
+            gen = open(_GEN_FILE).read().strip()
+        except OSError:
+            return  # no file: nothing to do
+        if gen == _last_gen:
+            return
+        _last_gen = gen
+        random.seed(os.urandom(2500))  # reseed the standard library generator
+        try:
+            import numpy as np
+            np.random.seed(int.from_bytes(os.urandom(4), "little"))
+        except ImportError:
+            pass
+    ```
   </TabItem>
   <TabItem label="Go">
+    ```go
+    // On Go 1.24 and newer, rand.Seed does nothing, so the top-level
+    // math/rand functions cannot be reseeded. Keep your own *rand.Rand and
+    // replace it on clone. crypto/rand asks the kernel each time and is safe.
+    var (
+        lastGen string
+        rng     = mathrand.New(mathrand.NewSource(newSeed()))
+    )
 
-```go
-// math/rand's global source is seeded once at startup and frozen into the
-// snapshot. Re-seed it from crypto/rand on clone. (math/rand/v2 and
-// crypto/rand read the OS and need no reseed.)
-var lastGen string
+    func newSeed() int64 {
+        var b [8]byte
+        _, _ = cryptorand.Read(b[:])
+        return int64(binary.LittleEndian.Uint64(b[:]))
+    }
 
-func reseedIfCloned() {
-	b, err := os.ReadFile("/run/aerolvm/clone-generation")
-	if err != nil {
-		return // file absent: nothing to do
-	}
-	gen := strings.TrimSpace(string(b))
-	if gen == lastGen {
-		return
-	}
-	lastGen = gen
-	var seed [8]byte
-	_, _ = cryptorand.Read(seed[:])
-	mathrand.Seed(int64(binary.LittleEndian.Uint64(seed[:])))
-}
-```
-
+    func reseedIfCloned() {
+        b, err := os.ReadFile("/run/aerolvm/clone-generation")
+        if err != nil {
+            return // no file: nothing to do
+        }
+        gen := strings.TrimSpace(string(b))
+        if gen == lastGen {
+            return
+        }
+        lastGen = gen
+        rng = mathrand.New(mathrand.NewSource(newSeed()))
+    }
+    ```
   </TabItem>
   <TabItem label="Rust">
+    ```rust
+    // rand::thread_rng() reseeds from the OS from time to time, but a
+    // StdRng or SmallRng you keep across the clone is frozen. Rebuild it.
+    use rand::SeedableRng;
+    use std::fs;
 
-```rust
-// rand::thread_rng() reseeds from the OS periodically, but a StdRng/SmallRng
-// you hold across the snapshot is frozen. Re-create it from entropy on clone.
-use rand::SeedableRng;
-use std::fs;
-
-fn reseed_if_cloned(last_gen: &mut String, rng: &mut rand::rngs::StdRng) {
-    let gen = match fs::read_to_string("/run/aerolvm/clone-generation") {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return, // file absent: nothing to do
-    };
-    if &gen == last_gen {
-        return;
+    fn reseed_if_cloned(last_gen: &mut String, rng: &mut rand::rngs::StdRng) {
+        let gen = match fs::read_to_string("/run/aerolvm/clone-generation") {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => return, // no file: nothing to do
+        };
+        if &gen == last_gen {
+            return;
+        }
+        *last_gen = gen;
+        *rng = rand::rngs::StdRng::from_entropy();
     }
-    *last_gen = gen;
-    *rng = rand::rngs::StdRng::from_entropy();
-}
-```
-
+    ```
   </TabItem>
   <TabItem label="Java">
+    ```java
+    // java.util.Random is seeded once and copied into the clone. Reseed it
+    // from SecureRandom, which asks the operating system and is safe.
+    private String lastGen = null;
 
-```java
-// java.util.Random is seeded once and frozen into the snapshot. Re-seed it
-// from SecureRandom on clone. SecureRandom itself reads the OS and is safe.
-private String lastGen = null;
-
-void reseedIfCloned(java.util.Random rng) {
-    String gen;
-    try {
-        gen = java.nio.file.Files.readString(
-            java.nio.file.Path.of("/run/aerolvm/clone-generation")).trim();
-    } catch (java.io.IOException e) {
-        return; // file absent: nothing to do
+    void reseedIfCloned(java.util.Random rng) {
+        String gen;
+        try {
+            gen = java.nio.file.Files.readString(
+                java.nio.file.Path.of("/run/aerolvm/clone-generation")).trim();
+        } catch (java.io.IOException e) {
+            return; // no file: nothing to do
+        }
+        if (gen.equals(lastGen)) {
+            return;
+        }
+        lastGen = gen;
+        rng.setSeed(new java.security.SecureRandom().nextLong());
     }
-    if (gen.equals(lastGen)) {
-        return;
-    }
-    lastGen = gen;
-    rng.setSeed(new java.security.SecureRandom().nextLong());
-}
-```
-
+    ```
   </TabItem>
 </Tabs>
 
-:::tip
-The simplest way to avoid this entirely is to **not** bake a started, RNG-stateful interpreter into a template snapshot. If each request starts a fresh process (the default for `exec` and code-run), the kernel reseed covers you and no in-guest reseeding is needed.
-:::
+<Aside type="tip">
+The simplest fix is to **not** keep a started program with random state in a template. If each request starts a new program (the default for `exec`), the kernel reseed covers you. Then you need no reseed code at all.
+</Aside>
 
-## Further reading
+## Next steps
 
-For how the kernel reseed and clock resync are implemented on the resume path, see [Snapshot Clone Correctness](/engineering-snapshot-correctness).
+- [Firecracker templates](/firecracker-templates/): build the templates that clones start from.
+- [Correct snapshot clones](/engineering-snapshot-correctness/): how the reseed and clock fix work when a clone starts.
+- [Firecracker](/firecracker-sandbox/): create and use Firecracker sandboxes.

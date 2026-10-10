@@ -1,198 +1,97 @@
 ---
-title: Sessions
+title: Terminal sessions
+description: Keep a shell, dev server or agent running in a sandbox after you disconnect, and reconnect later to see what you missed.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Sessions are persistent processes running inside a sandbox. Unlike `execStream`, which tears down when the connection drops, a session keeps running. Any new client that attaches receives a replay of buffered output and can then interact with the live process.
+A session is a program that keeps running inside a sandbox when no one is connected to it. It can be a shell, a dev server, a build or an AI agent. You attach to watch its output and type into it, detach, and attach again later.
 
-This makes sessions ideal for interactive shells, long-running agents, and any workflow where continuity across reconnects matters.
+When you attach, you first get the session's recent output, then the live output. So you see what happened while you were away. This is the main difference from [`execStream`](/exec-streaming/), which stops its command as soon as the connection drops.
 
-## Create a Session
+## Start a program that keeps running
+
+This starts a small web server in the background and prints the session's ID. You use the ID to read its output, attach to it or stop it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const session = await sandbox.createSession({
-      name:    'shell',
-      command: 'bash',
-      workDir: '/workspace',
-      pty:     true,
-      cols:    120,
-      rows:    40,
-    })
-
-    console.log(session.id)
+      name: "web",
+      command: "python3 -m http.server 8000",
+    });
+    console.log(session.id, session.status); // ses-... running
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     session = sandbox.create_session({
-        'name':    'shell',
-        'command': 'bash',
-        'workDir': '/workspace',
-        'pty':     True,
-        'cols':    120,
-        'rows':    40,
+        "name": "web",
+        "command": "python3 -m http.server 8000",
     })
-
-    print(session['id'])
+    print(session["id"], session["status"])  # ses-... running
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     session, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
-        Name:    "shell",
-        Command: "bash",
-        Workdir: "/workspace",
-        Pty:     true,
-        Cols:    120,
-        Rows:    40,
+        Name:    "web",
+        Command: "python3 -m http.server 8000",
     })
-    if err != nil { log.Fatal(err) }
-
-    fmt.Println(session.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(session.ID, session.Status) // ses-... running
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let session = sandbox.create_session(aerolvm_sdk::CreateSessionOptions {
-        name:     Some("shell".to_string()),
-        command:  Some("bash".to_string()),
-        work_dir: Some("/workspace".to_string()),
-        pty:      Some(true),
-        cols:     Some(120),
-        rows:     Some(40),
+    use aerolvm_sdk::CreateSessionOptions;
+
+    let session = sandbox.create_session(CreateSessionOptions {
+        name: Some("web".into()),
+        command: Some("python3 -m http.server 8000".into()),
         ..Default::default()
     })?;
-
-    println!("{}", session.id);
+    println!("{} {:?}", session.id, session.status); // ses-... Running
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Session session = sandbox.createSession(
-        new CreateSessionOptions()
-            .setName("shell")
-            .setCommand("bash")
-            .setWorkDir("/workspace")
-            .setPty(true)
-            .setCols(120)
-            .setRows(40)
-    );
-
-    System.out.println(session.id);
+    Session session = sandbox.createSession(new CreateSessionOptions()
+        .setName("web")
+        .setCommand("python3 -m http.server 8000"));
+    System.out.println(session.id + " " + session.status); // ses-... running
     ```
   </TabItem>
 </Tabs>
 
-## Attach to a Session
+The call returns as soon as the program starts. The program keeps running until it exits, you stop it, or the sandbox stops.
 
-On connect, the sandbox replays the in-memory output buffer so the client sees past output immediately. Multiple clients can attach to the same session simultaneously.
+## Read what it printed
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const attach = sandbox.attachSession(session.id, {
-      cols:     120,
-      rows:     40,
-      onStdout: chunk => process.stdout.write(chunk),
-    })
-
-    attach.write('echo hello\n')
-    const exit = await attach.done
-    console.log(exit.code)
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    import sys
-
-    attach = sandbox.attach_session(
-        session['id'],
-        {
-            'cols':     120,
-            'rows':     40,
-            'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
-        },
-    )
-
-    attach.write('echo hello\n')
-    print(attach.wait())
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    attached, err := sandbox.AttachSession(ctx, session.ID, microvm.SessionAttachOptions{
-        Cols:     120,
-        Rows:     40,
-        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
-    })
-    if err != nil { log.Fatal(err) }
-
-    _ = attached.WriteString("echo hello\n")
-    code, signal, err := attached.Wait()
-    fmt.Println(code, signal, err)
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    use std::sync::Arc;
-
-    let attached = sandbox.attach_session(
-        &session.id,
-        aerolvm_sdk::SessionAttachOptions {
-            cols:      Some(120),
-            rows:      Some(40),
-            on_stdout: Some(Arc::new(|chunk| {
-                print!("{}", String::from_utf8_lossy(&chunk))
-            })),
-            ..Default::default()
-        },
-    )?;
-
-    attached.write_string("echo hello\n")?;
-    println!("{:?}", attached.wait()?);
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    SessionAttachHandle attach = sandbox.attachSession(
-        session.id,
-        new SessionAttachOptions()
-            .setCols(120)
-            .setRows(40)
-            .setOnStdout(chunk ->
-                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
-    );
-
-    attach.write("echo hello\n");
-    attach.waitForExit();
-    ```
-  </TabItem>
-</Tabs>
-
-## Session Log
-
-Retrieve buffered output without opening a WebSocket connection.
+`sessionLog` returns the session's recent output as bytes, without attaching. It works while the program runs and after it ends.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const log = await sandbox.sessionLog(session.id)
-    console.log(log.toString())
+    const log = await sandbox.sessionLog(session.id);
+    console.log(new TextDecoder().decode(log));
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    log = sandbox.session_log(session['id'])
+    log = sandbox.session_log(session["id"])
     print(log.decode())
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    log, err := sandbox.SessionLog(ctx, session.ID)
-    fmt.Println(string(log))
+    out, err := sandbox.SessionLog(ctx, session.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(string(out))
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -204,23 +103,224 @@ Retrieve buffered output without opening a WebSocket connection.
   <TabItem label="Java">
     ```java
     byte[] log = sandbox.sessionLog(session.id);
-    System.out.println(new String(log));
+    System.out.println(new String(log, StandardCharsets.UTF_8));
     ```
   </TabItem>
 </Tabs>
 
-## How Sessions Work
+The log keeps the most recent 1 MB of output. Older output is dropped.
 
-The sandbox starts the process with either a PTY or a pipe pair. Output is written into a ring buffer in memory and fanned out to all currently attached clients. When a new client attaches, it reads the entire ring buffer before receiving live frames, giving a seamless replay experience.
+## Open a shell you can come back to
 
-Sessions are tied to the sandbox's runtime. If the sandbox is stopped and restarted, sessions do not persist across the restart.
+Set `pty` to true and leave out `command` to start a login shell (`bash`, or `sh` when the image has no bash). `pty` gives the program a terminal, which shells and full-screen programs like `vim` need. Then attach to type into it.
 
-## Difference from execStream
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const shell = await sandbox.createSession({ name: "shell", pty: true, cols: 120, rows: 40 });
 
-| | `execStream` | Session |
+    const attach = sandbox.attachSession(shell.id, {
+      cols: 120,
+      rows: 40,
+      onStdout: (chunk) => process.stdout.write(chunk),
+    });
+
+    attach.write("cd /tmp && ls\n");
+    attach.close(); // detach: the shell keeps running
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    shell = sandbox.create_session({"name": "shell", "pty": True, "cols": 120, "rows": 40})
+
+    attach = sandbox.attach_session(shell["id"], {
+        "cols": 120,
+        "rows": 40,
+        "onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
+    })
+
+    attach.write("cd /tmp && ls\n")
+    attach.close()  # detach: the shell keeps running
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    shell, err := sandbox.CreateSession(ctx, sdktypes.CreateSessionOptions{
+        Name: "shell",
+        PTY:  true,
+        Cols: 120,
+        Rows: 40,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    attach, err := sandbox.AttachSession(ctx, shell.ID, microvm.SessionAttachOptions{
+        Cols:     120,
+        Rows:     40,
+        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    attach.WriteString("cd /tmp && ls\n")
+    attach.Close() // detach: the shell keeps running
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{CreateSessionOptions, SessionAttachOptions};
+    use std::sync::Arc;
+
+    let shell = sandbox.create_session(CreateSessionOptions {
+        name: Some("shell".into()),
+        pty: Some(true),
+        cols: Some(120),
+        rows: Some(40),
+        ..Default::default()
+    })?;
+
+    let attach = sandbox.attach_session(&shell.id, SessionAttachOptions {
+        cols: Some(120),
+        rows: Some(40),
+        on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
+        ..Default::default()
+    })?;
+
+    attach.write_string("cd /tmp && ls\n")?;
+    attach.close()?; // detach: the shell keeps running
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Session shell = sandbox.createSession(new CreateSessionOptions()
+        .setName("shell")
+        .setPty(true)
+        .setCols(120)
+        .setRows(40));
+
+    SessionAttachHandle attach = sandbox.attachSession(shell.id, new SessionAttachOptions()
+        .setCols(120)
+        .setRows(40)
+        .setOnStdout(chunk -> System.out.print(new String(chunk, StandardCharsets.UTF_8))));
+
+    attach.write("cd /tmp && ls\n");
+    attach.close(); // detach: the shell keeps running
+    ```
+  </TabItem>
+</Tabs>
+
+Attach again with the same ID to pick up where you left off. The shell is still in `/tmp`, and you first see its recent output.
+
+## How attaching works
+
+- **You get recent output first.** Then you get new output as it arrives.
+- **Several people can attach at once.** Everyone sees the same output, and anyone can type. It works like a shared `tmux` window.
+- **Closing detaches.** `close` ends your connection, not the program.
+- **Waiting tells you when the program ends.** `done` in TypeScript, `wait` in Python, Go and Rust, and `waitForExit` in Java return the exit code. They fail if your connection drops first.
+- **Resizing** the terminal while attached: call `resize(cols, rows)` on the attach handle, or `resizeSession` with the session ID.
+
+## Session options
+
+| Option | What it does | Default |
 |---|---|---|
-| Process lifetime | Tied to WebSocket | Independent of connection |
-| Reconnect | Process killed on disconnect | Process keeps running |
-| Multi-client | No | Yes - concurrent attachment |
-| Output replay | No | Yes - ring buffer |
-| Use case | One-shot commands | Interactive shells, agents |
+| `name` | A label for the session. | `default` |
+| `command` | A shell command to run, such as `npm run dev`. | A login shell |
+| `argv` | The program and its arguments as a list, run without a shell. Use it instead of `command`. | None |
+| `workDir` | The folder to start in. | The image's working folder |
+| `env` | Extra environment variables. | None |
+| `pty` | Give the program a terminal. Shells and full-screen programs need it. | `false` |
+| `cols`, `rows` | The terminal size, in characters. | 80 by 24 |
+
+Go spells these `Name`, `Command`, `Argv`, `WorkDir`, `Env`, `PTY`, `Cols` and `Rows`. Rust uses `work_dir`, and wraps each value in `Some(...)`. Java has a setter for each one, such as `setWorkDir`.
+
+## Manage sessions
+
+| Task | TypeScript | Python | Go | Rust | Java |
+|---|---|---|---|---|---|
+| List all | `listSessions()` | `list_sessions()` | `ListSessions(ctx)` | `list_sessions()` | `listSessions()` |
+| Get one | `getSession(id)` | `get_session(id)` | `GetSession(ctx, id)` | `get_session(&id)` | `getSession(id)` |
+| Send a signal | `signalSession(id, "TERM")` | `signal_session(id, "TERM")` | `SignalSession(ctx, id, "TERM")` | `signal_session(&id, "TERM")` | `signalSession(id, "TERM")` |
+| Resize the terminal | `resizeSession(id, 120, 40)` | `resize_session(id, 120, 40)` | `ResizeSession(ctx, id, 120, 40)` | `resize_session(&id, 120, 40)` | `resizeSession(id, 120, 40)` |
+| Read recent output | `sessionLog(id)` | `session_log(id)` | `SessionLog(ctx, id)` | `session_log(&id)` | `sessionLog(id)` |
+| Download the recording | `sessionRecording(id)` | `session_recording(id)` | `SessionRecording(ctx, id)` | `session_recording(&id)` | `sessionRecording(id)` |
+| Stop and remove | `deleteSession(id)` | `delete_session(id)` | `DeleteSession(ctx, id)` | `delete_session(&id)` | `deleteSession(id)` |
+
+All of these are methods on the sandbox. Signals work as they do for [running commands](/exec-streaming/#stop-a-command): `INT`, `TERM`, `KILL`, `HUP` and `QUIT` go to the program and everything it started. `deleteSession` stops the program at once and removes the session.
+
+This lists every session and its state:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    for (const s of await sandbox.listSessions()) {
+      console.log(s.name, s.status, s.exitCode);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    for s in sandbox.list_sessions():
+        print(s["name"], s["status"], s["exitCode"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sessions, err := sandbox.ListSessions(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, s := range sessions {
+        fmt.Println(s.Name, s.Status, s.ExitCode)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    for s in sandbox.list_sessions()? {
+        println!("{} {:?} {}", s.name, s.status, s.exit_code);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    for (Session s : sandbox.listSessions()) {
+        System.out.println(s.name + " " + s.status + " " + s.exitCode);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+| Status | Meaning |
+|---|---|
+| `running` | The program is still running. |
+| `exited` | The program ended on its own. `exitCode` says how. |
+| `killed` | A signal stopped it. `exitSignal` names the signal. |
+| `failed` | The program could not start. |
+
+A session that has ended stays in the list, with its log, until you delete it.
+
+## Recordings
+
+Every session is recorded in the asciinema format, a text file of everything shown in the terminal, with timings. Download it with `sessionRecording` and replay it with the free `asciinema play` tool. The recording also holds what was typed into the session, so treat it like a log that may contain secrets.
+
+Recordings are stored inside the sandbox. They are deleted with the sandbox, and any recording older than 7 days is deleted sooner.
+
+## Good to know
+
+- **A name is only a label.** Creating a session with a name you already used starts a second session. To reuse one, find it with `listSessions`.
+- **Sessions end when the sandbox stops.** Starting the sandbox again does not bring them back.
+- **Replayed output arrives through `onStdout`,** even the parts that were error output.
+- **A slow reader can miss live output.** The session does not wait for attached clients. The session log still holds the most recent 1 MB.
+- **The `default` session is shared.** [`aerolvm shell`](/cli/) and an [SSH login](/ssh-access/) both open the session named `default`, or start it if it is not running.
+- **Sessions are for container and virtual machine sandboxes:** Docker, gVisor and Firecracker. V8 isolate sandboxes have no shell, so they have no sessions.
+
+## Next steps
+
+- [Run commands](/exec-streaming/): run one command and get its result.
+- [SSH access](/ssh-access/): open the same shell from any SSH client.
+- [aerolvm CLI](/cli/): `aerolvm shell` opens a session from your terminal.
+- [Share a web app](/preview/): give the server you started a public address.

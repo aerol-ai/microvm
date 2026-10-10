@@ -1,66 +1,141 @@
 ---
-title: Using Daytona SDK
-description: Point the official Daytona SDK at AerolVM's /daytona compatibility facade.
+title: Use the Daytona SDK
+description: Point the official Daytona SDK at your AerolVM server, and see exactly which Daytona features work there and which do not.
 ---
 
-AerolVM exposes a Daytona-compatible API under `/daytona`, so existing Daytona SDK clients can talk to AerolVM without rewriting their sandbox lifecycle code. Use your normal AerolVM PAT token as the Daytona `apiKey`, and point the client `apiUrl` at your AerolVM server with the `/daytona` suffix.
+import { Aside } from '@astrojs/starlight/components';
 
-## Install
+AerolVM answers the same API calls as Daytona, under the `/daytona` path of your server. So code written for the Daytona SDK can run on AerolVM. You change two settings: the address and the key. Your AerolVM API token is the key.
+
+This layer translates Daytona's calls into AerolVM's own. Your sandboxes are normal AerolVM sandboxes, so the AerolVM SDKs and the [CLI](/cli/) can see them too.
+
+## Connect the Daytona SDK
+
+Install the Daytona TypeScript SDK:
 
 ```bash
 npm install @daytona/sdk
 ```
 
-## Configure the client
+Set your server's address and token:
 
 ```bash
 export SB_API_URL=https://sandbox.example.com
-export SB_PAT_TOKEN=your-token
+export SB_PAT_TOKEN=your-secret-pat
 ```
 
+Then point the SDK at `/daytona` on that address:
+
 ```ts
-import { Daytona } from '@daytona/sdk'
+import { Daytona } from "@daytona/sdk";
 
 const daytona = new Daytona({
-  apiKey: `${process.env.SB_PAT_TOKEN}`,
+  apiKey: process.env.SB_PAT_TOKEN,
   apiUrl: `${process.env.SB_API_URL}/daytona`,
-  target: 'us',
-})
+  target: "us",
+});
 
-const sandbox = await daytona.create()
+const sandbox = await daytona.create();
 
 const response = await sandbox.process.executeCommand(
   'echo "Hello from Daytona on AerolVM"',
-  undefined,
-  undefined,
-  10,
-)
+  undefined, // working folder
+  undefined, // environment variables
+  10,        // time limit in seconds
+);
 
 if (response.exitCode !== 0) {
-  throw new Error(response.result)
+  throw new Error(response.result);
 }
+console.log(response.result);
 
-console.log(response.result)
-await sandbox.delete()
+await sandbox.delete();
 ```
 
-## What works today
+```text
+Hello from Daytona on AerolVM
+```
 
-- Create, list, fetch, start, stop, resize, and delete Daytona sandboxes.
-- Replace labels and manage Daytona-style autostop, autodelete, and autoarchive timers.
-- Create, list, fetch, and delete snapshots.
-- Use toolbox-backed process execution and file APIs through the Daytona SDK.
-- Resolve preview URLs through the Daytona facade.
+We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona examples](https://github.com/aerol-ai/aerolvm-examples/tree/main/daytona-examples) also use this TypeScript SDK. They cover commands, files, Git, lifecycle timers, volumes, images and more.
 
-## Current gaps
+## What works
 
-- Daytona volume routes are recognized, but they currently return `405 Not Implemented` because AerolVM does not expose a Daytona volume backend yet.
-- The compatibility layer is API-compatible, not infrastructure-compatible. Daytona control-plane features outside the routed `/daytona` surface still need AerolVM-native equivalents.
+### Sandboxes
 
-## Examples
+| Daytona feature | On AerolVM |
+|---|---|
+| Create, get, list (also page by page), start, stop, delete | Works. |
+| Resize CPU, memory and disk | Works. Memory is in GB, as on Daytona. |
+| Create from a snapshot name or an image name | Works. With neither, the sandbox uses `ubuntu:22.04`, or the image your operator chose. |
+| Create from a Dockerfile (Daytona's `Image` builder) | Works. A one-line `FROM image` needs nothing extra. Longer Dockerfiles are built on the server. Builds that upload local files need your operator to turn on `SB_IMAGE_BUILD_CONTEXT_ENABLED`. |
+| Labels | Works. Replacing labels updates the sandbox's [tags](/sandbox-tags/). |
+| Auto-stop and auto-delete timers | Works, both at create and later. |
+| Preview links for a port | Works. Asking for a link publishes that port. See [Public or private](#public-or-private). |
+| Environment variables, the user to run as, and `networkBlockAll` | Works. |
 
-The public examples repository includes end-to-end Daytona examples that target AerolVM directly:
+### Inside the sandbox
 
-- [daytona-examples](https://github.com/aerol-ai/aerolvm-examples/tree/main/daytona-examples)
+| Daytona feature | On AerolVM |
+|---|---|
+| `process.executeCommand` | Works. |
+| `process.codeRun` | Works for `python`, `javascript` (Node.js), `typescript` (needs `ts-node` in the image) and `bash` or `sh`. The language's program must be installed in the image. |
+| Sessions: create, run commands, read command logs, send input, delete | Works. |
+| Files: list, get info, upload (one file or many), move, search by name, find text in files | Works. |
+| Git: clone, status, add, commit, branches, checkout, history, pull, push | Works when `git` is installed in the image. |
+| Home folder and working folder | Works. |
 
-If you are migrating an existing Daytona app, the main change is the base URL: point the SDK at `https://your-host/daytona` and keep using your AerolVM PAT token.
+### Snapshots and volumes
+
+| Daytona feature | On AerolVM |
+|---|---|
+| Snapshots: create from an image or a Dockerfile, list, get, delete | Works. |
+| Take a snapshot of a running sandbox | Works. |
+| Volumes: create, list, get, get by name, delete, and attach when creating a sandbox | Works when your operator has turned on [platform volumes](/platform-volumes/). Otherwise these calls fail with HTTP 412. |
+
+## What does not work
+
+These calls fail. Most return HTTP 404 or 501, so your code gets an error rather than a silent no-op.
+
+| Daytona feature | What happens |
+|---|---|
+| Download files (`fs.downloadFile`, `fs.downloadFiles`) | Fails with `Target metadata missing for valid source` in our tests with SDK versions 0.175.0 and 0.223.1. Read a file with `process.executeCommand` instead, for example with `cat` or `base64`. |
+| Delete a file, create a folder, replace text in files, set file permissions | Not supported (HTTP 404). Run `rm`, `mkdir`, `sed` or `chmod` with `process.executeCommand` instead. |
+| Terminals (`process.createPty` and related calls) | Not supported (HTTP 404). Use a session, or the AerolVM SDK's [`execStream`](/exec-streaming/) with a terminal. |
+| Language servers (LSP) | Not supported (HTTP 404). |
+| `codeInterpreter` (Daytona's stateful notebook-style runner) | Not supported (HTTP 501). Use `process.codeRun` or `process.executeCommand`. |
+| `sandbox.archive()` | Not supported (no such route). |
+| The auto-archive timer | Saved and returned, but nothing is ever archived. |
+| `networkAllowList` on create | Refused (HTTP 400). Use AerolVM's [allow lists](/egress-domain-filtering/) instead. |
+| GPUs on create | Refused (HTTP 400). |
+| Regions and `target` | `target` is saved and returned, but it does not choose where the sandbox runs. There is no regions list. |
+| Volumes on WebAssembly sandboxes | Refused, because they have no container file system. |
+
+## Public or private
+
+Daytona makes preview links public unless you say otherwise, and so does AerolVM's Daytona layer. If you leave out `public`, the sandbox gets public preview links.
+
+`public: false` starts the sandbox fully private, with no public address at all. This is stricter than Daytona, which still serves preview links that need a token, because AerolVM has no token-protected public link. Asking for a preview link later publishes that port and makes the sandbox public. See [Share a web app](/preview/).
+
+<Aside type="caution">
+Sandboxes created with the AerolVM SDKs are private by default. Only the Daytona and E2B layers make them public by default, to match those products.
+</Aside>
+
+## Good to know
+
+- **Your sandboxes are shared across APIs.** A sandbox made with the Daytona SDK is a normal AerolVM sandbox. Daytona labels and AerolVM tags are the same data.
+- **Moving from Daytona** is mostly a change of address: point `apiUrl` at `https://your-server/daytona` and use your AerolVM token as `apiKey`.
+- **It matches Daytona's API, not Daytona's whole service.** Daytona features outside the calls listed here have no AerolVM version.
+
+## For server operators
+
+| Variable | What it does | Default |
+|---|---|---|
+| `SB_DAYTONA_DEFAULT_IMAGE` | The image for a Daytona create that names no snapshot or image. | `ubuntu:22.04` |
+| `SB_IMAGE_BUILD_CONTEXT_ENABLED` | Allow Dockerfile builds that upload local files. | Off |
+
+## Next steps
+
+- [Use the E2B SDK](/using-e2b-sdk/): the same idea for E2B code.
+- [SDK setup](/sdk-setup/): switch to an AerolVM SDK to use every feature.
+- [Platform volumes](/platform-volumes/): what backs Daytona volumes on AerolVM.
+- [AerolVM vs Daytona vs E2B](/comparison/): how the three compare.

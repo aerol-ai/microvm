@@ -1,271 +1,299 @@
 ---
-title: Custom Domains
+title: Custom domains
+description: Serve a sandbox on a domain you own, such as api.acme.com, with an HTTPS certificate set up for you.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Attach a public hostname (`api.acme.com`, `acme.com`) to a sandbox so traffic to
-that host reaches the sandbox over HTTPS. TLS is issued automatically via ACME
-HTTP-01.
+A custom domain is a web address you own, such as `api.acme.com` or `acme.com`. You can attach one to a sandbox. Then people open `https://api.acme.com` instead of the long sandbox URL.
 
-## Prerequisites
+The server gets an HTTPS certificate for the domain for you. A certificate is the file that proves to browsers the site is really yours. It comes free from Let's Encrypt, a public certificate authority.
 
-Before a custom domain can go `ready`, three things must be true:
+To make it work, you add two DNS records at the company that hosts your domain. A DNS record is an entry that tells the internet something about a name, such as which server it points to.
 
-1. **DNS points at the cluster ingress.** Issuance uses ACME HTTP-01, so Let's
-   Encrypt must reach the hostname on port 80/443 at your ingress. Until DNS
-   resolves, the domain stays `pending_dns`. See [DNS records](#dns-records).
-   On a network without the internet, the operator can issue from an internal
-   CA instead; see
-   [Certificates without the internet](/egress-domain-filtering#certificates-without-the-internet).
-2. **An ownership TXT record is published.** Without it, `attach` returns `403`.
-   See [ownership verification](#ownership-verification).
-3. **The sandbox exposes HTTP/HTTPS only on a given PORT).** Custom domains bind to the sandbox
-   root (or a target port). A sandbox with a raw `tcp://` / `tls://` exposure
-   rejects custom domains with `409` - the two can't coexist.
+<Aside type="caution" title="Server setup needed">
+Custom domains only work on a server installed with a domain, and the operator must turn the feature on. They are off by default. On a local install, or a server without a domain, every custom-domain call fails with `412`. See [For server operators](#for-server-operators).
+</Aside>
 
+## Before you start
 
-### Ownership verification
+- **The sandbox must be public.** Expose a port first, or create the sandbox with `allowPublicTraffic: true`. Attaching a domain never makes a private sandbox public on its own. See [Share a web app](/preview/).
+- **The sandbox must not have TCP or TLS ports.** A sandbox can have custom domains or [TCP and TLS ports](/tcp-ports/), not both.
+- **You need access to your domain's DNS settings,** at a provider such as Cloudflare, Route 53 or your registrar.
 
-Publish a TXT record proving you control the zone. It is keyed to the
-**hostname** (not the sandbox), so provision it once and reuse it across
-recreates.
+## Step 1: Prove you own the domain
 
-| Custom hostname | TXT name | TXT value |
+Add a TXT record (a DNS record that holds a line of text). The server reads it to check that you control the domain. Without it, attaching the domain fails with `403`.
+
+| Your domain | TXT record name | TXT record value |
 |---|---|---|
-| Subdomain (`api.acme.com`) | `_aerol-verify.api` | `aerol-verify=api.acme.com` |
-| Apex (`acme.com`) | `_aerol-verify` | `aerol-verify=acme.com` |
+| A subdomain, such as `api.acme.com` | `_aerol-verify.api` | `aerol-verify=api.acme.com` |
+| A root domain, such as `acme.com` | `_aerol-verify` | `aerol-verify=acme.com` |
 
-Some provider UIs want the FQDN (`_aerol-verify.api.acme.com`) instead of the
-zone-relative name; the value is unchanged. 
+Some providers want the full name, such as `_aerol-verify.api.acme.com`. The value stays the same.
 
-Verify with `dig TXT _aerol-verify.<host>` before attaching. 
+The record belongs to the domain, not to one sandbox. Add it once and reuse it when you delete and recreate sandboxes. To check that it is live, run `dig TXT _aerol-verify.api.acme.com` in a terminal.
 
+## Step 2: Point the domain at the server
 
-:::caution[Cloudflare and other TLS-terminating proxies]
-Set the record to **DNS-only (gray cloud)**, not Proxied. A proxy that
-terminates TLS hides the SNI from the cluster, so ACME never runs and the domain
-stays `pending_dns` forever. Apex works as a plain `CNAME` in Cloudflare thanks
-to built-in flattening.
-:::
-
-## Attach to a running sandbox
+Ask the server which address your domain should point to:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.customDomains.add("api.acme.com", { port: 3333 });
+    const target = await client.dns.target();
+    console.log(target.hostname ?? target.ips); // "ingress.example.com" or ["203.0.113.10"]
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.add_custom_domain("api.acme.com", port=3333)
+    target = client.dns_target()
+    print(target.get("hostname") or target.get("ips"))  # "ingress.example.com" or ["203.0.113.10"]
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    _, err := sandbox.AddCustomDomain(ctx, "api.acme.com", microvm.WithTargetPort(3333))
+    target, err := client.DNSTarget(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(target.Hostname, target.IPs)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.add_custom_domain("api.acme.com", Some(AddCustomDomainOptions::with_port(3333)))?;
+    let target = client.dns_target()?;
+    println!("{:?} {:?}", target.hostname, target.ips);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.addCustomDomain("api.acme.com", 3333);
+    IngressTarget target = client.dnsTarget();
+    System.out.println(target.hostname + " " + target.ips);
     ```
   </TabItem>
 </Tabs>
 
-## DNS records
+Then add one routing record at your DNS provider:
 
-`sandbox.customDomains.dns()` returns, for each attached hostname, the routing
-record (`CNAME` / `A` / `AAAA`) and the ownership `TXT` record. Each record has
-`hostname`, `type`, `name`, `value`, and an optional `notes`. An **apex** domain
-on a hostname ingress instead returns three mutually-exclusive routing rows —
-`CNAME`, `ANAME`, and `ALIAS` — since a bare `CNAME` is invalid at a zone root
-and providers expose flattening under different types.
+- **If you got a hostname,** add a `CNAME` record (a record that points one name at another name). For `api.acme.com`, the name is `api` and the value is the hostname.
+- **If you got IP addresses,** add an `A` record (a record that points a name at an IP address) for each one. Use `AAAA` for IPv6 addresses.
+- **For a root domain** such as `acme.com`, see [Root domains](#root-domains) below.
+
+<Aside type="caution" title="Cloudflare and other CDNs">
+Set the record to **DNS only (gray cloud)**, not Proxied. A proxy that handles HTTPS itself hides the request from the server. The certificate is then never issued, and the domain never works.
+</Aside>
+
+## Step 3: Attach the domain
+
+Attach the domain and pick the port your app listens on. This example sends `api.acme.com` to a web server on port 3000.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.exposePort(3000); // makes the sandbox public
+    await sandbox.customDomains.add("api.acme.com", { port: 3000 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.expose_port(3000)  # makes the sandbox public
+    sandbox.add_custom_domain("api.acme.com", port=3000)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := sandbox.ExposePort(ctx, 3000); err != nil { // makes the sandbox public
+        log.Fatal(err)
+    }
+    if _, err := sandbox.AddCustomDomain(ctx, "api.acme.com", microvm.WithTargetPort(3000)); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{AddCustomDomainOptions, ExposeOptions};
+
+    sandbox.expose_port(3000, ExposeOptions::default())?; // makes the sandbox public
+    sandbox.add_custom_domain("api.acme.com", Some(AddCustomDomainOptions::with_port(3000)))?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.exposePort(3000); // makes the sandbox public
+    sandbox.addCustomDomain("api.acme.com", 3000);
+    ```
+  </TabItem>
+</Tabs>
+
+If you leave out the port, the domain shows the same thing as the sandbox's main URL (`publicURL`), not your app. You set the port once. To change it, remove the domain and add it again.
+
+The certificate is issued the first time someone opens `https://api.acme.com`, so the first visit waits while that happens. Your DNS records must be live by then.
+
+## See the DNS records for a sandbox
+
+After you attach a domain, the server can list the exact records to add for it. This includes the routing record and the TXT record.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const dns = await sandbox.customDomains.dns();
-
-    // dns.target  → { hostname: "ingress.example.com", source: "hostname" }
-    // dns.records → [
-    //   { hostname: "api.acme.com", type: "CNAME", name: "api",
-    //     value: "ingress.example.com",
-    //     notes: "Cloudflare/CDN: set the record to DNS only (gray cloud). …" },
-    //   { hostname: "api.acme.com", type: "TXT", name: "_aerol-verify.api",
-    //     value: "aerol-verify=api.acme.com",
-    //     notes: "Required for domain ownership verification." },
-    // ]
-
     for (const r of dns.records) {
-      console.log(`${r.type}\t${r.name}\t→ ${r.value}`);
+      console.log(r.type, r.name, r.value);
     }
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     dns = sandbox.custom_domain_dns()
-
-    # dns["target"]  -> {"hostname": "ingress.example.com", "source": "hostname"}
-    # dns["records"] -> [
-    #   {"hostname": "api.acme.com", "type": "CNAME", "name": "api",
-    #    "value": "ingress.example.com",
-    #    "notes": "Cloudflare/CDN: set the record to DNS only (gray cloud). …"},
-    #   {"hostname": "api.acme.com", "type": "TXT", "name": "_aerol-verify.api",
-    #    "value": "aerol-verify=api.acme.com",
-    #    "notes": "Required for domain ownership verification."},
-    # ]
-
     for r in dns["records"]:
-        print(r["type"], r["name"], "->", r["value"])
+        print(r["type"], r["name"], r["value"])
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     dns, err := sandbox.CustomDomainDNS(ctx)
-    if err != nil { log.Fatal(err) }
-
-    // dns.Target  = {Hostname: "ingress.example.com", Source: "hostname"}
-    // dns.Records = [
-    //   {Hostname: "api.acme.com", Type: "CNAME", Name: "api",
-    //    Value: "ingress.example.com", Notes: "Cloudflare/CDN: … (gray cloud). …"},
-    //   {Hostname: "api.acme.com", Type: "TXT", Name: "_aerol-verify.api",
-    //    Value: "aerol-verify=api.acme.com", Notes: "Required for domain ownership verification."},
-    // ]
-
+    if err != nil {
+        log.Fatal(err)
+    }
     for _, r := range dns.Records {
-        fmt.Printf("%s\t%s\t→ %s\n", r.Type, r.Name, r.Value)
+        fmt.Println(r.Type, r.Name, r.Value)
     }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let dns = sandbox.custom_domain_dns()?;
-
-    // dns.target  = IngressTarget { hostname: Some("ingress.example.com"), source: "hostname", .. }
-    // dns.records = [
-    //   DnsRecord { hostname: "api.acme.com", record_type: "CNAME", name: "api",
-    //     value: "ingress.example.com", notes: Some("Cloudflare/CDN: … (gray cloud). …") },
-    //   DnsRecord { hostname: "api.acme.com", record_type: "TXT", name: "_aerol-verify.api",
-    //     value: "aerol-verify=api.acme.com", notes: Some("Required for domain ownership verification.") },
-    // ]
-
-    // NB: the JSON `type` field is exposed as `record_type` in Rust.
     for r in &dns.records {
-        println!("{}\t{}\t→ {}", r.record_type, r.name, r.value);
+        // The record's `type` is called `record_type` in Rust.
+        println!("{} {} {}", r.record_type, r.name, r.value);
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     CustomDomainDnsRecords dns = sandbox.customDomainDns();
-
-    // dns.target  = IngressTarget{hostname="ingress.example.com", source="hostname"}
-    // dns.records = [
-    //   DnsRecord{hostname="api.acme.com", type="CNAME", name="api",
-    //     value="ingress.example.com", notes="Cloudflare/CDN: … (gray cloud). …"},
-    //   DnsRecord{hostname="api.acme.com", type="TXT", name="_aerol-verify.api",
-    //     value="aerol-verify=api.acme.com", notes="Required for domain ownership verification."},
-    // ]
-
     for (DnsRecord r : dns.records) {
-        System.out.println(r.type + "\t" + r.name + "\t→ " + r.value);
+        System.out.println(r.type + " " + r.name + " " + r.value);
     }
     ```
   </TabItem>
 </Tabs>
 
-For the example above (a subdomain against a hostname ingress), the routing row
-to add at your DNS provider is:
+For `api.acme.com` on a server whose address is a hostname, you see:
 
-| Type | Name | Value |
-|---|---|---|
-| `CNAME` | `api` | `ingress.example.com` |
+```text
+CNAME api ingress.example.com
+TXT _aerol-verify.api aerol-verify=api.acme.com
+```
 
-The type depends on `target`. A hostname against a raw-IP ingress returns one
-`A` / `AAAA` per IP instead of a `CNAME`. The same response also carries the
-ownership `TXT` record from [Ownership verification](#ownership-verification). In
-Cloudflare, set the `CNAME` to **DNS only (gray cloud)** — a proxied record
-terminates TLS at the CDN and blocks ACME issuance.
+Each record also has a `hostname` field (the domain it belongs to) and sometimes `notes` with tips, such as the Cloudflare gray-cloud warning. If the server's address is a list of IP addresses, you get one `A` or `AAAA` record per address instead of the `CNAME`.
 
-For an **apex** domain (e.g. `acme.com`) on a hostname ingress, the response
-returns three rows at `@` with the same value. Add **only the one** your
-provider supports:
+### Root domains
 
-| Type | Name | Value | Provider |
+A root domain (also called an apex domain) is the bare name, such as `acme.com`. DNS does not allow a plain `CNAME` there. So when the server's address is a hostname, the list shows three routing records at `@` (which means the root) with the same value. **Add only the one your provider supports:**
+
+| Type | Name | Value | Providers |
 |---|---|---|---|
-| `CNAME` | `@` | `ingress.example.com` | Cloudflare (CNAME flattening) |
-| `ANAME` | `@` | `ingress.example.com` | dnsmadeeasy, EasyDNS |
+| `CNAME` | `@` | `ingress.example.com` | Cloudflare (it flattens the CNAME for you) |
+| `ANAME` | `@` | `ingress.example.com` | DNS Made Easy, EasyDNS |
 | `ALIAS` | `@` | `ingress.example.com` | Route 53, DNSimple |
 
-## Status lifecycle
+For a root domain, the list shows the TXT record name as `_aerol-verify.@`. Enter it as `_aerol-verify` at your provider.
 
-Each hostname carries a `status`. Poll `list` (or re-read the sandbox) to observe
-transitions - there is no push notification.
-
-| Status | Meaning |
-|---|---|
-| `pending_dns` | Row exists, no TLS handshake seen yet. DNS not pointed, or no client has connected. |
-| `issuing` | First HTTPS hit arrived; ACME HTTP-01 challenge in progress. |
-| `ready` | Certificate issued and serving traffic. |
-| `failed` | ACME gave up. `lastError` has the reason (usually wrong DNS or LE rate-limit). Detach + reattach to retry. |
+## List and remove domains
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const domains = await sandbox.customDomains.list();
-    await sandbox.customDomains.remove("acme.com");
+    await sandbox.customDomains.remove("api.acme.com");
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     domains = sandbox.list_custom_domains()
-    sandbox.remove_custom_domain("acme.com")
+    sandbox.remove_custom_domain("api.acme.com")
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    domains, _ := sandbox.ListCustomDomains(ctx)
-    err := sandbox.RemoveCustomDomain(ctx, "acme.com")
+    domains, err := sandbox.ListCustomDomains(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    err = sandbox.RemoveCustomDomain(ctx, "api.acme.com")
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let domains = sandbox.list_custom_domains()?;
-    sandbox.remove_custom_domain("acme.com")?;
+    sandbox.remove_custom_domain("api.acme.com")?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     List<CustomDomain> domains = sandbox.listCustomDomains();
-    sandbox.removeCustomDomain("acme.com");
+    sandbox.removeCustomDomain("api.acme.com");
     ```
   </TabItem>
 </Tabs>
 
-Detach removes the Caddy route and deletes the row (the cert ages out of storage
-on renewal). Removing a hostname not attached to this sandbox returns `404`.
+Removing a domain stops the server from serving it right away. Removing a domain that is not attached to this sandbox fails with `404`.
+
+Each domain in the list has a `status` field:
+
+| Status | Meaning |
+|---|---|
+| `pending_dns` | The domain is attached. No HTTPS visit has arrived yet. |
+| `issuing` | The first HTTPS visit arrived and the certificate is being issued. |
+| `ready` | The certificate is issued and the domain serves traffic. |
+| `failed` | Issuing the certificate failed. `lastError` says why: usually wrong DNS, or Let's Encrypt's rate limit. Remove the domain and add it again to retry. |
+
+<Aside type="caution" title="Do not wait for ready">
+In this version, the server sets every new domain to `pending_dns` and does not move it to the other states yet. A domain can work while its status still says `pending_dns`. To check a domain, open it in a browser.
+</Aside>
 
 ## Errors
 
-| Status | When |
+| Error | What it means |
 |---|---|
-| `400 Bad Request` | Hostname malformed or includes a port, or `target_port` outside `1..65535`. |
-| `403 Forbidden` | Ownership TXT missing or wrong at `_aerol-verify.<hostname>`. See [ownership verification](#ownership-verification). |
-| `409 Conflict` | Hostname already attached elsewhere (globally unique), the sandbox has a `tcp://`/`tls://` exposure, the per-sandbox cap is reached, or it's re-added with a different `target_port`. |
-| `412 Precondition Failed` | Custom domains disabled (`SB_ENABLE_CUSTOM_DOMAINS=false`) or server in IP mode (`SB_DOMAIN` unset). |
-| `429 Too Many Requests` | Daemon-wide ACME issuance budget exhausted. Honour `Retry-After`. |
+| `400 Bad Request` | The name is not a valid public domain. For example, it has a port, is an IP address, is `localhost` or ends in `.local`, or sits under the server's own domain (those names already work). Also returned for a port outside 1 to 65535. |
+| `403 Forbidden` | The TXT record from [Step 1](#step-1-prove-you-own-the-domain) is missing or has the wrong value. |
+| `404 Not Found` | You tried to remove a domain that is not attached to this sandbox. |
+| `409 Conflict` | The domain is attached to another sandbox (each domain can be on only one sandbox), the sandbox is still private, the sandbox has a TCP or TLS port, it already has the most domains allowed (25 by default), or you added the same domain again with a different port. |
+| `412 Precondition Failed` | Custom domains are off on this server, or the server has no domain. |
 
-## Cluster mode
+## Good to know
 
-The hostname-to-sandbox mapping replicates through Raft, so any ingress node
-accepts traffic for a custom domain regardless of which node owns the sandbox;
-non-owner nodes pass TLS through to the owner over SNI. A shared `certmagic-s3`
-cert store means only one node runs ACME per hostname - see
-[multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md).
+- **Attach at create time.** You can also pass up to 5 domains when you create a sandbox. The option is `customDomains` in TypeScript and Python, `CustomDomains` in Go, `custom_domains` in Rust and `setCustomDomains` in Java. The sandbox must also be created with `allowPublicTraffic: true`.
+- **Host header masking applies here too.** If you set `maskRequestHost` on the sandbox, requests to a custom domain with a port get the same rewrite. See [Share a web app](/preview/).
+- **Certificates are rate limited.** Let's Encrypt limits how many certificates one account can get. If too many new domains ask for one in a short time, the server holds back new requests for a while. Those domains wait, then get their certificate later.
+
+## For server operators
+
+Turn the feature on with `SB_ENABLE_CUSTOM_DOMAINS=true`. It requires `SB_DOMAIN`: the server refuses to start with custom domains on and no domain. The server must be reachable on ports 80 and 443 at the address users point their DNS at, so Let's Encrypt can reach it. For a network with no internet access, issue certificates from your own certificate authority instead. See [Certificates without the internet](/egress-domain-filtering/#certificates-without-the-internet).
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_ENABLE_CUSTOM_DOMAINS` | Turns custom domains on. | `false` |
+| `SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX` | Most domains one sandbox can have. | `25` |
+| `SB_CUSTOM_DOMAIN_VERIFY_PREFIX` | Start of the TXT record name. | `_aerol-verify` |
+| `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX` | Start of the TXT record value. | `aerol-verify=` |
+| `SB_ACME_DAEMON_BUDGET_CAPACITY` | New certificate requests allowed per window. | `300` |
+| `SB_ACME_DAEMON_BUDGET_WINDOW` | Length of that window. | `3h` |
+| `SB_ACME_DAEMON_BUDGET_FRACTION` | Share of the budget the server uses before it holds back new requests. | `0.8` (240 of 300) |
+
+Certificates for custom domains are issued on demand. The first HTTPS visit to a domain makes Caddy (the web proxy) ask the server whether the name belongs to a sandbox. Only then does it request a certificate from Let's Encrypt. Unknown names are refused, so random visitors cannot use up your certificate limit. When the budget above runs low, the server tells Caddy to back off and retry later.
+
+When you remove a domain, the server deletes its route and its record. The certificate ages out of storage at renewal time.
+
+**In a cluster,** every server knows which domain belongs to which sandbox. That list is shared through Raft (the system the cluster servers use to agree on shared data). Any server that accepts public traffic can take a request for a custom domain. If another server runs the sandbox, it passes the encrypted connection to that server unchanged, using the name the visitor asked for. A shared certificate store in S3 lets one server request each certificate instead of every server racing to do it. Turn it on before you enable custom domains on any cluster with more than one server. See [multi-node cert sharing](https://github.com/aerol-ai/microvm/blob/main/setup/multi-node-cert-sharing.md).
+
+## Next steps
+
+- [Share a web app](/preview/): expose a port and get a public URL.
+- [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.
+- [TCP and TLS ports](/tcp-ports/): share a database instead of a website.
+- [Install on a server](/getting-started/single-node-setup/): set up the server domain that custom domains need.

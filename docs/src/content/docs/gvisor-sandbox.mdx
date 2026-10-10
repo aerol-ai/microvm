@@ -1,177 +1,139 @@
 ---
-title: gVisor Sandbox
-description: Create sandboxes backed by the gVisor user-space kernel for stronger syscall isolation.
+title: gVisor sandboxes
+description: Run untrusted code in a container with an extra kernel layer between it and the server.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-gVisor sandboxes run inside the standard Docker runtime but with an extra layer between the container and the host kernel. gVisor implements a user-space kernel (`runsc`) that intercepts every system call the container makes - so instead of talking directly to the Linux kernel, the process talks to gVisor, which then decides what to pass through.
+A gVisor sandbox is a container with an extra wall around it. In a normal container, programs talk straight to the server's Linux kernel, the core of the operating system. In a gVisor sandbox, a program called `runsc` sits in between. It catches every request the program makes to the kernel (a system call) and decides what to pass on.
 
-Use gVisor when:
-- You are running LLM-generated or otherwise untrusted code that should not have direct access to the host kernel
-- You need stronger isolation than standard Docker containers without the overhead of full VMs
-- Your workload is compatible with gVisor's Linux ABI coverage (most common workloads are)
+Choose gVisor for code you do not trust, such as code written by an AI model. It protects the server better than a normal container. It is lighter than a full virtual machine like [Firecracker](/firecracker-sandbox/). Most common programs run fine under gVisor.
 
-gVisor works on **any standard server** - there are no bare-metal or special hardware requirements.
+gVisor works on any normal Linux server or cloud VM. It does not need bare-metal hardware.
 
-## Limitations
+## What the server needs
 
-- Not compatible with GPU passthrough. A sandbox can use gVisor or a GPU, but not both.
-- Privileged containers (`--privileged`) are not supported under gVisor.
-- `disk_gb` limits are not enforced by gVisor - disk usage falls back to host limits.
-- Requires cgroupv2 + systemd on the host (satisfied by default on Ubuntu 22.04+).
+The server operator installs gVisor with the `--with-gvisor` installer flag. The server's Linux must use cgroup v2 and systemd (cgroup v2 is how Linux limits a program's CPU and memory). Ubuntu 22.04 and newer have both by default. See [For server operators](#for-server-operators).
 
 ## Create a gVisor sandbox
 
-Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — `exposePort` flips the sandbox public on first use, or set `allowPublicTraffic: true` at create for a boot-time public URL; see [Network Isolation](/network-isolation/).
+Add `runtime: "gvisor"` to a normal create call. Everything else works like any other sandbox.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    const client = new MicroVM({
-      apiUrl: process.env.SB_API_URL,
-      patToken: process.env.SB_PAT_TOKEN,
-    })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      runtime: 'gvisor',
-      cpu: 1,
-      memoryMB: 512,
-    })
+    const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "gvisor" });
+    const result = await sandbox.exec("echo hello from gVisor");
+    console.log(result.stdout);
 
-    console.log(sandbox.id)
+    await sandbox.destroy();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     from microvm import MicroVM
 
-    client = MicroVM(
-        api_url='https://sandbox.example.com',
-        pat_token='your-token',
-    )
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
 
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'runtime': 'gvisor',
-        'cpu': 1.0,
-        'memoryMB': 512,
-    })
+    sandbox = client.create(image="ubuntu:22.04", runtime="gvisor")
+    result = sandbox.exec("echo hello from gVisor")
+    print(result["stdout"])
 
-    print(sandbox.id)
+    sandbox.destroy()
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    import (
-        "context"
-        "fmt"
-        "log"
-        "os"
-
-        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
-        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
-    )
-
-    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
-        APIUrl:   os.Getenv("SB_API_URL"),
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
-    })
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
     if err != nil {
         log.Fatal(err)
     }
 
-    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
-        Image:    "ubuntu:22.04",
-        Runtime:  sdktypes.RuntimeGvisor,
-        CPU:      1,
-        MemoryMB: 512,
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:   "ubuntu:22.04",
+        Runtime: sdktypes.RuntimeGvisor,
     })
     if err != nil {
         log.Fatal(err)
     }
+    defer sandbox.Destroy(ctx)
 
-    fmt.Println(sandbox.ID)
+    result, err := sandbox.ExecCommand(ctx, "echo hello from gVisor")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     use aerolvm_sdk::{Client, CreateOptions};
 
-    let client = Client::new(
-        Some("https://sandbox.example.com"),
-        Some("your-token"),
-    )?;
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
 
     let sandbox = client.create(CreateOptions {
-        image:   "ubuntu:22.04".to_string(),
-        runtime: Some("gvisor".to_string()),
-        cpu:     Some(1),
-        memory_mb: Some(512),
+        image: "ubuntu:22.04".into(),
+        runtime: Some("gvisor".into()),
         ..Default::default()
     })?;
+    let result = sandbox.exec("echo hello from gVisor")?;
+    print!("{}", result.stdout);
 
-    println!("{}", sandbox.data.id);
+    sandbox.destroy()?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.MicroVMClient;
-    import ai.aerol.microvm.MicroVMConfig;
-    import ai.aerol.microvm.Sandbox;
-    import ai.aerol.microvm.model.CreateOptions;
-
-    MicroVMClient client = new MicroVMClient(
-        new MicroVMConfig()
-            .setApiUrl("https://sandbox.example.com")
-            .setPatToken(System.getenv("SB_PAT_TOKEN"))
-    );
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
 
     Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setRuntime("gvisor")
-            .setCpu(1.0)
-            .setMemoryMb(512)
+        new CreateOptions().setImage("ubuntu:22.04").setRuntime("gvisor")
     );
+    ExecResult result = sandbox.exec("echo hello from gVisor");
+    System.out.print(result.stdout);
 
-    System.out.println(sandbox.id);
+    sandbox.destroy();
     ```
   </TabItem>
 </Tabs>
 
-## With lifecycle
+A new sandbox is private. To give it a public web address, see [Share a web app](/preview/).
+
+## Set resources and auto-stop
+
+CPU, memory and lifecycle timers work the same as on any sandbox. This one gets 2 CPU cores and 1 GB of memory. It stops after 30 idle minutes and is deleted when it is 4 hours old. Timer values are in nanoseconds, except in Go, which uses `time.Duration`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      runtime: 'gvisor',
+      image: "ubuntu:22.04",
+      runtime: "gvisor",
       cpu: 2,
       memoryMB: 1024,
       lifecycle: {
         stopIfIdleFor: 30 * 60 * 1_000_000_000,     // 30 minutes
         destroyAtAge:  4 * 60 * 60 * 1_000_000_000, // 4 hours
       },
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'runtime': 'gvisor',
-        'cpu': 2.0,
-        'memoryMB': 1024,
-        'lifecycle': {
-            'stopIfIdleFor': 1_800_000_000_000,   # 30 minutes
-            'destroyAtAge':  14_400_000_000_000,  # 4 hours
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        runtime="gvisor",
+        cpu=2.0,
+        memory_mb=1024,
+        lifecycle={
+            "stopIfIdleFor": 1_800_000_000_000,  # 30 minutes
+            "destroyAtAge": 14_400_000_000_000,  # 4 hours
         },
-    })
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -191,13 +153,13 @@ Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — `e
   <TabItem label="Rust">
     ```rust
     let sandbox = client.create(CreateOptions {
-        image:   "ubuntu:22.04".to_string(),
-        runtime: Some("gvisor".to_string()),
-        cpu:     Some(2),
+        image: "ubuntu:22.04".into(),
+        runtime: Some("gvisor".into()),
+        cpu: Some(2),
         memory_mb: Some(1024),
         lifecycle: Some(aerolvm_sdk::Lifecycle {
-            stop_if_idle_for: 1_800_000_000_000,
-            destroy_at_age:   14_400_000_000_000,
+            stop_if_idle_for: 1_800_000_000_000, // 30 minutes
+            destroy_at_age: 14_400_000_000_000,  // 4 hours
             ..Default::default()
         }),
         ..Default::default()
@@ -213,11 +175,40 @@ Pass `runtime: "gvisor"` in the create request. Public exposure is opt-in — `e
             .setCpu(2.0)
             .setMemoryMb(1024)
             .setLifecycle(new Lifecycle()
-                .setStopIfIdleFor(1_800_000_000_000L)
-                .setDestroyAtAge(14_400_000_000_000L))
+                .setStopIfIdleFor(1_800_000_000_000L)   // 30 minutes
+                .setDestroyAtAge(14_400_000_000_000L))  // 4 hours
     );
     ```
   </TabItem>
 </Tabs>
 
-**Lifecycle operations** (stop, start, destroy, resize) work the same as Docker sandboxes. See [Docker Sandbox](/sandboxes) for those examples.
+Stop, start, resize and delete work the same as on a normal sandbox. See [Create and manage sandboxes](/sandboxes/).
+
+## Good to know
+
+- **No GPU.** A sandbox can use gVisor or a GPU, not both. Asking for both fails.
+- **No privileged containers.** gVisor refuses containers that ask for full access to the server.
+- **Disk limits are not enforced.** gVisor ignores `diskGB`, so disk use is limited only by the server.
+- **Some programs may not run.** gVisor implements most, but not all, of the Linux kernel's features. If a program fails only under gVisor, try it in a normal sandbox.
+
+## For server operators
+
+Add `--with-gvisor` to the install command (see [Install on a server](/getting-started/single-node-setup/)). The installer then:
+
+- downloads `runsc` and checks its SHA-512 checksum, unless it is already on the `PATH`;
+- registers `runsc` with Docker in `/etc/docker/daemon.json`, and restarts Docker if that file changed;
+- installs the `containerd-shim-runsc-v1` helper, so the containerd engine (another container engine AerolVM can use) can run gVisor too;
+- writes `SB_HOST_RUNTIMES=docker,gvisor`, so the server reports that it can run gVisor sandboxes.
+
+Use `--runsc-path /path/to/runsc` with `--with-gvisor` to register a `runsc` you installed yourself.
+
+On a cluster, set `with_gvisor = true` on each worker in `terraform.tfvars` (see [Cluster setup](/cluster-setup/)). Workers without it keep running normal containers only.
+
+If a create fails with `runtime "gvisor" not supported on this host`, the server does not list gVisor in `SB_HOST_RUNTIMES`. Add it there and restart the server.
+
+## Next steps
+
+- [Firecracker](/firecracker-sandbox/): give each sandbox its own virtual machine for even stronger walls.
+- [Create and manage sandboxes](/sandboxes/): all create options.
+- [Block or allow the internet](/network-isolation/): limit what untrusted code can reach.
+- [Run commands](/exec-streaming/): stream output from programs in the sandbox.

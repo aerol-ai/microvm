@@ -1,35 +1,57 @@
 ---
-title: Generate Architecture Diagram of Repository
-description: Run Claude Code headlessly inside an AerolVM sandbox, clone a GitHub repository, and generate arch.md as a reusable architecture artifact.
+title: Generate an architecture diagram
+description: Have Claude Code read a GitHub repository in a sandbox and write arch.md, a diagram and guide to how the code fits together.
 ---
 
-This workflow spins up a low-cost sandbox, installs Claude Code and GitHub CLI, clones a real repository with a GitHub token, and asks Claude to create `arch.md` with a Mermaid architecture diagram plus a short explanation. It is a strong fit for engineering due diligence, onboarding, solution-architecture reviews, and repo handoff automation.
+In this project you point Claude Code at a GitHub repository and get back a file called `arch.md`. It holds a Mermaid diagram (a text format that draws flowcharts) and a short guide to the main parts of the code. It helps when you join a new codebase, check a project before you depend on it, or hand a repository to another team.
 
+Claude Code runs inside a small sandbox. It can clone and read the code there without touching your machine.
 
-## Copy-paste TypeScript script
+## What you need
 
+- An AerolVM server and Node.js 22 or newer. See [Quickstart](/quick-start/).
+- These environment variables:
+
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key. Claude Code uses it to call the model. | None. You must set it. |
+| `GITHUB_TOKEN` | A GitHub token that can read the repository. | None. You must set it. |
+| `ANTHROPIC_MODEL` | The Claude model to use. | `claude-sonnet-4-6` |
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir arch-agent && cd arch-agent
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Set your keys
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export ANTHROPIC_API_KEY=your-anthropic-key
+export GITHUB_TOKEN=your-github-token
+```
+
+### Step 3: Save the script
+
+Save this as `architecture-agent.ts`. To read a different repository, change `repoSlug`.
 
 ```ts
-import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+import { MicroVM, type Sandbox } from "@aerol-ai/aerolvm-sdk";
 import { writeFile } from "node:fs/promises";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
-const patToken = process.env.SB_PAT_TOKEN;
-const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-const githubToken = process.env.GITHUB_TOKEN;
+const patToken = requireEnv("SB_PAT_TOKEN");
+const anthropicApiKey = requireEnv("ANTHROPIC_API_KEY");
+const githubToken = requireEnv("GITHUB_TOKEN");
 const anthropicModel = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
-
-if (!patToken) {
-  throw new Error("Set SB_PAT_TOKEN before running this example.");
-}
-
-if (!anthropicApiKey) {
-  throw new Error("Set ANTHROPIC_API_KEY before running this example.");
-}
-
-if (!githubToken) {
-  throw new Error("Set GITHUB_TOKEN before running this example.");
-}
 
 const repoSlug = "open-telemetry/opentelemetry-collector";
 const claudeSettings = JSON.stringify(
@@ -61,6 +83,30 @@ Requirements:
 - Modify only arch.md.
 `;
 
+// Reads a required environment variable, or stops with a clear message.
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Set ${name} before running this example.`);
+  }
+  return value;
+}
+
+// Runs a command in the sandbox and shows its output as it happens.
+// Stops the script if the command fails.
+async function run(sandbox: Sandbox, command: string) {
+  const handle = sandbox.execStream({
+    command,
+    onStdout: (chunk) => process.stdout.write(chunk),
+    onStderr: (chunk) => process.stderr.write(chunk),
+    onError: (message) => process.stderr.write(`${message}\n`),
+  });
+  const exit = await handle.done;
+  if (exit.code !== 0) {
+    throw new Error(`Command failed (exit ${exit.code}): ${command}`);
+  }
+}
+
 async function main() {
   const client = new MicroVM({ apiUrl, patToken });
   const sandbox = await client.create({
@@ -75,13 +121,14 @@ async function main() {
       GH_TOKEN: githubToken,
     },
     lifecycle: {
-      destroyIfIdleFor: 30 * 60 * 1_000_000_000,
+      destroyIfIdleFor: 30 * 60 * 1_000_000_000, // 30 minutes, in nanoseconds
     },
   });
 
   try {
-    await sandbox.exec({
-      command: [
+    await run(
+      sandbox,
+      [
         "apt-get update",
         "DEBIAN_FRONTEND=noninteractive apt-get install -y git gh curl ca-certificates",
         "curl -fsSL https://claude.ai/install.sh | bash",
@@ -89,18 +136,17 @@ async function main() {
         "claude --version",
         "gh --version",
       ].join(" && "),
-      timeoutSeconds: 900,
-    });
+    );
 
-    await sandbox.exec({
-      command: [
+    await run(
+      sandbox,
+      [
         "mkdir -p /workspace /workspace/out",
         "gh auth status -h github.com",
         `gh repo clone ${repoSlug} /workspace/repo -- --depth=1`,
         "mkdir -p /workspace/repo/.claude",
       ].join(" && "),
-      timeoutSeconds: 900,
-    });
+    );
 
     await sandbox.uploadFile(
       "/workspace/repo/.claude/settings.json",
@@ -114,7 +160,7 @@ async function main() {
     const stdoutChunks: string[] = [];
     const stderrChunks: string[] = [];
 
-    const run = sandbox.execStream({
+    const claudeRun = sandbox.execStream({
       command: [
         'export PATH="$HOME/.local/bin:$PATH"',
         `claude --model "$ANTHROPIC_MODEL" --dangerously-skip-permissions -p '${claudeTask}'`,
@@ -137,7 +183,7 @@ async function main() {
       },
     });
 
-    const exit = await run.done;
+    const exit = await claudeRun.done;
     if (exit.code !== 0) {
       throw new Error(`claude run failed with exit code ${exit.code}`);
     }
@@ -185,21 +231,41 @@ main().catch((error) => {
 });
 ```
 
-## What to export
+### Step 4: Run it
 
-- `repository-architecture.md` as the final architecture artifact.
-- `repository-architecture.patch` if you want to review exactly what Claude added.
-- `repository-architecture-claude.log` for auditability and debugging.
+```bash
+npx tsx architecture-agent.ts
+```
 
-## AerolVM primitives used
+Claude Code's output streams to your terminal while it works. When it is done, the script prints `arch.md` and saves three files in your folder.
 
-- `create`
-- `exec` and `execStream`
-- `uploadFile` and `downloadFile`
-- lifecycle policies on sandbox creation
+## What the script does
 
-## Related docs
+1. **Creates a sandbox** from the `node:22-bookworm` image with half a CPU core, 2 GB of memory and 16 GB of disk. A lifecycle rule deletes it after 30 idle minutes, in case your script stops early.
+2. **Installs the tools:** Git, the GitHub command-line tool `gh`, and Claude Code. You see the install output live. If a command fails, the script stops.
+3. **Clones the repository** with your GitHub token. It fetches only the latest commit (`--depth=1`), which is faster.
+4. **Uploads two files.** `.claude/settings.json` picks the model. `CLAUDE.md` tells Claude Code what to focus on and to edit only `arch.md`.
+5. **Runs Claude Code** with `execStream`, so you see its output live. The `--dangerously-skip-permissions` flag lets it work without stopping to ask you for approval.
+6. **Downloads the results** and deletes the sandbox, even if a step failed.
 
-- [Process & Code Execution](/exec-streaming/)
-- [File System](/file-system/)
-- [Environment](/environment/)
+## What you get
+
+| File | What is in it |
+|---|---|
+| `repository-architecture.md` | The finished guide with its diagram. |
+| `repository-architecture.patch` | Exactly what Claude Code added, as a Git diff. |
+| `repository-architecture-claude.log` | Everything Claude Code printed, for checking and debugging. |
+
+## Good to know
+
+- Lifecycle times are in nanoseconds. `30 * 60 * 1_000_000_000` is 30 minutes.
+- The script runs every step with `execStream`, not `exec`. In Node.js, one `exec` call can wait only about 5 minutes for its answer, because Node's built-in `fetch` stops waiting after that. A slow install can take longer.
+- Claude Code can read every environment variable you pass in, including your GitHub token. Give it a token that can only read the repositories it needs.
+- Large repositories take longer and use more model tokens, so they cost more.
+
+## Next steps
+
+- [Run commands](/exec-streaming/): more on `exec` and `execStream`.
+- [Files](/file-system/): upload and download files.
+- [Images, resources and lifecycle](/environment/): change CPU, memory and auto-delete rules.
+- [Review a pull request](/use-cases/coding-agents/pull-request-review-auto-fix-agent/): an agent that posts its results back to GitHub.

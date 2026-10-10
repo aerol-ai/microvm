@@ -1,11 +1,22 @@
 ---
-title: WASM Architecture
-description: How AerolVM runs WASM sandboxes — workers, checkpoints, and AOCR durability.
+title: WASM architecture
+description: How AerolVM runs WebAssembly sandboxes, with one worker process each and saved checkpoints, plus the planned durable copies.
 ---
 
-WASM sandboxes use a **host-mediated** model: the API server stays in `sandboxd`, while each sandbox runs inside a dedicated worker subprocess speaking IPC over a Unix socket.
+A WASM sandbox runs a WebAssembly module instead of a whole Linux machine. **WebAssembly** (WASM) is a compact program format that runs inside a locked-down virtual machine. AerolVM runs these sandboxes with a **host-mediated** model: the server reaches the outside world on the sandbox's behalf.
 
-## Components
+The AerolVM server process (`sandboxd`) keeps handling the API. Each sandbox runs in its own worker subprocess. The server and the worker talk over a Unix socket, a private channel between two processes on one machine.
+
+**In short:**
+
+- Each WASM sandbox runs in its own worker process, either newly started or taken from a warm pool.
+- To pause a sandbox created with `durability: "passivatable"`, AerolVM saves a checkpoint of its memory and state to disk, then stops the worker.
+- To wake it up, AerolVM restores that checkpoint into a worker.
+- Durable sandboxes, whose checkpoints would also go to a registry for failover, are not available yet.
+
+## The parts
+
+This section shows the pieces inside the server that run WASM sandboxes.
 
 ```text
 sandboxd (service layer)
@@ -15,34 +26,52 @@ sandboxd (service layer)
        └─ toolbox reverse proxy (files / exec)
 ```
 
-## Checkpoint format
+- **`internal/runtime/wasm.Driver`** is the WASM runtime driver: the part of the server that creates, pauses and stops WASM sandboxes.
+- **The `pkg/wasmmod` resolver** finds the module a sandbox asks for, and keeps a local cache of modules.
+- **The `pkg/wasm/worker` supervisor** starts and watches the worker processes.
+- **The toolbox reverse proxy** passes toolbox requests (reading files, running commands) on to the right worker. A **reverse proxy** receives requests and forwards them to another program.
 
-Passivation writes a `mem.snap` directory:
+## What a checkpoint holds
 
-- `config.json` — engine metadata, clone generation, module digest
-- `memory.zstd`, `globals.cbor`, `wasi-state.cbor` — guest state
+This section describes the saved state of a WASM sandbox. **Passivation** means pausing a sandbox to free its resources. WASM sandboxes are `ephemeral` by default and keep no checkpoint. A sandbox created with `durability: "passivatable"` writes a `mem.snap` folder when it passivates, which is its **checkpoint**:
 
-Durable sandboxes push the directory to AOCR at:
+- `config.json`: engine metadata, the clone generation and the module digest. The **clone generation** is a token that changes when a sandbox is restored from a saved copy. The **digest** is a hash that names the exact module.
+- `memory.zstd`, `globals.cbor` and `wasi-state.cbor`: the guest's own state. The guest is the program running inside the sandbox. **WASI** (the WebAssembly System Interface) is how a module reaches files, clocks and other system features.
+
+### Durable checkpoints (not available yet)
+
+Durable sandboxes are designed to also push this folder to AOCR, the Aerol OCI Registry. (OCI is the standard format for container images and their registries.) Another server could then restore the sandbox after a failure. The push path is:
 
 `cluster/<cluster-id>/wasm-checkpoints/<sandbox-id>:latest`
 
+The server already has the code to push and pull these checkpoints (`internal/service/wasm_checkpoint.go` and `wasm_checkpoint_pull.go`). But a create that asks for `durability: "durable"` is refused today as not implemented (`NormalizeCreateDurability` in `pkg/models`). So no WASM sandbox can be durable yet, and the durable steps below are planned behavior.
+
 ## Lifecycle
 
-1. **Create** — resolve module, start or acquire warm worker, instantiate, invoke entrypoint.
-2. **Passivate** — checkpoint live guest, stop worker, release admission.
-3. **Rehydrate** — restore from local `mem.snap` (pull from AOCR first when durable and missing).
-4. **Failover** — cluster owner calls `RecreateSandbox`; durable WASM pulls checkpoint then rehydrates.
+This section walks through the four stages of a WASM sandbox's life.
 
-## Configuration
+1. **Create.** Find the module, start a worker or take a warm one, and instantiate the module (load it into the worker). Then call its entry point.
+2. **Passivate.** Save a checkpoint of the running guest, stop the worker and release its admission (its reserved share of the host).
+3. **Rehydrate.** Restore from the local `mem.snap`. For a durable sandbox (planned), a missing local copy is first pulled from AOCR.
+4. **Failover (planned, durable only).** When a cluster member fails, the server that now owns the sandbox calls `RecreateSandbox`. A durable WASM sandbox pulls its checkpoint, then rehydrates.
 
-| Variable | Purpose |
-|---|---|
-| `SB_ENABLE_WASM` | Master gate |
-| `SB_WASM_MODULES_DIR` | Module + checkpoint cache root |
-| `SB_WASM_CHECKPOINT_INTERVAL` | Optional periodic boundary checkpoint |
-| `SB_WASM_DURABLE_PUSH_INTERVAL` | Retry AOCR push for durable rows |
-| `SB_SNAPSHOT_PUSH_ENABLED` | Enables AOCR push/pull credentials |
+## For server operators
 
-## Operations
+This section lists the server settings for the WASM runtime.
 
-See the [WASM runtime health runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/wasm-runtime-health.md) for failure modes and log signatures.
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_ENABLE_WASM` | Turns the WASM runtime on. | `false` |
+| `SB_WASM_MODULES_DIR` | Root folder for the module cache and checkpoints. | `/var/lib/sandboxd/wasm/modules` |
+| `SB_WASM_CHECKPOINT_INTERVAL` | Takes a checkpoint of running passivatable sandboxes at a safe boundary, on a fixed interval. Optional. | `0` (off) |
+| `SB_WASM_DURABLE_PUSH_INTERVAL` | Retries the AOCR push for durable sandboxes. Has no effect until durable sandboxes are available. | `0` (off; the push still happens at passivation) |
+| `SB_SNAPSHOT_PUSH_ENABLED` | Turns on the credentials for AOCR push and pull. | `false` |
+
+See the [WASM runtime health runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/wasm-runtime-health.md) for failure modes and the log lines each one leaves.
+
+## Next steps
+
+- [WebAssembly (WASM)](/wasm-sandbox/): create and use WASM sandboxes.
+- [WASM modules](/wasm-modules/): register the modules your sandboxes run.
+- [WASM networking](/wasm-networking/): how WASM sandboxes reach the network.
+- [Durability and failover](/durability/): how sandboxes survive restarts and server failures.

@@ -1,21 +1,45 @@
 ---
 title: SQL on Kaggle with DuckDB
-description: Launch a DuckDB instance inside a sandbox to run SQL queries directly on Kaggle datasets without a traditional database setup.
+description: Load a Kaggle dataset into DuckDB inside a sandbox and send it SQL queries through a web link.
 ---
 
-This use case shows how to use **DuckDB** inside an AerolVM sandbox to perform high-performance SQL analytics on Kaggle datasets. DuckDB is an in-process SQL OLAP database management system that is perfect for analyzing large CSV or Parquet files.
+DuckDB is a small SQL database that runs inside your program, so there is no database server to set up. It reads CSV and Parquet files directly and is fast at analysis queries. In this project a sandbox downloads a Kaggle dataset, loads it into DuckDB, and runs a tiny web service that answers SQL queries.
 
-## The DuckDB Advantage
+Each analyst or project can get its own sandbox, with nothing to install on their own computer.
 
-- **No Installation:** Run complex SQL queries without setting up a full database server.
-- **Direct CSV/Parquet Querying:** DuckDB can query files directly from disk (or even HTTP) with high efficiency.
-- **Sandboxed Analytics:** Each analyst or project gets their own isolated compute environment.
+## What you need
 
-## Copy-paste TypeScript script
+- An AerolVM server and Node.js 18 or newer. See [Quickstart](/quick-start/). On a server set up with a domain, the link works from anywhere. See [Install on a server](/getting-started/single-node-setup/).
+- A Kaggle account and an API token. You can create one in your Kaggle account settings.
+- These environment variables:
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/duckdb-dataset-explorer](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/duckdb-dataset-explorer)
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `KAGGLE_USERNAME` | Your Kaggle user name. | None. You must set it. |
+| `KAGGLE_KEY` or `KAGGLE_API_TOKEN` | Your Kaggle API key. | None. You must set one. |
+| `KAGGLE_DATASET` | The dataset to load, as `owner/name`. | `dgomonov/new-york-city-airbnb-open-data` |
 
-This script downloads a dataset and starts a simple HTTP proxy that allows you to send SQL queries to the sandbox.
+The full project is also on GitHub: [duckdb-dataset-explorer](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/duckdb-dataset-explorer).
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir duckdb-explorer && cd duckdb-explorer
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export KAGGLE_USERNAME=your-kaggle-name
+export KAGGLE_KEY=your-kaggle-key
+```
+
+### Step 2: Save the script
+
+Save this as `duckdb-explorer.ts`. The Python program inside it runs in the sandbox. It downloads the dataset, loads the first CSV file as a table named `data`, and answers each POST request by running its body as SQL.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -25,8 +49,6 @@ const patToken = process.env.SB_PAT_TOKEN;
 const kaggleUsername = process.env.KAGGLE_USERNAME;
 const kaggleKey = process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN;
 const kaggleDataset = process.env.KAGGLE_DATASET ?? "dgomonov/new-york-city-airbnb-open-data";
-
-
 
 const sqlProxyScript = `
 import os
@@ -69,8 +91,8 @@ async function main() {
   if (!patToken || !kaggleUsername || !kaggleKey) {
     throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY (or KAGGLE_API_TOKEN).");
   }
-  console.log("Initializing AerolVM client...");
   const client = new MicroVM({ apiUrl, patToken });
+
   console.log("Creating DuckDB sandbox (0.5 CPU, 2GB RAM)...");
   const sandbox = await client.create({
     image: "python:3.11-bookworm",
@@ -78,36 +100,96 @@ async function main() {
     memoryMB: 2048,
     env: { KAGGLE_USERNAME: kaggleUsername, KAGGLE_KEY: kaggleKey, KAGGLE_DATASET: kaggleDataset }
   });
-  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
+  console.log(`Sandbox created: ${sandbox.id}`);
 
-  console.log("Installing DuckDB and Kaggle dependencies...");
-  const installRes = await sandbox.exec("pip install duckdb kaggle pandas");
-  console.log(`Dependencies installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
+  try {
+    console.log("Installing DuckDB, Kaggle and pandas...");
+    const install = await sandbox.exec("pip install duckdb kaggle pandas");
+    if (install.exitCode !== 0) {
+      throw new Error(`pip install failed:\n${install.stderr}`);
+    }
 
-  console.log("Uploading DuckDB SQL Proxy script...");
-  await sandbox.uploadFile("/workspace/proxy.py", sqlProxyScript);
-  console.log("Script uploaded to /workspace/proxy.py");
+    await sandbox.uploadFile("/workspace/proxy.py", sqlProxyScript);
 
-  console.log("Starting DuckDB SQL Proxy session...");
-  const session = await sandbox.createSession({
-    name: "duckdb-proxy",
-    command: "python3 /workspace/proxy.py",
-  });
-  console.log(`Session started! ID: ${session.id}`);
+    console.log("Starting the SQL service in a session...");
+    await sandbox.createSession({
+      name: "duckdb-proxy",
+      command: "python3 /workspace/proxy.py",
+    });
 
-  console.log("Exposing port 8080...");
-  const exposure = await sandbox.exposePort(8080);
-  console.log(`Port exposed!`);
-  
-  console.log(`\n✅ DuckDB SQL Proxy ready at: ${exposure.url}`);
-  console.log(`Try running: curl -X POST -d "SELECT * FROM data LIMIT 5" ${exposure.url}`);
+    const exposure = await sandbox.exposePort(8080);
+    console.log(`\nDuckDB SQL service: ${exposure.url}`);
+    console.log("It answers once the dataset has finished downloading.");
+    console.log(`When you are done, delete sandbox ${sandbox.id}.`);
+  } catch (error) {
+    // Setup failed: delete the sandbox so it does not keep running.
+    await sandbox.destroy();
+    throw error;
+  }
 }
 
 main().catch(console.error);
 ```
 
-## Related docs
-- [Exposing Ports](/tcp-ports/)
-- [Sessions](/sessions/)
-- [Environment Variables](/environment/)
----
+### Step 3: Run it
+
+```bash
+npx tsx duckdb-explorer.ts
+```
+
+The script prints the address of the SQL service and exits. The sandbox keeps running, so the service stays up.
+
+### Step 4: Send a query
+
+Save this as `query.ts`. It sends one SQL query to the address the script printed and shows the answer.
+
+```ts
+const [url, sql = "SELECT * FROM data LIMIT 5"] = process.argv.slice(2);
+if (!url) {
+  throw new Error("Pass the address that duckdb-explorer.ts printed.");
+}
+
+fetch(url, { method: "POST", body: sql })
+  .then((response) => response.text())
+  .then((text) => console.log(text));
+```
+
+Run it with the address and a query:
+
+```bash
+npx tsx query.ts https://your-sandbox-address "SELECT room_type, COUNT(*) AS listings FROM data GROUP BY room_type"
+```
+
+The answer is a JSON list with one object per row. A bad query returns the error message from DuckDB instead.
+
+## What the script does
+
+1. **Creates a sandbox** from `python:3.11-bookworm` with half a CPU core and 2 GB of memory. Your Kaggle name, key and dataset go in as environment variables.
+2. **Installs DuckDB, the Kaggle library and pandas.** If the install fails, the script deletes the sandbox and stops.
+3. **Uploads the Python program** to `/workspace/proxy.py`.
+4. **Starts it in a session**, a process that keeps running inside the sandbox after your script exits.
+5. **Shares port 8080** with `exposePort` and prints the address.
+
+## Delete the sandbox when you are done
+
+The sandbox runs until you delete it. Pass the ID the script printed:
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+client.destroy("sb-your-sandbox-id").then(() => console.log("Deleted."));
+```
+
+## Good to know
+
+- The service starts listening only after the dataset is downloaded and loaded. A query sent before that fails. Wait a minute and try again.
+- Anyone who has the address can run any SQL query, and the service has no password. Use it for testing, and delete the sandbox when you are done.
+- The first CSV file in the dataset becomes the `data` table. For a dataset with several files, change the Python program to load the one you want.
+
+## Next steps
+
+- [Share a web app](/preview/): how `exposePort` gives a sandbox a web address.
+- [Terminal sessions](/sessions/): run programs that keep going after you disconnect.
+- [Environment variables](/sandbox-env/): pass settings and keys into a sandbox.
+- [Kaggle dataset to Parquet](/use-cases/data-processing-ml/kaggle-to-parquet/): convert a dataset instead of querying it.

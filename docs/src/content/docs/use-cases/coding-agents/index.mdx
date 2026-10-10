@@ -1,40 +1,49 @@
 ---
-title: Coding Agents & Autonomous Engineering
-description: The highest-priority agent workflows from the AerolVM use-case plan, organized as a dedicated category with subpages.
+title: Coding agents
+description: Run Claude Code inside a sandbox to review, test, fix and explain real GitHub repositories.
 ---
 
-This category is the highest-priority part of the use-case plan because it lines up with AerolVM's best primitives: isolated sandboxes, streamed execution, persistent sessions, file transfer, and explicit lifecycle control.
+A coding agent is an AI program that reads code, edits files and runs commands. It needs a computer to do that. A sandbox gives it one: the agent can install tools and run tests there without touching your machine.
 
-## Selected subcategories
+Each project below runs Claude Code, Anthropic's coding agent, on a real GitHub repository. Claude Code runs headless, which means from a script with no chat window.
 
-| Use case | Rating | Why it made the cut |
-|---|---:|---|
-| [Claude Code repository architecture agent](/use-cases/coding-agents/claude-code-repository-architecture-agent/) | 10/10 | It shows a real headless agent workflow that turns an open-source repository into a reusable architecture artifact. |
-| [Claude Code GitHub PR review and auto-fix agent](/use-cases/coding-agents/pull-request-review-auto-fix-agent/) | 9/10 | It is the closest match to a real coding-agent review loop: check out the PR, review it with Claude, post the review, and export any safe fixes. |
-| [Write 500 test cases](/use-cases/coding-agents/test-writing-failure-reproduction-agent/) | 9/10 | It turns large-scale test authoring into a measurable agent workflow with a hard completion gate and exported validation artifacts. |
-| [Claude Code security vulnerability remediation agent](/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent/) | 9/10 | It turns dependency and code vulnerability remediation into a real multi-step security workflow that ends with an actual pull request. |
-| [Zero-shot code execution agent](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | 9/10 | It turns an open-ended repository modification prompt into a real sandboxed execution loop that validates the result and opens a pull request. |
+## Pick a project
 
-## Why AerolVM fits this category
+| Project | What it does |
+|---|---|
+| [Generate an architecture diagram](/use-cases/coding-agents/claude-code-repository-architecture-agent/) | Turns a repository into `arch.md`: a diagram and a short guide to how the code fits together. |
+| [Review a pull request](/use-cases/coding-agents/pull-request-review-auto-fix-agent/) | Checks out a pull request, reviews it, posts the review on GitHub and saves any small fixes. |
+| [Write 500 tests](/use-cases/coding-agents/test-writing-failure-reproduction-agent/) | Writes a large batch of tests, checks how many really exist, and fails below a set share. |
+| [Find and fix security problems](/use-cases/coding-agents/claude-code-security-vulnerability-remediation-agent/) | Scans for known security problems, fixes what it can and opens a pull request. |
+| [Make a code change and open a pull request](/use-cases/coding-agents/large-scale-refactor-migration-agent/) | Takes a change request in plain words, makes the change, tests it and opens a pull request. |
 
-- `create` provisions one sandbox per task, repo, or branch.
-- `execStream` gives live stdout and stderr for agent progress.
-- `createSession` and `attachSession` keep long-running jobs alive across reconnects.
-- `uploadFile` and `downloadFile` move prompts, patches, logs, and artifacts in and out.
-- `updateLifecycle` keeps expensive work alive while an orchestrator or reviewer is still attached.
+## What every project needs
 
-## Recommended implementation pattern
+- **An AerolVM server and the TypeScript SDK.** See [Quickstart](/quick-start/) and [SDK setup](/sdk-setup/).
+- **Node.js 22 or newer.** The SDK streams live output over WebSocket, which Node.js has built in from version 22.
+- **An Anthropic API key** in `ANTHROPIC_API_KEY`, so Claude Code can call the model.
+- **A GitHub token** in `GITHUB_TOKEN`. It must be able to read the repository. Projects that push a branch or open a pull request also need write access.
+- **Internet access from the sandbox.** The scripts download tools and talk to GitHub and the Anthropic API.
 
-1. Create one sandbox per work item.
-2. Clone the target public repository inside the sandbox, then upload prompts, task metadata, and policy files.
-3. Run the agent with `execStream` for shorter jobs or sessions for long migrations.
-4. Download the diff, report, or reproduction artifact.
-5. Destroy or stop the sandbox once the review loop is complete.
+## How these projects work
 
-## Related docs
+1. **Create one sandbox per task.** Each repository, branch or pull request gets its own clean machine.
+2. **Clone the repository inside the sandbox.** Then upload the prompt and any settings files.
+3. **Run the agent.** Use `execStream` to watch a short job live. Use a session for a long job, because it keeps running if your connection drops.
+4. **Download the results.** For example a report, a patch (a file listing every changed line) or a log.
+5. **Delete the sandbox** when the job is done.
 
-- [SDK Setup](/sdk-setup/)
-- [Process & Code Execution](/exec-streaming/)
-- [Sessions](/sessions/)
-- [File System](/file-system/)
-- [Network Isolation](/network-isolation/)
+| SDK call | Why the projects use it |
+|---|---|
+| `create` | Start one sandbox per task, repository or branch. |
+| `execStream` | See the agent's output live while it works. |
+| `createSession`, `attachSession` | Keep a long job alive across dropped connections. |
+| `uploadFile`, `downloadFile` | Move prompts, patches, logs and reports in and out. |
+| `updateLifecycle` | Keep a sandbox alive longer while someone is still using it. |
+
+## Next steps
+
+- [Run commands](/exec-streaming/): how `exec` and `execStream` work.
+- [Terminal sessions](/sessions/): run jobs that outlive your connection.
+- [Files](/file-system/): copy files into and out of a sandbox.
+- [Block or allow the internet](/network-isolation/): limit what an agent can reach.

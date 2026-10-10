@@ -1,14 +1,43 @@
 ---
-title: AI App Hosting
-description: Clone a website repository into AerolVM, run npm install, npm run build, and npm run start, then return the hosted preview URL.
+title: Host a web app from GitHub
+description: Clone a website from GitHub into a sandbox, build it with Bun and serve it on a public link.
 ---
 
-This workflow hosts a website inside AerolVM from a GitHub repository URL. It clones the repository, writes a production `.env`, runs `npm install`, `npm run build`, and `npm run start`, and exits by printing the hosted preview URL.
+import { Aside } from '@astrojs/starlight/components';
 
-## Copy-paste TypeScript script
+In this tutorial you write a script that turns a GitHub repository into a live website. The script clones the code into a sandbox, builds it and starts it. Then it prints a public link to the running site.
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/ai-app-hosting](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/ai-app-hosting)
+This is how an AI app builder or a preview service works. Each generated app gets its own sandbox and its own link. A broken or hostile app cannot reach your servers or the other apps.
 
+## What you need
+
+- **An AerolVM server.** For a link that other people can open, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), the link works only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **Node.js 20 or newer.**
+- **A GitHub repository that builds with Bun.** The script uses a public portfolio site as the example. For a private repository, also set `GITHUB_TOKEN`.
+
+## What the script does
+
+1. Creates a sandbox from the `node:22-bookworm` image, with half a CPU core, 256 MB of memory and 4 GB of disk.
+2. Asks for a public link to port 3000 first, so the app can be told its own address.
+3. Installs `git` and Bun inside the sandbox.
+4. Clones the repository and writes a `.env` file with production settings.
+5. Runs `bun install` and `bun run build`, and prints their output as it happens.
+6. Starts the app with `bun run server` in a session. A session is a program that keeps running after your script exits.
+7. Prints the link and exits. The site keeps running.
+
+### Step 1: Set up a project
+
+```bash
+mkdir ai-app-hosting && cd ai-app-hosting
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Save the script
+
+Save this as `index.ts`. To host your own site, change the two repository URLs and the three `bun` commands to match your project. The same program is in the [examples repository](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/ai-app-hosting).
 
 ```ts
 import { randomBytes } from "node:crypto";
@@ -136,3 +165,48 @@ main().catch((error) => {
   process.exitCode = 1;
 });
 ```
+
+A few parts worth knowing:
+
+- **`runCommand`** uses `execStream`, which prints a command's output while it runs. A plain `exec` would only return the output at the end.
+- **`attachSession`** shows the app's first 5 seconds of logs. Then `stream.close()` stops watching, but the app keeps running.
+- **`destroyIfIdleFor`** deletes the sandbox after 45 minutes with no activity. Durations in TypeScript are in nanoseconds.
+
+### Step 3: Run it
+
+```bash
+npx tsx index.ts
+```
+
+You should see each command's output, then the link:
+
+```text
+Sandbox created: sb-...
+Preview URL reserved: https://<sandbox-id>-3000.<your-domain>
+Running: apt-get update && apt-get install -y git ca-certificates
+...
+App has been hosted on the following URL: https://<sandbox-id>-3000.<your-domain>
+```
+
+Open the link in your browser to see the site.
+
+## Clean up
+
+The sandbox deletes itself after 45 minutes with no activity. To delete it now, call `sandbox.destroy()` from your code, or run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/).
+
+## Good to know
+
+- **New sandboxes are private.** Calling `exposePort` is what makes this one public.
+- **The link exists before the app does.** If you open it before the app starts, you get an error page. Reload once the script finishes.
+- **256 MB of memory is small.** If `bun install` or the build stops because it ran out of memory, raise `memoryMB`.
+
+<Aside type="caution">
+With `GITHUB_TOKEN` set, the token is part of the clone URL. Git saves that URL inside the sandbox in `.git/config`, where the app's code can read it. Use a token that can only read this one repository.
+</Aside>
+
+## Next steps
+
+- [Share a web app](/preview/): how public links work, and how to remove one.
+- [Run commands](/exec-streaming/): more on `exec` and `execStream`.
+- [Terminal sessions](/sessions/): reconnect to the running app and read its logs.
+- [Serverless sandboxes](/serverless/): stop the app when idle and wake it on the next visit.

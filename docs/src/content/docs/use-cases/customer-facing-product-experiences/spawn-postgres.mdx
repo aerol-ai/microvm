@@ -1,38 +1,54 @@
 ---
-title: Deploy Your Own Postgres
-description: Run a dedicated Postgres instance inside an AerolVM sandbox, keep credentials in env vars, and publish an HTTP admin endpoint on a public URL.
+title: Your own Postgres
+description: Give each customer a private Postgres database in a sandbox, with an encrypted address and a small status page.
 ---
 
-This workflow boots a dedicated Postgres instance inside an AerolVM sandbox, initializes it from environment variables, and keeps the database alive in a long-running session. It also starts a tiny HTTP admin endpoint that checks the database and can be exposed on a public URL.
+import { Aside } from '@astrojs/starlight/components';
 
-This is the Postgres foundation, not the full Supabase control plane. If you want a Supabase-style stack, add PostgREST, GoTrue, storage, realtime, and pooling on top of this database runtime.
+In this tutorial you start a private Postgres database in a sandbox and put it online. One script creates the database, a small password-protected status page, and an encrypted address you can connect to with `psql`.
 
-## Why AerolVM fits
+Run the script once per customer or per workspace. Each one gets its own database, its own password and its own sandbox. This is the base of a Supabase-style service. To build the rest, add tools such as PostgREST (a REST API for Postgres), sign-in, file storage and connection pooling on top.
 
-- `create` gives each workspace or customer its own isolated database runtime.
-- Environment variables let you inject credentials without baking them into the image.
-- `createSession` keeps both Postgres and an optional HTTP admin surface alive after setup finishes.
-- Lifecycle policies let you stop or destroy idle database sandboxes automatically.
+## How it works
 
-## Native Postgres endpoint via `exposePort` with `protocol: "tcp"`
+The sandbox runs two programs, each in a session. A session is a program that keeps running after your script exits.
 
-This page exposes the Postgres wire protocol directly using `exposePort(5432, { protocol: "tcp" })`. The daemon allocates a parent-host port from the configured `[22000, 23000]` pool and points caddy-l4 at the container's `5432`, so the returned result has a `tcp://<public-host>:<host-port>` URL and separate `host` / `hostPort` fields that work with `psql`, Prisma, SQLAlchemy, pgAdmin, and any other client that speaks the PostgreSQL wire protocol.
+| Program | Port in the sandbox | Public address | What it is for |
+|---|---|---|---|
+| Postgres | 5432 | `tls://<sandbox-id>-5432.<domain>:443` | Your database clients |
+| A small Python web server | 3000 | `https://...` link | A status page that shows the database is up |
 
-If you only need browser-shaped traffic (a small admin UI, REST shim, PostgREST), call `exposePort()` with no options - that's the HTTPS-only path documented in [Preview](/preview/). See [TCP & TLS Ports](/tcp-ports/) for the full surface.
+The database address uses TLS, the same encryption HTTPS uses. AerolVM's edge server handles the encryption with your domain's certificate. Inside the sandbox, Postgres itself needs no certificate.
 
-## Copy-paste TypeScript script
+### Why you connect through a tunnel
 
-Set these environment variables before running the script:
+The edge server sends each encrypted connection to the right sandbox by reading the name in the connection's first message. Postgres clients do not start that way: they first send a plain "can we encrypt?" message. So the edge server cannot tell which sandbox you want.
 
-- `SB_PAT_TOKEN`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
-- Optional: `POSTGRES_DB` (defaults to `appdb`)
-- Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint. If omitted, the script falls back to the Postgres credentials. In production, use separate values.
+The fix is a tunnel: a small program on your computer, `socat` or `stunnel`. It opens the encrypted connection itself and passes `psql`'s traffic through it. The script prints the exact tunnel command for you.
 
-If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
+## What you need
+
+- **An AerolVM server with a domain.** See [Install on a server](/getting-started/single-node-setup/). Encrypted addresses do not work on a local install: the call fails with `TLS-SNI exposure requires --domain to be configured`. For a local install, use the [unencrypted variation](#connect-without-a-tunnel) instead.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **Node.js 20 or newer.**
+- **`socat` or `stunnel`** on the computer you connect from, plus `psql`.
+- **Optional settings.** `POSTGRES_USER` (default `appuser`), `POSTGRES_PASSWORD` (default: random), `POSTGRES_DB` (default `appdb`). For the status page, `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` default to the database user and password. Use separate values in production.
+
+### Step 1: Set up a project
+
+```bash
+mkdir my-postgres && cd my-postgres
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Save the script
+
+Save this as `index.ts`. A longer version is in the [examples repository](https://github.com/aerol-ai/aerolvm-examples/tree/main/customer-facing/your-own-supabase). It also sets up row-level security, Postgres's per-row access rules.
 
 ```ts
+import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -40,7 +56,8 @@ import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 const postgresUser = process.env.POSTGRES_USER || 'appuser';
-const postgresPassword = process.env.POSTGRES_PASSWORD ?? 'password';
+// A random password unless you pass one: this database gets a public address.
+const postgresPassword = process.env.POSTGRES_PASSWORD ?? randomBytes(16).toString("hex");
 const postgresDB = process.env.POSTGRES_DB ?? "appdb";
 const publicAuthUser = process.env.PUBLIC_AUTH_USER ?? postgresUser;
 const publicAuthPassword = process.env.PUBLIC_AUTH_PASSWORD ?? postgresPassword;
@@ -195,6 +212,9 @@ async function main() {
     cpu: 2,
     memoryMB: 2048,
     diskGB: 12,
+    // Keep the image's own Postgres from starting. Otherwise it holds the
+    // data directory and the Postgres session below exits at once.
+    containerCommand: ["sleep", "infinity"],
     env: {
       POSTGRES_DB: postgresDB,
       POSTGRES_USER: postgresUser,
@@ -321,29 +341,104 @@ main().catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
-
 ```
 
-## What the script gives you
+What the script does, in order:
 
-- `deploy-your-own-postgres.json` with the sandbox ID, the running session IDs, the public HTTP admin URL, and a native `postgresql://...` DSN.
-- A Postgres server listening on port `5432` inside the sandbox, published as a `tcp://<public-host>:<host-port>` endpoint via caddy-l4.
-- A password-protected HTTP endpoint on port `3000` that proves the database is up and returns basic metadata.
+1. Creates a sandbox from the official `postgres:16-bookworm` image, with 2 CPU cores, 2 GB of memory and 12 GB of disk. The database settings go in as environment variables, so they are not baked into the image.
+2. Installs Python for the status page.
+3. Starts Postgres in a session, using the image's own start script, and waits until it accepts connections.
+4. Starts the status page in a second session and waits until it answers.
+5. Shares the status page as an HTTPS link and Postgres as an encrypted `tls://` address.
+6. Writes the addresses, the tunnel commands and a ready-made connection string to `deploy-your-own-postgres.json`.
 
-## Connecting natively
+### Step 3: Run it
 
-The `postgresURL` returned by the script is a real Postgres DSN. Plug it into any client:
-
+```bash
+npx tsx index.ts
 ```
-psql "postgresql://user:pass@<public-host>:<host-port>/appdb"
+
+The last lines show the connection details, for example:
+
+```text
+{
+  "sandboxID": "sb-...",
+  "adminURL": "https://<sandbox-id>-3000.<your-domain>",
+  "postgresTLSEndpoint": "tls://<sandbox-id>-5432.<your-domain>:443",
+  "tunnelDSN": "postgresql://appuser:<password>@127.0.0.1:15432/appdb?sslmode=disable",
+  "tunnelSetup": {
+    "socat": "socat TCP-LISTEN:15432,reuseaddr,fork OPENSSL:<sandbox-id>-5432.<your-domain>:443,cafile=/etc/ssl/certs/ca-certificates.crt",
+    ...
+  },
+  ...
+}
 ```
 
-The host port is one of the parent-host ports allocated from the configured `[22000, 23000]` pool. Make sure that range is open on the host firewall - see [TCP & TLS Ports](/tcp-ports/) for the full surface and reconcile guarantees.
+### Step 4: Open the tunnel
 
-## Related docs
+In a new terminal, run the `socat` command from `tunnelSetup.socat`. It listens on port 15432 on your computer and keeps running.
 
-- [TCP & TLS Ports](/tcp-ports/)
-- [Environment](/environment/)
-- [Preview](/preview/)
-- [Port Allowlist](/port-allowlist/)
-- [Sessions](/sessions/)
+On macOS, change `cafile=/etc/ssl/certs/ca-certificates.crt` to `cafile=/etc/ssl/cert.pem`. That is where macOS keeps its list of trusted certificates.
+
+To use `stunnel` instead, put the `tunnelSetup.stunnel` text in a `stunnel.conf` file and start `stunnel` with it.
+
+### Step 5: Connect with psql
+
+In another terminal, connect through the tunnel with the `tunnelDSN` value:
+
+```bash
+psql "postgresql://appuser:<password>@127.0.0.1:15432/appdb?sslmode=disable"
+```
+
+`sslmode=disable` is correct here. The tunnel already encrypts the connection, so `psql` must not try to add its own.
+
+### Step 6: Check the status page
+
+Open `adminURL` in your browser. It asks for a user name and password: use `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD`. These are the database user and password unless you set them. The page shows the database name, user, Postgres version and current time.
+
+## Connect without a tunnel
+
+You can also share Postgres as a raw TCP address instead. Then `psql` connects directly, with no tunnel, and it works on a local install too. The traffic is **not encrypted**, so use this only for test data or on a private network.
+
+In the script, find the line that logs `Exposing Postgres port`. Replace it and everything after it, down to the end of `main()`, with this:
+
+```ts
+  const postgresExposure = await sandbox.exposePort(postgresPort, { protocol: "tcp" });
+  if (postgresExposure.protocol !== "tcp") {
+    throw new Error("expected tcp exposure for Postgres");
+  }
+
+  const dsn = `postgresql://${encodeURIComponent(postgresUser)}:${encodeURIComponent(postgresPassword)}@${postgresExposure.host}:${postgresExposure.hostPort}/${encodeURIComponent(postgresDB)}`;
+  await writeFile("deploy-your-own-postgres.json", `${JSON.stringify({ sandboxID: sandbox.id, adminURL: adminExposure.url, dsn }, null, 2)}\n`);
+  log(`Connect with: psql "${dsn}"`);
+}
+```
+
+The address looks like `tcp://<host>:<port>`, where the port comes from a fixed range on the server. See [TCP or TLS?](/tcp-vs-tls-ports/) to compare the two kinds of address.
+
+## Clean up
+
+The sandbox stops after 30 idle minutes and deletes itself after 6 idle hours. Durations in TypeScript are in nanoseconds. To delete it now, run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/), or call `sandbox.destroy()`.
+
+## Good to know
+
+- **Postgres does not start again by itself.** Sessions do not survive a stop and start. After the sandbox stops, start it and create both sessions again. The data files in `/workspace/postgres/data` are still there.
+- **The tunnel's local port is up to you.** The script uses 15432. If that port is busy on your computer, pick another and change both the tunnel and the connection string.
+
+<Aside type="caution">
+Anyone with the connection string can read and change the whole database. Treat it like a password, and give each customer their own sandbox and password.
+</Aside>
+
+## For server operators
+
+- **Encrypted addresses** need the server installed with `--domain`. They share the server's port 443 and its wildcard certificate (one certificate for every name under your domain). So they need no extra firewall rules.
+- **Raw TCP addresses** use a port from the TCP port pool, `22000` to `23000` by default. The firewall must allow inbound traffic on that range. The installer does not open it for you.
+
+See [TCP and TLS ports](/tcp-ports/) for both.
+
+## Next steps
+
+- [TCP or TLS?](/tcp-vs-tls-ports/): pick the right kind of address for each database.
+- [TCP and TLS ports](/tcp-ports/): the full details of both.
+- [Terminal sessions](/sessions/): reconnect to Postgres or read its log.
+- [Environment variables](/sandbox-env/): pass settings into a sandbox.

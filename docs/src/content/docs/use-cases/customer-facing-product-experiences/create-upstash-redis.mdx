@@ -1,43 +1,59 @@
 ---
-title: Create your own Upstash Redis
-description: Run a dedicated Redis instance inside an AerolVM sandbox, keep credentials in env vars, and publish an HTTP admin endpoint on a public URL.
+title: Your own Upstash-style Redis
+description: Give each customer a private Redis in a sandbox, reachable with redis-cli and with the Upstash REST SDK.
 ---
 
-This workflow boots a dedicated Redis instance inside an AerolVM sandbox, initializes it from environment variables, and keeps the database alive in a long-running session. It also starts a tiny HTTP admin endpoint that checks the database and can be exposed on a public URL.
+import { Aside } from '@astrojs/starlight/components';
 
-This is the Redis foundation, providing a serverless-like experience where each user or project gets its own isolated instance.
+In this tutorial you build a small Redis service like Upstash. One script starts a private Redis server in a sandbox and gives you two ways to reach it. Normal Redis clients connect to a network address. Web and serverless apps send HTTPS requests through the Upstash SDK.
 
+Run the script once per customer or per project. Each one gets its own Redis, its own password and its own sandbox.
 
-## Native Redis endpoint 
+## How it works
 
-- via `exposePort` with `protocol: "tcp"`
+The sandbox runs two programs:
 
-This page exposes the Redis protocol directly using `exposePort(6379, { protocol: "tcp" })`. The daemon allocates a parent-host port from the configured pool and points caddy-l4 at the container's `6379`, so the returned result has a `tcp://<public-host>:<host-port>` URL. This works with `redis-cli`, Ioredis, StackExchange.Redis, and any other client that speaks the Redis protocol.
+| Program | Port in the sandbox | Public address | Who uses it |
+|---|---|---|---|
+| `redis-server` | 6379 | `tcp://<host>:<port>` | `redis-cli`, ioredis, and any other Redis client |
+| A small Python web server | 3000 | `https://...` link | The `@upstash/redis` SDK |
 
-If you only need browser-shaped traffic (a small admin UI, REST shim), call `exposePort()` with no options - that's the HTTPS-only path.
+The Python server copies the Upstash REST format. Each HTTPS request carries one Redis command, such as `["SET", "foo", "bar"]`. The server runs it on Redis and sends back `{"result": ...}`.
 
-## Copy-paste TypeScript script
+Both programs run in sessions. A session is a program that keeps running after your script exits.
 
-Set these environment variables before running the script:
+## What you need
 
-- `SB_PAT_TOKEN`
-- `REDIS_PASSWORD`
-- Optional: `PUBLIC_AUTH_USER` and `PUBLIC_AUTH_PASSWORD` for the HTTP admin endpoint.
+- **An AerolVM server.** For addresses other people can reach, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), both addresses work only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **Node.js 20 or newer.**
+- **Optional:** `REDIS_PASSWORD` and `REST_TOKEN`. If you leave them out, the script makes random ones and prints them.
 
-If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
+### Step 1: Set up a project
 
-Code Location: [https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/create-upstash-redis/index.ts](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/create-upstash-redis/index.ts)
+```bash
+mkdir upstash-redis && cd upstash-redis
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Save the script
+
+Save this as `index.ts`. A longer version is in the [examples repository](https://github.com/aerol-ai/aerolvm-examples/blob/main/customer-facing/create-upstash-redis/index.ts).
 
 ```ts
+import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
-const redisPassword = process.env.REDIS_PASSWORD ?? 'password';
-const publicAuthUser = process.env.PUBLIC_AUTH_USER ?? 'admin';
-const publicAuthPassword = process.env.PUBLIC_AUTH_PASSWORD ?? redisPassword;
+// Random secrets unless you pass your own. Never reuse SB_PAT_TOKEN as the
+// REST token: every app that talks to this Redis gets a copy of it.
+const redisPassword = process.env.REDIS_PASSWORD ?? randomBytes(16).toString("hex");
+const restToken = process.env.REST_TOKEN ?? randomBytes(24).toString("hex");
 
 const redisPort = 6379;
 const adminPort = 3000;
@@ -149,22 +165,6 @@ function log(msg: string) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
-async function withRetry<T>(label: string, fn: () => Promise<T>, attempts = 5): Promise<T> {
-  let lastErr: unknown;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      return await fn();
-    } catch (err) {
-      lastErr = err;
-      const wait = Math.min(8000, 1000 * 2 ** i);
-      const cause = (err as { cause?: { code?: string } } | undefined)?.cause?.code;
-      log(`  ${label}: attempt ${i + 1}/${attempts} failed (${cause ?? (err as Error).message}); retrying in ${wait}ms`);
-      await delay(wait);
-    }
-  }
-  throw lastErr;
-}
-
 async function waitForRedis(sandbox: Awaited<ReturnType<MicroVM["create"]>>) {
   log("Waiting for Redis to accept connections...");
   for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -204,7 +204,7 @@ async function waitForAdmin(sandbox: Awaited<ReturnType<MicroVM["create"]>>, adm
   }
 
   const sessionLog = await sandbox.sessionLog(adminSessionID);
-  console.error("[admin session log]\\n" + new TextDecoder().decode(sessionLog));
+  console.error("[admin session log]\n" + new TextDecoder().decode(sessionLog));
   throw new Error("The REST proxy did not become ready in time.");
 }
 
@@ -223,7 +223,6 @@ async function main() {
     containerCommand: ["sleep", "infinity"],
     env: {
       REDIS_PASSWORD: redisPassword,
-      PUBLIC_AUTH_TOKEN: patToken!,
       PORT: String(adminPort),
     },
     lifecycle: {
@@ -265,8 +264,7 @@ async function main() {
     workDir: "/workspace/admin",
     env: {
       REDIS_URL: redisURL,
-      PUBLIC_AUTH_USER: publicAuthUser,
-      PUBLIC_AUTH_PASSWORD: publicAuthPassword,
+      PUBLIC_AUTH_TOKEN: restToken,
       PORT: String(adminPort),
     },
   });
@@ -287,9 +285,9 @@ async function main() {
     redisSessionID: redisSession.id,
     adminSessionID: adminSession.id,
     upstashRestUrl: adminExposure.url,
-    upstashToken: patToken,
+    upstashToken: restToken,
     redisEndpoint: redisExposure.url,
-    connectionString: `redis://:${redisPassword}@${redisExposure.url.replace('tcp://', '')}`,
+    connectionString: `redis://:${encodeURIComponent(redisPassword)}@${redisExposure.url.replace("tcp://", "")}`,
   };
 
   await writeFile("create-upstash-redis.json", `${JSON.stringify(payload, null, 2)}\n`);
@@ -303,39 +301,81 @@ main().catch((error) => {
 });
 ```
 
-## What the script gives you
+What the script does, in order:
 
-- `create-upstash-redis.json` with the sandbox ID, the running session IDs, the public Upstash-compatible REST URL and Token, and a native `redis://...` connection string.
-- A Redis server listening on port `6379` inside the sandbox, published as a `tcp://<public-host>:<host-port>` endpoint.
-- A REST proxy on port `3000` that mimics the Upstash REST API.
+1. Creates a sandbox from the `redis:7-bookworm` image. `containerCommand` replaces the image's own start command, so you can start Redis with a password instead.
+2. Installs Python and its Redis library.
+3. Uploads the Python web server and starts Redis and the web server in two sessions.
+4. Waits until each one answers.
+5. Shares port 3000 as an HTTPS link and port 6379 as a raw TCP address.
+6. Writes everything you need to `create-upstash-redis.json` and prints it.
 
-## Connecting via Upstash SDK
-
-The `upstashRestUrl` and `upstashToken` returned by the script are compatible with the `@upstash/redis` library:
-
-```ts
-import { Redis } from '@upstash/redis'
-
-const redis = new Redis({
-  url: 'https://...', // your upstashRestUrl
-  token: '...',       // your upstashToken
-})
-
-const data = await redis.set('foo', 'bar')
-```
-
-## Connecting natively
-
-The `redisEndpoint` or `connectionString` returned by the script can be used with any Redis client:
+### Step 3: Run it
 
 ```bash
-redis-cli -u "redis://:password@<public-host>:<host-port>"
+npx tsx index.ts
 ```
 
-## Related docs
+At the end, the script prints something like this:
 
-- [TCP & TLS Ports](/tcp-ports/)
-- [Environment](/environment/)
-- [Preview](/preview/)
-- [Port Allowlist](/port-allowlist/)
-- [Sessions](/sessions/)
+```text
+{
+  "sandboxID": "sb-...",
+  "redisSessionID": "...",
+  "adminSessionID": "...",
+  "upstashRestUrl": "https://<sandbox-id>-3000.<your-domain>",
+  "upstashToken": "...",
+  "redisEndpoint": "tcp://<host>:<port>",
+  "connectionString": "redis://:<password>@<host>:<port>"
+}
+```
+
+### Step 4: Connect with the Upstash SDK
+
+Use `upstashRestUrl` and `upstashToken` from the output:
+
+```ts
+import { Redis } from "@upstash/redis";
+
+const redis = new Redis({
+  url: "https://...",  // upstashRestUrl
+  token: "...",        // upstashToken
+});
+
+await redis.set("foo", "bar");
+console.log(await redis.get("foo")); // bar
+```
+
+### Step 5: Connect with any Redis client
+
+Use `connectionString` from the output:
+
+```bash
+redis-cli -u "redis://:<password>@<host>:<port>"
+```
+
+## Clean up
+
+The sandbox stops after 30 idle minutes and deletes itself after 6 idle hours. Durations in TypeScript are in nanoseconds. To delete it now, run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/), or call `sandbox.destroy()`.
+
+## Good to know
+
+- **Redis does not start again by itself.** Sessions do not survive a stop and start. After the sandbox stops, start it and create both sessions again.
+- **Redis keeps its data in memory.** This script does not set up how Redis saves to disk. Set that up and test a restart before you store data you cannot lose.
+- **It is close to Upstash, not identical.** For example, `SET` returns `1` here, where real Upstash returns `"OK"`.
+- **Cannot reach the TCP address?** The server's firewall may be blocking its port range. See the operator note below.
+
+<Aside type="caution">
+Anyone with the connection string or the REST token can read and change all the data. Treat both like passwords, and give each customer their own.
+</Aside>
+
+## For server operators
+
+The TCP address uses a port from the server's TCP port pool, `22000` to `23000` by default. The server's firewall must allow inbound traffic on that range. The installer does not open it for you. See [TCP and TLS ports](/tcp-ports/) for how to change the range.
+
+## Next steps
+
+- [TCP and TLS ports](/tcp-ports/): how raw TCP addresses work.
+- [Terminal sessions](/sessions/): reconnect to Redis or read its log.
+- [Environment variables](/sandbox-env/): pass settings into a sandbox.
+- [Share a web app](/preview/): how HTTPS links work.

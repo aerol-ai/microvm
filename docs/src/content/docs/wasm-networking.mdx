@@ -1,34 +1,34 @@
 ---
-title: WASM Networking
-description: Expose HTTP ports and custom domains for WASM sandboxes through the host-mediated ingress path.
+title: WASM networking
+description: Give a web server running in a WASM sandbox a public URL or your own domain.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-WASM sandboxes do not receive a routable container NIC. HTTP ingress is **host-mediated**: Caddy dials a loopback mediator on the worker, and sandboxd forwards requests into the guest wasip1 listener. The port you pass to `expose_port` is a **routing key** for public URLs, not the TCP port the guest binds inside WASI.
+A [WASM sandbox](/wasm-sandbox/) has no network card of its own. The AerolVM server handles its network traffic for it. For incoming web requests, AerolVM's web proxy sends each request to a small relay on the server. The relay passes it to the listener your module serves on.
 
-For sandbox creation and durability, see [WASM Sandbox](/wasm-sandbox/). For operator-owned hostnames and TLS, see [Custom Domains](/custom-domains/).
+So the port number you pass to `exposePort` is a label for the public URL. It is not a TCP port your module opens inside the sandbox.
 
-## Expose an HTTP port
+## Share a web server
 
-Call `exposePort` with protocol `http` (the default). The preview URL shape is `{sandbox-id}-{port}.{domain}`.
+Call `exposePort` to get a public URL. HTTP is the default, and the only kind WASM supports. The URL looks like `https://<sandbox-id>-<port>.<domain>`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const exposure = await sandbox.exposePort(8080, { protocol: 'http' })
-    console.log(exposure.url)
+    const exposure = await sandbox.exposePort(8080);
+    console.log(exposure.url);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    exposure = sandbox.expose_port(8080, protocol='http')
+    exposure = sandbox.expose_port(8080)
     print(exposure.url)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    exposure, err := sandbox.ExposePort(ctx, 8080, microvm.WithProtocol(sdktypes.ExposeProtocolHTTP))
+    exposure, err := sandbox.ExposePort(ctx, 8080)
     if err != nil {
         log.Fatal(err)
     }
@@ -46,31 +46,31 @@ Call `exposePort` with protocol `http` (the default). The preview URL shape is `
   <TabItem label="Java">
     ```java
     ExposeResult exposure = sandbox.exposePort(8080);
-    System.out.println(exposure.url());
+    System.out.println(exposure.url);
     ```
   </TabItem>
 </Tabs>
 
-`expose_port` is idempotent: retries return the same public URL without walking the port pool again.
+A new sandbox is private. Calling `exposePort` makes it public. It is safe to call again: a retry returns the same URL.
 
-## Custom domains on WASM
+## Use your own domain
 
-Attach a hostname with `target_port` selecting which logical service receives traffic:
+You can point your own hostname, such as `api.acme.com`, at a WASM sandbox. The port you pass picks what answers:
 
-| `target_port` | Routes to |
+| Port | What answers |
 |---|---|
-| `0` | Toolbox (same dial shape as the default `{id}.{domain}` sandbox URL) |
-| Exposed HTTP port (e.g. `8080`) | Guest HTTP through the host mediator (same upstream as the preview URL) |
+| `0` | The toolbox, the helper the SDK talks to. This is the same as the sandbox's default `<sandbox-id>.<domain>` address. |
+| An exposed HTTP port, such as `8080` | Your module's web server, the same as its `exposePort` URL. |
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.customDomains.add('api.acme.com', { port: 8080 })
+    await sandbox.customDomains.add("api.acme.com", { port: 8080 });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.add_custom_domain('api.acme.com', port=8080)
+    sandbox.add_custom_domain("api.acme.com", port=8080)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -96,16 +96,23 @@ Attach a hostname with `target_port` selecting which logical service receives tr
   </TabItem>
 </Tabs>
 
-You may attach a custom domain before `expose_port`; once the port is exposed, Caddy routes refresh automatically. If the sandbox already exposes HTTP ports, `target_port` must match one of them (or `0` for toolbox).
+You can add the domain before you call `exposePort`. Once the port is exposed, the routes update by themselves. If the sandbox already exposes HTTP ports, the port you pass must be one of them, or `0`. The hostname's DNS record (its entry in the internet's address book) must point at your server first. See [Custom domains](/custom-domains/) for DNS and certificates.
 
-## Guest requirements
+## What your module must do
 
-- **Ingress:** wasip1 HTTP server using the pre-open TCP listener (`WASIListenPort: 0` binds an ephemeral host port). TinyGo and production guests discover the listener via WASI socket APIs.
-- **Egress:** outbound TCP/UDP goes through the `aerol/vm/net` host hook (see [WASM Architecture](/wasm-architecture/)).
-- **Filesystem:** guests that serve files from `/work` while listening should use WASI socket discovery (listener fd may be greater than 3 when `/work` is pre-opened). Reference wazero test modules that hardcode fd 3 are for engine tests only.
+- **Serve incoming requests** on the TCP listener the server opens for the module before it starts (a pre-opened socket). Find it with the WASI socket functions (WASI is the standard system interface for WebAssembly programs). TinyGo and other real-world modules do this.
+- **Make outgoing connections** through the server. Outbound TCP and UDP go through `aerol/vm/net`, a set of network functions the server gives the module. See [WASM architecture](/wasm-architecture/).
+- **Do not assume the listener's number.** A file descriptor is the number a program uses for an open file or socket. When the module also has the `/work` folder open, the listener's number may be above 3. Find it with the WASI socket functions. Some test modules expect it at 3, but they are meant only for testing the engine.
 
 ## Limits
 
-- TCP and TLS `expose_port` are not supported on WASM (`runtime not implemented`).
-- Native WASI Preview 2 / Component Model ingress is not available on the default wazero engine.
-- Custom domains cannot coexist with TCP/TLS exposed ports on the same sandbox (the same rule as Docker sandboxes).
+- **No TCP or TLS ports.** `exposePort` with `tcp` or `tls` (encrypted TCP) fails with `runtime not implemented` on WASM.
+- **No WASI Preview 2.** Modules built for WASI Preview 2 (the Component Model) cannot take incoming connections on the default `wazero` engine.
+- **Custom domains and TCP or TLS ports do not mix** on one sandbox. This is the same rule as for container sandboxes.
+
+## Next steps
+
+- [WebAssembly (WASM)](/wasm-sandbox/): create WASM sandboxes.
+- [Share a web app](/preview/): public URLs for any sandbox.
+- [Custom domains](/custom-domains/): DNS records and certificates for your own hostnames.
+- [WASM architecture](/wasm-architecture/): how the server relays a module's network traffic.

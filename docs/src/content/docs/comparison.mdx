@@ -1,0 +1,139 @@
+---
+title: AerolVM vs Daytona vs E2B
+description: See how AerolVM compares with Daytona and E2B on hosting, isolation, start time, features and cost.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Daytona and E2B are two other products that run code in sandboxes. This page compares them with AerolVM, and explains why we built AerolVM.
+
+The Daytona and E2B columns describe those products as we understood them when we wrote this page. Check their own docs for the latest.
+
+## Side by side
+
+| | AerolVM | E2B | Daytona |
+|---|---|---|---|
+| **Where it runs** | Your own servers, or a managed multi-tenant service | E2B's cloud (managed, no self-hosting) | Self-hosted |
+| **Setup effort** | Easy on one server | No self-hosting | Very hard, even on one server |
+| **Runs on your laptop** | ✅ | ✗ | ✗ |
+| **Open source** | ✅ | ✗ | ✅ |
+| **Main use** | AI agents and short-lived CI jobs | Running code for AI agents | Developer workspaces |
+| **Sandbox start time (median)** | V8 isolate about 4 ms · WASM about 22 ms · Firecracker about 34 ms · containers on containerd about 189 ms | About 200 ms | Under 90 ms |
+| **Isolation options** | Containers (Docker or containerd), gVisor, Firecracker virtual machines, WebAssembly (WASM), V8 isolates | Firecracker | Docker |
+| **Serverless sandboxes** | ✅ WASM and V8 isolates, in the style of AWS Lambda or Cloudflare Workers | ✗ | ✗ |
+| **Extra security layers** | gVisor, Firecracker, the isolate jail, WASM sandboxing | Firecracker | ✗ |
+| **Port isolation** | ✅ | ✗ | ✗ |
+| **Persistent sandboxes** | ✅ | ✗ | ✅ |
+| **Longest sandbox life** | No limit | 1 day | No limit |
+| **Clusters of many servers** | ✅ Shared placement records kept by Raft. Separate server, worker and ingress roles. | Managed for you (details not public) | ✗ |
+| **Failover when a server dies** | ✅ Copied placement records, detection of dead servers, and [reconcile](/reconcile/) (repair when the records and the running sandboxes disagree) | Managed for you | ✗ |
+| **Works with existing Daytona and E2B SDKs** | ✅ Compatibility APIs at `/daytona` and `/e2b`. You change the server URL, not your code. | ✗ | ✗ |
+| **Terminal sessions you can reconnect to** | ✅ Reconnect and see the output you missed | ✗ | ✗ |
+| **Cloud storage mounts** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
+| **GPUs** | ✅ | ✗ | ✗ |
+| **Raw TCP ports** | ✅ | ✗ | ✗ |
+| **TLS ports routed by hostname (SNI)** | ✅ | ✗ | ✗ |
+| **SSH access** | ✅ An Ed25519 key per sandbox, through a gateway | ✗ | ✅ |
+| **Outbound traffic rules per sandbox** | ✅ | ✗ | ✗ |
+| **Network data caps per sandbox** | ✅ Byte limits for traffic in and out. Traffic is dropped once a limit is reached. | ✗ | ✗ |
+| **Tags for multi-tenant apps** | ✅ Filter the sandbox list by tags. A sandbox must match every tag you pass. | ✗ | ✗ |
+| **Port allowlist** | ✅ Public traffic reaches a port only after you expose it | ✗ | ✗ |
+| **SDK languages** | TypeScript, Python, Go, Rust, Java | TypeScript, Python | TypeScript, Python, Ruby, Go, Java |
+| **Cost per month for 100 sandboxes running at once** (2 vCPU, 4 GB RAM and 16 GB disk each) | About $4,000 ([see the math](#how-we-worked-out-the-cost)) | About $12,000 | About $12,000 |
+
+A few terms from the table:
+
+- **Raft** is a method for several servers to agree on one shared record. AerolVM uses it to track which server runs each sandbox.
+- **Ingress** servers take in public traffic and pass it to the server that runs the sandbox.
+- **SNI** is the hostname a client sends at the start of a TLS (encrypted) connection. AerolVM routes on it, so many sandboxes can share port 443.
+
+### What the start times measure
+
+Each AerolVM number is a median: half of the sandbox creates were faster. We measured it inside the AerolVM server on our AWS test servers. It does not count the network trip between your app and the server. In every test the image, module or code bundle was already on the server.
+
+| Sandbox kind | Median start | Test servers |
+|---|---|---|
+| V8 isolate | about 4 ms | One `t3.medium`. The tenant's isolate group was already running. |
+| WASM | about 22 ms | Three `t3.large` servers in a cluster, with the WASM module already loaded |
+| Firecracker | about 34 ms | One `c5.metal`, using the snapshot warm pool (copies of an already-booted VM, ready to resume) |
+| Containers on containerd | about 189 ms | Three `t3.medium` servers in a cluster |
+
+The E2B and Daytona numbers are the vendors' own published figures. We did not measure them.
+
+### How we worked out the cost
+
+<Aside>
+These sandboxes run on shared servers. You pay for 2 vCPU and 4 GB of memory per sandbox, but most sandboxes use much less.
+</Aside>
+
+We used the AWS on-demand `m4.4xlarge` server as the reference. It has 16 vCPU and 64 GiB of memory and costs about $0.80 an hour. Over a month that is 0.80 × 730 hours, or about $584.
+
+At full size, 100 sandboxes need 200 vCPU and 400 GiB of memory. But sandboxes like these rarely use their full size. Here is the cost if they use a quarter of it, or half of it:
+
+| | Each sandbox uses 1/4 of its size | Each sandbox uses 1/2 of its size |
+|---|---|---|
+| vCPU needed | 200 ÷ 4 = 50 | 200 ÷ 2 = 100 |
+| Memory needed | 400 ÷ 4 = 100 GiB | 400 ÷ 2 = 200 GiB |
+| Servers needed for CPU | 50 ÷ 16 = 3.125, so 4 | 100 ÷ 16 = 6.25, so 7 |
+| Servers needed for memory | 100 ÷ 64 = 1.56, so 2 | 200 ÷ 64 = 3.125, so 4 |
+| Servers to buy (CPU is the limit) | 4 | 7 |
+| Monthly cost | 4 × $584 = $2,336 | 7 × $584 = $4,088 |
+
+The table above uses the more cautious case, about $4,000. The $12,000 figure is the vendor price for 100 full-size sandboxes. Sharing servers is what closes that gap.
+
+The 16 GB of disk per sandbox costs extra, but compute is the main cost here.
+
+## AerolVM vs E2B
+
+E2B is a managed cloud service built for AI agent sandboxes. It is the fastest way to start if you do not want to run any servers. But the trade-offs add up:
+
+- **No self-hosting.** Your code, your customers' code and your data all run on E2B's servers. That rules out regulated workloads, air-gapped networks (networks with no link to the internet) and running in your own cloud account.
+- **You pay per sandbox-hour.** Cost grows with every sandbox you run. A team running more than 1,000 sandboxes can pay over $500 a month on E2B. With AerolVM, the same team could pay about $20 a month for one server.
+- **A one-day limit.** E2B sandboxes end after 1 day. AerolVM sandboxes have no time limit, and you can stop and start them without losing their files.
+- **Missing features.** E2B has no GPUs, cloud storage mounts, SSH, TCP ports, per-sandbox outbound traffic rules, network data caps or tags.
+
+**Already using the E2B SDK?** AerolVM has an `/e2b` compatibility API. Set three environment variables so the E2B SDK talks to your AerolVM server, and keep your code. See [Use the E2B SDK](/using-e2b-sdk/).
+
+AerolVM covers the same AI use case on your own servers. You get stronger isolation for untrusted code, and a fixed server bill instead of metered billing.
+
+## AerolVM vs Daytona
+
+Daytona focuses on long-lived developer workspaces: IDE integration, Git-based environments and dev containers. It is not built for the fast, frequent sandbox creation that AI agents need.
+
+- **Start time.** AerolVM creates a Firecracker sandbox in about 34 ms and a V8 isolate in about 4 ms, measured inside the server. Plain containers take about 189 ms. That is the gap between an agent waiting on servers and an agent running code.
+- **Setup.** Daytona is hard to self-host. It has many parts, needs extra infrastructure and takes ongoing upkeep. AerolVM installs with a one-line script.
+- **Isolation.** Daytona has no kernel-level isolation, no per-sandbox outbound traffic rules and no port allowlist. It assumes you trust the people using your workspaces. AerolVM assumes you do not trust the code running inside the sandbox.
+- **Built for people, not programs.** Daytona's SDK and features suit humans editing code in an IDE. AerolVM's SDKs (TypeScript, Python, Go, Rust, Java) suit programs that create many sandboxes.
+
+**Already using the Daytona SDK?** AerolVM has a `/daytona` compatibility API. Point the Daytona SDK at `https://your-host/daytona`, use your AerolVM token, and keep your code. See [Use the Daytona SDK](/using-daytona-sdk/).
+
+If developers SSH into one long-lived workspace a day, Daytona is a reasonable fit. If an agent starts 10,000 sandboxes an hour, runs untrusted code and deletes them, AerolVM is built for that.
+
+## Growing past one server
+
+E2B (managed) and AerolVM are both built for heavy sandbox traffic. Daytona is not. The difference from E2B is how you grow. With AerolVM you run a [cluster](/cluster-setup/) on your own servers, instead of paying per sandbox-hour on someone else's.
+
+- **Shared placement records.** Raft keeps a copy of where each sandbox lives on every server. Any server can answer "where is sandbox X?" without asking the leader.
+- **Separate roles.** Each server takes one or more roles: `server` (keeps the Raft records and votes), `worker` (runs sandboxes) or `ingress` (holds the public route table). You keep 3 or 5 `server` nodes however many workers you add. Kubernetes splits control-plane nodes from worker nodes the same way. See [Ingress nodes](/cluster-ingress/).
+- **One public address.** Put a load balancer in front of the ingress servers. A cloud load balancer, a MetalLB virtual IP or round-robin DNS all work. Round-robin DNS means one name that points to several IP addresses. Your app and your users use one hostname, whichever worker runs the sandbox.
+- **Failover.** Servers notice a dead worker through gossip, a constant exchange of short status messages. Calls for its sandboxes then return `410 Gone`, so clients know to create new ones. Sandboxes that opt in are recreated for you. Raft also keeps copies of each sandbox's create settings, sealed credentials and exposed ports. See [Durability and failover](/durability/).
+
+## Why we built AerolVM
+
+We built AerolVM because running AI-generated code safely kept forcing the same hard choice.
+
+1. **Hosted sandboxes were easy to start with, but the pricing made us nervous.** If an agent got stuck in a loop, the meter kept running. E2B charges while sandboxes run, and Modal uses usage-based serverless pricing too.
+2. **Running it ourselves was not much better.** Firecracker gave us a solid virtual machine layer. But it was not the whole product: we still needed files, logs, commands, networking, cleanup and SDKs around it.
+3. **We did not want to run random AI code in plain Docker and hope for the best.** Docker's own docs warn about the attack surface of its background service, which runs as root unless you use rootless mode.
+4. **We wanted gVisor built in from day one.** It adds another layer between the code and the server's operating system.
+
+We also did not want to spend weeks gluing together the basics before we could ship: file upload, streaming command output, logs, exposed ports, outbound traffic rules, cleanup and SDKs in several languages.
+
+So we built AerolVM: a sandbox system you run on your own servers, with strong isolation, fast start times and network controls.
+
+## Next steps
+
+- [Quickstart](/quick-start/): run your first sandbox in about five minutes.
+- [Choose a setup](/getting-started/): your computer, one server, or a cluster.
+- [Create and manage sandboxes](/sandboxes/): every option for creating a sandbox.
+- [Use the E2B SDK](/using-e2b-sdk/) or [Use the Daytona SDK](/using-daytona-sdk/): move existing code to AerolVM.

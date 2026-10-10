@@ -1,0 +1,240 @@
+---
+title: Quickstart
+description: Install AerolVM on your computer and run your first sandbox in about five minutes.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+In this guide you install the AerolVM server on your own computer, connect an SDK to it, and run one line of Python inside a sandbox. You do not need a domain name, a cloud account or a TLS certificate.
+
+## Before you start
+
+- **macOS:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/) must be running. You do not need admin rights.
+- **Linux:** you need `sudo`. The installer adds Docker Engine if it is missing.
+- **One of these languages:** Node.js 18 or newer, Python 3.9 or newer, Go, Rust, or Java 11 or newer.
+
+## Run your first sandbox
+
+### Step 1: Install the server
+
+Pick a secret token. It works like a password for your server.
+
+On macOS, run the installer as yourself, **without** `sudo`:
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- \
+    --local \
+    --pat-token your-secret-pat
+```
+
+On Linux:
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --local \
+    --pat-token your-secret-pat
+```
+
+When it finishes, the server is running at `http://localhost:21212`. It starts again by itself after you restart your computer (on macOS, when you log back in).
+
+### Step 2: Tell your code where the server is
+
+The SDKs read these two settings from your terminal:
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+### Step 3: Install the SDK for your language
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npm install @aerol-ai/aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    pip install aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```bash
+    go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```bash
+    cargo add aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    The Java SDK is on GitHub Packages. Add the repository and the dependency to your `pom.xml`:
+
+    ```xml
+    <repositories>
+      <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/aerol-ai/microvm</url>
+      </repository>
+    </repositories>
+
+    <dependencies>
+      <dependency>
+        <groupId>ai.aerol</groupId>
+        <artifactId>aerolvm-sdk</artifactId>
+        <version>0.6.4</version>
+      </dependency>
+    </dependencies>
+    ```
+
+    GitHub Packages needs you to sign in, even for public packages. Create a GitHub token with the `read:packages` permission. Add it to your Maven `settings.xml` under a server with the id `github`.
+  </TabItem>
+</Tabs>
+
+### Step 4: Run code in a sandbox
+
+Save this as a file and run it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // hello.ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    const sandbox = await client.create({ image: "python:3.12-slim" });
+    const result = await sandbox.exec(`python3 -c "print('Hello from AerolVM!')"`);
+    console.log(result.stdout);
+
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    # hello.py
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    sandbox = client.create(image="python:3.12-slim")
+    result = sandbox.exec("python3 -c \"print('Hello from AerolVM!')\"")
+    print(result["stdout"])
+
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    // main.go
+    package main
+
+    import (
+        "context"
+        "fmt"
+        "log"
+
+        microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
+        sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
+    )
+
+    func main() {
+        ctx := context.Background()
+
+        client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12-slim"})
+        if err != nil {
+            log.Fatal(err)
+        }
+        defer sandbox.Destroy(ctx)
+
+        result, err := sandbox.ExecCommand(ctx, `python3 -c "print('Hello from AerolVM!')"`)
+        if err != nil {
+            log.Fatal(err)
+        }
+        fmt.Print(result.Stdout)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // src/main.rs
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    fn main() -> Result<(), aerolvm_sdk::Error> {
+        let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+        let sandbox = client.create(CreateOptions {
+            image: "python:3.12-slim".into(),
+            ..Default::default()
+        })?;
+        let result = sandbox.exec(r#"python3 -c "print('Hello from AerolVM!')""#)?;
+        print!("{}", result.stdout);
+
+        sandbox.destroy()?;
+        Ok(())
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    // Hello.java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.ExecResult;
+
+    public class Hello {
+        public static void main(String[] args) {
+            MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
+            Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12-slim"));
+            ExecResult result = sandbox.exec("python3 -c \"print('Hello from AerolVM!')\"");
+            System.out.print(result.stdout);
+
+            sandbox.destroy();
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+You should see:
+
+```text
+Hello from AerolVM!
+```
+
+<Aside type="tip">
+The first run takes longer because the server downloads the `python:3.12-slim` image from Docker Hub. Later runs reuse it and start much faster.
+</Aside>
+
+## What just happened?
+
+1. **The server got the image.** It pulled `python:3.12-slim` from Docker Hub, unless it already had it.
+2. **It started a sandbox.** The sandbox got its own files, its own network and its own process list, all separate from your computer.
+3. **It ran your command.** A small helper program inside the sandbox, called the toolbox, ran `python3` and sent the output back.
+4. **`destroy()` cleaned up.** The sandbox and everything in it were deleted.
+
+## If something goes wrong
+
+| What you see | What it means | How to fix it |
+|---|---|---|
+| `PAT token is required` | The SDK could not find your token. | Run the `export` commands from step 2 in the same terminal. |
+| `unauthorized` | The token does not match the server's token. | Use the token you passed to `--pat-token`, or the one the installer printed. |
+| `Connection refused` | The server is not running. | Check the log: `~/.aerolvm/logs/sandboxd.log` on macOS, `journalctl -u sandboxd -f` on Linux. |
+| `pull access denied ... repository does not exist` | The image name is wrong. | Check the spelling, for example `python:3.12-slim`. |
+
+## Next steps
+
+- [Create and manage sandboxes](/sandboxes/): pick resources, name sandboxes, stop and start them.
+- [Run commands](/exec-streaming/): stream output while a command runs.
+- [Files](/file-system/): copy files into and out of a sandbox.
+- [Block or allow the internet](/network-isolation/): control what a sandbox can reach.
+- [Install on a server](/getting-started/single-node-setup/): give sandboxes public web addresses on your own domain.

@@ -1,0 +1,363 @@
+---
+title: Cluster setup
+description: Start a group of AerolVM servers on AWS with Terraform, so you can run more sandboxes and survive a server failure.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A **cluster** is a group of AerolVM servers that work together as one system. Each server in the group is called a **node**. The cluster spreads sandboxes across its nodes, so you can run more of them at once. It keeps working if one node goes down.
+
+One server is fine for development and light production use (see [Install on a server](/getting-started/single-node-setup/)). You need a cluster when:
+
+- one server cannot fit all your sandboxes,
+- the system must keep running when a server fails, or
+- you want public web traffic to land on different machines than the sandboxes.
+
+This guide uses **Terraform**, a tool that creates cloud machines from config files. You fill in three config files and start Terraform. It then creates the machines on AWS, installs AerolVM on each one and connects them.
+
+## Before you start
+
+You need:
+
+- **Terraform 1.5 or newer.** [Download it here](https://developer.hashicorp.com/terraform/install).
+- **An AWS account** that can create EC2 instances (cloud servers), VPCs (private networks), IAM roles, S3 buckets and security groups.
+- **AWS credentials** on your computer: environment variables, `~/.aws/credentials`, or an IAM instance role.
+- **A Cloudflare account** that manages your domain, plus an API token with the `Zone:DNS:Edit` permission.
+- **An SSH key pair.** Terraform reads `~/.ssh/id_rsa.pub` unless you set another path.
+- **A copy of the AerolVM repository** from [GitHub](https://github.com/aerol-ai/microvm). You run every command below from its top folder.
+
+No domain yet? The cluster still works, but without HTTPS. Sandbox URLs then use IP addresses. You can add a domain later.
+
+## Create the cluster
+
+### Step 1: Copy the config files
+
+From the top folder of the repository, run:
+
+```bash
+cp config/terraform.tfvars.example config/terraform.tfvars
+cp config/secrets.example.yml      config/secrets.yml
+```
+
+You edit three files in total:
+
+| File | What goes in it |
+|---|---|
+| `config/secrets.yml` | Passwords and API tokens. Never commit this file to Git. |
+| `config/cluster.yml` | How the cluster behaves: domain name, email, image settings. |
+| `config/terraform.tfvars` | Which servers to create and how big they are. |
+
+### Step 2: Add your secrets
+
+Open `config/secrets.yml` and fill in these two values:
+
+```yaml
+cluster:
+  pat_token: ""     # the shared password for the cluster (see below)
+
+cloudflare:
+  api_token: ""     # Cloudflare API token with Zone:DNS:Edit permission
+```
+
+The **PAT token** (personal access token) is the shared password for your cluster. Every node and every SDK client uses it. All nodes must have the same value, or they reject each other's requests.
+
+Make a strong token with this command, then store it somewhere safe:
+
+```bash
+openssl rand -hex 32 | sed 's/^/avm_/'
+```
+
+The **Cloudflare API token** lets Terraform create DNS records (the entries that point your domain name at your servers). AerolVM also uses it to get free HTTPS certificates from Let's Encrypt.
+
+### Step 3: Set your domain
+
+Open `config/cluster.yml` and change the `ingress` section. Ingress means traffic coming in from the internet.
+
+```yaml
+ingress:
+  domain_name: "cluster.example.com"   # your domain
+  acme_email:  "you@example.com"        # your email, for certificate expiry notices
+```
+
+Each sandbox gets its own address under this domain, for example `abc123.cluster.example.com`. Terraform creates the DNS records for you.
+
+Leave `domain_name` empty to skip HTTPS and use IP addresses instead.
+
+### Step 4: Choose your servers
+
+Open `config/terraform.tfvars`. Each entry in the `nodes` block is one server.
+
+The simplest setup that is ready for production is three `mixed` nodes:
+
+```hcl
+aws_region = "us-east-1"
+
+nodes = {
+  node1 = { role = "mixed", seed = true }
+  node2 = { role = "mixed" }
+  node3 = { role = "mixed" }
+}
+```
+
+A `mixed` node does every job: it votes on cluster decisions, runs sandboxes and takes public traffic. With three of them, you can lose one and the cluster keeps running.
+
+Exactly one node must have `seed = true`. The seed starts the cluster, and the other nodes join it. The seed's role must include `server` (or be `mixed`).
+
+#### Node roles
+
+As the cluster grows, you can give each node a narrower job:
+
+| Role | Votes on cluster decisions | Runs sandboxes | Takes public traffic |
+|---|---|---|---|
+| `mixed` | Yes | Yes | Yes |
+| `server` | Yes | No | No |
+| `worker` | No | Yes | No |
+| `ingress` | No | No | Yes |
+| `server,worker` | Yes | Yes | No |
+| `server,ingress` | Yes | No | Yes |
+| `worker,ingress` | No | Yes | Yes |
+
+Nodes with `server` in their role (or `mixed`) keep the cluster's shared record of which sandbox runs on which node. They agree on every change with a method called **Raft**. A change only goes through when a majority of these voting nodes is online. That majority is called a **quorum**.
+
+With 3 voting nodes you can lose 1. With 5 you can lose 2. Always use an odd number of voting nodes: 3, 5 or 7. The [Glossary](/cluster-glossary/) has the full table.
+
+Mixed and combined roles are only for clusters of 10 nodes or fewer. Bigger clusters need separate `server`, `worker` and `ingress` nodes. See [Ingress nodes](/cluster-ingress/).
+
+A larger cluster with separate roles looks like this:
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  srv2 = { role = "server",              instance_type = "t3.small" }
+  srv3 = { role = "server",              instance_type = "t3.small" }
+  wrk1 = { role = "worker",              instance_type = "t3.large", volume_size_gb = 200 }
+  wrk2 = { role = "worker",              instance_type = "t3.large", volume_size_gb = 200 }
+  ing1 = { role = "ingress",             instance_type = "t3.medium" }
+  ing2 = { role = "ingress",             instance_type = "t3.medium" }
+}
+```
+
+How big to make each node:
+
+- **Server nodes** do little work. `t3.small` or `t3.medium` is enough.
+- **Worker nodes** run the sandboxes, so they need more memory and disk. Size them for your workload.
+- **Ingress nodes** pass network traffic along. `t3.medium` is a good start.
+
+### Step 5: Turn on gVisor (optional)
+
+gVisor adds an extra wall around each container. It puts its own small kernel (the core of an operating system) between the sandbox and the server. If code in a sandbox attacks a kernel bug, it hits gVisor instead of the real kernel.
+
+gVisor works on any normal EC2 instance type. It needs no special hardware.
+
+To turn it on for a worker node, add `with_gvisor = true`:
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  wrk1 = { role = "worker", with_gvisor = true, instance_type = "t3.large" }
+  wrk2 = { role = "worker", with_gvisor = true, instance_type = "t3.large" }
+  ing1 = { role = "ingress",                    instance_type = "t3.medium" }
+}
+```
+
+After you deploy, create sandboxes with `runtime: "gvisor"` to use it. The runtime is the kind of wall a sandbox runs inside. The cluster sends those sandboxes only to nodes that have gVisor. See [gVisor](/gvisor-sandbox/).
+
+### Step 6: Turn on Firecracker (optional)
+
+Firecracker runs each sandbox in its own microVM: a small, fast virtual machine that boots in under 100 ms. This is the strongest wall AerolVM offers. Each sandbox has its own kernel, so a bug in one cannot reach the server or other sandboxes.
+
+<Aside type="caution" title="Firecracker needs bare-metal AWS instances">
+Firecracker needs direct access to the chip's virtualization feature (the `/dev/kvm` device). Normal EC2 types (`t3`, `c6i`, `m5`, `r5` and so on) are virtual machines themselves, so they do not have it. You must use **bare-metal** types: the `*.metal` sizes.
+
+- Compute: `c5.metal`, `c5n.metal`, `c6i.metal`, `c7g.metal`
+- General purpose: `m5.metal`, `m5zn.metal`, `m6i.metal`
+- Storage and memory: `i3.metal`, `r5.metal`
+
+Bare-metal instances cost more. Use them only for the worker nodes that run Firecracker. If a node has no `/dev/kvm`, its setup stops with a message and the node does not join.
+
+All nodes in one cluster must use the same kind of CPU. `c7g.metal` is an ARM (Graviton) machine, so every other node in that cluster must be ARM too, such as `t4g`. Terraform refuses a cluster that mixes ARM and x86.
+</Aside>
+
+To turn it on, set `with_firecracker = true` on worker nodes and pick a bare-metal `instance_type`:
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  wrk1 = { role = "worker", with_firecracker = true, instance_type = "c5.metal" }
+  wrk2 = { role = "worker", with_firecracker = true, instance_type = "c5.metal" }
+  ing1 = { role = "ingress",                         instance_type = "t3.medium" }
+}
+```
+
+You only set `with_firecracker` on nodes whose role includes `worker` (or `mixed`). Terraform refuses it anywhere else.
+
+By default, setup downloads the official Firecracker release and a matching Linux kernel for the microVMs. To use your own files instead, add a `firecracker` block with their download addresses:
+
+```hcl
+firecracker = {
+  binary_url        = "https://example.com/firecracker"
+  jailer_url        = "https://example.com/jailer"
+  kernel_url        = "https://example.com/vmlinux"
+  kernel_config_url = "https://example.com/vmlinux.config"
+  kernel_path       = "/var/lib/sandboxd/firecracker/vmlinux"
+}
+```
+
+Good to know:
+
+- If `kernel_config_url` is empty, setup tries `kernel_url` with `.config` added to the end.
+- The kernel config must turn on `CONFIG_VMGENID=y`. If it does not, setup stops.
+- If your server image already has the files, set `auto_install_artifacts = false` and leave the URLs empty. The kernel must be at `kernel_path`, with its config next to it (by default `/var/lib/sandboxd/firecracker/vmlinux.config`).
+
+After you deploy, turn a container image into a Firecracker template, then create sandboxes with the `firecracker` runtime. See [Firecracker templates](/firecracker-templates/).
+
+### Step 7: Turn on V8 isolates (optional)
+
+The V8 isolate runtime runs small JavaScript or TypeScript web handlers (`fetch` handlers). It uses Cloudflare's `workerd` program, the same model as Cloudflare Workers. It is off by default.
+
+Add `with_isolate = true` to a worker. Setup then installs a fixed, checksum-verified version of `workerd` and sets `SB_ENABLE_ISOLATE=true`:
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true, instance_type = "t3.small" }
+  wrk1 = { role = "worker", with_isolate = true, instance_type = "t3.large" }
+  wrk2 = { role = "worker", with_isolate = true, instance_type = "t3.large" }
+  ing1 = { role = "ingress",                     instance_type = "t3.medium" }
+}
+```
+
+To turn it on for every node, set `default_with_isolate = true` instead.
+
+After you deploy, upload your JavaScript bundle (`POST /v1/js-bundles`). Then create a sandbox with `runtime: "isolate"` and a `module_ref` that points at the bundle. Some cluster rules:
+
+- A bundle lives only on the one worker that received the upload.
+- Listing bundles from any node shows every bundle in the cluster.
+- If that worker is gone, upload the bundle again. The API tells you with the error code `artifact_node_unavailable`.
+
+See [V8 isolate](/isolate-sandbox/) for outbound traffic, cluster behavior and current limits.
+
+### Step 8: Turn on GPUs (optional)
+
+AerolVM can give sandboxes direct use of a physical GPU. Both NVIDIA and AMD GPUs work. GPU workers sit next to normal workers. The cluster sends GPU sandboxes only to nodes with a matching GPU.
+
+GPU sandboxes cannot also use gVisor. You can still have GPU nodes and gVisor nodes in the same cluster. Each one just takes different sandboxes.
+
+#### NVIDIA GPUs
+
+Set `with_nvidia_gpu = true` on worker nodes that have an NVIDIA GPU. Setup installs the NVIDIA Container Toolkit, which lets containers use the GPU.
+
+The NVIDIA driver itself must already be on the machine (the `nvidia-smi` command must work). Pick an `ami_id` (server image) that includes it.
+
+Common NVIDIA instance types on AWS:
+
+| Instance | GPU |
+|---|---|
+| `g4dn.xlarge` | NVIDIA T4 |
+| `g5.xlarge` | NVIDIA A10G |
+| `p3.2xlarge` | NVIDIA V100 |
+
+```hcl
+nodes = {
+  srv1 = { role = "server", seed = true,  instance_type = "t3.small" }
+  wrk1 = { role = "worker",               instance_type = "t3.large" }
+  wrk2 = { role = "worker", with_nvidia_gpu = true, instance_type = "g5.xlarge",
+            volume_size_gb = 500, tags = { gpu = "nvidia-a10g" } }
+  ing1 = { role = "ingress",              instance_type = "t3.medium" }
+}
+```
+
+The optional `tags` field adds AWS tags to the instance. They help you find it in the AWS console. Sandboxes do not pick a GPU by these tags. They ask for a GPU maker (`nvidia` or `amd`), and the cluster finds a node that has one.
+
+#### AMD GPUs
+
+Set `with_amd_gpu = true` on worker nodes with AMD GPUs that support ROCm (AMD's GPU software). This only works on `x86_64` instances. The GPU must already be visible to the operating system (`/dev/kfd` must exist).
+
+```hcl
+wrk3 = { role = "worker", with_amd_gpu = true, instance_type = "g4ad.xlarge",
+          volume_size_gb = 300 }
+```
+
+After you deploy, see [GPU](/gpu-sandboxes/) to create GPU sandboxes.
+
+### Step 9: Deploy
+
+Set up Terraform's plugins. You only do this once per computer:
+
+```bash
+scripts/terraform.sh init
+```
+
+Then create the cluster:
+
+```bash
+scripts/terraform.sh apply
+```
+
+Terraform shows a plan of everything it will create. Read it, then type `yes`. This usually takes 3 to 5 minutes.
+
+<Aside type="tip">
+Always run `scripts/terraform.sh`, not `terraform` by itself. The script passes your `config/` files to Terraform. Plain `terraform` in the `Terraform/` folder does not find them and makes an incomplete plan.
+</Aside>
+
+When `apply` finishes, Terraform prints each node's public IP address. It also prints the SSH command for the seed as `ssh_command_seed`.
+
+Each node then sets itself up. Watch the seed's setup log to see when it is done:
+
+```bash
+ssh ubuntu@<seed-ip> sudo tail -f /var/log/aerolvm-bootstrap.log
+```
+
+Wait for the line `[bootstrap] complete`. The seed starts the cluster first. It then saves the join details in an S3 bucket, and the other nodes use them to join.
+
+### Step 10: Check that every node joined
+
+Use the built-in [Dashboard](/dashboard/) to see every node. The dashboard is served on the API port, 21212. Your domain does not serve it, so connect through an SSH tunnel. The tunnel is a secure link from your computer to the node, and it keeps your token off the open internet.
+
+Open the tunnel and leave this terminal running:
+
+```bash
+ssh -L 21212:127.0.0.1:21212 ubuntu@<seed-ip>
+```
+
+Then:
+
+1. In your browser, open `http://localhost:21212/ui`.
+2. Sign in with your PAT token from `config/secrets.yml`.
+3. Look at the **Nodes** panel. It lists every node with its status and role. Its heading names the current leader and the number of members.
+
+What each node's status means:
+
+| Status | What it means |
+|---|---|
+| `active` | The node is up and taking work. |
+| `dead` | The node is not answering. SSH into it and read `/var/log/aerolvm-bootstrap.log`. |
+| `stale` | The node is up, but its latest report of free CPU and memory is old. |
+| `drained` | Someone marked the node so it gets no new sandboxes. |
+
+To check that your code can reach the cluster, point an SDK at `https://cluster.example.com`. See [SDK setup](/sdk-setup/).
+
+## Tear down
+
+To delete the whole cluster and every AWS resource it made:
+
+```bash
+scripts/terraform.sh destroy
+```
+
+<Aside type="caution">
+This deletes every EC2 instance, VPC and S3 bucket in the cluster, and every running sandbox. You cannot undo it.
+</Aside>
+
+## Good to know
+
+- **Lock down SSH and the API.** By default, `admin_allowed_cidrs` lets any address reach SSH (port 22) and the API (port 21212). Set it to your own IP ranges in `config/terraform.tfvars`.
+- **Keep `config/secrets.yml` private.** It holds your cluster token and your Cloudflare token.
+- **Node names are limited.** Each name in `nodes` must start with a letter or number. It may use only letters, numbers, dots, underscores and hyphens, up to 128 characters.
+
+## Next steps
+
+- [Ingress nodes](/cluster-ingress/): split jobs across nodes and put a load balancer in front.
+- [Secrets providers](/cluster-secrets/): keep sandbox passwords safe when a node fails.
+- [Glossary](/cluster-glossary/): every cluster setting written on each node.
+- [Dashboard](/dashboard/): watch node health and cluster members.
+- [Runbooks](/operational-runbooks/): step-by-step fixes for outages.

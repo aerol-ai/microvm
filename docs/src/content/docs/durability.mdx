@@ -1,132 +1,69 @@
 ---
 title: Durability and Failover
+description: Keep a sandbox's data safe through restarts and failures, and choose what happens when a cluster node dies.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox's container is ephemeral. Files written into the container's writable layer (`/tmp`, the working directory, anywhere not on a mount) live only as long as the container itself. If the container is destroyed - by an explicit `Destroy`, by a host crash, or by the loss of the owner node in cluster mode - that data is gone. By default the sandbox placement is gone too: the API returns `410 Gone`. Sandboxes that opt into `failover.policy = "recreate"` are best-effort recreated on another worker from their replicated create spec.
+Files a sandbox writes to its own disk last only as long as the sandbox. That covers `/tmp`, the working folder, and anywhere else that is not attached storage. If you delete the sandbox, its server crashes, or the cluster node running it dies, those files are gone.
 
-This is the same model used by GitHub Codespaces, Daytona workspaces, and Coder workspaces. Persistent state lives on a separate, declared volume; the container is treated as cattle. Add cluster mode and *the sandbox* is also treated as cattle - a fresh `Create` is the way to recover.
+To keep data, write it to [attached cloud storage](/external-storage/). Treat the sandbox itself as replaceable: if you lose one, create a new one and attach the same storage. Cloud workspaces such as GitHub Codespaces, Daytona and Coder work the same way.
 
-## Durability class
+A cluster is a group of AerolVM servers. In a cluster, you can also ask for a sandbox to be rebuilt on a healthy node when its node dies.
 
-`durability` is a top-level create field on **every** runtime, not a WASM-only knob. It selects how hard the daemon tries to keep a sandbox alive across its own restarts.
+## What survives, and what does not
 
-| Class | Behavior |
-|---|---|
-| `ephemeral` | Lost on daemon restart. |
-| `passivatable` | Checkpointed locally on drain and rehydrated on start. |
-| `durable` | Local checkpoint plus cross-node failover push. |
-
-The only runtime-specific behavior is the **default** when you omit the field, because container/VM runtimes survive a daemon restart natively while WASM workers do not:
-
-| Runtime | Default when omitted |
-|---|---|
-| `docker`, `firecracker`, `gvisor` | `passivatable` |
-| `wasm` | `ephemeral` |
-
-`durable` is currently implemented for WASM only; requesting it on another runtime is rejected at create time. The field name, values, and SDK shape are identical everywhere — see [WASM Sandbox](/wasm-sandbox) for the checkpoint mechanics that back it on WASM.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      durability: 'passivatable',
-    })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'durability': 'passivatable',
-    })
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image:      "ubuntu:22.04",
-        Durability: "passivatable",
-    })
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.create(CreateOptions {
-        image:      "ubuntu:22.04".to_string(),
-        durability: Some("passivatable".to_string()),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setDurability("passivatable")
-    );
-    ```
-  </TabItem>
-</Tabs>
-
-Durability class governs survival across *daemon* restarts. The rest of this page covers the orthogonal concerns of *workspace state* (mounts) and *cluster owner death* (failover policy).
-
-## What survives, what does not
-
-| Asset | Single-node `Destroy` | Single-node host crash | Cluster-mode owner death |
+| What | You delete the sandbox | The server crashes (one server) | A cluster node dies |
 |---|---|---|---|
-| Container writable layer | Lost | Lost | Lost |
-| Mounted volumes (S3, NFS, SSHFS, rclone) | Survive (external) | Survive (external) | Survive (external) - a *new* sandbox can re-mount them |
-| Sandbox ID | Reused on next `Create` | Preserved if record persisted | Default: lost (`410 Gone`). With `failover.policy="recreate"`: preserved if recreation succeeds |
-| Environment variables, image, resource limits | N/A | Restored on `Start` | Default: lost. With recreate: restored from replicated spec |
-| Idle lifecycle policy | N/A | Restored on `Start` | Default: lost. With recreate: restored |
-| Exposed ports (preview, TCP, TLS) | Removed | Restored on `Start` | Default: lost. With recreate: replayed when possible |
-| Caddy routes | Removed | Restored on `Start` | Default: lost. With recreate: rebuilt by the new owner and ingress reconciler |
-| Host port number | N/A | Same host, same port | Default: lost. With recreate: preferred raw TCP host ports are replayed when available |
-| Public URL | Removed | Restored on `Start` | Default: lost. With recreate: stable ingress host remains, owner route changes underneath |
+| Files on the sandbox's own disk | Lost | Lost | Lost |
+| Files on attached storage (S3, NFS, SSHFS, rclone) | Kept (they live outside the sandbox) | Kept | Kept. A new sandbox can attach them again. |
+| Sandbox ID | Gone. A new sandbox gets a new ID. | Kept if the server saved its record | Lost by default (`410 Gone`). With recreate: kept, if the rebuild works. |
+| Environment variables, image, CPU and memory | Gone | Restored on `start` | Lost by default. With recreate: restored from the cluster's copy. |
+| Lifecycle timers | Gone | Restored on `start` | Lost by default. With recreate: restored. |
+| Exposed ports (web, TCP, TLS) | Removed | Restored on `start` | Lost by default. With recreate: exposed again when possible. |
+| Traffic routes to the sandbox | Removed | Restored on `start` | Lost by default. With recreate: rebuilt by the new node. |
+| TCP host port number | Gone | Same server, same port | Lost by default. With recreate: the same port is reused when it is free. |
+| Public URL | Removed | Restored on `start` | Lost by default. With recreate: the URL stays the same and now points at the new node. |
 
-## Make workspace state durable
+## Keep your files on attached storage
 
-Mount external storage at the path you want to keep across container lifetimes. The mount is established by the host (not the sandbox), so credentials never enter the container, and the data persists independently of any single sandbox or node.
+Attach storage at the folder you want to keep. The server, not the sandbox, connects the storage, so your storage passwords never enter the sandbox. The data lives on its own, apart from any one sandbox or server.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
+      image: "ubuntu:22.04",
       mounts: [
         {
-          type:   's3',
-          target: '/workspace',
-          source: 's3://my-bucket/project-42',
+          type: "s3",
+          target: "/workspace",
+          source: "s3://my-bucket/project-42",
           credentials: {
-            access_key_id:     'AKIA...',
-            secret_access_key: 'secret...',
+            access_key_id: "AKIA...",
+            secret_access_key: "secret...",
           },
         },
       ],
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'mounts': [
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        mounts=[
             {
-                'type':   's3',
-                'target': '/workspace',
-                'source': 's3://my-bucket/project-42',
-                'credentials': {
-                    'access_key_id':     'AKIA...',
-                    'secret_access_key': 'secret...',
+                "type": "s3",
+                "target": "/workspace",
+                "source": "s3://my-bucket/project-42",
+                "credentials": {
+                    "access_key_id": "AKIA...",
+                    "secret_access_key": "secret...",
                 },
             },
         ],
-    })
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -149,19 +86,23 @@ Mount external storage at the path you want to keep across container lifetimes. 
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::{CreateOptions, MountSpec, MountType};
     use std::collections::HashMap;
 
-    let mut creds = HashMap::new();
-    creds.insert("access_key_id".to_string(), "AKIA...".to_string());
-    creds.insert("secret_access_key".to_string(), "secret...".to_string());
+    let creds = HashMap::from([
+        ("access_key_id".to_string(), "AKIA...".to_string()),
+        ("secret_access_key".to_string(), "secret...".to_string()),
+    ]);
 
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        mounts: Some(vec![aerolvm_sdk::MountSpec {
-            type_:       "s3".to_string(),
-            target:      "/workspace".to_string(),
-            source:      "s3://my-bucket/project-42".to_string(),
+        image: "ubuntu:22.04".into(),
+        mounts: Some(vec![MountSpec {
+            mount_type: MountType::S3,
+            target: "/workspace".into(),
+            source: "s3://my-bucket/project-42".into(),
+            options: None,
             credentials: Some(creds),
+            read_only: None,
         }]),
         ..Default::default()
     })?;
@@ -169,164 +110,235 @@ Mount external storage at the path you want to keep across container lifetimes. 
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.model.MountSpec;
-    import java.util.List;
-    import java.util.Map;
-
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setMounts(List.of(
-                new MountSpec()
-                    .setType("s3")
-                    .setTarget("/workspace")
-                    .setSource("s3://my-bucket/project-42")
-                    .setCredentials(Map.of(
-                        "access_key_id",     "AKIA...",
-                        "secret_access_key", "secret..."
-                    ))
-            ))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setMounts(List.of(new MountSpec()
+            .setType("s3")
+            .setTarget("/workspace")
+            .setSource("s3://my-bucket/project-42")
+            .setCredentials(Map.of(
+                "access_key_id", "AKIA...",
+                "secret_access_key", "secret...")))));
     ```
   </TabItem>
 </Tabs>
 
-Anything written under `/workspace` outlives the container. Anything written elsewhere does not. See [External Storage](/external-storage) for the full mount surface (S3, NFS, SSHFS, rclone).
+Anything written under `/workspace` outlives the sandbox. Anything written elsewhere does not. [Attach cloud storage](/external-storage/) covers every storage type: S3, NFS, SSHFS and rclone.
 
-## Cluster-mode owner death
+## Rebuild sandboxes when a cluster node dies
 
-When `SB_ENABLE_CLUSTER=true` and a sandbox's owner node dies, the default policy is:
+By default, when a cluster node dies, its sandboxes are lost. Any call for one of them returns `410 Gone`. Your app should then create a new sandbox on the nodes that are left.
 
-1. After `SB_DEAD_OWNER_GRACE` (default 30s) the cluster leader **orphans** every placement that the dead node owned (`OwnerNodeID = ""` in the replicated FSM) and removes the node from the raft configuration.
-2. Any further API call for one of those sandboxes returns `410 Gone`.
-3. Clients should issue a fresh `Create` to land a new sandbox on the surviving fleet.
-
-For workloads that can tolerate losing writable-layer state but need the same sandbox ID and route intents, opt in at create time:
+If your app can live without the sandbox's own disk but needs the same ID and the same ports, turn on recreate at create time:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      failover: { policy: 'recreate' },
-    })
+      image: "ubuntu:22.04",
+      failover: { policy: "recreate" },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'failover': {'policy': 'recreate'},
-    })
+    sandbox = client.create(image="ubuntu:22.04", failover={"policy": "recreate"})
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
+        Image:    "ubuntu:22.04",
         Failover: &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
     })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::Failover;
+
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        failover: Some(aerolvm_sdk::Failover { policy: "recreate".to_string() }),
+        image: "ubuntu:22.04".into(),
+        failover: Some(Failover { policy: "recreate".into() }),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setFailover(new Failover().setPolicy("recreate"))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setFailover(new Failover().setPolicy("recreate")));
     ```
   </TabItem>
 </Tabs>
 
-The cluster replicates each sandbox's create spec (image, env, resource limits, mounts, lifecycle, failover policy), the sealed registry/mount credential bag, and every exposed-port route intent. When an opted-in owner dies, the leader reassigns that placement to a live worker that satisfies the spec; the new worker recreates the sandbox with the original ID and replays exposed ports.
+`failover.policy` is `none` (the default) or `recreate`.
 
-`failover.policy="recreate"` is rejected for local-only images because no other worker can pull them. Writable-layer state is still lost, so put durable state on a mount.
+The cluster keeps a copy of each sandbox's create request: image, environment variables, resources, attached storage, lifecycle and failover policy. It also keeps the sandbox's sealed (encrypted) registry and storage passwords, and every port you exposed. When a node with a recreate sandbox dies, the cluster hands that sandbox to a healthy worker node that fits it. That worker rebuilds the sandbox with the same ID and exposes the same ports again.
 
-If you ever need to re-expose a port manually (for example, the original `ExposePort` call landed during a network partition and was dropped), the API is idempotent:
+Good to know:
+
+- **The image must be reachable from every node.** Recreate is refused for an image that exists on only one node. Examples are a local build, or a [snapshot](/snapshots/) (a saved copy of a sandbox) that was not shared.
+- **The sandbox's own disk is still lost.** Put data you need on attached storage.
+
+### Expose a port again by hand
+
+Exposing a port is safe to repeat. If the port is already exposed, `exposePort` returns the existing URL. Call it again if you are unsure an earlier call went through, for example after a network outage.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await client.exposePort(sandboxId, { port: 3000, protocol: 'http' })
+    const result = await sandbox.exposePort(3000);
+    console.log(result.url);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    client.expose_port(sandbox_id, port=3000, protocol='http')
+    result = sandbox.expose_port(3000)
+    print(result.url)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    if err := client.ExposePort(ctx, sandboxID, sdktypes.ExposePortOptions{
-        Port:     3000,
-        Protocol: "http",
-    }); err != nil {
+    result, err := sandbox.ExposePort(ctx, 3000)
+    if err != nil {
         log.Fatal(err)
     }
+    fmt.Println(result.PublicURL)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    client.expose_port(&sandbox_id, ExposePortOptions {
-        port:     3000,
-        protocol: "http".to_string(),
+    use aerolvm_sdk::{ExposeOptions, ExposeResult};
+
+    if let ExposeResult::Http { url } = sandbox.expose_port(3000, ExposeOptions::http())? {
+        println!("{}", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExposeResult result = sandbox.exposePort(3000);
+    System.out.println(result.url);
+    ```
+  </TabItem>
+</Tabs>
+
+## Choose how a sandbox survives a server restart
+
+`durability` decides what happens to a sandbox when the AerolVM server itself restarts. It is a create option on every runtime (the technology that walls off the sandbox).
+
+| Value | What it means |
+|---|---|
+| `ephemeral` | The sandbox is lost when the server restarts. |
+| `passivatable` | The sandbox is kept across a server restart. A WebAssembly sandbox is saved to local disk when the server shuts down and brought back when it starts. |
+| `durable` | Planned: also send the saved state to another node for failover. It is not available yet. The server rejects it on every runtime today. |
+
+If you leave it out, you get the default for the runtime. Containers and virtual machines survive a server restart on their own, but WebAssembly and V8 isolate sandboxes do not:
+
+| Runtime | Default |
+|---|---|
+| `docker`, `gvisor`, `firecracker` | `passivatable` |
+| `wasm` | `ephemeral` |
+| `isolate` | `ephemeral` (`passivatable` is rejected, because an isolate has nothing to save) |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      durability: "passivatable",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04", durability="passivatable")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "ubuntu:22.04",
+        Durability: sdktypes.DurabilityPassivatable,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        durability: Some("passivatable".into()),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    client.exposePort(sandboxId, new ExposePortOptions()
-        .setPort(3000)
-        .setProtocol("http"));
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setDurability("passivatable"));
     ```
   </TabItem>
 </Tabs>
 
-## Cluster network security
+Durability only covers server restarts. Keeping files (attached storage) and losing a cluster node (failover) are separate, as the sections above show. For how WebAssembly saves and restores sandboxes, see [WebAssembly (WASM)](/wasm-sandbox/).
 
-Cluster traffic uses two transports:
+## Limits
 
-- **Gossip** (`SB_GOSSIP_BIND_ADDR`, default `:7001`) - SWIM membership and role/identity metadata.
-- **Capacity heartbeats** (`GET /v1/capacity`) - authenticated worker capacity snapshots used by server-role schedulers.
-- **Raft** (`SB_RAFT_BIND_ADDR`, default `:7000`) - placement-map consensus.
+- **Rebuilding is opt-in.** When a node dies, its sandboxes return `410 Gone` and your app must create new ones. Only sandboxes created with `failover.policy = "recreate"` are rebuilt.
+- **New ports take a moment to reach every node.** Public URLs and TCP ports are shared across the cluster. But ingress nodes (the nodes that receive outside traffic) refresh their routes on a timer. Right after a new `exposePort`, a request can briefly get `404` or `502`.
+- **The sandbox's own disk is never copied.** Treat anything outside attached storage as a cache. If you need it after a crash, write it to attached storage.
+- **One server works the same way.** A crash can lose the sandbox's own disk there too. Attach storage for anything that must survive.
 
-When a node successfully joins gossip, it is added to the Raft configuration as a voter until `SB_CLUSTER_MAX_AUTO_VOTERS` is reached, then as a non-voter. **Anyone who can reach these ports can still join the cluster and influence placement replication.** Run them on a private network the operator controls (VPC peering, WireGuard mesh, dedicated cluster subnet); never expose them to the public internet.
+## A pattern that works
 
-To authenticate gossip and reject foreign joiners, set `SB_GOSSIP_SECRET_KEY` to a base64-encoded 16, 24, or 32-byte key (AES-128/192/256-GCM). The same key must be configured on every node in the cluster.
+1. Pick the folder your app writes lasting data to, such as a project folder, a database data folder or a model cache.
+2. Attach storage at that folder when you create the sandbox.
+3. Treat everything else in the sandbox as scratch space.
+4. In a cluster, have your app create a new sandbox when it gets `410 Gone`. The new sandbox attaches the same storage and picks up where the old one stopped.
 
-```sh
-# Generate a 32-byte key once and distribute it to every node.
+This works the same on one server, in a cluster, and on every runtime. The create request describes the sandbox, the storage holds the data, and the sandbox itself can be replaced.
+
+## For server operators
+
+### What happens when a node dies
+
+When `SB_ENABLE_CLUSTER=true` and a node dies:
+
+1. After `SB_DEAD_OWNER_GRACE` (default 30 seconds), the leader node unassigns every sandbox the dead node owned. It also removes the node from the Raft configuration (the list of nodes that vote on cluster state).
+2. Any further call for a default sandbox from that node returns `410 Gone`.
+3. Sandboxes created with `failover.policy = "recreate"` are handed to a healthy worker and rebuilt.
+
+### Keep cluster traffic private
+
+Cluster nodes talk to each other in three ways:
+
+| Channel | What it carries | Setting and default |
+|---|---|---|
+| Gossip | How nodes find each other and share their role (SWIM membership). | `SB_GOSSIP_BIND_ADDR`, default `0.0.0.0:7001` |
+| Capacity heartbeats | Each worker's free capacity, used to place new sandboxes. Requires a login. | `GET /v1/capacity` on the API port |
+| Raft | Agreement on which node runs which sandbox. | `SB_RAFT_BIND_ADDR`, default `0.0.0.0:7000` |
+
+A node that joins through gossip (the way nodes find each other) becomes a Raft voter until there are `SB_CLUSTER_MAX_AUTO_VOTERS` voters (default 5). After that, new nodes join as non-voters.
+
+Two settings protect these channels, and cluster mode requires both:
+
+- **`SB_GOSSIP_SECRET_KEY`** is a base64-encoded 16, 24 or 32-byte key (AES-128, 192 or 256). Every node needs the same key. A node without it cannot join. The server refuses to start in cluster mode without the key, unless you set `SB_CLUSTER_INSECURE_GOSSIP=true`. Use that only on a fully isolated test network.
+- **`SB_CLUSTER_TLS_DIR`** holds the cluster's certificates. Raft and internal cluster requests use mutual TLS (both sides prove who they are) with these certificates.
+
+Generate the gossip key once and copy it to every node:
+
+```bash
 openssl rand -base64 32
-
-# Then on each node:
-export SB_GOSSIP_SECRET_KEY="<the-base64-key>"
 ```
 
-When `SB_GOSSIP_SECRET_KEY` is unset, the daemon logs a warning at boot. Raft itself remains plaintext today; the gossip key is what gates the join, so a peer that can't decrypt the gossip handshake never reaches Raft. Wrap Raft in TLS at the network layer (e.g., a private overlay) for defense in depth.
+Even so, keep these ports on a private network you control, such as VPC peering, a WireGuard mesh or a dedicated cluster subnet. Never expose them to the public internet. See [Glossary](/cluster-glossary/) for every cluster setting.
 
-## Limitations
+## Next steps
 
-- **Sandbox HA is opt-in.** Owner-node death orphans default placements; clients see `410 Gone` and must create a fresh sandbox. Only sandboxes created with `failover.policy="recreate"` are reassigned and recreated.
-- **Ingress has a convergence window.** Public HTTP/TLS URLs and raw TCP host ports for *live* sandboxes are replicated through the cluster route map, but non-owner ingress routes refresh periodically. Immediately after a new `ExposePort` call, a backend can briefly return 404/502 until it has reconciled.
-- **Writable-layer state is not replicated.** Treat anything outside a mount as cache. If you need it after a crash, write it to a mount.
-- **Single-node deployments inherit the same model.** A host crash loses the writable layer just as owner death does. Mount external storage for anything that must survive.
-
-## Recommended pattern
-
-1. Pick the directory your workload writes durable state to (often a project root, a database data dir, or a model cache).
-2. Declare it as a mount target at `Create` time.
-3. Treat everything else inside the container as scratch.
-4. In cluster mode, design the client to call `Create` again on `410 Gone`. The mount keeps the durable state intact; a new sandbox picks up where the old one left off.
-
-This keeps the durability story identical across single-node, cluster-mode, and any future runtime: the spec describes the sandbox, the mounts hold the data, the container is replaceable - and, in cluster mode, the sandbox itself is replaceable too.
+- [Attach cloud storage](/external-storage/): every storage type and its options.
+- [Snapshots](/snapshots/): share snapshots across a cluster so recreate can use them.
+- [Cluster setup](/cluster-setup/): build a cluster with failover.
+- [Placement and failover](/engineering-placement-failover/): the deep dive on how the cluster picks and replaces nodes.

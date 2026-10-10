@@ -1,0 +1,188 @@
+---
+title: SDK Setup
+description: Install an AerolVM SDK and connect it to your server.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+An SDK is a library that lets your code talk to the AerolVM server. There is one for TypeScript, Python, Go, Rust and Java. They all do the same things, so you can pick whichever language you already use.
+
+## Install the SDK
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```bash
+    npm install @aerol-ai/aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```bash
+    pip install aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```bash
+    go get github.com/aerol-ai/microvm/sdk/go/pkg/microvm@latest
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```bash
+    cargo add aerolvm-sdk
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    The Java SDK is on GitHub Packages. Add the repository and the dependency to your `pom.xml`:
+
+    ```xml
+    <repositories>
+      <repository>
+        <id>github</id>
+        <url>https://maven.pkg.github.com/aerol-ai/microvm</url>
+      </repository>
+    </repositories>
+
+    <dependencies>
+      <dependency>
+        <groupId>ai.aerol</groupId>
+        <artifactId>aerolvm-sdk</artifactId>
+        <version>0.6.4</version>
+      </dependency>
+    </dependencies>
+    ```
+
+    GitHub Packages needs you to sign in, even for public packages. Create a GitHub token with the `read:packages` permission. Add it to your Maven `settings.xml` under a server with the id `github`.
+  </TabItem>
+</Tabs>
+
+## Tell the SDK where your server is
+
+Every SDK needs two things:
+
+| Setting | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | The secret token you chose when you installed the server. | None. You must set it. |
+
+The easiest way is to set them in your terminal before you run your code:
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+You can also pass them in code. Code values win over the terminal settings.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM({
+      apiUrl: "http://localhost:21212",
+      patToken: "your-secret-pat",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM(
+        api_url="http://localhost:21212",
+        pat_token="your-secret-pat",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
+        APIUrl:   "http://localhost:21212",
+        PATToken: "your-secret-pat",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(Some("http://localhost:21212"), Some("your-secret-pat"))?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.MicroVMConfig;
+
+    MicroVMClient client = new MicroVMClient(
+        new MicroVMConfig()
+            .setApiUrl("http://localhost:21212")
+            .setPatToken("your-secret-pat")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution">
+Treat the token like a password. Do not commit it to Git or put it in code that runs in a browser. Read it from an environment variable or a secret manager instead.
+</Aside>
+
+## Check that it works
+
+This lists your sandboxes. If the address or token is wrong, it fails with a clear error.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandboxes = await client.list();
+    console.log(`Connected. You have ${sandboxes.length} sandboxes.`);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandboxes = client.list()
+    print(f"Connected. You have {len(sandboxes)} sandboxes.")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandboxes, err := client.List(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("Connected. You have %d sandboxes.\n", len(sandboxes))
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandboxes = client.list()?;
+    println!("Connected. You have {} sandboxes.", sandboxes.len());
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    List<Sandbox> sandboxes = client.list();
+    System.out.println("Connected. You have " + sandboxes.size() + " sandboxes.");
+    ```
+  </TabItem>
+</Tabs>
+
+| Error | Fix |
+|---|---|
+| `PAT token is required` | Set `SB_PAT_TOKEN`, or pass the token in code. |
+| `unauthorized` | The token does not match the one the server was installed with. |
+| `Connection refused` | The server is not running, or `SB_API_URL` points to the wrong address. |
+
+## Other ways to use AerolVM
+
+- **From a terminal or script.** The [aerolvm CLI](/cli/) creates sandboxes and runs commands without writing code.
+- **From an AI coding tool.** The same CLI is an [MCP server](/mcp/) for Claude Code, Cursor, VS Code and other MCP clients.
+- **With the Daytona SDK.** Point the official Daytona SDK at your server. See [Use the Daytona SDK](/using-daytona-sdk/).
+- **With the E2B SDK.** Point the official E2B SDK at your server. See [Use the E2B SDK](/using-e2b-sdk/).
+
+## Next steps
+
+- [Quickstart](/quick-start/): run your first sandbox from start to finish.
+- [Create and manage sandboxes](/sandboxes/): every option for creating a sandbox.

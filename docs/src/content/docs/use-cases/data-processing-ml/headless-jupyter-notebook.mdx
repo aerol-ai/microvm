@@ -1,32 +1,53 @@
 ---
-title: Headless Jupyter Notebook
-description: Spin up a full JupyterLab environment in a sandbox and access it via a public URL.
+title: Headless Jupyter notebook
+description: Start JupyterLab in a sandbox and open it in your browser through the link the script prints.
 ---
 
-Sometimes you need a clean, interactive environment to explore a new dataset or library. This use case shows how to boot a sandbox, install a data science stack, and start a **JupyterLab** server that you can access from your browser.
+JupyterLab is a web app for notebooks: pages where you mix Python code, its output and notes. In this project a sandbox installs a data science stack, starts JupyterLab, and gives you a link to open it in your browser. "Headless" means the sandbox has no screen of its own; you use it from your browser.
 
-## Interactive Sandboxes
+It gives you a clean place to explore a new dataset or library, without installing anything on your computer.
 
-- **Disposable Labs:** Spin up a new lab for every experiment.
-- **Pre-configured Stacks:** Launch a notebook with specific versions of PyTorch, TensorFlow, or JAX already installed.
-- **Secure Access:** Only the bearer of the token (and the public URL) can access the environment.
+## Why use a sandbox for this
 
-## Copy-paste TypeScript script
+- **A fresh lab for every experiment.** Start a new one, try things, and delete it when you are done.
+- **Your own stack.** Use an image that already has the versions of PyTorch, TensorFlow or JAX you want.
+- **Locked with a token.** Only someone with both the link and the token can open the notebook.
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/headless-jupyter-notebook](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/headless-jupyter-notebook)
+## What you need
+
+- An AerolVM server and Node.js 18 or newer. See [Quickstart](/quick-start/). On a server set up with a domain, the link works from anywhere. See [Install on a server](/getting-started/single-node-setup/).
+- `SB_PAT_TOKEN` set to your AerolVM token, and `SB_API_URL` if your server is not at `http://127.0.0.1:21212`.
+- Optional: `JUPYTER_TOKEN`, the token that unlocks the notebook. If you leave it out, the script makes a random one.
+
+The full project is also on GitHub: [headless-jupyter-notebook](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/headless-jupyter-notebook).
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir jupyter-sandbox && cd jupyter-sandbox
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+### Step 2: Save the script
+
+Save this as `jupyter.ts`.
 
 ```ts
+import { randomBytes } from "node:crypto";
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
-const jupyterToken = "aerolvm-secret-token"; // Choose a secure token
-
-
+// The notebook is on a public link, so use a token nobody can guess.
+const jupyterToken = process.env.JUPYTER_TOKEN ?? randomBytes(16).toString("hex");
 
 async function main() {
   if (!patToken) throw new Error("Set SB_PAT_TOKEN.");
-  console.log("Initializing AerolVM client...");
   const client = new MicroVM({ apiUrl, patToken });
 
   console.log("Creating Jupyter sandbox (1 CPU, 2GB RAM)...");
@@ -35,36 +56,72 @@ async function main() {
     cpu: 1,
     memoryMB: 2048,
   });
-  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
+  console.log(`Sandbox created: ${sandbox.id}`);
 
-  console.log("Installing JupyterLab and Data Science stack (this may take a minute)...");
-  const installRes = await sandbox.exec("pip install jupyterlab pandas matplotlib polars");
-  console.log(`Packages installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
+  try {
+    console.log("Installing JupyterLab and the data science stack (this may take a minute)...");
+    const install = await sandbox.exec("pip install jupyterlab pandas matplotlib polars");
+    if (install.exitCode !== 0) {
+      throw new Error(`pip install failed:\n${install.stderr}`);
+    }
 
-  console.log("Starting JupyterLab server session...");
-  const session = await sandbox.createSession({
-    name: "jupyter-server",
-    command: `jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='${jupyterToken}' --allow-root`,
-  });
-  console.log(`JupyterLab session started! ID: ${session.id}`);
+    console.log("Starting JupyterLab in a session...");
+    await sandbox.createSession({
+      name: "jupyter-server",
+      command: `jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --NotebookApp.token='${jupyterToken}' --allow-root`,
+    });
 
-  console.log("Exposing Jupyter port 8888...");
-  const exposure = await sandbox.exposePort(8888);
-  console.log(`Port exposed successfully!`);
+    const exposure = await sandbox.exposePort(8888);
 
-  console.log("\n--- JupyterLab Ready ---");
-  console.log(`URL: ${exposure.url}?token=${jupyterToken}`);
-  console.log("-------------------------\n");
-  
-  console.log("The sandbox will stay alive as long as you use the notebook.");
+    console.log("\n--- JupyterLab Ready ---");
+    console.log(`URL: ${exposure.url}?token=${jupyterToken}`);
+    console.log("-------------------------\n");
+    console.log(`When you are done, delete sandbox ${sandbox.id}.`);
+  } catch (error) {
+    // Setup failed: delete the sandbox so it does not keep running.
+    await sandbox.destroy();
+    throw error;
+  }
 }
 
 main().catch(console.error);
-
 ```
 
-## Related docs
-- [Exposing Ports](/tcp-ports/)
-- [Sessions](/sessions/)
-- [Preview URLs](/preview/)
----
+### Step 3: Run it
+
+```bash
+npx tsx jupyter.ts
+```
+
+Open the printed URL in your browser. If the page does not load at first, wait a few seconds: JupyterLab takes a moment to start.
+
+## What the script does
+
+1. **Creates a sandbox** from `python:3.11-bookworm` with 1 CPU core and 2 GB of memory.
+2. **Installs JupyterLab, pandas, matplotlib and Polars** with `pip`. If the install fails, the script deletes the sandbox and stops.
+3. **Starts JupyterLab in a session**, a process that keeps running inside the sandbox after your script exits. JupyterLab listens on port 8888 and accepts only requests that carry the token. `--allow-root` is needed because the sandbox runs as the root user.
+4. **Shares port 8888** with `exposePort` and prints the link, with the token added at the end.
+
+## Use your own image
+
+To start with your own libraries already installed, change `image` to an image that has them, such as one you built with PyTorch. Then remove those libraries from the `pip install` line. See [Images, resources and lifecycle](/environment/).
+
+## Delete the sandbox when you are done
+
+The sandbox keeps running until you delete it. Pass the ID the script printed:
+
+```ts
+import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+client.destroy("sb-your-sandbox-id").then(() => console.log("Deleted."));
+```
+
+Your notebooks are deleted with it. Download any you want to keep first, from JupyterLab or with `downloadFile`. See [Files](/file-system/).
+
+## Next steps
+
+- [Share a web app](/preview/): how `exposePort` gives a sandbox a web address.
+- [Terminal sessions](/sessions/): run programs that keep going after you disconnect.
+- [Images, resources and lifecycle](/environment/): more CPU or memory, and auto-stop rules.
+- [Hyperparameter tuning farm](/use-cases/data-processing-ml/hyperparameter-tuning-farm/): train models in several sandboxes at once.

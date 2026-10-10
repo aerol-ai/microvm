@@ -1,62 +1,73 @@
 ---
-title: Lifecycle + Environment
+title: Images, Resources and Lifecycle
+description: Choose the image a sandbox runs, how much CPU, memory and disk it gets, and when it stops or is deleted.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-## Idle Lifecycle
+You set up a sandbox when you create it. You choose the image it starts from, how much of the server it may use, and when it should stop. This page lists those options and their defaults.
 
-Sandboxes can self-terminate based on age or inactivity. Both fields are optional and can be set independently.
+New to sandboxes? Start with [Create and manage](/sandboxes/) first.
 
-| Field | Behavior |
-|---|---|
-| `stopIfIdleFor` | Stop the sandbox after this duration of inactivity (nanoseconds). |
-| `destroyAtAge` | Destroy the sandbox once it is this old (nanoseconds from creation). |
+## Choose an image
 
-Go uses `time.Duration` for these fields. TypeScript, Python, and Rust use integer nanoseconds.
+`image` is the one option every container and Firecracker sandbox needs. Any image name works, such as `ubuntu:22.04`, `python:3.12-slim` or `ghcr.io/your-org/app:1.4`. The server downloads (pulls) the image the first time you use it. Later creates reuse the copy it already has, so they start much faster.
+
+You can also pass the name of a [snapshot](/snapshots/) (a saved copy of a sandbox) as the image. WebAssembly and V8 isolate sandboxes use a module instead of an image. See [WebAssembly (WASM)](/wasm-sandbox/) and [V8 isolate](/isolate-sandbox/).
+
+### Use an image from a private registry
+
+A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`. If yours needs a login, pass it in `registry`. The server uses it to pull the image.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      lifecycle: {
-        stopIfIdleFor: 60 * 60 * 1_000_000_000,   // 1 hour
-        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours
+      image: "ghcr.io/your-org/app:1.4",
+      registry: {
+        server: "ghcr.io",
+        username: "your-user",
+        password: process.env.GHCR_TOKEN!,
       },
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'lifecycle': {
-            'stopIfIdleFor': 3_600_000_000_000,
-            'destroyAtAge':  86_400_000_000_000,
+    import os
+
+    sandbox = client.create(
+        image="ghcr.io/your-org/app:1.4",
+        registry={
+            "server": "ghcr.io",
+            "username": "your-user",
+            "password": os.environ["GHCR_TOKEN"],
         },
-    })
+    )
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
-        Lifecycle: &sdktypes.Lifecycle{
-            StopIfIdleFor: time.Hour,
-            DestroyAtAge:  24 * time.Hour,
+        Image: "ghcr.io/your-org/app:1.4",
+        Registry: &sdktypes.RegistryAuth{
+            Server:   "ghcr.io",
+            Username: "your-user",
+            Password: os.Getenv("GHCR_TOKEN"),
         },
     })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::RegistryAuth;
+
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        lifecycle: Some(Lifecycle {
-            stop_if_idle_for: 3_600_000_000_000,
-            destroy_at_age:   86_400_000_000_000,
-            ..Default::default()
+        image: "ghcr.io/your-org/app:1.4".into(),
+        registry: Some(RegistryAuth {
+            server: "ghcr.io".into(),
+            username: "your-user".into(),
+            password: std::env::var("GHCR_TOKEN").unwrap(),
         }),
         ..Default::default()
     })?;
@@ -64,114 +75,99 @@ Go uses `time.Duration` for these fields. TypeScript, Python, and Rust use integ
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setLifecycle(new Lifecycle()
-                .setStopIfIdleFor(3_600_000_000_000L)
-                .setDestroyAtAge(86_400_000_000_000L))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ghcr.io/your-org/app:1.4")
+        .setRegistry(new RegistryAuth()
+            .setServer("ghcr.io")
+            .setUsername("your-user")
+            .setPassword(System.getenv("GHCR_TOKEN"))));
     ```
   </TabItem>
 </Tabs>
 
-## Environment
+### Choose what runs when the sandbox starts
 
-The sandbox environment is fully specified at creation time. All fields are optional except `image`.
-
-Pass key-value pairs into the container at creation. Variables are stored encrypted at rest and are not returned by list or get endpoints.
+When a container sandbox starts, it runs the image's own start command in the background. That is the `ENTRYPOINT` and `CMD` from the image's Dockerfile. To run something else, pass `containerCommand`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      env: {
-        DATABASE_URL: 'postgres://...',
-        APP_ENV: 'sandbox',
-      },
-    })
+      image: "python:3.12-slim",
+      containerCommand: ["python3", "-m", "http.server", "8080"],
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'env': {
-            'DATABASE_URL': 'postgres://...',
-            'APP_ENV': 'sandbox',
-        },
-    })
+    sandbox = client.create(
+        image="python:3.12-slim",
+        container_command=["python3", "-m", "http.server", "8080"],
+    )
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image: "ubuntu:22.04",
-        Env: map[string]string{
-            "DATABASE_URL": "postgres://...",
-            "APP_ENV":      "sandbox",
-        },
+        Image:            "python:3.12-slim",
+        ContainerCommand: []string{"python3", "-m", "http.server", "8080"},
     })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    use std::collections::HashMap;
-
-    let mut env = HashMap::new();
-    env.insert("DATABASE_URL".to_string(), "postgres://...".to_string());
-    env.insert("APP_ENV".to_string(), "sandbox".to_string());
-
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        env: Some(env),
+        image: "python:3.12-slim".into(),
+        container_command: Some(vec![
+            "python3".into(), "-m".into(), "http.server".into(), "8080".into(),
+        ]),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import java.util.Map;
-
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setEnv(Map.of("DATABASE_URL", "postgres://...", "APP_ENV", "sandbox"))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setContainerCommand(List.of("python3", "-m", "http.server", "8080")));
     ```
   </TabItem>
 </Tabs>
 
-## Resource Limits
+You do not need a start command to use a sandbox. You can run everything with [Run commands](/exec-streaming/) or [Terminal sessions](/sessions/). The sandbox stays up even if the start command exits.
 
-| Field | Unit | Default | Description |
+## Set CPU, memory and disk
+
+| Option | What it does | Default |
+|---|---|---|
+| `cpu` | How many CPU cores the sandbox may use. Fractions work, like `0.5`. | `1` |
+| `memoryMB` | The most memory the sandbox may use, in megabytes. | `1024` |
+| `diskGB` | The most disk space the sandbox may write, in gigabytes. | `10` |
+
+The option names change a little by language:
+
+| Language | CPU | Memory | Disk |
 |---|---|---|---|
-| `cpu` | vCPUs | 1 | CPU quota |
-| `memoryMB` | megabytes | 512 | Memory limit |
-| `diskGB` | gigabytes | 10 | Writable layer size |
-
-Resources can be changed on a live sandbox without a restart using [resize](/sandboxes#resize).
+| TypeScript | `cpu` | `memoryMB` | `diskGB` |
+| Python | `cpu` | `memory_mb` or `memoryMB` | `disk_gb` or `diskGB` |
+| Go | `CPU` | `MemoryMB` | `DiskGB` |
+| Rust | `cpu` (whole cores only) | `memory_mb` | `disk_gb` |
+| Java | `setCpu` | `setMemoryMb` | `setDiskGb` |
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
+      image: "ubuntu:22.04",
       cpu: 2,
       memoryMB: 2048,
       diskGB: 20,
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'cpu': 2.0,
-        'memoryMB': 2048,
-        'diskGB': 20,
-    })
+    sandbox = client.create(image="ubuntu:22.04", cpu=2, memory_mb=2048, disk_gb=20)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -187,29 +183,183 @@ Resources can be changed on a live sandbox without a restart using [resize](/san
   <TabItem label="Rust">
     ```rust
     let sandbox = client.create(CreateOptions {
-        image:     "ubuntu:22.04".to_string(),
-        cpu:       Some(2),
+        image: "ubuntu:22.04".into(),
+        cpu: Some(2),
         memory_mb: Some(2048),
-        disk_gb:   Some(20),
+        disk_gb: Some(20),
         ..Default::default()
     })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setCpu(2.0)
-            .setMemoryMb(2048)
-            .setDiskGb(20)
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setCpu(2.0)
+        .setMemoryMb(2048)
+        .setDiskGb(20));
     ```
   </TabItem>
 </Tabs>
 
+To change CPU or memory on a running sandbox, see [Change CPU or memory](/sandboxes/#change-cpu-or-memory).
 
+<Aside type="caution">
+The disk limit is only enforced when the server runs containers on Docker. Servers that use containerd (another container engine), and gVisor sandboxes, record the value but do not enforce it.
+</Aside>
 
-## Entrypoint
+## Stop or delete a sandbox automatically
 
-The sandbox image's default entrypoint and `CMD` are not used. Your workload runs via the exec or session APIs instead. See [Process & Code Execution](/exec-streaming) and [Sessions](/sessions).
+A lifecycle is a set of timers. When one runs out, the server stops or deletes the sandbox for you. Every timer is optional, and a timer you leave out is off.
+
+| Option | What it does |
+|---|---|
+| `stopIfIdleFor` | Stop the sandbox after it has had no activity for this long. |
+| `destroyIfIdleFor` | Delete the sandbox after it has had no activity for this long. |
+| `stopAtAge` | Stop the sandbox this long after it was created. |
+| `destroyAtAge` | Delete the sandbox this long after it was created. |
+| `serverless` | Start the sandbox again by itself when a request reaches it. Needs `stopIfIdleFor`. See [Serverless sandboxes](/serverless/). |
+
+Activity means anything that reaches the sandbox: a command, a file read or write, a terminal or SSH session, or traffic to its public URL.
+
+### Write the times in nanoseconds
+
+The SDKs take each time in nanoseconds (billionths of a second). One hour is `60 * 60 * 1_000_000_000` nanoseconds. The SDKs do not add their own time helpers, but some languages have one built in:
+
+- **Go** takes a normal `time.Duration`, so `time.Hour` just works.
+- **Rust** can use `std::time::Duration::from_secs(3600).as_nanos() as u64`.
+- **Java** can use `java.time.Duration.ofHours(1).toNanos()`.
+- **TypeScript** and **Python** need the multiplication.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: {
+        stopIfIdleFor: HOUR,
+        destroyAtAge: 24 * HOUR,
+      },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
+
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"stopIfIdleFor": HOUR, "destroyAtAge": 24 * HOUR},
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: time.Hour,
+            DestroyAtAge:  24 * time.Hour,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: hour,
+            destroy_at_age: 24 * hour,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = Duration.ofHours(1).toNanos(); // java.time.Duration
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle()
+            .setStopIfIdleFor(hour)
+            .setDestroyAtAge(24 * hour)));
+    ```
+  </TabItem>
+</Tabs>
+
+### Change the timers later
+
+`updateLifecycle` sets new timers on a sandbox without a restart. It replaces all of them at once. A timer you leave out is turned off, so send every timer you want to keep.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.updateLifecycle({
+      stopIfIdleFor: 2 * HOUR,
+      destroyAtAge: 48 * HOUR,
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.update_lifecycle({"stopIfIdleFor": 2 * HOUR, "destroyAtAge": 48 * HOUR})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.UpdateLifecycle(ctx, sdktypes.Lifecycle{
+        StopIfIdleFor: 2 * time.Hour,
+        DestroyAtAge:  48 * time.Hour,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // update_lifecycle() updates the sandbox, so declare it with `let mut`.
+    sandbox.update_lifecycle(Lifecycle {
+        stop_if_idle_for: 2 * hour,
+        destroy_at_age: 48 * hour,
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.updateLifecycle(new Lifecycle()
+        .setStopIfIdleFor(2 * hour)
+        .setDestroyAtAge(48 * hour));
+    ```
+  </TabItem>
+</Tabs>
+
+### Good to know
+
+- **The longest timer is 30 days.** A longer value is rejected.
+- **Delete cannot come before stop.** If you set both `stopIfIdleFor` and `destroyIfIdleFor`, the delete time must be the same or longer. The same rule applies to `stopAtAge` and `destroyAtAge`.
+- **Delete wins.** If a stop timer and a delete timer are both due, the sandbox is deleted.
+- **Timers are checked about once a minute.** A sandbox can run up to a minute past its timer.
+- **A stopped sandbox keeps its files.** Start it again with `start`. A deleted sandbox is gone for good.
+
+## Set environment variables
+
+Pass settings and secrets to the sandbox with `env`. See [Environment variables](/sandbox-env/) for how to set them and read them back.
+
+## For server operators
+
+`SB_IDLE_TIMEOUT_MIN` sets a default idle stop for the whole server. It stops any running sandbox that has been idle for that many minutes. It only applies to sandboxes with no lifecycle timers of their own. The default is `0` (off).
+
+## Next steps
+
+- [Create and manage](/sandboxes/): stop, start, resize and delete sandboxes.
+- [Serverless sandboxes](/serverless/): stop when idle, start again on the next request.
+- [Snapshots](/snapshots/): turn a set-up sandbox into an image you can reuse.
+- [Durability and failover](/durability/): keep data safe when a sandbox or server goes away.

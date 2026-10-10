@@ -1,0 +1,114 @@
+---
+title: Install on your computer
+description: Run the AerolVM server on your Mac or Linux computer for development. No domain or certificate needed.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page installs the AerolVM server on your own Mac or Linux computer. It is the fastest way to build and test an app that uses AerolVM. The server only listens on your computer, at `http://localhost:21212`.
+
+You do not need a domain name, a cloud account or a TLS certificate (the file that makes HTTPS work). The [Quickstart](/quick-start/) uses this same install, then runs a first sandbox. This page has the details.
+
+## Before you start
+
+- **macOS:** [Docker Desktop](https://www.docker.com/products/docker-desktop/) or [OrbStack](https://orbstack.dev/) must be running. You do not need admin rights.
+- **Linux:** you need `sudo`. If Docker is missing, the installer adds it with `apt`.
+
+## Install on macOS
+
+Pick a secret token. It works like a password for your server. Run the installer as yourself, **without** `sudo`:
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- \
+    --local \
+    --pat-token your-secret-pat
+```
+
+The server starts again by itself each time you log in.
+
+## Install on Linux
+
+Pick a secret token, then run:
+
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+    --local \
+    --pat-token your-secret-pat
+```
+
+The server starts again by itself each time the computer starts.
+
+## If you leave out the token
+
+You can skip `--pat-token`. The installer then makes a random token and prints it once, so copy it somewhere safe.
+
+- **On macOS,** running the installer again keeps your current token.
+- **On Linux,** running it again without `--pat-token` makes a new token. Your apps then need the new one.
+
+## Connect your code
+
+The SDKs read two settings from your terminal:
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+```
+
+Then install the SDK for your language. [SDK setup](/sdk-setup/) shows how, and how to check that it can reach the server.
+
+## Find your token and logs
+
+| What | macOS | Linux |
+|---|---|---|
+| Server address | `http://localhost:21212` | `http://localhost:21212` |
+| Token | Printed by the installer. Or run `plutil -extract EnvironmentVariables.SB_PAT_TOKEN raw ~/Library/LaunchAgents/com.aerol.sandboxd.plist` | Printed by the installer. Or read `/etc/sandboxd/sandboxd.env` with `sudo` |
+| Logs | `~/.aerolvm/logs/sandboxd.log` (errors in `sandboxd.err`) | `journalctl -u sandboxd -f` |
+
+## Stop and start the server
+
+| Task | macOS | Linux |
+|---|---|---|
+| Stop | `launchctl bootout gui/$(id -u)/com.aerol.sandboxd` | `sudo systemctl stop sandboxd` |
+| Start | `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.aerol.sandboxd.plist` | `sudo systemctl start sandboxd` |
+| Restart | Run the stop command, then the start command | `sudo systemctl restart sandboxd` |
+
+## Good to know
+
+<Aside type="caution" title="A local install is for development">
+It leaves out some protections that a server install has. Do not rely on it to contain code you do not trust.
+</Aside>
+
+- **No public web links.** Only your computer can reach your sandboxes. To share a sandbox's web app, [install on a server](/getting-started/single-node-setup/).
+- **Network rules are off.** Blocking the internet, or allowing only some IP addresses, has no effect here. Test [network rules](/network-isolation/) on a server.
+- **On a Mac, size limits are off.** CPU, memory and disk settings are ignored, and resizing a sandbox does nothing. The Linux virtual machine inside Docker Desktop or OrbStack cannot enforce disk limits.
+- **Containers only.** The local installer sets up plain container sandboxes. gVisor, Firecracker, WebAssembly, V8 isolates and NVIDIA or AMD GPUs need a server install.
+- **Apple Silicon GPUs work only here.** On a Mac, Docker Desktop can pass the Apple GPU to a sandbox. See [GPU](/gpu-sandboxes/).
+
+## What the installer sets up
+
+The installer puts two programs on your computer: `sandboxd`, the AerolVM server, and `toolboxd`, a small helper that runs inside each sandbox.
+
+**On macOS** it installs only for you. It writes nothing outside your home folder.
+
+- Puts `sandboxd` in `~/.aerolvm/bin` and `toolboxd` in `~/.aerolvm/toolbox`.
+- Keeps state, keys and logs under `~/.aerolvm`.
+- Registers a LaunchAgent (a macOS background service that starts at login) named `com.aerol.sandboxd`. Its settings, including your token, live in `~/Library/LaunchAgents/com.aerol.sandboxd.plist`.
+- Binds every listener to `127.0.0.1`, so only your computer can connect.
+- Sets `SB_DOCKER_TOOLBOX_LOOPBACK=true`. Each sandbox then publishes only the port of its `toolboxd` helper, on `127.0.0.1`, which is how `sandboxd` reaches it. macOS privacy settings block it from reaching the Docker virtual machine's addresses directly.
+- Sets `SB_RESOURCE_LIMITS_DISABLED=true`, `SB_ENABLE_NETWORK_RULES=false` and `SB_ENABLE_CADDY=false`. Caddy is the web server a server install uses for HTTPS and public links.
+
+**On Linux:**
+
+- Puts `sandboxd` and `toolboxd` in `/usr/local/bin`.
+- Writes settings to `/etc/sandboxd/sandboxd.env`, readable only by root. It sets `SB_ENABLE_CADDY=false` and `SB_ENABLE_NETWORK_RULES=false`, and the API listens on `127.0.0.1:21212`.
+- Keeps state in `/var/lib/sandboxd`.
+- Registers a systemd service (a Linux background service) named `sandboxd`. If the server crashes, systemd restarts it after 5 seconds.
+- Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds.
+- Adds the `aerolvm-egress-gateway` service, which handles sandboxes' outbound traffic.
+
+## Next steps
+
+- [Quickstart](/quick-start/): run your first sandbox from start to finish.
+- [SDK setup](/sdk-setup/): connect your code in your language.
+- [Create and manage sandboxes](/sandboxes/): pick an image, name sandboxes, stop and start them.
+- [Install on a server](/getting-started/single-node-setup/): get public web links on your own domain.

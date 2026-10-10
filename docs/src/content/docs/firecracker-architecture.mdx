@@ -1,53 +1,49 @@
 ---
-title: Firecracker Architecture
-description: How the AerolVM daemon turns a request into a jailer-isolated Firecracker microVM - the components, the anatomy of one VM, and the Create boot path step by step.
+title: Firecracker architecture
+description: How the AerolVM server turns a create request into a Firecracker microVM, from its parts to each step of the boot path.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-A Firecracker sandbox is a Linux VM with its own kernel, memory, block and
-network devices, isolated from the host by KVM. AerolVM's job is to deliver one
-(booted, network up, agent listening) by resuming pre-warmed pieces instead of
-cold-booting. On the warm-pool-hit path the wall-clock budget is sub-100ms on a
-healthy host; cold boots and snapshot loads against a cold page cache are much
-slower (see [Boot-time budget](#boot-time-budget)).
+A Firecracker sandbox is a small Linux virtual machine, called a **microVM**, with its own kernel, memory, disk and network devices. **KVM** (the hardware virtualization built into the Linux kernel) keeps it apart from the host. AerolVM's job is to hand you one that is booted, online and running its agent. It does that by resuming pieces prepared ahead of time, instead of booting from cold.
 
-For how those pieces are pre-warmed and shared, read
-[Snapshot restore and the warm-VMM pool](/firecracker-hydration). For the user-facing
-how-to, see [Firecracker Sandbox](/firecracker-sandbox).
+The **warm pool** is a set of VMs started ahead of time and paused. When one is waiting there, the target is under 100 ms on a healthy host. Cold boots are much slower. So are loads from a **snapshot** (a saved copy of a running VM) when the snapshot file is not yet in memory (see [Boot-time budget](#boot-time-budget)).
+
+**In short:**
+
+- Firecracker runs each sandbox as a microVM under KVM, with its own kernel and only a few simple virtual devices.
+- On production hosts, each VM process is locked in a jailer: a private file tree, its own view of processes, resource limits and no root rights.
+- A sandbox can start three ways: from any image (slowest), from a template snapshot, or from a paused VM in the warm pool (fastest).
+- The host talks to the agent inside the VM over vsock, a direct host-to-VM channel that survives snapshots.
+- If any step fails, `Create` undoes every earlier step in reverse order, so nothing leaks.
+
+For how those pieces are prepared and shared, read [Firecracker snapshot restore](/firecracker-hydration/). For the how-to guide, see [Firecracker](/firecracker-sandbox/).
 
 ## Why Firecracker, not Kata or gVisor
 
-Firecracker runs each guest under KVM with a dedicated kernel and an MMIO-only
-virtio device tree. The trade-offs versus the obvious neighbors:
+This section compares Firecracker with two common alternatives. Firecracker runs each guest under KVM with its own kernel and an MMIO-only virtio device tree. **virtio** is a standard set of simple virtual devices. **MMIO-only** means they connect through memory addresses, with no PCI bus.
 
-- **gVisor.** Shared host kernel via syscall interception. Defense in depth,
-  not isolation parity with hardware virtualization. AerolVM uses Docker today
-  for its non-Firecracker runtime; gVisor would slot in there, not here.
-- **Kata Containers.** QEMU by default. Heavier cold boot and harder to drive
-  the snapshot/resume primitives that the warm-pool depends on.
-- **Firecracker.** KVM-only, no QEMU, no PCI bus, no GPU passthrough. The cost
-  is "no GPU in a sandbox today"; the win is sub-150ms cold boots upstream and
-  the snapshot/resume model the warm-pool is built on.
+Here are the trade-offs against the obvious neighbors:
 
-Firecracker requires `/dev/kvm`. AerolVM hosts must be bare-metal or
-nested-virt-capable Linux. No Windows host, no macOS host, no TCG fallback.
+- **gVisor.** It shares the host kernel and intercepts each system call. That is defense in depth, not isolation equal to hardware virtualization. AerolVM already offers gVisor as its own runtime ([gVisor](/gvisor-sandbox/)). It is a stronger container, not a replacement for Firecracker.
+- **Kata Containers.** It uses QEMU (a full machine emulator) by default. That means a heavier cold boot. It also makes the snapshot and resume steps that the warm pool depends on harder to drive.
+- **Firecracker.** KVM only: no QEMU, no PCI bus, no GPU passthrough. The cost is no GPU in a sandbox today. The gain is cold boots under 150 ms in the Firecracker project itself, and the snapshot and resume model the warm pool is built on.
 
-## Components
+Firecracker needs `/dev/kvm`. AerolVM hosts must run Linux on bare metal, or on a VM that supports nested virtualization (a VM that can run its own VMs). There is no Windows host, no macOS host and no TCG fallback (QEMU's slow, software-only CPU emulation).
 
-The Firecracker runtime driver is the second implementation of the daemon's
-`Runtime` interface (the first being the Docker client). The version-agnostic
-service layer calls into it.
+## The parts
 
-| Component | Responsibility |
+This section lists the pieces of the Firecracker runtime driver, the part of the server that runs Firecracker sandboxes. The driver is the second implementation of the server's `Runtime` interface; the Docker client is the first. The service layer, which is the same for every API version, calls into it.
+
+| Part | What it does |
 |---|---|
-| **Firecracker driver** | Implements `Runtime` against Firecracker. Drives `Create` / `Destroy`. Owns the live-VMM map. |
-| **TAP slot pool** | Per-host pool of `(TAP device, host IP, guest IP, /30 CIDR, vsock CID)` slots, seeded ahead of time. Each sandbox claims one slot for its network identity. |
-| **Warm-VMM pool** | Per-template pool of already-spawned, snapshot-loaded, *paused* Firecracker processes. A pool hit skips both the spawn and the `LoadSnapshot` call. |
-| **Rootfs builder** | The OCI-to-`ext4` pipeline (`skopeo` + `umoci` + `mkfs.ext4`). Runs on the ad-hoc path; pre-run once on the template path. |
-| **Template resolver** | Resolves a `template_id` to the host paths of a pre-built rootfs and snapshot artifacts. |
-| **VMM supervisor + jailer** | Spawns the `firecracker` process, wrapped in `jailer` (chroot + new PID and mount namespaces + cgroups + UID/GID drop) on production hosts, bare on dev/CI. The firecracker binary itself installs a seccomp filter from inside the chroot. |
-| **vsock dialer** | Host side of the `AF_VSOCK` handshake used to confirm the in-guest agent (toolbox) is alive and to push post-resume signals. |
+| **Firecracker driver** | Implements `Runtime` on top of Firecracker. Runs `Create` and `Destroy`. Keeps the map of live VMMs (virtual machine monitors: one Firecracker process per VM). |
+| **TAP slot pool** | A per-host pool of slots, set up ahead of time. Each slot is a TAP device (a virtual network cable), a host IP, a guest IP, a `/30` subnet and a vsock CID (the VM's vsock address). Each sandbox claims one slot as its network identity. |
+| **Warm-VMM pool** | A per-template pool of Firecracker processes that are already started, have the snapshot loaded, and are *paused*. A pool hit skips both the start and the `LoadSnapshot` call. |
+| **Rootfs builder** | Turns an OCI image (a standard container image) into an `ext4` root file system disk, using `skopeo`, `umoci` and `mkfs.ext4`. It runs on every ad-hoc create. On the template path it runs once, ahead of time. |
+| **Template resolver** | Turns a `template_id` into the host paths of a pre-built rootfs and its snapshot files. |
+| **VMM supervisor and jailer** | Starts the `firecracker` process. On production hosts it wraps the process in `jailer`: a chroot (a private file tree), new PID and mount namespaces, cgroups (resource limits) and a switch to a non-root user. On dev and CI hosts it runs bare. The firecracker binary then installs a seccomp filter (a list of allowed system calls) from inside the chroot. |
+| **vsock dialer** | The host side of the `AF_VSOCK` handshake. It confirms that the agent in the guest (toolbox) is alive, and sends it the post-resume signal. |
 
 ```mermaid
 graph TB
@@ -62,15 +58,13 @@ graph TB
     TPL -.->|snapshot artifacts| WARM
 ```
 
-## Anatomy of one microVM
+## One microVM up close
 
-On a production host every Firecracker process runs inside a `jailer` chroot.
-The jailer hard-links the `firecracker` binary into a private root, drops the
-process to an unprivileged UID/GID, enters new PID and mount namespaces, and
-confines it with cgroups. The firecracker binary then installs a seccomp filter
-from inside the chroot. The daemon stages the guest's block devices into the
-chroot before the VM starts, so the VM only ever sees files the daemon put
-there.
+This section shows what surrounds a single VM on a production host. Every Firecracker process runs inside a `jailer` chroot: a private root folder it cannot see out of. The jailer hard-links the `firecracker` binary into that private root, and switches the process to an unprivileged user and group.
+
+The jailer also puts the process in new PID and mount **namespaces**, so it sees only its own processes and mounts. It limits the process with **cgroups**, the kernel's resource controls. The firecracker binary then installs a **seccomp** filter from inside the chroot, which limits the system calls it may make.
+
+The server places the guest's disk files into the chroot before the VM starts. So the VM only ever sees files the server put there.
 
 ```mermaid
 graph LR
@@ -91,60 +85,34 @@ graph LR
     DRV <-->|AF_VSOCK handshake| TBX
 ```
 
-Per sandbox: one jailer chroot, one `rootfs.ext4` (backing the guest's `/`),
-an optional sparse `overlay.ext4` for writes, one TAP slot for the network,
-one vsock CID for the control channel, and the toolbox agent listening inside
-the guest on vsock port `1024`.
+Each sandbox gets:
 
-A few invariants worth naming up front:
+- one jailer chroot
+- one `rootfs.ext4`, which backs the guest's `/`
+- an optional sparse `overlay.ext4` for writes (a sparse file takes disk space only where data is written)
+- one TAP slot for the network
+- one vsock CID for the control channel
+- the toolbox agent, listening inside the guest on vsock port `1024`
 
-- **Kernel.** The daemon does not build a kernel. The host path to the
-  uncompressed `vmlinux` is configured via `SB_FIRECRACKER_KERNEL` (default
-  `/var/lib/sandboxd/firecracker/vmlinux`) and validated at startup
-  (`driver.go:425`). The jailer hard-links it into each per-sandbox chroot.
-  Operators supply the kernel; we recommend the upstream Firecracker-recommended
-  build.
-- **Devices.** MMIO-only virtio: virtio-blk for `rootfs.ext4` and the optional
-  `overlay.ext4`, virtio-net for the TAP, virtio-vsock for the control channel.
-  No PCI bus, so no PCI passthrough, no SR-IOV NIC, no GPU. Agents that want
-  GPU inference cannot get it inside a Firecracker sandbox today.
-- **Networking.** Each sandbox gets one TAP, one host-side `/30`, and one guest
-  IP from the slot. No CNI, no multiple NICs, no virtio-balloon. Host-side
-  routing and egress firewalling are outside this page.
-- **RNG.** AerolVM does not attach a virtio-rng device. Cold-boot guests get
-  their entropy from the kernel's own bootstrap path; snapshot/warm clones
-  would otherwise resume with identical RNG state (two clones drawing the same
-  `getrandom` bytes is a real correctness issue, not cosmetic: TLS session
-  tickets, JWT nonces, session-id generation all depend on it). The `post_resume`
-  signal below tells the in-guest agent to reseed the kernel RNG from
-  virtio-rng and set `CLOCK_REALTIME` from the host before any service runs;
-  cold boots skip this because the kernel just initialized.
-- **MMDS.** Firecracker's MicroVM Metadata Service exists. AerolVM does not use
-  it. Per-sandbox config is delivered over vsock by `post_resume`; MMDS would
-  add an HTTP-over-link-local dependency that does not survive `LoadSnapshot`
-  cleanly.
-- **Memory backend.** Snapshot loads use Firecracker's `File` backend
-  (`mem_backend.backend_type = "File"`, see `driver.go:893` and `warmspawn.go:187`).
-  That gives `mmap`-based CoW from the template's memory image. The `Uffd`
-  backend (lazy demand-faulting via `userfaultfd`) is a future axis for
-  tail-latency reduction on multi-GiB snapshots; not in production today.
+A few rules are worth naming up front:
+
+- **Kernel.** The server does not build a kernel. You set the host path to the uncompressed `vmlinux` with `SB_FIRECRACKER_KERNEL` (default `/var/lib/sandboxd/firecracker/vmlinux`). The server checks that path at startup, and the jailer hard-links the file into each sandbox's chroot. Operators supply the kernel; we recommend the build the Firecracker project recommends.
+- **Devices.** Only MMIO virtio devices: virtio-blk for `rootfs.ext4` and the optional `overlay.ext4`, virtio-net for the TAP, and virtio-vsock for the control channel. There is no PCI bus, so there is no PCI passthrough, no SR-IOV network card and no GPU. Agents that want GPU inference cannot get it inside a Firecracker sandbox today.
+- **Networking.** Each sandbox gets one TAP, one host-side `/30` subnet and one guest IP from its slot. There is no CNI (container network plugin), no second network card and no virtio-balloon (a device for handing memory back to the host). Host-side routing and outbound firewall rules are outside this page.
+- **Randomness.** AerolVM does not attach a virtio-rng device (a virtual device that passes random bytes from the host). Cold-boot guests get their randomness from the kernel's own startup path. Clones from a snapshot or the warm pool would otherwise resume with identical random-number state. Two clones drawing the same `getrandom` bytes is a real correctness problem, not a cosmetic one. TLS session tickets (TLS is the encryption behind HTTPS), JWT nonces and session IDs all depend on it.
+- **post_resume.** After every boot or resume, the host sends a `post_resume` message over vsock (`postResumeData` in `driver.go`). The agent sets `CLOCK_REALTIME` from the host, applies this sandbox's network settings, and forces a kernel reseed (`ReseedRandom` in `cmd/toolboxd/quiesce_linux.go`). The reseed bytes come from the guest's own generator, since there is no virtio-rng device. On snapshot clones, vmgenid (Firecracker's VM generation ID) makes a guest kernel that supports it reseed itself on restore.
+- **MMDS.** Firecracker's MicroVM Metadata Service exists, but AerolVM does not use it. Per-sandbox config arrives over vsock in `post_resume` instead. MMDS would add a dependency on HTTP over a link-local address, which does not survive `LoadSnapshot` cleanly.
+- **Memory backend.** Snapshot loads use Firecracker's `File` backend (`mem_backend.backend_type = "File"`, in `driver.go` and `warmspawn.go`). That gives copy-on-write through `mmap` from the template's memory image. **Copy-on-write** (CoW) means clones share each page until one writes to it, and then that clone gets its own copy. The `Uffd` backend loads pages on demand through `userfaultfd`, which lets a program handle page faults itself. It is a future option for speeding up the slowest creates on multi-GiB snapshots, and is not in production today.
 
 ## The boot path
 
-`Create` releases everything it acquired (TAP slot, host TAP, VMM process,
-overlay file) in reverse order on any failure, so a half-built sandbox never
-leaks a slot (`driver.go:466-526`, deferred closures gated by a `released`
-flag). There are three branches through it:
+This section walks through `Create`, the call that builds a sandbox. If any step fails, `Create` releases everything it took, in reverse order: TAP slot, host TAP, VMM process and overlay file. So a half-built sandbox never leaks a slot.
 
-- **Ad-hoc** - no `template_id`. The full OCI-to-rootfs pipeline runs, then a
-  cold kernel boot (`InstanceStart`). Tens of seconds.
-- **Snapshot-load** - a `template_id` whose template captured a memory snapshot.
-  The driver spawns firecracker, issues `LoadSnapshot` + `Resume`. Sub-100ms
-  on a hot page cache; multi-GiB snapshots against a cold page cache spend
-  hundreds of ms faulting in memory pages.
-- **Warm-pool hit** - same template, but a paused VMM with the snapshot
-  *already loaded* was waiting in the pool. The driver only patches per-sandbox
-  state onto it and resumes. The fastest path.
+In `driver.go` this is done with deferred cleanup functions, guarded by a `released` flag. There are three branches through `Create`:
+
+- **Ad-hoc**: no `template_id`. The full OCI-to-rootfs pipeline runs, then a cold kernel boot (`InstanceStart`). This takes tens of seconds.
+- **Snapshot-load**: a `template_id` whose template captured a memory snapshot. The driver starts firecracker, calls `LoadSnapshot`, then resumes the VM with `PatchVM` (Firecracker's `PATCH /vm`, state `Resumed`). This takes under 100 ms when the snapshot is already in the host's **page cache** (the kernel's in-memory copy of file data). When it is not, a multi-GiB snapshot spends hundreds of ms loading memory pages from disk.
+- **Warm-pool hit**: same template, but a paused VMM with the snapshot *already loaded* was waiting in the pool. The driver hands the warm slot's TAP to this sandbox, points the disks at this sandbox's own files, and resumes the VM. This is the fastest path. `Create` tries the warm pool first, before it allocates a new TAP slot.
 
 ```mermaid
 sequenceDiagram
@@ -154,75 +122,55 @@ sequenceDiagram
     participant FC as firecracker process
     participant G as guest (toolbox)
 
-    C->>TAP: allocate slot (TAP, IPs, vsock CID)
     C->>W: tryAcquireWarm(template)
     alt warm-pool hit
         W-->>C: paused VMM, snapshot already loaded
-        C->>FC: PATCH per-sandbox TAP + overlay
-        C->>FC: Action(Resume)
+        C->>TAP: transfer the warm slot's TAP to this sandbox
+        C->>FC: PatchDrive rootfs + overlay
+        C->>FC: PATCH /vm state=Resumed
     else miss - spawn fresh
+        C->>TAP: allocate slot (TAP, IPs, vsock CID)
         C->>FC: spawn (jailer chroot, no Start yet)
         C->>C: stage rootfs.ext4 (build or hard-link)
         C->>TAP: bring host TAP up
         C->>FC: Start + wait for api.socket
         C->>FC: allocate overlay (if requested)
         alt snapshot-load
-            C->>FC: machine-config + LoadSnapshot
-            C->>FC: Action(Resume)
+            C->>FC: LoadSnapshot (TAP override) + PatchDrive
+            C->>FC: PATCH /vm state=Resumed
         else cold boot
-            C->>FC: boot-source + drives + net + InstanceStart
+            C->>FC: machine-config + boot-source + drives + net + InstanceStart
         end
     end
     C->>G: vsock handshake (cid, :1024)
-    opt snapshot/warm path
-        C->>G: post_resume (reseed RNG, set clock)
-    end
+    C->>G: post_resume (clock, network, reseed)
     G-->>C: ready
     C->>C: register handle, commit slot to sandbox
 ```
 
 Details that bite if you skip them:
 
-- **REST ordering on cold boot.** `machine-config` and `boot-source` go before
-  drives; drives and network interfaces before `InstanceStart`. The
-  snapshot-load path issues only `machine-config` + `LoadSnapshot`; every other
-  device is restored from the snapshot state file. Firecracker itself doesn't
-  demand `machine-config` before `LoadSnapshot` - AerolVM sends it first as a
-  defensive guard against a stale config from a previous lifecycle leaking in.
-- **The overlay is sparse.** A requested overlay drive is allocated as a sparse
-  file, so a 64 GiB overlay occupies sub-MiB on disk until the guest writes.
-- **Snapshot clones resume with stale entropy and clock.** Two clones of the
-  same snapshot would otherwise draw identical `getrandom` bytes and a time
-  that jumped backwards. After resume the driver sends a best-effort
-  `post_resume` signal so the in-guest agent sets the clock from the host
-  (`wallclock_unix_ns`) and unconditionally reseeds the kernel RNG from
-  virtio-rng via `RNDADDENTROPY` (`cmd/toolboxd/vsock.go:247`,
-  `cmd/toolboxd/quiesce_linux.go:41`). Cold boots skip this entirely
-  because their kernel just initialized.
-- **The vsock CID differs by path.** On the snapshot/warm path the guest listens
-  on the template's CID (baked into the snapshot at build time), not the
-  per-sandbox slot CID, so the host dials that CID for the handshake. vsock is
-  used because it is snapshot-safe; a TCP control channel over the TAP would
-  tear on resume.
-- **Snapshot/warm clones share guest memory copy-on-write.** `LoadSnapshot`
-  `mmap`s the template's memory image with `MAP_PRIVATE`; the kernel CoW
-  handler allocates a private anonymous page on the first write to any page,
-  leaving the underlying file untouched. The `track_dirty_pages` flag is a
-  separate mechanism for *identifying* dirty pages for diff snapshots, not for
-  diverting writes; enabling it costs a VM-exit per first-touch write. The full
-  memory model is in
-  [Snapshot restore and the warm-VMM pool](/firecracker-hydration#memory-copy-on-write-clones).
+- **REST call order on cold boot.** `machine-config` and `boot-source` go before the drives. Drives and network interfaces go before `InstanceStart`.
 
-## Two creation paths, two boot budgets
+  The snapshot-load path sends no `machine-config` (`configureVMMForLoad` in `driver.go`). It sends `LoadSnapshot` with a network override that points the guest's network card at this sandbox's TAP. Then it sends `PatchDrive` for the rootfs and the overlay. Every other device comes back from the snapshot's state file.
+- **The overlay is sparse.** A requested overlay disk is created as a sparse file. So a 64 GiB overlay uses less than 1 MiB on disk until the guest writes to it.
+- **Snapshot clones resume with stale randomness and a stale clock.** Two clones of one snapshot would otherwise draw identical `getrandom` bytes, and see a time that jumped backwards. After the handshake, the driver sends a best-effort `post_resume` signal (if it fails, the create goes on). The agent sets the clock from the host (`wallclock_unix_ns`) and applies the `network` settings. It then forces a reseed with `RNDADDENTROPY` and `RNDRESEEDCRNG` (`OnPostResume` in `cmd/toolboxd/vsock.go`). Cold boots get the same message; there it mainly re-applies the static network address once the agent is running.
+- **The vsock CID depends on the path.** On the snapshot and warm paths, the guest listens on the template's CID, which was baked into the snapshot at build time. It does not listen on the sandbox's slot CID, so the host dials the template CID for the handshake. AerolVM uses vsock because it survives snapshots; a TCP control channel over the TAP would break on resume.
+- **Snapshot and warm clones share guest memory copy-on-write.** `LoadSnapshot` maps the template's memory image with `MAP_PRIVATE`. On the first write to any page, the kernel's CoW handler gives that VM a private anonymous page and leaves the file untouched. The full memory model is in [How clones share memory](/firecracker-hydration/#how-clones-share-memory-copy-on-write).
+- **`track_dirty_pages` is a separate feature.** It *finds* changed pages for diff snapshots, and does not redirect writes. Turning it on costs a VM exit (a trip from the guest back to the host) on each first write to a page.
+
+## Boot-time budget
+
+This section compares the two ways to create a Firecracker sandbox, and how long each takes.
 
 | Path | How | Boot time |
 |---|---|---|
-| **Ad-hoc** | Pass any OCI image (`ubuntu:22.04`). The daemon builds a Firecracker rootfs on demand. | 10–60 seconds per create |
-| **Template-backed** | Pre-build a rootfs + snapshot once, then pass `template_id`. Snapshot-load, or a warm-pool hit. | Sub-100ms on a warm-pool hit; snapshot-load is a few hundred ms |
+| **Ad-hoc** | Pass any OCI image, such as `ubuntu:22.04`. The server builds a Firecracker rootfs when you ask. | 10 to 60 seconds per create |
+| **Template-backed** | Build a rootfs and snapshot once, then pass `template_id`. You get a snapshot load or a warm-pool hit. | Under 100 ms on a warm-pool hit; a few hundred ms for a snapshot load |
 
-The driver picks the branch from the request alone - there is no separate API.
-Creating a Firecracker sandbox looks the same regardless of which path runs
-underneath:
+The warm-hit target is a timeout inside the driver, not a published benchmark. The time it saves is real, but the exact number depends on the kind of host, the kernel size and the warm-pool depth.
+
+The driver picks the branch from the request alone; there is no separate API. Creating a Firecracker sandbox looks the same whichever path runs underneath. To take the template path, add the template id: `templateId` in TypeScript and Python, `TemplateID` in Go, `template_id` in Rust and `setTemplateId` in Java.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -342,22 +290,19 @@ underneath:
   </TabItem>
 </Tabs>
 
-## Next
-
-The warm-hit budget above is an internal driver timeout, not a published
-benchmark; the cost it avoids is real, but the headline number depends on host
-class, kernel size, and warm-pool depth.
-[Snapshot restore and the warm-VMM pool](/firecracker-hydration) covers how the
-rootfs, kernel snapshot, and live VMM are pre-warmed, restored, and shared
-across a host, and what AerolVM still doesn't do today (UFFD, huge pages,
-diff-snapshot API).
-
 ## Further reading
 
-The primary sources behind the design on these two pages:
+These are the primary sources behind the design on this page and on [Firecracker snapshot restore](/firecracker-hydration/):
 
-- [Firecracker: Lightweight Virtualization for Serverless Applications](https://www.usenix.org/conference/nsdi20/presentation/agache) (USENIX NSDI 2020): the foundational paper on the VMM design AerolVM builds on.
-- [Firecracker snapshotting](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md) - the upstream spec for `LoadSnapshot`, diff snapshots, the dirty bitmap, and the `File` vs `Uffd` memory backends behind the [copy-on-write model](/firecracker-hydration#memory-copy-on-write-clones).
-- [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) - chroot + cgroups + privilege drop; the source for the microVM anatomy above.
-- [Firecracker network setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md) - TAP-device guest networking, the basis for the TAP slot pool.
-- [Firecracker REST API](https://github.com/firecracker-microvm/firecracker/blob/main/src/firecracker/swagger/firecracker.yaml) - the wire contract for every `Put`/`Patch`/`Action` call in the boot sequence.
+- [Firecracker: Lightweight Virtualization for Serverless Applications](https://www.usenix.org/conference/nsdi20/presentation/agache) (USENIX NSDI 2020): the founding paper on the VMM design AerolVM builds on.
+- [Firecracker snapshotting](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md): the Firecracker spec for `LoadSnapshot`, diff snapshots, the dirty bitmap, and the `File` and `Uffd` memory backends behind the [copy-on-write model](/firecracker-hydration/#how-clones-share-memory-copy-on-write).
+- [Firecracker jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md): chroot, cgroups and privilege drop; the source for the microVM layout above.
+- [Firecracker network setup](https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md): guest networking over TAP devices, the basis for the TAP slot pool.
+- [Firecracker REST API](https://github.com/firecracker-microvm/firecracker/blob/main/src/firecracker/swagger/firecracker.yaml): the wire contract for every `Put`, `Patch` and `Action` call in the boot sequence.
+
+## Next steps
+
+- [Firecracker snapshot restore](/firecracker-hydration/): how the rootfs, snapshot and live VMs are prepared, restored and shared, and what is not built yet (UFFD, huge pages, a diff-snapshot API).
+- [Firecracker](/firecracker-sandbox/): create and use Firecracker sandboxes.
+- [Firecracker templates](/firecracker-templates/): build the templates that make fast starts possible.
+- [Correct snapshot clones](/engineering-snapshot-correctness/): what can go wrong when many VMs resume from one snapshot.

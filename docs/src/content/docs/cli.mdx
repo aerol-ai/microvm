@@ -1,54 +1,83 @@
 ---
 title: aerolvm CLI
-description: Open a shell in a sandbox, or drive sandboxes from a script, CI, or an AI coding agent, with the aerolvm command.
+description: Open a shell in a sandbox, run commands, copy files and share ports from your terminal, a script, CI or an AI agent.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-`aerolvm` opens a shell in a sandbox, runs commands in it, copies files and exposes ports from a terminal. It is built for scripts and AI coding agents as much as for people: stdout carries only data, every command has a `--json` form, and retries are safe. The same binary is also an MCP server; see [MCP Server](/mcp).
+`aerolvm` is a command-line tool for AerolVM. It opens a shell in a sandbox, runs commands, copies files and shares ports, all from your terminal. It talks to the same server API as the SDKs, so it works with a local install, a single server or a cluster.
 
-It is a thin client over the same API the SDKs use, so it works against a local daemon, a single node or a cluster.
+It is built for scripts and AI agents as much as for people. Normal output carries only data, every command can print JSON, and repeating a command is safe. The same program is also an [MCP server](/mcp/) for AI coding tools.
 
 ## Install
 
-Pick one. Every option installs the same static binary, for Linux, macOS and Windows on x64 and arm64.
+Every option installs the same single program. It runs on Linux, macOS and Windows, on 64-bit Intel or ARM chips.
 
-| Option | Command | Notes |
-|---|---|---|
-| npm | `npm install -g @aerol-ai/aerolvm` | Or run it without installing: `npx -y @aerol-ai/aerolvm --help`. |
-| Installer | the [Local Setup](/getting-started/local-setup) one-liner, with `--cli-only` in place of `--local` | Linux and macOS. Checks the release checksum. Needs no root: without it, installs to `~/.local/bin`. |
-| Go | `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest` | Builds from source. |
-| Download | `aerolvm_<os>_<arch>` from the [GitHub releases](https://github.com/aerol-ai/microvm/releases) | Verify it against the release's `checksums.txt`. |
+**With the installer** (Linux and macOS):
 
-Then sign in once and check the connection:
+```bash
+curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- --cli-only
+```
 
-```sh
+`--cli-only` installs just the CLI: no server, no Docker, and no admin rights needed. The installer picks the right file for your machine and checks it against the release's checksums. Without admin rights it installs to `~/.local/bin`.
+
+**With Go:**
+
+```bash
+go install github.com/aerol-ai/microvm/cmd/aerolvm@latest
+```
+
+**By hand:** download `aerolvm_<os>_<arch>` from the [GitHub releases](https://github.com/aerol-ai/microvm/releases). The `os` is `linux`, `darwin` (macOS) or `windows`, and the `arch` is `amd64` or `arm64`. The Windows file ends in `.exe`. Check it against the release's `checksums.txt`, make it executable, and put it on your `PATH`.
+
+**With npm:** coming soon. The `@aerol-ai/aerolvm` package is not published yet, so `npm install -g @aerol-ai/aerolvm` and `npx @aerol-ai/aerolvm` do not work today.
+
+<Aside type="caution" title="Some commands are newer than the latest release">
+`aerolvm shell`, `aerolvm login`, `aerolvm logout` and the `-i` and `-t` flags of `exec` are not in release v0.6.5. Until the next release, install from the main branch with `go install github.com/aerol-ai/microvm/cmd/aerolvm@main`. Or skip `login` and set `SB_API_URL` and `SB_PAT_TOKEN`, as shown below.
+</Aside>
+
+## Sign in
+
+Sign in once, then check the connection:
+
+```bash
 aerolvm login https://sandbox.example.com
 aerolvm health
 ```
 
-`aerolvm login` asks for your API token with typing hidden, checks it against sandboxd, and saves it in `~/.config/aerolvm/config.json`, readable only by you. Run it with no URL to use the [local setup](/getting-started/local-setup) address, `http://127.0.0.1:21212`. The token is the one sandboxd runs with; the local setup prints it when it installs. `aerolvm logout` forgets it again. Logging out only removes the token from this machine; the token itself stays valid on sandboxd.
+`aerolvm login` asks for your API token, with typing hidden. It checks the token with the server, then saves it in `~/.config/aerolvm/config.json`, where only you can read it. With no URL, it uses the local install's address, `http://127.0.0.1:21212`. The token is the one your server was installed with; the local install prints it when it finishes.
 
-In CI or a script, pipe the token in with `aerolvm login <url> --token-stdin`, or set the variables every SDK reads, `SB_API_URL` and `SB_PAT_TOKEN`. When `SB_PAT_TOKEN` is set it takes precedence over the login. The saved token is only ever sent to the URL it was saved for: if `SB_API_URL` points at another server, aerolvm asks you to log in to that one instead.
+`aerolvm logout` forgets the saved login on this machine. The token itself keeps working on the server.
+
+**In CI or a script,** pipe the token in with `aerolvm login <url> --token-stdin`. Or set the same two variables every SDK reads:
+
+| Variable | What it is |
+|---|---|
+| `SB_API_URL` | Your server's address. Defaults to your login, then `http://127.0.0.1:21212`. |
+| `SB_PAT_TOKEN` | Your API token. When set, it wins over the saved login. |
+
+The saved token is only ever sent to the address it was saved for. If `SB_API_URL` points at a different server, `aerolvm` asks you to log in to that one.
 
 ## Open a shell in a sandbox
 
-```sh
+```bash
 aerolvm shell build-box
 ```
 
-You get a login shell inside the sandbox: bash, or `sh` when the image has no bash. Run `aerolvm shell` with no name to choose from your sandboxes. Any sandbox you can reach works, including ones your application created through an SDK; you don't need to create it from the CLI.
+You get a login shell inside the sandbox: `bash`, or `sh` when the image has no bash. Run `aerolvm shell` with no name to pick from a list of your sandboxes. Any sandbox works, including ones your app created with an SDK.
 
 - **The shell keeps running when you leave.** `Ctrl-]` detaches, and so does closing the terminal or losing the network. Run the same command again to get back in, with the shell's recent output on screen. `exit` or `Ctrl-D` ends the shell.
-- **Stopping or destroying the sandbox ends the shell.** When the connection drops, `aerolvm shell` asks sandboxd what happened and says whether the shell is still there to reopen.
-- **One shared shell per name.** Two terminals on the same sandbox share its `default` shell, like tmux, and an [SSH login](/ssh-access) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
-- **It behaves like a local terminal.** Resizing the window resizes the remote terminal, so `vim`, `top` and `less` redraw to fit. The shell gets a `TERM` the image knows: your own when it is a common one, and `xterm-256color` otherwise.
-- A stopped sandbox is started first. WASM and isolate sandboxes have no shell, and neither does an image without bash or `sh` (distroless, `scratch`).
-- `shell` needs a terminal. Scripts and agents use [`exec`](#running-commands).
+- **Stopping or deleting the sandbox ends the shell.** When the connection drops, `aerolvm shell` asks the server what happened. It tells you whether the shell is still there to reopen.
+- **One shared shell per name.** Two terminals on the same sandbox share its `default` shell, like `tmux`. An [SSH login](/ssh-access/) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
+- **It acts like a local terminal.** Resizing your window resizes the remote one, so `vim`, `top` and `less` redraw to fit.
+- **A stopped sandbox is started first.**
+- **Some sandboxes have no shell.** These are WebAssembly and V8 isolate sandboxes, and images without `bash` or `sh` (such as distroless or `scratch` images).
+- **`shell` needs a real terminal.** Scripts and agents use [`exec`](#run-commands) instead.
+
+These shells are [terminal sessions](/sessions/), so the SDK can see and manage them too.
 
 ## A first session
 
-```sh
+```bash
 aerolvm create --name build-box --image python:3.12 --destroy-if-idle 2h
 aerolvm cp ./requirements.txt build-box:/work/requirements.txt
 aerolvm exec build-box --cwd /work -- "pip install -r requirements.txt && python -V"
@@ -57,122 +86,140 @@ aerolvm expose build-box 8000
 aerolvm destroy build-box
 ```
 
-`expose` prints the public URL. Sandboxes are [private by default](/network-isolation/), and `expose` is what makes a port reachable.
+1. `create` starts a sandbox named `build-box` that deletes itself after 2 hours with no activity.
+2. `cp` copies a file into it.
+3. `exec` runs a command in it and prints the output.
+4. `exec --background` starts a web server that keeps running.
+5. `expose` prints a public web address for port 8000. Sandboxes are [private by default](/network-isolation/), and `expose` is what makes a port reachable.
+6. `destroy` deletes the sandbox.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `shell` | Open an interactive shell in a sandbox (`--new`, `--session`) |
-| `exec` | Run a command and stream its output |
-| `cp` | Copy a file between this machine and a sandbox (`<sandbox>:<path>`; `-` is stdin or stdout) |
-| `ls` | List a directory in a sandbox |
-| `logs` | Print a background command's output (`--follow` to keep streaming) |
-| `expose` | Publish a sandbox port and print its URL (`--tcp` for raw TCP) |
-| `list` | List sandboxes, one page at a time (`--tag`, `--limit`, `--page-token`) |
-| `get` | Show one sandbox |
-| `create` | Create a sandbox, or return the existing one with that name |
-| `start` / `stop` | Start or stop sandboxes; stopping keeps the files |
-| `destroy` | Destroy sandboxes; one that is already gone counts as destroyed |
-| `snapshot` | Save a sandbox's filesystem as an image other sandboxes can start from |
-| `login` / `logout` | Save the sandboxd URL and token for every command, or forget them |
-| `health` | Check that sandboxd is reachable and the token works |
-| `version` | Print the version |
-| `mcp` | Run the [MCP server](/mcp) over stdio, or print client setup |
+| `shell` | Open an interactive shell in a sandbox (`--new`, `--session`). |
+| `exec` | Run a command and stream its output. |
+| `cp` | Copy a file between this machine and a sandbox. Write a sandbox path as `<sandbox>:<path>`. Use `-` for your input or output. |
+| `ls` | List a folder in a sandbox. |
+| `logs` | Print a background command's output (`--follow` keeps printing). |
+| `expose` | Publish a sandbox port and print its address (`--tcp` for raw TCP). |
+| `list` | List sandboxes, one page at a time (`--tag`, `--limit`, `--page-token`). |
+| `get` | Show one sandbox. |
+| `create` | Create a sandbox, or return the one that already has that name. |
+| `start` / `stop` | Start or stop sandboxes. Stopping keeps their files. |
+| `destroy` | Delete sandboxes. One that is already gone counts as deleted. |
+| `snapshot` | Save a sandbox's files as an image other sandboxes can start from. |
+| `login` / `logout` | Save the server address and token for every command, or forget them. |
+| `health` | Check that the server answers and the token works. |
+| `version` | Print the version. |
+| `mcp` | Run the [MCP server](/mcp/), or print setup for an MCP client. |
 
-`aerolvm <command> --help` prints that command's flags, examples and JSON shape. The help is written for agents to read: it is short, and it is the reference for anything this page leaves out.
+`aerolvm <command> --help` prints that command's flags, examples and JSON shape. The help is short and written so agents can read it. It is the full reference for anything this page leaves out.
 
-A sandbox is addressed as `<id-or-name>`. Anything shaped like a generated ID (`sb-` followed by 16 hex digits) is an ID, and anything else is a name. Names are [unique per account](/sandboxes#named-sandboxes).
+You name a sandbox by its ID or its name. Anything shaped like a generated ID (`sb-` and 16 hex digits) is read as an ID, and anything else as a name. Names are [unique in your account](/sandboxes/#give-the-sandbox-a-name).
 
-## Safe to retry
+## Run commands
 
-`create` is keyed by name. If you already have a sandbox with that name, `create` returns it instead of making a second one, and `--json` reports `"created": false`. Without `--name`, aerolvm picks a name (`agent-` plus random characters) before the first attempt, so a retry after a dropped connection finds the sandbox that attempt made.
+One argument after `--` runs as a shell command line, so pipes and `&&` work. Several arguments are quoted and joined.
 
-Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`, unless you set that tag yourself. `aerolvm list --tag aerolvm.created_by=cli` finds them.
+```bash
+aerolvm exec build-box -- "make test | tail -50"
+aerolvm exec build-box --cwd /app --env CI=1 --timeout 15m -- npm test
+```
 
-`destroy` and `expose` are safe to repeat too. Destroying a sandbox that is already gone succeeds, and repeating `expose` returns the same URL.
+| Flag | What it does |
+|---|---|
+| `--cwd D` | Run in this folder. |
+| `--env K=V` | Set an environment variable. Repeat it for more. |
+| `--timeout D` | Stop the command after this long, such as `10m`, and exit with code 124. |
+| `--background` | Start the command and return at once. It prints a session ID. |
+| `--no-stdin` | Never pass your input to the command. |
+| `-i` | Pass your input even when it is a terminal. |
+| `-t` | Give the command a terminal. `-it` does both, as in `docker exec`. |
+| `--json` | Wait for the command, then print one JSON result. |
+
+- **Output streams live** as the command prints it.
+- **Your input is passed along** when it is not a terminal, so `echo hi | aerolvm exec box -- cat` works. Some agent tools leave input open and never close it. A command that reads input then waits until `--timeout`, so pass `--no-stdin` there.
+- **Interactive programs:** `aerolvm exec box -it -- htop` works like `docker exec`. For a shell, use [`aerolvm shell`](#open-a-shell-in-a-sandbox): it survives a dropped connection, and `exec` does not.
+- **Stopping:** `--timeout` and `Ctrl-C` both stop the command inside the sandbox, not just the local program. If the connection drops, the sandbox stops the command too. See [If the connection drops](/exec-streaming/#if-the-connection-drops).
+- **Background commands:** `--background` starts the command as a [session](/sessions/) and prints its ID. Read its output with `aerolvm logs <sandbox> <session-id> --follow`.
+- **With `--json`,** the result holds `exit_code`, `stdout` and `stderr`. Each stream keeps its first 4 KB and last 12 KB, and the result says how much was cut.
+- **A stopped sandbox** is started before the command runs.
 
 ## Output for scripts and agents
 
-Stdout is data and stderr is everything else: progress, notes and errors. Pass `--json`, or set `AEROLVM_OUTPUT=json` once, to get one JSON document on stdout. With `--json`, an error is printed on stderr as:
+Normal output (stdout) is data. Everything else goes to the error stream (stderr): progress, notes and errors. Pass `--json`, or set `AEROLVM_OUTPUT=json` once, to get one JSON document on stdout. With `--json`, an error is printed to stderr like this:
 
 ```json
 {"error":{"code":"not_found","message":"sandbox \"build-box\" not found","http_status":404,"retryable":false}}
 ```
 
-The `code` field is stable and is the field to branch on. The common ones are `not_found`, `conflict`, `invalid_argument`, `unauthorized`, `unavailable`, `timeout`, `server_unsupported` and `unsupported_runtime`. `retryable` says whether repeating the same call can succeed.
+Branch on the `code` field: it does not change between versions. Common codes are `not_found`, `conflict`, `invalid_argument`, `unauthorized`, `unavailable`, `timeout`, `server_unsupported` and `unsupported_runtime`. `retryable` says whether trying the same call again can work.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success |
-| `1` | The command failed |
-| `2` | Bad usage: an unknown flag or a missing argument |
+| `0` | It worked. |
+| `1` | The command failed. |
+| `2` | Bad usage, such as an unknown flag or a missing argument. |
 
-`exec` and `shell` exit with the remote command's own code instead. They exit with `128+n` when signal `n` killed the command, and `125` when aerolvm itself failed before the command produced an exit code. `exec` exits with `124` when `--timeout` fired, and `shell` exits with `0` when you detach.
+`exec` and `shell` exit with the remote command's own code instead. They use `128+n` when signal `n` killed the command, and `125` when `aerolvm` itself failed before the command finished. `exec` exits with `124` when `--timeout` fired. `shell` exits with `0` when you detach.
 
-## Running commands
+## Safe to repeat
 
-One argument after `--` runs as a shell command line, so pipes and `&&` work. Several arguments are quoted and joined.
+`create` looks up the name first. If you already have a sandbox with that name, `create` returns it instead of making a second one, and `--json` reports `"created": false`. Without `--name`, `aerolvm` picks a name (`agent-` and random characters) before its first try. So a retry after a dropped connection finds the sandbox that the first try made.
 
-```sh
-aerolvm exec build-box -- "make test | tail -50"
-aerolvm exec build-box --cwd /app --env CI=1 --timeout 15m -- npm test
-```
+Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`, unless you set that tag yourself. `aerolvm list --tag aerolvm.created_by=cli` finds them.
 
-- **Live output.** Output streams as it is produced. With `--json`, aerolvm waits for the command and prints `{"exit_code","stdout","stderr",...}`. Each stream keeps its first 4 KiB and last 12 KiB, and the result says how much was cut.
-- **Stdin.** aerolvm forwards stdin when it is not a terminal, so `echo hi | aerolvm exec box -- cat` works. Some agent harnesses leave stdin open and never close it. A command that reads stdin then waits until `--timeout`, so pass `--no-stdin` there. Pass `-i` to forward a terminal's stdin, and `-t` for an interactive terminal; `-it` does both, as in `docker exec`, so `aerolvm exec box -it -- htop` works. For a shell, use [`aerolvm shell`](#open-a-shell-in-a-sandbox): it survives a dropped connection, which an `exec` doesn't.
-- **Stopping.** `--timeout` and Ctrl-C both kill the remote command, not just the local client. If the connection drops, the sandbox kills the command too. See [When the connection drops](/exec-streaming#when-the-connection-drops).
-- **Background commands.** `--background` starts the command, prints a session ID, and returns. Read its output with `aerolvm logs <sandbox> <session-id> --follow`.
-- **Stopped sandboxes** start before the command runs.
+`destroy` and `expose` are safe to repeat too. Deleting a sandbox that is already gone succeeds, and repeating `expose` returns the same address.
 
-### Runtime differences
+## Limit outbound network
 
-- **WASM sandboxes** have no streaming exec. `exec` runs the command buffered, without stdin, and prints the output when it finishes. `-i`, `-t` and `shell` are refused.
-- **Isolate sandboxes** run a single `fetch` handler, with no shell and no filesystem. `shell`, `exec`, `cp` and `ls` return `unsupported_runtime`; use the SDK's invoke call instead. See [Isolate Sandbox](/isolate-sandbox).
+`--allow-host` gives a new sandbox an allow list: it can reach only the places you name, and everything else is refused. Repeat the flag or pass a comma list. An entry is a host name, a `*.` wildcard, `host:port`, or an IP range in CIDR form (such as `10.0.0.0/8`).
 
-## Limiting outbound network
-
-`--allow-host` gives a new sandbox an allow list: it reaches only the destinations you name, and everything else is refused. Repeat the flag or pass a comma list. An entry is a host, a `*.` wildcard, `host:port` or a CIDR.
-
-```sh
+```bash
 aerolvm create --name build-box --image python:3.12 --allow-host pypi.org --allow-host '*.pythonhosted.org'
 aerolvm create --name deploy --allow-host github.com:22,10.0.0.0/8
 ```
 
-`--block-network` turns outbound traffic off entirely, so it can't be combined with `--allow-host`. To change the list of a running sandbox, use `setNetworkPolicy` from an SDK. [Egress Domain Filtering](/egress-domain-filtering) covers the rules and how a denial is reported.
+`--block-network` turns outbound traffic off completely, so you cannot combine it with `--allow-host`. To change the list of a running sandbox, use `setNetworkPolicy` from an SDK. [Allow only some websites](/egress-domain-filtering/) explains the rules and how a refused connection is reported.
+
+## Differences between sandbox types
+
+- **WebAssembly sandboxes** have no streamed commands. `exec` runs the command, waits, and prints the output when it ends. It passes no input, and `-i`, `-t` and `shell` are refused.
+- **V8 isolate sandboxes** run a single request handler, with no shell and no files. `shell`, `exec`, `cp` and `ls` fail with `unsupported_runtime`; call the handler from an SDK instead. See [V8 isolate](/isolate-sandbox/).
 
 ## Debugging
 
-`--debug` logs every API request and response status to stderr. The token is redacted.
+`--debug` prints every API request and response status to stderr. The token is hidden.
 
 ## Same thing from the SDK
 
-The [first session](#a-first-session) in each SDK: get or create a named sandbox, run a command, and destroy it.
+The [first session](#a-first-session) in each SDK: get or create a sandbox named `build-box`, run a command, and delete it.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox =
-      (await client.getByName('build-box')) ??
-      (await client.create({ name: 'build-box', image: 'python:3.12' }))
+      (await client.getByName("build-box")) ??
+      (await client.create({ name: "build-box", image: "python:3.12" }));
 
-    const result = await sandbox.exec({ command: 'python -V' })
-    console.log(result.exitCode, result.stdout)
+    const result = await sandbox.exec("python -V");
+    console.log(result.exitCode, result.stdout);
 
-    await sandbox.destroy()
+    await sandbox.destroy();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.get_by_name('build-box') or client.create({
-        'name': 'build-box',
-        'image': 'python:3.12',
-    })
+    sandbox = client.get_by_name("build-box") or client.create(
+        name="build-box",
+        image="python:3.12",
+    )
 
-    result = sandbox.exec_command('python -V')
-    print(result['exit_code'], result['stdout'])
+    result = sandbox.exec("python -V")
+    print(result["exitCode"], result["stdout"])
 
     sandbox.destroy()
     ```
@@ -204,16 +251,13 @@ The [first session](#a-first-session) in each SDK: get or create a named sandbox
     let sandbox = match client.get_by_name("build-box")? {
         Some(sandbox) => sandbox,
         None => client.create(CreateOptions {
-            name: Some("build-box".to_string()),
-            image: "python:3.12".to_string(),
+            name: Some("build-box".into()),
+            image: "python:3.12".into(),
             ..Default::default()
         })?,
     };
 
-    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
-        command: "python -V".to_string(),
-        ..Default::default()
-    })?;
+    let result = sandbox.exec("python -V")?;
     println!("{} {}", result.exit_code, result.stdout);
 
     sandbox.destroy()?;
@@ -227,7 +271,7 @@ The [first session](#a-first-session) in each SDK: get or create a named sandbox
         return client.create(options);
     });
 
-    ExecResult result = sandbox.exec(new ExecOptions().setCommand("python -V"));
+    ExecResult result = sandbox.exec("python -V");
     System.out.println(result.exitCode + " " + result.stdout);
 
     sandbox.destroy();
@@ -235,4 +279,11 @@ The [first session](#a-first-session) in each SDK: get or create a named sandbox
   </TabItem>
 </Tabs>
 
-Two clients that race to create the same name both succeed: one creates the sandbox, and the other gets HTTP 409 Conflict and should look the name up again. The CLI does that for you.
+If two programs race to create the same name, both calls succeed. One creates the sandbox. The other gets HTTP 409 (Conflict) and should look the name up again. The CLI does that for you.
+
+## Next steps
+
+- [MCP server](/mcp/): give an AI coding tool its own sandboxes through the same program.
+- [Run commands](/exec-streaming/): what `exec` does, from the SDK side.
+- [Terminal sessions](/sessions/): the shells and background commands behind `shell` and `--background`.
+- [SDK setup](/sdk-setup/): drive sandboxes from your own code.

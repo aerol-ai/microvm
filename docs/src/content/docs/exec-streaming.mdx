@@ -1,114 +1,225 @@
 ---
-title: Process & Code Execution
+title: Run commands
+description: Run a shell command in a sandbox, read its output and exit code, or watch its output live while it runs.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-`exec` runs a command, buffers its full output, and returns when the command exits. Use it for short, non-interactive commands.
+You run programs in a sandbox the way you would in a terminal. You send a command, and you get back what it printed. There are two ways to do it:
 
-`execStream` opens a live WebSocket connection that streams stdout/stderr in real time, accepts stdin, and optionally allocates a pseudo-terminal (PTY) for interactive programs like `bash`, `vim`, or `top`.
+- **`exec`** runs a command, waits for it to finish, and returns all of its output at once. Use it for short commands like `ls`, `pip install` or `python script.py`.
+- **`execStream`** hands you the output while the command is still running, and lets you type into it. Use it for long builds, live logs and interactive programs.
 
-## When to use which
-
-| Use case | Method |
-|---|---|
-| `ls`, `git status`, anything short and non-interactive | `exec` |
-| `npm install`, `make`, anything where you want live output | `execStream` |
-| `bash`, `python -i`, `vim`, anything interactive | `execStream` with `tty: true` |
-| Multi-gigabyte output | `execStream` |
-
-## One-shot exec
+## Run a command
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const result = await sandbox.exec({ command: 'echo hello' })
-    console.log(result.stdout)  // "hello\n"
-    console.log(result.exitCode)
-
-    // With working directory and environment variables
-    const result2 = await sandbox.exec({
-      command: 'node index.js',
-      workDir: '/workspace',
-      env: { NODE_ENV: 'production' },
-      timeoutSeconds: 30,
-    })
+    const result = await sandbox.exec("echo hello");
+    console.log(result.stdout);   // hello
+    console.log(result.exitCode); // 0
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    result = sandbox.exec_command('echo hello')
-    print(result['stdout'])   # "hello\n"
-    print(result['exit_code'])
-
-    # With options
-    result2 = sandbox.exec_command('node index.js', workdir='/workspace', env={'NODE_ENV': 'production'})
+    result = sandbox.exec("echo hello")
+    print(result["stdout"])    # hello
+    print(result["exitCode"])  # 0
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     result, err := sandbox.ExecCommand(ctx, "echo hello")
-    if err != nil { log.Fatal(err) }
-    fmt.Println(result.Stdout)
-
-    // With full options
-    result2, err := sandbox.Exec(ctx, sdktypes.ExecOptions{
-        Command:        "node index.js",
-        Workdir:        "/workspace",
-        Env:            map[string]string{"NODE_ENV": "production"},
-        TimeoutSeconds: 30,
-    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)     // hello
+    fmt.Println(result.ExitCode) // 0
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let result = sandbox.exec(aerolvm_sdk::ExecRequest {
-        command: "echo hello".to_string(),
-        ..Default::default()
-    })?;
-    println!("{}", result.stdout);
-
-    // With options
-    let result2 = sandbox.exec(aerolvm_sdk::ExecRequest {
-        command:         "node index.js".to_string(),
-        work_dir:        Some("/workspace".to_string()),
-        timeout_seconds: Some(30),
-        ..Default::default()
-    })?;
+    let result = sandbox.exec("echo hello")?;
+    print!("{}", result.stdout);      // hello
+    println!("{}", result.exit_code); // 0
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    ExecResult result = sandbox.exec(new ExecOptions().setCommand("echo hello"));
-    System.out.println(result.stdout);   // "hello\n"
-    System.out.println(result.exitCode);
-
-    // With options
-    ExecResult result2 = sandbox.exec(
-        new ExecOptions()
-            .setCommand("node index.js")
-            .setWorkDir("/workspace")
-            .setEnv(Map.of("NODE_ENV", "production"))
-            .setTimeoutSeconds(30)
-    );
+    ExecResult result = sandbox.exec("echo hello");
+    System.out.print(result.stdout);     // hello
+    System.out.println(result.exitCode); // 0
     ```
   </TabItem>
 </Tabs>
 
-## Live streaming output
+The command runs in a shell (`/bin/sh`), so pipes (`|`), `&&` and variables like `$HOME` all work. The call returns when the command exits.
+
+## What you get back
+
+| What | TypeScript and Python | Go | Rust | Java |
+|---|---|---|---|---|
+| What the command printed | `stdout` | `Stdout` | `stdout` | `stdout` |
+| Error messages it printed | `stderr` | `Stderr` | `stderr` | `stderr` |
+| Exit code | `exitCode` | `ExitCode` | `exit_code` | `exitCode` |
+| How long it ran, in milliseconds | `durationMS` | `DurationMS` | `duration_ms` | `durationMs` |
+
+In Python the result is a dictionary, so you read `result["stdout"]`. An exit code of `0` means the command worked. Any other number means it failed, and `-1` means it was stopped by a signal.
+
+## Check whether a command worked
+
+A command that fails does not raise an error in your code. Check the exit code yourself.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec("ls /does-not-exist");
+    if (result.exitCode !== 0) {
+      console.log(`failed (exit code ${result.exitCode}): ${result.stderr}`);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec("ls /does-not-exist")
+    if result["exitCode"] != 0:
+        print(f"failed (exit code {result['exitCode']}): {result['stderr']}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.ExecCommand(ctx, "ls /does-not-exist")
+    if err != nil {
+        log.Fatal(err)
+    }
+    if result.ExitCode != 0 {
+        fmt.Printf("failed (exit code %d): %s", result.ExitCode, result.Stderr)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let result = sandbox.exec("ls /does-not-exist")?;
+    if result.exit_code != 0 {
+        print!("failed (exit code {}): {}", result.exit_code, result.stderr);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec("ls /does-not-exist");
+    if (result.exitCode != 0) {
+        System.out.print("failed (exit code " + result.exitCode + "): " + result.stderr);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+```text
+failed (exit code 2): ls: cannot access '/does-not-exist': No such file or directory
+```
+
+The SDK raises an error only when the command cannot start at all. For example, the command is empty or its working directory does not exist.
+
+## Set the folder, variables and time limit
+
+Pass an options object instead of a string to choose where the command runs, add environment variables, or set a time limit.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const result = await sandbox.exec({
+      command: "echo $GREETING from $(pwd)",
+      workDir: "/tmp",
+      env: { GREETING: "hello" },
+      timeoutSeconds: 30,
+    });
+    console.log(result.stdout); // hello from /tmp
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    result = sandbox.exec({
+        "command": "echo $GREETING from $(pwd)",
+        "workDir": "/tmp",
+        "env": {"GREETING": "hello"},
+        "timeoutSeconds": 30,
+    })
+    print(result["stdout"])  # hello from /tmp
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    result, err := sandbox.Exec(ctx, sdktypes.ExecRequest{
+        Command:        "echo $GREETING from $(pwd)",
+        WorkDir:        "/tmp",
+        Env:            map[string]string{"GREETING": "hello"},
+        TimeoutSeconds: 30,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout) // hello from /tmp
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecRequest;
+    use std::collections::HashMap;
+
+    let result = sandbox.exec(ExecRequest {
+        command: "echo $GREETING from $(pwd)".into(),
+        work_dir: Some("/tmp".into()),
+        env: Some(HashMap::from([("GREETING".to_string(), "hello".to_string())])),
+        timeout_seconds: Some(30),
+    })?;
+    print!("{}", result.stdout); // hello from /tmp
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecResult result = sandbox.exec(new ExecRequest()
+        .setCommand("echo $GREETING from $(pwd)")
+        .setWorkDir("/tmp")
+        .setEnv(Map.of("GREETING", "hello"))
+        .setTimeoutSeconds(30));
+    System.out.print(result.stdout); // hello from /tmp
+    ```
+  </TabItem>
+</Tabs>
+
+| Option | What it does | Default |
+|---|---|---|
+| `workDir` | The folder the command starts in. It must already exist. | The image's working folder, often `/` |
+| `env` | Extra environment variables for this one command. They are added to the sandbox's own variables. | None |
+| `timeoutSeconds` | The longest the command may run before it is stopped. | 300 (5 minutes) |
+
+The tabs above show how each language spells these names. Python also accepts `workdir` and `timeout_seconds`.
+
+When the time limit runs out, the result has exit code `-1` and `stderr` says `signal: killed`.
+
+<Aside type="caution" title="The time limit stops the shell, not always what it started">
+`timeoutSeconds` stops the shell that runs your command. A program the shell started can keep running, and the call waits for it. On our test server, `sleep 10` with a 2-second limit still took 10 seconds to return. For a hard limit, put `timeout` in the command itself: `timeout 30 npm test` stops after 30 seconds and exits with code `124`.
+</Aside>
+
+## Watch output while a command runs
+
+`execStream` returns a handle right away. Your callbacks get each piece of output as the command prints it. Wait on the handle to get the exit code.
+
+This example runs `npm install` in a Node.js sandbox that has a project in `/workspace`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const handle = sandbox.execStream({
-      command:   'npm install',
-      workdir:   '/workspace',
-      onStdout:  chunk => process.stdout.write(chunk),
-      onStderr:  chunk => process.stderr.write(chunk),
-    })
+      command: "npm install",
+      workdir: "/workspace",
+      onStdout: (chunk) => process.stdout.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+    });
 
-    const { code } = await handle.done
-    console.log(`exited with ${code}`)
+    const { code } = await handle.done;
+    console.log(`exited with ${code}`);
     ```
   </TabItem>
   <TabItem label="Python">
@@ -116,10 +227,10 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     import sys
 
     handle = sandbox.exec_stream({
-        'command':  'npm install',
-        'workdir':  '/workspace',
-        'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
-        'onStderr': lambda chunk: sys.stderr.buffer.write(chunk),
+        "command": "npm install",
+        "workdir": "/workspace",
+        "onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
+        "onStderr": lambda chunk: sys.stderr.buffer.write(chunk),
     })
 
     print(handle.wait())  # {'code': 0}
@@ -128,71 +239,81 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
   <TabItem label="Go">
     ```go
     handle, err := sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{
-        Command: "npm install",
-        Workdir: "/workspace",
+        Command:  "npm install",
+        Workdir:  "/workspace",
         OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
         OnStderr: func(chunk []byte) { os.Stderr.Write(chunk) },
     })
-    if err != nil { log.Fatal(err) }
+    if err != nil {
+        log.Fatal(err)
+    }
 
     exit, err := handle.Wait()
-    fmt.Println(exit.Code, exit.Signal)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println("exited with", exit.Code)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::ExecStreamOptions;
     use std::sync::Arc;
 
-    let handle = sandbox.exec_stream(aerolvm_sdk::ExecStreamOptions {
-        command:   "npm install".to_string(),
-        on_stdout: Some(Arc::new(|chunk| {
-            print!("{}", String::from_utf8_lossy(&chunk))
-        })),
+    let handle = sandbox.exec_stream(ExecStreamOptions {
+        command: "npm install".into(),
+        workdir: Some("/workspace".into()),
+        on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
+        on_stderr: Some(Arc::new(|chunk| eprint!("{}", String::from_utf8_lossy(&chunk)))),
         ..Default::default()
     })?;
 
-    println!("{:?}", handle.wait()?);
+    let exit = handle.wait()?;
+    println!("exited with {}", exit.code);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    ExecStreamHandle handle = sandbox.execStream(
-        new ExecStreamOptions()
-            .setCommand("npm install")
-            .setWorkDir("/workspace")
-            .setOnStdout(chunk ->
-                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
-    );
+    ExecStreamHandle handle = sandbox.execStream(new ExecStreamOptions()
+        .setCommand("npm install")
+        .setWorkDir("/workspace")
+        .setOnStdout(chunk -> System.out.print(new String(chunk, StandardCharsets.UTF_8)))
+        .setOnStderr(chunk -> System.err.print(new String(chunk, StandardCharsets.UTF_8))));
 
     ExecExitInfo exit = handle.waitForExit();
-    System.out.println(exit.code);
+    System.out.println("exited with " + exit.code);
     ```
   </TabItem>
 </Tabs>
 
-## Interactive shell with PTY
+Output arrives as raw bytes, in the pieces the command happened to print. A piece can end in the middle of a line.
 
-In PTY mode, stdout and stderr are merged onto the terminal, so only `onStdout` fires.
+| Option | What it does |
+|---|---|
+| `command` | The shell command to run. Required. |
+| `workdir` | The folder to start in. Note the spelling: `workdir` here, but `workDir` for `exec` in TypeScript and Python. |
+| `env` | Extra environment variables for this command. |
+| `onStdout`, `onStderr` | Called with each piece of output and error output. |
+| `onError` | Called with a message if the stream reports an error. |
+| `tty`, `cols`, `rows` | Run the command in a terminal of this size. See [Run an interactive program](#run-an-interactive-program). |
+
+The exit info has a `code`, and a `signal` name when a signal stopped the command. `execStream` has no time limit option. To stop a command, [send it a signal](#stop-a-command).
+
+## Send input to a command
+
+`write` sends text to the command's input (stdin), as if you typed it. `close` ends the input, like pressing Ctrl-D. The command then keeps running until it exits on its own.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const handle = sandbox.execStream({
-      command:  'bash',
-      tty:      true,
-      cols:     process.stdout.columns,
-      rows:     process.stdout.rows,
-      onStdout: chunk => process.stdout.write(chunk),
-    })
+      command: "wc -l",
+      onStdout: (chunk) => process.stdout.write(chunk),
+    });
 
-    process.stdin.setRawMode?.(true)
-    process.stdin.on('data', chunk => handle.write(chunk))
-
-    process.stdout.on('resize', () => {
-      handle.resize(process.stdout.columns, process.stdout.rows)
-    })
-
-    await handle.done
+    handle.write("one\ntwo\nthree\n");
+    handle.close();
+    await handle.done; // wc prints 3
     ```
   </TabItem>
   <TabItem label="Python">
@@ -200,124 +321,230 @@ In PTY mode, stdout and stderr are merged onto the terminal, so only `onStdout` 
     import sys
 
     handle = sandbox.exec_stream({
-        'command':  'bash',
-        'tty':      True,
-        'cols':     120,
-        'rows':     40,
-        'onStdout': lambda chunk: sys.stdout.buffer.write(chunk),
+        "command": "wc -l",
+        "onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
     })
 
-    handle.write('echo hello\n')
+    handle.write("one\ntwo\nthree\n")
+    handle.close()
+    handle.wait()  # wc prints 3
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    handle, err := sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{
+        Command:  "wc -l",
+        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    handle.WriteString("one\ntwo\nthree\n")
+    handle.Close()
+    handle.Wait() // wc prints 3
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExecStreamOptions;
+    use std::sync::Arc;
+
+    let handle = sandbox.exec_stream(ExecStreamOptions {
+        command: "wc -l".into(),
+        on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
+        ..Default::default()
+    })?;
+
+    handle.write_string("one\ntwo\nthree\n")?;
+    handle.close()?;
+    handle.wait()?; // wc prints 3
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    ExecStreamHandle handle = sandbox.execStream(new ExecStreamOptions()
+        .setCommand("wc -l")
+        .setOnStdout(chunk -> System.out.print(new String(chunk, StandardCharsets.UTF_8))));
+
+    handle.write("one\ntwo\nthree\n");
+    handle.close();
+    handle.waitForExit(); // wc prints 3
+    ```
+  </TabItem>
+</Tabs>
+
+## Run an interactive program
+
+Programs like `bash`, `vim`, `top` and the Python prompt expect a terminal. Set `tty` to true to give the command one. This is a pseudo-terminal (PTY): a fake terminal that makes the program act as if a person is typing at it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const handle = sandbox.execStream({
+      command: "bash",
+      tty: true,
+      cols: process.stdout.columns,
+      rows: process.stdout.rows,
+      onStdout: (chunk) => process.stdout.write(chunk),
+    });
+
+    // Pass every key you press straight to the sandbox.
+    process.stdin.setRawMode?.(true);
+    process.stdin.on("data", (chunk) => handle.write(chunk));
+
+    // Keep the remote terminal the same size as yours.
+    process.stdout.on("resize", () => {
+      handle.resize(process.stdout.columns, process.stdout.rows);
+    });
+
+    await handle.done;
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import sys
+
+    handle = sandbox.exec_stream({
+        "command": "bash",
+        "tty": True,
+        "cols": 120,
+        "rows": 40,
+        "onStdout": lambda chunk: sys.stdout.buffer.write(chunk),
+    })
+
+    handle.write("echo hello\n")
+    handle.write("exit\n")
     print(handle.wait())
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     handle, err := sandbox.ExecStream(ctx, sdktypes.ExecStreamOptions{
-        Command: "bash",
-        TTY:     true,
-        Cols:    120,
-        Rows:    40,
-        OnStdout: func(chunk []byte) { fmt.Print(string(chunk)) },
+        Command:  "bash",
+        TTY:      true,
+        Cols:     120,
+        Rows:     40,
+        OnStdout: func(chunk []byte) { os.Stdout.Write(chunk) },
     })
-    if err != nil { log.Fatal(err) }
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    if err := handle.WriteString("echo hello\n"); err != nil { log.Fatal(err) }
-
+    handle.WriteString("echo hello\n")
+    handle.WriteString("exit\n")
     exit, err := handle.Wait()
-    fmt.Println(exit.Code, exit.Signal)
+    fmt.Println(exit.Code, err)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::ExecStreamOptions;
     use std::sync::Arc;
 
-    let handle = sandbox.exec_stream(aerolvm_sdk::ExecStreamOptions {
-        command:   "bash".to_string(),
-        tty:       true,
-        cols:      Some(120),
-        rows:      Some(40),
-        on_stdout: Some(Arc::new(|chunk| {
-            print!("{}", String::from_utf8_lossy(&chunk))
-        })),
+    let handle = sandbox.exec_stream(ExecStreamOptions {
+        command: "bash".into(),
+        tty: true,
+        cols: Some(120),
+        rows: Some(40),
+        on_stdout: Some(Arc::new(|chunk| print!("{}", String::from_utf8_lossy(&chunk)))),
         ..Default::default()
     })?;
 
     handle.write_string("echo hello\n")?;
+    handle.write_string("exit\n")?;
     println!("{:?}", handle.wait()?);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    ExecStreamHandle handle = sandbox.execStream(
-        new ExecStreamOptions()
-            .setCommand("bash")
-            .setTty(true)
-            .setCols(120)
-            .setRows(40)
-            .setOnStdout(chunk ->
-                System.out.print(new String(chunk, StandardCharsets.UTF_8)))
-    );
+    ExecStreamHandle handle = sandbox.execStream(new ExecStreamOptions()
+        .setCommand("bash")
+        .setTty(true)
+        .setCols(120)
+        .setRows(40)
+        .setOnStdout(chunk -> System.out.print(new String(chunk, StandardCharsets.UTF_8))));
 
     handle.write("echo hello\n");
+    handle.write("exit\n");
     ExecExitInfo exit = handle.waitForExit();
     System.out.println(exit.code);
     ```
   </TabItem>
 </Tabs>
 
-## Sending signals
+In a terminal, normal output and error output arrive mixed together, so only `onStdout` is called. Call `resize(cols, rows)` on the handle when your window changes size, so programs like `vim` redraw to fit.
+
+## Stop a command
+
+Send the command a signal: a short message from the system that asks a program to stop. It goes to the command and to every program the command started.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    handle.signal('INT')   // Ctrl-C
-    handle.signal('TERM')
-    handle.signal('KILL')
+    handle.signal("INT"); // same as pressing Ctrl-C
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    handle.signal('INT')
-    handle.signal('TERM')
+    handle.signal("INT")  # same as pressing Ctrl-C
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    handle.Signal("INT")
-    handle.Signal("TERM")
+    handle.Signal("INT") // same as pressing Ctrl-C
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    handle.signal("INT")?;
-    handle.signal("TERM")?;
+    handle.signal("INT")?; // same as pressing Ctrl-C
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    handle.signal("INT");
-    handle.signal("TERM");
+    handle.signal("INT"); // same as pressing Ctrl-C
     ```
   </TabItem>
 </Tabs>
 
-Signals target the process group, so child processes receive them too.
+| Signal | What it does |
+|---|---|
+| `INT` | Interrupts the command, like Ctrl-C. |
+| `TERM` | Asks the command to stop and clean up. |
+| `KILL` | Stops the command at once. It cannot refuse. |
+| `HUP` | Tells the command its terminal closed. |
+| `QUIT` | Like Ctrl-\. Many programs stop and print debug details. |
 
-## When the connection drops
+A command stopped by a signal reports exit code `-1` and the signal's name, for example `interrupt`.
 
-An `execStream` command lives exactly as long as its connection. If the
-WebSocket closes or errors before the exit message arrives (your process
-exits, the network drops, a proxy cuts the socket), the sandbox kills the
-command's whole process group, including anything it started in the
-background. Nothing keeps running with no one to read its output or stop it.
+## If the connection drops
 
-A command that prints nothing for a long time is not treated as dropped. The
-sandbox pings every open stream every 30 seconds, which also keeps load
-balancers and proxies that close idle WebSockets from cutting a quiet
-command. Every SDK answers the pings for you. If no reply or message arrives
-for 90 seconds, the connection counts as dropped.
+A streamed command lives only as long as its connection. If the connection closes before the command exits, the sandbox stops the command and everything it started. This covers your program exiting, the network failing, or a proxy cutting the link. Nothing is left running with no one to read its output.
 
-For work that must outlive the connection (a dev server, a long build you
-want to check on later), start a [session](/sessions) instead: sessions keep
-running after you disconnect and replay their logs when you reattach.
+A command that prints nothing for a long time is not treated as dropped. The sandbox checks every open stream every 30 seconds, which also stops proxies from closing quiet connections. Every SDK answers those checks for you. If no answer arrives for 90 seconds, the connection counts as dropped.
+
+For work that must keep going after you disconnect, such as a dev server or a long build, use a [terminal session](/sessions/). Sessions keep running, and they replay their recent output when you reconnect.
+
+## Which one to use
+
+| You want to | Use |
+|---|---|
+| Run a short command and read the result: `ls`, `git status`, a test script | `exec` |
+| See output as it happens: `npm install`, `make`, a training run | `execStream` |
+| Run something interactive: `bash`, `python`, `vim` | `execStream` with `tty: true` |
+| Handle very large output without holding it all in memory | `execStream` |
+| Keep a program running after you disconnect | A [terminal session](/sessions/) |
+
+## Good to know
+
+- **Background jobs make `exec` wait.** If your command starts something with `&`, `exec` waits until that program ends too, because it still holds the output open. Start servers and other long-running programs in a [terminal session](/sessions/) instead.
+- **`exec` keeps all output in memory** until the command ends. For commands that print a lot, use `execStream`.
+- **WebAssembly sandboxes** support `exec`, but not `execStream` or terminals. What a command does there depends on the module. See [WebAssembly (WASM)](/wasm-sandbox/).
+- **V8 isolate sandboxes** have no shell. There, `exec` calls the isolate's request handler, and the command is the URL path to request. See [V8 isolate](/isolate-sandbox/).
+
+## Next steps
+
+- [Terminal sessions](/sessions/): keep a shell or server running after you disconnect.
+- [Files](/file-system/): copy files into a sandbox and read results back.
+- [aerolvm CLI](/cli/): run commands from your terminal without writing code.
+- [SSH access](/ssh-access/): log in to a sandbox with a normal SSH client.

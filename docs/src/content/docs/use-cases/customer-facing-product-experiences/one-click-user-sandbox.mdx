@@ -1,21 +1,40 @@
 ---
-title: One-Click User Sandbox Per Workspace
-description: Provision a dedicated AerolVM sandbox for each workspace and manage start, stop, resume, and preview with no hidden inputs.
+title: One sandbox per workspace
+description: Give each workspace in your app its own sandbox that you can preview, stop and start again without losing files.
 ---
 
-## What you are building
+In this tutorial you tie a sandbox to each workspace in your product. When a user creates a workspace, you create a sandbox for it. The sandbox holds the workspace's files and serves a preview of them.
 
-This pattern attaches a sandbox directly to a workspace object in your product. Each workspace gets an isolated runtime that can be previewed, stopped, resumed, and cleaned up independently.
+Each workspace's sandbox is separate. You can stop it when the user leaves, start it again when they come back, and delete it when the workspace is deleted. Stopping and starting keeps the files.
 
-## Why AerolVM fits
+## Match workspace events to SDK calls
 
-- `create`, `start`, and `stop` map directly to workspace lifecycle events.
-- Lifecycle policies make idle cleanup predictable.
-- Preview ports and environment variables give you a straightforward product surface for each workspace.
+| When the user... | Call | What happens |
+|---|---|---|
+| Creates a workspace | `client.create()` | A new sandbox starts, just for this workspace. |
+| Opens a preview | `sandbox.exposePort(3000)` | Port 3000 gets a public link. |
+| Leaves for a while | `sandbox.stop()`, or `lifecycle.stopIfIdleFor` | The sandbox stops. Files stay on disk. |
+| Comes back | `sandbox.start()` | The sandbox starts again with the same files. |
+| Deletes the workspace | `sandbox.destroy()`, or `lifecycle.destroyIfIdleFor` | The sandbox and its files are deleted. |
 
-## Copy-paste TypeScript script
+## What you need
 
-This script is self-contained. The only required environment variable is `SB_PAT_TOKEN`. If `SB_API_URL` is unset, the script defaults to `http://127.0.0.1:21212`.
+- **An AerolVM server.** For a preview link other people can open, [install on a server](/getting-started/single-node-setup/) with a domain. On [your computer](/getting-started/local-setup/), the link works only on that computer.
+- **`SB_API_URL` and `SB_PAT_TOKEN`** set in your terminal, as shown in [SDK setup](/sdk-setup/).
+- **Node.js 20 or newer.**
+
+### Step 1: Set up a project
+
+```bash
+mkdir workspace-sandbox && cd workspace-sandbox
+npm init -y
+npm pkg set type=module
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Save the script
+
+Save this as `index.ts`. It needs no other settings.
 
 ```ts
 import { MicroVM } from "@aerol-ai/aerolvm-sdk";
@@ -126,14 +145,49 @@ main().catch((error) => {
 });
 ```
 
-## Product outputs
+What the script does, in order:
 
-- `one-click-user-sandbox.json` with initial and resumed preview details.
-- A per-workspace runtime that survives stop and start.
-- Predictable idle cleanup behavior through the lifecycle policy.
+1. Creates a sandbox with 2 CPU cores, 2 GB of memory and 12 GB of disk. It passes the workspace and user IDs in as environment variables.
+2. Uploads two starter files, a `README.md` and an `index.html`.
+3. Starts a small web server in a session and shares port 3000 as the preview link. A session is a program that keeps running after your call returns.
+4. Stops the sandbox and starts it again, as if the user left and came back.
+5. Reads `README.md` again, to show the files survived.
+6. Starts the web server again in a new session and asks for the preview link again.
 
-## Related docs
+### Step 3: Run it
 
-- [Environment](/environment/)
-- [Preview](/preview/)
-- [SSH Access](/ssh-access/)
+```bash
+npx tsx index.ts
+```
+
+The script prints this and saves it to `one-click-user-sandbox.json`:
+
+```text
+{
+  "sandboxID": "sb-...",
+  "previewSessionID": "ses-...",
+  "resumedPreviewSessionID": "ses-...",
+  "initialPreviewURL": "https://<sandbox-id>-3000.<your-domain>",
+  "resumedPreviewURL": "https://<sandbox-id>-3000.<your-domain>",
+  "persistedReadme": "# Workspace demo\n\nThis file proves that workspace state survives stop and start.\n"
+}
+```
+
+Both preview links are the same. Open one to see the workspace preview page.
+
+## Clean up
+
+The sandbox stops after 30 idle minutes and deletes itself after 24 idle hours. Durations in TypeScript are in nanoseconds. To delete it now, run `aerolvm destroy <sandbox-id>` with the [aerolvm CLI](/cli/), or call `sandbox.destroy()`.
+
+## Good to know
+
+- **Programs do not survive a stop.** Files stay, but sessions end when the sandbox stops. That is why the script starts the web server again after `start()`.
+- **The preview link stays the same.** Asking for the same port again returns the link it already has.
+- **Find a workspace's sandbox later** by giving it a `name`, such as the workspace ID, and looking it up with `client.getByName()`. You can also label it with tags. See [Create and manage](/sandboxes/) and [Tags](/sandbox-tags/).
+
+## Next steps
+
+- [Create and manage](/sandboxes/): start, stop, name and delete sandboxes.
+- [Images, resources and lifecycle](/environment/): set idle times and resources.
+- [Share a web app](/preview/): how preview links work.
+- [SSH access](/ssh-access/): give users a terminal in their workspace.

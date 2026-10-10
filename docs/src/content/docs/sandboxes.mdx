@@ -1,220 +1,205 @@
 ---
-title: Docker Sandbox
-description: Create, manage, and resize standard Docker sandboxes.
+title: Create and Manage Sandboxes
+description: Create a sandbox, give it a name and resources, then stop, start, resize, find and delete it.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox is an isolated compute environment. Container and microVM sandboxes
-have their own filesystem, network namespace, and configurable vCPU, memory, and
-disk. WASM and isolate sandboxes are host-mediated (no guest filesystem) and
-opt into a different create shape (`module_ref` instead of `image`).
+A sandbox is a separate, locked-down place to run code. Most sandboxes have their own files, their own network and their own share of CPU, memory and disk. You create one with a single SDK call, use it, and delete it when you are done.
 
-Warm server-side create is roughly **~4ms** (isolate), **~22ms** (WASM resident
-host), **~34ms** (Firecracker warm pool), **~189ms** (default OCI on
-containerd) — see the live UC-94 table in the repository README.
+This page covers the everyday tasks: create, name, find, stop, start, resize and delete. The [Images, resources and lifecycle](/environment/) page lists every option in more detail.
 
-## Sandbox types
+## Create a sandbox
 
-| Type | Runtime value | Description |
-|---|---|---|
-| OCI / Docker API | `docker` (default) | Standard runc-backed containers on the **containerd** host engine by default (`SB_CONTAINER_ENGINE=containerd`). Works on any node. |
-| gVisor | `gvisor` | User-space kernel - intercepts syscalls. Better isolation, same hardware requirements. See [gVisor Sandbox](/gvisor-sandbox). |
-| Firecracker | `firecracker` | Full microVM - warm-pool create ~34ms server-side. Requires bare-metal / KVM nodes. See [Firecracker Sandbox](/firecracker-sandbox). |
-| WASM | `wasm` | WASI modules in host workers; optional durable checkpoints. See [WASM Sandbox](/wasm-sandbox). |
-| Isolate | `isolate` | V8 isolate (`workerd`) running a JS/TS `fetch` handler — no image. Off by default (`--with-isolate`). See [Isolate Sandbox](/isolate-sandbox). |
-| GPU | `docker` + `gpus` field | Standard Docker with direct GPU passthrough. See [GPU Sandbox](/gpu-sandboxes). |
-
-## Lifecycle states
-
-```
-created ──► running ──► stopped ──► running
-                │
-                ▼
-           destroyed
-```
-
-| State | Description |
-|---|---|
-| `running` | Sandbox is up and accepting requests. |
-| `stopped` | Sandbox is paused; filesystem state is persisted. |
-| `destroyed` | Sandbox and all its data are permanently removed. |
-
-## Create
-
-:::note
-Sandboxes are **private by default**: omitting `allowPublicTraffic` gives no public ingress URL at boot. The first `exposePort` call opts the sandbox in (flips it public and installs its routes); set `allowPublicTraffic: true` at create to have the URL live from boot instead — see [Network Isolation](/network-isolation/).
-:::
+The only thing a sandbox needs is an image. An image is a packaged Linux system, such as `ubuntu:22.04` or `python:3.12-slim` from Docker Hub.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    const client = new MicroVM({
-      apiUrl: process.env.SB_API_URL,
-      patToken: process.env.SB_PAT_TOKEN,
-    })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      cpu: 1,
-      memoryMB: 1024,
-      diskGB: 10,
-      lifecycle: {
-        stopIfIdleFor: 60 * 60 * 1_000_000_000,    // 1 hour in nanoseconds
-        destroyAtAge:  24 * 60 * 60 * 1_000_000_000, // 24 hours in nanoseconds
-      },
-    })
-
-    console.log(sandbox.id)
-    console.log(sandbox.sshPrivateKey) // only returned by create()
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    console.log(sandbox.id); // sb-1a2b3c4d5e6f7a8b
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     from microvm import MicroVM
 
-    client = MicroVM(
-        api_url='https://sandbox.example.com',
-        pat_token='your-token',
-    )
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
 
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'cpu': 1.0,
-        'memoryMB': 1024,
-        'diskGB': 10,
-        'lifecycle': {
-            'stopIfIdleFor': 3_600_000_000_000,    # 1 hour
-            'destroyAtAge':  86_400_000_000_000,   # 24 hours
-        },
-    })
-
-    print(sandbox.id)
-    print(sandbox.sshPrivateKey)  # only returned by create()
+    sandbox = client.create(image="ubuntu:22.04")
+    print(sandbox.id)  # sb-1a2b3c4d5e6f7a8b
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    import (
-        "context"
-        "fmt"
-        "log"
-        "os"
-        "time"
-
-        microvm   "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
-        sdktypes  "github.com/aerol-ai/microvm/sdk/go/pkg/types"
-    )
-
-    client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
-        APIUrl:   os.Getenv("SB_API_URL"),
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
-    })
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
     if err != nil {
         log.Fatal(err)
     }
 
-    sandbox, err := client.Create(context.Background(), sdktypes.CreateSandboxOptions{
-        Image:    "ubuntu:22.04",
-        CPU:      1,
-        MemoryMB: 1024,
-        DiskGB:   10,
-        Lifecycle: &sdktypes.Lifecycle{
-            StopIfIdleFor: time.Hour,
-            DestroyAtAge:  24 * time.Hour,
-        },
-    })
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
     if err != nil {
         log.Fatal(err)
     }
-
-    fmt.Println(sandbox.ID)
-    fmt.Println(sandbox.SSHPrivateKey) // only returned by Create()
+    fmt.Println(sandbox.ID) // sb-1a2b3c4d5e6f7a8b
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    use aerolvm_sdk::{Client, CreateOptions, Lifecycle};
+    use aerolvm_sdk::{Client, CreateOptions};
 
-    let client = Client::new(
-        Some("https://sandbox.example.com"),
-        Some("your-token"),
-    )?;
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
 
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        cpu: Some(1),
-        memory_mb: Some(1024),
-        disk_gb: Some(10),
-        lifecycle: Some(Lifecycle {
-            stop_if_idle_for: 3_600_000_000_000,
-            destroy_at_age:   86_400_000_000_000,
-            ..Default::default()
-        }),
+        image: "ubuntu:22.04".into(),
         ..Default::default()
     })?;
-
-    println!("{}", sandbox.data.id);
-    println!("{:?}", sandbox.ssh_private_key); // only returned by create()
+    println!("{}", sandbox.data.id); // sb-1a2b3c4d5e6f7a8b
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.MicroVMClient;
-    import ai.aerol.microvm.MicroVMConfig;
-    import ai.aerol.microvm.Sandbox;
-    import ai.aerol.microvm.model.CreateOptions;
-    import ai.aerol.microvm.model.Lifecycle;
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    MicroVMClient client = new MicroVMClient(
-        new MicroVMConfig()
-            .setApiUrl("https://sandbox.example.com")
-            .setPatToken(System.getenv("SB_PAT_TOKEN"))
-    );
-
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setCpu(1.0)
-            .setMemoryMb(1024)
-            .setDiskGb(10)
-            .setLifecycle(new Lifecycle()
-                .setStopIfIdleFor(3_600_000_000_000L)
-                .setDestroyAtAge(86_400_000_000_000L))
-    );
-
-    System.out.println(sandbox.id);
-    System.out.println(sandbox.sshPrivateKey); // only returned by create()
+    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+    System.out.println(sandbox.id); // sb-1a2b3c4d5e6f7a8b
     ```
   </TabItem>
 </Tabs>
 
-### Named sandboxes
+The sandbox is running when the call returns. It gets 1 CPU, 1024 MB of memory and 10 GB of disk unless you ask for more.
 
-Pass a `name` field to pin a human-readable identifier to the sandbox. Names are unique per owner: two accounts (two tokens with different owners) can each have a sandbox called `build-box`, but one account cannot have two. If you call `create` with a name that one of your sandboxes already has, the daemon returns **HTTP 409 Conflict** with `"sandbox name already in use"`. Omit the field (or leave it empty) to let the daemon generate a random ID.
+The create result also holds the sandbox's SSH private key: `sshPrivateKey` (Go `SSHPrivateKey`, Rust `ssh_private_key`). Only create returns it. Save it now if you plan to use [SSH access](/ssh-access/).
 
-A name can't start with `owner:`, and it can't look like a generated ID (`sb-` followed by 16 hex digits), so a name and an ID never collide.
+<Aside>
+A new sandbox is private. It has no public web address. To share a web app running inside it, call `exposePort`, or set `allowPublicTraffic: true` when you create it. See [Block or allow the internet](/network-isolation/).
+</Aside>
 
-### Look up a sandbox by name
+The rest of this page assumes you already have a `client` and a `sandbox` from the step above.
 
-`getByName` returns your sandbox with that name in one request, or nothing when you have none. It only sees your own sandboxes, so another account's `build-box` is never returned. Together with the 409 on create, this makes a retry-safe get-or-create: look the name up, create it if it is missing, and on a 409 look it up again.
+## Give the sandbox more CPU, memory or disk
+
+Set `cpu`, `memoryMB` and `diskGB` when you create the sandbox. CPU can be a fraction, like `0.5` for half a core.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.getByName('build-box')
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      cpu: 2,
+      memoryMB: 2048,
+      diskGB: 20,
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04", cpu=2, memory_mb=2048, disk_gb=20)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        CPU:      2,
+        MemoryMB: 2048,
+        DiskGB:   20,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        cpu: Some(2),
+        memory_mb: Some(2048),
+        disk_gb: Some(20),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setCpu(2.0)
+        .setMemoryMb(2048)
+        .setDiskGb(20));
+    ```
+  </TabItem>
+</Tabs>
+
+You can change CPU and memory later without a restart. See [Change CPU or memory](#change-cpu-or-memory).
+
+## Give the sandbox a name
+
+A name is a label you choose, such as `build-box`. Without one, you can only find the sandbox by its ID.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "ubuntu:22.04", name: "build-box" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04", name="build-box")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Name:  "build-box",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        name: Some("build-box".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    CreateOptions options = new CreateOptions().setImage("ubuntu:22.04");
+    options.name = "build-box"; // there is no setName(); set the field directly
+    Sandbox sandbox = client.create(options);
+    ```
+  </TabItem>
+</Tabs>
+
+Rules for names:
+
+- **Unique per account.** You cannot have two sandboxes with the same name. Another account (a different token owner) can use the same name.
+- **A repeat name fails.** Creating a sandbox with a name you already use returns HTTP 409 Conflict with `sandbox name already in use`.
+- **Two shapes are reserved.** A name cannot start with `owner:`. It also cannot look like an ID (`sb-` followed by 16 hex digits), so a name and an ID never get mixed up.
+
+### Find a sandbox by its name
+
+`getByName` returns your sandbox with that name, or nothing if you have none. It only looks at your own sandboxes.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.getByName("build-box");
     if (sandbox === null) {
-      console.log('no sandbox called build-box')
+      console.log("no sandbox called build-box");
     }
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.get_by_name('build-box')
+    sandbox = client.get_by_name("build-box")
     if sandbox is None:
-        print('no sandbox called build-box')
+        print("no sandbox called build-box")
     ```
   </TabItem>
   <TabItem label="Go">
@@ -237,7 +222,7 @@ A name can't start with `owner:`, and it can't look like a generated ID (`sb-` f
   </TabItem>
   <TabItem label="Java">
     ```java
-    java.util.Optional<Sandbox> sandbox = client.getByName("build-box");
+    Optional<Sandbox> sandbox = client.getByName("build-box");
     if (sandbox.isEmpty()) {
         System.out.println("no sandbox called build-box");
     }
@@ -245,199 +230,222 @@ A name can't start with `owner:`, and it can't look like a generated ID (`sb-` f
   </TabItem>
 </Tabs>
 
-An older server that predates name lookup ignores the filter and answers with an ordinary list. Every SDK checks the reply and raises a "does not support sandbox name lookup" error instead of picking a sandbox from that list; use the sandbox ID there, or upgrade the server.
+Names make "get or create" safe to retry. Look the name up. If it is missing, create it. If the create fails with 409, another call won the race, so look it up again.
 
-## Connect to existing sandbox
+An older server that does not support name lookup returns a normal list instead. Every SDK notices this and raises a "does not support sandbox name lookup" error. It never guesses which sandbox you meant. Use the ID with that server, or upgrade it.
 
-Retrieve a running sandbox by ID to get a fully usable sandbox object.
+## Stop or delete it automatically
+
+A lifecycle tells the server when to stop or delete a sandbox for you. This example stops it after one hour with no activity, and deletes it 24 hours after it was created.
+
+The SDKs measure these times in nanoseconds (billionths of a second). One hour is `60 * 60 * 1_000_000_000` nanoseconds. Go is the exception: it takes a normal `time.Duration`, such as `time.Hour`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.get('sbx_abc123')
+    const HOUR = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
 
-    console.log(sandbox.id)
-    console.log(sandbox.publicURL)
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      lifecycle: {
+        stopIfIdleFor: HOUR,
+        destroyAtAge: 24 * HOUR,
+      },
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.get('sbx_abc123')
+    HOUR = 60 * 60 * 1_000_000_000  # one hour in nanoseconds
 
-    print(sandbox.id)
-    print(sandbox.publicURL)
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        lifecycle={"stopIfIdleFor": HOUR, "destroyAtAge": 24 * HOUR},
+    )
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    sandbox, err := client.Get(ctx, "sbx_abc123")
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: time.Hour,
+            DestroyAtAge:  24 * time.Hour,
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Lifecycle;
+
+    let hour: u64 = 60 * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        lifecycle: Some(Lifecycle {
+            stop_if_idle_for: hour,
+            destroy_at_age: 24 * hour,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    long hour = 60L * 60 * 1_000_000_000; // one hour in nanoseconds
+
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setLifecycle(new Lifecycle()
+            .setStopIfIdleFor(hour)
+            .setDestroyAtAge(24 * hour)));
+    ```
+  </TabItem>
+</Tabs>
+
+There are four timers in all, and you can change them later. See [Stop or delete a sandbox automatically](/environment/#stop-or-delete-a-sandbox-automatically).
+
+## Pick a runtime
+
+A runtime is the technology that walls the sandbox off from the server. Set it with the `runtime` option. If you leave it out, you get a standard container.
+
+| Runtime | `runtime` value | Pick it when | Learn more |
+|---|---|---|---|
+| Standard container | `docker` (default) | You want the most compatible choice. Any Linux image works. | This page |
+| gVisor | `gvisor` | You run code you do not trust and want an extra wall between it and the server's kernel (the core of the operating system). | [gVisor](/gvisor-sandbox/) |
+| Firecracker | `firecracker` | You want the strongest wall: a small virtual machine with its own kernel. It needs servers that support hardware virtualization (KVM). | [Firecracker](/firecracker-sandbox/) |
+| WebAssembly | `wasm` | You run small WebAssembly programs and want very fast starts. You pass a module instead of a Linux image. | [WebAssembly (WASM)](/wasm-sandbox/) |
+| V8 isolate | `isolate` | You run a JavaScript or TypeScript web handler, like a Cloudflare Worker. There is no image. | [V8 isolate](/isolate-sandbox/) |
+| GPU | `docker` plus the `gpus` option | Your code needs an NVIDIA, AMD or Apple GPU. | [GPU](/gpu-sandboxes/) |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "ubuntu:22.04", runtime: "gvisor" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04", runtime="gvisor")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:   "ubuntu:22.04",
+        Runtime: "gvisor",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        runtime: Some("gvisor".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setRuntime("gvisor"));
+    ```
+  </TabItem>
+</Tabs>
+
+Only the standard container is always on. gVisor, Firecracker, WebAssembly and V8 isolates work only after the server operator turns them on.
+
+How fast is a create? On our AWS test servers, with warm pools on, the median server time was about 4 ms for a V8 isolate. It was 22 ms for WebAssembly, 34 ms for Firecracker and 189 ms for a standard container. Network time between your app and the server comes on top.
+
+## Connect to a sandbox you already have
+
+Use the ID to get a sandbox object you can work with.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get("sb-1a2b3c4d5e6f7a8b");
+    console.log(sandbox.status, sandbox.publicURL);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.get("sb-1a2b3c4d5e6f7a8b")
+    print(sandbox.status, sandbox.publicURL)
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Get(ctx, "sb-1a2b3c4d5e6f7a8b")
     if err != nil {
         log.Fatal(err)
     }
-
-    fmt.Println(sandbox.ID, sandbox.PublicURL)
+    fmt.Println(sandbox.Status, sandbox.PublicURL)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let sandbox = client.get("sbx_abc123")?;
-
-    println!("{} {:?}", sandbox.data.id, sandbox.data.public_url);
+    let sandbox = client.get("sb-1a2b3c4d5e6f7a8b")?;
+    println!("{} {}", sandbox.data.status, sandbox.data.public_url);
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    Sandbox sandbox = client.get("sbx_abc123");
-
-    System.out.println(sandbox.id + " " + sandbox.publicUrl);
+    Sandbox sandbox = client.get("sb-1a2b3c4d5e6f7a8b");
+    System.out.println(sandbox.status + " " + sandbox.publicUrl);
     ```
   </TabItem>
 </Tabs>
 
-## Start and stop
+The public URL is empty until the sandbox is made public.
 
-Stopping persists all container-level filesystem state. Starting resumes from the persisted layer - running processes are not retained across a stop/start cycle.
+## List your sandboxes
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    await sandbox.stop()
-    await sandbox.start()
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox.stop()
-    sandbox.start()
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    if err := sandbox.Stop(ctx); err != nil { log.Fatal(err) }
-    if err := sandbox.Start(ctx); err != nil { log.Fatal(err) }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    sandbox.stop()?;
-    sandbox.start()?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    sandbox.stop();
-    sandbox.start();
-    ```
-  </TabItem>
-</Tabs>
-
-## Destroy
-
-Permanently removes the sandbox, all its data, and its metadata. External storage mounts are unmounted before removal.
+`list` returns every sandbox your token can see.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.destroy()
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox.destroy()
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    if err := sandbox.Destroy(ctx); err != nil { log.Fatal(err) }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    sandbox.destroy()?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    sandbox.destroy();
-    ```
-  </TabItem>
-</Tabs>
-
-## Resize
-
-Change CPU or memory allocation on a running sandbox without restarting it.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    await sandbox.resize({ cpu: 2, memoryMB: 2048 })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox.resize({'cpu': 2, 'memoryMB': 2048})
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    err := sandbox.Resize(ctx, sdktypes.ResizeOptions{CPU: 2, MemoryMB: 2048})
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    sandbox.resize(aerolvm_sdk::ResizeOptions { cpu: Some(2), memory_mb: Some(2048) })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    sandbox.resize(new ResizeOptions().setCpu(2.0).setMemoryMb(2048));
-    ```
-  </TabItem>
-</Tabs>
-
-## List and get
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandboxes = await client.list()
-    const sandbox   = await client.get(id)
+    const sandboxes = await client.list();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     sandboxes = client.list()
-    sandbox   = client.get(sandbox_id)
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandboxes, err := client.List(ctx)
-    sandbox, err   := client.Get(ctx, id)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
     let sandboxes = client.list()?;
-    let sandbox   = client.get(&id)?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    var sandboxes = client.list();
-    var sandbox   = client.get(id);
+    List<Sandbox> sandboxes = client.list();
     ```
   </TabItem>
 </Tabs>
 
-For large fleet inventories, use the page-at-a-time API so the client does not
-retain all 100,000+ sandbox records in memory:
+To list only some sandboxes, give them [tags](/sandbox-tags/) and filter on those.
+
+### Read a long list one page at a time
+
+`list` holds every sandbox in memory at once. If you have many thousands, read one page at a time instead.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     for await (const page of client.listPages()) {
-      await processPage(page)
+      processPage(page);
     }
     ```
   </TabItem>
@@ -452,16 +460,20 @@ retain all 100,000+ sandbox records in memory:
     token := ""
     for {
         page, next, err := client.ListPage(ctx, token)
-        if err != nil { return err }
+        if err != nil {
+            log.Fatal(err)
+        }
         processPage(page)
-        if next == "" { break }
+        if next == "" {
+            break
+        }
         token = next
     }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let tags = std::collections::HashMap::new();
+    let tags = std::collections::HashMap::new(); // no tag filter
     let mut token = String::new();
     loop {
         let page = client.list_page_with_options(&tags, false, &token)?;
@@ -477,7 +489,7 @@ retain all 100,000+ sandbox records in memory:
     ```java
     String token = "";
     do {
-        var page = client.listPage(java.util.Collections.emptyMap(), false, token);
+        MicroVMClient.SandboxPage page = client.listPage(Collections.emptyMap(), false, token);
         processPage(page.sandboxes);
         token = page.nextPageToken;
     } while (!token.isEmpty());
@@ -485,53 +497,149 @@ retain all 100,000+ sandbox records in memory:
   </TabItem>
 </Tabs>
 
-## Idle lifecycle
+## Stop and start a sandbox
 
-Sandboxes can self-terminate based on age or inactivity. Lifecycle parameters can be updated at any time without restarting the sandbox.
+Stopping a sandbox frees its CPU and memory but keeps its files. Starting it again brings the same files back. Running programs do not survive a stop, so start them again after `start`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.updateLifecycle({
-      stopIfIdleFor: 2 * 60 * 60 * 1_000_000_000,  // 2 hours
-      destroyAtAge:  48 * 60 * 60 * 1_000_000_000, // 48 hours
-    })
+    await sandbox.stop();
+    await sandbox.start();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.update_lifecycle({
-        'stopIfIdleFor': 7_200_000_000_000,
-        'destroyAtAge':  172_800_000_000_000,
-    })
+    sandbox.stop()
+    sandbox.start()
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    err := sandbox.UpdateLifecycle(ctx, sdktypes.Lifecycle{
-        StopIfIdleFor: 2 * time.Hour,
-        DestroyAtAge:  48 * time.Hour,
-    })
+    if err := sandbox.Stop(ctx); err != nil {
+        log.Fatal(err)
+    }
+    if err := sandbox.Start(ctx); err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.update_lifecycle(aerolvm_sdk::Lifecycle {
-        stop_if_idle_for: 7_200_000_000_000,
-        destroy_at_age:   172_800_000_000_000,
-        ..Default::default()
-    })?;
+    // stop() and start() update the sandbox, so declare it with `let mut`.
+    sandbox.stop()?;
+    sandbox.start()?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.updateLifecycle(
-        new Lifecycle()
-            .setStopIfIdleFor(7_200_000_000_000L)
-            .setDestroyAtAge(172_800_000_000_000L)
-    );
+    sandbox.stop();
+    sandbox.start();
     ```
   </TabItem>
 </Tabs>
 
-See [Environment](/environment) for image selection, environment variables, and resource defaults.
+## Change CPU or memory
+
+`resize` changes CPU and memory on a running sandbox without a restart. Leave a value out to keep it as it is.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.resize({ cpu: 2, memoryMB: 2048 });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.resize({"cpu": 2, "memoryMB": 2048})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    err := sandbox.Resize(ctx, sdktypes.ResizeSandboxOptions{CPU: 2, MemoryMB: 2048})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ResizeOptions;
+
+    sandbox.resize(ResizeOptions { cpu: Some(2), memory_mb: Some(2048), disk_gb: None })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.resize(new ResizeOptions().setCpu(2.0).setMemoryMb(2048));
+    ```
+  </TabItem>
+</Tabs>
+
+Resize works for container and WebAssembly sandboxes. Firecracker and V8 isolate sandboxes cannot be resized yet. The server refuses a resize that would go over its capacity, and then nothing changes.
+
+## Delete a sandbox
+
+`destroy` deletes the sandbox, its files and its record. Attached cloud storage is unmounted first, so the data in your bucket stays safe. You cannot undo a delete.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if err := sandbox.Destroy(ctx); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+## Sandbox states
+
+```mermaid
+flowchart LR
+    creating --> started
+    started --> stopped
+    stopped --> started
+    started --> destroyed
+    stopped --> destroyed
+```
+
+| State | What it means |
+|---|---|
+| `creating` | The server is setting the sandbox up. |
+| `started` | The sandbox is running and accepts commands. |
+| `stopped` | The sandbox is not running. Its files are kept. |
+| `error` | Something went wrong. Check the sandbox's `lastError` field. |
+| `destroyed` | The sandbox and its data are gone for good. |
+
+WebAssembly sandboxes have a few extra states, such as `passivated` (saved to disk while the server restarts). See [WebAssembly (WASM)](/wasm-sandbox/).
+
+## For server operators
+
+- **Default runtime.** `SB_CONTAINER_RUNTIME` sets the runtime a create gets when it leaves `runtime` out. The default is `docker`.
+- **Container engine.** Standard containers run on Docker. They can also run directly on containerd (the engine Docker is built on) when you set `SB_CONTAINER_ENGINE=containerd` (installer flag `--with-containerd-engine`). The `runtime` value stays `docker` either way.
+- **Turning on other runtimes.** gVisor needs `runsc` on the host (installer flag `--with-gvisor`). Firecracker needs `SB_ENABLE_FIRECRACKER=true` and KVM. WebAssembly needs `SB_ENABLE_WASM=true`. V8 isolates need `SB_ENABLE_ISOLATE=true` (installer flag `--with-isolate`).
+
+## Next steps
+
+- [Images, resources and lifecycle](/environment/): every create option and its default.
+- [Run commands](/exec-streaming/): run programs and stream their output.
+- [Files](/file-system/): copy files into and out of a sandbox.
+- [Tags](/sandbox-tags/): label sandboxes and list only the ones you want.
+- [Snapshots](/snapshots/): save a set-up sandbox and start copies of it.

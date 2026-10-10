@@ -1,159 +1,217 @@
 ---
-title: WASM Sandbox
-description: Run WebAssembly/WASI workloads with optional checkpoint durability and AOCR failover.
+title: WebAssembly (WASM) sandboxes
+description: Run a compiled WebAssembly program as a sandbox that starts in milliseconds, with no container image.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-WASM sandboxes run guest modules inside isolated worker processes on the host.
-They boot quickly, share the same toolbox and routing model as Docker sandboxes,
-and support optional checkpoint durability for daemon restarts and cluster
-failover. With the resident host enabled (default on recent releases), warm
-create is ~**22ms** server p50 on `cluster-3-mixed-wasm` (flat ~20–50ms; the
-multi-second cold-compile tail is gone).
+WebAssembly (WASM) is a portable format for compiled programs. A WASM sandbox runs one such program, called a module, in its own worker process on the server. There is no container image and no Linux system inside: just your program.
+
+The module reaches files, the clock and the network through WASI (the WebAssembly System Interface), a standard set of system functions for WebAssembly. AerolVM runs core WASI preview 1 modules, often written `wasip1`. You can build one from Go, Rust and other languages, or use a ready-made language module such as Python.
+
+Choose WASM when you want sandboxes that start very fast and use little memory, and your code can be compiled to WebAssembly. With the server's default settings, creating a WASM sandbox took about 22 ms on the server (median) on our three-server test cluster. Most creates take 20 to 50 ms.
+
+## What the server needs
+
+WASM needs no special hardware. It is off by default: the server operator turns it on with `SB_ENABLE_WASM=true` (see [For server operators](#for-server-operators)). Until they do, a create fails with `runtime "wasm" requires SB_ENABLE_WASM=true`.
 
 ## Create a WASM sandbox
 
-Pass `runtime: "wasm"` and a `module_ref`. The simplest `module_ref` is a
-**standard-module keyword** your operator has staged on every node — e.g.
-`"python"` or `"javascript"` — so you never reference a host path. A
-`module_ref` can also be an `oci://` registry ref (for your own modules, see
-[WASM modules](/wasm-modules)) or, for self-managed hosts, a file path. Set
-`durability` to `passivatable` or `durable` when you need restart survival.
+Set `runtime: "wasm"` and say which module to run with `moduleRef`. The easiest choice is a standard module, a short name such as `python` that your operator set up on every server. Ask your operator which names they offer.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { MicroVM } from '@aerol-ai/aerolvm-sdk'
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 
-    const client = new MicroVM({
-      apiUrl: process.env.SB_API_URL,
-      patToken: process.env.SB_PAT_TOKEN,
-    })
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
 
     const sandbox = await client.create({
-      module_ref: 'python',
-      runtime: 'wasm',
-      cpu: 0.5,
-      memoryMB: 256,
-      durability: 'passivatable',
-    })
+      image: "python", // the TypeScript SDK requires image: use the module name
+      moduleRef: "python",
+      runtime: "wasm",
+    });
+    console.log(sandbox.id);
 
-    console.log(sandbox.id)
+    await sandbox.destroy();
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     from microvm import MicroVM
 
-    client = MicroVM(
-        api_url='https://sandbox.example.com',
-        pat_token='your-token',
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    sandbox = client.create(
+        image="python",  # the Python SDK requires image: use the module name
+        module_ref="python",
+        runtime="wasm",
     )
-
-    sandbox = client.create({
-        'module_ref': 'python',
-        'runtime': 'wasm',
-        'cpu': 0.5,
-        'memoryMB': 256,
-        'durability': 'passivatable',
-    })
-
     print(sandbox.id)
+
+    sandbox.destroy()
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    import (
-        "context"
-        "fmt"
-        "log"
-
-        "github.com/aerol-ai/microvm/pkg/microvm"
-        "github.com/aerol-ai/microvm/pkg/types"
-    )
-
-    client, err := microvm.New(microvm.Config{
-        APIURL:   "https://sandbox.example.com",
-        PATToken: "your-token",
-    })
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
     if err != nil {
         log.Fatal(err)
     }
 
-    sb, err := client.Create(context.Background(), types.CreateSandboxRequest{
-        ModuleRef:  "python",
-        Runtime:    types.RuntimeWasm,
-        CPU:        0.5,
-        MemoryMB:   256,
-        Durability: types.DurabilityPassivatable,
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef: "python",
+        Runtime:   sdktypes.RuntimeWasm,
     })
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println(sb.ID)
+    defer sandbox.Destroy(ctx)
+
+    fmt.Println(sandbox.ID)
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    use aerolvm_sdk::{Client, CreateSandboxRequest};
+    use aerolvm_sdk::{Client, CreateOptions};
 
-    #[tokio::main]
-    async fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let client = Client::new("https://sandbox.example.com", "your-token")?;
-        let sandbox = client
-            .create(CreateSandboxRequest {
-                module_ref: Some("python".into()),
-                runtime: Some("wasm".into()),
-                cpu: Some(0.5),
-                memory_mb: Some(256),
-                durability: Some("passivatable".into()),
-                ..Default::default()
-            })
-            .await?;
-        println!("{}", sandbox.id);
-        Ok(())
-    }
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        module_ref: Some("python".into()),
+        runtime: Some("wasm".into()),
+        ..Default::default()
+    })?;
+    println!("{}", sandbox.data.id);
+
+    sandbox.destroy()?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.MicroVM;
-    import ai.aerol.microvm.model.CreateSandboxRequest;
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
 
-    public class WasmExample {
-        public static void main(String[] args) throws Exception {
-            MicroVM client = new MicroVM("https://sandbox.example.com", "your-token");
-            CreateSandboxRequest req = new CreateSandboxRequest();
-            req.setModuleRef("python");
-            req.setRuntime("wasm");
-            req.setCpu(0.5);
-            req.setMemoryMB(256);
-            req.setDurability("passivatable");
-            var sandbox = client.create(req);
-            System.out.println(sandbox.getId());
-        }
-    }
+    Sandbox sandbox = client.create(
+        new CreateOptions().setModuleRef("python").setRuntime("wasm")
+    );
+    System.out.println(sandbox.id);
+
+    sandbox.destroy();
     ```
   </TabItem>
 </Tabs>
 
-## Durability
+## Choose a module
 
-`durability` is the same cross-runtime create field documented under
-[Durability and Failover](/durability#durability-class) — WASM just **defaults to
-`ephemeral`** (worker processes die with the daemon) instead of `passivatable`,
-and is the only runtime that currently implements `durable`. The values below
-describe how WASM backs each class:
+`moduleRef` accepts four kinds of names. The server checks them in this order:
 
-| Class | Behavior |
-|---|---|
-| `ephemeral` | Default for WASM. Lost on daemon restart. |
-| `passivatable` | Checkpointed to local `mem.snap` on drain; rehydrates on start. |
-| `durable` | Local checkpoint plus AOCR push for cross-node failover. |
+| Kind | Example | When to use it |
+|---|---|---|
+| Standard module | `python` | A language your operator set up on every server. No upload, no path. |
+| Registry reference | `oci://registry.example.com/team/app:v1` | Your own module, stored in a container registry. |
+| Catalogue ID | the `id` from `createWasmModule` | A module already registered on this server. |
+| File on the server | `file:///opt/agent.wasm` | Self-hosted servers where you can put files on the server yourself. |
 
-## See also
+To build and push your own module, see [WASM modules](/wasm-modules/).
 
-- [WASM networking](/wasm-networking) — `expose_port`, custom domains, and host-mediated HTTP ingress
-- [WASM modules](/wasm-modules) — catalogue and warm pool
-- [WASM architecture](/wasm-architecture) — worker model and checkpoints
+## Run commands
+
+`exec` works on WASM sandboxes, but there is no shell. Each `exec` runs the module from the start, with your command split on spaces as its arguments. Quotes do not group words. Files the module writes under `/work` stay there between runs.
+
+## Keep the sandbox across server restarts
+
+By default, a WASM sandbox is lost when the server restarts. Set `durability` to keep it. This is the same create field described in [Durability and failover](/durability/), but WASM uses a different default.
+
+| `durability` | What happens | Default for WASM |
+|---|---|---|
+| `ephemeral` | The sandbox is lost when the server restarts. | Yes |
+| `passivatable` | When the server shuts down cleanly, it saves the sandbox's memory and state to its disk (a checkpoint). The sandbox comes back from that checkpoint. | No |
+| `durable` | Not available yet. The server rejects it with `not yet implemented`. | No |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "python",
+      moduleRef: "python",
+      runtime: "wasm",
+      memoryMB: 256,
+      durability: "passivatable",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="python",
+        module_ref="python",
+        runtime="wasm",
+        memory_mb=256,
+        durability="passivatable",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef:  "python",
+        Runtime:    sdktypes.RuntimeWasm,
+        MemoryMB:   256,
+        Durability: sdktypes.DurabilityPassivatable,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        module_ref: Some("python".into()),
+        runtime: Some("wasm".into()),
+        memory_mb: Some(256),
+        durability: Some("passivatable".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setModuleRef("python")
+            .setRuntime("wasm")
+            .setMemoryMb(256)
+            .setDurability("passivatable")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+If you leave out `memoryMB`, the sandbox gets the server's WASM default, 256 MB unless your operator changed it.
+
+## Good to know
+
+- **No GPU, no templates.** WASM sandboxes reject `gpus` and `template_id`.
+- **Allow and block lists work; method and path rules do not.** You can block the internet or allow only some hosts. The finer method and path rules from [Rules and inspection](/egress-rules-and-inspection/) are rejected.
+- **HTTP only for public ports.** You can share a web server the module runs, but not raw TCP ports or TLS (encrypted TCP) ports. See [WASM networking](/wasm-networking/).
+
+## For server operators
+
+Turn WASM on with `SB_ENABLE_WASM=true` in the server's environment file. On a cluster, set `wasm.enabled: true` in `config/cluster.yml`, and WASM sandboxes run on the worker servers. There is no install script flag.
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_ENABLE_WASM` | Turns the WASM runtime on. | `false` |
+| `SB_WASM_STANDARD_MODULES` | The standard module names, as `alias=file.wasm,...`. Stage the files with the `stage-wasm-modules` Ansible playbook. | Empty |
+| `SB_WASM_DEFAULT_MEMORY_MB` | Memory for a WASM sandbox that does not ask for any. | `256` |
+| `SB_WASM_RESIDENT_HOST_ENABLED` | Keep compiled modules loaded in a long-running worker, so creates skip the slow compile step. | `true` |
+| `SB_WASM_POOL_ENABLED` | Keep started workers ready for each module. See [WASM modules](/wasm-modules/). | `true` |
+| `SB_WASM_CHECKPOINT_INTERVAL` | Also save `passivatable` sandboxes on a timer, not only at shutdown. | `0` (off) |
+| `SB_WASM_MAX_INSTANCES` | The most WASM sandboxes one server will run. | `0` (no limit) |
+
+For how workers and checkpoints work inside, see [WASM architecture](/wasm-architecture/).
+
+## Next steps
+
+- [WASM modules](/wasm-modules/): use standard modules or push your own.
+- [WASM networking](/wasm-networking/): share a web server running in a WASM sandbox.
+- [V8 isolate](/isolate-sandbox/): run JavaScript or TypeScript handlers instead.
+- [WASM architecture](/wasm-architecture/): workers, checkpoints and failover in detail.

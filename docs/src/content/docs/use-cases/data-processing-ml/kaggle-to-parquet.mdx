@@ -1,25 +1,57 @@
 ---
-title: Kaggle Dataset to Parquet
-description: Download a large dataset from Kaggle, process it using Polars inside an AerolVM sandbox, and export the optimized Parquet file.
+title: Kaggle dataset to Parquet
+description: Download a Kaggle dataset in a sandbox, clean it with Polars, and save it as a smaller Parquet file on your computer.
 ---
 
-This workflow demonstrates how to use a high-memory AerolVM sandbox as an ephemeral ETL (Extract, Transform, Load) worker. We download a dataset from Kaggle, use **Polars** for lightning-fast data manipulation, and save the result as an optimized Parquet file.
+In this project a sandbox works as a throwaway data worker. It downloads a dataset from Kaggle, cleans it with Polars (a fast Python library for tables of data), and saves it as Parquet. Parquet is a compact file format for tables that loads much faster than CSV.
 
-## Why use a sandbox for ETL?
+This kind of job is often called ETL: extract the data, transform it, and load it somewhere useful.
 
-- **Isolation:** Don't clutter your local machine with multi-gigabyte CSVs.
-- **Resource Scaling:** Spin up a sandbox with 16GB or 32GB of RAM for heavy processing, then destroy it when done.
-- **Reproducibility:** The environment (Python version, libraries) is locked and consistent every time.
+## Why use a sandbox for this
 
-## Copy-paste TypeScript script
+- **Keep your machine clean.** The multi-gigabyte CSV files stay in the sandbox and are deleted with it.
+- **Use more memory only when you need it.** Give the sandbox 16 or 32 GB of memory for a big job, then delete it.
+- **Get the same setup every time.** The Python version and libraries are the same on every run.
 
-Code URL: [https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/kaggle-to-parquet](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/kaggle-to-parquet)
+## What you need
 
-Set these environment variables before running:
-- `SB_PAT_TOKEN`
-- `KAGGLE_USERNAME`
-- `KAGGLE_KEY`
-- `KAGGLE_DATASET` (e.g., `mlg-ulb/creditcardfraud`)
+- An AerolVM server and Node.js 18 or newer. See [Quickstart](/quick-start/).
+- A Kaggle account and an API token. You can create one in your Kaggle account settings.
+- These environment variables:
+
+| Variable | What it is | Default |
+|---|---|---|
+| `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
+| `SB_PAT_TOKEN` | Your AerolVM token. | None. You must set it. |
+| `KAGGLE_USERNAME` | Your Kaggle user name. | None. You must set it. |
+| `KAGGLE_KEY` or `KAGGLE_API_TOKEN` | Your Kaggle API key. | None. You must set one. |
+| `KAGGLE_DATASET` | The dataset to download, as `owner/name`. | `mlg-ulb/creditcardfraud` |
+
+The full project is also on GitHub: [kaggle-to-parquet](https://github.com/aerol-ai/aerolvm-examples/tree/main/ml-data-engineering/kaggle-to-parquet).
+
+## Build it
+
+### Step 1: Set up a project
+
+```bash
+mkdir kaggle-etl && cd kaggle-etl
+npm init -y
+npm install @aerol-ai/aerolvm-sdk
+```
+
+### Step 2: Set your keys
+
+```bash
+export SB_API_URL=http://localhost:21212
+export SB_PAT_TOKEN=your-secret-pat
+export KAGGLE_USERNAME=your-kaggle-name
+export KAGGLE_KEY=your-kaggle-key
+export KAGGLE_DATASET=mlg-ulb/creditcardfraud
+```
+
+### Step 3: Save the script
+
+Save this as `kaggle-to-parquet.ts`. The Python program inside it runs in the sandbox.
 
 ```ts
 import { writeFile } from "node:fs/promises";
@@ -28,10 +60,8 @@ import { MicroVM } from "@aerol-ai/aerolvm-sdk";
 const apiUrl = process.env.SB_API_URL ?? "http://127.0.0.1:21212";
 const patToken = process.env.SB_PAT_TOKEN;
 const kaggleUsername = process.env.KAGGLE_USERNAME;
-const kaggleKey = process.env.KAGGLE_API_TOKEN ;
+const kaggleKey = process.env.KAGGLE_KEY || process.env.KAGGLE_API_TOKEN;
 const kaggleDataset = process.env.KAGGLE_DATASET ?? "mlg-ulb/creditcardfraud";
-
-
 
 const processingScript = `
 import os
@@ -66,9 +96,8 @@ print("Done!")
 
 async function main() {
   if (!patToken || !kaggleUsername || !kaggleKey) {
-    throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY before running.");
+    throw new Error("Set SB_PAT_TOKEN, KAGGLE_USERNAME, and KAGGLE_KEY (or KAGGLE_API_TOKEN) before running.");
   }
-  console.log("Initializing AerolVM client...");
   const client = new MicroVM({ apiUrl, patToken });
 
   console.log("Creating ETL sandbox (1 CPU, 2GB RAM)...");
@@ -80,51 +109,70 @@ async function main() {
       KAGGLE_USERNAME: kaggleUsername,
       KAGGLE_KEY: kaggleKey,
       KAGGLE_DATASET: kaggleDataset,
-    }
+    },
   });
-  console.log(`Sandbox created successfully! ID: ${sandbox.id}`);
+  console.log(`Sandbox created: ${sandbox.id}`);
 
-  console.log("Installing dependencies (polars, kaggle)...");
-  const installRes = await sandbox.exec("pip install polars kaggle");
-  console.log(`Dependencies installed (exit code: ${installRes.exitCode}, duration: ${installRes.durationMS}ms)`);
+  try {
+    console.log("Installing polars and kaggle...");
+    const install = await sandbox.exec("pip install polars kaggle");
+    if (install.exitCode !== 0) {
+      throw new Error(`pip install failed:\n${install.stderr}`);
+    }
 
-  console.log("Preparing ETL directory...");
-  await sandbox.exec("mkdir -p /etl");
+    await sandbox.exec("mkdir -p /etl");
+    await sandbox.uploadFile("/etl/process.py", processingScript);
 
-  console.log("Uploading processing script...");
-  await sandbox.uploadFile("/etl/process.py", processingScript);
-  console.log("Script uploaded to /etl/process.py");
+    console.log("Running the ETL job (this downloads and processes the data)...");
+    const result = await sandbox.exec({ command: "python3 /etl/process.py", workDir: "/etl" });
+    console.log(result.stdout);
+    if (result.exitCode !== 0) {
+      throw new Error(`ETL failed (exit code ${result.exitCode}):\n${result.stderr}`);
+    }
 
-  console.log("Running ETL pipeline (this downloads and processes data)...");
-  const result = await sandbox.exec({ command: "python3 /etl/process.py", workDir: "/etl" });
-  console.log(`ETL Pipeline finished! (exit code: ${result.exitCode}, duration: ${result.durationMS}ms)`);
-  
-  if (result.exitCode !== 0) {
-    console.error("ETL Failed.");
-    console.error("--- STDOUT ---");
-    console.error(result.stdout);
-    console.error("--- STDERR ---");
-    console.error(result.stderr);
-    process.exit(1)
+    const parquetData = await sandbox.downloadFile("/etl/processed_data.parquet");
+    await writeFile("processed_data.parquet", parquetData);
+    console.log(`Saved processed_data.parquet (${parquetData.byteLength} bytes).`);
+  } finally {
+    await sandbox.destroy();
+    console.log("Sandbox deleted.");
   }
-
-  console.log("ETL Complete. Downloading optimized Parquet file to local machine...");
-  const parquetData = await sandbox.downloadFile("/etl/processed_data.parquet");
-  console.log(`Downloaded ${parquetData.byteLength} bytes.`);
-  
-  await writeFile("processed_data.parquet", Buffer.from(parquetData));
-  console.log("Success! File saved to disk as processed_data.parquet");
-  
-  console.log("Cleaning up: Destroying sandbox...");
-  await sandbox.destroy();
-  console.log("Sandbox destroyed.");
 }
 
-main().catch(console.error);
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
 ```
 
-## Related docs
-- [Creating Sandboxes](/environment/)
-- [File Transfers](/files/)
-- [Compute Resources](/compute/)
----
+### Step 4: Run it
+
+```bash
+npx tsx kaggle-to-parquet.ts
+```
+
+When it finishes, `processed_data.parquet` is in your folder. Open it with Polars, pandas, DuckDB or any tool that reads Parquet.
+
+## What the script does
+
+1. **Creates a sandbox** from `python:3.11-bookworm` with 1 CPU core and 2 GB of memory. Your Kaggle name, key and dataset go in as environment variables.
+2. **Installs Polars and the Kaggle library** with `pip`. If the install fails, the script stops.
+3. **Uploads the Python program** to `/etl/process.py`.
+4. **Runs it.** It downloads the dataset, reads the first CSV file it finds, drops every row with a missing value, and writes `processed_data.parquet`.
+5. **Downloads the Parquet file** to your computer, then deletes the sandbox, even if a step failed.
+
+## Process a bigger dataset
+
+Raise `memoryMB` (and `cpu` if you like) in the `create` call. For example, `memoryMB: 16384` gives the sandbox 16 GB.
+
+Long jobs need two more changes:
+
+- Set `timeoutSeconds` on the `exec` call. Without it, a command is stopped after 5 minutes.
+- In Node.js, one `exec` call waits only about 5 minutes for its answer, because Node's built-in `fetch` stops waiting after that. For longer jobs, run the program with `execStream` or a session instead. See [Run commands](/exec-streaming/) and [Terminal sessions](/sessions/).
+
+## Next steps
+
+- [Create and manage sandboxes](/sandboxes/): every option for `create`.
+- [Images, resources and lifecycle](/environment/): pick CPU, memory and disk.
+- [Files](/file-system/): more ways to move files in and out.
+- [SQL on Kaggle with DuckDB](/use-cases/data-processing-ml/duckdb-dataset-explorer/): query a dataset instead of converting it.

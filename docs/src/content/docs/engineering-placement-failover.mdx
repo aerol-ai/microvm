@@ -1,72 +1,63 @@
 ---
-title: Placement and Failover
-description: AerolVM's cluster mode runs hashicorp/raft for the placement FSM and hashicorp/memberlist (SWIM) for membership. Capacity is pulled, not gossiped. Placement uses power-of-two-choices and stays local; mutating calls reverse-proxy to the owner. The cluster package is a no-op when disabled, so the rest of the daemon never branches on cluster mode.
+title: Placement and failover
+description: How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-AerolVM has one binary. It runs as the standalone daemon and as a cluster
-node: same `sandboxd`, different config. No separate scheduler process; no
-etcd. Cluster mode is `hashicorp/raft` for the placement FSM and
-`hashicorp/memberlist` (SWIM) for membership. Capacity is pulled out-of-band,
-not stuffed into gossip. The thesis: put the consistency boundary at the
-points where divergence is destructive (cluster-wide name uniqueness, capacity
-reservation, custom-domain binding) and leave everything else to best-effort
-gossip plus local decisions.
+AerolVM is one program. It runs as the standalone daemon and as a cluster node: the same `sandboxd`, with different config. (A daemon is a program that runs in the background on a server.) There is no separate scheduler process and no etcd.
 
-Three things in `internal/cluster/` are worth understanding before reading
-the code:
+Cluster mode is built from two libraries. `hashicorp/raft` keeps the placement FSM, the shared record of which node (server) owns each sandbox. `hashicorp/memberlist` tracks which nodes are members, using SWIM. Capacity reports travel separately, outside of gossip.
 
-1. **Two-stage create with reservations.** Placement is two FSM writes, not
-   one: `opReserve` claims capacity and name; `opPlace` promotes to placed
-   once docker has actually run the sandbox. The reservation prevents two
-   concurrent creates from picking the same node between capacity-heartbeat
-   fetches.
-2. **Owner-sharded execution with reverse-proxy forwarding.** Any node accepts
-   any request. Mutating requests for sandbox X reverse-proxy to X's owner.
-   The cluster presents a single endpoint to callers.
-3. **Capacity-heartbeat freshness gating.** A candidate's last capacity
-   heartbeat must be fresh. A node alive in gossip but missing recent
-   capacity fetches drops out of the placement set.
+Those terms, in plain words:
 
-`Noop` (`internal/cluster/noop.go`) is selected when `cfg.EnableCluster=false`
-so the `cluster.Client` interface stays addressable in single-node mode.
-Function and type names below are real and grep-able.
+- **Raft** is a consensus algorithm: a way for servers to agree on shared data even when some of them fail.
+- **The FSM** (finite state machine) is the shared table Raft keeps. Every server changes it only by applying agreed entries from the Raft log.
+- **SWIM** is a gossip protocol. In gossip, servers keep telling each other who is alive, and the news spreads like a rumor.
+
+The idea behind the design: use strong agreement only where disagreement would do damage. That means cluster-wide name uniqueness, capacity reservation and custom-domain binding. Everything else uses best-effort gossip plus local decisions.
+
+**In short:**
+
+- Raft holds the few facts that must never disagree: who owns each sandbox, sandbox names, reserved capacity and custom hostnames.
+- A create first reserves capacity and the name in Raft, then becomes "placed" once the sandbox runs, so two creates cannot double-book a node.
+- Placement samples two nodes and picks the one with more room. Nodes with stale capacity reports are skipped.
+- Any node accepts any request and forwards it to the sandbox's owner, so callers see one endpoint.
+- When a node dies, sandboxes that opted in are rebuilt elsewhere. The rest are marked orphaned (HTTP 410), never silently deleted.
+
+## Three ideas to know first
+
+Three things in `internal/cluster/` are worth understanding before you read the code:
+
+1. **A two-step create with reservations.** Placement is two FSM writes, not one. `opReserve` claims capacity and the name; `opPlace` promotes the sandbox to "placed" once it is actually running. The reservation stops two creates running at once from picking the same node between capacity reports.
+2. **Owner-sharded execution with forwarding.** Each sandbox has one owner node. Any node accepts any request, and requests that change sandbox X are reverse-proxied (passed along) to X's owner. Callers see a single endpoint.
+3. **Capacity freshness gating.** A candidate node's last capacity report must be recent. A node that is alive in gossip but missing recent capacity reports drops out of the placement set.
+
+`Noop` (`internal/cluster/noop.go`) is used when `cfg.EnableCluster=false`, so the `cluster.Client` interface still works in single-node mode. Function and type names on this page are real, so you can search the code for them.
 
 ## Why not a single central scheduler
 
-Two workload assumptions shape the design:
+AerolVM spreads placement decisions across nodes instead of running one central scheduler. Two assumptions about the workload drive that choice:
 
-1. Each resource node is large (a beefy bare-metal box or VM). AerolVM packs
-   over 1K sandboxes per node, so each node has enough headroom to absorb
-   minor scheduling drift.
-2. Sandboxes are short-lived; the set on any one node turns over fast.
+1. Each resource node is large: a big bare-metal box or VM. AerolVM packs over 1,000 sandboxes per node, so each node has room to absorb small scheduling drift.
+2. Sandboxes are short-lived, so the set on any one node turns over fast.
 
-A central scheduler buys global optimality at the cost of one more moving
-part to keep alive, and this workload makes the trade unattractive. A
-perfectly-balanced cluster decays back to "roughly balanced" in seconds
-anyway. Power-of-two-choices on per-node capacity gets to roughly balanced in
-O(1) per decision, with no scheduler to lose. Where a correctness boundary
-is required (cluster-wide name uniqueness, capacity reservation,
-custom-domain binding), Raft holds it. Everywhere else: gossip and local
-decisions.
+A central scheduler buys perfect global choices, at the cost of one more moving part to keep alive. This workload makes that trade unattractive. A perfectly balanced cluster drifts back to "roughly balanced" within seconds anyway.
 
-**CAP positioning.** The placement FSM is CP. Placement writes (`opReserve`,
-`opPlace`, `opReassign`, custom-domain ops) require a leader; during a leader
-election they fail with `ErrNotLeader` and the API surfaces 503. Already-placed
-sandboxes keep serving; owner-routed reads and toolbox traffic do not touch
-Raft.
+Power-of-two-choices on per-node capacity reaches roughly balanced at a fixed cost per decision (O(1)), with no scheduler to lose. Where correctness needs a hard boundary, Raft holds it. Everywhere else, gossip and local decisions do the job.
+
+**Where it sits on CAP.** The CAP theorem says that when a network splits, a distributed system must choose between consistency and availability. The placement FSM is CP: it chooses consistency. Placement writes (`opReserve`, `opPlace`, `opReassign` and the custom-domain commands) need a Raft leader, the one server that writes new log entries.
+
+During a leader election, those writes fail with `ErrNotLeader` and the API returns 503. Sandboxes already placed keep serving. Reads routed to the owner never touch Raft, and neither does toolbox traffic. (The toolbox is the small agent inside each sandbox that runs commands and file operations.)
 
 ## Topology
 
-Two roles, plus an ingress-only variant:
+A cluster has two kinds of nodes, plus an ingress-only variant. (Ingress means incoming traffic from the internet.)
 
-- **Server-role nodes** run the Raft FSM that holds the placement map.
-  Mutations go through Raft consensus; reads are local to the FSM cache.
-- **Worker / ingress-only nodes** run `Agent` instead: gossip identity,
-  receive forwarded API requests, but do not store the FSM and do not join
-  Raft. All placement reads/writes go to the server quorum over authenticated
-  RPC.
+- **Server-role nodes** run the Raft FSM that holds the placement map. Changes go through Raft consensus, and reads come from the local FSM copy.
+- **Worker and ingress-only nodes** run `Agent` instead. They gossip their identity and receive forwarded API requests, but they do not store the FSM or join Raft. All their placement reads and writes go to the server quorum over authenticated RPC (remote procedure calls).
+
+The quorum is the set of voting Raft servers. A majority of it must agree on every change.
 
 ```mermaid
 graph TB
@@ -92,18 +83,15 @@ graph TB
     W2 -.->|RPC to any server; writes leader-forwarded| server
 ```
 
-Gossip (`hashicorp/memberlist`) carries identity and role only. The payload
-has to fit memberlist's 512-byte `NodeMeta` cap, and a capacity snapshot
-blows past it (`gossip.go` documents the regression that motivated splitting
-them). `capacityLeaseCache` fetches `capacity.Snapshot` from each
-worker-capable peer over an authenticated `/v1/capacity` GET on the gossip
-interval (default 5s; TTL = 3× interval, clamped ≥15s; see `capacity_lease.go`).
-Worker / Agent nodes do not join Raft; they call into any server-role member
-over RPC and writes get leader-forwarded.
+Gossip (`hashicorp/memberlist`) carries only identity and role. Its payload must fit memberlist's 512-byte `NodeMeta` limit, and a capacity report is bigger than that. (`gossip.go` documents the bug that led to splitting them.)
+
+Instead, `capacityLeaseCache` fetches `capacity.Snapshot`, a point-in-time report of free resources, from each worker-capable peer. It uses an authenticated `/v1/capacity` GET request on the gossip interval. That interval is 5 seconds by default, and a report expires after 3 intervals or 15 seconds, whichever is longer (see `capacity_lease.go`).
+
+Worker and Agent nodes do not join Raft. They call any server-role member over RPC, and writes get forwarded to the leader.
 
 ## The placement FSM
 
-`internal/cluster/fsm.go` defines a small command set:
+The FSM changes only through a fixed set of commands, and each one is one Raft log entry. `internal/cluster/fsm.go` defines them. These are the placement commands:
 
 ```go
 opPlace              opCode = 1
@@ -122,46 +110,27 @@ opAddCustomDomain    opCode = 13  // cluster-wide hostname binding
 opRemoveCustomDomain opCode = 14
 ```
 
-Every mutation is one Raft log entry. The placement state is deterministic
-across replicas: `f.version = log.Index` on apply (`fsm.go`) uses the raft
-log index as the FSM version, so it survives snapshots and matches
-leader/follower without extra bookkeeping. The earlier in-process counter
-reset to zero on every cold restart and broke watchers; pinning it to
-`log.Index` fixed B9.
+Later commands (15 and up) cover platform volumes, audit cleanup, secret recipients, two-phase deletes, node storage retirement and template catalogues.
 
-One caveat: `now := time.Now().Unix()` is also set on apply, so timestamps
-like `UpdatedUnix` and `OrphanedUnix` are local wall-clock and differ between
-leader and followers by milliseconds. Placement correctness does not depend
-on those fields being byte-identical across replicas; the keys and ownership
-fields are.
+Because every change is one Raft log entry, placement state ends up the same on every replica (copy of the FSM). On apply, `f.version = log.Index` makes the Raft log index the FSM version. That version survives Raft snapshots (compact saved copies of the state) and matches between leader and followers with no extra bookkeeping. An earlier in-process counter reset to zero on every cold restart and broke watchers; tying the version to `log.Index` fixed that.
 
-Reads are local off the FSM cache; the leader is only on the write path.
+One caveat: apply also sets `now := time.Now().Unix()`. So timestamps such as `UpdatedUnix` and `OrphanedUnix` come from each server's own clock, and differ between leader and followers by milliseconds. Placement correctness does not need those fields to match byte for byte. It needs the keys and ownership fields to match, and they do.
 
-**No split-brain on placement.** Two nodes cannot both win a write because
-Raft only accepts an entry once a majority of voters has logged it. During a
-leader election, writes block (the API returns 503); reads keep working off
-each replica's last committed state. Gossip and capacity heartbeats can
-partition and let two halves hold different *capacity views*, but neither
-side can mutate placement without a majority.
+Reads come from the local FSM copy. The leader is only on the write path.
 
-> **Invariant.** Ownership of sandbox X is whatever the committed FSM state
-> says about `placements[X]`. The FSM mutates only by raft log entry. Two
-> replicas may briefly disagree while a commit is in flight; once committed,
-> every server-role node converges to the same owner.
+**No split-brain on placement.** Split-brain is when two halves of a cluster both act as if they are in charge. Two nodes cannot both win a write, because Raft accepts an entry only once a majority of voters has logged it. During a leader election, writes block (the API returns 503), while reads keep working from each replica's last committed state.
+
+Gossip and capacity reports can split, so two halves may hold different *views of capacity*. But neither half can change placement without a majority.
+
+> **Invariant** (a rule that always holds). Ownership of sandbox X is whatever the committed FSM state says about `placements[X]`. The FSM changes only through Raft log entries. Two replicas may briefly disagree while a commit is in flight; once it commits, every server-role node agrees on the same owner.
 
 ## Reservations: the two-step create
 
-Without reservations, two concurrent creates with the same capacity snapshot
-pick the same node and double-book it. AerolVM commits intent before docker
-runs:
+Reservations stop two creates from double-booking a node. Without them, two creates running at once with the same capacity report would pick the same node. AerolVM records the intent in Raft before anything starts:
 
-1. **Router-side.** A server-role router runs `SelectPlacement` locally; a
-   worker / ingress-only Agent calls the control-plane RPC to get a target
-   back. The router then writes `opReserve` for `(sandbox_id, spec,
-   target_owner)`. The FSM checks cluster-wide name uniqueness, refuses to
-   overwrite an already-placed sandbox, and accounts the reservation against
-   the chosen owner. Other in-flight reservations on the same owner are
-   subtracted from headroom before the next `SelectPlacement` runs:
+1. **On the router.** The router is whichever node received the create. A server-role router runs `SelectPlacement` locally; a worker or ingress-only Agent asks the control plane over RPC for a target. The router then writes `opReserve` for `(sandbox_id, spec, target_owner)`.
+
+   The FSM checks that the name is unique across the cluster, refuses to overwrite a placed sandbox, and counts the reservation against the chosen owner. Before the next `SelectPlacement` runs, other in-flight reservations on that owner are subtracted from its headroom (spare capacity). The code comment explains why:
 
    > Subtract still-in-flight reservations (router wrote opReserve but the
    > target hasn't yet promoted via opPlace, so the gossip ledger doesn't
@@ -170,9 +139,7 @@ runs:
    > book it. The FSM serializes opReserve through raft, so the second
    > SelectPlacement on the same leader sees the first reservation here.
 
-2. **Owner-side.** The chosen owner runs docker locally. On success it writes
-   `opPlace`, promoting "reserved" to "placed". On failure the router writes
-   `opCancelReserve` and the reservation is released.
+2. **On the owner.** The chosen owner starts the sandbox locally. On success, it writes `opPlace`, which promotes "reserved" to "placed". On failure, the router writes `opCancelReserve` and the reservation is released.
 
 `opCancelReserve` has a deliberate safety property:
 
@@ -181,13 +148,9 @@ runs:
 > property that lets the router fire CancelReservation freely on any failure
 > without worrying about a racing successful promote.
 
-`opReserveBatch` is the burst optimization: N creates fold into one Raft
-entry instead of N. `validateReservationBatchLocked` runs under the FSM lock
-on every replica before the loop, so a batch with even one conflict (name
-collision, capacity overflow) is rejected whole and a partial commit cannot
-leave half the sandboxes reserved. The leader also runs
-`admitReservationCommand` as a pre-raft check; that one is just to avoid
-wasting log entries.
+`opReserveBatch` handles bursts: N creates fold into one Raft entry instead of N. `validateReservationBatchLocked` runs under the FSM lock on every replica before anything is applied. So a batch with even one conflict (a name collision or capacity overflow) is rejected whole. No partial commit can leave half the sandboxes reserved.
+
+The leader also runs `admitReservationCommand` as a check before Raft. That check only avoids wasting log entries.
 
 ```mermaid
 sequenceDiagram
@@ -211,16 +174,11 @@ sequenceDiagram
     end
 ```
 
-> **Invariant.** Once `opReserve` commits, the next `SelectPlacement` on the
-> leader sees the held capacity. Followers see it once they apply the log
-> entry locally (sub-millisecond in normal operation, bounded by raft commit
-> plus apply latency). A sandbox occupies capacity at most once on any node,
-> even under concurrent creates with a stale capacity lease.
+> **Invariant.** Once `opReserve` commits, the next `SelectPlacement` on the leader sees the held capacity. Followers see it once they apply the log entry locally. That is under a millisecond normally, bounded by Raft commit plus apply time. A sandbox takes up capacity at most once on any node, even when creates run at once against a stale capacity report.
 
 ## Power-of-two-choices placement
 
-`SelectPlacement` does not scan all members. The comment at `placement.go`
-spells it out:
+`SelectPlacement` does not scan every node; it samples two and picks the better one. The comment in `placement.go` spells it out:
 
 > The algorithm samples up to 2 random alive members (including self) and
 > picks the one with the most CPU+memory headroom relative to the requested
@@ -228,141 +186,88 @@ spells it out:
 > coordination; at scale it converges to within a small constant factor of
 > the truly-optimal choice while costing O(1) per placement.
 
-Why power-of-two and not consistent hashing / Maglev / load-aware random?
-Power-of-two has no rebalancing on membership change, constant decision
-cost, and works without global state. The Mitzenmacher result (linked
-below) is the reason it gets within a constant factor of optimal.
+Why power-of-two instead of consistent hashing, Maglev or load-aware random choice? Power-of-two needs no rebalancing when members change, costs the same for every decision, and needs no global state. A result by Michael Mitzenmacher (see Further reading) explains why it lands within a constant factor of the best choice.
 
-Scoring is `(budget − reserved − pending − request) / budget`, averaged
-across CPU, memory, and (when reported) disk; see `headroomScore` in
-`placement.go`. Candidates are rejected for: drained, dead, role-disallowed
-(`CanOwnSandboxRole`), no advertised API URL (partially joined), stale
-capacity (`CapacityStale`), capacity-budget overflow, GPU mismatch, runtime
-mismatch, or template miss (Phase 6 PR-D, with an unknown-allow rule for
-legacy peers).
+The score is `(budget − reserved − pending − request) / budget`, averaged across CPU, memory and (when reported) disk. See `headroomScore` in `placement.go`. A candidate is rejected if any of these is true:
 
-**Self wins ties.** The comparison at `placement.go:139` is `>`, not `>=`:
-`a` (the first pick) wins unless `b` has strictly greater headroom. When
-`a` is self, self stays. The intent is "only forward when a peer is
-genuinely better"; placement stays single-node-shaped until the cluster
-has a reason to disagree.
+- It is drained or dead.
+- Its role cannot own sandboxes (`CanOwnSandboxRole`).
+- It has not advertised an API URL, which means it is only partly joined.
+- Its capacity report is stale (`CapacityStale`), or the request would overflow its budget.
+- Its GPU or runtime (container, gVisor, Firecracker and so on) does not match the request.
+- It lacks the requested template. Older peers that do not report templates are let through (the "unknown-allow" rule).
 
-Drain is a hard admission rule, not a soft-scoring penalty:
+**The local node wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
+
+The intent is to forward only when a peer is truly better. Placement behaves like a single node until the cluster has a reason to disagree.
+
+Draining is a hard admission rule, not a scoring penalty. (Draining a node tells the cluster to stop placing new sandboxes on it.) The code says:
 
 > Drained nodes are excluded from the candidate set entirely. Cheaper and
 > clearer than threading the flag through nodeFits; drain is a hard
 > admission rule (operator says "don't put more work here"), not a
 > soft-scoring penalty.
 
-> **Invariant.** A placement decision uses the freshest information the
-> deciding node has: capacity-lease snapshot, minus in-flight reservations
-> (visible to the leader synchronously; visible to other replicas once
-> their FSM apply catches up), minus drain marks. Stale-capacity nodes drop
-> out of the candidate set until the next successful heartbeat fetch.
+> **Invariant.** A placement decision uses the freshest information the deciding node has. That is the capacity report, minus in-flight reservations, minus drain marks. The leader sees reservations at once; other replicas see them once their FSM apply catches up. Nodes with stale capacity drop out of the candidate set until their next successful report.
 
-## Capacity heartbeats and freshness gating
+## Capacity reports and freshness
 
-Capacity is pulled, not gossiped. `capacityLeaseCache` runs a fan-out
-(`capacityLeaseFetchConcurrency = 32`) that pulls `capacity.Snapshot` from
-each worker-capable peer over an authenticated `/v1/capacity` GET. The
-interval is the gossip period (default 5s); TTL is interval × 3, clamped to
-≥15s. A snapshot older than the TTL is marked stale and the node drops out
-of the candidate set.
+Each node pulls capacity reports from its peers instead of receiving them through gossip. `capacityLeaseCache` fetches `capacity.Snapshot` from each worker-capable peer over an authenticated `/v1/capacity` GET. It runs up to 32 fetches at a time (`capacityLeaseFetchConcurrency = 32`).
 
-Why pull and not push? Trust boundary. Pulls reuse the existing PAT auth on
-`/v1/capacity`; push would need a separate auth endpoint on every peer. At
-N=1000 peers, a 32-way fanout on a 5s interval is roughly 6 req/sec/peer;
-order of magnitude, not 10K req/s/peer.
+The interval is the gossip period, 5 seconds by default. A report expires after 3 intervals or 15 seconds, whichever is longer. An expired report is marked stale, and that node drops out of the candidate set.
 
-Local capacity is refreshed every tick from the in-process `Admitter`
-(`pkg/capacity`), not pulled (that would be a self-call). The same path
-overlays template inventory before storing, so the local view matches what
-peers see when they pull this node:
+Why pull instead of push? Because of the trust boundary. Pulls reuse the existing PAT (personal access token) auth on `/v1/capacity`. Pushes would need a separate authenticated endpoint on every peer.
+
+With 1,000 peers, a 32-way fan-out every 5 seconds is roughly 6 requests per second per peer. That is an order-of-magnitude estimate, but the point stands: it is nowhere near 10,000 per second per peer.
+
+Local capacity is refreshed on every tick from the in-process `Admitter` (`pkg/capacity`). It is not pulled, since that would be a call to itself. The same path adds the node's template list before storing the report, so the local view matches what peers see when they pull this node:
 
 > placement reads straight off this lease, so without the overlay our own
 > snapshot would advertise no templates and the unknown-allow rule would let
 > creates land on peers that lack them.
 
-> **Invariant.** A node is a candidate for placement only if its capacity
-> report is fresh (≤ TTL). Membership liveness is not enough. A partition
-> that drops capacity traffic but not gossip degrades to "unplaceable", not
-> "placed but unreachable". Existing sandboxes keep serving; forwarding
-> uses the gossiped `APIURL` / `InternalURL`, not capacity.
+> **Invariant.** A node is a placement candidate only if its capacity report is fresh (within the TTL). Being alive in gossip is not enough. A network split that drops capacity traffic but not gossip makes the node "unplaceable", not "placed but unreachable". Existing sandboxes keep serving, because forwarding uses the gossiped `APIURL` and `InternalURL`, not capacity.
 
 ## Owner-sharded execution
 
-A placed sandbox lives on its owner. Its local SQLite store, its docker
-container, its toolbox agent: none of that moves. Everything else is glued
-together with reverse-proxy forwarding (`forward.go`):
+A placed sandbox stays on its owner node, and every other node forwards requests to it. Its local SQLite record, its container and its toolbox agent never move. Everything else is joined up with reverse-proxy forwarding (`ForwardHTTP` in `forward.go`). The package overview in `cluster.go` says:
 
 > Once a sandbox is placed on node N, all of its state and lifecycle stays on
 > N. The local SQLite store is unchanged. Cross-node API calls (toolbox,
 > sessions, port forwards) are transparently reverse-proxied to the owner.
 
-`ForwardHTTP` caches one `httputil.ReverseProxy` per peer URL. Separate
-caches for plaintext and mTLS-pinned channels. TLS state and keepalives are
-never shared between transports.
+`ForwardHTTP` caches one `httputil.ReverseProxy` per peer URL. It keeps separate caches for plain connections and for mTLS-pinned ones. Mutual TLS (mTLS) is the encryption behind HTTPS, with both sides proving who they are by certificate. TLS state and keepalive connections are never shared between the two kinds.
 
-**Loop detection.** A stale placement view could bounce a request between
-two nodes that both think the other owns sandbox X. `forward.go` sets
-`X-Cluster-Forwarded: 1` on the way out; on receive, a node that sees the
-header AND is about to forward again returns 421 Misdirected Request so the
-caller retries against fresh placement.
+**Loop detection.** A stale placement view could bounce a request between two nodes that each think the other owns sandbox X. `forward.go` sets `X-Cluster-Forwarded: 1` on the way out. A node that receives a request with that header, and is about to forward it again, returns 421 Misdirected Request instead. The caller then retries against fresh placement.
 
-**The trade.** Owner-sharded execution buys local consistency: the toolbox
-sessions, SQLite row, and docker container for one sandbox live on one
-host, so no cross-node consensus is needed for its state. It costs a
-forwarded latency hit on every cross-node API call, and binds the sandbox
-to its owner: a long-lived sandbox cannot be migrated without going through
-the failover path.
+**The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
-> **Invariant.** A sandbox is reachable from any node in the cluster via
-> the public API, regardless of which node owns it. Forwarding is
-> automatic; the client does not need to know placement.
+The cost is an extra forwarding hop on every cross-node API call. It also ties the sandbox to its owner: a long-lived sandbox cannot move except through the failover path.
 
-## Dead-owner handling: reassign, then orphan, then evict
+> **Invariant.** A sandbox is reachable through the public API from any node in the cluster, whichever node owns it. Forwarding is automatic, so the client does not need to know placement.
 
-When SWIM declares a node dead, `deadOwnerTracker` records the first
-observed dead-at. After `ClusterDeadOwnerGrace` (default 30s, so a brief
-flap does not trigger expensive cleanup), the leader's `evictDeadOwner`
-loop in `dead_owner.go` runs three ordered steps:
+## When a node dies: reassign, then orphan, then evict
 
-1. **Per-sandbox `opReassign` for recreate-policy placements.** For every
-   sandbox owned by the dead node whose spec opted into
-   `failover.policy = "recreate"`, the leader runs `pickRecreationTarget`
-   (which calls `SelectPlacement` against the replicated spec; self is a
-   valid target; the leader can pick itself) and applies `opReassign`
-   pointing the placement at the new owner. One Raft entry per sandbox.
-2. **One `opOrphanOwner` for the rest.** Sandboxes owned by the dead node
-   that did not opt into recreate get orphaned in a single FSM mutation:
-   `OwnerNodeID=""`, `OwnerState=Orphaned`, ID preserved. Pending
-   reservations on the dead owner are released in the same op.
-3. **`RemoveServer` on the raft config.** The dead node is evicted from
-   the quorum. The order matters: orphan first, then remove. If
-   `RemoveServer` ran first and the leader then crashed, on restart the
-   FSM would still show the dead node as owner with no way to discover
-   it was gone (raft no longer tracks it). Doing placements first means a
-   crashed leader leaves observably-orphaned rows the next leader's tick
-   re-orphans idempotently.
+When a node dies, the leader moves, marks or removes its sandboxes in a fixed order. First, SWIM declares the node dead, and `deadOwnerTracker` records when that was first seen. After `ClusterDeadOwnerGrace` (30 seconds by default, so a brief flap does not trigger costly cleanup), the leader's `evictDeadOwner` loop in `dead_owner.go` runs three steps:
 
-Recreate-policy sandboxes never pass through the orphaned state. The new
-owner finds out via the owner-watcher loop on its FSM apply; only the
-node whose ID matches the new owner runs recreate. The owner-watcher
-dereferences `RecoveryRef` to fetch the sealed spec out-of-band, unseals
-locally, and calls `SandboxRecreator.RecreateSandbox(ctx, id, spec,
-secrets, exposedPorts)` (see `cluster.go`), which is implemented by the
-service layer. The leader is allowed to be its own recreation target; no
-special-case routing.
+1. **`opReassign` for each sandbox with the recreate policy.** These are the dead node's sandboxes whose spec set `failover.policy = "recreate"`. For each one, the leader picks a new owner with `selectRecreationTarget` and applies `opReassign`, one Raft entry per sandbox. Any node can be the target, including the leader itself.
+2. **One `opOrphanOwner` for the rest.** The dead node's other sandboxes are orphaned in a single FSM change: `OwnerNodeID=""` and `OwnerState=Orphaned`, with the sandbox ID kept. Pending reservations on the dead owner are released in the same command.
+3. **`RemoveServer` on the Raft configuration.** This removes the dead node from the quorum.
 
-For sandboxes that did get orphaned, two recovery paths remain:
+`selectRecreationTarget` (in `owner_watcher.go`) uses ordinary `SelectPlacement` for a sandbox with no sealed secrets. A sandbox with sealed secrets can only move to a node in its secret's recipient set, the nodes allowed to decrypt it. For that case, the leader scores every node in the set and picks the best.
 
-- **`opClaimOrphan`.** When the original owner comes back online, its
-  boot-time `AssertOwnership` re-asserts ownership of its orphaned
-  placements. The `opPlace` path refuses to overwrite an orphan: an
-  orphan must be explicitly claimed, never silently re-placed, because
-  the original may still be running the docker container locally.
-- **Operator delete.** Until claimed or deleted, the API surfaces 410
-  Gone for the orphaned sandbox.
+The order of the steps matters: orphan first, then remove.
+
+Suppose `RemoveServer` ran first and the leader then crashed. After restart, the FSM would still show the dead node as owner, and nothing could discover it was gone, because Raft no longer tracks it. Doing placements first means a crashed leader leaves visibly orphaned rows. The next leader's tick re-orphans them idempotently: repeating the step has the same effect as doing it once.
+
+Recreate-policy sandboxes never pass through the orphaned state. Every node runs an owner-watcher loop that checks the FSM every 5 seconds for sandboxes now assigned to it. Only the node whose ID matches the new owner runs the recreate.
+
+That node loads the sandbox's spec and opens its sealed (encrypted) secrets locally. It then calls `SandboxRecreator.RecreateSandbox(ctx, id, spec, secrets, exposedPorts)` (see `cluster.go`), which the service layer implements. If the recreate fails 5 times in a row (about 25 seconds), the watcher asks the cluster to reassign the sandbox to a different node.
+
+Orphaned sandboxes have two ways out:
+
+- **`opClaimOrphan`.** When the original owner comes back online, `AssertOwnership` runs at boot and reclaims its orphaned placements. The `opPlace` path refuses to overwrite an orphan. An orphan must be claimed on purpose, never silently re-placed, because the original node may still be running the container.
+- **Operator delete.** Until it is claimed or deleted, the API returns 410 Gone for the orphaned sandbox.
 
 ```mermaid
 sequenceDiagram
@@ -375,106 +280,68 @@ sequenceDiagram
     T->>T: markDead(node-D, now)
     Note over T: wait ClusterDeadOwnerGrace (30s default)
     loop for each D-owned sandbox with failover.policy=recreate
-        L->>L: pickRecreationTarget(spec)<br/>→ SelectPlacement (self allowed)
+        L->>L: selectRecreationTarget(placement)<br/>→ SelectPlacement (self allowed)
         L->>FSM: opReassign(id, new owner=N)
-        FSM-->>N: owner-watcher fires on apply
-        N->>N: fetch RecoveryRef, unseal, SandboxRecreator.RecreateSandbox
+        N->>FSM: owner watcher sees new owner (polls every 5s)
+        N->>N: load spec, open sealed secrets, SandboxRecreator.RecreateSandbox
     end
     L->>FSM: opOrphanOwner(node-D) for remaining placements
     FSM-->>FSM: remaining D-owned → OwnerNodeID=""<br/>(not deleted; 410 Gone)
     L->>L: RemoveServer(node-D)
 ```
 
-> **Invariant.** A node loss never deletes placements. Recreate-policy
-> placements are reassigned (preserving sandbox ID; restoring the
-> container on a new owner). The rest are orphaned and surfaced as 410
-> Gone until the original returns and claims, or the operator deletes
-> them. No silent re-placement.
+> **Invariant.** Losing a node never deletes placements. Recreate-policy placements are reassigned: they keep their sandbox ID and get a new container on a new owner. The rest are orphaned and return 410 Gone until the original node returns and claims them, or an operator deletes them. Nothing is silently re-placed.
 
-## Recovery replication
+## Keeping secrets out of the Raft log
 
-`opPlace`, `opClaimOrphan`, `opUpsertSpec`, `opReserve`, and `opReserveBatch`
-all carry the sandbox spec. Raw specs may contain plaintext secrets (mount
-credentials, env), which must not enter the Raft log in cleartext.
+Sandbox specs can contain secrets, so credentials are removed before a spec enters the Raft log. `opPlace`, `opClaimOrphan`, `opUpsertSpec`, `opReserve` and `opReserveBatch` all carry the sandbox spec. A raw spec may hold plaintext secrets, such as mount credentials or environment variables, and those must never enter the log in the clear.
 
-`externalizeCommandRecovery` (in `recovery_replication.go`) runs before
-the command goes into the log. It seals the spec + secrets into a
-`RecoveryBlob`, replicates that blob out-of-band to peer server-role nodes
-via authenticated HTTP, and then strips `Spec`, `SecretRef`, `SecretVersion`,
-and `SealedSecrets` from the command, replacing them with a `RecoveryRef`.
-The log entry that gets replicated by Raft carries only the ref, not the
-payload.
+Before a spec reaches the cluster layer, the service seals its secrets and strips them out, in two steps:
 
-> Spec/SecretRef/SealedSecrets remain in the struct for legacy log entries
-> and direct FSM tests; any Spec MUST be redacted of plaintext credentials
-> before encoding.
+1. It seals the secrets (mount credentials, the registry password and the environment variables) as a cluster secret. The secret is sealed for a recipient set: the owner plus backup nodes that may need to recreate the sandbox. See [Secrets providers](/cluster-secrets/) for how sealing and copying work.
+2. `RedactClusterSecrets` (in `internal/service/cluster_secrets.go`) returns a copy of the spec with those values removed. The Raft command carries this cleaned spec plus a handle to the sealed secret: its reference, version and recipient node IDs.
 
-The recovery-blob backing store is on each server-role node: a content-
-addressed local store (`recoveryStore`) plus peer-to-peer fetch on miss
-(`fetchRecoveryBlob` walks `recoveryServerMembers`). Followers apply the
-FSM mutation without unsealing; only the node whose ID matches the new
-owner runs the unseal + recreate path, by way of the owner-watcher loop
-calling `SandboxRecreator.RecreateSandbox`. A follower that is not the
-owner never touches the plaintext.
+The cluster code states the rule on every entry point:
 
-> **Invariant.** The Raft log never contains plaintext credentials.
-> Recovery material is sealed and replicated out-of-band; the log carries
-> references. Unsealing happens only on the assigned owner.
+> Spec MUST be redacted (no plaintext registry password / mount credentials)
+> before being handed to AssertOwnership; Secrets carries the provider ref
+> that the new owner re-merges on recreate.
 
-## The Noop degradation
+Each server-role node splits a placement into a small "hot" row and its recovery data (the spec and secret handle). The recovery data goes into a content-addressed local store (`recoveryStore`), where each item is filed under a hash of its contents. The hot row keeps only a `RecoveryRef` pointing at it.
 
-The whole machine has a `Noop` peer (`internal/cluster/noop.go`) selected when
-`cfg.EnableCluster=false`:
+Raft snapshots carry the hot rows with their references, not the recovery data. So a server that joins from a snapshot fetches each item once from a peer (`fetchRecoveryBlob` walks `recoveryServerMembers`), then caches it. Followers apply FSM changes without ever opening the sealed secrets.
+
+> **Invariant.** The Raft log never contains plaintext credentials. Specs are cleaned before they enter the log, and secrets travel sealed, by reference. Only a node in the secret's recipient set can open it, and only the assigned owner does so, to recreate the sandbox.
+
+## The Noop fallback
+
+In single-node mode, a `Noop` implementation (`internal/cluster/noop.go`) stands in for the whole cluster. It is selected when `cfg.EnableCluster=false`:
 
 > Every method behaves as if this node owns every sandbox and is the only
 > cluster member. Used when cfg.EnableCluster is false so callsites can be
 > unconditional.
 
-The `cluster.Client` interface stays addressable in single-node mode. The
-service layer calls into it without checking `EnableCluster`; the Noop
-returns "yes I own this", "yes you can place here", "the only ingress
-target is me". Service-layer call sites that need to know whether they are
-talking to themselves still branch on `IsSelf`, but the cluster-package
-surface itself never goes away. Cluster code can grow without forcing
-every caller to re-discover whether the cluster is real.
+The `cluster.Client` interface stays usable in single-node mode. The service layer calls it without checking `EnableCluster`. The Noop answers "yes, I own this", "yes, you can place here" and "the only ingress target is me".
 
-> **Invariant.** Cluster-mode code is no-op when disabled. The service layer
-> calls into `cluster.Client` unconditionally; the implementation, not the
-> caller, decides whether there is a quorum to talk to.
+Service code that needs to know whether it is talking to itself still checks `IsSelf`. But the cluster package itself never goes away. So cluster code can grow without forcing every caller to re-check whether the cluster is real.
+
+> **Invariant.** Cluster-mode code does nothing when cluster mode is off. The service layer calls `cluster.Client` every time. The implementation, not the caller, decides whether there is a quorum to talk to.
 
 ## Where the limits are
 
-The page would be dishonest if it implied this stack is mature in every axis.
-Real Phase-1 limitations, called out:
+These are the current limits of cluster mode. This page would be dishonest if it implied the stack is mature in every way:
 
-- **Capacity is pulled, not push-streamed.** A network blip between fetches
-  does not lose membership but can stale-mark capacity; TTL is 3× interval
-  (default 5s → 15s minimum), so a host that recovers quickly may take a
-  tick or two to re-enter the placement set.
-- **Reservations are TTL'd.** A router that crashes between `opReserve` and
-  the docker call leaves an orphaned reservation. The reconciler tick is 5s
-  and the reservation TTL is 120s, so the worst-case window where the
-  chosen owner's headroom looks artificially low is ~125s.
-- **Dead-owner grace is 30s.** `ClusterDeadOwnerGrace` defaults to 30s.
-  Recreate-policy failover does not kick in until the dead-owner tracker
-  has observed the node as dead continuously for that long. Tunable via
-  `SB_DEAD_OWNER_GRACE`.
-- **`failover.policy = "recreate"` is best-effort.** The new owner rebuilds
-  from the spec, but ephemeral state inside the container's writable layer
-  is gone; see [Durability & Failover](/durability) for the full table.
-- **Raft requires odd quorum.** Two server-role nodes do not survive one
-  loss; three do. `LargeClusterTopologyError` (in `topology.go`) rejects
-  two-voter topologies at startup rather than letting an operator deploy
-  into a split-brain trap.
+- **Capacity is pulled, not streamed.** A network blip between fetches does not lose membership, but it can mark capacity stale. A report expires after 3 intervals or 15 seconds, whichever is longer (the default interval is 5 seconds). A host that recovers quickly may take a tick or two to rejoin the placement set.
+- **Reservations expire on a timer.** A router that crashes between `opReserve` and starting the sandbox leaves a stray reservation. The cleanup loop runs every 5 seconds and the reservation TTL is 120 seconds. So at worst, the chosen owner's headroom looks too low for about 125 seconds.
+- **The dead-owner grace period is 30 seconds.** `ClusterDeadOwnerGrace` defaults to 30 seconds, and you can change it with `SB_DEAD_OWNER_GRACE`. Recreate-policy failover does not start until the dead-owner tracker has seen the node dead for that long without a break.
+- **`failover.policy = "recreate"` is best effort.** The new owner rebuilds from the spec. Anything kept only in the container's writable layer is gone; see [Durability and failover](/durability/) for the full table.
+- **Raft needs a majority.** Two server-role nodes cannot survive losing one; three can, so run an odd number of server-role nodes. Above 10 live nodes, `LargeClusterTopologyError` (in `topology.go`) also requires dedicated server, worker and ingress roles, and it caps the server tier at 7 nodes.
 
-None of this is hidden. Operators planning a cluster need to know the
-guarantees and the failure modes; the [cluster setup
-guide](/cluster-setup) covers the operational shape.
+None of this is hidden. Operators planning a cluster need to know the guarantees and the failure modes. [Cluster setup](/cluster-setup/) covers how to run one.
 
 ## What this buys you
 
-Same call shape works single-node, three-node, and mid-failover. The
-recreate-on-failover variant:
+The same create call works on one node, on three nodes, and in the middle of a failover. This is the version that opts into recreate-on-failover:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -611,14 +478,13 @@ recreate-on-failover variant:
 
 ## Further reading
 
-- [Durability & Failover](/durability) describes the user-facing contract for what
-  survives a host loss and what `failover.policy = "recreate"` actually
-  preserves.
-- [Cluster Setup](/cluster-setup) covers the operator-facing topology and quorum
-  rules.
-- [Idempotency on a Single Writer](/engineering-idempotency) covers the local-node
-  invariants the FSM mirrors at cluster scope (name uniqueness, partial
-  unique indexes).
-- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership](https://en.wikipedia.org/wiki/SWIM_Protocol) is the gossip protocol that backs `hashicorp/memberlist`.
-- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf) is the consensus algorithm `hashicorp/raft` implements.
-- [The Power of Two Choices in Randomized Load Balancing](https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf) is the result that makes random-sample placement near-optimal at scale.
+- [SWIM: Scalable Weakly-consistent Infection-style Process Group Membership](https://en.wikipedia.org/wiki/SWIM_Protocol): the gossip protocol behind `hashicorp/memberlist`.
+- [In Search of an Understandable Consensus Algorithm (Raft)](https://raft.github.io/raft.pdf): the consensus algorithm `hashicorp/raft` implements.
+- [The Power of Two Choices in Randomized Load Balancing](https://www.eecs.harvard.edu/~michaelm/postscripts/tpds2001.pdf): the result that makes sampling two nodes nearly as good as checking them all.
+
+## Next steps
+
+- [Durability and failover](/durability/): what survives a host loss, and what `failover.policy = "recreate"` keeps.
+- [Cluster setup](/cluster-setup/): how to deploy a cluster, and the quorum rules.
+- [Safe retries (idempotency)](/engineering-idempotency/): the single-node rules (name uniqueness, partial unique indexes) that the FSM mirrors across the cluster.
+- [Secrets providers](/cluster-secrets/): how sealed secrets are copied to the nodes that may need them.

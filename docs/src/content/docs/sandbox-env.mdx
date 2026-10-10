@@ -1,70 +1,126 @@
 ---
-title: Sandbox Environment Variables
+title: Environment Variables
+description: Pass settings and secrets into a sandbox, and read them back only when your code needs them.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Environment variables set at create time are secrets. `get` and `list` **omit `env` by default**. Pass an explicit opt-in to load them; those reads are audited on the daemon.
+Environment variables are named settings, like `APP_ENV=staging`, that every program in the sandbox can read. You set them when you create the sandbox.
 
-Create, get, and list responses are redacted unless the read API explicitly
-opts in to env materialization.
+AerolVM treats every variable as a secret. The server stores them encrypted. It leaves them out of what create, get and list return, unless you ask for them.
 
-At rest, env values exist only as an authenticated encrypted blob in
-`sandbox_env`, bound to the sandbox ID **and its lifecycle incarnation**.
-Copying ciphertext to another sandbox, or to a replacement that reuses its ID,
-does not make it decryptable there. Missing keys or invalid ciphertext fail
-closed. A sandbox created without environment variables has no env row.
+## Set environment variables
 
-Startup transactionally migrates legacy plaintext columns and upgrades older
-unbound encrypted env rows using the existing encryption key. The binding
-upgrade is recorded in the schema; normal reads and subsequent restarts never
-fall back to unbound decryption. Back up the database **and its matching key**
-before upgrading, and retain them together for rollback to an older binary.
-Do not run an older binary against an upgraded database.
-
-## Migrating existing clients
-
-Hiding env is an intentional breaking response-contract change, including
-single-node and local deployments. An absent `env` in a default response does
-**not** mean that the sandbox lost its environment. There is no server flag
-that restores plaintext disclosure to old clients.
-
-1. Identify code that reads `sandbox.env` after get/list (including code that
-   copies those values into a new create request). Do not interpret a redacted
-   response as an empty environment to propagate elsewhere.
-2. Upgrade the SDK to a release with the opt-in methods below, then request env
-   only where the application actually needs secret values. Routine inventory,
-   status polling, and dashboards should continue using the redacted defaults.
-3. Test both the explicit read and the redacted default in a staging deployment
-   before upgrading production. Confirm the explicit read produces an audit
-   event and that the application does not log the returned secrets.
-
-The next two sections show the replacement calls for all five SDKs. Clients
-that cannot yet be upgraded need an application migration before this server
-upgrade; they are not silently made compatible by the database migration.
-
-## Get a sandbox with env
+Pass a map of names and values in `env`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const sandbox = await client.get(id, { includeEnv: true })
-    console.log(sandbox.env?.API_KEY)
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      env: {
+        DATABASE_URL: "postgres://...",
+        APP_ENV: "sandbox",
+      },
+    });
+
+    const result = await sandbox.exec("echo $APP_ENV");
+    console.log(result.stdout); // sandbox
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        env={
+            "DATABASE_URL": "postgres://...",
+            "APP_ENV": "sandbox",
+        },
+    )
+
+    result = sandbox.exec("echo $APP_ENV")
+    print(result["stdout"])  # sandbox
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ubuntu:22.04",
+        Env: map[string]string{
+            "DATABASE_URL": "postgres://...",
+            "APP_ENV":      "sandbox",
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    result, err := sandbox.ExecCommand(ctx, "echo $APP_ENV")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout) // sandbox
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let env = HashMap::from([
+        ("DATABASE_URL".to_string(), "postgres://...".to_string()),
+        ("APP_ENV".to_string(), "sandbox".to_string()),
+    ]);
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        env: Some(env),
+        ..Default::default()
+    })?;
+
+    let result = sandbox.exec("echo $APP_ENV")?;
+    print!("{}", result.stdout); // sandbox
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setEnv(Map.of(
+            "DATABASE_URL", "postgres://...",
+            "APP_ENV", "sandbox")));
+
+    ExecResult result = sandbox.exec("echo $APP_ENV");
+    System.out.print(result.stdout); // sandbox
+    ```
+  </TabItem>
+</Tabs>
+
+You cannot change a sandbox's variables after you create it. To pass a value to a single command instead, use the `env` option of `exec`. See [Run commands](/exec-streaming/).
+
+## Read the variables back
+
+`get` leaves the variables out unless you ask for them. Ask only when your code really needs the values. The server writes an audit record each time someone reads them.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.get(id, { includeEnv: true });
+    console.log(sandbox.env?.APP_ENV);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     sandbox = client.get(sandbox_id, include_env=True)
-    print(sandbox.get('env', {}).get('API_KEY'))
+    print(sandbox.to_dict().get("env", {}).get("APP_ENV"))
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
     sandbox, err := client.Get(ctx, id, microvm.WithGetIncludeEnv())
     if err != nil {
-        return err
+        log.Fatal(err)
     }
-    fmt.Println(sandbox.Env["API_KEY"])
+    fmt.Println(sandbox.Env["APP_ENV"])
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -76,28 +132,27 @@ upgrade; they are not silently made compatible by the database migration.
   <TabItem label="Java">
     ```java
     Sandbox sandbox = client.get(id, true);
-    System.out.println(sandbox.env.get("API_KEY"));
+    System.out.println(sandbox.env.get("APP_ENV"));
     ```
   </TabItem>
 </Tabs>
 
-## List sandboxes with env
+## List sandboxes with their variables
+
+`list` takes the same opt-in. This example also filters by [tag](/sandbox-tags/).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandboxes = await client.list({
-      tags: { tenant: 'acme' },
+      tags: { tenant: "acme" },
       includeEnv: true,
-    })
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandboxes = client.list(
-        tags={'tenant': 'acme'},
-        include_env=True,
-    )
+    sandboxes = client.list(tags={"tenant": "acme"}, include_env=True)
     ```
   </TabItem>
   <TabItem label="Go">
@@ -110,53 +165,40 @@ upgrade; they are not silently made compatible by the database migration.
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let mut tags = std::collections::HashMap::new();
-    tags.insert("tenant".into(), "acme".into());
+    let tags = HashMap::from([("tenant".to_string(), "acme".to_string())]);
     let sandboxes = client.list_with_options(&tags, true)?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    java.util.Map<String, String> tags = new java.util.HashMap<>();
-    tags.put("tenant", "acme");
-    java.util.List<Sandbox> sandboxes = client.list(tags, true);
+    List<Sandbox> sandboxes = client.list(Map.of("tenant", "acme"), true);
     ```
   </TabItem>
 </Tabs>
 
-## Default get/list (no env)
+<Aside type="caution">
+A normal `get` or `list` has no variables in it. In TypeScript `env` is `undefined`, in Go it is `nil`, in Rust it is `None`, and in Java it is `null`. In Python the `env` key is missing. That does **not** mean the sandbox lost its variables. Never copy that empty value into a new sandbox.
+</Aside>
 
-Omit the opt-in flag — responses do not include `env`.
+## If your code reads env from get or list
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.get(id)
-    // sandbox.env is undefined / empty
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.get(sandbox_id)
-    # sandbox has no env (or empty)
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sandbox, err := client.Get(ctx, id)
-    // sandbox.Env is nil / empty
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let sandbox = client.get(&id)?;
-    // sandbox.data.env is None / empty
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox sandbox = client.get(id);
-    // sandbox.env is null / empty
-    ```
-  </TabItem>
-</Tabs>
+Older AerolVM servers returned `env` on every get and list. Newer servers hide it, on every kind of install, including a single server or your laptop. No server setting brings the old behavior back. Update your code before you upgrade the server:
+
+1. **Find the code that reads `env`** after a get or list. Look closely at code that copies those values into a new create. An empty `env` now means "hidden", not "none".
+2. **Upgrade the SDK** to a version with the opt-in shown above. Ask for env only where you need the secret values. Dashboards, status checks and inventory code should keep the default.
+3. **Test both cases** in a staging setup first. Check that the opt-in read works and creates an audit record. Check that your app does not log the secrets it gets back.
+
+A client you cannot upgrade yet needs a code change before the server upgrade. The database upgrade does not make old clients work.
+
+## For server operators
+
+- **Encryption.** The server stores variables in the `sandbox_env` table as one encrypted, signed blob per sandbox. The blob is tied to the sandbox ID and to that one life of the sandbox. Copying it to another sandbox, or to a new sandbox that reuses the ID, does not make it readable there.
+- **Fails closed.** If the key is missing or the blob is damaged, the read fails. It never falls back to plain text. A sandbox created with no variables has no row.
+- **Upgrade.** On startup, the server moves old plain-text values into the encrypted form, in one transaction. It also re-ties older encrypted rows to their sandbox with the existing key. It records the upgrade in the schema, so later reads and restarts never use the old form.
+- **Back up first.** Back up the database **and its matching key** before you upgrade. Keep them together in case you roll back. Do not run an older server binary against an upgraded database.
+
+## Next steps
+
+- [Run commands](/exec-streaming/): pass a variable to one command with `env`.
+- [Tags](/sandbox-tags/): filter lists of sandboxes by label.
+- [Secrets providers](/cluster-secrets/): how a cluster protects other sandbox secrets, like registry passwords.

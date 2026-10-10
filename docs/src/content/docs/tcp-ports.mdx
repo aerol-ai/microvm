@@ -1,54 +1,45 @@
 ---
-title: TCP & TLS Ports
-description: Publish native TCP endpoints (Postgres, Redis, MySQL, Mongo, gRPC) from a sandbox using caddy-l4.
+title: TCP and TLS ports
+description: Connect Postgres, Redis and other non-web clients to a service running inside a sandbox.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Browser-shaped traffic is happy on a Caddy HTTP reverse proxy, but raw-protocol clients - Postgres, Redis, MySQL, MongoDB, MQTT, gRPC, SSH, dedicated game servers - speak the wire directly and need a real TCP listener. AerolVM exposes both, behind one SDK call:
+Browsers talk HTTP, the language of the web. Many other programs do not. Databases such as Postgres, Redis, MySQL and MongoDB, plus MQTT brokers, gRPC services, SSH and game servers, send their own data over TCP. TCP is the basic way two programs send bytes over a network. An HTTP URL cannot carry that traffic.
 
-```
-exposePort(port, { protocol: "http" | "tcp" | "tls" })
-```
+So `exposePort` takes a `protocol` option. Leave it out to get a normal web URL. Set it to `"tcp"` or `"tls"` to give a non-web service an address that its usual client can connect to. TLS is the encryption behind `https://`, and a `"tls"` port adds it for you.
 
-`protocol` defaults to `"http"`, which keeps the existing `https://<sandbox-id>-<port>.<domain>` route. Pass `"tcp"` to allocate a parent-host port via [`caddy-l4`](https://github.com/mholt/caddy-l4) and get a `tcp://<host>:<host-port>` URL that plugs straight into a native client. Pass `"tls"` to add a TLS-SNI route to the shared `:443` listener.
+| Protocol | You get | Use it for |
+|---|---|---|
+| `"http"` (default) | A web URL: `https://<sandbox-id>-<port>.<domain>` | Websites, REST APIs, websockets |
+| `"tcp"` | `tcp://<host>:<host-port>`, plus `host` and `hostPort` | Postgres, Redis, MySQL, MongoDB and any other TCP service |
+| `"tls"` | `tls://<sandbox-id>-<port>.<domain>:443` | Clients that connect with TLS encryption from the first byte |
 
-The return value is a discriminated result keyed on `protocol`. Only the `"tcp"` variant carries `host` / `hostPort` - those are the dial coordinates a Postgres or Redis driver actually wants.
+Not sure which one to pick? See [TCP or TLS?](/tcp-vs-tls-ports/) for a side-by-side guide.
 
-| Mode | Call | Result fields | When |
-|---|---|---|---|
-| HTTP | `exposePort(port)` | `url` | browsers, REST APIs, websockets |
-| Raw TCP | `exposePort(port, { protocol: "tcp" })` | `url`, `host`, `hostPort` | Postgres, Redis, MySQL, Mongo, raw protocols |
-| TLS-SNI | `exposePort(port, { protocol: "tls" })` | `url` | TLS-aware backends that already speak SNI |
+<Aside type="caution" title="Server setup needed">
+These addresses only work on a server install. TCP ports work with or without a domain. TLS ports need a server with a domain. A local install returns an address, but nothing answers there. See [Share a web app](/preview/).
+</Aside>
 
-All three share the same lifecycle: routes are torn down on stop / destroy and re-published on start, and a single `unexposePort(port)` tears down whichever surface the row was on.
+## Connect to a database with a TCP port
 
-Not sure which non-HTTP option fits your workload? See [TCP vs TLS Ports](/tcp-vs-tls-ports/) for a side-by-side mental model, a workload-by-workload picker, and the trade-offs each mode imposes.
-
-## Raw TCP
-
-`exposePort(port, { protocol: "tcp" })` allocates a parent-host port from the configured pool (default `[22000, 23000]`) and points caddy-l4 at the sandbox's container IP. The returned result has `url` in `tcp://<public-host>:<host-port>` form, plus `host` and `hostPort` as separate fields so you can build a DSN without parsing the URL.
+Pass `protocol: "tcp"`. The server picks a free port on its own network, called the **host port**. It forwards every byte from that port to the port inside the sandbox. The result has the full `url`, plus `host` and `hostPort` as separate fields. Use those two to build a connection string (the one line of text a database client uses to connect).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const exposure = await sandbox.exposePort(5432, { protocol: "tcp" });
     if (exposure.protocol === "tcp") {
-      // exposure.url      === "tcp://203.0.113.10:37412"
-      // exposure.host     === "203.0.113.10"
-      // exposure.hostPort === 37412
       const dsn = `postgresql://user:pass@${exposure.host}:${exposure.hostPort}/appdb`;
+      console.log(exposure.url); // tcp://sandbox.example.com:22417
     }
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     exposure = sandbox.expose_port(5432, protocol="tcp")
-    # exposure.protocol  == "tcp"
-    # exposure.url       == "tcp://203.0.113.10:37412"
-    # exposure.host      == "203.0.113.10"
-    # exposure.host_port == 37412
     dsn = f"postgresql://user:pass@{exposure.host}:{exposure.host_port}/appdb"
+    print(exposure.url)  # tcp://sandbox.example.com:22417
     ```
   </TabItem>
   <TabItem label="Go">
@@ -57,134 +48,99 @@ Not sure which non-HTTP option fits your workload? See [TCP vs TLS Ports](/tcp-v
     if err != nil {
         log.Fatal(err)
     }
-    // exposure.Protocol == "tcp"
-    // exposure.PublicURL == "tcp://203.0.113.10:37412"
-    // exposure.Host == "203.0.113.10"
-    // exposure.HostPort == 37412
     dsn := fmt.Sprintf("postgresql://user:pass@%s:%d/appdb", exposure.Host, exposure.HostPort)
+    fmt.Println(exposure.PublicURL) // tcp://sandbox.example.com:22417
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let exposure = sandbox.expose_port(5432, ExposeOptions::tcp())?;
-    if let ExposeResult::Tcp { url, host, host_port } = exposure {
-        // url == "tcp://203.0.113.10:37412"
+    use aerolvm_sdk::{ExposeOptions, ExposeResult};
+
+    if let ExposeResult::Tcp { url, host, host_port } = sandbox.expose_port(5432, ExposeOptions::tcp())? {
         let dsn = format!("postgresql://user:pass@{}:{}/appdb", host, host_port);
+        println!("{}", url); // tcp://sandbox.example.com:22417
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
     ExposeResult exposure = sandbox.exposePort(5432, ExposeOptions.tcp());
-    // exposure.protocol == ExposeProtocol.TCP
-    // exposure.url      equals "tcp://203.0.113.10:37412"
-    // exposure.host     equals "203.0.113.10"
-    // exposure.hostPort equals 37412
     String dsn = String.format("postgresql://user:pass@%s:%d/appdb", exposure.host, exposure.hostPort);
+    System.out.println(exposure.url); // tcp://sandbox.example.com:22417
     ```
   </TabItem>
 </Tabs>
 
-The tuple `(host, hostPort)` is everything you need to build a DSN for any TCP protocol - pass it directly to `psql`, `redis-cli`, `mysql`, `mongosh`, or your application's connection string.
+On a server with a domain, `host` is the server's domain. Without a domain, it is the server's IP address, such as `203.0.113.10`. The host port comes from a range the operator sets, `22000` to `23000` by default.
 
-### Host port pool
+Pass the host and port to any client: `psql`, `redis-cli`, `mysql`, `mongosh`, or your app's connection string.
 
-The allocator picks a candidate at random from `[SB_L4_PORT_RANGE_START, SB_L4_PORT_RANGE_END]` and reserves it via a single atomic `INSERT OR IGNORE`. Random-first keeps p95 fast even with many concurrent allocations; on collision it falls back to a deterministic linear scan so the pool is exhausted fully before giving up.
+<Aside type="caution" title="Anyone can try to connect">
+A TCP port is open to the whole internet. AerolVM passes the bytes through and does not check who is connecting. Protect the service itself, for example with a strong database password.
+</Aside>
 
-The default pool is `[22000, 23000]` - 1000 slots, which is the per-host cap on concurrent TCP exposures. The range is chosen to sit **below** the Linux ephemeral port range (`net.ipv4.ip_local_port_range`, typically `32768–60999`) so the kernel never picks one of these as the source port for an unrelated outbound connection. Overlap there caused intermittent `EADDRINUSE` failures when the allocator's `bind()` raced with a kernel-chosen ephemeral source port; keeping the pool out of that range eliminates the failure mode entirely.
+## Get a TLS address on port 443
 
-Override the pool with environment variables on `sandboxd`:
+With `protocol: "tls"`, clients connect with TLS to the server's shared port 443. Each exposure gets its own name, such as `sb-9f2c41d07a3e5b86-5432.sandbox.example.com`.
 
-```
-SB_L4_PORT_RANGE_START=22000
-SB_L4_PORT_RANGE_END=23000
-```
-
-If you raise these bounds, keep both sides outside your kernel's ephemeral range - check it with `cat /proc/sys/net/ipv4/ip_local_port_range`. Picking values inside the ephemeral range will reintroduce the random-collision failure mode on busy hosts.
-
-The host firewall must permit inbound traffic on that range. The installer prints a reminder, but does not auto-open the firewall - operators decide their own policy.
-
-### What gets restored on restart
-
-The `host_port` reservation is persisted alongside the exposure row. After a sandboxd restart, the periodic reconcile re-publishes the layer4 server pointing at the (possibly new) container IP, and the same host port stays bound - clients with cached connection strings keep working.
-
-In cluster mode, the selected host port is also replicated in the placement route map. Non-owner nodes bind the same public host port and proxy to the current owner, so `tcp://<cluster-host>:<host-port>` remains the intended stable endpoint after route convergence. If a failover owner cannot bind the replicated host port because something local already owns it, the exposure needs operator attention rather than silently changing to a different port.
-
-## TLS-SNI multiplexing
-
-`exposePort(port, { protocol: "tls" })` reuses one shared listener (default `:443`), terminates TLS at the edge using Caddy's wildcard certificate, and forwards plaintext bytes to the container. The result has `url` in `tls://<id>-<port>.<domain>:<l4-port>` form.
-
-Your backend speaks plain TCP - no certificate management, no renewal, no private key inside the container. Caddy's wildcard cert lives on the host and never crosses the container boundary.
+The server holds the TLS certificate (the file that proves to clients the address is really yours). It decrypts the traffic and forwards plain bytes to your service. Your service does not need a certificate or any TLS setup.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    const exposure = await sandbox.exposePort(5432, { protocol: "tls" });
-    // exposure.protocol === "tls"
-    // exposure.url      === "tls://abc-5432.sandbox.example.com:443"
+    const exposure = await sandbox.exposePort(6379, { protocol: "tls" });
+    console.log(exposure.url); // tls://sb-9f2c41d07a3e5b86-6379.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    exposure = sandbox.expose_port(5432, protocol="tls")
-    # exposure.url == "tls://abc-5432.sandbox.example.com:443"
+    exposure = sandbox.expose_port(6379, protocol="tls")
+    print(exposure.url)  # tls://sb-9f2c41d07a3e5b86-6379.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    exposure, err := sandbox.ExposePort(ctx, 5432, microvm.WithProtocol(sdktypes.ExposeProtocolTLS))
+    exposure, err := sandbox.ExposePort(ctx, 6379, microvm.WithProtocol(sdktypes.ExposeProtocolTLS))
     if err != nil {
         log.Fatal(err)
     }
-    // exposure.PublicURL == "tls://abc-5432.sandbox.example.com:443"
+    fmt.Println(exposure.PublicURL) // tls://sb-9f2c41d07a3e5b86-6379.sandbox.example.com:443
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let exposure = sandbox.expose_port(5432, ExposeOptions::tls())?;
-    if let ExposeResult::Tls { url } = exposure {
-        // url == "tls://abc-5432.sandbox.example.com:443"
+    if let ExposeResult::Tls { url } = sandbox.expose_port(6379, ExposeOptions::tls())? {
+        println!("{}", url); // tls://sb-9f2c41d07a3e5b86-6379.sandbox.example.com:443
     }
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    ExposeResult exposure = sandbox.exposePort(5432, ExposeOptions.tls());
-    // exposure.url equals "tls://abc-5432.sandbox.example.com:443"
+    ExposeResult exposure = sandbox.exposePort(6379, ExposeOptions.tls());
+    System.out.println(exposure.url); // tls://sb-9f2c41d07a3e5b86-6379.sandbox.example.com:443
     ```
   </TabItem>
 </Tabs>
 
-Requirement: **domain mode**. `--domain` must be configured (the SNI hostname needs an A record pointing at the host). Domain-mode installs always run DNS-01 wildcard TLS - `install.sh` requires `--dns-provider` and `--dns-api-token` whenever `--domain` is set, so TLS-SNI multiplexing is always available. caddy-l4 owns `:443` (`SB_L4_TLS_LISTEN=:443`) and the regular Caddy HTTPS listener is relocated to `127.0.0.1:8443`. Caddy's wildcard cert for `*.<domain>` is issued once via DNS-01 at startup and reused for every TLS-SNI exposure.
+What to know about TLS ports:
 
-TLS is **terminated at the edge** by caddy-l4. Caddy's auto-managed wildcard cert is presented to the client; bytes after the handshake are forwarded as plaintext to the container. This means:
+- **They need a server with a domain.** On a server without one, the call fails with `TLS-SNI exposure requires --domain to be configured`.
+- **The client must send the name it wants.** Clients do this at the start of the TLS connection. This is called SNI (Server Name Indication), and the server uses it to pick the right sandbox. Almost every modern client sends it.
+- **The client must start with TLS right away.** Some protocols, such as MySQL and default Postgres, start in plain text and switch to TLS later. Use a TCP port for those.
+- **The TLS connection ends at the server.** Client certificates (mutual TLS) and custom protocol negotiation never reach your service. Use a TCP port if you need them.
 
-- **No cert lives inside the container.** Your sandbox process speaks plain TCP and is unaware that clients connected over TLS.
-- **No per-sandbox cert work happens at expose time.** The wildcard already exists; we just add an SNI route to the layer4 server. Expose latency is one Caddy admin API call plus one SQLite insert.
-- **mTLS, custom ALPN, and HTTP/2 client-cert auth are not supported in this mode** - the terminator consumes the original handshake. Use `protocol: "tcp"` if you need those.
+## Stop sharing a port
 
-## Reconciliation
-
-Reconcile keeps caddy and the sandbox database in sync across all three protocols (`http`, `tcp`, `tls`). The periodic loop and `POST /v1/admin/reconcile` both:
-
-- Re-upsert routes for running sandboxes whose caddy entries are missing.
-- Drop routes when the underlying sandbox is `destroyed`.
-- Garbage-collect zombie caddy routes / layer4 servers whose IDs match our convention but no longer correspond to any DB row (e.g. after a destroyed-row TTL purge or development DB wipe).
-
-See [Reconcile](/reconcile) for full details.
-
-## Unexposing
-
-`unexposePort(port)` tears down whichever surface the port was published on - HTTP, TCP, or TLS. The daemon dispatches on the recorded protocol from the `exposed_ports` row, so the caller does not need to remember which protocol was used:
+`unexposePort(port)` removes the address, whatever protocol you used. You do not need to say which one.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await sandbox.exposePort(3000);                            // -> { protocol: "http", url }
-    await sandbox.exposePort(5432, { protocol: "tcp" });       // -> { protocol: "tcp",  url, host, hostPort }
-    await sandbox.exposePort(6379, { protocol: "tls" });       // -> { protocol: "tls",  url }
+    await sandbox.exposePort(3000);                        // web
+    await sandbox.exposePort(5432, { protocol: "tcp" });   // TCP
+    await sandbox.exposePort(6379, { protocol: "tls" });   // TLS
 
-    // All tear down with the same call:
+    // The same call removes each one:
     await sandbox.unexposePort(3000);
     await sandbox.unexposePort(5432);
     await sandbox.unexposePort(6379);
@@ -192,10 +148,11 @@ See [Reconcile](/reconcile) for full details.
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox.expose_port(3000)
-    sandbox.expose_port(5432, protocol="tcp")
-    sandbox.expose_port(6379, protocol="tls")
+    sandbox.expose_port(3000)                   # web
+    sandbox.expose_port(5432, protocol="tcp")   # TCP
+    sandbox.expose_port(6379, protocol="tls")   # TLS
 
+    # The same call removes each one:
     sandbox.unexpose_port(3000)
     sandbox.unexpose_port(5432)
     sandbox.unexpose_port(6379)
@@ -203,7 +160,7 @@ See [Reconcile](/reconcile) for full details.
   </TabItem>
   <TabItem label="Go">
     ```go
-    if _, err := sandbox.ExposePort(ctx, 3000); err != nil {
+    if _, err := sandbox.ExposePort(ctx, 3000); err != nil { // web
         log.Fatal(err)
     }
     if _, err := sandbox.ExposePort(ctx, 5432, microvm.WithProtocol(sdktypes.ExposeProtocolTCP)); err != nil {
@@ -213,17 +170,21 @@ See [Reconcile](/reconcile) for full details.
         log.Fatal(err)
     }
 
-    _ = sandbox.UnexposePort(ctx, 3000)
-    _ = sandbox.UnexposePort(ctx, 5432)
-    _ = sandbox.UnexposePort(ctx, 6379)
+    // The same call removes each one:
+    for _, port := range []int{3000, 5432, 6379} {
+        if err := sandbox.UnexposePort(ctx, port); err != nil {
+            log.Fatal(err)
+        }
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    sandbox.expose_port(3000, ExposeOptions::default())?;
-    sandbox.expose_port(5432, ExposeOptions::tcp())?;
-    sandbox.expose_port(6379, ExposeOptions::tls())?;
+    sandbox.expose_port(3000, ExposeOptions::default())?; // web
+    sandbox.expose_port(5432, ExposeOptions::tcp())?;     // TCP
+    sandbox.expose_port(6379, ExposeOptions::tls())?;     // TLS
 
+    // The same call removes each one:
     sandbox.unexpose_port(3000)?;
     sandbox.unexpose_port(5432)?;
     sandbox.unexpose_port(6379)?;
@@ -231,10 +192,11 @@ See [Reconcile](/reconcile) for full details.
   </TabItem>
   <TabItem label="Java">
     ```java
-    sandbox.exposePort(3000);
-    sandbox.exposePort(5432, ExposeOptions.tcp());
-    sandbox.exposePort(6379, ExposeOptions.tls());
+    sandbox.exposePort(3000);                         // web
+    sandbox.exposePort(5432, ExposeOptions.tcp());    // TCP
+    sandbox.exposePort(6379, ExposeOptions.tls());    // TLS
 
+    // The same call removes each one:
     sandbox.unexposePort(3000);
     sandbox.unexposePort(5432);
     sandbox.unexposePort(6379);
@@ -242,25 +204,75 @@ See [Reconcile](/reconcile) for full details.
   </TabItem>
 </Tabs>
 
-### What unexpose actually does
+Unexposing a TCP port gives its host port back to the pool for other sandboxes.
 
-The daemon dispatches on the protocol stored on the `exposed_ports` row:
+## Change the protocol of a port
 
-| Recorded protocol | Caddy surface torn down | Host-side cleanup |
+A port can have only one protocol at a time. If you expose a port again with a different protocol, the call fails with `port 5432 already exposed as tcp; unexpose it first`. Call `unexposePort(port)`, then `exposePort` with the new protocol.
+
+Exposing a port again with the **same** protocol is safe. It returns the same address, and a TCP port keeps its host port.
+
+## Good to know
+
+- **Restarts keep the address.** Stop and start the sandbox, and its ports come back with the same addresses. A TCP port keeps the same host port, so saved connection strings keep working.
+- **Serverless sandboxes wake on connections.** A [serverless sandbox](/serverless/) that stopped while idle starts again when a client connects to its TCP or TLS port.
+- **Listen on all addresses.** The service inside the sandbox must listen on `0.0.0.0`, not only `localhost`.
+- **The firewall must allow the host ports.** If you cannot connect to a TCP port, ask your operator to open ports `22000` to `23000`.
+- **No custom domains with TCP or TLS.** A sandbox with a TCP or TLS port cannot also have a [custom domain](/custom-domains/).
+- **WASM and V8 isolate sandboxes** support web (HTTP) ports only.
+
+## For server operators
+
+### The host port pool
+
+Each TCP exposure takes one port from a pool on the server. The pool is `22000` to `23000` by default, about 1,000 ports. That is also the most TCP exposures one server can have at a time. When it runs out, `exposePort` fails with `L4 port pool exhausted`.
+
+The server picks a random free port first, which stays fast when many exposures happen at once. If that port is taken, it checks the pool in order, so it uses every port before it gives up. Each pick is saved in the database in one step, so two calls can never get the same port.
+
+Change the pool with these settings on `sandboxd`:
+
+```text
+SB_L4_PORT_RANGE_START=22000
+SB_L4_PORT_RANGE_END=23000
+```
+
+The start must be at least `1024` and lower than the end. The end can be at most `65535`.
+
+Keep the pool below the Linux ephemeral port range. That is the range the kernel picks from when a program opens an outgoing connection, usually `32768` to `60999`. Check yours with `cat /proc/sys/net/ipv4/ip_local_port_range`. If the two ranges overlap, the kernel can take a pool port for an outgoing connection. On busy hosts, an exposure then fails with `EADDRINUSE`.
+
+The host firewall must allow incoming traffic on the whole pool. The installer prints a reminder but does not open the firewall for you.
+
+### The shared TLS port
+
+TLS ports run on caddy-l4, the layer-4 module of Caddy (the web proxy in front of the server). It handles raw TCP traffic, not just web requests. In domain mode, the installer sets `SB_L4_TLS_LISTEN=:443`, so caddy-l4 owns port 443. Normal HTTPS traffic for the API and web URLs moves to `127.0.0.1:8443` (`SB_L4_TLS_FALLBACK`). caddy-l4 sends every name that is not a TLS port there.
+
+TLS ports reuse the server's wildcard certificate for `*.<domain>`. Caddy gets it once with DNS-01 at startup. So exposing a TLS port does no certificate work: it adds one route to Caddy and one row to the database. The certificate's private key stays on the host and never enters a sandbox. If `SB_L4_TLS_LISTEN` is empty, TLS exposures fail with `TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set`.
+
+### Restarts and clusters
+
+The host port is saved with the exposure. After a `sandboxd` restart, the server's regular sync pass puts each TCP route back, pointing at the sandbox's current address, on the same host port.
+
+In a cluster, the chosen host port is copied to every server. Servers that do not run the sandbox open the same host port and forward to the server that does. So `tcp://<cluster-host>:<host-port>` stays the same address after the cluster settles. If the server taking over a failed sandbox cannot open that port because something else uses it, the exposure needs an operator's help. The server does not quietly move it to another port.
+
+### What unexpose removes
+
+The server looks up the protocol saved with the exposure and removes the matching Caddy route:
+
+| Saved protocol | Caddy route removed | Extra cleanup |
 |---|---|---|
-| `http` (or empty, for legacy rows) | `DELETE /id/sandbox-<id>-port-<port>` on the HTTP server | none |
-| `tcp` | `DELETE /config/apps/layer4/servers/tcp-port-<host-port>` | host port returns to the `[22000, 23000]` pool |
-| `tls` | `DELETE /id/sandbox-<id>-port-<port>-tls` on the SNI mux | none |
+| `http` (or empty, on old rows) | `sandbox-<id>-port-<port>` on the HTTP server | None |
+| `tcp` | The layer-4 server `tcp-port-<host-port>` | The host port goes back to the pool |
+| `tls` | `sandbox-<id>-port-<port>-tls` on the shared TLS listener | None |
 
-In every case the row in `exposed_ports` is deleted and the toolbox port allowlist is refreshed so subsequent calls to `/proxy/<port>/` on the public sandbox URL are rejected immediately.
+In every case, the exposure row is deleted. The sandbox's port allowlist is updated, so the proxy path `/proxy/<port>/` refuses requests right away.
 
-### Switching protocols on a port
+### Keeping routes in sync
 
-`(sandbox_id, port)` allows only one row at a time, so re-exposing the same port under a different protocol fails fast with `port N already exposed as <proto>; unexpose it first`. Call `unexposePort(port)` and then re-`exposePort` with the new options.
+The server's regular sync pass, and a manual run, keep Caddy and the database matched for all three protocols. They add missing routes for running sandboxes and remove routes for deleted ones. They also delete leftover routes and layer-4 servers that match AerolVM's naming but no longer belong to any sandbox. See [Reconcile](/reconcile/).
 
-## Related docs
+## Next steps
 
-- [TCP vs TLS Ports](/tcp-vs-tls-ports/) - deeper picker for choosing between `protocol: "tcp"` and `protocol: "tls"`.
-- [Preview](/preview/) - HTTPS-shaped exposures.
-- [Port Allowlist](/port-allowlist/) - explicit exposure before public traffic is accepted.
-- [Reconcile](/reconcile/) - how caddy state is kept consistent with the database.
+- [TCP or TLS?](/tcp-vs-tls-ports/): pick the right protocol for your service.
+- [Share a web app](/preview/): web URLs for websites and APIs.
+- [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.
+- [Reconcile](/reconcile/): how the server keeps its routes in sync.
