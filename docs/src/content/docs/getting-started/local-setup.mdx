@@ -19,7 +19,7 @@ You do not need a domain name, a cloud account or a TLS certificate (the file th
 Pick a secret token. It works like a password for your server. Run the installer as yourself, **without** `sudo`:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- \
+curl -fsSL https://aerolvm.aerol.ai | bash -s -- \
     --local \
     --pat-token your-secret-pat
 ```
@@ -31,7 +31,7 @@ The server starts again by itself each time you log in.
 Pick a secret token, then run:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
     --local \
     --pat-token your-secret-pat
 ```

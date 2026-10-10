@@ -295,7 +295,7 @@ every node.
 On `node-a`, `node-b`, `node-c`:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token shared-pat-token \
@@ -848,7 +848,7 @@ SSH to each instance (the EIPs you allocated earlier are the SSH targets):
 
 ```bash
 ssh ubuntu@<node-a-EIP>
-sudo curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+sudo curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token shared-pat-token-pick-something-strong \
