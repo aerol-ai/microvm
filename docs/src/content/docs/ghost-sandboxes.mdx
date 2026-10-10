@@ -1,13 +1,13 @@
 ---
-title: Serverless Sandboxes
+title: Ghost Sandboxes
 description: Let a sandbox stop when nobody uses it and start again by itself when the next request arrives.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A serverless sandbox stops by itself when it sits idle. When the next request reaches one of its public ports, the server starts it again, then passes the request through. The request can be web traffic (HTTP), a raw TCP connection, or a TLS connection (encrypted TCP). The sandbox keeps its files and its public URL the whole time.
+A Ghost/serverless sandbox stops by itself when it sits idle. When the next request reaches one of its public ports, the server starts it again, then passes the request through. The request can be web traffic (HTTP), a raw TCP connection, or a TLS connection (encrypted TCP). The sandbox keeps its files and its public URL the whole time.
 
-Use this for sandboxes that serve traffic only now and then, such as preview sites, per-user coding spaces or model endpoints. While they sleep, they use no CPU or memory.
+Use this for sandboxes that serve traffic only now and then, such as preview sites, per-user coding spaces or model endpoints. While they sleep, they use no CPU or memory. This is the architecture Vercel or Fly.io uses.
 
 ## What you can build with it
 

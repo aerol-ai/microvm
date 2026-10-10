@@ -66,13 +66,14 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     label: 'Sandboxes',
     category: NavigationCategory.SANDBOXES,
     entries: [
-      link('/sandboxes', 'Create and manage'),
+      link('/sandboxes', 'Create and Manage'),
+      link('/ghost-sandboxes', 'Ghost Mode'),
       link('/environment', 'Images, resources and lifecycle'),
+      link('/ssh-access', 'SSH access'),
       link('/sandbox-env', 'Environment variables'),
       link('/sandbox-tags', 'Tags'),
       link('/snapshots', 'Snapshots'),
-      link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
-      link('/serverless', 'Serverless sandboxes'),
+      
       link('/durability', 'Durability and failover'),
     ],
   },
@@ -84,7 +85,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/exec-streaming', 'Run commands'),
       link('/file-system', 'Files'),
       link('/sessions', 'Terminal sessions'),
-      link('/ssh-access', 'SSH access'),
     ],
   },
   {
@@ -147,6 +147,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     label: 'Deep Dives',
     category: NavigationCategory.ENGINEERING,
     entries: [
+      link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
       link('/engineering-distributed-sandbox-runtime', 'Why AerolVM exists'),
       link('/engineering-runtime-layers', 'Engine, chassis, runtime'),
       link('/engineering-idempotency', 'Safe retries (idempotency)'),

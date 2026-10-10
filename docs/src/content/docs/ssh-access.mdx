@@ -146,15 +146,6 @@ ssh -i sandbox_key -p 2220 sb-0123456789abcdef@sandbox.example.com
 
 When a login reaches a server that does not run the sandbox, that server checks the key against the server that does. It then passes the session there over the cluster's private, encrypted channel. Only the sandbox's public key and the session itself cross between servers. The key is checked on every login and never cached, so a changed key takes effect at once.
 
-### Give every node the same host key
-
-By default each server makes its own host key. Users who land on different servers may then see a warning that the host key changed. To avoid it, give every ingress node the same host key:
-
-- **Terraform:** set the `ssh_host_key_pem` variable (marked sensitive) to a shared OpenSSH ed25519 private key. Setup writes it to `SB_SSH_HOST_KEY_PATH` on every node.
-- **Ansible:** set `ssh.host_key` in `config/secrets.yml`, or point `sandboxd_ssh_host_key_src` at a file on the control machine. The `configure-ops.yml` playbook installs it.
-
-Leave both unset to keep a separate key per node.
-
 ## Next steps
 
 - [Terminal sessions](/sessions/): manage the same shells from code.

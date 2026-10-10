@@ -630,12 +630,6 @@ flowchart LR
 
 WebAssembly sandboxes have a few extra states, such as `passivated` (saved to disk while the server restarts). See [WebAssembly (WASM)](/wasm-sandbox/).
 
-## For server operators
-
-- **Default runtime.** `SB_CONTAINER_RUNTIME` sets the runtime a create gets when it leaves `runtime` out. The default is `docker`.
-- **Container engine.** Standard containers run on Docker. They can also run directly on containerd (the engine Docker is built on) when you set `SB_CONTAINER_ENGINE=containerd` (installer flag `--with-containerd-engine`). The `runtime` value stays `docker` either way.
-- **Turning on other runtimes.** gVisor needs `runsc` on the host (installer flag `--with-gvisor`). Firecracker needs `SB_ENABLE_FIRECRACKER=true` and KVM. WebAssembly needs `SB_ENABLE_WASM=true`. V8 isolates need `SB_ENABLE_ISOLATE=true` (installer flag `--with-isolate`).
-
 ## Next steps
 
 - [Images, resources and lifecycle](/environment/): every create option and its default.
