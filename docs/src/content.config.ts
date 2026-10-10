@@ -51,6 +51,18 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   },
   {
     type: 'group',
+    label: 'SDKs and Tools',
+    category: NavigationCategory.SDKS,
+    entries: [
+      link('/sdk-setup', 'SDK setup'),
+      link('/cli', 'aerolvm CLI'),
+      link('/mcp', 'MCP server'),
+      link('/using-daytona-sdk', 'Use the Daytona SDK'),
+      link('/using-e2b-sdk', 'Use the E2B SDK'),
+    ],
+  },
+  {
+    type: 'group',
     label: 'Sandboxes',
     category: NavigationCategory.SANDBOXES,
     entries: [
@@ -114,18 +126,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link('/external-storage', 'Attach cloud storage'),
       link('/platform-volumes', 'Platform volumes'),
-    ],
-  },
-  {
-    type: 'group',
-    label: 'SDKs and Tools',
-    category: NavigationCategory.SDKS,
-    entries: [
-      link('/sdk-setup', 'SDK setup'),
-      link('/cli', 'aerolvm CLI'),
-      link('/mcp', 'MCP server'),
-      link('/using-daytona-sdk', 'Use the Daytona SDK'),
-      link('/using-e2b-sdk', 'Use the E2B SDK'),
     ],
   },
   {
