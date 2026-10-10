@@ -638,6 +638,23 @@ var Registry = []UseCase{
 	{ID: "UC-214", Title: "The policy check endpoint answers allowed, matched rule and default verdict for hosts, ports, wildcards, CIDRs, deny lists and block-all", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-215", Title: "Two sandboxes on one node with different allowlists share its gateway and are filtered apart", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	{ID: "UC-216", Title: "Sandboxes on two different workers are each filtered by their node's gateway, and a policy change through the API reaches whichever node owns the sandbox", Requires: []Capability{CapEgressFQDN, CapCluster}, Implemented: true},
+
+	// The aerolvm CLI as a person uses it: a real terminal, a saved login, and
+	// every remaining verb (PRs #633/#634).
+	{ID: "UC-217", Title: "aerolvm shell in a real terminal: the remote gets a TERM it knows and the local size, a window resize reaches it, and its exit code passes through", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-218", Title: "aerolvm shell: Ctrl-] detaches and the shell keeps running; reopening lands in the same shell with its output replayed; after exit the next one is new", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-219", Title: "aerolvm shell: the client dying mid-shell leaves the shell running, and the next aerolvm shell is back in it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-220", Title: "aerolvm shell --new starts a separate shell that --session reopens; the default shell can't see into it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-221", Title: "aerolvm shell with no sandbox named offers a list and opens the one picked; without a terminal it refuses and opens no session", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-222", Title: "aerolvm shell and an SSH login to the sandbox land in the same default shell", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-223", Title: "aerolvm exec -it works like docker exec -it: TERM and size reach the command, a resize follows, Ctrl-C goes to it; -it after -- is the command's", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-224", Title: "aerolvm login --token-stdin verifies the token and saves it 0600; every command then runs with no SB_* variables; a wrong token is never saved", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-225", Title: "Interactive aerolvm login in a real terminal never shows the token; logout forgets it and a second logout is a no-op", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-226", Title: "The saved login's token is never sent to another server; aerolvm health rejects a wrong token though /health needs none; version and the help overview", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-227", Title: "aerolvm stop keeps files and start resumes; a command on a stopped sandbox starts it; get and list --tag / --limit follow", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-228", Title: "aerolvm snapshot, then create --image with the snapshot's name starts a sandbox with the files", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-229", Title: "aerolvm exec --background, logs and logs --follow to the exit code, ls --json, and expose of a background server", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-230", Title: "After aerolvm login, mcp config carries no credentials and the stdio MCP server runs on the login alone", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
