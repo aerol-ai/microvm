@@ -422,7 +422,7 @@ func TestDaytonaCommandStreamDropsFramesForFullSubscriber(t *testing.T) {
 
 // runDaytonaSessionCommandIn runs command in a fresh pipe-mode shell
 // session built from argv.
-func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string) *daytonaSessionExecuteResponse {
+func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string) (*daytonaSessionExecuteResponse, *daytonaCommandState) {
 	t.Helper()
 	srv := newDaytonaTestServer(t)
 	sess, err := srv.sessions.Create(context.Background(), models.CreateSessionRequest{Name: "cov96b-" + id, Argv: argv})
@@ -448,10 +448,27 @@ func runDaytonaSessionCommandIn(t *testing.T, argv []string, id, command string)
 		if r.err != nil {
 			t.Fatalf("runDaytonaSessionCommand: %v", r.err)
 		}
-		return r.resp
+		return r.resp, cmd
 	case <-time.After(10 * time.Second):
 		t.Fatal("runDaytonaSessionCommand did not return")
-		return nil
+		return nil, nil
+	}
+}
+
+func TestAbsorbDaytonaErrSentinel(t *testing.T) {
+	sentinel := "__SB_DAYTONA_ERR_x__\n"
+	var buf strings.Builder
+	if absorbDaytonaErrSentinel(&buf, "oops\n__SB", sentinel) {
+		t.Fatal("partial sentinel reported complete")
+	}
+	if got := buf.String(); got != "oops\n__SB" {
+		t.Fatalf("buffer = %q", got)
+	}
+	if !absorbDaytonaErrSentinel(&buf, "_DAYTONA_ERR_x__\ntrailing", sentinel) {
+		t.Fatal("sentinel not recognized")
+	}
+	if got := buf.String(); got != "oops\n" {
+		t.Fatalf("stderr = %q, want command bytes only", got)
 	}
 }
 
@@ -466,12 +483,16 @@ func TestRunDaytonaSessionCommandMarkerParsing(t *testing.T) {
 	// /bin/echo is external on purpose. Dash (Ubuntu /bin/sh) runs echo as a
 	// builtin whose output goes through the shell stdout buffer, so
 	// `echo oops >&2` is written to stdout and this case never sees stderr.
-	// The sleep gives the runner time to observe the start marker before
-	// the stderr frame arrives.
+	// No sleep: the wrapper's stderr sentinel, not a delay, is what keeps
+	// this from losing the race against the stdout end marker.
 	t.Run("stderr-after-start", func(t *testing.T) {
-		resp := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "err1", "sleep 0.2; /bin/echo oops >&2")
-		if !strings.Contains(deref(resp.Stderr), "oops") || *resp.ExitCode != 0 {
-			t.Fatalf("resp stderr=%q exit=%d", deref(resp.Stderr), *resp.ExitCode)
+		resp, cmd := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "err1", "/bin/echo oops >&2")
+		if !strings.Contains(deref(resp.Stderr), "oops") || strings.Contains(deref(resp.Stderr), "__SB_DAYTONA_ERR_") || *resp.ExitCode != 0 {
+			t.Fatalf("resp stderr=%q stdout=%q exit=%d", deref(resp.Stderr), deref(resp.Stdout), *resp.ExitCode)
+		}
+		initial, _, finished := cmd.stream.subscribe()
+		if !finished || !bytes.Contains(initial, []byte("oops")) || bytes.Contains(initial, []byte("__SB_DAYTONA_ERR_")) {
+			t.Fatalf("live stderr replay = %q finished=%v", initial, finished)
 		}
 	})
 
@@ -479,7 +500,7 @@ func TestRunDaytonaSessionCommandMarkerParsing(t *testing.T) {
 	// trimmed rather than growing without bound.
 	t.Run("noise-before-start-marker", func(t *testing.T) {
 		argv := []string{"/bin/sh", "-c", `printf '%0300d' 0; exec /bin/sh`}
-		resp := runDaytonaSessionCommandIn(t, argv, "noise1", "echo real")
+		resp, _ := runDaytonaSessionCommandIn(t, argv, "noise1", "echo real")
 		if got := deref(resp.Stdout); strings.TrimSpace(got) != "real" {
 			t.Fatalf("stdout = %q, want only the command output", got)
 		}
@@ -489,7 +510,7 @@ func TestRunDaytonaSessionCommandMarkerParsing(t *testing.T) {
 	// end marker follows: the first sighting has no exit-code line yet, and
 	// the text after it is not a number, so the exit code falls back to 1.
 	t.Run("end-pattern-without-code", func(t *testing.T) {
-		resp := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "end1", `printf '%s' '__SB_DAYTONA_END_end1__:'; sleep 0.3`)
+		resp, _ := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "end1", `printf '%s' '__SB_DAYTONA_END_end1__:'; sleep 0.3`)
 		if *resp.ExitCode != 1 {
 			t.Fatalf("exit = %d, want 1", *resp.ExitCode)
 		}
@@ -498,7 +519,7 @@ func TestRunDaytonaSessionCommandMarkerParsing(t *testing.T) {
 	// The shell exits inside the command while holding back a partial end
 	// marker; that tail is flushed once the session closes.
 	t.Run("session-exits-with-held-tail", func(t *testing.T) {
-		resp := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "tail1", `printf '__SB_DAYTONA_'; exit 5`)
+		resp, _ := runDaytonaSessionCommandIn(t, []string{"/bin/sh"}, "tail1", `printf '__SB_DAYTONA_'; exit 5`)
 		if got := deref(resp.Stdout); got != "__SB_DAYTONA_" {
 			t.Fatalf("stdout = %q", got)
 		}

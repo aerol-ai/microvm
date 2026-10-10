@@ -698,7 +698,15 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	// lines (status capture, end marker) from bash's parse buffer instead of
 	// waiting for input. The trailing newline before `}` lets the user's last
 	// command terminate normally.
-	payload := "printf '%s\\n' " + shellSingleQuote(startMarker) + "; { " + command.command + "\n}; __sb_daytona_status=$?; printf '%s:%s\\n' " + shellSingleQuote(endMarker) + " \"$__sb_daytona_status\"\n"
+	//
+	// The stderr sentinel is printed after the user command and before the
+	// stdout end marker. Those two streams are separate pipes, so the end
+	// marker is often read first and the command's stderr is still sitting
+	// in the other pipe. Returning on the end marker alone drops that
+	// stderr (the race behind TestRunDaytonaSessionCommandMarkerParsing
+	// on Ubuntu dash). The runner keeps reading until the sentinel arrives.
+	errSentinel := "__SB_DAYTONA_ERR_" + command.id + "__\n"
+	payload := "printf '%s\\n' " + shellSingleQuote(startMarker) + "; { " + command.command + "\n}; __sb_daytona_status=$?; printf '%s' " + shellSingleQuote(errSentinel) + " >&2; printf '%s:%s\\n' " + shellSingleQuote(endMarker) + " \"$__sb_daytona_status\"\n"
 	if _, err := sess.Write([]byte(payload)); err != nil {
 		state.finishCommand(command.id, "", err.Error(), 1)
 		return nil, err
@@ -707,16 +715,55 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	var stdout strings.Builder
 	var stderr strings.Builder
 	started := false
-	// stdoutBroadcasted tracks how many bytes of the post-start stdout
-	// buffer have already been pushed to live subscribers, so each new
-	// frame broadcasts only the genuinely new prefix-safe slice.
+	stderrDone := false
+	// stdoutBroadcasted / stderrBroadcasted track how many bytes of the
+	// post-start buffers have already been pushed to live subscribers, so
+	// each new frame broadcasts only the genuinely new prefix-safe slice.
 	stdoutBroadcasted := 0
+	stderrBroadcasted := 0
+	publishStderr := func() {
+		// Hold pre-start stderr. It may be shell noise, and it may be the
+		// command's stderr arriving before the start marker is observed;
+		// either way it stays out of the live stream until the command
+		// has been delimited. Once the sentinel lands the bytes are the
+		// command's, even if the start marker frame has not been read yet.
+		if !started && !stderrDone {
+			return
+		}
+		captured := stderr.String()
+		safeLen := len(captured)
+		if !stderrDone {
+			safeLen -= longestEndMarkerPrefixSuffix(captured, errSentinel)
+		}
+		if safeLen > stderrBroadcasted {
+			command.stream.broadcast(sessions.StreamStderr, []byte(captured[stderrBroadcasted:safeLen]))
+			stderrBroadcasted = safeLen
+		}
+	}
+	var pendingStdout string
+	var pendingExit int32
+	havePending := false
+	complete := func(stdoutText string, exitCode int32) (*daytonaSessionExecuteResponse, error) {
+		stderrText := stderr.String()
+		state.finishCommand(command.id, stdoutText, stderrText, exitCode)
+		output := stdoutText + stderrText
+		return &daytonaSessionExecuteResponse{
+			CmdID:    command.id,
+			ExitCode: int32Ptr(exitCode),
+			Output:   stringOrNil(output),
+			Stderr:   stringOrNil(stderrText),
+			Stdout:   stringOrNil(stdoutText),
+		}, nil
+	}
 	for frame := range frames {
 		chunk := string(frame.Data)
 		if frame.Stream == sessions.StreamStderr {
-			if started {
-				stderr.WriteString(chunk)
-				command.stream.broadcast(sessions.StreamStderr, []byte(chunk))
+			if !stderrDone {
+				stderrDone = absorbDaytonaErrSentinel(&stderr, chunk, errSentinel)
+				publishStderr()
+			}
+			if havePending && stderrDone {
+				return complete(pendingStdout, pendingExit)
 			}
 			continue
 		}
@@ -739,6 +786,7 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 			stdout.Reset()
 			stdout.WriteString(captured)
 			stdoutBroadcasted = 0
+			publishStderr()
 		}
 
 		captured = stdout.String()
@@ -760,17 +808,15 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 			if parsed, perr := strconv.ParseInt(strings.TrimSpace(rest[:lineEnd]), 10, 32); perr == nil {
 				exitCode = int32(parsed)
 			}
-			stdoutText := captured[:index]
-			stderrText := stderr.String()
-			state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
-			output := stdoutText + stderrText
-			return &daytonaSessionExecuteResponse{
-				CmdID:    command.id,
-				ExitCode: int32Ptr(int32(exitCode)),
-				Output:   stringOrNil(output),
-				Stderr:   stringOrNil(stderrText),
-				Stdout:   stringOrNil(stdoutText),
-			}, nil
+			// Stdout is done, but stderr may still be unread on the other
+			// pipe. Hold the result until the wrapper's sentinel arrives.
+			pendingStdout = captured[:index]
+			pendingExit = exitCode
+			havePending = true
+			if stderrDone {
+				return complete(pendingStdout, pendingExit)
+			}
+			continue
 		}
 		// No end marker yet. Only hold back the trailing window that is
 		// actually a partial prefix of the end marker — anything else
@@ -785,7 +831,30 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 		}
 	}
 
+	// The shell exited before the wrapper could print the stderr sentinel.
+	// An end marker already parsed is the command's status; otherwise the
+	// process exit code is all we have. Stderr buffered before the start
+	// marker, with no sentinel, is shell noise and stays out of the result.
+	// Nothing more will arrive, so a held-back sentinel prefix is user data
+	// and has to be broadcast.
+	flushStderr := func() {
+		if !started && !stderrDone {
+			return
+		}
+		captured := stderr.String()
+		if len(captured) > stderrBroadcasted {
+			command.stream.broadcast(sessions.StreamStderr, []byte(captured[stderrBroadcasted:]))
+			stderrBroadcasted = len(captured)
+		}
+	}
+	if havePending {
+		flushStderr()
+		return complete(pendingStdout, pendingExit)
+	}
 	stdoutText := stdout.String()
+	if !started && !stderrDone {
+		stderr.Reset()
+	}
 	stderrText := stderr.String()
 	exitCode, _ := sess.ExitInfo()
 	if exitCode < 0 {
@@ -796,6 +865,7 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 	if started && len(stdoutText) > stdoutBroadcasted {
 		command.stream.broadcast(sessions.StreamStdout, []byte(stdoutText[stdoutBroadcasted:]))
 	}
+	flushStderr()
 	state.finishCommand(command.id, stdoutText, stderrText, int32(exitCode))
 	output := stdoutText + stderrText
 	return &daytonaSessionExecuteResponse{
@@ -805,6 +875,22 @@ func (s *server) runDaytonaSessionCommand(sess *sessions.Session, state *daytona
 		Stderr:   stringOrNil(stderrText),
 		Stdout:   stringOrNil(stdoutText),
 	}, nil
+}
+
+// absorbDaytonaErrSentinel appends chunk and reports whether sentinel is
+// now present. The sentinel and anything after it is removed so it never
+// becomes part of the command's stderr. A partial sentinel stays in buf;
+// callers hold that suffix back from live subscribers.
+func absorbDaytonaErrSentinel(buf *strings.Builder, chunk, sentinel string) bool {
+	buf.WriteString(chunk)
+	captured := buf.String()
+	i := strings.Index(captured, sentinel)
+	if i < 0 {
+		return false
+	}
+	buf.Reset()
+	buf.WriteString(captured[:i])
+	return true
 }
 
 func newDaytonaCommandID() (string, error) {
