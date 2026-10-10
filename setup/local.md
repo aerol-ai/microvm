@@ -31,7 +31,7 @@ No port-forwarding, DNS, or firewall changes are needed - the API binds to
 macOS (as yourself, **no** `sudo`):
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | bash -s -- \
       --local \
       --pat-token your-secret-pat
@@ -40,7 +40,7 @@ curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.
 Linux:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --local \
       --pat-token your-secret-pat

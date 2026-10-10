@@ -48,7 +48,7 @@ Caddy proves you own the domain by adding a DNS record through Cloudflare's API.
 ### Step 4: Run the installer
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
     --domain sandbox.example.com \
     --pat-token your-secret-pat \
     --dns-provider cloudflare \
@@ -100,7 +100,7 @@ Add any of these to the command in step 4.
 The flags for extra sandbox kinds and GPUs are in the next two sections. To see every option, run:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- --help
+curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 ```
 
 ## Add more kinds of sandbox
@@ -120,7 +120,7 @@ A plain container is the default. You can add stronger walls between the sandbox
 For example, this installs the server with gVisor:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
     --domain sandbox.example.com \
     --pat-token your-secret-pat \
     --dns-provider cloudflare \
@@ -149,7 +149,7 @@ A sandbox cannot use a GPU and gVisor at the same time. To create a sandbox with
 You can install without `--domain` to try AerolVM on a bare IP address. The installer calls this IP mode.
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- \
+curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- \
     --public-host 203.0.113.42 \
     --pat-token your-secret-pat
 ```

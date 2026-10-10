@@ -251,10 +251,10 @@ Options:
   --help                       Show this help
 
 Examples:
-	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
+	curl -fsSL https://aerolvm.aerol.ai | sudo bash -s -- --domain sandbox.example.com --pat-token my-pat-token
   ./scripts/install.sh --version v0.1.0 --public-host 203.0.113.42
 	./scripts/install.sh --public-host 203.0.113.42 --pat-token dev-token --build-from-source
-	curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh | bash -s -- --cli-only
+	curl -fsSL https://aerolvm.aerol.ai | bash -s -- --cli-only
 	./scripts/install.sh --domain sandbox.example.com --pat-token my-pat-token \
 	    --dns-provider cloudflare --dns-api-token cf-scoped-token
 EOF

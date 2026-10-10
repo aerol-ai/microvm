@@ -25,15 +25,15 @@ You run the server yourself: on your laptop, on one Linux server, or on a cluste
 
 ## Where your code runs
 
-Each sandbox runs in one of five execution environments. You pick it with the `runtime` option when you create the sandbox. If you leave it out, you get a container.
+Each sandbox runs in one of five environments. Docker is the default.
 
-| Environment | `runtime` | What it is | Good for | Server needs |
-|---|---|---|---|---|
-| [Container](/sandboxes/) | `docker` (default) | A normal Linux container, run by Docker or containerd. It shares the server's kernel. | Most work: scripts, builds, agents, dev environments | Nothing extra. Works on macOS and Linux. |
-| [gVisor](/gvisor-sandbox/) | `gvisor` | A container with an extra kernel layer that checks every request the code makes to the real kernel. | Untrusted code that still needs a full Linux system | Linux, installed with `--with-gvisor` |
-| [Firecracker](/firecracker-sandbox/) | `firecracker` | A microVM: a small virtual machine that boots its own Linux kernel. | The riskiest code. This is the strongest wall. | Linux with KVM (`/dev/kvm`) and `SB_ENABLE_FIRECRACKER=true` |
-| [WebAssembly](/wasm-sandbox/) | `wasm` | One compiled WebAssembly program, with no Linux system inside. | Small jobs that must start fast | `SB_ENABLE_WASM=true` |
-| [V8 isolate](/isolate-sandbox/) | `isolate` | A JavaScript or TypeScript web handler running in V8, the engine inside Chrome. | Tiny web handlers that must start in milliseconds | Installed with `--with-isolate` |
+| Environment | What it is | Best for |
+|---|---|---|
+| [Docker](/sandboxes/) | A standard Linux container | Most work |
+| [gVisor](/gvisor-sandbox/) | A container with an extra security layer | Untrusted code |
+| [Firecracker](/firecracker-sandbox/) | A small virtual machine with its own kernel | The riskiest code |
+| [WebAssembly](/wasm-sandbox/) | One compiled program, no operating system | Small, fast jobs |
+| [V8 isolate](/isolate-sandbox/) | A JavaScript/TypeScript function | Tiny web handlers |
 
 ## What people build with it
 
@@ -132,9 +132,11 @@ The client class is called `MicroVM` (`MicroVMClient` in Java) after the project
 ```mermaid
 flowchart LR
     App["Your app"] -->|SDK or CLI| Server["AerolVM server"]
-    Server --> S1["Sandbox"]
-    Server --> S2["Sandbox"]
-    Server --> S3["Sandbox"]
+    Server --> S1["Docker Sandbox"]
+    Server --> S2["gVisor Sandbox"]
+    Server --> S3["Firecracker"]
+    Server --> S4["Wasm"]
+    Server --> S5["v8 isolate"]
 ```
 
 Your app never runs the risky code itself. It sends requests to the AerolVM server. The server starts the sandbox, runs your commands inside it and sends back the output.
