@@ -114,7 +114,7 @@ These calls fail. Most return HTTP 404 or 501, so your code gets an error rather
 
 Daytona makes preview links public unless you say otherwise, and so does AerolVM's Daytona layer. If you leave out `public`, the sandbox gets public preview links.
 
-`public: false` starts the sandbox fully private, with no public address at all. This is stricter than Daytona, which still serves preview links that need a token, because AerolVM has no token-protected public link. Asking for a preview link later publishes that port and makes the sandbox public. See [Share a web app](/preview/).
+`public: false` starts the sandbox fully private, with no public address at all. This is stricter than Daytona, which still serves preview links that need a token, because AerolVM has no token-protected public link. Asking for a preview link later publishes that port and makes the sandbox public. See [Public URLs](/public-urls/).
 
 <Aside type="caution">
 Sandboxes created with the AerolVM SDKs are private by default. Only the Daytona and E2B layers make them public by default, to match those products.

@@ -180,7 +180,7 @@ Set `runtime: "isolate"` and pass the bundle's `module_ref` as `moduleRef`. Then
 
 `exec` sends a `GET` request by default. To use another method, set the `METHOD` environment variable on the exec request, for example `METHOD=POST`. If the handler answers with status 400 or higher, the exit code is 1.
 
-To give the handler a public URL, call `exposePort`. Isolates support HTTP only, not raw TCP or TLS (encrypted TCP) ports. See [Share a web app](/preview/).
+To give the handler a public URL, call `exposePort`. Isolates support HTTP only, not raw TCP or TLS (encrypted TCP) ports. See [Public URLs](/public-urls/).
 
 ## Control outbound requests
 
@@ -277,5 +277,5 @@ Bundles stored in a registry, so that any worker can fetch them, are planned.
 
 - [WebAssembly (WASM)](/wasm-sandbox/): run compiled programs that need files or arguments.
 - [Allow only some websites](/network-access/#allow-only-some-websites): more about outbound allow lists.
-- [Share a web app](/preview/): give a handler a public URL.
+- [Public URLs](/public-urls/): give a handler a public URL.
 - [Cluster setup](/cluster-setup/): add isolate workers to a cluster.

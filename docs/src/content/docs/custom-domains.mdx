@@ -17,7 +17,7 @@ Custom domains only work on a server installed with a domain, and the operator m
 
 ## Before you start
 
-- **The sandbox must be public.** Expose a port first, or create the sandbox with `allowPublicTraffic: true`. Attaching a domain never makes a private sandbox public on its own. See [Share a web app](/preview/).
+- **The sandbox must be public.** Expose a port first, or create the sandbox with `allowPublicTraffic: true`. Attaching a domain never makes a private sandbox public on its own. See [Public URLs](/public-urls/).
 - **The sandbox must not have TCP or TLS ports.** A sandbox can have custom domains or [TCP and TLS ports](/tcp-ports/), not both.
 - **You need access to your domain's DNS settings,** at a provider such as Cloudflare, Route 53 or your registrar.
 
@@ -268,7 +268,7 @@ In this version, the server sets every new domain to `pending_dns` and does not 
 ## Good to know
 
 - **Attach at create time.** You can also pass up to 5 domains when you create a sandbox. The option is `customDomains` in TypeScript and Python, `CustomDomains` in Go, `custom_domains` in Rust and `setCustomDomains` in Java. The sandbox must also be created with `allowPublicTraffic: true`.
-- **Host header masking applies here too.** If you set `maskRequestHost` on the sandbox, requests to a custom domain with a port get the same rewrite. See [Share a web app](/preview/).
+- **Host header masking applies here too.** If you set `maskRequestHost` on the sandbox, requests to a custom domain with a port get the same rewrite. See [Public URLs](/public-urls/).
 - **Certificates are rate limited.** Let's Encrypt limits how many certificates one account can get. If too many new domains ask for one in a short time, the server holds back new requests for a while. Those domains wait, then get their certificate later.
 
 ## For server operators
@@ -293,7 +293,7 @@ When you remove a domain, the server deletes its route and its record. The certi
 
 ## Next steps
 
-- [Share a web app](/preview/): expose a port and get a public URL.
-- [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.
+- [Public URLs](/public-urls/): expose a port and get a public URL.
+- [Public URLs](/public-urls/): how ports stay closed until you expose them.
 - [TCP and TLS ports](/tcp-ports/): share a database instead of a website.
 - [Install on a server](/getting-started/single-node-setup/): set up the server domain that custom domains need.
