@@ -1,14 +1,18 @@
+import { satteri } from '@astrojs/markdown-satteri'
 import starlight from '@astrojs/starlight'
 import { defineConfig } from 'astro/config'
 import mermaid from 'astro-mermaid'
 
 export default defineConfig({
-  // Starlight's setup replaces `markdown.remarkPlugins` but does not set `gfm`.
-  // @astrojs/mdx only enables pipe tables when `gfm: true`; plain .md pages still
-  // default to GFM via @astrojs/markdown-remark, which is why tables looked fine
-  // in dev and on .md pages in production while .mdx pages showed raw `| ... |`.
+  // Pin GFM on the processor itself. Under the old remark pipeline .mdx pages
+  // only got pipe tables when `gfm: true` was set explicitly, so they shipped
+  // raw `| ... |` while .md pages looked fine. Astro 7 deprecated
+  // `markdown.gfm` in favour of processor features; Sätteri defaults GFM on
+  // today, but stating it here keeps a default flip from bringing that back.
+  // @astrojs/mdx reads `features.gfm` from this processor, and Starlight adds
+  // its own plugins to the same instance.
   markdown: {
-    gfm: true,
+    processor: satteri({ features: { gfm: true } }),
   },
   site: process.env.PUBLIC_SITE_URL || 'http://localhost:4321',
   base: process.env.PUBLIC_BASE_PATH || '/',
