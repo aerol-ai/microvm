@@ -406,28 +406,6 @@ Deleting removes the disk and snapshot files. If any sandbox still uses the temp
   </TabItem>
 </Tabs>
 
-## For server operators
-
-### Share templates across a cluster
-
-In a cluster, templates can be published to AOCR, AerolVM's image registry (a server that stores images). The server that built the template uploads its disk and snapshot as one file, named `cluster/<id>/templates/<tid>:latest`. Other servers download it the first time a sandbox from that template lands on them, so that first create waits for the download. When AerolVM places a sandbox, it prefers servers that already have the template. In cluster mode, each template call goes to the worker that owns the template, and the cluster leader combines the list results.
-
-This uses the same upload switch as [Snapshots](/snapshots/). One setting turns on both, and both upload to the same AOCR host with the same cluster token:
-
-| Setting | What it does |
-|---|---|
-| `SB_SNAPSHOT_PUSH_ENABLED` | Turns on background uploads for snapshots **and** templates. When `false` (the default), templates stay on the server that built them. |
-| `SB_ENABLE_FIRECRACKER` | Templates exist only on Firecracker servers, so template uploads also need this. |
-| `SB_MIRROR_PUSH_HOST` | The AOCR host to upload to. Falls back to `SB_IMAGE_DISTRIBUTION_AOCR_HOST`. |
-| `SB_AUTO_IMPORT_CLUSTER_ID` | The cluster name. It is part of each file's name and limits what the token can reach. |
-| `SB_AUTO_IMPORT_CLUSTER_PAT_PATH` | A file holding the cluster token used to upload **and** download. The server reads it on every call, so you rotate the token by rewriting the file. |
-
-Downloading does not need `SB_SNAPSHOT_PUSH_ENABLED`. A server that only downloads needs just the cluster ID and the token file. Each template reports a `pushState` (and `registryRef` once uploaded) so you can follow the upload, the same as snapshots. Unlike snapshots, a template cannot be made from an image already in the registry. It always carries the disk and snapshot this cluster built. See [Cluster setup](/cluster-setup/) for the rest of the cluster settings.
-
-### Rebuild templates on a schedule
-
-Set both `SB_FIRECRACKER_TEMPLATE_ROTATION_INTERVAL` and `SB_FIRECRACKER_TEMPLATE_MAX_AGE`. On each interval, the server rebuilds every template older than the max age. Both must be above zero. If you set only the interval, the server logs a warning and does nothing. This is the same as calling `rebuildTemplate` on every `ready` template yourself, which you can do from your own code for finer control.
-
 ## Next steps
 
 - [Firecracker](/firecracker-sandbox/): what Firecracker sandboxes are and what the server needs.
