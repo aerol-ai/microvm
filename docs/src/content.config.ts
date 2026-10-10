@@ -121,6 +121,12 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
             label: 'Using E2B SDK',
             description: 'Point the official E2B SDK at AerolVM\'s /e2b compatibility facade.',
           },
+          {
+            type: 'link',
+            href: '/using-runloop-sdk',
+            label: 'Using Runloop SDK',
+            description: 'Point the official Runloop SDK at AerolVM\'s /runloop compatibility facade.',
+          },
         ],
       },
       {

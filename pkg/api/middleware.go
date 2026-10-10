@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -134,6 +135,24 @@ func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 			return
 		}
 		apie2b.WriteError(w, http.StatusUnauthorized, "Unauthorized, please check your credentials.")
+	})
+}
+
+// requireRunloopAuth is requireAuth with the Runloop error body: the Runloop
+// SDKs send `Authorization: Bearer <RUNLOOP_API_KEY>`, the same credential
+// shape every other surface takes.
+func (s *Server) requireRunloopAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := extractBearerToken(r)
+		if s.isPATToken(token) {
+			next.ServeHTTP(w, s.withOperatorAccess(r))
+			return
+		}
+		if r2, ok := s.authenticateUserToken(r, token); ok {
+			next.ServeHTTP(w, r2)
+			return
+		}
+		runloop.WriteError(w, http.StatusUnauthorized, "unauthorized: check RUNLOOP_API_KEY")
 	})
 }
 
