@@ -123,6 +123,19 @@ func startTracked(cmd *exec.Cmd) (*trackedChild, error) {
 	return execChildren.start(cmd, cmd.Start)
 }
 
+// startSessionProcess starts a session's command as a tracked child, so the
+// reaper hands a background command's or a shell's exit status to its
+// session. Before sessions went through here, every pipe session lost the
+// race (it waits for its output pumps before cmd.Wait) and `aerolvm logs
+// --follow` reported exit 0 for a command that exited 4.
+func startSessionProcess(cmd *exec.Cmd, start func() error) (func() (int, string), error) {
+	child, err := execChildren.start(cmd, start)
+	if err != nil {
+		return nil, err
+	}
+	return func() (int, string) { return interpretWaitResult(child.wait()) }, nil
+}
+
 // trackedCombinedOutput is cmd.CombinedOutput for an exec child.
 func trackedCombinedOutput(cmd *exec.Cmd) ([]byte, error) {
 	if cmd.Stdout != nil || cmd.Stderr != nil {

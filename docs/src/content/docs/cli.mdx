@@ -20,15 +20,16 @@ Pick one. Every option installs the same static binary, for Linux, macOS and Win
 | Go | `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest` | Builds from source. |
 | Download | `aerolvm_<os>_<arch>` from the [GitHub releases](https://github.com/aerol-ai/microvm/releases) | Verify it against the release's `checksums.txt`. |
 
-Point it at your server with the same variables the SDKs read, then check the connection:
+Then sign in once and check the connection:
 
 ```sh
-export SB_API_URL=https://sandbox.example.com
-export SB_PAT_TOKEN=your-token
+aerolvm login https://sandbox.example.com
 aerolvm health
 ```
 
-`SB_API_URL` defaults to `http://127.0.0.1:21212`, the [local setup](/getting-started/local-setup) address.
+`aerolvm login` asks for your API token with typing hidden, checks it against sandboxd, and saves it in `~/.config/aerolvm/config.json`, readable only by you. Run it with no URL to use the [local setup](/getting-started/local-setup) address, `http://127.0.0.1:21212`. The token is the one sandboxd runs with; the local setup prints it when it installs. `aerolvm logout` forgets it again. Logging out only removes the token from this machine; the token itself stays valid on sandboxd.
+
+In CI or a script, pipe the token in with `aerolvm login <url> --token-stdin`, or set the variables every SDK reads, `SB_API_URL` and `SB_PAT_TOKEN`. When `SB_PAT_TOKEN` is set it takes precedence over the login. The saved token is only ever sent to the URL it was saved for: if `SB_API_URL` points at another server, aerolvm asks you to log in to that one instead.
 
 ## Open a shell in a sandbox
 
@@ -39,9 +40,10 @@ aerolvm shell build-box
 You get a login shell inside the sandbox: bash, or `sh` when the image has no bash. Run `aerolvm shell` with no name to choose from your sandboxes. Any sandbox you can reach works, including ones your application created through an SDK; you don't need to create it from the CLI.
 
 - **The shell keeps running when you leave.** `Ctrl-]` detaches, and so does closing the terminal or losing the network. Run the same command again to get back in, with the shell's recent output on screen. `exit` or `Ctrl-D` ends the shell.
+- **Stopping or destroying the sandbox ends the shell.** When the connection drops, `aerolvm shell` asks sandboxd what happened and says whether the shell is still there to reopen.
 - **One shared shell per name.** Two terminals on the same sandbox share its `default` shell, like tmux, and an [SSH login](/ssh-access) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
 - **It behaves like a local terminal.** Resizing the window resizes the remote terminal, so `vim`, `top` and `less` redraw to fit. The shell gets a `TERM` the image knows: your own when it is a common one, and `xterm-256color` otherwise.
-- A stopped sandbox is started first. WASM and isolate sandboxes have no shell.
+- A stopped sandbox is started first. WASM and isolate sandboxes have no shell, and neither does an image without bash or `sh` (distroless, `scratch`).
 - `shell` needs a terminal. Scripts and agents use [`exec`](#running-commands).
 
 ## A first session
@@ -73,6 +75,7 @@ aerolvm destroy build-box
 | `start` / `stop` | Start or stop sandboxes; stopping keeps the files |
 | `destroy` | Destroy sandboxes; one that is already gone counts as destroyed |
 | `snapshot` | Save a sandbox's filesystem as an image other sandboxes can start from |
+| `login` / `logout` | Save the sandboxd URL and token for every command, or forget them |
 | `health` | Check that sandboxd is reachable and the token works |
 | `version` | Print the version |
 | `mcp` | Run the [MCP server](/mcp) over stdio, or print client setup |

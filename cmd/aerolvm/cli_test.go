@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"io"
 	"os"
@@ -55,12 +56,14 @@ func (s *syncBuffer) Reset() {
 }
 
 // fakeTerm is a 120x40 terminal. size overrides that; resized delivers
-// resize notifications; rawCalls and restores count raw-mode switches.
+// resize notifications; rawCalls and restores count raw-mode switches;
+// secret answers a hidden prompt.
 type fakeTerm struct {
 	rawCalls *int
 	restores *int
 	size     func() (int, int)
 	resized  chan struct{}
+	secret   func() (string, error)
 }
 
 func (f fakeTerm) Size() (int, int, bool) {
@@ -83,6 +86,13 @@ func (f fakeTerm) MakeRaw() (func(), error) {
 }
 
 func (f fakeTerm) NotifyResize() (<-chan struct{}, func()) { return f.resized, func() {} }
+
+func (f fakeTerm) ReadSecret() (string, error) {
+	if f.secret == nil {
+		return "", errors.New("no secret scripted")
+	}
+	return f.secret()
+}
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()

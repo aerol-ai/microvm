@@ -449,7 +449,7 @@ install_cli() {
 		*":$dest:"*) ;;
 		*) echo "Add $dest to your PATH to run it as aerolvm." ;;
 	esac
-	echo "Point it at a sandboxd: export SB_API_URL=<api url> SB_PAT_TOKEN=<token>"
+	echo "Point it at a sandboxd: aerolvm login <api url>"
 	echo "Add it to an MCP client: aerolvm mcp config claude-code"
 }
 

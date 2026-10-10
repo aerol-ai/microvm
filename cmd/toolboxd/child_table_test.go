@@ -208,3 +208,31 @@ func TestTrackedChildWaitECHILDWithoutStatus(t *testing.T) {
 		t.Fatalf("wait = %v, want ECHILD", waitErr)
 	}
 }
+
+// Sessions (`aerolvm exec --background`, `aerolvm shell`, Daytona process
+// sessions) start through startSessionProcess. Even when the reaper takes
+// the child first, the session gets the real exit status, not 0.
+func TestSessionProcessKeepsExitStatusWhenReaperWinsTheRace(t *testing.T) {
+	for _, tc := range []struct {
+		script     string
+		wantCode   int
+		wantSignal string
+	}{
+		{"exit 4", 4, ""},
+		{"kill -9 $$", -1, "killed"},
+		{"exit 0", 0, ""},
+	} {
+		cmd := exec.Command("sh", "-c", tc.script)
+		wait, err := startSessionProcess(cmd, cmd.Start)
+		if err != nil {
+			t.Fatalf("%s: start: %v", tc.script, err)
+		}
+		reapBeforeWait(t, &trackedChild{table: execChildren, cmd: cmd, pid: cmd.Process.Pid})
+		if code, sig := wait(); code != tc.wantCode || sig != tc.wantSignal {
+			t.Fatalf("%s: wait = (%d, %q), want (%d, %q)", tc.script, code, sig, tc.wantCode, tc.wantSignal)
+		}
+	}
+	if _, err := startSessionProcess(exec.Command("sh"), func() error { return errors.New("boom") }); err == nil {
+		t.Fatal("a failed start returned no error")
+	}
+}

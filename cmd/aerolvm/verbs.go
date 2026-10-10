@@ -341,7 +341,11 @@ func runHealth(ctx context.Context, a *app, args []string) int {
 	if len(pos) > 0 {
 		return a.usageError(c, "health", "unexpected argument %q", pos[0])
 	}
-	tools, err := a.tools(c)
+	conn, err := a.connection()
+	if err != nil {
+		return a.fail(c, err, exitError)
+	}
+	tools, err := a.toolsFor(c, conn)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -349,11 +353,17 @@ func runHealth(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
+	// /health answers without a token, so on its own it can't back the
+	// "the token works" this verb promises.
+	if err := verifyToken(ctx, tools, conn.apiURL); err != nil {
+		return a.fail(c, err, exitError)
+	}
 	if c.json {
 		a.printJSON(health)
 		return exitOK
 	}
 	fmt.Fprintf(a.stdout, "%s (sandboxd %s)\n", health.Status, health.Version)
+	a.note("aerolvm: %s with the token from %s", conn.apiURL, conn.from)
 	return exitOK
 }
 

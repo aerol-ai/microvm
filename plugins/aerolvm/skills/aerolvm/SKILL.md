@@ -47,6 +47,9 @@ aerolvm destroy build-box
   `aerolvm exec box -- "make test | tail -50"`.
 - Run `aerolvm <verb> --help` for a verb's flags, examples and JSON shape.
   It is written for agents and is shorter than any docs page.
+- If a command fails with `not logged in`, ask the user to run
+  `aerolvm login` themselves; it asks for their API token, which you should
+  not handle.
 - `aerolvm shell <sandbox>` is for a person at a terminal and refuses to run
   without one. Use `exec` yourself; suggest `aerolvm shell build-box` when the
   user wants to look around inside a sandbox.

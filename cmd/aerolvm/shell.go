@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -22,6 +23,14 @@ const detachKey = 0x1d
 
 // pickLimit is how many sandboxes the picker offers.
 const pickLimit = 20
+
+// shellFateWait bounds the check after a dropped connection, so a sandboxd
+// that is itself unreachable doesn't hold the terminal; shellFatePoll is
+// how often it asks. Variables so tests needn't wait.
+var (
+	shellFateWait = 10 * time.Second
+	shellFatePoll = 500 * time.Millisecond
+)
 
 // runShell is the one interactive verb. Every other verb follows the agent
 // contract (§5.2 rule 1: never interactive); shell exists to be typed into,
@@ -75,13 +84,13 @@ func runShell(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.fail(c, err, execFailure)
 	}
-	return a.attachShell(ctx, c, sb, ref, sh, cols, rows)
+	return a.attachShell(ctx, c, tools, sb, ref, sh, cols, rows)
 }
 
 // attachShell connects the terminal to a shell session until the shell
 // exits, the user detaches, or the connection drops. Only an exit ends the
 // shell; the other two leave it running for the next `aerolvm shell`.
-func (a *app) attachShell(ctx context.Context, c *commonFlags, sb *microvm.Sandbox, ref string, sh agenttools.Shell, cols, rows int) int {
+func (a *app) attachShell(ctx context.Context, c *commonFlags, tools *agenttools.Tools, sb *microvm.Sandbox, ref string, sh agenttools.Shell, cols, rows int) int {
 	reopen := "aerolvm shell " + ref
 	if sh.Session.Name != agenttools.DefaultShellSession {
 		reopen += " --session " + sh.Session.Name
@@ -152,10 +161,56 @@ func (a *app) attachShell(ctx context.Context, c *commonFlags, sb *microvm.Sandb
 		return signalExit(sig)
 	}
 	if e.err != nil {
-		left("lost the connection (" + agenttools.Classify(e.err).Message + ")")
+		fmt.Fprintln(a.stderr)
+		a.note("aerolvm: lost the connection (%s); %s", agenttools.Classify(e.err).Message, shellFate(ctx, tools, sb.ID, sh.Session.ID, ref, reopen))
 		return execFailure
 	}
 	return agenttools.ExitStatus(e.code, e.signal)
+}
+
+// shellFate says what became of a shell whose connection dropped. The
+// stream ends the same way whether the network blinked or the sandbox was
+// stopped or destroyed under it, and only the first leaves a shell to
+// reopen, so it asks sandboxd instead of guessing. A stop or destroy drops
+// the stream before the sandbox's status catches up, so an answer that
+// can't tell yet is asked again until shellFateWait runs out.
+func shellFate(ctx context.Context, tools *agenttools.Tools, sandboxID, sessionID, ref, reopen string) string {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shellFateWait)
+	defer cancel()
+	for {
+		if fate, known := shellFateOnce(ctx, tools, sandboxID, sessionID, ref, reopen); known {
+			return fate
+		}
+		select {
+		case <-ctx.Done():
+			return "the shell may still be running. Reopen it with: " + reopen
+		case <-time.After(shellFatePoll):
+		}
+	}
+}
+
+func shellFateOnce(ctx context.Context, tools *agenttools.Tools, sandboxID, sessionID, ref, reopen string) (string, bool) {
+	cur, err := tools.Client().Get(ctx, sandboxID)
+	switch {
+	case agenttools.IsCode(err, agenttools.CodeNotFound) || (err == nil && cur.Status == models.SandboxStatusDestroyed):
+		return "sandbox " + ref + " was destroyed, and its shell with it", true
+	case err != nil:
+		return "", false
+	case cur.Status == models.SandboxStatusStopped:
+		return "sandbox " + ref + " was stopped, which ended its shell. Start it with a new shell: aerolvm shell " + ref, true
+	case cur.Status != models.SandboxStatusStarted:
+		return fmt.Sprintf("sandbox %s is %s, and its shell has ended", ref, cur.Status), true
+	}
+	sessions, err := cur.ListSessions(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, s := range sessions {
+		if s.ID == sessionID && s.Status == models.SessionStatusRunning {
+			return "the shell keeps running. Reopen it with: " + reopen, true
+		}
+	}
+	return "the shell has ended. Open a new one with: " + reopen, true
 }
 
 // pumpShellInput copies keystrokes to the shell until the detach key or the

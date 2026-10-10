@@ -4,7 +4,7 @@
 terminal, a script or an AI agent. The same binary is a CLI and an MCP server.
 
 ```sh
-export SB_API_URL=https://sandbox.example.com SB_PAT_TOKEN=<token>
+npx -y @aerol-ai/aerolvm login https://sandbox.example.com   # asks for your token once
 npx -y @aerol-ai/aerolvm shell build-box     # an interactive shell in a sandbox
 npx -y @aerol-ai/aerolvm exec build-box -- python -V
 ```

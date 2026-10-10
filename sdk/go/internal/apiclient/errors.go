@@ -24,6 +24,16 @@ var (
 	ErrNameLookupUnsupported = errors.New("sandbox name lookup not supported by this server")
 )
 
+// StreamError is a failure the toolbox reported on an exec or session
+// stream (an "error" frame: the command could not start, say), as opposed
+// to the stream itself dropping. Error() returns the toolbox's message
+// unchanged.
+type StreamError struct {
+	Message string
+}
+
+func (e *StreamError) Error() string { return e.Message }
+
 // APIError is an HTTP error response from sandboxd. Error() returns the
 // server's message unchanged, so callers that printed or matched the plain
 // error text before this type existed see the same string.
