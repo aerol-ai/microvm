@@ -215,7 +215,7 @@ Exposing a port again with the **same** protocol is safe. It returns the same ad
 ## Good to know
 
 - **Restarts keep the address.** Stop and start the sandbox, and its ports come back with the same addresses. A TCP port keeps the same host port, so saved connection strings keep working.
-- **Serverless sandboxes wake on connections.** A [serverless sandbox](/serverless/) that stopped while idle starts again when a client connects to its TCP or TLS port.
+- **Ghost sandboxes wake on connections.** A [ghost sandbox](/ghost-sandboxes/) that stopped while idle starts again when a client connects to its TCP or TLS port.
 - **Listen on all addresses.** The service inside the sandbox must listen on `0.0.0.0`, not only `localhost`.
 - **The firewall must allow the host ports.** If you cannot connect to a TCP port, ask your operator to open ports `22000` to `23000`.
 - **No custom domains with TCP or TLS.** A sandbox with a TCP or TLS port cannot also have a [custom domain](/custom-domains/).

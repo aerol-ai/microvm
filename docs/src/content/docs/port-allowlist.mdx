@@ -156,7 +156,7 @@ The server saves the allowlist. When you stop a sandbox and start it again, the 
 
 1. **Check that the port is on the list.** Refresh the sandbox and look at its exposed ports (code below).
 2. **Check that `exposePort` succeeded.** It throws an error if it could not open the port.
-3. **Check that the sandbox is running.** Its status must be `started`. A stopped sandbox does not answer, unless it is a [serverless sandbox](/serverless/) that wakes on traffic.
+3. **Check that the sandbox is running.** Its status must be `started`. A stopped sandbox does not answer, unless it is a [ghost sandbox](/ghost-sandboxes/) that wakes on traffic.
 
 If the URL returns `502 Bad Gateway` instead, the port is open but nothing in the sandbox is listening on it. Check that your server is running and listens on `0.0.0.0`.
 

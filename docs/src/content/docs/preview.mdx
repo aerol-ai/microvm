@@ -270,7 +270,7 @@ This only changes web (HTTP) ports. TCP and TLS ports have no `Host` header, so 
 
 - **Listen on all addresses.** Start your server on `0.0.0.0`, not only `localhost` or `127.0.0.1`. The public URL connects to the sandbox's network address. For Vite, run `vite --host`.
 - **You can expose a port before the server starts.** The URL returns an error (usually `502 Bad Gateway`) until something listens on the port.
-- **Stop and start keep your ports.** When a stopped sandbox starts again, its exposed ports come back with the same URLs. A stopped sandbox does not answer, unless it is a [serverless sandbox](/serverless/) that wakes on traffic.
+- **Stop and start keep your ports.** When a stopped sandbox starts again, its exposed ports come back with the same URLs. A stopped sandbox does not answer, unless it is a [ghost sandbox](/ghost-sandboxes/) that wakes on traffic.
 - **Blocking the internet does not block your URL.** `networkBlockAll` only stops traffic going out of the sandbox. See [Block or allow the internet](/network-isolation/).
 - **One protocol per port.** A port exposed for the web cannot also be a TCP or TLS port. Unexpose it first. See [TCP and TLS ports](/tcp-ports/).
 - **WASM and V8 isolate sandboxes** support web (HTTP) ports only.
@@ -290,5 +290,5 @@ How Caddy handles certificates depends on the install:
 - [Port allowlist](/port-allowlist/): how ports stay closed until you expose them.
 - [Custom domains](/custom-domains/): serve a sandbox on your own domain, such as `app.acme.com`.
 - [TCP and TLS ports](/tcp-ports/): share a database or another service that is not a website.
-- [Serverless sandboxes](/serverless/): stop idle sandboxes and wake them on the next visit.
+- [Ghost sandboxes](/ghost-sandboxes/): stop idle sandboxes and wake them on the next visit.
 - [Install on a server](/getting-started/single-node-setup/): set up a domain so public URLs work.

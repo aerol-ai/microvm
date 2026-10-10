@@ -24,7 +24,7 @@ One server is enough for development and light production use. You need a cluste
 - **More room as you add servers.** Each new sandbox goes to a worker with free room. It only lands on a worker that can run its runtime and has the GPUs it asks for.
 - **One address for everything.** Your app sends every request to one URL. Any node can take a call and pass it to the node that runs the sandbox. Public links, [TCP ports](/tcp-ports/) and [custom domains](/custom-domains/) work the same way.
 - **Room to grow.** The split layout is built for about 1,000 worker nodes. Adding workers does not add voters, so agreeing on changes does not get slower as the cluster grows.
-- **Snapshots and templates on every node.** A [snapshot](/snapshots/) or [Firecracker template](/firecracker-templates/) made on one node can be shared, so it starts on any other.
+- **Snapshots and templates on every node.** A [snapshot](/images-and-snapshots/#snapshots) or [Firecracker template](/firecracker-templates/) made on one node can be shared, so it starts on any other.
 - **Fast creates.** Median create times on our AWS test servers, with warm pools on: V8 isolate 4 ms, WebAssembly 22 ms, Firecracker 34 ms, standard container 189 ms.
 
 ### Durability
