@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -207,6 +208,24 @@ func verifyToken(ctx context.Context, tools *agenttools.Tools, apiURL string) er
 		return e
 	}
 	return nil
+}
+
+// explainRefusal names the token sandboxd turned away and how to replace it.
+// sandboxd's 401 says only "unauthorized", and a saved token that was
+// revoked since `aerolvm login` gives no other clue that login is the fix.
+func (a *app) explainRefusal(e *agenttools.Error) *agenttools.Error {
+	if e == nil || e.HTTPStatus != http.StatusUnauthorized || a.conn == nil {
+		return e
+	}
+	refused := *e
+	if a.conn.saved {
+		refused.Message = "sandboxd at " + a.conn.apiURL + " refused the saved token"
+		refused.Hint = "sign in again: aerolvm login " + a.conn.apiURL
+	} else {
+		refused.Message = "sandboxd at " + a.conn.apiURL + " refused the token in SB_PAT_TOKEN"
+		refused.Hint = "check SB_PAT_TOKEN, or unset it and run `aerolvm login`"
+	}
+	return &refused
 }
 
 func runLogin(ctx context.Context, a *app, args []string) int {

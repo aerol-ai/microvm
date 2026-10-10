@@ -426,3 +426,35 @@ func TestSaveAndLoadFailures(t *testing.T) {
 		}
 	}
 }
+
+// sandboxd's 401 says only "unauthorized". Every command names the token it
+// refused and how to replace it, as `aerolvm health` does.
+func TestCommandsNameTheRefusedToken(t *testing.T) {
+	h, path := loginHarness(t)
+	h.fake.AddSandbox(models.Sandbox{Name: "box"})
+	h.app.stdinIsTTY, h.app.stdoutIsTTY, h.app.term = true, true, fakeTerm{}
+	if err := saveLogin(path, savedLogin{APIURL: h.fake.URL, Token: "revoked-since-login"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"list"}, {"exec", "box", "--", "true"}, {"shell", "box"}} {
+		if code := h.run(args...); code == exitOK ||
+			!strings.Contains(h.stderr.String(), "sandboxd at "+h.fake.URL+" refused the saved token") ||
+			!strings.Contains(h.stderr.String(), "hint: sign in again: aerolvm login "+h.fake.URL) {
+			t.Fatalf("%v with a revoked saved token = %d %q", args, code, h.stderr.String())
+		}
+	}
+	if code := h.run("list", "--json"); code == exitOK || !strings.Contains(h.stderr.String(), `"message":"sandboxd at `+h.fake.URL+` refused the saved token"`) {
+		t.Fatalf("list --json = %d %q", code, h.stderr.String())
+	}
+
+	h.env["SB_API_URL"], h.env["SB_PAT_TOKEN"] = h.fake.URL, "wrong"
+	if code := h.run("list"); code == exitOK || !strings.Contains(h.stderr.String(), "refused the token in SB_PAT_TOKEN") || !strings.Contains(h.stderr.String(), "check SB_PAT_TOKEN, or unset it") {
+		t.Fatalf("list with a wrong SB_PAT_TOKEN = %d %q", code, h.stderr.String())
+	}
+
+	// Other failures keep their own words.
+	h.env["SB_PAT_TOKEN"] = agenttoolstest.Token
+	if code := h.run("exec", "nope", "--", "true"); code == exitOK || strings.Contains(h.stderr.String(), "refused") {
+		t.Fatalf("a missing sandbox = %d %q", code, h.stderr.String())
+	}
+}

@@ -815,7 +815,7 @@ func detectShell() (string, error) {
 	if err == nil {
 		return path, nil
 	}
-	return "", errors.New("no shell found in container")
+	return "", sessions.ErrNoShell
 }
 
 func envMapToSlice(values map[string]string) []string {

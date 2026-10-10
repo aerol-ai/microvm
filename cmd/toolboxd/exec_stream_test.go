@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/gorilla/websocket"
 )
 
@@ -314,5 +315,36 @@ func TestExecStreamRejectsEmptyCommand(t *testing.T) {
 	}
 	if ctrl.Type != "error" || ctrl.Message != "command is required" {
 		t.Fatalf("unexpected control message: %+v", ctrl)
+	}
+}
+
+// An image with no shell gets the reason, not "fork/exec /bin/sh: no such
+// file or directory" from a start that was never going to work.
+func TestExecStreamNoShellImage(t *testing.T) {
+	oldStatFn, oldLookPathFn := statFn, lookPathFn
+	t.Cleanup(func() { statFn, lookPathFn = oldStatFn, oldLookPathFn })
+	statFn = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	lookPathFn = func(string) (string, error) { return "", os.ErrNotExist }
+
+	s := &server{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	httpSrv := httptest.NewServer(http.HandlerFunc(s.handleExecStream))
+	defer httpSrv.Close()
+	for _, tty := range []bool{false, true} {
+		conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(httpSrv.URL, "http"), nil)
+		if err != nil {
+			t.Fatalf("websocket dial error: %v", err)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if err := conn.WriteJSON(map[string]any{"command": "true", "tty": tty}); err != nil {
+			t.Fatalf("write start message: %v", err)
+		}
+		var ctrl execStreamControlOut
+		if err := conn.ReadJSON(&ctrl); err != nil {
+			t.Fatalf("read control message: %v", err)
+		}
+		_ = conn.Close()
+		if ctrl.Type != "error" || ctrl.Message != sessions.ErrNoShell.Error() {
+			t.Fatalf("tty=%v: control = %+v, want the no-shell error", tty, ctrl)
+		}
 	}
 }

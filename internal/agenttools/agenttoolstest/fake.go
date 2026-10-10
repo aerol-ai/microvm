@@ -97,6 +97,9 @@ type Server struct {
 	DropAfterCreate int
 	// ExecFunc overrides the built-in command interpreter.
 	ExecFunc Exec
+	// ExecStartError makes a streamed exec answer its start message with
+	// this error frame, as toolboxd does for a command it can't start.
+	ExecStartError string
 	// BufferedPad adds this many bytes of padding to buffered exec stdout.
 	BufferedPad int
 	// FailStart makes POST /start fail with 500.
@@ -115,6 +118,10 @@ type Server struct {
 	DropAttach bool
 	// FailAttach makes the session websocket handshake fail with 500.
 	FailAttach bool
+	// OnAttach runs, without the lock held, once a session attach has its
+	// websocket and before DropAttach drops it: a test stops or destroys
+	// the sandbox there to see what the client makes of the dropped stream.
+	OnAttach func(sandboxID, sessionID string)
 	// LiveAttach makes a session attach interactive, like a shell: it
 	// replays the log, then runs the exec function on the session's
 	// command with the client's stdin. A client "close" or a dropped
@@ -689,7 +696,12 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 	s.LastExecStart = start
 	s.ExecCommands = append(s.ExecCommands, start.Command)
 	exec := s.execFunc()
+	startError := s.ExecStartError
 	s.mu.Unlock()
+	if startError != "" {
+		_ = conn.WriteJSON(map[string]any{"type": "error", "message": startError})
+		return
+	}
 
 	stdinR, stdinW := io.Pipe()
 	killed := make(chan struct{})
@@ -916,7 +928,11 @@ func (s *Server) attachSession(w http.ResponseWriter, r *http.Request, sb *Sandb
 	exitSignal := s.AttachExitSignal
 	drop := s.DropAttach
 	live := s.LiveAttach
+	onAttach := s.OnAttach
 	s.mu.Unlock()
+	if onAttach != nil {
+		onAttach(sb.ID, sessionID)
+	}
 	if drop {
 		return
 	}

@@ -448,30 +448,45 @@ func orDefault(v, fallback int) int {
 	return v
 }
 
+// ErrNoShell is returned for a shell or a command string in an image with
+// neither bash nor sh (distroless, scratch). Without it the session fails
+// later as "fork/exec /bin/sh: no such file or directory", which reads as a
+// toolboxd fault rather than a property of the image.
+var ErrNoShell = errors.New("this sandbox's image has no shell: neither bash nor sh is installed")
+
+// lookPath and statPath are the filesystem lookups detectShell makes,
+// variables so tests can stand in an image without a shell.
+var (
+	lookPath = exec.LookPath
+	statPath = os.Stat
+)
+
 // buildArgv resolves the final argv from a CreateSessionRequest. If both
 // Argv and Command are empty, defaults to a login shell.
 func buildArgv(req models.CreateSessionRequest) ([]string, error) {
 	if len(req.Argv) > 0 {
 		return append([]string{}, req.Argv...), nil
 	}
-	if cmd := strings.TrimSpace(req.Command); cmd != "" {
-		shell := detectShell()
-		return []string{shell, "-c", cmd}, nil
+	shell, err := detectShell()
+	if err != nil {
+		return nil, err
 	}
-	// Default: a login shell. Prefer bash, fall back to sh.
-	shell := detectShell()
-	if filepath.Base(shell) == "bash" {
-		return []string{shell, "-l"}, nil
+	if cmd := strings.TrimSpace(req.Command); cmd != "" {
+		return []string{shell, "-c", cmd}, nil
 	}
 	return []string{shell, "-l"}, nil
 }
 
-func detectShell() string {
-	if path, err := exec.LookPath("bash"); err == nil {
-		return path
+// detectShell prefers bash, falls back to sh on PATH, then to /bin/sh for
+// a toolboxd started with a PATH that misses it.
+func detectShell() (string, error) {
+	for _, name := range []string{"bash", "sh"} {
+		if path, err := lookPath(name); err == nil {
+			return path, nil
+		}
 	}
-	if path, err := exec.LookPath("sh"); err == nil {
-		return path
+	if _, err := statPath("/bin/sh"); err == nil {
+		return "/bin/sh", nil
 	}
-	return "/bin/sh"
+	return "", ErrNoShell
 }

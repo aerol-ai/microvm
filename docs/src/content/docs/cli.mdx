@@ -40,9 +40,10 @@ aerolvm shell build-box
 You get a login shell inside the sandbox: bash, or `sh` when the image has no bash. Run `aerolvm shell` with no name to choose from your sandboxes. Any sandbox you can reach works, including ones your application created through an SDK; you don't need to create it from the CLI.
 
 - **The shell keeps running when you leave.** `Ctrl-]` detaches, and so does closing the terminal or losing the network. Run the same command again to get back in, with the shell's recent output on screen. `exit` or `Ctrl-D` ends the shell.
+- **Stopping or destroying the sandbox ends the shell.** When the connection drops, `aerolvm shell` asks sandboxd what happened and says whether the shell is still there to reopen.
 - **One shared shell per name.** Two terminals on the same sandbox share its `default` shell, like tmux, and an [SSH login](/ssh-access) lands in the same one. `--new` starts a separate shell, and `--session <name>` opens a named one.
 - **It behaves like a local terminal.** Resizing the window resizes the remote terminal, so `vim`, `top` and `less` redraw to fit. The shell gets a `TERM` the image knows: your own when it is a common one, and `xterm-256color` otherwise.
-- A stopped sandbox is started first. WASM and isolate sandboxes have no shell.
+- A stopped sandbox is started first. WASM and isolate sandboxes have no shell, and neither does an image without bash or `sh` (distroless, `scratch`).
 - `shell` needs a terminal. Scripts and agents use [`exec`](#running-commands).
 
 ## A first session
