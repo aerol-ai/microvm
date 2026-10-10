@@ -24,6 +24,32 @@ The start time depends on whether you use a template, a disk image prepared ahea
 | From a template | About 34 ms on the server (median, on an AWS `c5.metal` test server). Measured from a laptop, about 300 ms, most of it network travel time. |
 | From an image, no template | 10 to 60 seconds. The server builds a fresh disk image from the container image on every create. |
 
+## How it works
+
+```mermaid
+flowchart TB
+    Server["sandboxd<br/>(the AerolVM server)"] --> Driver["Firecracker driver"]
+    Driver --> Disk["VM disk<br/>(built from the image, or a template)"]
+    Driver --> Jailer["jailer<br/>(locks the process down)"]
+    Jailer --> FC["firecracker process<br/>(one per sandbox)"]
+    FC --> VM
+    subgraph VM["microVM"]
+        Guest["Its own Linux kernel"]
+        Toolbox["toolboxd"]
+        Code["Your code"]
+    end
+    FC -- "KVM" --> CPU["The CPU's hardware virtualization"]
+    Server -- "vsock: exec, files" --> Toolbox
+```
+
+1. **The server drives Firecracker itself.** No container engine is involved.
+2. **It turns your image into a VM disk,** or uses a [template](/firecracker-templates/) built ahead of time.
+3. **It starts one `firecracker` process per sandbox.** On production servers a jailer locks that process down: a private file tree, resource limits and no root rights.
+4. **The VM boots its own Linux kernel.** KVM, the CPU's hardware virtualization, keeps it apart from the server.
+5. **The server talks to toolboxd inside the VM over vsock,** a direct host-to-VM channel. Network traffic uses a virtual network cable (a TAP device).
+
+For every part and each step of the boot, see [Firecracker architecture](/firecracker-architecture/).
+
 ## What the server needs
 
 Firecracker needs KVM, the Linux feature that lets the CPU run virtual machines. It shows up on the server as `/dev/kvm`.
@@ -31,7 +57,7 @@ Firecracker needs KVM, the Linux feature that lets the CPU run virtual machines.
 - **Your own hardware:** any Linux server with hardware virtualization turned on.
 - **Cloud servers:** standard AWS types such as `t3`, `c6i` and `m5` are virtual machines themselves and do not offer `/dev/kvm`. Use a bare-metal type instead, such as `c5.metal` or `m5.metal`.
 
-Firecracker is off by default. The server operator turns it on (see [For server operators](#for-server-operators)). Until they do, a create fails with `runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true`.
+Firecracker is off by default. The server operator turns it on (see [Turn on Firecracker](/getting-started/installer-options/#turn-on-firecracker)). Until they do, a create fails with `runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true`.
 
 ## Create a Firecracker sandbox
 

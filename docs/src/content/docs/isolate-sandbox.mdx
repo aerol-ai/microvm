@@ -22,6 +22,28 @@ These numbers are for a warm create: the code is already uploaded and its worker
 
 The laptop numbers include network travel time to the cloud region, so use the server numbers for the cost of a create. The first create for a tenant (one customer or account) also starts that tenant's workerd process. Later creates for the same tenant reuse it.
 
+## How it works
+
+```mermaid
+flowchart TB
+    Server["sandboxd<br/>(the AerolVM server)"] --> Driver["Isolate driver"]
+    Driver --> GA
+    Driver --> GB
+    subgraph GA["workerd process for tenant A (jailed)"]
+        I1["Isolate: sandbox 1"]
+        I2["Isolate: sandbox 2"]
+    end
+    subgraph GB["workerd process for tenant B (jailed)"]
+        I3["Isolate: sandbox 3"]
+    end
+    I1 -- "fetch()" --> Egress["The server checks the<br/>sandbox's allow list"]
+```
+
+1. **Your code is a fetch handler.** There is no image, no container and no file system.
+2. **One workerd process per tenant.** Each sandbox is an isolate inside it: a walled-off space in V8 with its own memory. Different tenants never share a process.
+3. **Each workerd process is jailed by default:** a private file tree, resource limits, a filtered list of system calls and no root rights.
+4. **Outbound requests leave through the server.** It checks each one against that sandbox's allow list, and can tell which sandbox made it.
+
 ## What the server needs
 
 Isolates are off by default. The server operator installs workerd with the `--with-isolate` installer flag, which also sets `SB_ENABLE_ISOLATE=true`. On a cluster, set `with_isolate = true` on a worker in Terraform, or `default_with_isolate = true` for all of them. Until isolates are on, a create fails with `runtime "isolate" requires SB_ENABLE_ISOLATE=true`.
