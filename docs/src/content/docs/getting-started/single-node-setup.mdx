@@ -132,15 +132,6 @@ Now do [steps 3 and 4 of the Quickstart](/quick-start/#step-3-install-the-sdk-fo
 
 ## If something goes wrong
 
-| What you see | What to do |
-|---|---|
-| The installer stops with `--domain requires --dns-provider and --dns-api-token` | Add `--dns-provider cloudflare` and `--dns-api-token` to the command. |
-| The health page does not load | Check that both DNS records point at the server's IP and say **DNS only**. Check that port `443` is open. |
-| The browser warns about the certificate | Wait two minutes. If it keeps happening, check the token permissions from step 3. |
-| The health page shows `"status":"degraded"` | Docker or Caddy (the web server the installer adds) is not working. Run `sudo systemctl status docker caddy` to see which one. |
-| Your code gets a `401` or `unauthorized` error | `SB_PAT_TOKEN` does not match the server's token. |
-| You lost your token | On the server, run `sudo grep SB_PAT_TOKEN /etc/sandboxd/sandboxd.env`. |
-
 To see what the server is doing, read its logs on the server:
 
 ```bash
