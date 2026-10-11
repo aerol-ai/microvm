@@ -1221,6 +1221,12 @@ type SandboxSnapshot struct {
 	// PushError is populated only when PushState is "error" — the last error
 	// the reconciler saw, surfaced to the Daytona facade's errorReason field.
 	PushError string `json:"push_error,omitempty"`
+	// OwnerRef is the account the snapshot belongs to, with the same meaning
+	// and scoping rule as Sandbox.OwnerRef. It lives on the snapshot because
+	// a snapshot outlives the sandbox it was taken from: once the source is
+	// destroyed there is nothing else left to check ownership against. Never
+	// exposed over the wire.
+	OwnerRef string `json:"-"`
 }
 
 func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {

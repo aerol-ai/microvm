@@ -690,6 +690,11 @@ type Service struct {
 	// in handleNetworkSamples so the subsequent Get failure arm can be forced.
 	// Nil in production.
 	testAfterNetstatsUpdate func()
+
+	// idempotencySweepAt is the unix-nano time the next request_idempotency
+	// expiry sweep may run (idempotency_ledger.go). Claims trigger it, so
+	// the table is pruned without a dedicated background loop.
+	idempotencySweepAt atomic.Int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -3549,8 +3554,10 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 
 	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
 		// Retry semantics: same name + same image → echo back the existing
-		// row. Different image under the same name is a conflict.
-		if strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
+		// row. Different image under the same name is a conflict, and so is
+		// another tenant's row: names are global, but its contents are not
+		// the caller's to read back.
+		if snapshotVisible(ctx, existing) && strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
 			return existing, nil
 		}
 		return nil, store.ErrSnapshotNameConflict
@@ -3562,6 +3569,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		snapshot.CreatedAt = time.Now().UTC()
 	}
 	snapshot.Name = name
+	snapshot.OwnerRef = ownerRefForCreate(ctx)
 	snapshot.PushState = s.initialSnapshotPushState(snapshot)
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		return nil, err
@@ -3583,10 +3591,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	defer s.snapshotMu.Unlock()
 
 	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
-		if existing.SourceSandboxID == sandboxID {
-			return existing, false, nil
-		}
-		return nil, false, store.ErrSnapshotNameConflict
+		return replayExistingSnapshot(ctx, existing, sandboxID)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, false, err
 	}
@@ -3611,6 +3616,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		ImageID:         imageID,
 		SourceSandboxID: sandboxID,
 		CreatedAt:       time.Now().UTC(),
+		// The source sandbox's owner, not the caller's: an operator
+		// snapshotting a tenant's sandbox produces that tenant's snapshot.
+		OwnerRef: sandbox.OwnerRef,
 	}
 	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, true); err != nil {
 		return nil, false, err
@@ -3621,15 +3629,30 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
-			existing, getErr := s.store.GetSnapshot(ctx, name)
-			if getErr == nil && existing.SourceSandboxID == sandboxID {
-				return existing, false, nil
+			if existing, getErr := s.store.GetSnapshot(ctx, name); getErr == nil {
+				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
 	return snapshot, true, nil
+}
+
+// replayExistingSnapshot answers a snapshot create whose name is taken. The
+// same source sandbox makes it a retry, answered with the stored row — but
+// only to a caller who may see it: the name check runs before the source
+// sandbox is loaded, so without this a user token naming another tenant's
+// sandbox would be handed that tenant's snapshot. A different source is a
+// name conflict.
+func replayExistingSnapshot(ctx context.Context, existing *models.SandboxSnapshot, sandboxID string) (*models.SandboxSnapshot, bool, error) {
+	if existing.SourceSandboxID != sandboxID {
+		return nil, false, store.ErrSnapshotNameConflict
+	}
+	if !snapshotVisible(ctx, existing) {
+		return nil, false, store.ErrNotFound
+	}
+	return existing, false, nil
 }
 
 // initialSnapshotPushState picks the push_state value to write for a
@@ -3711,6 +3734,9 @@ func (s *Service) kickTemplateArtifactPushReconciler(templateID string) {
 	}()
 }
 
+// GetSnapshot resolves a snapshot by name or image ID. Another tenant's
+// snapshot reads as store.ErrNotFound for a user token, the same 404 a
+// cross-owner sandbox id gets.
 func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {
 	needle := strings.TrimSpace(idOrName)
 	if needle == "" {
@@ -3718,7 +3744,10 @@ func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.San
 	}
 	snapshot, err := s.store.GetSnapshot(ctx, needle)
 	if err == nil {
-		return snapshot, nil
+		if snapshotVisible(ctx, snapshot) {
+			return snapshot, nil
+		}
+		return nil, store.ErrNotFound
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -3728,15 +3757,53 @@ func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.San
 		return nil, err
 	}
 	for _, snapshot := range snapshots {
-		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle {
+		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle && snapshotVisible(ctx, snapshot) {
 			return snapshot, nil
 		}
 	}
 	return nil, store.ErrNotFound
 }
 
+// ListSnapshots returns the snapshots the caller may see: every row for
+// operator and internal callers, the caller's own account's for a user token.
 func (s *Service) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
-	return s.store.ListSnapshots(ctx)
+	snapshots, err := s.store.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, scoped := ownerScope(ctx); !scoped {
+		return snapshots, nil
+	}
+	visible := make([]*models.SandboxSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshotVisible(ctx, snapshot) {
+			visible = append(visible, snapshot)
+		}
+	}
+	return visible, nil
+}
+
+// ListSnapshotPage returns one name-ordered page of the snapshots the caller
+// may see, optionally narrowed to one source sandbox and joined with one
+// facade's alias rows. It pages in the store, so a list costs one bounded
+// range scan however large the catalogue is.
+func (s *Service) ListSnapshotPage(ctx context.Context, sourceSandboxID, aliasFacade, afterName string, limit int) ([]store.SnapshotPageRow, error) {
+	owner, scoped := ownerScope(ctx)
+	return s.store.ListSnapshotPage(ctx, store.SnapshotPageQuery{
+		OwnerRef:        owner,
+		Scoped:          scoped,
+		SourceSandboxID: sourceSandboxID,
+		AliasFacade:     aliasFacade,
+		AfterName:       afterName,
+		Limit:           limit,
+	})
+}
+
+// CountSnapshots counts the snapshots ListSnapshotPage would walk for the
+// caller with the same source filter.
+func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (int, error) {
+	owner, scoped := ownerScope(ctx)
+	return s.store.CountSnapshots(ctx, owner, scoped, sourceSandboxID)
 }
 
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {

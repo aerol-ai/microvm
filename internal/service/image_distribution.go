@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -53,6 +54,21 @@ func (p defaultImageDistributionProvider) ClassifyImage(_ context.Context, image
 	}, nil
 }
 
+// snapshotUsableForCreate decides whether a create may resolve its image
+// through snapshot. A user token may not build on another tenant's snapshot.
+// A row with no owner (operator-registered, or a pre-ownership snapshot whose
+// source sandbox was gone before the backfill could attribute it) stays
+// usable by name, deliberately: operator-registered shared images are meant
+// to be started by every tenant, and such a row is exactly as reachable as
+// it was before snapshots carried an owner. Reads (GetSnapshot, lists) still
+// hide those rows from user tokens — only the create-by-name path is open.
+func snapshotUsableForCreate(ctx context.Context, snapshot *models.SandboxSnapshot) bool {
+	if snapshot.OwnerRef == "" {
+		return true
+	}
+	return snapshotVisible(ctx, snapshot)
+}
+
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
 // create request's image-distribution metadata before placement decisions are
 // made. The method is intentionally side-effect free: it does not pull, push,
@@ -66,6 +82,8 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 	if s != nil && s.store != nil && req.Image != "" {
 		snapshot, err := s.store.GetSnapshot(ctx, req.Image)
 		switch {
+		case err == nil && snapshot != nil && !snapshotUsableForCreate(ctx, snapshot):
+			return fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
 		case err == nil && snapshot != nil:
 			if image := strings.TrimSpace(snapshot.Image); image != "" {
 				req.Image = image
