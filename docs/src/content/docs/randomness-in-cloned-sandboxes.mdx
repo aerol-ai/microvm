@@ -22,10 +22,33 @@ A Linux machine keeps random state in two places, and AerolVM handles them diffe
 
 ## What AerolVM does for you
 
-Each time a clone starts, a small helper program inside the sandbox (the toolbox) gives the kernel fresh random data from the host. This happens before any program you start through the SDK runs. So:
+Each time a clone starts, a small helper program inside the sandbox (the toolbox) makes the kernel reseed its random number generator. To reseed means to mix in new data and start a fresh stream. This happens before any program you start through the SDK runs. So:
 
 - **New programs are safe.** Any program you start after the clone begins gets the fresh kernel state. Each `exec` starts a new program, so each one is already different from other clones.
 - **Secure random calls are safe.** Code that asks the kernel each time, like Go `crypto/rand`, Python `secrets`, Node `crypto` and WebCrypto, or Java `SecureRandom`, needs nothing from you.
+
+This is what happens each time a clone starts.
+
+```mermaid
+sequenceDiagram
+    participant App as Your app
+    participant S as Server
+    participant VM as Clone VM
+    participant T as Toolbox
+    App->>S: create from a template
+    S->>VM: load the template memory, resume
+    Note over VM: may reseed here,<br/>where VM generation ID works
+    S->>T: a clone started: time and network
+    T->>T: set the clock and the network
+    T->>T: reseed the kernel's random numbers
+    T->>T: change the clone-generation token
+    T-->>S: done
+    S-->>App: sandbox ready
+    App->>S: run a command
+    S->>T: start it, with fresh kernel state
+```
+
+- The toolbox changes the clone-generation token last. So a program that sees a new token can reseed its own generator from a kernel that is already fresh. The next section explains the token.
 
 There is one timing gap. A program that was **already running inside the template** may get to run for a moment before the reseed lands. The deep dive [Correct snapshot clones](/engineering-snapshot-correctness/) explains that gap and how Firecracker's VM generation ID closes it where it is available. It is the same long-running-program case described next.
 
@@ -33,7 +56,37 @@ There is one timing gap. A program that was **already running inside the templat
 
 AerolVM cannot fix a long-running program that was already started inside the template and keeps a random generator in its own memory. A common example is a Python interpreter that was started in the template and already ran `import numpy`. Its `random` and `numpy` state was saved with the template. The kernel reseed does not reach into that program's memory. So every clone of that template would produce the same `random` and `numpy` numbers.
 
+Here is the gap, shown with two clones of one template.
+
+```mermaid
+flowchart TB
+    T["Template memory<br/>random state S"] --> A["Clone A starts<br/>with state S"]
+    T --> B["Clone B starts<br/>with state S"]
+    A --> KA["Kernel reseeded<br/>new state in A"]
+    A --> PA["Old program's own generator<br/>still state S"]
+    B --> KB["Kernel reseeded<br/>a different state in B"]
+    B --> PB["Old program's own generator<br/>still state S"]
+    PA --> X["Same numbers in A and B<br/>until the program reseeds"]
+    PB --> X
+```
+
+- The kernel side is fixed for you, so A and B get different secure random numbers.
+- The old program's generator is not, so A and B repeat each other's plain random numbers.
+
 To let such a program notice that it is a clone, the toolbox publishes a **clone-generation token**. The token changes every time a clone starts. A program can read it from the file `/run/aerolvm/clone-generation` (fast, local, no login needed), or you can read it with the SDK.
+
+These are the two ways to read the token.
+
+```mermaid
+flowchart LR
+    App["Your app"] -- "cloneGeneration" --> S["AerolVM server"]
+    S -- "asks" --> T["Toolbox in the sandbox"]
+    T -- "writes" --> F["Token file<br/>/run/aerolvm/clone-generation"]
+    P["Program inside the sandbox"] -- "reads" --> F
+```
+
+- Use the file from inside the sandbox. It is the fastest way.
+- Use the SDK from your own app, outside the sandbox.
 
 ## Check for a clone from the SDK
 
@@ -90,11 +143,25 @@ To let such a program notice that it is a clone, the toolbox publishes a **clone
   </TabItem>
 </Tabs>
 
-`resumedAt` is the host's clock at the last clone start, in Unix nanoseconds. It is `0` if the sandbox was never cloned.
+`resumedAt` is the host's clock at the last clone start, in Unix nanoseconds. It is `0` on sandboxes that never get this start signal, such as containers. A Firecracker sandbox also gets the signal on a fresh boot, so a value other than `0` does not prove it was cloned.
 
 ## Reseed your own program inside the sandbox
 
 If your template keeps a program running, have **that program** read the token and reseed its own generator when the token changes. The code below runs **inside** the sandbox, in the language of that program. Secure random calls are already safe, so only reseed the plain generators you control.
+
+Each example below follows the same steps.
+
+```mermaid
+flowchart TB
+    S["Before you use your generator"] --> R["Read the token file"]
+    R --> E{"Was the file there?"}
+    E -- "No" --> U["Use the generator as it is"]
+    E -- "Yes" --> Q{"Same token<br/>as last time?"}
+    Q -- "Yes" --> U
+    Q -- "No" --> M["Save the new token"]
+    M --> N["Reseed the generator<br/>from a secure source"]
+    N --> U
+```
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

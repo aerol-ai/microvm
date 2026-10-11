@@ -79,8 +79,8 @@ graph TB
     S3 -. SWIM gossip .- W2
     S1 -- "capacity pull /v1/capacity" --> W1
     S2 -- "capacity pull /v1/capacity" --> W2
-    W1 -.->|RPC to any server; writes leader-forwarded| server
-    W2 -.->|RPC to any server; writes leader-forwarded| server
+    W1 -.->|RPC to any server, writes leader-forwarded| server
+    W2 -.->|RPC to any server, writes leader-forwarded| server
 ```
 
 Gossip (`hashicorp/memberlist`) carries only identity and role. Its payload must fit memberlist's 512-byte `NodeMeta` limit, and a capacity report is bigger than that. (`gossip.go` documents the bug that led to splitting them.)
@@ -139,7 +139,7 @@ Reservations stop two creates from double-booking a node. Without them, two crea
    > book it. The FSM serializes opReserve through raft, so the second
    > SelectPlacement on the same leader sees the first reservation here.
 
-2. **On the owner.** The chosen owner starts the sandbox locally. On success, it writes `opPlace`, which promotes "reserved" to "placed". On failure, the router writes `opCancelReserve` and the reservation is released.
+2. **On the owner.** The chosen owner starts the sandbox locally. On success, it writes `opPlace`, which promotes "reserved" to "placed". On failure, the owner cleans up and writes `opCancelReserve`, and the reservation is released.
 
 `opCancelReserve` has a deliberate safety property:
 
@@ -169,7 +169,8 @@ sequenceDiagram
         O-->>R: ok
         R-->>C: sandbox
     else docker create failed
-        R->>L: opCancelReserve sandbox_id
+        O->>L: opCancelReserve sandbox_id
+        O-->>R: error
         R-->>C: error
     end
 ```
@@ -197,9 +198,28 @@ The score is `(budget − reserved − pending − request) / budget`, averaged 
 - Its GPU or runtime (container, gVisor, Firecracker and so on) does not match the request.
 - It lacks the requested template. Older peers that do not report templates are let through (the "unknown-allow" rule).
 
-**The local node wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
+**The first pick wins ties.** The comparison in `placement.go` uses `>`, not `>=`. So `a` (the first pick) wins unless `b` has strictly more headroom. When `a` is the local node, the local node keeps the sandbox.
 
-The intent is to forward only when a peer is truly better. Placement behaves like a single node until the cluster has a reason to disagree.
+Both picks are random, so the local node keeps a tie only when it happens to be the first pick.
+
+This is the whole choice, from the full member list down to one winner:
+
+```mermaid
+flowchart TB
+    ALL["Every node this server knows about"] --> F1["Drop nodes that are dead, drained,<br/>cannot own sandboxes or have no API address"]
+    F1 --> F2["Drop nodes whose capacity report is stale"]
+    F2 --> F3["Drop nodes that cannot fit the request<br/>after subtracting pending reservations"]
+    F3 --> ANY{"Any nodes left?"}
+    ANY -- "no" --> NONE["Answer 503<br/>no node has room"]
+    ANY -- "yes" --> PICK["Pick two of them at random"]
+    PICK --> CMP{"Does the second pick have<br/>strictly more headroom?"}
+    CMP -- "yes" --> WB["The second pick wins"]
+    CMP -- "no" --> WA["The first pick wins"]
+```
+
+- The filters check every node, but only two nodes are ever scored and compared.
+- "Cannot fit" also covers a wrong GPU, runtime or template, from the list above.
+- With only one node left, both picks are that node, so it wins.
 
 Draining is a hard admission rule, not a scoring penalty. (Draining a node tells the cluster to stop placing new sandboxes on it.) The code says:
 
@@ -236,9 +256,26 @@ A placed sandbox stays on its owner node, and every other node forwards requests
 > N. The local SQLite store is unchanged. Cross-node API calls (toolbox,
 > sessions, port forwards) are transparently reverse-proxied to the owner.
 
-`ForwardHTTP` caches one `httputil.ReverseProxy` per peer URL. It keeps separate caches for plain connections and for mTLS-pinned ones. Mutual TLS (mTLS) is the encryption behind HTTPS, with both sides proving who they are by certificate. TLS state and keepalive connections are never shared between the two kinds.
+`ForwardHTTP` caches one `httputil.ReverseProxy` per peer, keyed by the peer's node ID and internal URL. Every forward uses mutual TLS (mTLS), the encryption behind HTTPS with both sides proving who they are by certificate. A cached connection is never reused for a different peer.
 
 **Loop detection.** A stale placement view could bounce a request between two nodes that each think the other owns sandbox X. `forward.go` sets `X-Cluster-Forwarded: 1` on the way out. A node that receives a request with that header, and is about to forward it again, returns 421 Misdirected Request instead. The caller then retries against fresh placement.
+
+Every node runs the same check on a request for a sandbox, whether the request came from a caller or from another node:
+
+```mermaid
+flowchart TB
+    IN["A request for sandbox X<br/>arrives at a node"] --> WHO{"Who owns X,<br/>by this node's placement view?"}
+    WHO -- "no record" --> LOCAL["Handle it here<br/>404 if X is not here either"]
+    WHO -- "orphaned" --> GONE["Answer 410 Gone"]
+    WHO -- "this node" --> SERVE["Serve it here"]
+    WHO -- "another node" --> SEEN{"Was it already<br/>forwarded once?"}
+    SEEN -- "yes" --> LOOP["Answer 421<br/>the caller retries"]
+    SEEN -- "no" --> FWD["Forward it to the owner over mTLS<br/>and mark it as forwarded"]
+    FWD -- "the owner runs the same check" --> WHO
+```
+
+- A request is forwarded at most once. A second hop would mean two nodes disagree about the owner, so the request stops with 421.
+- Finding the owner is only a read. No Raft write happens on this path.
 
 **The trade.** Owner-sharded execution buys local consistency. The toolbox sessions, the SQLite row and the container for one sandbox all live on one host. So that sandbox's state needs no agreement across nodes.
 
@@ -254,7 +291,7 @@ When a node dies, the leader moves, marks or removes its sandboxes in a fixed or
 2. **One `opOrphanOwner` for the rest.** The dead node's other sandboxes are orphaned in a single FSM change: `OwnerNodeID=""` and `OwnerState=Orphaned`, with the sandbox ID kept. Pending reservations on the dead owner are released in the same command.
 3. **`RemoveServer` on the Raft configuration.** This removes the dead node from the quorum.
 
-`selectRecreationTarget` (in `owner_watcher.go`) uses ordinary `SelectPlacement` for a sandbox with no sealed secrets. A sandbox with sealed secrets can only move to a node in its secret's recipient set, the nodes allowed to decrypt it. For that case, the leader scores every node in the set and picks the best.
+`selectRecreationTarget` (in `owner_watcher.go`) uses ordinary `SelectPlacement` for a sandbox with no sealed secrets. A sandbox with sealed secrets can only move to a node in its secret's recipient set, the nodes the secret was sealed for. For that case, the leader scores every node in the set and picks the best.
 
 The order of the steps matters: orphan first, then remove.
 
@@ -264,6 +301,23 @@ Recreate-policy sandboxes never pass through the orphaned state. Every node runs
 
 That node loads the sandbox's spec and opens its sealed (encrypted) secrets locally. It then calls `SandboxRecreator.RecreateSandbox(ctx, id, spec, secrets, exposedPorts)` (see `cluster.go`), which the service layer implements. If the recreate fails 5 times in a row (about 25 seconds), the watcher asks the cluster to reassign the sandbox to a different node.
 
+This is the loop each node's owner watcher runs for the sandboxes assigned to it:
+
+```mermaid
+flowchart TB
+    TICK["Every 5 seconds, list the sandboxes<br/>the placement table assigns to this node"] --> WANT{"Recreate policy<br/>and a saved spec?"}
+    WANT -- "no" --> SKIP["Leave it alone"]
+    WANT -- "yes" --> MAKE["Rebuild it from the spec<br/>if it is not already running here"]
+    MAKE --> OK{"Did it work?"}
+    OK -- "yes" --> DONE["Reset its failure count"]
+    OK -- "no" --> COUNT{"Fifth failure in a row?"}
+    COUNT -- "no" --> TICK
+    COUNT -- "yes" --> MOVE["Ask the cluster to move it<br/>to a different node"]
+```
+
+- The rebuild is safe to repeat. A sandbox that already runs here is left as it is.
+- If no other node can take it, the sandbox stays here and the watcher keeps trying.
+
 Orphaned sandboxes have two ways out:
 
 - **`opClaimOrphan`.** When the original owner comes back online, `AssertOwnership` runs at boot and reclaims its orphaned placements. The `opPlace` path refuses to overwrite an orphan. An orphan must be claimed on purpose, never silently re-placed, because the original node may still be running the container.
@@ -271,35 +325,69 @@ Orphaned sandboxes have two ways out:
 
 ```mermaid
 sequenceDiagram
-    participant SWIM as SWIM gossip
-    participant T as deadOwnerTracker
+    participant G as Gossip
     participant L as Raft leader
-    participant FSM as Placement FSM
-    participant N as Recreation target
-    SWIM->>T: node-D suspect → dead
-    T->>T: markDead(node-D, now)
-    Note over T: wait ClusterDeadOwnerGrace (30s default)
-    loop for each D-owned sandbox with failover.policy=recreate
-        L->>L: selectRecreationTarget(placement)<br/>→ SelectPlacement (self allowed)
-        L->>FSM: opReassign(id, new owner=N)
-        N->>FSM: owner watcher sees new owner (polls every 5s)
-        N->>N: load spec, open sealed secrets, SandboxRecreator.RecreateSandbox
+    participant R as Placement record
+    participant N as New owner
+    G->>L: node D is dead
+    Note over L: waits 30 seconds by default
+    loop each sandbox on D with failover
+        L->>R: reassign it to node N
+        N->>R: sees the change, checks every 5s
+        N->>N: rebuilds the sandbox
     end
-    L->>FSM: opOrphanOwner(node-D) for remaining placements
-    FSM-->>FSM: remaining D-owned → OwnerNodeID=""<br/>(not deleted; 410 Gone)
-    L->>L: RemoveServer(node-D)
+    L->>R: orphan the rest, they answer 410 Gone
+    L->>L: removes D from the voters
 ```
 
 > **Invariant.** Losing a node never deletes placements. Recreate-policy placements are reassigned: they keep their sandbox ID and get a new container on a new owner. The rest are orphaned and return 410 Gone until the original node returns and claims them, or an operator deletes them. Nothing is silently re-placed.
+
+Putting the create and failover rules together, one placement record moves through these states:
+
+```mermaid
+stateDiagram-v2
+    state "Reserved, capacity and name held" as Reserved
+    state "Placed, running on its owner" as Placed
+    state "Orphaned, answers 410 Gone" as Orphaned
+    [*] --> Reserved : opReserve from the router
+    Reserved --> Placed : opPlace after the owner starts it
+    Reserved --> [*] : create failed, timer ran out or owner died
+    Placed --> Placed : owner died, recreate policy moves it with opReassign
+    Placed --> Orphaned : owner died, no recreate policy
+    Orphaned --> Placed : original owner returns, opClaimOrphan
+    Orphaned --> [*] : operator deletes it
+    Placed --> [*] : sandbox deleted
+```
+
+- A reservation never turns into an orphan. When its owner dies, `opOrphanOwner` releases it in the same command.
+- Every change in the picture is written through Raft, so every server ends up with the same state.
 
 ## Keeping secrets out of the Raft log
 
 Sandbox specs can contain secrets, so credentials are removed before a spec enters the Raft log. `opPlace`, `opClaimOrphan`, `opUpsertSpec`, `opReserve` and `opReserveBatch` all carry the sandbox spec. A raw spec may hold plaintext secrets, such as mount credentials or environment variables, and those must never enter the log in the clear.
 
-Before a spec reaches the cluster layer, the service seals its secrets and strips them out, in two steps:
+Before a spec reaches the cluster layer, the service strips its secrets out. It also seals them, so a new owner can get them back. Two steps do this:
 
 1. It seals the secrets (mount credentials, the registry password and the environment variables) as a cluster secret. The secret is sealed for a recipient set: the owner plus backup nodes that may need to recreate the sandbox. See [Secrets providers](/cluster-secrets/) for how sealing and copying work.
 2. `RedactClusterSecrets` (in `internal/service/cluster_secrets.go`) returns a copy of the spec with those values removed. The Raft command carries this cleaned spec plus a handle to the sealed secret: its reference, version and recipient node IDs.
+
+On a create, the two steps happen on different nodes and at different times:
+
+```mermaid
+sequenceDiagram
+    participant R as Router node
+    participant L as Raft leader
+    participant O as Chosen owner
+    R->>R: Strip the secrets from a copy of the spec
+    R->>L: opReserve with the clean spec
+    R->>O: Forward the full create request over mTLS
+    O->>O: Start the sandbox and seal its secrets at the same time
+    O->>L: opPlace with the clean spec and the sealed-secret handle
+```
+
+- Both Raft entries carry the clean spec, never a secret value.
+- For a recreate-policy sandbox, the reservation also fixes the recipient set, the nodes the secret will be sealed for.
+- When the router picks itself, the router and the owner are the same node, and nothing is forwarded.
 
 The cluster code states the rule on every entry point:
 
@@ -311,7 +399,7 @@ Each server-role node splits a placement into a small "hot" row and its recovery
 
 Raft snapshots carry the hot rows with their references, not the recovery data. So a server that joins from a snapshot fetches each item once from a peer (`fetchRecoveryBlob` walks `recoveryServerMembers`), then caches it. Followers apply FSM changes without ever opening the sealed secrets.
 
-> **Invariant.** The Raft log never contains plaintext credentials. Specs are cleaned before they enter the log, and secrets travel sealed, by reference. Only a node in the secret's recipient set can open it, and only the assigned owner does so, to recreate the sandbox.
+> **Invariant.** The Raft log never contains plaintext credentials. Specs are cleaned before they enter the log, and secrets travel sealed, by reference. A recreate goes to a node in the secret's recipient set, and only the assigned owner opens the secret, to recreate the sandbox.
 
 ## The Noop fallback
 

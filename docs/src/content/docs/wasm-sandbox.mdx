@@ -27,7 +27,7 @@ flowchart TB
 
 1. **There is no container and no kernel of its own.** Your code is a WebAssembly module.
 2. **Each sandbox gets its own worker process,** which runs the module in the wazero WebAssembly runtime. The module can only do what that runtime allows. It makes no system calls of its own.
-3. **The server talks to the worker over a Unix socket,** a private channel between two programs on one machine. Commands and files go through it.
+3. **The server talks to the worker over a Unix socket,** a private channel between two programs on one machine. Commands go through it. File requests are served by the server from the sandbox's own work folder.
 4. **The server makes network connections for the module** (host-mediated), so it can apply your network rules to each one.
 5. **A `passivatable` sandbox can be saved to disk** as a checkpoint and brought back later. See [Keep the sandbox across server restarts](#keep-the-sandbox-across-server-restarts).
 

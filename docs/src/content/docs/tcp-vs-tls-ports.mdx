@@ -16,6 +16,22 @@ For how to call them, see [TCP and TLS ports](/tcp-ports/).
 
 On a server with a domain, TLS is a good default when your client supports it. Use TCP if your client does not send SNI (explained below), if your service needs the original handshake, or if the server has no domain.
 
+This chart asks the same questions in order.
+
+```mermaid
+flowchart TB
+    Q1{"Does the server<br/>have a domain?"}
+    Q1 -- "No" --> TCP["Use TCP"]
+    Q1 -- "Yes" --> Q2{"Does the client start with TLS<br/>and send SNI?"}
+    Q2 -- "No" --> TCP
+    Q2 -- "Yes" --> Q3{"Does your service need the<br/>client's own TLS handshake,<br/>for example client certificates?"}
+    Q3 -- "Yes" --> TCP
+    Q3 -- "No" --> TLS["Use TLS"]
+```
+
+- A "no" to either of the first two questions means TCP.
+- TCP always works. TLS saves host ports when the client can use it.
+
 ## How a TCP port works
 
 The server opens one of its own ports for each exposure, called the **host port**. It comes from a pool, `22000` to `23000` by default. Every byte that arrives there goes to the port inside the sandbox, unchanged.
@@ -32,6 +48,34 @@ flowchart LR
 - Each TCP port uses one host port from the pool and one opening in the server's firewall.
 - It works for **any** TCP protocol, with or without TLS.
 
+Here is what happens when you call `exposePort` with `protocol: "tcp"`.
+
+```mermaid
+sequenceDiagram
+    participant App as Your app
+    participant S as AerolVM server
+    participant R as Port records
+    participant P as Public listener
+    App->>S: expose port 5432 as TCP
+    S->>R: is port 5432 already exposed?
+    alt Already exposed as TCP
+        R-->>S: yes, host port 22417
+        S->>P: make sure 22417 still forwards to port 5432
+        S-->>App: the same address as before
+    else Exposed as HTTP or TLS
+        S-->>App: error, unexpose it first
+    else Not exposed yet
+        S->>R: reserve a free host port from the pool
+        R-->>S: host port 22417
+        S->>P: listen on 22417 and forward to port 5432
+        S-->>App: new address with host port 22417
+    end
+```
+
+- Calling `exposePort` twice for the same port is safe. You get the same host port back, so the address does not change.
+- To switch a port between TCP and TLS, unexpose it first.
+- In a cluster, the host port is also reserved in the shared records, so no two sandboxes in the cluster get the same one.
+
 ## How a TLS port works
 
 All TLS ports share one port on the server, usually `443`. A client starting a TLS connection first says which name it wants. This is called **SNI** (Server Name Indication). The server reads that name and picks the right sandbox.
@@ -39,13 +83,16 @@ All TLS ports share one port on the server, usually `443`. A client starting a T
 The server then ends the TLS connection itself, using the wildcard certificate it already has for `*.<domain>`. A wildcard certificate covers every name under the domain. The server sends the decrypted bytes to the sandbox on its normal port.
 
 ```mermaid
-flowchart LR
-    C["Client"] -->|"TLS to sb-abc-5432.domain:443"| E["Server, shared port 443"]
-    E -->|"decrypts with the wildcard certificate"| R{"Which name?"}
-    R -->|"sb-abc-5432"| A["Sandbox abc, port 5432, plain bytes"]
-    R -->|"sb-xyz-6379"| B["Sandbox xyz, port 6379, plain bytes"]
+flowchart TB
+    C["Client"] -- "TLS to sb-abc-5432 on port 443" --> E["Server, shared port 443"]
+    E -- "reads the name first" --> R{"Which name?"}
+    R -- "sb-abc-5432" --> A["Decrypt, then sandbox abc<br/>port 5432, plain bytes"]
+    R -- "sb-xyz-6379" --> B["Decrypt, then sandbox xyz<br/>port 6379, plain bytes"]
+    R -- "no TLS port has it" --> H["Server's normal HTTPS site,<br/>passed on still encrypted"]
 ```
 
+- The server picks the sandbox from the name first. Only then does it decrypt.
+- Port 443 also carries the server's normal HTTPS traffic, such as web URLs and the API. A name that matches no TLS port goes there unchanged.
 - The address looks like `tls://<sandbox-id>-<port>.<domain>:443`.
 - Your service speaks **plain TCP**. It does not need a certificate, renewals, or any TLS setup.
 - Many TLS ports share the same server port and the same certificate. They use no host ports and need no extra firewall openings.
@@ -166,6 +213,25 @@ A TLS port. Pick this when the client sends SNI, the service speaks plain TCP, a
 | Client must send SNI? | No | Yes |
 | Server needs a domain? | No | Yes |
 | Firewall openings per exposure | 1 | 0 (shared port) |
+
+This picture shows the biggest difference: three TCP ports need three host ports, but three TLS ports share one.
+
+```mermaid
+flowchart TB
+    subgraph TCPSIDE["Three TCP ports"]
+        T1["Host port 22104"] --> A1["Sandbox A, port 5432"]
+        T2["Host port 22417"] --> A2["Sandbox B, port 6379"]
+        T3["Host port 22890"] --> A3["Sandbox C, port 27017"]
+    end
+    subgraph TLSSIDE["Three TLS ports"]
+        P["One shared port 443"] --> B1["Sandbox A, port 5432"]
+        P --> B2["Sandbox B, port 6379"]
+        P --> B3["Sandbox C, port 27017"]
+    end
+```
+
+- Each TCP port takes one host port from the pool, `22000` to `23000` by default.
+- TLS ports take none, however many you add.
 
 ## Next steps
 

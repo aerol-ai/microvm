@@ -29,6 +29,21 @@ The kernel's random-number state had been captured in the snapshot's memory imag
 
 Every `getrandom()` call returned the same bytes in the same order. `ssh-keygen -A` ran during early boot and made bit-identical Ed25519 keys across the fleet.
 
+This is how one saved random state turned into one shared key:
+
+```mermaid
+flowchart TB
+    SNAP["Template snapshot<br/>with the kernel's random state inside"] --> CA["Clone A resumes"]
+    SNAP --> CB["Clone B resumes"]
+    CA --> KA["ssh-keygen asks the kernel<br/>for random bytes"]
+    CB --> KB["ssh-keygen asks the kernel<br/>for random bytes"]
+    KA --> SAME["Both get the same bytes<br/>so both make the same SSH host key"]
+    KB --> SAME
+```
+
+- Nothing went wrong inside either clone. Each one behaved correctly for the machine it believed it was.
+- The fault is that both clones were the same machine when the key was made.
+
 That is the headline hazard. It is also the friendliest one, because SSH fingerprints make the bug *visible*. The four hazards below it are worse because they are silent:
 
 - **Wall clock frozen at capture time.** `CLOCK_REALTIME` reads back the moment the snapshot was taken: minutes, hours, sometimes days ago. **TLS** handshakes (the encryption behind HTTPS) reject certificates as "not yet valid". `apt` thinks stale package lists are fresh, and `make` thinks files from the future need rebuilding. Log times go backwards across a resume, which breaks every tool that lines logs up later.
@@ -56,6 +71,25 @@ But the host cannot reach into the guest's memory to install them. The guest can
 
 This section describes the three steps, in order. Each one is load-bearing: remove any of them and the hazards come back.
 
+Here are the states one clone passes through on the way to being unique:
+
+```mermaid
+stateDiagram-v2
+    state "Loaded and paused, network on its own TAP" as Paused
+    state "Paused, disks on its own files" as Swapped
+    state "Running with the template's randomness and clock" as Running
+    state "Agent answered on vsock" as Ready
+    state "Unique, with its own clock, network and randomness" as Unique
+    [*] --> Paused : step 1, load the snapshot without starting the vCPUs
+    Paused --> Swapped : step 1, point the disks at this clone's files
+    Swapped --> Running : step 1, resume the vCPUs
+    Running --> Ready : step 2, ping answered over vsock
+    Ready --> Unique : step 3, post_resume handled
+```
+
+- Both swaps happen while the vCPUs are stopped, so guest code never runs against the template's disk or network card.
+- The "Running" state is the short unsafe window covered later on this page.
+
 ### 1. Resume paused, swap the devices, then start
 
 The first step gives each clone its own disk and network before it runs. AerolVM calls `LoadSnapshot` with `ResumeVM=false`. The clone's memory image is mapped and its virtual CPUs (vCPUs) are set up, but **the vCPUs do not run yet.** Two swaps happen before they do:
@@ -67,7 +101,7 @@ These calls are in `configureVMMForLoad` in `driver.go`. On the warm path, the T
 
 Only then does the resume call start the vCPUs: `PatchVM`, which is Firecracker's `PATCH /vm` with state `Resumed`. The guest kernel never runs against the template's disk or network card. It runs against its own from the first instant.
 
-`EnableDiffSnapshots` is what makes the disk swap possible. Without it, the memory image is mapped read/write, and clone writes corrupt the template directly. With it, the mapping is `MAP_PRIVATE`, and the kernel's copy-on-write handler sends each first write to a fresh private page.
+`EnableDiffSnapshots` does the same job for memory. Without it, the memory image is mapped read/write, and clone writes corrupt the template directly. With it, the mapping is `MAP_PRIVATE`, and the kernel's copy-on-write handler sends each first write to a fresh private page.
 
 ### 2. vsock: a channel that works before the network does
 
@@ -133,6 +167,18 @@ This is the rule we publish for template authors:
 
 A program inside the guest can tell when that is: toolboxd changes the clone-generation token in `/run/aerolvm/clone-generation` as the last step of `post_resume`. [Randomness in clones](/randomness-in-cloned-sandboxes/) shows how to watch it.
 
+From inside the guest, the timeline looks like this:
+
+```mermaid
+flowchart LR
+    RES["vCPUs resume"] --> WIN["Unsafe window<br/>shared randomness<br/>old clock"]
+    WIN --> DONE["post_resume finishes<br/>the token changes"]
+    DONE --> SAFE["Safe to make keys,<br/>certificates and IDs"]
+```
+
+- Code that makes secrets should wait for the token to change, not for a fixed delay.
+- On a deployment that supports vmgenid, the kernel reseeds at the first box. The clock is still old until `post_resume`.
+
 Our shipped templates wait until `post_resume` has finished before they make SSH host keys, TLS certificates and the machine ID. Application code that runs at boot must wait for the same point.
 
 This is the key trade-off. We chose a small, *visible* unsafe window with a written rule over a hidden one covered by a heuristic (a rule of thumb).
@@ -148,6 +194,23 @@ This section explains why the host ignores the `post_resume` reply. Making the r
 - The host becomes responsible for a property that belongs to the guest: that the reseed worked. Tying the two together reverses the direction of the dependency.
 
 In practice, the guest-side calls (the `RNDADDENTROPY` ioctl and `clock_settime`) cannot fail on a healthy kernel. If they did, the clone is too sick to use anyway, and the next operation on it will show that. We chose to let a slow guest recover on its own, rather than tie sandbox health to reply timing.
+
+The ping and the `post_resume` message are treated differently, as this shows:
+
+```mermaid
+flowchart TB
+    RES["The clone resumes"] --> PING{"Agent answers the ping<br/>before the deadline?"}
+    PING -- "no" --> FAIL["The create fails and every<br/>earlier step is undone"]
+    PING -- "yes" --> SEND["Send post_resume"]
+    SEND --> SENT{"Could the message<br/>be sent?"}
+    SENT -- "no" --> WARN["Log a warning"]
+    SENT -- "yes" --> WAIT["Wait briefly for the reply,<br/>then go on whatever it says"]
+    WARN --> RET["Return the sandbox"]
+    WAIT --> RET
+```
+
+- The ping is required, because it proves the agent is alive. The host keeps trying for up to 5 seconds.
+- The `post_resume` wait is capped by a timeout, 2 seconds by default.
 
 ## What this does not fix
 

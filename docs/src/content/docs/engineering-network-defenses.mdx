@@ -16,10 +16,26 @@ Untrusted code that can reach your private network can attack it. This post expl
 | Runtime | Outbound, with no policy | Inbound |
 |---|---|---|
 | Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses, the cloud metadata service and other sandboxes | Nothing, until you share a port |
-| WebAssembly | The same as containers: no filter until you set a policy | Nothing, until you share a port |
+| WebAssembly | No filter until you set a policy | Nothing, until you share a port |
 | V8 isolate | The internet over HTTPS only. Private, loopback, link-local and metadata addresses are always blocked. | Nothing, until you share a port |
 
 So for code you do not trust, always set a policy, or have your operator set one for every sandbox on the server. See [For server operators](#for-server-operators).
+
+This is how a new container, gVisor or Firecracker sandbox gets its outbound policy.
+
+```mermaid
+flowchart TB
+    Create["A create request"] --> Q{"Does it set a<br/>network policy?"}
+    Q -- "yes" --> Own["Use the sandbox's own policy"]
+    Q -- "no" --> Op{"Did the operator set a default<br/>of block everything or an allow list?"}
+    Op -- "yes" --> Def["Use the operator's default"]
+    Op -- "no" --> Open["No filter"]
+    Own --> Floor["The operator's always-blocked<br/>ranges, if set, still apply"]
+    Def --> Floor
+    Open --> Floor
+```
+
+- The default is saved with the sandbox when it is created, so reading the sandbox shows the policy it got.
 
 ## Turn on a policy
 
@@ -96,6 +112,26 @@ flowchart LR
 2. **Web traffic goes to the server's proxy.** On ports 80 and 443, the proxy reads the site name the program asked for (the SNI or `Host` header), checks it against the list, and looks the name up again itself. It ignores the address the program tried to use.
 3. **Everything else is refused.**
 
+This is the same flow, step by step, for one HTTPS connection to an allowed site.
+
+```mermaid
+sequenceDiagram
+    participant B as Sandbox
+    participant D as DNS filter
+    participant P as Server's proxy
+    participant S as pypi.org
+    B->>D: Look up pypi.org
+    D-->>B: An address, because the name is on the list
+    B->>P: HTTPS to that address, asking for pypi.org
+    P->>P: Is pypi.org on the list?
+    P->>P: Look up pypi.org again, itself
+    P->>P: Guard checks each address it got
+    P->>S: Connect, then pass the bytes through
+```
+
+- The proxy never trusts the address the sandbox chose. It connects to the address it looked up itself.
+- It does not decrypt the traffic unless you turned on inspection for that site.
+
 ## Private addresses and cloud metadata
 
 When a sandbox has a name allow list (or is in learn mode), a guard checks every address before the server connects:
@@ -103,7 +139,22 @@ When a sandbox has a name allow list (or is in learn mode), a guard checks every
 - **Blocked:** loopback, link-local (`169.254.0.0/16`, which includes the cloud metadata service at `169.254.169.254`) and private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`).
 - **Opened only on purpose:** a private range opens only if your list names it as an address range, or if the operator marks it as an internal zone.
 
-A sandbox with "block everything", an address-range allow list or a name allow list also cannot reach the server itself. A sandbox with only a deny list, or no policy, can.
+The guard asks these questions in order, for every address.
+
+```mermaid
+flowchart TB
+    A["An address the server<br/>is about to connect to"] --> Q1{"Loopback, link-local,<br/>multicast or 0.0.0.0?"}
+    Q1 -- "yes" --> R["Refused"]
+    Q1 -- "no" --> Q2{"In the operator's<br/>always-blocked ranges?"}
+    Q2 -- "yes" --> R
+    Q2 -- "no" --> Q3{"In a private range<br/>not opened on purpose?"}
+    Q3 -- "yes" --> R
+    Q3 -- "no" --> Q4{"Name on the allow list, or<br/>address allowed by the policy?"}
+    Q4 -- "yes" --> OK["Connect"]
+    Q4 -- "no" --> R
+```
+
+A sandbox with "block everything", an address-range allow list or a name allow list also cannot reach the server itself. To cover every sandbox, turn on the control-port guard in the server's policy file.
 
 ## DNS tricks
 

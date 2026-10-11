@@ -159,6 +159,25 @@ Details that bite if you skip them:
 - **Snapshot and warm clones share guest memory copy-on-write.** `LoadSnapshot` maps the template's memory image with `MAP_PRIVATE`. On the first write to any page, the kernel's CoW handler gives that VM a private anonymous page and leaves the file untouched. The full memory model is in [How clones share memory](/firecracker-hydration/#how-clones-share-memory-copy-on-write).
 - **`track_dirty_pages` is a separate feature.** It *finds* changed pages for diff snapshots, and does not redirect writes. Turning it on costs a VM exit (a trip from the guest back to the host) on each first write to a page.
 
+Here is the cleanup rule from the start of this section, for the cold and snapshot-load paths. The steps run top to bottom, and a failure at any step starts the undo at once:
+
+```mermaid
+flowchart TB
+    S1["Take a TAP slot from the pool"] --> S2["Create the VM process, not started yet"]
+    S2 --> S3["Put the root disk in its run folder"]
+    S3 --> S4["Bring up the host TAP<br/>and its firewall rules"]
+    S4 --> S5["Start the VM process,<br/>then boot or resume the guest"]
+    S5 --> S6["vsock handshake with the agent"]
+    S6 --> CHK{"Did every step work?"}
+    CHK -- "yes" --> OK["Done, the sandbox now owns<br/>the slot, the TAP and the VM"]
+    CHK -- "no" --> U1["Remove the firewall rules<br/>and the host TAP"]
+    U1 --> U2["Stop the VM process and delete<br/>its run folder and the files in it"]
+    U2 --> U3["Return the TAP slot to the pool"]
+```
+
+- Undo runs in the reverse of the order things were taken, and only for steps that already happened.
+- A failed `post_resume` is not on this list. It only logs a warning, so it never triggers the undo.
+
 ## Boot-time budget
 
 This section compares the two ways to create a Firecracker sandbox, and how long each takes.
@@ -169,6 +188,29 @@ This section compares the two ways to create a Firecracker sandbox, and how long
 | **Template-backed** | Build a rootfs and snapshot once, then pass `template_id`. You get a snapshot load or a warm-pool hit. | Under 100 ms on a warm-pool hit; a few hundred ms for a snapshot load |
 
 The warm-hit target is a timeout inside the driver, not a published benchmark. The time it saves is real, but the exact number depends on the kind of host, the kernel size and the warm-pool depth.
+
+The paths differ in speed because each faster path skips work the slower one does:
+
+```mermaid
+flowchart TB
+    subgraph adhoc["Ad-hoc, any image"]
+        A1["Build a root disk from the image"] --> A2["Start a VM process"]
+        A2 --> A3["Boot the kernel from scratch"]
+    end
+    subgraph snap["Snapshot load"]
+        B1["Start a VM process"] --> B2["Load the template snapshot, paused"]
+        B2 --> B3["Resume the VM"]
+    end
+    subgraph warm["Warm-pool hit"]
+        C1["Take a paused VM with the<br/>snapshot already loaded"] --> C2["Resume the VM"]
+    end
+    A3 --> H["vsock handshake and post_resume"]
+    B3 --> H
+    C2 --> H
+```
+
+- The snapshot load skips the disk build and the kernel boot. The warm-pool hit also skips starting the process and loading the snapshot.
+- All three paths end the same way, so your code sees the same kind of sandbox.
 
 The driver picks the branch from the request alone; there is no separate API. Creating a Firecracker sandbox looks the same whichever path runs underneath. To take the template path, add the template id: `templateId` in TypeScript and Python, `TemplateID` in Go, `template_id` in Rust and `setTemplateId` in Java.
 

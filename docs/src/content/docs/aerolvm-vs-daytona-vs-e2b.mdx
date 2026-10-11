@@ -47,6 +47,21 @@ A few terms from the table:
 - **Ingress** servers take in public traffic and pass it to the server that runs the sandbox.
 - **SNI** is the hostname a client sends at the start of a TLS (encrypted) connection. AerolVM routes on it, so many sandboxes can share port 443.
 
+One AerolVM server can run every kind of sandbox in the table. You pick the kind for each sandbox when you create it.
+
+```mermaid
+flowchart LR
+    App["Your app"] --> S["AerolVM server<br/>one API"]
+    S --> C["Containers<br/>Docker or containerd"]
+    S --> G["gVisor<br/>containers with an<br/>extra kernel layer"]
+    S --> F["Firecracker<br/>small virtual machines"]
+    S --> W["WASM<br/>WebAssembly modules"]
+    S --> V["V8 isolates<br/>lightweight JavaScript sandboxes"]
+```
+
+- The server operator chooses which kinds to turn on.
+- You create every kind with the same SDK. Some features differ between kinds.
+
 ### What the start times measure
 
 Each AerolVM number is a median: half of the sandbox creates were faster. We measured it inside the AerolVM server on our AWS test servers. It does not count the network trip between your app and the server. In every test the image, module or code bundle was already on the server.
@@ -79,6 +94,19 @@ At full size, 100 sandboxes need 200 vCPU and 400 GiB of memory. But sandboxes l
 | Servers to buy (CPU is the limit) | 4 | 7 |
 | Monthly cost | 4 × $584 = $2,336 | 7 × $584 = $4,088 |
 
+Here is the half-size case as a chain of steps.
+
+```mermaid
+flowchart TB
+    A["100 sandboxes<br/>2 vCPU and 4 GB each"] --> B["Full size<br/>200 vCPU and 400 GiB"]
+    B --> C["Each uses about half<br/>100 vCPU and 200 GiB"]
+    C --> D["CPU<br/>100 ÷ 16 per server = 6.25<br/>round up to 7 servers"]
+    C --> E["Memory<br/>200 ÷ 64 per server = 3.125<br/>round up to 4 servers"]
+    D --> F["Buy 7 servers<br/>CPU is the limit"]
+    E --> F
+    F --> G["7 × $584 a month<br/>about $4,088"]
+```
+
 The table above uses the more cautious case, about $4,000. The $12,000 figure is the vendor price for 100 full-size sandboxes. Sharing servers is what closes that gap.
 
 The 16 GB of disk per sandbox costs extra, but compute is the main cost here.
@@ -107,16 +135,62 @@ Daytona focuses on long-lived developer workspaces: IDE integration, Git-based e
 
 **Already using the Daytona SDK?** AerolVM has a `/daytona` compatibility API. Point the Daytona SDK at `https://your-host/daytona`, use your AerolVM token, and keep your code. See [Use the Daytona SDK](/using-daytona-sdk/).
 
+Both compatibility APIs sit in front of the same sandbox service as AerolVM's own API.
+
+```mermaid
+flowchart TB
+    A["AerolVM SDKs"] -- "/v1" --> S["One sandbox service<br/>on your AerolVM server"]
+    D["Daytona SDK"] -- "/daytona" --> S
+    E["E2B SDK"] -- "/e2b" --> S
+    S --> R["Your sandboxes"]
+```
+
+- Each compatibility API turns the other SDK's calls into AerolVM's own sandbox calls.
+- All three APIs are served by the same AerolVM server. There is no separate Daytona or E2B server to run.
+
 If developers SSH into one long-lived workspace a day, Daytona is a reasonable fit. If an agent starts 10,000 sandboxes an hour, runs untrusted code and deletes them, AerolVM is built for that.
 
 ## Growing past one server
 
 E2B (managed) and AerolVM are both built for heavy sandbox traffic. Daytona is not. The difference from E2B is how you grow. With AerolVM you run a [cluster](/cluster-setup/) on your own servers, instead of paying per sandbox-hour on someone else's.
 
-- **Shared placement records.** Raft keeps a copy of where each sandbox lives on every server. Any server can answer "where is sandbox X?" without asking the leader.
+- **Shared placement records.** Raft keeps a copy of where each sandbox lives on every `server` node. Any `server` node can answer "where is sandbox X?" without asking the leader.
 - **Separate roles.** Each server takes one or more roles: `server` (keeps the Raft records and votes), `worker` (runs sandboxes) or `ingress` (holds the public route table). You keep 3 or 5 `server` nodes however many workers you add. Kubernetes splits control-plane nodes from worker nodes the same way. See [Ingress nodes](/cluster-ingress/).
 - **One public address.** Put a load balancer in front of the ingress servers. A cloud load balancer, a MetalLB virtual IP or round-robin DNS all work. Round-robin DNS means one name that points to several IP addresses. Your app and your users use one hostname, whichever worker runs the sandbox.
 - **Failover.** Servers notice a dead worker through gossip, a constant exchange of short status messages. Calls for its sandboxes then return `410 Gone`, so clients know to create new ones. Sandboxes that opt in are recreated for you. Raft also keeps copies of each sandbox's create settings, sealed credentials and exposed ports. See [Durability and failover](/durability/).
+
+This is how a request reaches a sandbox in a cluster.
+
+```mermaid
+flowchart TB
+    U["Your app and your users<br/>one hostname"] --> LB["Load balancer"]
+    LB --> I1["Ingress server"]
+    LB --> I2["Ingress server"]
+    I1 --> W["Worker that runs<br/>the sandbox"]
+    I2 --> W
+    SV["Server nodes<br/>keep placement records with Raft"] -- "where each sandbox runs" --> I1
+    SV -- "where each sandbox runs" --> I2
+    SV -- "picks a worker for each new sandbox" --> W
+```
+
+- Any ingress server can take a request, because each one learns where every sandbox runs.
+- You add workers to run more sandboxes. The number of `server` nodes stays small.
+
+This is what happens when a worker dies.
+
+```mermaid
+flowchart TB
+    D["A worker stops answering"] --> G["Other nodes notice<br/>through gossip"]
+    G --> P["The Raft leader waits a grace period<br/>30 seconds by default"]
+    P --> Q{"Did the sandbox opt in<br/>to be recreated?"}
+    Q -- "Yes" --> M["Its record moves<br/>to a healthy worker"]
+    M --> N["That worker recreates it<br/>from the copied create settings"]
+    Q -- "No" --> O["Its record points<br/>to no worker"]
+    O --> X["Calls for it return 410 Gone<br/>so your app creates a new one"]
+```
+
+- The grace period stops a worker that drops off for a moment from losing its sandboxes.
+- If no healthy worker can take an opted-in sandbox, it ends up like one that did not opt in.
 
 ## Why we built AerolVM
 
