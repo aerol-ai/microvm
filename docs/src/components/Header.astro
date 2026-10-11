@@ -3,7 +3,7 @@
 // own package.json keeps it in step with every SDK release instead of a
 // hard-coded string that goes stale.
 import sdkPackage from '../../../sdk/typescript/package.json'
-import { isBlogPath } from '../content.config'
+import { isBlogPath, isEnterprisePath } from '../content.config'
 import { isActiveOrParentPath } from '../utils/navigation'
 import LanguageSelect from './LanguageSelect.astro'
 import ThemeSelect from './ThemeSelect.astro'
@@ -16,11 +16,13 @@ const onUseCases = isActiveOrParentPath(useCasesHref, currentPath)
 // Blog posts live at root URLs, so match them by membership, with the base path
 // stripped the same way the sidebar sees it.
 const onBlog = isBlogPath(`/${currentPath.slice(basePath.length)}`)
+const onEnterprise = isEnterprisePath(`/${currentPath.slice(basePath.length)}`.replace(/\/$/, ''))
 
 const navLinks = [
-  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases && !onBlog },
+  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases && !onBlog && !onEnterprise },
   { label: 'Use Cases', href: useCasesHref, active: onUseCases },
   { label: 'Blogs', href: `${basePath}blog/`, active: onBlog },
+  { label: 'For enterprise', href: `${basePath}enterprise/`, active: onEnterprise },
 ]
 
 const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
@@ -81,3 +83,12 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
     </div>
   </nav>
 </header>
+
+<script>
+  // On narrow phones the tab row can scroll sideways; keep the current tab in view.
+  const row = document.querySelector<HTMLElement>('.mobile-navbar-links')
+  const active = row?.querySelector<HTMLElement>('a.active')
+  if (row && active && row.scrollWidth > row.clientWidth) {
+    row.scrollLeft = active.offsetLeft - row.offsetLeft - (row.clientWidth - active.offsetWidth) / 2
+  }
+</script>

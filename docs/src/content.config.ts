@@ -27,6 +27,7 @@ export enum NavigationCategory {
   OPERATIONS,
   ENGINEERING,
   USE_CASES,
+  ENTERPRISE,
 }
 
 const link = (href: string, label: string) => ({ type: 'link' as const, href, label })
@@ -239,6 +240,30 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
   },
 ]
 
+const ent = '/enterprise'
+
+// The For enterprise tab: the security model, one page per part of the
+// boundary, in the order a security reviewer reads them.
+const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
+  {
+    type: 'group',
+    label: 'For enterprise',
+    category: NavigationCategory.ENTERPRISE,
+    entries: [
+      link(ent, 'Security model'),
+      link(`${ent}/isolation-boundary`, 'Isolation boundary'),
+      link(`${ent}/filesystem-and-images`, 'Filesystem and images'),
+      link(`${ent}/network-defenses`, 'Network defenses'),
+      link(`${ent}/secret-handling`, 'Secret handling'),
+      link(`${ent}/hardening`, 'Hardening'),
+    ],
+  },
+]
+
+export function isEnterprisePath(pathname: string): boolean {
+  return pathname === ent || pathname.startsWith(`${ent}/`)
+}
+
 function isUseCasesPath(pathname: string): boolean {
   return pathname === '/use-cases' || pathname.startsWith('/use-cases/')
 }
@@ -249,6 +274,7 @@ export function isBlogPath(pathname: string): boolean {
 
 export const getSidebarConfig = (pathname = '/'): NavigationGroup[] => {
   if (isUseCasesPath(pathname)) return getUseCasesSidebarConfig()
+  if (isEnterprisePath(pathname)) return getEnterpriseSidebarConfig()
   if (isBlogPath(pathname)) return getBlogSidebarConfig()
   return getDocsSidebarConfig()
 }
