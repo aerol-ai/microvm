@@ -319,17 +319,33 @@ func TestSnapshotInProgress(t *testing.T) {
 func TestRetryOfUnsubmittedExecutionConflicts(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	old := submitWait
-	submitWait = 30 * time.Millisecond
-	t.Cleanup(func() { submitWait = old })
-	// Simulate an original request that claimed the session and died.
-	sid := ephemeralPrefix + shortHash(devbox.ID, "dead")
-	if _, err := env.h.createSession(context.Background(), devbox.ID, sid); err != nil {
+	shorten(t, &submitWait, 30*time.Millisecond)
+	// An original request that claimed the execution and its session, then
+	// died before submitting: the retry must not guess, so it conflicts.
+	ref := execRef{session: ephemeralPrefix + shortHash(devbox.ID, "dead")}
+	if _, acquired, err := env.h.claimLedger(context.Background(), ledgerKey(devbox.ID, ref)); err != nil || !acquired {
+		t.Fatalf("claim = %v %v", acquired, err)
+	}
+	if _, err := env.h.createSession(context.Background(), devbox.ID, ref.session); err != nil {
 		t.Fatal(err)
 	}
 	rr := env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", `{"command":"echo x","command_id":"dead"}`, nil)
 	expectStatus(t, rr, http.StatusConflict)
 	if rr.Header().Get("x-should-retry") != "false" {
 		t.Fatal("conflict must not be retried")
+	}
+	if env.toolbox.execCount() != 0 {
+		t.Fatal("the retry submitted the command")
+	}
+
+	// A leftover session nobody holds a claim on (the claim lapsed): the
+	// new claim holder adopts the session and submits once.
+	orphan := execRef{session: ephemeralPrefix + shortHash(devbox.ID, "orphan")}
+	if _, err := env.h.createSession(context.Background(), devbox.ID, orphan.session); err != nil {
+		t.Fatal(err)
+	}
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", `{"command":"echo y","command_id":"orphan"}`, nil), http.StatusOK)
+	if env.toolbox.execCount() != 1 {
+		t.Fatalf("exec count = %d, want 1", env.toolbox.execCount())
 	}
 }

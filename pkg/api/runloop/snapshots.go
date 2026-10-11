@@ -6,23 +6,29 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// Snapshot ids. A snapshot taken through this facade is snp-<devbox>.<hash>:
-// the source devbox id is embedded so the status/update/delete routes can
-// be forwarded to the node holding the snapshot while that devbox lives,
-// and the hash makes a retried snapshot_disk land on the same snapshot.
-// Snapshots taken through other APIs are addressed by their native name,
-// base64url-encoded behind snx- because native names are image refs
-// ("repo/name:tag") that cannot sit in a URL path segment.
+// Snapshot ids. A snapshot lives in the catalogue (and the image store) of
+// the node that took it, and nowhere else. In a cluster, every id this
+// facade hands out therefore names that node: snp-<node>.<hash> for a
+// snapshot taken here, snx-<node>.<name> for one taken through another API.
+// Status, update, delete and create-from-snapshot route on the node in the
+// id, so they keep working after the source devbox is shut down or moves,
+// and through any ingress — an indexed lookup, never a fleet-wide search.
+// <node> is the base32 node affinity (models.EncodeNodeAffinity), which
+// cannot contain the '.' separator. Single-node ids leave the node out.
+//
+// <hash> makes a retried snapshot_disk land on the same snapshot. <name>
+// is the native name base64url-encoded, because native names are image
+// refs ("repo/name:tag") that cannot sit in a URL path segment.
 const (
 	snapshotPrefix       = "snp-"
 	nativeSnapshotPrefix = "snx-"
@@ -62,18 +68,48 @@ func newSnapshotTracker() *snapshotTracker {
 	return newFlightTracker[snapshotMeta, *models.SandboxSnapshot]()
 }
 
-// snapshotSourceDevbox extracts the devbox id embedded in a facade
-// snapshot id.
-func snapshotSourceDevbox(id string) (string, bool) {
-	rest, ok := strings.CutPrefix(id, snapshotPrefix)
+// snapshotNodeSegment is the node prefix ids minted on this node carry:
+// "<affinity>." in a cluster, "" on a single node.
+func (h *handlers) snapshotNodeSegment() string {
+	c := h.clusterClient()
+	if c == nil {
+		return ""
+	}
+	encoded, ok := models.EncodeNodeAffinity(c.SelfNodeID())
 	if !ok {
-		return "", false
+		return ""
 	}
-	devboxID, hash, found := strings.Cut(rest, ".")
-	if !found || models.ValidateSandboxID(devboxID) != nil || !isHex(hash) {
-		return "", false
+	return encoded + "."
+}
+
+// splitSnapshotID splits an id this facade minted into its home node
+// (empty for a single-node id) and the rest. ok is false for anything
+// else, including a node segment that does not decode.
+func splitSnapshotID(id string) (prefix, nodeID, rest string, ok bool) {
+	for _, p := range []string{snapshotPrefix, nativeSnapshotPrefix} {
+		body, found := strings.CutPrefix(id, p)
+		if !found {
+			continue
+		}
+		if encoded, tail, bound := strings.Cut(body, "."); bound {
+			node, valid := models.DecodeNodeAffinity(encoded)
+			if !valid || tail == "" {
+				return "", "", "", false
+			}
+			return p, node, tail, true
+		}
+		if body == "" {
+			return "", "", "", false
+		}
+		return p, "", body, true
 	}
-	return devboxID, true
+	return "", "", "", false
+}
+
+// snapshotHomeNode reports the node a snapshot id is bound to.
+func snapshotHomeNode(id string) (string, bool) {
+	_, node, _, ok := splitSnapshotID(id)
+	return node, ok && node != ""
 }
 
 // nativeSnapshotName is the image ref the snapshot is committed under.
@@ -81,8 +117,25 @@ func nativeSnapshotName(snapshotID string) string {
 	return "runloop/" + shortHash(snapshotID) + ":latest"
 }
 
-func snapshotIDForName(name string) string {
-	return nativeSnapshotPrefix + base64.RawURLEncoding.EncodeToString([]byte(name))
+func (h *handlers) snapshotIDForName(name string) string {
+	return nativeSnapshotPrefix + h.snapshotNodeSegment() + base64.RawURLEncoding.EncodeToString([]byte(name))
+}
+
+// snapshotNameForID is the native name behind an id, without a lookup —
+// the list cursor. Ids this facade did not mint are taken as native names.
+func snapshotNameForID(id string) string {
+	prefix, _, rest, ok := splitSnapshotID(id)
+	switch {
+	case !ok:
+		return id
+	case prefix == snapshotPrefix:
+		return nativeSnapshotName(id)
+	}
+	name, err := base64.RawURLEncoding.DecodeString(rest)
+	if err != nil {
+		return id
+	}
+	return string(name)
 }
 
 // lookupSnapshot resolves any snapshot id this facade hands out — or a
@@ -105,24 +158,25 @@ func (h *handlers) lookupSnapshotWithAlias(ctx context.Context, id string) (*mod
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, nil, err
 	}
-	if encoded, ok := strings.CutPrefix(id, nativeSnapshotPrefix); ok {
-		name, err := base64.RawURLEncoding.DecodeString(encoded)
+	prefix, _, rest, ok := splitSnapshotID(id)
+	switch {
+	case ok && prefix == nativeSnapshotPrefix:
+		name, err := base64.RawURLEncoding.DecodeString(rest)
 		if err != nil {
 			return nil, nil, store.ErrNotFound
 		}
 		snapshot, err := h.deps.Service.GetSnapshot(ctx, string(name))
 		return snapshot, nil, err
-	}
-	if strings.HasPrefix(id, snapshotPrefix) {
+	case strings.HasPrefix(id, snapshotPrefix), strings.HasPrefix(id, nativeSnapshotPrefix):
 		return nil, nil, store.ErrNotFound
 	}
 	snapshot, err := h.deps.Service.GetSnapshot(ctx, id)
 	return snapshot, nil, err
 }
 
-func newSnapshotView(snapshot *models.SandboxSnapshot, alias *models.SnapshotAlias) (snapshotView, error) {
+func (h *handlers) newSnapshotView(snapshot *models.SandboxSnapshot, alias *models.SnapshotAlias) (snapshotView, error) {
 	view := snapshotView{
-		ID:             snapshotIDForName(snapshot.Name),
+		ID:             h.snapshotIDForName(snapshot.Name),
 		CreateTimeMs:   unixMillis(snapshot.CreatedAt),
 		Metadata:       map[string]string{},
 		SourceDevboxID: snapshot.SourceSandboxID,
@@ -200,7 +254,7 @@ func (h *handlers) writeSnapshotFlight(w http.ResponseWriter, r *http.Request, f
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	view, err := newSnapshotView(snapshot, alias)
+	view, err := h.newSnapshotView(snapshot, alias)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -224,7 +278,7 @@ func (h *handlers) startSnapshot(w http.ResponseWriter, r *http.Request, devboxI
 	if key == "" {
 		key = randomHex()
 	}
-	id := snapshotPrefix + devboxID + "." + shortHash(service.OwnerRefForCreate(r.Context()), key, string(raw))
+	id := snapshotPrefix + h.snapshotNodeSegment() + shortHash(service.OwnerRefForCreate(r.Context()), devboxID, key, string(raw))
 	blob := snapshotBlob{Name: trimPtr(req.Name), Metadata: cloneStringMap(req.Metadata), CommitMessage: trimPtr(req.CommitMessage)}
 	f, started := h.snapshots.claim(id, snapshotMeta{owner: service.OwnerRefForCreate(r.Context()), devboxID: devboxID, blob: blob})
 	if started {
@@ -280,7 +334,7 @@ func (h *handlers) snapshotStatus(w http.ResponseWriter, r *http.Request, id str
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	view, err := newSnapshotView(snapshot, alias)
+	view, err := h.newSnapshotView(snapshot, alias)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -288,6 +342,16 @@ func (h *handlers) snapshotStatus(w http.ResponseWriter, r *http.Request, id str
 	writeJSON(w, http.StatusOK, snapshotStatusView{Status: "complete", Snapshot: &view})
 }
 
+// snapshotScanBatch is how many catalogue rows listSnapshots reads per
+// query while filling a page.
+const snapshotScanBatch = 200
+
+// listSnapshots pages the caller's catalogue in native-name order, which
+// the store can seek: starting_after maps to a name without a lookup
+// (snapshotNameForID), and each page reads only the rows it needs. The
+// metadata filter lives in the facade's alias state, so rows are scanned in
+// batches until the page fills; memory stays bounded by the page, never by
+// the catalogue or the caller's limit.
 func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := defaultListLimit
@@ -299,50 +363,22 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = n
 	}
-	startingAfter := strings.TrimSpace(q.Get("starting_after"))
+	limit = min(limit, clusterlist.MaxPageLimit)
+	after := ""
+	if raw := strings.TrimSpace(q.Get("starting_after")); raw != "" {
+		after = snapshotNameForID(raw)
+	}
 	devboxFilter := strings.TrimSpace(q.Get("devbox_id"))
 	metadataFilter := metadataQuery(q)
 
-	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	page := make([]snapshotView, 0, limit+1)
+	err := h.scanSnapshots(r.Context(), devboxFilter, after, metadataFilter, func(view snapshotView) bool {
+		page = append(page, view)
+		return len(page) <= limit
+	})
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
-	}
-	aliases, err := h.deps.Service.ListSnapshotAliases(r.Context(), models.FacadeRunloop)
-	if err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	byName := make(map[string]models.SnapshotAlias, len(aliases))
-	for _, alias := range aliases {
-		byName[alias.SnapshotName] = alias
-	}
-	views := make([]snapshotView, 0, len(snapshots))
-	for _, snapshot := range snapshots {
-		if devboxFilter != "" && snapshot.SourceSandboxID != devboxFilter {
-			continue
-		}
-		var alias *models.SnapshotAlias
-		if a, ok := byName[snapshot.Name]; ok {
-			alias = &a
-		}
-		view, err := newSnapshotView(snapshot, alias)
-		if err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
-		if !metadataMatches(view.Metadata, metadataFilter) {
-			continue
-		}
-		views = append(views, view)
-	}
-	sort.Slice(views, func(i, j int) bool { return views[i].ID < views[j].ID })
-	total := len(views)
-	page := make([]snapshotView, 0, limit)
-	for _, view := range views {
-		if view.ID > startingAfter {
-			page = append(page, view)
-		}
 	}
 	hasMore := len(page) > limit
 	if hasMore {
@@ -350,9 +386,53 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := listSnapshotsResponse{Snapshots: page, HasMore: hasMore}
 	if q.Get("include_total_count") != "false" {
+		total, err := h.countSnapshots(r.Context(), devboxFilter, metadataFilter)
+		if err != nil {
+			writeStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
 		resp.TotalCount = &total
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// scanSnapshots walks the caller's catalogue after the name `after`,
+// calling yield with each view that passes the metadata filter until yield
+// returns false or the catalogue ends.
+func (h *handlers) scanSnapshots(ctx context.Context, devboxFilter, after string, metadataFilter map[string][]string, yield func(snapshotView) bool) error {
+	for {
+		rows, err := h.deps.Service.ListSnapshotPage(ctx, devboxFilter, models.FacadeRunloop, after, snapshotScanBatch)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			view, err := h.newSnapshotView(row.Snapshot, row.Alias)
+			if err != nil {
+				return err
+			}
+			if metadataMatches(view.Metadata, metadataFilter) && !yield(view) {
+				return nil
+			}
+		}
+		if len(rows) < snapshotScanBatch {
+			return nil
+		}
+		after = rows[len(rows)-1].Snapshot.Name
+	}
+}
+
+// countSnapshots is total_count. Without a metadata filter the store
+// counts; with one, the matching rows are counted in a streaming scan.
+func (h *handlers) countSnapshots(ctx context.Context, devboxFilter string, metadataFilter map[string][]string) (int, error) {
+	if len(metadataFilter) == 0 {
+		return h.deps.Service.CountSnapshots(ctx, devboxFilter)
+	}
+	total := 0
+	err := h.scanSnapshots(ctx, devboxFilter, "", metadataFilter, func(snapshotView) bool {
+		total++
+		return true
+	})
+	return total, err
 }
 
 // metadataQuery reads Runloop's `metadata[key]=value` and
@@ -425,7 +505,7 @@ func (h *handlers) updateSnapshot(w http.ResponseWriter, r *http.Request, id str
 	// here, under its snx- id — never under the id the caller passed,
 	// which may be another facade's alias row that this upsert would
 	// otherwise take over.
-	updated := models.SnapshotAlias{Alias: snapshotIDForName(snapshot.Name), SnapshotName: snapshot.Name, Facade: models.FacadeRunloop, StateJSON: blob.encode()}
+	updated := models.SnapshotAlias{Alias: h.snapshotIDForName(snapshot.Name), SnapshotName: snapshot.Name, Facade: models.FacadeRunloop, StateJSON: blob.encode()}
 	if alias != nil {
 		updated.Alias, updated.ExtraNames, updated.CreatedAt = alias.Alias, alias.ExtraNames, alias.CreatedAt
 	}
@@ -433,7 +513,7 @@ func (h *handlers) updateSnapshot(w http.ResponseWriter, r *http.Request, id str
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	view, err := newSnapshotView(snapshot, &updated)
+	view, err := h.newSnapshotView(snapshot, &updated)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

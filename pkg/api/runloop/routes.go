@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/aerol-ai/microvm/internal/service"
 )
@@ -37,7 +36,8 @@ type handlers struct {
 	execs      *execTracker
 	snapshots  *snapshotTracker
 	shutdowns  *tombstones
-	homes      sync.Map // devbox id → resolved $HOME for relative file paths
+	homes      *homeCache
+	recovery   execRecovery
 }
 
 func newHandlers(d Deps) *handlers {
@@ -48,6 +48,7 @@ func newHandlers(d Deps) *handlers {
 		execs:      newExecTracker(),
 		snapshots:  newSnapshotTracker(),
 		shutdowns:  newTombstones(),
+		homes:      newHomeCache(),
 	}
 }
 
@@ -59,6 +60,9 @@ func newHandlers(d Deps) *handlers {
 // match the same path with neither more specific.
 func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := newHandlers(d)
+	// Executions a previous process left running still owe their session
+	// cleanup; re-attach watchers to them off the boot path.
+	h.recoverExecutionsInBackground()
 	mux.Handle(devboxesPath, d.Auth(http.HandlerFunc(h.route)))
 	mux.Handle(devboxesPath+"/", d.Auth(http.HandlerFunc(h.route)))
 }
@@ -194,17 +198,16 @@ func (h *handlers) routeExecution(w http.ResponseWriter, r *http.Request, devbox
 	}
 }
 
-// routeSnapshots serves /v1/devboxes/disk_snapshots/... Snapshots live in
-// the node-local catalogue of the node that took them. A facade snapshot
-// id names its source devbox, so per-snapshot calls follow that devbox to
-// its owner while it exists; the list (like the /e2b facade's) is local.
+// routeSnapshots serves /v1/devboxes/disk_snapshots/... A snapshot lives in
+// the catalogue of the node that took it, and its id names that node, so
+// per-snapshot calls go there — whatever happened to the source devbox
+// since. The list is node-local, like the /e2b facade's.
 func (h *handlers) routeSnapshots(w http.ResponseWriter, r *http.Request, segs []string) {
 	if len(segs) > 0 {
-		if devboxID, ok := snapshotSourceDevbox(segs[0]); ok {
-			r.SetPathValue("id", devboxID)
-			h.clusterForwardWrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if node, ok := snapshotHomeNode(segs[0]); ok {
+			h.forwardToNode(w, r, node, func(w http.ResponseWriter, r *http.Request) {
 				h.routeSnapshotItem(w, r, segs)
-			})).ServeHTTP(w, r)
+			})
 			return
 		}
 	}

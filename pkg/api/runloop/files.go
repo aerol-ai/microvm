@@ -1,6 +1,7 @@
 package runloop
 
 import (
+	"container/list"
 	"context"
 	"errors"
 	"io"
@@ -8,7 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // maxUploadBytes matches toolboxd's default SB_UPLOAD_MAX_BYTES, so the
@@ -34,11 +39,16 @@ func (h *handlers) resolvePath(ctx context.Context, devboxID, p string) (string,
 	return path.Join(home, p), nil
 }
 
-// homeDir asks the toolbox for $HOME once per devbox; it cannot change
-// for the devbox's lifetime.
+// homeDir asks the toolbox for $HOME once per devbox incarnation; it cannot
+// change for the devbox's lifetime.
 func (h *handlers) homeDir(ctx context.Context, devboxID string) (string, error) {
-	if cached, ok := h.homes.Load(devboxID); ok {
-		return cached.(string), nil
+	sandbox, err := h.deps.Service.GetSandbox(ctx, devboxID)
+	if err != nil {
+		return "", err
+	}
+	key := homeCacheKey(sandbox)
+	if home, ok := h.homes.get(key); ok {
+		return home, nil
 	}
 	res, err := h.runOneShot(ctx, devboxID, `printf %s "$HOME"`)
 	if err != nil {
@@ -48,8 +58,85 @@ func (h *handlers) homeDir(ctx context.Context, devboxID string) (string, error)
 	if res.ExitCode != 0 || !strings.HasPrefix(home, "/") {
 		return "", errors.New("could not resolve the devbox home directory")
 	}
-	h.homes.Store(devboxID, home)
+	h.homes.put(key, home)
 	return home, nil
+}
+
+// maxHomeEntries bounds the home cache. An entry is one short path, and a
+// miss costs one toolbox exec, so the bound only has to cover the devboxes
+// in active use on this node.
+const maxHomeEntries = 4096
+
+// homeCache is a bounded LRU of resolved home directories. Keys carry the
+// sandbox's creation time, so an entry can never answer for a later devbox
+// that reuses the id (a deterministic create retried after shutdown), and an
+// entry for a devbox deleted by any path — native API, another facade, the
+// lifecycle reconciler, or a lookup racing the delete — is simply never
+// asked for again and ages out of the LRU. Nothing has to hook deletion.
+type homeCache struct {
+	mu      sync.Mutex
+	entries map[string]*list.Element
+	order   *list.List // front = most recently used
+}
+
+type homeEntry struct {
+	key  string
+	home string
+}
+
+func newHomeCache() *homeCache {
+	return &homeCache{entries: make(map[string]*list.Element), order: list.New()}
+}
+
+func homeCacheKey(sandbox *models.Sandbox) string {
+	return sandbox.ID + "@" + strconv.FormatInt(sandbox.CreatedAt.UnixNano(), 10)
+}
+
+func (c *homeCache) get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	c.order.MoveToFront(el)
+	return el.Value.(*homeEntry).home, true
+}
+
+func (c *homeCache) put(key, home string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.entries[key]; ok {
+		el.Value.(*homeEntry).home = home
+		c.order.MoveToFront(el)
+		return
+	}
+	c.entries[key] = c.order.PushFront(&homeEntry{key: key, home: home})
+	for c.order.Len() > maxHomeEntries {
+		oldest := c.order.Back()
+		c.order.Remove(oldest)
+		delete(c.entries, oldest.Value.(*homeEntry).key)
+	}
+}
+
+// forget drops every cached incarnation of devboxID (a facade shutdown;
+// other deletions rely on the incarnation key and the LRU bound).
+func (c *homeCache) forget(devboxID string) {
+	prefix := devboxID + "@"
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for key, el := range c.entries {
+		if strings.HasPrefix(key, prefix) {
+			c.order.Remove(el)
+			delete(c.entries, key)
+		}
+	}
+}
+
+func (c *homeCache) len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.order.Len()
 }
 
 func (h *handlers) readFileContents(w http.ResponseWriter, r *http.Request, devboxID string) {

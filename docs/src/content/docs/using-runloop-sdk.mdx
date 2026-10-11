@@ -70,14 +70,14 @@ The TypeScript SDK on Node talks HTTP/2 by default. Behind TLS that is negotiate
 - Output streaming (`stream_stdout_updates`, `stream_stderr_updates`), which the SDKs use for output callbacks and for output past `last_n` lines.
 - Files: `read_file_contents`, `write_file_contents`, `upload_file`, `download_file`. Relative paths resolve against the devbox user's home directory, as on Runloop.
 - Disk snapshots: `snapshot_disk`, `snapshot_disk_async`, status, list (with `devbox_id` and `metadata[...]` filters), update, delete, and creating a devbox from `snapshot_id`.
-- Retries are safe. Both SDKs resend the same `x-request-id` (and the same `command_id` on `execute`) when they retry, and the facade answers a retry with the devbox, execution or snapshot the first attempt made. Keep proxies in front of sandboxd from rewriting `X-Request-Id`.
+- Retries are safe. Both SDKs resend the same `x-request-id` (and the same `command_id` on `execute`) when they retry, and the facade answers a retry with the devbox, execution or snapshot the first attempt made. A retried command never runs twice, even after sandboxd restarts: the facade remembers each command for 24 hours. Keep proxies in front of sandboxd from rewriting `X-Request-Id`.
 
 ## How Runloop settings map
 
 | Runloop | AerolVM |
 |---|---|
 | `blueprint_id` / `blueprint_name` | An image, looked up in `SB_RUNLOOP_BLUEPRINT_MAP_JSON` (a JSON object of blueprint name to image). With neither set, the `default` entry is used, `ubuntu:22.04` unless you map it. An unmapped blueprint is refused. |
-| `snapshot_id` | The snapshot's committed image. |
+| `snapshot_id` | The snapshot's committed image. In a cluster, the new devbox runs on the node that holds the snapshot. |
 | `launch_parameters.resource_size_request` | CPU, memory and disk from Runloop's size table; `CUSTOM_SIZE` uses the `custom_*` fields. |
 | `launch_parameters.keep_alive_time_seconds` | The devbox is destroyed that long after create. Defaults to one hour, as on Runloop. |
 | `launch_parameters.after_idle` | `on_idle: suspend` stops the devbox after the idle time; `shutdown` destroys it. `keep_alive` resets the idle clock. |
@@ -93,8 +93,10 @@ export SB_RUNLOOP_BLUEPRINT_MAP_JSON='{"default":"ubuntu:24.04","python":"python
 - Tunnels (`enable_tunnel`, `getTunnelUrl`) answer `501`. The SDK builds tunnel URLs as `{port}-{key}.tunnel.{domain}`, which does not match AerolVM's port routes. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/).
 - Create fields with no equivalent are refused with `501` rather than ignored: `entrypoint`, `launch_commands`, `secrets`, `mounts`, `code_mounts`, `file_mounts`, `gateways`, `mcp`, `user_parameters`, `network_policy_id`, `required_services`, the `flex` provisioning tier, lifecycle hooks, and resume triggers.
 - Blueprint builds, storage objects, secrets, agents, axons, network policies, devbox logs, usage, SSH keys and eviction notices are not part of the facade.
-- Streamed output arrives when the command finishes rather than line by line. Output callbacks still see every line.
+- Streamed output arrives when the command finishes rather than line by line.
+- After a command finishes, the facade keeps the last 1 MiB of its stdout and the last 1 MiB of its stderr, for up to an hour. If a command printed more, output callbacks first get a line like `[AerolVM: 40319 earlier bytes of stdout were not kept; ...]` and then the last 1 MiB. When that output is dropped (after an hour, or sooner on a busy node), the exit status is still there, and callbacks get only the notice line. To keep everything, write long output to a file in the devbox and read the file.
 - `send_std_in` signals (`EOF`, `INTERRUPT`) answer `501`. Killing an execution in a named shell ends that shell.
+- A snapshot stays on the node that took it. You can still reach it through any node, even after its source devbox shuts down. If that node leaves the cluster, the snapshot goes with it, and its routes answer `503`.
 - In a cluster, the snapshot list shows the snapshots on the node that answers.
 
 ## Same thing from the SDK

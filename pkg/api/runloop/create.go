@@ -46,7 +46,8 @@ type createMeta struct {
 // CreateSandboxWithID returns the existing row — but two attempts in flight
 // at once would both run the runtime create before either persisted the
 // row. In a cluster the reservation conflict already routes a duplicate to
-// the node holding the original, so the join happens there.
+// the node holding the original, and a create from a snapshot always runs
+// on the snapshot's node, so the join happens there.
 type createTracker = flightTracker[createMeta, *models.Sandbox]
 
 func newCreateTracker() *createTracker { return newFlightTracker[createMeta, *models.Sandbox]() }
@@ -67,6 +68,17 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 	raw, ok := readBody(w, r, &req)
 	if !ok {
 		return
+	}
+	// A snapshot is only resolvable — and its image only present — on the
+	// node that took it, so a create from one runs there. Route before
+	// translating: this node may know nothing about the snapshot.
+	if node, bound := snapshotHomeNode(trimPtr(req.SnapshotID)); bound {
+		if c := h.clusterClient(); c != nil && node != c.SelfNodeID() {
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			r.ContentLength = int64(len(raw))
+			h.forwardToNode(w, r, node, h.handleCreate)
+			return
+		}
 	}
 	serviceReq, blob, err := h.translateCreate(r.Context(), req)
 	if err != nil {
@@ -133,21 +145,23 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 // write is part of the create: a devbox without it would answer GETs with
 // its blueprint/name/launch parameters missing, so a failed write rolls
 // the sandbox back rather than leaving it half-described.
+//
+// id is the devbox id; reservationID is Prepare's decision and is empty
+// whenever no reservation exists — single-node, or a local-only image
+// (snapshot, mapped build) in a cluster. The two are kept apart: an empty
+// reservation must take the unreserved create, under id.
 func (h *handlers) runCreate(ctx context.Context, req models.CreateSandboxRequest, reservationID, id string, blob devboxBlob) (*models.Sandbox, error) {
-	if reservationID == "" {
-		reservationID = id
-	}
 	// A duplicate that checked the store just before the original's row
 	// landed, and claimed just after its flight retired, ends up here with
 	// nothing left to do. Answering from the row keeps it from re-running
 	// the reserved-create path against a placement that is already
 	// promoted.
-	if existing, err := h.deps.Service.GetSandbox(ctx, reservationID); err == nil {
+	if existing, err := h.deps.Service.GetSandbox(ctx, id); err == nil {
 		return existing, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
 	}
-	resp, err := clustercreate.CreateOnSelectedNode(ctx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
+	resp, err := clustercreate.CreateOnSelectedNode(ctx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: id})
 	if err != nil {
 		return nil, err
 	}
@@ -211,6 +225,16 @@ func (h *handlers) translateCreate(ctx context.Context, req createDevboxRequest)
 	// Runloop devboxes are reachable only through tunnels, which this
 	// facade does not offer, so there is no reason to open a public route.
 	private := false
+	distribution := ""
+	if blob.SnapshotID != "" {
+		// The snapshot's facade metadata lives only on this node, and the
+		// create was routed here for it; keep the devbox here too, under
+		// the local-image placement contract, even when the image itself
+		// was also pushed to a registry. A forward to another worker would
+		// re-translate the request there, where the snapshot id resolves
+		// to nothing.
+		distribution = models.ImageDistributionLocalOnly
+	}
 	serviceReq := models.CreateSandboxRequest{
 		Image:              image,
 		CPU:                cpu,
@@ -221,7 +245,8 @@ func (h *handlers) translateCreate(ctx context.Context, req createDevboxRequest)
 		AllowPublicTraffic: &private,
 		// Runloop metadata is label-shaped, so it goes in the native tags
 		// and round-trips through every API surface, not just /runloop.
-		Tags: cloneStringMap(req.Metadata),
+		Tags:                  cloneStringMap(req.Metadata),
+		ImageDistributionMode: distribution,
 	}
 	return serviceReq, blob, nil
 }

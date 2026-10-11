@@ -185,6 +185,12 @@ type fakeToolbox struct {
 	badJSON    map[string]bool
 	home       string // $HOME the one-shot exec reports; "" = /home/user
 	badCmdID   bool   // exec answers a non-hex command id
+
+	beforeServe func(*http.Request) // runs first on every request
+	homeCalls   int                 // one-shot $HOME lookups served
+	// racyCreate answers every session create 201, like a toolboxd
+	// older than the atomic GetOrCreate: created is no claim.
+	racyCreate bool
 }
 
 type fakeSession struct {
@@ -214,6 +220,12 @@ func (f *fakeToolbox) failAlways(suffix string, status int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.failSuffix[suffix] = status
+}
+
+func (f *fakeToolbox) setBeforeServe(fn func(*http.Request)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.beforeServe = fn
 }
 
 func (f *fakeToolbox) clearFaults() {
@@ -278,6 +290,12 @@ func (f *fakeToolbox) execCount() int {
 
 func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
+	before := f.beforeServe
+	f.mu.Unlock()
+	if before != nil {
+		before(r)
+	}
+	f.mu.Lock()
 	if status, ok := f.failNext[r.URL.Path]; ok {
 		delete(f.failNext, r.URL.Path)
 		f.mu.Unlock()
@@ -318,6 +336,9 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if home == "" {
 			home = "/home/user"
 		}
+		f.mu.Lock()
+		f.homeCalls++
+		f.mu.Unlock()
 		writeJSON(w, http.StatusOK, models.ExecResult{Stdout: home, ExitCode: 0})
 	case path == "/process/session" && r.Method == http.MethodPost:
 		var req struct {
@@ -328,6 +349,9 @@ func (f *fakeToolbox) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, exists := f.sessions[req.SessionID]
 		if !exists {
 			f.sessions[req.SessionID] = &fakeSession{}
+		}
+		if f.racyCreate {
+			exists = false
 		}
 		f.mu.Unlock()
 		if exists {
@@ -474,6 +498,12 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	return newTestEnvWithConfig(t, nil)
+}
+
+// newTestEnvWithConfig is newTestEnv with the service config adjusted.
+func newTestEnvWithConfig(t *testing.T, mutate func(*config.Config)) *testEnv {
+	t.Helper()
 	t.Setenv(blueprintMapEnv, `{"python":"python:3.12"}`)
 
 	toolbox := newFakeToolbox()
@@ -500,6 +530,9 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatalf("secrets.NewCipher: %v", err)
 	}
 	cfg := config.Config{PublicHost: "sandbox.test", EnableCaddy: false, ToolboxPort: port, HTTPClientTimeout: 5 * time.Second}
+	if mutate != nil {
+		mutate(&cfg)
+	}
 	rt := newFakeRuntime()
 	svc := service.New(cfg, logger, st, rt, nil, caddy.New(cfg), cipher, mountManager, nil)
 

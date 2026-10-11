@@ -162,7 +162,7 @@ type executionDetailView struct {
 
 type executionUpdateChunk struct {
 	Output string `json:"output"`
-	Offset int    `json:"offset"`
+	Offset int64  `json:"offset"`
 }
 
 type readFileRequest struct {

@@ -237,7 +237,7 @@ func TestStreamOutput(t *testing.T) {
 		t.Fatalf("content type = %q", ct)
 	}
 	chunks := readSSE(t, rr.Body.String())
-	if len(chunks) != 1 || chunks[0].Output != "streamed\n" || chunks[0].Offset != len("streamed\n") {
+	if len(chunks) != 1 || chunks[0].Output != "streamed\n" || chunks[0].Offset != int64(len("streamed\n")) {
 		t.Fatalf("chunks = %+v", chunks)
 	}
 	// Reconnecting at the end offset yields nothing more.
@@ -268,6 +268,7 @@ func readSSE(t *testing.T, body string) []executionUpdateChunk {
 	t.Helper()
 	var chunks []executionUpdateChunk
 	scanner := bufio.NewScanner(strings.NewReader(body))
+	scanner.Buffer(make([]byte, 0, 64<<10), 8<<20) // chunks can be megabytes
 	for scanner.Scan() {
 		line := scanner.Text()
 		data, ok := strings.CutPrefix(line, "data: ")
@@ -280,6 +281,9 @@ func readSSE(t *testing.T, body string) []executionUpdateChunk {
 		}
 		chunks = append(chunks, chunk)
 	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("read SSE: %v", err)
+	}
 	return chunks
 }
 
@@ -290,11 +294,11 @@ func deref(s *string) string {
 	return *s
 }
 
-// TestLiveStateFallsBackWhenWatcherCleansUp pins the race the go-race CI job
+// TestReaderFallsBackWhenWatcherCleansUp pins the race the go-race CI job
 // hit: a reader sees the session and the finished command, then the
 // watcher captures the result and deletes the session before the reader's
 // logs read, which 404s. The reader must answer from the capture.
-func TestLiveStateFallsBackWhenWatcherCleansUp(t *testing.T) {
+func TestReaderFallsBackWhenWatcherCleansUp(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
 	ref := execRef{session: ephemeralPrefix + "0123456789abcdef"}
@@ -302,12 +306,17 @@ func TestLiveStateFallsBackWhenWatcherCleansUp(t *testing.T) {
 	env.toolbox.mu.Lock()
 	env.toolbox.sessions[ref.session] = &fakeSession{commands: []*fakeCommand{{id: "00000000000000aa", command: "echo raced", exitCode: &exit, stdout: "raced\n"}}}
 	env.toolbox.mu.Unlock()
-	env.h.execs.record(&execResult{key: resultKey(devbox.ID, ref.id()), stdout: "raced\n"})
-	env.toolbox.setFailNext("/process/session/"+ref.session+"/command/00000000000000aa/logs", http.StatusNotFound)
+	logsPath := "/process/session/" + ref.session + "/command/00000000000000aa/logs"
+	env.toolbox.setBeforeServe(func(r *http.Request) {
+		if r.URL.Path == logsPath {
+			env.h.execs.record(&execResult{key: resultKey(devbox.ID, ref.id()), stdout: "raced\n", stdoutLen: 7})
+		}
+	})
+	env.toolbox.setFailNext(logsPath, http.StatusNotFound)
 
-	state, err := env.h.liveState(context.Background(), devbox.ID, ref)
+	state, err := env.h.executionState(context.Background(), devbox.ID, ref)
 	if err != nil {
-		t.Fatalf("liveState after cleanup race: %v", err)
+		t.Fatalf("executionState after cleanup race: %v", err)
 	}
 	if !state.completed || state.stdout != "raced\n" {
 		t.Fatalf("state = %+v", state)
@@ -368,21 +377,7 @@ func TestExecTrackerEvictsByBytes(t *testing.T) {
 	if tr.bytes != 0 || len(tr.results) != 0 {
 		t.Fatalf("forgetDevbox left %d bytes / %d results", tr.bytes, len(tr.results))
 	}
-	if out, cut := keepTail(big + "tail"); !cut || !strings.HasSuffix(out, "tail") || len(out) != maxCapturedStream {
-		t.Fatal("keepTail must keep the tail")
-	}
-}
-
-func TestNamedClaimsAreBounded(t *testing.T) {
-	tr := newExecTracker()
-	for i := 0; i < maxNamedClaims+10; i++ {
-		c, owner := tr.claimNamed("d/s\x00" + strings.Repeat("k", i%50) + string(rune(i)))
-		if !owner {
-			t.Fatal("fresh key was not owned")
-		}
-		tr.finishNamed("k", c, "rls-00.00", nil)
-	}
-	if len(tr.named) > maxNamedClaims {
-		t.Fatalf("named claims grew to %d", len(tr.named))
+	if out, n := keepTail(big + "tail"); n != int64(len(big)+4) || !strings.HasSuffix(out, "tail") || len(out) != maxCapturedStream {
+		t.Fatal("keepTail must keep the tail and report the full length")
 	}
 }

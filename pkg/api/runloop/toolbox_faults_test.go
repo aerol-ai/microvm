@@ -16,13 +16,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-func setWatchMaxErrors(t *testing.T, n int) {
-	t.Helper()
-	old := watchMaxErrors
-	watchMaxErrors = n
-	t.Cleanup(func() { watchMaxErrors = old })
-}
-
 // plainSession is the session a plain execution keyed by key runs in.
 func plainSession(devboxID, key string) string {
 	return ephemeralPrefix + shortHash(devboxID, key)
@@ -102,33 +95,54 @@ func multipartBody(t *testing.T, path string) (io.Reader, string) {
 func TestNamedClaimJoiners(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	key := devbox.ID + "/s\x00k"
+	ctx := context.Background()
 
-	claim, _ := env.h.execs.claimNamed(key)
+	// A retry arriving while the original holds the claim gets the
+	// original's execution once it is recorded.
+	key := namedLedgerKey(devbox.ID, "s", "k")
+	if _, acquired, err := env.h.claimLedger(ctx, key); err != nil || !acquired {
+		t.Fatalf("claim = %v %v", acquired, err)
+	}
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		env.h.execs.finishNamed(key, claim, "rls-00.01", nil)
+		_ = env.h.completeLedger(ctx, key, "rls-00.01")
 	}()
-	ref, err := env.h.startNamedExecution(context.Background(), devbox.ID, "echo", "s", "k")
+	ref, err := env.h.startNamedExecution(ctx, devbox.ID, "echo", "s", "k")
 	if err != nil || ref.id() != "rls-00.01" {
 		t.Fatalf("joiner = %v, %v", ref, err)
 	}
 
-	failKey := devbox.ID + "/s\x00f"
-	failing, _ := env.h.execs.claimNamed(failKey)
+	// The original failing and letting go: the retry takes over and runs.
+	failKey := namedLedgerKey(devbox.ID, "s", "f")
+	if _, _, err := env.h.claimLedger(ctx, failKey); err != nil {
+		t.Fatal(err)
+	}
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		env.h.execs.finishNamed(failKey, failing, "", errors.New("submit failed"))
+		env.h.releaseLedger(ctx, failKey)
 	}()
-	if _, err := env.h.startNamedExecution(context.Background(), devbox.ID, "echo", "s", "f"); err == nil {
-		t.Fatal("joiner of a failed claim succeeded")
+	before := env.toolbox.execCount()
+	if _, err := env.h.startNamedExecution(ctx, devbox.ID, "echo", "s", "f"); err != nil {
+		t.Fatalf("retry after a released claim: %v", err)
+	}
+	if env.toolbox.execCount() != before+1 {
+		t.Fatal("the retry did not run the command")
 	}
 
-	env.h.execs.claimNamed(devbox.ID + "/s\x00c")
-	ctx, cancel := context.WithCancel(context.Background())
+	// A claim that is never recorded: the retry gives up with a conflict.
+	shorten(t, &submitWait, 30*time.Millisecond)
+	if _, _, err := env.h.claimLedger(ctx, namedLedgerKey(devbox.ID, "s", "stuck")); err != nil {
+		t.Fatal(err)
+	}
+	var reqErr requestError
+	if _, err := env.h.startNamedExecution(ctx, devbox.ID, "echo", "s", "stuck"); !errors.As(err, &reqErr) || reqErr.status != http.StatusConflict {
+		t.Fatalf("stuck claim err = %v", err)
+	}
+
+	cancelled, cancel := context.WithCancel(ctx)
 	cancel()
-	if _, err := env.h.startNamedExecution(ctx, devbox.ID, "echo", "s", "c"); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled joiner err = %v", err)
+	if _, err := env.h.startNamedExecution(cancelled, devbox.ID, "echo", "s", "c"); err == nil {
+		t.Fatal("cancelled named execution succeeded")
 	}
 }
 
@@ -141,7 +155,7 @@ func TestAwaitSubmittedFaults(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := env.h.awaitSubmitted(ctx, devbox.ID, sid); !errors.Is(err, context.Canceled) {
+	if err := env.h.awaitSubmitted(ctx, devbox.ID, execRef{session: sid}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled await = %v", err)
 	}
 	env.toolbox.failAlways("GET /process/session/"+sid, http.StatusInternalServerError)
@@ -151,15 +165,23 @@ func TestAwaitSubmittedFaults(t *testing.T) {
 func TestWatcherExits(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	setWatchMaxErrors(t, 2)
+	watching := func(id string) bool { return env.h.execs.signal(resultKey(devbox.ID, id)) != nil }
 
-	// Persistent toolbox failures: the watcher gives up.
-	var giveUp executionView
-	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"block-w1"}`, &giveUp, "X-Request-Id", "w1"), http.StatusOK)
-	env.toolbox.failAlways("GET /process/session/"+giveUp.ExecutionID, http.StatusInternalServerError)
-	waitFor(t, "watcher to give up", func() bool { return env.h.execs.signal(resultKey(devbox.ID, giveUp.ExecutionID)) == nil })
+	// Toolbox failures do not end a watcher: it owns the session's cleanup.
+	// Once the toolbox answers again it finishes the job.
+	var flaky executionView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"block-w1"}`, &flaky, "X-Request-Id", "w1"), http.StatusOK)
+	env.toolbox.failAlways("GET /process/session/"+flaky.ExecutionID, http.StatusInternalServerError)
+	waitFor(t, "the watcher to see the failure", func() bool { return !env.h.execs.running(resultKey(devbox.ID, flaky.ExecutionID)) })
+	if !watching(flaky.ExecutionID) {
+		t.Fatal("watcher gave up on toolbox failures")
+	}
 	env.toolbox.clearFaults()
 	env.toolbox.unblock("block-w1")
+	waitFor(t, "the watcher to finish and clean up", func() bool {
+		_, cached := env.h.execs.result(resultKey(devbox.ID, flaky.ExecutionID))
+		return cached && env.toolbox.sessionCount() == 0
+	})
 
 	// The session vanishing under it: the watcher stops.
 	var gone executionView
@@ -167,32 +189,48 @@ func TestWatcherExits(t *testing.T) {
 	if err := env.h.deleteSession(context.Background(), devbox.ID, gone.ExecutionID); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "watcher to stop", func() bool { return env.h.execs.signal(resultKey(devbox.ID, gone.ExecutionID)) == nil })
+	waitFor(t, "watcher to stop", func() bool { return !watching(gone.ExecutionID) })
 	env.toolbox.unblock("block-w2")
+
+	// The devbox going away: the watcher stops.
+	var orphan executionView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"block-w4"}`, &orphan, "X-Request-Id", "w4"), http.StatusOK)
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/shutdown", nil, nil), http.StatusOK)
+	waitFor(t, "watcher of a shut-down devbox to stop", func() bool { return !watching(orphan.ExecutionID) })
+	env.toolbox.unblock("block-w4")
 
 	// A second watcher for the same execution is not started.
 	ref := execRef{session: plainSession(devbox.ID, "w3")}
-	env.h.execs.watch(resultKey(devbox.ID, ref.id()))
+	if !env.h.execs.watch(resultKey(devbox.ID, ref.id())) || env.h.execs.watch(resultKey(devbox.ID, ref.id())) {
+		t.Fatal("watch must claim once")
+	}
 	env.h.startWatcher(context.Background(), devbox.ID, ref)
 }
 
 func TestExecutionHandlerFaults(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	setWatchMaxErrors(t, 1)
 	base := "/" + devbox.ID
 
 	for _, action := range []string{"execute_async", "execute_sync", "execute"} {
 		expectStatus(t, env.do(t, http.MethodPost, base+"/"+action, `{`, nil), http.StatusBadRequest)
 		expectStatus(t, env.do(t, http.MethodPost, base+"/"+action, `{"command":" "}`, nil), http.StatusBadRequest)
 	}
-	// The live read fails right after submit.
-	for i, action := range []string{"execute_async", "execute_sync", "execute"} {
+	// The live read fails right after submit. The blocking forms report it;
+	// execute_async answers from the watcher it just started ("running"),
+	// and the failure shows on the next read once the watcher has seen it.
+	for i, action := range []string{"execute_sync", "execute"} {
 		key := "f" + string(rune('0'+i))
 		env.toolbox.failAlways("GET /process/session/"+plainSession(devbox.ID, key), http.StatusInternalServerError)
 		expectStatus(t, env.do(t, http.MethodPost, base+"/"+action, `{"command":"echo x","command_id":"`+key+`"}`, nil, "X-Request-Id", key), http.StatusBadGateway)
 		env.toolbox.clearFaults()
 	}
+	asyncSession := plainSession(devbox.ID, "f9")
+	env.toolbox.failAlways("GET /process/session/"+asyncSession, http.StatusInternalServerError)
+	expectStatus(t, env.do(t, http.MethodPost, base+"/execute_async", `{"command":"echo x"}`, nil, "X-Request-Id", "f9"), http.StatusOK)
+	waitFor(t, "the watcher to see the failure", func() bool { return !env.h.execs.running(resultKey(devbox.ID, asyncSession)) })
+	expectStatus(t, env.do(t, http.MethodGet, base+"/executions/"+asyncSession, nil, nil), http.StatusBadGateway)
+	env.toolbox.clearFaults()
 
 	var running executionView
 	expectStatus(t, env.do(t, http.MethodPost, base+"/execute_async", `{"command":"block-h"}`, &running, "X-Request-Id", "h"), http.StatusOK)
@@ -219,6 +257,7 @@ func TestExecutionHandlerFaults(t *testing.T) {
 
 	sid := running.ExecutionID
 	env.toolbox.failAlways("GET /process/session/"+sid, http.StatusInternalServerError)
+	waitFor(t, "the watcher to see the failure", func() bool { return !env.h.execs.running(resultKey(devbox.ID, sid)) })
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodGet, exec, ""},
 		{http.MethodPost, exec + "/wait_for_status", `{"statuses":["completed"]}`},
@@ -229,6 +268,7 @@ func TestExecutionHandlerFaults(t *testing.T) {
 		expectStatus(t, env.do(t, tc.method, tc.path, tc.body, nil), http.StatusBadGateway)
 	}
 	env.toolbox.clearFaults()
+	waitFor(t, "the watcher to recover", func() bool { return env.h.execs.running(resultKey(devbox.ID, sid)) })
 	env.toolbox.failAlways("DELETE /process/session/"+sid, http.StatusInternalServerError)
 	expectStatus(t, env.do(t, http.MethodPost, exec+"/kill", nil, nil), http.StatusBadGateway)
 	env.toolbox.clearFaults()
@@ -272,7 +312,6 @@ func mustRef(t *testing.T, id string) execRef {
 func TestStreamHeartbeatAndMidStreamFailure(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	setWatchMaxErrors(t, 1)
 	shorten(t, &sseHeartbeat, 10*time.Millisecond)
 
 	var beat executionView
@@ -388,7 +427,7 @@ func TestSnapshotFacadeAliasesFromOtherFacades(t *testing.T) {
 	// Another facade's alias resolves, but is not treated as Runloop state.
 	var status snapshotStatusView
 	expectStatus(t, env.do(t, http.MethodGet, "/disk_snapshots/snapshot_e2b/status", nil, &status), http.StatusOK)
-	if status.Snapshot == nil || status.Snapshot.ID != snapshotIDForName(native.Name) {
+	if status.Snapshot == nil || status.Snapshot.ID != env.h.snapshotIDForName(native.Name) {
 		t.Fatalf("status = %+v", status)
 	}
 	var list listSnapshotsResponse
@@ -405,29 +444,55 @@ func TestExecTrackerEdges(t *testing.T) {
 	if _, ok := tr.result("d/old"); ok {
 		t.Fatal("expired result answered")
 	}
+	// A watcher owns cleanup, so it can attach after a reader recorded the
+	// result; a recorded result's signal is already closed.
 	tr.record(&execResult{key: "d/done"})
-	if tr.watch("d/done") {
-		t.Fatal("watched an execution that already has a result")
+	if !tr.watch("d/done") {
+		t.Fatal("a recorded result blocked the cleanup watcher")
+	}
+	select {
+	case <-tr.signal("d/done"):
+	default:
+		t.Fatal("signal for a recorded result must already be closed")
 	}
 	if !tr.watch("d/w") || tr.watch("d/w") {
 		t.Fatal("watch must claim once")
 	}
+	if !tr.running("d/w") {
+		t.Fatal("a healthy watcher reads as running")
+	}
+	sig := tr.signal("d/w")
+	tr.observed("d/w", true)
+	select {
+	case <-sig:
+	default:
+		t.Fatal("a failing watcher must wake its waiters")
+	}
+	if tr.running("d/w") {
+		t.Fatal("a failing watcher must not read as running")
+	}
+	tr.observed("d/w", false)
+	tr.finishing("d/w")
+	if tr.running("d/w") {
+		t.Fatal("a finishing watcher must not read as running")
+	}
 	tr.unwatch("d/w")
 	tr.unwatch("d/w")
+	tr.observed("d/w", true)
+	tr.finishing("d/w")
+	if tr.signal("d/w") != nil {
+		t.Fatal("an unwatched execution has no signal")
+	}
 	tr.watch("d/w2")
-	tr.claimNamed("d/s\x00k")
+	waiter := tr.signal("d/w2")
 	tr.forgetDevbox("d")
-	if len(tr.watches) != 0 || len(tr.named) != 0 || len(tr.results) != 0 {
-		t.Fatal("forgetDevbox left state behind")
+	select {
+	case <-waiter:
+	default:
+		t.Fatal("forgetDevbox must wake waiters")
 	}
-
-	for i := 0; i < maxNamedClaims; i++ {
-		c, _ := tr.claimNamed("e/" + time.Duration(i).String())
-		c.at = time.Now().Add(-2 * namedClaimTTL)
-	}
-	tr.claimNamed("e/fresh")
-	if len(tr.named) != 1 {
-		t.Fatalf("expired named claims kept: %d", len(tr.named))
+	if len(tr.results) != 0 || tr.bytes != 0 {
+		t.Fatal("forgetDevbox left results behind")
 	}
 
 	ts := newTombstones()

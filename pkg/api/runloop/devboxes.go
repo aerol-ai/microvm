@@ -3,6 +3,7 @@ package runloop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
@@ -240,7 +241,7 @@ func (h *handlers) listDevboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if c := h.clusterClient(); c != nil {
-		h.listClusterDevboxes(w, r, c, local, limit, startingAfter)
+		h.listClusterDevboxes(w, r, c, local, limit, startingAfter, statusFilter != "")
 		return
 	}
 
@@ -264,52 +265,91 @@ func (h *handlers) listDevboxes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// maxStatusScanPlacements bounds how many placements one filtered cluster
+// list may walk looking for its first match (see listClusterDevboxes). A
+// variable only so tests can lower it.
+var maxStatusScanPlacements = 10000
+
 // listClusterDevboxes pages the cluster's placement index, which is
 // ordered by sandbox id with the last id as its cursor — exactly
 // Runloop's starting_after — and merges the owners' views for that page.
 // total_count is left out: counting would mean walking every placement.
-func (h *handlers) listClusterDevboxes(w http.ResponseWriter, r *http.Request, c cluster.Client, local []devboxView, limit int, startingAfter string) {
+//
+// Two rules keep the SDK's cursor paging from silently dropping devboxes:
+//
+//   - The SDKs take the next cursor from the last devbox returned and stop
+//     on an empty page, whatever has_more says. A status filter can empty a
+//     placement page that is followed by matches, so a filtered list keeps
+//     walking placement pages until it has a match (or a full page), and a
+//     page it returns always ends in a real devbox. If maxStatusScanPlacements
+//     pass without one match it fails rather than answer "nothing more".
+//   - A page whose owner could not be asked is not answered as if it were
+//     complete: the request fails with a retryable 503 instead.
+func (h *handlers) listClusterDevboxes(w http.ResponseWriter, r *http.Request, c cluster.Client, local []devboxView, limit int, startingAfter string, filtered bool) {
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
-	peers, placements, next, viewReady, missing := clusterlist.SelectPeersForPage(c, ownerRef, startingAfter, limit)
-	if !viewReady {
-		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
-		return
-	}
-	want := clusterlist.PlacementWantIDs(placements)
-	if placements == nil {
-		// Cold index on a small fleet: SelectPeersForPage fanned out to
-		// every owner, so page by id here instead.
-		want = nil
-	}
-	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(v devboxView) string { return v.ID }, clusterlist.Options{
-		OwnerRef:   ownerRef,
-		AuthHeader: r.Header.Get("Authorization"),
-		RawQuery:   stripListPaging(r.URL.Query()),
-		Path:       devboxesPath,
-		Transport:  clusterlist.TransportFromCluster(c),
-		SelfNodeID: c.SelfNodeID(),
-		WantIDs:    want,
-		Warn: func(msg, peer string, peerErr error) {
-			if h.deps.Logger != nil {
-				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
-			}
-		},
-	})
-	if len(missing) > 0 {
-		cov.Missing = append(cov.Missing, missing...)
-		cov.Partial = true
-	}
-	clusterlist.WriteCoverageHeaders(w, cov, next)
-	sortViews(items)
-	page := make([]devboxView, 0, len(items))
-	for _, view := range items {
-		if view.ID > startingAfter {
-			page = append(page, view)
+	page := make([]devboxView, 0, limit)
+	cursor, next := startingAfter, ""
+	scanned := 0
+	coverage := clusterlist.Coverage{PlacementViewReady: true}
+	for {
+		peers, placements, pageNext, viewReady, missing := clusterlist.SelectPeersForPage(c, ownerRef, cursor, limit)
+		if !viewReady {
+			w.Header().Set("Retry-After", "1")
+			WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
+			return
 		}
+		want := clusterlist.PlacementWantIDs(placements)
+		if placements == nil {
+			// Cold index on a small fleet: SelectPeersForPage fanned out to
+			// every owner, so page by id here instead.
+			want = nil
+		}
+		items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(v devboxView) string { return v.ID }, clusterlist.Options{
+			OwnerRef:   ownerRef,
+			AuthHeader: r.Header.Get("Authorization"),
+			RawQuery:   stripListPaging(r.URL.Query()),
+			Path:       devboxesPath,
+			Transport:  clusterlist.TransportFromCluster(c),
+			SelfNodeID: c.SelfNodeID(),
+			WantIDs:    want,
+			Warn: func(msg, peer string, peerErr error) {
+				if h.deps.Logger != nil {
+					h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
+				}
+			},
+		})
+		if len(missing) > 0 {
+			cov.Missing = append(cov.Missing, missing...)
+			cov.Partial = true
+		}
+		if cov.Partial {
+			clusterlist.WriteCoverageHeaders(w, cov, pageNext)
+			w.Header().Set("Retry-After", "2")
+			WriteError(w, http.StatusServiceUnavailable, "devbox list is incomplete: some owner nodes did not answer")
+			return
+		}
+		coverage.Answered = append(coverage.Answered, cov.Answered...)
+		for _, view := range items {
+			if view.ID > cursor {
+				page = append(page, view)
+			}
+		}
+		next = pageNext
+		scanned += len(placements)
+		if want == nil || !filtered || len(page) > 0 || next == "" {
+			break
+		}
+		if scanned >= maxStatusScanPlacements {
+			w.Header().Set("x-should-retry", "false")
+			WriteError(w, http.StatusServiceUnavailable, fmt.Sprintf("no devbox matching the status filter among the next %d; page with a later starting_after or list without the filter", scanned))
+			return
+		}
+		cursor = next
 	}
+	clusterlist.WriteCoverageHeaders(w, coverage, next)
+	sortViews(page)
 	hasMore := next != ""
-	if want == nil && len(page) > limit {
+	if len(page) > limit {
 		page, hasMore = page[:limit], true
 	}
 	writeJSON(w, http.StatusOK, listDevboxesResponse{Devboxes: page, HasMore: hasMore})
@@ -417,7 +457,7 @@ func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id str
 	view.ShutdownReason = stringPtr("api_shutdown")
 	view.FailureReason = nil
 	h.shutdowns.put(id, sandbox.OwnerRef, view)
-	h.homes.Delete(id)
+	h.homes.forget(id)
 	h.execs.forgetDevbox(id)
 	writeJSON(w, http.StatusOK, view)
 }

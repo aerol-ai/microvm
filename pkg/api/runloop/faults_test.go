@@ -254,18 +254,20 @@ func TestListDevboxesClusterEdges(t *testing.T) {
 		Authoritative: true,
 		Placements:    []cluster.Placement{{SandboxID: "sb-ghost", OwnerNodeID: "ghost"}},
 	}})
+	// An incomplete page is not answered as though it were complete.
 	rr := env.do(t, http.MethodGet, "", nil, nil)
-	expectStatus(t, rr, http.StatusOK)
-	if rr.Header().Get(clusterlist.HeaderPartial) != "true" {
-		t.Fatalf("partial header = %q", rr.Header().Get(clusterlist.HeaderPartial))
+	expectStatus(t, rr, http.StatusServiceUnavailable)
+	if rr.Header().Get(clusterlist.HeaderPartial) != "true" || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("partial header = %q, retry-after = %q", rr.Header().Get(clusterlist.HeaderPartial), rr.Header().Get("Retry-After"))
 	}
 	// A cold index on a fleet too large to fan out is not answerable.
 	big := &bigFleetCluster{}
 	env.svc.AttachCluster(big)
 	expectStatus(t, env.do(t, http.MethodGet, "", nil, nil), http.StatusServiceUnavailable)
-	// A reachable-looking peer that fails is reported, not fatal.
+	// A reachable-looking peer that fails leaves the page incomplete, which
+	// is reported as a retryable failure, not as an empty list.
 	env.svc.AttachCluster(&peerFleetCluster{})
-	expectStatus(t, env.do(t, http.MethodGet, "", nil, nil), http.StatusOK)
+	expectStatus(t, env.do(t, http.MethodGet, "", nil, nil), http.StatusServiceUnavailable)
 	if (&handlers{deps: Deps{Service: env.svc}}).clusterClient() == nil {
 		t.Fatal("a real cluster client was treated as single-node")
 	}

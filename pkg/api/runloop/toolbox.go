@@ -17,8 +17,12 @@ import (
 )
 
 // maxToolboxResponse caps a decoded toolbox JSON answer. Command logs are
-// the large ones; output past this fails the read rather than sandboxd.
-const maxToolboxResponse = 64 << 20
+// the large ones; output past this fails the read rather than sandboxd. A
+// variable only so tests can lower it.
+var maxToolboxResponse int64 = 64 << 20
+
+// errToolboxResponseTooLarge reports an answer past maxToolboxResponse.
+var errToolboxResponseTooLarge = errors.New("toolbox response exceeds the facade's read limit")
 
 // toolboxError is a non-2xx answer from the in-sandbox toolbox.
 type toolboxError struct {
@@ -74,7 +78,11 @@ func (h *handlers) toolboxCall(ctx context.Context, devboxID, method, path strin
 	if out != nil {
 		// The toolbox runs inside the sandbox, so its answers are guest
 		// controlled: bound what sandboxd will decode into memory.
-		if err := json.NewDecoder(io.LimitReader(resp.Body, maxToolboxResponse)).Decode(out); err != nil {
+		limited := &io.LimitedReader{R: resp.Body, N: maxToolboxResponse + 1}
+		if err := json.NewDecoder(limited).Decode(out); err != nil {
+			if limited.N <= 0 {
+				return resp.StatusCode, errToolboxResponseTooLarge
+			}
 			return resp.StatusCode, fmt.Errorf("decode toolbox response: %w", err)
 		}
 	} else {
@@ -97,9 +105,10 @@ func readToolboxError(resp *http.Response) error {
 }
 
 // createSession opens toolbox session sid, reporting whether this call
-// created it. The 201-vs-200 split is atomic inside toolboxd, which is what
-// makes it a claim: of several requests racing to start the same
-// execution, exactly one sees created=true and runs the command.
+// created it. It is not what decides who runs a command — the execution
+// ledger claim does, because toolboxd images older than the atomic
+// GetOrCreate can report created=true to two racing callers. created only
+// tells the claim holder whether the session predates its claim.
 func (h *handlers) createSession(ctx context.Context, devboxID, sid string) (bool, error) {
 	status, err := h.toolboxCall(ctx, devboxID, http.MethodPost, "/process/session", nil, map[string]string{"sessionId": sid}, nil)
 	if err != nil {

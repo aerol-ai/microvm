@@ -106,7 +106,7 @@ func TestSnapshotLifecycle(t *testing.T) {
 
 	var snap snapshotView
 	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/snapshot_disk", `{"name":"base","metadata":{"stage":"dev"},"commit_message":"first"}`, &snap, "X-Request-Id", "snap-1"), http.StatusOK)
-	if !strings.HasPrefix(snap.ID, snapshotPrefix+devbox.ID+".") || snap.SourceDevboxID != devbox.ID {
+	if !strings.HasPrefix(snap.ID, snapshotPrefix) || snap.SourceDevboxID != devbox.ID {
 		t.Fatalf("snapshot = %+v", snap)
 	}
 	if snap.Name == nil || *snap.Name != "base" || snap.Metadata["stage"] != "dev" || snap.CommitMessage == nil {
@@ -174,7 +174,7 @@ func TestSnapshotDiskAsyncAndFailure(t *testing.T) {
 		t.Fatalf("failed snapshot status = %d", rr.Code)
 	}
 	// The failure stays answerable on the status route.
-	id := snapshotPrefix + devbox.ID + "." + shortHash("", "snap-fail", `{"name":"broken"}`)
+	id := snapshotPrefix + shortHash("", devbox.ID, "snap-fail", `{"name":"broken"}`)
 	expectStatus(t, env.do(t, http.MethodGet, "/disk_snapshots/"+id+"/status", nil, &status), http.StatusOK)
 	if status.Status != "error" || status.ErrorMessage == nil {
 		t.Fatalf("failed status = %+v", status)
@@ -193,7 +193,7 @@ func TestNativeSnapshotsAreAddressable(t *testing.T) {
 	}
 	var list listSnapshotsResponse
 	expectStatus(t, env.do(t, http.MethodGet, "/disk_snapshots?limit=1", nil, &list), http.StatusOK)
-	if len(list.Snapshots) != 1 || list.Snapshots[0].ID != snapshotIDForName(native.Name) {
+	if len(list.Snapshots) != 1 || list.Snapshots[0].ID != env.h.snapshotIDForName(native.Name) {
 		t.Fatalf("native listing = %+v", list)
 	}
 	id := list.Snapshots[0].ID
@@ -211,12 +211,34 @@ func TestNativeSnapshotsAreAddressable(t *testing.T) {
 }
 
 func TestSnapshotHelpers(t *testing.T) {
-	if id, ok := snapshotSourceDevbox("snp-sb-0123.89ab"); !ok || id != "sb-0123" {
-		t.Fatalf("source = %q %v", id, ok)
+	node, _ := models.EncodeNodeAffinity("worker-1")
+	for _, tc := range []struct {
+		id, prefix, node, rest string
+		ok                     bool
+	}{
+		{"snp-89ab", snapshotPrefix, "", "89ab", true},
+		{"snp-" + node + ".89ab", snapshotPrefix, "worker-1", "89ab", true},
+		{"snx-" + node + ".dGVhbQ", nativeSnapshotPrefix, "worker-1", "dGVhbQ", true},
+		{"snx-dGVhbQ", nativeSnapshotPrefix, "", "dGVhbQ", true},
+		{"snp-", "", "", "", false},
+		{"snp-!!.89ab", "", "", "", false},
+		{"snp-" + node + ".", "", "", "", false},
+		{"other", "", "", "", false},
+	} {
+		prefix, gotNode, rest, ok := splitSnapshotID(tc.id)
+		if ok != tc.ok || prefix != tc.prefix || gotNode != tc.node || rest != tc.rest {
+			t.Errorf("splitSnapshotID(%q) = %q %q %q %v", tc.id, prefix, gotNode, rest, ok)
+		}
 	}
-	for _, bad := range []string{"snp-sb-0123", "snx-abc", "snp-sb/x.89ab", "snp-sb-0123.zz"} {
-		if _, ok := snapshotSourceDevbox(bad); ok {
-			t.Fatalf("snapshotSourceDevbox(%q) accepted", bad)
+	if got := snapshotNameForID("snx-" + node + ".dGVhbQ"); got != "team" {
+		t.Errorf("native cursor name = %q", got)
+	}
+	if got := snapshotNameForID("snp-" + node + ".89ab"); got != nativeSnapshotName("snp-"+node+".89ab") {
+		t.Errorf("facade cursor name = %q", got)
+	}
+	for _, raw := range []string{"plain-name", "snx-!!"} {
+		if got := snapshotNameForID(raw); got != raw {
+			t.Errorf("snapshotNameForID(%q) = %q", raw, got)
 		}
 	}
 	filters := metadataQuery(map[string][]string{"metadata[a]": {"1"}, "metadata[b][in]": {"x,y"}, "limit": {"3"}})
