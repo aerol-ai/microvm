@@ -242,20 +242,32 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 
 const ent = '/enterprise'
 
-// The For enterprise tab: the security model, one page per part of the
-// boundary, in the order a security reviewer reads them.
+// The Enterprise tab, in the order an evaluating company reads it: what you
+// get, the controls, who owns what, how to lock it down, then the maintainer.
+// The second group holds the older deep dives until they move to Blogs
+// (plans/enterprise-docs-rework.md).
 const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
-    label: 'For enterprise',
+    label: 'Enterprise',
     category: NavigationCategory.ENTERPRISE,
     entries: [
-      link(ent, 'Security model'),
+      link(ent, 'Overview'),
+      link(`${ent}/security-controls`, 'Security controls'),
+      link(`${ent}/responsibility`, 'Responsibility and limits'),
+      link(`${ent}/hardening`, 'Hardening'),
+      link(`${ent}/maintainer`, 'Work with the maintainer'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Deep dives (moving to Blogs)',
+    category: NavigationCategory.ENTERPRISE,
+    entries: [
       link(`${ent}/isolation-boundary`, 'Isolation boundary'),
       link(`${ent}/filesystem-and-images`, 'Filesystem and images'),
       link(`${ent}/network-defenses`, 'Network defenses'),
       link(`${ent}/secret-handling`, 'Secret handling'),
-      link(`${ent}/hardening`, 'Hardening'),
     ],
   },
 ]

@@ -3,7 +3,7 @@ title: Hardening
 description: The settings to tighten for one sandbox and for the whole server, matched to how much you trust the code.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 The defaults are set for getting started, not for hostile code. This page lists the controls to turn up, for each sandbox and for the whole server, and ends with three postures to pick from.
 
@@ -171,10 +171,6 @@ node_control_port_guard: true          # no sandbox can reach AerolVM's own port
 - **Use AWS KMS for sealed copies:** `SB_SECRET_PROVIDER=awskms`, and set `SB_SECRET_PROVIDER_STRICT_BOOT=true` so a server with a broken KMS setup refuses to start instead of starting anyway. See [Secrets providers](/cluster-secrets/).
 - **Send the audit log off the server,** to a webhook or S3, so a server that is taken over cannot quietly rewrite it. The bundled alerts fire if the hash chain breaks.
 
-<Aside title="Enterprise mode">
-The managed build has an enterprise mode, `SB_ENTERPRISE_MODE`. It refuses to start with privileged containers, with limits turned off or with the cluster's safety checks turned off. It also requires off-server audit export and an enforcing V8 isolate jail. The open-source server refuses to start in this mode. [Talk to us](/enterprise/#run-aerolvm-for-your-team) to use it.
-</Aside>
-
 ## Choosing a posture
 
 | | Your own code | Code from your users | Hostile code, many tenants |
@@ -195,6 +191,6 @@ The managed build has an enterprise mode, `SB_ENTERPRISE_MODE`. It refuses to st
 
 ## Next steps
 
-- [Security model](/enterprise/): the boundary and its scope.
+- [Responsibility and limits](/enterprise/responsibility/): what hardening cannot fix.
 - [Advanced network rules](/advanced-network-rules/): profiles, learn mode and request rules.
 - [Clusters](/getting-started/cluster-setup/): what a cluster adds.
