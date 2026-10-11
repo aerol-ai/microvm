@@ -10,6 +10,9 @@ interface Props {
 }
 
 const { href, title, label = 'Book a call' } = Astro.props
+// Booking links leave the site, so they open in a new tab. Links to other
+// docs pages stay in the same tab.
+const external = /^https?:\/\//.test(href)
 ---
 
 <div class="book-call not-content">
@@ -17,7 +20,12 @@ const { href, title, label = 'Book a call' } = Astro.props
     <p class="book-call__title">{title}</p>
     <div class="book-call__body"><slot /></div>
   </div>
-  <a class="book-call__button" href={href} target="_blank" rel="noopener noreferrer">
+  <a
+    class="book-call__button"
+    href={href}
+    target={external ? '_blank' : undefined}
+    rel={external ? 'noopener noreferrer' : undefined}
+  >
     {label}
     <span aria-hidden="true">→</span>
   </a>

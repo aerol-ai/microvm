@@ -1,0 +1,50 @@
+---
+title: Responsibility and limits
+description: What AerolVM takes care of, what you manage, and every known limit with what to do about it.
+---
+
+AerolVM is software you run yourself. It enforces the boundary between each sandbox and your server. You run the servers, choose the settings and decide what code to trust. This page splits the work, then lists every known limit in one place.
+
+## Who does what
+
+| AerolVM provides | You manage |
+|---|---|
+| The wall between a sandbox and the server, for the runtime you pick | Picking a runtime that matches how much you trust the code |
+| Network policies, the DNS filter and the guard for private addresses | Setting a policy on each sandbox, or a default for the whole server |
+| Encrypted secrets, inject rules and the audit log | The server's encryption key, its API token, and where audit records are sent |
+| Mutual TLS, encrypted membership traffic and AWS KMS support in a cluster | The servers, their operating system, the firewall and the cloud account |
+| Signed releases, and security fixes on the newest release line | Checking each download and staying on that line |
+| Nothing: AerolVM runs whatever image you give it | Your images: where they come from and what is in them |
+
+## Known limits
+
+Each limit has a workaround you can use today. Where a fix is planned, the last column links to its discussion.
+
+| Limit | What to do | Proposal |
+|---|---|---|
+| **Outbound traffic is open by default.** A sandbox with no policy can reach your private network, the cloud metadata service and other sandboxes. V8 isolates are the exception. | Set a policy on each sandbox. Better, have the operator set `default_policy: block_all` and block the metadata address for the whole server. See [Hardening](/enterprise/hardening/). | [Closed by default](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Containers share the server's kernel.** A kernel bug can let code out of a container. | Run code you do not trust in gVisor or Firecracker. | |
+| **Code runs as the image's default user**, which is usually root. Setting a user at create time does not change this yet. | Build your image with a non-root `USER`. | |
+| **Some limits are not enforced on every runtime.** Disk is not limited on containerd and gVisor. The number of processes is not limited in containers. | Use Firecracker for hostile code. It has its own disk and its own kernel. | |
+| **Images are not checked for signatures.** | Check signatures in your build pipeline, then pin the image by digest (`image@sha256:...`). | [Image signature checks](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **One API token per server.** Anyone with it can run commands in any sandbox. | Keep it in a secret manager, and keep the API port private. | [Scoped tokens and roles](https://github.com/aerol-ai/microvm/discussions/categories/ideas), [SSO](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Limits are per sandbox, not per team.** | Enforce team limits in the service that calls AerolVM. | [Quotas per team](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Audit records name the server, not the API caller.** | Put your own gateway in front of the API and log callers there. | [Caller identity](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Code in a sandbox can read its own variables**, and container snapshots save them. | Use an inject rule for API keys, so the sandbox only holds a placeholder. | |
+| **Inject rules are not supported on WebAssembly or Firecracker yet.** | Use a container, gVisor or a V8 isolate for code that needs a protected key. | |
+| **Public URLs have no login,** and shared TCP ports are open to the whole internet. | Protect the app itself, or share only what must be public. | |
+
+## Out of scope by design
+
+- **The server.** `sandboxd` runs as root, because it manages containers, virtual machines, firewall rules and mounts. Whoever controls the server, or holds its API token, is on the trusted side.
+- **The kernel, the hypervisor and the CPU.** A bug below the boundary is below the model.
+- **What an allowed site does with your data.** The filter controls where traffic goes, not what the far side does with it.
+- **Overloading your own deployment.** A sandbox can use up its own limits. Protect a public deployment the way you would any service.
+
+Found a way across one of these lines? Report it privately, as the [security policy](https://github.com/aerol-ai/microvm/blob/main/SECURITY.md) explains. Do not open a public issue.
+
+## Next steps
+
+- [Security controls](/enterprise/security-controls/): every control and its default.
+- [Hardening](/enterprise/hardening/): close the open defaults.
+- [Work with the maintainer](/enterprise/maintainer/): sponsor a fix on this list.
