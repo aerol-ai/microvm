@@ -17,7 +17,7 @@ flowchart TB
     Server -- "2. encrypt, tied to this one sandbox" --> Store[("Server database<br/>AES-256-GCM")]
     Store -- "3. opened when the sandbox starts" --> Box["Sandbox<br/>programs read the variables"]
     Server -- "4. every open is recorded" --> Audit["Audit log<br/>hash-chained"]
-    Server -- "5. sealed copy, failover sandboxes only" --> Backups["Backup nodes<br/>only they can open it"]
+    Server -- "5. sealed copy, failover sandboxes only" --> Backups["Backup nodes<br/>the copy is addressed to them"]
     KMS["AWS KMS (optional)<br/>holds the keys for sealed copies"] -.-> Backups
     Server -. "6. get and list: hidden<br/>unless you ask" .-> App
 ```
@@ -268,7 +268,7 @@ A record with `ref` `env:<sandbox-id>` is a read of the variables. Registry pass
 A cluster is a group of AerolVM servers that work as one. Every node keeps a shared record of every sandbox, so any node can answer for it. That shared record never holds your variables.
 
 - **By default, the variables stay on one node.** They are sealed (encrypted for chosen nodes) on the node that runs the sandbox, and nowhere else.
-- **Sandboxes with failover get backup copies.** Create a sandbox with `failover: { policy: "recreate" }` and a sealed copy also goes to backup nodes (two by default). Only those nodes can open it. The create waits until at least one backup confirms its copy. If the sandbox's node dies, a backup rebuilds it with the same variables. See [Durability and failover](/durability/).
+- **Sandboxes with failover get backup copies.** Create a sandbox with `failover: { policy: "recreate" }` and a sealed copy also goes to backup nodes (two by default). The copy is addressed to those nodes. With the default key, every node shares one key, so the address is checked in software, not by the encryption. The create waits until at least one backup confirms its copy. If the sandbox's node dies, a backup rebuilds it with the same variables. See [Durability and failover](/durability/).
 - **AWS KMS can hold the keys.** Then AWS permissions decide which nodes may open a sealed copy, and AWS logs every use of the key. See [Secrets providers](/cluster-secrets/).
 - **Nodes prove who they are** before they exchange sealed copies, over mutual TLS.
 

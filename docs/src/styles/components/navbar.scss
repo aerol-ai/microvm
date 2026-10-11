@@ -159,9 +159,12 @@
     }
   }
 
+  // The row sits below the menu button, so it can use the width the nav
+  // keeps free for that button on the first row.
   .mobile-navbar-links {
     order: 2;
-    width: 100%;
+    width: calc(100% + 52px);
+    flex-shrink: 0;
     margin: 0;
     padding: 0;
     border-left: 0;
@@ -170,8 +173,8 @@
   }
 
   .mobile-navbar-links a {
-    padding: 6px 12px;
-    font-size: 0.75rem;
+    padding: 6px 8px;
+    font-size: 0.6875rem;
   }
 
   @media (max-width: 650px) {

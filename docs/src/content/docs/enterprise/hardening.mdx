@@ -1,0 +1,200 @@
+---
+title: Hardening
+description: The settings to tighten for one sandbox and for the whole server, matched to how much you trust the code.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The defaults are set for getting started, not for hostile code. This page lists the controls to turn up, for each sandbox and for the whole server, and ends with three postures to pick from.
+
+## A hardened sandbox
+
+This sandbox runs in gVisor, has no network, has firm limits, and stops when idle and is deleted after 4 hours:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      runtime: "gvisor",
+      networkBlockAll: true,
+      cpu: 2,
+      memoryMB: 1024,
+      lifecycle: {
+        stopIfIdleFor: 30 * 60 * 1_000_000_000,     // 30 minutes
+        destroyAtAge:  4 * 60 * 60 * 1_000_000_000, // 4 hours
+      },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        runtime="gvisor",
+        network_block_all=True,
+        cpu=2.0,
+        memory_mb=1024,
+        lifecycle={
+            "stopIfIdleFor": 1_800_000_000_000,  # 30 minutes
+            "destroyAtAge": 14_400_000_000_000,  # 4 hours
+        },
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        Runtime:         sdktypes.RuntimeGvisor,
+        NetworkBlockAll: true,
+        CPU:             2,
+        MemoryMB:        1024,
+        Lifecycle: &sdktypes.Lifecycle{
+            StopIfIdleFor: 30 * time.Minute,
+            DestroyAtAge:  4 * time.Hour,
+        },
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        runtime: Some("gvisor".into()),
+        network_block_all: Some(true),
+        cpu: Some(2),
+        memory_mb: Some(1024),
+        lifecycle: Some(aerolvm_sdk::Lifecycle {
+            stop_if_idle_for: 1_800_000_000_000, // 30 minutes
+            destroy_at_age: 14_400_000_000_000,  // 4 hours
+            ..Default::default()
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setRuntime("gvisor")
+            .setNetworkBlockAll(true)
+            .setCpu(2.0)
+            .setMemoryMb(1024)
+            .setLifecycle(new Lifecycle()
+                .setStopIfIdleFor(1_800_000_000_000L)   // 30 minutes
+                .setDestroyAtAge(14_400_000_000_000L))  // 4 hours
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+## For each sandbox
+
+### Pick the right runtime
+
+Match the runtime to how much you trust the code. Containers share the server's kernel. gVisor answers most system calls itself. Firecracker gives the code its own kernel. See [Isolation boundary](/enterprise/isolation-boundary/).
+
+### Turn the network off, or allow only what is needed
+
+- **No network at all:** `networkBlockAll: true`.
+- **Only some sites:** `networkAllowOut` with names. This also blocks private addresses and the cloud metadata service.
+- **Avoid deny lists** for untrusted code. They block what you list and allow everything else.
+
+See [Network defenses](/enterprise/network-defenses/).
+
+### Drop root
+
+Sandboxes run as the image's default user, which is usually root. Setting a user at create time does not change this yet. Build your image with a non-root user instead:
+
+```dockerfile
+FROM python:3.12
+RUN useradd --create-home app
+USER app
+```
+
+### Mount as little as you can
+
+Mount only the folders the code needs, and set `readOnly: true` wherever it only reads. A Firecracker sandbox cannot take mounts at all. See [Filesystem and images](/enterprise/filesystem-and-images/).
+
+### Pin and check your images
+
+AerolVM does not check image signatures. Check them in your own build pipeline, then pin the result by digest (`image@sha256:...`) so the sandbox runs exactly what you checked.
+
+### Keep keys out with inject rules
+
+For keys to outside APIs, use an inject rule instead of a plain variable. The sandbox only gets a placeholder. See [Secret handling](/enterprise/secret-handling/).
+
+### Bound resources and lifetime
+
+- **Set CPU, memory and disk** for the job. Remember that some runtimes do not enforce disk or process limits.
+- **Set timers** so forgotten sandboxes stop or get deleted: `stopIfIdleFor`, `destroyIfIdleFor`, `stopAtAge` and `destroyAtAge`, each up to 30 days. See [Lifecycle](/lifecycle/).
+- **Cap traffic** with byte limits on what a sandbox sends and receives. See [Limit egress and ingress](/network-usage/).
+
+## For the whole server
+
+### Make every sandbox start closed
+
+Set a private-network policy file (`SB_EGRESS_OPERATOR_FILE`) so no sandbox starts open:
+
+```yaml
+version: 1
+default_policy:
+  mode: block_all                      # creates that set no policy get no network
+deny_cidrs: [169.254.169.254/32]     # the cloud metadata service; add your private ranges
+node_control_port_guard: true          # no sandbox can reach AerolVM's own ports
+```
+
+`deny_cidrs` and `node_control_port_guard` apply to every sandbox, whatever its own policy says. Add your company's private ranges to `deny_cidrs`, but not the ranges the server gives its own sandboxes. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
+
+### Lock down the server
+
+- **Protect the operator token.** The installer prints it once. Store it in a secret manager. Whoever holds it controls the server.
+- **Use a domain, not an IP address.** In domain mode, Caddy serves HTTPS with its own certificate. IP mode is plain HTTP.
+- **Keep the API off the network.** On a single server in domain mode, Caddy reaches the API on `127.0.0.1`. So you can set `SB_API_HOST=127.0.0.1` and keep port `21212` private.
+- **Firewall the server.** Open `80` and `443` to the world. Open the TCP port range (`22000` to `23000`) only if you share TCP ports, and `2220` only if you use SSH. Keep `21212` and the cluster ports `7000` to `7002` private.
+- **Turn off what you do not use.** `SB_ENABLE_SSH_GATEWAY=false` turns off SSH. Custom domains are off until you turn them on.
+- **Allow only the runtimes you need.** Leave Firecracker, WebAssembly and V8 isolates off unless you use them. `SB_HOST_RUNTIMES` lists the container runtimes the server may run.
+- **Keep the safety settings on.** Leave `SB_CONTAINER_PRIVILEGED` off and do not set `SB_RESOURCE_LIMITS_DISABLED`.
+- **Verify what you install.** Each release has `checksums.txt` and a signed SLSA provenance file. See [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md).
+- **Stay up to date.** Security fixes land on the latest release line only.
+
+### Harden a cluster
+
+- **Keep the cluster's certificate authority off the servers.** Each new server makes its own key and asks to be signed, so the authority's private key never has to leave the first server. Node certificates last 90 days, and the bundled Prometheus alerts warn before one expires.
+- **Keep the gossip key on.** Do not set `SB_CLUSTER_INSECURE_GOSSIP`.
+- **Use AWS KMS for sealed copies:** `SB_SECRET_PROVIDER=awskms`, and set `SB_SECRET_PROVIDER_STRICT_BOOT=true` so a server with a broken KMS setup refuses to start instead of starting anyway. See [Secrets providers](/cluster-secrets/).
+- **Send the audit log off the server,** to a webhook or S3, so a server that is taken over cannot quietly rewrite it. The bundled alerts fire if the hash chain breaks.
+
+<Aside title="Enterprise mode">
+The managed build has an enterprise mode, `SB_ENTERPRISE_MODE`. It refuses to start with privileged containers, with limits turned off or with the cluster's safety checks turned off. It also requires off-server audit export and an enforcing V8 isolate jail. The open-source server refuses to start in this mode. [Talk to us](/enterprise/#run-aerolvm-for-your-team) to use it.
+</Aside>
+
+## Choosing a posture
+
+| | Your own code | Code from your users | Hostile code, many tenants |
+|---|---|---|---|
+| Runtime | Container | gVisor | Firecracker |
+| Network | Deny list, or open | Allow list of names | Block everything, or a short allow list |
+| Server default | Open | `default_policy: allowlist` | `default_policy: block_all`, `deny_cidrs`, control-port guard |
+| Root | Fine | Non-root image | Non-root image |
+| Mounts | As needed | Read-only where possible | None |
+| Keys | Variables | Inject rules | Inject rules, or none |
+| Timers | Optional | Idle stop | Idle stop and a maximum age |
+
+## Where hardening stops
+
+- **The server is trusted.** `sandboxd` runs as root, because it manages containers, virtual machines, firewall rules and mounts. Protect the machine like any other root service.
+- **Some limits are not enforced on every runtime,** such as disk on containerd and gVisor, and the number of processes in containers.
+- **No setting turns off exec or terminals.** Anyone with the API token can run commands in any sandbox.
+
+## Next steps
+
+- [Security model](/enterprise/): the boundary and its scope.
+- [Advanced network rules](/advanced-network-rules/): profiles, learn mode and request rules.
+- [Clusters](/getting-started/cluster-setup/): what a cluster adds.

@@ -143,7 +143,7 @@ An agent that installs packages or calls one API rarely needs the whole internet
 
 Now `pip install requests` works, and `curl https://example.com` fails at once with a message that names the host. Programs inside look up names and connect the usual way.
 
-You write names, not IP addresses. The server looks up their addresses itself and checks the name on every connection. So a sandbox cannot reach another site just because it shares an address with an allowed one.
+You write names, not IP addresses. On web ports (80 and 443), the server looks up the addresses itself and checks the name on every connection. So a sandbox cannot reach another site there just because it shares an address with an allowed one. An entry with another port, such as `github.com:22`, works differently: the server opens the addresses that name looked up to, on that port. Another site at the same address and port can then be reached too.
 
 ### What each entry allows
 

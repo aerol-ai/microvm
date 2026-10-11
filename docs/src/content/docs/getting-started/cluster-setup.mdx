@@ -5,8 +5,7 @@ description: What an AerolVM cluster adds over one server, the two ways to build
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 import BookCall from '../../../components/BookCall.astro';
-
-export const bookingUrl = 'https://calendly.com/REPLACE-WITH-YOUR-LINK';
+import { BOOKING_URL as bookingUrl } from '../../../utils/links';
 
 A cluster is a group of AerolVM servers that work as one similar to Kubernetes. Your app still talks to one address. Behind it, sandboxes spread across many machines, and the cluster keeps running when one of them dies.
 
