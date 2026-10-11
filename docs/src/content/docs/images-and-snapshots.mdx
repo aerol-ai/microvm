@@ -1,0 +1,495 @@
+---
+title: Images and Snapshots
+description: "Choose what a sandbox starts from, and save a set-up sandbox as a snapshot so new ones start ready to go."
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Every sandbox starts from something you name when you create it. Usually that is an image: a packaged Linux system with programs already installed, such as `ubuntu:22.04` or `python:3.12-slim`.
+
+Once you have set up a sandbox the way you like, you can save it and start new ones from that copy. For container sandboxes the saved copy is a snapshot. For Firecracker it is a template.
+
+What a sandbox can start from depends on its kind:
+
+| Kind of sandbox | Starts from | To reuse a sandbox you set up |
+|---|---|---|
+| Container (the default) | An image | Save it as a [snapshot](#snapshots) |
+| [Firecracker](/firecracker-sandbox/) | An image | Build a [Firecracker template](#firecracker-use-a-template) |
+| [WebAssembly](/wasm-sandbox/) | A WebAssembly module | See [WebAssembly](/wasm-sandbox/) |
+| [V8 isolate](/isolate-sandbox/) | JavaScript code | Not available |
+
+## Start from an image
+
+Pass any image name as `image`, such as `python:3.12-slim` or `ghcr.io/your-org/app:1.4`. The server downloads the image the first time. Later creates reuse its copy, so they start much faster. See [Create a sandbox](/sandboxes/#create-a-sandbox) for a full example.
+
+### Use an image from a private registry
+
+A registry is a server that stores images, like Docker Hub or GitHub's `ghcr.io`. If yours needs a login, pass it in `registry`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ghcr.io/your-org/app:1.4",
+      registry: {
+        server: "ghcr.io",
+        username: "your-user",
+        password: process.env.GHCR_TOKEN!,
+      },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    import os
+
+    sandbox = client.create(
+        image="ghcr.io/your-org/app:1.4",
+        registry={
+            "server": "ghcr.io",
+            "username": "your-user",
+            "password": os.environ["GHCR_TOKEN"],
+        },
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image: "ghcr.io/your-org/app:1.4",
+        Registry: &sdktypes.RegistryAuth{
+            Server:   "ghcr.io",
+            Username: "your-user",
+            Password: os.Getenv("GHCR_TOKEN"),
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::RegistryAuth;
+
+    let sandbox = client.create(CreateOptions {
+        image: "ghcr.io/your-org/app:1.4".into(),
+        registry: Some(RegistryAuth {
+            server: "ghcr.io".into(),
+            username: "your-user".into(),
+            password: std::env::var("GHCR_TOKEN").unwrap(),
+        }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ghcr.io/your-org/app:1.4")
+        .setRegistry(new RegistryAuth()
+            .setServer("ghcr.io")
+            .setUsername("your-user")
+            .setPassword(System.getenv("GHCR_TOKEN"))));
+    ```
+  </TabItem>
+</Tabs>
+
+This works for container sandboxes. The server uses the login only to download the image, and keeps the password encrypted.
+
+## Snapshots
+
+A snapshot is a saved copy of a container sandbox's files and installed software, stored as an image with a short name. Use snapshots to skip slow setup steps, like installing packages, every time you create a sandbox. V8 isolate sandboxes do not support them, and Firecracker uses [templates](#firecracker-use-a-template) instead.
+
+There are three ways to make a snapshot:
+
+- **[Save a running sandbox](#save-a-running-sandbox)** with `createSnapshot`.
+- **[Give an existing image a short name](#give-an-existing-image-a-snapshot-name)** with `registerSnapshot` and `image`.
+- **[Build one from a Dockerfile](#build-a-snapshot-from-a-dockerfile)** with `registerSnapshot` and `dockerfileContent`.
+
+Whichever way you make it, you [start from a snapshot](#start-from-a-snapshot) by passing its name as the `image`.
+
+### Save a running sandbox
+
+Set up a sandbox the way you want it, then save it. The original sandbox keeps running, and the snapshot does not depend on it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "ubuntu:22.04" });
+    await sandbox.exec("apt-get update && apt-get install -y python3-pip");
+
+    const snapshot = await sandbox.createSnapshot("py-ready");
+    console.log(snapshot.name, snapshot.image);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04")
+    sandbox.exec("apt-get update && apt-get install -y python3-pip")
+
+    snapshot = sandbox.create_snapshot("py-ready")
+    print(snapshot["name"], snapshot["image"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "ubuntu:22.04"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    if _, err := sandbox.ExecCommand(ctx, "apt-get update && apt-get install -y python3-pip"); err != nil {
+        log.Fatal(err)
+    }
+
+    snapshot, err := sandbox.CreateSnapshot(ctx, "py-ready")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(snapshot.Name, snapshot.Image)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        ..Default::default()
+    })?;
+    sandbox.exec("apt-get update && apt-get install -y python3-pip")?;
+
+    let snapshot = sandbox.create_snapshot("py-ready")?;
+    println!("{} {}", snapshot.name, snapshot.image);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("ubuntu:22.04"));
+    sandbox.exec("apt-get update && apt-get install -y python3-pip");
+
+    SandboxSnapshot snapshot = sandbox.createSnapshot("py-ready");
+    System.out.println(snapshot.name + " " + snapshot.image);
+    ```
+  </TabItem>
+</Tabs>
+
+Snapshot names are unique across the whole server. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
+
+### Start from a snapshot
+
+Pass the snapshot's name where you would normally pass an image:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "py-ready" });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="py-ready")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "py-ready"})
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "py-ready".into(),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions().setImage("py-ready"));
+    ```
+  </TabItem>
+</Tabs>
+
+- **The name becomes the real image.** The server swaps the name for the real image before it creates the sandbox. Afterward, the sandbox's `image` field shows the real image.
+- **A snapshot name wins** over a registry image with the same name. Snapshot names are short words, so this rarely matters.
+- **CPU, memory and disk are not copied.** The new sandbox gets the [defaults](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk) unless you set them.
+
+### Give an existing image a snapshot name
+
+If the image is already in a registry, you do not need to build or save anything. `registerSnapshot` just records a short name that points at it. The server does not download the image until the first sandbox uses it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.registerSnapshot({
+      name: "py-base",
+      image: "python:3.12-slim",
+      cpu: 2,
+      memoryMB: 4096,
+      diskGB: 10,
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.register_snapshot({
+        "name": "py-base",
+        "image": "python:3.12-slim",
+        "cpu": 2,
+        "memoryMB": 4096,
+        "diskGB": 10,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := client.RegisterSnapshot(ctx, sdktypes.RegisterSnapshotOptions{
+        Name:     "py-base",
+        Image:    "python:3.12-slim",
+        CPU:      2,
+        MemoryMB: 4096,
+        DiskGB:   10,
+    }); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::RegisterSnapshotOptions;
+
+    client.register_snapshot(RegisterSnapshotOptions {
+        name: "py-base".into(),
+        image: Some("python:3.12-slim".into()),
+        cpu: Some(2.0),
+        memory_mb: Some(4096),
+        disk_gb: Some(10),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.registerSnapshot(new RegisterSnapshotOptions()
+        .setName("py-base")
+        .setImage("python:3.12-slim")
+        .setCpu(2.0)
+        .setMemoryMb(4096)
+        .setDiskGb(10));
+    ```
+  </TabItem>
+</Tabs>
+
+The `cpu`, `memoryMB` and `diskGB` values are hints. The server stores them and returns them with the snapshot, so your own app can show sensible defaults. They are not applied to new sandboxes.
+
+Registering the same name with the same image again is safe and returns the existing snapshot. The same name with a different image fails with `snapshot name already in use`.
+
+### Build a snapshot from a Dockerfile
+
+If the image does not exist yet, send a Dockerfile. The server builds it and points the snapshot at the result.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.registerSnapshot({
+      name: "data-tools",
+      dockerfileContent: [
+        "FROM python:3.12-slim",
+        "RUN pip install --no-cache-dir pandas duckdb polars",
+      ].join("\n"),
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.register_snapshot({
+        "name": "data-tools",
+        "dockerfileContent": (
+            "FROM python:3.12-slim\n"
+            "RUN pip install --no-cache-dir pandas duckdb polars"
+        ),
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    if _, err := client.RegisterSnapshot(ctx, sdktypes.RegisterSnapshotOptions{
+        Name: "data-tools",
+        DockerfileContent: "FROM python:3.12-slim\n" +
+            "RUN pip install --no-cache-dir pandas duckdb polars",
+    }); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.register_snapshot(RegisterSnapshotOptions {
+        name: "data-tools".into(),
+        dockerfile_content: Some(
+            "FROM python:3.12-slim\nRUN pip install --no-cache-dir pandas duckdb polars".into(),
+        ),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.registerSnapshot(new RegisterSnapshotOptions()
+        .setName("data-tools")
+        .setDockerfileContent(
+            "FROM python:3.12-slim\n" +
+            "RUN pip install --no-cache-dir pandas duckdb polars"));
+    ```
+  </TabItem>
+</Tabs>
+
+- **Pass one or the other.** `image` and `dockerfileContent` cannot be used together.
+- **A lone `FROM` line is fast.** If the Dockerfile only names a base image, the server registers that image without running a build.
+- **Builds are cached.** The server names the built image after a hash of the Dockerfile. Registering the same Dockerfile again reuses the earlier build.
+- **There is a builder helper.** Each SDK can also turn its `Image` builder object into a Dockerfile for you, with `registerSnapshotFromImage` (Python `register_snapshot_from_image`, Go `RegisterSnapshotFromImage`, Rust `register_snapshot_from_image`).
+
+### What a snapshot keeps
+
+A snapshot saves the sandbox's image, not the running state around it.
+
+| Saved | Not saved |
+|---|---|
+| Files and installed packages | Attached cloud storage (it lives outside the sandbox; see [Attach cloud storage](/external-storage/)) |
+| The image's start command and working folder | Running programs, open terminal sessions, anything in memory |
+| The OS user and the image's own environment variables | Network rules, exposed ports and public URLs |
+| Environment variables set with `env` at create time | |
+| CPU, memory and disk hints, when you set them | |
+
+<Aside type="caution">
+Saving a sandbox also saves the environment variables you passed in `env`. A sandbox started from that snapshot can read them, even though its own `env` is empty. We confirmed this on a server that runs containers on Docker. Do not snapshot a sandbox whose `env` holds secrets you would not share with every user of the snapshot.
+</Aside>
+
+To keep data next to an image, write it to [attached cloud storage](/external-storage/) instead. Declare the same storage when you create the new sandbox. The data then lives on its own, apart from any one sandbox.
+
+### Ideas for using snapshots
+
+- **One base image per kind of work.** Register `py-base`, `node-base` or `cuda-base` once when you deploy. Then create every sandbox from it. It is faster than running `apt-get install` in each sandbox, and you update versions in one place.
+- **A shared starting point.** Set up a sandbox once (clone a repo, build it, load test data), then save it. Start one sandbox per user from that snapshot. Each user gets a fresh copy of the same starting point.
+
+## Firecracker: use a template
+
+A Firecracker sandbox also starts from a normal image. But the server must turn that image into a virtual machine disk first, which takes 10 to 60 seconds on every create.
+
+Snapshots do not work for Firecracker. Use a template instead. A template is built once from an image, and holds the disk plus a paused copy of the booted machine. Sandboxes made from it start in under 100 ms.
+
+Pass the template's ID, along with the image it was built from:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "python:3.11",
+      runtime: "firecracker",
+      templateId: "py311",
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="python:3.11",
+        runtime="firecracker",
+        templateId="py311",
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:      "python:3.11",
+        Runtime:    sdktypes.RuntimeFirecracker,
+        TemplateID: "py311",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.11".into(),
+        runtime: Some("firecracker".into()),
+        template_id: Some("py311".into()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.11")
+        .setRuntime("firecracker")
+        .setTemplateId("py311"));
+    ```
+  </TabItem>
+</Tabs>
+
+Building a template needs the server's operator token. See [Firecracker templates](/firecracker-templates/) to build, list and rebuild them.
+
+## Change what runs at start
+
+A container sandbox runs its image's own start command when it starts: the `ENTRYPOINT` and `CMD` from the image's Dockerfile. To run something else, pass `containerCommand`.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "python:3.12-slim",
+      containerCommand: ["python3", "-m", "http.server", "8080"],
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(
+        image="python:3.12-slim",
+        container_command=["python3", "-m", "http.server", "8080"],
+    )
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:            "python:3.12-slim",
+        ContainerCommand: []string{"python3", "-m", "http.server", "8080"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        container_command: Some(vec![
+            "python3".into(), "-m".into(), "http.server".into(), "8080".into(),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("python:3.12-slim")
+        .setContainerCommand(List.of("python3", "-m", "http.server", "8080")));
+    ```
+  </TabItem>
+</Tabs>
+
+You do not need a start command. You can run everything later with [Run commands](/exec-streaming/). The sandbox stays up even if the start command exits.
+
+The server tracks a push state for each snapshot (`push_state` in the API, `PushState` in the Go SDK):
+
+| Push state | What it means |
+|---|---|
+| `active` | No push was needed, or the push finished. |
+| `pending`, `pushing` | Waiting for, or in, the background job. |
+| `error` | The last push failed. `push_error` says why, and the job tries again next run. |
+
+A failed push does no harm: the snapshot still works on the node that made it. Snapshots made before you turned the feature on stay `active`; the server does not push them after the fact.
+
+## Next steps
+
+- [Firecracker templates](/firecracker-templates/): build a template so Firecracker sandboxes start in milliseconds.
+- [Lifecycle](/lifecycle/): stop or delete a sandbox automatically.
+- [Attach cloud storage](/external-storage/): keep data that should outlive any one sandbox.
+- [Durability and failover](/durability/): recreate sandboxes when a cluster node fails.

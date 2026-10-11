@@ -41,7 +41,7 @@ func (c *Client) ToolboxRequest(ctx context.Context, sandboxID, method, path str
 	var response *http.Response
 	var err error
 	if body == nil && (method == http.MethodGet || method == http.MethodHead) {
-		response, err = c.doWithRetry(ctx, build)
+		response, err = c.doWithRetry(ctx, retryIdempotent, build)
 	} else {
 		var request *http.Request
 		request, err = build()

@@ -219,9 +219,10 @@ export interface CreateOptions {
    */
   networkEgressRules?: EgressRule[];
   /**
-   * Whether the sandbox may be exposed to the public internet. Omitted defaults
-   * to private (no public URL, `exposePort` fails). Set `true` to opt in to
-   * public exposure; `false` permanently refuses it for this sandbox.
+   * Whether the sandbox is public from boot. Omitted or `false` creates it
+   * private: no public URL and no ingress route. `true` makes it public from
+   * boot. Either way the first `exposePort` call makes the sandbox public, so
+   * `false` does not stop a later `exposePort`.
    */
   allowPublicTraffic?: boolean;
   /**
@@ -294,6 +295,13 @@ export interface CreateOptions {
    * `sandbox.customDomains.add(host)` for each entry after create.
    */
   customDomains?: string[];
+  /**
+   * Firecracker template id (from `createTemplate`); the template must be
+   * ready. Requires `runtime: "firecracker"` and `image`: pass the image the
+   * template was built from. The sandbox boots from the template's prepared
+   * rootfs instead of building one from `image` on every create.
+   */
+  templateId?: string;
 }
 
 export interface ResizeOptions {

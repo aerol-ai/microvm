@@ -124,7 +124,7 @@ ALLOW 22000-23000/TCP from anywhere     # Raw-TCP sandbox exposures (only if you
 One command:
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token your-secret-pat \
@@ -255,7 +255,7 @@ Re-run the installer with the same flags. The daemon restarts in place; the
 state DB and certs are preserved.
 
 ```bash
-curl -fsSL https://github.com/aerol-ai/microvm/releases/latest/download/install.sh \
+curl -fsSL https://aerolvm.aerol.ai \
   | sudo bash -s -- \
       --domain sandbox.example.com \
       --pat-token your-secret-pat \

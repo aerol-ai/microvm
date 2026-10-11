@@ -4,6 +4,7 @@ import importlib
 import json
 import os
 import random
+import socket
 import threading
 import time
 import urllib.error
@@ -12,7 +13,7 @@ import urllib.request
 import uuid
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from io import BytesIO
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
@@ -34,6 +35,7 @@ from .types import (
     ExposeProtocol,
     ExposeResult,
     Failover,
+    GPUOptions,
     HealthStatus,
     IngressTarget,
     Lifecycle,
@@ -80,6 +82,16 @@ _DEFAULT_API_VERSION = "v1"
 _PATH_PREFIXES: Dict[str, str] = {
     "v1": _V1_PATH_PREFIX,
 }
+
+# Statuses retried on an idempotent request. 421 is a misdirected request (a
+# stale route or a coalesced connection): the server closes the connection,
+# so the retry reconnects and the ingress re-routes it.
+_RETRY_STATUSES = frozenset({421, 429, 502, 503, 504})
+# A request that must not run twice (exec) retries only the statuses that say
+# the server turned it away before doing any work. A 421, 502 or 504 comes
+# from a hop that already read the request, so whether the command started
+# is unknown.
+_NOT_STARTED_STATUSES = frozenset({429, 503})
 
 
 def _normalize_url(value: str) -> str:
@@ -312,7 +324,12 @@ class Sandbox:
         self._data = updated.to_dict()
         return self
 
-    def exec(self, request: ExecRequest) -> ExecResult:
+    def exec(self, request: Union[str, ExecRequest]) -> ExecResult:
+        # A plain string is a shell command, matching exec(string) in the
+        # TypeScript and Java SDKs, so the one-line hello world reads the same
+        # in every language.
+        if isinstance(request, str):
+            return self.exec_command(request)
         return self._client.exec(self.id, request)
 
     def exec_command(self, command: str) -> ExecResult:
@@ -499,9 +516,13 @@ class MicroVM:
         """
         return f"{self._version_prefix}{suffix}"
 
-    def create(self, options: CreateOptions) -> Sandbox:
-        resolved_options = dict(options)
-        resolved_options["image"] = self._resolve_image(_first_of(options, "image"))
+    def create(self, options: Optional[CreateOptions] = None, **fields: Any) -> Sandbox:
+        # Keyword arguments are the same fields as the options dict, in either
+        # spelling (memory_mb or memoryMB), so create(image="python:3.12")
+        # and create({"image": "python:3.12"}) send the same request. A
+        # keyword replaces the same key in the dict.
+        resolved_options: Dict[str, Any] = {**(options or {}), **fields}
+        resolved_options["image"] = self._resolve_image(_first_of(resolved_options, "image"))
         sandbox = self._do_json("POST", self._versioned("/sandboxes"), _to_api_create_options(resolved_options))
         return self._wrap_sandbox(sandbox)
 
@@ -964,7 +985,15 @@ class MicroVM:
         return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
 
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
-        response = self._do_json("POST", f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute", _to_api_exec_request(request))
+        # Not idempotent: a re-sent POST runs the user's command again, so a
+        # timeout or reset after the request went out surfaces instead of
+        # retrying. Sandbox.exec and exec_command both end here.
+        response = self._do_json(
+            "POST",
+            f"{self._version_prefix}/sandboxes/{sandbox_id}/toolbox/process/execute",
+            _to_api_exec_request(request),
+            idempotent=False,
+        )
         return _from_api_exec_result(response)
 
     def exec_stream(self, sandbox_id: str, options: ExecStreamOptions) -> ExecStreamHandle:
@@ -1152,8 +1181,17 @@ class MicroVM:
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
 
-    def _request(self, method: str, url: str, body: Optional[bytes] = None, content_type: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None) -> bytes:
-        raw, _ = self._request_headers(method, url, body, content_type, extra_headers)
+    def _request(
+        self,
+        method: str,
+        url: str,
+        body: Optional[bytes] = None,
+        content_type: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+        *,
+        idempotent: bool = True,
+    ) -> bytes:
+        raw, _ = self._request_headers(method, url, body, content_type, extra_headers, idempotent=idempotent)
         return raw
 
     def _request_headers(
@@ -1163,10 +1201,22 @@ class MicroVM:
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        *,
+        idempotent: bool = True,
     ) -> tuple[bytes, Dict[str, str]]:
+        """Send one request, retrying transient failures with backoff.
+
+        ``idempotent=True`` (every endpoint but exec; the daemon designs them
+        for duplicate calls) retries any transport failure and the statuses
+        in ``_RETRY_STATUSES``. ``idempotent=False`` retries only failures
+        that prove the server never got the request, plus 429 and 503: a
+        timeout or reset after the request was written leaves it unknown
+        whether the command ran, and a retry would run it again.
+        """
         max_retries = self._retry_config["maxRetries"]
         base_delay_ms = self._retry_config["baseDelayMs"]
         max_delay_ms = self._retry_config["maxDelayMs"]
+        retry_statuses = _RETRY_STATUSES if idempotent else _NOT_STARTED_STATUSES
 
         last_exc: Optional[Exception] = None
 
@@ -1184,12 +1234,14 @@ class MicroVM:
                     return response.read(), headers
             except urllib.error.HTTPError as exc:
                 last_exc = exc
-                # 421: misdirected (connection coalescing / stale route);
-                # the server closed the connection, so the retry reconnects.
-                if exc.code in (421, 429, 502, 503, 504) and attempt < max_retries:
-                    pass # Handled by the retry logic below
+                if exc.code in retry_statuses and attempt < max_retries:
+                    # Free the socket before the backoff sleep.
+                    exc.close()
                 else:
-                    payload = exc.read()
+                    try:
+                        payload = exc.read()
+                    finally:
+                        exc.close()
                     try:
                         data = json.loads(payload.decode("utf-8"))
                         raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
@@ -1197,11 +1249,14 @@ class MicroVM:
                         raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
-                if attempt >= max_retries:
+                if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
                     raise
             except Exception as exc:
+                # Raised while waiting for or reading the response (a read
+                # timeout, a reset, the server closing without a reply): the
+                # server may already be acting on the request.
                 last_exc = exc
-                if attempt >= max_retries:
+                if attempt >= max_retries or not idempotent:
                     raise
             
             # Compute delay with exponential backoff and jitter
@@ -1212,17 +1267,24 @@ class MicroVM:
         assert last_exc is not None
         raise last_exc
 
-    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> Any:
-        data, _ = self._do_json_headers(method, path, payload)
+    def _do_json(self, method: str, path: str, payload: Optional[Dict[str, Any]], *, idempotent: bool = True) -> Any:
+        data, _ = self._do_json_headers(method, path, payload, idempotent=idempotent)
         return data
 
-    def _do_json_headers(self, method: str, path: str, payload: Optional[Dict[str, Any]]) -> tuple[Any, Dict[str, str]]:
+    def _do_json_headers(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[Dict[str, Any]],
+        *,
+        idempotent: bool = True,
+    ) -> tuple[Any, Dict[str, str]]:
         body = None
         content_type = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             content_type = "application/json"
-        raw, headers = self._request_headers(method, self._url(path), body, content_type)
+        raw, headers = self._request_headers(method, self._url(path), body, content_type, idempotent=idempotent)
         if raw == b"":
             return {}, headers
         return json.loads(raw.decode("utf-8")), headers
@@ -1296,6 +1358,21 @@ def _to_websocket_url(base_url: str, path: str) -> str:
     return urllib.parse.urlunparse((scheme, parsed.netloc, path, "", "", ""))
 
 
+def _request_never_sent(exc: urllib.error.URLError) -> bool:
+    """Whether a transport failure proves the server never got the request.
+
+    urlopen wraps only connect- and send-phase OSErrors in URLError; a
+    failure while waiting for or reading the response is raised unwrapped.
+    Of the wrapped ones, a refused connection and a failed DNS lookup happen
+    before any byte is sent. A timeout fires while connecting or before the
+    request was fully written, and a request whose body never fully arrived
+    fails to decode on the server, so nothing runs. A reset or broken pipe
+    is not taken as that proof, so it surfaces to the caller.
+    """
+    # socket.timeout is TimeoutError from 3.10; listed apart for 3.9.
+    return isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror, socket.timeout, TimeoutError))
+
+
 def _first_of(mapping: Dict[str, Any], *keys: str) -> Any:
     for key in keys:
         # Callers pass string field names. Skip anything else so a dict
@@ -1345,6 +1422,7 @@ def _append_query_param(path: str, key: str, value: str) -> str:
 def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
     lifecycle = _first_of(options, "lifecycle")
     failover = _first_of(options, "failover")
+    gpus = _first_of(options, "gpus")
     return _compact(
         {
             "name": _first_of(options, "name"),
@@ -1379,6 +1457,18 @@ def _to_api_create_options(options: CreateOptions) -> Dict[str, Any]:
             "module_ref": _first_of(options, "moduleRef", "module_ref"),
             "tenant_id": _first_of(options, "tenantId", "tenant_id"),
             "custom_domains": _first_of(options, "customDomains", "custom_domains"),
+            "gpus": _to_api_gpus(gpus) if isinstance(gpus, dict) else None,
+            "template_id": _first_of(options, "templateId", "template_id"),
+        }
+    )
+
+
+def _to_api_gpus(gpus: GPUOptions) -> Dict[str, Any]:
+    return _compact(
+        {
+            "vendor": _first_of(gpus, "vendor"),
+            "count": _first_of(gpus, "count"),
+            "device_ids": _first_of(gpus, "deviceIDs", "device_ids"),
         }
     )
 

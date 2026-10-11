@@ -334,6 +334,56 @@ func TestCreateForwardsPlatformVolumes(t *testing.T) {
 	}
 }
 
+// TestCreateForwardsGPUsAndTemplateID guards the gpus and template_id wire
+// shapes. Other SDKs silently dropped these at create; the Go SDK aliases
+// pkg/models, so this pins the snake_case keys and that unset fields stay
+// off the wire rather than arriving as null or "".
+func TestCreateForwardsGPUsAndTemplateID(t *testing.T) {
+	ctx := context.Background()
+	var bodies []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var seen map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		bodies = append(bodies, seen)
+		_ = json.NewEncoder(w).Encode(models.CreateSandboxResponse{
+			Sandbox: models.Sandbox{ID: "sb-gpu", Image: "ubuntu:22.04", Status: models.SandboxStatusStarted},
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, ClientOptions{PATToken: "pat", HTTPClient: server.Client()})
+	if _, _, err := client.Create(ctx, CreateOptions{
+		Image:      "ubuntu:22.04",
+		Runtime:    models.RuntimeFirecracker,
+		TemplateID: "tpl-1",
+		GPUs:       &models.GPURequest{Vendor: models.GPUVendorNVIDIA, Count: 2, DeviceIDs: []string{"0", "1"}},
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	if _, _, err := client.Create(ctx, CreateOptions{Image: "ubuntu:22.04"}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	set := bodies[0]
+	if set["template_id"] != "tpl-1" {
+		t.Fatalf("template_id = %#v, want tpl-1", set["template_id"])
+	}
+	gpus, ok := set["gpus"].(map[string]any)
+	if !ok || gpus["vendor"] != "nvidia" || gpus["count"] != float64(2) {
+		t.Fatalf("gpus wire shape = %#v", set["gpus"])
+	}
+	if ids, _ := gpus["device_ids"].([]any); len(ids) != 2 || ids[0] != "0" || ids[1] != "1" {
+		t.Fatalf("gpus.device_ids = %#v, want [0 1]", gpus["device_ids"])
+	}
+	for _, key := range []string{"gpus", "template_id"} {
+		if _, present := bodies[1][key]; present {
+			t.Fatalf("unset %s sent on the wire: %#v", key, bodies[1][key])
+		}
+	}
+}
+
 // TestRegisterSnapshotSendsImagePath verifies the image-only happy path:
 // fields land on the wire under their snake_case names, the URL targets
 // /v1/snapshots, and the daemon's response is round-tripped back to the

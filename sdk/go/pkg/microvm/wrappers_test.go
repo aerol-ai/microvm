@@ -283,3 +283,43 @@ func TestClientAndSandboxWrappers(t *testing.T) {
 		t.Fatalf("Sandbox.Destroy() error = %v", err)
 	}
 }
+
+// TestSandboxExecIsNotResent pins the public exec entry points to the
+// send-once rule: a connection dropped after the server read the request must
+// fail the call, not run the command again, even with retries configured.
+func TestSandboxExecIsNotResent(t *testing.T) {
+	ctx := context.Background()
+	var execs int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		execs++
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("Hijack() error = %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	maxRetries, delay := 3, 1
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{
+		PATToken: "pat",
+		APIUrl:   server.URL,
+		Retry:    &sdktypes.RetryConfig{MaxRetries: &maxRetries, BaseDelayMs: &delay, MaxDelayMs: &delay},
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig() error = %v", err)
+	}
+	sb := &Sandbox{Sandbox: sdktypes.Sandbox{ID: "sb1"}, client: client}
+
+	if _, err := sb.Exec(ctx, sdktypes.ExecRequest{Command: "sleep 40"}); err == nil {
+		t.Fatal("Sandbox.Exec() succeeded on a dropped connection")
+	}
+	if _, err := sb.ExecCommand(ctx, "sleep 40"); err == nil {
+		t.Fatal("Sandbox.ExecCommand() succeeded on a dropped connection")
+	}
+	if execs != 2 {
+		t.Fatalf("server saw %d exec requests for 2 calls, want 2", execs)
+	}
+}

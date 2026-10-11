@@ -55,8 +55,10 @@ export interface MicroVMConfig {
   /**
    * Retry policy for transient transport errors (socket closed, connection
    * reset) and retryable HTTP status codes (421, 429, 502, 503, 504). The SDK
-   * retries up to 3 times with exponential backoff by default. Pass
-   * `{ maxRetries: 0 }` to disable.
+   * retries up to 3 times with exponential backoff by default. `exec` retries
+   * only failures that prove the command never reached the server
+   * (connection refused, connect timeout, DNS) and HTTP 429/503, so a command
+   * never runs twice. Pass `{ maxRetries: 0 }` to disable.
    */
   retry?: RetryConfig;
 }

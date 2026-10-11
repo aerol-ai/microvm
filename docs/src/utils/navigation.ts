@@ -78,6 +78,17 @@ export function getSidebar(
   return sidebarConfig
 }
 
+// The top-level sidebar group a page sits in, shown above the page title so a
+// reader landing from search knows which part of the docs they are in.
+export function getSectionLabel(
+  sidebarConfig: NavigationGroup[],
+  currentPath: string
+): string | undefined {
+  return sidebarConfig.find(group =>
+    flattenEntries(group.entries || []).some(link => comparePaths(link.href, currentPath))
+  )?.label
+}
+
 export function getPagination(
   sidebarConfig: NavigationGroup[],
   currentPath: string

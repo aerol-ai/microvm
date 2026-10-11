@@ -1,6 +1,6 @@
 ---
-title: Using Runloop SDK
-description: Point the official Runloop SDK at AerolVM's /runloop compatibility facade.
+title: Use the Runloop SDK
+description: Point the official Runloop SDK at your AerolVM server, and see exactly which Runloop features work there and which do not.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
@@ -90,7 +90,7 @@ export SB_RUNLOOP_BLUEPRINT_MAP_JSON='{"default":"ubuntu:24.04","python":"python
 
 ## Current gaps
 
-- Tunnels (`enable_tunnel`, `getTunnelUrl`) answer `501`. The SDK builds tunnel URLs as `{port}-{key}.tunnel.{domain}`, which does not match AerolVM's port routes. Use the AerolVM SDK's [`exposePort`](/preview) for now.
+- Tunnels (`enable_tunnel`, `getTunnelUrl`) answer `501`. The SDK builds tunnel URLs as `{port}-{key}.tunnel.{domain}`, which does not match AerolVM's port routes. To share a port, use the AerolVM SDK's `exposePort`; see [Public URLs](/public-urls/).
 - Create fields with no equivalent are refused with `501` rather than ignored: `entrypoint`, `launch_commands`, `secrets`, `mounts`, `code_mounts`, `file_mounts`, `gateways`, `mcp`, `user_parameters`, `network_policy_id`, `required_services`, the `flex` provisioning tier, lifecycle hooks, and resume triggers.
 - Blueprint builds, storage objects, secrets, agents, axons, network policies, devbox logs, usage, SSH keys and eviction notices are not part of the facade.
 - Streamed output arrives when the command finishes rather than line by line. Output callbacks still see every line.

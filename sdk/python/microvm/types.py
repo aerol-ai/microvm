@@ -177,8 +177,10 @@ class CreateOptions(TypedDict, total=False):
     # 443 with the node's CA, which only a sandbox created with such a rule
     # trusts, so set inspect rules here rather than adding them later.
     networkEgressRules: List["EgressRule"]
-    # Whether the sandbox may be exposed publicly. Omitted defaults to private
-    # (no public URL, expose_port fails). True opts in; False permanently refuses.
+    # Omitted or False: the sandbox is private at create (no public URL).
+    # True: public from boot. The first expose_port makes a private sandbox
+    # public whether the flag was omitted or False, because asking for a
+    # public port is the opt-in.
     allowPublicTraffic: bool
     # Rewrite the upstream Host header on ingress to exposed HTTP ports to this
     # value so frameworks that validate Host (Vite, Django ALLOWED_HOSTS,
@@ -219,6 +221,11 @@ class CreateOptions(TypedDict, total=False):
     # time. Server-side cap: ``MaxCustomDomainsPerCreateRequest`` (5). Each
     # host is normalized + validated; the server lowercases for you.
     customDomains: List[str]
+    # Firecracker template id (see create_template): boots from the
+    # template's prepared rootfs instead of building one from the image.
+    # Requires runtime="firecracker" and image; the template must be ready.
+    # template_id is accepted too.
+    templateId: str
 
 
 class ResizeOptions(TypedDict, total=False):
