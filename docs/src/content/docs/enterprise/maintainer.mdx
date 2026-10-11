@@ -10,6 +10,15 @@ AerolVM is open source, and you can run it without talking to anyone. If your co
 
 ## Ways to work together
 
+Most companies move through these stages. You can start at any of them.
+
+```mermaid
+flowchart LR
+    A["Architecture review"] --> B["Rollout help"] --> C["Maintenance partnership"]
+    B -.-> D["Sponsored features"]
+    C -.-> D
+```
+
 | | What you get | Good for |
 |---|---|---|
 | **Architecture review** | A call about your workload. You leave with a runtime choice, a network policy and a cluster layout. | Teams deciding whether AerolVM fits |
@@ -36,11 +45,25 @@ Today one maintainer leads the project, as [GOVERNANCE.md](https://github.com/ae
 
 Connect on [LinkedIn](https://www.linkedin.com/in/ssumansaurabh/) or [GitHub](https://github.com/sumansaurabh).
 
+## How security reports are handled
+
+AerolVM follows coordinated disclosure: a report stays private until a fix is released.
+
+```mermaid
+flowchart TB
+    R["You report privately"] --> A["Reply within<br/>3 business days"]
+    A --> S["Assessment within<br/>7 business days"]
+    S --> F["Fix: about 14 days if critical,<br/>30 if high"]
+    F --> P["Fixed release and advisory,<br/>CVE requested, credit to you"]
+```
+
+Report through a [private advisory](https://github.com/aerol-ai/microvm/security/advisories/new) or [security@aerol.ai](mailto:security@aerol.ai). Never post details in a public issue or chat. The full process is in the [security policy](https://github.com/aerol-ai/microvm/blob/main/SECURITY.md).
+
 ## Join the community
 
 | To | Go to |
 |---|---|
-| Ask a question | [Q&A](https://github.com/aerol-ai/microvm/discussions/categories/q-a) |
+| Ask a question | [Q&A](https://github.com/aerol-ai/microvm/discussions/categories/q-a), or chat on [Discord](https://discord.gg/QWQpymQgYJ) |
 | Propose a feature | [Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas). An accepted idea becomes a change to [ROADMAP.md](https://github.com/aerol-ai/microvm/blob/main/ROADMAP.md). |
 | Join the community call | The first Saturday of every month, 8 pm Pacific Time. The join link is posted in [the call's announcement](https://github.com/aerol-ai/microvm/discussions/652) before each call. |
 | Report a vulnerability | A [private advisory](https://github.com/aerol-ai/microvm/security/advisories/new) or [security@aerol.ai](mailto:security@aerol.ai). You get a reply within 3 business days. See the [security policy](https://github.com/aerol-ai/microvm/blob/main/SECURITY.md). |

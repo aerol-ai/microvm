@@ -21,21 +21,31 @@ This page lays out the layers and shows where AerolVM's five runtimes sit in the
 
 ## The layers
 
-The stack has four layers. From the bottom up:
+The stack has four layers. The picture reads from the top down, and the list after it goes from the bottom up.
 
-```
-  AerolVM service layer  (internal/service)                ← orchestration
-                    │
-        ┌───────────┼──────────────┐
-      runc        gVisor         Kata                       ← OCI RUNTIMES
-     (docker)    (runsc)     (kata-runtime)                   "how is a container isolated?"
-        │           │              │
-   namespaces   userspace    launches a real VM
-                 kernel             │
-                          ┌─────────┼──────────┐
-                    Firecracker  Cloud Hyp.   QEMU          ← VMMs / "hypervisors"
-                          └─────────┼──────────┘              the actual engine
-                                   KVM                       ← kernel CPU virtualization
+```mermaid
+flowchart TB
+    ORCH["Orchestration<br/>here, the AerolVM service layer"]
+    subgraph OCIL["OCI runtimes, which decide how a container is isolated"]
+        RUNC["runc<br/>Linux namespaces"]
+        GV["gVisor, runsc<br/>a kernel run as a normal program"]
+        KATA["Kata<br/>starts a real VM"]
+    end
+    subgraph VMML["VMMs, the engines that run a VM"]
+        FC["Firecracker"]
+        CH["Cloud Hypervisor"]
+        QEMU["QEMU"]
+    end
+    KVM["KVM<br/>CPU virtualization in the Linux kernel"]
+    ORCH --> RUNC
+    ORCH --> GV
+    ORCH --> KATA
+    KATA --> FC
+    KATA --> CH
+    KATA --> QEMU
+    FC --> KVM
+    CH --> KVM
+    QEMU --> KVM
 ```
 
 - **KVM** is the Linux kernel's built-in support for running virtual machines on the real CPU. Everything with a real VM sits on it.
@@ -76,6 +86,23 @@ The API still says `runtime: "docker"` for OCI sandboxes. On servers, AerolVM ru
 
 WASM and isolate sit off the OCI diagram entirely. They isolate at the language-VM layer, not the container layer. They give up full syscall compatibility in exchange for packing more sandboxes per server and faster creates (see [WASM architecture](/wasm-architecture/) and [V8 isolate](/isolate-sandbox/)).
 
+Here is where each `runtime` value goes once a create call reaches the service layer.
+
+```mermaid
+flowchart LR
+    SVC["AerolVM service layer<br/>reads the runtime field"]
+    SVC -- "docker or gvisor" --> ENG["Container engine<br/>containerd, or Docker"]
+    ENG -- "docker" --> RUNC["runc<br/>namespaces and cgroups"]
+    ENG -- "gvisor" --> RUNSC["runsc<br/>gVisor's own kernel"]
+    SVC -- "firecracker" --> FCD["Firecracker driver"]
+    FCD --> FCV["Firecracker VMM<br/>on KVM"]
+    SVC -- "wasm" --> WASM["WASM driver<br/>WASI modules"]
+    SVC -- "isolate" --> ISO["Isolate driver<br/>off by default"]
+```
+
+- Two of the five values share one path through a container engine. The other three each have their own driver.
+- There is no `kata` path. The value is reserved, and a create that asks for it is turned down.
+
 Firecracker is the interesting row. There is no off-the-shelf OCI runtime in it, because **we wrote it ourselves.**
 
 ## We built our own Kata
@@ -92,6 +119,25 @@ AerolVM ended up writing its own small Kata for one engine. We did not set out t
 | Host networking | `internal/network/tap/` | Hands out a TAP device (virtual network card), an IPv4 slot and a vsock CID (host-to-VM socket address), one set per VM |
 | Snapshot capture + warm pool | `internal/runtime/firecracker/snapshot.go`, `warmspawn.go`, `internal/pool/vmm/` | Boots VMMs ahead of time from a template snapshot, leaves them paused, and hands one to a create call for a boot under 100 ms |
 
+Side by side, the two ways to reach a Firecracker VM look like this.
+
+```mermaid
+flowchart TB
+    subgraph KP["With Kata"]
+        direction TB
+        K1["containerd or Kubernetes"] --> K2["Kata runtime<br/>hides the VMM"]
+        K2 --> K3["Firecracker, Cloud Hypervisor<br/>or QEMU"]
+    end
+    subgraph AP["AerolVM today"]
+        direction TB
+        A1["AerolVM service layer"] --> A2["AerolVM Firecracker driver"]
+        A2 -- "REST calls over<br/>a Unix socket" --> A3["Firecracker VMM"]
+    end
+```
+
+- With Kata, the caller never talks to the VMM. Kata makes those calls for it.
+- AerolVM's driver sends every VMM call itself, so it can load, pause and resume snapshots when it wants.
+
 Kata provides every row except the last. So why not use Kata and delete most of that table?
 
 ## Why we drive the VMM directly
@@ -99,6 +145,27 @@ Kata provides every row except the last. So why not use Kata and delete most of 
 The answer is the last row of that table. AerolVM's fast start comes from loading snapshots. (A snapshot is a saved copy of a VM's memory and device state.)
 
 A warm pool holds VMMs that already booted from a template snapshot and were left **paused**. A create call claims one, sends it the new sandbox's settings with a PATCH request, and resumes it. That skips the kernel boot entirely. The code lives in [`warmspawn.go`](/firecracker-hydration/) and the [warm pool](/firecracker-hydration/), and it only works because AerolVM speaks the Firecracker snapshot API directly.
+
+Here is the warm path in order, and the first two steps happen before any create call arrives.
+
+```mermaid
+sequenceDiagram
+    participant P as Pool refill
+    participant V as Firecracker
+    participant D as Driver
+    participant G as Guest agent
+    P->>V: start with its own network card
+    P->>V: load the template, stay paused
+    Note over P,V: the paused VM waits in the pool
+    D->>P: claim a paused VM
+    D->>V: point the disks at this sandbox
+    D->>V: resume the VM
+    D->>G: handshake over vsock
+    G-->>D: ready
+```
+
+- The slow steps, starting the process and loading the snapshot, already happened in the pool.
+- If the pool is empty, the driver falls back to starting a VMM on the spot.
 
 Kata hides the VMM on purpose; that is its whole value. But that hiding would also bury the pause-and-resume snapshot steps our warm pool is built on. Adopting Kata would trade our main advantage for the containerd and Kubernetes ecosystem.
 
@@ -131,6 +198,31 @@ Some of those rows need a word of explanation:
 Reach for Cloud Hypervisor when you need something Firecracker *cannot* do by design. That means **GPU passthrough** for inference sandboxes, or **confidential VMs** for a tier where the host operator cannot read guest memory. It also covers bigger, longer-lived VMs that need hotplug.
 
 Here is the payoff of building our own chassis: **adding Cloud Hypervisor means swapping the engine, not the car.** A new `pkg/cloudhypervisor/client.go` would mirror `pkg/firecracker/client.go`, since both speak HTTP over a Unix socket. A second driver would reuse everything else we already own: `pkg/oci`, `internal/network/tap`, the process-supervisor pattern, even the warm-pool hook. Cloud Hypervisor also supports snapshots, so the fast-boot trick carries over intact.
+
+In the picture below, solid lines exist today and dotted lines show what a second engine would add.
+
+```mermaid
+flowchart TB
+    SVC["AerolVM service layer"]
+    FCD["Firecracker driver<br/>ships today"]
+    CHD["Cloud Hypervisor driver<br/>a candidate, not built"]
+    SHARED["Shared chassis parts<br/>image-to-disk builder, TAP network slots,<br/>process supervisor pattern, warm pool hook"]
+    FCC["Firecracker REST client"]
+    CHC["Cloud Hypervisor REST client<br/>would mirror the Firecracker one"]
+    FCV["Firecracker VMM"]
+    CHV["Cloud Hypervisor VMM"]
+    KVM["KVM"]
+    SVC --> FCD
+    SVC -.-> CHD
+    FCD --> SHARED
+    CHD -.-> SHARED
+    FCD --> FCC
+    CHD -.-> CHC
+    FCC --> FCV
+    CHC -.-> CHV
+    FCV --> KVM
+    CHV -.-> KVM
+```
 
 None of this touches the SDK. You choose the runtime with one string in the create call, the same field that already picks Docker, gVisor, Firecracker, WASM or isolate. A new engine fits in behind that field without changing a line of client code:
 
@@ -254,6 +346,29 @@ None of this touches the SDK. You choose the runtime with one string in the crea
 ## Picking a layer, then an engine
 
 The point of the layers is that isolation is *two* decisions, not one. First pick how strongly you want to isolate, which means picking a layer. Then, if that layer is a VM, pick the engine.
+
+Here are the two decisions as a short set of questions.
+
+```mermaid
+flowchart TB
+    Q1{"Does the code need<br/>a full Linux system?"}
+    WASM["WASM"]
+    ISO["Isolate"]
+    Q2{"How much do you<br/>trust the code?"}
+    RUNC["runc via containerd<br/>runtime docker"]
+    GV["gVisor"]
+    Q3{"Need GPU passthrough,<br/>confidential VMs or hotplug?"}
+    FC["Firecracker"]
+    CH["Cloud Hypervisor<br/>a candidate engine"]
+    Q1 -- "no, it is a WASI module" --> WASM
+    Q1 -- "no, it is a JS fetch handler" --> ISO
+    Q1 -- "yes" --> Q2
+    Q2 -- "mostly trusted" --> RUNC
+    Q2 -- "untrusted, keep containers" --> GV
+    Q2 -- "untrusted, want a hardware VM" --> Q3
+    Q3 -- "no" --> FC
+    Q3 -- "yes" --> CH
+```
 
 | You want | Pick this layer | Notes |
 |---|---|---|

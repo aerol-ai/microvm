@@ -17,6 +17,31 @@ You can search the code for every path and name on this page.
 - Network rules and byte counters live on the host, where code in the sandbox cannot change them.
 - `sandboxd` holds the key to every secret. The default runtime, runc (the software that runs a plain container), does not stop kernel exploits. Use gVisor or Firecracker for untrusted tenants.
 
+This picture shows which parts run on the host and which run in the sandbox.
+
+```mermaid
+flowchart TB
+    subgraph Host["The host, trusted"]
+        D["sandboxd<br/>holds the encryption key"]
+        DB["Database<br/>secrets stored sealed"]
+        M["Mount tools<br/>use your storage credentials"]
+        FW["Firewall rules<br/>and byte counters"]
+    end
+    subgraph Box["A sandbox, untrusted"]
+        App["Your code"]
+        T["toolboxd<br/>runs commands for the API"]
+    end
+    D -- "seals and opens" --> DB
+    D -- "starts" --> M
+    D -- "installs" --> FW
+    D -- "sends requests<br/>with the toolbox token" --> T
+    M -- "a plain folder" --> App
+    FW -- "filters and counts<br/>its traffic" --> App
+```
+
+- The sandbox gets only what the arrows hand it: a folder, filtered traffic and toolbox requests.
+- The `env` block is the exception. It reaches the sandbox as plain variables.
+
 ## Threat model
 
 A threat model lists the attacks a design defends against, and the ones it does not. A tenant here is one customer or user of the platform.
@@ -76,6 +101,25 @@ Secrets are encrypted inside one package before they reach the database, logs or
 
 The 32-byte AES key never leaves `pkg/secrets`. `NewCipher` takes either an explicit base64 key from the operator or a fallback file path. If neither exists on first run, it generates a fresh key. It writes the key to the fallback path with mode `0o600` (owner read and write only). Then it uses that key; the logic is in `loadOrGenerateKey`.
 
+This is how `sandboxd` finds its key each time it starts.
+
+```mermaid
+flowchart TB
+    Start["sandboxd starts"] --> K{"Did the operator<br/>pass a key in?"}
+    K -- "yes" --> Use["Decode the key"]
+    K -- "no" --> F{"Does the key file exist?"}
+    F -- "yes" --> Read["Read the key file"]
+    F -- "no" --> Gen["Make 32 random bytes"]
+    Gen --> Write["Write them to the key file<br/>owner read and write only"]
+    Use --> Ready["Cipher is ready"]
+    Read --> Ready
+    Write --> Ready
+    Use -. "not a valid 32-byte key" .-> Stop["sandboxd stops<br/>with an error"]
+    Read -. "unreadable or not a valid key" .-> Stop
+```
+
+- A bad key never falls back to a new one. `sandboxd` refuses to start instead, so old secrets are not lost by accident.
+
 `Cipher` has no method that returns the key bytes. A caller in the same process could still re-read the fallback file from disk, since it shares the same binary and the same user. So the no-getter rule prevents accidents, not a determined caller.
 
 **What is sealed.** These columns are encrypted before they are written:
@@ -94,21 +138,32 @@ Older releases stored the environment and the toolbox token as plain text, in `e
 
 **Where the AAD binding matters.** Binding stops a sealed value from being copied onto a different row and opened there. Environment variables, toolbox tokens and cluster secrets have it. So a stolen cluster envelope cannot be replayed against a different set of recipient nodes or a different sandbox.
 
+This picture shows why a copied environment blob will not open on another sandbox's row.
+
+```mermaid
+flowchart TB
+    Env["Environment for sandbox A"] -- "sealed with the label<br/>sandbox A, life 1" --> Blob["Sealed blob"]
+    Blob -- "opened on A's row<br/>with the same label" --> Ok["Opens"]
+    Blob -. "copied onto sandbox B's row" .-> Try["Opened with the label<br/>for sandbox B"]
+    Try --> Fail["Fails<br/>the label does not match"]
+```
+
+- The label is not stored in the blob. The server rebuilds it from the row it is reading.
+- A recreated sandbox starts a new life, so a blob from its old life does not open either.
+
 Mount credentials and registry logins do not have it. `sealMounts` and `sealRegistry` (in `internal/service/service.go`) call `s.cipher.Encrypt(plain)` with no AAD.
 
 ```mermaid
 sequenceDiagram
-    participant C as Caller (API)
+    participant C as API caller
     participant S as Service layer
-    participant SEC as pkg/secrets.Cipher
+    participant K as Cipher
     participant DB as SQLite
-    participant DISK as DB file
-    C->>S: create(spec with mount credentials)
-    S->>SEC: Encrypt(credentials)
-    SEC-->>S: sealed bytes (nonce || ct || tag)
-    S->>DB: INSERT sandbox_mounts(sealed_blob)
-    DB->>DISK: write (0700 dir, 0600 file)
-    Note over DISK: mounts, registry login, env and<br/>toolbox token are all stored<br/>as ciphertext.
+    C->>S: create, with mount credentials
+    S->>K: encrypt the credentials
+    K-->>S: sealed bytes
+    S->>DB: store the sealed blob
+    Note over DB: mounts, registry login, env<br/>and toolbox token are all<br/>stored encrypted
 ```
 
 > **Invariant** (a rule that always holds). Mount credentials, registry logins, environment variables, toolbox tokens and cluster-secret payloads are stored only as sealed blobs. They cross the database file, logs, the Raft log (the cluster's shared, replicated record) and error messages sealed. Only `pkg/secrets`, inside the running daemon, turns them back into plain text.
@@ -196,9 +251,32 @@ Network rules and traffic counters run on the host, out of the sandbox's reach. 
 
 Docker accepts its own bridge traffic early, which would skip any rule simply added to the `FORWARD` chain. `DOCKER-USER` is jumped to from `FORWARD` before `DOCKER-FORWARD`, so AerolVM's rules run first. That holds on older iptables and on Docker 28 and later alike. The rules run on the host, before packets leave its network card. They live in the host's network namespace (its own view of network devices and routes).
 
-**The byte counters.** `pkg/docker/netstats` polls each sandbox's counters for incoming and outgoing traffic from `/proc/<container_pid>/net/dev`. It reads them from the host, by entering the container's network namespace (netns). When a sandbox hits its limit, `sandboxd` installs DROP rules for both directions on the container IP.
+This is the order in which a packet from a container sandbox meets the host's firewall.
+
+```mermaid
+flowchart TB
+    P["A packet leaves a sandbox"] --> FWD["Host firewall<br/>FORWARD chain"]
+    FWD -- "jumps first to" --> U["DOCKER-USER, or<br/>AEROLVM-USER under containerd"]
+    U -- "matches a drop rule" --> X["Dropped"]
+    U -- "no drop rule matched" --> N["Normal forwarding rules"]
+    N --> Out["Leaves through the<br/>host's network card"]
+```
+
+**The byte counters.** `pkg/docker/netstats` polls each sandbox's counters for incoming and outgoing traffic from `/proc/<container_pid>/net/dev`. It reads them from the host, by entering the container's network namespace (netns). When a sandbox hits a limit, `sandboxd` installs a DROP rule for that direction on the container IP.
 
 It also saves a quota-exceeded flag on the sandbox (`MarkNetworkQuotaExceeded`, called from `internal/service/netstats.go`). So reconcile, the repair loop, re-applies the block after a restart. The metrics are published through expvar, Go's built-in metrics endpoint. They include `aerolvm_netstats_poll_total`, `aerolvm_netstats_samples_total` and counters for dropped samples (`pkg/docker/netstats/metrics.go`).
+
+This loop is how a byte limit turns into a block.
+
+```mermaid
+flowchart TB
+    Poll["Every 10 seconds by default,<br/>sandboxd reads each sandbox's byte counters"] --> Add["Adds the new bytes<br/>to the sandbox's totals"]
+    Add --> Q{"Over a limit you set?"}
+    Q -- "no" --> Poll
+    Q -- "yes" --> Drop["Adds a DROP rule<br/>for that direction"]
+    Drop --> Flag["Saves the<br/>quota-exceeded flag"]
+    Flag -. "after a restart" .-> Rec["The repair loop reads the flag<br/>and adds the rule again"]
+```
 
 Both tools do nothing until rules or limits are set. A sandbox with no `network_block_all` and no egress rules can reach everywhere the host can. [Block or allow the internet](/network-access/) and [Usage and limits](/network-usage/) cover the defaults. The trust-boundary point is that the enforcement, when present, lives on the host.
 

@@ -45,6 +45,20 @@ Writes go to the sandbox's own layer. They never change the image, and they neve
 
 You can attach outside storage: an S3 bucket, an NFS share, an SSH server or an rclone remote. See [Attach cloud storage](/external-storage/) and [Platform volumes](/platform-volumes/).
 
+On a container sandbox, your storage takes this path.
+
+```mermaid
+flowchart TB
+    Req["Create request<br/>with storage credentials"] --> Seal["Credentials stored sealed<br/>in the server's database"]
+    Req --> Cred["Credential file, if needed,<br/>that only the server can read"]
+    Cred --> Tool["Mount tool runs on the server<br/>and connects to your storage"]
+    Tool --> HostDir["A private folder on the server,<br/>one per mount"]
+    Tool -. "S3 and rclone,<br/>once the mount is ready" .-> Del["Credential file deleted"]
+    HostDir -- "bind mount, read-only<br/>if you asked" --> Target["Your target folder<br/>inside the sandbox"]
+```
+
+A bind mount makes one folder appear at a second place. The sandbox gets the folder, not the tool or the credentials.
+
 - **The mount runs on the server.** The mount tool connects with your credentials, outside every sandbox. The sandbox sees a plain folder.
 - **Credentials stay out of the sandbox.** They are stored encrypted and written to a file only the server can read. That file is deleted when the sandbox is deleted, and sooner for some storage types.
 - **Read-only is enforced twice:** by the mount tool on the server, and again where the folder enters the sandbox.
@@ -163,6 +177,15 @@ Replace `...` with the image's real digest. `docker buildx imagetools inspect py
 
 The SDK's file calls (upload, download, list and move) go through the helper inside the sandbox.
 
+This is the path a file call takes to a container sandbox.
+
+```mermaid
+flowchart LR
+    SDK["Your SDK<br/>file call"] -- "your API token" --> S["AerolVM server"]
+    S -- "the sandbox's own token" --> T["toolboxd<br/>inside the sandbox"]
+    T --> F["Files in that<br/>sandbox only"]
+```
+
 - **On container sandboxes, every call needs that sandbox's own token,** which only the server holds.
 - **Any path inside the sandbox works,** and links are followed. The sandbox's own wall is the fence, so the file API can only reach that sandbox's files.
 - **Uploads are up to 256 MB** by default. Downloads have no size limit.
@@ -172,7 +195,20 @@ The SDK's file calls (upload, download, list and move) go through the helper ins
 
 A snapshot saves a sandbox so new ones can start from it. See [Images and Snapshots](/images-and-snapshots/).
 
-- **A container snapshot saves files and environment variables.** It does not save memory. Since it keeps the variables, do not snapshot a sandbox whose secrets you would not give every user of the snapshot.
+This is what a container snapshot keeps, and what it leaves behind.
+
+```mermaid
+flowchart TB
+    SB["A container sandbox"] --> Snap["Take a snapshot"]
+    Snap --> Files["Kept<br/>the image plus the sandbox's file changes"]
+    Snap --> Env["Kept on Docker<br/>the environment variables"]
+    Snap -. "not kept" .-> Mem["Memory and running programs"]
+    Snap -. "not kept" .-> Mnt["The contents of your mounts"]
+    Files --> New["A new image that<br/>new sandboxes start from"]
+    Env --> New
+```
+
+- **A container snapshot saves files, and on Docker also environment variables.** It does not save memory. Since it can keep the variables, do not snapshot a sandbox whose secrets you would not give every user of the snapshot.
 - **Stopping a Firecracker sandbox writes its memory to disk** on the server, so it can resume where it left off.
 - **Clones of one Firecracker template are made unique.** Each one gets fresh randomness and the right time before your code runs. [Correct snapshot clones](/engineering-snapshot-correctness/) explains how, and lists the gaps that remain.
 - **Named snapshots outlive the sandbox.** Deleting a sandbox does not delete them. Delete them yourself.

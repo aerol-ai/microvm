@@ -50,11 +50,31 @@ In cluster mode, three pieces do the coordinating:
 
 There is no separate scheduler, no etcd and no Kubernetes. A node is one server in the cluster, and in a small cluster every node does every job. Clusters above 10 nodes must give nodes separate server, worker and ingress roles, but every role runs the same program. When `EnableCluster=false`, the cluster code does nothing, so standalone mode pays nothing for it.
 
-Ingress is [Caddy](https://caddyserver.com/), a web server that runs next to `sandboxd` on each node. [caddy-l4](https://github.com/mholt/caddy-l4) adds raw TCP and TLS routes on top of normal HTTPS. (L4 means layer 4 of the network: plain TCP connections, one level below HTTP.) `sandboxd` adds and removes Caddy routes as sandboxes come and go. It does this through Caddy's admin API, with no downtime.
+Ingress is [Caddy](https://caddyserver.com/), a web server that runs next to `sandboxd` on each node. [caddy-l4](https://github.com/mholt/caddy-l4) adds raw TCP and TLS routes on top of normal HTTPS. (L4 means layer 4 of the network: plain TCP connections, one level below HTTP.) `sandboxd` adds and removes Caddy routes as sandboxes come and go, with no downtime.
 
 Each node stores its data in SQLite, a database that lives in one file. Only one connection writes to it (`MaxOpenConns=1`), and it uses WAL mode so reads can run during a write.
 
 Cluster state lives in memory in the Raft FSM and is copied to other servers through Raft. (FSM stands for finite state machine. Here it is the shared table every server changes only through agreed Raft log entries.)
+
+Here is one server with all of those parts in place.
+
+```mermaid
+flowchart TB
+    SDK["Your SDK or CLI"] --> API
+    WEB["Internet traffic"] --> CADDY
+    subgraph PROG["sandboxd: one Go program on one server"]
+        direction TB
+        API["API server<br/>takes SDK and CLI calls"] --> SVC["Service layer<br/>creates, stops and deletes sandboxes"]
+        SVC --> CL["Cluster code: Raft, SWIM, forwarding<br/>does nothing in standalone mode"]
+    end
+    SVC --> DB[("SQLite file<br/>one writer, WAL mode")]
+    SVC -- "adds and removes routes" --> CADDY["Caddy with caddy-l4<br/>HTTPS, TLS and raw TCP routes"]
+    SVC -- "starts and stops" --> SBX["Sandboxes"]
+    CADDY --> SBX
+```
+
+- Your SDK talks to `sandboxd`. Internet traffic for a sandbox goes through Caddy.
+- In cluster mode, each server runs the same program. The difference is that the cluster code now does work.
 
 That is the whole design. The four features below all come from it.
 
@@ -68,6 +88,28 @@ The first feature is that a cluster needs nothing but copies of `sandboxd`. Othe
 - A split between control and data servers, which means at least two programs to deploy.
 
 AerolVM needs none of those. The program that runs your sandboxes is also the Raft member, the SWIM member, the ingress controller, the API server and the SDK's target. `internal/cluster/` is about 20,000 lines of Go. When cluster mode is off, it returns the `Noop` implementation, and the rest of the daemon never checks which mode it is in.
+
+Here is a small three-node cluster where every node runs the same program.
+
+```mermaid
+flowchart TB
+    CALL["SDK call for sandbox X"]
+    A["Node A<br/>sandboxd, Caddy, SQLite<br/>Raft leader"]
+    B["Node B<br/>sandboxd, Caddy, SQLite"]
+    C["Node C<br/>sandboxd, Caddy, SQLite<br/>owns sandbox X"]
+    G["SWIM gossip<br/>each node tells the others it is alive"]
+    CALL --> B
+    B -- "forwards over HTTP<br/>to the owner" --> C
+    A -- "copies Raft entries" --> B
+    A -- "copies Raft entries" --> C
+    A -.- G
+    B -.- G
+    C -.- G
+```
+
+- Any node can take any call. Node B looks up the owner of sandbox X and forwards the call to node C.
+- Only the leader writes new Raft entries. The other nodes keep copies.
+- Above 10 nodes, nodes take separate server, worker and ingress roles. Only server nodes keep a Raft copy.
 
 For operators, it looks like this:
 
@@ -106,6 +148,26 @@ AerolVM uses caddy-l4 to share ports by SNI. Where SNI does not apply, it uses t
 
 The result: a sandbox can publish a real Postgres, Redis, MongoDB, MySQL or Mosquitto MQTT port to the public internet. Any TCP service works. TLS termination is optional (Caddy can handle the encryption for you), and the address sits on the domain your DNS already points at the cluster. (DNS is the system that turns names like `example.com` into server addresses.)
 
+A connection reaches a sandbox port in one of two ways.
+
+```mermaid
+flowchart TB
+    TCPC["Raw TCP client<br/>for example psql"]
+    TLSC["TLS client<br/>for example a database client using TLS"]
+    HP["Caddy listener on this<br/>sandbox's own host port"]
+    SNI["Caddy shared TLS port<br/>picks the route by SNI"]
+    DEC["Caddy decrypts the traffic<br/>with its own certificate"]
+    PORT["Port inside the sandbox<br/>such as 5432"]
+    TCPC -- "cluster domain and host port" --> HP
+    TLSC -- "per-port hostname, shared port" --> SNI
+    SNI --> DEC
+    HP -- "bytes passed through unchanged" --> PORT
+    DEC -- "plain TCP" --> PORT
+```
+
+- In a cluster, any node that serves ingress accepts the connection. A node that does not own the sandbox passes it on to the owner.
+- The raw TCP host port comes from a pool. A retried expose gets the same port back.
+
 **No other open-source sandbox runtime does this.** Managed VM platforms that are not sold as sandboxes do, Fly Machines in particular. So the gap in the sandbox space is real.
 
 See [TCP and TLS ports](/tcp-ports/) for the how-to. See [Deploy your own Supabase](/use-cases/customer-facing-product-experiences/spawn-postgres/) for a worked Postgres example.
@@ -118,16 +180,38 @@ The mechanism, step by step:
 
 1. **Storage outside the server.** A sandbox can declare a mount backed by S3, NFS, SSHFS or any [rclone](https://rclone.org) remote (see [Attach cloud storage](/external-storage/)). The mount tools run on the host, not in the sandbox (see [Where secrets live](/engineering-trust-boundary/)). So credentials never enter the sandbox, and the mount does not live or die with the container.
 2. **Cluster-wide placement state in Raft.** The sandbox's identity lives in the Raft FSM: its name, hostname binding, mounts and exposed ports. When the owner node dies, the surviving Raft leader (the one server that writes new Raft entries) still has that state.
-3. **SWIM notices the dead owner.** `memberlist` marks a node `Failed` after its suspect-then-confirm window. That takes from under a second to a few seconds, depending on cluster size and probe interval.
+3. **SWIM notices the dead owner.** `memberlist` marks a node dead after its suspect-then-confirm window. That takes from under a second to a few seconds, depending on cluster size and probe interval.
 4. **Re-placement.** This step applies to sandboxes created with the failover policy `recreate`. After a grace period (30 seconds by default), the leader picks a new owner. The placement code (`internal/cluster/placement.go`) uses power-of-two-choices: it samples two healthy nodes and picks the one with more spare capacity. The recovery code (`internal/cluster/recovery_replication.go` and `recovery_store.go`) rebuilds the sandbox on the new owner.
 5. **Mount reattachment.** The new owner's mount manager attaches the same external volume. Because the storage is external (S3 or NFS), the bytes never moved. The new container sees the same files the old one wrote.
 6. **Ingress cutover.** The Caddy route now points at the new owner. Clients using the public address, over HTTP or raw TCP, reach the new sandbox without any change on their side. Long-lived TCP connections drop at the cutover, and clients reconnect.
+
+Here are the same steps as a timeline.
+
+```mermaid
+sequenceDiagram
+    participant G as SWIM gossip
+    participant L as Raft leader
+    participant N as New owner
+    participant X as S3 or NFS storage
+    G->>L: the old owner stopped answering and is dead
+    Note over L: wait out the grace period<br/>30 seconds by default
+    L->>L: pick a healthy node with room
+    L->>L: write a Raft entry that names N as owner
+    Note over N: owner watcher sees the entry<br/>it checks every 5 seconds
+    N->>X: mount the same volume
+    N->>N: start the sandbox from its saved spec
+    N->>N: add its ports back on the same host ports
+    Note over N: ingress routes now lead to N
+```
+
+- Only sandboxes created with `failover: { policy: 'recreate' }` move. The others return HTTP 410 Gone until their old node comes back or an operator deletes them.
+- The sandbox keeps its ID, so SDK calls that use that ID keep working.
 
 The honest caveats:
 
 - **Writes still in flight can be lost.** The cutover does not promise zero RPO (recovery point objective: how much recent data you can lose). If Postgres had a transaction in memory, not yet flushed to the S3 mount, when the host died, that transaction is lost. Real Postgres behaves the same way after a `kill -9`; AerolVM adds no durability the database itself lacks.
 - **There is downtime.** Detection, the grace period, re-placement, mounting and container start all take time. The grace period alone is 30 seconds by default (`SB_DEAD_OWNER_GRACE`), so expect at least that long. HTTP clients with retries cope on their own; custom TCP clients need a reconnect loop.
-- **Your storage must handle the handoff.** S3 with one writer at a time is fine, but S3 with two writers at once never is. During the cutover the dying owner might still write, so AerolVM force-detaches its mount before the new owner mounts. We tested the common cases, but your data's safety still depends on your storage's consistency model.
+- **Your storage must handle the handoff.** S3 with one writer at a time is fine, but S3 with two writers at once never is. During the cutover the dying owner might still write. AerolVM does not wait for it to let go of the mount. When the old owner reaches the cluster again, it sees the sandbox has moved, stops its copy and unmounts. We tested the common cases, but your data's safety still depends on your storage's consistency model.
 - **You need at least one healthy node with room.** If the whole cluster is at capacity, the sandbox stays unplaced until capacity frees up.
 
 With those caveats stated: **yes, kill the host, and the sandbox comes back on a healthy node with its data.** The public address routes to the new sandbox. Run your own Postgres, Redis or single-tenant MinIO in a sandbox, and it survives losing a node.
@@ -144,6 +228,25 @@ On top of the native SDKs, AerolVM has two compatibility facades. A facade is a 
 
 - **`/daytona`** speaks the Daytona SDK protocol. Point the official Daytona SDK at it, and your existing code runs unchanged.
 - **`/e2b`** speaks the E2B SDK protocol. It includes the duplicate-request protection described in [Safe retries (idempotency)](/engineering-idempotency/).
+
+All three kinds of SDK end up in the same place.
+
+```mermaid
+flowchart TB
+    NAT["AerolVM SDKs<br/>TypeScript, Python, Go, Rust, Java"]
+    DSDK["Official Daytona SDK"]
+    ESDK["Official E2B SDK"]
+    V1["Native API<br/>under /v1"]
+    DF["Daytona facade<br/>under /daytona"]
+    EF["E2B facade<br/>under /e2b"]
+    SVC["One service layer<br/>same sandboxes, same rules"]
+    NAT --> V1
+    DSDK --> DF
+    ESDK --> EF
+    V1 --> SVC
+    DF -- "translates the request" --> SVC
+    EF -- "translates the request" --> SVC
+```
 
 This is not in the same league as stateful sandboxes that survive a dead server. It is a migration path. If you use E2B or Daytona today and want to move to AerolVM, self-hosted or managed, you change one URL.
 
@@ -353,6 +456,28 @@ This example starts Postgres with its data on S3, opts it into failover, and pub
 </Tabs>
 
 The same calls work against `localhost` and against a cluster. The sandbox opted into `recreate`, so the owner of `shared-postgres` can die. The next `psql` connection then lands on the new owner with the data intact.
+
+In a cluster, that one create call runs through a few steps the SDK never sees.
+
+```mermaid
+sequenceDiagram
+    participant S as SDK
+    participant R as Node that gets the call
+    participant L as Raft leader
+    participant O as Chosen owner
+    S->>R: create shared-postgres
+    Note over R: sample two healthy nodes<br/>keep the one with more room
+    R->>L: reserve the owner and the name
+    L-->>R: reserved
+    R->>O: forward the create over HTTP
+    O->>O: mount the S3 volume and start Postgres
+    O->>L: record the placement
+    O-->>R: sandbox details
+    R-->>S: sandbox details
+```
+
+- If you already have a sandbox with that name, the reserve step fails and the SDK gets HTTP 409.
+- If the node that gets the call picks itself, there is no forward.
 
 ## What I am not claiming
 

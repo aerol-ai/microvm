@@ -135,6 +135,34 @@ The `expose_port` call breaks most easily under retry, because it changes two sy
 
 Without that flag, retrying a half-installed `expose_port` would tear down another caller's exposure while it is in progress. This is the hand-wired piece the database cannot do for you.
 
+Here is the path a raw TCP `exposePort` call takes, including the rollback rule.
+
+```mermaid
+flowchart TB
+    A["exposePort call<br/>for a raw TCP port"]
+    B{"Was this port already<br/>exposed when the call began?"}
+    R["Install the route again<br/>on the same host port"]
+    OUT["Return the existing URL"]
+    C["Reserve a host port row<br/>and note if this call inserted it"]
+    D{"Did the Caddy<br/>route install work?"}
+    OK["Return the new URL"]
+    E{"Did this call<br/>insert the row?"}
+    DEL["Delete the row,<br/>then return the error"]
+    KEEP["Leave the row alone,<br/>then return the error"]
+    A --> B
+    B -- "yes" --> R
+    R --> OUT
+    B -- "no" --> C
+    C --> D
+    D -- "yes" --> OK
+    D -- "no" --> E
+    E -- "yes, reused is false" --> DEL
+    E -- "no, another call did" --> KEEP
+```
+
+- Installing a route is safe to repeat, so the "already exposed" path just installs it again.
+- The row is only undone by the call that created it.
+
 ## Hazard 2: names and hostnames across the cluster
 
 Sandbox names and custom hostnames must each point at one sandbox, both on one server and across the whole cluster. Sandbox names are unique per owner (the account that created the sandbox). On one node (one server), the `idx_sandboxes_name` partial unique index rejects duplicates:
@@ -150,6 +178,30 @@ An empty name, the default for unnamed sandboxes, is allowed any number of times
 Across the cluster, the Raft FSM keeps the same rule in its `nameIndex` map (`internal/cluster/fsm.go`). Raft is how cluster servers agree on shared data even when some fail. The FSM (finite state machine) is the shared table that every server changes only through agreed Raft log entries.
 
 A second create with the same name can land on a different server. There it gets `cluster.ErrNameConflict`, which the API returns as HTTP 409. Daytona's lookup by name is the most visible user of this.
+
+Here is a race between two creates from the same account that both ask for the name `db`.
+
+```mermaid
+flowchart TB
+    A["Create named db<br/>arrives at node A"]
+    B["Create named db<br/>arrives at node B"]
+    RA["Node A asks the Raft leader<br/>to reserve the name"]
+    RB["Node B asks the Raft leader<br/>to reserve the name"]
+    LOG["Raft log<br/>entries apply one at a time"]
+    WIN["Name now held in the FSM<br/>this create goes ahead"]
+    LOSE["Name already held<br/>HTTP 409 Conflict"]
+    LOCAL["Owner node saves the sandbox<br/>its local unique index holds the name too"]
+    A --> RA
+    B --> RB
+    RA --> LOG
+    RB --> LOG
+    LOG -- "first entry" --> WIN
+    LOG -- "second entry" --> LOSE
+    WIN --> LOCAL
+```
+
+- In the usual path, the name is reserved before any sandbox starts, so the losing create has nothing to undo.
+- On a single server there is no Raft step. The local index alone rejects the second name, also with a 409.
 
 Custom domains follow the same two-level shape. Locally, `hostname` is the primary key:
 
@@ -222,6 +274,29 @@ Here is what is actually guaranteed:
 - **Within the replay window after a success, duplicates get the same `target_id` without redoing the work** (case 2). Two duplicates in flight at once either share the pending attempt (case 3), or one waits for the other and replays.
 - **Outside the replay window, or once a failed attempt's `locked_until` passes, the work runs again** (case 4). The dedupe is at-least-once with replay for finished work, not at-most-once. At-least-once means the work may run more than once but is never skipped, so a crash mid-create cannot leave the fingerprint stuck forever.
 
+Here is case 3 in time order: a retry arrives while the first E2B create is still running.
+
+```mermaid
+sequenceDiagram
+    participant A as First call
+    participant B as Retry
+    participant T as request_idempotency table
+    participant S as Sandbox service
+    A->>T: claim the fingerprint
+    T-->>A: claimed, row is pending
+    A->>S: create the sandbox
+    B->>T: claim the same fingerprint
+    T-->>B: row is pending, so wait
+    S-->>A: sandbox is running
+    A->>T: mark ready and save the sandbox ID
+    B->>T: check the row again
+    T-->>B: ready, here is the sandbox ID
+    Note over A,B: both calls return the same sandbox
+```
+
+- The retry checks the row every 250 ms for up to 30 seconds. After that it gets HTTP 503 and can try again.
+- If the first call fails, it deletes the row. The waiting retry then claims the row and does the work itself.
+
 `DeleteIdempotentRequest` is the explicit cleanup. Use it when the work itself rolls back (for example, the container create failed) and the next retry should start fresh. Otherwise that retry would wait out `locked_until`. The E2B handler calls it on every rollback path in `pkg/api/e2b/handlers.go`.
 
 > **Invariant.** Within the replay window after a success, every duplicate of `(scope, fingerprint)` returns the same `target_id` without redoing the work. Outside that window, or after a failed attempt's lock expires, the row resets and a new caller runs the work.
@@ -232,7 +307,7 @@ Two TTLs (time-to-live limits) control how long a claim lasts, and each facade s
 
 `pendingTTL` is how long an in-flight claim holds its lock. If it is too short, a slow but healthy create lets a second caller start in parallel. That is split-brain: two attempts, each sure it owns the work. If it is too long, a crashed worker blocks retries for that long.
 
-`replayTTL` is how long the same fingerprint keeps replaying the same sandbox. After that, the row resets and a duplicate request makes a new sandbox.
+`replayTTL` is how long the same fingerprint keeps replaying the same sandbox. After that, the row resets and a duplicate request runs the create again.
 
 `createRequestFingerprint` (`pkg/api/e2b/meta.go`) builds the hash from a fixed list of fields:
 
@@ -249,7 +324,29 @@ The `request_idempotency` table only protects retries that reach the same server
 
 The native v1 placement router picks a node by capacity, not by fingerprint (`pkg/api/v1/cluster_handler.go`). So a retry can land on a different node from the original and find an empty table there.
 
-The E2B facade avoids this in the common case. It derives a fixed sandbox ID from the fingerprint (`sandboxIDFromFingerprint` in `pkg/api/e2b/handlers.go`). A second create with the same body picks the same ID and collides in the cluster-wide name index and placement layer. Even so, the per-node claim-and-replay logic only protects retries that hit the *same* node.
+The E2B facade avoids this in the common case. It derives a fixed sandbox ID from the fingerprint (`sandboxIDFromFingerprint` in `pkg/api/e2b/handlers.go`). A second create with the same body picks the same ID and collides in the cluster-wide placement layer. Even so, the per-node claim-and-replay logic only protects retries that hit the *same* node.
+
+Here is what happens when an E2B retry lands on a different node from the first create.
+
+```mermaid
+flowchart TB
+    IN["Same E2B create body<br/>arrives at node B"]
+    FP["Hash the body<br/>into a fingerprint"]
+    ID["Derive the sandbox ID<br/>from the fingerprint"]
+    RES{"Ask the cluster to<br/>reserve that ID"}
+    NEW["Create the sandbox<br/>on the chosen node"]
+    FWD["Forward the request to<br/>the node that owns that ID"]
+    REP["That node's request table<br/>replays the first result"]
+    IN --> FP
+    FP --> ID
+    ID --> RES
+    RES -- "the ID is free" --> NEW
+    RES -- "the ID is already placed" --> FWD
+    FWD --> REP
+```
+
+- The claim-and-replay row lives on the node that ran the first create. Forwarding by ID is how a retry finds it.
+- The replay only happens inside the 10-second replay window.
 
 ## Why a single writer at all
 

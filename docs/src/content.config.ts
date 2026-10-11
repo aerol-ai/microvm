@@ -247,23 +247,45 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 
 const ent = '/enterprise'
 
-// The Enterprise tab, in the order an evaluating company reads it: what you
-// get, how to run it, the controls, the evidence, how to lock it down, who
-// owns what, then the maintainer. The engineering deep dives live in Blogs.
+// The Enterprise tab, grouped the way enterprise docs usually are: start
+// here, architecture, security, compliance, then support.
 const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
     label: 'Enterprise',
     category: NavigationCategory.ENTERPRISE,
+    entries: [link(ent, 'Overview')],
+  },
+  {
+    type: 'group',
+    label: 'Architecture',
+    category: NavigationCategory.ENTERPRISE,
     entries: [
-      link(ent, 'Overview'),
-      link(`${ent}/deployment`, 'Run it in production'),
-      link(`${ent}/security-controls`, 'Security controls'),
-      link(`${ent}/audit-evidence`, 'Evidence for your audit'),
-      link(`${ent}/hardening`, 'Hardening'),
-      link(`${ent}/responsibility`, 'Responsibility and limits'),
-      link(`${ent}/maintainer`, 'Work with the maintainer'),
+      link(`${ent}/architecture`, 'Security architecture'),
+      link(`${ent}/deployment`, 'Reference architectures'),
     ],
+  },
+  {
+    type: 'group',
+    label: 'Security',
+    category: NavigationCategory.ENTERPRISE,
+    entries: [
+      link(`${ent}/security-controls`, 'Security baseline'),
+      link(`${ent}/hardening`, 'Hardening guide'),
+      link(`${ent}/responsibility`, 'Shared responsibility'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Compliance',
+    category: NavigationCategory.ENTERPRISE,
+    entries: [link(`${ent}/audit-evidence`, 'Audit and compliance')],
+  },
+  {
+    type: 'group',
+    label: 'Support',
+    category: NavigationCategory.ENTERPRISE,
+    entries: [link(`${ent}/maintainer`, 'Work with the maintainer')],
   },
 ]
 

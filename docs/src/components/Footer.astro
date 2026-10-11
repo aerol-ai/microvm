@@ -1,4 +1,5 @@
 ---
+import DiagramZoom from './DiagramZoom.astro'
 import EditLink from './EditLink.astro'
 import GiscusComments from './GiscusComments.astro'
 import Pagination from './Pagination.astro'
@@ -14,6 +15,7 @@ issueUrl.searchParams.set('body', `Page: ${Astro.url.pathname}\n\nWhat was wrong
 ---
 
 <GiscusComments />
+<DiagramZoom />
 
 <div class="docs-footer__page-actions">
   <EditLink />

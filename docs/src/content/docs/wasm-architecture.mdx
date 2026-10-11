@@ -18,18 +18,28 @@ The AerolVM server process (`sandboxd`) keeps handling the API. Each sandbox run
 
 This section shows the pieces inside the server that run WASM sandboxes.
 
-```text
-sandboxd (service layer)
-  └─ internal/runtime/wasm.Driver
-       ├─ pkg/wasmmod resolver (module cache)
-       ├─ pkg/wasm/worker supervisor
-       └─ toolbox reverse proxy (files / exec)
+```mermaid
+flowchart TB
+    App["Your app"]
+    subgraph SRV["AerolVM server process"]
+        D["WASM driver<br/>creates, pauses and stops sandboxes"]
+        R["Module resolver<br/>finds modules, keeps a local cache"]
+        SUP["Worker supervisor<br/>starts and watches workers"]
+        T["Toolbox reverse proxy<br/>files and commands"]
+    end
+    App -- "API calls" --> SRV
+    D --> R
+    D --> SUP
+    SUP --> W1["Worker process<br/>sandbox A"]
+    SUP --> W2["Worker process<br/>sandbox B"]
+    D -- "Unix socket" --> W1
+    T -- "exec commands" --> W1
 ```
 
 - **`internal/runtime/wasm.Driver`** is the WASM runtime driver: the part of the server that creates, pauses and stops WASM sandboxes.
 - **The `pkg/wasmmod` resolver** finds the module a sandbox asks for, and keeps a local cache of modules.
 - **The `pkg/wasm/worker` supervisor** starts and watches the worker processes.
-- **The toolbox reverse proxy** passes toolbox requests (reading files, running commands) on to the right worker. A **reverse proxy** receives requests and forwards them to another program.
+- **The toolbox reverse proxy** handles toolbox requests (reading files, running commands) for the right sandbox. Each `exec` command runs in that sandbox's worker. A **reverse proxy** receives requests and forwards them to another program.
 
 ## What a checkpoint holds
 
@@ -50,10 +60,66 @@ The server already has the code to push and pull these checkpoints (`internal/se
 
 This section walks through the four stages of a WASM sandbox's life.
 
-1. **Create.** Find the module, start a worker or take a warm one, and instantiate the module (load it into the worker). Then call its entry point.
+1. **Create.** Find the module, start a worker or take a warm one, and instantiate the module (load it into the worker). Its entry point runs later: once for each `exec` command, or in the background when you expose an HTTP port.
 2. **Passivate.** Save a checkpoint of the running guest, stop the worker and release its admission (its reserved share of the host).
 3. **Rehydrate.** Restore from the local `mem.snap`. For a durable sandbox (planned), a missing local copy is first pulled from AOCR.
 4. **Failover (planned, durable only).** When a cluster member fails, the server that now owns the sandbox calls `RecreateSandbox`. A durable WASM sandbox pulls its checkpoint, then rehydrates.
+
+This chart shows the create step. A warm worker has already compiled the module, which is often the slowest part.
+
+```mermaid
+flowchart TB
+    A["Create request"] --> B["Find the module<br/>in the local cache or a registry"]
+    B --> C{"Is a warm worker ready<br/>for this module?"}
+    C -- "Yes" --> D["Take the warm worker<br/>module already compiled"]
+    C -- "No" --> E["Start a new worker"]
+    E --> F["Load and compile<br/>the module"]
+    D --> G["Instantiate the module<br/>in the worker"]
+    F --> G
+    G --> H["Sandbox is started"]
+    H --> I["Entry point runs later<br/>on exec, or when an HTTP port is exposed"]
+```
+
+This picture shows passivate and rehydrate for a `passivatable` sandbox.
+
+```mermaid
+sequenceDiagram
+    participant App as Your app
+    participant S as AerolVM server
+    participant W as Worker
+    participant Disk as Server disk
+    Note over S,Disk: Passivate, for example when the server shuts down cleanly
+    S->>W: save a checkpoint
+    W->>Disk: write the mem.snap folder
+    S->>W: stop the worker
+    S->>S: release the sandbox's share of the host
+    Note over S,Disk: Rehydrate, when you start the sandbox again
+    App->>S: start the sandbox
+    S->>W: start a new worker with the same module version
+    W->>Disk: read the mem.snap folder
+    W-->>S: memory and state restored
+    S-->>App: sandbox started
+```
+
+- The new worker loads the exact module version the sandbox was created with, not a newer one with the same name.
+- Rehydrate always starts a new worker. It does not take one from the warm pool.
+
+These are the states a WASM sandbox moves between.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Started: create
+    Started --> Passivated: server shuts down cleanly, passivatable only
+    Passivated --> Started: start, restore the checkpoint
+    Started --> Stopped: stop
+    Stopped --> Started: start, module begins again with fresh memory
+    Started --> [*]: delete
+    Stopped --> [*]: delete
+```
+
+- **Stop** does not save memory. The next start runs the module from the beginning. Files the module wrote under `/work` stay.
+- **Passivate** saves memory, so the next start picks up where the guest left off.
+- An `ephemeral` sandbox (the default) is marked stopped if the server restarts, because it has no checkpoint.
 
 ## For server operators
 

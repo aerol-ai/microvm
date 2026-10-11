@@ -21,6 +21,20 @@ This section shows the basic trick that makes clones fast. Firecracker's `LoadSn
 
 With `MAP_PRIVATE`, all clones read the same pages. When a clone first writes to a page, the kernel's **copy-on-write** (CoW) handler gives that clone its own private copy. The file itself is never changed.
 
+Here is the sharing for two clones of one template:
+
+```mermaid
+flowchart TB
+    FILE["Template memory file<br/>never changed by a clone"]
+    FILE -- "reads shared pages" --> CA["Clone A"]
+    FILE -- "reads shared pages" --> CB["Clone B"]
+    CA -- "first write to a page" --> PA["Clone A's own copy<br/>of that one page"]
+    CB -- "first write to a page" --> PB["Clone B's own copy<br/>of that one page"]
+```
+
+- A clone holds private memory only for the pages it has written. Everything else stays shared.
+- Every clone starts from the same pages, so every clone starts out as the same machine. That is the root of the hazards below.
+
 [Firecracker snapshot restore](/firecracker-hydration/) covers the sharing and the warm pool in detail. [Firecracker architecture](/firecracker-architecture/) covers the boot steps.
 
 ## Why a snapshot is risky to copy
@@ -54,6 +68,19 @@ AerolVM uses **virtio-vsock** (vsock for short) for the control channel, not TCP
 AerolVM keeps no vsock connection open across the snapshot. The only vsock state in the snapshot is the guest's listener on `(guest_CID, 1024)`, and a listener can restart. After the VM resumes, the host dials fresh (`vsockHandshake` in `driver.go`), the guest accepts, and the channel is live.
 
 A vsock *connection* left open across the snapshot would break just like TCP. So the safe part is the listener, not all vsock state.
+
+This picture compares what each kind of saved state turns into when a clone wakes up:
+
+```mermaid
+flowchart TB
+    SNAP["The snapshot freezes the guest's memory"] --> TCP["Open TCP connection state<br/>sequence numbers and socket table"]
+    SNAP --> VS["A vsock listener<br/>no open connection"]
+    TCP -- "clone resumes on a new TAP" --> DEAD["The other end is gone<br/>the connection hangs until it times out"]
+    VS -- "clone resumes" --> LIVE["The host dials a new connection<br/>and the channel works"]
+```
+
+- What survives is a listener, not an open connection. Vsock also needs no IP settings, and a fresh clone still has the template's.
+- The template's own TAP is removed after the snapshot is written, so nothing on the host still matches the saved TCP state.
 
 > **Invariant.** The host-to-guest control channel carries no connection state across the snapshot. Every exchange with a restored clone starts with a fresh vsock dial. The listener it dials does not depend on any host endpoint that existed at capture time.
 
@@ -162,6 +189,21 @@ The moment the kernel sees the value change on resume, it reseeds its CSPRNG ins
 
 The two fixes stack as layers of defense. vmgenid reseeds the kernel CSPRNG with no gap at all. `post_resume` still does what vmgenid does *not*. It resets `CLOCK_REALTIME` (vmgenid handles randomness only), applies the network settings, and forces one more kernel reseed with `RNDADDENTROPY` and `RNDRESEEDCRNG`.
 
+This shows the two layers in the order they run after a resume:
+
+```mermaid
+flowchart TB
+    RES["The clone resumes"] --> VG{"Does the deployment<br/>support vmgenid?"}
+    VG -- "yes" --> EARLY["The guest kernel reseeds itself<br/>before any program runs"]
+    VG -- "no" --> GAP["Programs run with the template's<br/>randomness for a short time"]
+    EARLY --> PR["The host sends post_resume over vsock"]
+    GAP --> PR
+    PR --> FIX["The agent sets the clock, applies the network<br/>and forces another reseed"]
+```
+
+- With vmgenid, the kernel's randomness is fixed before `post_resume` arrives. The clock and the network still wait for it.
+- Without vmgenid, the short gap is the one Hazard 2 describes above.
+
 vmgenid only works when the deployment supplies three pieces. AerolVM controls only one of them in code:
 
 - **Kernel command line (in code).** On x86 hosts vmgenid reaches the guest over ACPI, so ACPI must stay on. The x86 boot arguments (`baseBootArgsAMD64` in `driver.go`) deliberately leave out `acpi=off`, while `pci=off` is unrelated and safe. On Arm hosts Firecracker has no ACPI and delivers vmgenid through the device tree instead. A regression test fails the build if a later edit adds `acpi=off` back. That edit would quietly turn off the early reseed.
@@ -234,6 +276,24 @@ By default the full scan does not run on every load. With `SB_FIRECRACKER_SNAPSH
 
 Set the mode to `always` to re-hash on every create, which repeats the scan done at capture each time. Either way, the other choice is a corrupt page faulting into a tenant's guest minutes later.
 
+This is the check a snapshot passes before it is loaded:
+
+```mermaid
+flowchart TB
+    START["A snapshot is about to be loaded"] --> MODE{"Verify mode?"}
+    MODE -- "always" --> HASH["Hash the memory file and the state file<br/>with streaming SHA-256"]
+    MODE -- "once, the default" --> SEEN{"Same files already passed<br/>since this server started?"}
+    SEEN -- "yes" --> LOAD["Load the snapshot"]
+    SEEN -- "no" --> HASH
+    HASH --> MATCH{"Matches the checksum<br/>saved at capture?"}
+    MATCH -- "yes" --> LOAD
+    MATCH -- "no" --> STOP["Stop before the snapshot is loaded"]
+    STOP --> SICK["Mark the template unhealthy<br/>and start a rebuild"]
+```
+
+- "Same files" means the same device, inode, size and modification time, plus the same expected checksum. A failed check is never cached.
+- The same check runs when the warm pool prepares a paused VM, so a bad snapshot never reaches the pool either.
+
 > **Invariant.** A corrupt snapshot fails before it is mapped, not after it is running. Integrity is a host-side precondition of `LoadSnapshot`, never a surprise inside the guest.
 
 ## Hazard 5: counting memory when clones share it
@@ -258,7 +318,27 @@ Until the first sample window finishes, `Ready()` returns false. Admission then 
 
 On Docker-only hosts the sampler is `nil`, and the watermark check only runs when `rss != nil`. `pkg/daemon/daemon.go` turns the interface into a true nil to keep that check honest.
 
-> **Invariant.** Once the sampler's first window has finished, admission counts the memory clones really use, not the sum of reservations. Before that, and on hosts without Firecracker, admission falls back to the reserved numbers.
+The watermark check is off by default. An operator turns it on with `SB_FIRECRACKER_RSS_WATERMARK_RATIO`, the share of host memory that must stay really free. The reserved-size budget always applies as well. Its memory over-provision factor (`SB_MEMORY_OVERPROVISION_FACTOR`, 10 by default) lets reservations add up to more than the host has. A live free-memory floor and the watermark are what keep a high factor safe.
+
+Admission runs these memory checks on every new sandbox:
+
+```mermaid
+flowchart TB
+    NEW["A new sandbox asks for memoryMB"] --> BUD{"Reserved total still under the budget?<br/>host memory x 0.85 x 10 by default"}
+    BUD -- "no" --> NO["Refuse the sandbox"]
+    BUD -- "yes" --> FLOOR{"Free memory now, minus this request,<br/>above the 5% floor?"}
+    FLOOR -- "no" --> NO
+    FLOOR -- "yes" --> WM{"Watermark turned on<br/>and the sampler ready?"}
+    WM -- "no" --> YES["Admit the sandbox"]
+    WM -- "yes" --> RSS{"Host memory minus measured RSS,<br/>minus this request, above the watermark?"}
+    RSS -- "yes" --> YES
+    RSS -- "no" --> NO
+```
+
+- The first check counts reservations. The last check counts what clones really use.
+- A sampler that has not finished its first window is skipped, so its starting zero never reads as an empty host.
+
+> **Invariant.** Admission never reads the sampler before its first window has finished. After that, if the operator has turned on the watermark, admission also refuses a sandbox that would leave too little memory really free. The reserved-size budget applies in every case, and on hosts without Firecracker it is the only memory budget.
 
 ## Known gaps
 

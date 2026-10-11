@@ -204,7 +204,7 @@ Sandboxes often need secrets, such as API keys, database passwords and storage k
 ### Sealing and opening
 
 ```mermaid
-flowchart LR
+flowchart TB
     App["Your app<br/>sends env with the create"] --> Seal["Sealed with AES-256-GCM<br/>bound to this sandbox"]
     Seal --> DB[("Database<br/>only the sealed envelope")]
     DB -- "the sandbox starts" --> Open["Opened in memory"]
@@ -222,7 +222,7 @@ flowchart LR
 
 The key is 32 random bytes. It comes from `SB_CREDENTIAL_ENCRYPTION_KEY`, or from a file the server makes on first start. When the server makes that file, only the server's own user can read it. The database folder and files are locked the same way.
 
-A copied database alone does not reveal secrets, because the key lives outside it. Back up the key and the database together, and keep the key safe. It opens everything.
+A copied database alone does not reveal secrets, because the key lives outside it. Back up the key whenever you back up the database, and store the two copies apart. It opens everything.
 
 ### What else is sealed
 
@@ -350,7 +350,7 @@ A hash is a fingerprint of some data. Change one letter, and the fingerprint cha
 ### Sending a copy out
 
 ```mermaid
-flowchart LR
+flowchart TB
     Log[("Logbook on the server")] --> Check["Re-checks the chain"]
     Check --> Ship["Ships a batch"]
     Ship -- "signed with HMAC" --> Hook["Your webhook"]
@@ -440,7 +440,7 @@ flowchart LR
 All of this only helps if you are running the real AerolVM. Releases are built so you can check that.
 
 ```mermaid
-flowchart LR
+flowchart TB
     Code["Source code"] --> CI["Checks on every pull request:<br/>gosec, dependency review,<br/>govulncheck on Go changes"]
     CI --> Build["Release build<br/>tests run first"]
     Build --> Files["Binaries, checksums.txt,<br/>bill of materials"]

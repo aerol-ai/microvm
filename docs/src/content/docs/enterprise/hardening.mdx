@@ -1,16 +1,32 @@
 ---
-title: Hardening
-description: A checklist to lock down AerolVM for untrusted code, for each sandbox, for each server and for a cluster.
+title: Hardening guide
+description: Three security levels for AerolVM, how to pick one, and checklists for each sandbox, each server and each cluster, tied to the security baseline.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-The defaults are set for getting started, not for hostile code. Pick a posture first, then work through the checklists. What no setting can fix is on [Responsibility and limits](/enterprise/responsibility/).
+The defaults are set for getting started, not for hostile code. This guide turns the [security baseline](/enterprise/security-controls/) into three levels and three checklists. Pick the level that matches the code you run, then work through every item marked for that level.
 
-## Pick a posture
+## Pick a level
 
-| | Your own code | Code from your users | Hostile code, many tenants |
+```mermaid
+flowchart TB
+    Q{"Who writes the code<br/>that runs in the sandboxes?"}
+    Q -- "Your own team" --> L1["Level 1: Baseline"]
+    Q -- "Your users or customers" --> L2["Level 2: Recommended"]
+    Q -- "Anyone, including people<br/>who may attack you" --> L3["Level 3: High security"]
+    L2 -. "many tenants on<br/>the same servers?" .-> L3
+```
+
+```mermaid
+flowchart LR
+    L1["Level 1: Baseline<br/>containers, open network"] --> L2["Level 2: Recommended<br/>gVisor, allow lists, inject rules"]
+    L2 --> L3["Level 3: High security<br/>Firecracker, closed by default"]
+```
+
+| | Level 1: Baseline | Level 2: Recommended | Level 3: High security |
 |---|---|---|---|
+| For | Your own code | Code from your users | Hostile code, many tenants |
 | Runtime | Container | gVisor | Firecracker |
 | Network | A deny list, or open | An allow list of site names | Block everything, or a short allow list |
 | Server default | Open | `default_policy: allowlist` | `default_policy: block_all`, plus `deny_cidrs` and the control-port guard |
@@ -18,10 +34,11 @@ The defaults are set for getting started, not for hostile code. Pick a posture f
 | Mounts | As needed | Read-only where possible | None |
 | API keys | Variables | Inject rules | Inject rules, or none |
 | Timers | Optional | Stop when idle | Stop when idle, and a maximum age |
+| Audit log | On the server | Exported off the server | Exported off the server |
 
 ## A hardened sandbox
 
-This sandbox runs in gVisor, has no network and firm limits, stops when idle and is deleted after 4 hours:
+This sandbox runs in gVisor, has no network and firm limits, stops when idle and is deleted after 4 hours. That meets Level 2. For Level 3, switch the runtime to Firecracker.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -106,56 +123,85 @@ This sandbox runs in gVisor, has no network and firm limits, stops when idle and
   </TabItem>
 </Tabs>
 
-## Checklist for each sandbox
+## Sandbox checklist
 
-1. **Pick the runtime** from the posture table: `runtime: "gvisor"` or `"firecracker"`. See [Sandboxes](/sandboxes/).
-2. **Close the network,** or open only what the code needs: `networkBlockAll: true`, or `networkAllowOut` with site names. Avoid deny lists for untrusted code, because they allow everything you did not list. See [Network access](/network-access/).
-3. **Use a non-root image.** Setting a user at create time does not change the user yet, so set it in the image:
+| ID | Do this | Levels | Baseline |
+|---|---|---|---|
+| HS‑1 | Pick the runtime from the level table: `runtime: "gvisor"` or `"firecracker"` | 2, 3 | WI‑1 |
+| HS‑2 | Close the network, or allow only named sites, with `networkBlockAll` or `networkAllowOut`. Avoid deny lists for untrusted code. | 2, 3 | NS‑2 |
+| HS‑3 | Build images with a non-root `USER`. Setting a user at create time does not change it yet. | 2, 3 | WI‑5 |
+| HS‑4 | Mount only what the code needs, with `readOnly: true` where it only reads | 2, 3 | DP‑6 |
+| HS‑5 | Check image signatures in your pipeline, then pin images by digest (`image@sha256:...`) | 2, 3 | |
+| HS‑6 | Use inject rules for API keys instead of plain variables | 2, 3 | DP‑3 |
+| HS‑7 | Set `cpu`, `memoryMB` and `diskGB` for the job | All | WI‑2 |
+| HS‑8 | Set `stopIfIdleFor`, and `destroyAtAge` for hostile code | 2, 3 | WI‑4 |
+| HS‑9 | Cap traffic with byte limits if the code moves data | 3 | NS‑8 |
 
-   ```dockerfile
-   FROM python:3.12
-   RUN useradd --create-home app
-   USER app
-   ```
+A non-root image looks like this:
 
-4. **Mount as little as you can,** with `readOnly: true` on every mount that only reads. See [External storage](/external-storage/).
-5. **Pin the image by digest** (`image@sha256:...`) after you check its signature in your build pipeline.
-6. **Keep API keys out** with an inject rule instead of a plain variable. See [Keep an API key out of the sandbox](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox).
-7. **Set limits and timers:** `cpu`, `memoryMB` and `diskGB`, plus `stopIfIdleFor` and `destroyAtAge`. See [Lifecycle](/lifecycle/).
-8. **Cap traffic** with byte limits if the code moves data. See [Limit egress and ingress](/network-usage/).
+```dockerfile
+FROM python:3.12
+RUN useradd --create-home app
+USER app
+```
 
-## Checklist for each server
+## Server checklist
 
-1. **Start every sandbox closed.** Point `SB_EGRESS_OPERATOR_FILE` at a policy file like this one:
+| ID | Do this | Levels | Baseline |
+|---|---|---|---|
+| HV‑1 | Keep the API token in a secret manager. The installer prints it once. | All | IM‑1 |
+| HV‑2 | Install with a domain, so Caddy serves HTTPS | All | NS‑6 |
+| HV‑3 | Keep port `21212` private. On a single server, set `SB_API_HOST=127.0.0.1` so only Caddy reaches it. | All | NS‑6 |
+| HV‑4 | Firewall the server as shown below | All | NS‑6 |
+| HV‑5 | Set the server key (`SB_CREDENTIAL_ENCRYPTION_KEY`) from your secret manager. Back it up when you back up the database, and store the copies apart. | All | DP‑5, BR‑1 |
+| HV‑6 | Keep privileged mode (`SB_CONTAINER_PRIVILEGED`) off. Never set `SB_RESOURCE_LIMITS_DISABLED`. | All | WI‑6 |
+| HV‑7 | Verify each download, and stay on the newest release line | All | PV‑1, PV‑3 |
+| HV‑8 | Start every sandbox closed with a policy file (below) | 3 | NS‑3, NS‑4 |
+| HV‑9 | Turn off what you do not use: `SB_ENABLE_SSH_GATEWAY=false`, and leave Firecracker, WebAssembly and V8 isolates off unless needed | 2, 3 | IM‑3 |
+| HV‑10 | Send the audit log off the server with `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3` | 2, 3 | LT‑4 |
+| HV‑11 | Load the bundled alerts and dashboards | 2, 3 | LT‑7 |
+| HV‑12 | Encrypt the server's disks | 3 | DP‑7 |
 
-   ```yaml
-   version: 1
-   default_policy:
-     mode: block_all                    # creates that set no policy get no network
-   deny_cidrs: [169.254.169.254/32]     # the cloud metadata service; add your private ranges
-   node_control_port_guard: true        # no sandbox can reach AerolVM's own ports
-   ```
+### Firewall
 
-   Do not add the ranges the server gives its own sandboxes to `deny_cidrs`. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
-2. **Protect the API token.** The installer prints it once. Keep it in a secret manager.
-3. **Use a domain, not an IP address,** so Caddy (the web server in front of AerolVM) serves HTTPS.
-4. **Keep the API port private.** On a single server in domain mode, set `SB_API_HOST=127.0.0.1` so only Caddy reaches port `21212`.
-5. **Firewall the server.** Open `80` and `443`. Open `22000` to `23000` only if you share TCP ports, and `2220` only if you use SSH. Keep `21212` and `7000` to `7002` private.
-6. **Turn off what you do not use:** `SB_ENABLE_SSH_GATEWAY=false`, and leave Firecracker, WebAssembly and V8 isolates off unless you need them. `SB_HOST_RUNTIMES` lists the container runtimes the server may run.
-7. **Keep the safety settings on.** Leave `SB_CONTAINER_PRIVILEGED` off. It also turns off name allow lists. Never set `SB_RESOURCE_LIMITS_DISABLED`.
-8. **Send the audit log off the server** with `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3`. See [Evidence for your audit](/enterprise/audit-evidence/).
-9. **Verify each download** against `checksums.txt` and its signed build provenance. See [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md).
-10. **Stay on the newest release line.** Security fixes land there only.
+```mermaid
+flowchart TB
+    Net["The internet"] --> FW{"Firewall"}
+    FW -- "open" --> W["80 and 443<br/>HTTPS and public links"]
+    FW -- "open only if used" --> O["22000 to 23000 for TCP ports<br/>2220 for SSH"]
+    FW -. "closed" .-x API["21212<br/>the API"]
+    FW -. "closed" .-x CL["7000 to 7002<br/>cluster ports"]
+```
 
-## Checklist for a cluster
+### Policy file for Level 3
 
-1. **Keep the cluster's signing key off the servers.** Each new server makes its own key and asks to be signed. Node certificates last 90 days, and bundled alerts warn before one expires.
-2. **Keep the gossip key on.** Never set `SB_CLUSTER_INSECURE_GOSSIP`.
-3. **Use AWS KMS for secret copies:** `SB_SECRET_PROVIDER=awskms` with `SB_SECRET_PROVIDER_STRICT_BOOT=true`, so a server with a broken KMS setup refuses to start. See [Secrets providers](/cluster-secrets/).
-4. **Keep the cluster ports on a private network** that the internet cannot reach.
+Point `SB_EGRESS_OPERATOR_FILE` at a file like this one:
+
+```yaml
+version: 1
+default_policy:
+  mode: block_all                    # creates that set no policy get no network
+deny_cidrs: [169.254.169.254/32]     # the cloud metadata service; add your private ranges
+node_control_port_guard: true        # no sandbox can reach AerolVM's own ports
+```
+
+<Aside type="caution">
+Do not add the ranges the server gives its own sandboxes to `deny_cidrs`, or sandbox networking breaks. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
+</Aside>
+
+## Cluster checklist
+
+| ID | Do this | Levels | Baseline |
+|---|---|---|---|
+| HC‑1 | Keep the gossip key on. Never set `SB_CLUSTER_INSECURE_GOSSIP`. | All | NS‑7 |
+| HC‑2 | Keep the cluster ports on a private network that the internet cannot reach | All | NS‑7 |
+| HC‑3 | Run 3 or 5 voting servers | All | BR‑3 |
+| HC‑4 | Keep the cluster authority's signing key off the servers. Each new server makes its own key and asks to be signed. | 3 | IM‑4 |
+| HC‑5 | Use AWS KMS for secret copies (`SB_SECRET_PROVIDER=awskms`) with `SB_SECRET_PROVIDER_STRICT_BOOT=true`, so a broken KMS setup stops the server from starting | 3 | DP‑5 |
+| HC‑6 | Ask for failover on sandboxes that must survive a lost server | As needed | BR‑2 |
 
 ## Next steps
 
-- [Responsibility and limits](/enterprise/responsibility/): what hardening cannot fix.
-- [Security controls](/enterprise/security-controls/): every control and its default.
-- [Run it in production](/enterprise/deployment/): pick a single server or a cluster.
+- [Shared responsibility](/enterprise/responsibility/): what hardening cannot fix.
+- [Reference architectures](/enterprise/deployment/): where each setting fits in your layout.
+- [Audit and compliance](/enterprise/audit-evidence/): show your auditors what you turned on.
