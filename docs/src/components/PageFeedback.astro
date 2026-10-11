@@ -1,131 +1,37 @@
 ---
-// "Was this page helpful?" 👍/👎. Each vote goes to the Worker in docs/worker/,
-// which records it in a GitHub Discussion named after the page path. The page
-// renders this twice: at the top of the right column on desktop, and at the
-// end of the page on small screens or pages without a right column. The two
-// copies share one state, so a vote in either shows in both.
-interface Props {
-  placement: 'sidebar' | 'footer'
-}
-
-const { placement } = Astro.props
-const endpoint = `${import.meta.env.BASE_URL}api/feedback`
+// "Was this page helpful?" at the top of the right column. Voting happens in
+// the giscus widget at the end of the page (GiscusComments.astro), where
+// readers sign in with GitHub; these buttons jump there. The counts come from
+// the metadata giscus posts to this page, so they appear once the page's
+// discussion exists, and a reader's own reaction is highlighted.
 ---
 
-<div class={`page-feedback page-feedback--${placement} not-content`} data-endpoint={endpoint}>
+<div class="page-feedback not-content">
   <p class="page-feedback__title">Was this page helpful?</p>
   <div class="page-feedback__buttons">
-    <button type="button" class="page-feedback__vote" data-vote="up" aria-pressed="false">
-      <span aria-hidden="true">👍</span> Yes
-    </button>
-    <button type="button" class="page-feedback__vote" data-vote="down" aria-pressed="false">
-      <span aria-hidden="true">👎</span> No
-    </button>
+    <a class="page-feedback__vote" href="#page-feedback" data-reaction="THUMBS_UP">
+      <span aria-hidden="true">👍</span> Yes <span class="page-feedback__count"></span>
+    </a>
+    <a class="page-feedback__vote" href="#page-feedback" data-reaction="THUMBS_DOWN">
+      <span aria-hidden="true">👎</span> No <span class="page-feedback__count"></span>
+    </a>
   </div>
-  <form class="page-feedback__note" hidden>
-    <label>
-      <span class="page-feedback__label">What was missing or wrong? (optional)</span>
-      <textarea name="note" rows="3" maxlength="1000"></textarea>
-    </label>
-    <p class="page-feedback__hint">Notes are posted publicly on GitHub. Don't include anything private.</p>
-    <button type="submit" class="page-feedback__send">Send</button>
-  </form>
-  <p class="page-feedback__status" role="status" aria-live="polite"></p>
+  <p class="page-feedback__hint">Vote at the end of the page with your GitHub account.</p>
 </div>
 
 <script>
-  type Vote = 'up' | 'down'
-
-  const page = location.pathname.endsWith('/') ? location.pathname : `${location.pathname}/`
-  const storageKey = `docs-feedback:${page}`
-
-  // Remembering the vote is only a convenience, so a blocked or empty
-  // localStorage just means the buttons show again.
-  function remembered(): Vote | null {
-    try {
-      const v = localStorage.getItem(storageKey)
-      return v === 'up' || v === 'down' ? v : null
-    } catch {
-      return null
-    }
-  }
-
-  function remember(vote: Vote) {
-    try {
-      localStorage.setItem(storageKey, vote)
-    } catch {
-      // Private window or blocked storage: the vote still counted.
-    }
-  }
-
-  async function send(endpoint: string, body: Record<string, string>) {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ page, ...body }),
+  // Only trust messages from the giscus iframe itself.
+  window.addEventListener('message', event => {
+    if (event.origin !== 'https://giscus.app') return
+    const reactions = event.data?.giscus?.discussion?.reactions
+    if (!reactions) return
+    document.querySelectorAll<HTMLElement>('.page-feedback__vote').forEach(link => {
+      const group = reactions[link.dataset.reaction!]
+      if (!group) return
+      link.querySelector('.page-feedback__count')!.textContent = String(group.count)
+      link.classList.toggle('is-reacted', Boolean(group.viewerHasReacted))
     })
-    if (res.ok) return
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.error || 'Could not send your feedback. Try again later.')
-  }
-
-  const widgets = Array.from(document.querySelectorAll<HTMLElement>('.page-feedback'))
-
-  function render(vote: Vote | null, status = '', askForNote = false) {
-    for (const w of widgets) {
-      w.querySelectorAll<HTMLButtonElement>('.page-feedback__vote').forEach(b => {
-        b.setAttribute('aria-pressed', String(b.dataset.vote === vote))
-        b.disabled = vote !== null
-      })
-      w.querySelector<HTMLFormElement>('.page-feedback__note')!.hidden = !askForNote
-      w.querySelector('.page-feedback__status')!.textContent = status
-    }
-  }
-
-  const previous = remembered()
-  if (previous) render(previous, 'Thanks for your feedback.')
-
-  for (const w of widgets) {
-    const endpoint = w.dataset.endpoint!
-
-    w.querySelectorAll<HTMLButtonElement>('.page-feedback__vote').forEach(button => {
-      button.addEventListener('click', async () => {
-        const vote = button.dataset.vote as Vote
-        render(vote, 'Sending…')
-        try {
-          await send(endpoint, { kind: 'vote', vote })
-          remember(vote)
-          if (vote === 'down') {
-            render(vote, 'Thanks. Tell us what to fix?', true)
-            w.querySelector<HTMLTextAreaElement>('textarea')?.focus()
-          } else {
-            render(vote, 'Thanks for your feedback.')
-          }
-        } catch (err) {
-          render(null, (err as Error).message)
-        }
-      })
-    })
-
-    const form = w.querySelector<HTMLFormElement>('.page-feedback__note')!
-    form.addEventListener('submit', async event => {
-      event.preventDefault()
-      const textarea = form.querySelector('textarea')!
-      const note = textarea.value.trim()
-      if (!note) return
-      const sendButton = form.querySelector<HTMLButtonElement>('.page-feedback__send')!
-      sendButton.disabled = true
-      try {
-        await send(endpoint, { kind: 'note', vote: 'down', note })
-        widgets.forEach(other => (other.querySelector('textarea')!.value = ''))
-        render('down', 'Thanks. Your note was sent.')
-      } catch (err) {
-        w.querySelector('.page-feedback__status')!.textContent = (err as Error).message
-      } finally {
-        sendButton.disabled = false
-      }
-    })
-  }
+  })
 </script>
 
 <style>
@@ -150,8 +56,7 @@ const endpoint = `${import.meta.env.BASE_URL}api/feedback`
     gap: 8px;
   }
 
-  .page-feedback__vote,
-  .page-feedback__send {
+  .page-feedback__vote {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -160,97 +65,30 @@ const endpoint = `${import.meta.env.BASE_URL}api/feedback`
     border-radius: 999px;
     background: var(--bg-color);
     color: var(--primary-text-color);
-    font: inherit;
     font-size: 0.8125rem;
-    cursor: pointer;
+    text-decoration: none;
     transition: border-color 0.2s ease, color 0.2s ease;
   }
 
-  .page-feedback__vote:hover:not(:disabled),
-  .page-feedback__send:hover:not(:disabled) {
+  .page-feedback__vote:hover,
+  .page-feedback__vote.is-reacted {
     border-color: var(--hover-color);
     color: var(--hover-color);
   }
 
-  .page-feedback__vote:disabled {
-    cursor: default;
-    opacity: 0.55;
+  .page-feedback__count {
+    font-variant-numeric: tabular-nums;
+    color: var(--secondary-text-color);
   }
 
-  .page-feedback__vote[aria-pressed='true'] {
-    border-color: var(--hover-color);
-    color: var(--hover-color);
-    opacity: 1;
-  }
-
-  .page-feedback__note {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin-top: 12px;
-  }
-
-  .page-feedback__note[hidden] {
+  .page-feedback__count:empty {
     display: none;
   }
 
-  .page-feedback__label {
-    display: block;
-    margin-bottom: 6px;
-    color: var(--primary-text-color);
-    font-size: 0.8125rem;
-  }
-
-  .page-feedback__note textarea {
-    box-sizing: border-box;
-    width: 100%;
-    padding: 8px;
-    border: var(--border);
-    border-radius: 6px;
-    background: var(--bg-color);
-    color: var(--primary-text-color);
-    font: inherit;
-    font-size: 0.8125rem;
-    resize: vertical;
-  }
-
   .page-feedback__hint {
-    margin: 0;
-    color: var(--secondary-text-color);
-    font-size: 0.75rem;
-    line-height: 1.4;
-  }
-
-  .page-feedback__send {
-    align-self: flex-start;
-  }
-
-  .page-feedback__status {
     margin: 8px 0 0;
     color: var(--secondary-text-color);
     font-size: 0.75rem;
     line-height: 1.4;
-  }
-
-  .page-feedback__status:empty {
-    display: none;
-  }
-
-  /* The footer copy is for small screens, where the right column is hidden,
-     and for pages that have no right column at all. */
-  .page-feedback--footer {
-    display: none;
-    max-width: 420px;
-    margin-top: 2rem;
-  }
-
-  :global(html:not([data-has-toc])) .page-feedback--footer {
-    display: block;
-  }
-
-  @media (max-width: 1024px) {
-    .page-feedback--footer {
-      display: block;
-    }
   }
 </style>

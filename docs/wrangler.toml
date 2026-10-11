@@ -1,23 +1,5 @@
 name = "microvm"
-main = "worker/index.js"
 compatibility_date = "2025-01-01"
 
-# Static files are served first; the Worker runs only for paths that are not a
-# file, which is just the page-feedback endpoint.
 [assets]
 directory = "./dist"
-binding = "ASSETS"
-
-# Page feedback writes one GitHub Discussion per docs page into this category.
-# Create the category in the repo first (Announcement format, so only
-# maintainers and the token can open discussions in it). The token itself is a
-# secret: `npx wrangler secret put GITHUB_TOKEN`.
-[vars]
-FEEDBACK_REPO = "aerol-ai/microvm"
-FEEDBACK_CATEGORY = "Docs feedback"
-
-# Readers vote without signing in, so cap each visitor's requests.
-[[ratelimits]]
-name = "FEEDBACK_LIMITER"
-namespace_id = "1001"
-simple = { limit = 10, period = 60 }
