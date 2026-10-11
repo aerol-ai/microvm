@@ -43,7 +43,8 @@
   > p a,
   > ol a,
   > ul a,
-  > table a {
+  > table a,
+  > .table-wrapper a {
     color: var(--primary-text-color);
     font-weight: 500;
     text-decoration: underline;
@@ -54,7 +55,8 @@
   > p a:hover,
   > ol a:hover,
   > ul a:hover,
-  > table a:hover {
+  > table a:hover,
+  > .table-wrapper a:hover {
     text-decoration-color: var(--hover-color);
   }
 

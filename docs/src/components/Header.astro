@@ -3,6 +3,7 @@
 // own package.json keeps it in step with every SDK release instead of a
 // hard-coded string that goes stale.
 import sdkPackage from '../../../sdk/typescript/package.json'
+import { isBlogPath } from '../content.config'
 import { isActiveOrParentPath } from '../utils/navigation'
 import LanguageSelect from './LanguageSelect.astro'
 import ThemeSelect from './ThemeSelect.astro'
@@ -12,10 +13,14 @@ const version = sdkPackage.version
 const basePath = import.meta.env.BASE_URL
 const useCasesHref = `${basePath}use-cases/`
 const onUseCases = isActiveOrParentPath(useCasesHref, currentPath)
+// Blog posts live at root URLs, so match them by membership, with the base path
+// stripped the same way the sidebar sees it.
+const onBlog = isBlogPath(`/${currentPath.slice(basePath.length)}`)
 
 const navLinks = [
-  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases },
+  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases && !onBlog },
   { label: 'Use Cases', href: useCasesHref, active: onUseCases },
+  { label: 'Blogs', href: `${basePath}blog/`, active: onBlog },
 ]
 
 const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
@@ -33,7 +38,7 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
       </span>
     </a>
     <div class="navbar-links">
-      {navLinks.map(link => <a href={link.href} class:list={{ active: link.active }}>{link.label}</a>)}
+      {navLinks.map(link => <a href={link.href} class:list={{ active: link.active }} aria-current={link.active ? 'page' : undefined}>{link.label}</a>)}
     </div>
     <div class="nav__items_side_menu">
       <a
@@ -68,11 +73,11 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
       </span>
       <span class="brand-copy">
         <span class="brand-name">AerolVM</span>
-        <span class="brand-subtitle">Docs</span>
+        <span class="brand-subtitle">Sandbox Platform</span>
       </span>
     </a>
     <div class="navbar-links mobile-navbar-links">
-      {navLinks.map(link => <a href={link.href} class:list={{ active: link.active }}>{link.label}</a>)}
+      {navLinks.map(link => <a href={link.href} class:list={{ active: link.active }} aria-current={link.active ? 'page' : undefined}>{link.label}</a>)}
     </div>
   </nav>
 </header>

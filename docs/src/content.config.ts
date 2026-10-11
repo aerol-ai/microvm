@@ -130,14 +130,32 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
   //     link('/operational-runbooks', 'Runbooks'),
   //   ],
   // },
+]
+
+// Blog posts keep the URLs they had as docs pages, because the docs link to
+// them. So the blog sidebar is chosen by membership in this list, not by a
+// /blog/ prefix the way use cases are.
+const getBlogSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
-    label: 'Deep Dives',
+    label: 'Blogs',
+    category: NavigationCategory.ENGINEERING,
+    entries: [link('/blog', 'All posts')],
+  },
+  {
+    type: 'group',
+    label: 'Comparisons',
     category: NavigationCategory.ENGINEERING,
     entries: [
       link('/aerolvm-vs-daytona-vs-e2b', 'AerolVM vs Daytona vs E2B'),
       link('/tcp-vs-tls-ports', 'TCP or TLS?'),
-      link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'How AerolVM Is Built',
+    category: NavigationCategory.ENGINEERING,
+    entries: [
       link('/engineering-distributed-sandbox-runtime', 'Why AerolVM exists'),
       link('/engineering-runtime-layers', 'Engine, chassis, runtime'),
       link('/engineering-idempotency', 'Safe retries (idempotency)'),
@@ -145,12 +163,26 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-trust-boundary', 'Where secrets live'),
       link('/engineering-snapshot-correctness', 'Correct snapshot clones'),
       link('/engineering-frozen-kernel-problem', 'The frozen-kernel problem'),
+      link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
+    ],
+  },
+  {
+    type: 'group',
+    label: 'Architecture',
+    category: NavigationCategory.ENGINEERING,
+    entries: [
       link('/firecracker-architecture', 'Firecracker architecture'),
       link('/firecracker-hydration', 'Firecracker snapshot restore'),
       link('/wasm-architecture', 'WASM architecture'),
     ],
   },
 ]
+
+const blogPaths = new Set(
+  getBlogSidebarConfig().flatMap(group =>
+    (group.entries || []).flatMap(entry => (entry.type === 'link' ? [entry.href] : []))
+  )
+)
 
 const ucp = '/use-cases/customer-facing-product-experiences'
 const uca = '/use-cases/coding-agents'
@@ -211,5 +243,12 @@ function isUseCasesPath(pathname: string): boolean {
   return pathname === '/use-cases' || pathname.startsWith('/use-cases/')
 }
 
-export const getSidebarConfig = (pathname = '/'): NavigationGroup[] =>
-  isUseCasesPath(pathname) ? getUseCasesSidebarConfig() : getDocsSidebarConfig()
+export function isBlogPath(pathname: string): boolean {
+  return blogPaths.has(pathname.replace(/\/$/, '') || '/')
+}
+
+export const getSidebarConfig = (pathname = '/'): NavigationGroup[] => {
+  if (isUseCasesPath(pathname)) return getUseCasesSidebarConfig()
+  if (isBlogPath(pathname)) return getBlogSidebarConfig()
+  return getDocsSidebarConfig()
+}
