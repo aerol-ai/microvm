@@ -161,6 +161,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-runtime-layers', '- Engine, chassis, runtime'),
       link('/engineering-idempotency', '- Safe retries (idempotency)'),
       link('/engineering-placement-failover', '- Placement and failover'),
+      link('/engineering-security-overview', '- Security, end to end'),
       link('/engineering-trust-boundary', '- Where secrets live'),
       link('/engineering-isolation', '- How sandboxes are isolated'),
       link('/engineering-sandbox-filesystem', '- What a sandbox sees on disk'),

@@ -19,7 +19,7 @@ Each feature is marked **Default** (on with no setup), **You turn it on**, or **
 | API keys kept out of the sandbox with inject rules | You turn it on | [Advanced network rules](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox) |
 | Encrypted environment variables, with every read recorded | Default | [Environment variables](/sandbox-env/) |
 | Storage credentials that never enter the sandbox | Default | [External storage](/external-storage/) |
-| A tamper-evident audit log | Default | [Evidence for your audit](/enterprise/audit-evidence/) |
+| A hash-chained audit log | Default | [Evidence for your audit](/enterprise/audit-evidence/) |
 | Audit export to a file, a webhook or S3 | You turn it on | [Audit](/enterprise/security-controls/#audit) |
 | Clusters with failover and mutual TLS between servers | You turn it on | [Run it in production](/enterprise/deployment/) |
 | AWS KMS for the secret copies a cluster keeps | You turn it on | [Secrets providers](/cluster-secrets/) |
@@ -43,8 +43,10 @@ Need a proposed feature? Say so in [Ideas](https://github.com/aerol-ai/microvm/d
 | Where do secrets live? | Encrypted on the server. Every time one is opened, a record is written. | [Secrets](/enterprise/security-controls/#secrets) |
 | Can an AI agent leak an API key? | Not with an inject rule. The sandbox only ever holds a placeholder. | [Secrets](/enterprise/security-controls/#secrets) |
 | Who can call the API? | Anyone with the server's API token. | [API access](/enterprise/security-controls/#api-access) |
-| What gets recorded? | Every secret read, and the outbound connections the filter refuses. The records form a chain that shows tampering. | [Audit](/enterprise/security-controls/#audit) |
+| What gets recorded? | Every secret read, and the outbound connections the filter refuses. Each record is chained to the one before, and you can keep a copy off the server. | [Audit](/enterprise/security-controls/#audit) |
 | What is out of scope? | The server itself, the kernel and hardware, and where your images come from. | [Known limits](/enterprise/responsibility/) |
+
+For the whole picture, with diagrams of every door, secret and record, read [How AerolVM keeps everything safe](/engineering-security-overview/).
 
 ## Evidence for a security review
 

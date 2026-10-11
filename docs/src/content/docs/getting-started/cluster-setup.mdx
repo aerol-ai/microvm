@@ -43,7 +43,7 @@ One server is enough for development and light production use. You need a cluste
 
 - **Every secret open is recorded.** Each time a sandbox's environment variables, registry password or storage credentials are opened, the node writes a record. It says which sandbox, which tenant, which node, and whether it worked.
 - **Refused traffic is recorded.** Each outbound connection the network filter refuses is logged with its destination and the reason. The destinations of allowed traffic can be recorded too.
-- **Records cannot be quietly changed.** Each record carries a fingerprint (hash) of the one before it, so editing or deleting a record breaks the chain. The server can check the whole chain on demand, and an alert fires when it breaks.
+- **Records are chained.** Each record carries a fingerprint (hash) of the one before it, so editing or deleting a record breaks the chain. The server can check the whole chain on demand, and an alert fires when it breaks. Someone with root on a node could rebuild that node's whole chain, so ship a copy to your own systems.
 - **History from any node.** `sandbox.audit()` in every SDK reads a sandbox's history, whichever node it ran on.
 - **Shipped to your own systems.** Each node can send its audit log to a file, a webhook or an S3 bucket. If your system is down, nothing is dropped: the node keeps the records, retries, and fires an alert when it falls behind.
 - **Gaps are visible.** If a burst overflows the buffer, the log writes a marker with the number of missed events instead of losing them silently.

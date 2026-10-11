@@ -5,7 +5,7 @@ description: Every security control in AerolVM, what it does by default, and the
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-This page lists each security control once, by area. Each row gives the default and the setting that tightens it. What the controls do not cover is on [Responsibility and limits](/enterprise/responsibility/).
+This page lists each security control once, by area. Each row gives the default and the setting that tightens it. What the controls do not cover is on [Responsibility and limits](/enterprise/responsibility/). For the whole system, from the network doors to the releases, read [How AerolVM keeps everything safe](/engineering-security-overview/).
 
 ## Where the boundary is
 
@@ -84,7 +84,7 @@ flowchart TB
 | Control | Default | To tighten |
 |---|---|---|
 | What is recorded | Every time a secret is opened. Outbound connections the filter refuses, up to 25 records a second for each sandbox, so one sandbox cannot flood the log. | Nothing to set |
-| Tamper evidence | Each record holds a hash of the one before, so a changed or deleted record breaks the chain | Bundled alerts fire when the chain breaks |
+| Chained records | Each record holds a hash of the one before, so a changed or deleted record breaks the chain. Someone with root on the server could rebuild the whole chain. | Keep a copy off the server (the next row). Bundled alerts fire when the chain breaks. |
 | Where records go | Kept for 30 days on the server's disk | `SB_AUDIT_EXPORT_BACKEND` set to `file`, `stdout`, `webhook` (signed with HMAC) or `s3` |
 | Reading a sandbox's history | `sandbox.audit()` in every SDK, from any server in a cluster | Nothing to set |
 

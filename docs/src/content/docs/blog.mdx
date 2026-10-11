@@ -20,6 +20,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [Engine, chassis, runtime](/engineering-runtime-layers/) | Why Firecracker, Cloud Hypervisor, Kata and gVisor sit at different layers, and why AerolVM drives Firecracker itself. |
 | [Safe retries (idempotency)](/engineering-idempotency/) | How retried and duplicate API calls stay safe. |
 | [Placement and failover](/engineering-placement-failover/) | How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies. |
+| [How AerolVM keeps everything safe](/engineering-security-overview/) | The whole security picture, with diagrams: every door into a server, the secrets, the cluster, the audit log, monitoring and the releases. |
 | [Where secrets live](/engineering-trust-boundary/) | Which secrets AerolVM encrypts, where mounts and network rules run, and what the host does and does not protect against. |
 | [How AerolVM isolates sandboxes](/engineering-isolation/) | The wall each runtime puts between a sandbox and the server, root inside the sandbox, and resource limits. |
 | [What a sandbox can see on disk](/engineering-sandbox-filesystem/) | Mounts, the file API, what snapshots copy, and where images come from. |
