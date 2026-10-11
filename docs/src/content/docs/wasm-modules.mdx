@@ -1,116 +1,116 @@
 ---
-title: WASM Modules
-description: Module references, local cache, and warm-worker pools for WASM sandboxes.
+title: WASM modules
+description: Pick a standard WASM module, push your own module to a registry, and see how the server caches and reuses modules.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-WASM sandboxes are created from a **module reference** (`module_ref`). The daemon resolves the ref to a content-addressed file under `SB_WASM_MODULES_DIR` and records it in the `wasm_modules` catalogue.
+A [WASM sandbox](/wasm-sandbox/) runs a module: a compiled `.wasm` program. You choose it with `moduleRef` when you create the sandbox. This page covers where modules come from and how the server stores them.
 
-## Module references
+## How the server finds a module
 
-A `module_ref` is resolved in this precedence order:
+The server reads `moduleRef` and checks these kinds of names in order:
 
-1. **Standard-module keyword** — a short alias your operator staged on every
-   node (e.g. `python`, `javascript`). Recommended: no host paths, identical
-   fleet-wide. See [Standard modules](#standard-modules).
-2. **`oci://host/repo:tag`** — a registry artifact, pulled under your own
-   credentials and cached content-addressed. See
-   [Bring your own module](#bring-your-own-module).
-3. **Catalogue id** — a digest id returned by `createWasmModule`.
-4. **`file:///path/to/module.wasm`** / bare filename under `SB_WASM_MODULES_DIR`
-   — for self-managed hosts.
+1. **Standard module name**, such as `python` or `javascript`. Your operator puts these on every server. This is the easiest choice: no upload and no file paths. See [Use a standard module](#use-a-standard-module).
+2. **Registry reference**, such as `oci://registry.example.com/team/app:v1`. The server downloads the module from a container registry with your credentials and keeps a copy. See [Bring your own module](#bring-your-own-module).
+3. **Catalogue ID**: the `id` that `createWasmModule` returned. See [Register a module on the server](#register-a-module-on-the-server).
+4. **File on the server**: `file:///path/to/module.wasm`, or a bare file name inside the server's modules folder. For self-hosted servers.
 
-Whatever the form, the daemon validates the artifact is a **core wasip1**
-module (WASI components are rejected), records the resolved digest, and pins it
-to the sandbox so a restart or failover boots the exact same bytes. Remote
-`oci://` pulls are restricted to the hosts in `SB_WASM_REGISTRY_ALLOWLIST`.
+Whatever you pass, the server checks that the file is a core WASI preview 1 (`wasip1`) module. WASI is the standard set of system functions a WASM program uses for files, the clock and the network. The server rejects WASI components, a newer module format. It then records the module's digest (a hash that names the exact bytes) and ties it to the sandbox. A restart or a move to another server runs exactly the same bytes.
 
-## Standard modules
+## Use a standard module
 
-Operators pre-stage a curated set of language modules on every node (via the
-`stage-wasm-modules` playbook) and expose them as reserved keywords through
-`SB_WASM_STANDARD_MODULES`. You reference one by name — no upload, no path:
+Pass the name your operator gave the module. There is nothing to upload.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    await client.create({ module_ref: 'python', runtime: 'wasm' })
+    // The TypeScript SDK requires image: use the module name.
+    await client.create({ image: "python", moduleRef: "python", runtime: "wasm" });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    client.create({'module_ref': 'python', 'runtime': 'wasm'})
+    # The Python SDK requires image: use the module name.
+    client.create(image="python", module_ref="python", runtime="wasm")
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    client.Create(ctx, types.CreateSandboxRequest{ModuleRef: "python", Runtime: types.RuntimeWasm})
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef: "python",
+        Runtime:   sdktypes.RuntimeWasm,
+    })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    client.create(CreateSandboxRequest {
+    let sandbox = client.create(CreateOptions {
         module_ref: Some("python".into()),
         runtime: Some("wasm".into()),
         ..Default::default()
-    }).await?;
+    })?;
     ```
   </TabItem>
   <TabItem label="Java">
     ```java
-    CreateSandboxRequest req = new CreateSandboxRequest();
-    req.setModuleRef("python");
-    req.setRuntime("wasm");
-    client.create(req);
+    Sandbox sandbox = client.create(
+        new CreateOptions().setModuleRef("python").setRuntime("wasm")
+    );
     ```
   </TabItem>
 </Tabs>
 
-A standard-module keyword always wins over a same-named file in the modules
-dir, so the curated runtime can never be shadowed.
+A standard module name always wins over a file with the same name in the modules folder. A stray file cannot replace the real module.
 
 ## Bring your own module
 
-Compile your program to a **core wasip1** module (`GOOS=wasip1` for Go,
-`--target wasm32-wasip1` for Rust), then push it to the registry under your own
-credentials. The daemon **validates and forwards** the bytes — it never stores
-them or acts as a registry — and returns the `oci://` ref to use on create.
+First compile your program to a core `wasip1` module:
+
+- **Go:** `GOOS=wasip1 GOARCH=wasm go build -o app.wasm`
+- **Rust:** `cargo build --target wasm32-wasip1`
+
+Then upload it with `pushWasmModule`, using your own registry credentials. The server checks the file and passes it on to the registry. It never stores the file itself. It returns the `oci://` reference to use when you create a sandbox.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
-    import { readFile } from 'node:fs/promises'
+    import { readFile } from "node:fs/promises";
 
-    const wasm = await readFile('app.wasm')
+    const wasm = await readFile("app.wasm");
     const pushed = await client.pushWasmModule({
-      name: 'tenant/app',
-      tag: 'v1',
+      name: "tenant/app",
+      tag: "v1",
       module: new Uint8Array(wasm),
       registryUsername: process.env.AOCR_USER,
       registryToken: process.env.AOCR_TOKEN!,
-    })
-    await client.create({ module_ref: pushed.moduleRef, runtime: 'wasm' })
+    });
+    await client.create({ image: pushed.moduleRef, moduleRef: pushed.moduleRef, runtime: "wasm" });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    with open('app.wasm', 'rb') as f:
+    import os
+
+    with open("app.wasm", "rb") as f:
         module = f.read()
     pushed = client.push_wasm_module({
-        'name': 'tenant/app',
-        'tag': 'v1',
-        'module': module,
-        'registryUsername': os.environ['AOCR_USER'],
-        'registryToken': os.environ['AOCR_TOKEN'],
+        "name": "tenant/app",
+        "tag": "v1",
+        "module": module,
+        "registryUsername": os.environ["AOCR_USER"],
+        "registryToken": os.environ["AOCR_TOKEN"],
     })
-    client.create({'module_ref': pushed['moduleRef'], 'runtime': 'wasm'})
+    client.create(image=pushed["moduleRef"], module_ref=pushed["moduleRef"], runtime="wasm")
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    wasm, _ := os.ReadFile("app.wasm")
-    pushed, err := client.PushWasmModule(ctx, types.PushWasmModuleOptions{
+    wasm, err := os.ReadFile("app.wasm")
+    if err != nil {
+        log.Fatal(err)
+    }
+    pushed, err := client.PushWasmModule(ctx, sdktypes.PushWasmModuleOptions{
         Name:             "tenant/app",
         Tag:              "v1",
         Module:           wasm,
@@ -120,24 +120,27 @@ them or acts as a registry — and returns the `oci://` ref to use on create.
     if err != nil {
         log.Fatal(err)
     }
-    client.Create(ctx, types.CreateSandboxRequest{ModuleRef: pushed.ModuleRef, Runtime: types.RuntimeWasm})
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        ModuleRef: pushed.ModuleRef,
+        Runtime:   sdktypes.RuntimeWasm,
+    })
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
-    let module = std::fs::read("app.wasm")?;
+    let module = std::fs::read("app.wasm").expect("read app.wasm");
     let pushed = client.push_wasm_module(PushWasmModuleOptions {
         name: "tenant/app".into(),
         tag: "v1".into(),
         module,
-        registry_username: std::env::var("AOCR_USER")?,
-        registry_token: std::env::var("AOCR_TOKEN")?,
+        registry_username: std::env::var("AOCR_USER").unwrap_or_default(),
+        registry_token: std::env::var("AOCR_TOKEN").unwrap_or_default(),
     })?;
-    client.create(CreateSandboxRequest {
+    let sandbox = client.create(CreateOptions {
         module_ref: Some(pushed.module_ref),
         runtime: Some("wasm".into()),
         ..Default::default()
-    }).await?;
+    })?;
     ```
   </TabItem>
   <TabItem label="Java">
@@ -149,54 +152,63 @@ them or acts as a registry — and returns the `oci://` ref to use on create.
         .setModule(module)
         .setRegistryUsername(System.getenv("AOCR_USER"))
         .setRegistryToken(System.getenv("AOCR_TOKEN")));
-    CreateSandboxRequest req = new CreateSandboxRequest();
-    req.setModuleRef(pushed.moduleRef);
-    req.setRuntime("wasm");
-    client.create(req);
+    Sandbox sandbox = client.create(
+        new CreateOptions().setModuleRef(pushed.moduleRef).setRuntime("wasm")
+    );
     ```
   </TabItem>
 </Tabs>
 
-You can also `oras push` your module to the registry directly and skip the
-daemon — then create with the `oci://` ref plus your `registry` credentials.
-Either way the registry is the source of truth and the daemon only pulls to run.
+You can also skip the server and push the module to the registry yourself with `oras push`. Then create the sandbox with the `oci://` reference and your registry credentials in the `registry` create option. Either way, the registry holds the module, and the server only downloads it to run it.
 
-## Catalogue API
+<Aside type="caution">
+`pushWasmModule` works only when the operator has set an upload registry (`SB_WASM_REGISTRY_PUSH_HOST`). The server downloads `oci://` modules only from registries on its allow list (`SB_WASM_REGISTRY_ALLOWLIST`). With an empty list, it downloads nothing from registries.
+</Aside>
 
-Register modules on the host before create, or let create resolve inline. WASM
-catalogue rows are per-node and are not cluster-forwarded. Firecracker template
-administration is different: it is an operator-only cluster control plane with
-worker-routed create/item operations and a leader-coalesced list.
+## Register a module on the server
+
+You can add a module to the server's catalogue (its list of known modules) before you create sandboxes. You can also skip this and let the create call find the module. The catalogue belongs to one server: in a cluster, each server has its own.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const mod = await client.createWasmModule({
-      moduleRef: 'file:///opt/agent.wasm',
-      entrypoint: '_start',
-    })
-    const rows = await client.listWasmModules()
-    await client.deleteWasmModule(mod.id)
+      moduleRef: "file:///opt/agent.wasm",
+      entrypoint: "_start",
+    });
+    const rows = await client.listWasmModules();
+    console.log(rows.length);
+    await client.deleteWasmModule(mod.id);
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
     mod = client.create_wasm_module({
-        'moduleRef': 'file:///opt/agent.wasm',
-        'entrypoint': '_start',
+        "moduleRef": "file:///opt/agent.wasm",
+        "entrypoint": "_start",
     })
     rows = client.list_wasm_modules()
-    client.delete_wasm_module(mod.id)
+    print(len(rows))
+    client.delete_wasm_module(mod["id"])
     ```
   </TabItem>
   <TabItem label="Go">
     ```go
-    mod, err := client.CreateWasmModule(ctx, types.CreateWasmModuleOptions{
+    mod, err := client.CreateWasmModule(ctx, sdktypes.CreateWasmModuleOptions{
         ModuleRef:  "file:///opt/agent.wasm",
         Entrypoint: "_start",
     })
+    if err != nil {
+        log.Fatal(err)
+    }
     rows, err := client.ListWasmModules(ctx)
-    err = client.DeleteWasmModule(ctx, mod.ID)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(len(rows))
+    if err := client.DeleteWasmModule(ctx, mod.ID); err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
@@ -207,6 +219,7 @@ worker-routed create/item operations and a leader-coalesced list.
         id: None,
     })?;
     let rows = client.list_wasm_modules()?;
+    println!("{}", rows.len());
     client.delete_wasm_module(&module.id)?;
     ```
   </TabItem>
@@ -216,78 +229,62 @@ worker-routed create/item operations and a leader-coalesced list.
         .setModuleRef("file:///opt/agent.wasm")
         .setEntrypoint("_start"));
     List<WasmModule> rows = client.listWasmModules();
+    System.out.println(rows.size());
     client.deleteWasmModule(mod.id);
     ```
   </TabItem>
 </Tabs>
 
-## Warm pool
+| Option | What it does | Default |
+|---|---|---|
+| `moduleRef` | The module to register, in any form from [How the server finds a module](#how-the-server-finds-a-module). | None (required) |
+| `entrypoint` | The function the server calls to start the module. | `_start` |
+| `id` | Your own ID for the catalogue entry. | The module's digest |
 
-When `SB_WASM_POOL_ENABLED=true`, the daemon keeps pre-spawned workers per module digest. Creates against a warm module skip cold worker boot.
+The server checks the module during the call, so the returned entry is usually already `ready`. If it is `failed`, `lastError` says why.
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    const sandbox = await client.create({
-      module_ref: 'https://example.com/builds/agent.wasm',
-      runtime: 'wasm',
-      memoryMB: 512,
-    })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox = client.create({
-        'module_ref': 'https://example.com/builds/agent.wasm',
-        'runtime': 'wasm',
-        'memoryMB': 512,
-    })
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    sb, err := client.Create(ctx, types.CreateSandboxRequest{
-        ModuleRef: "https://example.com/builds/agent.wasm",
-        Runtime:   types.RuntimeWasm,
-        MemoryMB:  512,
-    })
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    client.create(CreateSandboxRequest {
-        module_ref: Some("https://example.com/builds/agent.wasm".into()),
-        runtime: Some("wasm".into()),
-        memory_mb: Some(512),
-        ..Default::default()
-    }).await?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    CreateSandboxRequest req = new CreateSandboxRequest();
-    req.setModuleRef("https://example.com/builds/agent.wasm");
-    req.setRuntime("wasm");
-    req.setMemoryMB(512);
-    client.create(req);
-    ```
-  </TabItem>
-</Tabs>
+## Faster starts with warm workers
 
-## Cluster placement
+The server keeps a few worker processes started and ready for each module it knows. A create for that module takes a ready worker and skips starting a new one. Your create call does not change. This is on by default.
 
-Peers gossip `local_wasm_module_ids` via `/v1/capacity`. Placement prefers nodes that already cache the requested `module_ref`.
+- The server starts warming a module the first time you create a sandbox from it, or as soon as you [register it](#register-a-module-on-the-server). Registering first makes even the first create fast.
+- Ready workers use the server's default WASM memory. A sandbox that asks for a different `memoryMB` starts a fresh worker instead.
 
-## Garbage collection
+In a cluster, servers tell each other which modules they have cached. AerolVM prefers to place a new sandbox on a server that already has its module.
 
-When `SB_WASM_MODULE_GC_ENABLED=true`, the wasm module janitor runs two sweeps
-each `SB_WASM_MODULE_GC_INTERVAL`:
+## For server operators
 
-- **Catalogue rows.** Unreferenced rows older than `SB_WASM_MODULE_GC_TTL` are
-  removed.
-- **`oci://` cache bytes.** Content-addressed files under `SB_WASM_CACHE_DIR`
-  (`<digest>.wasm`) are evicted when older than `SB_WASM_CACHE_GC_TTL` (default
-  24h), or oldest-first when the cache exceeds `SB_WASM_CACHE_MAX_BYTES`
-  (default unlimited). A digest still referenced by a sandbox or a catalogue row
-  is **never** evicted, regardless of age or disk pressure — eviction only
-  reclaims pull-on-create modules that nothing depends on.
+### Standard modules and registries
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_WASM_STANDARD_MODULES` | Standard module names, as `alias=file.wasm,...`. The files live in the modules folder. | Empty |
+| `SB_WASM_MODULES_DIR` | The modules folder. | `/var/lib/sandboxd/wasm/modules` |
+| `SB_WASM_REGISTRY_ALLOWLIST` | Registry hosts that `oci://` references may download from. Empty blocks all registry downloads. | Empty |
+| `SB_WASM_REGISTRY_PUSH_HOST` | The registry `pushWasmModule` uploads to. Empty turns uploads off. | Empty |
+
+On a cluster, list standard modules under `wasm.standard_modules` in `config/cluster.yml`. Then run the `stage-wasm-modules` Ansible playbook. It downloads each module to every server and checks its sha256 hash.
+
+### Warm workers
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_WASM_POOL_ENABLED` | Keep started workers ready for each module. | `true` |
+| `SB_WASM_POOL_DEPTH_DEFAULT` | How many ready workers to keep per module. | `2` |
+
+Turn the pool off on servers that are short of memory, since ready workers hold memory while they wait.
+
+### Cleanup
+
+The server cleans up unused modules on a timer (`SB_WASM_MODULE_GC_INTERVAL`, every 15 minutes by default). It is on by default (`SB_WASM_MODULE_GC_ENABLED=true`). Each run does two sweeps:
+
+- **Catalogue entries.** It removes entries that nothing uses and that are older than `SB_WASM_MODULE_GC_TTL` (7 days by default).
+- **Downloaded modules.** It deletes cached `oci://` files (`<digest>.wasm` under `SB_WASM_CACHE_DIR`) older than `SB_WASM_CACHE_GC_TTL` (24 hours by default). If the cache is bigger than `SB_WASM_CACHE_MAX_BYTES` (no limit by default), it deletes the oldest files first.
+
+A module that a sandbox or a catalogue entry still uses is **never** deleted, however old it is or however full the disk is. Cleanup only removes downloaded modules that nothing depends on.
+
+## Next steps
+
+- [WebAssembly (WASM)](/wasm-sandbox/): create WASM sandboxes and keep them across restarts.
+- [WASM networking](/wasm-networking/): share a web server running in a module.
+- [WASM architecture](/wasm-architecture/): how workers and checkpoints work inside.

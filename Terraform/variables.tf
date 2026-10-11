@@ -564,7 +564,7 @@ variable "cloudflare_record_ttl" {
 variable "install_script_url" {
   description = "URL of the single-node install.sh."
   type        = string
-  default     = "https://github.com/aerol-ai/microvm/releases/latest/download/install.sh"
+  default     = "https://aerolvm.aerol.ai"
 }
 
 variable "caddy_binary_url" {

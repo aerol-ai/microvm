@@ -1,0 +1,1621 @@
+---
+title: Advanced Network Rules
+description: IP address lists, reusable allow lists, learn mode, rules for single requests, HTTPS inspection and API keys the sandbox never sees.
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+[Network access](/network-access/) covers the everyday choices: block the internet, allow only some websites, and see what was refused. This page has everything else.
+
+| You want to | Read |
+|---|---|
+| Allow or block ranges of IP addresses | [Allow or block lists of IP addresses](#allow-or-block-lists-of-ip-addresses) |
+| Change the rules of a running sandbox | [Change the policy of a running sandbox](#change-the-policy-of-a-running-sandbox) |
+| Reuse one allow list in many sandboxes | [Reusable allow lists](#reusable-allow-lists) |
+| Build an allow list by watching a trusted run | [Learn an allow list](#learn-an-allow-list) |
+| Test a policy before you use it | [Check a policy before you use it](#check-a-policy-before-you-use-it) |
+| Allow only some requests to a site, such as `GET /repos/**` | [Allow only some requests](#allow-only-some-requests) |
+| Let the sandbox use an API key it can never read | [Keep an API key out of the sandbox](#keep-an-api-key-out-of-the-sandbox) |
+| Let only some programs, such as `pip`, connect | [Let only some programs connect](#let-only-some-programs-connect) |
+| Make a sandbox public from the start | [More about inbound traffic](#more-about-inbound-traffic) |
+
+## Allow or block lists of IP addresses
+Blocking everything is often too strict. An agent may need one API while everything else stays off. For that, give the sandbox a list of address ranges.
+
+An address range is written as an IP address, a slash and a number. `8.8.8.8/32` is one address. `10.0.0.0/8` is every address that starts with `10.`. Networking tools call this form a CIDR.
+
+| Option | What it does |
+|---|---|
+| `networkAllowOut` | The sandbox can reach only these ranges. All other outbound traffic is dropped. |
+| `networkDenyOut` | The sandbox can reach everything except these ranges. |
+| `networkBlockAll` | The sandbox can reach nothing. |
+
+This sandbox can reach `1.1.1.0/24` and `8.8.8.8`, and nothing else:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Allow only 1.1.1.0/24 and 8.8.8.8; block everything else.
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkAllowOut: ['1.1.1.0/24', '8.8.8.8/32'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkAllowOut': ['1.1.1.0/24', '8.8.8.8/32'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "ubuntu:22.04",
+        NetworkAllowOut: []string{"1.1.1.0/24", "8.8.8.8/32"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_allow_out: Some(vec!["1.1.1.0/24".to_string(), "8.8.8.8/32".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.List;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkAllowOut(List.of("1.1.1.0/24", "8.8.8.8/32"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+To do the opposite, block a few ranges and allow the rest, pass the list to `networkDenyOut`:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      networkDenyOut: ['10.0.0.0/8'], // block the internal range, allow the rest
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'networkDenyOut': ['10.0.0.0/8'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "ubuntu:22.04",
+        NetworkDenyOut: []string{"10.0.0.0/8"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        network_deny_out: Some(vec!["10.0.0.0/8".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import java.util.List;
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setNetworkDenyOut(List.of("10.0.0.0/8"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The lists are saved with the sandbox. They come back after a stop and start, and after the server restarts, the same as `networkBlockAll`.
+
+### Use both lists together
+
+You can set both lists. The server decides each connection in this order:
+
+1. A destination in `networkAllowOut` is allowed.
+2. Otherwise, a destination in `networkDenyOut` is dropped.
+3. Anything else is allowed.
+
+So to make the allow list the only way out, also set `networkDenyOut` to `['0.0.0.0/0']` (every IPv4 address). That deny list on its own blocks everything, the same as `networkBlockAll`.
+
+The deny list takes address ranges only. The allow list also takes website names, such as `pypi.org`. See [Allow only some websites](/network-access/#allow-only-some-websites).
+
+To change the lists while the sandbox runs, use `setNetworkPolicy`. See [Change the policy of a running sandbox](/advanced-network-rules/#change-the-policy-of-a-running-sandbox).
+
+## Change the policy of a running sandbox
+
+`setNetworkPolicy` replaces the sandbox's whole outbound policy while it runs. Any list you leave out is cleared, so an empty call gives full internet access. The call returns once the new policy is in force. Connections the new policy does not allow are closed.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.setNetworkPolicy({
+      networkAllowOut: ['pypi.org', '*.pythonhosted.org', 'registry.npmjs.org'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.set_network_policy({
+        'networkAllowOut': ['pypi.org', '*.pythonhosted.org', 'registry.npmjs.org'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: []string{"pypi.org", "*.pythonhosted.org", "registry.npmjs.org"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    // set_network_policy updates the sandbox value, so declare it with `let mut sandbox`.
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "registry.npmjs.org".to_string(),
+        ],
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.setNetworkPolicy(
+        new NetworkPolicyOptions()
+            .setNetworkAllowOut(List.of("pypi.org", "*.pythonhosted.org", "registry.npmjs.org"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+- **Safe to retry.** Sending the policy a sandbox already has changes nothing.
+- **Never open, even for a moment.** Outbound traffic is shut during the swap, so neither the old policy nor the new one is ever skipped.
+- **Stopped sandboxes** keep the new policy and apply it when they start.
+- **A sandbox that is still being created** answers `409`. Retry once it is up.
+- **Failures** return `503` with a code that says what happened:
+
+| Code | What it means |
+|---|---|
+| `spec_commit_failed` | Nothing changed. In a cluster, the new policy could not be saved. |
+| `apply_failed_held` | The policy is saved but could not be applied. The sandbox has no outbound traffic until a retry succeeds. |
+
+## Check the filter's state
+
+For Docker, containerd and gVisor sandboxes, a separate filter service on each server does the name checks. (containerd is another container engine, like Docker.) It is called the egress gateway. If it is down, sandboxes that use names lose all outbound traffic instead of running unfiltered. `get` tells you which state a sandbox is in:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const current = await client.get(sandbox.id)
+    console.log(current.egressStatus) // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    current = client.get(sandbox.id)
+    print(getattr(current, 'egressStatus', None))  # "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    current, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        return err
+    }
+    fmt.Println(current.EgressStatus) // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let current = client.get(&sandbox.data.id)?;
+    println!("{:?}", current.data.egress_status); // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox current = client.get(sandbox.id);
+    System.out.println(current.egressStatus); // "active", "held" or "unavailable"
+    ```
+  </TabItem>
+</Tabs>
+
+| Status | What it means |
+|---|---|
+| `active` | The filter is working as listed. |
+| `unavailable` | The filter service is down or restarting. Traffic comes back by itself within seconds of it returning. |
+| `held` | The policy could not be applied. The sandbox gets no outbound traffic until it can be. |
+
+A create that lists names while the server's filter cannot take it returns `503`, with code `egress_gateway_unavailable` and a `Retry-After` header. Retry it. In a cluster, these creates only go to servers whose filter is ready.
+
+## Reusable allow lists
+
+Many sandboxes often need the same outbound access, such as a package mirror, a code host and an internal API. Copying that list into every create gets out of date fast. A **profile** is a named allow list you keep in one place. Sandboxes use it by name, and when you change it, every sandbox that uses it gets the change.
+
+This page also covers two helpers. **Learn mode** records what a trusted run connects to and suggests a list. **Policy check** tests a list without creating a sandbox.
+
+Profiles hold the same entries as [Allow only some websites](/network-access/#allow-only-some-websites): names, `*.` wildcards, `host:port` and IP address ranges. If allow lists are new to you, start there.
+
+### Create a profile and use it
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await client.putEgressProfile('python-deps', {
+      allowOut: ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+      description: 'pip and git over ssh',
+    })
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    client.put_egress_profile('python-deps', {
+        'allowOut': ['pypi.org', '*.pythonhosted.org', 'github.com:22'],
+        'description': 'pip and git over ssh',
+    })
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := client.PutEgressProfile(ctx, "python-deps", sdktypes.EgressProfileOptions{
+        AllowOut:    []string{"pypi.org", "*.pythonhosted.org", "github.com:22"},
+        Description: "pip and git over ssh",
+    })
+    if err != nil {
+        return err
+    }
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"python-deps"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    client.put_egress_profile("python-deps", EgressProfileOptions {
+        allow_out: vec![
+            "pypi.org".to_string(),
+            "*.pythonhosted.org".to_string(),
+            "github.com:22".to_string(),
+        ],
+        description: "pip and git over ssh".to_string(),
+    })?;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["python-deps".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    client.putEgressProfile("python-deps", new EgressProfileOptions()
+        .setAllowOut(List.of("pypi.org", "*.pythonhosted.org", "github.com:22"))
+        .setDescription("pip and git over ssh"));
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("python-deps"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+The sandbox can reach its own `networkAllowOut` entries plus the entries of every profile it uses. Putting a profile replaces all of it. Sending the same body again changes nothing, so it is safe to retry.
+
+| Rule | Detail |
+|---|---|
+| Profile names | Lower-case letters, digits, `.`, `_` and `-`, up to 63 characters, starting with a letter or digit. They belong to your account, like sandbox names. |
+| Size of one profile | Up to 512 names. |
+| Profiles per sandbox | Up to 16. |
+| Total per sandbox | At most 1024 names across the sandbox's own list and all its profiles. Each list counts on its own, so a name in two lists can count twice. |
+| Block-all | `networkBlockAll` together with `egressProfiles` is refused. |
+
+To allow only some methods or paths on a site a profile allows, add [rules](#allow-only-some-requests) to the sandbox. If a later profile change drops that site, its rules stop mattering: the site is refused anyway.
+
+### Change a profile
+
+Put the profile again with its new entries. Each change raises its `generation` number. Each sandbox reports the generation it is using in `egressProfilesApplied`, so you can tell when a change has reached it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const profile = await client.putEgressProfile('python-deps', {
+      allowOut: ['pypi.org', '*.pythonhosted.org'],
+    })
+    const current = await client.get(sandbox.id)
+    console.log(profile.generation, current.egressProfilesApplied)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    profile = client.put_egress_profile('python-deps', {
+        'allowOut': ['pypi.org', '*.pythonhosted.org'],
+    })
+    current = client.get(sandbox.id)
+    print(profile['generation'], getattr(current, 'egressProfilesApplied', None))
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    profile, err := client.PutEgressProfile(ctx, "python-deps", sdktypes.EgressProfileOptions{
+        AllowOut: []string{"pypi.org", "*.pythonhosted.org"},
+    })
+    if err != nil {
+        return err
+    }
+    current, err := client.Get(ctx, sandbox.ID)
+    if err != nil {
+        return err
+    }
+    fmt.Println(profile.Generation, current.EgressProfilesApplied)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let profile = client.put_egress_profile("python-deps", EgressProfileOptions {
+        allow_out: vec!["pypi.org".to_string(), "*.pythonhosted.org".to_string()],
+        ..Default::default()
+    })?;
+    let current = client.get(&sandbox.data.id)?;
+    println!("{} {:?}", profile.generation, current.data.egress_profiles_applied);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfile profile = client.putEgressProfile("python-deps", new EgressProfileOptions()
+        .setAllowOut(List.of("pypi.org", "*.pythonhosted.org")));
+    Sandbox current = client.get(sandbox.id);
+    System.out.println(profile.generation + " " + current.egressProfilesApplied);
+    ```
+  </TabItem>
+</Tabs>
+
+- **When it applies.** The server you sent the change to applies it to its sandboxes at once. In a cluster, every other server applies it to its own sandboxes within about 30 seconds. Connections the narrower profile no longer allows are closed.
+- **Changes that are refused.** A change that would push some sandbox past the 1024-name total is refused with `409` (`egress_profile_cap_exceeded`). The error names those sandboxes, and nothing changes.
+- **When one sandbox cannot take it.** That sandbox is shut off from the internet (`egressStatus: "held"`) rather than left on the old list. The change is retried every 10 seconds.
+
+To change which profiles a running sandbox uses, call `setNetworkPolicy` with `egressProfiles`. See [Change the policy of a running sandbox](/advanced-network-rules/#change-the-policy-of-a-running-sandbox).
+
+### List and delete profiles
+
+`listEgressProfiles` returns your profiles a page at a time, sorted by name. Pass `nextCursor` back as `cursor` for the next page.
+
+`deleteEgressProfile` is refused with `409` (`egress_profile_in_use`) while any sandbox still uses the profile. Deleting a profile that is already gone succeeds.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await client.listEgressProfiles({ limit: 50 })
+    for (const p of page.profiles) console.log(p.name, p.generation)
+    await client.deleteEgressProfile('python-deps')
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = client.list_egress_profiles({'limit': 50})
+    for p in page['profiles']:
+        print(p['name'], p['generation'])
+    client.delete_egress_profile('python-deps')
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := client.ListEgressProfiles(ctx, sdktypes.ListEgressProfilesOptions{Limit: 50})
+    if err != nil {
+        return err
+    }
+    for _, p := range page.Profiles {
+        fmt.Println(p.Name, p.Generation)
+    }
+    err = client.DeleteEgressProfile(ctx, "python-deps")
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = client.list_egress_profiles(ListEgressProfilesOptions {
+        limit: Some(50),
+        ..Default::default()
+    })?;
+    for p in &page.profiles {
+        println!("{} {}", p.name, p.generation);
+    }
+    client.delete_egress_profile("python-deps")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfileList page = client.listEgressProfiles(new ListEgressProfilesOptions().setLimit(50));
+    for (EgressProfile p : page.profiles) {
+        System.out.println(p.name + " " + p.generation);
+    }
+    client.deleteEgressProfile("python-deps");
+    ```
+  </TabItem>
+</Tabs>
+
+### Built-in profiles
+
+AerolVM comes with allow lists for common package registries and code hosts. Use one as `builtin:<name>` anywhere you would use your own profile, alone or next to yours.
+
+| Name | Covers |
+|---|---|
+| `builtin:pypi` | pip: `pypi.org` and `files.pythonhosted.org` |
+| `builtin:npm` | the npm and Yarn registries |
+| `builtin:github` | `github.com`, its API, raw files, release downloads, `git` over SSH, and `ghcr.io` |
+| `builtin:huggingface` | `huggingface.co` and its download hosts |
+| `builtin:golang-proxy` | the Go module proxy and checksum database |
+| `builtin:crates` | `crates.io` and its download host |
+| `builtin:apt-ubuntu` | the Ubuntu archive and security mirrors |
+| `builtin:docker-hub` | Docker Hub's registry, token service and download hosts (Cloudflare, R2, and Docker's S3 bucket in `us-east-1`), for tools like `crane`. On AWS, Docker Hub serves downloads from its bucket in your region. Outside `us-east-1`, add that bucket's host to your own list. |
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['builtin:pypi', 'builtin:github'],
+    })
+    console.log(sandbox.egressProfiles) // ['builtin:pypi@20261006', 'builtin:github@20261006']
+
+    const pypi = await client.getEgressProfile('builtin:pypi')
+    console.log(pypi.allowOut)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['builtin:pypi', 'builtin:github'],
+    })
+    print(sandbox.egressProfiles)  # ['builtin:pypi@20261006', 'builtin:github@20261006']
+
+    pypi = client.get_egress_profile('builtin:pypi')
+    print(pypi['allowOut'])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"builtin:pypi", "builtin:github"},
+    })
+    if err != nil {
+        return err
+    }
+    fmt.Println(sandbox.EgressProfiles) // [builtin:pypi@20261006 builtin:github@20261006]
+
+    pypi, err := client.GetEgressProfile(ctx, "builtin:pypi")
+    if err != nil {
+        return err
+    }
+    fmt.Println(pypi.AllowOut)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["builtin:pypi".to_string(), "builtin:github".to_string()]),
+        ..Default::default()
+    })?;
+    println!("{:?}", sandbox.data.egress_profiles); // builtin:pypi@20261006, builtin:github@20261006
+
+    let pypi = client.get_egress_profile("builtin:pypi")?;
+    println!("{:?}", pypi.allow_out);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("builtin:pypi", "builtin:github"))
+    );
+    System.out.println(sandbox.egressProfiles); // [builtin:pypi@20261006, builtin:github@20261006]
+
+    EgressProfile pypi = client.getEgressProfile("builtin:pypi");
+    System.out.println(pypi.allowOut);
+    ```
+  </TabItem>
+</Tabs>
+
+- **Fixed when you create the sandbox.** `builtin:pypi` is saved as `builtin:pypi@<YYYYMMDD>`, the date of the list the server had at create. Upgrading AerolVM never changes what a running sandbox can reach. To move a sandbox to the newest list, call `setNetworkPolicy` with the plain name again. You can also ask for a dated version yourself.
+- **Read-only.** You can read a built-in list with `getEgressProfile` (the plain name gives the newest version). You cannot change or delete it. It counts toward the 16-profile and 1024-name limits like any other profile.
+- **During an upgrade.** A sandbox can be pinned to a list newer than its server has. This can happen after a failover in the middle of a rolling upgrade. That sandbox gets no outbound traffic and shows `egressStatus: "unavailable"` until it runs on a server with that version. A new create that asks for such a version on an older server gets `503`. Retry it.
+- **Missing a host?** The lists are kept up by hand. If a tool needs a host that a list lacks, add it to `networkAllowOut` next to the built-in list.
+- **Turned off.** Your operator can turn built-in lists off. Then a create or policy change that names one gets `400` "built-in profiles disabled on this deployment". Sandboxes that already use one keep it.
+
+### Org profiles
+
+On a private network, your operator can publish allow lists for everyone on the deployment as `org:<name>` profiles. An example is the company's package mirrors. Every account can read them and use them like its own. Only the operator can change them.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const mirrors = await client.getEgressProfile('org:mirrors')
+    console.log(mirrors.allowOut, mirrors.description)
+
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      egressProfiles: ['org:mirrors', 'python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    mirrors = client.get_egress_profile('org:mirrors')
+    print(mirrors['allowOut'], mirrors.get('description'))
+
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'egressProfiles': ['org:mirrors', 'python-deps'],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    mirrors, err := client.GetEgressProfile(ctx, "org:mirrors")
+    if err != nil {
+        return err
+    }
+    fmt.Println(mirrors.AllowOut, mirrors.Description)
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:          "python:3.12",
+        EgressProfiles: []string{"org:mirrors", "python-deps"},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mirrors = client.get_egress_profile("org:mirrors")?;
+    println!("{:?} {}", mirrors.allow_out, mirrors.description);
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        egress_profiles: Some(vec!["org:mirrors".to_string(), "python-deps".to_string()]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    EgressProfile mirrors = client.getEgressProfile("org:mirrors");
+    System.out.println(mirrors.allowOut + " " + mirrors.description);
+
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEgressProfiles(List.of("org:mirrors", "python-deps"))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+- **Not fixed at create.** Unlike built-in lists, a sandbox follows its org profiles. When the operator edits one, every sandbox that uses it gets the change within about 10 seconds, and `generation` changes.
+- **The default policy.** The operator's default policy may name org profiles. Then a sandbox created with no outbound settings uses them, so it follows edits too.
+- **When one goes away.** The operator might remove an org profile a sandbox uses, or grow it past the 1024-name total for that sandbox. Then the sandbox is shut off (`egressStatus: "held"`) until the operator fixes it.
+- **Unknown names** are refused with `400`, at create and in `setNetworkPolicy`.
+- **Not in the list.** Org profiles do not appear in `listEgressProfiles`. Your operator tells you their names.
+
+## Learn an allow list
+
+Writing an allow list for code you did not write is guesswork. **Learn mode** gives a sandbox full internet access for one trusted run and records every destination it reaches. When you read the recording, it comes with the allow list that would have allowed that run. You can then use it to lock the sandbox down.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: 'python:3.12', networkEgressMode: 'learn' })
+    await sandbox.exec('pip install requests')
+
+    const learned = await sandbox.learned()
+    console.log(learned.entries.map((e) => e.host))
+    await sandbox.setNetworkPolicy({ networkAllowOut: learned.suggestedAllowOut })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({'image': 'python:3.12', 'networkEgressMode': 'learn'})
+    sandbox.exec_command('pip install requests')
+
+    learned = sandbox.learned()
+    print([e['host'] for e in learned['entries']])
+    sandbox.set_network_policy({'networkAllowOut': learned['suggestedAllowOut']})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:             "python:3.12",
+        NetworkEgressMode: sdktypes.NetworkEgressModeLearn,
+    })
+    if err != nil {
+        return err
+    }
+    if _, err := sandbox.ExecCommand(ctx, "pip install requests"); err != nil {
+        return err
+    }
+    learned, err := sandbox.Learned(ctx)
+    if err != nil {
+        return err
+    }
+    _, err = sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: learned.SuggestedAllowOut,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let mut sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_egress_mode: Some("learn".to_string()),
+        ..Default::default()
+    })?;
+    sandbox.exec(ExecRequest {
+        command: "pip install requests".to_string(),
+        ..Default::default()
+    })?;
+
+    let learned = sandbox.learned()?;
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: learned.suggested_allow_out,
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions().setImage("python:3.12").setNetworkEgressMode("learn"));
+    sandbox.exec("pip install requests");
+
+    NetworkLearned learned = sandbox.learned();
+    sandbox.setNetworkPolicy(new NetworkPolicyOptions().setNetworkAllowOut(learned.suggestedAllowOut));
+    ```
+  </TabItem>
+</Tabs>
+
+<Aside type="caution">
+A sandbox in learn mode can reach anything. Use it only for code you trust. Switch the sandbox to an allow list, as above, before any untrusted code runs.
+</Aside>
+
+- **Every connection is logged.** Each one goes into the [audit log](/network-access/#see-what-was-refused) with the reason `learn_mode`.
+- **No lists with it.** Learn mode takes no allow or deny lists, no profiles and no block-all. It is never a default.
+- **How the suggestion is built.** Three or more names under one domain become `*.domain` (never a public suffix such as `*.com`). Ports other than the web ports stay as `host:port`. Addresses reached without a name become single-address ranges.
+- **Large suggestions.** If the suggestion holds more than 64 names, it comes back as `suggestedProfile` instead of `suggestedAllowOut`. That is a ready body for `putEgressProfile`.
+- **Size limit.** A recording holds up to 1024 destinations. Past that, `truncated` is `true` and new destinations are not recorded.
+- **How long it lasts.** A recording stays readable after the sandbox switches to an allow list. It goes away when the sandbox is destroyed. It is not copied to other servers, so a sandbox recreated on another server after a failure starts a new recording. A WASM sandbox's recording lives in its running worker and goes away when it stops.
+
+## Check a policy before you use it
+
+`checkNetworkPolicy` tells you whether a sandbox created with some outbound settings would reach a destination. It uses the same matching the filter uses, and it creates no sandbox. The destination is a host, `host:port`, an IP address, or `IP:port`. A plain host is checked on the web ports (80 and 443).
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const check = await client.checkNetworkPolicy({
+      networkAllowOut: ['*.github.com'],
+      destination: 'api.github.com',
+    })
+    console.log(check.allowed, check.matchedRule) // true "*.github.com"
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    check = client.check_network_policy({
+        'networkAllowOut': ['*.github.com'],
+        'destination': 'api.github.com',
+    })
+    print(check['allowed'], check['matchedRule'])  # True "*.github.com"
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    check, err := client.CheckNetworkPolicy(ctx, sdktypes.NetworkPolicyCheckOptions{
+        NetworkAllowOut: []string{"*.github.com"},
+        Destination:     "api.github.com",
+    })
+    if err != nil {
+        return err
+    }
+    fmt.Println(check.Allowed, check.MatchedRule) // true *.github.com
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let check = client.check_network_policy(NetworkPolicyCheckOptions {
+        network_allow_out: vec!["*.github.com".to_string()],
+        destination: "api.github.com".to_string(),
+        ..Default::default()
+    })?;
+    println!("{} {}", check.allowed, check.matched_rule); // true *.github.com
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    NetworkPolicyCheckResult check = client.checkNetworkPolicy(new NetworkPolicyCheckOptions()
+        .setNetworkAllowOut(List.of("*.github.com"))
+        .setDestination("api.github.com"));
+    System.out.println(check.allowed + " " + check.matchedRule); // true *.github.com
+    ```
+  </TabItem>
+</Tabs>
+
+| Field | What it tells you |
+|---|---|
+| `allowed` | Whether the destination would be reached. |
+| `matchedRule` | The entry that decided. Empty when no entry matched. |
+| `defaultVerdict` | What happens to a destination that no entry matches: `allow` or `deny`. |
+| `outsideCeiling` | An entry that falls outside the limits your operator set. A create with it would be refused. |
+
+The check does not look up names. So a deny range that a name's address falls into is only caught when the sandbox connects.
+
+## Allow only some requests
+
+An allow list decides by website name. Once `api.github.com` is allowed, a sandbox can call any endpoint on it, including ones that change data. **Rules** narrow an allowed site down to the requests you expect, such as `GET /repos/acme/**` and nothing else.
+
+Rules sit on top of an allow list from [Allow only some websites](/network-access/#allow-only-some-websites) or [Reusable allow lists](#reusable-allow-lists). They can only narrow it. A site must be allowed there before a rule can name it.
+
+### Allow some paths on a plain HTTP site
+
+Debian's package mirror uses plain HTTP, so a rule on port 80 needs no extra setup. This sandbox can download packages from `deb.debian.org` and do nothing else there:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'debian:12',
+      networkAllowOut: ['deb.debian.org'],
+      networkEgressRules: [
+        { host: 'deb.debian.org', methods: ['GET'], paths: ['/debian/**', '/debian-security/**'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'debian:12',
+        'networkAllowOut': ['deb.debian.org'],
+        'networkEgressRules': [
+            {'host': 'deb.debian.org', 'methods': ['GET'], 'paths': ['/debian/**', '/debian-security/**']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "debian:12",
+        NetworkAllowOut: []string{"deb.debian.org"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "deb.debian.org",
+            Methods: []string{"GET"},
+            Paths:   []string{"/debian/**", "/debian-security/**"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "debian:12".to_string(),
+        network_allow_out: Some(vec!["deb.debian.org".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "deb.debian.org".to_string(),
+            methods: vec!["GET".to_string()],
+            paths: vec!["/debian/**".to_string(), "/debian-security/**".to_string()],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("debian:12")
+            .setNetworkAllowOut(List.of("deb.debian.org"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("deb.debian.org")
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/debian/**", "/debian-security/**"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+`apt-get update` and `apt-get install` work as before. A `POST`, or a `GET` for any other path on `deb.debian.org`, gets a `403`. The response body says what was refused:
+
+```text
+aerolvm egress policy: GET /admin on deb.debian.org is not allowed by network_egress_rules
+```
+
+A rule on port 80 does not touch HTTPS to the same site. Without an inspect rule, HTTPS is still decided by the name alone.
+
+### Check HTTPS requests too
+
+HTTPS is encrypted, so the filter cannot see a request's method or path. An **inspect rule** (`inspect: true`) lets it look. The server's filter service decrypts the sandbox's HTTPS connection, checks each request, and sends it on over its own HTTPS connection to the real site. A company proxy that inspects HTTPS works the same way.
+
+To do this, the filter shows the sandbox a certificate signed by the server's own certificate authority (CA). A CA is a service that vouches for site certificates. Only a sandbox created with an inspect rule trusts this CA.
+
+A rule on port 443 needs `inspect: true`. This sandbox may read the `acme` organization's repositories through the GitHub API, and do nothing else there:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        { host: 'api.github.com', inspect: true, methods: ['GET'], paths: ['/repos/acme/**'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['GET'], 'paths': ['/repos/acme/**']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "api.github.com",
+            Inspect: true,
+            Methods: []string{"GET"},
+            Paths:   []string{"/repos/acme/**"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec!["api.github.com".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "api.github.com".to_string(),
+            inspect: true,
+            methods: vec!["GET".to_string()],
+            paths: vec!["/repos/acme/**".to_string()],
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("api.github.com"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setMethods(List.of("GET"))
+                .setPaths(List.of("/repos/acme/**"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `GET https://api.github.com/repos/acme/widgets` works the usual way. The program sees a certificate for `api.github.com`, signed by the server's CA, which the sandbox trusts. A `POST` to the same URL, or a `GET` of `https://api.github.com/users/octocat`, gets a `403` from the filter.
+
+Other allowed sites are not affected. Their HTTPS still passes through without being opened.
+
+<Aside type="tip">
+Set inspect rules when you create the sandbox. A Docker, containerd or gVisor sandbox created without one cannot add one later. (containerd is another container engine, like Docker.) If you may want inspection later, start with an inspect rule.
+</Aside>
+
+### How a rule matches
+
+| Field | What it does | Default |
+|---|---|---|
+| `host` | An exact name or a `*.` wildcard, without a port. The allow list (`networkAllowOut` or a [profile](#reusable-allow-lists)) must already allow it, or the create is refused with `400`. | Required |
+| `ports` | The ports the rule covers: 80, or 443 with `inspect: true`. A rule with only `binaries` is the exception: it may name any port the allow list opens, and 443 without `inspect`. | `[80]`, or `[443]` with `inspect` |
+| `methods` | HTTP methods, exact and upper case, like `GET` or `HEAD`. | Any method |
+| `paths` | Path patterns. See the next table. | Any path |
+| `inspect` | Decrypt HTTPS on port 443 so the rule can see each request. | `false` |
+| `inject` | `{header, secretRef}`. Sets `header` on the requests the rule allows, from the env key that `secretRef` names (`env:<KEY>`). Needs `inspect`. See [Keep an API key out of the sandbox](#keep-an-api-key-out-of-the-sandbox). | None |
+| `binaries` | Absolute paths, inside the sandbox, of the programs that may use the rule. Docker and containerd sandboxes on runc only. See [Let only some programs connect](#let-only-some-programs-connect). | Any program |
+
+The names differ a little by SDK. Go uses `Host`, `Ports`, `Inject` with `Header` and `SecretRef`, and so on. Rust uses `secret_ref`. Java uses setters such as `setHost` and `setSecretRef`.
+
+#### Path patterns
+
+A path is split into segments, the parts between slashes. `*` matches any characters inside one segment. `**`, written as a whole segment, matches any number of segments, including none.
+
+| Pattern | Matches | Does not match |
+|---|---|---|
+| `/repos/acme/*` | `/repos/acme/widgets` | `/repos/acme`, `/repos/acme/widgets/issues` |
+| `/repos/acme/**` | `/repos/acme`, `/repos/acme/widgets/issues/1` | `/repos/other/widgets` |
+| `/v1/*.json` | `/v1/index.json` | `/v1/a/index.json` |
+| `/files/**/raw` | `/files/raw`, `/files/a/b/raw` | `/files/a/b` |
+
+#### How rules work together
+
+- **Rules are alternatives.** A request passes when any rule for its host and port allows both its method and its path. A rule with `binaries` must also allow its program. A request that no rule allows gets a `403`. A site that no rule names keeps its allow-list decision.
+- **Paths only.** Rules match the path, not the query string after `?`. A rule's path cannot contain `?`, `#`, `%` or spaces.
+- **No tricky paths.** On a site with rules, some paths are refused with `403` (`path_not_canonical`), because a server could read them as a different path. These are `.` or `..` segments, empty segments (`//`), an encoded slash (`%2F` or `%5C`), and a backslash. This stops `/repos/acme/../../admin` from passing as `/repos/acme/**`. One trailing slash is fine.
+- **Size limits.** Up to 32 rules. Each rule takes up to 16 methods, 32 paths and 16 programs, and each path or program path is at most 256 bytes.
+- **An allow list to narrow.** Rules need website names to narrow. So they are refused with `400` next to `networkBlockAll` or learn mode.
+- **Refusals are logged.** Each one goes into the sandbox's [audit log](/network-access/#see-what-was-refused). The reason is `rule_denied` or `path_not_canonical`. For a rule with `binaries`, it is `binary_not_allowed` or `binary_unknown`.
+
+### What the sandbox trusts
+
+Only a sandbox **created** with at least one inspect rule trusts the server's CA. It gets two files:
+
+| Path | What it holds |
+|---|---|
+| `/etc/aerolvm/egress-ca.pem` | The server's CA certificate, read-only. |
+| `/run/aerolvm/ca-bundle.pem` | A CA bundle: one file that lists every CA a program should trust. It holds the image's usual list plus the server's CA. It is written when the sandbox starts, before your command or any exec runs. |
+
+The sandbox's environment points common HTTPS clients at those files:
+
+| Variable | Points at | Read by |
+|---|---|---|
+| `SSL_CERT_FILE` | the bundle | OpenSSL-based clients, Python's `ssl` and `urllib`, Go on Linux |
+| `REQUESTS_CA_BUNDLE` | the bundle | Python `requests` |
+| `PIP_CERT` | the bundle | pip |
+| `CURL_CA_BUNDLE` | the bundle | curl |
+| `NODE_EXTRA_CA_CERTS` | the CA | Node.js, which adds it to its built-in list |
+| `AEROLVM_EGRESS_CA`, `AEROLVM_EGRESS_CA_BUNDLE` | the CA, the bundle | your own tools |
+
+- **Your settings win.** If the create sets one of these variables itself, it is left alone. So you can point a client at a bundle of your own. Include the server's CA in it.
+- **The system list does not change.** A program that ignores these variables and reads the image's default list will not trust the CA. Point it at the bundle.
+- **One CA per server.** sandboxd creates it the first time a sandbox on the server asks for inspection. It keeps the CA's private key sealed on disk. The filter holds the key in memory only and gives each site a certificate that lasts 24 hours.
+- **Nothing else trusts it.** Sandboxes created without an inspect rule do not get the CA.
+
+### Extra checks on inspected HTTPS
+
+On an inspected connection, the filter checks every request, not just the first one:
+
+| Check | What happens |
+|---|---|
+| The host must match | Each request's `Host` header must equal the site name the program sent when it opened HTTPS. Anything else gets `421` (`host_mismatch`). This blocks domain fronting, a trick where a connection to an allowed site carries requests for another site on the same CDN. |
+| Request bodies have a size limit | A request body over the limit gets `413` (`body_too_large`). The default limit is 256 MiB, and your operator can change it. |
+| Each request meets the current policy | HTTP/1.1 keep-alive and HTTP/2 both work. Each request is checked against the policy at that moment, so a `setNetworkPolicy` change reaches connections that are already open. |
+| The real site is verified | The filter checks the real site's certificate against the server's trusted list. It goes through your operator's outbound proxy when there is one. |
+| Never let through unchecked | If the filter does not have the server's CA, the connection fails with an `access_denied` alert (`inspect_unavailable`). It is never passed through unchecked. |
+
+### Keep an API key out of the sandbox
+
+Anything a sandbox can read, a hijacked agent can send somewhere else. An `inject` rule keeps a key out of the sandbox completely:
+
+1. You pass the key in the create's `env`, as usual, and name it in the rule.
+2. The sandbox only ever sees a placeholder.
+3. The filter puts the real value on the requests the rule allows.
+
+This sandbox can call the GitHub API with a token it cannot leak:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      env: { GITHUB_TOKEN: 'Bearer ghp_...' },
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        {
+          host: 'api.github.com',
+          inspect: true,
+          paths: ['/repos/**'],
+          inject: { header: 'Authorization', secretRef: 'env:GITHUB_TOKEN' },
+        },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'env': {'GITHUB_TOKEN': 'Bearer ghp_...'},
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {
+                'host': 'api.github.com',
+                'inspect': True,
+                'paths': ['/repos/**'],
+                'inject': {'header': 'Authorization', 'secretRef': 'env:GITHUB_TOKEN'},
+            },
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        Env:             map[string]string{"GITHUB_TOKEN": "Bearer ghp_..."},
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{{
+            Host:    "api.github.com",
+            Inspect: true,
+            Paths:   []string{"/repos/**"},
+            Inject:  &sdktypes.EgressInject{Header: "Authorization", SecretRef: "env:GITHUB_TOKEN"},
+        }},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use std::collections::HashMap;
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        env: Some(HashMap::from([("GITHUB_TOKEN".to_string(), "Bearer ghp_...".to_string())])),
+        network_allow_out: Some(vec!["api.github.com".to_string()]),
+        network_egress_rules: Some(vec![EgressRule {
+            host: "api.github.com".to_string(),
+            inspect: true,
+            paths: vec!["/repos/**".to_string()],
+            inject: Some(EgressInject {
+                header: "Authorization".to_string(),
+                secret_ref: "env:GITHUB_TOKEN".to_string(),
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setEnv(Map.of("GITHUB_TOKEN", "Bearer ghp_..."))
+            .setNetworkAllowOut(List.of("api.github.com"))
+            .setNetworkEgressRules(List.of(new EgressRule()
+                .setHost("api.github.com")
+                .setInspect(true)
+                .setPaths(List.of("/repos/**"))
+                .setInject(new EgressInject()
+                    .setHeader("Authorization")
+                    .setSecretRef("env:GITHUB_TOKEN"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `GITHUB_TOKEN` holds `aerolvm-placeholder:GITHUB_TOKEN`. Code there sends its requests the usual way, for example with `Authorization: $GITHUB_TOKEN`. `api.github.com` receives `Authorization: Bearer ghp_...`.
+
+What the rule does with the key:
+
+- **The value is the whole header.** The filter replaces the header. It does not fill in part of it. So put the scheme in the env value, as in `Bearer ghp_...` or `token ghp_...`. Whatever the sandbox sends in that header, or if it sends nothing, the site receives the real value.
+- **Headers only.** The value is only ever set as the header the rule names. It is never written into a body, a URL or another header. A placeholder the sandbox puts anywhere else reaches the site as a placeholder.
+- **Only on requests the rule allows.** The header is set only on requests that match this rule's host, method and path. A request to another site carries what the sandbox sent, which is at most the placeholder.
+- **The sandbox never holds it.** Docker, containerd and gVisor sandboxes get the placeholder in their environment. The filter keeps the real value in memory and never writes it to its disk. A hijacked agent cannot send a key it never had.
+- **Never sent with the placeholder.** If the filter does not have the value, the request is refused with `403` (`secret_missing`). It is not sent without the key.
+- **The audit log shows names, not values.** The [audit log](/network-access/#see-what-was-refused) names an inject rule by its header and reference, such as `rules[0] api.github.com (inject Authorization from env:GITHUB_TOKEN)`. It never shows the value.
+- **A new key means a new sandbox.** A sandbox's env cannot change after create. To use a new token, recreate the sandbox with it.
+
+What the rule needs:
+
+- **`inspect: true`.** The key is only added inside the filter's own HTTPS connection. An `inject` rule on port 80 is refused with `400`.
+- **A key in `env`.** `secretRef` is `env:<KEY>`, and that key must be in the create's `env` (`400` otherwise).
+- **A header you are allowed to set.** Headers that frame or route a request are refused with `400`: `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`, `Keep-Alive`, `Proxy-Authorization` and `Proxy-Connection`.
+
+On a V8 isolate sandbox, the code never sees its env at all, so nothing is replaced with a placeholder. The isolate's outbound proxy sets the header from the sandbox's sealed env. A missing value gets the same `secret_missing` refusal.
+
+### Let only some programs connect
+
+A rule's `binaries` field names the programs in the sandbox that may use it. This sandbox lets `ssh` reach `github.com` on port 22, which git uses for SSH remotes. It lets `pip` reach `pypi.org` over HTTPS. No other program in the sandbox can make either connection:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'python:3.12',
+      networkAllowOut: ['github.com:22', 'pypi.org'],
+      networkEgressRules: [
+        { host: 'github.com', ports: [22], binaries: ['/usr/bin/ssh'] },
+        { host: 'pypi.org', ports: [443], binaries: ['/usr/local/bin/pip'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'python:3.12',
+        'networkAllowOut': ['github.com:22', 'pypi.org'],
+        'networkEgressRules': [
+            {'host': 'github.com', 'ports': [22], 'binaries': ['/usr/bin/ssh']},
+            {'host': 'pypi.org', 'ports': [443], 'binaries': ['/usr/local/bin/pip']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "python:3.12",
+        NetworkAllowOut: []string{"github.com:22", "pypi.org"},
+        NetworkEgressRules: []sdktypes.EgressRule{
+            {Host: "github.com", Ports: []uint16{22}, Binaries: []string{"/usr/bin/ssh"}},
+            {Host: "pypi.org", Ports: []uint16{443}, Binaries: []string{"/usr/local/bin/pip"}},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let rule = |host: &str, port: u16, binary: &str| EgressRule {
+        host: host.to_string(),
+        ports: vec![port],
+        binaries: vec![binary.to_string()],
+        ..Default::default()
+    };
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".to_string(),
+        network_allow_out: Some(vec!["github.com:22".to_string(), "pypi.org".to_string()]),
+        network_egress_rules: Some(vec![
+            rule("github.com", 22, "/usr/bin/ssh"),
+            rule("pypi.org", 443, "/usr/local/bin/pip"),
+        ]),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("python:3.12")
+            .setNetworkAllowOut(List.of("github.com:22", "pypi.org"))
+            .setNetworkEgressRules(List.of(
+                new EgressRule().setHost("github.com").setPorts(List.of(22))
+                    .setBinaries(List.of("/usr/bin/ssh")),
+                new EgressRule().setHost("pypi.org").setPorts(List.of(443))
+                    .setBinaries(List.of("/usr/local/bin/pip"))))
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Inside the sandbox, `git clone git@github.com:acme/widgets.git` connects, and pip reads the package index on `pypi.org`. `curl https://pypi.org/simple/` is refused. So is a Python script that opens its own connection to either site.
+
+pip downloads the packages themselves from `files.pythonhosted.org`. A sandbox that installs packages allows that site too, with the same kind of rule.
+
+How the filter decides which program it is:
+
+- **By the file at the path.** Each entry is a clean absolute path inside the sandbox, such as `/usr/bin/ssh`. The filter compares the program with the file at that path by its identity on disk (device and inode number). A copy of the program somewhere else does not count.
+- **The program that holds the connection.** What counts is the process that holds the connection, not the one that started it. git runs `ssh` for SSH remotes and `git-remote-https` for HTTPS ones. So a rule for git's traffic names those, and it allows any use of them, not only git's. A child that a listed program starts is not allowed on its behalf.
+- **Scripts count for interpreters.** For an interpreter (python, node, ruby, perl, php, a shell or busybox), the script it runs counts too. This works when the script is started by its absolute path, as a `#!` script is. That is how `/usr/local/bin/pip`, a Python script, works. `python -m pip` runs as `python`, so a `pip` rule does not allow it.
+
+How program rules combine with the rest:
+
+- **Whole connections, on any port.** A rule with only `binaries` decides whole connections. It has no `methods`, `paths`, `inject` or `inspect`. So it can name any port the allow list opens, such as `github.com:22`, and 443 without inspection.
+- **Set the ports.** Without `ports`, a rule covers port 80 only. A rule covers only its own ports, so the `pypi.org` rule above leaves port 80 to the allow list.
+- **With methods and paths.** A rule that also has `methods` and `paths` (and `inspect` on 443) applies its request checks only to the listed programs. Rules for one site are alternatives, so a request passes if any rule allows both its program and its method and path.
+- **Refused, never let through.** A connection from a program that no rule for its site and port allows is refused. On 443 it gets an `access_denied` alert. On 80 it gets a `403` that names `network_egress_rules` binaries. On other ports the connection is closed at once.
+- **Audit reasons.** The reason is `binary_not_allowed`. It is `binary_unknown` when the filter could not trace the connection to a program, which it then refuses.
+- **TCP only.** UDP traffic to a site and port that a program rule covers is refused.
+
+<Aside type="caution">
+Program rules keep trusted tools to the sites they need. They do not contain a hostile process. Root in the sandbox can replace a listed program. Code that controls an interpreter's environment, such as `PYTHONPATH`, runs under the script's name.
+</Aside>
+
+Program rules work only on Docker and containerd sandboxes that use runc, the standard container runner. Other sandbox types refuse `binaries` with `501`. See [Which sandbox types support it](#which-sandbox-types-support-rules).
+
+### Change rules on a running sandbox
+
+`setNetworkPolicy` replaces the rules along with the rest of the outbound policy. This call adds a second rule, so the sandbox can also open issues:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    await sandbox.setNetworkPolicy({
+      networkAllowOut: ['api.github.com'],
+      networkEgressRules: [
+        { host: 'api.github.com', inspect: true, methods: ['GET'], paths: ['/repos/acme/**'] },
+        { host: 'api.github.com', inspect: true, methods: ['POST'], paths: ['/repos/acme/*/issues'] },
+      ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox.set_network_policy({
+        'networkAllowOut': ['api.github.com'],
+        'networkEgressRules': [
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['GET'], 'paths': ['/repos/acme/**']},
+            {'host': 'api.github.com', 'inspect': True, 'methods': ['POST'], 'paths': ['/repos/acme/*/issues']},
+        ],
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    _, err := sandbox.SetNetworkPolicy(ctx, sdktypes.NetworkPolicyOptions{
+        NetworkAllowOut: []string{"api.github.com"},
+        NetworkEgressRules: []sdktypes.EgressRule{
+            {Host: "api.github.com", Inspect: true, Methods: []string{"GET"}, Paths: []string{"/repos/acme/**"}},
+            {Host: "api.github.com", Inspect: true, Methods: []string{"POST"}, Paths: []string{"/repos/acme/*/issues"}},
+        },
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let rule = |method: &str, path: &str| EgressRule {
+        host: "api.github.com".to_string(),
+        inspect: true,
+        methods: vec![method.to_string()],
+        paths: vec![path.to_string()],
+        ..Default::default()
+    };
+    // set_network_policy updates the sandbox value, so declare it with `let mut sandbox`.
+    sandbox.set_network_policy(NetworkPolicyOptions {
+        network_allow_out: vec!["api.github.com".to_string()],
+        network_egress_rules: vec![rule("GET", "/repos/acme/**"), rule("POST", "/repos/acme/*/issues")],
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    sandbox.setNetworkPolicy(new NetworkPolicyOptions()
+        .setNetworkAllowOut(List.of("api.github.com"))
+        .setNetworkEgressRules(List.of(
+            new EgressRule().setHost("api.github.com").setInspect(true)
+                .setMethods(List.of("GET")).setPaths(List.of("/repos/acme/**")),
+            new EgressRule().setHost("api.github.com").setInspect(true)
+                .setMethods(List.of("POST")).setPaths(List.of("/repos/acme/*/issues")))));
+    ```
+  </TabItem>
+</Tabs>
+
+- **A full replace.** Rules you leave out are removed, as with every field of `setNetworkPolicy`. A policy with no rules leaves each site to the allow list. The sandbox's `networkEgressRules` shows the new list.
+- **Inspection starts at create.** Trusting the CA is set up when the sandbox is created. On a Docker, containerd or gVisor sandbox created without an inspect rule, adding one is refused with `409` "recreate the sandbox with inspect rules". A sandbox created with one can add, change and remove inspect rules freely, and keeps trusting the CA.
+- **Injected keys are chosen at create.** On Docker, containerd and gVisor, a later policy can inject only keys that an inject rule named at create. Only those keys were kept out of the sandbox. Any other key is refused with `409` "recreate the sandbox with this inject rule". The sandbox already holds that value in plain form, so injecting it would protect nothing. On a V8 isolate, any key in the sandbox's env can be injected (`400` if it is not there).
+- **Safe to retry.** Sending the same policy again changes nothing.
+
+## Which sandbox types support rules
+
+| Runtime (kind of sandbox) | Method, path, inspect and inject rules | `binaries` |
+|---|---|---|
+| Docker, containerd | Yes, through the server's filter service. Inspect rules use the server's CA. Inject rules leave a placeholder in the sandbox's env. | Yes, on runc |
+| gVisor | Yes, as on Docker and containerd | No (`501`). The filter traces each connection to its program from outside the sandbox, and gVisor's own network layer hides that. |
+| V8 isolate | Yes, all of them, with no CA. The isolate's outbound proxy already sees each request in plain form, and the sandbox never sees its env. | No (`501`) |
+| WASM | No (`501`) | No (`501`) |
+| Firecracker | No (`501`) | No (`501`) |
+
+## More about inbound traffic
+
+Inbound traffic (traffic coming in from the internet) is private by default.
+
+A private sandbox has no public `<sandbox-id>.<domain>` address, and its public URL is empty. You can still run commands, copy files and connect over SSH. Those go through the server directly, not through the public address.
+
+There are two ways to make a sandbox public:
+
+1. **Call `exposePort`.** Asking for a public port is your consent. The first call on a private sandbox makes it public, sets up its `<sandbox-id>.<domain>` address, and then publishes the port. See [Public URLs](/public-urls/).
+2. **Set `allowPublicTraffic: true` when you create it.** Use this if you want the sandbox's address to work from the start, before you publish any port.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'ubuntu:22.04',
+      allowPublicTraffic: true,
+    })
+    // sandbox.publicURL works from the start, before any exposePort call.
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'ubuntu:22.04',
+        'allowPublicTraffic': True,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    publicOn := true
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:              "ubuntu:22.04",
+        AllowPublicTraffic: &publicOn,
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".to_string(),
+        allow_public_traffic: Some(true),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("ubuntu:22.04")
+            .setAllowPublicTraffic(true)
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+Good to know:
+
+- **Public is for good.** Once you publish a port, the sandbox stays public, even if you later unpublish every port.
+- **`false` is the same as leaving it out.** The sandbox starts private, and a later `exposePort` call still makes it public.
+- **A custom domain does not make a sandbox public.** Adding one to a private sandbox returns an error. Publish a port first, or create the sandbox with `allowPublicTraffic: true`.
+- **Private sandboxes start a little faster.** The server skips setting up a public address while it creates them.
+- **Daytona and E2B apps are public by default.** The [Daytona SDK](/using-daytona-sdk/) `public` field sets this flag, and leaving it out means `true`, as on Daytona. The [E2B SDK](/using-e2b-sdk/) always turns it on, because E2B sandboxes are public by design.
+
+### Blocking outbound traffic does not close published ports
+
+`networkBlockAll` and the lists only affect traffic going out. A port you publish still answers requests from the internet:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    // Expose port 80 to the public internet
+    const exposure = await sandbox.exposePort(80)
+    console.log(`Access the isolated sandbox at: ${exposure.url}`)
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    exposure = sandbox.expose_port(80)
+    print(f"Access the isolated sandbox at: {exposure.url}")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    exposure, err := sandbox.ExposePort(ctx, 80)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("Access the isolated sandbox at: %s\n", exposure.PublicURL)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ExposeOptions;
+
+    let exposure = sandbox.expose_port(80, ExposeOptions::http())?;
+    if let aerolvm_sdk::ExposeResult::Http { url } = exposure {
+        println!("Access the isolated sandbox at: {}", url);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.model.ExposeResult;
+
+    ExposeResult exposure = sandbox.exposePort(80);
+    System.out.println("Access the isolated sandbox at: " + exposure.url);
+    ```
+  </TabItem>
+</Tabs>
+
+The app inside answers on its public URL, even though the sandbox cannot start a connection to the internet itself.
+
+## Make your app accept the public address
+
+Every web request carries a `Host` header with the address the visitor used. For a published port, that is the sandbox's own address, such as `<sandbox-id>-3000.<your-domain>`. Many dev servers and frameworks refuse requests for an address they do not know:
+
+- Vite (`server.allowedHosts`): "Blocked request. This host is not allowed."
+- webpack-dev-server (`allowedHosts`)
+- Django (`ALLOWED_HOSTS`) and Rails host authorization
+
+Set `maskRequestHost` to a value your app accepts, usually `localhost`. The public URL stays the same. Only the `Host` header your app sees changes. Leave it unset to pass the header through as it is.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: 'node:22',
+      maskRequestHost: 'localhost',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create({
+        'image': 'node:22',
+        'maskRequestHost': 'localhost',
+    })
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:           "node:22",
+        MaskRequestHost: "localhost",
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "node:22".to_string(),
+        mask_request_host: Some("localhost".to_string()),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions()
+            .setImage("node:22")
+            .setMaskRequestHost("localhost")
+    );
+    ```
+  </TabItem>
+</Tabs>
+
+This works on HTTP ports only. It also applies when a request wakes a paused sandbox. Raw [TCP and TLS ports](/tcp-ports/) carry no `Host` header, so the setting does nothing there.
+
+## From the E2B SDK
+
+The [E2B SDK](/using-e2b-sdk/) compatibility layer maps `network.allowOut` and `network.denyOut` onto the same rules. That works on create and through `updateNetwork` on a running sandbox.
+
+One case reads more strictly here than on E2B. `allowOut` with no `denyOut` is an allow list here, but E2B would allow everything. `allowOut` together with `denyOut: [ALL_TRAFFIC]` means the same on both, so use that form.
+
+- **Profiles and learn mode.** `updateNetwork` keeps a sandbox's profiles, since the E2B API has no way to name them. It also keeps a sandbox in learn mode: setting lists on a learn-mode sandbox from the E2B SDK is refused with `409`. Switch it with `setNetworkPolicy` instead.
+- **Rules.** `updateNetwork` keeps a sandbox's rules, since the E2B API has no way to name them.
+
+## Limits
+
+- **IPv4 only.** None of these rules filter IPv6 traffic.
+- **Names, not paths.** The filter decides by site name. It does not read inside HTTPS, so on its own it cannot allow one path or method and refuse another. [Rules and inspection](#allow-only-some-requests) adds that, for plain HTTP and for HTTPS sites you choose to inspect.
+- **Firecracker** supports everything on this page: names, address lists and `networkBlockAll`, at create and with `setNetworkPolicy`. Each VM has its own network device, so another VM cannot pretend to be it. [Rules and inspection](#allow-only-some-requests) is not supported there (`501`).
+- **Inspected traffic is decrypted on the server.** The filter decrypts each inspected request and response in memory to check it, then encrypts it again. Any password or key the sandbox sends to an inspected site is visible to the server at that moment. An injected key is held by the server's filter for the sandbox's whole life. Inspect only the sites you need to.
+- **Java's trusted list is not covered.** The JVM ignores the variables above. A Java client fails to connect to an inspected site until you import `/etc/aerolvm/egress-ca.pem` into the trust store it uses.
+- **Certificate pinning.** Some programs accept only one specific certificate for a site. They reject the filter's certificate, so those sites cannot be inspected.
+- **The 4 KB cluster limit.** In a cluster, each sandbox's settings are copied to other servers so it can be recreated after a failure. That copy is limited to 4 KB, and rules count toward it with the rest of the policy. A long rule list can push a create over it. A failover keeps the rules, and a sandbox recreated on another server trusts that server's CA.
+- **Methods and paths on ports 80 and 443 only.** Method, path and inject rules work on HTTP over ports 80 and 443. A rule with only `binaries` works on any TCP port the allow list opens. No rule applies to UDP.
+
+## For server operators
+
+### Firewall rules
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_ENABLE_NETWORK_RULES` | Turns on the per-sandbox firewall rules behind `networkBlockAll`, the address lists and the byte caps. Linux only. When off, Docker sandboxes start without the rules, and Firecracker sandboxes refuse these options. | `true` |
+| `SB_NETRULES_BACKEND` | How the rules are written: `netlink` (nftables) or `exec` (the `iptables` tool). | `netlink` |
+
+### Website names
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_EGRESS_FQDN_ENABLED` | Runs the filter service (the egress gateway) that checks website names. It does nothing until a sandbox uses a name. When off, creates that list names get `501`. | `true` |
+| `SB_EGRESS_OPERATOR_FILE` | Path to the private-network policy file below. | Not set |
+
+A server cannot check names, and answers `501`, in these cases:
+
+- Privileged sandboxes are turned on for it.
+- Its sandbox network bridge carries IPv6.
+- Its host firewall drops the traffic the filter service redirects. The filter service tests for this itself when it starts.
+
+### Private networks
+
+A deployment may have no route to the internet, such as a bank's private cloud. The operator can describe that network in one file, `/etc/sandboxd/egress-policy.yaml`, set through `SB_EGRESS_OPERATOR_FILE`. Every setting in it is optional. Without the file, nothing changes.
+
+```yaml
+version: 1
+internal_zone:
+  suffixes: [corp.bank.internal]     # names that may resolve to internal ranges
+  cidrs: [10.0.0.0/8]                # the internal ranges those names may reach
+default_policy:
+  mode: allowlist                    # open | block_all | allowlist, for creates that set no egress
+  allow_out: [artifactory.corp.bank.internal, "org:mirrors"]
+org_profiles:                        # org:<name> lists every account can use
+  mirrors:
+    allow_out: [pypi.mirror.corp.bank.internal, npm.mirror.corp.bank.internal]
+    description: package mirrors
+builtin_profiles: false              # refuse builtin: profiles, which name public hosts
+ceiling:
+  allow_out: ["*.corp.bank.internal", pypi.org]   # every allow entry must fit inside
+deny_cidrs: [10.50.0.0/16]           # always dropped, for every sandbox
+node_control_port_guard: true        # sandboxes can't reach AerolVM control ports on any node
+upstream_proxy:
+  url: http://proxy.corp.bank.internal:3128
+  auth_file: /etc/sandboxd/proxy-auth   # user:password, mode 0600
+  no_proxy: [mirror.corp.bank.internal]
+```
+
+| Setting | What it does |
+|---|---|
+| `internal_zone` | A name under a listed suffix may resolve to an address in the listed ranges, and only that name's address is opened. Raw connections into the range stay blocked. So do other names that resolve there, and metadata addresses. |
+| `default_policy` | The policy a create gets when it says nothing about outbound traffic. It is saved with the sandbox, so later edits to the file never change a running sandbox. Org profiles it names are the exception: they stay references and follow edits. |
+| `org_profiles` | Lists every account can use as `org:<name>`. An edit reaches the sandboxes using one within about 10 seconds. See [Org profiles](#org-profiles). |
+| `builtin_profiles` | `false` refuses [built-in profiles](#built-in-profiles) with `400`, for networks where their public sites cannot be reached anyway. |
+| `ceiling` | The outer limit for every allow entry. An entry that does not fit inside is refused with `400`, naming it. |
+| `deny_cidrs` and `node_control_port_guard` | Applied to every sandbox on the server, whatever its own policy says. |
+| `upstream_proxy` | Allowed names outside the internal zone and `no_proxy` go out through this proxy. Their name lookups return placeholder addresses, since the proxy, not the sandbox, looks up outside names. `host:port` entries for these names must use port 80 or 443. |
+
+If the file is there but invalid when sandboxd starts, every create is refused with `503` and code `egress_operator_config_invalid` until you fix it.
+
+### Certificates without the internet
+
+Sandbox URLs and [custom domains](/custom-domains/) get their HTTPS certificates from Let's Encrypt by default. A private network cannot reach it. Point them at your own certificate authority (CA, the service that issues certificates) instead. These settings use ACME, the protocol Let's Encrypt uses to issue certificates.
+
+| Setting | install.sh flag | What it does |
+|---|---|---|
+| `SB_TLS_ACME_CA` | `--acme-ca <url>` | The ACME directory to issue from, such as your PKI or step-ca. `https` only. |
+| `SB_TLS_ACME_CA_ROOT` | `--acme-ca-root <pem>` | The root certificate to trust when talking to that CA. An absolute path. |
+| `SB_TLS_ISSUER` | `--tls-issuer internal` | Caddy's own CA issues every certificate, with no DNS provider. For labs: clients must trust Caddy's root certificate. |
+
+- The install flags set both the wildcard certificates and the custom-domain certificates. The environment variables alone cover custom domains only.
+- Changes take effect the next time sandboxd starts. Unset them to go back to Let's Encrypt.
+- With an ACME CA, a custom domain's DNS must still point the CA at the server that receives public traffic, for its HTTP check. Caddy's own CA needs no check.
+
+### Profiles
+
+- **Org profiles, the default policy and turning off built-in lists** are set in the private-network policy file. See [Private networks](#private-networks).
+- **`SB_EGRESS_PROFILE_APPLY_QPS`** (default `50`) caps how many sandboxes per second one server updates after a profile changes. This keeps one edit from flooding the filter and the firewall.
+
+### Request rules
+
+| Setting | What it does | Default |
+|---|---|---|
+| `SB_EGRESS_INSPECT_MAX_BODY_BYTES` | The largest request body the filter service accepts on an inspected connection. Larger bodies get `413`. Set it in the filter service's environment. | 256 MiB |
+| `SB_EGRESS_PROCID_SOCKET` | Where sandboxd answers the filter's "which program is this?" lookups for `binaries` rules. Empty turns those lookups off, and connections that a program rule covers are refused. | `/run/aerolvm/egress-procid.sock` |
+
+Program rules need cgroup v2 on the server (cgroups are the Linux feature that groups a sandbox's processes). Without it, connections that a program rule covers are refused with `binary_unknown`.
+
+## Next steps
+
+- [Network access](/network-access/): block the internet, allow only some websites, and read refusals.
+- [Environment variables](/sandbox-env/): how `env` works, including the keys an inject rule uses.
+- [Usage and limits](/network-usage/): count or cap the bytes a sandbox sends and receives.

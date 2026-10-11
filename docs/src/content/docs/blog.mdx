@@ -1,0 +1,39 @@
+---
+title: Blogs
+description: Deep dives into how AerolVM works, why it is built this way, and how it compares with other sandbox platforms.
+---
+
+These posts go deeper than the docs. They explain how AerolVM works inside, why it is built the way it is, and the problems we solved along the way. You do not need them to use AerolVM, but they help when you want to know what happens under the hood.
+
+## Comparisons
+
+| Post | What it covers |
+|---|---|
+| [AerolVM vs Daytona vs E2B](/aerolvm-vs-daytona-vs-e2b/) | How AerolVM compares with Daytona and E2B on hosting, isolation, start time, features and cost. |
+| [TCP or TLS?](/tcp-vs-tls-ports/) | When to share a database or another service as a raw TCP port, and when as a TLS address. |
+
+## How AerolVM is built
+
+| Post | What it covers |
+|---|---|
+| [Why AerolVM exists](/engineering-distributed-sandbox-runtime/) | Why no self-hosted sandbox platform could span many servers, and how one program fills that gap. |
+| [Engine, chassis, runtime](/engineering-runtime-layers/) | Why Firecracker, Cloud Hypervisor, Kata and gVisor sit at different layers, and why AerolVM drives Firecracker itself. |
+| [Safe retries (idempotency)](/engineering-idempotency/) | How retried and duplicate API calls stay safe. |
+| [Placement and failover](/engineering-placement-failover/) | How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies. |
+| [How AerolVM keeps everything safe](/engineering-security-overview/) | The whole security picture, with diagrams: every door into a server, the secrets, the cluster, the audit log, monitoring and the releases. |
+| [Where secrets live](/engineering-trust-boundary/) | Which secrets AerolVM encrypts, where mounts and network rules run, and what the host does and does not protect against. |
+| [How AerolVM isolates sandboxes](/engineering-isolation/) | The wall each runtime puts between a sandbox and the server, root inside the sandbox, and resource limits. |
+| [What a sandbox can see on disk](/engineering-sandbox-filesystem/) | Mounts, the file API, what snapshots copy, and where images come from. |
+| [How AerolVM fences a sandbox's network](/engineering-network-defenses/) | What a sandbox can reach by default, and the DNS tricks the filter stops. |
+| [Keeping API keys out of the sandbox](/engineering-secret-handling/) | How variables are sealed, how inject rules keep keys out, and what the audit trail records. |
+| [Correct snapshot clones](/engineering-snapshot-correctness/) | Five ways a cloned Firecracker snapshot can go wrong, and the rule that keeps each clone safe and unique. |
+| [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
+| [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |
+
+## Architecture
+
+| Post | What it covers |
+|---|---|
+| [Firecracker architecture](/firecracker-architecture/) | How a create request becomes a Firecracker microVM, from its parts to each step of the boot. |
+| [Firecracker snapshot restore](/firecracker-hydration/) | How VMs are prepared, restored and shared so a create is just attach and resume. |
+| [WASM architecture](/wasm-architecture/) | How WebAssembly sandboxes run, with one worker process each and saved checkpoints. |
