@@ -1,5 +1,6 @@
 ---
 import EditLink from './EditLink.astro'
+import PageFeedback from './PageFeedback.astro'
 import Pagination from './Pagination.astro'
 import ThemeSelect from './ThemeSelect.astro'
 
@@ -11,6 +12,8 @@ const issueUrl = new URL('https://github.com/aerol-ai/microvm/issues/new')
 issueUrl.searchParams.set('title', `Docs: ${title}`)
 issueUrl.searchParams.set('body', `Page: ${Astro.url.pathname}\n\nWhat was wrong or hard to follow?\n`)
 ---
+
+<PageFeedback placement="footer" />
 
 <div class="docs-footer__page-actions">
   <EditLink />

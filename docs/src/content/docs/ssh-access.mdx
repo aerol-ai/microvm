@@ -130,12 +130,6 @@ These shells are [terminal sessions](/sessions/), so you can also read and manag
 
 The SSH gateway is the part of the server that accepts SSH logins and passes them to sandboxes. It is on by default.
 
-| Variable | What it does | Default |
-|---|---|---|
-| `SB_ENABLE_SSH_GATEWAY` | Turns the SSH gateway on or off. | `true` |
-| `SB_SSH_LISTEN_ADDR` | The address and port the gateway listens on. | `0.0.0.0:2220` |
-| `SB_SSH_HOST_KEY_PATH` | Where the server's own host key is kept. It is created on first start if missing. | `/var/lib/aerolvm/ssh_host_ed25519_key` |
-
 ### SSH in a cluster
 
 In a cluster, one server runs each sandbox, but SSH logins arrive at any ingress node (a server that takes outside traffic). Users connect the same way no matter which server runs their sandbox:
