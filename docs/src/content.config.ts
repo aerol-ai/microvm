@@ -102,7 +102,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/network-access', 'Network Access'),
       link('/advanced-network-rules', 'Advanced Network Rules'),
       link('/network-usage', 'Limit Egress and Ingress'),
-      link('/public-urls', 'Public URLs'),
+      link('/public-urls', 'Expose Sandbox to Public'),
       link('/custom-domains', 'Custom domains'),
       link('/tcp-ports', 'TCP and TLS ports'),
     ],
