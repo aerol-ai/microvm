@@ -21,6 +21,10 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [Safe retries (idempotency)](/engineering-idempotency/) | How retried and duplicate API calls stay safe. |
 | [Placement and failover](/engineering-placement-failover/) | How a cluster picks a server for each sandbox, agrees on who owns it, and recovers sandboxes when a server dies. |
 | [Where secrets live](/engineering-trust-boundary/) | Which secrets AerolVM encrypts, where mounts and network rules run, and what the host does and does not protect against. |
+| [How AerolVM isolates sandboxes](/engineering-isolation/) | The wall each runtime puts between a sandbox and the server, root inside the sandbox, and resource limits. |
+| [What a sandbox can see on disk](/engineering-sandbox-filesystem/) | Mounts, the file API, what snapshots copy, and where images come from. |
+| [How AerolVM fences a sandbox's network](/engineering-network-defenses/) | What a sandbox can reach by default, and the DNS tricks the filter stops. |
+| [Keeping API keys out of the sandbox](/engineering-secret-handling/) | How variables are sealed, how inject rules keep keys out, and what the audit trail records. |
 | [Correct snapshot clones](/engineering-snapshot-correctness/) | Five ways a cloned Firecracker snapshot can go wrong, and the rule that keeps each clone safe and unique. |
 | [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
 | [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |

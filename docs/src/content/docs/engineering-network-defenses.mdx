@@ -1,11 +1,13 @@
 ---
-title: Network defenses
-description: What a sandbox can reach by default, how policies fence it in, how the filter handles DNS tricks, and who can reach the sandbox.
+title: How AerolVM fences a sandbox's network
+description: What a sandbox can reach by default, how policies fence it in, which DNS tricks the filter stops, and who can reach the sandbox.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Untrusted code that can reach your private network can attack it. This page explains what a sandbox can reach out to, how a policy fences that in, which tricks the filter stops, and who can reach in.
+*By [Suman Saurabh](https://www.linkedin.com/in/ssumansaurabh/), maintainer of AerolVM.*
+
+Untrusted code that can reach your private network can attack it. This post explains what a sandbox can reach out to, how a policy fences that in, which tricks the filter stops, and who can reach in.
 
 ## Default posture
 
@@ -171,4 +173,4 @@ If the server allows privileged containers, name allow lists are turned off. Kee
 
 - [Network access](/network-access/): block the internet, or allow only some sites.
 - [Advanced network rules](/advanced-network-rules/): profiles, learn mode and per-request rules.
-- [Secret handling](/enterprise/secret-handling/): keep API keys out of the sandbox.
+- [Secret handling](/engineering-secret-handling/): keep API keys out of the sandbox.

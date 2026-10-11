@@ -22,14 +22,14 @@ Each limit has a workaround you can use today. Where a fix is planned, the last 
 
 | Limit | What to do | Proposal |
 |---|---|---|
-| **Outbound traffic is open by default.** A sandbox with no policy can reach your private network, the cloud metadata service and other sandboxes. V8 isolates are the exception. | Set a policy on each sandbox. Better, have the operator set `default_policy: block_all` and block the metadata address for the whole server. See [Hardening](/enterprise/hardening/). | [Closed by default](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Outbound traffic is open by default.** A sandbox with no policy can reach your private network, the cloud metadata service and other sandboxes. V8 isolates are the exception. | Set a policy on each sandbox. Better, have the operator set `default_policy: block_all` and block the metadata address for the whole server. See [Hardening](/enterprise/hardening/). | [Closed by default](https://github.com/aerol-ai/microvm/discussions/651) |
 | **Containers share the server's kernel.** A kernel bug can let code out of a container. | Run code you do not trust in gVisor or Firecracker. | |
 | **Code runs as the image's default user**, which is usually root. Setting a user at create time does not change this yet. | Build your image with a non-root `USER`. | |
 | **Some limits are not enforced on every runtime.** Disk is not limited on containerd and gVisor. The number of processes is not limited in containers. | Use Firecracker for hostile code. It has its own disk and its own kernel. | |
-| **Images are not checked for signatures.** | Check signatures in your build pipeline, then pin the image by digest (`image@sha256:...`). | [Image signature checks](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| **One API token per server.** Anyone with it can run commands in any sandbox. | Keep it in a secret manager, and keep the API port private. | [Scoped tokens and roles](https://github.com/aerol-ai/microvm/discussions/categories/ideas), [SSO](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| **Limits are per sandbox, not per team.** | Enforce team limits in the service that calls AerolVM. | [Quotas per team](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| **Audit records name the server, not the API caller.** | Put your own gateway in front of the API and log callers there. | [Caller identity](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| **Images are not checked for signatures.** | Check signatures in your build pipeline, then pin the image by digest (`image@sha256:...`). | [Image signature checks](https://github.com/aerol-ai/microvm/discussions/650) |
+| **One API token per server.** Anyone with it can run commands in any sandbox. | Keep it in a secret manager, and keep the API port private. | [Scoped tokens and roles](https://github.com/aerol-ai/microvm/discussions/646), [SSO](https://github.com/aerol-ai/microvm/discussions/647) |
+| **Limits are per sandbox, not per team.** | Enforce team limits in the service that calls AerolVM. | [Quotas per team](https://github.com/aerol-ai/microvm/discussions/648) |
+| **Audit records name the server, not the API caller.** | Put your own gateway in front of the API and log callers there. | [Caller identity](https://github.com/aerol-ai/microvm/discussions/649) |
 | **Code in a sandbox can read its own variables**, and container snapshots save them. | Use an inject rule for API keys, so the sandbox only holds a placeholder. | |
 | **Inject rules are not supported on WebAssembly or Firecracker yet.** | Use a container, gVisor or a V8 isolate for code that needs a protected key. | |
 | **Public URLs have no login,** and shared TCP ports are open to the whole internet. | Protect the app itself, or share only what must be public. | |

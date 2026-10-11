@@ -19,7 +19,6 @@ One server is enough for development and light production use. You need a cluste
 
 ### Scalability
 
-- **20,000 sandboxes at once.** We have run 20,000 sandboxes at the same time on one AerolVM cluster.
 - **More room as you add servers.** Each new sandbox goes to a worker with free room. It only lands on a worker that can run its runtime and has the GPUs it asks for.
 - **One address for everything.** Your app sends every request to one URL. Any node can take a call and pass it to the node that runs the sandbox. Public links, [TCP ports](/tcp-ports/) and [custom domains](/custom-domains/) work the same way.
 - **Room to grow.** The split layout is built for about 1,000 worker nodes. Adding workers does not add voters, so agreeing on changes does not get slower as the cluster grows.
@@ -39,7 +38,6 @@ One server is enough for development and light production use. You need a cluste
 - **Encrypted discovery traffic.** Nodes find each other with a shared encryption key. A machine without the key cannot join.
 - **Sealed secrets.** Registry and storage passwords are encrypted so only chosen nodes can open them. [AWS KMS](/cluster-secrets/) can hold the keys, with AWS permissions and logs. Sandbox environment variables are always encrypted on disk.
 - **Internal calls stay internal.** Node-to-node requests use their own listener and are refused on the public one.
-- **Stricter production rules.** Enterprise mode turns on extra checks, such as two backups for every secret and no insecure shortcuts.
 
 ### Auditability
 

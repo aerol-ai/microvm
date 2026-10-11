@@ -1,0 +1,92 @@
+---
+title: Evidence for your audit
+description: What a security or compliance reviewer can collect from AerolVM, from audit records to release provenance and security documents.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+AerolVM has no SOC 2 or ISO 27001 report of its own. It gives you evidence to collect for your own review instead. This page lists each piece and where to find it.
+
+## What you can collect
+
+| Evidence | What it shows | Where to get it |
+|---|---|---|
+| Audit records | Every time a secret is opened, and the outbound connections the filter refuses | `sandbox.audit()` in every SDK. See [below](#read-a-sandboxs-audit-history). |
+| A tamper-evident chain | Each record holds a hash of the one before, so a changed or deleted record breaks the chain | The operator can check the whole chain on demand. Bundled alerts fire when it breaks. |
+| Records kept off the server | A copy a server that is taken over cannot rewrite | `SB_AUDIT_EXPORT_BACKEND` set to `webhook` (signed with HMAC) or `s3`. `file` and `stdout` also work, but stay on the server. |
+| Release checksums | A download is the official build | `checksums.txt` in each release |
+| Build provenance | How and where a release was built | The signed SLSA provenance file in each release (`<version>.intoto.jsonl`) |
+| Bill of materials | Every Go module in a release | `sbom.cdx.json` (CycloneDX) in each release |
+| Threat model | The trust boundaries, and what each one protects | [THREAT-MODEL.md](https://github.com/aerol-ai/microvm/blob/main/THREAT-MODEL.md) |
+| Security assessment | The problems that matter most, and where each one stands | [SECURITY-ASSESSMENT.md](https://github.com/aerol-ai/microvm/blob/main/SECURITY-ASSESSMENT.md) |
+| Vulnerability handling | How reports are handled, with response times | [SECURITY.md](https://github.com/aerol-ai/microvm/blob/main/SECURITY.md): a reply within 3 business days, an assessment within 7, and fixes in about 14 days for critical issues and 30 for high |
+| Supported versions | Which releases get security fixes | [SUPPORT.md](https://github.com/aerol-ai/microvm/blob/main/SUPPORT.md) |
+| How changes land | Who reviews and who releases | [GOVERNANCE.md](https://github.com/aerol-ai/microvm/blob/main/GOVERNANCE.md). CI runs OpenSSF Scorecard, gosec, govulncheck and dependency review. |
+
+To check a download yourself, follow [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md).
+
+## Read a sandbox's audit history
+
+Every SDK reads one sandbox's records, from whichever server ran it:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const page = await sandbox.audit({ kind: "secret_open" });
+    for (const event of page.events) {
+      console.log(event.time, event.actor, event.ref, event.result);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    page = sandbox.audit({"kind": "secret_open"})
+    for event in page["events"]:
+        print(event["time"], event.get("actor"), event.get("ref"), event["result"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    page, err := sandbox.Audit(ctx, sdktypes.AuditOptions{Kind: "secret_open"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, event := range page.Events {
+        fmt.Println(event.Time, event.Actor, event.Ref, event.Result)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let page = sandbox.audit(AuditOptions {
+        kind: Some("secret_open".to_string()),
+        ..Default::default()
+    })?;
+    for event in &page.events {
+        println!("{} {:?} {:?} {}", event.time, event.actor, event.r#ref, event.result);
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    AuditPage page = sandbox.audit(new AuditOptions().setKind("secret_open"));
+    for (AuditEvent event : page.events) {
+        System.out.println(event.time + " " + event.actor + " " + event.ref + " " + event.result);
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Each record has a time, the server that acted, what was opened and the result. Records about refused connections use the kind `egress`. A busy sandbox writes at most 25 of those a second, so one sandbox cannot flood the log.
+
+## Keep records as long as you need
+
+- **On the server,** records are kept for 30 days (`SB_SECRET_AUDIT_RETENTION_DAYS`).
+- **For longer,** export them and keep them in your own store, such as an S3 bucket with its own retention rules.
+- **Records do not name the API caller.** See [Responsibility and limits](/enterprise/responsibility/) for the workaround.
+
+## Next steps
+
+- [Security controls](/enterprise/security-controls/): every control and its default.
+- [Hardening](/enterprise/hardening/): the settings to send records off the server.
+- [Responsibility and limits](/enterprise/responsibility/): what the evidence does not cover.

@@ -19,17 +19,17 @@ Each feature is marked **Default** (on with no setup), **You turn it on**, or **
 | API keys kept out of the sandbox with inject rules | You turn it on | [Advanced network rules](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox) |
 | Encrypted environment variables, with every read recorded | Default | [Environment variables](/sandbox-env/) |
 | Storage credentials that never enter the sandbox | Default | [External storage](/external-storage/) |
-| A tamper-evident audit log | Default | [Audit](/enterprise/security-controls/#audit) |
+| A tamper-evident audit log | Default | [Evidence for your audit](/enterprise/audit-evidence/) |
 | Audit export to a file, a webhook or S3 | You turn it on | [Audit](/enterprise/security-controls/#audit) |
-| Clusters with failover and mutual TLS between servers | You turn it on | [Clusters](/getting-started/cluster-setup/) |
+| Clusters with failover and mutual TLS between servers | You turn it on | [Run it in production](/enterprise/deployment/) |
 | AWS KMS for the secret copies a cluster keeps | You turn it on | [Secrets providers](/cluster-secrets/) |
 | Metrics, traces, dashboards and alerts with runbooks | You turn it on | [Runbooks](/operational-runbooks/) |
 | Signed releases with checksums, build provenance and a bill of materials | Default | [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) |
-| Single sign-on (SSO) for the API | Proposed | [Discuss in Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| Scoped API tokens and roles | Proposed | [Discuss in Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| Quotas per team | Proposed | [Discuss in Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| The API caller's name in audit records | Proposed | [Discuss in Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
-| Image signature checks | Proposed | [Discuss in Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas) |
+| Single sign-on (SSO) for the API | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/647) |
+| Scoped API tokens and roles | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/646) |
+| Quotas per team | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/648) |
+| The API caller's name in audit records | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/649) |
+| Image signature checks | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/650) |
 
 Need a proposed feature? Say so in [Ideas](https://github.com/aerol-ai/microvm/discussions/categories/ideas). A company can also [sponsor a feature](/enterprise/maintainer/) to get it built sooner. It is built in the open and ships to everyone.
 
@@ -48,7 +48,7 @@ Need a proposed feature? Say so in [Ideas](https://github.com/aerol-ai/microvm/d
 
 ## Evidence for a security review
 
-These documents live in the repository:
+[Evidence for your audit](/enterprise/audit-evidence/) lists everything a reviewer can collect. The main documents live in the repository:
 
 - [Threat model](https://github.com/aerol-ai/microvm/blob/main/THREAT-MODEL.md): the trust boundaries and what each one protects.
 - [Security assessment](https://github.com/aerol-ai/microvm/blob/main/SECURITY-ASSESSMENT.md): the problems that matter most, and where each one stands.
@@ -66,4 +66,4 @@ These documents live in the repository:
 - [Security controls](/enterprise/security-controls/): every control, its default and how to turn it on.
 - [Responsibility and limits](/enterprise/responsibility/): who does what, and every known limit.
 - [Hardening](/enterprise/hardening/): the settings to tighten for untrusted code.
-- [Clusters](/getting-started/cluster-setup/): run AerolVM across many servers.
+- [Run it in production](/enterprise/deployment/): pick a single server or a cluster.

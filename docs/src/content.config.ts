@@ -162,6 +162,10 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-idempotency', '- Safe retries (idempotency)'),
       link('/engineering-placement-failover', '- Placement and failover'),
       link('/engineering-trust-boundary', '- Where secrets live'),
+      link('/engineering-isolation', '- How sandboxes are isolated'),
+      link('/engineering-sandbox-filesystem', '- What a sandbox sees on disk'),
+      link('/engineering-network-defenses', '- Fencing the network'),
+      link('/engineering-secret-handling', '- Keeping API keys out'),
       link('/engineering-snapshot-correctness', '- Correct snapshot clones'),
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
@@ -243,9 +247,8 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 const ent = '/enterprise'
 
 // The Enterprise tab, in the order an evaluating company reads it: what you
-// get, the controls, who owns what, how to lock it down, then the maintainer.
-// The second group holds the older deep dives until they move to Blogs
-// (plans/enterprise-docs-rework.md).
+// get, how to run it, the controls, the evidence, how to lock it down, who
+// owns what, then the maintainer. The engineering deep dives live in Blogs.
 const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
   {
     type: 'group',
@@ -253,21 +256,12 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.ENTERPRISE,
     entries: [
       link(ent, 'Overview'),
+      link(`${ent}/deployment`, 'Run it in production'),
       link(`${ent}/security-controls`, 'Security controls'),
-      link(`${ent}/responsibility`, 'Responsibility and limits'),
+      link(`${ent}/audit-evidence`, 'Evidence for your audit'),
       link(`${ent}/hardening`, 'Hardening'),
+      link(`${ent}/responsibility`, 'Responsibility and limits'),
       link(`${ent}/maintainer`, 'Work with the maintainer'),
-    ],
-  },
-  {
-    type: 'group',
-    label: 'Deep dives (moving to Blogs)',
-    category: NavigationCategory.ENTERPRISE,
-    entries: [
-      link(`${ent}/isolation-boundary`, 'Isolation boundary'),
-      link(`${ent}/filesystem-and-images`, 'Filesystem and images'),
-      link(`${ent}/network-defenses`, 'Network defenses'),
-      link(`${ent}/secret-handling`, 'Secret handling'),
     ],
   },
 ]

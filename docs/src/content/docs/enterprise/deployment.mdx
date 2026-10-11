@@ -1,0 +1,85 @@
+---
+title: Run it in production
+description: Pick a single server or a cluster for AerolVM, what each one gives you, and what to do before you go live.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+AerolVM runs on your own Linux servers. Start with one server, and move to a cluster when you need more room or need to survive a dead server. Your code does not change when you move.
+
+## Pick a layout
+
+| | Single server | Mixed cluster | Hetero cluster |
+|---|---|---|---|
+| Servers | 1 | 2 to 10, all alike | Any number. Required above 10. |
+| What each server does | Everything | Everything: votes, runs sandboxes, takes traffic | One job: vote, run sandboxes or take traffic |
+| Survives a dead server | No | Yes, with 3 or more servers | Yes |
+| Hardware | One Linux machine. 2 CPUs and 4 GB of memory to start. | All servers alike | A machine for each job: bare metal for Firecracker, GPU machines for GPUs |
+| Best for | Starting out, internal tools, one team | More room, and surviving a dead server | Large fleets, bare metal and GPUs |
+| How to start | [Install on a server](/getting-started/single-node-setup/), about 20 minutes | [Clusters](/getting-started/cluster-setup/) | [Clusters](/getting-started/cluster-setup/) |
+
+A cluster adds failover, mutual TLS between servers, and audit history you can read from any server. [Clusters](/getting-started/cluster-setup/) explains each layout and what running one takes.
+
+## Point your app at it
+
+The SDKs read the server's address from `SB_API_URL` and its token from `SB_PAT_TOKEN`. Both work the same for one server or a cluster. In a cluster, ask for failover when you create a sandbox, so a healthy server rebuilds it if its server dies:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({
+      image: "ubuntu:22.04",
+      failover: { policy: "recreate" },
+    });
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="ubuntu:22.04", failover={"policy": "recreate"})
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:    "ubuntu:22.04",
+        Failover: &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
+    })
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Failover;
+
+    let sandbox = client.create(CreateOptions {
+        image: "ubuntu:22.04".into(),
+        failover: Some(Failover { policy: "recreate".into() }),
+        ..Default::default()
+    })?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setFailover(new Failover().setPolicy("recreate")));
+    ```
+  </TabItem>
+</Tabs>
+
+## Before you go live
+
+1. **Harden it.** Work through the [Hardening](/enterprise/hardening/) checklists for each sandbox and each server.
+2. **Send the audit log off the server,** so a server that is taken over cannot quietly rewrite it. See [Evidence for your audit](/enterprise/audit-evidence/).
+3. **Back up the database and its encryption key together.** Without the key, the encrypted secrets in the database cannot be opened.
+4. **Watch it.** Every server offers Prometheus metrics and can send OpenTelemetry traces. Ready-made Grafana dashboards and alerts link to step-by-step [runbooks](/operational-runbooks/).
+5. **Plan upgrades.** Security fixes land on the newest release line only. In a cluster, restart one server at a time.
+
+## Get help with a rollout
+
+The maintainer can help you pick a layout, size the servers and take AerolVM to production. See [Work with the maintainer](/enterprise/maintainer/).
+
+## Next steps
+
+- [Install on a server](/getting-started/single-node-setup/): one server with your own domain.
+- [Clusters](/getting-started/cluster-setup/): mixed and hetero layouts in detail.
+- [Hardening](/enterprise/hardening/): lock it down for untrusted code.

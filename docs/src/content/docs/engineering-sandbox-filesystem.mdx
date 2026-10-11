@@ -1,11 +1,13 @@
 ---
-title: Filesystem and images
+title: What a sandbox can see on disk
 description: What a sandbox can see and keep, how mounts and the file API work, what snapshots copy, and where images come from.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-A sandbox starts from an image and writes to its own disk. This page covers what it can see, what the server adds, how storage you mount reaches it, what a snapshot keeps, and what AerolVM checks, and does not check, about images.
+*By [Suman Saurabh](https://www.linkedin.com/in/ssumansaurabh/), maintainer of AerolVM.*
+
+A sandbox starts from an image and writes to its own disk. This post covers what it can see, what the server adds, how storage you mount reaches it, what a snapshot keeps, and what AerolVM checks, and does not check, about images.
 
 ## Private by default
 
@@ -200,6 +202,6 @@ A snapshot saves a sandbox so new ones can start from it. See [Images and Snapsh
 
 ## Next steps
 
-- [Network defenses](/enterprise/network-defenses/): what a sandbox can reach.
-- [Secret handling](/enterprise/secret-handling/): how variables and keys are protected.
+- [Network defenses](/engineering-network-defenses/): what a sandbox can reach.
+- [Secret handling](/engineering-secret-handling/): how variables and keys are protected.
 - [Attach cloud storage](/external-storage/): mount your own bucket.
