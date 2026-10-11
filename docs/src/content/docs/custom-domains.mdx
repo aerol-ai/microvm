@@ -271,20 +271,6 @@ In this version, the server sets every new domain to `pending_dns` and does not 
 - **Host header masking applies here too.** If you set `maskRequestHost` on the sandbox, requests to a custom domain with a port get the same rewrite. See [Public URLs](/public-urls/).
 - **Certificates are rate limited.** Let's Encrypt limits how many certificates one account can get. If too many new domains ask for one in a short time, the server holds back new requests for a while. Those domains wait, then get their certificate later.
 
-## For server operators
-
-Turn the feature on with `SB_ENABLE_CUSTOM_DOMAINS=true`. It requires `SB_DOMAIN`: the server refuses to start with custom domains on and no domain. The server must be reachable on ports 80 and 443 at the address users point their DNS at, so Let's Encrypt can reach it. For a network with no internet access, issue certificates from your own certificate authority instead. See [Certificates without the internet](/advanced-network-rules/#certificates-without-the-internet).
-
-| Setting | What it does | Default |
-|---|---|---|
-| `SB_ENABLE_CUSTOM_DOMAINS` | Turns custom domains on. | `false` |
-| `SB_CUSTOM_DOMAINS_MAX_PER_SANDBOX` | Most domains one sandbox can have. | `25` |
-| `SB_CUSTOM_DOMAIN_VERIFY_PREFIX` | Start of the TXT record name. | `_aerol-verify` |
-| `SB_CUSTOM_DOMAIN_VERIFY_VALUE_PREFIX` | Start of the TXT record value. | `aerol-verify=` |
-| `SB_ACME_DAEMON_BUDGET_CAPACITY` | New certificate requests allowed per window. | `300` |
-| `SB_ACME_DAEMON_BUDGET_WINDOW` | Length of that window. | `3h` |
-| `SB_ACME_DAEMON_BUDGET_FRACTION` | Share of the budget the server uses before it holds back new requests. | `0.8` (240 of 300) |
-
 Certificates for custom domains are issued on demand. The first HTTPS visit to a domain makes Caddy (the web proxy) ask the server whether the name belongs to a sandbox. Only then does it request a certificate from Let's Encrypt. Unknown names are refused, so random visitors cannot use up your certificate limit. When the budget above runs low, the server tells Caddy to back off and retry later.
 
 When you remove a domain, the server deletes its route and its record. The certificate ages out of storage at renewal time.
