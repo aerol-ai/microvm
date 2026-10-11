@@ -80,7 +80,7 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
     category: NavigationCategory.SANDBOXES,
     entries: [
       link('/sandboxes', 'Create and Manage'),
-      link('/ghost-sandboxes', 'Ghost Mode'),
+      link('/ghost-sandboxes', 'Ghost(Vercel) Mode'),
       link('/images-and-snapshots', 'Images and Snapshots'),
       link('/lifecycle', 'Lifecycle'),
       link('/sandbox-env', 'Secured Env variables'),
