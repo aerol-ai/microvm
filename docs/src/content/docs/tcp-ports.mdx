@@ -5,25 +5,31 @@ description: Connect Postgres, Redis and other non-web clients to a service runn
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Browsers talk HTTP, the language of the web. Many other programs do not. Databases such as Postgres, Redis, MySQL and MongoDB, plus MQTT brokers, gRPC services, SSH and game servers, send their own data over TCP. TCP is the basic way two programs send bytes over a network. An HTTP URL cannot carry that traffic.
+Browsers talk HTTP, the language of the web. Many other programs do not. Databases such as Postgres, Redis, MySQL and MongoDB, plus MQTT brokers, gRPC services, SSH and game servers, send their own data over TCP, the basic way two programs send bytes over a network. A web URL cannot carry that traffic.
 
-So `exposePort` takes a `protocol` option. Leave it out to get a normal web URL. Set it to `"tcp"` or `"tls"` to give a non-web service an address that its usual client can connect to. TLS is the encryption behind `https://`, and a `"tls"` port adds it for you.
+So `exposePort` takes a `protocol` option:
 
 | Protocol | You get | Use it for |
 |---|---|---|
-| `"http"` (default) | A web URL: `https://<sandbox-id>-<port>.<domain>` | Websites, REST APIs, websockets |
-| `"tcp"` | `tcp://<host>:<host-port>`, plus `host` and `hostPort` | Postgres, Redis, MySQL, MongoDB and any other TCP service |
-| `"tls"` | `tls://<sandbox-id>-<port>.<domain>:443` | Clients that connect with TLS encryption from the first byte |
+| `"http"` (default) | A web URL: `https://<sandbox-id>-<port>.<domain>` | Websites, REST APIs, websockets. See [Public URLs](/public-urls/). |
+| `"tcp"` | `tcp://<host>:<host-port>` | Postgres, Redis, MySQL, MongoDB and any other TCP service |
+| `"tls"` | `tls://<sandbox-id>-<port>.<domain>:443` | Clients that encrypt with TLS (the encryption behind `https://`) from the first byte |
 
-Not sure which one to pick? See [TCP or TLS?](/tcp-vs-tls-ports/) for a side-by-side guide.
+Not sure which one to pick? See [TCP or TLS?](/tcp-vs-tls-ports/).
 
 <Aside type="caution" title="Server setup needed">
-These addresses only work on a server install. TCP ports work with or without a domain. TLS ports need a server with a domain. A local install returns an address, but nothing answers there. See [Public URLs](/public-urls/).
+These addresses only work on a server install. TCP ports work with or without a domain. TLS ports need a server with a domain. A local install returns an address, but nothing answers there.
 </Aside>
 
 ## Connect to a database with a TCP port
 
-Pass `protocol: "tcp"`. The server picks a free port on its own network, called the **host port**. It forwards every byte from that port to the port inside the sandbox. The result has the full `url`, plus `host` and `hostPort` as separate fields. Use those two to build a connection string (the one line of text a database client uses to connect).
+```mermaid
+flowchart LR
+    Client["Your client<br/>(psql, redis-cli, your app)"] -- "tcp://sandbox.example.com:22417" --> HostPort["Server<br/>host port 22417"]
+    HostPort -- "every byte, unchanged" --> Service["Postgres in the sandbox<br/>port 5432"]
+```
+
+Pass `protocol: "tcp"`. The server picks a free port on its own network, called the **host port**. It forwards every byte from that port to the port inside the sandbox. The result has the full `url`, plus `host` and `hostPort` to build a connection string (the one line of text a database client uses to connect).
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -71,9 +77,7 @@ Pass `protocol: "tcp"`. The server picks a free port on its own network, called 
   </TabItem>
 </Tabs>
 
-On a server with a domain, `host` is the server's domain. Without a domain, it is the server's IP address, such as `203.0.113.10`. The host port comes from a range the operator sets, `22000` to `23000` by default.
-
-Pass the host and port to any client: `psql`, `redis-cli`, `mysql`, `mongosh`, or your app's connection string.
+`host` is the server's domain, or its IP address on a server without a domain. The host port comes from a range the operator sets, `22000` to `23000` by default. Pass the two to any client: `psql`, `redis-cli`, `mysql`, `mongosh`, or your app's connection string.
 
 <Aside type="caution" title="Anyone can try to connect">
 A TCP port is open to the whole internet. AerolVM passes the bytes through and does not check who is connecting. Protect the service itself, for example with a strong database password.
@@ -81,9 +85,13 @@ A TCP port is open to the whole internet. AerolVM passes the bytes through and d
 
 ## Get a TLS address on port 443
 
-With `protocol: "tls"`, clients connect with TLS to the server's shared port 443. Each exposure gets its own name, such as `sb-9f2c41d07a3e5b86-5432.sandbox.example.com`.
+```mermaid
+flowchart LR
+    Client["Your client<br/>(connects with TLS)"] -- "port 443, asks for<br/>sb-...-6379.sandbox.example.com" --> Proxy["Server's port 443<br/>reads the name, decrypts"]
+    Proxy -- "plain bytes" --> Service["Redis in the sandbox<br/>port 6379"]
+```
 
-The server holds the TLS certificate (the file that proves to clients the address is really yours). It decrypts the traffic and forwards plain bytes to your service. Your service does not need a certificate or any TLS setup.
+With `protocol: "tls"`, every TLS port shares the server's port 443. Each one gets its own name, and the server uses that name to find the right sandbox. It also holds the certificate (the file that proves the address is really yours) and decrypts the traffic, so your service needs no TLS setup.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -124,93 +132,16 @@ The server holds the TLS certificate (the file that proves to clients the addres
 
 What to know about TLS ports:
 
-- **They need a server with a domain.** On a server without one, the call fails with `TLS-SNI exposure requires --domain to be configured`.
-- **The client must send the name it wants.** Clients do this at the start of the TLS connection. This is called SNI (Server Name Indication), and the server uses it to pick the right sandbox. Almost every modern client sends it.
+- **They need a server with a domain.** Without one, the call fails with `TLS-SNI exposure requires --domain to be configured`.
+- **The client must send the name it wants** at the start of the connection. This is called SNI (Server Name Indication). Almost every modern client sends it.
 - **The client must start with TLS right away.** Some protocols, such as MySQL and default Postgres, start in plain text and switch to TLS later. Use a TCP port for those.
-- **The TLS connection ends at the server.** Client certificates (mutual TLS) and custom protocol negotiation never reach your service. Use a TCP port if you need them.
+- **The TLS connection ends at the server.** Client certificates (mutual TLS) never reach your service. Use a TCP port if you need them.
 
-## Stop sharing a port
+## Stop sharing or change a port
 
-`unexposePort(port)` removes the address, whatever protocol you used. You do not need to say which one.
-
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    await sandbox.exposePort(3000);                        // web
-    await sandbox.exposePort(5432, { protocol: "tcp" });   // TCP
-    await sandbox.exposePort(6379, { protocol: "tls" });   // TLS
-
-    // The same call removes each one:
-    await sandbox.unexposePort(3000);
-    await sandbox.unexposePort(5432);
-    await sandbox.unexposePort(6379);
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    sandbox.expose_port(3000)                   # web
-    sandbox.expose_port(5432, protocol="tcp")   # TCP
-    sandbox.expose_port(6379, protocol="tls")   # TLS
-
-    # The same call removes each one:
-    sandbox.unexpose_port(3000)
-    sandbox.unexpose_port(5432)
-    sandbox.unexpose_port(6379)
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    if _, err := sandbox.ExposePort(ctx, 3000); err != nil { // web
-        log.Fatal(err)
-    }
-    if _, err := sandbox.ExposePort(ctx, 5432, microvm.WithProtocol(sdktypes.ExposeProtocolTCP)); err != nil {
-        log.Fatal(err)
-    }
-    if _, err := sandbox.ExposePort(ctx, 6379, microvm.WithProtocol(sdktypes.ExposeProtocolTLS)); err != nil {
-        log.Fatal(err)
-    }
-
-    // The same call removes each one:
-    for _, port := range []int{3000, 5432, 6379} {
-        if err := sandbox.UnexposePort(ctx, port); err != nil {
-            log.Fatal(err)
-        }
-    }
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    sandbox.expose_port(3000, ExposeOptions::default())?; // web
-    sandbox.expose_port(5432, ExposeOptions::tcp())?;     // TCP
-    sandbox.expose_port(6379, ExposeOptions::tls())?;     // TLS
-
-    // The same call removes each one:
-    sandbox.unexpose_port(3000)?;
-    sandbox.unexpose_port(5432)?;
-    sandbox.unexpose_port(6379)?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    sandbox.exposePort(3000);                         // web
-    sandbox.exposePort(5432, ExposeOptions.tcp());    // TCP
-    sandbox.exposePort(6379, ExposeOptions.tls());    // TLS
-
-    // The same call removes each one:
-    sandbox.unexposePort(3000);
-    sandbox.unexposePort(5432);
-    sandbox.unexposePort(6379);
-    ```
-  </TabItem>
-</Tabs>
-
-Unexposing a TCP port gives its host port back to the pool for other sandboxes.
-
-## Change the protocol of a port
-
-A port can have only one protocol at a time. If you expose a port again with a different protocol, the call fails with `port 5432 already exposed as tcp; unexpose it first`. Call `unexposePort(port)`, then `exposePort` with the new protocol.
-
-Exposing a port again with the **same** protocol is safe. It returns the same address, and a TCP port keeps its host port.
+- **To stop sharing,** call `unexposePort(port)`, the same call as for web ports (see [Stop sharing a port](/public-urls/#stop-sharing-a-port)). It works for every protocol. Unexposing a TCP port gives its host port back for other sandboxes.
+- **One protocol per port.** Exposing a port again with a different protocol fails with `port 5432 already exposed as tcp; unexpose it first`. Unexpose it, then expose it with the new protocol.
+- **Exposing again with the same protocol is safe.** It returns the same address, and a TCP port keeps its host port.
 
 ## Good to know
 
@@ -225,54 +156,27 @@ Exposing a port again with the **same** protocol is safe. It returns the same ad
 
 ### The host port pool
 
-Each TCP exposure takes one port from a pool on the server. The pool is `22000` to `23000` by default, about 1,000 ports. That is also the most TCP exposures one server can have at a time. When it runs out, `exposePort` fails with `L4 port pool exhausted`.
+Each TCP exposure takes one port from a pool on the server: `22000` to `23000` by default, about 1,000 ports. That is also the most TCP exposures one server can have at a time. When it runs out, `exposePort` fails with `L4 port pool exhausted`. The server picks a random free port first, then checks the pool in order. It saves each pick in the database in one step, so two calls never get the same port.
 
-The server picks a random free port first, which stays fast when many exposures happen at once. If that port is taken, it checks the pool in order, so it uses every port before it gives up. Each pick is saved in the database in one step, so two calls can never get the same port.
+Change the pool with `SB_L4_PORT_RANGE_START` and `SB_L4_PORT_RANGE_END` on `sandboxd`. The start must be at least `1024` and lower than the end, and the end at most `65535`.
 
-Change the pool with these settings on `sandboxd`:
-
-```text
-SB_L4_PORT_RANGE_START=22000
-SB_L4_PORT_RANGE_END=23000
-```
-
-The start must be at least `1024` and lower than the end. The end can be at most `65535`.
-
-Keep the pool below the Linux ephemeral port range. That is the range the kernel picks from when a program opens an outgoing connection, usually `32768` to `60999`. Check yours with `cat /proc/sys/net/ipv4/ip_local_port_range`. If the two ranges overlap, the kernel can take a pool port for an outgoing connection. On busy hosts, an exposure then fails with `EADDRINUSE`.
-
-The host firewall must allow incoming traffic on the whole pool. The installer prints a reminder but does not open the firewall for you.
+Keep the pool below the Linux ephemeral port range, the range the kernel uses for outgoing connections (usually `32768` to `60999`; check with `cat /proc/sys/net/ipv4/ip_local_port_range`). If they overlap, the kernel can take a pool port, and on busy hosts an exposure fails with `EADDRINUSE`. The host firewall must allow incoming traffic on the whole pool. The installer prints a reminder but does not open it.
 
 ### The shared TLS port
 
-TLS ports run on caddy-l4, the layer-4 module of Caddy (the web proxy in front of the server). It handles raw TCP traffic, not just web requests. In domain mode, the installer sets `SB_L4_TLS_LISTEN=:443`, so caddy-l4 owns port 443. Normal HTTPS traffic for the API and web URLs moves to `127.0.0.1:8443` (`SB_L4_TLS_FALLBACK`). caddy-l4 sends every name that is not a TLS port there.
+TLS ports run on caddy-l4, the module of Caddy (the server's web proxy) that handles raw TCP traffic. In domain mode, the installer sets `SB_L4_TLS_LISTEN=:443`, so caddy-l4 owns port 443. Normal HTTPS traffic for the API and web URLs moves to `127.0.0.1:8443` (`SB_L4_TLS_FALLBACK`), and caddy-l4 sends every name that is not a TLS port there. If `SB_L4_TLS_LISTEN` is empty, TLS exposures fail with `TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set`.
 
-TLS ports reuse the server's wildcard certificate for `*.<domain>`. Caddy gets it once with DNS-01 at startup. So exposing a TLS port does no certificate work: it adds one route to Caddy and one row to the database. The certificate's private key stays on the host and never enters a sandbox. If `SB_L4_TLS_LISTEN` is empty, TLS exposures fail with `TLS-SNI exposure requires SB_L4_TLS_LISTEN to be set`.
+TLS ports reuse the server's wildcard certificate for `*.<domain>`, which Caddy gets once at startup. So exposing a TLS port does no certificate work: it adds one route to Caddy and one row to the database. The certificate's private key never enters a sandbox.
 
-### Restarts and clusters
+### Restarts, clusters and cleanup
 
-The host port is saved with the exposure. After a `sandboxd` restart, the server's regular sync pass puts each TCP route back, pointing at the sandbox's current address, on the same host port.
-
-In a cluster, the chosen host port is copied to every server. Servers that do not run the sandbox open the same host port and forward to the server that does. So `tcp://<cluster-host>:<host-port>` stays the same address after the cluster settles. If the server taking over a failed sandbox cannot open that port because something else uses it, the exposure needs an operator's help. The server does not quietly move it to another port.
-
-### What unexpose removes
-
-The server looks up the protocol saved with the exposure and removes the matching Caddy route:
-
-| Saved protocol | Caddy route removed | Extra cleanup |
-|---|---|---|
-| `http` (or empty, on old rows) | `sandbox-<id>-port-<port>` on the HTTP server | None |
-| `tcp` | The layer-4 server `tcp-port-<host-port>` | The host port goes back to the pool |
-| `tls` | `sandbox-<id>-port-<port>-tls` on the shared TLS listener | None |
-
-In every case, the exposure row is deleted. The sandbox's port allowlist is updated, so the proxy path `/proxy/<port>/` refuses requests right away.
-
-### Keeping routes in sync
-
-The server's regular sync pass, and a manual run, keep Caddy and the database matched for all three protocols. They add missing routes for running sandboxes and remove routes for deleted ones. They also delete leftover routes and layer-4 servers that match AerolVM's naming but no longer belong to any sandbox. See [Reconcile](/reconcile/).
+- **Restarts.** The host port is saved with the exposure. After a `sandboxd` restart, the regular sync pass puts each TCP route back on the same host port.
+- **Clusters.** The host port is copied to every server. Servers that do not run the sandbox open the same port and forward to the one that does, so the address stays the same. If the server taking over a failed sandbox cannot open that port because something else uses it, the exposure needs an operator's help. The server does not quietly move it.
+- **Unexpose.** The server removes the Caddy route that matches the saved protocol: `sandbox-<id>-port-<port>` for HTTP, the layer-4 server `tcp-port-<host-port>` for TCP (the port goes back to the pool), and `sandbox-<id>-port-<port>-tls` for TLS. The exposure row is deleted and the proxy path `/proxy/<port>/` refuses requests right away.
+- **Sync.** The regular sync pass, and a manual run, keep Caddy and the database matched for all three protocols. They remove routes that no longer belong to any sandbox. See [Reconcile](/reconcile/).
 
 ## Next steps
 
 - [TCP or TLS?](/tcp-vs-tls-ports/): pick the right protocol for your service.
 - [Public URLs](/public-urls/): web URLs for websites and APIs.
-- [Public URLs](/public-urls/): how ports stay closed until you expose them.
 - [Reconcile](/reconcile/): how the server keeps its routes in sync.
