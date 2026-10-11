@@ -46,7 +46,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/getting-started/local-setup', 'Local Setup'),
       link('/getting-started/single-node-setup', 'Single Node Cloud Setup'),
       link('/getting-started/cluster-setup', 'Cluster Setup'),
-      link('/comparison', 'AerolVM vs Daytona vs E2B'),
     ],
   },
   {
@@ -106,7 +105,6 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/public-urls', 'Public URLs'),
       link('/custom-domains', 'Custom domains'),
       link('/tcp-ports', 'TCP and TLS ports'),
-      link('/tcp-vs-tls-ports', 'TCP or TLS?'),
     ],
   },
   {
@@ -118,25 +116,27 @@ const getDocsSidebarConfig = (): NavigationGroup[] => [
       link('/platform-volumes', 'Platform volumes'),
     ],
   },
-  {
-    type: 'group',
-    label: 'Run a Cluster',
-    category: NavigationCategory.OPERATIONS,
-    entries: [
-      link('/cluster-setup', 'Cluster setup'),
-      link('/cluster-ingress', 'Ingress nodes'),
-      link('/cluster-secrets', 'Secrets providers'),
-      link('/cluster-glossary', 'Glossary'),
-      link('/dashboard', 'Dashboard'),
-      link('/reconcile', 'Reconcile'),
-      link('/operational-runbooks', 'Runbooks'),
-    ],
-  },
+  // {
+  //   type: 'group',
+  //   label: 'Run a Cluster',
+  //   category: NavigationCategory.OPERATIONS,
+  //   entries: [
+  //     link('/cluster-setup', 'Cluster setup'),
+  //     link('/cluster-ingress', 'Ingress nodes'),
+  //     link('/cluster-secrets', 'Secrets providers'),
+  //     link('/cluster-glossary', 'Glossary'),
+  //     link('/dashboard', 'Dashboard'),
+  //     link('/reconcile', 'Reconcile'),
+  //     link('/operational-runbooks', 'Runbooks'),
+  //   ],
+  // },
   {
     type: 'group',
     label: 'Deep Dives',
     category: NavigationCategory.ENGINEERING,
     entries: [
+      link('/aerolvm-vs-daytona-vs-e2b', 'AerolVM vs Daytona vs E2B'),
+      link('/tcp-vs-tls-ports', 'TCP or TLS?'),
       link('/randomness-in-cloned-sandboxes', 'Randomness in clones'),
       link('/engineering-distributed-sandbox-runtime', 'Why AerolVM exists'),
       link('/engineering-runtime-layers', 'Engine, chassis, runtime'),
