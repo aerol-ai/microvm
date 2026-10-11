@@ -3,7 +3,7 @@
 // own package.json keeps it in step with every SDK release instead of a
 // hard-coded string that goes stale.
 import sdkPackage from '../../../sdk/typescript/package.json'
-import { isBlogPath, isEnterprisePath } from '../content.config'
+import { isBlogPath, isChangelogPath, isEnterprisePath } from '../content.config'
 import { isActiveOrParentPath } from '../utils/navigation'
 import LanguageSelect from './LanguageSelect.astro'
 import ThemeSelect from './ThemeSelect.astro'
@@ -17,12 +17,14 @@ const onUseCases = isActiveOrParentPath(useCasesHref, currentPath)
 // stripped the same way the sidebar sees it.
 const onBlog = isBlogPath(`/${currentPath.slice(basePath.length)}`)
 const onEnterprise = isEnterprisePath(`/${currentPath.slice(basePath.length)}`.replace(/\/$/, ''))
+const onChangelog = isChangelogPath(`/${currentPath.slice(basePath.length)}`.replace(/\/$/, ''))
 
 const navLinks = [
-  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases && !onBlog && !onEnterprise },
+  { label: 'Docs', href: `${basePath}introduction/`, active: !onUseCases && !onBlog && !onEnterprise && !onChangelog },
   { label: 'Use Cases', href: useCasesHref, active: onUseCases },
   { label: 'Blogs', href: `${basePath}blog/`, active: onBlog },
   { label: 'Enterprise', href: `${basePath}enterprise/`, active: onEnterprise },
+  { label: 'Changelog', href: `${basePath}changelog/`, active: onChangelog },
 ]
 
 const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
@@ -45,10 +47,8 @@ const languages = ['TypeScript', 'Python', 'Go', 'Rust', 'Java']
     <div class="nav__items_side_menu">
       <a
         class="version-pill"
-        href="https://github.com/aerol-ai/microvm/releases"
-        target="_blank"
-        rel="noreferrer"
-        title="SDK version. See all releases on GitHub."
+        href={`${basePath}changelog/`}
+        title="SDK version. See every release in the changelog."
       >
         v{version}
       </a>

@@ -289,6 +289,21 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
   },
 ]
 
+// The Changelog tab: one page, every release newest first. Its own sidebar
+// keeps the Docs sidebar from showing on a page that is not part of it.
+const getChangelogSidebarConfig = (): NavigationGroup[] => [
+  {
+    type: 'group',
+    label: 'Changelog',
+    category: NavigationCategory.ENGINEERING,
+    entries: [link('/changelog', 'All releases')],
+  },
+]
+
+export function isChangelogPath(pathname: string): boolean {
+  return pathname === '/changelog' || pathname === '/changelog/'
+}
+
 export function isEnterprisePath(pathname: string): boolean {
   return pathname === ent || pathname.startsWith(`${ent}/`)
 }
@@ -304,6 +319,7 @@ export function isBlogPath(pathname: string): boolean {
 export const getSidebarConfig = (pathname = '/'): NavigationGroup[] => {
   if (isUseCasesPath(pathname)) return getUseCasesSidebarConfig()
   if (isEnterprisePath(pathname)) return getEnterpriseSidebarConfig()
+  if (isChangelogPath(pathname)) return getChangelogSidebarConfig()
   if (isBlogPath(pathname)) return getBlogSidebarConfig()
   return getDocsSidebarConfig()
 }
