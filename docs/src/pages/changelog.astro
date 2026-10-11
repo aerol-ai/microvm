@@ -1,0 +1,121 @@
+---
+// The Changelog, built from GitHub Releases at build time (see
+// src/utils/releases.ts). It renders through StarlightPage so it gets the
+// site's header, sidebar and "On this page" list like any docs page.
+import { createSatteriMarkdownProcessor } from '@astrojs/markdown-satteri'
+import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro'
+import { dateRange, formatDate, getReleases, groupByLine, monthTimeline, slugify, splitNotes } from '../utils/releases'
+
+const { releases, source } = await getReleases()
+const lines = groupByLine(releases)
+const latestLine = lines[0]?.line
+
+const markdown = await createSatteriMarkdownProcessor({ features: { gfm: true } })
+const render = async (md: string) => (md ? (await markdown.render(md)).code : '')
+
+const usedSlugs = new Set<string>()
+const uniqueSlug = (text: string) => {
+  const base = slugify(text)
+  let slug = base
+  for (let n = 1; usedSlugs.has(slug); n++) slug = `${base}-${n}`
+  usedSlugs.add(slug)
+  return slug
+}
+
+const sections = await Promise.all(
+  lines.map(async ({ line, releases: inLine }) => ({
+    line,
+    slug: uniqueSlug(`${line} release line`),
+    entries: await Promise.all(
+      inLine.map(async release => {
+        const notes = splitNotes(release.body)
+        return {
+          release,
+          slug: uniqueSlug(release.name),
+          intro: await render(notes.intro),
+          highlights: await render(notes.highlights),
+          upgrade: await render(notes.upgrade),
+        }
+      })
+    ),
+  }))
+)
+
+const headings = sections.flatMap(section => [
+  { depth: 2, slug: section.slug, text: `${section.line} release line` },
+  ...section.entries.map(entry => ({ depth: 3, slug: entry.slug, text: entry.release.name })),
+])
+
+const timeline = monthTimeline(releases)
+---
+
+<StarlightPage
+  frontmatter={{
+    title: 'Changelog',
+    description: 'Every AerolVM release, newest first, with what changed and what to check before you upgrade.',
+  }}
+  headings={headings}
+>
+  <p>
+    Each entry below is one release: its highlights, and anything to check before you upgrade. This page is built
+    from the <a href="https://github.com/aerol-ai/microvm/releases">GitHub release notes</a> every time the docs
+    are published. The full notes, the merged pull requests and the downloads are on GitHub.
+  </p>
+  <p>
+    Security fixes land on the newest release line only, which is <strong>{latestLine}</strong> today. See
+    the <a href="https://github.com/aerol-ai/microvm/blob/main/SUPPORT.md">support policy</a>.
+  </p>
+
+  <pre class="mermaid">{timeline}</pre>
+
+  <table>
+    <thead>
+      <tr><th>Release line</th><th>Releases</th><th>Dates</th><th>Latest</th></tr>
+    </thead>
+    <tbody>
+      {
+        sections.map(section => (
+          <tr>
+            <td><a href={`#${section.slug}`}>{section.line}</a></td>
+            <td>{section.entries.length}</td>
+            <td>{dateRange(section.entries.map(e => e.release))}</td>
+            <td><a href={`#${section.entries[0].slug}`}>{section.entries[0].release.tag}</a></td>
+          </tr>
+        ))
+      }
+    </tbody>
+  </table>
+
+  {
+    sections.map(section => (
+      <>
+        <h2 id={section.slug}>{section.line} release line</h2>
+        {section.entries.map(entry => (
+          <>
+            <h3 id={entry.slug}>{entry.release.name}</h3>
+            <p class="release-meta">
+              <em>{formatDate(entry.release.publishedAt)}</em>
+              {entry.release.prerelease && <> · Pre-release</>} · <a href={entry.release.url}>Full notes</a>
+            </p>
+            {entry.intro && <Fragment set:html={entry.intro} />}
+            <Fragment set:html={entry.highlights} />
+            {entry.upgrade && (
+              <>
+                <p><strong>Before you upgrade:</strong></p>
+                <Fragment set:html={entry.upgrade} />
+              </>
+            )}
+          </>
+        ))}
+      </>
+    ))
+  }
+
+  {
+    source === 'snapshot' && (
+      <p class="release-meta">
+        <em>GitHub could not be reached when this page was built, so it shows the saved release list.</em>
+      </p>
+    )
+  }
+</StarlightPage>
