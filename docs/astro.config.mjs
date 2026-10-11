@@ -31,6 +31,7 @@ export default defineConfig({
     // preview.mdx and port-allowlist.mdx were merged into public-urls.mdx.
     '/preview': '/public-urls',
     '/port-allowlist': '/public-urls',
+    '/comparison': '/aerolvm-vs-daytona-vs-e2b',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into
