@@ -1,6 +1,6 @@
 ---
 import EditLink from './EditLink.astro'
-import PageFeedback from './PageFeedback.astro'
+import GiscusComments from './GiscusComments.astro'
 import Pagination from './Pagination.astro'
 import ThemeSelect from './ThemeSelect.astro'
 
@@ -13,7 +13,7 @@ issueUrl.searchParams.set('title', `Docs: ${title}`)
 issueUrl.searchParams.set('body', `Page: ${Astro.url.pathname}\n\nWhat was wrong or hard to follow?\n`)
 ---
 
-<PageFeedback placement="footer" />
+<GiscusComments />
 
 <div class="docs-footer__page-actions">
   <EditLink />
