@@ -640,6 +640,10 @@ func WithProtocol(p sdktypes.ExposeProtocol) ExposeOption {
 //
 // With no option (or WithProtocol(ExposeProtocolHTTP)) the result is the
 // default Caddy HTTP reverse-proxy URL.
+//
+// A sandbox created with AllowPublicTraffic omitted or false starts private,
+// with no public URL; the first ExposePort makes it public, whichever of the
+// two it was. Set AllowPublicTraffic to true to make it public from boot.
 func (s *Sandbox) ExposePort(ctx context.Context, port int, opts ...ExposeOption) (sdktypes.ExposeResult, error) {
 	cfg := exposeOptions{protocol: sdktypes.ExposeProtocolHTTP}
 	for _, opt := range opts {

@@ -1,16 +1,48 @@
 ---
+import { getSidebarConfig } from '../content.config'
+import { getSectionLabel } from '../utils/navigation'
 import { PAGE_TITLE_ID } from './TableOfContent/constants'
 
 const entry = Astro.locals.starlightRoute?.entry
 const data = entry?.data
+const section = getSectionLabel(getSidebarConfig(Astro.url.pathname), Astro.url.pathname)
 ---
 
 {
-  data && !data.hideTitleOnPage && <h1 id={PAGE_TITLE_ID} class="page-title">{data.title}</h1>
+  data && !data.hideTitleOnPage && (
+    <div class="page-heading">
+      {section && <p class="page-section">{section}</p>}
+      <h1 id={PAGE_TITLE_ID} class="page-title">{data.title}</h1>
+      {data.description && <p class="page-description">{data.description}</p>}
+    </div>
+  )
 }
 
 <style>
+  .page-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .page-section {
+    margin: 0;
+    font-family: var(--font-condensed);
+    font-size: 0.8125rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--hover-color);
+  }
+
   .page-title {
     margin: 0;
+  }
+
+  .page-description {
+    margin: 0;
+    font-size: 1.125rem;
+    line-height: 1.5;
+    color: var(--secondary-text-color);
   }
 </style>

@@ -283,6 +283,7 @@ See [Server Setup](https://microvm.aerol.ai/getting-started) for all installatio
 | [Comparison](https://microvm.aerol.ai/comparison) | AerolVM vs e2b vs Daytona - full feature and cost analysis. |
 | [Actors and actions](DESIGN.md) | Who acts on a released node, and which component carries out each action. |
 | [Security assessment](SECURITY-ASSESSMENT.md) | The most likely and most severe problems for a released node, and where the 0.6.3 review left each one. |
+| [Releasing](RELEASING.md) | How the maintainer publishes a release and keeps the changelog in sync. |
 
 ## Dependencies
 

@@ -1,65 +1,57 @@
 ---
-title: Platform Volumes
+title: Platform volumes
+description: Attach lasting storage to a sandbox by name only, and get the same files back from any later sandbox.
 ---
 
-import { Tabs, TabItem } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Platform volumes are **named, persistent storage that the operator backs with
-shared cloud storage and you reference by name.** Unlike [external
-storage](/external-storage), you never supply a bucket URL or credentials — the
-operator configures one shared backend, and you just ask for a volume by name.
+A platform volume is named storage that outlives your sandboxes. You pick a name and a folder. AerolVM does the rest. You never handle a bucket address or credentials.
 
 A platform volume:
 
-- has a **name**, scoped to your tenant;
-- **persists across the sandbox lifecycle** — it survives stop *and* destroy;
-- can be **re-attached by the same name** from a later sandbox and see the same
-  data, **on any node** (it is backed by shared storage, not a host directory);
-- can be **shared** by multiple sandboxes.
+- has a **name** that belongs to your account;
+- **keeps its files** when a sandbox stops or is deleted;
+- can be **attached again by the same name** from a later sandbox, on any server in a cluster;
+- can be **shared** by several sandboxes at once.
 
-## When to use which
+## How it works
 
-| | External storage | Platform volume |
-|---|---|---|
-| Who owns the backend | You (your bucket + creds) | The operator (shared bucket) |
-| What you pass | `source` + `credentials` | just a `name` |
-| Lifetime | Remote data outlives the mount | Volume persists, re-attach by name |
-| Cluster | Works (you point at your store) | Works — shared storage is the source of truth |
+```mermaid
+flowchart LR
+    subgraph Store["Shared store, set up by your operator (S3 or NFS)"]
+        Yours["Your account's<br/>volume named data"]
+        Theirs["Another account's<br/>volume named data"]
+    end
+    Yours -- "server 1 mounts it" --> One["Your sandbox 1<br/>/workspace"]
+    Yours -- "server 2 mounts it" --> Two["Your sandbox 2<br/>/workspace, read-only"]
+    Theirs -- "a separate folder" --> Other["Their sandbox"]
+```
 
-## Prerequisites
+1. **You pass a name and a folder,** such as `data` at `/workspace`.
+2. **The server looks up the name in your account.** The first time, it makes the volume, which starts empty. After that, the same name finds the same volume.
+3. **The server mounts the volume's folder from the shared store.** The sandbox sees a plain folder. It never sees the store's address or keys.
 
-Platform volumes must be **enabled by the operator** (see [Operator
-setup](#operator-setup)). If they are not configured, every volume request is
-rejected with **412 Precondition Failed**. Volumes are supported on the
-`docker` and `gvisor` runtimes only — `firecracker`, `wasm`, and `isolate`
-reject them.
-Platform volumes count against the same per-sandbox cap as external mounts (8
-total).
+Every server reads the same store, so a volume has the same files on every server.
 
-## Attach a volume at create
+## Attach a volume
 
-First use of a name creates the volume; reuse re-attaches the same data. The
-volume is mounted read-write by default.
+This attaches the volume `data` at `/workspace`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
     ```ts
     const sandbox = await client.create({
-      image: 'ubuntu:22.04',
-      platformVolumes: [
-        { name: 'data', path: '/workspace' },
-      ],
-    })
+      image: "ubuntu:22.04",
+      platformVolumes: [{ name: "data", path: "/workspace" }],
+    });
     ```
   </TabItem>
   <TabItem label="Python">
     ```python
-    sandbox = client.create({
-        'image': 'ubuntu:22.04',
-        'platformVolumes': [
-            {'name': 'data', 'path': '/workspace'},
-        ],
-    })
+    sandbox = client.create(
+        image="ubuntu:22.04",
+        platformVolumes=[{"name": "data", "path": "/workspace"}],
+    )
     ```
   </TabItem>
   <TabItem label="Go">
@@ -70,15 +62,20 @@ volume is mounted read-write by default.
             {Name: "data", Path: "/workspace"},
         },
     })
+    if err != nil {
+        log.Fatal(err)
+    }
     ```
   </TabItem>
   <TabItem label="Rust">
     ```rust
+    use aerolvm_sdk::PlatformVolumeMount;
+
     let sandbox = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
-            name: "data".to_string(),
-            path: "/workspace".to_string(),
+        image: "ubuntu:22.04".into(),
+        platform_volumes: Some(vec![PlatformVolumeMount {
+            name: "data".into(),
+            path: "/workspace".into(),
             read_only: None,
         }]),
         ..Default::default()
@@ -87,161 +84,114 @@ volume is mounted read-write by default.
   </TabItem>
   <TabItem label="Java">
     ```java
-    import ai.aerol.microvm.model.PlatformVolumeMount;
-    import java.util.List;
-
-    Sandbox sandbox = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setPlatformVolumes(List.of(
-                new PlatformVolumeMount().setName("data").setPath("/workspace")
-            ))
-    );
+    Sandbox sandbox = client.create(new CreateOptions()
+        .setImage("ubuntu:22.04")
+        .setPlatformVolumes(List.of(
+            new PlatformVolumeMount().setName("data").setPath("/workspace"))));
     ```
   </TabItem>
 </Tabs>
 
-## Re-attach the same volume from another sandbox
+| Field | What it does | Default |
+|---|---|---|
+| `name` | The volume's name. | Required |
+| `path` | The folder inside the sandbox, as a full path. | Required |
+| `readOnly` | Let the sandbox read the files but not change them. | `false` |
 
-Reference the same name from a second sandbox to see the data the first one
-wrote. Because the volume lives in shared storage, the second sandbox can land
-on a different node and still read it.
+Go spells these `Name`, `Path` and `ReadOnly`. Rust uses `read_only`. Python also accepts `platform_volumes` and `read_only`.
 
-<Tabs syncKey="lang">
-  <TabItem label="TypeScript">
-    ```ts
-    // First sandbox writes into the volume.
-    const a = await client.create({
-      image: 'ubuntu:22.04',
-      platformVolumes: [{ name: 'data', path: '/workspace' }],
-    })
-    // Later, a second sandbox mounts the same volume read-only.
-    const b = await client.create({
-      image: 'ubuntu:22.04',
-      platformVolumes: [{ name: 'data', path: '/workspace', readOnly: true }],
-    })
-    ```
-  </TabItem>
-  <TabItem label="Python">
-    ```python
-    a = client.create({
-        'image': 'ubuntu:22.04',
-        'platformVolumes': [{'name': 'data', 'path': '/workspace'}],
-    })
-    b = client.create({
-        'image': 'ubuntu:22.04',
-        'platformVolumes': [{'name': 'data', 'path': '/workspace', 'readOnly': True}],
-    })
-    ```
-  </TabItem>
-  <TabItem label="Go">
-    ```go
-    a, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image:           "ubuntu:22.04",
-        PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: "data", Path: "/workspace"}},
-    })
-    b, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
-        Image:           "ubuntu:22.04",
-        PlatformVolumes: []sdktypes.PlatformVolumeMount{{Name: "data", Path: "/workspace", ReadOnly: true}},
-    })
-    ```
-  </TabItem>
-  <TabItem label="Rust">
-    ```rust
-    let a = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
-            name: "data".to_string(),
-            path: "/workspace".to_string(),
-            read_only: None,
-        }]),
-        ..Default::default()
-    })?;
-    let b = client.create(CreateOptions {
-        image: "ubuntu:22.04".to_string(),
-        platform_volumes: Some(vec![aerolvm_sdk::PlatformVolumeMount {
-            name: "data".to_string(),
-            path: "/workspace".to_string(),
-            read_only: Some(true),
-        }]),
-        ..Default::default()
-    })?;
-    ```
-  </TabItem>
-  <TabItem label="Java">
-    ```java
-    Sandbox a = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setPlatformVolumes(List.of(
-                new PlatformVolumeMount().setName("data").setPath("/workspace")
-            ))
-    );
-    Sandbox b = client.create(
-        new CreateOptions()
-            .setImage("ubuntu:22.04")
-            .setPlatformVolumes(List.of(
-                new PlatformVolumeMount().setName("data").setPath("/workspace").setReadOnly(true)
-            ))
-    );
-    ```
-  </TabItem>
-</Tabs>
+<Aside>
+Platform volumes only work when your operator has turned them on. If they are off, every request that uses a volume fails with HTTP 412 (Precondition Failed). Ask your server operator to turn them on.
+</Aside>
 
-## Semantics
+## Share files between sandboxes
 
-- **Persistence.** Destroying a sandbox tears down the mount but never deletes
-  the volume's data. Re-attach by name to get it back.
-- **Naming.** Names are lowercased and limited to `[a-z0-9._-]`; path separators
-  and `..` are rejected.
-- **Tenant isolation.** Volume names are scoped per tenant — two tenants using
-  the name `data` get separate, isolated storage.
-- **Quotas.** Operators can cap the number of volumes per tenant; exceeding it
-  returns a `409`.
-- **Concurrent writers.** The default S3 backend is eventually consistent with
-  no file locking — concurrent writers to the same volume can lose data. Use
-  one writer plus read-only attachers, or coordinate at the application layer.
-- **Cluster.** Shared storage is the single source of truth, so a volume works
-  no matter which node a sandbox is placed on. No node affinity is required.
+Give a second sandbox the same name to see what the first one wrote. It can run on a different server and still read the same files.
 
-## Operator setup
+To let the second sandbox read but not change the files, add `readOnly: true` to its volume. That is `ReadOnly: true` in Go, `read_only: Some(true)` in Rust and `.setReadOnly(true)` in Java.
 
-Platform volumes are off by default. Enable them by pointing the daemon at a
-shared storage backend.
+A safe pattern is one sandbox that writes and any number that attach read-only. Two sandboxes writing the same files at once can lose data, because the store does not lock files.
 
-S3 (or any S3-compatible store such as Cloudflare R2 or MinIO):
+## What happens to the files
 
-```
-SB_PLATFORM_VOLUMES_ENABLED=true
-SB_PLATFORM_VOLUMES_BACKEND=s3
-SB_PLATFORM_VOLUMES_S3_BUCKET=my-org-volumes
-SB_PLATFORM_VOLUMES_S3_PREFIX=volumes            # optional, default "volumes"
-SB_PLATFORM_VOLUMES_S3_REGION=us-east-1
-SB_PLATFORM_VOLUMES_S3_ENDPOINT=                 # optional, for R2/MinIO
-SB_PLATFORM_VOLUMES_S3_ACCESS_KEY_ID=...         # omit to use an instance role
-SB_PLATFORM_VOLUMES_S3_SECRET_ACCESS_KEY=...
-SB_PLATFORM_VOLUMES_MAX_PER_TENANT=0             # 0 = unlimited
+```mermaid
+stateDiagram-v2
+    state "In use" as InUse
+    state "Not in use" as Unused
+    state "Deleted" as Deleted
+    [*] --> InUse: a sandbox uses the name for the first time
+    InUse --> Unused: every sandbox that used it is deleted
+    Unused --> InUse: a new sandbox uses the same name
+    Unused --> Deleted: you delete the volume
+    Deleted --> [*]: files removed a few minutes later
 ```
 
-NFS (a credential-free kernel mount against a shared export):
+- **Stopping or deleting a sandbox never deletes the volume's files.** Attach the same name again to get them back.
+- **A volume in use cannot be deleted.** A stopped sandbox still counts. Delete every sandbox that uses the volume first, or the delete fails with HTTP 409 (Conflict).
+- **Deleting a volume deletes its files.** The server removes them in the background, a few minutes later. If you reuse the name before that, the old files are still there.
+- **There is no AerolVM SDK call to list or delete volumes yet.** The [Daytona SDK](/using-daytona-sdk/) can create, list, get and delete them through AerolVM.
 
-```
-SB_PLATFORM_VOLUMES_ENABLED=true
-SB_PLATFORM_VOLUMES_BACKEND=nfs
-SB_PLATFORM_VOLUMES_NFS_SERVER=10.0.0.5
-SB_PLATFORM_VOLUMES_NFS_EXPORT=/exports/volumes
-SB_PLATFORM_VOLUMES_NFS_OPTIONS=vers=4.1         # optional
-```
+## What you can do with the files
 
-Gating:
+This depends on the store your operator picked. Ask them which one it is.
 
-| Condition | Behavior |
+| | S3 store | NFS store |
+|---|---|---|
+| Read files | Yes | Yes |
+| Add new files | Yes, written from start to finish in one go | Yes |
+| Change, rename or delete a file already there | No | Yes |
+
+On an S3 store, the server mounts the bucket with `mount-s3`, which only adds new files by default. To change a file, write a new file with a new name.
+
+## Platform volume or your own storage?
+
+| | [Attach cloud storage](/external-storage/) | Platform volume |
+|---|---|---|
+| Who owns the storage | You: your bucket and your keys | Your operator: one shared store |
+| What you pass | A `source` and `credentials` | Only a `name` |
+| How long the files last | As long as your storage keeps them | Until the volume is deleted |
+| In a cluster | Works, because you point at your own store | Works, because the shared store holds the files |
+
+## Naming rules
+
+- Names are turned into lowercase. They may use only `a` to `z`, `0` to `9`, `.`, `_` and `-`. Any other character is refused, not removed.
+- A name can be up to 64 characters. `.` and `..` are not allowed.
+- **Each account has its own names.** Two tenants (separate accounts on the same server) can both use `data`, and each gets separate storage.
+
+## Good to know
+
+- **Only Docker and gVisor sandboxes** can attach platform volumes. Firecracker, WebAssembly and V8 isolate sandboxes refuse them with HTTP 400.
+- **A sandbox can have up to 8 mounts in total.** Platform volumes and [cloud storage mounts](/external-storage/) share that limit.
+- **Your operator can limit how many volumes each account has.** Going over the limit fails with HTTP 409 (Conflict).
+- **Volumes survive a server failure.** If a sandbox is rebuilt on another server after a failure, it mounts the same volume again. See [Durability and failover](/durability/).
+- **The E2B SDK** can attach volumes too, with its `volumeMounts` option. See [Use the E2B SDK](/using-e2b-sdk/).
+
+
+
+| Setup | What happens |
 |---|---|
-| Disabled / unset | Volume APIs return **412** |
-| Enabled but misconfigured | Daemon fails fast at startup |
-| Enabled + configured | Volumes attach normally |
+| Off or not set | Every volume request fails with HTTP 412. |
+| On, but a required setting is missing | The server refuses to start, so you find out at once. |
+| On and fully set | Volumes attach normally. |
 
-The operator owns and pays for the backing store, and is responsible for any
-storage-side lifecycle or retention policy. Operator credentials are sealed at
-rest, never returned by any read API, and never enter the sandbox — the mount
-runs on the host.
+How it is laid out and kept safe:
+
+- **Each volume is one folder in the store:** `<bucket>/<prefix>/<account>/<name>` on S3, or `<export>/<account>/<name>` on NFS. The account part is a hash made on the server, so callers cannot pick or guess another account's folder.
+- **A volume's folder is fixed when the volume is made.** If you later change the bucket, prefix or export, existing volumes keep mounting from their old folder, with the current keys.
+- **The store's keys stay on the server.** They are saved encrypted in the server's database with each mount. No read API returns them, and they never enter a sandbox, because the mount runs on the server.
+- **You own and pay for the store.** Set any lifecycle or retention rules on it yourself.
+
+When a volume is deleted, a background job removes its files. On S3 it runs `aws s3 rm --recursive`, so the AWS CLI must be installed on each server. The one-line installer does not install it, but the cluster Terraform setup does. On NFS it mounts the export and removes the volume's folder. A failed cleanup is tried again on the next pass.
+
+| Variable | What it does | Default |
+|---|---|---|
+| `SB_PLATFORM_VOLUMES_RECLAIM_INTERVAL` | How often the server looks for deleted volumes to clean up. | `5m` |
+| `SB_PLATFORM_VOLUMES_RECLAIM_CONCURRENCY` | How many cleanups run at the same time. | `8` |
+| `SB_PLATFORM_VOLUMES_RECLAIM_MOUNT_ROOT` | The scratch folder used while cleaning up NFS volumes. | `/var/lib/aerolvm/volume-reclaim` |
+
+## Next steps
+
+- [Attach cloud storage](/external-storage/): mount your own bucket or share instead.
+- [Files](/file-system/): copy single files in and out.
+- [Use the Daytona SDK](/using-daytona-sdk/): create, list and delete volumes.
+- [Durability and failover](/durability/): what happens to sandboxes when a server fails.

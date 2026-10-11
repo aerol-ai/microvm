@@ -12,7 +12,9 @@ type MicroVMConfig struct {
 	// independently — bumping the SDK doesn't move the wire version.
 	APIVersion string
 	// Retry configures the policy for transient transport errors and retryable
-	// HTTP status codes (421, 429, 502, 503, 504).
+	// HTTP status codes (421, 429, 502, 503, 504). Exec is narrower: it is
+	// re-sent only when the connection never opened or on 429/503, because a
+	// re-sent exec runs the command again.
 	Retry *RetryConfig
 }
 

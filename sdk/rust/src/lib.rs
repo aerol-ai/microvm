@@ -5,6 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use reqwest::blocking::{
@@ -35,7 +36,8 @@ pub use types::{
     CustomDomain,
     CustomDomainDnsRecords,
     CustomDomainStatus, DnsRecord, ExecExitInfo, ExecRequest, ExecResult, ExposeOptions,
-    ExposeProtocol, ExposeResult, ExposedPort, Failover, HealthStatus, IngressTarget, Lifecycle,
+    ExposeProtocol, ExposeResult, ExposedPort, Failover, GPUOptions, GPUVendor, HealthStatus,
+    IngressTarget, Lifecycle,
     MountSpec, MountSpecRedacted, MountType, NetworkUsage, PlatformVolumeMount,
     RegisterSnapshotOptions, RegistryAuth,
     ResizeOptions, RetryConfig, Sandbox as SandboxData, SandboxSnapshot, Session, SessionList,
@@ -162,6 +164,65 @@ impl Default for ApiVersion {
 /// Python SDK and `sdk/go/internal/apiclient/v1/paths.go` in the Go SDK.
 mod api_v1 {
     pub const PATH_PREFIX: &str = "/v1";
+}
+
+/// Bounds only the TCP/TLS connect, which no legitimate call needs long for.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `HttpClient::new()` caps every request at 30 s in total, which fails any
+/// exec, build or upload that legitimately runs longer, so production passes
+/// `None` (no total cap) and leaves ending long calls to the server's own
+/// limits, such as exec `timeout_seconds`. The argument exists so a test can
+/// prove the value reaches reqwest rather than its 30 s default.
+fn build_http_client(total_timeout: Option<Duration>) -> Result<HttpClient, Error> {
+    HttpClient::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(total_timeout)
+        .build()
+        .map_err(Error::Reqwest)
+}
+
+/// Which failures [`Client::send_json`] answers by sending the request again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryPolicy {
+    /// The daemon designs these endpoints for retry under duplicates, so any
+    /// transport error and the routing/overload statuses re-send.
+    Idempotent,
+    /// Re-sending repeats the work (exec runs the user's command again), so
+    /// only re-send what provably did none: a connection that never opened,
+    /// or a 429/503 the server refused up front. A timeout, reset or 502/504
+    /// can arrive after the command started, so it goes to the caller.
+    UnsentOnly,
+}
+
+impl RetryPolicy {
+    fn retries_status(self, status: reqwest::StatusCode) -> bool {
+        use reqwest::StatusCode as S;
+        match self {
+            // 421: misdirected (connection coalescing or a stale route); the
+            // server closed the connection, so the retry reconnects.
+            RetryPolicy::Idempotent => [
+                S::MISDIRECTED_REQUEST,
+                S::TOO_MANY_REQUESTS,
+                S::BAD_GATEWAY,
+                S::SERVICE_UNAVAILABLE,
+                S::GATEWAY_TIMEOUT,
+            ]
+            .contains(&status),
+            RetryPolicy::UnsentOnly => {
+                [S::TOO_MANY_REQUESTS, S::SERVICE_UNAVAILABLE].contains(&status)
+            }
+        }
+    }
+
+    fn retries_error(self, err: &reqwest::Error) -> bool {
+        match self {
+            RetryPolicy::Idempotent => err.is_request() || err.is_connect() || err.is_timeout(),
+            // is_connect covers refused, DNS failure and connect timeout, all
+            // of which fail before a byte of the request is written.
+            RetryPolicy::UnsentOnly => err.is_connect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -336,8 +397,10 @@ impl Sandbox {
         Ok(self)
     }
 
-    pub fn exec(&self, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.client.exec(&self.data.id, request)
+    /// Runs a command and waits for it to exit. See [`Client::exec`] for why a
+    /// failure after the request was sent is returned instead of retried.
+    pub fn exec(&self, request: impl Into<ExecRequest>) -> Result<ExecResult, Error> {
+        self.client.exec(&self.data.id, request.into())
     }
 
     /// Read this sandbox's clone-generation token (changes on
@@ -572,7 +635,7 @@ impl Client {
             api_url,
             pat_token,
             api_version,
-            inner: HttpClient::new(),
+            inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
         })
     }
@@ -1272,8 +1335,12 @@ impl Client {
         )
     }
 
+    /// Runs a command and waits for it to exit. Unlike other calls, a failure
+    /// after the request may have reached the sandbox (timeout, reset, 502,
+    /// 504) is returned rather than retried, because a re-send would run the
+    /// command a second time; the command may or may not have run.
     pub fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecResult, Error> {
-        self.do_json::<ExecRequest, ExecResult>(
+        let (body, _) = self.send_json::<ExecRequest, ExecResult>(
             Method::POST,
             &format!(
                 "{}/sandboxes/{}/toolbox/process/execute",
@@ -1281,7 +1348,9 @@ impl Client {
                 id
             ),
             Some(&request),
-        )
+            RetryPolicy::UnsentOnly,
+        )?;
+        Ok(body)
     }
 
     pub fn create_session(&self, id: &str, opts: CreateSessionOptions) -> Result<Session, Error> {
@@ -1656,6 +1725,16 @@ impl Client {
         path: &str,
         payload: Option<&T>,
     ) -> Result<(U, reqwest::header::HeaderMap), Error> {
+        self.send_json(method, path, payload, RetryPolicy::Idempotent)
+    }
+
+    fn send_json<T: Serialize, U: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        payload: Option<&T>,
+        policy: RetryPolicy,
+    ) -> Result<(U, reqwest::header::HeaderMap), Error> {
         let max_retries = self.retry_config.max_retries.unwrap_or(3);
         let base_delay = self.retry_config.base_delay_ms.unwrap_or(200);
         let max_delay = self.retry_config.max_delay_ms.unwrap_or(5000);
@@ -1673,16 +1752,7 @@ impl Client {
 
             match builder.send() {
                 Ok(response) => {
-                    let status = response.status();
-                    // 421: misdirected (connection coalescing or a stale route);
-                    // the server closed the connection, so the retry reconnects.
-                    if (status == reqwest::StatusCode::MISDIRECTED_REQUEST
-                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                        || status == reqwest::StatusCode::BAD_GATEWAY
-                        || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-                        || status == reqwest::StatusCode::GATEWAY_TIMEOUT)
-                        && attempt < max_retries
-                    {
+                    if attempt < max_retries && policy.retries_status(response.status()) {
                         // Fall through to retry logic
                     } else {
                         let response = self.handle_response(response)?;
@@ -1696,7 +1766,7 @@ impl Client {
                     }
                 }
                 Err(err) => {
-                    if attempt >= max_retries || !err.is_request() && !err.is_connect() && !err.is_timeout() {
+                    if attempt >= max_retries || !policy.retries_error(&err) {
                         return Err(Error::Reqwest(err));
                     }
                 }
@@ -2031,6 +2101,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::thread;
     use tokio_tungstenite::accept_async;
@@ -2068,6 +2139,83 @@ mod tests {
         });
 
         (format!("http://{}", addr), request_rx)
+    }
+
+    /// One scripted answer per accepted connection.
+    enum Reply {
+        /// Read the whole request, then close without answering, as a daemon
+        /// or proxy that dies mid-call does.
+        Hangup,
+        Json {
+            status: &'static str,
+            body: String,
+            delay: Duration,
+        },
+    }
+
+    impl Reply {
+        fn ok(body: String) -> Self {
+            Reply::Json { status: "200 OK", body, delay: Duration::ZERO }
+        }
+
+        fn status(status: &'static str) -> Self {
+            Reply::Json {
+                status,
+                body: r#"{"error":"scripted"}"#.to_string(),
+                delay: Duration::ZERO,
+            }
+        }
+    }
+
+    /// Serves `script` one connection at a time and counts the requests it
+    /// read. The last reply repeats for every further connection, so a client
+    /// that re-sends more than expected is counted rather than refused.
+    fn spawn_scripted_server(script: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let server_hits = hits.clone();
+        thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = read_http_request(&mut stream);
+                server_hits.fetch_add(1, Ordering::SeqCst);
+                if let Reply::Json { status, body, delay } = &script[i.min(script.len() - 1)] {
+                    thread::sleep(*delay);
+                    let head = format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status,
+                        body.len()
+                    );
+                    // The client may have given up already; that is the point
+                    // of some scripts, so a failed write is not an error.
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            }
+        });
+        (format!("http://{}", addr), hits)
+    }
+
+    /// Retries in milliseconds, so a test that counts re-sends stays fast.
+    fn fast_retry_client(url: &str) -> Client {
+        Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(1),
+                    max_delay_ms: Some(5),
+                }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build")
+    }
+
+    fn exec_ok_json() -> String {
+        serde_json::json!({"stdout": "", "stderr": "", "exit_code": 0, "duration_ms": 1}).to_string()
     }
 
     fn spawn_create_with_image_server() -> (String, std::sync::mpsc::Receiver<String>) {
@@ -2255,6 +2403,7 @@ mod tests {
             lifecycle: None,
             failover: None,
             runtime: None,
+            template_id: None,
             gpus: None,
             custom_domains: None,
             durability: None,
@@ -2418,6 +2567,117 @@ mod tests {
             .expect("421 should be retried to success");
         assert_eq!(sandbox.data.id, "sb-421");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    // The proven failure: a 40 s exec ran four times because a transport
+    // error after the POST was sent re-sent it. Once the server has read the
+    // request, the failure must reach the caller with the command sent once.
+    #[test]
+    fn exec_does_not_resend_after_the_request_was_sent() {
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup]);
+        let err = fast_retry_client(&url)
+            .exec("sb-1", ExecRequest::from("sleep 40"))
+            .expect_err("a hangup after the request was sent must surface");
+        assert!(matches!(err, Error::Reqwest(_)), "unexpected error: {}", err);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // 429 and 503 are refusals before any work, so exec re-sends them; 421,
+    // 502 and 504 can follow a command that already started, so they surface.
+    #[test]
+    fn exec_retries_only_up_front_refusal_statuses() {
+        for (status, retried) in [
+            ("429 Too Many Requests", true),
+            ("503 Service Unavailable", true),
+            ("421 Misdirected Request", false),
+            ("502 Bad Gateway", false),
+            ("504 Gateway Timeout", false),
+        ] {
+            let (url, hits) =
+                spawn_scripted_server(vec![Reply::status(status), Reply::ok(exec_ok_json())]);
+            let result = fast_retry_client(&url).exec("sb-1", ExecRequest::from("true"));
+            assert_eq!(result.is_ok(), retried, "{}: {:?}", status, result.as_ref().err());
+            assert_eq!(hits.load(Ordering::SeqCst), if retried { 2 } else { 1 }, "{}", status);
+        }
+    }
+
+    // Refused means the connection never opened, so nothing ran and exec may
+    // re-send. Nothing listens, so attempts are counted by time instead: each
+    // re-send first sleeps its backoff (at least 75% of 40 + 80 + 160 ms
+    // here), while an unretried refusal on loopback returns at once.
+    #[test]
+    fn exec_retries_connection_refused() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("listener should bind")
+            .local_addr()
+            .expect("listener address")
+            .port();
+        let client = Client::with_config(
+            ClientConfig {
+                api_url: Some(format!("http://127.0.0.1:{}", port)),
+                pat_token: Some("pat-token".to_string()),
+                retry: Some(RetryConfig {
+                    max_retries: Some(3),
+                    base_delay_ms: Some(40),
+                    max_delay_ms: Some(1000),
+                }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        let started = std::time::Instant::now();
+        let err = client
+            .exec("sb-1", ExecRequest::from("true"))
+            .expect_err("nothing listens on the port");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&err, Error::Reqwest(inner) if inner.is_connect()),
+            "unexpected error: {}",
+            err
+        );
+        assert!(elapsed >= Duration::from_millis(200), "refusal was not retried: {:?}", elapsed);
+    }
+
+    // Every other call is safe to repeat, so an ambiguous failure (the
+    // connection dying after the request was read) still re-sends.
+    #[test]
+    fn get_still_retries_a_hangup_after_the_request_was_sent() {
+        let body = named_sandbox_json("sb-1", "web").to_string();
+        let (url, hits) = spawn_scripted_server(vec![Reply::Hangup, Reply::ok(body)]);
+        let sandbox = fast_retry_client(&url)
+            .get("sb-1")
+            .expect("get should retry to success");
+        assert_eq!(sandbox.data.id, "sb-1");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    // reqwest's 30 s default total timeout failed every exec longer than
+    // 30 s. Waiting that out is too slow for a unit test, so prove both
+    // halves: the value build_http_client takes reaches reqwest (a 50 ms cap
+    // trips on a reply 300 ms away), and the client Client::new builds waits
+    // for that same slow reply.
+    #[test]
+    fn http_client_has_no_total_request_timeout() {
+        let slow = |body: String| Reply::Json {
+            status: "200 OK",
+            body,
+            delay: Duration::from_millis(300),
+        };
+        let (url, _) = spawn_scripted_server(vec![slow("{}".to_string())]);
+        let err = build_http_client(Some(Duration::from_millis(50)))
+            .expect("client should build")
+            .get(&url)
+            .send()
+            .expect_err("a 50 ms cap must trip on a 300 ms reply");
+        assert!(err.is_timeout(), "unexpected error: {}", err);
+
+        let (url, hits) = spawn_scripted_server(vec![slow(exec_ok_json())]);
+        let result = Client::new(Some(&url), Some("pat-token"))
+            .expect("client should build")
+            .exec("sb-1", ExecRequest::from("sleep 1"))
+            .expect("a slow exec must not time out");
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3414,6 +3674,38 @@ mod tests {
     }
 
     #[test]
+    fn exec_request_from_plain_command_string() {
+        for req in [ExecRequest::from("echo hello"), ExecRequest::from("echo hello".to_string())] {
+            assert_eq!(req.command, "echo hello");
+            assert!(req.work_dir.is_none() && req.env.is_none() && req.timeout_seconds.is_none());
+        }
+    }
+
+    #[test]
+    fn sandbox_exec_accepts_plain_command_string() {
+        let body = serde_json::json!({"stdout": "hello\n", "stderr": "", "exit_code": 0, "duration_ms": 3}).to_string();
+        let (url, request_rx) = spawn_json_server(body);
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let data: SandboxData = serde_json::from_value(serde_json::json!({
+            "id": "sb-1", "image": "alpine", "status": "started", "public_url": "", "cpu": 1,
+            "memory_mb": 512, "disk_gb": 1, "os_user": "root", "network_block_all": false,
+            "toolbox_enabled": true, "created_at": "", "updated_at": "", "last_active_at": "",
+            "lifecycle": {}, "runtime": "docker"
+        }))
+        .expect("sandbox data should parse");
+        let sandbox = Sandbox::new(client, data);
+        let result = sandbox.exec("echo hello").expect("exec should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+        assert!(
+            request.starts_with("POST /v1/sandboxes/sb-1/toolbox/process/execute HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(request_json_body(&request), serde_json::json!({"command": "echo hello"}));
+        assert_eq!(result.stdout, "hello\n");
+    }
+
+    #[test]
     fn get_network_learned_maps_nulls() {
         let body = serde_json::json!({
             "mode": "learn", "truncated": false,
@@ -3861,6 +4153,41 @@ mod tests {
         let value = serde_json::to_value(&opts).expect("serialize create options");
         assert_eq!(value["name"], "agent");
         assert_eq!(value["tags"]["a"], "b");
+    }
+
+    #[test]
+    fn create_sends_template_id_and_gpus() {
+        let (url, request_rx) = spawn_json_server(named_sandbox_json("sb-fc", "fc").to_string());
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .create(CreateOptions {
+                runtime: Some("firecracker".to_string()),
+                template_id: Some("tpl-1".to_string()),
+                gpus: Some(GPUOptions {
+                    vendor: GPUVendor::Nvidia,
+                    count: Some(2),
+                    device_ids: Some(vec!["0".to_string(), "GPU-abc".to_string()]),
+                }),
+                ..minimal_create_options()
+            })
+            .expect("create should succeed");
+        let body = request_json_body(&request_rx.recv().expect("request should be captured"));
+        assert_eq!(body["template_id"], "tpl-1");
+        assert_eq!(
+            body["gpus"],
+            serde_json::json!({"vendor": "nvidia", "count": 2, "device_ids": ["0", "GPU-abc"]})
+        );
+
+        let plain = serde_json::to_value(minimal_create_options()).expect("serialize");
+        assert!(plain.get("template_id").is_none());
+        assert!(plain.get("gpus").is_none());
+        let amd = serde_json::to_value(GPUOptions {
+            vendor: GPUVendor::Amd,
+            count: None,
+            device_ids: None,
+        })
+        .expect("serialize gpus");
+        assert_eq!(amd, serde_json::json!({"vendor": "amd"}));
     }
 
     #[test]

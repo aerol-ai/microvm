@@ -1,0 +1,94 @@
+---
+// "Was this page helpful?" at the top of the right column. Voting happens in
+// the giscus widget at the end of the page (GiscusComments.astro), where
+// readers sign in with GitHub; these buttons jump there. The counts come from
+// the metadata giscus posts to this page, so they appear once the page's
+// discussion exists, and a reader's own reaction is highlighted.
+---
+
+<div class="page-feedback not-content">
+  <p class="page-feedback__title">Was this page helpful?</p>
+  <div class="page-feedback__buttons">
+    <a class="page-feedback__vote" href="#page-feedback" data-reaction="THUMBS_UP">
+      <span aria-hidden="true">👍</span> Yes <span class="page-feedback__count"></span>
+    </a>
+    <a class="page-feedback__vote" href="#page-feedback" data-reaction="THUMBS_DOWN">
+      <span aria-hidden="true">👎</span> No <span class="page-feedback__count"></span>
+    </a>
+  </div>
+  <p class="page-feedback__hint">Vote at the end of the page with your GitHub account.</p>
+</div>
+
+<script>
+  // Only trust messages from the giscus iframe itself.
+  window.addEventListener('message', event => {
+    if (event.origin !== 'https://giscus.app') return
+    const reactions = event.data?.giscus?.discussion?.reactions
+    if (!reactions) return
+    document.querySelectorAll<HTMLElement>('.page-feedback__vote').forEach(link => {
+      const group = reactions[link.dataset.reaction!]
+      if (!group) return
+      link.querySelector('.page-feedback__count')!.textContent = String(group.count)
+      link.classList.toggle('is-reacted', Boolean(group.viewerHasReacted))
+    })
+  })
+</script>
+
+<style>
+  .page-feedback {
+    margin-bottom: 1.5rem;
+    padding: 14px;
+    border: var(--border);
+    border-radius: 8px;
+    background: var(--block-bg-color);
+    font-family: var(--font-sans);
+  }
+
+  .page-feedback__title {
+    margin: 0 0 10px;
+    color: var(--primary-text-color);
+    font-size: 0.875rem;
+    font-weight: 600;
+  }
+
+  .page-feedback__buttons {
+    display: flex;
+    gap: 8px;
+  }
+
+  .page-feedback__vote {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border: var(--border);
+    border-radius: 999px;
+    background: var(--bg-color);
+    color: var(--primary-text-color);
+    font-size: 0.8125rem;
+    text-decoration: none;
+    transition: border-color 0.2s ease, color 0.2s ease;
+  }
+
+  .page-feedback__vote:hover,
+  .page-feedback__vote.is-reacted {
+    border-color: var(--hover-color);
+    color: var(--hover-color);
+  }
+
+  .page-feedback__count {
+    font-variant-numeric: tabular-nums;
+    color: var(--secondary-text-color);
+  }
+
+  .page-feedback__count:empty {
+    display: none;
+  }
+
+  .page-feedback__hint {
+    margin: 8px 0 0;
+    color: var(--secondary-text-color);
+    font-size: 0.75rem;
+    line-height: 1.4;
+  }
+</style>

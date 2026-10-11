@@ -46,7 +46,12 @@ public class CreateOptions {
      */
     @JsonProperty("network_egress_rules")
     public List<EgressRule> networkEgressRules;
-    /** Whether the sandbox may be exposed publicly. Omitted defaults to private; true opts in; false permanently refuses exposePort. */
+    /**
+     * Whether the sandbox is public from boot. Omitted or false creates it
+     * private, with no public URL; true makes it public from boot. Either way
+     * the first {@code exposePort} makes the sandbox public, so false does not
+     * block a later exposure.
+     */
     @JsonProperty("allow_public_traffic")
     public Boolean allowPublicTraffic;
     /** Rewrite the upstream Host header on ingress to exposed HTTP ports to this value
@@ -91,6 +96,14 @@ public class CreateOptions {
      */
     @JsonProperty("custom_domains")
     public List<String> customDomains;
+    /**
+     * Firecracker template id (from {@code createTemplate}). Requires
+     * {@code runtime="firecracker"} and {@code image}; the sandbox boots from
+     * the template's prepared rootfs instead of building one per create, and
+     * the template must be ready.
+     */
+    @JsonProperty("template_id")
+    public String templateId;
 
     public CreateOptions setImage(String image) {
         this.image = image;
@@ -229,6 +242,11 @@ public class CreateOptions {
 
     public CreateOptions setCustomDomains(List<String> customDomains) {
         this.customDomains = customDomains;
+        return this;
+    }
+
+    public CreateOptions setTemplateId(String templateId) {
+        this.templateId = templateId;
         return this;
     }
 }
