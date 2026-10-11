@@ -36,7 +36,7 @@ flowchart TB
 | How the platform stores them | Plain text, in the container's settings | Encrypted, tied to one sandbox |
 | Who can read them through the API | Anyone who can look at the container | Only callers who ask for them, and every read is recorded |
 | Copies on other servers | Up to you | Sealed, and only on the nodes that need them |
-| A record of who read them | None | A tamper-evident audit log |
+| A record of who read them | None | A hash-chained audit log |
 
 AerolVM still hands the values to the container engine on the node that runs the sandbox. Someone with admin access to that machine can see them there. See [Good to know](#good-to-know).
 

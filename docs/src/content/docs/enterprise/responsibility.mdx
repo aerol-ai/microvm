@@ -29,6 +29,7 @@ Each limit has a workaround you can use today. Where a fix is planned, the last 
 | **Images are not checked for signatures.** | Check signatures in your build pipeline, then pin the image by digest (`image@sha256:...`). | [Image signature checks](https://github.com/aerol-ai/microvm/discussions/650) |
 | **One API token per server.** Anyone with it can run commands in any sandbox. | Keep it in a secret manager, and keep the API port private. | [Scoped tokens and roles](https://github.com/aerol-ai/microvm/discussions/646), [SSO](https://github.com/aerol-ai/microvm/discussions/647) |
 | **Limits are per sandbox, not per team.** | Enforce team limits in the service that calls AerolVM. | [Quotas per team](https://github.com/aerol-ai/microvm/discussions/648) |
+| **The audit log on a server can be rewritten by someone with root on it.** The hash chain catches a changed record, not a rebuilt chain. | Send the records off the server to a webhook or an S3 bucket you control. | |
 | **Audit records name the server, not the API caller.** | Put your own gateway in front of the API and log callers there. | [Caller identity](https://github.com/aerol-ai/microvm/discussions/649) |
 | **Code in a sandbox can read its own variables**, and container snapshots save them. | Use an inject rule for API keys, so the sandbox only holds a placeholder. | |
 | **Inject rules are not supported on WebAssembly or Firecracker yet.** | Use a container, gVisor or a V8 isolate for code that needs a protected key. | |

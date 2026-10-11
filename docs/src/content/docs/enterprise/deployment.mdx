@@ -69,7 +69,7 @@ The SDKs read the server's address from `SB_API_URL` and its token from `SB_PAT_
 ## Before you go live
 
 1. **Harden it.** Work through the [Hardening](/enterprise/hardening/) checklists for each sandbox and each server.
-2. **Send the audit log off the server,** so a server that is taken over cannot quietly rewrite it. See [Evidence for your audit](/enterprise/audit-evidence/).
+2. **Send the audit log off the server,** so you keep a copy outside it. See [Evidence for your audit](/enterprise/audit-evidence/).
 3. **Back up the database and its encryption key together.** Without the key, the encrypted secrets in the database cannot be opened.
 4. **Watch it.** Every server offers Prometheus metrics and can send OpenTelemetry traces. Ready-made Grafana dashboards and alerts link to step-by-step [runbooks](/operational-runbooks/).
 5. **Plan upgrades.** Security fixes land on the newest release line only. In a cluster, restart one server at a time.
