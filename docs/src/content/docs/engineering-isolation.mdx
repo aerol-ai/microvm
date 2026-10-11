@@ -1,11 +1,13 @@
 ---
-title: Isolation boundary
-description: The wall each runtime puts between a sandbox and the server, the control channel, root inside the sandbox, and resource limits.
+title: How AerolVM isolates sandboxes
+description: The wall each runtime puts between a sandbox and the server, how the server talks to a sandbox, root inside it, and resource limits.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The isolation boundary is the wall between code in a sandbox and the server it runs on. AerolVM has five runtimes, and each one builds that wall a different way. This page explains each wall, how the server talks to a sandbox, who the code runs as, and which limits apply.
+*By [Suman Saurabh](https://www.linkedin.com/in/ssumansaurabh/), maintainer of AerolVM.*
+
+The isolation boundary is the wall between code in a sandbox and the server it runs on. AerolVM has five runtimes, and each one builds that wall a different way. This post explains each wall, how the server talks to a sandbox, who the code runs as, and which limits apply.
 
 ## Five runtimes, five walls
 
@@ -178,7 +180,7 @@ Root inside a sandbox does not get the server's full root powers. The runtime's 
 
 - **Files and processes are separate.** Each sandbox has its own writable layer, its own processes and its own address.
 - **Addresses cannot be faked.** Sandboxes cannot forge packets, and the server checks that each packet comes from the address it should.
-- **The network is open between them by default.** Without a policy, sandboxes on the same server can connect to each other. A policy fences that off. See [Network defenses](/enterprise/network-defenses/).
+- **The network is open between them by default.** Without a policy, sandboxes on the same server can connect to each other. A policy fences that off. See [Network defenses](/engineering-network-defenses/).
 
 ## Resource limits
 
@@ -203,7 +205,7 @@ GPU sandboxes need the Docker engine. NVIDIA GPUs are passed in through Docker. 
 
 - **Every call needs a token.** The server compares it in constant time, so its timing does not reveal the token.
 - **The open-source server has one token**, the operator token. Whoever holds it is trusted like the server's operator.
-- **Tenant tokens need the managed build.** There, each tenant only sees its own sandboxes. Asking for another tenant's sandbox returns "not found".
+- **Scoped tokens are proposed.** Tokens tied to one owner, with roles, are [open for discussion](https://github.com/aerol-ai/microvm/discussions/646).
 
 ## Where this boundary ends
 
@@ -213,6 +215,6 @@ GPU sandboxes need the Docker engine. NVIDIA GPUs are passed in through Docker. 
 
 ## Next steps
 
-- [Filesystem and images](/enterprise/filesystem-and-images/): what a sandbox can see and keep.
-- [Network defenses](/enterprise/network-defenses/): fence off the network.
+- [Filesystem and images](/engineering-sandbox-filesystem/): what a sandbox can see and keep.
+- [Network defenses](/engineering-network-defenses/): fence off the network.
 - [Firecracker](/firecracker-sandbox/): set up the strongest runtime.

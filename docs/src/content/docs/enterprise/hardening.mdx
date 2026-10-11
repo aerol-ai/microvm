@@ -1,15 +1,27 @@
 ---
 title: Hardening
-description: The settings to tighten for one sandbox and for the whole server, matched to how much you trust the code.
+description: A checklist to lock down AerolVM for untrusted code, for each sandbox, for each server and for a cluster.
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-The defaults are set for getting started, not for hostile code. This page lists the controls to turn up, for each sandbox and for the whole server, and ends with three postures to pick from.
+The defaults are set for getting started, not for hostile code. Pick a posture first, then work through the checklists. What no setting can fix is on [Responsibility and limits](/enterprise/responsibility/).
+
+## Pick a posture
+
+| | Your own code | Code from your users | Hostile code, many tenants |
+|---|---|---|---|
+| Runtime | Container | gVisor | Firecracker |
+| Network | A deny list, or open | An allow list of site names | Block everything, or a short allow list |
+| Server default | Open | `default_policy: allowlist` | `default_policy: block_all`, plus `deny_cidrs` and the control-port guard |
+| User in the image | Root is fine | Non-root | Non-root |
+| Mounts | As needed | Read-only where possible | None |
+| API keys | Variables | Inject rules | Inject rules, or none |
+| Timers | Optional | Stop when idle | Stop when idle, and a maximum age |
 
 ## A hardened sandbox
 
-This sandbox runs in gVisor, has no network, has firm limits, and stops when idle and is deleted after 4 hours:
+This sandbox runs in gVisor, has no network and firm limits, stops when idle and is deleted after 4 hours:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -94,103 +106,56 @@ This sandbox runs in gVisor, has no network, has firm limits, and stops when idl
   </TabItem>
 </Tabs>
 
-## For each sandbox
+## Checklist for each sandbox
 
-### Pick the right runtime
+1. **Pick the runtime** from the posture table: `runtime: "gvisor"` or `"firecracker"`. See [Sandboxes](/sandboxes/).
+2. **Close the network,** or open only what the code needs: `networkBlockAll: true`, or `networkAllowOut` with site names. Avoid deny lists for untrusted code, because they allow everything you did not list. See [Network access](/network-access/).
+3. **Use a non-root image.** Setting a user at create time does not change the user yet, so set it in the image:
 
-Match the runtime to how much you trust the code. Containers share the server's kernel. gVisor answers most system calls itself. Firecracker gives the code its own kernel. See [Isolation boundary](/enterprise/isolation-boundary/).
+   ```dockerfile
+   FROM python:3.12
+   RUN useradd --create-home app
+   USER app
+   ```
 
-### Turn the network off, or allow only what is needed
+4. **Mount as little as you can,** with `readOnly: true` on every mount that only reads. See [External storage](/external-storage/).
+5. **Pin the image by digest** (`image@sha256:...`) after you check its signature in your build pipeline.
+6. **Keep API keys out** with an inject rule instead of a plain variable. See [Keep an API key out of the sandbox](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox).
+7. **Set limits and timers:** `cpu`, `memoryMB` and `diskGB`, plus `stopIfIdleFor` and `destroyAtAge`. See [Lifecycle](/lifecycle/).
+8. **Cap traffic** with byte limits if the code moves data. See [Limit egress and ingress](/network-usage/).
 
-- **No network at all:** `networkBlockAll: true`.
-- **Only some sites:** `networkAllowOut` with names. This also blocks private addresses and the cloud metadata service.
-- **Avoid deny lists** for untrusted code. They block what you list and allow everything else.
+## Checklist for each server
 
-See [Network defenses](/enterprise/network-defenses/).
+1. **Start every sandbox closed.** Point `SB_EGRESS_OPERATOR_FILE` at a policy file like this one:
 
-### Drop root
+   ```yaml
+   version: 1
+   default_policy:
+     mode: block_all                    # creates that set no policy get no network
+   deny_cidrs: [169.254.169.254/32]     # the cloud metadata service; add your private ranges
+   node_control_port_guard: true        # no sandbox can reach AerolVM's own ports
+   ```
 
-Sandboxes run as the image's default user, which is usually root. Setting a user at create time does not change this yet. Build your image with a non-root user instead:
+   Do not add the ranges the server gives its own sandboxes to `deny_cidrs`. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
+2. **Protect the API token.** The installer prints it once. Keep it in a secret manager.
+3. **Use a domain, not an IP address,** so Caddy (the web server in front of AerolVM) serves HTTPS.
+4. **Keep the API port private.** On a single server in domain mode, set `SB_API_HOST=127.0.0.1` so only Caddy reaches port `21212`.
+5. **Firewall the server.** Open `80` and `443`. Open `22000` to `23000` only if you share TCP ports, and `2220` only if you use SSH. Keep `21212` and `7000` to `7002` private.
+6. **Turn off what you do not use:** `SB_ENABLE_SSH_GATEWAY=false`, and leave Firecracker, WebAssembly and V8 isolates off unless you need them. `SB_HOST_RUNTIMES` lists the container runtimes the server may run.
+7. **Keep the safety settings on.** Leave `SB_CONTAINER_PRIVILEGED` off. It also turns off name allow lists. Never set `SB_RESOURCE_LIMITS_DISABLED`.
+8. **Send the audit log off the server** with `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3`. See [Evidence for your audit](/enterprise/audit-evidence/).
+9. **Verify each download** against `checksums.txt` and its signed build provenance. See [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md).
+10. **Stay on the newest release line.** Security fixes land there only.
 
-```dockerfile
-FROM python:3.12
-RUN useradd --create-home app
-USER app
-```
+## Checklist for a cluster
 
-### Mount as little as you can
-
-Mount only the folders the code needs, and set `readOnly: true` wherever it only reads. A Firecracker sandbox cannot take mounts at all. See [Filesystem and images](/enterprise/filesystem-and-images/).
-
-### Pin and check your images
-
-AerolVM does not check image signatures. Check them in your own build pipeline, then pin the result by digest (`image@sha256:...`) so the sandbox runs exactly what you checked.
-
-### Keep keys out with inject rules
-
-For keys to outside APIs, use an inject rule instead of a plain variable. The sandbox only gets a placeholder. See [Secret handling](/enterprise/secret-handling/).
-
-### Bound resources and lifetime
-
-- **Set CPU, memory and disk** for the job. Remember that some runtimes do not enforce disk or process limits.
-- **Set timers** so forgotten sandboxes stop or get deleted: `stopIfIdleFor`, `destroyIfIdleFor`, `stopAtAge` and `destroyAtAge`, each up to 30 days. See [Lifecycle](/lifecycle/).
-- **Cap traffic** with byte limits on what a sandbox sends and receives. See [Limit egress and ingress](/network-usage/).
-
-## For the whole server
-
-### Make every sandbox start closed
-
-Set a private-network policy file (`SB_EGRESS_OPERATOR_FILE`) so no sandbox starts open:
-
-```yaml
-version: 1
-default_policy:
-  mode: block_all                      # creates that set no policy get no network
-deny_cidrs: [169.254.169.254/32]     # the cloud metadata service; add your private ranges
-node_control_port_guard: true          # no sandbox can reach AerolVM's own ports
-```
-
-`deny_cidrs` and `node_control_port_guard` apply to every sandbox, whatever its own policy says. Add your company's private ranges to `deny_cidrs`, but not the ranges the server gives its own sandboxes. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
-
-### Lock down the server
-
-- **Protect the operator token.** The installer prints it once. Store it in a secret manager. Whoever holds it controls the server.
-- **Use a domain, not an IP address.** In domain mode, Caddy serves HTTPS with its own certificate. IP mode is plain HTTP.
-- **Keep the API off the network.** On a single server in domain mode, Caddy reaches the API on `127.0.0.1`. So you can set `SB_API_HOST=127.0.0.1` and keep port `21212` private.
-- **Firewall the server.** Open `80` and `443` to the world. Open the TCP port range (`22000` to `23000`) only if you share TCP ports, and `2220` only if you use SSH. Keep `21212` and the cluster ports `7000` to `7002` private.
-- **Turn off what you do not use.** `SB_ENABLE_SSH_GATEWAY=false` turns off SSH. Custom domains are off until you turn them on.
-- **Allow only the runtimes you need.** Leave Firecracker, WebAssembly and V8 isolates off unless you use them. `SB_HOST_RUNTIMES` lists the container runtimes the server may run.
-- **Keep the safety settings on.** Leave `SB_CONTAINER_PRIVILEGED` off and do not set `SB_RESOURCE_LIMITS_DISABLED`.
-- **Verify what you install.** Each release has `checksums.txt` and a signed SLSA provenance file. See [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md).
-- **Stay up to date.** Security fixes land on the latest release line only.
-
-### Harden a cluster
-
-- **Keep the cluster's certificate authority off the servers.** Each new server makes its own key and asks to be signed, so the authority's private key never has to leave the first server. Node certificates last 90 days, and the bundled Prometheus alerts warn before one expires.
-- **Keep the gossip key on.** Do not set `SB_CLUSTER_INSECURE_GOSSIP`.
-- **Use AWS KMS for sealed copies:** `SB_SECRET_PROVIDER=awskms`, and set `SB_SECRET_PROVIDER_STRICT_BOOT=true` so a server with a broken KMS setup refuses to start instead of starting anyway. See [Secrets providers](/cluster-secrets/).
-- **Send the audit log off the server,** to a webhook or S3, so a server that is taken over cannot quietly rewrite it. The bundled alerts fire if the hash chain breaks.
-
-## Choosing a posture
-
-| | Your own code | Code from your users | Hostile code, many tenants |
-|---|---|---|---|
-| Runtime | Container | gVisor | Firecracker |
-| Network | Deny list, or open | Allow list of names | Block everything, or a short allow list |
-| Server default | Open | `default_policy: allowlist` | `default_policy: block_all`, `deny_cidrs`, control-port guard |
-| Root | Fine | Non-root image | Non-root image |
-| Mounts | As needed | Read-only where possible | None |
-| Keys | Variables | Inject rules | Inject rules, or none |
-| Timers | Optional | Idle stop | Idle stop and a maximum age |
-
-## Where hardening stops
-
-- **The server is trusted.** `sandboxd` runs as root, because it manages containers, virtual machines, firewall rules and mounts. Protect the machine like any other root service.
-- **Some limits are not enforced on every runtime,** such as disk on containerd and gVisor, and the number of processes in containers.
-- **No setting turns off exec or terminals.** Anyone with the API token can run commands in any sandbox.
+1. **Keep the cluster's signing key off the servers.** Each new server makes its own key and asks to be signed. Node certificates last 90 days, and bundled alerts warn before one expires.
+2. **Keep the gossip key on.** Never set `SB_CLUSTER_INSECURE_GOSSIP`.
+3. **Use AWS KMS for secret copies:** `SB_SECRET_PROVIDER=awskms` with `SB_SECRET_PROVIDER_STRICT_BOOT=true`, so a server with a broken KMS setup refuses to start. See [Secrets providers](/cluster-secrets/).
+4. **Keep the cluster ports on a private network** that the internet cannot reach.
 
 ## Next steps
 
 - [Responsibility and limits](/enterprise/responsibility/): what hardening cannot fix.
-- [Advanced network rules](/advanced-network-rules/): profiles, learn mode and request rules.
-- [Clusters](/getting-started/cluster-setup/): what a cluster adds.
+- [Security controls](/enterprise/security-controls/): every control and its default.
+- [Run it in production](/enterprise/deployment/): pick a single server or a cluster.

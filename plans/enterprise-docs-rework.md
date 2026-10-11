@@ -1,6 +1,6 @@
 # Enterprise docs rework
 
-Status: proposed, 2026-10-11. Replaces the six pages under `docs/src/content/docs/enterprise/` (uncommitted).
+Status: done 2026-10-11. All seven pages are written. The four deep dives moved to Blogs as `engineering-isolation`, `engineering-sandbox-filesystem`, `engineering-network-defenses` and `engineering-secret-handling`, with a byline. The tab is about 1,700 words of prose, down from 7,400.
 
 ## Positioning (founder decisions, 2026-10-11)
 
@@ -121,9 +121,9 @@ The deep-dive pages (isolation, filesystem, network, secrets) go away, or move t
 | D4 | No certification badge. Page 4 is "Evidence for your audit". |
 | D5 | Open. Until the defaults are fixed, Known limits lists them with their workarounds. |
 | D6 | The bio uses the resume line, "200M+ users". The 20,000-sandbox number stays off the Enterprise tab until a run is published. |
-| D7 | "Talk to the maintainer" uses `BOOKING_URL` in `docs/src/utils/links.ts`. **It is still a placeholder.** |
+| D7 | "Talk to the maintainer" uses `BOOKING_URL` in `docs/src/utils/links.ts`, set to the Google Calendar booking page. |
 | D8 | The four deep dives leave the tab and become Blogs posts under the maintainer's name. |
-| Extra | Add `ADOPTERS.md`. Hold a monthly community call. **The first call must be scheduled before the page that mentions it ships.** |
+| Extra | Add `ADOPTERS.md`. Hold the community call on the first Saturday of every month at 8 pm Pacific Time. The join link goes in the announcement thread ([#652](https://github.com/aerol-ai/microvm/discussions/652)) before each call. |
 
 ### Starter proposals for the Ideas category
 
