@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -35,6 +36,22 @@ func TestSubmitFailureKeepsTheClaimUnlessRefused(t *testing.T) {
 		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadRequest)
 		if env.toolbox.sessionCount() != 0 {
 			t.Fatal("a refused submit left its session behind")
+		}
+		env.toolbox.clearFaults()
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusOK)
+		if got := env.toolbox.execCount(); got != 1 {
+			t.Fatalf("ran %d times; want 1", got)
+		}
+	})
+	t.Run("session refused", func(t *testing.T) {
+		env := newTestEnv(t)
+		devbox := env.mustCreate(t, "")
+		env.toolbox.failAlways("POST /process/session", http.StatusBadRequest)
+		body := `{"command":"echo x","command_id":"s0"}`
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadRequest)
+		ref := execRef{session: plainSession(devbox.ID, "s0")}
+		if _, err := env.svc.GetIdempotentRequest(context.Background(), execLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("claim after a refused session = %v; want it released", err)
 		}
 		env.toolbox.clearFaults()
 		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusOK)

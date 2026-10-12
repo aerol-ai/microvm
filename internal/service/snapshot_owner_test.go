@@ -430,7 +430,7 @@ func TestUpsertSnapshotAliasExistingReadError(t *testing.T) {
 func TestNormalizeCreateImageDistributionSnapshotOwner(t *testing.T) {
 	svc, _, _ := newSnapshotOwnerService(t)
 	registry := func(owner, name string) string {
-		return "aocr.test/cluster/c1/snapshots/" + snapshotRepoName(owner, name) + ":latest"
+		return snapshotAOCRRef("aocr.test", "c1", owner, name, "")
 	}
 	tests := []struct {
 		name        string

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -133,28 +134,85 @@ func (c *daytonaCommandStream) finish() {
 	}
 }
 
+// logWindow is one stream's bytes from an offset: text, then end, the offset
+// just past them, and length, the stream's full length so far, all counted
+// in the stream's own bytes. text is valid UTF-8 of the same length as the
+// bytes it stands for (see sameLengthUTF8), so a reader's offsets agree
+// whether it counts end or the text it has been sent.
+type logWindow struct {
+	text        string
+	end, length int64
+}
+
 // window returns each stream's bytes from its offset — at most limit bytes
-// of each, 0 meaning no limit — with each stream's full length, read in one
-// critical section so the two agree. Only the window is copied, so a poller
-// reading a long-running command's new output pays for the new bytes, not
-// for everything the command has written.
-func (c *daytonaCommandStream) window(stdoutFrom, stderrFrom, limit int64) (stdout, stderr string, stdoutLen, stderrLen int64) {
+// of each, 0 meaning no limit — read in one critical section so the two
+// agree. Only the window is copied, so a poller reading a long-running
+// command's new output pays for the new bytes, not for everything the
+// command has written.
+func (c *daytonaCommandStream) window(stdoutFrom, stderrFrom, limit int64) (stdout, stderr logWindow) {
 	if c == nil {
-		return "", "", 0, 0
+		return logWindow{}, logWindow{}
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return string(logWindow(c.stdout, stdoutFrom, limit)), string(logWindow(c.stderr, stderrFrom, limit)), int64(len(c.stdout)), int64(len(c.stderr))
+	return cutLogWindow(c.stdout, stdoutFrom, limit, false), cutLogWindow(c.stderr, stderrFrom, limit, false)
 }
 
-// logWindow is text[from:], cut to limit bytes when limit is positive.
-func logWindow[T ~string | ~[]byte](text T, from, limit int64) T {
+// cutLogWindow is text[from:], cut to limit bytes when limit is positive,
+// and never ending partway through a UTF-8 character: a character the cut
+// would split is left for the next window, so each one decodes whole.
+// final says text will not grow; without it a character still being written
+// at the end of text is held back too. A cut that would leave nothing (a
+// limit shorter than one character) keeps the bytes, so a reader always
+// moves forward.
+func cutLogWindow[T ~string | ~[]byte](text T, from, limit int64, final bool) logWindow {
 	from = min(from, int64(len(text)))
-	text = text[from:]
-	if limit > 0 && int64(len(text)) > limit {
-		text = text[:limit]
+	window := text[from:]
+	cut := limit > 0 && int64(len(window)) > limit
+	if cut {
+		window = window[:limit]
 	}
-	return text
+	if cut || !final {
+		if whole := wholeRunesLen(window); whole > 0 || !cut {
+			window = window[:whole]
+		}
+	}
+	return logWindow{text: sameLengthUTF8(string(window)), end: from + int64(len(window)), length: int64(len(text))}
+}
+
+// sameLengthUTF8 replaces each byte of text that is not part of a valid
+// UTF-8 character with '?'. The text goes out as a JSON string, and JSON
+// would replace each such byte with a three-byte character instead, so a
+// reader counting the text it received would drift past the stream's real
+// length and resume at the wrong place.
+func sameLengthUTF8(text string) string {
+	if utf8.ValidString(text) {
+		return text
+	}
+	out := []byte(text)
+	for i := 0; i < len(out); {
+		r, size := utf8.DecodeRune(out[i:])
+		if r == utf8.RuneError && size == 1 {
+			out[i] = '?'
+		}
+		i += size
+	}
+	return string(out)
+}
+
+// wholeRunesLen is the length of text without a final UTF-8 character that
+// is missing its last bytes. Invalid bytes count as whole: no later byte
+// can complete them.
+func wholeRunesLen[T ~string | ~[]byte](text T) int {
+	for i := len(text) - 1; i >= 0 && i > len(text)-utf8.UTFMax; i-- {
+		if utf8.RuneStart(text[i]) {
+			if utf8.FullRune([]byte(text[i:])) {
+				return len(text)
+			}
+			return i
+		}
+	}
+	return len(text)
 }
 
 // subscribe registers a new live subscriber. Returns the framed replay of
@@ -226,11 +284,15 @@ type daytonaSessionLogsResponse struct {
 	Stderr string `json:"stderr"`
 	Stdout string `json:"stdout"`
 	// StdoutLength / StderrLength are each stream's full length so far, so a
-	// caller that read from an offset knows where the text it got sits.
-	// Their presence also tells a caller this toolbox serves a running
-	// command's output and honours the offset parameters.
+	// caller that read from an offset knows how much is left. Their presence
+	// also tells a caller this toolbox serves a running command's output and
+	// honours the offset parameters.
 	StdoutLength int64 `json:"stdoutLength"`
 	StderrLength int64 `json:"stderrLength"`
+	// StdoutEnd / StderrEnd are the offsets just past the returned text, in
+	// the stream's bytes: where the caller's next read starts.
+	StdoutEnd int64 `json:"stdoutEnd"`
+	StderrEnd int64 `json:"stderrEnd"`
 }
 
 type daytonaSessionInputRequest struct {
@@ -638,17 +700,20 @@ func (s *server) handleDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.
 		}
 		bounds[i] = n
 	}
-	var resp daytonaSessionLogsResponse
+	var stdout, stderr logWindow
 	if command.exitCode == nil {
 		// Still running: the final text is set only when the command ends,
 		// so answer with what it has written so far — what a follower
 		// would have been sent.
-		resp.Stdout, resp.Stderr, resp.StdoutLength, resp.StderrLength = command.stream.window(bounds[0], bounds[1], bounds[2])
+		stdout, stderr = command.stream.window(bounds[0], bounds[1], bounds[2])
 	} else {
-		resp.Stdout, resp.Stderr = logWindow(command.stdout, bounds[0], bounds[2]), logWindow(command.stderr, bounds[1], bounds[2])
-		resp.StdoutLength, resp.StderrLength = int64(len(command.stdout)), int64(len(command.stderr))
+		stdout, stderr = cutLogWindow(command.stdout, bounds[0], bounds[2], true), cutLogWindow(command.stderr, bounds[1], bounds[2], true)
 	}
-	resp.Output = resp.Stdout + resp.Stderr
+	resp := daytonaSessionLogsResponse{
+		Stdout: stdout.text, StdoutEnd: stdout.end, StdoutLength: stdout.length,
+		Stderr: stderr.text, StderrEnd: stderr.end, StderrLength: stderr.length,
+		Output: stdout.text + stderr.text,
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -3534,6 +3535,11 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 // is assumed to already be runnable. Idempotency is by snapshot name; a
 // re-register with matching image is treated as a no-op so SDK retries don't
 // fail. A different image under the same name is a conflict.
+//
+// The image is authorized as the caller now, the same way a create from it
+// would be: a user token cannot record a pointer to an image it could not
+// start, such as another tenant's snapshot named directly or through
+// registered names of its own.
 func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) (*models.SandboxSnapshot, error) {
 	if snapshot == nil {
 		return nil, errors.New("snapshot is required")
@@ -3552,16 +3558,28 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
 
-	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+	if existing, err := s.getSnapshotAnySpelling(ctx, name); err == nil {
 		// Retry semantics: same name + same image → echo back the existing
 		// row. Different image under the same name is a conflict, and so is
 		// another tenant's row: names are global, but its contents are not
-		// the caller's to read back.
-		if snapshotVisible(ctx, existing) && strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
+		// the caller's to read back. Another spelling of an existing name
+		// conflicts too: the engine would treat the two as one image.
+		if existing.Name == name && snapshotVisible(ctx, existing) && strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
 			return existing, nil
 		}
 		return nil, store.ErrSnapshotNameConflict
 	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	if slices.Contains(docker.EquivalentImageNames(name), strings.TrimSpace(snapshot.Image)) {
+		// Named after its own image: there is no catalog row behind it
+		// (none has this name), so only the reference form is checked.
+		if owner, scoped := ownerScope(ctx); scoped {
+			if err := authorizeTenantImageRef(owner, snapshot.Image); err != nil {
+				return nil, err
+			}
+		}
+	} else if _, _, err := s.resolveSnapshotChain(ctx, snapshot.Image, name); err != nil {
 		return nil, err
 	}
 
@@ -3590,7 +3608,11 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
 
-	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+	// Every spelling of the name, not just this one: the runtime commits to
+	// the name as an image tag, and "snap" and "snap:latest" are one tag, so
+	// a second owner committing to either would replace the first owner's
+	// image under its catalog row.
+	if existing, err := s.getSnapshotAnySpelling(ctx, name); err == nil {
 		return replayExistingSnapshot(ctx, existing, sandboxID)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, false, err
@@ -3629,7 +3651,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
-			if existing, getErr := s.store.GetSnapshot(ctx, name); getErr == nil {
+			if existing, getErr := s.getSnapshotAnySpelling(ctx, name); getErr == nil {
 				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
@@ -3653,6 +3675,15 @@ func replayExistingSnapshot(ctx context.Context, existing *models.SandboxSnapsho
 		return nil, false, store.ErrNotFound
 	}
 	return existing, false, nil
+}
+
+// getSnapshotAnySpelling returns the snapshot whose name is name in any
+// spelling the engine treats as the same image ("snap", "snap:latest",
+// "docker.io/library/snap", ...), the literal spelling first. Creating,
+// reading and deleting a snapshot all go through it, as resolving one for a
+// create does, so no spelling reaches a snapshot the others would not.
+func (s *Service) getSnapshotAnySpelling(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
+	return s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(name))
 }
 
 // initialSnapshotPushState picks the push_state value to write for a
@@ -3742,7 +3773,7 @@ func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.San
 	if needle == "" {
 		return nil, store.ErrNotFound
 	}
-	snapshot, err := s.store.GetSnapshot(ctx, needle)
+	snapshot, err := s.getSnapshotAnySpelling(ctx, needle)
 	if err == nil {
 		if snapshotVisible(ctx, snapshot) {
 			return snapshot, nil

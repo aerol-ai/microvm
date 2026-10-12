@@ -69,30 +69,44 @@ func TestLedgerClaimFailureNeverRunsTheCommand(t *testing.T) {
 	}
 }
 
-// The outcome write (step 2 of finishPlain) failing must not stop the
-// cleanup, and the completion write carries the outcome anyway: a restart
-// still replays the real exit status without running the command again.
-func TestLedgerOutcomeWriteFailureIsCoveredByCompletion(t *testing.T) {
+// The session is the only other copy of a finished command's exit status,
+// so it stays until the outcome is stored (step 2 of finishPlain). While the
+// store refuses the write, a process that restarts still finds the real
+// status in the session; once the write lands the session goes, and a retry
+// replays the status without running the command again.
+func TestOutcomeIsStoredBeforeTheSessionGoes(t *testing.T) {
 	env := newTestEnv(t)
+	shorten(t, &watchMaxBackoff, 20*time.Millisecond)
 	devbox := env.mustCreate(t, "")
-	failLedger(t, env.store, "outcome")
+	ctx := context.Background()
+	clearOutcome := failLedger(t, env.store, "outcome")
+	clearComplete := failLedger(t, env.store, "complete")
 
 	var first executionView
-	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", `{"command":"exit 3","command_id":"o"}`, &first), http.StatusOK)
-	if first.ExitStatus == nil || *first.ExitStatus != 3 {
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", `{"command":"exit 7","command_id":"o"}`, &first), http.StatusOK)
+	if first.ExitStatus == nil || *first.ExitStatus != 7 {
 		t.Fatalf("execution = %+v", first)
 	}
 	ref := mustRef(t, first.ExecutionID)
+	time.Sleep(100 * time.Millisecond)
+	if env.toolbox.sessionCount() != 1 {
+		t.Fatal("the session went while the store had no outcome; a restart now could only call the execution lost")
+	}
+	restarted := newHandlers(env.h.deps)
+	if state, err := restarted.executionState(ctx, devbox.ID, ref); err != nil || !state.completed || state.exit != 7 {
+		t.Fatalf("a restart in the gap = %+v, %v; want the real exit status from the session", state, err)
+	}
+
+	clearOutcome()
 	waitFor(t, "session cleanup", func() bool { return env.toolbox.sessionCount() == 0 })
+	if outcome, owed, ok := env.h.ledgerOutcome(ctx, devbox.ID, ref); !ok || !owed || outcome.Exit != 7 {
+		t.Fatalf("after the session went the ledger holds %+v (owed %v, ok %v); want the outcome, still owed", outcome, owed, ok)
+	}
+	clearComplete()
 	waitFor(t, "the ledger to settle", func() bool { return ledgerSettled(env.h, devbox.ID, ref) })
 
-	restarted := newHandlers(env.h.deps)
-	if _, err := restarted.startExecution(context.Background(), devbox.ID, "exit 3", "", "o"); err != nil {
+	if _, err := newHandlers(env.h.deps).startExecution(ctx, devbox.ID, "exit 7", "", "o"); err != nil {
 		t.Fatal(err)
-	}
-	state, err := restarted.executionState(context.Background(), devbox.ID, ref)
-	if err != nil || !state.completed || state.exit != 3 {
-		t.Fatalf("replay after restart = %+v, %v", state, err)
 	}
 	if got := env.toolbox.execCount(); got != 1 {
 		t.Fatalf("command ran %d times; want 1", got)

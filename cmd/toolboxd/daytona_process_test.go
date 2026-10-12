@@ -857,7 +857,8 @@ func TestDaytonaSessionCommandLogsWhileRunning(t *testing.T) {
 	if live.StdoutLength != 6 || live.StderrLength != 4 || live.Output != "ready\nwarn" {
 		t.Fatalf("running logs = %+v", live)
 	}
-	if _, part := logsAt(t, srv, "live", cmd, "?stdoutOffset=2&stderrOffset=9&limit=3"); part.Stdout != "ady" || part.Stderr != "" || part.StdoutLength != 6 || part.StderrLength != 4 {
+	if _, part := logsAt(t, srv, "live", cmd, "?stdoutOffset=2&stderrOffset=9&limit=3"); part.Stdout != "ady" || part.Stderr != "" ||
+		part.StdoutEnd != 5 || part.StderrEnd != 4 || part.StdoutLength != 6 || part.StderrLength != 4 {
 		t.Fatalf("windowed running logs = %+v", part)
 	}
 	for _, bad := range []string{"?stdoutOffset=-1", "?limit=x", "?stderrOffset=1.5"} {
@@ -872,7 +873,46 @@ func TestDaytonaSessionCommandLogsWhileRunning(t *testing.T) {
 		t.Fatal("command never finished")
 	}
 	_, final := logsAt(t, srv, "live", cmd, "?stdoutOffset=6")
-	if final.Stdout != "done" || final.StdoutLength != 10 || final.Stderr != "warn" {
+	if final.Stdout != "done" || final.StdoutEnd != 10 || final.StdoutLength != 10 || final.Stderr != "warn" {
 		t.Fatalf("final logs from offset = %+v", final)
+	}
+}
+
+// A log window never ends inside a UTF-8 character, so its text decodes
+// whole and the reader's next window starts on a character. Bytes that are
+// not valid UTF-8 become '?', one for one, so the text is as long as the
+// bytes it stands for and end agrees with it.
+func TestCutLogWindowKeepsCharactersWhole(t *testing.T) {
+	const smile = "\U0001F642" // four bytes
+	tests := []struct {
+		name        string
+		text        string
+		from, limit int64
+		final       bool
+		want        string
+		wantEnd     int64
+	}{
+		{name: "limit inside a character stops before it", text: "ab" + smile + "c", limit: 3, final: true, want: "ab", wantEnd: 2},
+		{name: "the next window starts on it", text: "ab" + smile + "c", from: 2, limit: 5, final: true, want: smile + "c", wantEnd: 7},
+		{name: "a limit shorter than a character still moves", text: "ab" + smile, from: 2, limit: 3, final: true, want: "???", wantEnd: 5},
+		{name: "running: a character still being written waits", text: "ok" + smile[:2], want: "ok", wantEnd: 2},
+		{name: "running: nothing whole yet", text: smile[:1], want: "", wantEnd: 0},
+		{name: "finished: a cut-off character is all there is", text: "ok" + smile[:2], final: true, want: "ok??", wantEnd: 4},
+		{name: "invalid bytes are whole, one '?' each", text: "a\xffb\x80", want: "a?b?", wantEnd: 4},
+		{name: "a real replacement character is kept", text: "\uFFFD", want: "\uFFFD", wantEnd: 3},
+		{name: "a character ending at the limit", text: "ab" + smile, limit: 6, final: true, want: "ab" + smile, wantEnd: 6},
+		{name: "past the end", text: "abc", from: 9, want: "", wantEnd: 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, got := range []logWindow{
+				cutLogWindow(tt.text, tt.from, tt.limit, tt.final),
+				cutLogWindow([]byte(tt.text), tt.from, tt.limit, tt.final),
+			} {
+				if got.text != tt.want || got.end != tt.wantEnd || got.length != int64(len(tt.text)) {
+					t.Fatalf("cutLogWindow = %q end %d length %d; want %q end %d", got.text, got.end, got.length, tt.want, tt.wantEnd)
+				}
+			}
+		})
 	}
 }

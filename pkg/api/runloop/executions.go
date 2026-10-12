@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -498,15 +499,24 @@ func (h *handlers) startExecution(ctx context.Context, devboxID, command, shellN
 }
 
 // submitPlain runs command in ref's session. release reports, on failure,
-// that the command certainly did not run — the session could not be
-// opened, or the toolbox refused the command — so the claim can be dropped
-// for a clean retry. Any other failure (a lost reply, a timeout, a 5xx)
-// leaves it unknown whether the command started, so the claim stays: a retry
-// adopts whatever the session holds, and never submits a second copy.
+// that the command certainly did not run and left nothing behind — the
+// toolbox refused the session or the command, or the session it may have
+// opened is confirmed gone — so the claim can be dropped for a clean retry.
+// Any other failure (a lost reply, a timeout, a 5xx) leaves a session that
+// may exist, or a command that may have started, so the claim stays and the
+// watcher owns the session: a retry adopts whatever the session holds, and
+// never submits a second copy.
 func (h *handlers) submitPlain(ctx context.Context, devboxID string, ref execRef, command string) (release bool, err error) {
 	created, err := h.createSession(ctx, devboxID, ref.session)
 	if err != nil {
-		return true, err
+		if refusedByToolbox(err) {
+			return true, err
+		}
+		// The toolbox may have opened the session and lost only the
+		// reply. No command went into it, so once it is gone nothing ran
+		// and nothing is left; until the delete is confirmed the session
+		// is a shell in the guest that only this claim's watcher knows of.
+		return h.deleteSession(context.WithoutCancel(ctx), devboxID, ref.session) == nil, err
 	}
 	if !created {
 		// The session predates this claim: a previous holder got as far as
@@ -797,8 +807,10 @@ func (h *handlers) devboxRunning(ctx context.Context, devboxID string) (running,
 // session, in an order that keeps every step recoverable:
 //
 //  1. cache the result, so readers answer at once;
-//  2. store the outcome on the still-pending ledger row, so a restart or
-//     an evicted cache cannot lose it;
+//  2. store the outcome on the still-pending ledger row, retrying until it
+//     lands — the session is the only other copy of the exit status, so it
+//     must not go while the store has none: a restart in between would
+//     find neither and could only call the execution lost;
 //  3. delete the session, retrying until it is gone — a session left
 //     behind is a live shell in the guest;
 //  4. mark the ledger row ready: nothing is owed any more.
@@ -812,10 +824,19 @@ func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef
 	res := h.execs.record(resultFromState(key, state))
 	outcome := outcomeFromResult(res).encode()
 	fingerprint := ledgerKey(devboxID, ref)
-	if err := h.deps.Service.SetIdempotentRequestTarget(ctx, execLedgerScope, fingerprint, outcome); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
-		h.deps.Logger.Warn("runloop execution outcome write failed", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
-	}
 	backoff := pace.min
+	for failures := 0; ; failures++ {
+		err := h.deps.Service.SetIdempotentRequestTarget(ctx, execLedgerScope, fingerprint, outcome)
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		if (failures == 0 || failures%100 == 0) && h.deps.Logger != nil {
+			h.deps.Logger.Warn("runloop execution outcome write failed; retrying before the session is released", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
+		}
+		time.Sleep(backoff)
+		backoff = pace.next(backoff)
+	}
+	backoff = pace.min
 	for failures := 0; ; failures++ {
 		running, gone := h.devboxRunning(ctx, devboxID)
 		if gone {
@@ -997,13 +1018,17 @@ func (h *handlers) readLiveState(ctx context.Context, devboxID string, ref execR
 	return state, nil
 }
 
-// keepTail returns the last maxCapturedStream bytes of value and value's
-// full length.
+// keepTail returns at most the last maxCapturedStream bytes of value,
+// starting on a whole character, and value's full length.
 func keepTail(value string) (string, int64) {
 	if len(value) <= maxCapturedStream {
 		return value, int64(len(value))
 	}
-	return value[len(value)-maxCapturedStream:], int64(len(value))
+	start := len(value) - maxCapturedStream
+	for i := 0; i < utf8.UTFMax-1 && !utf8.RuneStart(value[start]); i++ {
+		start++
+	}
+	return value[start:], int64(len(value))
 }
 
 // awaitExecution holds until the execution completes or hold passes. With a
@@ -1251,7 +1276,9 @@ func (h *handlers) sendStdin(w http.ResponseWriter, r *http.Request, devboxID, e
 // A toolbox too old to serve a running command's output gets everything at
 // the end instead. offset is a byte position in the command's full output:
 // the client echoes the last chunk's offset back on reconnect, so each
-// chunk's offset is where the next one starts.
+// chunk's offset is where the next one starts. The toolbox sends text as
+// long as the bytes it stands for, so live reads and the captured result
+// count positions the same way.
 func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID, execID string, stderr bool) {
 	ref, ok := h.lookupExecution(w, devboxID, execID)
 	if !ok {
@@ -1294,13 +1321,14 @@ func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID
 		}
 		if live && cid != "" {
 			// A failed read is left to the status read below, which ends
-			// the stream if the toolbox stays down.
-			text, total, supported, err := h.liveOutput(r.Context(), devboxID, ref.session, cid, stderr, offset, maxCapturedStream)
+			// the stream if the toolbox stays down. end, not the text's
+			// length, is how far the read reached.
+			text, end, total, supported, err := h.liveOutput(r.Context(), devboxID, ref.session, cid, stderr, offset, maxCapturedStream)
 			switch {
 			case err == nil && !supported:
 				live = false
-			case err == nil && text != "":
-				offset += int64(len(text))
+			case err == nil && end > offset:
+				offset = end
 				if !send(executionUpdateChunk{Output: text, Offset: offset}) {
 					return
 				}

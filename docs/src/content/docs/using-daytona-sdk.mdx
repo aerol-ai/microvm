@@ -79,7 +79,7 @@ We checked this example with `@daytona/sdk` 0.223.1. AerolVM's own [Daytona exam
 |---|---|
 | `process.executeCommand` | Works. |
 | `process.codeRun` | Works for `python`, `javascript` (Node.js), `typescript` (needs `ts-node` in the image) and `bash` or `sh`. The language's program must be installed in the image. |
-| Sessions: create, run commands, read command logs, send input, delete | Works. |
+| Sessions: create, run commands, read command logs, send input, delete | Works. In command logs, each byte that is not valid UTF-8 reads as `?`. |
 | Files: list, get info, upload (one file or many), move, search by name, find text in files | Works. |
 | Git: clone, status, add, commit, branches, checkout, history, pull, push | Works when `git` is installed in the image. |
 | Home folder and working folder | Works. |

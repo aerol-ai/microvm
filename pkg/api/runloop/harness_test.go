@@ -17,6 +17,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -489,17 +490,42 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 				n, _ := strconv.ParseInt(query.Get(name), 10, 64)
 				return n
 			}
-			window := func(text string, from int64) string {
-				text = text[min(from, int64(len(text))):]
+			// Like toolboxd: a window never ends inside a character, unless
+			// the command has exited and the character never will be whole,
+			// and invalid bytes go out as '?', one for one.
+			window := func(text string, from int64) (string, int64) {
+				from = min(from, int64(len(text)))
+				text = text[from:]
+				cut := false
 				if limit := bound("limit"); limit > 0 && int64(len(text)) > limit {
-					text = text[:limit]
+					text, cut = text[:limit], true
 				}
-				return text
+				if cut || snapshot.exitCode == nil {
+					for i := len(text) - 1; i >= 0 && i > len(text)-utf8.UTFMax; i-- {
+						if utf8.RuneStart(text[i]) {
+							if !utf8.FullRuneInString(text[i:]) && (i > 0 || !cut) {
+								text = text[:i]
+							}
+							break
+						}
+					}
+				}
+				out := []byte(text)
+				for i := 0; i < len(out); {
+					r, size := utf8.DecodeRune(out[i:])
+					if r == utf8.RuneError && size == 1 {
+						out[i] = '?'
+					}
+					i += size
+				}
+				return string(out), from + int64(len(text))
 			}
-			stdout, stderr := window(snapshot.stdout, bound("stdoutOffset")), window(snapshot.stderr, bound("stderrOffset"))
+			stdout, stdoutEnd := window(snapshot.stdout, bound("stdoutOffset"))
+			stderr, stderrEnd := window(snapshot.stderr, bound("stderrOffset"))
 			writeJSON(w, http.StatusOK, map[string]any{
 				"stdout": stdout, "stderr": stderr, "output": stdout + stderr,
 				"stdoutLength": len(snapshot.stdout), "stderrLength": len(snapshot.stderr),
+				"stdoutEnd": stdoutEnd, "stderrEnd": stderrEnd,
 			})
 		case "input":
 			var req struct {

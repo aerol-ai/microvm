@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // liveStream opens an output stream over a real connection, so chunks can be
@@ -182,5 +183,67 @@ func TestStreamFromAnOlderToolboxWaitsForTheExit(t *testing.T) {
 	env.toolbox.mu.Unlock()
 	if got := nextChunk(t, chunks, "the output at exit"); got.Output != "all at once\n" || got.Offset != 12 {
 		t.Fatalf("chunk = %+v", got)
+	}
+}
+
+// A read never ends inside a character, so a character that straddles the
+// read limit arrives whole in the next read, and the offsets count the
+// output's own bytes: the reads together are the output, byte for byte.
+func TestLiveOutputKeepsCharactersWhole(t *testing.T) {
+	env := newTestEnv(t)
+	devbox := env.mustCreate(t, "")
+	output := strings.Repeat("x", maxCapturedStream-1) + "\U0001F642END"
+	ref, cmd := runningCommand(t, env, devbox.ID, "unicode", output, "")
+	var got strings.Builder
+	var offset int64
+	for reads := 0; offset < int64(len(output)); reads++ {
+		text, end, total, supported, err := env.h.liveOutput(context.Background(), devbox.ID, ref.session, cmd.id, false, offset, maxCapturedStream)
+		if err != nil || !supported || end <= offset || total != int64(len(output)) || reads > 2 {
+			t.Fatalf("read from %d = %q end %d total %d (%v, %v)", offset, text, end, total, supported, err)
+		}
+		if !utf8.ValidString(text) || int64(len(text)) != end-offset {
+			t.Fatalf("read from %d sent %q for %d bytes", offset, text, end-offset)
+		}
+		got.WriteString(text)
+		offset = end
+	}
+	if got.String() != output {
+		t.Fatalf("reads delivered %d bytes ending %q; want the output", got.Len(), got.String()[maxCapturedStream-4:])
+	}
+}
+
+// The stream counts the command's own bytes. A character the command has
+// only half written waits for its other half instead of going out broken,
+// and a byte that is not UTF-8 goes out as one '?', so the offsets a client
+// resumes from stay true.
+func TestStreamCountsTheCommandsBytes(t *testing.T) {
+	env := newTestEnv(t)
+	shorten(t, &liveOutputMax, 20*time.Millisecond)
+	devbox := env.mustCreate(t, "")
+	const smile = "\U0001F642"
+	ref, cmd := runningCommand(t, env, devbox.ID, "bytes", "a\xffb", "")
+	chunks := liveStream(t, env, "/"+devbox.ID+"/executions/"+ref.id()+"/stream_stdout_updates")
+	if got := nextChunk(t, chunks, "the first write"); got.Output != "a?b" || got.Offset != 3 {
+		t.Fatalf("first chunk = %+v", got)
+	}
+	env.toolbox.mu.Lock()
+	cmd.stdout += "ok" + smile[:2]
+	env.toolbox.mu.Unlock()
+	if got := nextChunk(t, chunks, "the whole characters"); got.Output != "ok" || got.Offset != 5 {
+		t.Fatalf("second chunk = %+v; want the half-written character held back", got)
+	}
+	exit := int32(0)
+	env.toolbox.mu.Lock()
+	cmd.stdout += smile[2:]
+	cmd.exitCode = &exit
+	env.toolbox.mu.Unlock()
+	var rest strings.Builder
+	last := int64(5)
+	for chunk := range chunks {
+		rest.WriteString(chunk.Output)
+		last = chunk.Offset
+	}
+	if rest.String() != smile || last != 9 {
+		t.Fatalf("after exit the stream sent %q ending at %d; want the character, ending at 9", rest.String(), last)
 	}
 }

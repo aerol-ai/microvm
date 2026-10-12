@@ -2,6 +2,7 @@ package runloop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -25,6 +27,77 @@ func loseExecReply(env *testEnv) {
 			})
 		}
 	})
+}
+
+// loseSessionCreateReply makes the toolbox open the next session and then
+// answer 503: the session exists in the guest, only the reply is lost.
+func loseSessionCreateReply(env *testEnv) {
+	env.toolbox.setBeforeServe(func(r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/process/session" {
+			env.toolbox.setBeforeServe(nil)
+			env.toolbox.ServeHTTP(httptest.NewRecorder(), r)
+			env.toolbox.setFailNext(r.URL.Path, http.StatusServiceUnavailable)
+		}
+	})
+}
+
+// A session whose create reply was lost may exist in the guest. No command
+// went into it, so once it is deleted nothing ran and nothing is left: the
+// claim is released and a retry of the same id runs the command once.
+func TestLostSessionCreateReplyLeavesNothingBehind(t *testing.T) {
+	env := newTestEnv(t)
+	devbox := env.mustCreate(t, "")
+	ctx := context.Background()
+	loseSessionCreateReply(env)
+	ref := execRef{session: plainSession(devbox.ID, "lost-create")}
+	if _, err := env.h.startExecution(ctx, devbox.ID, "echo ok", "", "lost-create"); err == nil {
+		t.Fatal("fault setup: the session create's reply was not lost")
+	}
+	if env.toolbox.sessionCount() != 0 {
+		t.Fatal("the session the toolbox opened was left in the guest")
+	}
+	if _, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("claim after a confirmed delete = %v; want it released, since nothing ran", err)
+	}
+	if _, err := env.h.startExecution(ctx, devbox.ID, "echo ok", "", "lost-create"); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.toolbox.execCount(); got != 1 {
+		t.Fatalf("the retry ran the command %d times; want 1", got)
+	}
+}
+
+// If that session cannot be deleted either, the claim stays and a watcher
+// owns the session: once the toolbox lets it, the watcher deletes the
+// session and settles the execution, with no retry or restart needed.
+func TestLostSessionCreateReplyWithFailedDeleteKeepsAWatcher(t *testing.T) {
+	env := newTestEnv(t)
+	shorten(t, &submitGrace, 20*time.Millisecond)
+	shorten(t, &watchMaxBackoff, 20*time.Millisecond)
+	devbox := env.mustCreate(t, "")
+	ctx := context.Background()
+	ref := execRef{session: plainSession(devbox.ID, "stuck-create")}
+	key := resultKey(devbox.ID, ref.id())
+	loseSessionCreateReply(env)
+	env.toolbox.failAlways("DELETE /process/session/"+ref.session, http.StatusServiceUnavailable)
+	if _, err := env.h.startExecution(ctx, devbox.ID, "echo ok", "", "stuck-create"); err == nil {
+		t.Fatal("fault setup: the session create's reply was not lost")
+	}
+	time.Sleep(80 * time.Millisecond)
+	if !watcherAlive(env.h.execs, key) || env.toolbox.sessionCount() != 1 {
+		t.Fatal("a session that could not be deleted has no owner")
+	}
+	if _, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref)); err != nil {
+		t.Fatalf("the claim was dropped with the session still in the guest: %v", err)
+	}
+	env.toolbox.clearFaults()
+	waitFor(t, "the session deleted and the execution settled", func() bool {
+		outcome, _, ok := env.h.ledgerOutcome(ctx, devbox.ID, ref)
+		return ok && outcome.Lost && env.toolbox.sessionCount() == 0 && !watcherAlive(env.h.execs, key)
+	})
+	if env.toolbox.execCount() != 0 {
+		t.Fatal("a command ran though none was submitted")
+	}
 }
 
 // A lost reply is not a refusal: the command may already have done its

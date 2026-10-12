@@ -165,7 +165,7 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 		return SnapshotPushResult{}, fmt.Errorf("snapshot push: read PAT: %w", err)
 	}
 
-	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, snapshotRepoName(snapshot.OwnerRef, name), p.cfg.TagSuffix)
+	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, snapshot.OwnerRef, name, p.cfg.TagSuffix)
 
 	var digest string
 	pushed, err := p.docker.PushImage(ctx, docker.PushImageRequest{
@@ -211,7 +211,7 @@ func (p *SnapshotPusher) DestRefFor(ownerRef, snapshotName string) string {
 	if name == "" {
 		return ""
 	}
-	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, snapshotRepoName(ownerRef, name), p.cfg.TagSuffix)
+	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, ownerRef, name, p.cfg.TagSuffix)
 }
 
 // snapshotOwnerNamespaceLen is the hex length of an owner's namespace hash:
@@ -237,13 +237,9 @@ func snapshotOwnerNamespace(ownerRef string) string {
 	return "tenant-" + hex.EncodeToString(sum[:])[:snapshotOwnerNamespaceLen]
 }
 
-// snapshotRepoName is the snapshot's path under `snapshots/`.
-func snapshotRepoName(ownerRef, snapshotName string) string {
-	if ns := snapshotOwnerNamespace(ownerRef); ns != "" {
-		return ns + "/" + snapshotName
-	}
-	return snapshotName
-}
+// snapshotHashedRepoPrefix starts a snapshot repository named by a hash of
+// the snapshot's name rather than by the name itself.
+const snapshotHashedRepoPrefix = "hashed-"
 
 // snapshotRefNamespace parses ref as a ref into some cluster's snapshot
 // registry (`[host/]cluster/<id>/snapshots/...`) and returns the owner
@@ -267,22 +263,40 @@ func snapshotRefNamespace(ref string) (namespace string, ok bool) {
 }
 
 // snapshotAOCRRef is the AOCR destination convention for cluster-local
-// snapshots: `<host>/cluster/<id>/snapshots/<repo>:latest<arch><suffix>`,
-// where repo is snapshotRepoName — the name, under its owner's namespace
-// when it has an owner. Mirrors the
-// auto-import path's `cluster/<id>/_imported/...` namespace pattern. The base
-// tag is "latest" — snapshot names are themselves unique (the store enforces a
-// PRIMARY KEY on `name`). An optional retention suffix (`--ttl-*` / `--idle-*`)
-// stays at the end of the tag so the registry reaper can age the tag out; empty
-// means a plain `latest` tag that is kept indefinitely. Push and pull must agree
-// on the tag, so every caller routes through here.
-func snapshotAOCRRef(host, clusterID, snapshotName, tagSuffix string) string {
+// snapshots: `<host>/cluster/<id>/snapshots/[<owner namespace>/]<repo>:latest<arch><suffix>`.
+// Mirrors the auto-import path's `cluster/<id>/_imported/...` namespace
+// pattern. Push and pull must agree on the ref, so every caller routes
+// through here.
+//
+// repo is the snapshot's name when that is a plain repository path, which
+// keeps every bare name where earlier releases pushed it; "name:latest" is
+// the same snapshot as "name". Any other name — one with a tag of its own
+// ("foo:v1"), upper case, or long enough to overflow the ref — is pushed
+// under a hash of the name instead. That keeps one repository per name, and
+// never builds a ref with two tags, which the registry rejects. A name that
+// starts like a hashed repository or an owner namespace is hashed as well,
+// so no name can land in a path that belongs to another.
+//
+// The base tag is "latest": the repository already names the snapshot. An
+// optional retention suffix (`--ttl-*` / `--idle-*`) stays at the end of the
+// tag so the registry reaper can age the tag out; empty means a plain
+// `latest` tag that is kept indefinitely.
+func snapshotAOCRRef(host, clusterID, ownerRef, snapshotName, tagSuffix string) string {
 	host = strings.TrimRight(strings.TrimSpace(host), "/")
-	clusterID = strings.TrimSpace(clusterID)
-	snapshotName = strings.ToLower(strings.TrimSpace(snapshotName))
-	tagSuffix = strings.ToLower(strings.TrimSpace(tagSuffix))
-	archSfx := archTagSuffix(snapshotRefArch())
-	return fmt.Sprintf("%s/cluster/%s/snapshots/%s:latest%s%s", host, clusterID, snapshotName, archSfx, tagSuffix)
+	root := fmt.Sprintf("%s/cluster/%s/snapshots/", host, strings.TrimSpace(clusterID))
+	if ns := snapshotOwnerNamespace(ownerRef); ns != "" {
+		root += ns + "/"
+	}
+	tag := ":latest" + archTagSuffix(snapshotRefArch()) + strings.ToLower(strings.TrimSpace(tagSuffix))
+	repo := strings.TrimSuffix(strings.TrimSpace(snapshotName), ":latest")
+	if repo != "" && !strings.ContainsAny(repo, ":@") &&
+		!strings.HasPrefix(repo, snapshotHashedRepoPrefix) && !strings.HasPrefix(repo, "tenant-") {
+		if _, err := reference.ParseNormalizedNamed(root + repo + tag); err == nil {
+			return root + repo + tag
+		}
+	}
+	sum := sha256.Sum256([]byte(repo))
+	return root + snapshotHashedRepoPrefix + hex.EncodeToString(sum[:])[:snapshotOwnerNamespaceLen] + tag
 }
 
 // readPATFile reads the bearer token from disk. Trailing whitespace

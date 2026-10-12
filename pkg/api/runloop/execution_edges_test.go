@@ -65,6 +65,12 @@ func TestKeepTailBoundary(t *testing.T) {
 	if !state.stdoutCut() || (execState{stdout: exact, stdoutLen: int64(len(exact))}).stdoutCut() {
 		t.Fatal("stdoutCut must report exactly the truncated stream")
 	}
+	// A cut that would land inside a character moves past it, so the kept
+	// text starts whole; the length is still the full stream's.
+	split := "\U0001F642" + strings.Repeat("c", maxCapturedStream-2)
+	if kept, n := keepTail(split); kept != split[4:] || n != int64(len(split)) {
+		t.Fatalf("a cut inside a character kept %q... of length %d", kept[:4], n)
+	}
 }
 
 // Whoever records an execution's result first decides how it ended: a kill
