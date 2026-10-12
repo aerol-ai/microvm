@@ -192,8 +192,9 @@ func TestFailoverReplayDoesNotResolveNames(t *testing.T) {
 	}
 }
 
-// A snapshot's image is removed with the last snapshot that holds it:
-// deleting a name registered for it leaves the image to the snapshot.
+// A snapshot's image is removed with the last snapshot that holds it, and
+// only when it is the snapshot's own: deleting a name registered for an
+// image — another snapshot's, a registry image, a build — leaves the image.
 func TestDeleteSnapshotKeepsAnImageAnotherSnapshotHolds(t *testing.T) {
 	svc, _, rt := newSnapshotOwnerService(t)
 	acme := userCtx("acme")
@@ -209,6 +210,19 @@ func TestDeleteSnapshotKeepsAnImageAnotherSnapshotHolds(t *testing.T) {
 	}
 	if err := svc.DeleteSnapshot(acme, "base"); err != nil || rt.removeHits != 1 || rt.lastRemoved != snap.Image {
 		t.Fatalf("delete snapshot = %v, removed %q (%d times)", err, rt.lastRemoved, rt.removeHits)
+	}
+	for _, image := range []string{"python:3.12", "aerolvm-build/0123456789abcdef:latest"} {
+		if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "points-at", Image: image}); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.DeleteSnapshot(acme, "points-at"); err != nil || rt.removeHits != 1 {
+			t.Fatalf("delete of a snapshot registered for %s = %v, %d removals; want the image left alone", image, err, rt.removeHits)
+		}
+	}
+	// A snapshot committed under its name before tags of its own still
+	// takes its image with it.
+	if err := svc.DeleteSnapshot(acme, "snap-acme"); err != nil || rt.removeHits != 2 || rt.lastRemoved != "snap-acme" {
+		t.Fatalf("delete of an older snapshot = %v, removed %q (%d times)", err, rt.lastRemoved, rt.removeHits)
 	}
 }
 

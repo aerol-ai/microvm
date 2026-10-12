@@ -3905,9 +3905,13 @@ func TestLoadMountsSnapshotsAndEnvWave32(t *testing.T) {
 	if _, err := svc.CreateSnapshot(ctx, "sb-mnt32", models.CreateSandboxSnapshotRequest{}); err == nil {
 		t.Fatal("nameless create snapshot")
 	}
-	existing, created, err := svc.CreateSnapshotWithOwnership(ctx, "sb-mnt32", models.CreateSandboxSnapshotRequest{Name: "snap32"})
-	if err != nil || created || existing.Name != "snap32" {
-		t.Fatalf("existing snapshot = %+v created=%v err=%v", existing, created, err)
+	// Registration records no source sandbox, whatever the caller sent, so
+	// a commit under the registered name is not a retry of it.
+	if got.SourceSandboxID != "" {
+		t.Fatalf("registered snapshot kept source %q", got.SourceSandboxID)
+	}
+	if _, _, err := svc.CreateSnapshotWithOwnership(ctx, "sb-mnt32", models.CreateSandboxSnapshotRequest{Name: "snap32"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
+		t.Fatalf("commit over a registered name = %v", err)
 	}
 	if _, _, err := svc.CreateSnapshotWithOwnership(ctx, "other", models.CreateSandboxSnapshotRequest{Name: "snap32"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
 		t.Fatalf("foreign snapshot name = %v", err)

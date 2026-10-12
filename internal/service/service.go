@@ -3604,6 +3604,9 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 	}
 	snapshot.Name = name
 	snapshot.OwnerRef = ownerRefForCreate(ctx)
+	// Only a commit has a source sandbox; that is how a delete tells an
+	// image the snapshot owns from one it only names.
+	snapshot.SourceSandboxID = ""
 	snapshot.PushState = s.initialSnapshotPushState(snapshot)
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		return nil, err
@@ -3869,20 +3872,33 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err != nil {
 		return err
 	}
-	// The image goes with the last snapshot that holds it: a name
-	// registered for another snapshot's image is deleted without taking
-	// that snapshot's image with it.
+	// Only a snapshot's own committed image is the snapshot's to remove,
+	// and only once no other snapshot holds it. A registered snapshot names
+	// an image that exists without it — a registry image, a build, someone
+	// else's snapshot — so deleting the name leaves that image to the image
+	// janitors, which remove it once nothing uses it.
 	holders, err := s.store.GetSnapshotsByImage(ctx, []string{snapshot.Image})
 	if err != nil {
 		return err
 	}
 	shared := slices.ContainsFunc(holders, func(other *models.SandboxSnapshot) bool { return other.Name != snapshot.Name })
-	if !shared {
+	switch {
+	case shared:
+	case snapshotOwnsImage(snapshot):
 		if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
 			return err
 		}
+	default:
+		s.schedulePendingImageGC(ctx, "", snapshot.Image)
 	}
 	return s.store.DeleteSnapshot(ctx, snapshot.Name)
+}
+
+// snapshotOwnsImage reports a snapshot whose image was committed for it:
+// one taken from a sandbox (only a commit records its source, see
+// RegisterSnapshot), or one under its own tag.
+func snapshotOwnsImage(snapshot *models.SandboxSnapshot) bool {
+	return snapshot.SourceSandboxID != "" || strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name)
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
