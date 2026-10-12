@@ -1,6 +1,8 @@
 package toolhost
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"io"
 	"mime/multipart"
@@ -28,11 +30,12 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	hostPath, err := resolveHostPath(h.workDir, targetPath)
+	root, rel, _, err := openInWorkDir(h.workDir, targetPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeOpenError(w, err)
 		return
 	}
+	defer root.Close()
 
 	file, header, err := r.FormFile("file")
 	if err != nil {
@@ -41,11 +44,11 @@ func (h *Host) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if err := os.MkdirAll(filepath.Dir(hostPath), 0o755); err != nil {
+	if err := root.MkdirAll(filepath.Dir(rel), 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if err := atomicWriteFile(hostPath, file); err != nil {
+	if err := atomicWriteFile(root, rel, file); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -62,16 +65,17 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "path is required")
 		return
 	}
-	hostPath, err := resolveHostPath(h.workDir, targetPath)
+	root, rel, hostPath, err := openInWorkDir(h.workDir, targetPath)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeOpenError(w, err)
 		return
 	}
+	defer root.Close()
 
 	// Stream from the file: this handler runs inside sandboxd, so reading a
 	// large guest file whole would land it in daemon memory, even when the
 	// client only wants its first window (the agent read_file tool).
-	f, err := os.Open(hostPath)
+	f, err := root.Open(rel)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, os.ErrNotExist) {
@@ -103,12 +107,19 @@ func (h *Host) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	targetPath := strings.TrimSpace(r.URL.Query().Get("path"))
-	hostPath, err := resolveHostPath(h.workDir, targetPath)
+	root, rel, _, err := openInWorkDir(h.workDir, targetPath)
+	if err != nil {
+		writeOpenError(w, err)
+		return
+	}
+	defer root.Close()
+	dir, err := root.Open(rel)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	entries, err := os.ReadDir(hostPath)
+	entries, err := dir.ReadDir(-1)
+	_ = dir.Close()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -120,15 +131,28 @@ func (h *Host) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, names)
 }
 
-// atomicWriteFile writes via a temp file in the same directory + rename.
-func atomicWriteFile(path string, src multipart.File) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".upload-*")
+// writeOpenError answers a failed openInWorkDir: a path the caller cannot
+// have is its mistake (400); a work directory the daemon cannot open is not
+// (500).
+func writeOpenError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, errPathEscape) {
+		status = http.StatusBadRequest
+	}
+	writeError(w, status, err.Error())
+}
+
+// atomicWriteFile writes rel inside root via a temp file in the same
+// directory and a rename, both through the root.
+func atomicWriteFile(root *os.Root, rel string, src multipart.File) error {
+	var suffix [8]byte
+	_, _ = rand.Read(suffix[:])
+	tmpName := filepath.Join(filepath.Dir(rel), ".upload-"+hex.EncodeToString(suffix[:]))
+	tmp, err := root.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	cleanup := func() { _ = os.Remove(tmpName) }
+	cleanup := func() { _ = root.Remove(tmpName) }
 	if _, err := io.Copy(tmp, src); err != nil {
 		_ = tmp.Close()
 		cleanup()
@@ -138,11 +162,11 @@ func atomicWriteFile(path string, src multipart.File) error {
 		cleanup()
 		return err
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := root.Chmod(tmpName, 0o644); err != nil {
 		cleanup()
 		return err
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := root.Rename(tmpName, rel); err != nil {
 		cleanup()
 		return err
 	}
