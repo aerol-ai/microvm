@@ -51,7 +51,6 @@ type daytonaCommandState struct {
 	command   string
 	stdout    string
 	stderr    string
-	output    string
 	exitCode  *int32
 	running   bool
 	createdAt time.Time
@@ -134,6 +133,30 @@ func (c *daytonaCommandStream) finish() {
 	}
 }
 
+// window returns each stream's bytes from its offset — at most limit bytes
+// of each, 0 meaning no limit — with each stream's full length, read in one
+// critical section so the two agree. Only the window is copied, so a poller
+// reading a long-running command's new output pays for the new bytes, not
+// for everything the command has written.
+func (c *daytonaCommandStream) window(stdoutFrom, stderrFrom, limit int64) (stdout, stderr string, stdoutLen, stderrLen int64) {
+	if c == nil {
+		return "", "", 0, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return string(logWindow(c.stdout, stdoutFrom, limit)), string(logWindow(c.stderr, stderrFrom, limit)), int64(len(c.stdout)), int64(len(c.stderr))
+}
+
+// logWindow is text[from:], cut to limit bytes when limit is positive.
+func logWindow[T ~string | ~[]byte](text T, from, limit int64) T {
+	from = min(from, int64(len(text)))
+	text = text[from:]
+	if limit > 0 && int64(len(text)) > limit {
+		text = text[:limit]
+	}
+	return text
+}
+
 // subscribe registers a new live subscriber. Returns the framed replay of
 // bytes already broadcast (so the subscriber doesn't miss earlier output)
 // and a channel for future frames. If the command has already finished the
@@ -202,6 +225,12 @@ type daytonaSessionLogsResponse struct {
 	Output string `json:"output"`
 	Stderr string `json:"stderr"`
 	Stdout string `json:"stdout"`
+	// StdoutLength / StderrLength are each stream's full length so far, so a
+	// caller that read from an offset knows where the text it got sits.
+	// Their presence also tells a caller this toolbox serves a running
+	// command's output and honours the offset parameters.
+	StdoutLength int64 `json:"stdoutLength"`
+	StderrLength int64 `json:"stderrLength"`
 }
 
 type daytonaSessionInputRequest struct {
@@ -276,7 +305,6 @@ func (s *daytonaSessionState) finishCommand(commandID, stdout, stderr string, ex
 	}
 	command.stdout = stdout
 	command.stderr = stderr
-	command.output = stdout + stderr
 	command.exitCode = int32Ptr(exitCode)
 	command.running = false
 	if s.activeCommandID == commandID {
@@ -597,7 +625,31 @@ func (s *server) handleDaytonaSessionCommandLogs(w http.ResponseWriter, r *http.
 		writeError(w, http.StatusNotFound, "command not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, daytonaSessionLogsResponse{Output: command.output, Stderr: command.stderr, Stdout: command.stdout})
+	var bounds [3]int64 // stdoutOffset, stderrOffset, limit
+	for i, name := range []string{"stdoutOffset", "stderrOffset", "limit"} {
+		raw := strings.TrimSpace(r.URL.Query().Get(name))
+		if raw == "" {
+			continue
+		}
+		n, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, name+" must be a non-negative integer")
+			return
+		}
+		bounds[i] = n
+	}
+	var resp daytonaSessionLogsResponse
+	if command.exitCode == nil {
+		// Still running: the final text is set only when the command ends,
+		// so answer with what it has written so far — what a follower
+		// would have been sent.
+		resp.Stdout, resp.Stderr, resp.StdoutLength, resp.StderrLength = command.stream.window(bounds[0], bounds[1], bounds[2])
+	} else {
+		resp.Stdout, resp.Stderr = logWindow(command.stdout, bounds[0], bounds[2]), logWindow(command.stderr, bounds[1], bounds[2])
+		resp.StdoutLength, resp.StderrLength = int64(len(command.stdout)), int64(len(command.stderr))
+	}
+	resp.Output = resp.Stdout + resp.Stderr
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // streamDaytonaSessionCommandLogs upgrades the request to a WebSocket and

@@ -12,11 +12,14 @@ import (
 // maxIdempotentListRows caps one ListIdempotentRequests read.
 const maxIdempotentListRows = 10000
 
-// ListIdempotentRequests returns up to limit rows of one scope in one state,
-// oldest first. It lets a claimer that keeps work outstanding under its
-// pending rows (the Runloop execution ledger) find that work again after a
-// restart. The (scope, fingerprint) primary key serves the scope filter.
-func (s *Store) ListIdempotentRequests(ctx context.Context, scope, state string, limit int) ([]*models.IdempotentRequestRecord, error) {
+// ListIdempotentRequests returns up to limit rows of one scope in one state
+// whose fingerprint sorts after afterFingerprint, in fingerprint order. It
+// lets a claimer that keeps work outstanding under its pending rows (the
+// Runloop execution ledger) find all of that work again after a restart: the
+// caller passes the last fingerprint of each page to get the next, so no
+// backlog is too large to walk. idx_request_idempotency_state makes each page
+// a range seek that never touches the scope's rows in other states.
+func (s *Store) ListIdempotentRequests(ctx context.Context, scope, state, afterFingerprint string, limit int) ([]*models.IdempotentRequestRecord, error) {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		return nil, fmt.Errorf("list idempotent requests: scope is required")
@@ -27,10 +30,10 @@ func (s *Store) ListIdempotentRequests(ctx context.Context, scope, state string,
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT scope, fingerprint, target_id, state, locked_until, replay_until, created_at, updated_at
 		FROM request_idempotency
-		WHERE scope = ? AND state = ?
-		ORDER BY created_at ASC
+		WHERE scope = ? AND state = ? AND fingerprint > ?
+		ORDER BY fingerprint ASC
 		LIMIT ?
-	`, scope, strings.TrimSpace(state), limit)
+	`, scope, strings.TrimSpace(state), afterFingerprint, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list idempotent requests: %w", err)
 	}

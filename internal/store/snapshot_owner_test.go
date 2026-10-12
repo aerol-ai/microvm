@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -297,6 +299,97 @@ func TestListSnapshotAliasesForOwner(t *testing.T) {
 	none, err := st.ListSnapshotAliasesForOwner(ctx, models.FacadeRunloop, "globex")
 	if err != nil || len(none) != 0 {
 		t.Fatalf("globex aliases = %+v, %v", none, err)
+	}
+}
+
+// The lookup answers with the earliest listed name that exists, whatever
+// order the rows come back in.
+func TestGetSnapshotByNames(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	seedSnapshotCatalogue(t, st)
+	for _, tc := range []struct {
+		names []string
+		want  string
+	}{
+		{[]string{"snap-3", "snap-1"}, "snap-3"},
+		{[]string{"missing", "snap-4", "snap-2"}, "snap-4"},
+		{[]string{" snap-5 "}, "snap-5"},
+	} {
+		got, err := st.GetSnapshotByNames(ctx, tc.names)
+		if err != nil || got.Name != tc.want {
+			t.Errorf("GetSnapshotByNames(%v) = %v, %v; want %s", tc.names, got, err, tc.want)
+		}
+	}
+	for _, names := range [][]string{nil, {"missing", "also-missing"}} {
+		if _, err := st.GetSnapshotByNames(ctx, names); !errors.Is(err, ErrNotFound) {
+			t.Errorf("GetSnapshotByNames(%v) = %v, want ErrNotFound", names, err)
+		}
+	}
+	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET entrypoint_json = '{' WHERE name = 'snap-2'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSnapshotByNames(ctx, []string{"snap-2"}); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("corrupt row = %v, want the scan error", err)
+	}
+	_ = st.Close()
+	if _, err := st.GetSnapshotByNames(ctx, []string{"snap-1"}); err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("closed store = %v", err)
+	}
+}
+
+// queryPlan returns SQLite's plan for query, one detail line per step.
+func queryPlan(t *testing.T, st *Store, query string, args []any) string {
+	t.Helper()
+	rows, err := st.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("explain: %v", err)
+	}
+	defer rows.Close()
+	var steps []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatalf("scan plan: %v", err)
+		}
+		steps = append(steps, detail)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("plan rows: %v", err)
+	}
+	return strings.Join(steps, "; ")
+}
+
+// A page and its count must narrow through the owner or source index, never
+// by walking the whole catalogue by name and filtering each row: LIMIT
+// bounds the rows returned, not the rows examined, so a tenant with no
+// matches would otherwise read every other tenant's rows on each page.
+func TestSnapshotPageAndCountSeekTheirIndex(t *testing.T) {
+	st := newTestStore(t)
+	seedSnapshotCatalogue(t, st)
+	for _, tc := range []struct {
+		name  string
+		query SnapshotPageQuery
+		index string
+	}{
+		{"scoped", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, AliasFacade: models.FacadeRunloop}, "idx_sandbox_snapshots_owner_name"},
+		{"scoped operator namespace", SnapshotPageQuery{Scoped: true}, "idx_sandbox_snapshots_owner_name"},
+		{"one source", SnapshotPageQuery{SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_source_sandbox_id"},
+		{"scoped one source", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_"},
+		{"unscoped", SnapshotPageQuery{AfterName: "snap-2"}, "sqlite_autoindex_sandbox_snapshots_1 (name>?)"},
+	} {
+		page, args := snapshotPageSQL(tc.query, 10)
+		plan := queryPlan(t, st, page, args)
+		if !strings.Contains(plan, tc.index) || strings.Contains(plan, "SCAN s") {
+			t.Errorf("%s page plan %q, want a seek of %s", tc.name, plan, tc.index)
+		}
+		count, countArgs := countSnapshotsSQL(tc.query.OwnerRef, tc.query.Scoped, tc.query.SourceSandboxID)
+		if plan := queryPlan(t, st, count, countArgs); tc.query.Scoped || tc.query.SourceSandboxID != "" {
+			if !strings.Contains(plan, "SEARCH s USING") {
+				t.Errorf("%s count plan %q, want an index search", tc.name, plan)
+			}
+		}
 	}
 }
 

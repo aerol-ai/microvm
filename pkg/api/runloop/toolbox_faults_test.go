@@ -21,15 +21,48 @@ func plainSession(devboxID, key string) string {
 	return ephemeralPrefix + shortHash(devboxID, key)
 }
 
-func TestSubmitFailureReleasesTheSession(t *testing.T) {
-	env := newTestEnv(t)
-	devbox := env.mustCreate(t, "")
-	env.toolbox.failAlways("/exec", http.StatusInternalServerError)
-	rr := env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", `{"command":"echo x","command_id":"s1"}`, nil)
-	expectStatus(t, rr, http.StatusBadGateway)
-	if env.toolbox.sessionCount() != 0 {
-		t.Fatal("a failed submit left its claimed session behind")
-	}
+// Only a refusal proves a command did not run. A toolbox 4xx drops the
+// claim and the session, so the same id runs cleanly next time. A 5xx may
+// have come after the command started, so the claim stays and a watcher
+// takes the session over: past the grace it removes the session and
+// settles the row as lost, and the id is never run a second time.
+func TestSubmitFailureKeepsTheClaimUnlessRefused(t *testing.T) {
+	t.Run("refused", func(t *testing.T) {
+		env := newTestEnv(t)
+		devbox := env.mustCreate(t, "")
+		env.toolbox.failAlways("/exec", http.StatusBadRequest)
+		body := `{"command":"echo x","command_id":"s1"}`
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadRequest)
+		if env.toolbox.sessionCount() != 0 {
+			t.Fatal("a refused submit left its session behind")
+		}
+		env.toolbox.clearFaults()
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusOK)
+		if got := env.toolbox.execCount(); got != 1 {
+			t.Fatalf("ran %d times; want 1", got)
+		}
+	})
+	t.Run("failed", func(t *testing.T) {
+		env := newTestEnv(t)
+		shorten(t, &submitGrace, 50*time.Millisecond)
+		devbox := env.mustCreate(t, "")
+		env.toolbox.failAlways("/exec", http.StatusInternalServerError)
+		body := `{"command":"echo x","command_id":"s2"}`
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadGateway)
+		ref := execRef{session: plainSession(devbox.ID, "s2")}
+		if !watcherAlive(env.h.execs, resultKey(devbox.ID, ref.id())) {
+			t.Fatal("an ambiguous submit left its session with no owner")
+		}
+		waitFor(t, "the session to be fenced and the row settled", func() bool {
+			outcome, _, ok := env.h.ledgerOutcome(context.Background(), devbox.ID, ref)
+			return ok && outcome.Lost && env.toolbox.sessionCount() == 0
+		})
+		env.toolbox.clearFaults()
+		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusConflict)
+		if got := env.toolbox.execCount(); got != 0 {
+			t.Fatalf("ran %d times; want none", got)
+		}
+	})
 }
 
 func TestNamedShellFaults(t *testing.T) {
@@ -204,7 +237,7 @@ func TestWatcherExits(t *testing.T) {
 	if !env.h.execs.watch(resultKey(devbox.ID, ref.id())) || env.h.execs.watch(resultKey(devbox.ID, ref.id())) {
 		t.Fatal("watch must claim once")
 	}
-	env.h.startWatcher(context.Background(), devbox.ID, ref)
+	env.h.startWatcher(context.Background(), devbox.ID, ref, false)
 }
 
 func TestExecutionHandlerFaults(t *testing.T) {

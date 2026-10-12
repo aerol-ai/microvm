@@ -18,14 +18,15 @@ const (
 	idempotencySweepBatch    = 500
 )
 
-// ListIdempotentRequests returns up to limit rows of one scope in one
-// state. Used by claimers that recover outstanding work after a restart; a
-// service with no store (embedded wiring) has none.
-func (s *Service) ListIdempotentRequests(ctx context.Context, scope, state string, limit int) ([]*models.IdempotentRequestRecord, error) {
+// ListIdempotentRequests returns one page of a scope's rows in one state,
+// after the cursor fingerprint (see the store method). Used by claimers that
+// recover outstanding work after a restart; a service with no store
+// (embedded wiring) has none.
+func (s *Service) ListIdempotentRequests(ctx context.Context, scope, state, afterFingerprint string, limit int) ([]*models.IdempotentRequestRecord, error) {
 	if s == nil || s.store == nil {
 		return nil, nil
 	}
-	return s.store.ListIdempotentRequests(ctx, scope, state, limit)
+	return s.store.ListIdempotentRequests(ctx, scope, state, afterFingerprint, limit)
 }
 
 // maybeSweepIdempotentRequests deletes one batch of expired rows when the

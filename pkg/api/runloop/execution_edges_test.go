@@ -82,28 +82,88 @@ func TestExecTrackerFirstRecordWins(t *testing.T) {
 }
 
 // A claimed execution whose command is not in its session yet reads as
-// running, and its watcher waits instead of treating the empty session as
-// finished.
+// running. Within the submit grace its watcher waits for the claiming
+// request instead of treating the empty session as finished or failed, and
+// adopts the command once it lands.
 func TestExecutionWithNoCommandYetReadsRunning(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
-	sid := plainSession(devbox.ID, "unsubmitted")
-	if _, err := env.h.createSession(context.Background(), devbox.ID, sid); err != nil {
+	ctx := context.Background()
+	ref := execRef{session: plainSession(devbox.ID, "unsubmitted")}
+	if _, _, err := env.h.claimLedger(ctx, ledgerKey(devbox.ID, ref)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.h.createSession(ctx, devbox.ID, ref.session); err != nil {
 		t.Fatal(err)
 	}
 	var view executionView
-	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+sid, nil, &view), http.StatusOK)
+	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+ref.id(), nil, &view), http.StatusOK)
 	if view.Status != execStatusRunning || view.ExitStatus != nil {
 		t.Fatalf("unsubmitted execution = %+v", view)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if !watcherAlive(env.h.execs, resultKey(devbox.ID, sid)) || env.toolbox.sessionCount() != 1 {
-		t.Fatal("the watcher must keep waiting on an empty session, not clean it up")
+	if !watcherAlive(env.h.execs, resultKey(devbox.ID, ref.id())) || env.toolbox.sessionCount() != 1 {
+		t.Fatal("within the grace the watcher must keep waiting on an empty session")
 	}
-	if err := env.h.deleteSession(context.Background(), devbox.ID, sid); err != nil {
+	if _, err := env.h.sessionExec(ctx, devbox.ID, ref.session, "echo late"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the watcher to stop", func() bool { return !watcherAlive(env.h.execs, resultKey(devbox.ID, sid)) })
+	waitFor(t, "the late command to be finished", func() bool { return ledgerSettled(env.h, devbox.ID, ref) })
+	if env.toolbox.sessionCount() != 0 {
+		t.Fatal("the adopted execution's session was not cleaned up")
+	}
+}
+
+// Past the grace an execution with no command is a failed submission. Its
+// watcher deletes the session first, so a submission still in flight lands
+// on nothing, then settles the row as lost: reads say it is gone, and a
+// retry of its id is refused rather than run, because the command's fate is
+// unknown. A claim whose session never appeared at all ends the same way.
+func TestUnsubmittedExecutionIsLostAfterTheGrace(t *testing.T) {
+	env := newTestEnv(t)
+	shorten(t, &submitGrace, 50*time.Millisecond)
+	devbox := env.mustCreate(t, "")
+	ctx := context.Background()
+
+	empty := execRef{session: plainSession(devbox.ID, "empty")}
+	if _, _, err := env.h.claimLedger(ctx, ledgerKey(devbox.ID, empty)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.h.createSession(ctx, devbox.ID, empty.session); err != nil {
+		t.Fatal(err)
+	}
+	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+empty.id(), nil, nil), http.StatusOK)
+	waitFor(t, "the empty session to be fenced and the row settled", func() bool {
+		outcome, owed, ok := env.h.ledgerOutcome(ctx, devbox.ID, empty)
+		return ok && !owed && outcome.Lost && env.toolbox.sessionCount() == 0
+	})
+	rr := env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+empty.id(), nil, nil)
+	expectStatus(t, rr, http.StatusNotFound)
+	if !strings.Contains(rr.Body.String(), "before its result was recorded") {
+		t.Fatalf("lost read = %s", rr.Body.String())
+	}
+	rr = env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"echo x"}`, nil, "X-Request-Id", "empty")
+	expectStatus(t, rr, http.StatusConflict)
+	if !strings.Contains(rr.Body.String(), "new command id") {
+		t.Fatalf("retry of a lost id = %s", rr.Body.String())
+	}
+
+	never := execRef{session: plainSession(devbox.ID, "never")}
+	if _, _, err := env.h.claimLedger(ctx, ledgerKey(devbox.ID, never)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(60 * time.Millisecond)
+	restarted := newHandlers(env.h.deps)
+	if err := restarted.recoverExecutions(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a claim with no session to settle", func() bool {
+		outcome, _, ok := restarted.ledgerOutcome(ctx, devbox.ID, never)
+		return ok && outcome.Lost
+	})
+	if got := env.toolbox.execCount(); got != 0 {
+		t.Fatalf("%d commands ran; want none", got)
+	}
 }
 
 func TestMalformedExecutionIDsAreNotFound(t *testing.T) {

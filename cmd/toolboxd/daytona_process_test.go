@@ -807,3 +807,72 @@ func TestDaytonaProcessRouteAndLookupErrorBranches(t *testing.T) {
 		srv.streamDaytonaSessionCommandLogs(rr, req, cmd)
 	})
 }
+
+// logsAt reads a session command's logs with the given query.
+func logsAt(t *testing.T, srv *server, session, cmdID, query string) (int, daytonaSessionLogsResponse) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/process/session/"+session+"/command/"+cmdID+"/logs"+query, nil)
+	rec := httptest.NewRecorder()
+	if !srv.handleDaytonaProcessRoute(rec, req) {
+		t.Fatal("expected logs route to be handled")
+	}
+	var resp daytonaSessionLogsResponse
+	if rec.Code == http.StatusOK {
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode logs: %v", err)
+		}
+	}
+	return rec.Code, resp
+}
+
+// A running command's logs answer with what it has written so far, so a
+// poller can deliver output before the command exits; offsets and a limit
+// let it read only what it has not seen. Once the command ends, the same
+// parameters apply to its final text.
+func TestDaytonaSessionCommandLogsWhileRunning(t *testing.T) {
+	srv := newDaytonaTestServer(t)
+	createRec := httptest.NewRecorder()
+	srv.handleDaytonaProcessRoute(createRec, httptest.NewRequest(http.MethodPost, "/process/session", bytes.NewBufferString(`{"sessionId":"live"}`)))
+	execRec := httptest.NewRecorder()
+	srv.handleDaytonaProcessRoute(execRec, httptest.NewRequest(http.MethodPost, "/process/session/live/exec",
+		bytes.NewBufferString(`{"command":"printf 'ready\\n'; printf 'warn' >&2; read go; printf 'done'","runAsync":true}`)))
+	var execResp daytonaSessionExecuteResponse
+	if err := json.Unmarshal(execRec.Body.Bytes(), &execResp); err != nil || execResp.CmdID == "" {
+		t.Fatalf("exec = %s, %v", execRec.Body.String(), err)
+	}
+	cmd := execResp.CmdID
+
+	deadline := time.Now().Add(daytonaAsyncTestTimeout)
+	var live daytonaSessionLogsResponse
+	for {
+		_, live = logsAt(t, srv, "live", cmd, "")
+		if live.Stdout == "ready\n" && live.Stderr == "warn" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("running command's logs = %+v, want its output so far", live)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if live.StdoutLength != 6 || live.StderrLength != 4 || live.Output != "ready\nwarn" {
+		t.Fatalf("running logs = %+v", live)
+	}
+	if _, part := logsAt(t, srv, "live", cmd, "?stdoutOffset=2&stderrOffset=9&limit=3"); part.Stdout != "ady" || part.Stderr != "" || part.StdoutLength != 6 || part.StderrLength != 4 {
+		t.Fatalf("windowed running logs = %+v", part)
+	}
+	for _, bad := range []string{"?stdoutOffset=-1", "?limit=x", "?stderrOffset=1.5"} {
+		if code, _ := logsAt(t, srv, "live", cmd, bad); code != http.StatusBadRequest {
+			t.Errorf("logs%s = %d, want 400", bad, code)
+		}
+	}
+
+	inputRec := httptest.NewRecorder()
+	srv.handleDaytonaProcessRoute(inputRec, httptest.NewRequest(http.MethodPost, "/process/session/live/command/"+cmd+"/input", bytes.NewBufferString(`{"data":"go\n"}`)))
+	if !waitForCommandStdoutContains(t, srv, "live", cmd, "done", daytonaAsyncTestTimeout) {
+		t.Fatal("command never finished")
+	}
+	_, final := logsAt(t, srv, "live", cmd, "?stdoutOffset=6")
+	if final.Stdout != "done" || final.StdoutLength != 10 || final.Stderr != "warn" {
+		t.Fatalf("final logs from offset = %+v", final)
+	}
+}

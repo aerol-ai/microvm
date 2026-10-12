@@ -64,6 +64,12 @@ var (
 	// sseHeartbeat keeps an idle output stream inside the SDK's 30s read
 	// timeout.
 	sseHeartbeat = 15 * time.Second
+	// liveOutputMin / liveOutputMax pace an output stream's toolbox reads
+	// while its command runs: quick while output keeps coming, backing off
+	// while the command is quiet. The cost is per open stream and each read
+	// carries only the bytes the client has not seen.
+	liveOutputMin = 100 * time.Millisecond
+	liveOutputMax = time.Second
 	// watchMinBackoff / watchMaxBackoff pace a watcher's toolbox reads: quick
 	// at first so short commands finish promptly, then capped so a long
 	// command costs one session+command read every couple of seconds — and
@@ -77,6 +83,12 @@ var (
 	// submitWait bounds how long a retry waits for the request that claimed
 	// an execution to submit its command.
 	submitWait = 5 * time.Second
+	// submitGrace is how long after its claim a plain execution may show no
+	// command before its watcher decides the submission failed. It is far
+	// longer than a submit takes, so the claiming request has finished
+	// trying by then; the watcher deletes the session first, so a submission
+	// still in flight lands on nothing rather than running unwatched.
+	submitGrace = time.Minute
 	// namedWatchIdle ends a named execution's watcher once nobody has
 	// asked about it for this long. A named shell owns its command, so the
 	// watcher there only coalesces readers; it must not poll a command that
@@ -340,11 +352,13 @@ type execState struct {
 	ref       execRef
 	shellName string
 	completed bool
-	exit      int
-	stdout    string
-	stderr    string
-	stdoutLen int64
-	stderrLen int64
+	// unsubmitted: a plain execution whose session holds no command yet.
+	unsubmitted bool
+	exit        int
+	stdout      string
+	stderr      string
+	stdoutLen   int64
+	stderrLen   int64
 }
 
 func (s execState) stdoutCut() bool { return s.stdoutLen != int64(len(s.stdout)) }
@@ -453,40 +467,50 @@ func (h *handlers) startExecution(ctx context.Context, devboxID, command, shellN
 	}
 	if !acquired {
 		if rec.TargetID != "" {
+			if outcome, ok := decodeOutcome(rec.TargetID); ok && outcome.Lost {
+				return execRef{}, lostConflict()
+			}
 			return ref, nil // finished; readers answer from the ledger
 		}
 		// In flight under the request that claimed it — possibly in a
-		// previous sandboxd process, whose watcher died with it.
+		// previous sandboxd process, whose watcher died with it. Either way
+		// the row needs a watcher, which also settles it if the command
+		// never arrives.
+		h.startWatcher(ctx, devboxID, ref, false)
 		if err := h.awaitSubmitted(ctx, devboxID, ref); err != nil {
 			return execRef{}, err
 		}
-		h.startWatcher(ctx, devboxID, ref)
 		return ref, nil
 	}
 	release, err := h.submitPlain(ctx, devboxID, ref, command)
-	if err != nil {
-		if release {
-			h.releaseLedger(ctx, ledgerKey(devboxID, ref))
-		}
+	if err != nil && release {
+		h.releaseLedger(ctx, ledgerKey(devboxID, ref))
 		return execRef{}, err
 	}
-	h.startWatcher(ctx, devboxID, ref)
+	// From here the command may be running, so its watcher owns it — even
+	// on an error: the session must still be cleaned up and the row settled
+	// whether or not the client ever retries.
+	h.startWatcher(ctx, devboxID, ref, err == nil)
+	if err != nil {
+		return execRef{}, err
+	}
 	return ref, nil
 }
 
 // submitPlain runs command in ref's session. release reports, on failure,
-// that the command certainly did not run (no session, or its session was
-// deleted again), so the claim can be dropped for a clean retry. When that
-// is not certain the claim stays, and a retry adopts whatever the session
-// holds instead of submitting a second copy.
+// that the command certainly did not run — the session could not be
+// opened, or the toolbox refused the command — so the claim can be dropped
+// for a clean retry. Any other failure (a lost reply, a timeout, a 5xx)
+// leaves it unknown whether the command started, so the claim stays: a retry
+// adopts whatever the session holds, and never submits a second copy.
 func (h *handlers) submitPlain(ctx context.Context, devboxID string, ref execRef, command string) (release bool, err error) {
 	created, err := h.createSession(ctx, devboxID, ref.session)
 	if err != nil {
 		return true, err
 	}
 	if !created {
-		// The session predates this claim: a previous holder whose claim
-		// lapsed got as far as creating it and may have submitted too.
+		// The session predates this claim: a previous holder got as far as
+		// creating it and may have submitted too.
 		sess, err := h.getSession(ctx, devboxID, ref.session)
 		if err != nil {
 			return false, err
@@ -495,19 +519,35 @@ func (h *handlers) submitPlain(ctx context.Context, devboxID string, ref execRef
 			return false, nil
 		}
 	}
-	if _, err := h.sessionExec(ctx, devboxID, ref.session, command); err != nil {
-		// Deleting the session also kills a command that did start before
-		// the failure was reported.
+	_, err = h.sessionExec(ctx, devboxID, ref.session, command)
+	if err == nil {
+		return false, nil
+	}
+	if refusedByToolbox(err) {
+		// Deleting the session as well keeps the retry's session fresh.
 		return h.deleteSession(context.WithoutCancel(ctx), devboxID, ref.session) == nil, err
 	}
-	return false, nil
+	// The toolbox may have accepted the command and lost only the reply. A
+	// plain session only ever holds this execution's command, so finding
+	// one there means the submit worked after all.
+	if sess, getErr := h.getSession(ctx, devboxID, ref.session); getErr == nil && len(sess.Commands) > 0 {
+		return false, nil
+	}
+	return false, err
+}
+
+// refusedByToolbox reports a toolbox 4xx: it rejected the request before
+// acting on it, so a submission that failed this way did not run.
+func refusedByToolbox(err error) bool {
+	var tbErr *toolboxError
+	return errors.As(err, &tbErr) && tbErr.status >= 400 && tbErr.status < 500
 }
 
 func (h *handlers) startNamedExecution(ctx context.Context, devboxID, command, shellName, key string) (execRef, error) {
 	fingerprint := namedLedgerKey(devboxID, shellName, key)
 	deadline := time.Now().Add(submitWait)
 	for {
-		rec, acquired, err := h.claimLedger(ctx, fingerprint)
+		rec, acquired, err := h.claimNamedLedger(ctx, fingerprint)
 		if err != nil {
 			return execRef{}, err
 		}
@@ -528,21 +568,27 @@ func (h *handlers) startNamedExecution(ctx context.Context, devboxID, command, s
 		return ref, nil
 	}
 	session := shellPrefix + shortHash(devboxID, shellName)
-	ref, err := func() (execRef, error) {
+	ref, notRun, err := func() (execRef, bool, error) {
 		if _, err := h.createSession(ctx, devboxID, session); err != nil {
-			return execRef{}, err
+			return execRef{}, true, err
 		}
 		cmd, err := h.sessionExec(ctx, devboxID, session, command)
 		if err != nil {
-			return execRef{}, err
+			return execRef{}, refusedByToolbox(err), err
 		}
 		if !isHex(cmd) {
-			return execRef{}, fmt.Errorf("toolbox returned an unexpected command id %q", cmd)
+			return execRef{}, false, fmt.Errorf("toolbox returned an unexpected command id %q", cmd)
 		}
-		return execRef{session: session, command: cmd}, nil
+		return execRef{session: session, command: cmd}, false, nil
 	}()
 	if err != nil {
-		h.releaseLedger(ctx, fingerprint)
+		// The claim is dropped only when the command certainly did not run.
+		// Otherwise it may be running in the shell under an id the toolbox
+		// never reported; the claim stays, and a retry of this id is told
+		// the outcome is unknown instead of running the command again.
+		if notRun {
+			h.releaseLedger(ctx, fingerprint)
+		}
 		return execRef{}, err
 	}
 	if err := h.completeLedger(ctx, fingerprint, ref.id()); err != nil && h.deps.Logger != nil {
@@ -601,7 +647,10 @@ func (h *handlers) awaitSubmitted(ctx context.Context, devboxID string, ref exec
 			if _, ok := h.execs.result(resultKey(devboxID, ref.id())); ok {
 				return nil
 			}
-			if _, _, ok := h.ledgerOutcome(ctx, devboxID, ref); ok {
+			if outcome, _, ok := h.ledgerOutcome(ctx, devboxID, ref); ok {
+				if outcome.Lost {
+					return lostConflict()
+				}
 				return nil
 			}
 		} else if len(sess.Commands) > 0 {
@@ -622,44 +671,54 @@ func (h *handlers) awaitSubmitted(ctx context.Context, devboxID string, ref exec
 // watchPace is a watcher's timing, read from the package variables once
 // when it starts: the goroutine outlives the call, and tests change them.
 type watchPace struct {
-	min, max, idle, namedIdle time.Duration
+	min, max, idle, namedIdle, grace time.Duration
 }
 
 func (p watchPace) next(backoff time.Duration) time.Duration { return min(backoff*2, p.max) }
 
 // startWatcher follows an execution to completion. It is detached from the
 // request but keeps its values, so its store and toolbox calls stay scoped
-// to the caller. At most one runs per execution.
-func (h *handlers) startWatcher(ctx context.Context, devboxID string, ref execRef) {
+// to the caller. At most one runs per execution. submitted says the caller
+// knows the command reached its session, so the watcher need not allow for
+// a claimer that has yet to open it.
+func (h *handlers) startWatcher(ctx context.Context, devboxID string, ref execRef, submitted bool) {
 	key := resultKey(devboxID, ref.id())
 	if !h.execs.watch(key) {
 		return
 	}
 	ctx = context.WithoutCancel(ctx)
-	pace := watchPace{min: watchMinBackoff, max: watchMaxBackoff, idle: watchIdleBackoff, namedIdle: namedWatchIdle}
+	pace := watchPace{min: watchMinBackoff, max: watchMaxBackoff, idle: watchIdleBackoff, namedIdle: namedWatchIdle, grace: submitGrace}
 	go func() {
 		defer h.execs.unwatch(key)
-		h.watchExecution(ctx, devboxID, ref, pace)
+		h.watchExecution(ctx, devboxID, ref, pace, submitted)
 	}()
 }
 
 // watchExecution polls ref until it completes and then, for a plain
-// execution, finishes it. It ends when that work is done, the session is
-// gone, the devbox is gone, or the ledger row has expired — never on a run
-// of toolbox errors, because a plain execution's session has no other
-// owner to clean it up.
-func (h *handlers) watchExecution(ctx context.Context, devboxID string, ref execRef, pace watchPace) {
+// execution, finishes it. A plain execution's watcher ends only once its
+// session is confirmed gone and its ledger row settled — never on a timer
+// or a run of toolbox errors, because the session has no other owner to
+// clean it up, however long the command runs or its devbox sleeps. A named
+// execution's watcher only coalesces readers, so it ends when they stop
+// asking (namedWatchIdle).
+func (h *handlers) watchExecution(ctx context.Context, devboxID string, ref execRef, pace watchPace, seen bool) {
 	key := resultKey(devboxID, ref.id())
-	deadline := time.Now().Add(execLedgerTTL)
 	backoff := pace.min
 	failures := 0
-	for time.Now().Before(deadline) {
+	// seen: the command reached its session, so the claiming request is
+	// past submitting and a missing session is gone for good.
+	for {
 		if ref.command != "" && h.execs.idleFor(key) > pace.namedIdle {
 			return
 		}
 		running, gone := h.devboxRunning(ctx, devboxID)
 		if gone {
-			return
+			// Its sessions went with it, so nothing is owed any more.
+			if ref.command != "" || h.settleLedger(ctx, devboxID, ref, true, pace) {
+				return
+			}
+			time.Sleep(pace.idle)
+			continue
 		}
 		if !running {
 			time.Sleep(pace.idle)
@@ -670,19 +729,22 @@ func (h *handlers) watchExecution(ctx context.Context, devboxID string, ref exec
 		switch {
 		case err == nil && state.completed:
 			if ref.command == "" {
-				h.finishPlain(ctx, devboxID, ref, state, deadline, pace)
+				h.finishPlain(ctx, devboxID, ref, state, pace)
 			}
 			return
-		case err == nil:
+		case err == nil && state.unsubmitted:
+			if h.abandonUnsubmitted(ctx, devboxID, ref, pace) {
+				return
+			}
 			failures = 0
+		case err == nil:
+			seen, failures = true, 0
 		case isToolboxNotFound(err):
-			// Killed, finished by another process's watcher, or the shell
-			// died with its devbox. A result already stored means only the
-			// ledger's final step is left.
-			if ref.command == "" {
-				h.settleLedger(ctx, devboxID, ref)
+			// Killed, finished by another process's watcher, never created,
+			// or the shell died with its devbox.
+			if ref.command != "" || h.settleLedger(ctx, devboxID, ref, seen, pace) {
+				return
 			}
-			return
 		default:
 			if failures++; failures == 1 || failures%100 == 0 {
 				if h.deps.Logger != nil {
@@ -693,6 +755,28 @@ func (h *handlers) watchExecution(ctx context.Context, devboxID string, ref exec
 		time.Sleep(backoff)
 		backoff = pace.next(backoff)
 	}
+}
+
+// abandonUnsubmitted handles a plain execution whose session exists but
+// holds no command. Within submitGrace of the claim the claiming request may
+// still be submitting, so the watcher waits. After that the submission
+// failed: the watcher deletes the session first — so a submission still in
+// flight lands on nothing rather than running unwatched — and then settles
+// the row as lost. A session no claim owns is an orphan and goes at once.
+// It reports whether nothing is left to watch.
+func (h *handlers) abandonUnsubmitted(ctx context.Context, devboxID string, ref execRef, pace watchPace) bool {
+	rec, err := h.deps.Service.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devboxID, ref))
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+	case err != nil:
+		return false
+	case time.Since(rec.CreatedAt) < pace.grace:
+		return false
+	}
+	if err := h.deleteSession(ctx, devboxID, ref.session); err != nil {
+		return false
+	}
+	return h.settleLedger(ctx, devboxID, ref, true, pace)
 }
 
 // devboxRunning reads the sandbox row — never the toolbox, which would wake
@@ -720,8 +804,9 @@ func (h *handlers) devboxRunning(ctx context.Context, devboxID string) (running,
 //  4. mark the ledger row ready: nothing is owed any more.
 //
 // A row still pending after step 2 is cleanup owed, which is exactly what
-// recoverExecutions re-attaches to after a restart.
-func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef, state execState, deadline time.Time, pace watchPace) {
+// recoverExecutions re-attaches to after a restart. A devbox deleted
+// meanwhile took the session with it, which also completes step 3.
+func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef, state execState, pace watchPace) {
 	key := resultKey(devboxID, ref.id())
 	h.execs.finishing(key)
 	res := h.execs.record(resultFromState(key, state))
@@ -732,12 +817,9 @@ func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef
 	}
 	backoff := pace.min
 	for failures := 0; ; failures++ {
-		if !time.Now().Before(deadline) {
-			return
-		}
 		running, gone := h.devboxRunning(ctx, devboxID)
 		if gone {
-			return
+			break
 		}
 		if !running {
 			time.Sleep(pace.idle)
@@ -753,21 +835,53 @@ func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef
 		time.Sleep(backoff)
 		backoff = pace.next(backoff)
 	}
-	if err := h.completeLedger(ctx, fingerprint, outcome); err != nil && h.deps.Logger != nil {
-		h.deps.Logger.Warn("runloop execution ledger completion failed", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
+	// Step 4 is retried like step 3: until it lands, the row says cleanup is
+	// owed, which a restart would act on again.
+	backoff = pace.min
+	for failures := 0; ; failures++ {
+		err := h.completeLedger(ctx, fingerprint, outcome)
+		if err == nil || errors.Is(err, store.ErrNotFound) {
+			return
+		}
+		if (failures == 0 || failures%100 == 0) && h.deps.Logger != nil {
+			h.deps.Logger.Warn("runloop execution ledger completion failed; retrying", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
+		}
+		time.Sleep(backoff)
+		backoff = pace.next(backoff)
 	}
 }
 
-// settleLedger completes a ledger row whose outcome is stored but whose
-// session turned out to be gone already: nothing is owed any more.
-func (h *handlers) settleLedger(ctx context.Context, devboxID string, ref execRef) {
+// settleLedger settles a plain execution whose session is gone, so nothing
+// is owed any more. A row with a stored outcome completes with it. A row
+// without one is lost — the command may have run, but nothing saw how it
+// ended. certain says the session cannot come back (it was seen and then
+// vanished, or the devbox is gone); without it, a claim younger than
+// pace.grace is left alone, because the claiming request may only not have
+// opened the session yet. It reports whether nothing is left to watch.
+func (h *handlers) settleLedger(ctx context.Context, devboxID string, ref execRef, certain bool, pace watchPace) bool {
 	rec, err := h.deps.Service.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devboxID, ref))
-	if err != nil || rec.State != models.RequestStatePending || rec.TargetID == "" {
-		return
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return true // released by a refused submit: nothing ran
+	case err != nil:
+		return false
+	case rec.State != models.RequestStatePending:
+		return true
 	}
-	if err := h.completeLedger(ctx, ledgerKey(devboxID, ref), rec.TargetID); err != nil && h.deps.Logger != nil {
-		h.deps.Logger.Warn("runloop execution ledger completion failed", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
+	target := rec.TargetID
+	if _, ok := decodeOutcome(target); !ok {
+		if !certain && time.Since(rec.CreatedAt) < pace.grace {
+			return false
+		}
+		target = execOutcome{Lost: true}.encode()
 	}
+	if err := h.completeLedger(ctx, ledgerKey(devboxID, ref), target); err != nil && !errors.Is(err, store.ErrNotFound) {
+		if h.deps.Logger != nil {
+			h.deps.Logger.Warn("runloop execution ledger completion failed", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
+		}
+		return false
+	}
+	return true
 }
 
 func resultFromState(key string, state execState) *execResult {
@@ -809,8 +923,11 @@ func (h *handlers) executionState(ctx context.Context, devboxID string, ref exec
 		return execState{ref: ref}, nil
 	}
 	if outcome, owed, ok := h.ledgerOutcome(ctx, devboxID, ref); ok {
+		if outcome.Lost {
+			return execState{}, errExecutionLost
+		}
 		if owed {
-			h.startWatcher(ctx, devboxID, ref)
+			h.startWatcher(ctx, devboxID, ref, true)
 		}
 		return stateFromOutcome(ref, outcome), nil
 	}
@@ -823,6 +940,9 @@ func (h *handlers) executionState(ctx context.Context, devboxID string, ref exec
 			return stateFromResult(ref, res), nil
 		}
 		if outcome, _, ok := h.ledgerOutcome(ctx, devboxID, ref); ok {
+			if outcome.Lost {
+				return execState{}, errExecutionLost
+			}
 			return stateFromOutcome(ref, outcome), nil
 		}
 		return execState{}, err
@@ -835,7 +955,7 @@ func (h *handlers) executionState(ctx context.Context, devboxID string, ref exec
 	// need someone to signal them — for a named one, only while they keep
 	// asking (namedWatchIdle).
 	if ref.command == "" || !state.completed {
-		h.startWatcher(ctx, devboxID, ref)
+		h.startWatcher(ctx, devboxID, ref, !state.unsubmitted)
 	}
 	return state, nil
 }
@@ -850,7 +970,7 @@ func (h *handlers) readLiveState(ctx context.Context, devboxID string, ref execR
 			return execState{}, err
 		}
 		if len(sess.Commands) == 0 {
-			return execState{ref: ref}, nil
+			return execState{ref: ref, unsubmitted: true}, nil
 		}
 		cid = sess.Commands[0].ID
 	}
@@ -1123,13 +1243,15 @@ func (h *handlers) sendStdin(w http.ResponseWriter, r *http.Request, devboxID, e
 	writeJSON(w, http.StatusOK, sendStdinResponse{DevboxID: devboxID, ExecutionID: ref.id(), Success: true})
 }
 
-// streamOutput serves stream_{stdout,stderr}_updates as SSE. Output is
-// delivered once the command completes — toolbox sessions expose a
-// command's output only at the end over plain HTTP — with comment
-// heartbeats while it runs so the SDK's 30s read timeout never fires.
-// offset is a byte position in the command's full output: the client echoes
-// the last chunk's offset back on reconnect, so each chunk's offset is
-// where the next one starts.
+// streamOutput serves stream_{stdout,stderr}_updates as SSE. While the
+// command runs it reads the stream's new bytes from the toolbox and sends
+// each as a chunk, so the SDK's log callbacks fire as output appears; once
+// the command completes, whatever is left comes from its captured result.
+// Comment heartbeats keep a quiet stream inside the SDK's 30s read timeout.
+// A toolbox too old to serve a running command's output gets everything at
+// the end instead. offset is a byte position in the command's full output:
+// the client echoes the last chunk's offset back on reconnect, so each
+// chunk's offset is where the next one starts.
 func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID, execID string, stderr bool) {
 	ref, ok := h.lookupExecution(w, devboxID, execID)
 	if !ok {
@@ -1154,10 +1276,40 @@ func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	_ = rc.Flush()
+	send := func(chunk executionUpdateChunk) bool {
+		payload, _ := json.Marshal(chunk)
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+			return false
+		}
+		_ = rc.Flush()
+		return true
+	}
 
 	key := resultKey(devboxID, ref.id())
 	lastBeat := time.Now()
+	live, cid, pause := true, ref.command, liveOutputMin
 	for !state.completed {
+		if live && cid == "" && !state.unsubmitted {
+			cid = h.plainCommandID(r.Context(), devboxID, ref)
+		}
+		if live && cid != "" {
+			// A failed read is left to the status read below, which ends
+			// the stream if the toolbox stays down.
+			text, total, supported, err := h.liveOutput(r.Context(), devboxID, ref.session, cid, stderr, offset, maxCapturedStream)
+			switch {
+			case err == nil && !supported:
+				live = false
+			case err == nil && text != "":
+				offset += int64(len(text))
+				if !send(executionUpdateChunk{Output: text, Offset: offset}) {
+					return
+				}
+				lastBeat, pause = time.Now(), liveOutputMin
+				if offset < total {
+					continue // more is already waiting
+				}
+			}
+		}
 		if time.Since(lastBeat) >= sseHeartbeat {
 			if _, err := fmt.Fprint(w, ": ping\n\n"); err != nil {
 				return
@@ -1165,7 +1317,11 @@ func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID
 			_ = rc.Flush()
 			lastBeat = time.Now()
 		}
-		if !h.sleepForExecution(r.Context(), key, time.Now().Add(sseHeartbeat), time.Second) {
+		wait, interval := sseHeartbeat, time.Second
+		if live {
+			wait, interval, pause = pause, pause, min(pause*2, liveOutputMax)
+		}
+		if !h.sleepForExecution(r.Context(), key, time.Now().Add(wait), interval) {
 			return
 		}
 		if state, err = h.executionState(r.Context(), devboxID, ref); err != nil {
@@ -1180,10 +1336,20 @@ func (h *handlers) streamOutput(w http.ResponseWriter, r *http.Request, devboxID
 		output, total, name = state.stderr, state.stderrLen, "stderr"
 	}
 	for _, chunk := range outputChunks(output, total, offset, name) {
-		payload, _ := json.Marshal(chunk)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", payload)
+		if !send(chunk) {
+			return
+		}
 	}
-	_ = rc.Flush()
+}
+
+// plainCommandID is the id of a plain execution's command, its session's
+// only one; "" while it has none or the session cannot be read.
+func (h *handlers) plainCommandID(ctx context.Context, devboxID string, ref execRef) string {
+	sess, err := h.getSession(ctx, devboxID, ref.session)
+	if err != nil || len(sess.Commands) == 0 {
+		return ""
+	}
+	return sess.Commands[0].ID
 }
 
 // outputChunks renders one stream from offset as update chunks. output is
@@ -1221,6 +1387,10 @@ func outputChunks(output string, total, offset int64, stream string) []execution
 func (h *handlers) writeExecutionError(w http.ResponseWriter, err error) {
 	if isToolboxNotFound(err) {
 		WriteError(w, http.StatusNotFound, "execution not found")
+		return
+	}
+	if errors.Is(err, errExecutionLost) {
+		WriteError(w, http.StatusNotFound, err.Error())
 		return
 	}
 	h.writeToolboxError(w, err)

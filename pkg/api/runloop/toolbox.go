@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/service"
@@ -54,6 +55,10 @@ type toolboxSession struct {
 type toolboxCommandLogs struct {
 	Stdout string `json:"stdout"`
 	Stderr string `json:"stderr"`
+	// The full stream lengths so far. A toolbox that predates live output
+	// sends neither, and ignores the offset parameters.
+	StdoutLength *int64 `json:"stdoutLength"`
+	StderrLength *int64 `json:"stderrLength"`
 }
 
 func (h *handlers) toolboxCall(ctx context.Context, devboxID, method, path string, query url.Values, body any, out any) (int, error) {
@@ -152,6 +157,32 @@ func (h *handlers) commandLogs(ctx context.Context, devboxID, sid, cid string) (
 		return nil, err
 	}
 	return &out, nil
+}
+
+// liveOutput reads one stream of a command, running or not, from offset:
+// at most limit bytes of it, and the stream's full length so far. supported
+// is false when the toolbox predates live output; it then serves a running
+// command's output only once the command ends.
+func (h *handlers) liveOutput(ctx context.Context, devboxID, sid, cid string, stderr bool, offset, limit int64) (text string, total int64, supported bool, err error) {
+	// The other stream is read from past any end, so it comes back empty.
+	const skip = "9223372036854775807"
+	query := url.Values{"stdoutOffset": {strconv.FormatInt(offset, 10)}, "stderrOffset": {skip}, "limit": {strconv.FormatInt(limit, 10)}}
+	if stderr {
+		query.Set("stdoutOffset", skip)
+		query.Set("stderrOffset", strconv.FormatInt(offset, 10))
+	}
+	var out toolboxCommandLogs
+	if _, err := h.toolboxCall(ctx, devboxID, http.MethodGet, "/process/session/"+sid+"/command/"+cid+"/logs", query, nil, &out); err != nil {
+		return "", 0, false, err
+	}
+	text, length := out.Stdout, out.StdoutLength
+	if stderr {
+		text, length = out.Stderr, out.StderrLength
+	}
+	if length == nil {
+		return "", 0, false, nil
+	}
+	return text, *length, true, nil
 }
 
 func (h *handlers) deleteSession(ctx context.Context, devboxID, sid string) error {

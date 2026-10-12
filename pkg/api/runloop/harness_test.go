@@ -186,6 +186,7 @@ type fakeToolbox struct {
 	home       string // $HOME the one-shot exec reports; "" = /home/user
 	badCmdID   bool   // exec answers a non-hex command id
 	emptyCmdID bool   // exec answers no command id at all
+	legacyLogs bool   // logs ignore offsets and send no lengths, like toolboxd before live output
 
 	beforeServe func(*http.Request) // runs first on every request
 	homeCalls   int                 // one-shot $HOME lookups served
@@ -476,7 +477,30 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 		case "":
 			writeJSON(w, http.StatusOK, toolboxCommand{Command: snapshot.command, ExitCode: snapshot.exitCode, ID: snapshot.id})
 		case "logs":
-			writeJSON(w, http.StatusOK, map[string]string{"stdout": snapshot.stdout, "stderr": snapshot.stderr, "output": snapshot.stdout + snapshot.stderr})
+			f.mu.Lock()
+			legacy := f.legacyLogs
+			f.mu.Unlock()
+			if legacy {
+				writeJSON(w, http.StatusOK, map[string]string{"stdout": snapshot.stdout, "stderr": snapshot.stderr, "output": snapshot.stdout + snapshot.stderr})
+				return
+			}
+			query := r.URL.Query()
+			bound := func(name string) int64 {
+				n, _ := strconv.ParseInt(query.Get(name), 10, 64)
+				return n
+			}
+			window := func(text string, from int64) string {
+				text = text[min(from, int64(len(text))):]
+				if limit := bound("limit"); limit > 0 && int64(len(text)) > limit {
+					text = text[:limit]
+				}
+				return text
+			}
+			stdout, stderr := window(snapshot.stdout, bound("stdoutOffset")), window(snapshot.stderr, bound("stderrOffset"))
+			writeJSON(w, http.StatusOK, map[string]any{
+				"stdout": stdout, "stderr": stderr, "output": stdout + stderr,
+				"stdoutLength": len(snapshot.stdout), "stderrLength": len(snapshot.stderr),
+			})
 		case "input":
 			var req struct {
 				Data string `json:"data"`

@@ -37,7 +37,7 @@ func TestListIdempotentRequestsFiltersScopeAndState(t *testing.T) {
 		{"e2b.create", models.RequestStatePending, maxIdempotentListRows + 1, 1},
 		{"nobody", models.RequestStatePending, 5, 0},
 	} {
-		rows, err := st.ListIdempotentRequests(ctx, tc.scope, tc.state, tc.limit)
+		rows, err := st.ListIdempotentRequests(ctx, tc.scope, tc.state, "", tc.limit)
 		if err != nil {
 			t.Fatalf("%s/%s: %v", tc.scope, tc.state, err)
 		}
@@ -50,8 +50,50 @@ func TestListIdempotentRequestsFiltersScopeAndState(t *testing.T) {
 			}
 		}
 	}
-	if _, err := st.ListIdempotentRequests(ctx, " ", models.RequestStatePending, 1); err == nil {
+	if _, err := st.ListIdempotentRequests(ctx, " ", models.RequestStatePending, "", 1); err == nil {
 		t.Fatal("blank scope accepted")
+	}
+}
+
+// A restart walks every pending row however many there are: each page
+// starts after the last fingerprint of the one before, rows in other states
+// are skipped by the index rather than counted against the page, and the walk
+// ends on a short page.
+func TestListIdempotentRequestsPagesByCursor(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for i := range 7 {
+		fp := fmt.Sprintf("dev/rlx-%02d", i)
+		if _, _, err := st.ClaimIdempotentRequest(ctx, "runloop.exec", fp, now, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 1 {
+			if err := st.CompleteIdempotentRequest(ctx, "runloop.exec", fp, "done", now, time.Hour); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var seen []string
+	after := ""
+	for pages := 0; ; pages++ {
+		if pages > 4 {
+			t.Fatalf("walk did not end: %v", seen)
+		}
+		rows, err := st.ListIdempotentRequests(ctx, "runloop.exec", models.RequestStatePending, after, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			seen = append(seen, row.Fingerprint)
+			after = row.Fingerprint
+		}
+		if len(rows) < 2 {
+			break
+		}
+	}
+	if fmt.Sprint(seen) != "[dev/rlx-00 dev/rlx-02 dev/rlx-04 dev/rlx-06]" {
+		t.Fatalf("walked %v", seen)
 	}
 }
 
@@ -96,7 +138,7 @@ func TestDeleteExpiredIdempotentRequestsOnlyRemovesFreeRows(t *testing.T) {
 	if _, err := st.DeleteExpiredIdempotentRequests(ctx, now, 1); err == nil {
 		t.Fatal("closed store accepted a sweep")
 	}
-	if _, err := st.ListIdempotentRequests(ctx, "s", models.RequestStatePending, 1); err == nil {
+	if _, err := st.ListIdempotentRequests(ctx, "s", models.RequestStatePending, "", 1); err == nil {
 		t.Fatal("closed store accepted a list")
 	}
 }

@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/distribution/reference"
 )
 
 // SnapshotPushConfig wires the optional background AOCR push to a specific
@@ -162,7 +165,7 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 		return SnapshotPushResult{}, fmt.Errorf("snapshot push: read PAT: %w", err)
 	}
 
-	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name, p.cfg.TagSuffix)
+	dest := snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, snapshotRepoName(snapshot.OwnerRef, name), p.cfg.TagSuffix)
 
 	var digest string
 	pushed, err := p.docker.PushImage(ctx, docker.PushImageRequest{
@@ -195,12 +198,12 @@ func (p *SnapshotPusher) PushOnce(ctx context.Context, snapshot *models.SandboxS
 }
 
 // DestRefFor returns the AOCR destination ref this pusher would write
-// for the given snapshot name. Used by callers that need the canonical
-// ref without actually pushing — e.g. cross-node snapshot lookup, where
-// a peer node took the snapshot and we want to pull from AOCR without
+// for owner's snapshot of the given name. Used by callers that need the
+// canonical ref without actually pushing — e.g. cross-node snapshot lookup,
+// where a peer node took the snapshot and we want to pull from AOCR without
 // asking the FSM whether the snapshot exists. Returns "" when the
 // pusher is nil so callers can no-op cleanly when push is disabled.
-func (p *SnapshotPusher) DestRefFor(snapshotName string) string {
+func (p *SnapshotPusher) DestRefFor(ownerRef, snapshotName string) string {
 	if p == nil {
 		return ""
 	}
@@ -208,11 +211,65 @@ func (p *SnapshotPusher) DestRefFor(snapshotName string) string {
 	if name == "" {
 		return ""
 	}
-	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, name, p.cfg.TagSuffix)
+	return snapshotAOCRRef(p.cfg.Host, p.cfg.ClusterID, snapshotRepoName(ownerRef, name), p.cfg.TagSuffix)
+}
+
+// snapshotOwnerNamespaceLen is the hex length of an owner's namespace hash:
+// 128 bits, so no two owners share one.
+const snapshotOwnerNamespaceLen = 32
+
+// snapshotOwnerNamespace is the registry path segment that holds owner's
+// snapshots: `tenant-<hash of the owner>`. The empty owner (operator
+// snapshots, and every snapshot pushed before owners were namespaced) has
+// none, which keeps those refs where they always were.
+//
+// The namespace is what lets a node that has no row for a snapshot still
+// authorize a pull of it: the ref a tenant's request resolves to is built
+// from that tenant's own owner, so it can only ever name the tenant's own
+// artifacts. A single shared path would also let two tenants' snapshots of
+// the same name, taken on different nodes, overwrite each other's tag.
+func snapshotOwnerNamespace(ownerRef string) string {
+	ownerRef = strings.TrimSpace(ownerRef)
+	if ownerRef == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(ownerRef))
+	return "tenant-" + hex.EncodeToString(sum[:])[:snapshotOwnerNamespaceLen]
+}
+
+// snapshotRepoName is the snapshot's path under `snapshots/`.
+func snapshotRepoName(ownerRef, snapshotName string) string {
+	if ns := snapshotOwnerNamespace(ownerRef); ns != "" {
+		return ns + "/" + snapshotName
+	}
+	return snapshotName
+}
+
+// snapshotRefNamespace parses ref as a ref into some cluster's snapshot
+// registry (`[host/]cluster/<id>/snapshots/...`) and returns the owner
+// namespace it points into: "" for the unnamespaced (operator and legacy)
+// path. ok is false for anything that is not a snapshot registry ref. The
+// host is not compared: the push and pull hosts can differ, and a ref with
+// the shape but a foreign host is refused to a tenant at no cost.
+func snapshotRefNamespace(ref string) (namespace string, ok bool) {
+	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
+	if err != nil {
+		return "", false
+	}
+	parts := strings.Split(reference.Path(named), "/")
+	if len(parts) < 4 || parts[0] != "cluster" || parts[2] != "snapshots" {
+		return "", false
+	}
+	if len(parts) >= 5 && strings.HasPrefix(parts[3], "tenant-") {
+		return parts[3], true
+	}
+	return "", true
 }
 
 // snapshotAOCRRef is the AOCR destination convention for cluster-local
-// snapshots: `<host>/cluster/<id>/snapshots/<name>:latest<arch><suffix>`. Mirrors the
+// snapshots: `<host>/cluster/<id>/snapshots/<repo>:latest<arch><suffix>`,
+// where repo is snapshotRepoName — the name, under its owner's namespace
+// when it has an owner. Mirrors the
 // auto-import path's `cluster/<id>/_imported/...` namespace pattern. The base
 // tag is "latest" — snapshot names are themselves unique (the store enforces a
 // PRIMARY KEY on `name`). An optional retention suffix (`--ttl-*` / `--idle-*`)

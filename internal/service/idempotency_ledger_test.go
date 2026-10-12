@@ -71,13 +71,13 @@ func TestIdempotencySweepBacklogAndFailure(t *testing.T) {
 		t.Fatal("a full batch must let the next claim continue the sweep")
 	}
 	svc.sweepIdempotentRequests(time.Now())
-	rows, err := svc.ListIdempotentRequests(ctx, "s", models.RequestStatePending, 0)
+	rows, err := svc.ListIdempotentRequests(ctx, "s", models.RequestStatePending, "", 0)
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("rows left after the backlog = %d, %v", len(rows), err)
 	}
 
 	// No store: nothing to list.
-	if rows, err := (&Service{}).ListIdempotentRequests(ctx, "s", models.RequestStatePending, 1); rows != nil || err != nil {
+	if rows, err := (&Service{}).ListIdempotentRequests(ctx, "s", models.RequestStatePending, "", 1); rows != nil || err != nil {
 		t.Fatalf("store-less list = %v, %v", rows, err)
 	}
 

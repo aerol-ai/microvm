@@ -100,11 +100,13 @@ func TestLedgerOutcomeWriteFailureIsCoveredByCompletion(t *testing.T) {
 }
 
 // A completion write that fails leaves the row pending with its outcome:
-// cleanup still owed, never forgotten. A restart while the store still
-// refuses keeps it owed; the first reader after the store recovers settles
-// it, and the retry replays rather than reruns.
+// cleanup still owed, never forgotten. The watcher keeps trying rather than
+// ending with the debt open, and so does a restarted process's; once the
+// store recovers the row settles with no reader's help, and the retry
+// replays rather than reruns.
 func TestLedgerCompletionFailureLeavesCleanupOwed(t *testing.T) {
 	env := newTestEnv(t)
+	shorten(t, &watchMaxBackoff, 20*time.Millisecond)
 	devbox := env.mustCreate(t, "")
 	clear := failLedger(t, env.store, "complete")
 
@@ -113,21 +115,26 @@ func TestLedgerCompletionFailureLeavesCleanupOwed(t *testing.T) {
 	ref := mustRef(t, done.ExecutionID)
 	key := resultKey(devbox.ID, ref.id())
 	waitFor(t, "session cleanup", func() bool { return env.toolbox.sessionCount() == 0 })
-	waitFor(t, "the watcher to end", func() bool { return !watcherAlive(env.h.execs, key) })
+	time.Sleep(50 * time.Millisecond)
 	if outcome, owed, ok := env.h.ledgerOutcome(context.Background(), devbox.ID, ref); !ok || !owed || outcome.Exit != 5 {
 		t.Fatalf("a row whose completion failed must stay owed with its outcome: %+v owed=%v ok=%v", outcome, owed, ok)
+	}
+	if !watcherAlive(env.h.execs, key) {
+		t.Fatal("the watcher ended with its completion still owed")
 	}
 
 	restarted := newHandlers(env.h.deps)
 	if err := restarted.recoverExecutions(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the recovered watcher to end", func() bool { return !watcherAlive(restarted.execs, key) })
-	if _, owed, ok := restarted.ledgerOutcome(context.Background(), devbox.ID, ref); !ok || !owed {
-		t.Fatal("a failed settle must leave the row owed")
+	time.Sleep(50 * time.Millisecond)
+	if _, owed, ok := restarted.ledgerOutcome(context.Background(), devbox.ID, ref); !ok || !owed || !watcherAlive(restarted.execs, key) {
+		t.Fatal("while the store refuses, the row stays owed and a watcher stays on it")
 	}
 
 	clear()
+	waitFor(t, "the ledger to settle on its own", func() bool { return ledgerSettled(env.h, devbox.ID, ref) })
+	waitFor(t, "both watchers to end", func() bool { return !watcherAlive(env.h.execs, key) && !watcherAlive(restarted.execs, key) })
 	if _, err := restarted.startExecution(context.Background(), devbox.ID, "exit 5", "", "c"); err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +142,6 @@ func TestLedgerCompletionFailureLeavesCleanupOwed(t *testing.T) {
 	if err != nil || !state.completed || state.exit != 5 {
 		t.Fatalf("replay = %+v, %v", state, err)
 	}
-	waitFor(t, "the ledger to settle", func() bool { return ledgerSettled(restarted, devbox.ID, ref) })
 	if got := env.toolbox.execCount(); got != 1 {
 		t.Fatalf("command ran %d times; want 1", got)
 	}
@@ -295,27 +301,26 @@ func TestCleanupOfAnAlreadyGoneSessionSettles(t *testing.T) {
 	waitFor(t, "the watcher to end", func() bool { return !watcherAlive(env.h.execs, resultKey(devbox.ID, ref.id())) })
 }
 
-// A toolbox that accepts a command without naming it leaves the facade
-// unable to follow it, so the session (and the command with it) is removed
-// and the claim dropped: the same id then runs cleanly.
-func TestSubmitWithoutACommandIDIsUndone(t *testing.T) {
+// A toolbox that accepts a command without naming it did accept it: a plain
+// session holds only this execution's command, so the facade finds it there
+// and follows it like any other, rather than killing it and running the id
+// again.
+func TestSubmitWithoutACommandIDIsAdopted(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
 	env.toolbox.mu.Lock()
 	env.toolbox.emptyCmdID = true
 	env.toolbox.mu.Unlock()
 	body := `{"command":"echo x","command_id":"noid"}`
-	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadGateway)
-	if env.toolbox.sessionCount() != 0 {
-		t.Fatal("an unfollowable command's session was left running")
+	var first executionView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, &first), http.StatusOK)
+	if first.Status != execStatusCompleted || first.Stdout == nil || *first.Stdout != "x\n" {
+		t.Fatalf("adopted execution = %+v", first)
 	}
-	env.toolbox.mu.Lock()
-	env.toolbox.emptyCmdID = false
-	env.toolbox.mu.Unlock()
 	var retried executionView
 	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, &retried), http.StatusOK)
-	if retried.Status != execStatusCompleted {
-		t.Fatalf("retry = %+v", retried)
+	if retried.ExecutionID != first.ExecutionID || env.toolbox.execCount() != 1 {
+		t.Fatalf("retry = %+v after %d runs; want the same execution, run once", retried, env.toolbox.execCount())
 	}
 }
 

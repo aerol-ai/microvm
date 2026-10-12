@@ -37,8 +37,10 @@ func TestWatcherSettlesLedgerWhenSessionIsGone(t *testing.T) {
 		return ok && !owed
 	})
 
-	// settleLedger leaves rows it does not own alone.
-	env.h.settleLedger(ctx, devbox.ID, execRef{session: plainSession(devbox.ID, "nothing")})
+	// A row nobody claimed has nothing to settle.
+	if !env.h.settleLedger(ctx, devbox.ID, execRef{session: plainSession(devbox.ID, "nothing")}, false, watchPace{grace: time.Minute}) {
+		t.Fatal("an unclaimed execution left its watcher something to do")
+	}
 	if _, _, ok := env.h.ledgerOutcome(ctx, devbox.ID, execRef{session: "rls-00", command: "01"}); ok {
 		t.Fatal("a named execution has no ledger outcome")
 	}

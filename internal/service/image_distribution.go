@@ -54,19 +54,33 @@ func (p defaultImageDistributionProvider) ClassifyImage(_ context.Context, image
 	}, nil
 }
 
-// snapshotUsableForCreate decides whether a create may resolve its image
-// through snapshot. A user token may not build on another tenant's snapshot.
-// A row with no owner (operator-registered, or a pre-ownership snapshot whose
-// source sandbox was gone before the backfill could attribute it) stays
-// usable by name, deliberately: operator-registered shared images are meant
-// to be started by every tenant, and such a row is exactly as reachable as
-// it was before snapshots carried an owner. Reads (GetSnapshot, lists) still
-// hide those rows from user tokens — only the create-by-name path is open.
-func snapshotUsableForCreate(ctx context.Context, snapshot *models.SandboxSnapshot) bool {
-	if snapshot.OwnerRef == "" {
-		return true
+// authorizeTenantImageRef refuses the reference forms a user token could use
+// to reach a snapshot it does not own without naming it:
+//
+//   - an image id, which the engine resolves by content (a short prefix is
+//     enough), so it reaches any image on the node whatever its name;
+//   - a ref into the cluster's snapshot registry outside the caller's own
+//     namespace: the cluster's pull credential would fetch another
+//     tenant's snapshot, or an operator one, for anyone who could spell it.
+//
+// Both read as not found, the answer a cross-tenant snapshot name gets. The
+// equivalent spellings of a snapshot's name are covered by the lookup itself
+// (docker.EquivalentImageNames). Operator and internal callers are not
+// checked: they may start any image.
+func authorizeTenantImageRef(owner string, refs ...string) error {
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" {
+			continue
+		}
+		if docker.LooksLikeImageID(ref) {
+			return fmt.Errorf("%w: image %q (start a snapshot by its name)", store.ErrNotFound, ref)
+		}
+		if namespace, ok := snapshotRefNamespace(ref); ok && namespace != snapshotOwnerNamespace(owner) {
+			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
+		}
 	}
-	return snapshotVisible(ctx, snapshot)
+	return nil
 }
 
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
@@ -80,9 +94,21 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 	req.Image = strings.TrimSpace(req.Image)
 
 	if s != nil && s.store != nil && req.Image != "" {
-		snapshot, err := s.store.GetSnapshot(ctx, req.Image)
+		owner, scoped := ownerScope(ctx)
+		if scoped {
+			if err := authorizeTenantImageRef(owner, req.Image, req.ImageRegistryRef); err != nil {
+				return err
+			}
+		}
+		// Every spelling the engine treats as this image, so "snap:latest"
+		// meets snapshot "snap"'s owner check instead of starting the
+		// committed image by its tag. A snapshot with no owner (registered
+		// by an operator, or older than ownership with its source already
+		// gone) is the operator's: nothing records which tenant, if any, may
+		// use it.
+		snapshot, err := s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(req.Image))
 		switch {
-		case err == nil && snapshot != nil && !snapshotUsableForCreate(ctx, snapshot):
+		case err == nil && !snapshotVisible(ctx, snapshot):
 			return fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
 		case err == nil && snapshot != nil:
 			if image := strings.TrimSpace(snapshot.Image); image != "" {
@@ -111,6 +137,13 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// check. Only applies to bare identifiers — anything that
 			// looks like a registry ref or a local-only build tag goes
 			// through the normal classifier below.
+			//
+			// With no row there is no owner to check, so the ref itself
+			// carries the authorization: a user token's ref is built in its
+			// own owner's namespace, where only its own snapshots were ever
+			// pushed. An operator or internal caller (a failover recreate
+			// replaying a stored spec) trusts the AOCR ref the spec already
+			// resolved, which can be in any namespace.
 			// snapshotAOCRRef always appends `:latest`, so a cross-node
 			// snapshot name must be a bare identifier with no tag/digest of
 			// its own — otherwise we'd build a double-tagged ref like
@@ -119,7 +152,11 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			// is a plain base image, not a snapshot, so fall through to the
 			// classifier below.
 			if imageRegistryHost(req.Image) == "" && !docker.IsLocalOnlyImageRef(req.Image) && !imageRefHasTagOrDigest(req.Image) {
-				if dest := s.snapshotPusher.DestRefFor(req.Image); dest != "" {
+				dest := s.snapshotPusher.DestRefFor(owner, req.Image)
+				if meta := req.ImageDistribution(); !scoped && meta.Mode == models.ImageDistributionAOCR && meta.RegistryRef != "" {
+					dest = meta.RegistryRef
+				}
+				if dest != "" {
 					if err := validateClusterArtifactRefArch(dest, hostSnapshotArch()); err != nil {
 						return err
 					}

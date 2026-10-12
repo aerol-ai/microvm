@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -421,36 +422,130 @@ func TestUpsertSnapshotAliasExistingReadError(t *testing.T) {
 	}
 }
 
+// A user token reaches a snapshot only through a snapshot it owns, under
+// every spelling of a reference the engine would accept: its name in any
+// equivalent form, an image id (resolved by content, a prefix is enough),
+// or a ref into the cluster's snapshot registry. A snapshot with no owner is
+// the operator's. Operator and internal callers may start anything.
 func TestNormalizeCreateImageDistributionSnapshotOwner(t *testing.T) {
 	svc, _, _ := newSnapshotOwnerService(t)
+	registry := func(owner, name string) string {
+		return "aocr.test/cluster/c1/snapshots/" + snapshotRepoName(owner, name) + ":latest"
+	}
 	tests := []struct {
-		name    string
-		ctx     context.Context
-		image   string
-		wantErr bool
+		name        string
+		ctx         context.Context
+		image       string
+		registryRef string
+		wantErr     bool
+		wantImage   string
 	}{
 		{name: "own snapshot", ctx: userCtx("acme"), image: "snap-acme"},
+		{name: "own snapshot by tag", ctx: userCtx("acme"), image: "snap-acme:latest", wantImage: "snap-acme"},
+		{name: "own snapshot by registry spelling", ctx: userCtx("acme"), image: "docker.io/library/snap-acme", wantImage: "snap-acme"},
+		{name: "own registry namespace", ctx: userCtx("acme"), image: registry("acme", "snap-acme")},
 		{name: "another tenant's snapshot", ctx: userCtx("acme"), image: "snap-globex", wantErr: true},
-		// Owner-less rows (operator-registered shared images) stay usable by
-		// name even though reads hide them from user tokens.
-		{name: "operator snapshot", ctx: userCtx("acme"), image: "snap-shared"},
+		{name: "another tenant's by tag", ctx: userCtx("acme"), image: "snap-globex:latest", wantErr: true},
+		{name: "another tenant's by registry spelling", ctx: userCtx("acme"), image: "index.docker.io/library/snap-globex:latest", wantErr: true},
+		{name: "another tenant's image id", ctx: userCtx("acme"), image: "sha256:globex", wantErr: true},
+		{name: "own image id", ctx: userCtx("acme"), image: "sha256:acme", wantErr: true},
+		{name: "image id prefix", ctx: userCtx("acme"), image: "4f1a", wantErr: true},
+		{name: "another tenant's registry namespace", ctx: userCtx("acme"), image: registry("globex", "snap-globex"), wantErr: true},
+		{name: "operator registry namespace", ctx: userCtx("acme"), image: registry("", "snap-shared"), wantErr: true},
+		{name: "forged registry ref", ctx: userCtx("acme"), image: "ubuntu:22.04", registryRef: registry("globex", "snap-globex"), wantErr: true},
+		{name: "operator snapshot", ctx: userCtx("acme"), image: "snap-shared", wantErr: true},
 		{name: "operator caller", ctx: operatorCtx(), image: "snap-globex"},
+		{name: "operator caller, operator snapshot", ctx: operatorCtx(), image: "snap-shared"},
+		{name: "operator caller, image id", ctx: operatorCtx(), image: "sha256:globex", wantImage: "sha256:globex"},
+		{name: "operator caller, any namespace", ctx: operatorCtx(), image: registry("globex", "snap-globex")},
 		{name: "internal caller", ctx: context.Background(), image: "snap-globex"},
 		{name: "plain image", ctx: userCtx("acme"), image: "ubuntu:22.04"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			req := models.CreateSandboxRequest{Image: tc.image}
+			req := models.CreateSandboxRequest{Image: tc.image, ImageRegistryRef: tc.registryRef}
 			err := svc.NormalizeCreateImageDistribution(tc.ctx, &req)
 			if tc.wantErr {
 				if !errors.Is(err, store.ErrNotFound) {
-					t.Fatalf("NormalizeCreateImageDistribution = %v, want ErrNotFound", err)
+					t.Fatalf("NormalizeCreateImageDistribution = %v (image %q), want ErrNotFound", err, req.Image)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("NormalizeCreateImageDistribution = %v", err)
 			}
+			if tc.wantImage != "" && req.Image != tc.wantImage {
+				t.Fatalf("image = %q, want %q", req.Image, tc.wantImage)
+			}
 		})
+	}
+}
+
+// A node with no row for a snapshot cannot check its owner, so the ref it
+// builds carries the authorization: a user token's lands in that tenant's
+// own registry namespace, where only its own snapshots were ever pushed, and
+// two tenants asking for the same name get different refs. An operator gets
+// the unnamespaced path, and a replayed spec keeps the ref it resolved to.
+func TestCrossNodeSnapshotRefIsOwnerBound(t *testing.T) {
+	svc, _, _ := newSnapshotOwnerService(t)
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{Enabled: true, Host: "aocr.test", ClusterID: "cluster-7", PATPath: writePATFile(t, "token")}, &fakeSnapshotPushDocker{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.snapshotPusher = pusher
+	resolve := func(ctx context.Context, req models.CreateSandboxRequest) string {
+		t.Helper()
+		if err := svc.NormalizeCreateImageDistribution(ctx, &req); err != nil {
+			t.Fatalf("NormalizeCreateImageDistribution(%q) = %v", req.Image, err)
+		}
+		return req.Image
+	}
+	acme := resolve(userCtx("acme"), models.CreateSandboxRequest{Image: "remote-snap"})
+	globex := resolve(userCtx("globex"), models.CreateSandboxRequest{Image: "remote-snap"})
+	if acme != pusher.DestRefFor("acme", "remote-snap") || !strings.Contains(acme, "/snapshots/"+snapshotOwnerNamespace("acme")+"/remote-snap:") {
+		t.Fatalf("acme resolved %q, want its own namespace", acme)
+	}
+	if globex == acme {
+		t.Fatalf("two tenants resolved one name to the same ref %q", acme)
+	}
+	if got := resolve(operatorCtx(), models.CreateSandboxRequest{Image: "remote-snap"}); got != pusher.DestRefFor("", "remote-snap") {
+		t.Fatalf("operator resolved %q", got)
+	}
+	replayed := models.CreateSandboxRequest{Image: "remote-snap", ImageDistributionMode: models.ImageDistributionAOCR, ImageRegistryRef: acme}
+	if got := resolve(context.Background(), replayed); got != acme {
+		t.Fatalf("a replayed spec resolved %q, want its stored ref %q", got, acme)
+	}
+	// A user token cannot carry another tenant's ref in through the spec.
+	forged := models.CreateSandboxRequest{Image: "remote-snap", ImageDistributionMode: models.ImageDistributionAOCR, ImageRegistryRef: acme}
+	if err := svc.NormalizeCreateImageDistribution(userCtx("globex"), &forged); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("forged spec = %v (image %q), want ErrNotFound", err, forged.Image)
+	}
+}
+
+// A tenant's snapshot is pushed under its owner's namespace; an operator's
+// keeps the unnamespaced path.
+func TestSnapshotPushUsesTheOwnerNamespace(t *testing.T) {
+	fake := &fakeSnapshotPushDocker{}
+	pusher, err := NewSnapshotPusher(SnapshotPushConfig{Enabled: true, Host: "aocr.test", ClusterID: "cluster-7", PATPath: writePATFile(t, "token")}, fake, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for owner, want := range map[string]string{
+		"acme": pusher.DestRefFor("acme", "snap"),
+		"":     "aocr.test/cluster/cluster-7/snapshots/snap:latest" + archTagSuffix(snapshotRefArch()),
+	} {
+		res, err := pusher.PushOnce(context.Background(), &models.SandboxSnapshot{Name: "snap", Image: "snap", OwnerRef: owner})
+		if err != nil || res.RegistryRef != want {
+			t.Fatalf("owner %q pushed to %q (%v), want %q", owner, res.RegistryRef, err, want)
+		}
+		namespace, ok := snapshotRefNamespace(res.RegistryRef)
+		if !ok || namespace != snapshotOwnerNamespace(owner) {
+			t.Fatalf("owner %q ref %q parses to namespace %q, %v", owner, res.RegistryRef, namespace, ok)
+		}
+	}
+	for _, ref := range []string{"ubuntu:22.04", "aocr.test/cluster/c/templates/x:latest", "aocr.test/cluster/c/snapshots", "Not A Ref"} {
+		if _, ok := snapshotRefNamespace(ref); ok {
+			t.Errorf("%q parsed as a snapshot registry ref", ref)
+		}
 	}
 }
