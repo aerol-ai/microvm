@@ -169,7 +169,7 @@ Set up a sandbox the way you want it, then save it. The original sandbox keeps r
   </TabItem>
 </Tabs>
 
-Snapshot names are unique across the whole server. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
+Snapshot names are unique across the whole server, and names that start with `aerolvm-snapshot/` are reserved. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
 
 ### Start from a snapshot
 
@@ -206,8 +206,8 @@ Pass the snapshot's name where you would normally pass an image:
   </TabItem>
 </Tabs>
 
-- **The name becomes the real image.** The server swaps the name for the real image before it creates the sandbox. Afterward, the sandbox's `image` field shows the real image.
-- **A snapshot name wins** over a registry image with the same name. Snapshot names are short words, so this rarely matters.
+- **The name becomes the real image.** The server swaps the name for the real image before it creates the sandbox. Afterward, the sandbox's `image` field shows the real image. For a saved snapshot, that is an image name the server picks, like `aerolvm-snapshot/3f9c…:latest`. So saving a snapshot never replaces another image on the server, whatever you call it.
+- **Your snapshot's name wins** over a registry image with the same name. Another account's snapshot never does: if someone else saves a snapshot called `python`, your `python` is still the registry image. An operator token sees every account's snapshots, so for it any snapshot name wins.
 - **CPU, memory and disk are not copied.** The new sandbox gets the [defaults](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk) unless you set them.
 
 ### Give an existing image a snapshot name

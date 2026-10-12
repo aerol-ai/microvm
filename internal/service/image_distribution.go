@@ -102,6 +102,13 @@ var errSnapshotChain = errors.New("snapshot image chain loops or is too long")
 // that would run is authorized, not just the name the caller wrote, however
 // many registered names lead to it.
 //
+// A snapshot's committed image (docker.SnapshotImageTag) named directly is
+// reachable only through the snapshot it was committed for. Another
+// account's snapshot with the caller's name does not stand in the way: its
+// image lives under its own tag, so to this caller the name is an ordinary
+// image. Only a snapshot committed before snapshots had tags of their own
+// holds the name's tag itself, and that one still answers not found.
+//
 // It returns the last snapshot reached (nil when image names none) and the
 // image to start. A catalog that cannot be read is an error, never "no
 // snapshot": a failed lookup must not let a private snapshot's name pass as
@@ -129,6 +136,18 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 				return nil, "", fmt.Errorf("%w: %q leads back to %q", errSnapshotChain, image, stop)
 			}
 		}
+		if docker.IsSnapshotImageRef(image) {
+			snapshot, err := s.snapshotCommittedAs(ctx, names)
+			switch {
+			case err != nil:
+				return nil, "", err
+			case snapshot != nil && snapshotVisible(ctx, snapshot):
+				return snapshot, snapshot.Image, nil
+			case scoped:
+				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
+			}
+			return last, image, nil
+		}
 		snapshot, err := s.store.GetSnapshotByNames(ctx, names)
 		if errors.Is(err, store.ErrNotFound) {
 			return last, image, nil
@@ -137,7 +156,10 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 			return nil, "", err
 		}
 		if !snapshotVisible(ctx, snapshot) {
-			return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
+			if snapshot.SourceSandboxID != "" && slices.Contains(names, strings.TrimSpace(snapshot.Image)) {
+				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
+			}
+			return last, image, nil
 		}
 		if hops == maxSnapshotChain {
 			return nil, "", fmt.Errorf("%w: %q", errSnapshotChain, image)
@@ -145,7 +167,8 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 		last = snapshot
 		next := strings.TrimSpace(snapshot.Image)
 		if next == "" || slices.Contains(docker.EquivalentImageNames(snapshot.Name), next) {
-			// A committed snapshot's image is its own name.
+			// A snapshot committed before snapshots had tags of their
+			// own, or one registered under its image's own name.
 			if next == "" {
 				next = image
 			}
@@ -153,6 +176,24 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 		}
 		image = next
 	}
+}
+
+// snapshotCommittedAs returns the snapshot whose committed image is any of
+// images (spellings of one docker.SnapshotImageTag), or nil. A tag is
+// derived from one snapshot's name, so it has exactly one such snapshot;
+// other rows naming the same image are registered aliases, which never
+// authorize it.
+func (s *Service) snapshotCommittedAs(ctx context.Context, images []string) (*models.SandboxSnapshot, error) {
+	holders, err := s.store.GetSnapshotsByImage(ctx, images)
+	if err != nil {
+		return nil, err
+	}
+	for _, snapshot := range holders {
+		if strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name) {
+			return snapshot, nil
+		}
+	}
+	return nil, nil
 }
 
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
@@ -177,10 +218,45 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 		// A snapshot with no owner (registered by an operator, or older
 		// than ownership with its source already gone) is the operator's:
 		// nothing records which tenant, if any, may use it.
-		snapshot, image, err := s.resolveSnapshotChain(ctx, req.Image, "")
+		var snapshot *models.SandboxSnapshot
+		image := req.Image
+		var err error
+		dist := req.ImageDistribution()
+		pushed := dist.Mode == models.ImageDistributionAOCR && dist.RegistryRef != ""
+		fromRegistry := false
+		switch {
+		case docker.IsSnapshotImageRef(req.Image):
+			// A snapshot's committed image, named by its tag. The tag
+			// names one snapshot only, so the snapshot is found by that
+			// image, and the caller must be able to see it. A node that
+			// does not hold the snapshot starts a pushed snapshot's
+			// registry copy (the create was placed or failed over here);
+			// a user token's registry ref was checked against its own
+			// namespace above.
+			snapshot, err = s.snapshotCommittedAs(ctx, docker.EquivalentImageNames(req.Image))
+			switch {
+			case err != nil:
+			case snapshot != nil && !snapshotVisible(ctx, snapshot):
+				err = fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
+			case snapshot != nil:
+				image = snapshot.Image
+			case pushed:
+				fromRegistry = true
+			case scoped:
+				err = fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
+			}
+		case !isStoredSpecReplay(ctx):
+			// A failover recreate replays an image its first create
+			// already resolved, so names are not looked up again: on this
+			// node a name may belong to a snapshot the sandbox never asked
+			// for.
+			snapshot, image, err = s.resolveSnapshotChain(ctx, req.Image, "")
+		}
 		switch {
 		case err != nil:
 			return err
+		case fromRegistry:
+			req.Image = dist.RegistryRef
 		case snapshot != nil:
 			// The last snapshot in the chain is the one whose image runs,
 			// so its distribution metadata is the one that places it.
@@ -316,8 +392,19 @@ func normalizeImageDistributionMetadata(image string, meta models.ImageDistribut
 	return meta, nil
 }
 
+// ImageRequiresLocalPlacement reports a create that must run on the node
+// receiving it, because its image exists only there. A pushed snapshot's
+// committed image is the exception: a node without it starts the registry
+// copy instead (see NormalizeCreateImageDistribution).
 func ImageRequiresLocalPlacement(req models.CreateSandboxRequest) bool {
-	return req.ImageDistributionMode == models.ImageDistributionLocalOnly || docker.IsLocalOnlyImageRef(req.Image)
+	if req.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return true
+	}
+	if !docker.IsLocalOnlyImageRef(req.Image) {
+		return false
+	}
+	pushed := req.ImageDistributionMode == models.ImageDistributionAOCR && strings.TrimSpace(req.ImageRegistryRef) != ""
+	return !(pushed && docker.IsSnapshotImageRef(req.Image))
 }
 
 // imageRefHasTagOrDigest reports whether image carries an explicit `:tag` or

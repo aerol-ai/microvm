@@ -3528,6 +3528,22 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 	return snapshot, err
 }
 
+// errReservedSnapshotName refuses a snapshot name in the namespace committed
+// snapshot images live under: a catalog name there could pass for another
+// snapshot's committed image.
+var errReservedSnapshotName = errors.New("snapshot names may not start with \"" + docker.SnapshotImageNamespace + "/\"")
+
+// validateSnapshotName checks a new snapshot's name.
+func validateSnapshotName(name string) error {
+	if name == "" {
+		return errors.New("snapshot name is required")
+	}
+	if docker.IsSnapshotImageRef(name) {
+		return fmt.Errorf("%w: %q", errReservedSnapshotName, name)
+	}
+	return nil
+}
+
 // RegisterSnapshot persists a snapshot row whose Image was resolved out-of-band
 // — either a pre-existing registry image the caller supplied by name, or a
 // freshly built local tag produced by the image builder (e.g. the daytona
@@ -3545,8 +3561,8 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, errors.New("snapshot is required")
 	}
 	name := strings.TrimSpace(snapshot.Name)
-	if name == "" {
-		return nil, errors.New("snapshot name is required")
+	if err := validateSnapshotName(name); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(snapshot.Image) == "" {
 		return nil, errors.New("snapshot image is required")
@@ -3601,8 +3617,8 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 // use the flag to avoid rolling back a snapshot that already existed.
 func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, bool, error) {
 	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		return nil, false, errors.New("snapshot name is required")
+	if err := validateSnapshotName(name); err != nil {
+		return nil, false, err
 	}
 
 	s.snapshotMu.Lock()
@@ -3627,14 +3643,18 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	if err != nil {
 		return nil, false, err
 	}
-	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), name)
+	// The image goes under a tag of the snapshot's own, never under its
+	// name: a name is the caller's choice, and as a tag it would replace
+	// whatever image already had it on this node — "python" for everyone.
+	image := docker.SnapshotImageTag(name)
+	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), image)
 	if err != nil {
 		return nil, false, err
 	}
 
 	snapshot := &models.SandboxSnapshot{
 		Name:            name,
-		Image:           name,
+		Image:           image,
 		ImageID:         imageID,
 		SourceSandboxID: sandboxID,
 		CreatedAt:       time.Now().UTC(),
@@ -3849,8 +3869,18 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+	// The image goes with the last snapshot that holds it: a name
+	// registered for another snapshot's image is deleted without taking
+	// that snapshot's image with it.
+	holders, err := s.store.GetSnapshotsByImage(ctx, []string{snapshot.Image})
+	if err != nil {
 		return err
+	}
+	shared := slices.ContainsFunc(holders, func(other *models.SandboxSnapshot) bool { return other.Name != snapshot.Name })
+	if !shared {
+		if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+			return err
+		}
 	}
 	return s.store.DeleteSnapshot(ctx, snapshot.Name)
 }

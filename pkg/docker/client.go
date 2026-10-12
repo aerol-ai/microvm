@@ -1390,9 +1390,13 @@ func imagePullKey(imageRef string, auth *models.RegistryAuth) string {
 	return strings.TrimSpace(imageRef) + "\x00" + strings.TrimSpace(auth.Server) + "\x00" + strings.TrimSpace(auth.Username)
 }
 
+// IsLocalOnlyImageRef reports an image only this node can have: a built
+// image, or a snapshot's committed image — including ones committed under a
+// "snapshots/..." name before snapshots had tags of their own.
 func IsLocalOnlyImageRef(imageRef string) bool {
 	imageRef = strings.TrimSpace(imageRef)
-	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, "snapshots/")
+	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, SnapshotImageNamespace+"/") ||
+		strings.HasPrefix(imageRef, "snapshots/")
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
