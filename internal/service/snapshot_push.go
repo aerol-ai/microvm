@@ -35,7 +35,7 @@ type SnapshotPushConfig struct {
 	// ClusterID is the AOCR-scoped tenant the snapshot ends up under.
 	// Used both as the registry-auth username (by convention; AOCR
 	// validates the PAT, not the username) and as the path namespace
-	// `cluster/<id>/snapshots/<name>`.
+	// `cluster/<id>/snapshots/...` (see snapshotAOCRRef).
 	ClusterID string
 	// PATPath is the file path to the bearer token presented as the
 	// Docker registry password. File-sourced so rotation is just a
@@ -137,9 +137,9 @@ func NewSnapshotPusher(cfg SnapshotPushConfig, docker SnapshotPushDocker, logger
 // success — used by the reconciler to fill ImageRegistryRef and flip
 // ImageDistributionMode to "aocr".
 //
-// Idempotent: re-pushing the same `cluster/<id>/snapshots/<name>:latest`
-// tag is safe; the registry treats the layer set as already-present and
-// the daemon's push completes without error.
+// Idempotent: re-pushing the same snapshot to its `:latest` tag is safe;
+// the registry treats the layer set as already-present and the daemon's
+// push completes without error.
 //
 // The PAT is read fresh from disk on every call so an operator can
 // rotate it without restarting sandboxd. The PAT never appears in the

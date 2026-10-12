@@ -209,9 +209,13 @@ wasm:
 #
 # push_host is the AOCR write vhost. It is required for snapshot distribution
 # (snapshot_push below): snapshots are pushed to
-# <push_host>/cluster/<auto_import.cluster_id>/snapshots/<name> so any node can
-# pull a sandbox created from a peer's snapshot. Without it a snapshot stays a
-# local-only commit and a derived sandbox placed on another node fails to pull.
+# <push_host>/cluster/<auto_import.cluster_id>/snapshots/tenant-<owner hash>/<name>
+# (operator snapshots, which have no owner, to .../snapshots/<name>) so any node
+# can pull a sandbox created from a peer's snapshot. Without it a snapshot stays
+# a local-only commit and a derived sandbox placed on another node fails to pull.
+# Tenant snapshots pushed by releases before the tenant- path stay at
+# .../snapshots/<name>; a user token reaches them only through the node that
+# took them, until they are taken again.
 mirror:
   host: "mirror.aocr.aerol.ai"
   push_host: "aocr.aerol.ai"
