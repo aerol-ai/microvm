@@ -217,7 +217,7 @@ The full requirement list, with a value card per case, is the eng-review test pl
 
 ## Phases
 
-Ship as stacked PRs, one per phase, and merge nothing until the whole stack is green.
+Ship as stacked PRs, one per phase, and merge nothing until the whole stack is green. Then merge Phases 1–5 and cut a release from them. Phases 6 and 7 (docs and the blog post) merge only after that release is published. The docs site publishes from `main`, and both phases tell readers to turn enterprise mode on with the free download, so merging them earlier would describe a release that does not exist yet.
 
 | # | Phase | Done when | Size (human / CC) |
 |---|---|---|---|
@@ -227,10 +227,12 @@ Ship as stacked PRs, one per phase, and merge nothing until the whole stack is g
 | 3 | Terraform bucket (lock mode and days variables), IAM, Ansible, runbook (rebuild, attribution) and config defaults | `terraform plan` is clean with and without the witness | ~2 days / ~2 h |
 | 4 | Integration on real Object Lock buckets: a new single-node scenario plus all six enterprise scenarios; then delete the itest witness | All runs green, tamper cases fail closed, `--destroy-only` leaves no bucket, `provider_itest.go` and the `sandboxd-witness` build deleted | ~4 days plus metal AWS time / ~4 h plus AWS time |
 | 5 | Chain verifier moved to `pkg/auditlog`; `aerolvm audit verify` | Catches a forged newer head, a rollback, a forged checkpoint and a missing link; passes an honest history across a prune using the export; memory stays bounded | ~4.5 days / ~4 h |
-| 6 | Docs and positioning | The pages below are updated and the docs checks pass | ~1 day / ~1 h |
-| 7 | Blog post | The post below is live, linked from the Blogs index and the security overview, and every number in it is traced to the shipped code or a Phase 4 run | ~1 day / ~1 h |
+| 6 | Docs and positioning | The pages below are updated, the docs checks pass, and the PR merges after the release of Phases 1–5 | ~1 day / ~1 h |
+| 7 | Blog post | The post below merges after the release of Phases 1–5 and is live, linked from the Blogs index and the security overview, and every number in it is traced to the shipped code or a Phase 4 run | ~1 day / ~1 h |
 
 ### Phase 6 docs
+
+These pages merge only after the release of Phases 1–5 is published (see Phases).
 
 - **Enterprise Overview:** add a row "Off-server audit witness (S3 Object Lock)", marked *You turn it on*. Enterprise mode is no longer managed-build only.
 - **Security controls, Audit:** add a "Tamper evidence off the server" row.
@@ -241,7 +243,7 @@ Ship as stacked PRs, one per phase, and merge nothing until the whole stack is g
 
 ### Phase 7 blog post
 
-A post in the docs site's Blogs section that tells the story behind the feature. The Phase 6 pages say how to turn it on; the post says why it exists and why each check is there. It is its own PR on top of the stack, but it merges only after a release containing Phases 1–6 is published, because it tells readers to turn the feature on with the free download.
+A post in the docs site's Blogs section that tells the story behind the feature. The Phase 6 pages say how to turn it on; the post says why it exists and why each check is there. It is its own PR on top of the stack, and like Phase 6 it merges only after the release of Phases 1–5 is published.
 
 - **File and links:** `docs/src/content/docs/engineering-audit-witness.mdx`, title "Catching a rewritten audit log". Add it to the "How AerolVM Is Built" group in `getBlogSidebarConfig` (`docs/src/content.config.ts`) as `link('/engineering-audit-witness', '- Catching a rewritten audit log')`, and add a row to the "How AerolVM is built" table in `docs/src/content/docs/blog.mdx`.
 - **Shape:** the same as the other `engineering-*.mdx` posts: the maintainer byline, an "In short" list, a mermaid diagram, plain language at a 10th-grade reading level, and a "Next steps" list.
@@ -288,7 +290,8 @@ A post in the docs site's Blogs section that tells the story behind the feature.
 - A rebuilt node's boot error names the new-`SB_NODE_ID` recovery.
 - All six existing enterprise scenarios run on the S3 witness, and the `itestwitness` build is gone.
 - With no witness setting, behavior is identical to today, and the test fake records zero S3 calls.
-- The blog post "Catching a rewritten audit log" is live after the release, linked from the Blogs index and the security overview, and its numbers match the shipped code and the Phase 4 runs.
+- The Phase 6 docs pages and the blog post go live only after the release of Phases 1–5 is published.
+- The blog post "Catching a rewritten audit log" is live, linked from the Blogs index and the security overview, and its numbers match the shipped code and the Phase 4 runs.
 
 ---
 
@@ -1225,11 +1228,11 @@ Critical gaps: 0. One was found (F1, a silent foreign-head overwrite) and resolv
 | `aerolvm audit verify` | `cmd/aerolvm`, `pkg/auditlog` | Verifier move; S3 client export |
 | Terraform, Ansible, installer, runbooks, alert rule | `Terraform/`, `Ansible/`, `setup/`, `install.sh` | — |
 | Integration scenarios and itest-witness removal | `integration-tests/`, `cmd/sandboxd` | Daemon wiring; Terraform step |
-| Docs | `docs/` | Daemon wiring; verifier |
+| Docs | `docs/` | Daemon wiring; verifier; merges after the release |
 | Blog post | `docs/` | Docs; Phase 4 numbers; merges after the release |
 
 Parallel lanes: Lane A: S3 backend → daemon wiring. Lane B: service changes → verifier move → `aerolvm audit verify` (shared `internal/service`, so sequential). Lane C: Terraform, Ansible and runbooks (independent).
-Execution order: launch A, B and C together; B's last step waits for A's client export. Then integration (needs A and C), then docs. Conflict flags: Lane B and Lane A's daemon wiring both touch witness call sites only through `pkg/controlplane` types, which nobody changes; `pkg/auditlog` is touched only by Lane B. Per the stacked-PR rule, each phase is its own PR, and nothing merges until the whole stack is green.
+Execution order: launch A, B and C together; B's last step waits for A's client export. Then integration (needs A and C), then docs. Conflict flags: Lane B and Lane A's daemon wiring both touch witness call sites only through `pkg/controlplane` types, which nobody changes; `pkg/auditlog` is touched only by Lane B. Per the stacked-PR rule, each phase is its own PR, and nothing merges until the whole stack is green. Phases 1–5 merge first and are released; the docs and blog PRs merge after the release.
 
 ## Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship. Effort assumes the default human ÷ CC ratios (features ~30x, tests ~50x, architecture ~5x).
@@ -1281,7 +1284,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
 - [ ] **T12 (P2, human: ~1 h / CC: ~5 min)** — plan + runbook — Document the cross-node write limit and CloudTrail attribution
   - Surfaced by: Architecture A7 (D8)
   - Files: `setup/runbooks/secrets-and-audit.md`, `docs/`
-  - Verify: docs checks pass
+  - Verify: docs checks pass; the `docs/` part ships in the Phase 6 PR, so it waits for the release too
 - [ ] **T13 (P2, human: ~30 min / CC: ~5 min)** — pkg/auditexport + pkg/auditwitness — Export `NewS3Client`; `Open` switches on the backend name, no registry
   - Surfaced by: Scope Challenge structure (D1)
   - Files: `pkg/auditexport/s3.go`, `pkg/auditwitness/open.go`
