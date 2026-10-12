@@ -245,3 +245,45 @@ func TestImageGCKeepsSnapshotImages(t *testing.T) {
 		t.Fatalf("built-image GC removed %v; want only the stale build", *removed)
 	}
 }
+
+// A snapshot tag whose holders cannot be read fails the create, whether the
+// tag is named directly or reached through an alias: not being able to tell
+// who holds an image never lets it through. An operator's alias for a tag
+// no snapshot holds passes the tag on.
+func TestSnapshotTagLookupFailsClosed(t *testing.T) {
+	svc, st, _ := newSnapshotOwnerService(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tag, gone := docker.SnapshotImageTag("broken"), docker.SnapshotImageTag("gone")
+	for _, row := range []*models.SandboxSnapshot{
+		{Name: "op-alias", Image: tag, CreatedAt: now},
+		{Name: "op-orphan-alias", Image: gone, CreatedAt: now},
+	} {
+		if err := st.CreateSnapshot(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+	}
+	normalize := func(ctx context.Context, image string) (string, error) {
+		req := models.CreateSandboxRequest{Image: image}
+		err := svc.NormalizeCreateImageDistribution(ctx, &req)
+		return req.Image, err
+	}
+	if got, err := normalize(operatorCtx(), "op-orphan-alias"); err != nil || got != gone {
+		t.Fatalf("operator alias for an unheld tag = %q, %v; want %q", got, err, gone)
+	}
+
+	coverage97Exec(t, st, `INSERT INTO sandbox_snapshots(name, image, source_sandbox_id, created_at, memory_mb) VALUES ('unreadable', '`+tag+`', 'sb-x', CURRENT_TIMESTAMP, 'lots')`)
+	for _, tc := range []struct {
+		ctx   context.Context
+		image string
+	}{
+		{userCtx("acme"), tag},
+		{operatorCtx(), tag},
+		{operatorCtx(), "op-alias"},
+		{contextWithStoredSpecReplay(ctx), tag},
+	} {
+		if _, err := normalize(tc.ctx, tc.image); err == nil || errors.Is(err, store.ErrNotFound) {
+			t.Errorf("create from %q with its holders unreadable = %v; want the read error", tc.image, err)
+		}
+	}
+}

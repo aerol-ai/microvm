@@ -34,6 +34,12 @@ func TestGetSnapshotsByImage(t *testing.T) {
 	if got, err := st.GetSnapshotsByImage(ctx, nil); err != nil || got != nil {
 		t.Fatalf("no images = %v, %v", got, err)
 	}
+	if _, err := st.db.Exec(`INSERT INTO sandbox_snapshots(name, image, source_sandbox_id, created_at, memory_mb) VALUES ('unreadable', 'aerolvm-snapshot/def:latest', 'sb-3', CURRENT_TIMESTAMP, 'lots')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetSnapshotsByImage(ctx, []string{"aerolvm-snapshot/def:latest"}); err == nil {
+		t.Fatal("a row the store cannot read was skipped instead of failing the lookup")
+	}
 	_ = st.Close()
 	if _, err := st.GetSnapshotsByImage(ctx, []string{"x"}); err == nil {
 		t.Fatal("a closed store answered")
