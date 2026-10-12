@@ -1,6 +1,7 @@
 package e2b
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 	"net/http/httputil"
@@ -35,8 +36,10 @@ func (h *handlers) runtimeProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if meta.Secure {
+		// The access token is this route's only credential (envd has no
+		// platform auth), so compare it in constant time.
 		accessToken := strings.TrimSpace(r.Header.Get("X-Access-Token"))
-		if accessToken == "" || accessToken != sandbox.ToolboxToken {
+		if accessToken == "" || subtle.ConstantTimeCompare([]byte(accessToken), []byte(sandbox.ToolboxToken)) != 1 {
 			WriteError(w, http.StatusUnauthorized, "Unauthorized")
 			return
 		}

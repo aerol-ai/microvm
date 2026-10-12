@@ -1,6 +1,7 @@
 package apihttp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -564,6 +565,31 @@ func TestWriteStoreAwareErrorMapsBuildErrors(t *testing.T) {
 	} {
 		if code, _ := storeAwareErr(t, fmt.Errorf("%w: detail", err)); code != want {
 			t.Errorf("%v -> %d, want %d", err, code, want)
+		}
+	}
+}
+
+// RequireOperator passes an operator and refuses everyone else: a scoped
+// user token (403) and a request the auth edge never stamped (403).
+func TestRequireOperator(t *testing.T) {
+	var reached bool
+	h := RequireOperator(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		want int
+	}{
+		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true}), http.StatusOK},
+		"user token": {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acme"}}), http.StatusForbidden},
+		"no access":  {context.Background(), http.StatusForbidden},
+	} {
+		reached = false
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(tc.ctx))
+		if rec.Code != tc.want || (tc.want == http.StatusForbidden && reached) {
+			t.Errorf("%s = %d (reached %v), want %d", name, rec.Code, reached, tc.want)
 		}
 	}
 }

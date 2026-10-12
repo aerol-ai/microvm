@@ -391,3 +391,17 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 	}
 	WriteError(w, http.StatusBadRequest, msg)
 }
+
+// RequireOperator rejects a caller that is not an operator with 403. It sits
+// inside an auth middleware, which marks PAT and cluster-peer calls as the
+// operator; a user token authenticates but is scoped to its account, so it
+// never reaches what this wraps: fleet-wide and cluster-internal routes.
+func RequireOperator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if access, ok := controlplane.AccessFromContext(r.Context()); !ok || !access.Operator {
+			WriteError(w, http.StatusForbidden, "operator authorization required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

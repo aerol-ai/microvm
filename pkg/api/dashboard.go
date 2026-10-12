@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"expvar"
 	"net/http"
+
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
 // dashboardHTML is the single-page operator dashboard, embedded so the binary
@@ -17,14 +19,15 @@ var dashboardHTML []byte
 // /debug/vars, and Prometheus-compatible metrics at /v1/metrics. The page
 // itself is served without auth (it carries no
 // secrets; auth happens client-side when the user pastes their PAT into the
-// sign-in form). Metrics endpoints ARE PAT-gated because the aerolvm_*
-// counters carry operational shape (lease state, queue depths, secret
-// decrypt failures) we do not want exposed unauthenticated.
+// sign-in form). Metrics endpoints are operator-only: the aerolvm_*
+// counters carry the whole fleet's operational shape (lease state, queue
+// depths, secret decrypt failures), which neither an unauthenticated caller
+// nor a tenant's user token may read.
 func (s *Server) registerDashboard() {
 	s.mux.HandleFunc("GET /ui", s.serveDashboard)
 	s.mux.HandleFunc("GET /ui/", s.serveDashboard)
-	s.mux.Handle("GET /debug/vars", s.requireAuth(expvar.Handler()))
-	s.mux.Handle("GET /v1/metrics", s.requireAuth(http.HandlerFunc(s.servePrometheusMetrics)))
+	s.mux.Handle("GET /debug/vars", s.requireAuth(apihttp.RequireOperator(expvar.Handler())))
+	s.mux.Handle("GET /v1/metrics", s.requireAuth(apihttp.RequireOperator(http.HandlerFunc(s.servePrometheusMetrics))))
 }
 
 func (s *Server) serveDashboard(w http.ResponseWriter, _ *http.Request) {
