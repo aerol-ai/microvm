@@ -1,6 +1,7 @@
 package runloop
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // asTenant serves one request as a user token scoped to owner, the way the
@@ -62,4 +64,36 @@ func TestTenantIsolation(t *testing.T) {
 	}
 	// Operator (no scoped Access) still sees it.
 	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID, nil, nil), http.StatusOK)
+}
+
+// A snapshot taken through another API is addressable here by its plain
+// native name as well as its snx- id. That lookup goes through the same
+// owner scope: another tenant cannot read, change or delete it by name.
+func TestSnapshotByNativeNameIsTenantScoped(t *testing.T) {
+	env := newTestEnv(t)
+	var devbox devboxView
+	expectStatus(t, env.asTenant(t, "acct-a", http.MethodPost, "/create_and_await_running", `{}`, &devbox), http.StatusOK)
+	ownerCtx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+		Identity: controlplane.Identity{OwnerRef: "acct-a", ExternalID: "acct-a"},
+	})
+	if _, _, err := env.svc.CreateSnapshotWithOwnership(ownerCtx, devbox.ID, models.CreateSandboxSnapshotRequest{Name: "team-base"}); err != nil {
+		t.Fatal(err)
+	}
+	status := "/disk_snapshots/team-base/status"
+
+	var mine snapshotStatusView
+	expectStatus(t, env.asTenant(t, "acct-a", http.MethodGet, status, "", &mine), http.StatusOK)
+	if mine.Snapshot == nil || mine.Snapshot.ID != env.h.snapshotIDForName("team-base") {
+		t.Fatalf("owner's lookup by name = %+v", mine)
+	}
+	expectStatus(t, env.asTenant(t, "acct-b", http.MethodGet, status, "", nil), http.StatusNotFound)
+	expectStatus(t, env.asTenant(t, "acct-b", http.MethodPost, "/disk_snapshots/team-base", `{"name":"taken"}`, nil), http.StatusNotFound)
+	expectStatus(t, env.asTenant(t, "acct-b", http.MethodPost, "/disk_snapshots/team-base/delete", "", nil), http.StatusOK)
+	expectStatus(t, env.asTenant(t, "acct-a", http.MethodGet, status, "", &mine), http.StatusOK)
+	if mine.Snapshot.Name != nil {
+		t.Fatalf("another tenant renamed the snapshot: %+v", mine.Snapshot)
+	}
+
+	expectStatus(t, env.asTenant(t, "acct-a", http.MethodPost, "/disk_snapshots/team-base/delete", "", nil), http.StatusOK)
+	expectStatus(t, env.asTenant(t, "acct-a", http.MethodGet, status, "", nil), http.StatusNotFound)
 }

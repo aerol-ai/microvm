@@ -51,6 +51,10 @@ const (
 	maxRecoveredExecutions = 10000
 )
 
+// recoveryBackoff is the first pause between restart-pass attempts; it
+// doubles after each failure. A variable so tests can shorten it.
+var recoveryBackoff = time.Second
+
 // execOutcome is what the ledger keeps of a finished plain execution: the
 // exit status and how many bytes each stream produced, so a replay after
 // the output itself is gone still reports real offsets and an honest
@@ -157,8 +161,8 @@ func (h *handlers) recoverExecutions(ctx context.Context) error {
 // recoverExecutionsInBackground runs the restart pass off the boot path,
 // retrying a failed store read a few times.
 func (h *handlers) recoverExecutionsInBackground() {
+	backoff := recoveryBackoff
 	go func() {
-		backoff := time.Second
 		for attempt := 0; attempt < 5; attempt++ {
 			err := h.recoverExecutions(context.Background())
 			if err == nil {

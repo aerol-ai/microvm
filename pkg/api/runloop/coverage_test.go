@@ -253,6 +253,17 @@ func TestMetaHelpers(t *testing.T) {
 	if _, err := decodeDevboxBlob(&models.SandboxCompatState{StateJSON: "{"}); err == nil {
 		t.Fatal("bad blob decoded")
 	}
+	// A devbox with no facade row yet (created through another API) has
+	// an empty blob, not an error.
+	for _, state := range []*models.SandboxCompatState{nil, {StateJSON: "  "}} {
+		if blob, err := decodeDevboxBlob(state); err != nil || blob.Name != "" {
+			t.Fatalf("empty state = %+v, %v", blob, err)
+		}
+	}
+	t.Setenv(blueprintMapEnv, "")
+	if got := loadBlueprintMap(nil); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
+		t.Fatalf("unset map = %v", got)
+	}
 	t.Setenv(blueprintMapEnv, "{bad")
 	if got := loadBlueprintMap(slog.New(slog.NewTextHandler(io.Discard, nil))); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
 		t.Fatalf("invalid map = %v", got)

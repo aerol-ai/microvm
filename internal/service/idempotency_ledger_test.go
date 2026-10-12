@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -85,5 +86,28 @@ func TestIdempotencySweepBacklogAndFailure(t *testing.T) {
 	svc.sweepIdempotentRequests(time.Now())
 	if err := svc.SetIdempotentRequestTarget(ctx, "s", "x", "y"); err == nil {
 		t.Fatal("closed store accepted a target write")
+	}
+}
+
+// Claims that all find the sweep due at once start it once: the CAS lets
+// one through, and every other claim returns without waiting on a lock.
+func TestIdempotencySweepIsSingleFlight(t *testing.T) {
+	svc, _ := newFacadeStateTestService(t)
+	svc.idempotencySweepAt.Store(1) // due
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			svc.maybeSweepIdempotentRequests()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	until := time.Until(time.Unix(0, svc.idempotencySweepAt.Load()))
+	if until <= 0 || until > idempotencySweepInterval {
+		t.Fatalf("next sweep due in %v, want within one interval", until)
 	}
 }

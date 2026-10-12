@@ -31,14 +31,24 @@ func TestCreateOnSelectedNodeUnreservedUsesSandboxID(t *testing.T) {
 		}
 	})
 
-	t.Run("no_cluster_client", func(t *testing.T) {
-		svc, _ := newCreateService(t, nil, true)
-		resp, err := CreateOnSelectedNode(context.Background(), svc, logger, local, "", CreateOptions{SandboxID: "sb-fedcba9876543210"})
-		if err != nil {
-			t.Fatalf("create without a cluster client: %v", err)
-		}
-		if resp.Sandbox.ID != "sb-fedcba9876543210" {
-			t.Fatalf("sandbox id = %q", resp.Sandbox.ID)
-		}
-	})
+	// service.New always wires the single-node Noop client; embedded wiring
+	// can run with no client at all. Both must honor the caller's id.
+	for name, clearCluster := range map[string]bool{"single_node_noop": false, "no_cluster_client": true} {
+		t.Run(name, func(t *testing.T) {
+			svc, st := newCreateService(t, nil, true)
+			if clearCluster {
+				svc.ClearClusterForTest()
+			}
+			resp, err := CreateOnSelectedNode(context.Background(), svc, logger, local, "", CreateOptions{SandboxID: "sb-fedcba9876543210"})
+			if err != nil {
+				t.Fatalf("create: %v", err)
+			}
+			if resp.Sandbox.ID != "sb-fedcba9876543210" {
+				t.Fatalf("sandbox id = %q", resp.Sandbox.ID)
+			}
+			if _, err := st.Get(context.Background(), resp.Sandbox.ID); err != nil {
+				t.Fatalf("created sandbox not stored under the caller's id: %v", err)
+			}
+		})
+	}
 }

@@ -185,6 +185,7 @@ type fakeToolbox struct {
 	badJSON    map[string]bool
 	home       string // $HOME the one-shot exec reports; "" = /home/user
 	badCmdID   bool   // exec answers a non-hex command id
+	emptyCmdID bool   // exec answers no command id at all
 
 	beforeServe func(*http.Request) // runs first on every request
 	homeCalls   int                 // one-shot $HOME lookups served
@@ -425,7 +426,7 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 		f.execs++
 		cmd := &fakeCommand{id: fmt.Sprintf("%016x", f.cmdSeq), command: req.Command}
 		sess.commands = append(sess.commands, cmd)
-		badCmdID := f.badCmdID
+		badCmdID, emptyCmdID := f.badCmdID, f.emptyCmdID
 		var wait chan struct{}
 		if strings.HasPrefix(req.Command, "block") {
 			wait = f.release[req.Command]
@@ -448,6 +449,10 @@ func (f *fakeToolbox) serveSession(w http.ResponseWriter, r *http.Request, rest 
 		}
 		if badCmdID {
 			writeJSON(w, http.StatusOK, map[string]string{"cmdId": "not-hex"})
+			return
+		}
+		if emptyCmdID {
+			writeJSON(w, http.StatusOK, map[string]string{})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"cmdId": cmd.id})
