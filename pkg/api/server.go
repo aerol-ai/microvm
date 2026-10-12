@@ -31,8 +31,6 @@ import (
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
-	builder         apiv1.ImageBuilder
-	build           daytona.BuildConfig
 	containerEngine string
 	patToken        string
 	validator       controlplane.Validator
@@ -48,12 +46,13 @@ type Server struct {
 // validator) for the open-source PAT-only behavior. A nil validator is treated
 // as reject-all so callers can't accidentally open the door by omission.
 //
-// builder is the image-builder the /images/build + snapshot-from-Dockerfile
-// paths use. On the dockerd engine this is the *docker.Client; on the
-// containerd engine the daemon passes a buildkit-backed builder. A nil builder
-// falls back to dockerClient so existing docker-only callers are unaffected;
-// when both are nil the build endpoints return 503 (builder not configured).
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder apiv1.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+// builder is the image builder the service builds with (every surface's
+// builds go through service.BuildImage). On the dockerd engine this is the
+// *docker.Client; on the containerd engine the daemon passes a
+// buildkit-backed builder. A nil builder falls back to dockerClient so
+// existing docker-only callers are unaffected; when both are nil the build
+// endpoints return 503 (builder not configured).
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder service.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
 	if validator == nil {
 		validator = controlplane.Noop().Validator
 	}
@@ -63,11 +62,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	if builder == nil && dockerClient != nil {
 		builder = dockerClient
 	}
+	if service != nil && builder != nil {
+		service.SetImageBuilder(builder)
+	}
 	s := &Server{
 		logger:          logger,
 		service:         service,
-		builder:         builder,
-		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
@@ -112,8 +112,6 @@ func (s *Server) routes() {
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
-		Builder:         s.builder,
-		Build:           s.build,
 		ContainerEngine: s.containerEngine,
 	})
 
@@ -134,8 +132,6 @@ func (s *Server) routes() {
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
 		AuditLimiter:    s.auditLimiter,
-		Builder:         s.builder,
-		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 		ContainerEngine: s.containerEngine,
 	})
 

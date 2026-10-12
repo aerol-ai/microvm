@@ -211,7 +211,7 @@ func TestDeleteSnapshotKeepsAnImageAnotherSnapshotHolds(t *testing.T) {
 	if err := svc.DeleteSnapshot(acme, "base"); err != nil || rt.removeHits != 1 || rt.lastRemoved != snap.Image {
 		t.Fatalf("delete snapshot = %v, removed %q (%d times)", err, rt.lastRemoved, rt.removeHits)
 	}
-	for _, image := range []string{"python:3.12", "aerolvm-build/0123456789abcdef:latest"} {
+	for _, image := range []string{"python:3.12", docker.BuildTagForOwner("FROM alpine\nRUN true", nil, "", snapshotOwnerNamespace("acme"))} {
 		if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "points-at", Image: image}); err != nil {
 			t.Fatal(err)
 		}

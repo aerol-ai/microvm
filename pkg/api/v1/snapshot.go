@@ -1,14 +1,11 @@
 package v1
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
-	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -68,21 +65,9 @@ func (h *handlers) registerSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resolvedImage := image
-	var freshlyBuiltTag string
-	if dockerfile != "" {
-		resolved, built, err := h.resolveSnapshotImage(r.Context(), dockerfile, req.ContextHashes)
-		if err != nil {
-			h.writeBuildError(w, err)
-			return
-		}
-		resolvedImage = resolved
-		freshlyBuiltTag = built
-	}
-
 	snapshot := &models.SandboxSnapshot{
 		Name:       name,
-		Image:      resolvedImage,
+		Image:      image,
 		Entrypoint: append([]string{}, req.Entrypoint...),
 		RegionID:   strings.TrimSpace(req.RegionID),
 		CPU:        req.CPU,
@@ -91,118 +76,16 @@ func (h *handlers) registerSnapshot(w http.ResponseWriter, r *http.Request) {
 		DiskGB:     req.DiskGB,
 	}
 
-	registered, err := h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	var registered *models.SandboxSnapshot
+	var err error
+	if dockerfile != "" {
+		registered, err = h.deps.Service.RegisterSnapshotFromDockerfile(r.Context(), snapshot, service.BuildImageRequest{Dockerfile: dockerfile, ContextHashes: req.ContextHashes})
+	} else {
+		registered, err = h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	}
 	if err != nil {
-		// Roll back a freshly built tag — if we don't, the built-image
-		// janitor would leak the layer because no snapshot row points at it.
-		if freshlyBuiltTag != "" && h.deps.Builder != nil {
-			if rbErr := h.deps.Builder.RemoveImage(r.Context(), freshlyBuiltTag); rbErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("v1 snapshot rollback failed", "tag", freshlyBuiltTag, "error", rbErr)
-			}
-		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusCreated, registered)
-}
-
-// resolveSnapshotImage turns a Dockerfile (+ optional context hashes) into
-// a runnable local image tag. Mirrors daytona.resolveBuildInfo without
-// pulling the daytona package into v1.
-func (h *handlers) resolveSnapshotImage(ctx context.Context, dockerfile string, contextHashes []string) (string, string, error) {
-	if base, ok := singleLineFROM(dockerfile); ok && len(contextHashes) == 0 {
-		return base, "", nil
-	}
-	if len(contextHashes) > 0 {
-		if !h.deps.Build.ContextEnabled {
-			return "", "", errors.New("context_hashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true)")
-		}
-		// The hash → blob resolver lives in object-storage wiring that
-		// hasn't landed yet. Fail loud so the COPY/ADD steps don't
-		// silently no-op.
-		return "", "", errBuildNotImplemented
-	}
-	if h.deps.Builder == nil {
-		return "", "", errors.New("multi-line dockerfile_content requires an image builder; daemon was started without one")
-	}
-
-	tag := docker.BuildTagFor(dockerfile, contextHashes)
-	exists, err := h.deps.Builder.ImageExists(ctx, tag)
-	if err != nil {
-		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperationalV1, err)
-	}
-	logger := h.deps.Logger
-	if exists {
-		if rtErr := h.deps.Builder.RefreshTag(ctx, tag); rtErr != nil && logger != nil {
-			logger.Warn("v1 snapshot build cache refresh-tag failed", "tag", tag, "error", rtErr)
-		}
-		return tag, "", nil
-	}
-
-	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
-	defer cancel()
-	err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{
-		Tag:               tag,
-		DockerfileContent: dockerfile,
-		OnLog: func(line string) {
-			if logger != nil {
-				logger.Debug("v1 snapshot build", "tag", tag, "line", line)
-			}
-		},
-	})
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("%w: %v", errBuildTimeoutV1, err)
-		}
-		return "", "", fmt.Errorf("%w: build image: %v", errBuildOperationalV1, err)
-	}
-	return tag, tag, nil
-}
-
-// writeBuildError maps the sentinel errors from resolveSnapshotImage to the
-// appropriate HTTP code. Validation errors (bad payload, flag disabled,
-// missing builder) → 400 / 501; daemon failures → 502 / 504.
-func (h *handlers) writeBuildError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, errBuildTimeoutV1):
-		apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
-	case errors.Is(err, errBuildOperationalV1):
-		apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-	case errors.Is(err, errBuildNotImplemented):
-		apihttp.WriteError(w, http.StatusNotImplemented, err.Error())
-	default:
-		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-	}
-}
-
-// Sentinel errors so writeBuildError can classify without string-matching.
-var (
-	errBuildOperationalV1  = errors.New("v1 build operational error")
-	errBuildTimeoutV1      = errors.New("v1 build exceeded timeout")
-	errBuildNotImplemented = errors.New("context_hashes is enabled but no context resolver is configured on this daemon")
-)
-
-// singleLineFROM detects the legacy `FROM <image>` shape and returns the
-// base image when matched. Comments and blank lines are ignored.
-// Mirrors daytona.singleLineFromImage.
-func singleLineFROM(dockerfile string) (string, bool) {
-	lines := make([]string, 0, 4)
-	for _, line := range strings.Split(dockerfile, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		lines = append(lines, trimmed)
-	}
-	if len(lines) != 1 {
-		return "", false
-	}
-	parts := strings.Fields(lines[0])
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
-		return "", false
-	}
-	if strings.TrimSpace(parts[1]) == "" {
-		return "", false
-	}
-	return parts[1], true
 }

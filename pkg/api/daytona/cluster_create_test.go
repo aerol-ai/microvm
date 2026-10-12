@@ -71,10 +71,8 @@ func TestCreateSandboxClusterForwardBuildsOnTargetNotRouter(t *testing.T) {
 	svc.AttachCluster(fakeCluster)
 	builder := &fakeImageBuilder{}
 	h := newHandlers(Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
-		Build:   BuildConfig{Timeout: time.Minute},
 	})
 
 	body := `{"name":"sdk-build","buildInfo":{"dockerfileContent":"FROM alpine\nRUN echo target"}}`

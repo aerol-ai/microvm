@@ -680,33 +680,6 @@ func TestHandlersErrorPaths(t *testing.T) {
 }
 
 func TestDaytonaHelperFunctions(t *testing.T) {
-	t.Run("singleLineFromImage", func(t *testing.T) {
-		img, ok := singleLineFromImage("FROM alpine")
-		if !ok || img != "alpine" {
-			t.Fatalf("FROM alpine failed: ok=%v, img=%s", ok, img)
-		}
-		img2, ok2 := singleLineFromImage("# comment\nFROM alpine")
-		if !ok2 || img2 != "alpine" {
-			t.Fatalf("FROM alpine with comment failed: ok=%v, img=%s", ok2, img2)
-		}
-		_, ok3 := singleLineFromImage("FROM alpine\nRUN echo")
-		if ok3 {
-			t.Fatal("expected false for multiline")
-		}
-		_, ok4 := singleLineFromImage("FROM")
-		if ok4 {
-			t.Fatal("expected false for bare FROM")
-		}
-		_, ok5 := singleLineFromImage("FROM ")
-		if ok5 {
-			t.Fatal("expected false for empty FROM")
-		}
-		_, ok6 := singleLineFromImage("RUN echo")
-		if ok6 {
-			t.Fatal("expected false for no FROM")
-		}
-	})
-
 	t.Run("mapSandboxState", func(t *testing.T) {
 		states := []struct {
 			status models.SandboxStatus
@@ -866,24 +839,25 @@ func TestHandlersDBAndTranslationErrors(t *testing.T) {
 	}
 
 	t.Run("translate_sandbox_error", func(t *testing.T) {
-		// Multi-line dockerfile without builder triggers translateCreateSandboxRequest error
+		// A multi-line Dockerfile on a daemon with no builder: the same 503
+		// every surface gives (service.ErrBuilderUnavailable).
 		body := `{"name": "test-build-err", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
 		req := httptest.NewRequest(http.MethodPost, "/daytona/sandbox", strings.NewReader(body))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
-		if rr.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", rr.Code)
 		}
 	})
 
 	t.Run("resolve_build_info_snapshot_error", func(t *testing.T) {
-		// Multi-line dockerfile without builder inside createSnapshotFromImage
+		// The same for a snapshot built from a Dockerfile.
 		body := `{"name": "test-snap-err", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
 		req := httptest.NewRequest(http.MethodPost, "/daytona/snapshots", strings.NewReader(body))
 		rr := httptest.NewRecorder()
 		handler.ServeHTTP(rr, req)
-		if rr.Code != http.StatusBadRequest {
-			t.Fatalf("expected 400, got %d", rr.Code)
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected 503, got %d", rr.Code)
 		}
 	})
 
@@ -937,6 +911,11 @@ func TestHandlersDBAndTranslationErrors(t *testing.T) {
 			}
 		}
 	})
+}
+
+// PushImage completes service.ImageBuilder; Daytona builds never push.
+func (f *handlersExtraFakeImageBuilder) PushImage(_ context.Context, req docker.PushImageRequest) (string, error) {
+	return req.DestRef, nil
 }
 
 type handlersExtraFakeImageBuilder struct {
@@ -1026,7 +1005,7 @@ func TestHandlersBuildAndImageEdgeCases(t *testing.T) {
 		}
 
 		// buildInfo.contextHashes requires operator-side support error
-		h2 := newHandlers(Deps{Build: BuildConfig{ContextEnabled: false}})
+		h2 := newHandlers(Deps{Service: buildService(nil, buildConfig{ContextEnabled: false})})
 		_, _, err2 := h2.resolveBuildInfo(context.Background(), &buildInfoRequest{
 			DockerfileContent: stringPtr("FROM alpine"),
 			ContextHashes:     []string{"123"},
@@ -1036,28 +1015,28 @@ func TestHandlersBuildAndImageEdgeCases(t *testing.T) {
 		}
 
 		// buildInfo.contextHashes is enabled but no context resolver is configured
-		h3 := newHandlers(Deps{Build: BuildConfig{ContextEnabled: true}})
+		h3 := newHandlers(Deps{Service: buildService(nil, buildConfig{ContextEnabled: true})})
 		_, _, err3 := h3.resolveBuildInfo(context.Background(), &buildInfoRequest{
 			DockerfileContent: stringPtr("FROM alpine"),
 			ContextHashes:     []string{"123"},
 		})
-		if err3 == nil || !strings.Contains(err3.Error(), "no context resolver") {
-			t.Fatalf("expected no context resolver error, got %v", err3)
+		if !errors.Is(err3, service.ErrBuildNotImplemented) {
+			t.Fatalf("expected the not-implemented build error, got %v", err3)
 		}
 	})
 
 	t.Run("resolve_build_info_builder_errors", func(t *testing.T) {
 		// 1. ImageExists error
 		b1 := &handlersExtraFakeImageBuilder{existsErr: errors.New("exists error")}
-		h1 := newHandlers(Deps{Builder: b1})
+		h1 := newHandlers(Deps{Service: buildService(b1, buildConfig{})})
 		_, _, err := h1.resolveBuildInfo(context.Background(), &buildInfoRequest{DockerfileContent: stringPtr("FROM alpine\nRUN echo")})
-		if err == nil || !errors.Is(err, errBuildOperational) {
-			t.Fatalf("expected errBuildOperational, got %v", err)
+		if !errors.Is(err, service.ErrBuildFailed) {
+			t.Fatalf("expected service.ErrBuildFailed, got %v", err)
 		}
 
 		// 2. RefreshTag error
 		b2 := &handlersExtraFakeImageBuilder{existsVal: true, refreshErr: errors.New("refresh error")}
-		h2 := newHandlers(Deps{Builder: b2, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+		h2 := newHandlers(Deps{Service: buildService(b2, buildConfig{}), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 		_, _, err = h2.resolveBuildInfo(context.Background(), &buildInfoRequest{DockerfileContent: stringPtr("FROM alpine\nRUN echo")})
 		if err != nil {
 			t.Fatalf("expected success on refresh failure, got %v", err)
@@ -1065,23 +1044,23 @@ func TestHandlersBuildAndImageEdgeCases(t *testing.T) {
 
 		// 3. BuildImage error
 		b3 := &handlersExtraFakeImageBuilder{buildErr: errors.New("build error")}
-		h3 := newHandlers(Deps{Builder: b3})
+		h3 := newHandlers(Deps{Service: buildService(b3, buildConfig{})})
 		_, _, err = h3.resolveBuildInfo(context.Background(), &buildInfoRequest{DockerfileContent: stringPtr("FROM alpine\nRUN echo")})
-		if err == nil || !errors.Is(err, errBuildOperational) {
-			t.Fatalf("expected errBuildOperational, got %v", err)
+		if !errors.Is(err, service.ErrBuildFailed) {
+			t.Fatalf("expected service.ErrBuildFailed, got %v", err)
 		}
 
 		// 4. BuildImage timeout error
 		b4 := &handlersExtraFakeImageBuilder{buildErr: context.DeadlineExceeded}
-		h4 := newHandlers(Deps{Builder: b4})
+		h4 := newHandlers(Deps{Service: buildService(b4, buildConfig{})})
 		_, _, err = h4.resolveBuildInfo(context.Background(), &buildInfoRequest{DockerfileContent: stringPtr("FROM alpine\nRUN echo")})
-		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("expected DeadlineExceeded, got %v", err)
+		if !errors.Is(err, service.ErrBuildTimeout) {
+			t.Fatalf("expected service.ErrBuildTimeout, got %v", err)
 		}
 
 		// 5. buildContextWithTimeout timeout > 0
 		b5 := &handlersExtraFakeImageBuilder{}
-		h5 := newHandlers(Deps{Builder: b5, Build: BuildConfig{Timeout: 10 * time.Second}})
+		h5 := newHandlers(Deps{Service: buildService(b5, buildConfig{Timeout: 10 * time.Second})})
 		_, _, err = h5.resolveBuildInfo(context.Background(), &buildInfoRequest{DockerfileContent: stringPtr("FROM alpine\nRUN echo")})
 		if err != nil {
 			t.Fatalf("expected success, got %v", err)
@@ -1103,10 +1082,9 @@ func TestCreateSandbox_HTTP_Errors(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  logger,
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		body := `{"name": "sb-timeout", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
@@ -1125,10 +1103,9 @@ func TestCreateSandbox_HTTP_Errors(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  logger,
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		body := `{"name": "sb-bad-gateway", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
@@ -1162,10 +1139,9 @@ func TestCreateSandbox_HTTP_Errors(t *testing.T) {
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  logger,
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		rt.createErr = errors.New("runtime create failed")
@@ -1239,10 +1215,9 @@ func TestCreateSnapshotFromImage_HTTP_Errors(t *testing.T) {
 		b := &handlersExtraFakeImageBuilder{buildErr: context.DeadlineExceeded}
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		body := `{"name": "snap-timeout", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
@@ -1260,10 +1235,9 @@ func TestCreateSnapshotFromImage_HTTP_Errors(t *testing.T) {
 		b := &handlersExtraFakeImageBuilder{buildErr: errors.New("build error")}
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		body := `{"name": "snap-bad-gateway", "buildInfo": {"dockerfileContent": "FROM alpine\nRUN echo"}}`
@@ -1281,10 +1255,9 @@ func TestCreateSnapshotFromImage_HTTP_Errors(t *testing.T) {
 		b := &handlersExtraFakeImageBuilder{removeErr: errors.New("remove error")}
 		mux := http.NewServeMux()
 		RegisterRoutes(mux, Deps{
-			Service: svc,
+			Service: withBuilder(svc, b),
 			Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 			Auth:    func(next http.Handler) http.Handler { return next },
-			Builder: b,
 		})
 
 		_ = st.Close()

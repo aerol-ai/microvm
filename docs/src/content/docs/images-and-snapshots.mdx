@@ -342,7 +342,8 @@ If the image does not exist yet, send a Dockerfile. The server builds it and poi
 
 - **Pass one or the other.** `image` and `dockerfileContent` cannot be used together.
 - **A lone `FROM` line is fast.** If the Dockerfile only names a base image, the server registers that image without running a build.
-- **Builds are cached.** The server names the built image after a hash of the Dockerfile. Registering the same Dockerfile again reuses the earlier build.
+- **Builds are cached, per account.** The server names the built image after a hash of the Dockerfile, under your account. Registering the same Dockerfile again reuses your earlier build. Another account's identical Dockerfile gets its own build.
+- **Builds start from registry images.** With an account token, every image a Dockerfile names (`FROM`, `COPY --from`) is pulled from its registry, never taken from images already on the server. A Dockerfile that names a snapshot, a built image or an image id is refused; start a sandbox from the snapshot instead.
 - **There is a builder helper.** Each SDK can also turn its `Image` builder object into a Dockerfile for you, with `registerSnapshotFromImage` (Python `register_snapshot_from_image`, Go `RegisterSnapshotFromImage`, Rust `register_snapshot_from_image`).
 
 ### What a snapshot keeps

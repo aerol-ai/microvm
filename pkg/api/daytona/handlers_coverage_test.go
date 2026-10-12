@@ -186,8 +186,8 @@ func (b *onLogImageBuilder) BuildImage(ctx context.Context, req docker.BuildImag
 func TestResolveBuildInfoOnLogCoverage95(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	h := newHandlers(Deps{
+		Service: buildService(&onLogImageBuilder{}, buildConfig{}),
 		Logger:  logger,
-		Builder: &onLogImageBuilder{},
 	})
 	_, _, err := h.resolveBuildInfo(context.Background(), &buildInfoRequest{
 		DockerfileContent: stringPtr("FROM alpine\nRUN echo hi"),
@@ -739,13 +739,16 @@ func TestDestroySandboxLoadMetaErrorCoverage95(t *testing.T) {
 	}
 }
 
+// A create that fails after a fresh build hands the tag to the image GC
+// (service.DiscardBuiltImage) instead of removing it on the spot: another
+// request may have been handed the same tag from the build cache.
 func TestCreateSandboxImageRollbackOnCreateFailureCoverage95(t *testing.T) {
 	svc, _, rt, _ := newHandlerExtraTestEnv(t)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	b := &rollbackTrackingBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc, Logger: logger, Builder: b,
+		Service: withBuilder(svc, b), Logger: logger,
 		Auth: func(next http.Handler) http.Handler { return next },
 	})
 	rt.createState = &models.SandboxRuntimeState{Status: models.SandboxStatusStarted}
@@ -757,8 +760,8 @@ func TestCreateSandboxImageRollbackOnCreateFailureCoverage95(t *testing.T) {
 	if rr.Code == http.StatusCreated {
 		t.Fatal("expected create failure")
 	}
-	if len(b.removed) == 0 {
-		t.Fatal("expected built image rollback")
+	if !b.buildsCalled || len(b.removed) != 0 {
+		t.Fatalf("built %v, direct removals %v; want a build and no direct removal", b.buildsCalled, b.removed)
 	}
 }
 

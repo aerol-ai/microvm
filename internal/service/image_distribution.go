@@ -62,7 +62,9 @@ func (p defaultImageDistributionProvider) ClassifyImage(_ context.Context, image
 //     enough), so it reaches any image on the node whatever its name;
 //   - a ref into the cluster's snapshot registry outside the caller's own
 //     namespace: the cluster's pull credential would fetch another
-//     tenant's snapshot, or an operator one, for anyone who could spell it.
+//     tenant's snapshot, or an operator one, for anyone who could spell it;
+//   - a built image under another owner's namespace (Service.BuildImage
+//     tags a tenant's builds with its own).
 //
 // Both read as not found, the answer a cross-tenant snapshot name gets. The
 // equivalent spellings of a snapshot's name are covered by the lookup itself
@@ -79,6 +81,11 @@ func authorizeTenantImageRef(owner string, refs ...string) error {
 		}
 		if namespace, ok := snapshotRefNamespace(ref); ok && namespace != snapshotOwnerNamespace(owner) {
 			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
+		}
+		if docker.IsBuiltImageRef(ref) {
+			if namespace := docker.BuiltImageOwnerNamespace(ref); namespace != "" && namespace != snapshotOwnerNamespace(owner) {
+				return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
+			}
 		}
 	}
 	return nil
@@ -134,6 +141,19 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 		for _, name := range names {
 			if stopNames[name] {
 				return nil, "", fmt.Errorf("%w: %q leads back to %q", errSnapshotChain, image, stop)
+			}
+		}
+		if scoped && docker.IsBuiltImageRef(image) && docker.BuiltImageOwnerNamespace(image) == "" {
+			// A build with no owner in its tag — an operator's, or one
+			// made before builds had owners — is anyone's who can guess its
+			// Dockerfile, so a user token reaches it only through a
+			// snapshot it can see that holds it.
+			holders, err := s.store.GetSnapshotsByImage(ctx, names)
+			if err != nil {
+				return nil, "", err
+			}
+			if !slices.ContainsFunc(holders, func(holder *models.SandboxSnapshot) bool { return snapshotVisible(ctx, holder) }) {
+				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			}
 		}
 		if docker.IsSnapshotImageRef(image) {

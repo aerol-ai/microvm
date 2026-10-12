@@ -90,9 +90,8 @@ func newSnapshotCreateTestEnv(t *testing.T, builder *fakeImageBuilder) *snapshot
 		builder = &fakeImageBuilder{}
 	}
 	deps := Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
 		Auth: func(next http.Handler) http.Handler {
 			return next
 		},

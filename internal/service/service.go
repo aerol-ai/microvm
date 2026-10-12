@@ -164,6 +164,10 @@ type Service struct {
 	dockerAux *docker.Client
 	caddy     *caddy.Client
 	cipher    *secrets.Cipher
+	// imageBuilder compiles Dockerfiles (SetImageBuilder); nil on a daemon
+	// without one.
+	imageBuilderMu sync.RWMutex
+	imageBuilder   ImageBuilder
 	// secretProvider owns cluster-secret Put/Open/Delete (ref → plaintext).
 	// Lazily built from cipher+store when tests construct &Service{...}
 	// without New; mount/registry seal paths still use cipher directly.
@@ -3528,17 +3532,17 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 	return snapshot, err
 }
 
-// errReservedSnapshotName refuses a snapshot name in the namespace committed
-// snapshot images live under: a catalog name there could pass for another
-// snapshot's committed image.
-var errReservedSnapshotName = errors.New("snapshot names may not start with \"" + docker.SnapshotImageNamespace + "/\"")
+// errReservedSnapshotName refuses a snapshot name in a namespace the daemon
+// keeps its own images under (committed snapshots, builds): a catalog name
+// there could pass for one of those images.
+var errReservedSnapshotName = errors.New("snapshot names may not start with \"" + docker.SnapshotImageNamespace + "/\" or \"" + docker.BuiltImageNamespace + "/\"")
 
 // validateSnapshotName checks a new snapshot's name.
 func validateSnapshotName(name string) error {
 	if name == "" {
 		return errors.New("snapshot name is required")
 	}
-	if docker.IsSnapshotImageRef(name) {
+	if docker.IsSnapshotImageRef(name) || docker.IsBuiltImageRef(name) {
 		return fmt.Errorf("%w: %q", errReservedSnapshotName, name)
 	}
 	return nil

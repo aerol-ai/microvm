@@ -552,3 +552,18 @@ func TestWriteStoreAwareError_EgressProfiles(t *testing.T) {
 		}
 	}
 }
+
+// Every build failure maps to one status on every surface that builds.
+func TestWriteStoreAwareErrorMapsBuildErrors(t *testing.T) {
+	for err, want := range map[error]int{
+		service.ErrBuildTimeout:        http.StatusGatewayTimeout,
+		service.ErrBuildFailed:         http.StatusBadGateway,
+		service.ErrBuilderUnavailable:  http.StatusServiceUnavailable,
+		service.ErrBuildNotImplemented: http.StatusNotImplemented,
+		service.ErrBuildInvalid:        http.StatusBadRequest,
+	} {
+		if code, _ := storeAwareErr(t, fmt.Errorf("%w: detail", err)); code != want {
+			t.Errorf("%v -> %d, want %d", err, code, want)
+		}
+	}
+}
