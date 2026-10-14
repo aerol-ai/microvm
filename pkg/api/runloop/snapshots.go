@@ -297,22 +297,16 @@ func (h *handlers) startSnapshot(w http.ResponseWriter, r *http.Request, devboxI
 // id the caller holds resolves to nothing, so a failed alias write rolls
 // the commit back (only when this run created it).
 func (h *handlers) runSnapshot(ctx context.Context, devboxID, id string, blob snapshotBlob) (*models.SandboxSnapshot, error) {
-	snapshot, created, err := h.deps.Service.CreateSnapshotWithOwnership(ctx, devboxID, models.CreateSandboxSnapshotRequest{Name: nativeSnapshotName(id)})
+	// Commit the devbox and its Runloop alias (carrying the attributes blob)
+	// in one service call, which rolls the commit back if the alias fails (D8).
+	snapshot, _, err := h.deps.Service.CreateSnapshotWithAlias(ctx, devboxID,
+		models.CreateSandboxSnapshotRequest{Name: nativeSnapshotName(id)},
+		models.SnapshotAlias{
+			Alias:     id,
+			Facade:    models.FacadeRunloop,
+			StateJSON: blob.encode(),
+		})
 	if err != nil {
-		return nil, err
-	}
-	err = h.deps.Service.UpsertSnapshotAlias(ctx, models.SnapshotAlias{
-		Alias:        id,
-		SnapshotName: snapshot.Name,
-		Facade:       models.FacadeRunloop,
-		StateJSON:    blob.encode(),
-	})
-	if err != nil {
-		if created {
-			if deleteErr := h.deps.Service.DeleteSnapshot(context.WithoutCancel(ctx), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("runloop snapshot rollback failed", "snapshot", snapshot.Name, "error", deleteErr)
-			}
-		}
 		return nil, err
 	}
 	return snapshot, nil
