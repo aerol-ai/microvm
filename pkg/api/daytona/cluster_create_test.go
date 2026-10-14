@@ -182,7 +182,7 @@ func TestClusterForwardWrapReturnsGoneForOrphanedDaytonaPlacement(t *testing.T) 
 	if rr.Code != http.StatusGone {
 		t.Fatalf("status = %d, want %d; body=%q", rr.Code, http.StatusGone, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), cluster.ErrOrphaned.Error()) {
+	if !strings.Contains(rr.Body.String(), "placement orphaned") {
 		t.Fatalf("body = %q, want orphaned error", rr.Body.String())
 	}
 }

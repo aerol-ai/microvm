@@ -1,6 +1,7 @@
 package e2b
 
 import (
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 	"log/slog"
 	"net/http"
 
@@ -33,6 +34,13 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshots", d.Auth(h.clusterForwardWrap(http.HandlerFunc(h.createSnapshot))))
 	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
 	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
-	mux.Handle(PathPrefix+"/runtime", http.HandlerFunc(h.runtimeProxy))
-	mux.Handle(PathPrefix+"/runtime/", http.HandlerFunc(h.runtimeProxy))
+	// /runtime carries its sandbox id in the E2b-Sandbox-Id header, not a
+	// path value, so it forwards to the owner node by that header (plan B5).
+	// Unauthenticated like the rest of /runtime: the envd token guards it.
+	runtimeForward := clusterroute.Wrap(h.deps.Service, clusterroute.Options{
+		ID:         func(r *http.Request) string { return r.Header.Get("E2b-Sandbox-Id") },
+		WriteError: WriteError,
+	}, http.HandlerFunc(h.runtimeProxy))
+	mux.Handle(PathPrefix+"/runtime", runtimeForward)
+	mux.Handle(PathPrefix+"/runtime/", runtimeForward)
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -55,54 +56,7 @@ const (
 // and falls through to the local handler. The X-Cluster-Forwarded header set
 // by ForwardHTTP guards against infinite loops if the placement view is stale.
 func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		if id == "" {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if h.deps.Service == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		c := h.deps.Service.Cluster()
-		if c == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		owner, err := c.OwnerOf(id)
-		if err != nil {
-			if errors.Is(err, cluster.ErrUnknownSandbox) {
-				local.ServeHTTP(w, r)
-				return
-			}
-			if errors.Is(err, cluster.ErrOrphaned) {
-				// 410 Gone: the sandbox's owning node died and was
-				// auto-evicted. The placement record exists but points
-				// nowhere. Clients should treat this as a permanent
-				// disappearance and (if they care to) issue a fresh create.
-				apihttp.WriteError(w, http.StatusGone, "sandbox owner died; placement orphaned (manual recovery required)")
-				return
-			}
-			apihttp.WriteError(w, http.StatusInternalServerError, "cluster lookup: "+err.Error())
-			return
-		}
-		if owner.IsSelf {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if owner.APIURL == "" && owner.InternalURL == "" {
-			// Route miss: placement says someone else owns the sandbox, but
-			// gossip hasn't surfaced any forwarding URL yet (mid-rollover,
-			// peer mid-boot, or misconfigured advertise URLs). Bump the
-			// counter so operator dashboards see persistent gossip-convergence
-			// lag rather than just sporadic 503s.
-			service.RecordRouteMiss()
-			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
-			return
-		}
-		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
-	})
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: apihttp.WriteError}, local)
 }
 
 // clusterCreateWrap is the handler for POST /v1/sandboxes. It implements the
