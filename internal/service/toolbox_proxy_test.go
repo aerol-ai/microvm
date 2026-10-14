@@ -363,7 +363,7 @@ func TestToolboxProxyErrorBranchesMore(t *testing.T) {
 	if _, err := svc.RoundTripToolbox(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
 		t.Fatal("RoundTripToolbox should reject invalid network method")
 	}
-	if _, err := svc.newNetworkToolboxRequest(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
+	if _, err := svc.newNetworkToolboxRequest(ctx, &models.Sandbox{ID: "sb-net-error", Status: models.SandboxStatusStarted, ContainerIP: "10.0.0.1", Runtime: models.RuntimeDocker}, "BAD METHOD", "/foo", nil, nil, nil); err == nil {
 		t.Fatal("newNetworkToolboxRequest should reject invalid method")
 	}
 }

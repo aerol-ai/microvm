@@ -29,10 +29,9 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	if err := refuseToolboxAdminPath(path); err != nil {
 		return err
 	}
-	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
-		return err
-	}
-	sandbox, err := s.scopedGet(ctx, sandboxID)
+	// Reuse the sandbox the wake helper already read (owner-scoped, post-wake)
+	// instead of a second scopedGet — one fewer store read per toolbox call (D15).
+	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -63,7 +62,7 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		return nil
 	}
 
-	endpoint, err := s.ToolboxTarget(ctx, sandboxID)
+	endpoint, err := s.toolboxEndpointForActiveCall(ctx, sandbox)
 	if err != nil {
 		return err
 	}
@@ -115,10 +114,8 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 	if err := refuseToolboxAdminPath(path); err != nil {
 		return nil, err
 	}
-	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
-		return nil, err
-	}
-	sandbox, err := s.scopedGet(ctx, sandboxID)
+	// Reuse the sandbox the wake helper already read (D15).
+	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +144,7 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 		}
 		return s.roundTripHostToolbox(ctx, sandbox, host, method, path, query, body, headers)
 	}
-	req, err := s.newNetworkToolboxRequest(ctx, sandboxID, method, path, query, body, headers)
+	req, err := s.newNetworkToolboxRequest(ctx, sandbox, method, path, query, body, headers)
 	if err != nil {
 		return nil, err
 	}
@@ -187,8 +184,8 @@ func (s *Service) roundTripHostToolbox(ctx context.Context, sandbox *models.Sand
 	return rec.Result(), nil
 }
 
-func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
-	endpoint, err := s.ToolboxTarget(ctx, sandboxID)
+func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandbox *models.Sandbox, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
+	endpoint, err := s.toolboxEndpointForActiveCall(ctx, sandbox)
 	if err != nil {
 		return nil, err
 	}
