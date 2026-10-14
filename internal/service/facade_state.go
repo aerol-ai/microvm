@@ -15,7 +15,22 @@ import (
 // the API surface and the persistence layer.
 
 func (s *Service) UpsertCompatState(ctx context.Context, sandboxID, facade, stateJSON string) error {
-	return s.store.UpsertCompatState(ctx, sandboxID, facade, stateJSON)
+	if err := s.store.UpsertCompatState(ctx, sandboxID, facade, stateJSON); err != nil {
+		return err
+	}
+	// Carry facade state on the replicated spec so a failover recreate restores
+	// it — the sandbox_compat_state rows are node-local and would otherwise go
+	// with the dead owner (B11). Build a fresh map (never mutate the one the FSM
+	// deep-copy shares) merging this facade's entry over any others.
+	s.replicateSpecPatch(ctx, sandboxID, func(spec *models.CreateSandboxRequest) {
+		merged := make(map[string]string, len(spec.CompatState)+1)
+		for k, v := range spec.CompatState {
+			merged[k] = v
+		}
+		merged[facade] = stateJSON
+		spec.CompatState = merged
+	})
+	return nil
 }
 
 func (s *Service) GetCompatState(ctx context.Context, sandboxID, facade string) (*models.SandboxCompatState, error) {
