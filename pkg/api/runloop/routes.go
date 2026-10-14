@@ -35,7 +35,6 @@ type handlers struct {
 	creates    *createTracker
 	execs      *execTracker
 	snapshots  *snapshotTracker
-	shutdowns  *tombstones
 	homes      *homeCache
 	recovery   execRecovery
 }
@@ -47,7 +46,6 @@ func newHandlers(d Deps) *handlers {
 		creates:    newCreateTracker(),
 		execs:      newExecTracker(),
 		snapshots:  newSnapshotTracker(),
-		shutdowns:  newTombstones(),
 		homes:      newHomeCache(),
 	}
 }

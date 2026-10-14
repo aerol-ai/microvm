@@ -544,17 +544,4 @@ func TestExecTrackerEdges(t *testing.T) {
 	if len(tr.results) != 0 || tr.bytes != 0 {
 		t.Fatal("forgetDevbox left results behind")
 	}
-
-	ts := newTombstones()
-	for i := 0; i < maxTombstones; i++ {
-		ts.put(time.Duration(i).String(), "", devboxView{})
-	}
-	for key, entry := range ts.views {
-		entry.at = time.Now().Add(-2 * tombstoneTTL)
-		ts.views[key] = entry
-	}
-	ts.put("fresh", "", devboxView{})
-	if len(ts.views) != 1 {
-		t.Fatalf("expired tombstones kept: %d", len(ts.views))
-	}
 }

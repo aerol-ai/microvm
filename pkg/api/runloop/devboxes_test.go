@@ -376,17 +376,24 @@ func TestDevboxStatusMapping(t *testing.T) {
 	}
 }
 
-func TestTombstonesEvict(t *testing.T) {
-	ts := newTombstones()
-	for i := 0; i < maxTombstones+5; i++ {
-		ts.put(strings.Repeat("x", i%7)+string(rune('a'+i%26))+time.Now().String()+string(rune(i)), "", devboxView{})
+// The shutdown tombstone now round-trips through the durable, service-backed
+// store (D6): put marshals the terminal view, get reads it back, and an
+// unknown id has none. Owner scoping and the replay window are covered by the
+// service tests (where the caller identity and the stored time are
+// controllable); the end-to-end replay is TestShutdownIsTerminalAndIdempotent.
+func TestShutdownTombstoneRoundTrip(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+	end := int64(1234)
+	view := devboxView{ID: "db-ts", Status: statusShutdown, EndTimeMs: &end}
+	if err := env.h.putShutdownTombstone(ctx, "db-ts", "", view); err != nil {
+		t.Fatalf("putShutdownTombstone: %v", err)
 	}
-	if len(ts.views) > maxTombstones {
-		t.Fatalf("tombstones grew to %d", len(ts.views))
+	got, ok := env.h.shutdownTombstone(ctx, "db-ts")
+	if !ok || got.ID != "db-ts" || got.Status != statusShutdown || got.EndTimeMs == nil || *got.EndTimeMs != end {
+		t.Fatalf("tombstone round trip = %+v ok=%v", got, ok)
 	}
-	ts.put("old", "", devboxView{ID: "old"})
-	ts.views["old"] = tombstone{view: devboxView{ID: "old"}, at: time.Now().Add(-2 * tombstoneTTL)}
-	if _, ok := ts.get(context.Background(), "old"); ok {
-		t.Fatal("expired tombstone answered")
+	if _, ok := env.h.shutdownTombstone(ctx, "unknown"); ok {
+		t.Fatal("unknown id returned a tombstone")
 	}
 }
