@@ -154,7 +154,7 @@ func TestLocalImageCreateInClusterTakesUnreservedPath(t *testing.T) {
 	env.svc.AttachCluster(cluster.NewNoop("worker", "", ""))
 	req := models.CreateSandboxRequest{Image: "aerolvm-build/review-local:latest"}
 	r := httptest.NewRequest(http.MethodPost, devboxesPath, nil)
-	decision, ok := clustercreate.Prepare(httptest.NewRecorder(), r, env.svc, req, WriteError, clustercreate.PrepareOptions{PreferredSandboxID: "sb-0123456789abcdef"})
+	decision, ok := clustercreate.Prepare(httptest.NewRecorder(), r, env.svc, req, writeErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: "sb-0123456789abcdef"})
 	if !ok || decision.ReservationID != "" {
 		t.Fatalf("expected an unreserved local-image decision, got %+v %v", decision, ok)
 	}

@@ -46,7 +46,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteError, clustercreate.PrepareOptions{})
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{})
 	if !ok {
 		return
 	}

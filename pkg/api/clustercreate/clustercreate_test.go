@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
@@ -491,7 +492,7 @@ func TestRouteExistingPlacement(t *testing.T) {
 			var status int
 			var message string
 
-			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, msg string) {
+			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, _, msg string) {
 				status = code
 				message = msg
 				w.WriteHeader(code)
@@ -541,7 +542,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-b")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -557,7 +558,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-a")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -605,7 +606,7 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image:                 "e2b/sb-local:default",
 			ImageDistributionMode: models.ImageDistributionLocalOnly,
-		}, func(_ http.ResponseWriter, code int, _ string) {
+		}, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -687,9 +688,11 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				status := 0
-				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+				writer := func(rw http.ResponseWriter, code int, errCode, msg string) {
 					status = code
-				}, PrepareOptions{})
+					apihttp.WriteErrorCode(rw, code, errCode, msg)
+				}
+				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, writer, PrepareOptions{})
 				if ok {
 					t.Fatal("Prepare returned ok=true, want false")
 				}
@@ -782,7 +785,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -801,7 +804,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -819,7 +822,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusInternalServerError {
 			t.Fatalf("ok=%v status=%d, want 500", ok, status)
 		}
@@ -966,7 +969,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				var status int
-				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _ string) {
+				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _, _ string) {
 					status = code
 				}, tc.opts)
 				if ok != tc.wantOK {
@@ -1669,10 +1672,10 @@ func TestCapacityRequestFromCreateEgressGateway(t *testing.T) {
 
 func TestWriteNoEgressGateway(t *testing.T) {
 	rr := httptest.NewRecorder()
-	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget) {
+	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget, apihttp.WriteErrorCode) {
 		t.Fatal("a plain placement failure is not a gateway failure")
 	}
-	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget) {
+	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget, apihttp.WriteErrorCode) {
 		t.Fatal("gateway sentinel must be written")
 	}
 	var body models.ErrorResponse
