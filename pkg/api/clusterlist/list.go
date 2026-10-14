@@ -73,7 +73,11 @@ type Transport struct {
 type Options struct {
 	OwnerRef string
 	// AuthHeader is the caller's Authorization. Sent only on mTLS InternalURL.
-	AuthHeader           string
+	AuthHeader string
+	// APIKeyHeader is the caller's X-API-KEY, for facades (E2B) whose inbound
+	// auth accepts it instead of Authorization. Forwarded on the same mTLS hop
+	// so an X-API-KEY-only caller's remote sandboxes are not dropped (B9).
+	APIKeyHeader         string
 	RawQuery             string
 	Path                 string
 	ForwardedHeaderName  string
@@ -589,10 +593,16 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 		return nil, err
 	}
 	req.Header.Set(fwdName, fwdVal)
-	// mTLS-only: forward the caller's Authorization so tenant scope is preserved.
-	// Never substitute the fleet PAT (that was the cross-tenant enumeration hole).
+	// mTLS-only: forward the caller's credential so tenant scope is preserved
+	// on the peer. Never substitute the fleet PAT (that was the cross-tenant
+	// enumeration hole). Forward whichever credential the caller used —
+	// Authorization and/or X-API-KEY (E2B accepts the latter) — so the peer
+	// authenticates as the same tenant (B9).
 	if opts.AuthHeader != "" {
 		req.Header.Set("Authorization", opts.AuthHeader)
+	}
+	if opts.APIKeyHeader != "" {
+		req.Header.Set("X-API-KEY", opts.APIKeyHeader)
 	}
 	cluster.SetPeerNodeIDHeader(req, opts.SelfNodeID)
 	resp, err := client.Do(req)

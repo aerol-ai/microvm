@@ -150,81 +150,31 @@ func sandboxIDFromFingerprint(fingerprint string) string {
 //
 // Cluster mode is placement-cursor based (page_token/limit). Callers must 503
 // when viewReady is false, matching /v1/sandboxes.
+// listFacadeClusterItems delegates to the shared cluster-list glue, forwarding
+// the caller's X-API-KEY as well as Authorization so an X-API-KEY-only tenant's
+// remote sandboxes are not dropped (B9).
 func (h *handlers) listFacadeClusterItems(r *http.Request, local []listedSandboxResponse) ([]listedSandboxResponse, clusterlist.Coverage, string, bool) {
-	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
-	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, cov, "", true
+	var c cluster.Client
+	if h.deps.Service != nil {
+		c = h.deps.Service.Cluster()
 	}
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return local, cov, "", true
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return local, cov, "", true
-	}
-	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
-	limit, pageToken := clusterlist.ParsePageParams(r.URL)
-	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
-	if !viewReady {
-		cov.PlacementViewReady = false
-		cov.Partial = true
-		return nil, cov, "", false
-	}
-	local = filterE2BLocalToPage(local, placements, pageToken)
-	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it listedSandboxResponse) string { return it.SandboxID }, clusterlist.Options{
-		OwnerRef:   ownerRef,
-		AuthHeader: r.Header.Get("Authorization"),
-		// Peers must not re-apply nextToken/limit — ingress paginates after merge.
-		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
-		Path:       PathPrefix + "/sandboxes",
-		Transport:  clusterlist.TransportFromCluster(c),
-		SelfNodeID: c.SelfNodeID(),
-		WantIDs:    clusterlist.PlacementWantIDs(placements),
+	return clusterlist.FacadeListPage(r, c, local, func(it listedSandboxResponse) string { return it.SandboxID }, clusterlist.FacadeListOptions{
+		Path:         PathPrefix + "/sandboxes",
+		AuthHeader:   r.Header.Get("Authorization"),
+		APIKeyHeader: r.Header.Get("X-API-KEY"),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 			}
 		},
 	})
-	cov.PlacementViewReady = viewReady
-	if len(missingOwners) > 0 {
-		cov.Missing = append(cov.Missing, missingOwners...)
-		cov.Partial = true
-	}
-	return items, cov, next, true
 }
 
-func filterE2BLocalToPage(local []listedSandboxResponse, placements []cluster.Placement, pageToken string) []listedSandboxResponse {
-	if placements == nil {
-		if strings.TrimSpace(pageToken) != "" {
-			return nil
-		}
-		return local
-	}
-	want := clusterlist.PlacementWantIDs(placements)
-	out := make([]listedSandboxResponse, 0, len(local))
-	for _, it := range local {
-		if _, ok := want[it.SandboxID]; ok {
-			out = append(out, it)
-		}
-	}
-	return out
-}
-
-// clusterListMode is true when a real cluster client is attached (not the
-// standalone Noop default from service.New) and this is not a forwarded peer hop.
 func clusterListMode(svc *svcmetrics.Service, r *http.Request) bool {
-	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if svc == nil {
 		return false
 	}
-	c := svc.Cluster()
-	if c == nil {
-		return false
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return false
-	}
-	return true
+	return clusterlist.ListMode(svc.Cluster(), r)
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {

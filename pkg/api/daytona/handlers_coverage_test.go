@@ -17,24 +17,10 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
-
-func TestFilterFacadeLocalToPage(t *testing.T) {
-	type item struct{ ID string }
-	local := []item{{ID: "sb-1"}, {ID: "sb-2"}, {ID: ""}}
-	if got := filterFacadeLocalToPage(local, nil, "", func(it item) string { return it.ID }); len(got) != 3 {
-		t.Fatalf("cold start = %d", len(got))
-	}
-	if got := filterFacadeLocalToPage(local, nil, "tok", func(it item) string { return it.ID }); got != nil {
-		t.Fatalf("terminal nil placements = %+v", got)
-	}
-	got := filterFacadeLocalToPage(local, []cluster.Placement{{SandboxID: "sb-2"}}, "", func(it item) string { return it.ID })
-	if len(got) != 1 || got[0].ID != "sb-2" {
-		t.Fatalf("page filter = %+v", got)
-	}
-}
 
 func TestReplaceLabelsBadJSON(t *testing.T) {
 	handler, svc, _ := newDaytonaVolumesTestEnv(t)
@@ -834,5 +820,70 @@ func TestCreateSnapshotOnSandboxSuccessCoverage95(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("snapshot status = %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// gatherAllClusterPages walks every placement page so the unpaginated list
+// returns all the owner's sandboxes, deduped, and surfaces a not-ready page as
+// a 503 (B10).
+func TestGatherAllClusterPages(t *testing.T) {
+	type item struct{ ID string }
+	id := func(it item) string { return it.ID }
+	r := httptest.NewRequest(http.MethodGet, "/daytona/sandbox", nil)
+
+	t.Run("walks and concatenates pages", func(t *testing.T) {
+		calls := 0
+		fetch := func(pr *http.Request, _ []item) ([]item, clusterlist.Coverage, string, bool) {
+			calls++
+			switch pr.URL.Query().Get("page_token") {
+			case "":
+				return []item{{ID: "a"}}, clusterlist.Coverage{}, "t2", true
+			case "t2":
+				return []item{{ID: "b"}}, clusterlist.Coverage{}, "", true
+			default:
+				t.Fatalf("unexpected page_token %q", pr.URL.Query().Get("page_token"))
+				return nil, clusterlist.Coverage{}, "", true
+			}
+		}
+		items, _, ok := gatherAllClusterPages(r, nil, id, fetch)
+		if !ok || calls != 2 || len(items) != 2 || items[0].ID != "a" || items[1].ID != "b" {
+			t.Fatalf("items=%+v calls=%d ok=%v", items, calls, ok)
+		}
+	})
+
+	t.Run("dedups ids seen on more than one page", func(t *testing.T) {
+		fetch := func(pr *http.Request, _ []item) ([]item, clusterlist.Coverage, string, bool) {
+			if pr.URL.Query().Get("page_token") == "" {
+				return []item{{ID: "a"}}, clusterlist.Coverage{}, "t2", true
+			}
+			return []item{{ID: "a"}, {ID: "b"}}, clusterlist.Coverage{}, "", true
+		}
+		items, _, ok := gatherAllClusterPages(r, nil, id, fetch)
+		if !ok || len(items) != 2 {
+			t.Fatalf("dedup items=%+v ok=%v", items, ok)
+		}
+	})
+
+	t.Run("a not-ready page returns ok=false", func(t *testing.T) {
+		fetch := func(*http.Request, []item) ([]item, clusterlist.Coverage, string, bool) {
+			return nil, clusterlist.Coverage{Partial: true}, "", false
+		}
+		if _, _, ok := gatherAllClusterPages(r, nil, id, fetch); ok {
+			t.Fatal("expected ok=false for a not-ready page")
+		}
+	})
+}
+
+func TestWithPageToken(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/daytona/sandbox?limit=10", nil)
+	clone := withPageToken(r, "tok-9")
+	if clone.URL.Query().Get("page_token") != "tok-9" {
+		t.Fatalf("page_token = %q", clone.URL.Query().Get("page_token"))
+	}
+	if clone.URL.Query().Get("limit") != "10" {
+		t.Fatalf("limit lost = %q", clone.URL.Query().Get("limit"))
+	}
+	if r.URL.RawQuery != "limit=10" {
+		t.Fatalf("original request mutated: %q", r.URL.RawQuery)
 	}
 }
