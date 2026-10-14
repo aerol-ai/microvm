@@ -722,7 +722,7 @@ func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request
 }
 
 func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, stop bool) {
-	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -737,21 +737,26 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	lifecycle := sandbox.Lifecycle
-	if stop {
-		if intervalPtr == nil {
-			lifecycle.StopIfIdleFor = 0
+	// Patch only the idle timer this route owns, reading the current Lifecycle
+	// under the sandbox lock so a concurrent E2B timeout change (which rewrites
+	// StopAtAge/DestroyAtAge) can't clobber it, and vice versa (D7).
+	updated, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandboxID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		lifecycle := sb.Lifecycle
+		if stop {
+			if intervalPtr == nil {
+				lifecycle.StopIfIdleFor = 0
+			} else {
+				lifecycle.StopIfIdleFor = durationFromMinutes(interval)
+			}
 		} else {
-			lifecycle.StopIfIdleFor = durationFromMinutes(interval)
+			if intervalPtr == nil {
+				lifecycle.DestroyIfIdleFor = 0
+			} else {
+				lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
+			}
 		}
-	} else {
-		if intervalPtr == nil {
-			lifecycle.DestroyIfIdleFor = 0
-		} else {
-			lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
-		}
-	}
-	updated, err := h.deps.Service.UpdateLifecycle(r.Context(), sandboxID, lifecycle)
+		return lifecycle, true, nil
+	})
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return

@@ -463,42 +463,22 @@ func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id str
 }
 
 func (h *handlers) suspendDevbox(w http.ResponseWriter, r *http.Request, id string) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), id)
+	// The "running" precondition and the stop are one locked transition in the
+	// service (D7); ErrSandboxNotRunning classifies to a 409 reworded here.
+	sandbox, err := h.deps.Service.PauseSandbox(r.Context(), id)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	switch sandbox.Status {
-	case models.SandboxStatusStopped:
-		// Already suspended: a retried suspend is a no-op.
-	case models.SandboxStatusStarted:
-		if sandbox, err = h.deps.Service.StopSandbox(r.Context(), id); err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
-	default:
-		WriteError(w, http.StatusConflict, "devbox is not running")
 		return
 	}
 	h.writeDevbox(w, r, sandbox)
 }
 
 func (h *handlers) resumeDevbox(w http.ResponseWriter, r *http.Request, id string) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), id)
+	// The "suspended" precondition and the start are one locked transition in
+	// the service (D7); ErrSandboxNotResumable classifies to a 409 reworded here.
+	sandbox, err := h.deps.Service.ResumeSandbox(r.Context(), id)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	switch sandbox.Status {
-	case models.SandboxStatusStarted:
-		// Already running: a retried resume is a no-op.
-	case models.SandboxStatusStopped:
-		if sandbox, err = h.deps.Service.StartSandbox(r.Context(), id); err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
-	default:
-		WriteError(w, http.StatusConflict, "devbox is not suspended")
 		return
 	}
 	h.writeDevbox(w, r, sandbox)

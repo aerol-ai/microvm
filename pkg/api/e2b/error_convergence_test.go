@@ -30,6 +30,8 @@ func TestE2BErrorsFollowTheSharedTable(t *testing.T) {
 		{"build invalid", service.ErrBuildInvalid, http.StatusBadRequest, ""},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, ""},
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, ""},
+		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, ""},
+		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -47,9 +49,11 @@ func TestE2BErrorsFollowTheSharedTable(t *testing.T) {
 	}
 	// E2B's SDK keeps its own wording for these.
 	for err, want := range map[error]string{
-		store.ErrNotFound:             "Not found",
-		store.ErrSnapshotNameConflict: "Snapshot name already in use",
-		models.ErrSandboxExists:       "Sandbox already exists",
+		store.ErrNotFound:              "Not found",
+		store.ErrSnapshotNameConflict:  "Snapshot name already in use",
+		models.ErrSandboxExists:        "Sandbox already exists",
+		service.ErrSandboxNotRunning:   "Sandbox is not running",
+		service.ErrSandboxNotResumable: "Sandbox is not available for connect",
 	} {
 		rr := httptest.NewRecorder()
 		writeStoreAwareError(nil, rr, err)

@@ -390,7 +390,11 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
+	// Connect is E2B's resume: start a stopped sandbox, no-op a started one,
+	// 409 anything else — one locked transition in the service (D7). The 404
+	// keeps E2B's wording; the 409 (ErrSandboxNotResumable) is reworded by the
+	// classifier to "Sandbox is not available for connect".
+	sandbox, err := h.deps.Service.ResumeSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			WriteError(w, http.StatusNotFound, "Sandbox not found")
@@ -405,26 +409,23 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sandbox.Status == models.SandboxStatusStopped {
-		sandbox, err = h.deps.Service.StartSandbox(r.Context(), sandbox.ID)
-		if err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
+	// Extend the timeout, but never shorten a longer one on reconnect — the
+	// patch reads the current Lifecycle under the sandbox lock and signals "no
+	// change" when the new deadline is not later.
+	updated, changed, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		currentDeadline, hasDeadline := timeoutDeadline(sb, meta)
+		desiredLifecycle := lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout)
+		desiredDeadline, _ := timeoutDeadline(&models.Sandbox{CreatedAt: sb.CreatedAt, Lifecycle: desiredLifecycle}, meta)
+		if hasDeadline && !desiredDeadline.After(currentDeadline) {
+			return models.Lifecycle{}, false, nil
 		}
-	} else if sandbox.Status != models.SandboxStatusStarted {
-		WriteError(w, http.StatusConflict, "Sandbox is not available for connect")
+		return desiredLifecycle, true, nil
+	})
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	currentDeadline, hasDeadline := timeoutDeadline(sandbox, meta)
-	desiredLifecycle := lifecycleForTimeout(sandbox, meta.OnTimeout, req.Timeout)
-	desiredDeadline, _ := timeoutDeadline(&models.Sandbox{CreatedAt: sandbox.CreatedAt, Lifecycle: desiredLifecycle}, meta)
-	if !hasDeadline || desiredDeadline.After(currentDeadline) {
-		sandbox, err = h.deps.Service.UpdateLifecycle(r.Context(), sandbox.ID, desiredLifecycle)
-		if err != nil {
-			writeStoreAwareError(h.deps.Logger, w, err)
-			return
-		}
+	if changed {
 		meta.TimeoutSeconds = req.Timeout
 		if err := h.persistSandboxMeta(r.Context(), sandbox.ID, meta); err != nil {
 			writeStoreAwareError(h.deps.Logger, w, err)
@@ -432,28 +433,18 @@ func (h *handlers) connectSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
+	writeJSON(w, http.StatusOK, h.toSandboxResponse(r, updated, meta))
 }
 
 func (h *handlers) pauseSandbox(w http.ResponseWriter, r *http.Request) {
-	sandbox, err := h.deps.Service.GetSandbox(r.Context(), r.PathValue("id"))
-	if err != nil {
+	// The "running" precondition and the stop are one locked transition in the
+	// service (D7); an already-stopped sandbox is a no-op. The 404 keeps E2B's
+	// wording; the 409 (ErrSandboxNotRunning) is reworded by the classifier.
+	if _, err := h.deps.Service.PauseSandbox(r.Context(), r.PathValue("id")); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			WriteError(w, http.StatusNotFound, "Sandbox not found")
 			return
 		}
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	if sandbox.Status == models.SandboxStatusStopped {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if sandbox.Status != models.SandboxStatusStarted {
-		WriteError(w, http.StatusConflict, "Sandbox is not running")
-		return
-	}
-	if _, err := h.deps.Service.StopSandbox(r.Context(), sandbox.ID); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -486,8 +477,12 @@ func (h *handlers) updateTimeout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	lifecycle := lifecycleForTimeout(sandbox, meta.OnTimeout, req.Timeout)
-	if _, err := h.deps.Service.UpdateLifecycle(r.Context(), sandbox.ID, lifecycle); err != nil {
+	// Reset the timeout timers, reading the current Lifecycle under the sandbox
+	// lock so a concurrent idle-timer change can't be clobbered (D7). OnTimeout
+	// is fixed at create, so reading meta outside the lock is safe.
+	if _, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandbox.ID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		return lifecycleForTimeout(sb, meta.OnTimeout, req.Timeout), true, nil
+	}); err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}

@@ -1,6 +1,7 @@
 package runloop
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -25,6 +26,8 @@ func TestRunloopErrorsFollowTheSharedTable(t *testing.T) {
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, "5"},
 		{"build timeout", service.ErrBuildTimeout, http.StatusGatewayTimeout, ""},
 		{"build invalid", service.ErrBuildInvalid, http.StatusBadRequest, ""},
+		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, ""},
+		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -40,5 +43,18 @@ func TestRunloopErrorsFollowTheSharedTable(t *testing.T) {
 				t.Fatalf("x-should-retry=false is %v for %d, want %v", got, tc.status, wantNoRetry)
 			}
 		})
+	}
+	// Runloop's SDK keeps its own wording for the lifecycle conflicts.
+	for err, want := range map[error]string{
+		service.ErrSandboxNotRunning:   "devbox is not running",
+		service.ErrSandboxNotResumable: "devbox is not suspended",
+	} {
+		rr := httptest.NewRecorder()
+		writeStoreAwareError(nil, rr, err)
+		var body errorResponse
+		_ = json.Unmarshal(rr.Body.Bytes(), &body)
+		if body.Message != want {
+			t.Errorf("%v message = %q, want %q", err, body.Message, want)
+		}
 	}
 }

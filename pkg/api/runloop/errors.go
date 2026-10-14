@@ -101,6 +101,10 @@ func runloopMessage(c apihttp.Classification) string {
 		return "not found"
 	case apihttp.ErrKindSandboxExists:
 		return "devbox already exists"
+	case apihttp.ErrKindSandboxNotRunning:
+		return "devbox is not running"
+	case apihttp.ErrKindSandboxNotResumable:
+		return "devbox is not suspended"
 	default:
 		return c.Message
 	}
