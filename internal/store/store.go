@@ -3047,6 +3047,39 @@ func (s *Store) ListCompatState(ctx context.Context, facade string) (map[string]
 	return items, nil
 }
 
+// ListCompatStateByOwner is ListCompatState narrowed to one owner's sandboxes,
+// joining sandbox_compat_state to sandboxes on the id. A scoped caller (a user
+// token) only ever needs its own rows, so the service uses this instead of
+// scanning every tenant's compat rows on each list — the fleet-wide scan is a
+// real cost at 100k sandboxes, and returning only the owner's rows keeps the
+// owner check inside the shared helper rather than relying on the caller.
+func (s *Store) ListCompatStateByOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SandboxCompatState, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT cs.sandbox_id, cs.facade, cs.state_json, cs.created_at, cs.updated_at
+		FROM sandbox_compat_state cs
+		JOIN sandboxes s ON s.id = cs.sandbox_id
+		WHERE cs.facade = ? AND s.owner_ref = ?
+		ORDER BY cs.sandbox_id ASC
+	`, strings.TrimSpace(facade), strings.TrimSpace(ownerRef))
+	if err != nil {
+		return nil, fmt.Errorf("list compat state by owner: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SandboxCompatState{}
+	for rows.Next() {
+		state, err := scanCompatState(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan compat state: %w", err)
+		}
+		items[state.SandboxID] = *state
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate compat state: %w", err)
+	}
+	return items, nil
+}
+
 // ResolveSandboxIDByName returns the ID of ownerRef's sandbox called name, or
 // ErrNotFound if no row matches. Names are unique per owner
 // (idx_sandboxes_name), and ownerRef "" is the operator namespace, so at most
