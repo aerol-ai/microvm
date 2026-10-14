@@ -35,6 +35,15 @@ func (e *toolboxHTTPError) Error() string {
 	return http.StatusText(e.StatusCode)
 }
 
+// Guest-controlled toolbox responses and client uploads are bounded so a
+// sandbox or a caller cannot exhaust the daemon's memory or temp disk (S11).
+// The JSON and upload caps mirror the Runloop facade.
+const (
+	maxToolboxJSONBytes  = 64 << 20  // a command's JSON response
+	maxToolboxErrorBytes = 4 << 10   // a toolbox error body
+	maxBulkUploadBytes   = 256 << 20 // a whole multipart upload
+)
+
 func (h *handlers) toolbox(w http.ResponseWriter, r *http.Request) {
 	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("id"))
 	if err != nil {
@@ -169,8 +178,11 @@ func (h *handlers) workDir(w http.ResponseWriter, r *http.Request, sandboxID str
 }
 
 func (h *handlers) bulkUpload(w http.ResponseWriter, r *http.Request, sandboxID string) {
+	// Cap the whole upload so a client cannot fill the daemon's memory or
+	// temp disk during the request (S11).
+	r.Body = http.MaxBytesReader(w, r.Body, maxBulkUploadBytes)
 	if err := r.ParseMultipartForm(64 << 20); err != nil {
-		apihttp.WriteError(w, http.StatusBadRequest, "invalid multipart form")
+		apihttp.WriteError(w, http.StatusBadRequest, "invalid multipart form (or too large)")
 		return
 	}
 
@@ -389,7 +401,9 @@ func (h *handlers) sendToolboxJSON(ctx context.Context, sandboxID, method, path 
 		return resp.StatusCode, readToolboxHTTPError(resp)
 	}
 	if responseBody != nil {
-		if err := json.NewDecoder(resp.Body).Decode(responseBody); err != nil {
+		// The response comes from inside the sandbox; cap it so a guest
+		// printing gigabytes cannot exhaust the daemon's memory (S11).
+		if err := json.NewDecoder(io.LimitReader(resp.Body, maxToolboxJSONBytes)).Decode(responseBody); err != nil {
 			return resp.StatusCode, err
 		}
 	}
@@ -416,7 +430,7 @@ func readToolboxHTTPError(resp *http.Response) error {
 	if resp == nil {
 		return &toolboxHTTPError{StatusCode: http.StatusBadGateway, Message: "toolbox unavailable"}
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxToolboxErrorBytes))
 	message := strings.TrimSpace(string(body))
 	if len(body) > 0 {
 		var payload struct {

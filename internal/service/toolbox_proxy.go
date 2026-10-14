@@ -122,8 +122,30 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 	if err != nil {
 		return nil, err
 	}
+	// WASM and isolate serve their toolbox in-process, like ServeToolboxReverseProxy
+	// — not over the container network (B7). Without the isolate branch a Daytona
+	// or Runloop call on an isolate sandbox dialled 127.0.0.1:<toolboxPort> and
+	// failed with 502. Mirror ServeToolboxReverseProxy's wording so both paths
+	// report the same driver/host errors.
 	if s.isWasmSandbox(sandbox) {
-		return s.roundTripWasmToolbox(ctx, sandbox, method, path, query, body, headers)
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
+		}
+		host, ok := s.wasm.(wasmruntime.ToolboxHost)
+		if !ok {
+			return nil, fmt.Errorf("wasm runtime does not implement toolbox host")
+		}
+		return s.roundTripHostToolbox(ctx, sandbox, host, method, path, query, body, headers)
+	}
+	if s.isIsolateSandbox(sandbox) {
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
+		}
+		host, ok := isolateruntime.AsToolboxHost(s.isolate)
+		if !ok {
+			return nil, fmt.Errorf("isolate runtime does not implement toolbox host")
+		}
+		return s.roundTripHostToolbox(ctx, sandbox, host, method, path, query, body, headers)
 	}
 	req, err := s.newNetworkToolboxRequest(ctx, sandboxID, method, path, query, body, headers)
 	if err != nil {
@@ -132,14 +154,13 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 	return http.DefaultClient.Do(req)
 }
 
-func (s *Service) roundTripWasmToolbox(ctx context.Context, sandbox *models.Sandbox, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
-	if s.wasm == nil {
-		return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
-	}
-	host, ok := s.wasm.(wasmruntime.ToolboxHost)
-	if !ok {
-		return nil, fmt.Errorf("wasm runtime does not implement toolbox host")
-	}
+// toolboxHostServer is the in-process toolbox both the WASM and isolate
+// runtimes expose; roundTripHostToolbox serves a request against either.
+type toolboxHostServer interface {
+	ServeToolbox(ctx context.Context, sandboxID, token string, w http.ResponseWriter, r *http.Request)
+}
+
+func (s *Service) roundTripHostToolbox(ctx context.Context, sandbox *models.Sandbox, host toolboxHostServer, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
 	if path == "" {
 		path = "/"
 	}
