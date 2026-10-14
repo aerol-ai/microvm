@@ -5,6 +5,7 @@
 package apihttp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -62,6 +63,31 @@ func DecodeJSONLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes i
 func ReadJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes)
 	return io.ReadAll(r.Body)
+}
+
+// DecodeAndBufferJSON reads the request body (bounded), decodes it into dst
+// with the same single-value strictness as DecodeJSON, and restores r.Body to
+// the original bytes. A create handler uses it so that when clustercreate
+// forwards the request to the placement target, the target re-reads the full
+// body instead of an empty one (plan B2). Returns the raw bytes.
+func DecodeAndBufferJSON(w http.ResponseWriter, r *http.Request, dst any) ([]byte, error) {
+	raw, err := ReadJSONBody(w, r)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(dst); err != nil {
+		return raw, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return raw, errors.New("request body must contain exactly one JSON value")
+		}
+		return raw, err
+	}
+	return raw, nil
 }
 
 // WriteJSON serializes value as JSON and writes it with the given status.

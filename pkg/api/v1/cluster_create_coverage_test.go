@@ -782,3 +782,27 @@ func TestCreateSandboxOnSelectedNode_SelfWinsPromoteRollbackErrors(t *testing.T)
 		t.Fatalf("DeletePlacement calls = %+v, want none while runtime destruction failed", stub.deleteCalls)
 	}
 }
+
+// The reserved path resolves platform volumes before promote (B3); when
+// resolution fails (here: volumes disabled) it cancels the reservation and
+// surfaces the error instead of promoting a spec with bare volume names.
+func TestCreateSandboxOnSelectedNode_PlatformVolumeResolveFails(t *testing.T) {
+	rt := &apiRecordingRuntime{}
+	stub := &promoteStubCluster{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	h, _ := newClusterCreateHarness(t, rt, stub)
+
+	req := models.CreateSandboxRequest{
+		Image:           "alpine:3.20",
+		PlatformVolumes: []models.PlatformVolumeMount{{Name: "data", Path: "/data"}},
+	}
+	rr := httptest.NewRecorder()
+	httpReq := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil)
+	h.createSandboxOnSelectedNode(rr, httpReq, req, "sb-vol-fail")
+
+	if rr.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status = %d, want 412 (platform volumes disabled); body=%s", rr.Code, rr.Body.String())
+	}
+	if rt.createCalls != 0 {
+		t.Fatal("sandbox was created although volume resolution failed before promote")
+	}
+}

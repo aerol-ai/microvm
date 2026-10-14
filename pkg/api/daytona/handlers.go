@@ -36,7 +36,9 @@ func newHandlers(d Deps) *handlers {
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxRequest
-	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+	// Buffer the body: clustercreate may forward this request to the
+	// placement target, which re-reads the original Daytona wire body (B2).
+	if _, err := apihttp.DecodeAndBufferJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

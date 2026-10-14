@@ -2,6 +2,7 @@ package e2b
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -20,6 +21,7 @@ type e2bForwardCluster struct {
 	reservedID      string
 	forwardedTarget string
 	forwardedID     string
+	forwardedBody   []byte
 }
 
 func (c *e2bForwardCluster) SelectPlacement(capacity.Request) (cluster.PlacementTarget, error) {
@@ -51,6 +53,7 @@ func (c *e2bForwardCluster) ReserveOnTarget(_ context.Context, sandboxID string,
 func (c *e2bForwardCluster) ForwardHTTP(_ cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
 	c.forwardedTarget = r.Header.Get("X-Cluster-Create-Target")
 	c.forwardedID = r.Header.Get("X-Cluster-Create-ID")
+	c.forwardedBody, _ = io.ReadAll(r.Body)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -81,6 +84,10 @@ func TestCreateSandboxClusterForwardSkipsLocalIdempotencyAndRuntime(t *testing.T
 	}
 	if fakeCluster.forwardedTarget != "worker-a" || fakeCluster.forwardedID == "" || fakeCluster.forwardedID != fakeCluster.reservedID {
 		t.Fatalf("forward headers target=%q id=%q reserved=%q", fakeCluster.forwardedTarget, fakeCluster.forwardedID, fakeCluster.reservedID)
+	}
+	// The forwarded request must carry the original E2B wire body (B2).
+	if !strings.Contains(string(fakeCluster.forwardedBody), "base") {
+		t.Fatalf("forwarded body = %q, want the original E2B create body", fakeCluster.forwardedBody)
 	}
 }
 
