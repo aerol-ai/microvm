@@ -823,8 +823,7 @@ func TestCreateSandboxTranslateErrorNonKnown(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLoadTemplateMapEmptyKeyValue(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"":  "someimage", "validkey": ""}`)
-	templates := loadTemplateMap(nil)
+	templates := loadTemplateMap(`{"":  "someimage", "validkey": ""}`, nil)
 	// Empty key / empty value entries should be ignored.
 	if _, ok := templates[""]; ok {
 		t.Fatal("empty key should be ignored in template map")

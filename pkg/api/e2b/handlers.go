@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,8 +38,8 @@ type handlers struct {
 func newHandlers(d Deps) *handlers {
 	return &handlers{
 		deps:           d,
-		templateMap:    loadTemplateMap(d.Logger),
-		clientID:       loadClientID(),
+		templateMap:    loadTemplateMap(d.TemplateMapJSON, d.Logger),
+		clientID:       loadClientID(d.ClientID),
 		defaultEnvdVer: defaultEnvdVersion,
 	}
 }
@@ -1337,9 +1336,9 @@ func stringMap(input map[string]any, field string) (map[string]string, error) {
 	return result, nil
 }
 
-func loadTemplateMap(logger *slog.Logger) map[string]string {
+func loadTemplateMap(raw string, logger *slog.Logger) map[string]string {
 	aliases := map[string]string{"base": "ubuntu:22.04"}
-	raw := strings.TrimSpace(os.Getenv("SB_E2B_TEMPLATE_MAP_JSON"))
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return aliases
 	}
@@ -1363,8 +1362,8 @@ func loadTemplateMap(logger *slog.Logger) map[string]string {
 	return aliases
 }
 
-func loadClientID() string {
-	clientID := strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID"))
+func loadClientID(clientID string) string {
+	clientID = strings.TrimSpace(clientID)
 	if clientID == "" {
 		return defaultClientID
 	}

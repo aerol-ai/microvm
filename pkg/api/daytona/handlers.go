@@ -6,7 +6,6 @@ import (
 	"errors"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -1281,7 +1280,7 @@ func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (s
 	if req.BuildInfo != nil {
 		return h.resolveBuildInfo(ctx, req.BuildInfo)
 	}
-	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
+	if configured := strings.TrimSpace(h.deps.DefaultImage); configured != "" {
 		return configured, "", nil
 	}
 	return "ubuntu:22.04", "", nil

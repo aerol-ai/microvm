@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -184,9 +183,9 @@ func provisioningView(id string, created time.Time, blob devboxBlob, metadata ma
 	}
 }
 
-func loadBlueprintMap(logger *slog.Logger) map[string]string {
+func loadBlueprintMap(raw string, logger *slog.Logger) map[string]string {
 	blueprints := map[string]string{defaultBlueprintKey: defaultImage}
-	raw := strings.TrimSpace(os.Getenv(blueprintMapEnv))
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return blueprints
 	}

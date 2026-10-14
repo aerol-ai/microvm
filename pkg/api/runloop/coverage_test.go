@@ -260,16 +260,13 @@ func TestMetaHelpers(t *testing.T) {
 			t.Fatalf("empty state = %+v, %v", blob, err)
 		}
 	}
-	t.Setenv(blueprintMapEnv, "")
-	if got := loadBlueprintMap(nil); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
+	if got := loadBlueprintMap("", nil); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
 		t.Fatalf("unset map = %v", got)
 	}
-	t.Setenv(blueprintMapEnv, "{bad")
-	if got := loadBlueprintMap(slog.New(slog.NewTextHandler(io.Discard, nil))); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
+	if got := loadBlueprintMap("{bad", slog.New(slog.NewTextHandler(io.Discard, nil))); got[defaultBlueprintKey] != defaultImage || len(got) != 1 {
 		t.Fatalf("invalid map = %v", got)
 	}
-	t.Setenv(blueprintMapEnv, `{"default":"debian:12"," ":"x"}`)
-	if got := loadBlueprintMap(nil); got[defaultBlueprintKey] != "debian:12" || len(got) != 1 {
+	if got := loadBlueprintMap(`{"default":"debian:12"," ":"x"}`, nil); got[defaultBlueprintKey] != "debian:12" || len(got) != 1 {
 		t.Fatalf("override map = %v", got)
 	}
 	if holdFor(nil, time.Second) != time.Second {

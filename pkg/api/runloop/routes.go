@@ -27,6 +27,10 @@ type Deps struct {
 	Service *service.Service
 	Logger  *slog.Logger
 	Auth    func(http.Handler) http.Handler
+	// BlueprintMapJSON maps blueprint names/ids → images
+	// (SB_RUNLOOP_BLUEPRINT_MAP_JSON), read once in config; the facade parses
+	// it and applies its own defaults.
+	BlueprintMapJSON string
 }
 
 type handlers struct {
@@ -42,7 +46,7 @@ type handlers struct {
 func newHandlers(d Deps) *handlers {
 	return &handlers{
 		deps:       d,
-		blueprints: loadBlueprintMap(d.Logger),
+		blueprints: loadBlueprintMap(d.BlueprintMapJSON, d.Logger),
 		creates:    newCreateTracker(),
 		execs:      newExecTracker(),
 		snapshots:  newSnapshotTracker(),

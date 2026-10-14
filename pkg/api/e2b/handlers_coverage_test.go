@@ -658,8 +658,7 @@ func TestParseMetadataFilterEmptyValue(t *testing.T) {
 
 func TestLoadTemplateMapInvalidJSONWithLogger(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "{invalid")
-	m := loadTemplateMap(logger)
+	m := loadTemplateMap("{invalid", logger)
 	if _, ok := m["base"]; !ok {
 		t.Fatal("expected default base template after invalid JSON")
 	}
@@ -757,8 +756,7 @@ func TestWaitForCreateReplayLockedUntilShorterThanPoll(t *testing.T) {
 }
 
 func TestLoadTemplateMapAddsDefaultBase(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"custom":"custom:img"}`)
-	m := loadTemplateMap(nil)
+	m := loadTemplateMap(`{"custom":"custom:img"}`, nil)
 	if m["base"] != "ubuntu:22.04" {
 		t.Fatalf("base = %q, want default ubuntu:22.04", m["base"])
 	}

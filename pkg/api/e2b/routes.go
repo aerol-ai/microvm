@@ -16,6 +16,12 @@ type Deps struct {
 	Service *service.Service
 	Logger  *slog.Logger
 	Auth    func(http.Handler) http.Handler
+	// TemplateMapJSON maps template ids → images (SB_E2B_TEMPLATE_MAP_JSON),
+	// ClientID is the client id the SDK echoes (SB_E2B_CLIENT_ID). Both are
+	// read once in config; the facade parses TemplateMapJSON and applies its
+	// own defaults.
+	TemplateMapJSON string
+	ClientID        string
 }
 
 // RegisterRoutes mounts the supported E2B control-plane compatibility surface.
