@@ -218,3 +218,45 @@ func TestClusterPlacementRequestCarriesWasmRuntime(t *testing.T) {
 		t.Fatal("wasm label without a module ref should fail placement translation")
 	}
 }
+
+// An Idempotency-Key on the cluster path threads into the reservation id, so a
+// retry reserves the same id (ErrReservationConflict routes to the existing
+// placement) instead of placing a second sandbox. Without the key the reserved
+// id is freshly minted each call. On the pre-fix code Prepare always minted a
+// fresh id, so the same-key reservations would differ — this test fails there.
+func TestDaytonaCreateClusterForwardIdempotencyKeyFixesReservedID(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	env := newDaytonaContractEnv(t)
+	fakeCluster := &daytonaForwardCluster{
+		Noop:   cluster.NewNoop("router", "http://router", ""),
+		target: cluster.PlacementTarget{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
+	}
+	env.service.AttachCluster(fakeCluster)
+	h := &handlers{deps: Deps{Service: env.service, Logger: logger}}
+
+	post := func(key string) string {
+		fakeCluster.reservedID = ""
+		req := httptest.NewRequest(http.MethodPost, "/daytona/sandbox", strings.NewReader(`{"snapshot":"alpine:3.20"}`))
+		if key != "" {
+			req.Header.Set("Idempotency-Key", key)
+		}
+		rr := httptest.NewRecorder()
+		h.createSandbox(rr, req)
+		if rr.Code != http.StatusAccepted {
+			t.Fatalf("status = %d, want 202 (forwarded); body=%s", rr.Code, rr.Body.String())
+		}
+		if fakeCluster.reservedID == "" {
+			t.Fatalf("no reservation recorded for key %q", key)
+		}
+		return fakeCluster.reservedID
+	}
+
+	withKey1 := post("key-xyz")
+	withKey2 := post("key-xyz")
+	if withKey1 != withKey2 {
+		t.Fatalf("same key reserved different ids %q vs %q", withKey1, withKey2)
+	}
+	if noKey := post(""); noKey == withKey1 {
+		t.Fatalf("keyless create reused the keyed reservation id %q", noKey)
+	}
+}

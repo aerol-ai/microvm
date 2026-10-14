@@ -80,6 +80,15 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 // the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
 // response straight to w), and the leader's reservation-GC sweep reclaims the
 // row 120s later. This is the documented orphan window in plans/release-blockers.
+// idempotentCreateID derives the opt-in deterministic sandbox id a v1 create
+// reuses across retries. It is empty unless the caller sent an Idempotency-Key
+// header, so a plain POST /v1/sandboxes still mints a fresh sandbox on every
+// call (the pre-existing, non-idempotent default). The id is namespaced by the
+// create owner, so one tenant's key never resolves to another tenant's id.
+func (h *handlers) idempotentCreateID(r *http.Request) string {
+	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+}
+
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -119,12 +128,17 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// selector landed — every create downloading one Member per eligible
 	// worker (~1.7 MB at 2k nodes) only to discard the slice.
 	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteErrorCode, clustercreate.PrepareOptions{
-		Normalize:      normalizeCreateRuntimeForPlacement,
-		OwnerRef:       service.OwnerRefForCreate(r.Context()),
-		SyncBody:       true,
-		MetricPrefix:   "v1.create",
-		OnForwardStale: cluster.RecordOwnerForwardStale,
-		Logger:         h.deps.Logger,
+		// An Idempotency-Key makes the cluster create retry-stable: the derived
+		// id is the reservation id, so a retry lands on ErrReservationConflict
+		// and routes to the existing placement instead of placing a second
+		// sandbox. Empty leaves Prepare to mint a fresh id (the default).
+		PreferredSandboxID: h.idempotentCreateID(r),
+		Normalize:          normalizeCreateRuntimeForPlacement,
+		OwnerRef:           service.OwnerRefForCreate(r.Context()),
+		SyncBody:           true,
+		MetricPrefix:       "v1.create",
+		OnForwardStale:     cluster.RecordOwnerForwardStale,
+		Logger:             h.deps.Logger,
 	})
 	if !ok {
 		return
@@ -203,7 +217,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := h.deps.Service.CreateSandbox(createCtx, req)
+	// Local-only images carry no pre-minted reservation id, so honor the
+	// Idempotency-Key here too: a retry replays the existing sandbox through
+	// CreateSandboxWithID's fast path instead of building a second one.
+	var resp *models.CreateSandboxResponse
+	var err error
+	if preferredID := h.idempotentCreateID(r); preferredID != "" {
+		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, preferredID)
+	} else {
+		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
+	}
 	if err != nil {
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)

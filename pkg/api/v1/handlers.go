@@ -93,7 +93,17 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	// WriteJSON/WriteError — response headers must land before the status line.
 	createStart := time.Now()
 	ctx, createTiming := docker.WithCreateTiming(r.Context())
-	response, err := h.deps.Service.CreateSandbox(ctx, req)
+	// An Idempotency-Key header makes the create retry-stable: the derived id
+	// is reused and CreateSandboxWithID replays the existing owner's sandbox
+	// instead of minting a second one. Without the header the id is empty and
+	// the create keeps its default, mint-fresh-every-call behaviour.
+	var response *models.CreateSandboxResponse
+	var err error
+	if preferredID := h.idempotentCreateID(r); preferredID != "" {
+		response, err = h.deps.Service.CreateSandboxWithID(ctx, req, preferredID)
+	} else {
+		response, err = h.deps.Service.CreateSandbox(ctx, req)
+	}
 	setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {

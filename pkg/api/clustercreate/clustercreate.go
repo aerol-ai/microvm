@@ -3,6 +3,8 @@ package clustercreate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -24,8 +26,33 @@ const (
 	HeaderTarget = "X-Cluster-Create-Target"
 	HeaderID     = "X-Cluster-Create-ID"
 
+	// HeaderIdempotencyKey is the client-supplied create idempotency key the
+	// v1 and Daytona surfaces honor. It is opt-in: a create without it keeps
+	// the default mint-fresh-every-call behaviour, so two deliberate identical
+	// POSTs still make two sandboxes (unlike E2B, which is content-addressed).
+	HeaderIdempotencyKey = "Idempotency-Key"
+
 	ReservationTTL = 120 * time.Second
 )
+
+// DeterministicSandboxID derives a stable sandbox id from an owner reference
+// and a caller-supplied idempotency key, so a retried create (same owner, same
+// key) resolves to the same id and is deduplicated by the reservation /
+// CreateSandboxWithID fast path instead of minting a second sandbox. It returns
+// "" when key is blank — the caller then mints a fresh random id and the create
+// is not idempotent, which keeps the mechanism opt-in. The owner is mixed in so
+// two tenants that happen to choose the same key never collide, and so a
+// derived id satisfies CreateSandboxWithID's owner check on replay. The shape
+// ("sb-" + 16 hex) matches service.GenerateSandboxID, so the id is a valid
+// container name and is indistinguishable downstream from a random one.
+func DeterministicSandboxID(ownerRef, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerRef) + "\x00" + key))
+	return "sb-" + hex.EncodeToString(sum[:8])
+}
 
 // ErrorWriter renders one error in the calling facade's envelope. code is
 // models.ErrorResponse.Code for surfaces that carry it (v1, Daytona); E2B and
