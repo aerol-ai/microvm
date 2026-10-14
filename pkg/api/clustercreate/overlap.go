@@ -24,6 +24,11 @@ const (
 	OverlapPhasePromote = "promote"
 )
 
+// overlapCommitTimeout bounds the seal (concurrent with the create) and,
+// separately, the promote that runs after the create+seal join. A var so tests
+// can shrink it.
+var overlapCommitTimeout = 5 * time.Second
+
 // OverlapFailure is returned when the create leg, seal leg, or the post-join
 // promote fails. Retract has already been attempted; the handler should
 // surface Err (not invent a new shape). Phase distinguishes create vs seal vs
@@ -108,7 +113,7 @@ func OverlapCreateAndPromote(
 	// commitCtx is derived from the request so an overall deadline still
 	// bounds seal+promote, but we NEVER treat cancelling it as cleanup: a
 	// Raft apply can fail client-side and still land in the FSM (§2.2).
-	commitCtx, commitCancel := context.WithTimeout(ctx, 5*time.Second)
+	commitCtx, commitCancel := context.WithTimeout(ctx, overlapCommitTimeout)
 	defer commitCancel()
 	sealStart := time.Now()
 	binding, bindingErr := svc.ReservedSecretBinding(commitCtx, reservationID)
@@ -184,13 +189,20 @@ func OverlapCreateAndPromote(
 		sr.secrets.OwnerRef = cr.resp.Sandbox.OwnerRef
 	}
 
+	// The promote runs only after the create and seal legs have joined, so it
+	// must not share the seal's commitCtx: that 5s clock started before the
+	// create leg, so a create slower than 5s (a cold image pull or boot) would
+	// leave commitCtx already expired and fail the promote with a deadline even
+	// though the sandbox is up (B13). Give the promote its own fresh 5s.
+	promoteCtx, promoteCancel := context.WithTimeout(ctx, overlapCommitTimeout)
+	defer promoteCancel()
 	promoteStart := time.Now()
 	var promoteErr error
 	if opts.PromoteWithSpec {
 		redacted := service.RedactClusterSecrets(req)
-		promoteErr = c.RecordPlacement(commitCtx, reservationID, &redacted, sr.secrets)
+		promoteErr = c.RecordPlacement(promoteCtx, reservationID, &redacted, sr.secrets)
 	} else {
-		promoteErr = c.RecordPlacement(commitCtx, reservationID, nil, sr.secrets)
+		promoteErr = c.RecordPlacement(promoteCtx, reservationID, nil, sr.secrets)
 	}
 	if opts.Timing != nil {
 		opts.Timing.RecordStage("cluster_promote", time.Since(promoteStart))

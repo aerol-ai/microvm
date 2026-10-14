@@ -215,7 +215,12 @@ func seedReservedPlacement(s *clusterStub, sandboxID string) {
 	}
 }
 
-func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+func (s *clusterStub) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+	// Honor the context like the real Raft-backed promote: an expired promote
+	// budget must surface, so the B13 fresh-timeout fix is observable.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.onRecord != nil {
 		s.onRecord()
 	}
@@ -1682,5 +1687,34 @@ func TestWriteNoEgressGateway(t *testing.T) {
 	_ = json.Unmarshal(rr.Body.Bytes(), &body)
 	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}
+
+// TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate pins B13:
+// the promote runs after the create+seal join on its own fresh budget, so a
+// create slower than the commit budget no longer expires the promote and fails
+// it even though the sandbox is up.
+func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testing.T) {
+	prev := overlapCommitTimeout
+	overlapCommitTimeout = 50 * time.Millisecond
+	defer func() { overlapCommitTimeout = prev }()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-slow-create")
+	rt := newFakeRuntime()
+	rt.createDelay = 200 * time.Millisecond // > overlapCommitTimeout
+	svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
+
+	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger,
+		models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-slow-create", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("OverlapCreateAndPromote with a create slower than the commit budget: %v", err)
+	}
+	if resp.Sandbox.ID != "sb-slow-create" {
+		t.Fatalf("sandbox id = %q", resp.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != 1 {
+		t.Fatalf("RecordPlacement calls = %d, want 1 (promote must succeed on its fresh budget)", len(stub.recordCalls))
 	}
 }
