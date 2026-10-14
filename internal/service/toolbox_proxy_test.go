@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -444,5 +445,40 @@ func TestRoundTripToolbox_IsolateNotToolboxHost(t *testing.T) {
 	}
 	if _, err := svc.RoundTripToolbox(ctx, "sb-iso-nohost", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "does not implement toolbox host") {
 		t.Fatalf("isolate round trip without a toolbox host = %v; want a toolbox-host error", err)
+	}
+}
+
+// ToolboxTarget must refuse a sandbox that is not running: Docker/containerd
+// keep a stale ContainerIP on stop, and dialing it would hand this sandbox's
+// toolbox token to whatever container reused that address (S12).
+func TestToolboxTargetRejectsStoppedSandbox(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+
+	// Stopped sandbox with a stale IP still on the row.
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-stopped", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStopped,
+		ContainerIP: "10.0.0.9", ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create stopped: %v", err)
+	}
+	if _, err := svc.ToolboxTarget(ctx, "sb-stopped"); !errors.Is(err, ErrSandboxNotRunning) {
+		t.Fatalf("ToolboxTarget(stopped) = %v, want ErrSandboxNotRunning", err)
+	}
+
+	// A started sandbox still resolves to its address.
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-running", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStarted,
+		ContainerIP: "10.0.0.10", ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create running: %v", err)
+	}
+	ep, err := svc.ToolboxTarget(ctx, "sb-running")
+	if err != nil {
+		t.Fatalf("ToolboxTarget(running): %v", err)
+	}
+	if ep.URL == "" || ep.Token != "tok" {
+		t.Fatalf("running endpoint = %+v", ep)
 	}
 }
