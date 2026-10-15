@@ -18,7 +18,7 @@ BIN_DIR ?= bin
 	integration-cert-store-init integration-clear-lease \
 	itest-build itest-publish itest-artifacts-init \
 	integration-secrets-single integration-secrets-cluster integration-secrets-kms \
-	integration-secrets-enterprise integration-secrets-hetero integration-secrets-hetero-kms \
+	integration-secrets-enterprise integration-secrets-enterprise-single integration-secrets-hetero integration-secrets-hetero-kms \
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
 	integration-routing integration-routing-hetero-lite \
@@ -143,6 +143,12 @@ integration-secrets-kms:
 
 integration-secrets-enterprise:
 	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)
+
+# Enterprise mode on one server with the stock daemon and an S3 Object Lock
+# witness (plans/open-audit-witness.md, Phase 4); the release smoke (T24) runs
+# the same scenario against a published tag.
+integration-secrets-enterprise-single:
+	integration-tests/run.sh single-node-secrets-enterprise $(RUN_FLAGS)
 
 # S1→S4 in order, cheapest first: a red S1 means the cluster scenarios are not
 # worth paying for. Sequential on purpose — they share the domain pool.

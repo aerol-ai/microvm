@@ -64,6 +64,14 @@ func NodePrefix(prefix, nodeID string) string {
 	return path.Join(cleanPrefix(prefix), "node="+nodeID) + "/"
 }
 
+// CanaryKey is where nodeID's boot canary writes. Every boot leaves one
+// locked version there and no delete marker, because both of the canary's
+// deletes must be refused before the node may start; the integration suite
+// reads the key back to prove that on a real bucket.
+func CanaryKey(prefix, nodeID string) string {
+	return path.Join(cleanPrefix(prefix), "canary", "node="+nodeID)
+}
+
 func cleanPrefix(prefix string) string {
 	return strings.Trim(strings.TrimSpace(prefix), "/")
 }

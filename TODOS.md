@@ -109,9 +109,10 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   that legitimately destroys evidence has no live coverage at all.
 - **Now:** the case skips on enterprise with that reason (it is not a pass).
 - **Unblock:** a test-only way to make records prunable under enterprise,
-  e.g. an `itestretention` build tag (same pattern as `itestwitness`,
-  `cmd/sandboxd/provider_itest.go`) that lets retention be expressed in
-  minutes. Do not relax the enterprise validator for it.
+  e.g. an `itestretention` build tag that lets retention be expressed in
+  minutes (the `itestwitness` tag that set that precedent is gone: the
+  enterprise scenarios now use the S3 witness and the shipped daemon). Do not
+  relax the enterprise validator for it.
 
 ## A resealed secret whose replacement holder is dead never re-seals (cluster secrets)
 

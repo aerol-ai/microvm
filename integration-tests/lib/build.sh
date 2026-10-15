@@ -2,7 +2,7 @@
 # build.sh — build the daemon artifacts LOCALLY and hand the integration
 # harness presigned URLs to provision from. See plans/integration-test-security.md §4.
 #
-#   build.sh build   [--ref <commit>] [--arch amd64,arm64] [--with-caddy] [--with-receiver] [--with-itest-witness]
+#   build.sh build   [--ref <commit>] [--arch amd64,arm64] [--with-caddy] [--with-receiver]
 #   build.sh publish [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh urls    [--ref <commit>] [--ttl 12h] [--arch ...]
 #   build.sh artifacts-init
@@ -57,10 +57,6 @@ BOOTSTRAP_SCRIPTS_OPTIONAL=(cluster-sign-node.sh)
 ARCHES=()
 WITH_CADDY=0
 WITH_RECEIVER=0
-WITH_ITEST_WITNESS=0
-# WITNESS_DAEMON makes `urls`/`publish` point sandboxd_url at the
-# -tags itestwitness artifact instead of the shipped one.
-WITNESS_DAEMON=0
 REF=""
 TTL_SECONDS=43200 # 12h — covers a slow *.metal provision (§4.2)
 
@@ -127,8 +123,6 @@ parse_common_flags() {
       --arch)          arch_csv="${2:?--arch needs amd64[,arm64]}"; shift 2 ;;
       --with-caddy)    WITH_CADDY=1; shift ;;
       --with-receiver) WITH_RECEIVER=1; shift ;;
-      --with-itest-witness) WITH_ITEST_WITNESS=1; shift ;;
-      --witness-daemon) WITNESS_DAEMON=1; WITH_ITEST_WITNESS=1; shift ;;
       --ttl)           TTL_SECONDS=$(parse_ttl "${2:?--ttl needs a duration}"); shift 2 ;;
       *) die "unknown flag: $1" ;;
     esac
@@ -280,19 +274,6 @@ build_one_arch() {
     fi
   fi
 
-  if (( WITH_ITEST_WITNESS )); then
-    # A SEPARATE artifact, never a replacement for sandboxd. The default path
-    # must keep provisioning the exact binary a release ships; only a scenario
-    # that needs enterprise (which cannot boot without a non-noop witness)
-    # points sandboxd_url at this one.
-    log "build: sandboxd-witness_linux_${arch} (CGO=1, -tags itestwitness)"
-    ( cd "$src" && CGO_ENABLED=1 GOOS=linux GOARCH="$goarch" \
-        CC="zig cc -target ${zig_target}" CXX="zig c++ -target ${zig_target}" \
-        go build -trimpath -tags itestwitness -ldflags "$ldflags" \
-        -o "${out}/sandboxd-witness_linux_${arch}" ./cmd/sandboxd )
-    assert_linux_elf "${out}/sandboxd-witness_linux_${arch}" "$arch"
-  fi
-
   if (( WITH_CADDY )); then
     # D5: Caddy is normally REUSED from the release, because this program does
     # not touch pkg/caddy. Building it is opt-in for the case where it does.
@@ -416,8 +397,7 @@ build_matches_request() {
   for arch in "${ARCHES[@]}"; do
     [[ -f "${out}/sandboxd_linux_${arch}" ]] || return 1
     [[ -f "${out}/toolboxd_linux_${arch}" ]] || return 1
-    (( WITH_CADDY ))         && { [[ -f "${out}/caddy_linux_${arch}" ]]            || return 1; }
-    (( WITH_ITEST_WITNESS )) && { [[ -f "${out}/sandboxd-witness_linux_${arch}" ]] || return 1; }
+    (( WITH_CADDY )) && { [[ -f "${out}/caddy_linux_${arch}" ]] || return 1; }
     # The receiver is source-dependent: a ref that predates it legitimately
     # produces no artifact, so requiring one here would make every build on
     # such a ref a cache MISS forever. Compare against what the recorded build
@@ -481,7 +461,6 @@ write_buildinfo() {
   "arches": [$(printf '"%s",' "${ARCHES[@]}" | sed 's/,$//')],
   "with_caddy": $( ((WITH_CADDY)) && echo true || echo false ),
   "with_receiver": $( ((WITH_RECEIVER)) && echo true || echo false ),
-  "with_itest_witness": $( ((WITH_ITEST_WITNESS)) && echo true || echo false ),
   "receiver_built": $( compgen -G "${out}/audit-receiver_linux_*" >/dev/null && echo true || echo false ),
   "zig_version": "$(zig version)",
   "zig_target_amd64": "${ZIG_TARGET_amd64}",
@@ -601,14 +580,14 @@ cmd_publish() {
   # built BOTH times. That is what makes an iterate-against---keep loop cost
   # nothing.
   #
-  # It is NOT enough on its own. The OPTIONAL assets (--with-receiver,
-  # --with-itest-witness, arm64) are built on demand, so the same id can name
-  # a larger artifact set than the one already in the bucket. Skipping on the
+  # It is NOT enough on its own. The OPTIONAL assets (--with-caddy,
+  # --with-receiver, arm64) are built on demand, so the same id can name a
+  # larger artifact set than the one already in the bucket. Skipping on the
   # id alone silently published nothing, and the failure surfaced much later
-  # and somewhere else:
+  # and somewhere else, when `urls` could not find an artifact the build had
+  # produced (it was the since-retired itest witness daemon at the time):
   #
   #   publish: 12a207585609 already in s3://… — skipping upload
-  #   build.sh: --witness-daemon: sandboxd-witness_linux_amd64 is not published
   #
   # So the skip has to prove the bucket holds everything this build produced,
   # not just that the id is known.
@@ -684,11 +663,6 @@ emit_urls() {
   # Present on this branch, absent on older refs. When it IS published it must
   # be the URL the seed uses: the CSR signing rendezvous needs the branch's
   # signer, not whatever releases/latest happens to hold.
-  local have_witness=0
-  if "${AWSCLI[@]}" --region "$region" s3api head-object \
-      --bucket "$bucket" --key "${prefix}/sandboxd-witness_linux_${arch}" >/dev/null 2>&1; then
-    have_witness=1
-  fi
   local have_receiver=0
   if "${AWSCLI[@]}" --region "$region" s3api head-object \
       --bucket "$bucket" --key "${prefix}/audit-receiver_linux_${arch}" >/dev/null 2>&1; then
@@ -709,16 +683,7 @@ emit_urls() {
   log "urls: presigning ${build_id} (ttl ${TTL_SECONDS}s)"
 
   printf '# generated by integration-tests/lib/build.sh — AEROL_BUILD_ID=%s\n' "$build_id"
-  if (( WITNESS_DAEMON )); then
-    # An enterprise scenario CANNOT use the shipped binary: enterprise forces
-    # SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon refuses to boot without a
-    # non-noop controlplane.Witness, which only the tagged build supplies.
-    (( have_witness )) || die "--witness-daemon: sandboxd-witness_linux_${arch} is not published (build with --with-itest-witness)"
-    printf 'sandboxd_url            = "%s"  # -tags itestwitness\n' \
-      "$(presign "$bucket" "$region" "${prefix}/sandboxd-witness_linux_${arch}")"
-  else
-    printf 'sandboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/sandboxd_linux_${arch}")"
-  fi
+  printf 'sandboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/sandboxd_linux_${arch}")"
   printf 'toolboxd_url            = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/toolboxd_linux_${arch}")"
   printf 'checksums_url           = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/checksums.txt")"
   printf 'install_script_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/install.sh")"
@@ -730,13 +695,6 @@ emit_urls() {
   if (( have_receiver )); then
     printf 'audit_receiver_url      = "%s"\n' "$(presign "$bucket" "$region" "${prefix}/audit-receiver_linux_${arch}")"
   fi
-  if (( have_witness && ! WITNESS_DAEMON )); then
-    # Inert hint: pass --witness-daemon (or advertise the audit-witness
-    # capability, which makes run.sh pass it) to select this build instead.
-    printf '# sandboxd_url          = "%s"  # -tags itestwitness (enterprise scenarios)\n' \
-      "$(presign "$bucket" "$region" "${prefix}/sandboxd-witness_linux_${arch}")"
-  fi
-
   # §3.3, the caddy trap. install.sh checksum-verifies the Caddy download
   # against OUR checksums.txt unless --caddy-binary-url was passed explicitly.
   # A checksums.txt carrying only sandboxd+toolboxd therefore BREAKS the Caddy

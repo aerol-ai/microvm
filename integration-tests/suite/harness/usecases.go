@@ -154,8 +154,12 @@ const (
 	// endpoint). Both halves matter: enterprise boot requires an off-node
 	// backend, but a case can only assert delivery if it can read the sink.
 	CapAuditExport Capability = "audit-export"
-	// CapAuditWitness means the external witness is wired to a receiver that
-	// retains chain heads and issues receipts.
+	// CapAuditWitness means the scenario has an external witness: an S3
+	// Object Lock bucket (Terraform audit_witness_enabled) that every node
+	// writes its chain heads to, and that the suite reads with the
+	// operator's credentials (AEROL_AUDIT_WITNESS_*, exported by run.sh) to
+	// check heads, plant a disagreeing one and count canary versions. The
+	// shipped daemon, not a test build, is what writes to it.
 	CapAuditWitness Capability = "audit-witness"
 	// CapSimulations gates the suite/sims workload catalogue and UC-108
 	// (per-sim pass/fail). Opt-in like CapBenchmark: slow, provisions long-
@@ -530,6 +534,10 @@ var Registry = []UseCase{
 	{ID: "UC-144", Title: "Witness fail-closed at boot: a receipt disagreeing with the local chain refuses the node", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
 	{ID: "UC-145", Title: "Ingest endpoint: a tokened event is accepted, an untokened one refused, listener loopback-only", Requires: []Capability{CapSecrets, CapCluster, CapEnterprise}, Implemented: true},
 	{ID: "UC-145b", Title: "Retention prune holds while export lags, then verifies across the checkpoint boundary", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	// Numbered after the facade block because it arrived after it; it belongs
+	// with the witness cases. Needs only the witness: the canary runs on every
+	// boot with SB_AUDIT_WITNESS_BACKEND set, enterprise or not.
+	{ID: "UC-263", Title: "Witness canary: every node's boot left a locked canary version and no delete marker, so the node role can neither delete nor hide a head", Requires: []Capability{CapAuditWitness}, Implemented: true},
 
 	// G. Quota, rate limits, overflow (F8).
 	{ID: "UC-146", Title: "Per-identity audit rate limit returns 429 with Retry-After; a second identity is unaffected", Requires: []Capability{CapSecrets}, Implemented: true},

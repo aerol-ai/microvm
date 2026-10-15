@@ -297,9 +297,10 @@ func TestAuditEvidenceSurvivesOwnerDeath(t *testing.T) {
 // log used to say.
 //
 // The fault is injected AT THE WITNESS, which is where it has to be — the
-// gate calls Witness.LastWitnessedHead at boot. An invented env knob would
-// have produced a case that skips forever, which the plan calls the worst of
-// the available options.
+// gate calls Witness.LastWitnessedHead at boot. It is a new version on the
+// victim's key for today in the real S3 Object Lock bucket, written with the
+// operator's credentials. An invented env knob would have produced a case
+// that skips forever, which the plan calls the worst of the available options.
 func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	harness.Require(t, sc, "UC-144")
 	if !harness.DisruptiveAllowed() {
@@ -309,58 +310,84 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	receiver, ok := harness.FindReceiverNode(t, targets)
-	if !ok {
-		t.Skip("no audit receiver provisioned in this scenario")
-	}
+	witness := harness.RequireWitnessBucket(t)
 	c := client(t)
 
 	// Pick a non-seed victim where possible: refusing the seed's boot on a
-	// cluster costs the rendezvous every joiner needs.
+	// cluster costs the rendezvous every joiner needs. A single server has no
+	// rendezvous to lose, and the single-node enterprise scenario exists to
+	// prove this gate on one box, so there the seed is the victim.
 	victim, ok := pickNonSeedNode(targets)
-	if !ok {
-		t.Skip("no SSH-reachable non-seed node to refuse")
+	if !ok && !sc.Has(harness.CapCluster) {
+		victim, ok = harness.PickRestartableNode(targets)
 	}
+	if !ok {
+		t.Skip("no SSH-reachable node to refuse")
+	}
+	// Resolved while the API still answers: on a single server, stopping the
+	// victim below takes the API down with it.
 	victimNodeID := heteroNodeID(t, c, targets, victim.Name)
+	victimTarget, _ := harness.SSHTarget(victim)
 
-	previous, hadPrevious, err := harness.WitnessedHeadFor(t, receiver, victimNodeID)
-	if err != nil {
-		t.Fatalf("read the current witnessed head for %s: %v", victimNodeID, err)
+	// Stop the victim BEFORE planting. Its ship loop reads the witness before
+	// every ship, and a head it did not ship is counted as foreign and then
+	// buried under its own head on that same tick (D23). A plant made while it
+	// runs therefore lasts at most one interval, and when that tick lands
+	// before the restart below, the victim boots against its own head and the
+	// case reports a gate that failed open. Stopped, only this case writes the
+	// victim's key; the loop does not ship on shutdown, so the stop writes
+	// nothing either. Registered first so it runs last: whatever fails below,
+	// the head is restored before the victim is started again.
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
+
+	// The head to restore with, read while the daemon is stopped so it cannot
+	// move: the last head the victim shipped (witness_tip.json), which its own
+	// chain contains. Read BEFORE planting, because Object Lock means a plant
+	// is never deleted, only buried under a newer version: without a head to
+	// bury it under, the victim could never boot under its node id again.
+	out, err := harness.SSHRun(t, victimTarget, nodeWitnessTipScript)
+	ownHead := lastNonEmptyLineSuite(out)
+	if err != nil || len(ownHead) != 64 {
+		t.Skipf("%s has no witness tip to restore with (%v): %q. It has never shipped a head (an empty chain), and planting one it could never bury would leave it unbootable under its node id",
+			victim.Name, err, strings.TrimSpace(out))
 	}
 
 	// A head that is well-formed but cannot be anywhere in the node's chain.
 	const plantedHead = "0000000000000000000000000000000000000000000000000000000000000000"
-	if err := harness.PlantWitnessHead(t, receiver, victimNodeID, plantedHead); err != nil {
-		t.Fatalf("plant a disagreeing head: %v", err)
-	}
-	victimTarget, _ := harness.SSHTarget(victim)
-	restoredHead := false
+	planted, restored := false, false
 	restoreHead := func() {
-		if restoredHead {
+		if !planted || restored {
 			return
 		}
-		restoredHead = true
-		// Put back a head the node's chain contains. A refused boot no longer
-		// re-ships over the witness (that was the bug this case caught), so
-		// leaving the planted head — or, with no previous head, doing nothing
-		// — refuses every later boot of this node, for good.
-		head := previous
-		if !hadPrevious {
-			out, err := harness.SSHRun(t, victimTarget, nodeWitnessTipScript)
-			head = lastNonEmptyLineSuite(out)
-			if err != nil || len(head) != 64 {
-				t.Errorf("RESTORE FAILED: cannot read %s's own witness tip to un-plant the head (%v): %q", victim.Name, err, strings.TrimSpace(out))
-				return
-			}
-		}
-		if rerr := harness.PlantWitnessHead(t, receiver, victimNodeID, head); rerr != nil {
-			t.Errorf("RESTORE FAILED: the witness still holds a planted head for %s and every later boot of that node will refuse: %v", victimNodeID, rerr)
+		restored = true
+		// Only the newest version counts at boot, so burying the plant under
+		// the victim's own head is a full restore; the planted version stays
+		// locked in the bucket's history. A refused boot never re-ships over
+		// the witness (that was the bug this case caught), so skipping this
+		// refuses every later boot of this node.
+		if rerr := harness.PlantWitnessHead(t, witness, victimNodeID, ownHead); rerr != nil {
+			t.Errorf("RESTORE FAILED: the newest witnessed head for %s is still the planted one, and every later boot of that node will refuse: %v", victimNodeID, rerr)
 		}
 	}
 	t.Cleanup(restoreHead)
 
-	// WithNodeEnv with no variables restarts the node and always puts it back
-	// — including when the boot is refused, which is the expected outcome.
+	if err := harness.PlantWitnessHead(t, witness, victimNodeID, plantedHead); err != nil {
+		t.Fatalf("plant a disagreeing head: %v", err)
+	}
+	planted = true
+	// Prove the plant is the newest head, read the way the victim's boot reads
+	// it. A plant that did not land, or landed under a prefix that drifted from
+	// the node's, would let the boot succeed, and this case would report a gate
+	// that failed open for a reason unrelated to the gate. (What this cannot
+	// see is this machine and the node disagreeing about the UTC date at
+	// midnight; PlantWitnessHead says why that window is accepted.)
+	if got, present, rerr := harness.WitnessedHeadFor(t, witness, victimNodeID); rerr != nil || !present || got != plantedHead {
+		t.Fatalf("the planted head is not the newest the witness holds for %s (got %q, present=%v, err=%v); the boot below would test nothing",
+			victimNodeID, got, present, rerr)
+	}
+
+	// WithNodeEnv with no variables starts the node and always puts it back —
+	// including when the boot is refused, which is the expected outcome.
 	harness.WithNodeEnv(t, victim, nil, func(res harness.NodeBootResult) {
 		// Un-plant BEFORE WithNodeEnv's restore restarts the node, even if an
 		// assertion below fails. From t.Cleanup it ran after that restart,

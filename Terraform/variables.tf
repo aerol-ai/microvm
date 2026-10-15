@@ -709,9 +709,10 @@ variable "audit_witness_auditor_policy_enabled" {
 # Audit receiver fixture (plans/integration-test-security.md §6.4).
 #
 # One small binary, built by the same pipeline and shipped over the same
-# presigned URL, run as a systemd unit on the seed. Webhook export and the
-# audit-chain witness both need something listening; without it a scenario can
-# only assert that the daemon TRIED to export.
+# presigned URL, run as a systemd unit on the seed. Webhook export needs
+# something listening; without it a scenario can only assert that the daemon
+# TRIED to export. (The audit witness is the S3 Object Lock bucket above, not
+# this fixture.)
 variable "audit_receiver_enabled" {
   description = "Run the audit-receiver fixture on the seed and point webhook export at it."
   type        = bool

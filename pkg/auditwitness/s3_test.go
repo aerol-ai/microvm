@@ -89,12 +89,12 @@ func (f *fixture) latest(t *testing.T) (string, bool, error) {
 func TestHeadKeyLayout(t *testing.T) {
 	day := time.Date(2026, 10, 11, 23, 59, 0, 0, time.FixedZone("x", -5*3600))
 	cases := []struct {
-		prefix, key, node string
+		prefix, key, node, canary string
 	}{
-		{"witness/", "witness/node=n1/day=2026-10-12/head.json", "witness/node=n1/"},
-		{"witness", "witness/node=n1/day=2026-10-12/head.json", "witness/node=n1/"},
-		{"/a/b/", "a/b/node=n1/day=2026-10-12/head.json", "a/b/node=n1/"},
-		{"", "node=n1/day=2026-10-12/head.json", "node=n1/"},
+		{"witness/", "witness/node=n1/day=2026-10-12/head.json", "witness/node=n1/", "witness/canary/node=n1"},
+		{"witness", "witness/node=n1/day=2026-10-12/head.json", "witness/node=n1/", "witness/canary/node=n1"},
+		{"/a/b/", "a/b/node=n1/day=2026-10-12/head.json", "a/b/node=n1/", "a/b/canary/node=n1"},
+		{"", "node=n1/day=2026-10-12/head.json", "node=n1/", "canary/node=n1"},
 	}
 	for _, c := range cases {
 		if got := HeadKey(c.prefix, "n1", day); got != c.key {
@@ -102,6 +102,9 @@ func TestHeadKeyLayout(t *testing.T) {
 		}
 		if got := NodePrefix(c.prefix, "n1"); got != c.node {
 			t.Errorf("NodePrefix(%q) = %q, want %q", c.prefix, got, c.node)
+		}
+		if got := CanaryKey(c.prefix, "n1"); got != c.canary {
+			t.Errorf("CanaryKey(%q) = %q, want %q", c.prefix, got, c.canary)
 		}
 	}
 }
