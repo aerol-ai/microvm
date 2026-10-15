@@ -1,6 +1,6 @@
 # Open audit witness: enterprise mode in the open-source build
 
-Status: decisions made 2026-10-11; engineering review done 2026-10-11, and its decisions (D1–D17, in the review at the end of this file) are folded into the sections below. Founder decision: make enterprise mode usable in the free download.
+Status: founder decisions made 2026-10-11 (F1–F5, under "Decisions"); engineering review done 2026-10-11, and its decisions (D1–D18, in the review below) are folded into the sections below. A follow-up review on 2026-10-16 (D19–D24, in "Follow-up review" at the end of this file) corrected five of those decisions against the code and AWS behavior; its changes are folded in too. Founder decision: make enterprise mode usable in the free download.
 
 ## In one paragraph
 
@@ -50,7 +50,7 @@ This repeats the property from `plans/secrets-hardening.md` so the docs never ov
 
 - **Records written since the last ship.** Heads ship every 30 seconds (`SB_SECRET_AUDIT_WITNESS_INTERVAL`), so the newest 30 seconds can be rewritten. The interval is a security setting.
 - **A server that was already compromised when it wrote.** It can write a forged chain and witness it from the start.
-- **That a newer forged head is false.** A compromised node can still write a new head that matches a rewritten chain. The daemon's boot check looks only at the **latest** head, so it passes. The **offline verifier** (Phase 5) catches this, because it checks every head ever written and those cannot be removed. It proves each witnessed head links to the next with records from the local log **and the off-node export**, because retention prunes the local log and leaves a checkpoint the node writes about itself (D5). The verifier is what makes this claim complete, so it is part of v1.
+- **That a newer forged head is false.** A compromised node can still write a new head that matches a rewritten chain. The daemon's boot check looks only at the **latest** head, so it passes. The **offline verifier** (Phase 5) catches this, because it checks every head witnessed inside the time window the auditor names, and those cannot be removed. It proves each witnessed head links to the next with records from the local log **and the off-node export**, because retention prunes the local log and leaves a checkpoint the node writes about itself (D5). The window comes from the auditor, never from the evidence, so an attacker who deletes the oldest records cannot shrink what gets checked (D22). The verifier is what makes this claim complete, so it is part of v1.
 
 ## Design
 
@@ -92,9 +92,10 @@ With a backend set, `SB_NODE_ID` is required and must not be `standalone`. The w
 
 - Object Lock requires versioning, so every write adds a **new version**. Older versions stay, locked.
 - A key holds at most one day of ships: 2,880 versions at the 30 s default. AWS recommends fewer than 100,000 versions per object, and a single key per node would pass that after about 34 days of locked history.
-- "The latest head" is a `GetObject` of today's key. When today's key has no current version, one `ListObjectVersions` with `Delimiter` under `node=<id>/` finds the newest day, then a `GetObject` of that day's key. It must be `ListObjectVersions`, not `ListObjectsV2`: `ListObjectsV2` hides a key whose current version is a delete marker, and the fallback would then validate against the previous day's head (C2).
+- "The latest head" is a `GetObject` of today's key. When today's key has no current version, one `ListObjectVersions` with `Delimiter` under `node=<id>/` finds the newest day, then a `GetObject` of that day's key. It must be `ListObjectVersions`, not `ListObjectsV2`: `ListObjectsV2` hides a key whose current version is a delete marker, and the fallback would then validate against the previous day's head (C2). The fallback depends on S3 answering 404 `NoSuchKey` for today's missing key, and S3 does that only when the caller holds `s3:ListBucket`; without it, S3 answers 403 `AccessDenied` (D19).
+- **An idle node still writes once a day (D20).** The ship loop writes only when the head changes. Without help, an idle node would have no key for today after UTC midnight, and every tick would pay a GET that misses, a LIST and a second GET. So the service re-ships an unchanged head on its first tick of each UTC day. Today's key then exists on every running node, the LIST runs only on a boot after downtime across midnight, and a node whose newest version is more than a day old has really stopped shipping.
 - Ordering within a day comes from S3. The day comes from the node's clock, so a clock jump across midnight can make boot read the wrong day; that fails closed, never silently.
-- The full history is `ListObjectVersions` under `node=<id>/`, ordered by S3 `LastModified`, which the verifier uses.
+- The full history is `ListObjectVersions` under `node=<id>/`, which the verifier uses. Within a key, the order is S3's own version order; across keys it is `LastModified`, with ties broken by the day key. `LastModified` alone is not enough, because list results carry it only to the second (D22).
 
 The object body is a small JSON document, about 300 bytes, and never holds audit payloads:
 
@@ -111,6 +112,7 @@ The object body is a small JSON document, about 300 bytes, and never holds audit
 | `WitnessHeads(heads)` | `PutObject` on today's key with `ChecksumAlgorithm: SHA256` | Exactly one head per call; any other count is an error (D11). **Gotcha:** S3 rejects any upload to a bucket with default Object Lock retention unless it carries `Content-MD5` or an SDK checksum. The shared client uses `RequestChecksumCalculationWhenRequired`, so set the algorithm explicitly. The receipt is `ReceiptID = VersionId`; `RecordedAt` stays zero, so the service stores `ShippedAt`. The witness-side time the original design requires (so an attacker cannot backdate a forged chain) is the version's `LastModified` in the bucket, which the node cannot change and the verifier reads. No `HeadObject` (D10). |
 | `LastWitnessedHead(node)`, found | `GetObject` on today's key, else on the newest day's key | Returns `head_hex`, `ok=true` |
 | `LastWitnessedHead(node)`, no current version | `ListObjectVersions` with `Delimiter` under `node=<id>/`, then on the newest day's key | No versions anywhere means "never recorded": `ok=false`, no error. If the newest day's latest entry is a **delete marker**, return an **error**. The daemon never deletes, so a delete marker means someone tried to hide the head. The daemon then fails closed through the existing path. |
+| `LastWitnessedHead("standalone")` | none | `ok=false` without a request. D3 means no S3 head can exist under that id, and the service's legacy-id fallback would otherwise read a key any node's role can write (D24). |
 
 `heads` holds one entry today (`shipSecretAuditHeadNow`), and the backend rejects any other count (D11).
 
@@ -121,7 +123,8 @@ The object body is a small JSON document, about 300 bytes, and never holds audit
 1. `GetBucketVersioning` returns `Enabled`.
 2. `GetObjectLockConfiguration` shows Object Lock enabled, with a **default retention rule**.
 3. Default retention is at least `SB_SECRET_AUDIT_RETENTION_DAYS`. A head must outlive the local records it vouches for.
-4. **Canary** (recommended; see Decisions): put `<prefix>canary/node=<id>`, then `DeleteObject` with that `VersionId` **and `BypassGovernanceRetention=true`**, the way an attacker would. Expect `AccessDenied`. If the delete succeeds, the lock is not protecting this node's writes, so refuse to start; on a governance bucket the message names `s3:BypassGovernanceRetention`. Any other error also refuses to start, because an unknown result is not proof of safety. Without the header, a governance lock refuses even a role that holds bypass, so the check would pass a role an attacker can use (D7). This costs two small objects per boot.
+4. **Missing-key probe (D19):** `GetObject` on a random key under `<prefix>probe/` must answer `NoSuchKey`. `AccessDenied` means the role lacks `s3:ListBucket`, so every missing key would later look like an error, and the first boot after an idle midnight would fail. Refuse to start and name the permission. The key is random so that no writer can make it exist. This costs one call per boot.
+5. **Canary** (recommended; see Decisions, F4): put `<prefix>canary/node=<id>`, then `DeleteObject` with that `VersionId` **and `BypassGovernanceRetention=true`**, the way an attacker would. Expect `AccessDenied`. If the delete succeeds, the lock is not protecting this node's writes, so refuse to start; on a governance bucket the message names `s3:BypassGovernanceRetention`. Any other error also refuses to start, because an unknown result is not proof of safety. Without the header, a governance lock refuses even a role that holds bypass, so the check would pass a role an attacker can use (D7). This costs two small objects per boot.
 
 Without these checks, a witness on an ordinary bucket would look healthy while providing nothing, which is the one outcome the existing code comments forbid ("a witness that silently 'succeeded' would let a scenario claim tamper-evidence it never had", `provider_itest.go`).
 
@@ -132,8 +135,13 @@ Without these checks, a witness on an ordinary bucket would look healthy while p
 | `s3:PutObject` and `s3:GetObject` on `<prefix>*` | `s3:DeleteObject` (blocks delete markers) and `s3:DeleteObjectVersion` |
 | `s3:GetObjectVersion` and `s3:ListBucketVersions` | `s3:PutObjectRetention`, `s3:PutObjectLegalHold` and `s3:BypassGovernanceRetention` |
 | `s3:GetBucketVersioning` and `s3:GetBucketObjectLockConfiguration` | `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`, `s3:PutLifecycleConfiguration` and `s3:PutBucketPolicy` |
+| `s3:ListBucket` on the bucket, with an `s3:prefix` condition of `<prefix>*` (D19) | |
 
 The canary's `DeleteObject` call expects this denial. Denied by IAM or by the lock, both mean the evidence is safe.
+
+Object actions take the object ARN (`arn:aws:s3:::<bucket>/<prefix>*`). `s3:ListBucket`, `s3:ListBucketVersions` and the two bucket reads take the bucket ARN. `s3:ListBucket` is not optional: without it, S3 answers a GET for a missing key with 403 instead of 404, so a first boot on an empty bucket fails, and so does any boot after an idle midnight (D19).
+
+The auditor who runs `aerolvm audit verify` needs read access only: `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject` and `s3:GetObjectVersion` on the witness bucket, plus list and read on the export bucket. Phase 3's Terraform outputs this as an optional read-only policy (D22).
 
 ### Retention mode
 
@@ -147,50 +155,52 @@ Cost control: add a lifecycle rule that expires **noncurrent** versions after th
 ### Cluster
 
 - Each node writes only under its own prefix (`node=<SB_NODE_ID>/day=…`). That matches `witnessNodeID()` and the legacy-id fallback in `witnessNodeIDCandidates()`.
-- **Known limit:** the Terraform node role is shared, so node A can write a version to node B's key. It cannot erase B's history, because the lock prevents that. It can make B refuse to boot, because B's latest head no longer matches. That is a denial of service, not silent tampering. Limiting each node to its own path with IAM needs a key that embeds the writer's AWS identity (`${aws:userid}`, as the cluster-join rendezvous uses), because IAM cannot express `SB_NODE_ID`. That is a v2 layout change, tracked in `TODOS.md` ("Per-node witness write scoping"). Until then, a cross-node write shows as a verifier FAIL on the victim and a boot refusal on its next restart; the runbook says to turn on CloudTrail S3 data events on the witness bucket to attribute it (D8).
+- **Known limit:** the Terraform node role is shared, so node A can write a version to node B's key. It cannot erase B's history, because the lock prevents that. It can make B refuse to boot, because B's latest head no longer matches. That is a denial of service, not silent tampering. Limiting each node to its own path with IAM needs a key that embeds the writer's AWS identity (`${aws:userid}`, as the cluster-join rendezvous uses), because IAM cannot express `SB_NODE_ID`. That is a v2 layout change, tracked in `TODOS.md` ("Per-node witness write scoping"). Until then, a cross-node write shows as a verifier FAIL on the victim and a foreign-head alert on the victim's next tick (D23). It makes the victim's restart fail only if the foreign head is still the newest when the victim restarts, because the victim's own next ship puts its head back on top. The runbook says to turn on CloudTrail S3 data events on the witness bucket to attribute it (D8).
 - No change to Raft, gossip or placement. Witness traffic is node to S3 only.
 
 ### Failure behavior
 
 | Situation | Result |
 |---|---|
-| S3 unreachable at boot, enterprise mode | Boot fails within the 30 s deadline, naming the check and bucket (D9), through the existing `ValidateSecretAuditWitness` error path. Strict on purpose; see Decisions. A witness configured without enterprise mode is validated at boot the same way. |
+| S3 unreachable at boot, enterprise mode | Boot fails within the 30 s deadline, naming the check and bucket (D9), through the existing `ValidateSecretAuditWitness` error path. Strict on purpose; see Decisions, F3. A witness configured without enterprise mode is validated at boot the same way. |
 | S3 unreachable at run time | The ship fails, `aerolvm_secret_audit_witness_healthy` drops to 0 and the failures counter rises. Records keep being written locally, and the next ship catches up. |
 | Bucket without lock or versioning | Boot fails with the fix in the message |
+| Node role without `s3:ListBucket` | Boot fails at the missing-key probe and names the permission (D19) |
 | `SB_AUDIT_WITNESS_BACKEND` set without `SB_NODE_ID`, or with `standalone` | Config load fails and names `SB_NODE_ID` (D3) |
 | Local log edited or deleted | Boot fails (`secret audit witness mismatch`). This behavior already exists. |
 | Disk lost or node rebuilt under the same `SB_NODE_ID` | Boot fails under the existing erasure rule. Object Lock forbids clearing the old head, so the message says to rebuild under a new `SB_NODE_ID`; the old id's locked history stays as the record of the loss. The runbook covers single servers and cluster remove-and-rejoin (D4). |
 | A delete marker on the newest day's head key | `LastWitnessedHead` returns an error, so boot fails |
-| Another node writes into this node's key (shared role), or two servers share an `SB_NODE_ID` by mistake | Within one interval the victim's ship loop counts it in `aerolvm_secret_audit_witness_foreign_head_total`, logs a warning naming both heads, and an alert fires; the loop then re-ships as today (D18). The next restart refuses to boot and the verifier reports FAIL; attribute the write with CloudTrail S3 data events (D8). |
+| Another node writes into this node's key (shared role), or two servers share an `SB_NODE_ID` by mistake | The victim reads the witness before every ship, so on its next tick, busy or idle, it counts the foreign head in `aerolvm_secret_audit_witness_foreign_head_total`, logs a warning naming both heads, and an alert fires; the loop then ships as today (D18, D23). A foreign write that lands between the victim's read and its write is buried under the victim's version, and only the verifier sees it. A restart fails only if the foreign head is still the newest. The verifier always reports FAIL; attribute the write with CloudTrail S3 data events (D8). |
+| Node idle across UTC midnight | Its first tick of the day re-ships the unchanged head to today's key. That is not counted as foreign (D20). |
 
 ### Cost (AWS list prices, us-east-1, per node)
 
-- Reads: one GET every 30 seconds while the head is unchanged, which is 2,880 a day, or about $0.001 a day.
-- Writes: at most one PUT every 30 seconds when the head changes (D10). That is under $0.015 a day.
+- Reads: one GET of today's key every 30 seconds, busy or idle, because the loop reads before it writes (D23). That is 2,880 a day, or about $0.001 a day.
+- Writes: at most one PUT every 30 seconds when the head changes (D10), plus one a day for an idle node (D20). That is under $0.015 a day.
 - Storage: about 300 bytes per version, up to about 1 million versions a year spread over one key per day (at most 2,880 per key), which is about 300 MB, or under $0.01 a month.
-- Boot: about five calls (versioning, lock configuration, canary PUT and DELETE, latest head), plus one LIST and one GET for a node idle since before today.
+- Boot: about six calls (versioning, lock configuration, missing-key probe, canary PUT and DELETE, latest head), plus one LIST and one GET for a node that was down across midnight.
 
 ## Code changes
 
 | Area | Change |
 |---|---|
-| `pkg/auditwitness/` (new) | `Open` (switches on the backend name, 30 s deadline), the `s3` backend with day-partitioned keys, boot checks with the bypass-header canary, and unit tests on an `httptest` S3 fake through the real client (D1, D2, D7, D9, D12) |
+| `pkg/auditwitness/` (new) | `Open` (switches on the backend name, 30 s deadline), the `s3` backend with day-partitioned keys, boot checks with the missing-key probe and the bypass-header canary, a local `ok=false` for the `standalone` id, and unit tests on an `httptest` S3 fake through the real client; the fake answers 403 for a missing key when its role lacks `s3:ListBucket` (D1, D2, D7, D9, D12, D19, D24) |
 | `pkg/auditexport/s3.go` | Rename `newS3Client` to an exported `NewS3Client` with a neutral error prefix (D1) |
 | `internal/config/config.go` | The `SB_AUDIT_WITNESS_*` settings, validation (including the `SB_NODE_ID` rule, D3), and `AuditWitnessConfig()` |
 | `pkg/daemon/daemon.go` | Resolve the witness before the gate at line 294 |
 | `pkg/controlplane/controlplane.go` | Update the `Witness` comment: "No-op unless a provider or `SB_AUDIT_WITNESS_BACKEND` supplies one" |
-| `internal/service/secret_audit_witness.go` | The erasure boot error names the rebuild-under-a-new-`SB_NODE_ID` recovery, and the comment at `:364-367` is updated (D4). The ship loop's repair branch (`:206-221`) counts a foreign or missing head in `aerolvm_secret_audit_witness_foreign_head_total` and logs a warning before re-shipping (D18) |
+| `internal/service/secret_audit_witness.go` | The erasure boot error names the rebuild-under-a-new-`SB_NODE_ID` recovery, and the comment at `:364-367` is updated (D4). The ship loop reads the witness before every ship, not only when the head is unchanged (`:203`), counts a head this node did not ship, or a missing head, in `aerolvm_secret_audit_witness_foreign_head_total` and logs a warning before shipping; a read error is not counted (D18, D23). It re-ships an unchanged head on its first tick of each UTC day, keyed on the receipt's `ShippedAt` date (D20) |
 | `setup/prometheus/` | An alert rule on any increase of `aerolvm_secret_audit_witness_foreign_head_total` (D18) |
 | `internal/service/secret_audit.go` → `pkg/auditlog` | Move `secretAuditChainVerifier` and `recomputeChain`'s scan rules into `pkg/auditlog`, shared by the daemon and the verifier; existing tests move with them (D6) |
-| `cmd/aerolvm/` | `aerolvm audit verify`, the offline verifier (Phase 5; D5, D6, D15) |
-| `Terraform/` | An optional witness bucket: Object Lock, versioning, default retention, a noncurrent-version lifecycle rule, the IAM statements above, and variables `witness_lock_mode` (default `COMPLIANCE`) and `witness_lock_days` (default 30, ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`) (D13) |
+| `cmd/aerolvm/` | `aerolvm audit verify`, the offline verifier (Phase 5; D5, D6, D15, D21, D22): `--since` (required), `--export s3://…` or `--export-dir`, `--local`, `--max-lag`; exit 0 PASS, 1 FAIL, 2 INCOMPLETE; export batches walked by chain linkage per UTC day |
+| `Terraform/` | An optional witness bucket: Object Lock, versioning, default retention, a noncurrent-version lifecycle rule, the IAM statements above (including `s3:ListBucket` with an `s3:prefix` condition, D19), an optional auditor read-only policy (D22), and variables `witness_lock_mode` (default `COMPLIANCE`) and `witness_lock_days` (default 30, ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`) (D13) |
 | `integration-tests/` | A new single-node enterprise scenario plus all six existing enterprise scenarios on governance 1-day buckets; teardown empties the bucket with the bypass flag; then delete `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build (D13, D17) |
 | `Ansible/`, `install.sh` | Pass the settings through, including `SB_NODE_ID`. The installer only documents them and never creates buckets. |
-| `setup/config-defaults.md`, `setup/runbooks/secrets-and-audit.md` | New settings, the bucket recipe, what to do on a witness mismatch, the rebuild-under-a-new-`SB_NODE_ID` procedure (D4), and cross-node write attribution with CloudTrail (D8) |
+| `setup/config-defaults.md`, `setup/runbooks/secrets-and-audit.md` | New settings, the bucket recipe, what to do on a witness mismatch, the rebuild-under-a-new-`SB_NODE_ID` procedure (D4), cross-node write attribution with CloudTrail (D8), and what a foreign-head alert does and does not prove (D23) |
 
 ## Tests
 
-The full requirement list, with a value card per case, is the eng-review test plan (`~/.gstack/projects/aerol-ai-microvm/sumansaurabh-docs-formatting-eng-review-test-plan-20261011-223323.md`).
+The full requirement list, with a value card per case, is [`plans/open-audit-witness-test-plan.md`](./open-audit-witness-test-plan.md).
 
 - **Unit (`pkg/auditwitness`, ≥85% coverage, table-driven), all through the real client against an `httptest` S3 fake that speaks S3 XML and error codes (D12):**
   - put, then get the latest head from today's key;
@@ -200,45 +210,62 @@ The full requirement list, with a value card per case, is the eng-review test pl
   - every boot-check failure: versioning off, lock off, no default rule, retention too short (including a rule given in Years), a canary delete that succeeds with the bypass header (D7), a canary delete that fails with a non-AccessDenied error, and an endpoint that never answers (30 s deadline, D9);
   - a PUT without `x-amz-sdk-checksum-algorithm` and `x-amz-checksum-sha256` is rejected 400 by the fake, exactly as S3 rejects it, and the real client's PUT succeeds;
   - one request per changed-head ship; the receipt is `ReceiptID = VersionId` with zero `RecordedAt` (D10);
-  - `len(heads) != 1` is an error (D11).
+  - `len(heads) != 1` is an error (D11);
+  - a missing key answers 403 when the fake's role lacks `s3:ListBucket`, and `Open` refuses boot naming the permission; with the permission it answers 404 and the fallback runs (D19);
+  - `LastWitnessedHead("standalone")` returns `ok=false` and the fake sees no request (D24).
 - **Config:** unknown backend, `s3` without a bucket, and backend set with `SB_NODE_ID` empty or `standalone` each fail with a message naming the setting (D3); a prefix without a trailing slash still yields `<prefix>/node=…`.
-- **Service:** the erasure boot error names the new-`SB_NODE_ID` recovery (D4); the ship loop's repair branch counts and logs a foreign head and a missing head, and leaves the counter alone for a matching head (D18); every existing `internal/service/secret_audit*_test.go` passes after the D6 move with unchanged assertions.
+- **Service:** the erasure boot error names the new-`SB_NODE_ID` recovery (D4); the ship loop counts and logs a foreign head and a missing head on an idle tick and on a busy tick (head changed since the last ship), and leaves the counter alone for a matching head and for a read error (D18, D23); the first tick of a new UTC day re-ships an unchanged head, and a later tick that day does not (D20); every existing `internal/service/secret_audit*_test.go` passes after the D6 move with unchanged assertions.
 - **Daemon (regression contract, D14):**
   - S3 witness settings present but the backend unset: the fake sees 0 requests, and `SB_SECRET_AUDIT_EXTERNAL_WITNESS=true` still fails closed with the existing message (`pkg/daemon/misc_coverage_test.go:10` stays green unchanged);
   - a provider witness plus `SB_AUDIT_WITNESS_BACKEND=s3`: the fake sees 0 requests and the provider witness is installed;
   - the setting fills a placeholder witness, and enterprise mode boots against the fake.
-- **Verifier (`pkg/auditlog`, `cmd/aerolvm`):** PASS across a retention prune when the link exists only in the export; FAIL on a forged newer head, a rollback to an older head, a forged retention checkpoint and a missing link; a node id whose newest head is older than N intervals is listed as silent (D5); export batches are read in numeric-offset order (offsets 9, 10, 100 across a day boundary) with bounded allocations (D15); `TestDependencyGuard` stays green with the AWS SDK added (D6).
+- **Verifier (`pkg/auditlog`, `cmd/aerolvm`):**
+  - PASS across a retention prune when the link exists only in the export; FAIL on a forged newer head, a rollback to an older head, a forged retention checkpoint and a missing link (D5);
+  - export batches are walked by chain linkage, one UTC day at a time, never by key order. An honest history passes across a prune in the middle of a day (the new generation's offsets restart), a batch re-sent after midnight, a re-export after a cursor reset, and node ids containing `_` (D21);
+  - a head newer than `--since` that the evidence never reaches is FAIL, including when the oldest export batches inside the window were removed; a head older than `--since` is listed and not checked (D22);
+  - without `--local`, a head newer than the end of the evidence is pending, and one pending longer than `--max-lag` makes the result INCOMPLETE (exit 2), never PASS (D22);
+  - two versions in the same second on one key keep S3's version order (D22);
+  - a node idle for days is not listed as silent; one with no version for more than a day plus N intervals is (D5, D20);
+  - allocations stay bounded by the witness version list plus one day's batch index on a large synthetic history (D15, D21);
+  - `TestDependencyGuard` stays green with the AWS SDK added (D6).
 - **Integration (real AWS, `integration-tests/`):**
   - a new single-node enterprise scenario, plus all six existing enterprise scenarios (`cluster-3-mixed-secrets-enterprise` and the five `cluster-hetero-*`), on governance buckets with a 1-day lock and `SB_SECRET_AUDIT_RETENTION_DAYS=1` (D13, D17);
+  - a first boot against an empty witness bucket with the Terraform node role (D19);
   - tamper cases: edit the local JSONL (boot fails), delete it (boot fails), try a delete marker with the node role (denied);
   - teardown empties each bucket with the bypass flag before `terraform destroy`; the first run must show a clean `--destroy-only` (D13);
-  - each scenario keeps `itestwitness` until it passes on S3; once all of them do, delete `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build (D17).
+  - each scenario keeps `itestwitness` until it passes on S3; once all of them do, delete `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build (D17);
+  - **release smoke (T24):** after the release of Phases 1–5 is published, the new single-node enterprise scenario runs once on the published artifact (`integration-tests/run.sh <scenario> --version <tag>`). Phase 4 tests working-tree builds, and the docs promise the released binary.
 - `make test` stays offline. AWS calls live only in `integration-tests/`.
 
 ## Phases
 
-Ship as stacked PRs, one per phase, and merge nothing until the whole stack is green. Then merge Phases 1–5 and cut a release from them. Phases 6 and 7 (docs and the blog post) merge only after that release is published. The docs site publishes from `main`, and both phases tell readers to turn enterprise mode on with the free download, so merging them earlier would describe a release that does not exist yet.
+Ship as stacked PRs, one per phase, and merge nothing until the whole stack is green. Then merge Phases 1–5 and cut a release from them. Phases 6 and 7 (docs and the blog post) merge only after that release is published and the release smoke (T24) passes on it. The docs site publishes from `main`, and both phases tell readers to turn enterprise mode on with the free download, so merging them earlier would describe a release that does not exist yet.
 
-| # | Phase | Done when | Size (human / CC) |
-|---|---|---|---|
-| 0 | Decisions below | Done 2026-10-11 | |
-| 1 | `pkg/auditwitness` S3 backend, boot checks and the `httptest` S3 fake | Unit tests green, ≥85% coverage | ~5 days / ~3 h |
-| 2 | Settings (including the `SB_NODE_ID` rule) and daemon wiring | Enterprise mode boots on the release build against the fake. With no setting the fake sees zero requests. | ~1 day / ~1 h |
-| 3 | Terraform bucket (lock mode and days variables), IAM, Ansible, runbook (rebuild, attribution) and config defaults | `terraform plan` is clean with and without the witness | ~2 days / ~2 h |
-| 4 | Integration on real Object Lock buckets: a new single-node scenario plus all six enterprise scenarios; then delete the itest witness | All runs green, tamper cases fail closed, `--destroy-only` leaves no bucket, `provider_itest.go` and the `sandboxd-witness` build deleted | ~4 days plus metal AWS time / ~4 h plus AWS time |
-| 5 | Chain verifier moved to `pkg/auditlog`; `aerolvm audit verify` | Catches a forged newer head, a rollback, a forged checkpoint and a missing link; passes an honest history across a prune using the export; memory stays bounded | ~4.5 days / ~4 h |
-| 6 | Docs and positioning | The pages below are updated, the docs checks pass, and the PR merges after the release of Phases 1–5 | ~1 day / ~1 h |
-| 7 | Blog post | The post below merges after the release of Phases 1–5 and is live, linked from the Blogs index and the security overview, and every number in it is traced to the shipped code or a Phase 4 run | ~1 day / ~1 h |
+The Tasks column maps each task in "Implementation Tasks" to the PR that carries it. A task split across two phases names its part.
+
+| # | Phase | Tasks | Done when | Size (human / CC) |
+|---|---|---|---|---|
+| 0 | Decisions below | | Done 2026-10-11; follow-up 2026-10-16 | |
+| 1 | `pkg/auditwitness` S3 backend, boot checks and the `httptest` S3 fake | T1, T7, T8, T13, T14, T15, T16, T18 (code and fake), T23 | Unit tests green, ≥85% coverage | ~5 days / ~3 h |
+| 2 | Settings (including the `SB_NODE_ID` rule), daemon wiring and the service changes | T2, T3, T6, T9, T19, T22 | Enterprise mode boots on the release build against the fake. With no setting the fake sees zero requests. The foreign-head, read-error and daily re-ship rows pass. | ~2.5 days / ~2 h |
+| 3 | Terraform bucket (lock mode and days variables), IAM (including `s3:ListBucket`), the auditor read-only policy, Ansible, runbook (rebuild, attribution) and config defaults | T10 (Terraform), T12 (runbook), T18 (IAM), T21 (auditor policy) | `terraform plan` is clean with and without the witness | ~2 days / ~2 h |
+| 4 | Integration on real Object Lock buckets: a new single-node scenario plus all six enterprise scenarios; then delete the itest witness | T10 (teardown), T11 | All runs green, a first boot on an empty bucket succeeds, tamper cases fail closed, `--destroy-only` leaves no bucket, `provider_itest.go` and the `sandboxd-witness` build deleted | ~4 days plus metal AWS time / ~4 h plus AWS time |
+| 5 | Chain verifier moved to `pkg/auditlog`; `aerolvm audit verify` | T4, T5, T20, T21 (verifier) | Catches a forged newer head, a rollback, a forged checkpoint, a missing link and removed early exports; passes an honest history across a prune, including one in the middle of a day; reports INCOMPLETE for a stalled export; memory stays bounded | ~6 days / ~5.5 h |
+| — | Release smoke | T24 | The new single-node enterprise scenario passes on the published release artifact | ~0.5 day / ~15 min plus AWS time |
+| 6 | Docs and positioning | T12 (docs) | The pages below are updated, the docs checks pass, and the PR merges after the release smoke passes | ~1 day / ~1 h |
+| 7 | Blog post | T17 | The post below merges after the release smoke passes and is live, linked from the Blogs index and the security overview, and every number in it is traced to the shipped code or a Phase 4 run | ~1 day / ~1 h |
 
 ### Phase 6 docs
 
 These pages merge only after the release of Phases 1–5 is published (see Phases).
 
-- **Enterprise Overview:** add a row "Off-server audit witness (S3 Object Lock)", marked *You turn it on*. Enterprise mode is no longer managed-build only.
-- **Security controls, Audit:** add a "Tamper evidence off the server" row.
-- **Hardening:** add enterprise mode back as a server setting, now open to everyone, with its requirements listed.
+- **Enterprise Overview (`enterprise/index.mdx`):** add a row "Off-server audit witness (S3 Object Lock)", marked *You turn it on*. Enterprise mode is no longer managed-build only.
+- **Security controls, Audit (`enterprise/security-controls.mdx`):** add a "Tamper evidence off the server" row.
+- **Hardening (`enterprise/hardening.mdx`):** add enterprise mode back as a server setting, now open to everyone, with its requirements listed.
+- **Audit and compliance (`enterprise/audit-evidence.mdx`):** add the witness to "Evidence you can collect", strengthen the AU-9 row, and add a step to "Prepare for an audit" that runs `aerolvm audit verify` with a `--since` that matches the retention period. Say that exports must be kept at least as long as that window. The integration suite's export bucket (`Terraform/audit_export.tf`) expires objects after 3 days, which suits tests and is too short for an audit.
+- **CLI (`cli.mdx`):** document `aerolvm audit verify` and its flags in the Reference section, in that page's own format.
 - **Secrets providers:** the checklist step "Set `SB_ENTERPRISE_MODE=true`" becomes correct. Add "configure the witness" next to it.
-- **New Docs page, "Enterprise mode":** what it turns on, the witness bucket recipe (including the required `SB_NODE_ID`), how to rebuild a node under a new id, how to run `aerolvm audit verify`, and the five-language `sandbox.audit()` example. Register it in `content.config.ts`.
+- **New Docs page, "Enterprise mode" (`enterprise/enterprise-mode.mdx`):** what it turns on, the witness bucket recipe (including the required `SB_NODE_ID` and `s3:ListBucket`), how to rebuild a node under a new id, how to run `aerolvm audit verify` (the `--since` window, and what PASS, FAIL and INCOMPLETE mean), what a foreign-head alert does and does not prove (D23), and the five-language `sandbox.audit()` example. Register it in the Enterprise tab (the `ent` group in `content.config.ts`).
 - **Ideas Discussions:** post this as proposal 7, or as an announcement if it ships first.
 
 ### Phase 7 blog post
@@ -250,10 +277,10 @@ A post in the docs site's Blogs section that tells the story behind the feature.
 - **Outline:**
   1. **The problem.** A hash chain catches an edited record but not a whole chain rebuilt by someone who controls the server. This picks up where "The logbook: audit" in `engineering-security-overview.mdx` stops.
   2. **The witness.** What it stores (fingerprints, not records), why the free build had only a placeholder, and what Object Lock adds. Diagram: `sandboxd` writes a fingerprint to the locked bucket every 30 seconds; an auditor's laptop runs `aerolvm audit verify` against the bucket, the export and the local log.
-  3. **Making sure the bucket is really locked.** The four boot checks, and why the test delete is sent with the bypass header, the way an attacker would send it (D7).
+  3. **Making sure the bucket is really locked.** The boot checks, and why the test delete is sent with the bypass header, the way an attacker would send it (D7).
   4. **One key per day.** The AWS guidance of fewer than 100,000 versions per object, and why finding the newest day needs `ListObjectVersions`: `ListObjectsV2` hides a key whose newest version is a delete marker (D2, C2).
-  5. **The attack the boot check misses.** A hacked server writes a new fake fingerprint that matches a rewritten chain. The verifier catches it by linking every fingerprint to the next one through the local log and the off-node export (D5, D15).
-  6. **What it does not protect.** The three limits in "What the witness proves, and what it does not" above, plus the cross-node write limit (D8), restarts blocked during an S3 outage (founder D3), and a rebuilt node needing a new `SB_NODE_ID` (D4).
+  5. **The attack the boot check misses.** A hacked server writes a new fake fingerprint that matches a rewritten chain. The verifier catches it by linking every fingerprint to the next one through the local log and the off-node export, over a time window the auditor sets, so deleting old records cannot shrink the check (D5, D21, D22).
+  6. **What it does not protect.** The three limits in "What the witness proves, and what it does not" above, plus the cross-node write limit (D8), a foreign write that slips between a node's read and its write, which only the verifier catches (D23), restarts blocked during an S3 outage (founder F3), and a rebuilt node needing a new `SB_NODE_ID` (D4).
   7. **What it costs.** S3 requests and storage per node.
   8. **Try it.** A link to the new "Enterprise mode" page for the settings, and the five-language `sandbox.audit()` example.
 - **Code rules:** the only code is the `sandbox.audit()` example in five `<Tabs syncKey="lang">` tabs (TypeScript, Python, Go, Rust, Java), checked against `sdk/*`. Settings and `aerolvm` commands stay on the "Enterprise mode" page, so the post has no shell or HTTP examples.
@@ -263,34 +290,41 @@ A post in the docs site's Blogs section that tells the story behind the feature.
 ## PR call-outs (`pr-review.md`)
 
 - **Boot-path latency (`CreateSandbox`):** none. The witness runs on daemon boot and on a background loop.
-- **Daemon boot:** adds about five S3 calls (versioning, lock configuration, canary put and delete, latest head) when configured, plus one LIST and one GET for a node idle since before today, all under a 30 s deadline; none otherwise.
+- **Daemon boot:** adds about six S3 calls (versioning, lock configuration, missing-key probe, canary put and delete, latest head) when configured, plus one LIST and one GET for a node that was down across midnight, all under a 30 s deadline; none otherwise.
+- **Witness ship loop (every backend):** reads the witness before every ship, not only when the head is unchanged (D23), and re-ships an unchanged head once per UTC day (D20). For the S3 backend that adds no request; for a provider witness it adds one read per changed-head ship and one write a day.
 - **Cluster:** no FSM, placement or gossip change. With cluster mode off, the behavior is the same.
-- **Idempotency:** re-shipping the same head adds a version. That is harmless, and the daemon already skips unchanged heads after a successful read-back.
+- **Idempotency:** re-shipping the same head adds a version. That is harmless, and the daemon already skips unchanged heads after a successful read-back, except for the one daily re-ship (D20).
 - **Failure paths:** no multi-step write across S3 and the store. The local receipt is written after the S3 acknowledgment, as today.
 
 ## Decisions (founder, 2026-10-11: "go with your suggestions")
 
+Founder decisions are numbered F1–F5 so they don't collide with the engineering review's D1–D24.
+
 | # | Question | Decision |
 |---|---|---|
-| D1 | Which retention mode do the docs recommend? | **Compliance for production, governance for trials.** |
-| D2 | AWS only in v1, or S3-compatible stores too? | **Support the endpoint setting, but test and document only AWS in v1.** The boot checks still protect any store, because one without Object Lock fails them. |
-| D3 | Should an S3 outage block node restarts in enterprise mode? | **Yes, for now.** Same as today with any witness. Revisit if users hit it. |
-| D4 | Keep the boot canary? | **Yes.** |
-| D5 | Keep the name "enterprise mode"? | **Keep it.** The docs say anyone can use it. |
+| F1 | Which retention mode do the docs recommend? | **Compliance for production, governance for trials.** |
+| F2 | AWS only in v1, or S3-compatible stores too? | **Support the endpoint setting, but test and document only AWS in v1.** The boot checks still protect any store, because one without Object Lock fails them. |
+| F3 | Should an S3 outage block node restarts in enterprise mode? | **Yes, for now.** Same as today with any witness. Revisit if users hit it. |
+| F4 | Keep the boot canary? | **Yes.** |
+| F5 | Keep the name "enterprise mode"? | **Keep it.** The docs say anyone can use it. |
 
 ## Acceptance
 
-- The released `sandboxd`, with `SB_ENTERPRISE_MODE=true` and a witness bucket, boots on one server and on a 3-node cluster.
+- The released `sandboxd`, with `SB_ENTERPRISE_MODE=true` and a witness bucket, boots on one server and on a 3-node cluster. The release smoke (T24) checks the published artifact before the docs merge.
+- A first boot against an empty witness bucket succeeds with the Terraform node role, and a role without `s3:ListBucket` is refused at boot by name (D19).
 - The same setup with an ordinary bucket refuses to start and names the fix.
 - Editing or deleting the local audit log makes the node refuse to boot.
 - The node role cannot delete or hide a witnessed head.
 - The offline verifier catches a rewritten history that the boot check passes.
-- The verifier passes an honest history across a retention prune by reading the export, and fails a rollback, a forged checkpoint and a missing link.
+- The verifier passes an honest history across a retention prune, including one in the middle of a day, by reading the export (D21), and fails a rollback, a forged checkpoint, a missing link and a window whose oldest export batches were removed (D22).
+- The verifier reports INCOMPLETE, never PASS, when the export has stalled and no local log was given (D22).
+- An idle node writes today's key once per UTC day, and the verifier does not list it as silent (D20).
+- A foreign write into a busy node's key raises the foreign-head alert on that node's next tick (D23).
 - Two single servers sharing a bucket without `SB_NODE_ID` refuse to start, naming the setting.
 - A rebuilt node's boot error names the new-`SB_NODE_ID` recovery.
 - All six existing enterprise scenarios run on the S3 witness, and the `itestwitness` build is gone.
 - With no witness setting, behavior is identical to today, and the test fake records zero S3 calls.
-- The Phase 6 docs pages and the blog post go live only after the release of Phases 1–5 is published.
+- The Phase 6 docs pages and the blog post go live only after the release of Phases 1–5 is published and the release smoke passes.
 - The blog post "Catching a rewritten audit log" is live, linked from the Blogs index and the security overview, and its numbers match the shipped code and the Phase 4 runs.
 
 ---
@@ -355,7 +389,7 @@ Plan unchanged; docs state the per-object version limit and the retention at whi
 State: approved
 Actual answer: A) Day-partitioned keys (D2, user answer 2026-10-11)
 Accepted scope: key = `path.Join(prefix, "node="+id, "day="+UTC yyyy-mm-dd, "head.json")`; a write PUTs today's key; the latest head is a GET of today's key and, on NoSuchKey, one `ListObjectVersions` with Delimiter under `node=<id>/` to find the newest day (so a day whose current version is a delete marker still counts as newest), then a GET of it with the planned delete-marker check; the verifier orders versions across day keys by S3 LastModified; unit tests cover the fallback branch, including a delete marker on the newest day's key of an idle node (must be an error, never a fall-back to the previous day). The plan's Storage layout, Mapping and Cost text is updated at the end of this review.
-History: 2026-10-11, Section 2 correction (no new answer needed; necessary implementation of the delete-marker check approved in D2). Earlier accepted-scope wording used "one ListObjectsV2 with Delimiter" to find the newest day. ListObjectsV2 omits keys whose current version is a delete marker, so a delete marker on the newest day's key made the fallback silently validate against the previous day's head, bypassing plan line 109's rule. Finding C2, P2, confidence 8/10, reviewer Claude.
+History: 2026-10-11, Section 2 correction (no new answer needed; necessary implementation of the delete-marker check approved in D2). Earlier accepted-scope wording used "one ListObjectsV2 with Delimiter" to find the newest day. ListObjectsV2 omits keys whose current version is a delete marker, so a delete marker on the newest day's key made the fallback silently validate against the previous day's head, bypassing plan line 109's rule. Finding C2, P2, confidence 8/10, reviewer Claude. 2026-10-16, follow-up review: D19 adds `s3:ListBucket`, which the fallback's 404 needs, and D20 adds a daily re-ship so the fallback leaves the steady-state path.
 
 ### R2: Single servers default to the same witness id
 Finding: A2, P1, confidence 9/10, `internal/service/secret_audit_witness.go:509-520` (`witnessNodeID` falls back to the cluster handle) and `:527-528` ("on a single-node box that is the Noop's \"standalone\", forever"); `install.sh` sets no `SB_NODE_ID`; plan lines 34 and 145. Reviewer Claude.
@@ -400,8 +434,8 @@ Accepted scope: `internal/config/config.go` rejects `SB_AUDIT_WITNESS_BACKEND` s
 History: none
 
 ### R3: A rebuilt node cannot boot for the whole lock period
-Finding: A3, P1, confidence 9/10, `internal/service/secret_audit_witness.go:364-381` (`emptyLocalChainIsErasure`; the comment at `:364-367` says an operator rebuilding a node "has to clear the node's witnessed head (and the stale local receipt) deliberately"); plan line 109 (a delete marker is an error); founder decision D1 (compliance mode in production); boot check 3 (lock ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`, default 30). Reviewer Claude.
-Plan baseline: original proposal: no rebuild or disk-loss recovery path; a delete marker fails boot; compliance mode for production (founder D1, approved). R1 (D2) and R2 (D3) approved.
+Finding: A3, P1, confidence 9/10, `internal/service/secret_audit_witness.go:364-381` (`emptyLocalChainIsErasure`; the comment at `:364-367` says an operator rebuilding a node "has to clear the node's witnessed head (and the stale local receipt) deliberately"); plan line 109 (a delete marker is an error); founder decision F1 (compliance mode in production); boot check 3 (lock ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`, default 30). Reviewer Claude.
+Plan baseline: original proposal: no rebuild or disk-loss recovery path; a delete marker fails boot; compliance mode for production (founder F1, approved). R1 (D2) and R2 (D3) approved.
 Runtime evidence: existing code fails boot when the local chain is empty and the witness still holds a head for this node id. Under compliance Object Lock nobody can delete those versions until the lock ends, and the plan treats a delete marker as tampering. So a node rebuilt or restored from an empty disk under the same `SB_NODE_ID` cannot boot for at least 30 days, and the documented recovery is impossible.
 Comparison grid:
 
@@ -498,7 +532,7 @@ Plan text unchanged; the Phase 5 author decides inputs and failure rules. Effort
 State: approved
 Actual answer: A) Specify the full verifier (D5, user answer 2026-10-11)
 Accepted scope: verifier inputs are every witness version per node id (ordered by S3 LastModified), the local JSONL, and exported batches. Each consecutive pair of witnessed heads must be linked by a recomputed hash-chain segment from those inputs; a pair with no linking segment is FAIL; the report names the covered window, bounded by export retention; node ids whose newest head is older than N witness intervals are listed as silent for the auditor to reconcile. Acceptance line 247 is kept. Phase 5 is re-sized to human ~3 days / CC ~3 h. Table tests cover each rule.
-History: none
+History: 2026-10-16, amended by D22: the window comes from the auditor's `--since`, not from the evidence; a head newer than the evidence is pending, and a stale pending head makes the result INCOMPLETE. D20 redefines "silent" as no version for more than a day plus N intervals.
 
 ### R5: Where the offline verifier lives
 Finding: A5, P2, confidence 8/10, plan line 174 ("`cmd/aerolvm/` or a `sandboxd` subcommand"); `integration-tests/lib/build.sh:288` (`sandboxd` is a CGO=1 Linux build); `cmd/aerolvm/deps_test.go:10-25` (forbids `internal/service`, requires a CGO-free build); `internal/service/secret_audit.go:1813-1884` (the chain verifier and `recomputeChain` live in `internal/service`); `internal/service/secret_audit.go:122` (`type SecretAuditEvent = auditlog.Event`, so the event type is already in `pkg/auditlog`). Reviewer Claude.
@@ -552,8 +586,8 @@ Accepted scope: add `aerolvm audit verify`. Move `secretAuditChainVerifier` and 
 History: none
 
 ### R6: The boot canary can't see a role that holds governance bypass
-Finding: A6, P2, confidence 8/10, plan line 120 ("then `DeleteObject` with that `VersionId`. Expect `AccessDenied`") and line 132 ("Denied by IAM or by the lock, both mean the evidence is safe"); founder D1 (governance mode for trials) and D4 (keep the canary). Reviewer Claude.
-Plan baseline: original proposal: the canary deletes its own version without the governance-bypass header. Founder D4 (keep the canary) approved. R1–R5 approved.
+Finding: A6, P2, confidence 8/10, plan line 120 ("then `DeleteObject` with that `VersionId`. Expect `AccessDenied`") and line 132 ("Denied by IAM or by the lock, both mean the evidence is safe"); founder F1 (governance mode for trials) and F4 (keep the canary). Reviewer Claude.
+Plan baseline: original proposal: the canary deletes its own version without the governance-bypass header. Founder F4 (keep the canary) approved. R1–R5 approved.
 Runtime evidence: per AWS, a principal holding `s3:BypassGovernanceRetention` can delete a governance-locked version, but only when the request carries `x-amz-bypass-governance-retention: true`. Without the header, the lock refuses the delete even for that principal. So a node role mistakenly granted bypass passes the planned canary, while an attacker on that node, who would send the header, can delete every governance-locked head. Compliance mode is unaffected, and boot checks 1 and 2 already refuse a bucket without Object Lock before the canary runs.
 Comparison grid:
 
@@ -568,7 +602,7 @@ Comparison grid:
 Question D7:
 D7 — Make the boot canary delete the way an attacker would
 Project/branch/task: reviewing plans/open-audit-witness.md; Section 1 (architecture).
-ELI10: At boot the node writes a test object and tries to delete it, expecting a refusal; if the delete works, the bucket isn't protecting anything. In governance mode (D1's trial setting), a delete only skips the lock when the request carries a special "bypass" header and the caller holds bypass permission. The planned canary never sends the header, so it's refused even when the node role wrongly holds bypass. An attacker would send the header and succeed.
+ELI10: At boot the node writes a test object and tries to delete it, expecting a refusal; if the delete works, the bucket isn't protecting anything. In governance mode (F1's trial setting), a delete only skips the lock when the request carries a special "bypass" header and the caller holds bypass permission. The planned canary never sends the header, so it's refused even when the node role wrongly holds bypass. An attacker would send the header and succeed.
 Stakes if we pick wrong: a trial customer's misconfigured role passes every boot check while any compromised node can delete all of its own witnessed heads.
 Recommendation: A because one extra request field makes the canary test the actual attack, at no cost in compliance mode.
 Completeness: A=9/10, B=6/10
@@ -638,7 +672,7 @@ Key = node=<id>/writer=<aws:userid>/day=<date>/head.json. Open calls sts:GetCall
 State: approved
 Actual answer: A) Document the limit (D8, user answer 2026-10-11)
 Accepted scope: keep the approved layout. Rewrite plan line 146: per-node scoping needs a key that embeds the writer's AWS identity, a v2 layout change. The runbook explains that a cross-node write shows as a verifier FAIL on the victim and a boot refusal on its next restart, and recommends CloudTrail S3 data events on the witness bucket for attribution. Accepted shortcut (completeness 6/10), logged with `gstack-decision-log`; revisit when a customer needs attribution without CloudTrail or a per-node identity layout lands.
-History: none
+History: 2026-10-16, D23 corrected the symptom text: the alert fires on the victim's next tick, and a restart fails only if the foreign head is still the newest.
 
 ### R8: `auditwitness.Open` has no time limit at boot
 Finding: A8, P3, confidence 7/10, plan lines 115-120 (boot checks and canary run inside `Open` during daemon boot) with no deadline; runtime witness calls are bounded by `secretAuditWitnessShipTimeout = 10 * time.Second` (`internal/service/secret_audit_witness.go:21`). Reviewer Claude.
@@ -821,7 +855,7 @@ Accepted scope: an `httptest` S3 fake in `pkg/auditwitness` tests implementing P
 History: none
 
 ### R12: Phase 4's live Object Lock buckets have no teardown plan
-Finding: T2, P2, confidence 8/10, plan lines 193-197 (move the enterprise scenarios to a real Object Lock bucket on `single-node` and `cluster-3-mixed`); founder D1 (compliance in production); boot check 3 (lock ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`, default 30, `internal/config/config.go:1840`); enterprise refuses zero retention (`internal/config/config.go:2515-2516`); `Terraform/audit_export.tf:16-24` (itest buckets rely on `force_destroy` so teardown is never blocked). Reviewer Claude.
+Finding: T2, P2, confidence 8/10, plan lines 193-197 (move the enterprise scenarios to a real Object Lock bucket on `single-node` and `cluster-3-mixed`); founder F1 (compliance in production); boot check 3 (lock ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`, default 30, `internal/config/config.go:1840`); enterprise refuses zero retention (`internal/config/config.go:2515-2516`); `Terraform/audit_export.tf:16-24` (itest buckets rely on `force_destroy` so teardown is never blocked). Reviewer Claude.
 Plan baseline: original proposal: Phase 4 runs on real Object Lock buckets; mode, lock length and teardown unspecified. Approved: R1–R11 (D2–D12).
 Runtime evidence: a compliance-mode version cannot be deleted by anyone until its lock ends, so a per-run compliance bucket can't be destroyed for at least 30 days at the default, and never in less than one day because enterprise refuses zero retention. Governance-mode versions can be deleted by a principal holding `s3:BypassGovernanceRetention` that sends the bypass header. Whether the Terraform AWS provider's `force_destroy` sends that header is unverified (the web search was inconclusive).
 Comparison grid:
@@ -918,7 +952,7 @@ History: 2026-10-11, item (4) revised by D17 (R16). The earlier value kept `ites
 
 Section 3 dispositions: T1 accepted, full `httptest` S3 fake (D12); T2 accepted (D13); T3 regression contract accepted (D14). The required proofs for D2–D11 are carried into the test plan without new questions. Tests made obsolete by this plan: "the receipt uses S3's `LastModified`" (plan line 187), replaced by D10; the `itestwitness` HTTP witness in all six enterprise scenarios, plus `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build, once every scenario passes on the S3 witness (contract item 4 as revised by D17).
 
-Test plan artifact: `~/.gstack/projects/aerol-ai-microvm/sumansaurabh-docs-formatting-eng-review-test-plan-20261011-223323.md`.
+Test plan artifact: [`plans/open-audit-witness-test-plan.md`](./open-audit-witness-test-plan.md). It was written to a local gstack directory and copied into the repo on 2026-10-16, with the follow-up review's rows added.
 
 Section 4 notes: steady state at 2,000 nodes is about 67 GET/s and at most 67 PUT/s per bucket, spread across `node=<id>/` prefixes, far below S3's per-prefix limits (3,500 PUT/s, 5,500 GET/s). D10 halves the per-ship requests and D2 removed the per-object version limit. Boot adds about 5 S3 calls, plus one LIST and one GET for an idle node.
 
@@ -968,7 +1002,7 @@ Phase 5 chooses. Effort: none now. Risk: out-of-memory on large histories and a 
 State: approved
 Actual answer: A) Stream in chain order (D15, user answer 2026-10-11)
 Accepted scope: one ordered pass per node: export batches by day key, then the numeric offset parsed from the batch key; then the local JSONL tail; duplicates dropped by event hash at the overlap; each witnessed head checked as the pass reaches it. Memory is bounded by the node's witness version list plus one batch. A test uses a large synthetic chain with offsets 9, 10 and 100 across a day boundary and asserts order and bounded allocations. Phase 5 grows by about human 0.5 day / CC 20 min.
-History: none
+History: 2026-10-16, order rule superseded by D21. The offset in a batch key is a byte position in the current file generation and restarts after every prune, so batches are walked by chain linkage per UTC day. The memory goal stands.
 
 Section 4 dispositions: P1 accepted (D15). Version-count scaling was resolved by D2.
 
@@ -1114,7 +1148,7 @@ No change; the first signal stays a refused restart or a verifier FAIL. Effort: 
 State: approved
 Actual answer: A) Count, log and alert (D18, user answer 2026-10-11)
 Accepted scope: in `shipSecretAuditHeadNow`'s repair branch (`internal/service/secret_audit_witness.go:206-221`), when the witness head differs from this node's last shipped head or is missing after a successful ship, increment `aerolvm_secret_audit_witness_foreign_head_total` and log a warning naming both heads, then re-ship as today. Add an alert rule in `setup/prometheus/` and table-test rows for foreign, missing and matching heads. Applies to every witness backend. The plan's Failure behavior, Code changes and Tests sections are updated.
-History: none
+History: 2026-10-16, amended by D23: the repair branch runs only when the head is unchanged, so a busy node never read the witness. The loop now reads before every ship, and read errors are not counted.
 
 Approval readiness: PASS. Checked D1 (scope record), R1/D2 (with the C2 correction as necessary implementation of D2), R2/D3, R3/D4, R4/D5, R5/D6, R6/D7, R7/D8, R8/D9, R9/D10, R10/D11, R11/D12, R12/D13, R13/D14 (item 4 revised by D17), R14/D15, R15/D16, R16/D17, R17/D18. Every accepted remedy cites its own user answer of 2026-10-11.
 
@@ -1122,13 +1156,14 @@ Note on line numbers: "plan line N" in the ledger refers to the plan as reviewed
 
 ## NOT in scope
 
-- **Testing and documenting S3-compatible stores (MinIO and others).** Founder D2: the endpoint setting is supported, but v1 tests and documents AWS only.
+- **Testing and documenting S3-compatible stores (MinIO and others).** Founder F2: the endpoint setting is supported, but v1 tests and documents AWS only.
 - **Per-node IAM write scoping.** Needs a v2 key layout with the writer's AWS identity; deferred by D8 and tracked in `TODOS.md` (D16).
 - **A signing key the daemon cannot read (HSM).** A plan non-goal; a separate follow-up in `plans/secrets-hardening.md`.
 - **GCS and Azure backends.** A plan non-goal; with no registry (D1), a second backend adds a switch case.
 - **An operator reset record so a rebuilt node keeps its id.** Rejected in D4 in favour of a new `SB_NODE_ID`, which adds no trust surface.
 - **Live compliance-mode integration runs.** Compliance buckets cannot be torn down; compliance boot checks are proven offline on the D12 fake (D13).
 - **UC-145b retention-prune live coverage.** Unchanged by this plan: enterprise still refuses zero retention (`TODOS.md`, "UC-145b").
+- **S3 conditional writes (`If-Match`) to close the gap between a node's read and its write.** No AWS documentation we found says they work on Object Lock buckets; the verifier covers that gap (D23).
 
 ## What already exists
 
@@ -1156,6 +1191,7 @@ cp := provider (Noop in the open-source build)
 auditwitness.Open  (30 s deadline; on expiry: names the check and the bucket)             [D9]
  +-- GetBucketVersioning == Enabled ..................................... else refuse
  +-- GetObjectLockConfiguration: enabled, default rule >= retention days ... else refuse
+ +-- GET <prefix>probe/<random> == NoSuchKey ............ else refuse (names s3:ListBucket)  [D19]
  +-- PUT canary (SHA256 checksum headers)                                                  [D12]
  +-- DELETE canary VersionId + BypassGovernanceRetention=true                              [D7]
  |      AccessDenied -> ok | success -> refuse (names the permission) | other error -> refuse
@@ -1164,16 +1200,20 @@ cp.Witness = s3 witness
  v
 gate: SB_SECRET_AUDIT_EXTERNAL_WITNESS => HasExternalWitness   (daemon.go:294, unchanged)
  v
-svc.SetWitness -> ValidateSecretAuditWitness (existing) -> ship loop every interval
-                                                         \-> foreign/missing head: count + warn + alert, then re-ship [D18]
+svc.SetWitness -> ValidateSecretAuditWitness (existing) -> ship loop every interval: read, then write if needed
+                                                         +-> head this node did not ship (idle or busy tick): count + warn + alert, then ship [D18, D23]
+                                                         +-> read error: not counted; ship if the head changed                               [D23]
+                                                         \-> unchanged head, first tick of a new UTC day: re-ship to today's key            [D20]
 ```
 
 Latest-head read (`LastWitnessedHead`, D2 + C2):
 
 ```
+id == "standalone" --> ok=false, no request                                                [D24]
 GET node=<id>/day=<today>/head.json
  +-- 200 --> parse; node_id mismatch or malformed --> error
- +-- NoSuchKey
+ +-- 403 AccessDenied --> error (Open's probe already refused a role without s3:ListBucket)  [D19]
+ +-- NoSuchKey (404, which needs s3:ListBucket; rare after D20: only on a boot after downtime across midnight)
        v
      ListObjectVersions(prefix node=<id>/, Delimiter "/")   <- sees delete-marked days
        +-- no day prefixes --> ok=false ("never recorded")
@@ -1186,16 +1226,26 @@ GET node=<id>/day=<today>/head.json
                                 +-- no versions --> ok=false
 ```
 
-Offline verifier (`aerolvm audit verify`, D5 + D6 + D15):
+Offline verifier (`aerolvm audit verify`, D5 + D6 + D15, as amended by D20–D22):
 
 ```
+aerolvm audit verify --since T (required) --export s3://bucket/prefix | --export-dir D  [--local F] [--max-lag 15m]
 for each node id under <prefix>:
-  heads  := ListObjectVersions(node=<id>/), ordered by S3 LastModified        (H1 .. Hn)
-  stream := export batches (day, then numeric offset) ++ local JSONL tail, deduped by event hash
-  pkg/auditlog verifier recomputes the chain in one pass; mark Hi when its hash is reached in order
-  any consecutive pair (Hi, Hi+1) not linked --> FAIL (names the pair)
-  report: covered window (bounded by export retention); "silent" if newest head older than N intervals
-memory: the witness version list + one export batch
+  heads := ListObjectVersions(node=<id>/): S3 version order within a key,
+           LastModified across keys, ties by day key                                    (H1 .. Hn)   [D22]
+  for each UTC day of the export layout, oldest first:                                               [D21]
+    index the day's batches: first record's prev_hash -> batch, last record's event_hash
+    walk the links from the tip carried over from the previous day; where batches overlap,
+      continue from the batch that holds the tip; count batches the walk never reaches
+    pkg/auditlog recomputes the chain in one pass; mark Hi when its hash is reached
+  then the --local tail, if given
+  Hi newer than T, never reached, older than the end of the evidence --> FAIL "evidence missing"   [D22]
+  consecutive reached pair (Hi, Hi+1) not linked -------------------> FAIL (names the pair)        [D5]
+  Hi older than T --------------------------------------------------> listed, not checked
+  Hi newer than the end of the evidence, no --local ----------------> pending; pending > --max-lag --> INCOMPLETE
+  report: the window T..now, unreached batches; "silent" if no version for > 1 day + N intervals    [D20]
+memory: the witness version list + one day's batch index (~150 B a batch) + one batch
+exit: 0 PASS, 1 FAIL, 2 INCOMPLETE
 ```
 
 ## Failure modes
@@ -1208,14 +1258,20 @@ memory: the witness version list + one export batch
 | `WitnessHeads` | S3 throttles or 503s | Fake error row | Ship fails, retried next tick | `healthy=0`, failures counter rises |
 | `LastWitnessedHead` | Delete marker on the newest day's key | C2 row | Error, boot fails | Boot error |
 | `LastWitnessedHead` | Node clock jumps across midnight | None | Existing mismatch check | Loud boot refusal (not silent) |
-| Ship loop | Foreign head or duplicate `SB_NODE_ID` | D18 rows | Counter, warning, alert, then re-ship | Alert within one interval |
+| Ship loop | Foreign head or duplicate `SB_NODE_ID` | D18, D23 rows (idle and busy ticks) | Read before every ship; counter, warning, alert, then ship | Alert on the next tick, idle or busy |
+| Ship loop | Foreign write between the victim's read and its write | Verifier rows | Buried under the victim's version | Verifier FAIL only |
+| Ship loop | Node idle across UTC midnight | D20 rows | Daily re-ship to today's key | Nothing; one PUT a day |
+| `Open` probe | Node role lacks `s3:ListBucket` | D19 403 row | Refuse boot | Boot error naming `s3:ListBucket` |
 | Config | `SB_NODE_ID` missing with a witness | D3 row | Config error | Clear error |
 | Rebuild | Empty disk under the same node id | D4 message test | Boot refusal | Error naming the new-id recovery |
 | Verifier | Export batch overwritten or missing | D5 rows | FAIL | FAIL naming the unlinked pair |
 | Verifier | Very large history | D15 allocation test | Streaming pass | Bounded memory |
+| Verifier | Retention prune in the middle of a day (offsets restart) | D21 row | Chain-linkage walk per day | PASS |
+| Verifier | The node removes the oldest export batches inside the window | D22 row | Window comes from `--since` | FAIL naming the unreached head |
+| Verifier | Export stalled and no local log given | D22 row | Pending past `--max-lag` | INCOMPLETE, never PASS |
 | Itest teardown | Locked objects block `terraform destroy` | First Phase 4 run | Empty with the bypass flag first | Harness error if it fails |
 
-Critical gaps: 0. One was found (F1, a silent foreign-head overwrite) and resolved by D18. The clock-jump case has no test but fails loudly, so it is not critical.
+Critical gaps: 0. One was found (F1, a silent foreign-head overwrite) and resolved by D18; the follow-up review found that D18 missed busy nodes and fixed that with D23. The clock-jump case has no test but fails loudly, so it is not critical. The read-to-write race in D23 is caught only by the verifier, and the docs say so.
 
 ## Worktree parallelization strategy
 
@@ -1223,7 +1279,7 @@ Critical gaps: 0. One was found (F1, a silent foreign-head overwrite) and resolv
 |---|---|---|
 | S3 client export, `pkg/auditwitness`, `httptest` S3 fake | `pkg/auditexport`, `pkg/auditwitness` | — |
 | Settings and daemon wiring | `internal/config`, `pkg/daemon` | S3 backend step |
-| Service changes (D4 message, D18 counter) | `internal/service` | — |
+| Service changes (D4 message, D18/D23 counter and read before every ship, D20 daily re-ship) | `internal/service` | — |
 | Chain verifier move | `internal/service`, `pkg/auditlog` | Service changes (same package) |
 | `aerolvm audit verify` | `cmd/aerolvm`, `pkg/auditlog` | Verifier move; S3 client export |
 | Terraform, Ansible, installer, runbooks, alert rule | `Terraform/`, `Ansible/`, `setup/`, `install.sh` | — |
@@ -1253,7 +1309,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Surfaced by: Architecture A5 (D6)
   - Files: `internal/service/secret_audit.go`, `pkg/auditlog/`
   - Verify: `go test ./internal/service/... ./pkg/auditlog/...` with unchanged assertions
-- [ ] **T5 (P1, human: ~3.5 days / CC: ~3.5 h)** — cmd/aerolvm — `aerolvm audit verify`: pairwise linkage over local and export, FAIL on a missing link, coverage window, silent ids, streaming in numeric-offset order
+- [ ] **T5 (P1, human: ~3.5 days / CC: ~3.5 h)** — cmd/aerolvm — `aerolvm audit verify`: pairwise linkage over local and export, FAIL on a missing link, coverage window, silent ids, bounded-memory streaming (export order superseded by T20, window rules by T21)
   - Surfaced by: Architecture A4 (D5) and Performance P1 (D15)
   - Files: `cmd/aerolvm/audit.go` (new), `pkg/auditlog/`
   - Verify: `go test ./cmd/aerolvm/... ./pkg/auditlog/...` (forged head, rollback, forged checkpoint, missing link, allocation rows); `TestDependencyGuard`
@@ -1306,6 +1362,37 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Files: `docs/src/content/docs/engineering-audit-witness.mdx` (new), `docs/src/content.config.ts`, `docs/src/content/docs/blog.mdx`, `docs/src/content/docs/engineering-security-overview.mdx`
   - Verify: `make docs-build`; the `sandbox.audit()` tabs match `sdk/*`; every number traced to the code or a Phase 4 report; merged only after the release
 
+Added by the follow-up review (2026-10-16). The Phases table names the phase for every task.
+
+- [ ] **T18 (P1, human: ~2 h / CC: ~15 min)** — pkg/auditwitness + Terraform — `s3:ListBucket` for the node role; `Open` probes a random missing key; the fake answers 403 without the permission
+  - Surfaced by: follow-up R18 (D19)
+  - Files: `pkg/auditwitness/checks.go`, `pkg/auditwitness/s3fake_test.go`, the Terraform witness file
+  - Verify: 403 and 404 fake rows; the Phase 4 first boot on an empty bucket
+- [ ] **T19 (P1, human: ~2 h / CC: ~15 min)** — internal/service — Re-ship an unchanged head on the first tick of each UTC day
+  - Surfaced by: follow-up R19 (D20)
+  - Files: `internal/service/secret_audit_witness.go` and its test
+  - Verify: day-rollover rows (first tick re-ships, later ticks don't, not counted as foreign)
+- [ ] **T20 (P1, human: ~1 day / CC: ~1 h)** — pkg/auditlog + cmd/aerolvm — Walk export batches by chain linkage, one UTC day at a time
+  - Surfaced by: follow-up R20 (D21)
+  - Files: `pkg/auditlog/`, `cmd/aerolvm/audit.go`
+  - Verify: mid-day prune, re-send across midnight, overlapping re-export, `_` in node ids, and allocation rows
+- [ ] **T21 (P1, human: ~0.5 day / CC: ~30 min)** — cmd/aerolvm + Terraform — `--since`, pending and INCOMPLETE, `--export` / `--export-dir` / `--local` / `--max-lag`, witness version order, auditor read-only policy
+  - Surfaced by: follow-up R21 (D22)
+  - Files: `cmd/aerolvm/audit.go`, `pkg/auditlog/`, the Terraform witness file
+  - Verify: removed-early-exports FAIL row, stalled-export INCOMPLETE row, same-second version row; `terraform plan` with the policy
+- [ ] **T22 (P2, human: ~2 h / CC: ~15 min)** — internal/service — Read the witness before every ship; count a foreign head on busy ticks; don't count read errors
+  - Surfaced by: follow-up R22 (D23); ships with T9
+  - Files: `internal/service/secret_audit_witness.go` and its test
+  - Verify: busy-tick foreign row, read-error row, matching-head row
+- [ ] **T23 (P3, human: ~30 min / CC: ~5 min)** — pkg/auditwitness — Answer the `standalone` id locally
+  - Surfaced by: follow-up R23 (D24)
+  - Files: `pkg/auditwitness/s3.go`
+  - Verify: zero-request row
+- [ ] **T24 (P2, human: ~0.5 day / CC: ~15 min + AWS time)** — integration-tests — Release smoke on the published artifact
+  - Surfaced by: follow-up review (acceptance item 1 was untested)
+  - Files: none beyond the Phase 4 scenario
+  - Verify: `integration-tests/run.sh <single-node enterprise scenario> --version <tag>` green; gates the Phase 6 and 7 merges
+
 ## Unresolved decisions
 
 None. Every choice raised in this review (D1–D18) has an answer.
@@ -1328,8 +1415,8 @@ None. Every choice raised in this review (D1–D18) has an answer.
 
 ## Suppressed findings (appendix)
 
-- `[P3] (confidence: 4/10) internal/service/secret_audit_witness.go:553-570` — `lastWitnessedHeadAny` drops one candidate's error when another candidate returns a head, so a delete-marker error on the canonical key could be masked by a head under the legacy id. Suppressed: the S3 backend never writes legacy keys, and anyone able to write one can already write a forged canonical version.
-- `[P3] (confidence: 4/10) pkg/auditexport/s3.go:79-87` — node ids are not sanitized in keys, so an id containing `/` produces nested keys. Suppressed: ids are operator-chosen and the effect is cosmetic.
+- `[P3] (confidence: 4/10) internal/service/secret_audit_witness.go:553-570` — `lastWitnessedHeadAny` drops one candidate's error when another candidate returns a head, so a delete-marker error on the canonical key could be masked by a head under the legacy id. Suppressed: the S3 backend never writes legacy keys, and anyone able to write one can already write a forged canonical version. (Since the follow-up review's D24, the S3 backend no longer reads the legacy `standalone` id at all.)
+- `[P3] (confidence: 4/10) pkg/auditexport/s3.go:79-87` — node ids are not sanitized in keys, so an id containing `/` produces nested keys. Suppressed: ids are operator-chosen and the effect is cosmetic. (Moot: `internal/config/config.go:2048` already rejects `/` in `SB_NODE_ID` through `models.ValidClusterNodeID`.)
 
 ## GSTACK REVIEW REPORT
 
@@ -1345,3 +1432,52 @@ None. Every choice raised in this review (D1–D18) has an answer.
 - **VERDICT:** no review is CLEAR. Eng Review found 15 issues and mapped every one to an approved plan change (18 decisions, 0 unresolved, 0 critical gaps). Ready to implement against the updated plan; eng review required to reach CLEAR.
 
 NO UNRESOLVED DECISIONS
+
+---
+
+# Follow-up review (2026-10-16)
+
+The plan was checked again against `origin/main` at `2598aa44`; line numbers in this section refer to that commit. The engineering review's code citations still hold. Only `internal/config/config.go` and `pkg/daemon/daemon.go` changed, and the external-witness gate moved one line, to `pkg/daemon/daemon.go:293`.
+
+Five approved decisions did not survive a closer read of the code and of AWS behavior. D19–D23 correct them, and D24 is a small hardening. The user approved all six on 2026-10-16 ("fix the plan"). Their changes are folded into the plan body, the diagrams, the failure-mode table and the task list above.
+
+### R18 / D19: The node role needs `s3:ListBucket`
+Finding: P1, confidence 9/10. The IAM table allowed `s3:GetObject`, `s3:GetObjectVersion` and `s3:ListBucketVersions`, but not `s3:ListBucket`. AWS documents that a GetObject on a missing key returns 403 AccessDenied, not 404 NoSuchKey, when the caller lacks `s3:ListBucket` (GetObject API reference, "Permissions"). The latest-head read falls back to `ListObjectVersions` only on NoSuchKey. So a first boot on an empty bucket would fail, and so would any boot after an idle midnight. The `httptest` fake always answered NoSuchKey, so no unit test would have seen it; only a Phase 4 run would.
+Decision: grant `s3:ListBucket` on the bucket ARN with an `s3:prefix` condition of `<prefix>*`. `Open` probes a random missing key under `<prefix>probe/` and refuses boot, naming the permission, on AccessDenied. The fake answers 403 for a missing key when its role lacks the permission. Boot grows by one call. Task T18.
+
+### R19 / D20: Idle nodes never write today's key
+Finding: P1, confidence 9/10. `shipSecretAuditHeadNow` writes only when the head changes, and reads only when it doesn't (`internal/service/secret_audit_witness.go:203-218`). Under the day layout (D2), an idle node has no key for today after UTC midnight. Every tick then paid a missed GET, a LIST (billed at the PUT rate) and a second GET, so the cost section's "one GET" was wrong. The D5 "silent node" rule (newest head older than N intervals) would also flag every healthy idle node.
+Decision: the service re-ships an unchanged head on its first tick of each UTC day, keyed on the receipt's `ShippedAt` date, for every backend. It is not counted as foreign. The LIST fallback then runs only on a boot after downtime across midnight. A node is silent when it has no version for more than a day plus N intervals. Task T19.
+
+### R20 / D21: Export batch keys do not sort in chain order
+Finding: P1, confidence 9/10. D15 ordered export batches by day, then by the offset parsed from the batch key. That offset is a byte position in the current audit-file generation, and a retention prune starts a new generation and re-pins the cursor (`internal/service/secret_audit_export.go:203-219`). The generation is not in the batch id (`auditExportBatchID`, `:65-74`), and it is a hash, not a counter (`auditGenerationOfLine`, `:391-396`). On a prune day, the new generation's small offsets sort ahead of the old generation's large ones, so the one-pass walk sees a broken chain and fails an honest history. Node ids may also contain `_` (`models.ValidClusterNodeID`), and the key turns `:` into `_` (`pkg/auditexport/s3.go:82`), so the offset cannot be split out from the left. Events carry no sequence number (`pkg/auditlog/event.go`), so nothing else in a record gives the order.
+Decision: walk export batches by chain linkage, one UTC day of the export layout at a time. Index the day's batches by their first record's `prev_hash` and last record's `event_hash` (about 150 bytes a batch; at most 86,400 batches a day at the 1 s `SB_AUDIT_EXPORT_FLUSH_INTERVAL` default, so about 13 MB). Walk from the tip carried over from the previous day; where batches overlap (a re-send across midnight, a re-export after a cursor reset), continue from the batch that holds the tip. Count batches the walk never reaches in the report, and carry the tip into the next day. Key names and offsets are never used for order, which also lets `--export-dir` take batches in any file layout. Memory: the witness version list, plus one day's batch index, plus one batch. This supersedes D15's order rule; D15's memory goal stands. Task T20.
+
+### R21 / D22: The verifier's window must come from the auditor
+Finding: P1, confidence 8/10. D5 made an unlinked pair a FAIL and said the report names a window "bounded by export retention". It never said what happens to heads older than the earliest record the verifier can read, and both readings fail. Failing those heads fails every honest cluster whose history outlives its records. Skipping them lets an attacker who controls a node rewrite the local log and overwrite the oldest export batches (the node role holds `s3:PutObject` on the export bucket, `Terraform/audit_export.tf:71`). That moves the walk's starting point past the last honest head, and the forged tail passes. D5 also left two inputs open: heads newer than the last exported record when no local log is given, and `webhook` or `bus` exports (`pkg/daemon/daemon.go:325`), which the verifier cannot read back.
+Decision: `aerolvm audit verify --since <time>` is required, because the right window depends on retention that the verifier cannot learn from the node. The report prints the window.
+- Every witnessed head newer than `--since` must be reached, or the result is FAIL ("evidence missing"). Older heads are listed, not checked.
+- Inputs: `--export s3://bucket/prefix`, or `--export-dir <path>` (NDJSON batches saved from a webhook or bus receiver), and an optional `--local <jsonl>` per node.
+- Without `--local`, a head newer than the end of the evidence is pending. A head pending longer than `--max-lag` (default 15 minutes; the export flushes every second) makes the result INCOMPLETE. Exit codes: 0 PASS, 1 FAIL, 2 INCOMPLETE.
+- Witness versions are ordered by S3's version order within a key, and by `LastModified` across keys with ties broken by the day key, because list results carry `LastModified` only to the second.
+- Terraform outputs an optional auditor read-only policy. The docs tell operators to keep exports at least as long as the window they verify.
+
+This amends D5. Task T21.
+
+### R22 / D23: A busy node never sees a foreign head
+Finding: P2, confidence 9/10. D18 counts a foreign head in the ship loop's repair branch, which runs only when the local head is unchanged (`if lastLocal == head`, `internal/service/secret_audit_witness.go:203`). A node whose head changes every interval ships without reading, so it never counts a foreign write. Its next ship then puts its own head back on top, so its next restart boots too. The failure table, D8 and D18 promised an alert within one interval and a refused restart for every node; for a busy victim, only the verifier saw the write.
+Decision: the loop reads `LastWitnessedHead` before every ship, idle or busy. A head that is neither this node's current head nor its last shipped head is counted and logged before the ship, and so is a missing head after a successful ship. A read error is not counted, so an S3 blip doesn't page anyone. For the S3 backend this adds no request, since the cost section already assumed a read every tick; for a provider witness it adds one read per changed-head ship. A foreign write that lands between the read and the write is still buried, and only the verifier sees it; the docs say so. A restart fails only if the foreign head is still the newest. S3 conditional writes (`If-Match`) could close that gap, but no AWS documentation we found says they work on Object Lock buckets, so they are not used. This amends D18 and corrects D8's symptom text. Task T22.
+
+### R23 / D24: The S3 backend ignores the legacy `standalone` id
+Finding: P3, confidence 8/10. `witnessNodeIDCandidates` (`internal/service/secret_audit_witness.go:536-549`) adds the cluster handle's id as a legacy fallback, and on a single server that is the Noop's `standalone`. With `SB_NODE_ID` now required (D3), a first boot also reads `node=standalone/`. That costs two wasted calls, against a key that D3 guarantees holds no real head but that any node's role can write. A head written there would fail a fresh server's boot.
+Decision: the S3 backend answers `LastWitnessedHead("standalone")` with `ok=false` and no request, and rejects a `standalone` write. The service code is unchanged. Task T23.
+
+### Editorial fixes (no decision needed)
+- The founder decisions are renamed F1–F5. They shared numbers with the review's D1–D5, and the body used both.
+- The test plan moved into the repo as [`plans/open-audit-witness-test-plan.md`](./open-audit-witness-test-plan.md). It had lived only in a local gstack directory that PR reviewers can't open.
+- The Phases table now maps every task to a phase. T3, T9 and the new service tasks had none, so Phase 2 now carries the service changes.
+- Phase 6 adds `enterprise/audit-evidence.mdx` and `cli.mdx`, and puts the new Enterprise mode page in the Enterprise tab.
+- A release smoke (T24) runs the single-node enterprise scenario on the published artifact before Phases 6 and 7 merge. Phase 4 tests working-tree builds, and acceptance item 1 and the docs promise the released binary.
+- The suppressed node-id finding is moot: config already rejects `/` in `SB_NODE_ID` (`internal/config/config.go:2048`).
+
+Unresolved decisions: none.
