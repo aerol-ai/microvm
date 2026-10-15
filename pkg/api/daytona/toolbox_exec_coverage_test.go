@@ -853,3 +853,21 @@ func TestToolboxDirectCoverage(t *testing.T) {
 		}
 	})
 }
+
+// A guest error body is bounded so a sandbox cannot make the daemon buffer
+// gigabytes while reading a failure response (S11).
+func TestReadToolboxHTTPErrorIsBounded(t *testing.T) {
+	huge := strings.Repeat("x", maxToolboxErrorBytes+4096)
+	resp := &http.Response{
+		StatusCode: http.StatusBadGateway,
+		Body:       io.NopCloser(strings.NewReader(huge)),
+	}
+	err := readToolboxHTTPError(resp)
+	var terr *toolboxHTTPError
+	if !errors.As(err, &terr) {
+		t.Fatalf("readToolboxHTTPError = %T, want *toolboxHTTPError", err)
+	}
+	if len(terr.Message) > maxToolboxErrorBytes {
+		t.Fatalf("error message is %d bytes; want at most %d", len(terr.Message), maxToolboxErrorBytes)
+	}
+}

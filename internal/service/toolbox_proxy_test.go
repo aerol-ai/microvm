@@ -366,3 +366,83 @@ func TestToolboxProxyErrorBranchesMore(t *testing.T) {
 		t.Fatal("newNetworkToolboxRequest should reject invalid method")
 	}
 }
+
+// An isolate sandbox serves its toolbox in-process, like WASM. RoundTripToolbox
+// must dispatch to the isolate host, not dial the container network (B7).
+func TestRoundTripToolbox_Isolate(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableIsolate = true
+	svc.SetIsolateRuntime(&fakeToolboxHost{})
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-rt", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp, err := svc.RoundTripToolbox(ctx, "sb-iso-rt", "GET", "/bar", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("RoundTripToolbox(isolate) = %v; want in-process dispatch", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "wasm-toolbox" {
+		t.Fatalf("isolate round trip = %d %q; want the in-process host's response", resp.StatusCode, body)
+	}
+}
+
+// Without an isolate driver wired, an isolate round trip is a clear error, not
+// a network dial.
+func TestRoundTripToolbox_IsolateNoDriver(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-none", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-iso-none", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "driver not registered") {
+		t.Fatalf("isolate round trip with no driver = %v; want a driver-not-registered error", err)
+	}
+}
+
+// A WASM sandbox with no WASM driver wired is a clear error, not a network dial
+// — mirroring the isolate no-driver case and ServeToolboxReverseProxy.
+func TestRoundTripToolbox_WasmNoDriver(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-wasm-none", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-wasm-none", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "driver not registered") {
+		t.Fatalf("wasm round trip with no driver = %v; want a driver-not-registered error", err)
+	}
+}
+
+// An isolate driver that does not implement the toolbox host surfaces a clear
+// error instead of being dispatched in-process.
+func TestRoundTripToolbox_IsolateNotToolboxHost(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableIsolate = true
+	svc.SetIsolateRuntime(&recordingRuntime{}) // non-nil, but no ServeToolbox
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-nohost", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-iso-nohost", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "does not implement toolbox host") {
+		t.Fatalf("isolate round trip without a toolbox host = %v; want a toolbox-host error", err)
+	}
+}
