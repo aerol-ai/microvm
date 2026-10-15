@@ -192,7 +192,7 @@ Cost control: add a lifecycle rule that expires **noncurrent** versions after th
 | `internal/service/secret_audit_witness.go` | The erasure boot error names the rebuild-under-a-new-`SB_NODE_ID` recovery, and the comment at `:364-367` is updated (D4). The ship loop reads the witness before every ship, not only when the head is unchanged (`:203`), counts a head this node did not ship, or a missing head, in `aerolvm_secret_audit_witness_foreign_head_total` and logs a warning before shipping; a read error is not counted (D18, D23). It re-ships an unchanged head on its first tick of each UTC day, keyed on the receipt's `ShippedAt` date (D20) |
 | `setup/prometheus/` | An alert rule on any increase of `aerolvm_secret_audit_witness_foreign_head_total` (D18) |
 | `internal/service/secret_audit.go` → `pkg/auditlog` | Move `secretAuditChainVerifier` and `recomputeChain`'s scan rules into `pkg/auditlog`, shared by the daemon and the verifier; existing tests move with them (D6) |
-| `cmd/aerolvm/` | `aerolvm audit verify`, the offline verifier (Phase 5; D5, D6, D15, D21, D22): `--since` (required), `--export s3://…` or `--export-dir`, `--local`, `--max-lag`; exit 0 PASS, 1 FAIL, 2 INCOMPLETE; export batches walked by chain linkage per UTC day |
+| `cmd/aerolvm/` | `aerolvm audit verify`, the offline verifier (Phase 5; D5, D6, D15, D21, D22): `--since` (required), `--export s3://…` or `--export-dir`, `--local`, `--max-lag`; exit 0 PASS, 1 FAIL, 3 INCOMPLETE (2 stays the CLI's usage error); export batches walked by chain linkage per UTC day |
 | `Terraform/` | An optional witness bucket: Object Lock, versioning, default retention, a noncurrent-version lifecycle rule, the IAM statements above (including an unconditioned `s3:ListBucket`, D19), an optional auditor read-only policy (D22), and variables `witness_lock_mode` (default `COMPLIANCE`) and `witness_lock_days` (default 30, ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`) (D13) |
 | `integration-tests/` | A new single-node enterprise scenario plus all six existing enterprise scenarios on governance 1-day buckets; teardown empties the bucket with the bypass flag; then delete `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build (D13, D17) |
 | `Ansible/`, `install.sh` | Pass the settings through, including `SB_NODE_ID`. The installer only documents them and never creates buckets. |
@@ -223,7 +223,7 @@ The full requirement list, with a value card per case, is [`plans/open-audit-wit
   - PASS across a retention prune when the link exists only in the export; FAIL on a forged newer head, a rollback to an older head, a forged retention checkpoint and a missing link (D5);
   - export batches are walked by chain linkage, one UTC day at a time, never by key order. An honest history passes across a prune in the middle of a day (the new generation's offsets restart), a batch re-sent after midnight, a re-export after a cursor reset, and node ids containing `_` (D21);
   - a head newer than `--since` that the evidence never reaches is FAIL, including when the oldest export batches inside the window were removed; a head older than `--since` is listed and not checked (D22);
-  - without `--local`, a head newer than the end of the evidence is pending, and one pending longer than `--max-lag` makes the result INCOMPLETE (exit 2), never PASS (D22);
+  - without `--local`, a head newer than the end of the evidence is pending, and one pending longer than `--max-lag` makes the result INCOMPLETE (exit 3), never PASS (D22);
   - two versions in the same second on one key keep S3's version order (D22);
   - a node idle for days is not listed as silent; one with no version for more than a day plus N intervals is (D5, D20);
   - allocations stay bounded by the witness version list plus one day's batch index on a large synthetic history (D15, D21);
@@ -1246,7 +1246,7 @@ for each node id under <prefix>:
   Hi newer than the end of the evidence, no --local ----------------> pending; pending > --max-lag --> INCOMPLETE
   report: the window T..now, unreached batches; "silent" if no version for > 1 day + N intervals    [D20]
 memory: the witness version list + one day's batch index (~150 B a batch) + one batch
-exit: 0 PASS, 1 FAIL, 2 INCOMPLETE
+exit: 0 PASS, 1 FAIL, 3 INCOMPLETE, 2 usage
 ```
 
 ## Failure modes
@@ -1459,7 +1459,7 @@ Finding: P1, confidence 8/10. D5 made an unlinked pair a FAIL and said the repor
 Decision: `aerolvm audit verify --since <time>` is required, because the right window depends on retention that the verifier cannot learn from the node. The report prints the window.
 - Every witnessed head newer than `--since` must be reached, or the result is FAIL ("evidence missing"). Older heads are listed, not checked.
 - Inputs: `--export s3://bucket/prefix`, or `--export-dir <path>` (NDJSON batches saved from a webhook or bus receiver), and an optional `--local <jsonl>` per node.
-- Without `--local`, a head newer than the end of the evidence is pending. A head pending longer than `--max-lag` (default 15 minutes; the export flushes every second) makes the result INCOMPLETE. Exit codes: 0 PASS, 1 FAIL, 2 INCOMPLETE.
+- Without `--local`, a head newer than the end of the evidence is pending. A head pending longer than `--max-lag` (default 15 minutes; the export flushes every second) makes the result INCOMPLETE. Exit codes: 0 PASS, 1 FAIL (or could not verify), 3 INCOMPLETE; 2 stays the CLI's usage error, which every other verb uses.
 - Witness versions are ordered by S3's version order within a key, and by `LastModified` across keys with ties broken by the day key, because list results carry `LastModified` only to the second.
 - Terraform outputs an optional auditor read-only policy. The docs tell operators to keep exports at least as long as the window they verify.
 

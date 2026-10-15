@@ -285,6 +285,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.deleteObject(w, r, b, key, q.Get("versionId"))
 	case "ListObjectVersions":
 		s.listObjectVersions(w, bucketName, b, q)
+	case "ListObjectsV2":
+		s.listObjectsV2(w, bucketName, b, q)
 	case "GetBucketVersioning":
 		writeXML(w, versioningConfiguration{Status: b.versioning})
 	case "GetObjectLockConfiguration":
@@ -310,6 +312,8 @@ func operation(method, key string, q url.Values) string {
 		switch {
 		case key != "":
 			return "GetObject"
+		case q.Get("list-type") == "2":
+			return "ListObjectsV2"
 		case q.Has("versions"):
 			return "ListObjectVersions"
 		case q.Has("versioning"):
@@ -638,6 +642,57 @@ func (s *Server) fillVersionPage(b *bucket, res *listVersionsResult) {
 	}
 	// A complete listing carries no continuation markers.
 	res.NextKeyMarker, res.NextVersionIDMarker = "", ""
+}
+
+// listObjectsV2 lists current versions only: a key whose newest version is
+// a delete marker is left out, which is exactly why the witness must not use
+// it to find a node's newest day (C2). The continuation token is the last
+// key returned.
+func (s *Server) listObjectsV2(w http.ResponseWriter, bucketName string, b *bucket, q url.Values) {
+	prefix, after := q.Get("prefix"), q.Get("continuation-token")
+	maxKeys := 1000
+	if mk, err := strconv.Atoi(q.Get("max-keys")); err == nil && mk > 0 && mk < maxKeys {
+		maxKeys = mk
+	}
+	keys := make([]string, 0, len(b.objects))
+	for k, versions := range b.objects {
+		if strings.HasPrefix(k, prefix) && k > after && !versions[len(versions)-1].DeleteMarker {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	res := listBucketResult{Name: bucketName, Prefix: prefix, MaxKeys: maxKeys, ContinuationToken: after}
+	for i, k := range keys {
+		if i == maxKeys {
+			res.IsTruncated = true
+			res.NextContinuationToken = keys[i-1]
+			break
+		}
+		v := b.objects[k][len(b.objects[k])-1]
+		res.Contents = append(res.Contents, objectEntry{Key: k, LastModified: s3Time(v.LastModified), ETag: v.ETag, Size: int64(len(v.Body)), StorageClass: "STANDARD"})
+	}
+	res.KeyCount = len(res.Contents)
+	writeXML(w, res)
+}
+
+type listBucketResult struct {
+	XMLName               xml.Name      `xml:"ListBucketResult"`
+	Name                  string        `xml:"Name"`
+	Prefix                string        `xml:"Prefix"`
+	MaxKeys               int           `xml:"MaxKeys"`
+	KeyCount              int           `xml:"KeyCount"`
+	IsTruncated           bool          `xml:"IsTruncated"`
+	ContinuationToken     string        `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string        `xml:"NextContinuationToken,omitempty"`
+	Contents              []objectEntry `xml:"Contents"`
+}
+
+type objectEntry struct {
+	Key          string `xml:"Key"`
+	LastModified string `xml:"LastModified"`
+	ETag         string `xml:"ETag"`
+	Size         int64  `xml:"Size"`
+	StorageClass string `xml:"StorageClass"`
 }
 
 // s3Time formats a timestamp the way S3 list results do: milliseconds are

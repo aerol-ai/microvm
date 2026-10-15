@@ -92,6 +92,9 @@ func (a *app) verbGroups() []verbGroup {
 			{"destroy", "Destroy sandboxes", destroyHelp, runDestroy},
 			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
 		}},
+		{"Audit", []verb{
+			{"audit", "Verify nodes' audit logs against their S3 witness", auditHelp, runAudit},
+		}},
 		{"Setup", []verb{
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
 			{"logout", "Forget the saved login", logoutHelp, runLogout},
