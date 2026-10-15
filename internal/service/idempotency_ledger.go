@@ -64,7 +64,15 @@ func (s *Service) sweepIdempotentRequests(now time.Time) {
 		}
 		return
 	}
-	if deleted == idempotencySweepBatch {
+	// Collect deleted-sandbox tombstones past their replay window on the same
+	// pass, reusing this single-flight sweep instead of starting another loop.
+	tombstoned, err := s.store.DeleteExpiredDeletedSandboxViews(ctx, now.Add(-deletedViewRetention), idempotencySweepBatch)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Warn("deleted sandbox view sweep failed", "error", err)
+		}
+	}
+	if deleted == idempotencySweepBatch || tombstoned == idempotencySweepBatch {
 		// A full batch means a backlog (first run after the upgrade, or a
 		// burst of expiries): make the sweep due again, so the next claim
 		// continues it rather than waiting out a whole interval.

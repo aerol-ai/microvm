@@ -359,6 +359,23 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			updated_at DATETIME NOT NULL,
 			PRIMARY KEY (scope, fingerprint)
 		);`,
+		// deleted_sandbox_view is the durable replacement for a facade keeping
+		// the terminal view of a just-deleted sandbox in memory (Runloop's
+		// shutdown tombstone): a destroyed sandbox leaves no row, so a retried
+		// shutdown or a GET of it would 404 once the in-process cache was lost
+		// to a restart. It deliberately has NO foreign key to sandboxes — the
+		// row must outlive the sandbox it describes. owner_ref scopes reads;
+		// view_json is the facade's rendered body; the service sweeps rows past
+		// the replay window by created_at (idx below makes that a range scan).
+		`CREATE TABLE IF NOT EXISTS deleted_sandbox_view (
+			sandbox_id TEXT NOT NULL,
+			facade TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			view_json TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			PRIMARY KEY (sandbox_id, facade)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_deleted_sandbox_view_created ON deleted_sandbox_view(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_status ON sandboxes(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandboxes_last_active_at ON sandboxes(last_active_at);`,
 		// idx_sandboxes_runtime backs ListByRuntime so the per-runtime background

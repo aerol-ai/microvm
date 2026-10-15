@@ -2,6 +2,7 @@ package runloop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -9,7 +10,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -27,12 +27,6 @@ const (
 	statusPollInterval = 250 * time.Millisecond
 
 	defaultListLimit = 20
-
-	// tombstoneTTL / maxTombstones bound the memory of devboxes this node
-	// shut down. A destroyed sandbox leaves no row, so without them a
-	// shutdown whose response was lost would 404 on the SDK's retry.
-	tombstoneTTL  = 10 * time.Minute
-	maxTombstones = 4096
 )
 
 func (h *handlers) getDevbox(w http.ResponseWriter, r *http.Request, id string) {
@@ -68,7 +62,7 @@ func (h *handlers) currentView(ctx context.Context, id string) (devboxView, bool
 			return view, false, nil
 		}
 	}
-	if view, ok := h.shutdowns.get(ctx, id); ok {
+	if view, ok := h.shutdownTombstone(ctx, id); ok {
 		return view, false, nil
 	}
 	return devboxView{}, false, store.ErrNotFound
@@ -433,7 +427,7 @@ func (h *handlers) updateDevbox(w http.ResponseWriter, r *http.Request, id strin
 func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id string) {
 	sandbox, err := h.deps.Service.GetSandbox(r.Context(), id)
 	if errors.Is(err, store.ErrNotFound) {
-		if view, ok := h.shutdowns.get(r.Context(), id); ok {
+		if view, ok := h.shutdownTombstone(r.Context(), id); ok {
 			writeJSON(w, http.StatusOK, view)
 			return
 		}
@@ -456,7 +450,14 @@ func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id str
 	view.EndTimeMs = &end
 	view.ShutdownReason = stringPtr("api_shutdown")
 	view.FailureReason = nil
-	h.shutdowns.put(id, sandbox.OwnerRef, view)
+	if err := h.putShutdownTombstone(r.Context(), id, sandbox.OwnerRef, view); err != nil {
+		// The sandbox is already gone; a tombstone write failure only costs a
+		// retried shutdown its replay (it would 404 instead of 200). Log and
+		// still return the terminal view for this call.
+		if h.deps.Logger != nil {
+			h.deps.Logger.Warn("record shutdown tombstone failed", "devbox", id, "error", err)
+		}
+	}
 	h.homes.forget(id)
 	h.execs.forgetDevbox(id)
 	writeJSON(w, http.StatusOK, view)
@@ -497,57 +498,29 @@ func (h *handlers) keepAlive(w http.ResponseWriter, r *http.Request, id string) 
 	writeJSON(w, http.StatusOK, struct{}{})
 }
 
-// tombstones remembers recently shut-down devboxes so a retried shutdown
-// (or a wait for `shutdown`) answers with the terminal view.
-type tombstones struct {
-	mu    sync.Mutex
-	views map[string]tombstone
-}
-
-type tombstone struct {
-	owner string
-	view  devboxView
-	at    time.Time
-}
-
-func newTombstones() *tombstones {
-	return &tombstones{views: make(map[string]tombstone)}
-}
-
-func (t *tombstones) put(id, owner string, view devboxView) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := time.Now()
-	if len(t.views) >= maxTombstones {
-		for key, entry := range t.views {
-			if now.Sub(entry.at) > tombstoneTTL {
-				delete(t.views, key)
-			}
-		}
-		if len(t.views) >= maxTombstones {
-			// Still full of live entries: drop the oldest.
-			oldest := ""
-			for key, entry := range t.views {
-				if oldest == "" || entry.at.Before(t.views[oldest].at) {
-					oldest = key
-				}
-			}
-			delete(t.views, oldest)
-		}
+// putShutdownTombstone durably records the terminal view of a devbox this
+// handler just shut down, so a retried shutdown (or a GET/wait that races the
+// delete) answers with it instead of 404 even across a restart (D6). The
+// owner scopes who may read it back.
+func (h *handlers) putShutdownTombstone(ctx context.Context, id, owner string, view devboxView) error {
+	blob, err := json.Marshal(view)
+	if err != nil {
+		return err
 	}
-	t.views[id] = tombstone{owner: owner, view: view, at: now}
+	return h.deps.Service.RecordDeletedSandboxView(ctx, id, models.FacadeRunloop, owner, string(blob))
 }
 
-func (t *tombstones) get(ctx context.Context, id string) (devboxView, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	entry, ok := t.views[id]
-	if !ok || !visibleTo(ctx, entry.owner) {
+// shutdownTombstone returns the recorded terminal view for a gone devbox, if
+// the caller may see it and it is still within the replay window. The owner
+// and window checks live in the service.
+func (h *handlers) shutdownTombstone(ctx context.Context, id string) (devboxView, bool) {
+	blob, ok, err := h.deps.Service.GetDeletedSandboxView(ctx, id, models.FacadeRunloop)
+	if err != nil || !ok {
 		return devboxView{}, false
 	}
-	if time.Since(entry.at) > tombstoneTTL {
-		delete(t.views, id)
+	var view devboxView
+	if err := json.Unmarshal([]byte(blob), &view); err != nil {
 		return devboxView{}, false
 	}
-	return entry.view, true
+	return view, true
 }
