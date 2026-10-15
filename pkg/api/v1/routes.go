@@ -101,6 +101,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// records they return, this is where the whole chain is proven.
 	mux.Handle("POST "+PathPrefix+"/audit/verify", withAuthOperator(d, http.HandlerFunc(h.verifySandboxAudit)))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
+	// Snapshot catalogue read/delete (I group). The list is node-local and
+	// store-paged; get/delete-by-id are wrapped so a cluster request reaches
+	// the node holding the image (B6). A v1 snapshot id is its name.
+	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
+	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.getSnapshot))))
+	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.deleteSnapshot))))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
 	// Phase 2). Templates are global operator-managed, per-worker artifacts; no

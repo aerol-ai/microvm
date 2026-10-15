@@ -57,7 +57,9 @@ import type {
   NetworkPolicyCheckResult,
   NetworkPolicyOptions,
   PlatformVolumeMount,
+  ListSnapshotsOptions,
   RegisterSnapshotOptions,
+  SnapshotList,
   SetNetworkLimitsOptions,
   ResizeOptions,
   Sandbox,
@@ -753,6 +755,31 @@ export class APIClient {
       name,
       dockerfileContent: image.dockerfile,
     });
+  }
+
+  async getSnapshot(name: string): Promise<SandboxSnapshot> {
+    return fromApiSandboxSnapshot(
+      await this.doJSON<ApiSandboxSnapshot>("GET", this.versioned(`/snapshots/${encodeURIComponent(name)}`)),
+    );
+  }
+
+  async listSnapshots(options: ListSnapshotsOptions = {}): Promise<SnapshotList> {
+    const params = new URLSearchParams();
+    if (options.limit) params.set("limit", String(options.limit));
+    if (options.startingAfter) params.set("starting_after", options.startingAfter);
+    const query = params.toString();
+    const response = await this.doJSON<{ snapshots: ApiSandboxSnapshot[] | null; has_more?: boolean }>(
+      "GET",
+      this.versioned(`/snapshots${query ? `?${query}` : ""}`),
+    );
+    return {
+      snapshots: (response.snapshots ?? []).map(fromApiSandboxSnapshot),
+      hasMore: response.has_more ?? false,
+    };
+  }
+
+  async deleteSnapshot(name: string): Promise<void> {
+    await this.doJSON<void>("DELETE", this.versioned(`/snapshots/${encodeURIComponent(name)}`));
   }
 
   async destroy(id: string): Promise<void> {

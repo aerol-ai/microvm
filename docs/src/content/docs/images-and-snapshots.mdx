@@ -346,6 +346,94 @@ If the image does not exist yet, send a Dockerfile. The server builds it and poi
 - **Builds start from registry images.** With an account token, every image a Dockerfile names (`FROM`, `COPY --from`) is pulled from its registry, never taken from images already on the server. A Dockerfile that names a snapshot, a built image or an image id is refused; start a sandbox from the snapshot instead.
 - **There is a builder helper.** Each SDK can also turn its `Image` builder object into a Dockerfile for you, with `registerSnapshotFromImage` (Python `register_snapshot_from_image`, Go `RegisterSnapshotFromImage`, Rust `register_snapshot_from_image`).
 
+### Find, list, and delete snapshots
+
+Once you have snapshots, you can look one up by name, page through all of them, and delete the ones you no longer need. In a cluster, a look-up or delete is routed to the node that holds the image, so it works from any node.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const snapshot = await client.getSnapshot("py-base");
+
+    const page = await client.listSnapshots({ limit: 20 });
+    for (const s of page.snapshots) {
+      console.log(s.name);
+    }
+    // page.hasMore is true when another page follows. Fetch it with
+    // { startingAfter: page.snapshots.at(-1)?.name }.
+
+    await client.deleteSnapshot("py-base");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    snapshot = client.get_snapshot("py-base")
+
+    page = client.list_snapshots(limit=20)
+    for s in page["snapshots"]:
+        print(s["name"])
+    # page["hasMore"] is True when another page follows. Fetch it with
+    # starting_after=page["snapshots"][-1]["name"].
+
+    client.delete_snapshot("py-base")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    snapshot, err := client.GetSnapshot(ctx, "py-base")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    page, err := client.ListSnapshots(ctx, sdktypes.ListSnapshotsOptions{Limit: 20})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, s := range page.Snapshots {
+        fmt.Println(s.Name)
+    }
+    // page.HasMore reports another page. Set StartingAfter to continue.
+
+    if err := client.DeleteSnapshot(ctx, "py-base"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ListSnapshotsOptions;
+
+    let snapshot = client.get_snapshot("py-base")?;
+
+    let page = client.list_snapshots(ListSnapshotsOptions {
+        limit: Some(20),
+        ..Default::default()
+    })?;
+    for s in &page.snapshots {
+        println!("{}", s.name);
+    }
+    // page.has_more reports another page. Set starting_after to continue.
+
+    client.delete_snapshot("py-base")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    SandboxSnapshot snapshot = client.getSnapshot("py-base");
+
+    SnapshotList page = client.listSnapshots(new ListSnapshotsOptions().setLimit(20));
+    for (SandboxSnapshot s : page.snapshots) {
+        System.out.println(s.name);
+    }
+    // page.hasMore reports another page. setStartingAfter(...) to continue.
+
+    client.deleteSnapshot("py-base");
+    ```
+  </TabItem>
+</Tabs>
+
+Listing returns one name-ordered page at a time. Pass `limit` to cap the page and `starting_after` (the last name you saw) to get the next one. Deleting a name that does not exist returns a not-found error. Deleting a snapshot only removes the snapshot's own saved image, and only when no other snapshot still points at it.
+
 ### What a snapshot keeps
 
 A snapshot saves the sandbox's image, not the running state around it.

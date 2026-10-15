@@ -89,6 +89,35 @@ class RecordingMicroVM(MicroVM):
                 "memory_mb": payload.get("memory_mb", 0),
                 "disk_gb": payload.get("disk_gb", 0),
             }
+        if method == "GET" and (path == "/v1/snapshots" or path.startswith("/v1/snapshots?")):
+            return {
+                "snapshots": [
+                    {
+                        "name": "snapshots/a:v1",
+                        "image": "snapshots/a:v1",
+                        "image_id": "sha256:a",
+                        "source_sandbox_id": "sb-a",
+                        "created_at": "2026-05-16T10:00:00Z",
+                    }
+                ],
+                "has_more": True,
+            }
+        if method == "GET" and path.startswith("/v1/snapshots/"):
+            name = urllib.parse.unquote(path[len("/v1/snapshots/"):])
+            return {
+                "name": name,
+                "image": "snapshots/built:resolved",
+                "image_id": "sha256:snap-get",
+                "source_sandbox_id": "sb-1",
+                "created_at": "2026-05-16T10:00:00Z",
+                "region_id": "us",
+                "cpu": 2,
+                "gpu": 0,
+                "memory_mb": 2048,
+                "disk_gb": 20,
+            }
+        if method == "DELETE" and path.startswith("/v1/snapshots/"):
+            return None
         if path == "/v1/sandboxes/sb-1/network/learned":
             return {
                 "mode": "learn",
@@ -803,6 +832,55 @@ class ClientTests(unittest.TestCase):
             client.register_snapshot({"name": "x", "image": "alpine", "dockerfileContent": "FROM busybox"})
 
         self.assertEqual(client.calls, [])
+
+    def test_get_snapshot_hits_versioned_path_and_parses_object(self):
+        client = RecordingMicroVM()
+
+        snapshot = client.get_snapshot("snapshots/demo:v1")
+
+        self.assertEqual(
+            client.calls[0],
+            ("GET", "/v1/snapshots/snapshots%2Fdemo%3Av1", None),
+        )
+        self.assertEqual(snapshot["name"], "snapshots/demo:v1")
+        self.assertEqual(snapshot["imageID"], "sha256:snap-get")
+        self.assertEqual(snapshot["sourceSandboxID"], "sb-1")
+        self.assertEqual(snapshot["regionID"], "us")
+        self.assertEqual(snapshot["memoryMB"], 2048)
+
+    def test_list_snapshots_sends_paging_and_parses_page(self):
+        client = RecordingMicroVM()
+
+        page = client.list_snapshots(limit=10, starting_after="snapshots/prev:v1")
+
+        method, path, payload = client.calls[0]
+        self.assertEqual((method, payload), ("GET", None))
+        self.assertTrue(path.startswith("/v1/snapshots?"))
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+        self.assertEqual(query["limit"], ["10"])
+        self.assertEqual(query["starting_after"], ["snapshots/prev:v1"])
+        self.assertEqual(page["hasMore"], True)
+        self.assertEqual(len(page["snapshots"]), 1)
+        self.assertEqual(page["snapshots"][0]["name"], "snapshots/a:v1")
+        self.assertEqual(page["snapshots"][0]["sourceSandboxID"], "sb-a")
+
+    def test_list_snapshots_omits_unset_paging_params(self):
+        client = RecordingMicroVM()
+
+        page = client.list_snapshots()
+
+        self.assertEqual(client.calls[0], ("GET", "/v1/snapshots", None))
+        self.assertEqual(page["hasMore"], True)
+
+    def test_delete_snapshot_issues_versioned_delete(self):
+        client = RecordingMicroVM()
+
+        self.assertIsNone(client.delete_snapshot("snapshots/demo:v1"))
+
+        self.assertEqual(
+            client.calls[0],
+            ("DELETE", "/v1/snapshots/snapshots%2Fdemo%3Av1", None),
+        )
 
     def test_exec_and_health_map_api_shapes(self):
         client = RecordingMicroVM()
