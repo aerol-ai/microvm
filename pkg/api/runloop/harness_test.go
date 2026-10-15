@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -591,7 +592,7 @@ func newTestEnvWithConfig(t *testing.T, mutate func(*config.Config)) *testEnv {
 	rt := newFakeRuntime()
 	svc := service.New(cfg, logger, st, rt, nil, caddy.New(cfg), cipher, mountManager, nil)
 
-	deps := Deps{Service: svc, Logger: logger, Auth: func(next http.Handler) http.Handler { return next }}
+	deps := Deps{Service: svc, Logger: logger, Auth: func(next http.Handler) http.Handler { return next }, BlueprintMapJSON: os.Getenv(blueprintMapEnv)}
 	h := newHandlers(deps)
 	mux := http.NewServeMux()
 	mux.Handle(devboxesPath, http.HandlerFunc(h.route))

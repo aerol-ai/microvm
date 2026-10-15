@@ -108,7 +108,7 @@ func cover96_funcs() {
 	cover96Call(func() {
 		createRequestFingerprint(zero96[string](), zero96[string](), zero96[models.CreateSandboxRequest](), zero96[sandboxMeta]())
 	}) // meta.go:317
-	cover96Call(func() { loadTemplateMap(zero96[*slog.Logger]()) })                                                      // handlers.go:1280
+	cover96Call(func() { loadTemplateMap(zero96[string](), zero96[*slog.Logger]()) })                                    // handlers.go:1280
 	cover96Call(func() { parseMetadataFilter(zero96[string]()) })                                                        // handlers.go:1179
 	cover96Call(func() { sandboxMetaFromNative(zero96[*models.Sandbox](), zero96[compatBlob]()) })                       // meta.go:108
 	cover96Call(func() { sandboxMetaToState(zero96[sandboxMeta]()) })                                                    // meta.go:165

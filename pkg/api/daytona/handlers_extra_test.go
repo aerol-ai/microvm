@@ -945,9 +945,8 @@ func (f *handlersExtraFakeImageBuilder) RemoveImage(_ context.Context, ref strin
 }
 
 func TestHandlersBuildAndImageEdgeCases(t *testing.T) {
-	t.Run("default_image_env", func(t *testing.T) {
-		t.Setenv("SB_DAYTONA_DEFAULT_IMAGE", "default-env-image")
-		h := newHandlers(Deps{})
+	t.Run("default_image_config", func(t *testing.T) {
+		h := newHandlers(Deps{DefaultImage: "default-env-image"})
 		req := createSandboxRequest{}
 		img, built, err := h.createImage(context.Background(), req)
 		if err != nil {
@@ -959,7 +958,6 @@ func TestHandlersBuildAndImageEdgeCases(t *testing.T) {
 	})
 
 	t.Run("image_default_fallback", func(t *testing.T) {
-		t.Setenv("SB_DAYTONA_DEFAULT_IMAGE", "")
 		h := newHandlers(Deps{})
 		req := createSandboxRequest{}
 		img, built, err := h.createImage(context.Background(), req)

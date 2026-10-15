@@ -20,6 +20,10 @@ type Deps struct {
 	Auth    func(http.Handler) http.Handler
 	// ContainerEngine selects BuildKit-absent clear errors on containerd hosts.
 	ContainerEngine string
+	// DefaultImage is the image a create falls back to when the request names
+	// neither a snapshot nor a build (SB_DAYTONA_DEFAULT_IMAGE, read once in
+	// config). Empty falls back to the built-in default.
+	DefaultImage string
 }
 
 // RegisterRoutes mounts the supported Daytona compatibility surface.

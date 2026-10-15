@@ -39,6 +39,13 @@ type Server struct {
 	mux             *http.ServeMux
 	root            http.Handler
 	mcp             *remotemcp.Handler
+
+	// Facade config, read once from config.Config (not per request in the
+	// facades). Each facade parses its own format.
+	daytonaDefaultImage     string
+	e2bTemplateMapJSON      string
+	e2bClientID             string
+	runloopBlueprintMapJSON string
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -77,7 +84,11 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 			OperatorRate: cfg.AuditRateLimitOperator,
 			NodeRate:     cfg.AuditRateLimitNode,
 		}),
-		mux: http.NewServeMux(),
+		daytonaDefaultImage:     cfg.DaytonaDefaultImage,
+		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
+		e2bClientID:             cfg.E2BClientID,
+		runloopBlueprintMapJSON: cfg.RunloopBlueprintMapJSON,
+		mux:                     http.NewServeMux(),
 	}
 	if cfg.MCPEnabled {
 		s.mcp = remotemcp.New(remotemcp.Config{
@@ -113,18 +124,22 @@ func (s *Server) routes() {
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
 		ContainerEngine: s.containerEngine,
+		DefaultImage:    s.daytonaDefaultImage,
 	})
 
 	e2b.RegisterRoutes(s.mux, e2b.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireE2BAuth,
+		Service:         s.service,
+		Logger:          s.logger,
+		Auth:            s.requireE2BAuth,
+		TemplateMapJSON: s.e2bTemplateMapJSON,
+		ClientID:        s.e2bClientID,
 	})
 
 	runloop.RegisterRoutes(s.mux, runloop.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireRunloopAuth,
+		Service:          s.service,
+		Logger:           s.logger,
+		Auth:             s.requireRunloopAuth,
+		BlueprintMapJSON: s.runloopBlueprintMapJSON,
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
