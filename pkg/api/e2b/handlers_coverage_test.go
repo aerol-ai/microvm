@@ -18,20 +18,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-func TestFilterE2BLocalToPage(t *testing.T) {
-	local := []listedSandboxResponse{{SandboxID: "sb-1"}, {SandboxID: "sb-2"}}
-	if got := filterE2BLocalToPage(local, nil, ""); len(got) != 2 {
-		t.Fatalf("cold start = %d", len(got))
-	}
-	if got := filterE2BLocalToPage(local, nil, "tok"); got != nil {
-		t.Fatalf("terminal = %+v", got)
-	}
-	got := filterE2BLocalToPage(local, []cluster.Placement{{SandboxID: "sb-2"}}, "")
-	if len(got) != 1 || got[0].SandboxID != "sb-2" {
-		t.Fatalf("page filter = %+v", got)
-	}
-}
-
 // e2bFacadeListCluster is not *cluster.Noop so listFacadeClusterItems runs the
 // placement-page merge instead of the standalone short-circuit.
 // e2bFacadeListCluster is not *cluster.Noop so listFacadeClusterItems runs the
@@ -658,8 +644,7 @@ func TestParseMetadataFilterEmptyValue(t *testing.T) {
 
 func TestLoadTemplateMapInvalidJSONWithLogger(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "{invalid")
-	m := loadTemplateMap(logger)
+	m := loadTemplateMap("{invalid", logger)
 	if _, ok := m["base"]; !ok {
 		t.Fatal("expected default base template after invalid JSON")
 	}
@@ -757,8 +742,7 @@ func TestWaitForCreateReplayLockedUntilShorterThanPoll(t *testing.T) {
 }
 
 func TestLoadTemplateMapAddsDefaultBase(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"custom":"custom:img"}`)
-	m := loadTemplateMap(nil)
+	m := loadTemplateMap(`{"custom":"custom:img"}`, nil)
 	if m["base"] != "ubuntu:22.04" {
 		t.Fatalf("base = %q, want default ubuntu:22.04", m["base"])
 	}

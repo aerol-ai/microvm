@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -27,9 +28,20 @@ const clusterControlHeaderPrefix = "X-Cluster-"
 // of node-authenticated transport, never a credential supplied by a public API
 // caller. This single guard covers v1 and all compatibility facades, including
 // create-target, fan-out loop, peer-node, and artifact-replication headers.
+// A single node has no peers to send them, so it drops them: otherwise a
+// caller could pick its own sandbox id through the create-target pair.
 func (s *Server) clusterControlHeaderGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.clusterEnabled || !hasClusterControlHeader(r.Header) {
+		if !hasClusterControlHeader(r.Header) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !s.clusterEnabled {
+			for name := range r.Header {
+				if strings.HasPrefix(http.CanonicalHeaderKey(name), clusterControlHeaderPrefix) {
+					r.Header.Del(name)
+				}
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -137,6 +149,24 @@ func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 	})
 }
 
+// requireRunloopAuth is requireAuth with the Runloop error body: the Runloop
+// SDKs send `Authorization: Bearer <RUNLOOP_API_KEY>`, the same credential
+// shape every other surface takes.
+func (s *Server) requireRunloopAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := extractBearerToken(r)
+		if s.isPATToken(token) {
+			next.ServeHTTP(w, s.withOperatorAccess(r))
+			return
+		}
+		if r2, ok := s.authenticateUserToken(r, token); ok {
+			next.ServeHTTP(w, r2)
+			return
+		}
+		runloop.WriteError(w, http.StatusUnauthorized, "unauthorized: check RUNLOOP_API_KEY")
+	})
+}
+
 // withOperatorAccess stamps the PAT/operator marker onto the request context so
 // the service layer bypasses owner scoping.
 func (s *Server) withOperatorAccess(r *http.Request) *http.Request {
@@ -153,6 +183,12 @@ func (s *Server) authenticateUserToken(r *http.Request, token string) (*http.Req
 	}
 	identity, err := s.validator.Validate(r.Context(), token)
 	if err != nil {
+		return nil, false
+	}
+	// An identity with no account would be scoped to owner "", which is
+	// every operator-created sandbox and snapshot. A validator answering
+	// that is broken; refuse rather than fail open.
+	if strings.TrimSpace(identity.OwnerRef) == "" {
 		return nil, false
 	}
 	access := controlplane.Access{Identity: identity}

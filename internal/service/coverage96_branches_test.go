@@ -2533,15 +2533,11 @@ func TestCB96StopRebuildToolboxGuards(t *testing.T) {
 	}
 
 	bare := cb96Service(tst, config.Config{})
-	if _, err := bare.roundTripWasmToolbox(ctx, &models.Sandbox{ID: "cb96-w", Runtime: models.RuntimeWasm}, http.MethodGet, "/", nil, nil, nil); err == nil {
-		t.Fatal("wasm toolbox without a driver succeeded")
+	if _, err := bare.roundTripHostToolbox(ctx, &models.Sandbox{ID: "cb96-w", Runtime: models.RuntimeWasm}, &fakeToolboxHost{}, "bad method", "/", nil, nil, nil); err == nil {
+		t.Fatal("host toolbox accepted an invalid method")
 	}
-	bare.wasm = &fakeToolboxHost{}
-	if _, err := bare.roundTripWasmToolbox(ctx, &models.Sandbox{ID: "cb96-w", Runtime: models.RuntimeWasm}, "bad method", "/", nil, nil, nil); err == nil {
-		t.Fatal("wasm toolbox accepted an invalid method")
-	}
-	if _, err := bare.newNetworkToolboxRequest(ctx, "cb96-missing", http.MethodGet, "/", nil, nil, nil); err == nil {
-		t.Fatal("network toolbox request for a missing sandbox succeeded")
+	if _, err := bare.newNetworkToolboxRequest(ctx, &models.Sandbox{ID: "cb96-missing"}, http.MethodGet, "/", nil, nil, nil); err == nil {
+		t.Fatal("network toolbox request for a non-running sandbox succeeded")
 	}
 }
 

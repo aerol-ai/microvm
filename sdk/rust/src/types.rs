@@ -654,6 +654,33 @@ pub struct SandboxSnapshot {
     pub disk_gb: Option<u32>,
 }
 
+/// Paging for `list_snapshots`: one name-ordered page. Both fields are
+/// optional — an empty value maps to the first page at the server default
+/// page size.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListSnapshotsOptions {
+    pub limit: Option<u32>,
+    pub starting_after: Option<String>,
+}
+
+/// One page of snapshots from `list_snapshots`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct SnapshotList {
+    #[serde(default, deserialize_with = "null_as_empty_snapshots")]
+    pub snapshots: Vec<SandboxSnapshot>,
+    /// `true` when another page follows; fetch it with the last name as
+    /// `starting_after`.
+    #[serde(rename = "has_more", default)]
+    pub has_more: bool,
+}
+
+fn null_as_empty_snapshots<'de, D>(d: D) -> Result<Vec<SandboxSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<SandboxSnapshot>>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HealthStatus {
     pub status: String,

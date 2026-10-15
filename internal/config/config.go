@@ -1325,6 +1325,20 @@ type Config struct {
 	// twice that. Default 20. SB_MCP_RATE_LIMIT.
 	MCPRateLimit float64
 
+	// Facade configuration read once here (not per request in the facades):
+	// which image/template a tenant lands on through each compatibility API.
+	// Each facade still parses its own format and applies its own defaults;
+	// config only owns the env read so there is one place the deployment sets
+	// them. DaytonaDefaultImage (SB_DAYTONA_DEFAULT_IMAGE) is the image a
+	// Daytona create falls back to; E2BTemplateMapJSON (SB_E2B_TEMPLATE_MAP_JSON)
+	// and RunloopBlueprintMapJSON (SB_RUNLOOP_BLUEPRINT_MAP_JSON) are the
+	// template/blueprint→image maps; E2BClientID (SB_E2B_CLIENT_ID) is the
+	// client id the E2B SDK echoes.
+	DaytonaDefaultImage     string
+	E2BTemplateMapJSON      string
+	E2BClientID             string
+	RunloopBlueprintMapJSON string
+
 	// Cluster-internal mTLS. When enabled, leader-forwarded raft applies (and
 	// any other future cluster-internal RPC) ride over a separate HTTPS listener
 	// that requires a client certificate signed by the cluster CA. Without TLS
@@ -1500,8 +1514,9 @@ type Config struct {
 	// stay local-only — identical to pre-feature behavior. When true,
 	// snapshots whose distribution mode is `local_only` (sandbox commits
 	// and aerolvm-build/* tags) are pushed in the background to
-	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`,
-	// reusing the cluster PAT as the registry password. Requires
+	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`
+	// (a tenant's under `snapshots/tenant-<owner hash>/<name>`), reusing
+	// the cluster PAT as the registry password. Requires
 	// AutoImportClusterID and AutoImportClusterPATPath to be set —
 	// validated at startup. SB_SNAPSHOT_PUSH_ENABLED.
 	SnapshotPushEnabled bool
@@ -1879,6 +1894,10 @@ func Load() (Config, error) {
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
 		MCPRateLimit:                  getEnvFloat("SB_MCP_RATE_LIMIT", 20),
+		DaytonaDefaultImage:           strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")),
+		E2BTemplateMapJSON:            strings.TrimSpace(os.Getenv("SB_E2B_TEMPLATE_MAP_JSON")),
+		E2BClientID:                   strings.TrimSpace(os.Getenv("SB_E2B_CLIENT_ID")),
+		RunloopBlueprintMapJSON:       strings.TrimSpace(os.Getenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON")),
 		ClusterTLSDir:                 strings.TrimSpace(os.Getenv("SB_CLUSTER_TLS_DIR")),
 		ClusterInternalListenAddr:     getEnv("SB_CLUSTER_INTERNAL_LISTEN", "0.0.0.0:7002"),
 		ClusterInternalAdvertiseURL:   strings.TrimSpace(os.Getenv("SB_CLUSTER_INTERNAL_ADVERTISE")),

@@ -1707,3 +1707,43 @@ func TestNodeIDRejectsProtocolDelimiters(t *testing.T) {
 		})
 	}
 }
+
+// Facade config (which image/template a tenant lands on) is read once here, not
+// per request in each facade (D11).
+func TestLoadFacadeConfig(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "token")
+	t.Setenv("SB_DAYTONA_DEFAULT_IMAGE", "daytona-default:1")
+	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"base":"ubuntu:22.04"}`)
+	t.Setenv("SB_E2B_CLIENT_ID", "client-xyz")
+	t.Setenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON", `{"default":"debian:12"}`)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DaytonaDefaultImage != "daytona-default:1" {
+		t.Fatalf("DaytonaDefaultImage = %q", cfg.DaytonaDefaultImage)
+	}
+	if cfg.E2BTemplateMapJSON != `{"base":"ubuntu:22.04"}` {
+		t.Fatalf("E2BTemplateMapJSON = %q", cfg.E2BTemplateMapJSON)
+	}
+	if cfg.E2BClientID != "client-xyz" {
+		t.Fatalf("E2BClientID = %q", cfg.E2BClientID)
+	}
+	if cfg.RunloopBlueprintMapJSON != `{"default":"debian:12"}` {
+		t.Fatalf("RunloopBlueprintMapJSON = %q", cfg.RunloopBlueprintMapJSON)
+	}
+
+	// Unset → empty (each facade applies its own default).
+	t.Setenv("SB_DAYTONA_DEFAULT_IMAGE", "")
+	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "")
+	t.Setenv("SB_E2B_CLIENT_ID", "")
+	t.Setenv("SB_RUNLOOP_BLUEPRINT_MAP_JSON", "")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DaytonaDefaultImage != "" || cfg.E2BTemplateMapJSON != "" || cfg.E2BClientID != "" || cfg.RunloopBlueprintMapJSON != "" {
+		t.Fatalf("expected empty facade config when unset, got %+v", cfg)
+	}
+}

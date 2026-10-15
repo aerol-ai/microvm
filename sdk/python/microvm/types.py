@@ -413,6 +413,14 @@ class SandboxSnapshot(TypedDict, total=False):
     diskGB: int
 
 
+class SnapshotList(TypedDict, total=False):
+    """One name-ordered page of snapshots from ``MicroVM.list_snapshots``."""
+
+    snapshots: List[SandboxSnapshot]
+    # True when more snapshots remain after this page.
+    hasMore: bool
+
+
 # Wire protocol an exposure publishes through. "http" maps to the Caddy HTTP
 # reverse proxy; "tcp" and "tls" map to caddy-l4 surfaces.
 ExposeProtocol = Literal["http", "tcp", "tls"]

@@ -26,8 +26,13 @@ func (e errorFile) Close() error {
 }
 
 func TestAtomicWriteFileCreateTempError(t *testing.T) {
-	// Passing a non-existent directory makes os.CreateTemp fail
-	err := atomicWriteFile("/nonexistent-directory-123456789/file.txt", errorFile{})
+	// A directory that does not exist inside the root fails the temp file.
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	err = atomicWriteFile(root, "nonexistent-directory-123456789/file.txt", errorFile{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -35,13 +40,17 @@ func TestAtomicWriteFileCreateTempError(t *testing.T) {
 
 func TestAtomicWriteFileCopyError(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "testfile.txt")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
 
-	err := atomicWriteFile(path, errorFile{})
+	err = atomicWriteFile(root, "testfile.txt", errorFile{})
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(dir, "testfile.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("expected file to not exist, got statErr: %v", statErr)
 	}
 }

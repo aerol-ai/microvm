@@ -28,7 +28,7 @@ use types::{CustomDomainListWire, ExposePortResponseWire};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
-    ListEgressProfilesOptions, NetworkLearned, NetworkLearnedEntry,
+    ListEgressProfilesOptions, ListSnapshotsOptions, SnapshotList, NetworkLearned, NetworkLearnedEntry,
     NetworkPolicy, NetworkPolicyCheckOptions, NetworkPolicyCheckResult, NetworkPolicyOptions,
     BuildImagePushOptions, BuildImageResult,
     CloneGeneration, ClientConfig, CreateOptions, CreateSessionOptions, CreateTemplateOptions,
@@ -1020,6 +1020,49 @@ impl Client {
         opts.image = None;
         opts.dockerfile_content = Some(image.dockerfile().to_string());
         self.register_snapshot(opts)
+    }
+
+    /// Look a snapshot up by name. In a cluster the request is routed to the
+    /// node holding the image. A missing snapshot surfaces as an `Api` error
+    /// carrying the server's 404.
+    pub fn get_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
+        self.do_json::<(), SandboxSnapshot>(
+            Method::GET,
+            &format!(
+                "{}/snapshots/{}",
+                self.version_prefix(),
+                urlencoding::encode(name)
+            ),
+            None,
+        )
+    }
+
+    /// List the caller's snapshots, one name-ordered page at a time. Maps
+    /// `limit` / `starting_after` to the matching query params; a null
+    /// `snapshots` array in the reply decodes to an empty vec.
+    pub fn list_snapshots(&self, opts: ListSnapshotsOptions) -> Result<SnapshotList, Error> {
+        let mut path = format!("{}/snapshots", self.version_prefix());
+        if let Some(limit) = opts.limit {
+            path = append_query_param(&path, "limit", &limit.to_string());
+        }
+        if let Some(starting_after) = &opts.starting_after {
+            path = append_query_param(&path, "starting_after", starting_after);
+        }
+        self.do_json::<(), SnapshotList>(Method::GET, &path, None)
+    }
+
+    /// Delete a snapshot by name. A missing snapshot surfaces as the server's
+    /// 404.
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), Error> {
+        self.do_json::<(), ()>(
+            Method::DELETE,
+            &format!(
+                "{}/snapshots/{}",
+                self.version_prefix(),
+                urlencoding::encode(name)
+            ),
+            None,
+        )
     }
 
     pub fn destroy(&self, id: &str) -> Result<(), Error> {
@@ -3277,6 +3320,130 @@ mod tests {
             })
             .expect_err("mutually exclusive fields should fail");
         assert!(both_set.to_string().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn get_snapshot_url_encodes_name_and_maps_response() {
+        let body = serde_json::json!({
+            "name": "team/py base:v1",
+            "image": "snapshots/py:v1",
+            "image_id": "sha256:snap-9",
+            "source_sandbox_id": "sb-7",
+            "created_at": "2026-05-16T10:00:00Z",
+            "region_id": "us",
+            "cpu": 2.0,
+            "memory_mb": 2048,
+            "disk_gb": 10
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let snapshot = client
+            .get_snapshot("team/py base:v1")
+            .expect("get snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        // The name carries a slash and a space, so the path must be
+        // percent-encoded; pin the encoded form so a regression that drops
+        // the encoder is caught.
+        assert!(
+            request.starts_with("GET /v1/snapshots/team%2Fpy%20base%3Av1 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(snapshot.name, "team/py base:v1");
+        assert_eq!(snapshot.image_id.as_deref(), Some("sha256:snap-9"));
+        assert_eq!(snapshot.source_sandbox_id, "sb-7");
+        assert_eq!(snapshot.region_id.as_deref(), Some("us"));
+        assert_eq!(snapshot.cpu, Some(2.0));
+        assert_eq!(snapshot.memory_mb, Some(2048));
+    }
+
+    #[test]
+    fn list_snapshots_sends_query_params_and_maps_page() {
+        let body = serde_json::json!({
+            "snapshots": [
+                {
+                    "name": "a",
+                    "image": "snapshots/a:v1",
+                    "image_id": "sha256:a",
+                    "source_sandbox_id": "sb-a",
+                    "created_at": "2026-05-16T10:00:00Z"
+                },
+                {
+                    "name": "b",
+                    "image": "snapshots/b:v1",
+                    "source_sandbox_id": "sb-b",
+                    "created_at": "2026-05-16T11:00:00Z"
+                }
+            ],
+            "has_more": true
+        })
+        .to_string();
+        let (url, request_rx) = spawn_json_server(body);
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_snapshots(ListSnapshotsOptions {
+                limit: Some(2),
+                starting_after: Some("last-name".to_string()),
+            })
+            .expect("list snapshots should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with(
+                "GET /v1/snapshots?limit=2&starting_after=last-name HTTP/1.1\r\n"
+            ),
+            "unexpected request: {}",
+            request
+        );
+        assert_eq!(page.snapshots.len(), 2);
+        assert_eq!(page.snapshots[0].name, "a");
+        assert_eq!(page.snapshots[1].name, "b");
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn list_snapshots_defaults_params_and_null_array_to_empty() {
+        // A null `snapshots` array and an absent `has_more` must decode to an
+        // empty page, and no query string should be sent when both options are
+        // unset.
+        let (url, request_rx) =
+            spawn_json_server(serde_json::json!({ "snapshots": null }).to_string());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        let page = client
+            .list_snapshots(ListSnapshotsOptions::default())
+            .expect("list snapshots should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("GET /v1/snapshots HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
+        assert!(page.snapshots.is_empty());
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn delete_snapshot_url_encodes_and_accepts_no_content() {
+        let (url, request_rx) =
+            spawn_response_server("204 No Content", "application/json", Vec::new());
+
+        let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
+        client
+            .delete_snapshot("team/py base:v1")
+            .expect("delete snapshot should succeed");
+        let request = request_rx.recv().expect("request should be captured");
+
+        assert!(
+            request.starts_with("DELETE /v1/snapshots/team%2Fpy%20base%3Av1 HTTP/1.1\r\n"),
+            "unexpected request: {}",
+            request
+        );
     }
 
     #[test]

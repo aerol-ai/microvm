@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -30,8 +31,6 @@ import (
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
-	builder         apiv1.ImageBuilder
-	build           daytona.BuildConfig
 	containerEngine string
 	patToken        string
 	validator       controlplane.Validator
@@ -40,6 +39,13 @@ type Server struct {
 	mux             *http.ServeMux
 	root            http.Handler
 	mcp             *remotemcp.Handler
+
+	// Facade config, read once from config.Config (not per request in the
+	// facades). Each facade parses its own format.
+	daytonaDefaultImage     string
+	e2bTemplateMapJSON      string
+	e2bClientID             string
+	runloopBlueprintMapJSON string
 }
 
 // NewServer constructs the API server. validator is the second-token (non-PAT)
@@ -47,12 +53,13 @@ type Server struct {
 // validator) for the open-source PAT-only behavior. A nil validator is treated
 // as reject-all so callers can't accidentally open the door by omission.
 //
-// builder is the image-builder the /images/build + snapshot-from-Dockerfile
-// paths use. On the dockerd engine this is the *docker.Client; on the
-// containerd engine the daemon passes a buildkit-backed builder. A nil builder
-// falls back to dockerClient so existing docker-only callers are unaffected;
-// when both are nil the build endpoints return 503 (builder not configured).
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder apiv1.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+// builder is the image builder the service builds with (every surface's
+// builds go through service.BuildImage). On the dockerd engine this is the
+// *docker.Client; on the containerd engine the daemon passes a
+// buildkit-backed builder. A nil builder falls back to dockerClient so
+// existing docker-only callers are unaffected; when both are nil the build
+// endpoints return 503 (builder not configured).
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder service.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
 	if validator == nil {
 		validator = controlplane.Noop().Validator
 	}
@@ -62,11 +69,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	if builder == nil && dockerClient != nil {
 		builder = dockerClient
 	}
+	if service != nil && builder != nil {
+		service.SetImageBuilder(builder)
+	}
 	s := &Server{
 		logger:          logger,
 		service:         service,
-		builder:         builder,
-		build:           daytona.BuildConfig{ContextEnabled: cfg.ImageBuildContextEnabled, Timeout: cfg.ImageBuildTimeout},
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
@@ -76,7 +84,11 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 			OperatorRate: cfg.AuditRateLimitOperator,
 			NodeRate:     cfg.AuditRateLimitNode,
 		}),
-		mux: http.NewServeMux(),
+		daytonaDefaultImage:     cfg.DaytonaDefaultImage,
+		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
+		e2bClientID:             cfg.E2BClientID,
+		runloopBlueprintMapJSON: cfg.RunloopBlueprintMapJSON,
+		mux:                     http.NewServeMux(),
 	}
 	if cfg.MCPEnabled {
 		s.mcp = remotemcp.New(remotemcp.Config{
@@ -111,15 +123,23 @@ func (s *Server) routes() {
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
-		Builder:         s.builder,
-		Build:           s.build,
 		ContainerEngine: s.containerEngine,
+		DefaultImage:    s.daytonaDefaultImage,
 	})
 
 	e2b.RegisterRoutes(s.mux, e2b.Deps{
-		Service: s.service,
-		Logger:  s.logger,
-		Auth:    s.requireE2BAuth,
+		Service:         s.service,
+		Logger:          s.logger,
+		Auth:            s.requireE2BAuth,
+		TemplateMapJSON: s.e2bTemplateMapJSON,
+		ClientID:        s.e2bClientID,
+	})
+
+	runloop.RegisterRoutes(s.mux, runloop.Deps{
+		Service:          s.service,
+		Logger:           s.logger,
+		Auth:             s.requireRunloopAuth,
+		BlueprintMapJSON: s.runloopBlueprintMapJSON,
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
@@ -127,8 +147,6 @@ func (s *Server) routes() {
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
 		AuditLimiter:    s.auditLimiter,
-		Builder:         s.builder,
-		Build:           apiv1.BuildConfig{ContextEnabled: s.build.ContextEnabled, Timeout: s.build.Timeout},
 		ContainerEngine: s.containerEngine,
 	})
 

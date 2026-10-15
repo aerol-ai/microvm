@@ -41,6 +41,11 @@ func newMountsManagerForTest(t *testing.T) *mounts.Manager {
 
 // fakeImageBuilder is the daytona.ImageBuilder stub used by tests that need
 // to assert build-path behavior without a real Docker daemon.
+// PushImage completes service.ImageBuilder; Daytona builds never push.
+func (f *fakeImageBuilder) PushImage(_ context.Context, req docker.PushImageRequest) (string, error) {
+	return req.DestRef, nil
+}
+
 type fakeImageBuilder struct {
 	exists     map[string]bool
 	builds     []docker.BuildImageRequest
@@ -132,7 +137,7 @@ func TestTranslateCreateSandboxRequestBuildsMultiLineDockerfile(t *testing.T) {
 	}
 
 	builder := &fakeImageBuilder{}
-	h := newHandlers(Deps{Builder: builder})
+	h := newHandlers(Deps{Service: buildService(builder, buildConfig{})})
 	translated, builtTag, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
@@ -167,7 +172,7 @@ func TestTranslateCreateSandboxRequestRejectsMultiLineWithoutBuilder(t *testing.
 		t.Fatalf("json.Unmarshal() error = %v", err)
 	}
 
-	h := newHandlers(Deps{}) // No Builder.
+	h := newHandlers(Deps{Service: buildService(nil, buildConfig{})}) // No builder.
 	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error when builder is nil")
@@ -185,7 +190,7 @@ func TestTranslateCreateSandboxRequestRejectsContextHashesWithoutFlag(t *testing
 		},
 	}
 
-	h := newHandlers(Deps{Builder: &fakeImageBuilder{}})
+	h := newHandlers(Deps{Service: buildService(&fakeImageBuilder{}, buildConfig{})})
 	_, _, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err == nil {
 		t.Fatal("expected error when contextHashes set but flag disabled")
@@ -204,7 +209,7 @@ func TestTranslateCreateSandboxRequestCacheHitSkipsBuild(t *testing.T) {
 		BuildInfo: &buildInfoRequest{DockerfileContent: stringPtr(dockerfile)},
 	}
 
-	h := newHandlers(Deps{Builder: builder})
+	h := newHandlers(Deps{Service: buildService(builder, buildConfig{})})
 	translated, builtTag, err := h.translateCreateSandboxRequest(context.Background(), req)
 	if err != nil {
 		t.Fatalf("translateCreateSandboxRequest() error = %v", err)
@@ -257,9 +262,11 @@ func TestTranslateCreateSandboxRequestPreservesIdleLifecycleFields(t *testing.T)
 // Dockerfile triggers a fresh image build inside the daytona handler. If
 // service.CreateSandbox then errors, there is no sandbox row to drive the
 // normal reference-counted GC — the freshly-built image would leak. The
-// handler is expected to call Builder.RemoveImage(builtTag) on the failure
-// path. (Cache hits and bare-reference images must NOT trigger a rollback;
-// those are tested elsewhere via builtTag == "" in resolveBuildInfo.)
+// failure path hands the tag to the image GC (service.DiscardBuiltImage),
+// which removes it once nothing uses it; it is not removed on the spot,
+// since another request may hold the same tag from the cache. (Cache hits
+// and bare-reference images must NOT trigger a rollback; those are tested
+// elsewhere via builtTag == "" in resolveBuildInfo.)
 func TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -270,14 +277,13 @@ func TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure(t *testing.T) {
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	rt := &fakeDaytonaSnapshotRuntime{createErr: errors.New("simulated docker failure")}
-	svc := service.New(config.Config{}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), newMountsManagerForTest(t), nil)
+	svc := service.New(config.Config{ImageBuildGCEnabled: true}, logger, st, rt, nil, nil, newDaytonaTestCipher(t), newMountsManagerForTest(t), nil)
 
 	builder := &fakeImageBuilder{}
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
 		Auth:    func(next http.Handler) http.Handler { return next },
 	})
 
@@ -293,8 +299,9 @@ func TestCreateSandboxRollsBackFreshlyBuiltImageOnServiceFailure(t *testing.T) {
 	if len(builder.builds) != 1 || builder.builds[0].Tag != wantTag {
 		t.Fatalf("expected one build for tag %q, got builds=%+v", wantTag, builder.builds)
 	}
-	if len(builder.removed) != 1 || builder.removed[0] != wantTag {
-		t.Fatalf("expected rollback RemoveImage(%q), got %+v", wantTag, builder.removed)
+	pending, err := st.ListPendingImageGCDue(ctx, time.Now().Add(time.Hour), 10)
+	if err != nil || len(builder.removed) != 0 || len(pending) != 1 || pending[0].Image != wantTag {
+		t.Fatalf("rollback: direct removals %+v, pending GC %+v (%v); want %q scheduled", builder.removed, pending, err, wantTag)
 	}
 }
 
@@ -320,9 +327,8 @@ func TestCreateSandboxNoRollbackOnCacheHit(t *testing.T) {
 
 	mux := http.NewServeMux()
 	RegisterRoutes(mux, Deps{
-		Service: svc,
+		Service: withBuilder(svc, builder),
 		Logger:  logger,
-		Builder: builder,
 		Auth:    func(next http.Handler) http.Handler { return next },
 	})
 

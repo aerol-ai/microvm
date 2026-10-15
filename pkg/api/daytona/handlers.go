@@ -4,10 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,7 +18,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
-	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -38,7 +35,9 @@ func newHandlers(d Deps) *handlers {
 
 func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxRequest
-	if err := apihttp.DecodeJSON(w, r, &req); err != nil {
+	// Buffer the body: clustercreate may forward this request to the
+	// placement target, which re-reads the original Daytona wire body (B2).
+	if _, err := apihttp.DecodeAndBufferJSON(w, r, &req); err != nil {
 		apihttp.WriteError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -48,7 +47,13 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteError, clustercreate.PrepareOptions{})
+	// An Idempotency-Key header makes the create retry-stable. On the cluster
+	// path the derived id is the reservation id, so a retry routes to the
+	// existing placement; on the single-node / local-image path it is the
+	// CreateOptions.SandboxID below, so CreateSandboxWithID replays the
+	// existing sandbox. Empty leaves both to mint a fresh id (the default).
+	preferredID := clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: preferredID})
 	if !ok {
 		return
 	}
@@ -56,38 +61,19 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
 		clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, decision.ReservationID)
-		// Image-build failures are operational, not user-input errors:
-		// reporting them as 400 would mislead retry/alerting (a transient
-		// daemon hiccup looks identical to bad client input). Distinguish
-		// timeouts (504) and build/registry failures (502) from validation
-		// errors that fail before BuildImage is reached (400).
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
-		case errors.Is(err, errBuildOperational):
-			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-		case errors.Is(err, models.ErrPlatformVolumesDisabled):
-			apihttp.WriteError(w, http.StatusPreconditionFailed, err.Error())
-		default:
-			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		}
+		// Build failures map like every surface's (service.BuildImage):
+		// 504/502 for the daemon's, 400 for the caller's.
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
-	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
+	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: preferredID})
 	if err != nil {
-		// If we built the image in this request and the create failed, the
-		// image is now orphaned: no sandbox row references it, so the normal
-		// reference-counted GC (service.maybeRemoveImage on destroy) will
-		// never see it. Roll it back here so a build storm of failed creates
-		// doesn't fill the daemon's image store.
-		//
-		// Use context.Background so cancellation of r.Context() (e.g. client
-		// disconnect on the failure response) doesn't skip the cleanup.
-		if freshlyBuiltImage != "" && h.deps.Builder != nil {
-			if rmErr := h.deps.Builder.RemoveImage(context.Background(), freshlyBuiltImage); rmErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("daytona image rollback failed", "tag", freshlyBuiltImage, "error", rmErr)
-			}
+		// A build this request made is now orphaned: no sandbox row
+		// references it. Hand it back so a storm of failed creates does not
+		// fill the image store.
+		if freshlyBuiltImage != "" {
+			h.deps.Service.DiscardBuiltImage(r.Context(), freshlyBuiltImage)
 		}
 		// Native uniqueness constraint on sandboxes.name surfaces as
 		// ErrSandboxNameConflict — translate to Daytona's wire-shape
@@ -158,6 +144,26 @@ func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandbo
 	if !distribution.IsZero() {
 		out.ApplyImageDistribution(distribution)
 	}
+	// Placement must know the runtime: without this a WASM sandbox is scored
+	// as docker and can land on a node with no WASM support (B4). The create
+	// path translates the request fully (translateCreateSandboxRequest); here
+	// we need only the runtime, so run the same WASM detection and carry its
+	// runtime/module ref onto the placement request.
+	catalogueID := strings.TrimSpace(valueOrEmpty(req.Snapshot))
+	if catalogueID == "" {
+		catalogueID = strings.TrimSpace(valueOrEmpty(req.Name))
+	}
+	var wasmGetter facadeutil.WasmModuleGetter
+	if h.deps.Service != nil {
+		wasmGetter = h.deps.Service
+	}
+	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, wasmGetter, catalogueID, mapValue(req.Labels)); err != nil {
+		return models.CreateSandboxRequest{}, err
+	} else if ok {
+		out.Runtime = wasmReq.Runtime
+		out.ModuleRef = wasmReq.ModuleRef
+		out.Image = wasmReq.Image
+	}
 	return out, nil
 }
 
@@ -168,10 +174,17 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	// Page the caller's catalogue in the store instead of loading every
+	// tenant's rows and filtering in Go (D9). Daytona's name filter, arbitrary
+	// sort and page-number pagination then run over just this owner's rows.
+	rows, err := h.deps.Service.ListOwnedSnapshots(r.Context(), "", "")
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
+	}
+	snapshots := make([]*models.SandboxSnapshot, 0, len(rows))
+	for _, row := range rows {
+		snapshots = append(snapshots, row.Snapshot)
 	}
 
 	items := h.filteredSnapshots(r, snapshots, filters)
@@ -252,35 +265,9 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var (
-		resolvedImage   string
-		freshlyBuiltTag string
-		err             error
-	)
-	if hasBuildInfo {
-		resolvedImage, freshlyBuiltTag, err = h.resolveBuildInfo(r.Context(), req.BuildInfo)
-		if err != nil {
-			// Mirror the createSandbox classification: timeouts and
-			// build/registry failures are operational (502/504); everything
-			// else is a 400 because it's a payload validation failure
-			// (e.g. contextHashes-without-flag).
-			switch {
-			case errors.Is(err, context.DeadlineExceeded):
-				apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
-			case errors.Is(err, errBuildOperational):
-				apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-			default:
-				apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-			}
-			return
-		}
-	} else {
-		resolvedImage = imageName
-	}
-
 	snapshot := &models.SandboxSnapshot{
 		Name:       req.Name,
-		Image:      resolvedImage,
+		Image:      imageName,
 		Entrypoint: append([]string{}, req.Entrypoint...),
 		RegionID:   strings.TrimSpace(valueOrEmpty(req.RegionID)),
 		CPU:        float64(float32Value(req.CPU)),
@@ -288,16 +275,17 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 		MemoryMB:   int(float32Value(req.Memory)) * 1024,
 		DiskGB:     int(float32Value(req.Disk)),
 	}
-	registered, err := h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	var registered *models.SandboxSnapshot
+	var err error
+	if hasBuildInfo {
+		registered, err = h.deps.Service.RegisterSnapshotFromDockerfile(r.Context(), snapshot, service.BuildImageRequest{
+			Dockerfile:    valueOrEmpty(req.BuildInfo.DockerfileContent),
+			ContextHashes: req.BuildInfo.ContextHashes,
+		})
+	} else {
+		registered, err = h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	}
 	if err != nil {
-		// We may have just freshly built a tag that's now orphaned (no
-		// snapshot row pointing to it). Roll it back so the built-image
-		// janitor doesn't leak the layer.
-		if freshlyBuiltTag != "" && h.deps.Builder != nil {
-			if rbErr := h.deps.Builder.RemoveImage(r.Context(), freshlyBuiltTag); rbErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("daytona snapshot rollback failed", "tag", freshlyBuiltTag, "error", rbErr)
-			}
-		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -313,83 +301,26 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 // placement page; native Daytona page/limit must not re-slice the merge. Callers
 // must 503 when viewReady is false (matches /v1/sandboxes).
 func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string, bool) {
-	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
-	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, cov, "", true
+	var c cluster.Client
+	if h.deps.Service != nil {
+		c = h.deps.Service.Cluster()
 	}
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return local, cov, "", true
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return local, cov, "", true
-	}
-	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
-	limit, pageToken := clusterlist.ParsePageParams(r.URL)
-	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
-	if !viewReady {
-		cov.PlacementViewReady = false
-		cov.Partial = true
-		return nil, cov, "", false
-	}
-	local = filterFacadeLocalToPage(local, placements, pageToken, func(it sandboxResponse) string { return it.ID })
-	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
-		OwnerRef:   ownerRef,
-		AuthHeader: r.Header.Get("Authorization"),
-		// Peers must not re-apply facade page/limit — ingress paginates after merge.
-		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
+	return clusterlist.FacadeListPage(r, c, local, func(it sandboxResponse) string { return it.ID }, clusterlist.FacadeListOptions{
 		Path:       PathPrefix + "/sandbox",
-		Transport:  clusterlist.TransportFromCluster(c),
-		SelfNodeID: c.SelfNodeID(),
-		WantIDs:    clusterlist.PlacementWantIDs(placements),
+		AuthHeader: r.Header.Get("Authorization"),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 			}
 		},
 	})
-	cov.PlacementViewReady = viewReady
-	if len(missingOwners) > 0 {
-		cov.Missing = append(cov.Missing, missingOwners...)
-		cov.Partial = true
-	}
-	return items, cov, next, true
 }
 
-func filterFacadeLocalToPage[T any](local []T, placements []cluster.Placement, pageToken string, idFn func(T) string) []T {
-	if placements == nil {
-		if strings.TrimSpace(pageToken) != "" {
-			return nil
-		}
-		return local
-	}
-	want := clusterlist.PlacementWantIDs(placements)
-	out := make([]T, 0, len(local))
-	for _, it := range local {
-		if id := idFn(it); id != "" {
-			if _, ok := want[id]; ok {
-				out = append(out, it)
-			}
-		}
-	}
-	return out
-}
-
-// clusterListMode is true when a real cluster client is attached (not the
-// standalone Noop default from service.New) and this is not a forwarded peer
-// hop. Native Daytona page/limit must not re-slice placement pages in that mode.
 func clusterListMode(svc *service.Service, r *http.Request) bool {
-	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if svc == nil {
 		return false
 	}
-	c := svc.Cluster()
-	if c == nil {
-		return false
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return false
-	}
-	return true
+	return clusterlist.ListMode(svc.Cluster(), r)
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -413,15 +344,72 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
-	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
-	if !viewReady {
+
+	// The unpaginated Daytona list returns every sandbox the caller owns: the
+	// SDK reads a bare array with no cursor field, so a next-page token in a
+	// response header is invisible to it. In a cluster the merge is
+	// placement-paged, so walk all pages and concatenate instead of returning
+	// only the first page (~100) and stranding the rest (B10). Single node
+	// returns its one page (all local rows) in a single iteration.
+	items, cov, ok := gatherAllClusterPages(r, localItems, func(it sandboxResponse) string { return it.ID }, h.listFacadeClusterItems)
+	if !ok {
 		w.Header().Set("Retry-After", "1")
 		clusterlist.WriteCoverageHeaders(w, cov, "")
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
 		return
 	}
-	clusterlist.WriteCoverageHeaders(w, cov, next)
+	// The whole list was gathered, so there is no next-page token to surface;
+	// coverage headers still report any owner node that did not answer.
+	clusterlist.WriteCoverageHeaders(w, cov, "")
 	apihttp.WriteJSON(w, http.StatusOK, items)
+}
+
+// maxUnpaginatedListPages bounds the placement-page walk the unpaginated list
+// does, so a cursor bug can never spin forever. At the default page size this is
+// far more than any one owner holds.
+const maxUnpaginatedListPages = 1000
+
+// gatherAllClusterPages walks every placement page and concatenates the results,
+// deduped by id — the unpaginated list returns all the owner's sandboxes (B10).
+// fetch returns one page for a request carrying its page_token; ok == false when
+// a page's placement view is not ready (the caller should 503).
+func gatherAllClusterPages[T any](r *http.Request, local []T, idFn func(T) string, fetch func(*http.Request, []T) ([]T, clusterlist.Coverage, string, bool)) ([]T, clusterlist.Coverage, bool) {
+	items := make([]T, 0, len(local))
+	seen := make(map[string]struct{})
+	var lastCov clusterlist.Coverage
+	pageReq := r
+	for i := 0; i < maxUnpaginatedListPages; i++ {
+		page, cov, next, viewReady := fetch(pageReq, local)
+		if !viewReady {
+			return nil, cov, false
+		}
+		lastCov = cov
+		for _, it := range page {
+			if id := idFn(it); id != "" {
+				if _, dup := seen[id]; dup {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			items = append(items, it)
+		}
+		if next == "" {
+			break
+		}
+		pageReq = withPageToken(r, next)
+	}
+	return items, lastCov, true
+}
+
+// withPageToken returns a shallow clone of r with the cluster page_token query
+// set, so the unpaginated list can walk successive placement pages without
+// mutating the caller's request.
+func withPageToken(r *http.Request, token string) *http.Request {
+	clone := r.Clone(r.Context())
+	q := clone.URL.Query()
+	q.Set("page_token", token)
+	clone.URL.RawQuery = q.Encode()
+	return clone
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
@@ -746,7 +734,7 @@ func (h *handlers) setAutoArchiveInterval(w http.ResponseWriter, r *http.Request
 }
 
 func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, stop bool) {
-	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	_, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -761,21 +749,26 @@ func (h *handlers) updateIdleLifecycle(w http.ResponseWriter, r *http.Request, s
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	lifecycle := sandbox.Lifecycle
-	if stop {
-		if intervalPtr == nil {
-			lifecycle.StopIfIdleFor = 0
+	// Patch only the idle timer this route owns, reading the current Lifecycle
+	// under the sandbox lock so a concurrent E2B timeout change (which rewrites
+	// StopAtAge/DestroyAtAge) can't clobber it, and vice versa (D7).
+	updated, _, err := h.deps.Service.ApplyLifecyclePatch(r.Context(), sandboxID, func(sb *models.Sandbox) (models.Lifecycle, bool, error) {
+		lifecycle := sb.Lifecycle
+		if stop {
+			if intervalPtr == nil {
+				lifecycle.StopIfIdleFor = 0
+			} else {
+				lifecycle.StopIfIdleFor = durationFromMinutes(interval)
+			}
 		} else {
-			lifecycle.StopIfIdleFor = durationFromMinutes(interval)
+			if intervalPtr == nil {
+				lifecycle.DestroyIfIdleFor = 0
+			} else {
+				lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
+			}
 		}
-	} else {
-		if intervalPtr == nil {
-			lifecycle.DestroyIfIdleFor = 0
-		} else {
-			lifecycle.DestroyIfIdleFor = durationFromMinutes(interval)
-		}
-	}
-	updated, err := h.deps.Service.UpdateLifecycle(r.Context(), sandboxID, lifecycle)
+		return lifecycle, true, nil
+	})
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -1300,128 +1293,30 @@ func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (s
 	if req.BuildInfo != nil {
 		return h.resolveBuildInfo(ctx, req.BuildInfo)
 	}
-	if configured := strings.TrimSpace(os.Getenv("SB_DAYTONA_DEFAULT_IMAGE")); configured != "" {
+	if configured := strings.TrimSpace(h.deps.DefaultImage); configured != "" {
 		return configured, "", nil
 	}
 	return "ubuntu:22.04", "", nil
 }
 
-// resolveBuildInfo turns a Daytona-shaped buildInfo payload into a runnable
-// local image reference. Three cases:
-//
-//  1. Single-line `FROM <image>` Dockerfile, no context  → return the bare
-//     image string; the runtime layer will `docker pull` it as usual. This
-//     preserves the legacy fast path for callers (Daytona SDK with a string
-//     image) that don't need a real build.
-//  2. Multi-line Dockerfile, no context                  → build locally with
-//     docker.Client.BuildImage; tag is content-addressed for idempotent
-//     retries.
-//  3. Any payload with contextHashes                     → gated behind the
-//     SB_IMAGE_BUILD_CONTEXT_ENABLED operator flag. With the flag off, we
-//     return a clear error pointing operators at the flag. With the flag on,
-//     a hash-resolved context tar is supplied to BuildImage (today that
-//     resolver is not wired — the flag returns "not yet implemented" so the
-//     contract is honored at the type level without misleading users).
-//
-// resolveBuildInfo returns (imageTag, freshlyBuiltTag, error). freshlyBuiltTag
-// is non-empty only when this call actually invoked BuildImage and produced
-// a new image (cache hits return the tag in the first slot only). Callers
-// use freshlyBuiltTag to roll back the image if the downstream sandbox
-// create fails — see createSandbox.
+// resolveBuildInfo builds a Daytona buildInfo payload through the service
+// (Service.BuildImage, with the single-line FROM shortcut): the same owner
+// rule, tag scheme and errors as every other build. It returns the image to
+// start and, when this call built it fresh, the tag a failed create hands
+// back with Service.DiscardBuiltImage.
 func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, string, error) {
 	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
 	if dockerfile == "" {
 		return "", "", errors.New("buildInfo is only supported when dockerfileContent is present")
 	}
-	if base, ok := singleLineFromImage(dockerfile); ok && len(info.ContextHashes) == 0 {
-		return base, "", nil
-	}
-	if len(info.ContextHashes) > 0 {
-		if !h.deps.Build.ContextEnabled {
-			return "", "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
-		}
-		// Context-resolver wiring is a separate piece of work (needs an
-		// object store + registry push). Fail loud so callers don't think
-		// their COPY/ADD steps silently no-op.
-		return "", "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
-	}
-	if h.deps.Builder == nil {
-		return "", "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
-	}
-
-	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
-	exists, err := h.deps.Builder.ImageExists(ctx, tag)
+	built, err := h.deps.Service.BuildImage(ctx, service.BuildImageRequest{Dockerfile: dockerfile, ContextHashes: info.ContextHashes, BaseShortcut: true})
 	if err != nil {
-		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperational, err)
+		return "", "", err
 	}
-	if exists {
-		// Bump LastTagTime so the built-image janitor doesn't GC a tag we
-		// just handed back to the caller. Best-effort: a refresh failure
-		// only narrows the GC window for this tag, so we log and continue.
-		if rtErr := h.deps.Builder.RefreshTag(ctx, tag); rtErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("daytona build cache refresh-tag failed", "tag", tag, "error", rtErr)
-		}
-		return tag, "", nil
+	if built.Fresh {
+		return built.Image, built.Image, nil
 	}
-
-	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
-	defer cancel()
-	logger := h.deps.Logger
-	err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{
-		Tag:               tag,
-		DockerfileContent: dockerfile,
-		OnLog: func(line string) {
-			if logger != nil {
-				logger.Debug("daytona build", "tag", tag, "line", line)
-			}
-		},
-	})
-	if err != nil {
-		// Surface DeadlineExceeded and the build-operational marker so the
-		// caller can return 504 / 502 instead of 400. Wrap with both: %w
-		// only chains one error, so emit a fmt.Errorf that errors.Is sees
-		// errBuildOperational; if the underlying err is DeadlineExceeded,
-		// the caller's first switch arm catches that via the chain.
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("build image timed out: %w", err)
-		}
-		return "", "", fmt.Errorf("%w: build image: %v", errBuildOperational, err)
-	}
-	return tag, tag, nil
-}
-
-// errBuildOperational marks errors that originate from the local Docker
-// daemon (build, image inspect) rather than from caller validation. The
-// daytona createSandbox handler maps it to HTTP 502 so that retries and
-// alerting can distinguish "daemon is sad" from "client sent garbage".
-var errBuildOperational = errors.New("build operational error")
-
-// singleLineFromImage detects the legacy `FROM <image>` shape and returns
-// the base image when matched. Comments and blank lines are ignored.
-func singleLineFromImage(dockerfile string) (string, bool) {
-	lines := make([]string, 0, 4)
-	for _, line := range strings.Split(dockerfile, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		lines = append(lines, trimmed)
-	}
-	if len(lines) != 1 {
-		return "", false
-	}
-	parts := strings.Fields(lines[0])
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
-		return "", false
-	}
-	return parts[1], true
-}
-
-func buildContextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
-		return context.WithCancel(parent)
-	}
-	return context.WithTimeout(parent, timeout)
+	return built.Image, "", nil
 }
 
 func parsePositiveFloatQuery(r *http.Request, key string, fallback float32) (float32, error) {

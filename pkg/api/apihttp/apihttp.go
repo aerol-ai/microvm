@@ -5,20 +5,15 @@
 package apihttp
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"strconv"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
-	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 // admissionRetryAfterSeconds is the Retry-After hint sent with a 503 when the
@@ -70,6 +65,31 @@ func ReadJSONBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return io.ReadAll(r.Body)
 }
 
+// DecodeAndBufferJSON reads the request body (bounded), decodes it into dst
+// with the same single-value strictness as DecodeJSON, and restores r.Body to
+// the original bytes. A create handler uses it so that when clustercreate
+// forwards the request to the placement target, the target re-reads the full
+// body instead of an empty one (plan B2). Returns the raw bytes.
+func DecodeAndBufferJSON(w http.ResponseWriter, r *http.Request, dst any) ([]byte, error) {
+	raw, err := ReadJSONBody(w, r)
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if err := dec.Decode(dst); err != nil {
+		return raw, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return raw, errors.New("request body must contain exactly one JSON value")
+		}
+		return raw, err
+	}
+	return raw, nil
+}
+
 // WriteJSON serializes value as JSON and writes it with the given status.
 func WriteJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -95,278 +115,22 @@ func WriteErrorCode(w http.ResponseWriter, status int, code, message string) {
 // clients depend on regardless of API version, so it lives here in the shared
 // helper package.
 func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
-	if errors.Is(err, store.ErrNotFound) {
-		WriteError(w, http.StatusNotFound, "sandbox not found")
-		return
-	}
-	// Fleet admission verdicts (managed builds only; the open-source admitter
-	// admits everything so these never fire there). Denied is a definite 403;
-	// unavailable is a retryable 503 so clients back off rather than treating a
-	// transient control-plane gap as a hard failure.
-	if errors.Is(err, controlplane.ErrAdmissionDenied) {
-		WriteError(w, http.StatusForbidden, "account access is not currently permitted")
-		return
-	}
-	if errors.Is(err, controlplane.ErrAdmissionUnavailable) {
-		w.Header().Set("Retry-After", strconv.Itoa(admissionRetryAfterSeconds))
-		WriteError(w, http.StatusServiceUnavailable, "fleet access validation temporarily unavailable; retry shortly")
-		return
-	}
-	// A sandbox row whose owning container engine is not wired on this node
-	// (e.g. an engine=containerd row reached after the operator flipped
-	// SB_CONTAINER_ENGINE back to docker) is a host wiring/migration state, not
-	// client fault. 503+Retry-After so SDK retry logic backs off instead of
-	// treating it as a malformed request that must not be retried.
-	if errors.Is(err, models.ErrContainerEngineNotRegistered) {
-		w.Header().Set("Retry-After", strconv.Itoa(admissionRetryAfterSeconds))
-		WriteError(w, http.StatusServiceUnavailable, "container engine for this sandbox is not available on this node; retry shortly")
-		return
-	}
-	// Wake-aware proxy sentinels (plans/serverless-sandbox-http-wake.md).
-	// 409 for manual-stop: the operator explicitly stopped the sandbox
-	// and the wake helper refused to auto-resume; the caller must
-	// StartSandbox first. 503+Retry-After:60 for circuit-open: the
-	// per-sandbox breaker has tripped after consecutive wake failures
-	// (D3); back off the full open window before retrying.
-	if errors.Is(err, service.ErrSandboxManuallyStopped) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrWakeCircuitOpen) {
-		w.Header().Set("Retry-After", "60")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	// Audit read slots on this node are all busy: 429 + Retry-After so the
-	// caller backs off instead of queueing until its deadline turns into a
-	// 504 (the audit rate limiter uses the same status for the same reason).
-	if errors.Is(err, service.ErrSecretAuditBusy) {
-		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusTooManyRequests, service.ErrSecretAuditBusy.Error())
-		return
-	}
-	// The node's audit chain no longer verifies: evidence is withheld, not
-	// served unverified. Not retryable until an operator repairs the log.
-	if errors.Is(err, service.ErrSecretAuditChainBroken) {
-		WriteError(w, http.StatusServiceUnavailable, service.ErrSecretAuditChainBroken.Error())
-		return
-	}
-	if errors.Is(err, service.ErrClusterFinalizationUnavailable) {
-		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, service.ErrClusterFinalizationUnavailable.Error())
-		return
-	}
-	// An option this runtime or build can't honor (Firecracker egress before
-	// Phase 4, hostname filtering without the gateway) is 501, not a 400:
-	// the request is well-formed, this node just can't serve it.
-	if errors.Is(err, models.ErrRuntimeNotImplemented) {
-		WriteError(w, http.StatusNotImplemented, err.Error())
-		return
-	}
-	// The egress gateway couldn't attach a hostname-filtered sandbox: the
-	// create was rolled back, retry once the gateway is back
-	// (plans/egress-domain-filtering.md G7).
-	if errors.Is(err, service.ErrEgressOperatorConfigInvalid) {
-		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressOperatorConfigInvalid, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressGatewayUnavailable) || errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
-		w.Header().Set("Retry-After", "5")
-		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
-		return
-	}
-	// Live policy updates (plans/egress-domain-filtering.md §5.8): two
-	// distinct 503 bodies so a caller knows whether anything changed, and a
-	// 409 while the sandbox is mid-create. The PUT is idempotent, so all
-	// three are safe to retry as-is.
-	if errors.Is(err, service.ErrEgressSpecCommitFailed) {
-		w.Header().Set("Retry-After", "5")
-		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressSpecCommitFailed, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressApplyFailedHeld) {
-		w.Header().Set("Retry-After", "5")
-		WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressApplyFailedHeld, err.Error())
-		return
-	}
-	// Named egress profiles (D21).
-	if errors.Is(err, service.ErrEgressProfileNotFound) {
-		WriteError(w, http.StatusNotFound, "egress profile not found")
-		return
-	}
-	if errors.Is(err, service.ErrEgressProfilesConflict) || errors.Is(err, service.ErrEgressLearnConflict) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressProfileInUse) {
-		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileInUse, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressProfileCapExceeded) {
-		WriteErrorCode(w, http.StatusConflict, models.ErrorCodeEgressProfileCapExceeded, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressProfileUnavailable) {
-		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressInspectRecreate) || errors.Is(err, service.ErrEgressInjectRecreate) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrEgressPolicyBusy) {
-		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, service.ErrPublicTrafficDisabled) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, store.ErrSandboxNameConflict) {
-		WriteError(w, http.StatusConflict, "sandbox name already in use")
-		return
-	}
-	if errors.Is(err, models.ErrSandboxExists) {
-		WriteError(w, http.StatusConflict, "sandbox already exists")
-		return
-	}
-	if errors.Is(err, store.ErrSnapshotNameConflict) {
-		WriteError(w, http.StatusConflict, "snapshot name already in use")
-		return
-	}
-	// Firecracker template sentinels (plans/snapshot-clone-fast-boot.md
-	// Phase 2). 409 on both: ErrTemplateIDConflict surfaces a PK collision
-	// when an operator POSTs the same explicit id twice (idempotency
-	// signal — the row already exists), and ErrTemplateInUse blocks a
-	// DELETE while a sandbox still references the template (forces the
-	// operator to destroy the sandbox first rather than yank rootfs out
-	// from under a live Firecracker guest).
-	if errors.Is(err, store.ErrTemplateIDConflict) || errors.Is(err, store.ErrTemplateInUse) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, store.ErrWasmModuleIDConflict) || errors.Is(err, store.ErrWasmModuleInUse) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, store.ErrJSBundleInUse) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	// Phase 6 operator-triggered rebuild (POST /v1/templates/{id}/rebuild).
-	// 412 distinguishes "row is in a state where rebuild can't be honoured"
-	// (busy / no snapshot to re-derive / terminal failed) from "row
-	// missing" (404). The wrapped error string carries the offending
-	// status so operators don't have to do a second GET.
-	if errors.Is(err, models.ErrTemplateNotRebuildable) {
-		WriteError(w, http.StatusPreconditionFailed, err.Error())
-		return
-	}
-	// Platform-volume sentinels (plans/e2b-volume-mounts.md). 412 distinguishes
-	// "this deployment hasn't enabled platform volumes" (operator must
-	// configure shared storage) from a malformed request (400). The runtime
-	// gate is a client-input problem (volumes on firecracker/wasm) → 400; the
-	// per-tenant quota is a 409 capacity conflict.
-	if errors.Is(err, models.ErrPlatformVolumesDisabled) {
-		WriteError(w, http.StatusPreconditionFailed, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrPlatformVolumesUnsupportedRuntime) {
-		WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrPlatformVolumeQuota) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	// Custom-domain sentinels (plans/custom-domains.md). 412 distinguishes
-	// "this deployment can't do custom domains at all" (feature flag off /
-	// IP mode) from "your input is malformed" (400). 409 covers both the
-	// cross-sandbox hostname conflict and the IRON RULE (tcp/tls + custom
-	// domain on the same sandbox) and the per-sandbox cap.
-	if errors.Is(err, models.ErrCustomDomainNotSupported) {
-		WriteError(w, http.StatusPreconditionFailed, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrCustomDomainProtocolConflict) ||
-		errors.Is(err, models.ErrCustomDomainPerSandboxCap) ||
-		errors.Is(err, store.ErrCustomDomainConflict) ||
-		errors.Is(err, store.ErrCustomDomainPortMismatch) {
-		WriteError(w, http.StatusConflict, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrCustomDomainInvalidTargetPort) ||
-		errors.Is(err, service.ErrWasmCustomDomainPortNotExposed) {
-		WriteError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if errors.Is(err, models.ErrCustomDomainVerificationFailed) {
-		WriteError(w, http.StatusForbidden, err.Error())
-		return
-	}
-	// WASM module resolution taxonomy (plans/wasm-standard-modules-distribution.md).
-	// The SDK branches on these statuses: 404 = wrong ref, 403 = registry not
-	// allowlisted (SSRF guard) or digest drift, 401 = fix your token, 413 =
-	// too big, 422 = unsupported artifact, 502+Retry-After = transient, retry.
-	if errors.Is(err, wasmmod.ErrModuleNotFound) {
-		WriteError(w, http.StatusNotFound, err.Error())
-		return
-	}
-	if errors.Is(err, wasmmod.ErrRegistryNotAllowed) || errors.Is(err, wasmmod.ErrModuleDigestMismatch) {
-		WriteError(w, http.StatusForbidden, err.Error())
-		return
-	}
-	if errors.Is(err, wasmmod.ErrRegistryAuth) {
-		WriteError(w, http.StatusUnauthorized, err.Error())
-		return
-	}
-	if errors.Is(err, wasmmod.ErrModuleTooLarge) {
-		WriteError(w, http.StatusRequestEntityTooLarge, err.Error())
-		return
-	}
-	if errors.Is(err, wasmmod.ErrComponentModelUnsupported) {
-		WriteError(w, http.StatusUnprocessableEntity, err.Error())
-		return
-	}
-	if errors.Is(err, wasmmod.ErrRegistryUnavailable) {
-		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	// Capacity rejections are 503 with a Retry-After hint so well-behaved
-	// clients (and load balancers) back off instead of treating it as a
-	// permanent 4xx. The error string already carries human-readable
-	// reasons from the admitter.
-	if errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, cluster.ErrCapacityExceeded) {
-		logger.Info("capacity rejected", "error", err)
-		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-		msg := err.Error()
-		if len(msg) > 200 {
-			msg = msg[:200]
+	c := Classify(err)
+	c.Apply(logger, err)
+	c.SetRetryAfter(w)
+	WriteErrorCode(w, c.Status, c.Code, c.Message)
+}
+
+// RequireOperator rejects a caller that is not an operator with 403. It sits
+// inside an auth middleware, which marks PAT and cluster-peer calls as the
+// operator; a user token authenticates but is scoped to its account, so it
+// never reaches what this wraps: fleet-wide and cluster-internal routes.
+func RequireOperator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if access, ok := controlplane.AccessFromContext(r.Context()); !ok || !access.Operator {
+			WriteError(w, http.StatusForbidden, "operator authorization required")
+			return
 		}
-		WriteError(w, http.StatusServiceUnavailable, msg)
-		return
-	}
-	if errors.Is(err, cluster.ErrCreateBackpressure) {
-		w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-		WriteError(w, http.StatusTooManyRequests, err.Error())
-		return
-	}
-	if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
-		if errors.Is(err, cluster.ErrInvalidTopology) {
-			w.Header().Set("Retry-After", strconv.Itoa(cluster.InvalidTopologyRetryAfterSeconds))
-		}
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-		return
-	}
-	// Surface only the top-level error message; underlying causes (Docker
-	// daemon strings, file paths) stay in the server log.
-	logger.Warn("request failed", "error", err)
-	msg := err.Error()
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
-	WriteError(w, http.StatusBadRequest, msg)
+		next.ServeHTTP(w, r)
+	})
 }

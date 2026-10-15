@@ -952,7 +952,7 @@ func TestSnapshotPusherValidateAndReadPAT(t *testing.T) {
 	if !SnapshotNeedsPush(&models.SandboxSnapshot{ImageDistributionMode: models.ImageDistributionLocalOnly}) {
 		t.Fatal("local-only should need push")
 	}
-	if p.DestRefFor("snap") == "" {
+	if p.DestRefFor("", "snap") == "" {
 		t.Fatal("DestRefFor empty")
 	}
 }

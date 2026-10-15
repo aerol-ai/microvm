@@ -602,6 +602,14 @@ type CreateSandboxRequest struct {
 	// sandbox. Used by facades that expose label-style metadata (Daytona
 	// labels, E2B metadata).
 	Tags map[string]string `json:"tags,omitempty"`
+	// CompatState carries each facade's per-sandbox compatibility state
+	// (sandbox_compat_state) on the FSM-replicated spec so a failover recreate
+	// can restore it — the rows are node-local and would otherwise be lost with
+	// the dead owner (B11). It is replication-internal: the create path strips
+	// any client-supplied value (normalizeCreateRequest), and only the service's
+	// own UpsertCompatState write-through populates it. Keyed by facade name →
+	// that facade's state JSON.
+	CompatState map[string]string `json:"compatState,omitempty"`
 	// Runtime selects the container runtime for this sandbox. Empty falls back
 	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
 	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed
@@ -1221,6 +1229,12 @@ type SandboxSnapshot struct {
 	// PushError is populated only when PushState is "error" — the last error
 	// the reconciler saw, surfaced to the Daytona facade's errorReason field.
 	PushError string `json:"push_error,omitempty"`
+	// OwnerRef is the account the snapshot belongs to, with the same meaning
+	// and scoping rule as Sandbox.OwnerRef. It lives on the snapshot because
+	// a snapshot outlives the sandbox it was taken from: once the source is
+	// destroyed there is nothing else left to check ownership against. Never
+	// exposed over the wire.
+	OwnerRef string `json:"-"`
 }
 
 func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {
@@ -1362,6 +1376,7 @@ const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 const (
 	FacadeDaytona = "daytona"
 	FacadeE2B     = "e2b"
+	FacadeRunloop = "runloop"
 )
 
 // SandboxCompatState carries facade-private state that has no native
@@ -1385,8 +1400,11 @@ type SnapshotAlias struct {
 	SnapshotName string
 	Facade       string
 	ExtraNames   []string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// StateJSON is facade-private state for the snapshot, opaque to the
+	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Idempotent-request states for request_idempotency.state. Pending means

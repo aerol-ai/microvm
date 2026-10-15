@@ -20,11 +20,13 @@ import (
 
 type cov96ErrCapture struct {
 	status  int
+	code    string
 	message string
 }
 
-func (c *cov96ErrCapture) write(_ http.ResponseWriter, status int, message string) {
+func (c *cov96ErrCapture) write(_ http.ResponseWriter, status int, code, message string) {
 	c.status = status
+	c.code = code
 	c.message = message
 }
 
@@ -130,13 +132,11 @@ func TestCov96PrepareBuiltImageArtifactNodeUnavailable(t *testing.T) {
 	if ok {
 		t.Fatal("Prepare ok=true, want artifact-node-unavailable rejection")
 	}
-	var body models.ErrorResponse
-	_ = json.Unmarshal(w.Body.Bytes(), &body)
-	if w.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeArtifactNodeUnavailable {
-		t.Fatalf("response = %d %+v, want 503 %s", w.Code, body, models.ErrorCodeArtifactNodeUnavailable)
-	}
-	if capture.status != 0 || w.Header().Get("Retry-After") != "" {
-		t.Fatalf("writeError status=%d Retry-After=%q, want direct write without retry hint", capture.status, w.Header().Get("Retry-After"))
+	// The error now flows through the facade's writer (plan B12), so the
+	// facade renders its own envelope; the code and status reach it, with no
+	// Retry-After for an artifact-node re-create.
+	if capture.status != http.StatusServiceUnavailable || capture.code != models.ErrorCodeArtifactNodeUnavailable || w.Header().Get("Retry-After") != "" {
+		t.Fatalf("writer got status=%d code=%q Retry-After=%q, want 503 %s no-retry", capture.status, capture.code, w.Header().Get("Retry-After"), models.ErrorCodeArtifactNodeUnavailable)
 	}
 }
 

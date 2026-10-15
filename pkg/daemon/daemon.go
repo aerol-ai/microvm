@@ -31,7 +31,6 @@ import (
 	"github.com/aerol-ai/microvm/internal/version"
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
-	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -927,7 +926,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// cp.Validator is the second-token (non-PAT) validation path. Under
 	// controlplane.Noop() it rejects every non-PAT token, so the server
 	// behaves exactly as the PAT-only build did before this seam existed.
-	var builder apiv1.ImageBuilder
+	var builder service.ImageBuilder
 	if apiBuilder != nil {
 		builder = apiBuilder
 	}
@@ -950,6 +949,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// keep-alive connections sitting between requests, so it can't
 		// kill an in-flight stream but does bound idle-connection buildup.
 		IdleTimeout: 2 * time.Minute,
+		Protocols:   apiListenerProtocols(),
 	}
 
 	go func() {

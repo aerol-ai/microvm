@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -362,7 +363,122 @@ func TestToolboxProxyErrorBranchesMore(t *testing.T) {
 	if _, err := svc.RoundTripToolbox(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
 		t.Fatal("RoundTripToolbox should reject invalid network method")
 	}
-	if _, err := svc.newNetworkToolboxRequest(ctx, "sb-net-error", "BAD METHOD", "/foo", nil, nil, nil); err == nil {
+	if _, err := svc.newNetworkToolboxRequest(ctx, &models.Sandbox{ID: "sb-net-error", Status: models.SandboxStatusStarted, ContainerIP: "10.0.0.1", Runtime: models.RuntimeDocker}, "BAD METHOD", "/foo", nil, nil, nil); err == nil {
 		t.Fatal("newNetworkToolboxRequest should reject invalid method")
+	}
+}
+
+// An isolate sandbox serves its toolbox in-process, like WASM. RoundTripToolbox
+// must dispatch to the isolate host, not dial the container network (B7).
+func TestRoundTripToolbox_Isolate(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableIsolate = true
+	svc.SetIsolateRuntime(&fakeToolboxHost{})
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-rt", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	resp, err := svc.RoundTripToolbox(ctx, "sb-iso-rt", "GET", "/bar", nil, nil, nil)
+	if err != nil {
+		t.Fatalf("RoundTripToolbox(isolate) = %v; want in-process dispatch", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK || string(body) != "wasm-toolbox" {
+		t.Fatalf("isolate round trip = %d %q; want the in-process host's response", resp.StatusCode, body)
+	}
+}
+
+// Without an isolate driver wired, an isolate round trip is a clear error, not
+// a network dial.
+func TestRoundTripToolbox_IsolateNoDriver(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-none", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-iso-none", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "driver not registered") {
+		t.Fatalf("isolate round trip with no driver = %v; want a driver-not-registered error", err)
+	}
+}
+
+// A WASM sandbox with no WASM driver wired is a clear error, not a network dial
+// — mirroring the isolate no-driver case and ServeToolboxReverseProxy.
+func TestRoundTripToolbox_WasmNoDriver(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-wasm-none", Runtime: models.RuntimeWasm, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-wasm-none", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "driver not registered") {
+		t.Fatalf("wasm round trip with no driver = %v; want a driver-not-registered error", err)
+	}
+}
+
+// An isolate driver that does not implement the toolbox host surfaces a clear
+// error instead of being dispatched in-process.
+func TestRoundTripToolbox_IsolateNotToolboxHost(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	svc.cfg.EnableIsolate = true
+	svc.SetIsolateRuntime(&recordingRuntime{}) // non-nil, but no ServeToolbox
+
+	now := time.Now().UTC()
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-iso-nohost", Runtime: models.RuntimeIsolate, Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := svc.RoundTripToolbox(ctx, "sb-iso-nohost", "GET", "/foo", nil, nil, nil); err == nil || !strings.Contains(err.Error(), "does not implement toolbox host") {
+		t.Fatalf("isolate round trip without a toolbox host = %v; want a toolbox-host error", err)
+	}
+}
+
+// ToolboxTarget must refuse a sandbox that is not running: Docker/containerd
+// keep a stale ContainerIP on stop, and dialing it would hand this sandbox's
+// toolbox token to whatever container reused that address (S12).
+func TestToolboxTargetRejectsStoppedSandbox(t *testing.T) {
+	ctx := context.Background()
+	svc, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	now := time.Now().UTC()
+
+	// Stopped sandbox with a stale IP still on the row.
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-stopped", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStopped,
+		ContainerIP: "10.0.0.9", ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create stopped: %v", err)
+	}
+	if _, err := svc.ToolboxTarget(ctx, "sb-stopped"); !errors.Is(err, ErrSandboxNotRunning) {
+		t.Fatalf("ToolboxTarget(stopped) = %v, want ErrSandboxNotRunning", err)
+	}
+
+	// A started sandbox still resolves to its address.
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: "sb-running", Runtime: models.RuntimeDocker, Status: models.SandboxStatusStarted,
+		ContainerIP: "10.0.0.10", ToolboxToken: "tok", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("create running: %v", err)
+	}
+	ep, err := svc.ToolboxTarget(ctx, "sb-running")
+	if err != nil {
+		t.Fatalf("ToolboxTarget(running): %v", err)
+	}
+	if ep.URL == "" || ep.Token != "tok" {
+		t.Fatalf("running endpoint = %+v", ep)
 	}
 }

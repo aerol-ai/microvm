@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -686,6 +687,10 @@ func newE2BHandlerTestEnvWithRuntime(t *testing.T, runtime *fakeE2BRuntime, cfg 
 		Auth: func(next http.Handler) http.Handler {
 			return next
 		},
+		// Thread the facade config the way config.Load → the server does, so
+		// env-driven handler tests (t.Setenv) still reach the handler.
+		TemplateMapJSON: os.Getenv("SB_E2B_TEMPLATE_MAP_JSON"),
+		ClientID:        os.Getenv("SB_E2B_CLIENT_ID"),
 	})
 	return svc, st, mux
 }

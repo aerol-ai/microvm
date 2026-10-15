@@ -1330,3 +1330,46 @@ test("MicroVM.list forwards a name filter and create sends name and tags", async
   assert.equal(created.name, "agent");
   assert.deepEqual(created.tags, { a: "b" });
 });
+
+test("MicroVM getSnapshot/listSnapshots/deleteSnapshot hit the v1 snapshot surface", async () => {
+  const seen: Array<{ method: string; url: string }> = [];
+  const sdk = new MicroVM({
+    patToken: "pat-token",
+    apiUrl: "https://api.example.com",
+    fetch: async (input, init) => {
+      const request = new Request(input, init);
+      seen.push({ method: request.method, url: request.url });
+      const u = new URL(request.url);
+      if (request.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      if (u.pathname === "/v1/snapshots/py-base") {
+        return new Response(
+          JSON.stringify({ name: "py-base", image: "python:3.12", source_sandbox_id: "", created_at: "2026-05-15T10:00:00Z" }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (u.pathname === "/v1/snapshots") {
+        return new Response(
+          JSON.stringify({ snapshots: [{ name: "py-base", image: "python:3.12", source_sandbox_id: "", created_at: "2026-05-15T10:00:00Z" }], has_more: true }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected ${request.method} ${request.url}`);
+    },
+  });
+
+  const snap = await sdk.getSnapshot("py-base");
+  assert.equal(snap.name, "py-base");
+
+  const page = await sdk.listSnapshots({ limit: 1, startingAfter: "cursor" });
+  assert.equal(page.hasMore, true);
+  assert.equal(page.snapshots.length, 1);
+  assert.equal(page.snapshots[0]?.name, "py-base");
+
+  await sdk.deleteSnapshot("py-base");
+
+  assert.ok(seen.some((s) => s.method === "GET" && s.url.endsWith("/v1/snapshots/py-base")));
+  assert.ok(seen.some((s) => s.method === "GET" && s.url.includes("/v1/snapshots?limit=1&starting_after=cursor")));
+  assert.ok(seen.some((s) => s.method === "DELETE" && s.url.endsWith("/v1/snapshots/py-base")));
+});

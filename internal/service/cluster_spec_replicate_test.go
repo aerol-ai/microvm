@@ -164,3 +164,150 @@ func TestResizeSandboxSkipsWriteThroughWhenSpecNotRecorded(t *testing.T) {
 		t.Fatalf("UpsertSpec was called %d times for a pre-cluster sandbox; want 0", len(calls))
 	}
 }
+
+// TestUpdateTagsWritesThroughToClusterSpec pins B11: a tag edit after create
+// must refresh the FSM-replicated spec, or a failover recreate replays the
+// create-time tags and silently drops the edit.
+func TestUpdateTagsWritesThroughToClusterSpec(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	stub := &specWriteThroughCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		spec: &models.CreateSandboxRequest{Image: "alpine", Tags: map[string]string{"team": "old"}},
+	}
+	svc.AttachCluster(stub)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-tags-replicate"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-tags-replicate", ContainerIP: "10.0.0.32",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	want := map[string]string{"team": "sdk", "env": "prod"}
+	if err := svc.UpdateTags(ctx, sandboxID, want); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+
+	calls := stub.calls()
+	if len(calls) != 1 {
+		t.Fatalf("UpsertSpec calls = %d, want 1", len(calls))
+	}
+	got := calls[0].Tags
+	if got["team"] != "sdk" || got["env"] != "prod" || len(got) != 2 {
+		t.Fatalf("replicated spec.Tags = %+v, want %+v", got, want)
+	}
+}
+
+// A pre-cluster sandbox (SpecOf nil) does not get a spurious spec write.
+func TestUpdateTagsSkipsWriteThroughWhenSpecNotRecorded(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	stub := &specWriteThroughCluster{Noop: cluster.NewNoop("self", "http://self", "")} // spec nil
+	svc.AttachCluster(stub)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-tags-nospec"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-tags-nospec", ContainerIP: "10.0.0.33",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	if err := svc.UpdateTags(ctx, sandboxID, map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+	if calls := stub.calls(); len(calls) != 0 {
+		t.Fatalf("UpsertSpec called %d times for a pre-cluster sandbox; want 0", len(calls))
+	}
+}
+
+// TestUpsertCompatStateWritesThroughToClusterSpec pins B11: facade compat state
+// must ride the FSM-replicated spec so a failover recreate can restore it (the
+// sandbox_compat_state rows are node-local).
+func TestUpsertCompatStateWritesThroughToClusterSpec(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	stub := &specWriteThroughCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		spec: &models.CreateSandboxRequest{Image: "alpine"},
+	}
+	svc.AttachCluster(stub)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-compat-replicate"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-compat-replicate", ContainerIP: "10.0.0.34",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	if err := svc.UpsertCompatState(ctx, sandboxID, models.FacadeRunloop, `{"name":"box"}`); err != nil {
+		t.Fatalf("UpsertCompatState runloop: %v", err)
+	}
+	if err := svc.UpsertCompatState(ctx, sandboxID, models.FacadeE2B, `{"t":1}`); err != nil {
+		t.Fatalf("UpsertCompatState e2b: %v", err)
+	}
+
+	calls := stub.calls()
+	if len(calls) != 2 {
+		t.Fatalf("UpsertSpec calls = %d, want 2", len(calls))
+	}
+	// The last write-through carries both facades' state, merged.
+	got := calls[len(calls)-1].CompatState
+	if got[models.FacadeRunloop] != `{"name":"box"}` || got[models.FacadeE2B] != `{"t":1}` {
+		t.Fatalf("replicated spec.CompatState = %+v, want both facades", got)
+	}
+}
+
+// restoreCompatStateAfterRecreate re-materializes the facade compat-state rows a
+// failover recreate inherited from the replicated spec (B11).
+func TestRestoreCompatStateAfterRecreate(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	now := time.Now().UTC()
+	const sandboxID = "sb-compat-restore"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-compat-restore", ContainerIP: "10.0.0.35",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	svc.restoreCompatStateAfterRecreate(ctx, sandboxID, map[string]string{
+		models.FacadeRunloop: `{"name":"restored"}`,
+		models.FacadeE2B:     `{"t":9}`,
+	})
+
+	got, err := st.GetCompatState(ctx, sandboxID, models.FacadeRunloop)
+	if err != nil || got.StateJSON != `{"name":"restored"}` {
+		t.Fatalf("runloop compat not restored: %+v err=%v", got, err)
+	}
+	e2b, err := st.GetCompatState(ctx, sandboxID, models.FacadeE2B)
+	if err != nil || e2b.StateJSON != `{"t":9}` {
+		t.Fatalf("e2b compat not restored: %+v err=%v", e2b, err)
+	}
+}
+
+// normalizeCreateRequest strips any client-supplied CompatState so only the
+// service's own write-through populates it (B11).
+func TestNormalizeCreateRequestStripsCompatState(t *testing.T) {
+	req := models.CreateSandboxRequest{
+		Image:       "alpine",
+		CompatState: map[string]string{models.FacadeRunloop: `{"injected":true}`},
+	}
+	if got := normalizeCreateRequest(req); got.CompatState != nil {
+		t.Fatalf("normalizeCreateRequest kept CompatState = %+v, want nil", got.CompatState)
+	}
+}

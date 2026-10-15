@@ -32,6 +32,7 @@ import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
 import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkLearnedEntry;
 import ai.aerol.microvm.model.NetworkPolicy;
@@ -70,6 +71,7 @@ import ai.aerol.microvm.model.ResizeOptions;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
+import ai.aerol.microvm.model.SnapshotList;
 import ai.aerol.microvm.model.SessionAttachOptions;
 import ai.aerol.microvm.model.SetNetworkLimitsOptions;
 import ai.aerol.microvm.model.Template;
@@ -417,6 +419,45 @@ public class MicroVMClient {
         resolved.image = null;
         resolved.dockerfileContent = image.getDockerfile();
         return registerSnapshot(resolved);
+    }
+
+    /** Reads one snapshot from the catalogue by name; 404 if there is none. */
+    public SandboxSnapshot getSnapshot(String name) {
+        return doJson("GET", snapshotPath(name), null, SandboxSnapshot.class);
+    }
+
+    /**
+     * Reads one name-ordered page of the caller's snapshots. Pass the last
+     * name of the previous page as {@link ListSnapshotsOptions#setStartingAfter}
+     * to walk the catalogue; an empty page or a false {@code hasMore} ends it.
+     */
+    public SnapshotList listSnapshots(ListSnapshotsOptions options) {
+        StringBuilder query = new StringBuilder();
+        if (options != null) {
+            appendQuery(query, "limit", options.getLimit() == null ? null : String.valueOf(options.getLimit()));
+            appendQuery(query, "starting_after", options.getStartingAfter());
+        }
+        SnapshotList page = doJson("GET", versioned("/snapshots") + query, null, SnapshotList.class);
+        if (page == null) {
+            page = new SnapshotList();
+        }
+        if (page.snapshots == null) {
+            page.snapshots = new ArrayList<>();
+        }
+        return page;
+    }
+
+    public SnapshotList listSnapshots() {
+        return listSnapshots(null);
+    }
+
+    /** Deletes a snapshot by name; deleting a missing snapshot is a 404. */
+    public void deleteSnapshot(String name) {
+        doNoContent("DELETE", snapshotPath(name), null);
+    }
+
+    private String snapshotPath(String name) {
+        return versioned("/snapshots/" + encodePathSegment(name));
     }
 
     public void destroy(String sandboxId) {

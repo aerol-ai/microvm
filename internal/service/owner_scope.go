@@ -55,6 +55,18 @@ func (s *Service) scopedGet(ctx context.Context, id string) (*models.Sandbox, er
 	return sandbox, nil
 }
 
+// snapshotVisible applies the sandbox owner rule to a snapshot row: operator
+// and internal callers see every snapshot, a user token only its own
+// account's. Snapshots carry their own owner because they outlive the
+// sandbox they were taken from, so the source row cannot be consulted.
+func snapshotVisible(ctx context.Context, snapshot *models.SandboxSnapshot) bool {
+	owner, scoped := ownerScope(ctx)
+	if !scoped {
+		return true
+	}
+	return snapshot != nil && snapshot.OwnerRef == owner
+}
+
 // ownerRefForCreate returns the owner_ref to stamp on a sandbox created by the
 // current request: the caller's account for a validated user token, or "" for
 // operator/PAT and internal creates (which carry no owner). It never errors —

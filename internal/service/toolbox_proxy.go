@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	pathpkg "path"
 	"strings"
 
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -24,10 +26,12 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	if fid := r.Header.Get("X-Aerol-Ssh-Forward-Id"); fid != "" && s.logger != nil {
 		s.logger.Info("ssh forward: owner serving session", "sandbox_id", sandboxID, "forward_id", fid, "path", path)
 	}
-	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
+	if err := refuseToolboxAdminPath(path); err != nil {
 		return err
 	}
-	sandbox, err := s.scopedGet(ctx, sandboxID)
+	// Reuse the sandbox the wake helper already read (owner-scoped, post-wake)
+	// instead of a second scopedGet — one fewer store read per toolbox call (D15).
+	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -58,7 +62,7 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		return nil
 	}
 
-	endpoint, err := s.ToolboxTarget(ctx, sandboxID)
+	endpoint, err := s.toolboxEndpointForActiveCall(ctx, sandbox)
 	if err != nil {
 		return err
 	}
@@ -92,33 +96,68 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	return nil
 }
 
+// refuseToolboxAdminPath answers not found for toolboxd's /admin endpoints.
+// They are the daemon's own controls (the port allowlist behind the
+// sandbox's public proxy route), reached with the toolbox token; the toolbox
+// proxies attach that token for every caller, so without this any caller
+// who may reach a sandbox's toolbox could change what the daemon set.
+func refuseToolboxAdminPath(toolboxPath string) error {
+	clean := pathpkg.Clean("/" + strings.TrimSpace(toolboxPath))
+	if clean == "/admin" || strings.HasPrefix(clean, "/admin/") {
+		return fmt.Errorf("%w: toolbox path %q", store.ErrNotFound, toolboxPath)
+	}
+	return nil
+}
+
 // RoundTripToolbox performs an HTTP round trip to the sandbox toolbox.
 func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
-	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
+	if err := refuseToolboxAdminPath(path); err != nil {
 		return nil, err
 	}
-	sandbox, err := s.scopedGet(ctx, sandboxID)
+	// Reuse the sandbox the wake helper already read (D15).
+	sandbox, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
+	// WASM and isolate serve their toolbox in-process, like ServeToolboxReverseProxy
+	// — not over the container network (B7). Without the isolate branch a Daytona
+	// or Runloop call on an isolate sandbox dialled 127.0.0.1:<toolboxPort> and
+	// failed with 502. Mirror ServeToolboxReverseProxy's wording so both paths
+	// report the same driver/host errors.
 	if s.isWasmSandbox(sandbox) {
-		return s.roundTripWasmToolbox(ctx, sandbox, method, path, query, body, headers)
+		if s.wasm == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
+		}
+		host, ok := s.wasm.(wasmruntime.ToolboxHost)
+		if !ok {
+			return nil, fmt.Errorf("wasm runtime does not implement toolbox host")
+		}
+		return s.roundTripHostToolbox(ctx, sandbox, host, method, path, query, body, headers)
 	}
-	req, err := s.newNetworkToolboxRequest(ctx, sandboxID, method, path, query, body, headers)
+	if s.isIsolateSandbox(sandbox) {
+		if s.isolate == nil {
+			return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
+		}
+		host, ok := isolateruntime.AsToolboxHost(s.isolate)
+		if !ok {
+			return nil, fmt.Errorf("isolate runtime does not implement toolbox host")
+		}
+		return s.roundTripHostToolbox(ctx, sandbox, host, method, path, query, body, headers)
+	}
+	req, err := s.newNetworkToolboxRequest(ctx, sandbox, method, path, query, body, headers)
 	if err != nil {
 		return nil, err
 	}
 	return http.DefaultClient.Do(req)
 }
 
-func (s *Service) roundTripWasmToolbox(ctx context.Context, sandbox *models.Sandbox, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
-	if s.wasm == nil {
-		return nil, fmt.Errorf("runtime %q: driver not registered", sandbox.Runtime)
-	}
-	host, ok := s.wasm.(wasmruntime.ToolboxHost)
-	if !ok {
-		return nil, fmt.Errorf("wasm runtime does not implement toolbox host")
-	}
+// toolboxHostServer is the in-process toolbox both the WASM and isolate
+// runtimes expose; roundTripHostToolbox serves a request against either.
+type toolboxHostServer interface {
+	ServeToolbox(ctx context.Context, sandboxID, token string, w http.ResponseWriter, r *http.Request)
+}
+
+func (s *Service) roundTripHostToolbox(ctx context.Context, sandbox *models.Sandbox, host toolboxHostServer, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
 	if path == "" {
 		path = "/"
 	}
@@ -145,8 +184,8 @@ func (s *Service) roundTripWasmToolbox(ctx context.Context, sandbox *models.Sand
 	return rec.Result(), nil
 }
 
-func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
-	endpoint, err := s.ToolboxTarget(ctx, sandboxID)
+func (s *Service) newNetworkToolboxRequest(ctx context.Context, sandbox *models.Sandbox, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Request, error) {
+	endpoint, err := s.toolboxEndpointForActiveCall(ctx, sandbox)
 	if err != nil {
 		return nil, err
 	}

@@ -48,6 +48,7 @@ import ai.aerol.microvm.model.EgressProfileOptions;
 import ai.aerol.microvm.model.EgressInject;
 import ai.aerol.microvm.model.EgressRule;
 import ai.aerol.microvm.model.ListEgressProfilesOptions;
+import ai.aerol.microvm.model.ListSnapshotsOptions;
 import ai.aerol.microvm.model.NetworkLearned;
 import ai.aerol.microvm.model.NetworkPolicy;
 import ai.aerol.microvm.model.NetworkPolicyCheckOptions;
@@ -77,6 +78,7 @@ import ai.aerol.microvm.model.RetryConfig;
 import ai.aerol.microvm.model.SandboxData;
 import ai.aerol.microvm.model.SandboxSnapshot;
 import ai.aerol.microvm.model.Session;
+import ai.aerol.microvm.model.SnapshotList;
 import ai.aerol.microvm.model.CreateTemplateOptions;
 import ai.aerol.microvm.model.CreateWasmModuleOptions;
 import ai.aerol.microvm.model.SessionAttachOptions;
@@ -686,6 +688,89 @@ class MicroVMClientTest {
                 new RegisterSnapshotOptions().setName("x").setImage("alpine").setDockerfileContent("FROM busybox")
             ));
             assertTrue(bothSet.getMessage().contains("mutually exclusive"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void snapshotSurfaceMethodsHitV1PathsAndParse() throws Exception {
+        List<String> seen = new ArrayList<>();
+        AtomicReference<String> listQuery = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            seen.add(method + " " + path);
+            if ("DELETE".equals(method) && "/v1/snapshots/py-base".equals(path)) {
+                writeResponse(exchange, 204, "application/json", new byte[0]);
+                return;
+            }
+            if ("GET".equals(method) && "/v1/snapshots/py-base".equals(path)) {
+                writeJson(exchange, 200, mapOf(
+                    "name", "py-base",
+                    "image", "python:3.12",
+                    "image_id", "sha256:snap",
+                    "source_sandbox_id", "",
+                    "created_at", "2026-05-15T10:00:00Z"
+                ));
+                return;
+            }
+            if ("GET".equals(method) && "/v1/snapshots".equals(path)) {
+                listQuery.set(exchange.getRequestURI().getRawQuery());
+                writeJson(exchange, 200, mapOf(
+                    "snapshots", List.of(mapOf(
+                        "name", "py-base",
+                        "image", "python:3.12",
+                        "source_sandbox_id", "",
+                        "created_at", "2026-05-15T10:00:00Z"
+                    )),
+                    "has_more", true
+                ));
+                return;
+            }
+            throw new AssertionError("unexpected request: " + method + " " + path);
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+
+            SandboxSnapshot snapshot = client.getSnapshot("py-base");
+            assertEquals("py-base", snapshot.name);
+            assertEquals("python:3.12", snapshot.image);
+            assertEquals("sha256:snap", snapshot.imageId);
+
+            SnapshotList page = client.listSnapshots(new ListSnapshotsOptions().setLimit(1).setStartingAfter("cursor"));
+            assertEquals("limit=1&starting_after=cursor", listQuery.get());
+            assertTrue(page.hasMore);
+            assertEquals(1, page.snapshots.size());
+            assertEquals("py-base", page.snapshots.get(0).name);
+
+            client.deleteSnapshot("py-base");
+
+            assertTrue(seen.contains("GET /v1/snapshots/py-base"));
+            assertTrue(seen.contains("GET /v1/snapshots"));
+            assertTrue(seen.contains("DELETE /v1/snapshots/py-base"));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void listSnapshotsMapsNullSnapshotsToEmptyList() throws Exception {
+        AtomicReference<String> listQuery = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            assertEquals("GET", exchange.getRequestMethod());
+            assertEquals("/v1/snapshots", exchange.getRequestURI().getPath());
+            listQuery.set(exchange.getRequestURI().getRawQuery());
+            writeJson(exchange, 200, mapOf("snapshots", null, "has_more", false));
+        });
+
+        try {
+            MicroVMClient client = clientFor(server);
+            SnapshotList page = client.listSnapshots();
+            assertNull(listQuery.get());
+            assertTrue(page.snapshots.isEmpty());
+            assertFalse(page.hasMore);
         } finally {
             server.stop(0);
         }

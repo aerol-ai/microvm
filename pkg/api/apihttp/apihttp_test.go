@@ -1,6 +1,7 @@
 package apihttp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -551,4 +552,90 @@ func TestWriteStoreAwareError_EgressProfiles(t *testing.T) {
 			t.Fatalf("%v: status=%d code=%q", tc.err, rr.Code, body.Code)
 		}
 	}
+}
+
+// Every build failure maps to one status on every surface that builds.
+func TestWriteStoreAwareErrorMapsBuildErrors(t *testing.T) {
+	for err, want := range map[error]int{
+		service.ErrBuildTimeout:        http.StatusGatewayTimeout,
+		service.ErrBuildFailed:         http.StatusBadGateway,
+		service.ErrBuilderUnavailable:  http.StatusServiceUnavailable,
+		service.ErrBuildNotImplemented: http.StatusNotImplemented,
+		service.ErrBuildInvalid:        http.StatusBadRequest,
+	} {
+		if code, _ := storeAwareErr(t, fmt.Errorf("%w: detail", err)); code != want {
+			t.Errorf("%v -> %d, want %d", err, code, want)
+		}
+	}
+}
+
+// RequireOperator passes an operator and refuses everyone else: a scoped
+// user token (403) and a request the auth edge never stamped (403).
+func TestRequireOperator(t *testing.T) {
+	var reached bool
+	h := RequireOperator(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	for name, tc := range map[string]struct {
+		ctx  context.Context
+		want int
+	}{
+		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true}), http.StatusOK},
+		"user token": {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acme"}}), http.StatusForbidden},
+		"no access":  {context.Background(), http.StatusForbidden},
+	} {
+		reached = false
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil).WithContext(tc.ctx))
+		if rec.Code != tc.want || (tc.want == http.StatusForbidden && reached) {
+			t.Errorf("%s = %d (reached %v), want %d", name, rec.Code, reached, tc.want)
+		}
+	}
+}
+
+// DecodeAndBufferJSON decodes with DecodeJSON's single-value strictness and
+// leaves r.Body re-readable so a later forward re-sends the original bytes.
+func TestDecodeAndBufferJSON(t *testing.T) {
+	type payload struct {
+		Name string `json:"name"`
+	}
+	t.Run("decodes and restores the body", func(t *testing.T) {
+		body := `{"name":"abc"}`
+		r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(body))
+		var p payload
+		raw, err := DecodeAndBufferJSON(httptest.NewRecorder(), r, &p)
+		if err != nil || p.Name != "abc" || string(raw) != body {
+			t.Fatalf("decode = %+v raw=%q err=%v", p, raw, err)
+		}
+		again, _ := io.ReadAll(r.Body)
+		if string(again) != body {
+			t.Fatalf("r.Body after = %q, want the original %q", again, body)
+		}
+	})
+	t.Run("rejects trailing JSON", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"name":"a"} {}`))
+		if _, err := DecodeAndBufferJSON(httptest.NewRecorder(), r, &payload{}); err == nil {
+			t.Fatal("want an error for two JSON values")
+		}
+	})
+	t.Run("surfaces a bad JSON error", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`not json`))
+		if _, err := DecodeAndBufferJSON(httptest.NewRecorder(), r, &payload{}); err == nil {
+			t.Fatal("want a decode error")
+		}
+	})
+	t.Run("malformed trailing bytes error", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(`{"name":"a"} @@@`))
+		if _, err := DecodeAndBufferJSON(httptest.NewRecorder(), r, &payload{}); err == nil {
+			t.Fatal("want an error for malformed trailing bytes")
+		}
+	})
+	t.Run("oversized body error", func(t *testing.T) {
+		big := `{"name":"` + strings.Repeat("a", int(MaxJSONBodyBytes)+10) + `"}`
+		r := httptest.NewRequest(http.MethodPost, "/x", strings.NewReader(big))
+		if _, err := DecodeAndBufferJSON(httptest.NewRecorder(), r, &payload{}); err == nil {
+			t.Fatal("want an error for an oversized body")
+		}
+	})
 }

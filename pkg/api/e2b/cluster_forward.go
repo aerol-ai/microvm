@@ -1,53 +1,26 @@
 package e2b
 
 import (
-	"errors"
 	"net/http"
-	"strings"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 )
 
 func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.deps.Service == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		c := h.deps.Service.Cluster()
-		if c == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: WriteError}, local)
+}
 
-		owner, err := c.OwnerOf(strings.TrimSpace(r.PathValue("id")))
-		if errors.Is(err, cluster.ErrUnknownSandbox) {
-			local.ServeHTTP(w, r)
-			return
+// snapshotForwardWrap routes a template(snapshot)-by-id DELETE to the node
+// holding the snapshot's image (B6). The E2B id is a reversible encoding of the
+// snapshot name for snapshots without a custom alias; those route. An id that is
+// a custom alias cannot be mapped to a name without the local alias row, so the
+// resolver returns "" and the request serves locally (the pre-index behaviour —
+// a miss then answers 404, unchanged).
+func (h *handlers) snapshotForwardWrap(local http.Handler) http.Handler {
+	return clusterroute.WrapSnapshot(h.deps.Service, func(r *http.Request) string {
+		if name, ok := snapshotNameFromID(r.PathValue("id")); ok {
+			return name
 		}
-		if errors.Is(err, cluster.ErrOrphaned) {
-			WriteError(w, http.StatusGone, err.Error())
-			return
-		}
-		if err != nil {
-			WriteError(w, http.StatusServiceUnavailable, err.Error())
-			return
-		}
-		if owner.IsSelf {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if owner.APIURL == "" && owner.InternalURL == "" {
-			service.RecordRouteMiss()
-			WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
-			return
-		}
-		if r.Header.Get("X-Cluster-Forwarded") == "1" {
-			cluster.RecordOwnerForwardStale()
-			WriteError(w, http.StatusMisdirectedRequest, "cluster: forwarding loop detected")
-			return
-		}
-		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
-	})
+		return ""
+	}, WriteError, local)
 }

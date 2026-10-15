@@ -169,7 +169,7 @@ Set up a sandbox the way you want it, then save it. The original sandbox keeps r
   </TabItem>
 </Tabs>
 
-Snapshot names are unique across the whole server. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
+Snapshot names are unique across the whole server, and names that start with `aerolvm-snapshot/` are reserved. If you save again after changes, use a new name, like `py-ready-2026-05`. Calling `createSnapshot` again with the same name on the **same** sandbox is safe: it returns the snapshot you already have. The same name on a **different** sandbox fails with `snapshot name already in use`.
 
 ### Start from a snapshot
 
@@ -206,8 +206,8 @@ Pass the snapshot's name where you would normally pass an image:
   </TabItem>
 </Tabs>
 
-- **The name becomes the real image.** The server swaps the name for the real image before it creates the sandbox. Afterward, the sandbox's `image` field shows the real image.
-- **A snapshot name wins** over a registry image with the same name. Snapshot names are short words, so this rarely matters.
+- **The name becomes the real image.** The server swaps the name for the real image before it creates the sandbox. Afterward, the sandbox's `image` field shows the real image. For a saved snapshot, that is an image name the server picks, like `aerolvm-snapshot/3f9c…:latest`. So saving a snapshot never replaces another image on the server, whatever you call it.
+- **Your snapshot's name wins** over a registry image with the same name. Another account's snapshot never does: if someone else saves a snapshot called `python`, your `python` is still the registry image. An operator token sees every account's snapshots, so for it any snapshot name wins.
 - **CPU, memory and disk are not copied.** The new sandbox gets the [defaults](/sandboxes/#give-the-sandbox-more-cpu-memory-or-disk) unless you set them.
 
 ### Give an existing image a snapshot name
@@ -342,8 +342,97 @@ If the image does not exist yet, send a Dockerfile. The server builds it and poi
 
 - **Pass one or the other.** `image` and `dockerfileContent` cannot be used together.
 - **A lone `FROM` line is fast.** If the Dockerfile only names a base image, the server registers that image without running a build.
-- **Builds are cached.** The server names the built image after a hash of the Dockerfile. Registering the same Dockerfile again reuses the earlier build.
+- **Builds are cached, per account.** The server names the built image after a hash of the Dockerfile, under your account. Registering the same Dockerfile again reuses your earlier build. Another account's identical Dockerfile gets its own build.
+- **Builds start from registry images.** With an account token, every image a Dockerfile names (`FROM`, `COPY --from`) is pulled from its registry, never taken from images already on the server. A Dockerfile that names a snapshot, a built image or an image id is refused; start a sandbox from the snapshot instead.
 - **There is a builder helper.** Each SDK can also turn its `Image` builder object into a Dockerfile for you, with `registerSnapshotFromImage` (Python `register_snapshot_from_image`, Go `RegisterSnapshotFromImage`, Rust `register_snapshot_from_image`).
+
+### Find, list, and delete snapshots
+
+Once you have snapshots, you can look one up by name, page through all of them, and delete the ones you no longer need. In a cluster, a look-up or delete is routed to the node that holds the image, so it works from any node.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const snapshot = await client.getSnapshot("py-base");
+
+    const page = await client.listSnapshots({ limit: 20 });
+    for (const s of page.snapshots) {
+      console.log(s.name);
+    }
+    // page.hasMore is true when another page follows. Fetch it with
+    // { startingAfter: page.snapshots.at(-1)?.name }.
+
+    await client.deleteSnapshot("py-base");
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    snapshot = client.get_snapshot("py-base")
+
+    page = client.list_snapshots(limit=20)
+    for s in page["snapshots"]:
+        print(s["name"])
+    # page["hasMore"] is True when another page follows. Fetch it with
+    # starting_after=page["snapshots"][-1]["name"].
+
+    client.delete_snapshot("py-base")
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    snapshot, err := client.GetSnapshot(ctx, "py-base")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    page, err := client.ListSnapshots(ctx, sdktypes.ListSnapshotsOptions{Limit: 20})
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, s := range page.Snapshots {
+        fmt.Println(s.Name)
+    }
+    // page.HasMore reports another page. Set StartingAfter to continue.
+
+    if err := client.DeleteSnapshot(ctx, "py-base"); err != nil {
+        log.Fatal(err)
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::ListSnapshotsOptions;
+
+    let snapshot = client.get_snapshot("py-base")?;
+
+    let page = client.list_snapshots(ListSnapshotsOptions {
+        limit: Some(20),
+        ..Default::default()
+    })?;
+    for s in &page.snapshots {
+        println!("{}", s.name);
+    }
+    // page.has_more reports another page. Set starting_after to continue.
+
+    client.delete_snapshot("py-base")?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    SandboxSnapshot snapshot = client.getSnapshot("py-base");
+
+    SnapshotList page = client.listSnapshots(new ListSnapshotsOptions().setLimit(20));
+    for (SandboxSnapshot s : page.snapshots) {
+        System.out.println(s.name);
+    }
+    // page.hasMore reports another page. setStartingAfter(...) to continue.
+
+    client.deleteSnapshot("py-base");
+    ```
+  </TabItem>
+</Tabs>
+
+Listing returns one name-ordered page at a time. Pass `limit` to cap the page and `starting_after` (the last name you saw) to get the next one. Deleting a name that does not exist returns a not-found error. Deleting a snapshot only removes the snapshot's own saved image, and only when no other snapshot still points at it.
 
 ### What a snapshot keeps
 

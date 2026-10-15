@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/url"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -163,6 +164,10 @@ type Service struct {
 	dockerAux *docker.Client
 	caddy     *caddy.Client
 	cipher    *secrets.Cipher
+	// imageBuilder compiles Dockerfiles (SetImageBuilder); nil on a daemon
+	// without one.
+	imageBuilderMu sync.RWMutex
+	imageBuilder   ImageBuilder
 	// secretProvider owns cluster-secret Put/Open/Delete (ref → plaintext).
 	// Lazily built from cipher+store when tests construct &Service{...}
 	// without New; mount/registry seal paths still use cipher directly.
@@ -380,6 +385,12 @@ type Service struct {
 	// handler raced it through the cluster placement delete and failed on
 	// the placement the API path had just removed, once per destroy.
 	destroyLocks egressPolicyLocks
+	// lifecycleLocks serializes a sandbox's lifecycle transitions — pause,
+	// resume, and the read-modify-write of its Lifecycle timers (D7). Without
+	// it two facade calls that each read the Lifecycle, patch one field and
+	// write the whole struct back (E2B timeout/connect, Daytona idle timers)
+	// race, and the later writer clobbers the earlier one's field.
+	lifecycleLocks egressPolicyLocks
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
@@ -690,6 +701,11 @@ type Service struct {
 	// in handleNetworkSamples so the subsequent Get failure arm can be forced.
 	// Nil in production.
 	testAfterNetstatsUpdate func()
+
+	// idempotencySweepAt is the unix-nano time the next request_idempotency
+	// expiry sweep may run (idempotency_ledger.go). Claims trigger it, so
+	// the table is pruned without a dedicated background loop.
+	idempotencySweepAt atomic.Int64
 }
 
 func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver runtime.Runtime, eventsClient docker.EventsSource, caddyClient *caddy.Client, cipher *secrets.Cipher, mountManager *mounts.Manager, admitter *capacity.Admitter) *Service {
@@ -1426,6 +1442,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 			return true, err
 		}
 		if attempted {
+			s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
 			s.logger.Info("cluster: recreated durable wasm sandbox after failover",
 				"sandbox_id", id, "replayed_ports", len(exposedPorts))
 		}
@@ -1467,12 +1484,27 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if _, err := s.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), merged, id); err != nil {
 		return true, err
 	}
+	s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
 		return true, err
 	}
 	s.logger.Info("cluster: recreated sandbox after failover",
 		"sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return true, nil
+}
+
+// restoreCompatStateAfterRecreate re-materializes the facade compat-state rows a
+// failover recreate inherited from the replicated spec (B11). The rows are
+// node-local, so the new owner rewrites them from spec.CompatState; a failure
+// only means a facade falls back to defaults until the next edit, so it logs
+// rather than failing the recreate.
+func (s *Service) restoreCompatStateAfterRecreate(ctx context.Context, id string, compat map[string]string) {
+	for facade, stateJSON := range compat {
+		if err := s.store.UpsertCompatState(ctx, id, facade, stateJSON); err != nil && s.logger != nil {
+			s.logger.Warn("cluster: restore facade compat state after recreate failed",
+				"sandbox_id", id, "facade", facade, "err", err)
+		}
+	}
 }
 
 func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, exposedPorts map[int]cluster.ExposedPortRoute) error {
@@ -3522,6 +3554,22 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 	return snapshot, err
 }
 
+// errReservedSnapshotName refuses a snapshot name in a namespace the daemon
+// keeps its own images under (committed snapshots, builds): a catalog name
+// there could pass for one of those images.
+var errReservedSnapshotName = errors.New("snapshot names may not start with \"" + docker.SnapshotImageNamespace + "/\" or \"" + docker.BuiltImageNamespace + "/\"")
+
+// validateSnapshotName checks a new snapshot's name.
+func validateSnapshotName(name string) error {
+	if name == "" {
+		return errors.New("snapshot name is required")
+	}
+	if docker.IsSnapshotImageRef(name) || docker.IsBuiltImageRef(name) {
+		return fmt.Errorf("%w: %q", errReservedSnapshotName, name)
+	}
+	return nil
+}
+
 // RegisterSnapshot persists a snapshot row whose Image was resolved out-of-band
 // — either a pre-existing registry image the caller supplied by name, or a
 // freshly built local tag produced by the image builder (e.g. the daytona
@@ -3529,13 +3577,18 @@ func (s *Service) CreateSnapshot(ctx context.Context, sandboxID string, req mode
 // is assumed to already be runnable. Idempotency is by snapshot name; a
 // re-register with matching image is treated as a no-op so SDK retries don't
 // fail. A different image under the same name is a conflict.
+//
+// The image is authorized as the caller now, the same way a create from it
+// would be: a user token cannot record a pointer to an image it could not
+// start, such as another tenant's snapshot named directly or through
+// registered names of its own.
 func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.SandboxSnapshot) (*models.SandboxSnapshot, error) {
 	if snapshot == nil {
 		return nil, errors.New("snapshot is required")
 	}
 	name := strings.TrimSpace(snapshot.Name)
-	if name == "" {
-		return nil, errors.New("snapshot name is required")
+	if err := validateSnapshotName(name); err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(snapshot.Image) == "" {
 		return nil, errors.New("snapshot image is required")
@@ -3547,14 +3600,28 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
 
-	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
+	if existing, err := s.getSnapshotAnySpelling(ctx, name); err == nil {
 		// Retry semantics: same name + same image → echo back the existing
-		// row. Different image under the same name is a conflict.
-		if strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
+		// row. Different image under the same name is a conflict, and so is
+		// another tenant's row: names are global, but its contents are not
+		// the caller's to read back. Another spelling of an existing name
+		// conflicts too: the engine would treat the two as one image.
+		if existing.Name == name && snapshotVisible(ctx, existing) && strings.TrimSpace(existing.Image) == strings.TrimSpace(snapshot.Image) {
 			return existing, nil
 		}
 		return nil, store.ErrSnapshotNameConflict
 	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	if slices.Contains(docker.EquivalentImageNames(name), strings.TrimSpace(snapshot.Image)) {
+		// Named after its own image: there is no catalog row behind it
+		// (none has this name), so only the reference form is checked.
+		if owner, scoped := ownerScope(ctx); scoped {
+			if err := authorizeTenantImageRef(owner, snapshot.Image); err != nil {
+				return nil, err
+			}
+		}
+	} else if _, _, err := s.resolveSnapshotChain(ctx, snapshot.Image, name); err != nil {
 		return nil, err
 	}
 
@@ -3562,11 +3629,16 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		snapshot.CreatedAt = time.Now().UTC()
 	}
 	snapshot.Name = name
+	snapshot.OwnerRef = ownerRefForCreate(ctx)
+	// Only a commit has a source sandbox; that is how a delete tells an
+	// image the snapshot owns from one it only names.
+	snapshot.SourceSandboxID = ""
 	snapshot.PushState = s.initialSnapshotPushState(snapshot)
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
+	s.registerSnapshotHome(ctx, snapshot.Name)
 	return snapshot, nil
 }
 
@@ -3575,18 +3647,19 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 // use the flag to avoid rolling back a snapshot that already existed.
 func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest) (*models.SandboxSnapshot, bool, error) {
 	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		return nil, false, errors.New("snapshot name is required")
+	if err := validateSnapshotName(name); err != nil {
+		return nil, false, err
 	}
 
 	s.snapshotMu.Lock()
 	defer s.snapshotMu.Unlock()
 
-	if existing, err := s.store.GetSnapshot(ctx, name); err == nil {
-		if existing.SourceSandboxID == sandboxID {
-			return existing, false, nil
-		}
-		return nil, false, store.ErrSnapshotNameConflict
+	// Every spelling of the name, not just this one: the runtime commits to
+	// the name as an image tag, and "snap" and "snap:latest" are one tag, so
+	// a second owner committing to either would replace the first owner's
+	// image under its catalog row.
+	if existing, err := s.getSnapshotAnySpelling(ctx, name); err == nil {
+		return replayExistingSnapshot(ctx, existing, sandboxID)
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, false, err
 	}
@@ -3600,17 +3673,24 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	if err != nil {
 		return nil, false, err
 	}
-	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), name)
+	// The image goes under a tag of the snapshot's own, never under its
+	// name: a name is the caller's choice, and as a tag it would replace
+	// whatever image already had it on this node — "python" for everyone.
+	image := docker.SnapshotImageTag(name)
+	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), image)
 	if err != nil {
 		return nil, false, err
 	}
 
 	snapshot := &models.SandboxSnapshot{
 		Name:            name,
-		Image:           name,
+		Image:           image,
 		ImageID:         imageID,
 		SourceSandboxID: sandboxID,
 		CreatedAt:       time.Now().UTC(),
+		// The source sandbox's owner, not the caller's: an operator
+		// snapshotting a tenant's sandbox produces that tenant's snapshot.
+		OwnerRef: sandbox.OwnerRef,
 	}
 	if err := s.normalizeSnapshotImageDistribution(ctx, snapshot, true); err != nil {
 		return nil, false, err
@@ -3621,15 +3701,67 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
-			existing, getErr := s.store.GetSnapshot(ctx, name)
-			if getErr == nil && existing.SourceSandboxID == sandboxID {
-				return existing, false, nil
+			if existing, getErr := s.getSnapshotAnySpelling(ctx, name); getErr == nil {
+				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
+	s.registerSnapshotHome(ctx, snapshot.Name)
 	return snapshot, true, nil
+}
+
+// CreateSnapshotWithAlias commits a snapshot and records the facade alias that
+// addresses it, in one call — the create-then-alias sequence E2B and Runloop
+// each used to re-implement, each with its own compensating delete (D8). The
+// alias's SnapshotName is filled in from the committed snapshot, so a caller
+// passes only its own Alias / Facade / ExtraNames / StateJSON. The alias is
+// part of the snapshot: an id that resolves to nothing is useless, so a failed
+// alias write rolls the commit back — but only when this call created it (a
+// replayed retry leaves the existing row alone and just re-asserts the alias,
+// which is idempotent). Snapshot creation stays serialized by the service's
+// snapshotMu inside CreateSnapshotWithOwnership.
+func (s *Service) CreateSnapshotWithAlias(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest, alias models.SnapshotAlias) (*models.SandboxSnapshot, bool, error) {
+	snapshot, created, err := s.CreateSnapshotWithOwnership(ctx, sandboxID, req)
+	if err != nil {
+		return nil, false, err
+	}
+	alias.SnapshotName = snapshot.Name
+	if err := s.UpsertSnapshotAlias(ctx, alias); err != nil {
+		if created {
+			if delErr := s.DeleteSnapshot(context.WithoutCancel(ctx), snapshot.Name); delErr != nil && s.logger != nil {
+				s.logger.Warn("snapshot alias rollback failed", "snapshot", snapshot.Name, "error", delErr)
+			}
+		}
+		return nil, false, err
+	}
+	return snapshot, created, nil
+}
+
+// replayExistingSnapshot answers a snapshot create whose name is taken. The
+// same source sandbox makes it a retry, answered with the stored row — but
+// only to a caller who may see it: the name check runs before the source
+// sandbox is loaded, so without this a user token naming another tenant's
+// sandbox would be handed that tenant's snapshot. A different source is a
+// name conflict.
+func replayExistingSnapshot(ctx context.Context, existing *models.SandboxSnapshot, sandboxID string) (*models.SandboxSnapshot, bool, error) {
+	if existing.SourceSandboxID != sandboxID {
+		return nil, false, store.ErrSnapshotNameConflict
+	}
+	if !snapshotVisible(ctx, existing) {
+		return nil, false, store.ErrNotFound
+	}
+	return existing, false, nil
+}
+
+// getSnapshotAnySpelling returns the snapshot whose name is name in any
+// spelling the engine treats as the same image ("snap", "snap:latest",
+// "docker.io/library/snap", ...), the literal spelling first. Creating,
+// reading and deleting a snapshot all go through it, as resolving one for a
+// create does, so no spelling reaches a snapshot the others would not.
+func (s *Service) getSnapshotAnySpelling(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
+	return s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(name))
 }
 
 // initialSnapshotPushState picks the push_state value to write for a
@@ -3711,14 +3843,20 @@ func (s *Service) kickTemplateArtifactPushReconciler(templateID string) {
 	}()
 }
 
+// GetSnapshot resolves a snapshot by name or image ID. Another tenant's
+// snapshot reads as store.ErrNotFound for a user token, the same 404 a
+// cross-owner sandbox id gets.
 func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.SandboxSnapshot, error) {
 	needle := strings.TrimSpace(idOrName)
 	if needle == "" {
 		return nil, store.ErrNotFound
 	}
-	snapshot, err := s.store.GetSnapshot(ctx, needle)
+	snapshot, err := s.getSnapshotAnySpelling(ctx, needle)
 	if err == nil {
-		return snapshot, nil
+		if snapshotVisible(ctx, snapshot) {
+			return snapshot, nil
+		}
+		return nil, store.ErrNotFound
 	}
 	if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -3728,15 +3866,116 @@ func (s *Service) GetSnapshot(ctx context.Context, idOrName string) (*models.San
 		return nil, err
 	}
 	for _, snapshot := range snapshots {
-		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle {
+		if snapshot != nil && strings.TrimSpace(snapshot.ImageID) == needle && snapshotVisible(ctx, snapshot) {
 			return snapshot, nil
 		}
 	}
 	return nil, store.ErrNotFound
 }
 
+// ListSnapshots returns the snapshots the caller may see: every row for
+// operator and internal callers, the caller's own account's for a user token.
 func (s *Service) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
-	return s.store.ListSnapshots(ctx)
+	snapshots, err := s.store.ListSnapshots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, scoped := ownerScope(ctx); !scoped {
+		return snapshots, nil
+	}
+	visible := make([]*models.SandboxSnapshot, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		if snapshotVisible(ctx, snapshot) {
+			visible = append(visible, snapshot)
+		}
+	}
+	return visible, nil
+}
+
+// ListSnapshotPage returns one name-ordered page of the snapshots the caller
+// may see, optionally narrowed to one source sandbox and joined with one
+// facade's alias rows. It pages in the store, so a list costs one bounded
+// range scan however large the catalogue is.
+func (s *Service) ListSnapshotPage(ctx context.Context, sourceSandboxID, aliasFacade, afterName string, limit int) ([]store.SnapshotPageRow, error) {
+	owner, scoped := ownerScope(ctx)
+	return s.store.ListSnapshotPage(ctx, store.SnapshotPageQuery{
+		OwnerRef:        owner,
+		Scoped:          scoped,
+		SourceSandboxID: sourceSandboxID,
+		AliasFacade:     aliasFacade,
+		AfterName:       afterName,
+		Limit:           limit,
+	})
+}
+
+// snapshotOwnedScanBatch is the page size ListOwnedSnapshots reads per store
+// round trip. It is well under maxSnapshotPageRows (1000) so one owner's
+// catalogue comes back in a few bounded scans rather than one unbounded read.
+const snapshotOwnedScanBatch = 200
+
+// ListOwnedSnapshots returns every snapshot the caller may see — optionally
+// narrowed to one source sandbox and joined with one facade's alias rows — by
+// paging the store's owner-scoped range scan. It exists so a facade that needs
+// its own sort order or page-number pagination (Daytona, E2B) can materialize
+// just the caller's snapshots instead of calling ListSnapshots, which reads
+// every tenant's rows and filters in Go (D9). Rows come back in the store's
+// keyset order (name ASC); the caller re-sorts as its wire API requires. Pass
+// aliasFacade "" when the caller does not join aliases.
+func (s *Service) ListOwnedSnapshots(ctx context.Context, sourceSandboxID, aliasFacade string) ([]store.SnapshotPageRow, error) {
+	var out []store.SnapshotPageRow
+	after := ""
+	for {
+		rows, err := s.ListSnapshotPage(ctx, sourceSandboxID, aliasFacade, after, snapshotOwnedScanBatch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
+		if len(rows) < snapshotOwnedScanBatch {
+			return out, nil
+		}
+		after = rows[len(rows)-1].Snapshot.Name
+	}
+}
+
+// CountSnapshots counts the snapshots ListSnapshotPage would walk for the
+// caller with the same source filter.
+func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (int, error) {
+	owner, scoped := ownerScope(ctx)
+	return s.store.CountSnapshots(ctx, owner, scoped, sourceSandboxID)
+}
+
+// registerSnapshotHome records, best-effort, that this node holds the snapshot's
+// image, so a snapshot-by-id GET/DELETE that lands on another node can be routed
+// here (B6). A snapshot lives in per-node SQLite with no node column, so the
+// replicated name → node index is the only cluster-wide home lookup. A failure
+// costs only routing — the snapshot is still usable locally and a re-register
+// would fix it — so it never fails the create. It is a no-op single-node (the
+// Noop client). The write detaches from the request context so a client that
+// disconnected right after the commit still gets the snapshot registered.
+func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	self := c.SelfNodeID()
+	if self == "" {
+		return
+	}
+	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), name, self); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
+	}
+}
+
+// forgetSnapshotHome drops the snapshot's home entry after it is deleted.
+// Best-effort: a stale entry is also swept when its node leaves the cluster.
+func (s *Service) forgetSnapshotHome(ctx context.Context, name string) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), name); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
+	}
 }
 
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
@@ -3751,10 +3990,37 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+	// Only a snapshot's own committed image is the snapshot's to remove,
+	// and only once no other snapshot holds it. A registered snapshot names
+	// an image that exists without it — a registry image, a build, someone
+	// else's snapshot — so deleting the name leaves that image to the image
+	// janitors, which remove it once nothing uses it.
+	holders, err := s.store.GetSnapshotsByImage(ctx, []string{snapshot.Image})
+	if err != nil {
 		return err
 	}
-	return s.store.DeleteSnapshot(ctx, snapshot.Name)
+	shared := slices.ContainsFunc(holders, func(other *models.SandboxSnapshot) bool { return other.Name != snapshot.Name })
+	switch {
+	case shared:
+	case snapshotOwnsImage(snapshot):
+		if err := s.docker.RemoveImage(ctx, snapshot.Image); err != nil {
+			return err
+		}
+	default:
+		s.schedulePendingImageGC(ctx, "", snapshot.Image)
+	}
+	if err := s.store.DeleteSnapshot(ctx, snapshot.Name); err != nil {
+		return err
+	}
+	s.forgetSnapshotHome(ctx, snapshot.Name)
+	return nil
+}
+
+// snapshotOwnsImage reports a snapshot whose image was committed for it:
+// one taken from a sandbox (only a commit records its source, see
+// RegisterSnapshot), or one under its own tag.
+func snapshotOwnsImage(snapshot *models.SandboxSnapshot) bool {
+	return snapshot.SourceSandboxID != "" || strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name)
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
@@ -3841,15 +4107,27 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
+	unlock := s.lifecycleLocks.lock(id)
+	defer unlock()
 	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	updated, _, err := s.writeLifecycleLocked(ctx, id, l, priorSandbox)
+	return updated, err
+}
+
+// writeLifecycleLocked persists lifecycle l for id and replays the resulting
+// serverless route transition. The caller holds s.lifecycleLocks.lock(id) and
+// passes the scoped prior read so the whole read→write is one critical section
+// (D7); l is already validated. It reports whether the write ran (always true
+// here; the bool lets ApplyLifecyclePatch tell a no-op apart).
+func (s *Service) writeLifecycleLocked(ctx context.Context, id string, l models.Lifecycle, priorSandbox *models.Sandbox) (*models.Sandbox, bool, error) {
 	if s.testAfterLifecycleScopedGet != nil {
 		s.testAfterLifecycleScopedGet()
 	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	lc := l
 	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
@@ -3857,7 +4135,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	})
 	updated, err := s.store.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// If Serverless flipped on a running sandbox, re-install exposed port
 	// routes in the matching shape. The install helpers own cleanup of the
@@ -3876,7 +4154,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 			}
 		}
 	}
-	return updated, nil
+	return updated, true, nil
 }
 
 // ExposePort publishes a sandbox container port through one of three caddy
@@ -4564,6 +4842,24 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if err != nil {
 		return ToolboxEndpoint{}, err
 	}
+	return s.toolboxEndpointForSandbox(ctx, sandbox)
+}
+
+// toolboxEndpointForSandbox builds the toolbox endpoint from an already-fetched,
+// owner-scoped sandbox. The toolbox dispatchers pass the sandbox the wake helper
+// already read, so the network path avoids re-reading the row (D15); it does not
+// touch the sandbox (ToolboxTarget and the dispatchers' TouchSandbox own that).
+func (s *Service) toolboxEndpointForSandbox(ctx context.Context, sandbox *models.Sandbox) (ToolboxEndpoint, error) {
+	// A stopped sandbox has no live toolbox. Only Firecracker clears ContainerIP
+	// on stop, so for Docker/containerd a stale ContainerIP would otherwise be
+	// dialed — and that address may have been reassigned to another container,
+	// which would then receive this sandbox's toolbox token (S12). Gate on the
+	// running state, which every caller has already ensured via
+	// EnsureSandboxAwakeForHTTP (a serverless sandbox is woken first; a
+	// manually-stopped one errors there). ErrSandboxNotRunning classifies to 409.
+	if sandbox.Status != models.SandboxStatusStarted {
+		return ToolboxEndpoint{}, ErrSandboxNotRunning
+	}
 	if sandbox.ContainerIP == "" {
 		return ToolboxEndpoint{}, errors.New("sandbox container IP is not available")
 	}
@@ -4575,6 +4871,16 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 		URL:   "http://" + addr,
 		Token: sandbox.ToolboxToken,
 	}, nil
+}
+
+// toolboxEndpointForActiveCall is the dispatcher entry: it touches the sandbox
+// (coalesced last-active write) and builds the endpoint from the sandbox the
+// dispatcher already read, skipping ToolboxTarget's re-read (D15).
+func (s *Service) toolboxEndpointForActiveCall(ctx context.Context, sandbox *models.Sandbox) (ToolboxEndpoint, error) {
+	if err := s.TouchSandbox(ctx, sandbox.ID); err != nil {
+		return ToolboxEndpoint{}, err
+	}
+	return s.toolboxEndpointForSandbox(ctx, sandbox)
 }
 
 // toolboxAddress is the host:port sandboxd dials for the sandbox's toolboxd:
@@ -6643,6 +6949,11 @@ func l4ListenPort(listen string) int {
 }
 
 func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandboxRequest {
+	// CompatState is replication-internal (B11): it rides the FSM spec only
+	// through the service's own UpsertCompatState write-through, never from a
+	// client create body. Strip anything supplied so a caller cannot inject it
+	// (a failover recreate reads it off the raw replicated spec, before here).
+	req.CompatState = nil
 	if req.CPU <= 0 {
 		req.CPU = models.DefaultCPU
 	}

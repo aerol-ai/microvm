@@ -21,6 +21,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
@@ -214,7 +215,12 @@ func seedReservedPlacement(s *clusterStub, sandboxID string) {
 	}
 }
 
-func (s *clusterStub) RecordPlacement(_ context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+func (s *clusterStub) RecordPlacement(ctx context.Context, sandboxID string, spec *models.CreateSandboxRequest, placementSecrets cluster.PlacementSecrets) error {
+	// Honor the context like the real Raft-backed promote: an expired promote
+	// budget must surface, so the B13 fresh-timeout fix is observable.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if s.onRecord != nil {
 		s.onRecord()
 	}
@@ -491,7 +497,7 @@ func TestRouteExistingPlacement(t *testing.T) {
 			var status int
 			var message string
 
-			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, msg string) {
+			handled, local := routeExistingPlacement(w, r, tc.stub, "sb-1", func(_ http.ResponseWriter, code int, _, msg string) {
 				status = code
 				message = msg
 				w.WriteHeader(code)
@@ -541,7 +547,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-b")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -557,7 +563,7 @@ func TestPrepare_ForwardedHeaderValidation(t *testing.T) {
 		r.Header.Set(HeaderTarget, "node-a")
 		w := httptest.NewRecorder()
 		var status int
-		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+		_, ok := Prepare(w, r, svc, baseReq, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -605,7 +611,7 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image:                 "e2b/sb-local:default",
 			ImageDistributionMode: models.ImageDistributionLocalOnly,
-		}, func(_ http.ResponseWriter, code int, _ string) {
+		}, func(_ http.ResponseWriter, code int, _, _ string) {
 			status = code
 		}, PrepareOptions{})
 		if ok {
@@ -687,9 +693,11 @@ func TestPrepare_GuardsAndPlacementBranches(t *testing.T) {
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				status := 0
-				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, func(_ http.ResponseWriter, code int, _ string) {
+				writer := func(rw http.ResponseWriter, code int, errCode, msg string) {
 					status = code
-				}, PrepareOptions{})
+					apihttp.WriteErrorCode(rw, code, errCode, msg)
+				}
+				_, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, baseReq, writer, PrepareOptions{})
 				if ok {
 					t.Fatal("Prepare returned ok=true, want false")
 				}
@@ -782,7 +790,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -801,7 +809,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusServiceUnavailable {
 			t.Fatalf("ok=%v status=%d, want 503", ok, status)
 		}
@@ -819,7 +827,7 @@ func TestPrepareLocalImageCoverageBranches(t *testing.T) {
 		var status int
 		_, ok := Prepare(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{
 			Image: docker.BuiltImageNamespace + "/abc:latest",
-		}, func(_ http.ResponseWriter, code int, _ string) { status = code }, PrepareOptions{})
+		}, func(_ http.ResponseWriter, code int, _, _ string) { status = code }, PrepareOptions{})
 		if ok || status != http.StatusInternalServerError {
 			t.Fatalf("ok=%v status=%d, want 500", ok, status)
 		}
@@ -966,7 +974,7 @@ func TestPrepare_ReservePaths(t *testing.T) {
 				svc := testServiceWithCluster(stub)
 				w := httptest.NewRecorder()
 				var status int
-				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _ string) {
+				decision, ok := Prepare(w, httptest.NewRequest(http.MethodPost, "/v1/sandboxes", nil), svc, models.CreateSandboxRequest{Image: "alpine:3.20"}, func(_ http.ResponseWriter, code int, _, _ string) {
 					status = code
 				}, tc.opts)
 				if ok != tc.wantOK {
@@ -1669,15 +1677,76 @@ func TestCapacityRequestFromCreateEgressGateway(t *testing.T) {
 
 func TestWriteNoEgressGateway(t *testing.T) {
 	rr := httptest.NewRecorder()
-	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget) {
+	if writeNoEgressGateway(rr, cluster.ErrNoPlacementTarget, apihttp.WriteErrorCode) {
 		t.Fatal("a plain placement failure is not a gateway failure")
 	}
-	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget) {
+	if !writeNoEgressGateway(rr, cluster.ErrNoEgressGatewayTarget, apihttp.WriteErrorCode) {
 		t.Fatal("gateway sentinel must be written")
 	}
 	var body models.ErrorResponse
 	_ = json.Unmarshal(rr.Body.Bytes(), &body)
 	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeEgressGatewayUnavailable || rr.Header().Get("Retry-After") == "" {
 		t.Fatalf("status=%d code=%q", rr.Code, body.Code)
+	}
+}
+
+// TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate pins B13:
+// the promote runs after the create+seal join on its own fresh budget, so a
+// create slower than the commit budget no longer expires the promote and fails
+// it even though the sandbox is up.
+// A retry that reaches OverlapCreateAndPromote with an id whose sandbox already
+// exists (the reservation-conflict idempotency replay) must return the existing
+// sandbox without re-binding or re-promoting — the reservation is already
+// consumed on the real cluster, so a second ReservedSecretBinding/RecordPlacement
+// fails with "reserved placement is no longer authoritative" (found live on the
+// single-node 1-node-cluster path). The stub does not model reservation
+// consumption, so this asserts the replay guard fires before any promote.
+func TestOverlapCreateAndPromote_IdempotentReplayReturnsExisting(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-replay")
+	svc, _ := newCreateServiceWithRuntime(t, stub, newFakeRuntime(), true)
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+
+	first, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	promotes := len(stub.recordCalls)
+
+	second, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if second.Sandbox.ID != "sb-replay" || second.Sandbox.ID != first.Sandbox.ID {
+		t.Fatalf("replay returned %q, want the existing %q", second.Sandbox.ID, first.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != promotes {
+		t.Fatalf("replay promoted again (%d → %d); it must return the existing sandbox without re-promoting", promotes, len(stub.recordCalls))
+	}
+}
+
+func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testing.T) {
+	prev := overlapCommitTimeout
+	overlapCommitTimeout = 50 * time.Millisecond
+	defer func() { overlapCommitTimeout = prev }()
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-slow-create")
+	rt := newFakeRuntime()
+	rt.createDelay = 200 * time.Millisecond // > overlapCommitTimeout
+	svc, _ := newCreateServiceWithRuntime(t, stub, rt, true)
+
+	resp, err := OverlapCreateAndPromote(context.Background(), svc, logger,
+		models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-slow-create", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("OverlapCreateAndPromote with a create slower than the commit budget: %v", err)
+	}
+	if resp.Sandbox.ID != "sb-slow-create" {
+		t.Fatalf("sandbox id = %q", resp.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != 1 {
+		t.Fatalf("RecordPlacement calls = %d, want 1 (promote must succeed on its fresh budget)", len(stub.recordCalls))
 	}
 }

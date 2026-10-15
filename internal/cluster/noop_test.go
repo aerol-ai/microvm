@@ -68,6 +68,22 @@ func TestNoopAlwaysSelf(t *testing.T) {
 // upgrade that started populating capacity.Request.TemplateID could
 // surface as a "placement target unknown" error when no other gating
 // changed. Asserts the noop behaviour persists end-to-end.
+// Single-node serves every snapshot locally, so the index writes are no-ops and
+// the home lookup always says "not found" (serve locally).
+func TestNoopSnapshotHomeNode(t *testing.T) {
+	n := NewNoop("standalone", "http://localhost:21212", "")
+	if err := n.RegisterSnapshotNode(context.Background(), "snap", "node"); err != nil {
+		t.Fatalf("RegisterSnapshotNode: %v", err)
+	}
+	if err := n.ForgetSnapshotNode(context.Background(), "snap"); err != nil {
+		t.Fatalf("ForgetSnapshotNode: %v", err)
+	}
+	node, found, err := n.SnapshotHomeNode(context.Background(), "snap")
+	if err != nil || found || node != "" {
+		t.Fatalf("SnapshotHomeNode = %q,%v,%v, want ''/false/nil (serve locally)", node, found, err)
+	}
+}
+
 func TestNoopIgnoresTemplateAwarePlacement(t *testing.T) {
 	n := NewNoop("standalone", "http://localhost:21212", "")
 	req := capacity.Request{

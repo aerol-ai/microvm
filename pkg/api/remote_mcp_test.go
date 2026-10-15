@@ -18,7 +18,11 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/api/daytona"
+	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
+	v1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -100,7 +104,14 @@ func TestRemoteMCPThroughRealAPI(t *testing.T) {
 // its @api matcher lists, so a /mcp missing there is unreachable through the
 // API domain even with SB_MCP_ENABLED=true. Both Caddyfile sources the
 // installers write must list it.
-func TestCaddyForwardsRemoteMCP(t *testing.T) {
+// The stock Caddy configs answer anything outside their @api matcher with a
+// 404 of their own, so every surface sandboxd mounts must be listed there —
+// each facade's prefix and everything under it.
+func TestCaddyForwardsEverySurface(t *testing.T) {
+	want := []string{remotemcp.Path}
+	for _, prefix := range []string{v1.PathPrefix, daytona.PathPrefix, e2b.PathPrefix, runloop.PathPrefix} {
+		want = append(want, prefix, prefix+"/*")
+	}
 	for _, file := range []string{"../../scripts/install.sh", "../../packaging/Caddyfile.template"} {
 		raw, err := os.ReadFile(file)
 		if err != nil {
@@ -110,8 +121,10 @@ func TestCaddyForwardsRemoteMCP(t *testing.T) {
 		for _, line := range strings.Split(string(raw), "\n") {
 			if fields := strings.Fields(line); len(fields) > 2 && fields[0] == "@api" && fields[1] == "path" {
 				matchers = append(matchers, line)
-				if !slices.Contains(fields[2:], remotemcp.Path) {
-					t.Errorf("%s: %q does not forward %s to sandboxd", file, strings.TrimSpace(line), remotemcp.Path)
+				for _, path := range want {
+					if !slices.Contains(fields[2:], path) {
+						t.Errorf("%s: %q does not forward %s to sandboxd", file, strings.TrimSpace(line), path)
+					}
 				}
 			}
 		}

@@ -4,38 +4,10 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/docker"
 )
-
-// ImageBuilder is the slice of pkg/docker.Client v1 needs to compile an
-// Image-builder graph into a content-addressed local image tag, and
-// optionally push the result to a remote registry. Declared as an
-// interface so the test harness can stub it without standing up a real
-// Docker daemon. PushImage is v1-only — the Daytona facade interface
-// deliberately omits it to keep its surface aligned with upstream Daytona.
-type ImageBuilder interface {
-	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
-	ImageExists(ctx context.Context, imageRef string) (bool, error)
-	PushImage(ctx context.Context, req docker.PushImageRequest) (string, error)
-	// RefreshTag bumps Docker's Metadata.LastTagTime so the built-image
-	// janitor doesn't GC a tag that was just handed out from the build
-	// cache. Called on the ImageExists==true short-circuit path.
-	RefreshTag(ctx context.Context, fullRef string) error
-	// RemoveImage rolls back a freshly built tag when the downstream
-	// snapshot-register call fails — otherwise the layer leaks because no
-	// snapshot row points at it for the built-image janitor to clean up.
-	RemoveImage(ctx context.Context, imageRef string) error
-}
-
-// BuildConfig mirrors the operator-configured image-build knobs.
-type BuildConfig struct {
-	ContextEnabled bool
-	Timeout        time.Duration
-}
 
 // Deps holds the shared dependencies a version package needs from the
 // top-level pkg/api router. Keeping these explicit (rather than reaching into
@@ -50,9 +22,6 @@ type Deps struct {
 	// AuditLimiter rate-limits GET /v1/sandboxes/{id}/audit only (E1b
 	// amplification bound). Nil disables limiting (tests).
 	AuditLimiter *AuditRateLimiter
-	// Builder is optional. When nil, POST /v1/images/build responds 503.
-	Builder ImageBuilder
-	Build   BuildConfig
 	// ContainerEngine is the host engine (docker|containerd). Used for
 	// Server-Timing engine tags and BuildKit-absent clear errors.
 	ContainerEngine string
@@ -132,6 +101,12 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	// records they return, this is where the whole chain is proven.
 	mux.Handle("POST "+PathPrefix+"/audit/verify", withAuthOperator(d, http.HandlerFunc(h.verifySandboxAudit)))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.registerSnapshot)))
+	// Snapshot catalogue read/delete (I group). The list is node-local and
+	// store-paged; get/delete-by-id are wrapped so a cluster request reaches
+	// the node holding the image (B6). A v1 snapshot id is its name.
+	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
+	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.getSnapshot))))
+	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.deleteSnapshot))))
 
 	// Firecracker template lifecycle (plans/snapshot-clone-fast-boot.md
 	// Phase 2). Templates are global operator-managed, per-worker artifacts; no
@@ -221,6 +196,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))
 	mux.Handle("GET "+cluster.PublicInternalVolumePath, internalOp(http.HandlerFunc(h.clusterInternalVolume)))
+	mux.Handle("GET "+cluster.PublicInternalSnapshotNodePath, internalOp(http.HandlerFunc(h.clusterInternalSnapshotNode)))
 	mux.Handle("GET "+cluster.PublicInternalDrainStatePath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalDrainState)))
 	mux.Handle("GET "+cluster.PublicInternalDrainedNodesPath, internalOp(http.HandlerFunc(h.clusterInternalDrainedNodes)))
 	mux.Handle("GET "+cluster.PublicInternalStorageObligationsPath, internalOp(http.HandlerFunc(h.clusterInternalStorageObligations)))

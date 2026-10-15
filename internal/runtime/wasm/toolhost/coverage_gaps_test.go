@@ -313,13 +313,17 @@ func (m *mockMultipartFile) Close() error { return m.closeErr }
 
 func TestAtomicWriteFileCloseChmodRenameErrors(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "out.txt")
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
 
-	if err := atomicWriteFile(path, &mockMultipartFile{Reader: bytes.NewReader([]byte("ok"))}); err != nil {
+	if err := atomicWriteFile(root, "out.txt", &mockMultipartFile{Reader: bytes.NewReader([]byte("ok"))}); err != nil {
 		t.Fatalf("atomicWriteFile: %v", err)
 	}
 
-	if err := atomicWriteFile(path, &mockMultipartFile{
+	if err := atomicWriteFile(root, "out.txt", &mockMultipartFile{
 		Reader:   bytes.NewReader([]byte("x")),
 		closeErr: errors.New("close failed"),
 	}); err != nil && !strings.Contains(err.Error(), "close") {
@@ -329,8 +333,11 @@ func TestAtomicWriteFileCloseChmodRenameErrors(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "existing"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := atomicWriteFile(filepath.Join(dir, "existing"), &mockMultipartFile{Reader: bytes.NewReader([]byte("x"))}); err == nil {
+	if err := atomicWriteFile(root, "existing", &mockMultipartFile{Reader: bytes.NewReader([]byte("x"))}); err == nil {
 		t.Fatal("expected rename error onto directory")
+	}
+	if err := atomicWriteFile(root, filepath.Join("missing", "out.txt"), &mockMultipartFile{Reader: bytes.NewReader([]byte("x"))}); err == nil {
+		t.Fatal("expected an error creating a temp file in a missing directory")
 	}
 }
 
@@ -783,7 +790,12 @@ func TestAtomicWriteFileChmodAndRenameErrors(t *testing.T) {
 	if err := os.Mkdir(path, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	err = atomicWriteFile(path, &mockMultipartFile{Reader: bytes.NewReader([]byte("x"))})
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	err = atomicWriteFile(root, filepath.Base(path), &mockMultipartFile{Reader: bytes.NewReader([]byte("x"))})
 	if err == nil {
 		t.Fatal("expected rename onto directory to fail")
 	}

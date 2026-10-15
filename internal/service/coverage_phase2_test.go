@@ -275,7 +275,7 @@ func TestDeleteSnapshotPaths(t *testing.T) {
 
 	now := time.Now().UTC()
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-		Name: "del-me", Image: "img:del", CreatedAt: now,
+		Name: "del-me", Image: "img:del", SourceSandboxID: "sb-gone", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestDeleteSnapshotPaths(t *testing.T) {
 	}
 
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{
-		Name: "del-fail", Image: "img:fail", CreatedAt: now,
+		Name: "del-fail", Image: "img:fail", SourceSandboxID: "sb-gone", CreatedAt: now,
 	}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}

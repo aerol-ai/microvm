@@ -401,8 +401,7 @@ func TestE2BHelperFunctions(t *testing.T) {
 
 	loggerOutput := &strings.Builder{}
 	logger := slog.New(slog.NewTextHandler(loggerOutput, nil))
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "{invalid-json}")
-	templates := loadTemplateMap(logger)
+	templates := loadTemplateMap("{invalid-json}", logger)
 	if templates["base"] != "ubuntu:22.04" {
 		t.Fatalf("expected template fallback, got %+v", templates)
 	}
@@ -443,7 +442,7 @@ func TestE2BHelperFunctions(t *testing.T) {
 		t.Fatal("startedAt(empty) should not be zero")
 	}
 
-	if id := loadClientID(); id != defaultClientID {
+	if id := loadClientID(""); id != defaultClientID {
 		t.Fatalf("expected default client ID, got %q", id)
 	}
 
@@ -786,8 +785,7 @@ func TestE2BDeleteSnapshotEmptyID(t *testing.T) {
 }
 
 func TestLoadClientIDEnv(t *testing.T) {
-	t.Setenv("SB_E2B_CLIENT_ID", "custom-client-id")
-	id := loadClientID()
+	id := loadClientID("custom-client-id")
 	if id != "custom-client-id" {
 		t.Fatalf("expected custom-client-id, got %q", id)
 	}
@@ -952,16 +950,14 @@ func TestE2BListSnapshotsPaginationNextToken(t *testing.T) {
 }
 
 func TestLoadTemplateMapEmpty(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", "")
-	templates := loadTemplateMap(nil)
+	templates := loadTemplateMap("", nil)
 	if templates["base"] != "ubuntu:22.04" {
 		t.Fatalf("expected default, got %+v", templates)
 	}
 }
 
 func TestLoadTemplateMapWithoutBase(t *testing.T) {
-	t.Setenv("SB_E2B_TEMPLATE_MAP_JSON", `{"custom":"image"}`)
-	templates := loadTemplateMap(nil)
+	templates := loadTemplateMap(`{"custom":"image"}`, nil)
 	if templates["base"] != "ubuntu:22.04" || templates["custom"] != "image" {
 		t.Fatalf("expected base default and custom, got %+v", templates)
 	}

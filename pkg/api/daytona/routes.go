@@ -1,13 +1,10 @@
 package daytona
 
 import (
-	"context"
 	"log/slog"
 	"net/http"
-	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/docker"
 )
 
 const (
@@ -15,40 +12,18 @@ const (
 	ToolboxPrefix = PathPrefix + "/toolbox"
 )
 
-// ImageBuilder is the slice of pkg/docker.Client the facade needs to turn a
-// Dockerfile into a runnable image. Declared as an interface so the test
-// harness can stub it without standing up a real Docker daemon.
-type ImageBuilder interface {
-	BuildImage(ctx context.Context, req docker.BuildImageRequest) error
-	ImageExists(ctx context.Context, imageRef string) (bool, error)
-	RemoveImage(ctx context.Context, imageRef string) error
-	// RefreshTag bumps Docker's Metadata.LastTagTime so the built-image
-	// janitor doesn't GC a tag we just handed back from the cache. Called
-	// on the ImageExists==true short-circuit in resolveBuildInfo.
-	RefreshTag(ctx context.Context, fullRef string) error
-}
-
-// BuildConfig surfaces the operator-configured image-build knobs through to
-// the facade. Mirrors the corresponding fields on internal/config.Config —
-// kept narrow so the package doesn't take a dep on internal/config.
-type BuildConfig struct {
-	ContextEnabled bool
-	Timeout        time.Duration
-}
-
 // Deps are the shared dependencies the Daytona facade needs from the
 // top-level API package.
 type Deps struct {
 	Service *service.Service
 	Logger  *slog.Logger
 	Auth    func(http.Handler) http.Handler
-	// Builder is optional. When nil, multi-line Dockerfile builds are
-	// rejected at the handler with a 400 — the legacy single-line `FROM`
-	// fast-path still works (it doesn't need a builder).
-	Builder ImageBuilder
-	Build   BuildConfig
 	// ContainerEngine selects BuildKit-absent clear errors on containerd hosts.
 	ContainerEngine string
+	// DefaultImage is the image a create falls back to when the request names
+	// neither a snapshot nor a build (SB_DAYTONA_DEFAULT_IMAGE, read once in
+	// config). Empty falls back to the built-in default.
+	DefaultImage string
 }
 
 // RegisterRoutes mounts the supported Daytona compatibility surface.
@@ -58,8 +33,8 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("POST "+PathPrefix+"/sandbox", d.Auth(http.HandlerFunc(h.createSandbox)))
 	mux.Handle("POST "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.createSnapshotFromImage)))
 	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
-	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.getSnapshot)))
-	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
+	mux.Handle("GET "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.getSnapshot))))
+	mux.Handle("DELETE "+PathPrefix+"/snapshots/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.deleteSnapshot))))
 	mux.Handle("GET "+PathPrefix+"/sandbox", d.Auth(http.HandlerFunc(h.listSandboxes)))
 	mux.Handle("GET "+PathPrefix+"/sandbox/paginated", d.Auth(http.HandlerFunc(h.listSandboxesPaginated)))
 	mux.Handle("GET "+PathPrefix+"/sandbox/{idOrName}", d.Auth(h.clusterForwardWrap("idOrName", http.HandlerFunc(h.getSandbox))))

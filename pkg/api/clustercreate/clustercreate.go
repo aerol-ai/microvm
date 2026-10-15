@@ -3,6 +3,8 @@ package clustercreate
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -14,7 +16,6 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
@@ -25,10 +26,38 @@ const (
 	HeaderTarget = "X-Cluster-Create-Target"
 	HeaderID     = "X-Cluster-Create-ID"
 
+	// HeaderIdempotencyKey is the client-supplied create idempotency key the
+	// v1 and Daytona surfaces honor. It is opt-in: a create without it keeps
+	// the default mint-fresh-every-call behaviour, so two deliberate identical
+	// POSTs still make two sandboxes (unlike E2B, which is content-addressed).
+	HeaderIdempotencyKey = "Idempotency-Key"
+
 	ReservationTTL = 120 * time.Second
 )
 
-type ErrorWriter func(w http.ResponseWriter, status int, message string)
+// DeterministicSandboxID derives a stable sandbox id from an owner reference
+// and a caller-supplied idempotency key, so a retried create (same owner, same
+// key) resolves to the same id and is deduplicated by the reservation /
+// CreateSandboxWithID fast path instead of minting a second sandbox. It returns
+// "" when key is blank — the caller then mints a fresh random id and the create
+// is not idempotent, which keeps the mechanism opt-in. The owner is mixed in so
+// two tenants that happen to choose the same key never collide, and so a
+// derived id satisfies CreateSandboxWithID's owner check on replay. The shape
+// ("sb-" + 16 hex) matches service.GenerateSandboxID, so the id is a valid
+// container name and is indistinguishable downstream from a random one.
+func DeterministicSandboxID(ownerRef, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(ownerRef) + "\x00" + key))
+	return "sb-" + hex.EncodeToString(sum[:8])
+}
+
+// ErrorWriter renders one error in the calling facade's envelope. code is
+// models.ErrorResponse.Code for surfaces that carry it (v1, Daytona); E2B and
+// Runloop ignore it and render their own shapes (and Runloop's x-should-retry).
+type ErrorWriter func(w http.ResponseWriter, status int, code, message string)
 
 type Decision struct {
 	ReservationID string
@@ -69,9 +98,14 @@ func (o PrepareOptions) metric(suffix string) string {
 
 func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req models.CreateSandboxRequest, writeError ErrorWriter, opts PrepareOptions) (Decision, bool) {
 	if writeError == nil {
-		writeError = func(w http.ResponseWriter, status int, message string) {
+		writeError = func(w http.ResponseWriter, status int, _, message string) {
 			http.Error(w, message, status)
 		}
+	}
+	// writeMsg is the common no-code path; the two coded cases below call
+	// writeError directly so a surface that carries a code keeps it.
+	writeMsg := func(w http.ResponseWriter, status int, message string) {
+		writeError(w, status, "", message)
 	}
 	if svc == nil {
 		return Decision{}, true
@@ -87,7 +121,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 				opts.OnForwardStale()
 			}
 			service.RecordFacadeIdempotencyConflict(opts.metric("forward"))
-			writeError(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
+			writeMsg(w, http.StatusMisdirectedRequest, "cluster: forwarded create reached wrong target")
 			return Decision{}, false
 		}
 		if service.ImageRequiresLocalPlacement(req) {
@@ -95,43 +129,43 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		sandboxID := strings.TrimSpace(r.Header.Get(HeaderID))
 		if sandboxID == "" {
-			writeError(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
+			writeMsg(w, http.StatusBadRequest, "cluster: forwarded create missing "+HeaderID)
 			return Decision{}, false
 		}
 		// The forward header is honored on the same handler the public listener
 		// serves (daemon mounts it on both), so reject a non-delimiter-safe id
 		// here rather than let it reach the mount manager as a host path.
 		if err := models.ValidateSandboxID(sandboxID); err != nil {
-			writeError(w, http.StatusBadRequest, "cluster: "+err.Error())
+			writeMsg(w, http.StatusBadRequest, "cluster: "+err.Error())
 			return Decision{}, false
 		}
 		return Decision{ReservationID: sandboxID}, true
 	}
 
 	if err := svc.NormalizeCreateImageDistribution(r.Context(), &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeMsg(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
 	if err := service.NormalizeCreateFailover(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeMsg(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
 	svc.NormalizeCreateEgressDefault(&req)
 	if opts.Normalize != nil {
 		if err := opts.Normalize(&req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMsg(w, http.StatusBadRequest, err.Error())
 			return Decision{}, false
 		}
 	}
 	// Reject reserved names before the reservation claims the name in Raft;
 	// the target node's create applies the same rule again.
 	if err := models.ValidateSandboxName(req.Name); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeMsg(w, http.StatusBadRequest, err.Error())
 		return Decision{}, false
 	}
 	if svc.ClusterEnabled() {
 		if err := service.ValidateClusterIsolateBundleRef(req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeMsg(w, http.StatusBadRequest, err.Error())
 			return Decision{}, false
 		}
 	}
@@ -140,7 +174,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if opts.SyncBody {
 		normalized, err := json.Marshal(req)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
+			writeMsg(w, http.StatusInternalServerError, "cluster: normalize create body: "+err.Error())
 			return Decision{}, false
 		}
 		r.Body = io.NopCloser(bytes.NewReader(normalized))
@@ -150,20 +184,20 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		requiredNodeID, nodeBound := docker.BuiltImagePlacementNode(req.Image)
 		if clusterCreateSelfCanOwnSandbox(c) && (!nodeBound || requiredNodeID == c.SelfNodeID()) {
 			if c.IsNodeDrained(c.SelfNodeID()) {
-				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
 			}
 			return Decision{}, true
 		}
 		target, err := c.SelectPlacement(CapacityRequestFromCreate(req))
 		if err != nil {
-			if writeNoEgressGateway(w, err) {
+			if writeNoEgressGateway(w, err, writeError) {
 				return Decision{}, false
 			}
 			if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 				// The artifact went with its node; no Retry-After, the client
 				// must re-create it (re-upload the bundle / rebuild the image).
-				apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+				writeError(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
 				return Decision{}, false
 			}
 			if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
@@ -172,21 +206,21 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 				} else {
 					w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 				}
-				writeError(w, http.StatusServiceUnavailable, err.Error())
+				writeMsg(w, http.StatusServiceUnavailable, err.Error())
 				return Decision{}, false
 			}
-			writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
+			writeMsg(w, http.StatusInternalServerError, "placement: "+err.Error())
 			return Decision{}, false
 		}
 		if target.IsSelf {
 			if c.IsNodeDrained(c.SelfNodeID()) {
-				writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+				writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 				return Decision{}, false
 			}
 			return Decision{}, true
 		}
 		if target.APIURL == "" && target.InternalURL == "" {
-			writeError(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
+			writeMsg(w, http.StatusServiceUnavailable, cluster.ErrNoPlacementTarget.Error())
 			return Decision{}, false
 		}
 		if opts.Logger != nil && strings.HasPrefix(strings.TrimSpace(req.Image), docker.BuiltImageNamespace+"/") {
@@ -206,7 +240,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	if sandboxID == "" {
 		generated, genErr := service.GenerateSandboxID()
 		if genErr != nil {
-			writeError(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
+			writeMsg(w, http.StatusInternalServerError, "cluster: generate sandbox id: "+genErr.Error())
 			return Decision{}, false
 		}
 		sandboxID = generated
@@ -217,13 +251,13 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	}
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	if err != nil {
-		if writeNoEgressGateway(w, err) {
+		if writeNoEgressGateway(w, err, writeError) {
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrArtifactNodeUnavailable) {
 			// A node-bound js-bundle whose worker is gone: the client must
 			// re-upload, so no Retry-After — waiting changes nothing.
-			apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
+			writeError(w, http.StatusServiceUnavailable, models.ErrorCodeArtifactNodeUnavailable, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrNoPlacementTarget) || errors.Is(err, cluster.ErrInvalidTopology) {
@@ -232,10 +266,10 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 			} else {
 				w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
 			}
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeMsg(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}
-		writeError(w, http.StatusInternalServerError, "placement: "+err.Error())
+		writeMsg(w, http.StatusInternalServerError, "placement: "+err.Error())
 		return Decision{}, false
 	}
 	// Names are unique per owner: the reservation claims the caller's
@@ -262,32 +296,32 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		if errors.Is(err, cluster.ErrNameConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("name"))
-			writeError(w, http.StatusConflict, "sandbox name already in use cluster-wide")
+			writeMsg(w, http.StatusConflict, "sandbox name already in use cluster-wide")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrReservationConflict) {
 			service.RecordFacadeIdempotencyConflict(opts.metric("reservation"))
-			writeError(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
+			writeMsg(w, http.StatusConflict, "cluster: reservation conflict on sandbox id")
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCreateBackpressure) {
 			w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-			writeError(w, http.StatusTooManyRequests, err.Error())
+			writeMsg(w, http.StatusTooManyRequests, err.Error())
 			return Decision{}, false
 		}
 		if errors.Is(err, cluster.ErrCapacityExceeded) || errors.Is(err, cluster.ErrNoPlacementTarget) {
 			w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-			writeError(w, http.StatusServiceUnavailable, err.Error())
+			writeMsg(w, http.StatusServiceUnavailable, err.Error())
 			return Decision{}, false
 		}
 		// Oversized specs are a caller problem, not a cluster problem: the
 		// recovery payload rides inline in the raft entry and has a hard size
 		// cap with no fallback delivery path.
 		if errors.Is(err, cluster.ErrRecoveryPayloadTooLarge) {
-			writeError(w, http.StatusBadRequest, "sandbox spec too large to replicate across the cluster: "+err.Error())
+			writeMsg(w, http.StatusBadRequest, "sandbox spec too large to replicate across the cluster: "+err.Error())
 			return Decision{}, false
 		}
-		writeError(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: reserve placement failed: "+err.Error())
 		return Decision{}, false
 	}
 	r.Header.Set(HeaderTarget, target.NodeID)
@@ -302,6 +336,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 }
 
 func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Client, sandboxID string, writeError ErrorWriter) (handled bool, local bool) {
+	writeMsg := func(w http.ResponseWriter, status int, message string) {
+		writeError(w, status, "", message)
+	}
 	owner, err := c.OwnerOf(sandboxID)
 	if err != nil {
 		return false, false
@@ -313,7 +350,7 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 	}
 	if owner.APIURL == "" && owner.InternalURL == "" {
 		service.RecordRouteMiss()
-		writeError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
+		writeMsg(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
 		return true, false
 	}
 	c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
@@ -322,6 +359,12 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 
 type CreateOptions struct {
 	PromoteWithSpec bool
+	// SandboxID is the id an UNRESERVED create uses. Prepare deliberately
+	// returns no reservation for local-only images (local snapshots, mapped
+	// built images), so a facade that derives a retry-stable id must not
+	// pass that id as reservationID — no reservation exists under it and
+	// the reserved path would refuse the create. Empty generates an id.
+	SandboxID string
 }
 
 func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slog.Logger, req models.CreateSandboxRequest, reservationID string, opts CreateOptions) (*models.CreateSandboxResponse, error) {
@@ -356,9 +399,20 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := svc.CreateSandbox(ctx, req)
+	var resp *models.CreateSandboxResponse
+	var err error
+	if id := strings.TrimSpace(opts.SandboxID); id != "" {
+		resp, err = svc.CreateSandboxWithID(ctx, req, id)
+	} else {
+		resp, err = svc.CreateSandbox(ctx, req)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if c == nil {
+		// No cluster client at all (embedded/test wiring): nothing to seal
+		// or promote, the same as OverlapCreateAndPromote's nil-cluster leg.
+		return resp, nil
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
 		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)
@@ -399,12 +453,12 @@ func CancelReservationBestEffort(ctx context.Context, svc *service.Service, logg
 // ready egress gateway could take (plans/egress-domain-filtering.md CEO D20):
 // 503 with a code and Retry-After, since a gateway coming back re-advertises
 // within seconds. Reports whether it wrote.
-func writeNoEgressGateway(w http.ResponseWriter, err error) bool {
+func writeNoEgressGateway(w http.ResponseWriter, err error, writeError ErrorWriter) bool {
 	if !errors.Is(err, cluster.ErrNoEgressGatewayTarget) {
 		return false
 	}
 	w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-	apihttp.WriteErrorCode(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
+	writeError(w, http.StatusServiceUnavailable, models.ErrorCodeEgressGatewayUnavailable, err.Error())
 	return true
 }
 

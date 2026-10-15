@@ -20,6 +20,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -55,54 +56,7 @@ const (
 // and falls through to the local handler. The X-Cluster-Forwarded header set
 // by ForwardHTTP guards against infinite loops if the placement view is stale.
 func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.PathValue("id")
-		if id == "" {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if h.deps.Service == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		c := h.deps.Service.Cluster()
-		if c == nil {
-			local.ServeHTTP(w, r)
-			return
-		}
-		owner, err := c.OwnerOf(id)
-		if err != nil {
-			if errors.Is(err, cluster.ErrUnknownSandbox) {
-				local.ServeHTTP(w, r)
-				return
-			}
-			if errors.Is(err, cluster.ErrOrphaned) {
-				// 410 Gone: the sandbox's owning node died and was
-				// auto-evicted. The placement record exists but points
-				// nowhere. Clients should treat this as a permanent
-				// disappearance and (if they care to) issue a fresh create.
-				apihttp.WriteError(w, http.StatusGone, "sandbox owner died; placement orphaned (manual recovery required)")
-				return
-			}
-			apihttp.WriteError(w, http.StatusInternalServerError, "cluster lookup: "+err.Error())
-			return
-		}
-		if owner.IsSelf {
-			local.ServeHTTP(w, r)
-			return
-		}
-		if owner.APIURL == "" && owner.InternalURL == "" {
-			// Route miss: placement says someone else owns the sandbox, but
-			// gossip hasn't surfaced any forwarding URL yet (mid-rollover,
-			// peer mid-boot, or misconfigured advertise URLs). Bump the
-			// counter so operator dashboards see persistent gossip-convergence
-			// lag rather than just sporadic 503s.
-			service.RecordRouteMiss()
-			apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: owner "+owner.NodeID+" URL unknown")
-			return
-		}
-		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
-	})
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: apihttp.WriteError}, local)
 }
 
 // clusterCreateWrap is the handler for POST /v1/sandboxes. It implements the
@@ -126,6 +80,15 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 // the peer: ForwardHTTP doesn't return a transport error (it streams the proxy
 // response straight to w), and the leader's reservation-GC sweep reclaims the
 // row 120s later. This is the documented orphan window in plans/release-blockers.
+// idempotentCreateID derives the opt-in deterministic sandbox id a v1 create
+// reuses across retries. It is empty unless the caller sent an Idempotency-Key
+// header, so a plain POST /v1/sandboxes still mints a fresh sandbox on every
+// call (the pre-existing, non-idempotent default). The id is namespaced by the
+// create owner, so one tenant's key never resolves to another tenant's id.
+func (h *handlers) idempotentCreateID(r *http.Request) string {
+	return clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+}
+
 func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// Parse the body up front so an invalid JSON request fails fast with 400
 	// without consuming a placement slot — and so the test that passes a nil
@@ -164,13 +127,18 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// v1 keep calling SelectPlacementWithCandidates after the bounded
 	// selector landed — every create downloading one Member per eligible
 	// worker (~1.7 MB at 2k nodes) only to discard the slice.
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteError, clustercreate.PrepareOptions{
-		Normalize:      normalizeCreateRuntimeForPlacement,
-		OwnerRef:       service.OwnerRefForCreate(r.Context()),
-		SyncBody:       true,
-		MetricPrefix:   "v1.create",
-		OnForwardStale: cluster.RecordOwnerForwardStale,
-		Logger:         h.deps.Logger,
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteErrorCode, clustercreate.PrepareOptions{
+		// An Idempotency-Key makes the cluster create retry-stable: the derived
+		// id is the reservation id, so a retry lands on ErrReservationConflict
+		// and routes to the existing placement instead of placing a second
+		// sandbox. Empty leaves Prepare to mint a fresh id (the default).
+		PreferredSandboxID: h.idempotentCreateID(r),
+		Normalize:          normalizeCreateRuntimeForPlacement,
+		OwnerRef:           service.OwnerRefForCreate(r.Context()),
+		SyncBody:           true,
+		MetricPrefix:       "v1.create",
+		OnForwardStale:     cluster.RecordOwnerForwardStale,
+		Logger:             h.deps.Logger,
 	})
 	if !ok {
 		return
@@ -225,6 +193,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
+		// Resolve platform-volume references into concrete MountSpecs before
+		// promote, so the replicated spec a failover replays carries real
+		// mounts, not bare volume names (B3). Store lookups only, no
+		// container; mirrors clustercreate.CreateOnSelectedNode.
+		if err := h.deps.Service.ResolvePlatformVolumesForReplication(createCtx, &req); err != nil {
+			clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, reservationID)
+			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
 		resp, err := clustercreate.OverlapCreateAndPromote(createCtx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.OverlapOptions{
 			PromoteWithSpec: true,
 			Timing:          createTiming,
@@ -239,7 +217,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := h.deps.Service.CreateSandbox(createCtx, req)
+	// Local-only images carry no pre-minted reservation id, so honor the
+	// Idempotency-Key here too: a retry replays the existing sandbox through
+	// CreateSandboxWithID's fast path instead of building a second one.
+	var resp *models.CreateSandboxResponse
+	var err error
+	if preferredID := h.idempotentCreateID(r); preferredID != "" {
+		resp, err = h.deps.Service.CreateSandboxWithID(createCtx, req, preferredID)
+	} else {
+		resp, err = h.deps.Service.CreateSandbox(createCtx, req)
+	}
 	if err != nil {
 		setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
@@ -1337,6 +1324,23 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 	default:
 		apihttp.WriteError(w, http.StatusBadRequest, "unknown volume query kind")
 	}
+}
+
+// clusterInternalSnapshotNode answers an agent-role node's snapshot-home read
+// from this server node's replicated FSM. Writes never hit this path — they flow
+// through the generic apply endpoint.
+func (h *handlers) clusterInternalSnapshotNode(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	node, found, err := c.SnapshotHomeNode(r.Context(), r.URL.Query().Get("name"))
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SnapshotNodeQueryResponse{NodeID: node, Found: found})
 }
 
 func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Request) {
