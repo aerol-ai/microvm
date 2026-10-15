@@ -9,6 +9,48 @@ permissions:
   contents: read
 
 jobs:
+  # A published release becomes /releases/latest at once, but its files only
+  # arrive when the release job finishes, about half an hour later. install.sh
+  # and the cluster docs download from /releases/latest/download/, so in that
+  # window every new install gets a 404, and a failed build leaves it that way.
+  # RELEASING.md publishes with --latest=false. This job covers a release
+  # published with --latest anyway: it points latest back at the previous
+  # stable release, and the release job moves it forward once the files are
+  # attached. A prerelease is never latest, so for one this is a no-op.
+  hold-latest:
+    name: Keep the previous release as latest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Reject a release tag that is not a version
+        run: |
+          # Same check as the test job. The tag reaches gh below.
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::release tag must look like v1.2.3"
+            exit 1
+          fi
+
+      - name: Point latest at the previous stable release
+        run: |
+          latest="$(gh release view --json tagName --jq .tagName)"
+          if [[ "$latest" != "$VERSION" ]]; then
+            echo "Latest is $latest, not $VERSION. Nothing to hold."
+            exit 0
+          fi
+          previous="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' | grep -vxF "$VERSION" | sort -V | tail -n 1)"
+          if [[ -z "$previous" ]]; then
+            echo "No earlier stable release. Latest stays on $VERSION."
+            exit 0
+          fi
+          gh release edit "$previous" --latest
+          echo "Latest is $previous until $VERSION has its files."
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -296,7 +338,7 @@ jobs:
 
   release:
     name: Publish release
-    needs: [build, cli]
+    needs: [hold-latest, build, cli]
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -380,6 +422,24 @@ jobs:
           tag_name: ${{ env.VERSION }}
           generate_release_notes: true
           files: dist/*
+          # Latest moves only in the next step, once every file is attached.
+          make_latest: "false"
+
+      # Only the newest stable release becomes latest, so re-running this
+      # workflow for an older tag never moves /releases/latest backwards.
+      - name: Mark the release as latest
+        if: ${{ !github.event.release.prerelease }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          newest="$(gh release list --exclude-drafts --exclude-pre-releases --limit 1000 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' | sort -V | tail -n 1)"
+          if [[ "$newest" != "$VERSION" ]]; then
+            echo "$newest is newer than $VERSION, so latest stays on $newest."
+            exit 0
+          fi
+          gh release edit "$VERSION" --latest
 
   # npm and the MCP Registry are opt-in until their one-time setup is done
   # (npm/README.md): set the repository variable AEROLVM_NPM_PUBLISH=true.
