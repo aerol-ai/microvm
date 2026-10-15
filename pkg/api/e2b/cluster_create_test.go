@@ -158,7 +158,31 @@ func TestClusterForwardWrapReturnsGoneForOrphanedE2BPlacement(t *testing.T) {
 	if rr.Code != http.StatusGone {
 		t.Fatalf("status = %d, want %d; body=%q", rr.Code, http.StatusGone, rr.Body.String())
 	}
-	if !strings.Contains(rr.Body.String(), cluster.ErrOrphaned.Error()) {
+	if !strings.Contains(rr.Body.String(), "placement orphaned") {
 		t.Fatalf("body = %q, want orphaned error", rr.Body.String())
+	}
+}
+
+// /e2b/runtime carries its sandbox id in a header, so it must forward to the
+// owner node by that header (plan B5); before, a non-owner node answered 404
+// from its local store.
+func TestE2BRuntimeForwardsToOwnerByHeader(t *testing.T) {
+	svc, _, handler := newE2BHandlerTestEnv(t)
+	fakeCluster := &e2bOwnerForwardCluster{
+		Noop:  cluster.NewNoop("router", "http://router", ""),
+		owner: cluster.OwnerInfo{NodeID: "worker-a", APIURL: "http://worker-a:21212"},
+	}
+	svc.AttachCluster(fakeCluster)
+
+	req := httptest.NewRequest(http.MethodGet, "/e2b/runtime/process", nil)
+	req.Header.Set("E2b-Sandbox-Id", "sb-remote")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if !fakeCluster.forwarded {
+		t.Fatalf("runtime call was not forwarded to the owner; status %d", rr.Code)
+	}
+	if rr.Code == http.StatusNotFound {
+		t.Fatal("runtime call 404'd on a non-owner node instead of forwarding")
 	}
 }

@@ -467,8 +467,8 @@ func TestClusterForwardWrap_GenericOwnerError(t *testing.T) {
 	req.SetPathValue("id", "sb-1")
 	rr := httptest.NewRecorder()
 	wrapped.ServeHTTP(rr, req)
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rr.Code)
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rr.Code)
 	}
 }
 
