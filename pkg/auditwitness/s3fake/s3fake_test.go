@@ -73,6 +73,7 @@ func TestVersionedBucketLifecycle(t *testing.T) {
 	clock := time.Date(2026, 10, 11, 0, 0, 0, 0, time.UTC)
 	s.SetClock(func() time.Time { return clock })
 	s.CreateBucket("b", BucketOptions{Versioning: true})
+	s.SetPolicy(Policy{AllowDeleteMarker: true, AllowDeleteVersion: true})
 	c := client(t, s)
 
 	v1 := put(t, c, "b", "k", "one")
@@ -128,6 +129,7 @@ func TestUnversionedBucket(t *testing.T) {
 	s := New()
 	defer s.Close()
 	s.CreateBucket("b", BucketOptions{})
+	s.SetPolicy(Policy{AllowDeleteMarker: true})
 	c := client(t, s)
 	out := put(t, c, "b", "k", "one")
 	if out.VersionId != nil {
@@ -162,13 +164,13 @@ func TestObjectLockRules(t *testing.T) {
 		advance  time.Duration
 		wantCode string
 	}{
-		{"compliance refuses even with bypass", Lock{Mode: ModeCompliance, Days: 1}, Policy{BypassGovernance: true}, true, 0, "AccessDenied"},
-		{"governance refuses without the header", Lock{Mode: ModeGovernance, Days: 1}, Policy{BypassGovernance: true}, false, 0, "AccessDenied"},
-		{"governance refuses without the permission", Lock{Mode: ModeGovernance, Days: 1}, Policy{}, true, 0, "AccessDenied"},
-		{"governance bypass with both", Lock{Mode: ModeGovernance, Days: 1}, Policy{BypassGovernance: true}, true, 0, ""},
-		{"expired lock", Lock{Mode: ModeCompliance, Days: 1}, Policy{}, false, 49 * time.Hour, ""},
-		{"years rule", Lock{Mode: ModeCompliance, Years: 1}, Policy{}, false, 300 * 24 * time.Hour, "AccessDenied"},
-		{"IAM denies delete", Lock{Mode: ModeGovernance, Days: 1}, Policy{DenyDelete: true, BypassGovernance: true}, true, 0, "AccessDenied"},
+		{"compliance refuses even with bypass", Lock{Mode: ModeCompliance, Days: 1}, Policy{AllowDeleteVersion: true, BypassGovernance: true}, true, 0, "AccessDenied"},
+		{"governance refuses without the header", Lock{Mode: ModeGovernance, Days: 1}, Policy{AllowDeleteVersion: true, BypassGovernance: true}, false, 0, "AccessDenied"},
+		{"governance refuses without the permission", Lock{Mode: ModeGovernance, Days: 1}, Policy{AllowDeleteVersion: true}, true, 0, "AccessDenied"},
+		{"governance bypass with both", Lock{Mode: ModeGovernance, Days: 1}, Policy{AllowDeleteVersion: true, BypassGovernance: true}, true, 0, ""},
+		{"expired lock", Lock{Mode: ModeCompliance, Days: 1}, Policy{AllowDeleteVersion: true}, false, 49 * time.Hour, ""},
+		{"years rule", Lock{Mode: ModeCompliance, Years: 1}, Policy{AllowDeleteVersion: true}, false, 300 * 24 * time.Hour, "AccessDenied"},
+		{"IAM denies the version delete", Lock{Mode: ModeGovernance, Days: 1}, Policy{BypassGovernance: true}, true, 0, "AccessDenied"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -275,7 +277,7 @@ func TestPermissionsAndRouting(t *testing.T) {
 	if _, err := get(c, "b", "missing", ""); code(err) != "AccessDenied" {
 		t.Fatalf("missing key without ListBucket err = %v", err)
 	}
-	s.SetPolicy(Policy{DenyDelete: true})
+	s.SetPolicy(Policy{})
 	if _, err := c.DeleteObject(context.Background(), &s3.DeleteObjectInput{Bucket: aws.String("b"), Key: aws.String("k")}); code(err) != "AccessDenied" {
 		t.Fatalf("denied delete err = %v", err)
 	}

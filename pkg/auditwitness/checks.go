@@ -114,12 +114,17 @@ func (w *s3Witness) checkMissingKeyProbe(ctx context.Context) error {
 	return fmt.Errorf("audit witness s3: probe a missing key in bucket %q: %w", w.bucket, err)
 }
 
-// checkCanary writes a version and tries to delete it the way an attacker
-// on this node would: by version id, with the governance bypass header. A
-// governance lock refuses even a bypass-holding role when the header is
-// absent, so a canary without it would pass the one misconfiguration that
-// leaves every head deletable (D7). Denied by IAM or by the lock, both mean
-// the evidence is safe; anything else is not proof that it is.
+// checkCanary writes a version and tries to remove it the two ways an
+// attacker on this node would.
+//
+// First by version id, with the governance bypass header. A governance lock
+// refuses even a bypass-holding role when the header is absent, so a canary
+// without it would pass the one misconfiguration that leaves every head
+// deletable (D7). Then with a plain delete, which on a versioned bucket
+// leaves the versions but hides the key behind a delete marker: Object Lock
+// does not stop that, only IAM does, and a node that can do it can hide its
+// newest head. Denied by IAM or by the lock, both mean the evidence is safe;
+// anything else is not proof that it is.
 func (w *s3Witness) checkCanary(ctx context.Context) error {
 	key := path.Join(cleanPrefix(w.prefix), "canary", "node="+w.nodeID)
 	body := fmt.Appendf(nil, `{"node_id":%q,"canary":%q}`, w.nodeID, w.now().UTC().Format(time.RFC3339))
@@ -140,8 +145,15 @@ func (w *s3Witness) checkCanary(ctx context.Context) error {
 	if err == nil {
 		return fmt.Errorf("audit witness s3: this node deleted a locked version in bucket %q using the governance bypass header, so it could delete every head it wrote; remove s3:BypassGovernanceRetention (and s3:DeleteObjectVersion) from the node role, or use COMPLIANCE mode", w.bucket)
 	}
-	if apiCode(err) == "AccessDenied" {
-		return nil
+	if apiCode(err) != "AccessDenied" {
+		return fmt.Errorf("audit witness s3: the canary delete in bucket %q returned %v; an unknown result is not proof that the lock holds", w.bucket, strings.TrimSpace(err.Error()))
 	}
-	return fmt.Errorf("audit witness s3: the canary delete in bucket %q returned %v; an unknown result is not proof that the lock holds", w.bucket, strings.TrimSpace(err.Error()))
+	_, err = w.api.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(w.bucket), Key: aws.String(key)})
+	if err == nil {
+		return fmt.Errorf("audit witness s3: this node put a delete marker on %s in bucket %q, so it could hide its newest head; deny s3:DeleteObject on the node role", key, w.bucket)
+	}
+	if apiCode(err) != "AccessDenied" {
+		return fmt.Errorf("audit witness s3: the canary delete-marker check in bucket %q returned %v; an unknown result is not proof that a head cannot be hidden", w.bucket, strings.TrimSpace(err.Error()))
+	}
+	return nil
 }

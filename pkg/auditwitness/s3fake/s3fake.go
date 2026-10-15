@@ -60,16 +60,20 @@ type BucketOptions struct {
 }
 
 // Policy models the IAM permissions of the caller. The zero value is the
-// node role the witness is designed for: list allowed, deletes allowed by
-// IAM (so the lock alone must refuse them), no governance bypass.
+// node role the witness is designed for: list and read allowed, every delete
+// denied by IAM, no governance bypass.
 type Policy struct {
 	// NoListBucket makes a GET of a missing key answer 403 AccessDenied, the
 	// way S3 answers a caller without s3:ListBucket.
 	NoListBucket bool
 	// BypassGovernance grants s3:BypassGovernanceRetention.
 	BypassGovernance bool
-	// DenyDelete makes IAM refuse every DeleteObject, versioned or not.
-	DenyDelete bool
+	// AllowDeleteMarker grants s3:DeleteObject: a DELETE without a version
+	// id, which on a versioned bucket hides the key behind a delete marker.
+	AllowDeleteMarker bool
+	// AllowDeleteVersion grants s3:DeleteObjectVersion; the lock still has
+	// the last word on a locked version.
+	AllowDeleteVersion bool
 }
 
 // Version is one stored version of a key, as Versions reports it.
@@ -489,7 +493,7 @@ func writeObject(w http.ResponseWriter, v *Version) {
 }
 
 func (s *Server) deleteObject(w http.ResponseWriter, r *http.Request, b *bucket, key, versionID string) {
-	if s.policy.DenyDelete {
+	if (versionID == "" && !s.policy.AllowDeleteMarker) || (versionID != "" && !s.policy.AllowDeleteVersion) {
 		writeError(w, http.StatusForbidden, "AccessDenied", "Access Denied")
 		return
 	}

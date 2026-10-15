@@ -124,7 +124,7 @@ The object body is a small JSON document, about 300 bytes, and never holds audit
 2. `GetObjectLockConfiguration` shows Object Lock enabled, with a **default retention rule**.
 3. Default retention is at least `SB_SECRET_AUDIT_RETENTION_DAYS`. A head must outlive the local records it vouches for.
 4. **Missing-key probe (D19):** `GetObject` on a random key under `<prefix>probe/` must answer `NoSuchKey`. `AccessDenied` means the role lacks `s3:ListBucket`, so every missing key would later look like an error, and the first boot after an idle midnight would fail. Refuse to start and name the permission. The key is random so that no writer can make it exist. This costs one call per boot.
-5. **Canary** (recommended; see Decisions, F4): put `<prefix>canary/node=<id>`, then `DeleteObject` with that `VersionId` **and `BypassGovernanceRetention=true`**, the way an attacker would. Expect `AccessDenied`. If the delete succeeds, the lock is not protecting this node's writes, so refuse to start; on a governance bucket the message names `s3:BypassGovernanceRetention`. Any other error also refuses to start, because an unknown result is not proof of safety. Without the header, a governance lock refuses even a role that holds bypass, so the check would pass a role an attacker can use (D7). This costs two small objects per boot.
+5. **Canary** (recommended; see Decisions, F4): put `<prefix>canary/node=<id>`, then `DeleteObject` with that `VersionId` **and `BypassGovernanceRetention=true`**, the way an attacker would. Expect `AccessDenied`. If the delete succeeds, the lock is not protecting this node's writes, so refuse to start; on a governance bucket the message names `s3:BypassGovernanceRetention`. Any other error also refuses to start, because an unknown result is not proof of safety. Without the header, a governance lock refuses even a role that holds bypass, so the check would pass a role an attacker can use (D7). Then a plain `DeleteObject` with no version id, which on a versioned bucket would hide the key behind a delete marker: Object Lock does not stop that, only IAM does, so a success refuses boot naming `s3:DeleteObject` (added in Phase 1; it makes "the node role cannot hide a head" a boot check rather than a one-off integration step). This costs one small locked object per boot.
 
 Without these checks, a witness on an ordinary bucket would look healthy while providing nothing, which is the one outcome the existing code comments forbid ("a witness that silently 'succeeded' would let a scenario claim tamper-evidence it never had", `provider_itest.go`).
 
@@ -178,7 +178,7 @@ Cost control: add a lifecycle rule that expires **noncurrent** versions after th
 - Reads: one GET of today's key every 30 seconds, busy or idle, because the loop reads before it writes (D23). That is 2,880 a day, or about $0.001 a day.
 - Writes: at most one PUT every 30 seconds when the head changes (D10), plus one a day for an idle node (D20). That is under $0.015 a day.
 - Storage: about 300 bytes per version, up to about 1 million versions a year spread over one key per day (at most 2,880 per key), which is about 300 MB, or under $0.01 a month.
-- Boot: about six calls (versioning, lock configuration, missing-key probe, canary PUT and DELETE, latest head), plus one LIST and one GET for a node that was down across midnight.
+- Boot: about seven calls (versioning, lock configuration, missing-key probe, canary PUT and two DELETEs, latest head), plus one LIST and one GET for a node that was down across midnight.
 
 ## Code changes
 
@@ -290,7 +290,7 @@ A post in the docs site's Blogs section that tells the story behind the feature.
 ## PR call-outs (`pr-review.md`)
 
 - **Boot-path latency (`CreateSandbox`):** none. The witness runs on daemon boot and on a background loop.
-- **Daemon boot:** adds about six S3 calls (versioning, lock configuration, missing-key probe, canary put and delete, latest head) when configured, plus one LIST and one GET for a node that was down across midnight, all under a 30 s deadline; none otherwise.
+- **Daemon boot:** adds about seven S3 calls (versioning, lock configuration, missing-key probe, canary put and two deletes, latest head) when configured, plus one LIST and one GET for a node that was down across midnight, all under a 30 s deadline; none otherwise.
 - **Witness ship loop (every backend):** reads the witness before every ship, not only when the head is unchanged (D23), and re-ships an unchanged head once per UTC day (D20). For the S3 backend that adds no request; for a provider witness it adds one read per changed-head ship and one write a day.
 - **Cluster:** no FSM, placement or gossip change. With cluster mode off, the behavior is the same.
 - **Idempotency:** re-shipping the same head adds a version. That is harmless, and the daemon already skips unchanged heads after a successful read-back, except for the one daily re-ship (D20).
@@ -1194,6 +1194,7 @@ auditwitness.Open  (30 s deadline; on expiry: names the check and the bucket)   
  +-- GET <prefix>probe/<random> == NoSuchKey ............ else refuse (names s3:ListBucket)  [D19]
  +-- PUT canary (SHA256 checksum headers)                                                  [D12]
  +-- DELETE canary VersionId + BypassGovernanceRetention=true                              [D7]
+ +-- DELETE canary key, no version (a delete marker): AccessDenied -> ok | else refuse (names s3:DeleteObject)
  |      AccessDenied -> ok | success -> refuse (names the permission) | other error -> refuse
  v
 cp.Witness = s3 witness

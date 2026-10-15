@@ -388,7 +388,8 @@ func TestOpen(t *testing.T) {
 	}{
 		{name: "compliance bucket", bucket: &lockedCompliance},
 		{name: "governance bucket, role without bypass", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeGovernance, Days: 30}}},
-		{name: "IAM denies every delete", bucket: &lockedCompliance, policy: s3fake.Policy{DenyDelete: true}},
+		{name: "lock alone refuses the version delete", bucket: &lockedCompliance, policy: s3fake.Policy{AllowDeleteVersion: true}},
+		{name: "governance lock refuses a role without bypass", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeGovernance, Days: 30}}, policy: s3fake.Policy{AllowDeleteVersion: true}},
 		{name: "rule in years", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeCompliance, Years: 1}}},
 		{name: "retention 0 needs any lock", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeCompliance, Days: 1}}, mutate: func(c *Config) { c.RetentionDays = 0 }},
 		{name: "unknown backend", mutate: func(c *Config) { c.Backend = "gcs" }, err: `unknown backend "gcs"`, offline: true},
@@ -402,7 +403,8 @@ func TestOpen(t *testing.T) {
 		{name: "retention too short", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeCompliance, Days: 7}}, err: "shorter than SB_SECRET_AUDIT_RETENTION_DAYS=30"},
 		{name: "years still too short", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeCompliance, Years: 1}}, mutate: func(c *Config) { c.RetentionDays = 400 }, err: "locks heads for 365 days"},
 		{name: "role without s3:ListBucket", bucket: &lockedCompliance, policy: s3fake.Policy{NoListBucket: true}, err: "grant the node role s3:ListBucket"},
-		{name: "role holds governance bypass", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeGovernance, Days: 30}}, policy: s3fake.Policy{BypassGovernance: true}, err: "s3:BypassGovernanceRetention"},
+		{name: "role holds governance bypass", bucket: &s3fake.BucketOptions{Lock: &s3fake.Lock{Mode: s3fake.ModeGovernance, Days: 30}}, policy: s3fake.Policy{BypassGovernance: true, AllowDeleteVersion: true}, err: "s3:BypassGovernanceRetention"},
+		{name: "role can place delete markers", bucket: &lockedCompliance, policy: s3fake.Policy{AllowDeleteMarker: true}, err: "deny s3:DeleteObject"},
 		{name: "missing bucket", err: "read versioning of bucket"},
 	}
 	for _, c := range cases {
@@ -445,32 +447,46 @@ func TestOpenCanaryLeavesLockedVersion(t *testing.T) {
 	if _, err := Open(context.Background(), testConfig(fake.URL)); err != nil {
 		t.Fatal(err)
 	}
-	if ops := fake.Ops(); ops["DeleteObject"] != 1 || ops["GetObject"] != 1 {
-		t.Fatalf("boot ops = %v (one canary delete, one missing-key probe)", ops)
+	if ops := fake.Ops(); ops["DeleteObject"] != 2 || ops["GetObject"] != 1 {
+		t.Fatalf("boot ops = %v (two canary deletes, one missing-key probe)", ops)
 	}
 	if v := fake.Versions(testBucket, "witness/canary/node="+testNode); len(v) != 1 || v[0].Mode != s3fake.ModeCompliance {
 		t.Fatalf("canary versions = %+v", v)
 	}
 }
 
-// Any canary answer other than AccessDenied is not proof the lock holds.
+// Any canary answer other than AccessDenied is not proof the evidence is
+// safe, for the version delete and for the delete marker alike.
 func TestCanaryUnexpectedDeleteErrorRefusesBoot(t *testing.T) {
-	fake := s3fake.New()
-	defer fake.Close()
-	fake.CreateBucket(testBucket, lockedCompliance)
-	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`<Error><Code>InvalidArgument</Code><Message>no</Message></Error>`))
-			return
-		}
-		fake.Config.Handler.ServeHTTP(w, r)
-	}))
-	defer front.Close()
-	testClient(t, front.URL)
-	_, err := Open(context.Background(), testConfig(front.URL))
-	if err == nil || !strings.Contains(err.Error(), "not proof that the lock holds") {
-		t.Fatalf("err = %v", err)
+	cases := []struct {
+		name string
+		// versioned picks which of the two canary deletes fails oddly.
+		versioned bool
+		want      string
+	}{
+		{"version delete", true, "not proof that the lock holds"},
+		{"delete marker", false, "not proof that a head cannot be hidden"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := s3fake.New()
+			defer fake.Close()
+			fake.CreateBucket(testBucket, lockedCompliance)
+			front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete && r.URL.Query().Has("versionId") == c.versioned {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`<Error><Code>InvalidArgument</Code><Message>no</Message></Error>`))
+					return
+				}
+				fake.Config.Handler.ServeHTTP(w, r)
+			}))
+			defer front.Close()
+			testClient(t, front.URL)
+			_, err := Open(context.Background(), testConfig(front.URL))
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want %q", err, c.want)
+			}
+		})
 	}
 }
 
