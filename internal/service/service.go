@@ -3694,6 +3694,33 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	return snapshot, true, nil
 }
 
+// CreateSnapshotWithAlias commits a snapshot and records the facade alias that
+// addresses it, in one call — the create-then-alias sequence E2B and Runloop
+// each used to re-implement, each with its own compensating delete (D8). The
+// alias's SnapshotName is filled in from the committed snapshot, so a caller
+// passes only its own Alias / Facade / ExtraNames / StateJSON. The alias is
+// part of the snapshot: an id that resolves to nothing is useless, so a failed
+// alias write rolls the commit back — but only when this call created it (a
+// replayed retry leaves the existing row alone and just re-asserts the alias,
+// which is idempotent). Snapshot creation stays serialized by the service's
+// snapshotMu inside CreateSnapshotWithOwnership.
+func (s *Service) CreateSnapshotWithAlias(ctx context.Context, sandboxID string, req models.CreateSandboxSnapshotRequest, alias models.SnapshotAlias) (*models.SandboxSnapshot, bool, error) {
+	snapshot, created, err := s.CreateSnapshotWithOwnership(ctx, sandboxID, req)
+	if err != nil {
+		return nil, false, err
+	}
+	alias.SnapshotName = snapshot.Name
+	if err := s.UpsertSnapshotAlias(ctx, alias); err != nil {
+		if created {
+			if delErr := s.DeleteSnapshot(context.WithoutCancel(ctx), snapshot.Name); delErr != nil && s.logger != nil {
+				s.logger.Warn("snapshot alias rollback failed", "snapshot", snapshot.Name, "error", delErr)
+			}
+		}
+		return nil, false, err
+	}
+	return snapshot, created, nil
+}
+
 // replayExistingSnapshot answers a snapshot create whose name is taken. The
 // same source sandbox makes it a retry, answered with the stored row — but
 // only to a caller who may see it: the name check runs before the source

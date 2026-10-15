@@ -585,7 +585,16 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 	h.snapshotMu.Lock()
 	defer h.snapshotMu.Unlock()
 
-	snapshot, createdSnapshot, err := h.deps.Service.CreateSnapshotWithOwnership(r.Context(), sandbox.ID, models.CreateSandboxSnapshotRequest{Name: snapshotName})
+	// Commit the snapshot and its E2B alias in one service call — the alias
+	// id and names derive from the (stable) requested name (D8).
+	snapshotID := snapshotIDFromName(snapshotName)
+	snapshot, _, err := h.deps.Service.CreateSnapshotWithAlias(r.Context(), sandbox.ID,
+		models.CreateSandboxSnapshotRequest{Name: snapshotName},
+		models.SnapshotAlias{
+			Alias:      snapshotID,
+			Facade:     models.FacadeE2B,
+			ExtraNames: []string{canonicalSnapshotName(snapshotName)},
+		})
 	if err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
 			WriteError(w, http.StatusConflict, "Snapshot name already in use")
@@ -594,26 +603,10 @@ func (h *handlers) createSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-
-	resp := snapshotInfoResponse{
-		SnapshotID: snapshotIDFromName(snapshot.Name),
+	writeJSON(w, http.StatusCreated, snapshotInfoResponse{
+		SnapshotID: snapshotID,
 		Names:      []string{canonicalSnapshotName(snapshot.Name)},
-	}
-	if err := h.deps.Service.UpsertSnapshotAlias(r.Context(), models.SnapshotAlias{
-		Alias:        resp.SnapshotID,
-		SnapshotName: snapshot.Name,
-		Facade:       models.FacadeE2B,
-		ExtraNames:   resp.Names,
-	}); err != nil {
-		if createdSnapshot {
-			if deleteErr := h.deps.Service.DeleteSnapshot(r.Context(), snapshot.Name); deleteErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("e2b snapshot metadata rollback failed", "snapshot_name", snapshot.Name, "error", deleteErr)
-			}
-		}
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, resp)
+	})
 }
 
 func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
