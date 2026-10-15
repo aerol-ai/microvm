@@ -109,7 +109,7 @@ func (w *s3Witness) checkMissingKeyProbe(ctx context.Context) error {
 	case "NoSuchKey":
 		return nil
 	case "AccessDenied":
-		return fmt.Errorf("audit witness s3: bucket %q answered a missing key with AccessDenied: grant the node role s3:ListBucket on the bucket (with an s3:prefix condition of %q), or S3 cannot report a missing head as missing", w.bucket, cleanPrefix(w.prefix)+"/*")
+		return fmt.Errorf("audit witness s3: bucket %q answered a missing key with AccessDenied: grant the node role s3:ListBucket on the bucket, without an s3:prefix condition (a read carries no prefix, so a conditioned grant does not count), or S3 cannot report a missing head as missing", w.bucket)
 	}
 	return fmt.Errorf("audit witness s3: probe a missing key in bucket %q: %w", w.bucket, err)
 }

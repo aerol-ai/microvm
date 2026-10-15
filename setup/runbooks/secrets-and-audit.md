@@ -83,6 +83,7 @@ only `ca.crt`, `node.crt`, and `node.key`.
 | `SandboxdSecretPutOutboxBacklogHigh` | Durable create-path peer PUTs are queued (`aerolvm_secret_put_outbox_pending`) | Check peer health/mTLS; put-outbox uses the same bounded worker pool as delete reconcile |
 | `SandboxdSecretPutOutboxFailures` | Put-outbox persist/reconcile failed (`aerolvm_secret_put_outbox_failures_total`) | Inspect disk/SQLite and peer reachability; creates retract when the initial journal fails |
 | `SandboxdSecretAuditExportFailing` | Off-node event batches are not being accepted | Restore receiver connectivity/auth before local disk loss exceeds the recovery objective |
+| `SandboxdAuditWitnessShipFailing` | Heads have not reached the witness for 15 minutes (`aerolvm_secret_audit_witness_healthy` is 0 and failures keep rising) | Fix the path to S3, the node role's witness grants or the bucket policy (the log names the error). Do not restart the node until the witness answers: boot validation needs it |
 | `SandboxdAuditWitnessForeignHead` | This node's witness key holds a head this node did not ship (`aerolvm_secret_audit_witness_foreign_head_total` rose) | Check for a duplicate `SB_NODE_ID`, then treat it as a security incident: [foreign head](#foreign-head-sandboxdauditwitnessforeignhead) |
 | `SandboxdClusterCertExpiring` | Node (<14 days) or CA (<30 days) certificate approaches expiry | Sign a fresh node pair and atomically replace `node.crt`/`node.key`; prefer ≤90-day leaf certs |
 | `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
@@ -220,13 +221,16 @@ Terraform builds all of this with `audit_witness_enabled = true`
    |---|---|---|
    | Allow | `s3:PutObject`, `s3:GetObject`, `s3:GetObjectVersion` | `arn:aws:s3:::<bucket>/<prefix>*` |
    | Allow | `s3:ListBucketVersions`, `s3:GetBucketVersioning`, `s3:GetBucketObjectLockConfiguration` | `arn:aws:s3:::<bucket>` |
-   | Allow | `s3:ListBucket`, condition `StringLike` `s3:prefix` = `<prefix>*` | `arn:aws:s3:::<bucket>` |
+   | Allow | `s3:ListBucket`, with no `s3:prefix` condition | `arn:aws:s3:::<bucket>` |
    | Deny | `s3:DeleteObject`, `s3:DeleteObjectVersion`, `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:BypassGovernanceRetention` | `arn:aws:s3:::<bucket>/*` |
    | Deny | `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`, `s3:PutLifecycleConfiguration`, `s3:PutBucketPolicy` | `arn:aws:s3:::<bucket>` |
 
    `s3:ListBucket` is not optional. Without it, S3 answers a read of a missing
    key with 403 instead of 404. A first boot on an empty bucket then fails,
-   and so does any boot after the node was down across UTC midnight.
+   and so does any boot after the node was down across UTC midnight. Do not
+   limit it with an `s3:prefix` condition: a read carries no prefix, so S3
+   would not count the grant and would still answer 403. Use a bucket that
+   holds only the witness.
 6. **Turn on CloudTrail S3 data events** (write events) for the bucket. An S3
    version does not record who wrote it. CloudTrail does, and it is the only
    way to attribute a foreign head.
@@ -260,8 +264,9 @@ it refuses to start, and the error names the fix.
 | Object Lock not enabled | Nothing stops a delete or an overwrite | Same as above |
 | No default retention rule | Heads are stored unlocked | Add a default retention rule with a mode and days |
 | Retention shorter than `SB_SECRET_AUDIT_RETENTION_DAYS` | A head could expire before the records it vouches for | Raise the bucket's default days (it applies to new versions), or lower `SB_SECRET_AUDIT_RETENTION_DAYS` |
-| `s3:ListBucket`, at the missing-key probe | S3 answered 403 for a key that does not exist | Grant `s3:ListBucket` on the bucket with the `s3:prefix` condition above |
+| `s3:ListBucket`, at the missing-key probe | S3 answered 403 for a key that does not exist | Grant `s3:ListBucket` on the bucket, without an `s3:prefix` condition |
 | `s3:BypassGovernanceRetention`, after the canary delete | sandboxd stored a test version and deleted it, the way an attacker would. The delete worked, so the lock does not protect this node | Remove bypass from the node role and add the Deny statements. Check that no other policy grants it |
+| `s3:DeleteObject`, after the canary delete marker | sandboxd then deleted the test key without a version id and got a delete marker. Object Lock does not block that, so this node could hide its newest head | Deny `s3:DeleteObject` on the node role (the Deny statements above do) |
 | The canary delete failed with something other than AccessDenied | sandboxd cannot prove deletes are blocked | Fix the cause in the message (region, network, endpoint). An unknown answer is never treated as safe |
 | A check and the bucket, after 30 seconds | S3 did not answer in time | Fix the path to S3 (VPC endpoint or NAT), the region or the endpoint |
 | `SB_NODE_ID`, at config load | The witness is set, but the id is empty or `standalone` | Set a unique `SB_NODE_ID` |

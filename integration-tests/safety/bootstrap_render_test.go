@@ -128,6 +128,11 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 					"SB_AUDIT_EXPORT_S3_BUCKET=aerolvm-itest-x-audit-abc123",
 					"SB_AUDIT_EXPORT_S3_PREFIX=aerolvm-itest-x",
 					"AWS_REGION=",
+					// The S3 audit witness rides on the same render.
+					"SB_AUDIT_WITNESS_BACKEND=s3",
+					"SB_AUDIT_WITNESS_S3_BUCKET=aerolvm-itest-x-witness-abc123",
+					"SB_AUDIT_WITNESS_S3_PREFIX=witness/",
+					"SB_AUDIT_WITNESS_S3_REGION=",
 				},
 				"joiner_audit_file": {
 					"SB_AUDIT_EXPORT_BACKEND=file",

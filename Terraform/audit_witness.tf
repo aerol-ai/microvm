@@ -167,18 +167,17 @@ data "aws_iam_policy_document" "audit_witness" {
   # key with 403 instead of 404 NoSuchKey, so a first boot on an empty bucket,
   # and any boot after downtime across UTC midnight, would fail. The daemon's
   # missing-key probe refuses to boot, naming s3:ListBucket, if this grant does
-  # not produce a 404. The s3:prefix condition keeps it to the witness prefix;
-  # the first Phase 4 boot on an empty bucket is the live proof that S3 answers
-  # 404 under the condition.
+  # not produce a 404.
+  #
+  # Deliberately unconditioned. A GetObject request carries no s3:prefix key,
+  # so a grant limited by an s3:prefix condition would not count when S3
+  # decides between 404 and 403, and the probe would refuse every boot. The
+  # bucket holds nothing but witness objects, and the node can already read
+  # every head under the prefix, so listing it reveals nothing more.
   statement {
     sid       = "WitnessListBucket"
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.witness[0].arn]
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values   = ["${var.audit_witness_prefix}*"]
-    }
   }
 
   # Boot checks 1 and 2: refuse a bucket that is not really WORM.
