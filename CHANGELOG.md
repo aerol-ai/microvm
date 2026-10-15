@@ -13,12 +13,12 @@ timeline
     June 2026 : 4 releases : v0.5.1 to v0.5.4
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
-    October 2026 : 5 releases : v0.6.1 to v0.6.5
+    October 2026 : 6 releases : v0.6.1 to v0.6.6
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 6 | Sep 28, 2026 to Oct 9, 2026 | [v0.6.5](#v065-agent-cli-and-mcp-server-egress-domain-filtering) |
+| [0.6](#06-release-line) | 7 | Sep 28, 2026 to Oct 15, 2026 | [v0.6.6](#v066-runloop-sdk-compatibility-and-aerolvm-shell) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -26,6 +26,25 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.6: Runloop SDK compatibility and aerolvm shell
+
+*October 15, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.6)
+
+- **Runloop SDK compatibility.** Code written against the official Runloop SDKs (`@runloop/api-client`, `runloop_api_client`) runs on AerolVM. Set `RUNLOOP_BASE_URL` to `https://<host>/runloop` and `RUNLOOP_API_KEY` to the same token the rest of the API uses. Devboxes, commands, files, and disk snapshots work. A retried request does its work once.
+- **`aerolvm shell`.** Open an interactive shell in a sandbox, and come back to it after you disconnect. `aerolvm exec -it` works the way `docker exec -it` does.
+- **A command is not run twice.** All five SDKs re-send an exec only when it never reached the server. A Rust command longer than 30 seconds is no longer cut off and sent again.
+- **Docker 29, Firecracker DNS, and warm pools.** Container stop, crash, and remove events are read again, so a stopped sandbox no longer leaves its firewall rules for the next one. A Firecracker guest gets DNS, so hostname allowlists and name lookups work. Warm-pool sandboxes survive a stop and start, a snapshot, and a sandboxd restart.
+- **A snapshot no longer replaces an image.** Saving a snapshot named `python` used to overwrite the `python` image on that node. Snapshots are now stored under a name the server chooses.
+
+**Before you upgrade:**
+
+- **Snapshots.** Snapshots saved before this release keep their old image names and keep working. A new snapshot is stored under a name the server chooses, so it cannot replace another image.
+- **Account-token image builds.** They always pull base images from the registry. A Dockerfile that names a snapshot or a previously built image is refused. Builds made with the operator token are unchanged.
+- **WASM files.** A path that resolves outside the sandbox work directory, including through a symlink, is refused.
+- **Multi-tenant auth.** `/debug/vars` and `/v1/metrics` are operator-only. A user token with an empty account is refused. Toolbox `/admin` paths are refused. A single-operator install is unchanged in practice, because every caller there is an operator.
+- **Create retries.** v1 and Daytona still create a second sandbox when a create is retried, unless the request carries an `Idempotency-Key` header.
+- **SDKs.** The packages published as 0.6.4 on 2026-10-10 do not include the exec-retry and create-option fixes. Those fixes are in this tag's SDK source and reach the package registries with the next SDK publish.
 
 ### v0.6.5: Agent CLI and MCP server, egress domain filtering
 
