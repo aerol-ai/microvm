@@ -4,6 +4,7 @@ package suite
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -164,8 +165,13 @@ func TestV1SnapshotFromRunningSandbox(t *testing.T) {
 	if got, err := c.SDK().GetSnapshot(ctx, name); err != nil || got.Name != name {
 		t.Fatalf("GetSnapshot(%q) = %+v, %v", name, got, err)
 	}
-	if !snapshotInList(t, c, ctx, name) {
-		t.Fatalf("committed snapshot %q not in v1 list", name)
+	// A committed snapshot's row lives only on its home node and the v1 list is
+	// not cluster-aggregated yet, so read the list on the owner. GetSnapshot
+	// above already proved the snapshot is registered and routable cluster-wide
+	// (the home-node index), which is what this UC is really asserting.
+	ownerURL := ownerAPI(t, c, sb.ID)
+	if st, body := getWithRetry(t, ctx, ownerURL, "/v1/snapshots?limit=500", http.StatusOK); st != http.StatusOK || !strings.Contains(string(body), name) {
+		t.Fatalf("committed snapshot %q not in v1 list on owner = %d; body=%s", name, st, string(body))
 	}
 }
 

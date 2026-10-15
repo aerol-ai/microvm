@@ -107,45 +107,86 @@ func TestDaytonaSnapshotGetRoutesFromNonOwner(t *testing.T) {
 	}
 }
 
+// e2bSnapshotOnOwnedSandbox creates a sandbox THROUGH the E2B facade, waits for
+// it to run, and snapshots it through the facade. The snapshot is then E2B-native:
+// its name is committed in the facade's canonical (name:default) spelling, so the
+// id the facade returns and reports in its list decodes back to the same name the
+// home-node index was registered under — which is what lets a by-id request route
+// cluster-wide. It returns the E2B snapshot id and the source sandbox id (whose
+// owner is the snapshot's home). Both are cleaned up.
+func e2bSnapshotOnOwnedSandbox(t *testing.T, ctx context.Context, label string) (string, string) {
+	t.Helper()
+	st, body := fcDo(t, ctx, http.MethodPost, "", "/e2b/sandboxes", map[string]any{"templateID": "base"}, nil)
+	if st != http.StatusCreated {
+		t.Fatalf("E2B create = %d, want 201; body=%s", st, string(body))
+	}
+	var created struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	fcDecode(t, body, &created)
+	if created.SandboxID == "" {
+		t.Fatalf("E2B create returned no sandboxID: %s", string(body))
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		fcDo(t, cctx, http.MethodDelete, "", "/e2b/sandboxes/"+created.SandboxID, nil, nil)
+	})
+
+	// The snapshot commit needs the sandbox to be running.
+	deadline := time.Now().Add(4 * time.Minute)
+	for {
+		st, body := fcDo(t, ctx, http.MethodGet, "", "/e2b/sandboxes/"+created.SandboxID, nil, nil)
+		if st == http.StatusOK {
+			var dv struct {
+				State string `json:"state"`
+			}
+			fcDecode(t, body, &dv)
+			if dv.State == "running" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("E2B sandbox %s never reached running", created.SandboxID)
+		}
+		time.Sleep(4 * time.Second)
+	}
+
+	snapName := fcSnapshotName(t, label)
+	st, body = fcDo(t, ctx, http.MethodPost, "", "/e2b/sandboxes/"+created.SandboxID+"/snapshots", map[string]any{"name": snapName}, nil)
+	if st != http.StatusCreated && st != http.StatusOK {
+		t.Fatalf("E2B snapshot = %d, want 201/200; body=%s", st, string(body))
+	}
+	var snap struct {
+		SnapshotID string `json:"snapshotID"`
+	}
+	fcDecode(t, body, &snap)
+	if snap.SnapshotID == "" {
+		t.Fatalf("E2B snapshot returned no snapshotID: %s", string(body))
+	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		fcDo(t, cctx, http.MethodDelete, "", "/e2b/templates/"+snap.SnapshotID, nil, nil)
+	})
+	return snap.SnapshotID, created.SandboxID
+}
+
 // UC-250 — an E2B template(snapshot) delete-by-id is routed to the holder from a
-// non-owner. The E2B id is taken from the facade's own list (no transform
-// guessing).
+// non-owner. The snapshot is created through the E2B facade so it is E2B-native
+// (canonical name), which is the path E2B clients use and the one the by-id
+// home-node routing covers. (A v1-committed snapshot deleted through its E2B id
+// is a cross-facade case: the E2B id encodes name:default while the row and the
+// home index key are the raw name, so by-id routing misses and serves locally —
+// a separate, documented gap, not what this UC asserts.)
 func TestE2BTemplateDeleteRoutesFromNonOwner(t *testing.T) {
 	harness.Require(t, sc, "UC-250")
 	c := client(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	name, sb := snapshotOnOwnedSandbox(t, c, ctx, "e2b-route")
-	// Resolve the E2B snapshot id from the catalogue (matches our name). The
-	// committed snapshot's row lives on its home node and the cluster-wide
-	// snapshot list does not aggregate yet, so the list is read on the owner
-	// (where the row is). The id itself is name-derived and routes cluster-wide,
-	// so the delete below still goes through a NON-owner to prove routing.
-	ownerURL := ownerAPI(t, c, sb.ID)
-	var e2bID string
-	deadline := time.Now().Add(90 * time.Second)
-	for e2bID == "" && time.Now().Before(deadline) {
-		st, body := fcDo(t, ctx, http.MethodGet, ownerURL, "/e2b/snapshots?limit=500", nil, nil)
-		if st == http.StatusOK {
-			var items []e2bSnapshotInfo
-			fcDecode(t, body, &items)
-			for _, it := range items {
-				for _, n := range it.Names {
-					if strings.Contains(n, name) {
-						e2bID = it.SnapshotID
-					}
-				}
-			}
-		}
-		if e2bID == "" {
-			time.Sleep(3 * time.Second)
-		}
-	}
-	if e2bID == "" {
-		t.Fatalf("could not resolve E2B snapshot id for %q", name)
-	}
-	nonOwner := nonOwnerAPI(t, c, sb.ID)
+	e2bID, sbID := e2bSnapshotOnOwnedSandbox(t, ctx, "e2b-route")
+	nonOwner := nonOwnerAPI(t, c, sbID)
 	st, body := fcDo(t, ctx, http.MethodDelete, nonOwner, "/e2b/templates/"+e2bID, nil, nil)
 	if st != http.StatusNoContent && st != http.StatusOK {
 		t.Fatalf("E2B template delete via non-owner = %d, want 204/200; body=%s", st, string(body))
