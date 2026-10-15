@@ -51,11 +51,11 @@ const (
 	secretAuditKindSecretOpen          = "secret_open"
 	secretAuditKindEgress              = "egress"
 	secretAuditKindGap                 = "gap"
-	secretAuditKindRetentionCheckpoint = "retention_checkpoint"
+	secretAuditKindRetentionCheckpoint = auditlog.KindRetentionCheckpoint
 	// secretAuditKindRetentionRedacted is what retention leaves of an expired
 	// record it cannot cut out of the chain: its two link hashes and nothing
 	// that says who opened what. See redactSecretAuditEvent.
-	secretAuditKindRetentionRedacted = "retention_redacted"
+	secretAuditKindRetentionRedacted = auditlog.KindRetentionRedacted
 
 	defaultSecretAuditBuffer = 1024
 	// enterpriseSecretAuditBuffer reduces spill likelihood under burst open
@@ -91,7 +91,9 @@ const (
 	secretAuditBootVerifyCheckpoint = "checkpoint"
 	// secretAuditMaxLineBytes bounds one JSONL record during chain scans; audit
 	// lines are metadata-only, so anything larger is corruption, not evidence.
-	secretAuditMaxLineBytes = 1024 * 1024
+	// The value lives in pkg/auditlog so the offline verifier reads with the
+	// same bound.
+	secretAuditMaxLineBytes = auditlog.MaxLineBytes
 )
 
 var (
@@ -530,10 +532,7 @@ func scanSecretAuditChainFromCheckpoint(path string, cp *secretAuditVerifiedChec
 	if err := json.Unmarshal(bytes.TrimSpace(buf), &ev); err != nil || ev.EventHash != cp.Head || verifySecretAuditRecord(ev) != nil {
 		return secretAuditChainScan{}, false, nil
 	}
-	verifier := newSecretAuditChainVerifier()
-	verifier.prev = cp.Head
-	verifier.started = true
-	verifier.allowBreak = ev.Kind == secretAuditKindRetentionCheckpoint
+	verifier := auditlog.ResumeChainVerifier(cp.Head, ev.Kind == secretAuditKindRetentionCheckpoint)
 	scan, err := scanSecretAuditChainReader(io.NewSectionReader(f, cp.Offset, st.Size()-cp.Offset), secretAuditScanOptions{
 		base:            cp.Offset,
 		verifier:        &verifier,
@@ -1619,23 +1618,11 @@ func secretAuditExpired(ev SecretAuditEvent, cutoff time.Time) bool {
 }
 
 // redactSecretAuditEvent is what retention leaves of an expired record that
-// sits behind a newer one and so cannot be cut out of the chain: the two link
-// hashes, the time and id (so a later prune reclaims it with the prefix and
-// an operator can place it), and nothing that says who opened what.
-// EventHash is the original — it is what the successor's prev_hash names —
-// so the chain still verifies through the stub; the verifier links a stub by
-// its stored hashes because the payload that produced them is gone, and
-// refuses one that still carries any other field.
+// sits behind a newer one: see auditlog.RedactForRetention. The rule lives
+// there because the chain verifier refuses any stub that differs from it,
+// and the offline verifier must refuse exactly the same stubs.
 func redactSecretAuditEvent(ev SecretAuditEvent) SecretAuditEvent {
-	return SecretAuditEvent{
-		Time:      ev.Time,
-		EventID:   ev.EventID,
-		Result:    secretAuditResultSuccess,
-		Reason:    "prune",
-		Kind:      secretAuditKindRetentionRedacted,
-		PrevHash:  ev.PrevHash,
-		EventHash: ev.EventHash,
-	}
+	return auditlog.RedactForRetention(ev)
 }
 
 func ensureSecretAuditEventID(ev *SecretAuditEvent) {
@@ -1804,69 +1791,13 @@ func RecomputeChainHead(path string) (head, eventID string, err error) {
 	return scan.head, scan.eventID, nil
 }
 
-type secretAuditChainVerifier struct {
-	prev       string
-	allowBreak bool
-	started    bool
-}
+// secretAuditChainVerifier is the per-event link checker; the rules live in
+// pkg/auditlog (see auditlog.ChainVerifier.Add) so the daemon and the
+// offline verifier judge a chain identically.
+type secretAuditChainVerifier = auditlog.ChainVerifier
 
 func newSecretAuditChainVerifier() secretAuditChainVerifier {
-	return secretAuditChainVerifier{prev: auditlog.GenesisPrevHash}
-}
-
-// Add validates one immutable event in stream order. The only permitted link
-// discontinuity is the first retained event after a retention checkpoint,
-// whose predecessor was deliberately removed. Missing hash fields are never
-// interpreted as a legacy format: this audit format is intentionally one-way.
-func (v *secretAuditChainVerifier) Add(ev SecretAuditEvent) error {
-	if v == nil {
-		return errors.New("secret audit chain verifier unavailable")
-	}
-	storedPrev := strings.TrimSpace(ev.PrevHash)
-	if storedPrev == "" {
-		return errors.New("prev_hash is missing")
-	}
-	if ev.EventHash == "" {
-		return errors.New("event_hash is missing")
-	}
-	if ev.Kind == secretAuditKindRetentionRedacted {
-		// Retention kept only this record's links. Its payload is gone, so
-		// event_hash cannot be recomputed; the stub is verified by position
-		// instead: prev_hash must be the chain so far and event_hash is what
-		// the next record must name. A stub can therefore stand only where a
-		// record stood — none can be inserted or removed — but its content is
-		// no longer provable, which is why one that still carries a payload
-		// is rejected rather than trusted.
-		if redactSecretAuditEvent(ev) != ev {
-			return errors.New("retention stub carries payload")
-		}
-		if storedPrev != v.prev && !v.allowBreak {
-			return fmt.Errorf("prev_hash mismatch (got %q want %q)", storedPrev, v.prev)
-		}
-		v.prev = ev.EventHash
-		v.allowBreak = false
-		v.started = true
-		return nil
-	}
-	if ev.EventHash != auditlog.HashEvent(storedPrev, ev) {
-		return errors.New("event_hash mismatch")
-	}
-	if ev.Kind == secretAuditKindRetentionCheckpoint {
-		if v.started {
-			return errors.New("retention checkpoint must be the first event")
-		}
-		v.prev = ev.EventHash
-		v.allowBreak = true
-		v.started = true
-		return nil
-	}
-	if storedPrev != v.prev && !v.allowBreak {
-		return fmt.Errorf("prev_hash mismatch (got %q want %q)", storedPrev, v.prev)
-	}
-	v.prev = ev.EventHash
-	v.allowBreak = false
-	v.started = true
-	return nil
+	return auditlog.NewChainVerifier()
 }
 
 // recomputeChain is the full verify path with an ancestry probe: instead of
@@ -1901,7 +1832,9 @@ func strictSecretAuditChainScan(path string, opts secretAuditScanOptions) (secre
 }
 
 // secretAuditScanOptions parameterize one pass. A nil verifier starts at
-// genesis; a primed one continues a chain from base (checkpoint boot).
+// genesis; a primed one continues a chain from base (checkpoint boot). It
+// mirrors auditlog.ScanOptions with unexported fields so the service's call
+// sites and tests read as they did before the scan moved.
 type secretAuditScanOptions struct {
 	base            int64
 	verifier        *secretAuditChainVerifier
@@ -1917,33 +1850,38 @@ type secretAuditScanOptions struct {
 // adds its own); tests assert that.
 var secretAuditFullScans atomic.Int64
 
-// secretAuditChainScan is one verified pass over secrets.jsonl.
+// secretAuditChainScan is one verified pass over secrets.jsonl: the
+// service's view of auditlog.ChainScan, whose field comments are the
+// contract. The unexported mirror keeps boot, repair, witness and query
+// code (and their tests) reading as they did before the scan moved;
+// secretAuditChainScanFrom copies every field, and a test pins the two
+// field lists together.
 type secretAuditChainScan struct {
-	head    string
-	eventID string
-	// lastLineStart is the offset of the record carrying head.
-	lastLineStart int64
-	// found reports which probed hashes the pass saw.
-	found map[string]bool
-	// witnessedThrough is the newest retention checkpoint's WitnessedThrough.
+	head             string
+	eventID          string
+	lastLineStart    int64
+	found            map[string]bool
 	witnessedThrough string
-	// validEnd is the byte offset just past the last complete, verified line.
-	validEnd int64
-	// tornBytes is the length of an unterminated, unparseable tail after
-	// validEnd — what a crash leaves when it interrupts one append write. The
-	// writer emits line+'\n' in a single write, so a crash leaves a strict
-	// byte-prefix, and no proper prefix of a JSON object is itself valid JSON;
-	// that is what makes this the only defect safe to classify as a tear.
-	tornBytes int64
-	// missingNewline reports a complete, verified final record without its
-	// terminator (the write stopped exactly between '}' and '\n').
-	missingNewline bool
-	// records counts verified records (blank lines excluded).
-	records int64
-	// redacted counts retention stubs among them: records whose payload
-	// retention removed in place. The node never produces one inside the
-	// retention window.
-	redacted int64
+	validEnd         int64
+	tornBytes        int64
+	missingNewline   bool
+	records          int64
+	redacted         int64
+}
+
+func secretAuditChainScanFrom(scan auditlog.ChainScan) secretAuditChainScan {
+	return secretAuditChainScan{
+		head:             scan.Head,
+		eventID:          scan.EventID,
+		lastLineStart:    scan.LastLineStart,
+		found:            scan.Found,
+		witnessedThrough: scan.WitnessedThrough,
+		validEnd:         scan.ValidEnd,
+		tornBytes:        scan.TornBytes,
+		missingNewline:   scan.MissingNewline,
+		records:          scan.Records,
+		redacted:         scan.Redacted,
+	}
 }
 
 // scanSecretAuditChain walks the file once, verifying every record against
@@ -1974,122 +1912,34 @@ func (scan *secretAuditChainScan) markFound(hash string) {
 // scanSecretAuditChainReader is scanSecretAuditChain over an already-bounded
 // reader (a size snapshot taken under the flock) so a verification can run
 // while the writer keeps appending. Memory is O(1) in the number of records.
+// The pass itself is auditlog.ScanChain; only the full-scan counter, a
+// daemon boot property the shared package has no business knowing, is
+// kept here.
 func scanSecretAuditChainReader(r io.Reader, opts secretAuditScanOptions) (secretAuditChainScan, error) {
-	scan := secretAuditChainScan{head: auditlog.GenesisPrevHash, validEnd: opts.base, lastLineStart: opts.startLineOffset}
-	br := bufio.NewReaderSize(r, 64*1024)
-	verifier := newSecretAuditChainVerifier()
-	if opts.verifier != nil {
-		verifier = *opts.verifier
-		scan.head = verifier.prev
-		scan.eventID = opts.startEventID
-	}
 	if opts.base == 0 {
 		secretAuditFullScans.Add(1)
 	}
-	probe := make(map[string]struct{}, len(opts.probe))
-	for _, h := range opts.probe {
-		if h != "" {
-			probe[h] = struct{}{}
-		}
-	}
-	offset := opts.base
-	lineNo := 0
-	for {
-		line, consumed, terminated, tooLong, err := readSecretAuditLine(br)
-		if err != nil {
-			return scan, err
-		}
-		if consumed == 0 {
-			return scan, nil
-		}
-		offset += consumed
-		if tooLong {
-			if !terminated {
-				scan.tornBytes = offset - scan.validEnd
-				return scan, nil
-			}
-			return scan, fmt.Errorf("secret audit chain line %d exceeds %d bytes", lineNo+1, secretAuditMaxLineBytes)
-		}
-		text := bytes.TrimSpace(line)
-		if len(text) == 0 {
-			// Whitespace is harmless in either position: a terminated blank line
-			// is kept, and unterminated trailing whitespace is left for the
-			// next append to follow (TrimSpace on read absorbs it).
-			if terminated {
-				scan.validEnd = offset
-			}
-			continue
-		}
-		lineNo++
-		var ev SecretAuditEvent
-		if err := json.Unmarshal(text, &ev); err != nil {
-			if !terminated {
-				scan.tornBytes = offset - scan.validEnd
-				return scan, nil
-			}
-			return scan, fmt.Errorf("secret audit chain line %d: malformed json: %w", lineNo, err)
-		}
-		// A parseable record that does not link is never a tear (see
-		// tornBytes) — fail regardless of whether its terminator is present.
-		if err := verifier.Add(ev); err != nil {
-			return scan, fmt.Errorf("secret audit chain line %d: %w", lineNo, err)
-		}
-		scan.head = ev.EventHash
-		scan.eventID = ev.EventID
-		scan.records++
-		if ev.Kind == secretAuditKindRetentionRedacted {
-			scan.redacted++
-		}
-		scan.lastLineStart = offset - consumed
-		if _, want := probe[ev.EventHash]; want {
-			scan.markFound(ev.EventHash)
-		}
-		if ev.Kind == secretAuditKindRetentionCheckpoint && strings.TrimSpace(ev.WitnessedThrough) != "" {
-			scan.witnessedThrough = strings.TrimSpace(ev.WitnessedThrough)
-		}
-		scan.validEnd = offset
-		if !terminated {
-			scan.missingNewline = true
-			return scan, nil
-		}
-	}
+	scan, err := auditlog.ScanChain(r, auditlog.ScanOptions{
+		Base:            opts.base,
+		Verifier:        opts.verifier,
+		StartEventID:    opts.startEventID,
+		StartLineOffset: opts.startLineOffset,
+		Probe:           opts.probe,
+	})
+	return secretAuditChainScanFrom(scan), err
 }
 
 // readSecretAuditLine returns one line (terminator included when present)
 // and the bytes consumed. A line past secretAuditMaxLineBytes is counted but
 // not retained so a NUL-filled or runaway tail cannot balloon the scan.
 func readSecretAuditLine(br *bufio.Reader) (line []byte, consumed int64, terminated, tooLong bool, err error) {
-	return readSecretAuditLineMax(br, secretAuditMaxLineBytes)
+	return auditlog.ReadLine(br, secretAuditMaxLineBytes)
 }
 
 // readSecretAuditLineMax is the bounded reader drainSpill uses with the ingest
 // body cap, so a worker cannot plant a line that fails strict boot.
 func readSecretAuditLineMax(br *bufio.Reader, max int64) (line []byte, consumed int64, terminated, tooLong bool, err error) {
-	if max <= 0 {
-		max = secretAuditMaxLineBytes
-	}
-	for {
-		chunk, readErr := br.ReadSlice('\n')
-		consumed += int64(len(chunk))
-		if !tooLong {
-			if int64(len(line))+int64(len(chunk)) > max {
-				tooLong = true
-				line = nil
-			} else {
-				line = append(line, chunk...)
-			}
-		}
-		switch {
-		case readErr == nil:
-			return line, consumed, true, tooLong, nil
-		case errors.Is(readErr, bufio.ErrBufferFull):
-			continue
-		case errors.Is(readErr, io.EOF):
-			return line, consumed, false, tooLong, nil
-		default:
-			return nil, consumed, false, tooLong, readErr
-		}
-	}
+	return auditlog.ReadLine(br, max)
 }
 
 func persistChainTip(path, head, eventID string) {
