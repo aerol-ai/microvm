@@ -33,12 +33,14 @@ An optional lead paragraph, or a `>` note for something every user must act on.
 ## 2. Publish the release
 
 ```bash
-gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>" --notes-file notes.md --latest
+gh release create vX.Y.Z --target <main commit> --title "vX.Y.Z: <short summary>" --notes-file notes.md --latest=false
 ```
 
 - **The tag must look like `vX.Y.Z`,** with an optional `-suffix`. The release workflow rejects other tags.
 - **Do not pass `--generate-notes`.** The workflow already appends GitHub's generated list, so the flag makes it appear twice.
-- **The workflow runs the tests, builds every binary and attaches the files.** Until it finishes, the release has no downloads. If a test fails for a timing reason, rerun the failed jobs with `gh run rerun <run id> --failed`.
+- **Publish with `--latest=false`.** The installer downloads from the latest release, so a release with no files yet would break every new install. The workflow marks the release as latest once it has attached the files. If you publish with `--latest` by mistake, the workflow points latest back at the previous release first.
+- **The workflow runs the tests, builds every binary and attaches the files.** Until it finishes, the release has no downloads and the previous release stays latest. If the workflow fails, the previous release stays latest until a rerun succeeds. If a test fails for a timing reason, rerun the failed jobs with `gh run rerun <run id> --failed`.
+- **Re-running the workflow for an older release does not make it latest.** Only the newest stable release becomes latest. A prerelease never does.
 
 ## 3. Sync the changelog
 
