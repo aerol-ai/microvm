@@ -34,7 +34,8 @@ flowchart LR
 | Mounts | As needed | Read-only where possible | None |
 | API keys | Variables | Inject rules | Inject rules, or none |
 | Timers | Optional | Stop when idle | Stop when idle, and a maximum age |
-| Audit log | On the server | Exported off the server | Exported off the server |
+| Audit log | On the server | Exported off the server | Exported off the server, plus the witness |
+| Enterprise mode | Off | Optional | On |
 
 ## A hardened sandbox
 
@@ -161,6 +162,7 @@ USER app
 | HV‑10 | Send the audit log off the server with `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3` | 2, 3 | LT‑4 |
 | HV‑11 | Load the bundled alerts and dashboards | 2, 3 | LT‑7 |
 | HV‑12 | Encrypt the server's disks | 3 | DP‑7 |
+| HV‑13 | Turn on [enterprise mode](#enterprise-mode) with the audit witness | 3 | LT‑8 |
 
 ### Firewall
 
@@ -189,6 +191,23 @@ node_control_port_guard: true        # no sandbox can reach AerolVM's own ports
 Do not add the ranges the server gives its own sandboxes to `deny_cidrs`, or sandbox networking breaks. Test a sandbox after each change. See [Private networks](/advanced-network-rules/#private-networks).
 </Aside>
 
+### Enterprise mode
+
+Enterprise mode is one server setting, `SB_ENTERPRISE_MODE=true`. It turns much of this checklist into rules the server enforces. If a rule is not met, the server refuses to start and names the setting. It is in the free download, and anyone can turn it on.
+
+It needs:
+
+- An `SB_PAT_TOKEN` of at least 32 bytes.
+- Privileged mode off and resource limits on (HV‑6).
+- The audit log sent off the server, to a webhook, S3 or a message bus (HV‑10). A webhook must use `https`.
+- An audit witness: an S3 bucket with Object Lock, plus a unique `SB_NODE_ID` on each server.
+- The audit log's strict start, retention and per-sandbox rate left on. They are on by default.
+- Strict start for AWS KMS, when you use it (HC‑5).
+- In a cluster: the gossip key, at least two backups, and no CA signing key on the servers (HC‑1, HC‑4).
+- When V8 isolates are on: their jail, with seccomp in `enforce` mode.
+
+[Enterprise mode](/enterprise/enterprise-mode/) has the full list, and sets up the witness bucket step by step.
+
 ## Cluster checklist
 
 | ID | Do this | Levels | Baseline |
@@ -204,4 +223,5 @@ Do not add the ranges the server gives its own sandboxes to `deny_cidrs`, or san
 
 - [Shared responsibility](/enterprise/responsibility/): what hardening cannot fix.
 - [Reference architectures](/enterprise/deployment/): where each setting fits in your layout.
+- [Enterprise mode](/enterprise/enterprise-mode/): have the server enforce these settings, and keep audit fingerprints where no server can change them.
 - [Audit and compliance](/enterprise/audit-evidence/): show your auditors what you turned on.
