@@ -47,7 +47,13 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{})
+	// An Idempotency-Key header makes the create retry-stable. On the cluster
+	// path the derived id is the reservation id, so a retry routes to the
+	// existing placement; on the single-node / local-image path it is the
+	// CreateOptions.SandboxID below, so CreateSandboxWithID replays the
+	// existing sandbox. Empty leaves both to mint a fresh id (the default).
+	preferredID := clustercreate.DeterministicSandboxID(service.OwnerRefForCreate(r.Context()), r.Header.Get(clustercreate.HeaderIdempotencyKey))
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, placementReq, apihttp.WriteErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: preferredID})
 	if !ok {
 		return
 	}
@@ -61,7 +67,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
+	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true, SandboxID: preferredID})
 	if err != nil {
 		// A build this request made is now orphaned: no sandbox row
 		// references it. Hand it back so a storm of failed creates does not
