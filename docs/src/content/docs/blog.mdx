@@ -26,6 +26,7 @@ These posts go deeper than the docs. They explain how AerolVM works inside, why 
 | [What a sandbox can see on disk](/engineering-sandbox-filesystem/) | Mounts, the file API, what snapshots copy, and where images come from. |
 | [How AerolVM fences a sandbox's network](/engineering-network-defenses/) | What a sandbox can reach by default, and the DNS tricks the filter stops. |
 | [Keeping API keys out of the sandbox](/engineering-secret-handling/) | How variables are sealed, how inject rules keep keys out, and what the audit trail records. |
+| [Catching a rewritten audit log](/engineering-audit-witness/) | How a locked S3 bucket catches an audit log that someone rebuilt after taking over a server, and why each check is there. |
 | [Correct snapshot clones](/engineering-snapshot-correctness/) | Five ways a cloned Firecracker snapshot can go wrong, and the rule that keeps each clone safe and unique. |
 | [The frozen-kernel problem](/engineering-frozen-kernel-problem/) | Why clones of one snapshot start out as the same machine, and how each one is made unique before your code runs. |
 | [Randomness in clones](/randomness-in-cloned-sandboxes/) | How Firecracker sandboxes cloned from one template avoid handing out the same random numbers. |

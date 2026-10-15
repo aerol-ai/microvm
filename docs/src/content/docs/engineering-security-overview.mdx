@@ -362,7 +362,7 @@ The server can send every record to your own systems: a webhook, an S3 bucket, a
 
 ### What the logbook does not do
 
-- **It does not stop someone with full control of the server.** That person could rebuild the whole chain from scratch. A copy in your own store is what protects against that. An outside witness for the free version is planned.
+- **It does not stop someone with full control of the server.** That person could rebuild the whole chain from scratch. A copy in your own store helps. The outside witness, now in the free version, is what catches it: see [Catching a rewritten audit log](/engineering-audit-witness/).
 - **Records name the server, not the API caller.** A [proposal](https://github.com/aerol-ai/microvm/discussions/649) to add the caller is open for discussion.
 - **Recording never blocks the work.** If the logbook falls far behind, it skips records and writes a marker with the count, rather than slow your sandboxes down.
 
