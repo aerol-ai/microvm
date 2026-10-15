@@ -71,7 +71,11 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cleanupReservation := func() {
-		if err := h.deps.Service.DeleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
+		// Detach from the request context: a client that disconnected mid-create
+		// is exactly when this runs, and it must still free the idempotency key
+		// promptly rather than leave a pending row to age out on its TTL (D5).
+		// This mirrors the create rollback, which already uses a detached context.
+		if err := h.deps.Service.DeleteIdempotentRequest(context.WithoutCancel(r.Context()), idempotencyScopeCreate, fingerprint); err != nil && !errors.Is(err, store.ErrNotFound) && h.deps.Logger != nil {
 			h.deps.Logger.Warn("e2b create reservation cleanup failed", "fingerprint", fingerprint, "error", err)
 		}
 	}
