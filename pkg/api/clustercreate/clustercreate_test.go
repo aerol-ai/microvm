@@ -1694,6 +1694,38 @@ func TestWriteNoEgressGateway(t *testing.T) {
 // the promote runs after the create+seal join on its own fresh budget, so a
 // create slower than the commit budget no longer expires the promote and fails
 // it even though the sandbox is up.
+// A retry that reaches OverlapCreateAndPromote with an id whose sandbox already
+// exists (the reservation-conflict idempotency replay) must return the existing
+// sandbox without re-binding or re-promoting — the reservation is already
+// consumed on the real cluster, so a second ReservedSecretBinding/RecordPlacement
+// fails with "reserved placement is no longer authoritative" (found live on the
+// single-node 1-node-cluster path). The stub does not model reservation
+// consumption, so this asserts the replay guard fires before any promote.
+func TestOverlapCreateAndPromote_IdempotentReplayReturnsExisting(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	stub := &clusterStub{Noop: cluster.NewNoop("node-a", "http://node-a", "")}
+	seedReservedPlacement(stub, "sb-replay")
+	svc, _ := newCreateServiceWithRuntime(t, stub, newFakeRuntime(), true)
+	req := models.CreateSandboxRequest{Image: "alpine:3.20"}
+
+	first, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("first create: %v", err)
+	}
+	promotes := len(stub.recordCalls)
+
+	second, err := OverlapCreateAndPromote(context.Background(), svc, logger, req, "sb-replay", OverlapOptions{PromoteWithSpec: true})
+	if err != nil {
+		t.Fatalf("idempotent replay: %v", err)
+	}
+	if second.Sandbox.ID != "sb-replay" || second.Sandbox.ID != first.Sandbox.ID {
+		t.Fatalf("replay returned %q, want the existing %q", second.Sandbox.ID, first.Sandbox.ID)
+	}
+	if len(stub.recordCalls) != promotes {
+		t.Fatalf("replay promoted again (%d → %d); it must return the existing sandbox without re-promoting", promotes, len(stub.recordCalls))
+	}
+}
+
 func TestOverlapCreateAndPromote_PromoteGetsFreshTimeoutAfterSlowCreate(t *testing.T) {
 	prev := overlapCommitTimeout
 	overlapCommitTimeout = 50 * time.Millisecond
