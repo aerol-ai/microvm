@@ -193,3 +193,28 @@ func TestClusterForwardWrapReturnsGoneForOrphanedDaytonaPlacement(t *testing.T) 
 		t.Fatalf("body = %q, want orphaned error", rr.Body.String())
 	}
 }
+
+// Placement must be told the runtime: a WASM-labeled create produces a
+// placement request with the WASM runtime so the scheduler picks a node with
+// WASM support, instead of scoring it as docker (B4).
+func TestClusterPlacementRequestCarriesWasmRuntime(t *testing.T) {
+	h := newHandlers(Deps{}) // nil service: no snapshot/module lookup, label path
+	labels := map[string]string{"runtime": "wasm", "module_ref": "python:3.12"}
+	name := "wasm-box"
+	out, err := h.clusterPlacementRequest(context.Background(), createSandboxRequest{Name: &name, Labels: &labels})
+	if err != nil || out.Runtime != models.RuntimeWasm || out.ModuleRef != "python:3.12" {
+		t.Fatalf("placement request = %+v, %v; want wasm runtime + module ref", out, err)
+	}
+
+	// A plain (docker) create leaves the runtime unset, as before.
+	dockerOut, err := h.clusterPlacementRequest(context.Background(), createSandboxRequest{Name: &name})
+	if err != nil || dockerOut.Runtime != "" {
+		t.Fatalf("docker placement request runtime = %q, %v; want empty", dockerOut.Runtime, err)
+	}
+
+	// A WASM label with no module ref is a bad request, surfaced at placement.
+	badLabels := map[string]string{"runtime": "wasm"}
+	if _, err := h.clusterPlacementRequest(context.Background(), createSandboxRequest{Name: &name, Labels: &badLabels}); err == nil {
+		t.Fatal("wasm label without a module ref should fail placement translation")
+	}
+}

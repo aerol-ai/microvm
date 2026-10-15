@@ -139,6 +139,26 @@ func (h *handlers) clusterPlacementRequest(ctx context.Context, req createSandbo
 	if !distribution.IsZero() {
 		out.ApplyImageDistribution(distribution)
 	}
+	// Placement must know the runtime: without this a WASM sandbox is scored
+	// as docker and can land on a node with no WASM support (B4). The create
+	// path translates the request fully (translateCreateSandboxRequest); here
+	// we need only the runtime, so run the same WASM detection and carry its
+	// runtime/module ref onto the placement request.
+	catalogueID := strings.TrimSpace(valueOrEmpty(req.Snapshot))
+	if catalogueID == "" {
+		catalogueID = strings.TrimSpace(valueOrEmpty(req.Name))
+	}
+	var wasmGetter facadeutil.WasmModuleGetter
+	if h.deps.Service != nil {
+		wasmGetter = h.deps.Service
+	}
+	if wasmReq, ok, err := facadeutil.TranslateWasmCreate(ctx, wasmGetter, catalogueID, mapValue(req.Labels)); err != nil {
+		return models.CreateSandboxRequest{}, err
+	} else if ok {
+		out.Runtime = wasmReq.Runtime
+		out.ModuleRef = wasmReq.ModuleRef
+		out.Image = wasmReq.Image
+	}
 	return out, nil
 }
 
