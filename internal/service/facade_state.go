@@ -54,7 +54,20 @@ func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[str
 	if _, err := s.scopedGet(ctx, sandboxID); err != nil {
 		return err
 	}
-	return s.store.UpdateTags(ctx, sandboxID, tags)
+	if err := s.store.UpdateTags(ctx, sandboxID, tags); err != nil {
+		return err
+	}
+	// Write the tags through to the replicated spec so a failover recreate
+	// restores the edited tags, not the create-time ones (B11). Tags are part
+	// of CreateSandboxRequest, so the recreate already applies spec.Tags.
+	replicated := make(map[string]string, len(tags))
+	for k, v := range tags {
+		replicated[k] = v
+	}
+	s.replicateSpecPatch(ctx, sandboxID, func(spec *models.CreateSandboxRequest) {
+		spec.Tags = replicated
+	})
+	return nil
 }
 
 // Snapshot aliases are scoped through the snapshot they point at: an alias,

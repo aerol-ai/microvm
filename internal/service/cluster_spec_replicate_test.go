@@ -164,3 +164,66 @@ func TestResizeSandboxSkipsWriteThroughWhenSpecNotRecorded(t *testing.T) {
 		t.Fatalf("UpsertSpec was called %d times for a pre-cluster sandbox; want 0", len(calls))
 	}
 }
+
+// TestUpdateTagsWritesThroughToClusterSpec pins B11: a tag edit after create
+// must refresh the FSM-replicated spec, or a failover recreate replays the
+// create-time tags and silently drops the edit.
+func TestUpdateTagsWritesThroughToClusterSpec(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	stub := &specWriteThroughCluster{
+		Noop: cluster.NewNoop("self", "http://self", ""),
+		spec: &models.CreateSandboxRequest{Image: "alpine", Tags: map[string]string{"team": "old"}},
+	}
+	svc.AttachCluster(stub)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-tags-replicate"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-tags-replicate", ContainerIP: "10.0.0.32",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+
+	want := map[string]string{"team": "sdk", "env": "prod"}
+	if err := svc.UpdateTags(ctx, sandboxID, want); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+
+	calls := stub.calls()
+	if len(calls) != 1 {
+		t.Fatalf("UpsertSpec calls = %d, want 1", len(calls))
+	}
+	got := calls[0].Tags
+	if got["team"] != "sdk" || got["env"] != "prod" || len(got) != 2 {
+		t.Fatalf("replicated spec.Tags = %+v, want %+v", got, want)
+	}
+}
+
+// A pre-cluster sandbox (SpecOf nil) does not get a spurious spec write.
+func TestUpdateTagsSkipsWriteThroughWhenSpecNotRecorded(t *testing.T) {
+	ctx := context.Background()
+	svc, _, st := newCapacityHarness(t, nil, nil)
+	stub := &specWriteThroughCluster{Noop: cluster.NewNoop("self", "http://self", "")} // spec nil
+	svc.AttachCluster(stub)
+
+	now := time.Now().UTC()
+	const sandboxID = "sb-tags-nospec"
+	if err := st.Create(ctx, &models.Sandbox{
+		ID: sandboxID, Image: "alpine", Status: models.SandboxStatusStarted,
+		ContainerID: "ctr-tags-nospec", ContainerIP: "10.0.0.33",
+		CPU: 1, MemoryMB: 512, Runtime: models.RuntimeDocker,
+		CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	if err := svc.UpdateTags(ctx, sandboxID, map[string]string{"k": "v"}); err != nil {
+		t.Fatalf("UpdateTags: %v", err)
+	}
+	if calls := stub.calls(); len(calls) != 0 {
+		t.Fatalf("UpsertSpec called %d times for a pre-cluster sandbox; want 0", len(calls))
+	}
+}
