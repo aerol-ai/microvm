@@ -24,6 +24,7 @@ type daytonaForwardCluster struct {
 	reservedReq     *models.CreateSandboxRequest
 	forwardedTarget string
 	forwardedID     string
+	forwardedBody   []byte
 }
 
 func (c *daytonaForwardCluster) SelectPlacement(capacity.Request) (cluster.PlacementTarget, error) {
@@ -56,6 +57,7 @@ func (c *daytonaForwardCluster) ReserveOnTarget(_ context.Context, sandboxID str
 func (c *daytonaForwardCluster) ForwardHTTP(_ cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
 	c.forwardedTarget = r.Header.Get("X-Cluster-Create-Target")
 	c.forwardedID = r.Header.Get("X-Cluster-Create-ID")
+	c.forwardedBody, _ = io.ReadAll(r.Body)
 	w.WriteHeader(http.StatusAccepted)
 }
 
@@ -91,6 +93,11 @@ func TestCreateSandboxClusterForwardBuildsOnTargetNotRouter(t *testing.T) {
 	}
 	if fakeCluster.reservedReq == nil || fakeCluster.reservedReq.Name != "sdk-build" {
 		t.Fatalf("reserved request = %+v, want Daytona name carried for cluster-wide uniqueness", fakeCluster.reservedReq)
+	}
+	// The forwarded request must carry the original wire body so the target
+	// re-translates it; an empty body would 400/502 on the worker (B2).
+	if !strings.Contains(string(fakeCluster.forwardedBody), "sdk-build") {
+		t.Fatalf("forwarded body = %q, want the original Daytona create body", fakeCluster.forwardedBody)
 	}
 }
 

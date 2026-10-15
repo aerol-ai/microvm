@@ -179,6 +179,16 @@ func (h *handlers) createSandboxOnSelectedNode(w http.ResponseWriter, r *http.Re
 
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
+		// Resolve platform-volume references into concrete MountSpecs before
+		// promote, so the replicated spec a failover replays carries real
+		// mounts, not bare volume names (B3). Store lookups only, no
+		// container; mirrors clustercreate.CreateOnSelectedNode.
+		if err := h.deps.Service.ResolvePlatformVolumesForReplication(createCtx, &req); err != nil {
+			clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, reservationID)
+			setCreateServerTiming(w, createStart, createTiming, h.deps.ContainerEngine)
+			apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+			return
+		}
 		resp, err := clustercreate.OverlapCreateAndPromote(createCtx, h.deps.Service, h.deps.Logger, req, reservationID, clustercreate.OverlapOptions{
 			PromoteWithSpec: true,
 			Timing:          createTiming,
