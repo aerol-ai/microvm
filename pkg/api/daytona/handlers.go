@@ -288,83 +288,26 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 // placement page; native Daytona page/limit must not re-slice the merge. Callers
 // must 503 when viewReady is false (matches /v1/sandboxes).
 func (h *handlers) listFacadeClusterItems(r *http.Request, local []sandboxResponse) ([]sandboxResponse, clusterlist.Coverage, string, bool) {
-	cov := clusterlist.Coverage{Answered: []string{"local"}, PlacementViewReady: true}
-	if h.deps.Service == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
-		return local, cov, "", true
+	var c cluster.Client
+	if h.deps.Service != nil {
+		c = h.deps.Service.Cluster()
 	}
-	c := h.deps.Service.Cluster()
-	if c == nil {
-		return local, cov, "", true
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return local, cov, "", true
-	}
-	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
-	limit, pageToken := clusterlist.ParsePageParams(r.URL)
-	peers, placements, next, viewReady, missingOwners := clusterlist.SelectPeersForPage(c, ownerRef, pageToken, limit)
-	if !viewReady {
-		cov.PlacementViewReady = false
-		cov.Partial = true
-		return nil, cov, "", false
-	}
-	local = filterFacadeLocalToPage(local, placements, pageToken, func(it sandboxResponse) string { return it.ID })
-	items, cov := clusterlist.MergeJSON(r.Context(), peers, local, func(it sandboxResponse) string { return it.ID }, clusterlist.Options{
-		OwnerRef:   ownerRef,
-		AuthHeader: r.Header.Get("Authorization"),
-		// Peers must not re-apply facade page/limit — ingress paginates after merge.
-		RawQuery:   clusterlist.StripFacadePagination(r.URL.RawQuery),
+	return clusterlist.FacadeListPage(r, c, local, func(it sandboxResponse) string { return it.ID }, clusterlist.FacadeListOptions{
 		Path:       PathPrefix + "/sandbox",
-		Transport:  clusterlist.TransportFromCluster(c),
-		SelfNodeID: c.SelfNodeID(),
-		WantIDs:    clusterlist.PlacementWantIDs(placements),
+		AuthHeader: r.Header.Get("Authorization"),
 		Warn: func(msg, peer string, peerErr error) {
 			if h.deps.Logger != nil {
 				h.deps.Logger.Warn(msg, "peer", peer, "error", peerErr)
 			}
 		},
 	})
-	cov.PlacementViewReady = viewReady
-	if len(missingOwners) > 0 {
-		cov.Missing = append(cov.Missing, missingOwners...)
-		cov.Partial = true
-	}
-	return items, cov, next, true
 }
 
-func filterFacadeLocalToPage[T any](local []T, placements []cluster.Placement, pageToken string, idFn func(T) string) []T {
-	if placements == nil {
-		if strings.TrimSpace(pageToken) != "" {
-			return nil
-		}
-		return local
-	}
-	want := clusterlist.PlacementWantIDs(placements)
-	out := make([]T, 0, len(local))
-	for _, it := range local {
-		if id := idFn(it); id != "" {
-			if _, ok := want[id]; ok {
-				out = append(out, it)
-			}
-		}
-	}
-	return out
-}
-
-// clusterListMode is true when a real cluster client is attached (not the
-// standalone Noop default from service.New) and this is not a forwarded peer
-// hop. Native Daytona page/limit must not re-slice placement pages in that mode.
 func clusterListMode(svc *service.Service, r *http.Request) bool {
-	if svc == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if svc == nil {
 		return false
 	}
-	c := svc.Cluster()
-	if c == nil {
-		return false
-	}
-	if _, ok := c.(*cluster.Noop); ok {
-		return false
-	}
-	return true
+	return clusterlist.ListMode(svc.Cluster(), r)
 }
 
 func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
@@ -388,15 +331,72 @@ func (h *handlers) listSandboxes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	localItems := h.filteredSandboxes(r, sandboxes, metadata, filters)
-	items, cov, next, viewReady := h.listFacadeClusterItems(r, localItems)
-	if !viewReady {
+
+	// The unpaginated Daytona list returns every sandbox the caller owns: the
+	// SDK reads a bare array with no cursor field, so a next-page token in a
+	// response header is invisible to it. In a cluster the merge is
+	// placement-paged, so walk all pages and concatenate instead of returning
+	// only the first page (~100) and stranding the rest (B10). Single node
+	// returns its one page (all local rows) in a single iteration.
+	items, cov, ok := gatherAllClusterPages(r, localItems, func(it sandboxResponse) string { return it.ID }, h.listFacadeClusterItems)
+	if !ok {
 		w.Header().Set("Retry-After", "1")
 		clusterlist.WriteCoverageHeaders(w, cov, "")
 		apihttp.WriteError(w, http.StatusServiceUnavailable, "placement view is not ready")
 		return
 	}
-	clusterlist.WriteCoverageHeaders(w, cov, next)
+	// The whole list was gathered, so there is no next-page token to surface;
+	// coverage headers still report any owner node that did not answer.
+	clusterlist.WriteCoverageHeaders(w, cov, "")
 	apihttp.WriteJSON(w, http.StatusOK, items)
+}
+
+// maxUnpaginatedListPages bounds the placement-page walk the unpaginated list
+// does, so a cursor bug can never spin forever. At the default page size this is
+// far more than any one owner holds.
+const maxUnpaginatedListPages = 1000
+
+// gatherAllClusterPages walks every placement page and concatenates the results,
+// deduped by id — the unpaginated list returns all the owner's sandboxes (B10).
+// fetch returns one page for a request carrying its page_token; ok == false when
+// a page's placement view is not ready (the caller should 503).
+func gatherAllClusterPages[T any](r *http.Request, local []T, idFn func(T) string, fetch func(*http.Request, []T) ([]T, clusterlist.Coverage, string, bool)) ([]T, clusterlist.Coverage, bool) {
+	items := make([]T, 0, len(local))
+	seen := make(map[string]struct{})
+	var lastCov clusterlist.Coverage
+	pageReq := r
+	for i := 0; i < maxUnpaginatedListPages; i++ {
+		page, cov, next, viewReady := fetch(pageReq, local)
+		if !viewReady {
+			return nil, cov, false
+		}
+		lastCov = cov
+		for _, it := range page {
+			if id := idFn(it); id != "" {
+				if _, dup := seen[id]; dup {
+					continue
+				}
+				seen[id] = struct{}{}
+			}
+			items = append(items, it)
+		}
+		if next == "" {
+			break
+		}
+		pageReq = withPageToken(r, next)
+	}
+	return items, lastCov, true
+}
+
+// withPageToken returns a shallow clone of r with the cluster page_token query
+// set, so the unpaginated list can walk successive placement pages without
+// mutating the caller's request.
+func withPageToken(r *http.Request, token string) *http.Request {
+	clone := r.Clone(r.Context())
+	q := clone.URL.Query()
+	q.Set("page_token", token)
+	clone.URL.RawQuery = q.Encode()
+	return clone
 }
 
 func (h *handlers) listSandboxesPaginated(w http.ResponseWriter, r *http.Request) {
