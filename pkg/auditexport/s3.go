@@ -69,6 +69,11 @@ func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 		// stores; the object is small and the SDK still validates when the
 		// store requires it.
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		// The SDK writes "Response has no supported checksum" to stderr for
+		// every GetObject whose response carries none, which is every head
+		// read: the witness reads one per node per interval, so this would
+		// flood the daemon's journal and the verifier's output.
+		o.DisableLogOutputChecksumValidationSkipped = true
 	}), nil
 }
 
