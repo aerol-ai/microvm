@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -56,7 +57,7 @@ func TestLostSessionCreateReplyLeavesNothingBehind(t *testing.T) {
 	if env.toolbox.sessionCount() != 0 {
 		t.Fatal("the session the toolbox opened was left in the guest")
 	}
-	if _, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
+	if _, err := env.svc.GetIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("claim after a confirmed delete = %v; want it released, since nothing ran", err)
 	}
 	if _, err := env.h.startExecution(ctx, devbox.ID, "echo ok", "", "lost-create"); err != nil {
@@ -87,7 +88,7 @@ func TestLostSessionCreateReplyWithFailedDeleteKeepsAWatcher(t *testing.T) {
 	if !watcherAlive(env.h.execs, key) || env.toolbox.sessionCount() != 1 {
 		t.Fatal("a session that could not be deleted has no owner")
 	}
-	if _, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref)); err != nil {
+	if _, err := env.svc.GetIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref)); err != nil {
 		t.Fatalf("the claim was dropped with the session still in the guest: %v", err)
 	}
 	env.toolbox.clearFaults()
@@ -176,16 +177,16 @@ func TestPendingRowsSurviveTheSweep(t *testing.T) {
 		t.Fatalf("execution id = %s", running.ExecutionID)
 	}
 
-	dayLater := time.Now().Add(execLedgerTTL + time.Hour)
+	dayLater := time.Now().Add(service.ExecLedgerTTL + time.Hour)
 	if _, err := env.store.DeleteExpiredIdempotentRequests(ctx, dayLater, 500); err != nil {
 		t.Fatal(err)
 	}
-	rec, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref))
+	rec, err := env.svc.GetIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref))
 	if err != nil || rec.State != models.RequestStatePending {
 		t.Fatalf("a day-old pending row was swept: %+v, %v", rec, err)
 	}
 	// Nor can a retry a day later claim it afresh and run the command again.
-	if _, acquired, err := env.svc.ClaimIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref), dayLater, execObligationHold); err != nil || acquired {
+	if _, acquired, err := env.svc.ClaimIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref), dayLater, service.ExecObligationHold); err != nil || acquired {
 		t.Fatalf("a day-old pending row was re-claimed: acquired=%v err=%v", acquired, err)
 	}
 	restarted := newHandlers(env.h.deps)
@@ -198,10 +199,10 @@ func TestPendingRowsSurviveTheSweep(t *testing.T) {
 
 	env.toolbox.unblock("block-long")
 	waitFor(t, "the execution to settle", func() bool { return ledgerSettled(env.h, devbox.ID, ref) })
-	if _, err := env.store.DeleteExpiredIdempotentRequests(ctx, time.Now().Add(execLedgerTTL+time.Minute), 500); err != nil {
+	if _, err := env.store.DeleteExpiredIdempotentRequests(ctx, time.Now().Add(service.ExecLedgerTTL+time.Minute), 500); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := env.svc.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref)); err == nil {
+	if _, err := env.svc.GetIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref)); err == nil {
 		t.Fatal("a settled row outlived its replay window")
 	}
 }
@@ -217,13 +218,13 @@ func TestRecoveryWalksEveryPage(t *testing.T) {
 	ctx := context.Background()
 	before := time.Now().Add(-time.Hour)
 	for i := range 2*recoveryPageRows + 1 {
-		if _, _, err := env.svc.ClaimIdempotentRequest(ctx, execLedgerScope, fmt.Sprintf("%s/rln-%08x", devbox.ID, i), before, execLedgerTTL); err != nil {
+		if _, _, err := env.svc.ClaimIdempotentRequest(ctx, service.ExecLedgerScope, fmt.Sprintf("%s/rln-%08x", devbox.ID, i), before, service.ExecLedgerTTL); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// "rlx-" sorts after "rln-", so this row is on the last page.
 	ref := execRef{session: plainSession(devbox.ID, "last-pending")}
-	if _, _, err := env.svc.ClaimIdempotentRequest(ctx, execLedgerScope, ledgerKey(devbox.ID, ref), before, execObligationHold); err != nil {
+	if _, _, err := env.svc.ClaimIdempotentRequest(ctx, service.ExecLedgerScope, ledgerKey(devbox.ID, ref), before, service.ExecObligationHold); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := env.h.createSession(ctx, devbox.ID, ref.session); err != nil {

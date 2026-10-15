@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -468,7 +469,7 @@ func (h *handlers) startExecution(ctx context.Context, devboxID, command, shellN
 	}
 	if !acquired {
 		if rec.TargetID != "" {
-			if outcome, ok := decodeOutcome(rec.TargetID); ok && outcome.Lost {
+			if outcome, ok := service.DecodeExecOutcome(rec.TargetID); ok && outcome.Lost {
 				return execRef{}, lostConflict()
 			}
 			return ref, nil // finished; readers answer from the ledger
@@ -624,7 +625,7 @@ func (h *handlers) awaitNamedClaim(ctx context.Context, fingerprint string, rec 
 			return "", ctx.Err()
 		}
 		var err error
-		if rec, err = h.deps.Service.GetIdempotentRequest(ctx, execLedgerScope, fingerprint); err != nil {
+		if rec, err = h.deps.Service.GetExecLedger(ctx, fingerprint); err != nil {
 			return "", err
 		}
 	}
@@ -775,7 +776,7 @@ func (h *handlers) watchExecution(ctx context.Context, devboxID string, ref exec
 // the row as lost. A session no claim owns is an orphan and goes at once.
 // It reports whether nothing is left to watch.
 func (h *handlers) abandonUnsubmitted(ctx context.Context, devboxID string, ref execRef, pace watchPace) bool {
-	rec, err := h.deps.Service.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devboxID, ref))
+	rec, err := h.deps.Service.GetExecLedger(ctx, ledgerKey(devboxID, ref))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 	case err != nil:
@@ -822,11 +823,11 @@ func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef
 	key := resultKey(devboxID, ref.id())
 	h.execs.finishing(key)
 	res := h.execs.record(resultFromState(key, state))
-	outcome := outcomeFromResult(res).encode()
+	outcome := outcomeFromResult(res).Encode()
 	fingerprint := ledgerKey(devboxID, ref)
 	backoff := pace.min
 	for failures := 0; ; failures++ {
-		err := h.deps.Service.SetIdempotentRequestTarget(ctx, execLedgerScope, fingerprint, outcome)
+		err := h.deps.Service.SetExecLedgerTarget(ctx, fingerprint, outcome)
 		if err == nil || errors.Is(err, store.ErrNotFound) {
 			break
 		}
@@ -880,7 +881,7 @@ func (h *handlers) finishPlain(ctx context.Context, devboxID string, ref execRef
 // pace.grace is left alone, because the claiming request may only not have
 // opened the session yet. It reports whether nothing is left to watch.
 func (h *handlers) settleLedger(ctx context.Context, devboxID string, ref execRef, certain bool, pace watchPace) bool {
-	rec, err := h.deps.Service.GetIdempotentRequest(ctx, execLedgerScope, ledgerKey(devboxID, ref))
+	rec, err := h.deps.Service.GetExecLedger(ctx, ledgerKey(devboxID, ref))
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		return true // released by a refused submit: nothing ran
@@ -890,11 +891,11 @@ func (h *handlers) settleLedger(ctx context.Context, devboxID string, ref execRe
 		return true
 	}
 	target := rec.TargetID
-	if _, ok := decodeOutcome(target); !ok {
+	if _, ok := service.DecodeExecOutcome(target); !ok {
 		if !certain && time.Since(rec.CreatedAt) < pace.grace {
 			return false
 		}
-		target = execOutcome{Lost: true}.encode()
+		target = service.ExecOutcome{Lost: true}.Encode()
 	}
 	if err := h.completeLedger(ctx, ledgerKey(devboxID, ref), target); err != nil && !errors.Is(err, store.ErrNotFound) {
 		if h.deps.Logger != nil {
@@ -913,8 +914,8 @@ func resultFromState(key string, state execState) *execResult {
 	}
 }
 
-func outcomeFromResult(res *execResult) execOutcome {
-	return execOutcome{Exit: res.exit, StdoutLen: res.stdoutLen, StderrLen: res.stderrLen}
+func outcomeFromResult(res *execResult) service.ExecOutcome {
+	return service.ExecOutcome{Exit: res.exit, StdoutLen: res.stdoutLen, StderrLen: res.stderrLen}
 }
 
 func stateFromResult(ref execRef, res *execResult) execState {
@@ -927,7 +928,7 @@ func stateFromResult(ref execRef, res *execResult) execState {
 
 // stateFromOutcome is a finished execution whose output is no longer held:
 // the exit status and stream lengths are real, the text is gone.
-func stateFromOutcome(ref execRef, outcome execOutcome) execState {
+func stateFromOutcome(ref execRef, outcome service.ExecOutcome) execState {
 	return execState{ref: ref, completed: true, exit: outcome.Exit, stdoutLen: outcome.StdoutLen, stderrLen: outcome.StderrLen}
 }
 
@@ -1222,7 +1223,7 @@ func (h *handlers) killExecution(w http.ResponseWriter, r *http.Request, devboxI
 	res := h.execs.record(&execResult{key: key, exit: killedExitStatus})
 	if ref.command == "" {
 		// Kill removed the session itself, so the execution is settled.
-		if err := h.completeLedger(r.Context(), ledgerKey(devboxID, ref), outcomeFromResult(res).encode()); err != nil && h.deps.Logger != nil {
+		if err := h.completeLedger(r.Context(), ledgerKey(devboxID, ref), outcomeFromResult(res).Encode()); err != nil && h.deps.Logger != nil {
 			h.deps.Logger.Warn("runloop execution ledger completion failed", "devbox_id", devboxID, "execution_id", ref.id(), "error", err)
 		}
 	}

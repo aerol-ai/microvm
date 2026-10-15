@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aerol-ai/microvm/internal/service"
 )
 
 // A watcher that cannot settle its row yet keeps the obligation instead of
@@ -104,7 +106,7 @@ func TestLostBetweenReads(t *testing.T) {
 	}
 	env.toolbox.setBeforeServe(func(r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/"+ref.session) {
-			_ = env.h.completeLedger(ctx, ledgerKey(devbox.ID, ref), execOutcome{Lost: true}.encode())
+			_ = env.h.completeLedger(ctx, ledgerKey(devbox.ID, ref), service.ExecOutcome{Lost: true}.Encode())
 		}
 	})
 	if _, err := env.h.executionState(ctx, devbox.ID, ref); !errors.Is(err, errExecutionLost) {
