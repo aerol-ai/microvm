@@ -24,6 +24,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -110,6 +111,24 @@ func New() *Server {
 	s := &Server{buckets: map[string]*bucket{}, ops: map[string]int{}, now: time.Now}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	return s
+}
+
+// NewTLS starts a fake that serves https, for configurations that refuse a
+// plain-http endpoint (enterprise mode). Point the SDK at CertificatePEM
+// through AWS_CA_BUNDLE.
+func NewTLS() *Server {
+	s := &Server{buckets: map[string]*bucket{}, ops: map[string]int{}, now: time.Now}
+	s.Server = httptest.NewTLSServer(http.HandlerFunc(s.serve))
+	return s
+}
+
+// CertificatePEM is the TLS server's certificate, PEM encoded; nil for a
+// plain-http fake.
+func (s *Server) CertificatePEM() []byte {
+	if s.TLS == nil {
+		return nil
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.Certificate().Raw})
 }
 
 // SetClock replaces the server clock; nil restores time.Now.
@@ -303,22 +322,37 @@ func operation(method, key string, q url.Values) string {
 }
 
 func (s *Server) putObject(w http.ResponseWriter, r *http.Request, b *bucket, key string) {
-	if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
-		// The SDK only frames a body this way over TLS; the fake serves plain
-		// HTTP. Refuse loudly so a client change can't pass unexamined.
-		writeError(w, http.StatusNotImplemented, "NotImplemented", "s3fake does not decode aws-chunked bodies")
-		return
-	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "IncompleteBody", err.Error())
 		return
 	}
+	header := r.Header
+	if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+		// Over TLS the SDK sends a checksummed upload as aws-chunked with the
+		// checksum in a trailer; over plain http it puts it in a header. Real
+		// S3 accepts both, so the fake must too, or the https path that
+		// production uses would go untested.
+		data, trailers, err := decodeAWSChunked(body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "IncompleteBody", err.Error())
+			return
+		}
+		if want := r.Header.Get("x-amz-decoded-content-length"); want != strconv.Itoa(len(data)) {
+			writeError(w, http.StatusBadRequest, "IncompleteBody", "decoded length "+strconv.Itoa(len(data))+" does not match x-amz-decoded-content-length "+want)
+			return
+		}
+		body = data
+		header = r.Header.Clone()
+		for k, v := range trailers {
+			header[k] = v
+		}
+	}
 	if b.lock != nil && b.lock.Mode != "" {
 		// S3: "Content-MD5 OR x-amz-checksum- HTTP header is required for Put
 		// Object requests with Object Lock parameters". A default retention
 		// rule counts as Object Lock parameters on every upload.
-		if msg := checksumProblem(r.Header, body); msg != "" {
+		if msg := checksumProblem(header, body); msg != "" {
 			writeError(w, http.StatusBadRequest, "InvalidRequest", msg)
 			return
 		}
@@ -329,6 +363,57 @@ func (s *Server) putObject(w http.ResponseWriter, r *http.Request, b *bucket, ke
 		w.Header().Set("x-amz-version-id", v.VersionID)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// decodeAWSChunked unframes an aws-chunked body: hex-sized chunks (each
+// size line may carry a ";chunk-signature=" extension), a zero-size chunk,
+// then trailer lines ending in a blank line.
+func decodeAWSChunked(raw []byte) ([]byte, http.Header, error) {
+	var data []byte
+	trailers := http.Header{}
+	rest := raw
+	next := func() (string, error) {
+		i := bytes.Index(rest, []byte("\r\n"))
+		if i < 0 {
+			return "", fmt.Errorf("aws-chunked body is truncated")
+		}
+		line := string(rest[:i])
+		rest = rest[i+2:]
+		return line, nil
+	}
+	for {
+		line, err := next()
+		if err != nil {
+			return nil, nil, err
+		}
+		sizeText, _, _ := strings.Cut(line, ";")
+		size, err := strconv.ParseInt(strings.TrimSpace(sizeText), 16, 64)
+		if err != nil || size < 0 {
+			return nil, nil, fmt.Errorf("aws-chunked size %q is not hex", sizeText)
+		}
+		if size == 0 {
+			break
+		}
+		if int64(len(rest)) < size+2 || string(rest[size:size+2]) != "\r\n" {
+			return nil, nil, fmt.Errorf("aws-chunked chunk of %d bytes is truncated", size)
+		}
+		data = append(data, rest[:size]...)
+		rest = rest[size+2:]
+	}
+	for {
+		line, err := next()
+		if err != nil {
+			return nil, nil, err
+		}
+		if line == "" {
+			return data, trailers, nil
+		}
+		k, v, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, nil, fmt.Errorf("aws-chunked trailer %q has no value", line)
+		}
+		trailers.Set(strings.TrimSpace(k), strings.TrimSpace(v))
+	}
 }
 
 // checksumProblem reports why an upload's integrity headers would not satisfy

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -543,5 +544,30 @@ func TestWitnessReadErrorsAreWrapped(t *testing.T) {
 	}
 	if _, err := w.latestIsDeleteMarker(context.Background(), "k"); err == nil {
 		t.Fatal("version list against a missing bucket must fail")
+	}
+}
+
+// Production reaches S3 over https, where the SDK sends the checksum as an
+// aws-chunked trailer rather than a header. The whole witness path must work
+// there too, not only over the plain-http fake.
+func TestWitnessOverTLS(t *testing.T) {
+	fake := s3fake.NewTLS()
+	defer fake.Close()
+	fake.CreateBucket(testBucket, lockedCompliance)
+	ca := t.TempDir() + "/ca.pem"
+	if err := os.WriteFile(ca, fake.CertificatePEM(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CA_BUNDLE", ca)
+	testClient(t, fake.URL)
+	w, err := Open(context.Background(), testConfig(fake.URL))
+	if err != nil {
+		t.Fatalf("Open over TLS: %v", err)
+	}
+	if _, err := w.WitnessHeads(context.Background(), []controlplane.AuditHead{{NodeID: testNode, HeadHex: headA}}); err != nil {
+		t.Fatalf("ship over TLS: %v", err)
+	}
+	if head, ok, err := w.LastWitnessedHead(context.Background(), testNode); err != nil || !ok || head != headA {
+		t.Fatalf("latest over TLS = %q %v %v", head, ok, err)
 	}
 }

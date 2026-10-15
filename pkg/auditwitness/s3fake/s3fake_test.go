@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -256,7 +257,7 @@ func TestChecksumRules(t *testing.T) {
 		{"bad content-md5", map[string]string{"Content-MD5": "AAAA"}, "", http.StatusBadRequest},
 		{"wrong sha256", map[string]string{"x-amz-sdk-checksum-algorithm": "SHA256", "x-amz-checksum-sha256": "AAAA"}, "", http.StatusBadRequest},
 		{"other algorithm", map[string]string{"x-amz-sdk-checksum-algorithm": "CRC32", "x-amz-checksum-sha256": "AAAA"}, "", http.StatusBadRequest},
-		{"aws-chunked", map[string]string{"Content-MD5": good}, "aws-chunked", http.StatusNotImplemented},
+		{"aws-chunked body that is not chunked", map[string]string{"Content-MD5": good}, "aws-chunked", http.StatusBadRequest},
 	}
 	for _, cs := range cases {
 		if got := raw(cs.h, cs.enc); got != cs.want {
@@ -380,5 +381,78 @@ func TestListObjectVersions(t *testing.T) {
 	}
 	if len(out.Versions) != 2 || aws.ToString(out.Versions[0].Key) != "p/node=b/day=2026-10-10/head.json" {
 		t.Fatalf("after-key listing = %+v", out.Versions)
+	}
+}
+
+// Over TLS the SDK frames a checksummed upload as aws-chunked with the
+// checksum in a trailer; the fake must accept that and still refuse an
+// upload with no checksum at all.
+func TestTLSUploadsUseTrailingChecksums(t *testing.T) {
+	s := NewTLS()
+	defer s.Close()
+	s.CreateBucket("b", BucketOptions{Lock: &Lock{Mode: ModeCompliance, Days: 1}})
+	ca := t.TempDir() + "/ca.pem"
+	if err := os.WriteFile(ca, s.CertificatePEM(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AWS_CA_BUNDLE", ca)
+	c := client(t, s)
+	put(t, c, "b", "k", "payload")
+	if v := s.Versions("b", "k"); len(v) != 1 || string(v[0].Body) != "payload" {
+		t.Fatalf("stored %+v", v)
+	}
+	if _, err := c.PutObject(context.Background(), &s3.PutObjectInput{Bucket: aws.String("b"), Key: aws.String("k"), Body: strings.NewReader("x")}); code(err) != "InvalidRequest" {
+		t.Fatalf("no checksum over TLS err = %v", err)
+	}
+	if New().CertificatePEM() != nil {
+		t.Fatal("a plain-http fake has no certificate")
+	}
+}
+
+func TestDecodeAWSChunked(t *testing.T) {
+	cases := []struct {
+		name, raw, data, err string
+	}{
+		{"two chunks and a trailer", "3;chunk-signature=x\r\nabc\r\n2\r\nde\r\n0\r\nx-amz-checksum-sha256:AAAA\r\n\r\n", "abcde", ""},
+		{"no trailer", "1\r\na\r\n0\r\n\r\n", "a", ""},
+		{"truncated size line", "3", "", "truncated"},
+		{"size not hex", "zz\r\n", "", "not hex"},
+		{"chunk shorter than its size", "5\r\nab\r\n", "", "truncated"},
+		{"trailer without a colon", "0\r\nnovalue\r\n\r\n", "", "has no value"},
+		{"missing final blank line", "0\r\nx-amz-checksum-sha256:AAAA\r\n", "", "truncated"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			data, trailers, err := decodeAWSChunked([]byte(c.raw))
+			if c.err != "" {
+				if err == nil || !strings.Contains(err.Error(), c.err) {
+					t.Fatalf("err = %v, want %q", err, c.err)
+				}
+				return
+			}
+			if err != nil || string(data) != c.data {
+				t.Fatalf("data = %q, %v", data, err)
+			}
+			if c.name == "two chunks and a trailer" && trailers.Get("x-amz-checksum-sha256") != "AAAA" {
+				t.Fatalf("trailers = %v", trailers)
+			}
+		})
+	}
+}
+
+func TestChunkedLengthMismatch(t *testing.T) {
+	s := New()
+	defer s.Close()
+	s.CreateBucket("b", BucketOptions{Versioning: true})
+	req, _ := http.NewRequest(http.MethodPut, s.URL+"/b/k", strings.NewReader("1\r\na\r\n0\r\n\r\n"))
+	req.Header.Set("Content-Encoding", "aws-chunked")
+	req.Header.Set("x-amz-decoded-content-length", "5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", resp.StatusCode)
 	}
 }
