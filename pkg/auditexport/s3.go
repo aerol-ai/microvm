@@ -33,7 +33,7 @@ type s3Backend struct {
 
 func init() {
 	Register(BackendS3, func(cfg Config) (Backend, error) {
-		api, err := newS3Client(context.Background(), cfg.S3)
+		api, err := NewS3Client(context.Background(), cfg.S3)
 		if err != nil {
 			return nil, err
 		}
@@ -45,14 +45,20 @@ func newS3Backend(api s3PutObjectAPI, cfg S3Config) *s3Backend {
 	return &s3Backend{api: api, bucket: cfg.Bucket, prefix: cfg.Prefix, h: newHealth(BackendS3)}
 }
 
-func newS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
+// NewS3Client builds the S3 client every audit S3 consumer shares: this
+// exporter, the Object Lock witness (pkg/auditwitness) and the offline
+// verifier. One builder keeps endpoint, path-style and checksum behaviour
+// identical across them, so a store that works for export works for the
+// witness. The error prefix is neutral because callers other than the
+// exporter wrap it with their own context.
+func NewS3Client(ctx context.Context, cfg S3Config) (*s3.Client, error) {
 	var loadOpts []func(*awsconfig.LoadOptions) error
 	if cfg.Region != "" {
 		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("audit export s3: load aws config: %w", err)
+		return nil, fmt.Errorf("s3 client: load aws config: %w", err)
 	}
 	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		if cfg.Endpoint != "" {

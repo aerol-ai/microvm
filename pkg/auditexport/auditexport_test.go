@@ -572,7 +572,7 @@ func TestS3BackendRealClientAgainstCompatibleEndpoint(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	client, err := newS3Client(context.Background(), S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	client, err := NewS3Client(context.Background(), S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
 	if err != nil {
 		t.Fatal(err)
 	}
