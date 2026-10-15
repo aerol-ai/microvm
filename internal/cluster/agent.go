@@ -1599,6 +1599,19 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 			// unchanged. See ApplyErrorStatus in apply_verdict.go.
 			return fmt.Errorf("%w: %s", ErrArtifactCatalogSuperseded, message)
 		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrReservationConflict.Error()) {
+			// Carry the reservation conflict across the control-plane hop (the
+			// non-voter-ingress twin of the leader-forward hop in
+			// forwardApplyStatus). The create path's idempotent-replay branch
+			// keys off errors.Is(err, ErrReservationConflict) to route an
+			// Idempotency-Key retry to the existing placement; without this a
+			// retry from a non-voter ingress 503s on a multi-node cluster
+			// (seen on cluster-hetero, where the ingress is not a raft voter).
+			return fmt.Errorf("%w: %s", ErrReservationConflict, message)
+		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrNameConflict.Error()) {
+			return fmt.Errorf("%w: %s", ErrNameConflict, message)
+		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive
 		}

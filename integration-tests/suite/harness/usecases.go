@@ -657,6 +657,42 @@ var Registry = []UseCase{
 	{ID: "UC-230", Title: "After aerolvm login, mcp config carries no credentials and the stdio MCP server runs on the login alone", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-231", Title: "aerolvm shell and exec -it get a real terminal (devpts, local size, resize, exit code) on every runtime the scenario runs: docker, gVisor, Firecracker", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-232", Title: "aerolvm shell says why it can't: the sandbox was stopped under it, the image has no shell (exec too, as a non-retryable invalid_argument), or the saved token was revoked", Requires: []Capability{CapDocker}, Implemented: true},
+
+	// Facade-convergence coverage (UC-233..UC-262): the new v1 snapshot
+	// catalogue surface, create idempotency across facades, the cross-facade
+	// shared snapshot data model, snapshot home-node routing (B6), the Runloop
+	// durable exec ledger (D14), and first live coverage of the Daytona / E2B /
+	// Runloop facades.
+	{ID: "UC-233", Title: "v1 register a snapshot then read it back by name (GET /v1/snapshots/{name})", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-234", Title: "v1 list snapshots returns the registered snapshot (GET /v1/snapshots)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-235", Title: "v1 snapshot list paginates by name with limit + starting_after", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-236", Title: "v1 delete a snapshot then a get by name is 404", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-237", Title: "v1 delete a missing snapshot is a not-found error", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-238", Title: "v1 snapshot a running sandbox then read it in get + list", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-239", Title: "v1 create with Idempotency-Key replays the same sandbox on retry", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-240", Title: "v1 create without an Idempotency-Key makes two distinct sandboxes", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-241", Title: "Daytona create with Idempotency-Key replays the same sandbox on retry", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-242", Title: "v1 cluster create with Idempotency-Key places the sandbox exactly once", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-243", Title: "A v1-registered snapshot is visible through the Daytona snapshot list (shared catalogue)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-244", Title: "A v1-registered snapshot is visible through the E2B snapshot list (shared catalogue)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-245", Title: "Daytona snapshot list paginates (page + limit) over the owner's snapshots", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-246", Title: "E2B snapshot list returns the snapshot catalogue", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-247", Title: "v1 snapshot get-by-name is routed to the node holding the image from a non-owner node (B6)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-248", Title: "v1 snapshot delete is routed to the holder from a non-owner node and removes it cluster-wide (B6)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-249", Title: "Daytona snapshot get-by-id is routed to the holder from a non-owner node (B6)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-250", Title: "E2B template(snapshot) delete-by-id is routed to the holder from a non-owner node (B6)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-251", Title: "A snapshot committed on one node is routable for get from every other node (B6 fan-in)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-252", Title: "Daytona create a sandbox runs end to end (first live Daytona create coverage)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-253", Title: "E2B create a sandbox runs end to end (first live E2B create coverage)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-254", Title: "Daytona create in a cluster is placed on a real runtime node and is reachable", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-255", Title: "A get for a missing sandbox is a 404 on v1 and on the Daytona facade (one error table)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-256", Title: "Runloop exec with a repeated command_id replays the same execution (durable exec ledger, D14)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-257", Title: "Runloop create a devbox and exec returns command output", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-258", Title: "An exec on a stopped sandbox is refused (S12 running-state gate)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-259", Title: "A toolbox exec is routed to the owner node and runs in a cluster", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+	{ID: "UC-260", Title: "A v1-registered snapshot creates a working sandbox (catalogue round-trip with exec)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-261", Title: "Snapshot home-node routing works across heterogeneous runtime nodes (B6 on hetero)", Requires: []Capability{CapDocker, CapCluster, CapFirecracker}, Implemented: true},
+	{ID: "UC-262", Title: "Create-from-snapshot works across nodes: snapshot on one node, new sandbox placed and running (B6 + distribution)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

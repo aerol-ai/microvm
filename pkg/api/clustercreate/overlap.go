@@ -110,6 +110,20 @@ func OverlapCreateAndPromote(
 		return svc.CreateSandboxWithID(ctx, req, reservationID)
 	}
 
+	// Idempotent replay: if a sandbox already exists locally under this id, the
+	// create + promote already happened. This path is reached when an
+	// Idempotency-Key retry (or a lost-ack retry) hits the reservation-conflict
+	// replay in Prepare, which routes the retry back here with the existing id
+	// once the sandbox is already Placed. Re-binding its (now consumed)
+	// reservation would fail with "reserved placement is no longer
+	// authoritative", so return the existing sandbox instead. The id is
+	// owner-namespaced for derived keys, so GetSandbox only matches the caller's
+	// own sandbox; a not-yet-created concurrent reservation falls through to the
+	// normal create+promote below.
+	if existing, err := svc.GetSandbox(ctx, reservationID); err == nil && existing != nil {
+		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
+	}
+
 	// commitCtx is derived from the request so an overall deadline still
 	// bounds seal+promote, but we NEVER treat cancelling it as cleanup: a
 	// Raft apply can fail client-side and still land in the FSM (§2.2).
