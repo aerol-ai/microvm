@@ -45,6 +45,7 @@ const (
 	PublicInternalRecoveryPath        = "/v1/cluster/internal/recovery/"
 	PublicInternalSelectPlacementPath = "/v1/cluster/internal/select-placement"
 	PublicInternalVolumePath          = "/v1/cluster/internal/volume"
+	PublicInternalSnapshotNodePath    = "/v1/cluster/internal/snapshot-node"
 	PublicInternalDrainStatePath      = "/v1/cluster/internal/drain/"
 	PublicInternalAuditACLPath        = "/v1/cluster/internal/audit-acl/"
 	PublicInternalClusterLeaderPath   = "/v1/cluster/leader"

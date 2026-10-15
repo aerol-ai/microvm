@@ -52,6 +52,10 @@ const (
 	opAllocateArtifactEpoch  opCode = 25 // issue one publisher its fencing token for a catalogue kind
 	// opReportStorageObligations = 26: owner delete-outbox snapshots folded by
 	// the leader (storage_obligations.go).
+	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
+	// egress-profile ops (fsm_egress_profiles.go). Next free codes are 29/30.
+	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
+	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
 
 // command is the wire format for one raft log entry. Recovery payloads ride
@@ -187,6 +191,13 @@ type command struct {
 	// EgressProfile carries the profile for opPutEgressProfile, and its owner
 	// and name for opDeleteEgressProfile (fsm_egress_profiles.go).
 	EgressProfile *EgressProfileRecord `json:"egress_profile,omitempty"`
+	// SnapshotName carries the (global) snapshot name for
+	// opRegisterSnapshotNode / opForgetSnapshotNode. The holding node rides in
+	// the existing NodeID field. The name → node row is replicated so any node
+	// can route a snapshot-by-id GET/DELETE to the node that holds the image,
+	// which a snapshot's local-only SQLite catalogue row cannot answer after
+	// the request lands elsewhere.
+	SnapshotName string `json:"snapshot_name,omitempty"`
 }
 
 type reservationCommand struct {
@@ -493,6 +504,12 @@ type placementFSM struct {
 	// is deterministic in S3/NFS, so only this small metadata table is replicated.
 	volumes         map[string]models.Volume
 	volumeNameIndex map[string]string
+	// snapshotNodeIndex maps a (global) snapshot name → the node that holds its
+	// image. Snapshots live in per-node SQLite with no node column, so only this
+	// replicated index lets any node route a snapshot-by-id GET/DELETE to the
+	// holder. The entry is tiny (name + node), carries no recovery payload, and
+	// is dropped when the snapshot is deleted or its node leaves the cluster.
+	snapshotNodeIndex map[string]string
 	// volumeAttachments is the cluster-wide live-reference index. It mirrors the
 	// single-node SQLite volume_attachments table but lives in raft so a delete
 	// request on any node sees sandboxes attached on every worker.
@@ -586,6 +603,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		auditACLBySandbox:            make(map[string]map[string]struct{}),
 		volumes:                      make(map[string]models.Volume),
 		volumeNameIndex:              make(map[string]string),
+		snapshotNodeIndex:            make(map[string]string),
 		volumeAttachments:            make(map[string]models.VolumeAttachment),
 		volumeAttachmentsByVolume:    make(map[string]map[string]struct{}),
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
@@ -1233,6 +1251,18 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 			delete(f.deletingIndex, id)
 			f.recordPlacementChangeLocked(id, true)
 		}
+		// Drop the dead node's snapshot-home entries: its local SQLite catalogue
+		// rows went with it, so the snapshots are gone from the cluster (if the
+		// image was pushed to a registry the bytes survive, but the catalogue
+		// metadata that a GET/DELETE needs does not). A left entry would route
+		// callers to a node that is no longer there. The scan is bounded by the
+		// index size and runs only on a node death. Mirrors how the loops above
+		// release the dead node's placements.
+		for name, node := range f.snapshotNodeIndex {
+			if node == cmd.NodeID {
+				delete(f.snapshotNodeIndex, name)
+			}
+		}
 		return nil
 	case opClaimOrphan:
 		if cmd.SandboxID == "" || cmd.OwnerNodeID == "" {
@@ -1834,6 +1864,26 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		}
 		delete(f.volumes, key)
 		delete(f.volumeNameIndex, volumeNameKey(tenant, row.Name))
+		return nil
+	case opRegisterSnapshotNode:
+		// Idempotent get-or-set-or-move: a re-register with the same name
+		// overwrites the node (a snapshot re-committed on a different node moves
+		// its home), so the op is safe under retry and a re-create.
+		name := strings.TrimSpace(cmd.SnapshotName)
+		node := strings.TrimSpace(cmd.NodeID)
+		if name == "" || node == "" {
+			return fmt.Errorf("placementFSM: opRegisterSnapshotNode requires snapshot_name and node_id")
+		}
+		f.snapshotNodeIndex[name] = node
+		return nil
+	case opForgetSnapshotNode:
+		name := strings.TrimSpace(cmd.SnapshotName)
+		if name == "" {
+			return fmt.Errorf("placementFSM: opForgetSnapshotNode requires snapshot_name")
+		}
+		// Idempotent: forgetting an unknown name is a no-op (a delete that races
+		// a never-registered snapshot, or a double delete).
+		delete(f.snapshotNodeIndex, name)
 		return nil
 	case opPutVolumeAttach:
 		if len(cmd.VolumeAttachments) == 0 {
@@ -3284,6 +3334,10 @@ type fsmSnapshotPayload struct {
 	// EgressProfiles is the replicated named-profile set. Optional; an older
 	// snapshot decodes it as nil, which reads as "no profiles".
 	EgressProfiles []EgressProfileRecord
+	// SnapshotNodes is the replicated snapshot name → holding-node index.
+	// Optional; an older snapshot decodes it as nil, which reads as "no
+	// snapshot-home entries" and routing falls back to local serving.
+	SnapshotNodes map[string]string
 }
 
 type placementSnapshotRow struct {
@@ -3309,6 +3363,10 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 	drained := make(map[string]bool, len(f.drainedNodes))
 	for k, v := range f.drainedNodes {
 		drained[k] = v
+	}
+	snapshotNodes := make(map[string]string, len(f.snapshotNodeIndex))
+	for k, v := range f.snapshotNodeIndex {
+		snapshotNodes[k] = v
 	}
 	auditACLs := make(map[string]AuditACL, len(f.auditACLs))
 	for id, acl := range f.auditACLs {
@@ -3357,6 +3415,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		volumes:            f.volumesSnapshotLocked(),
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
+		snapshotNodes:      snapshotNodes,
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3530,6 +3589,14 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	} else {
 		f.drainedNodes = payload.DrainedNodes
 	}
+	// Snapshots written before the snapshot-home index existed carry none —
+	// initialize empty so the register path never nil-panics; raft replays any
+	// post-snapshot opRegisterSnapshotNode entries to bring us current.
+	if payload.SnapshotNodes == nil {
+		f.snapshotNodeIndex = make(map[string]string)
+	} else {
+		f.snapshotNodeIndex = payload.SnapshotNodes
+	}
 	// Snapshots written before storage retirement existed carry none.
 	if payload.StorageRetirements == nil {
 		f.storageRetirements = make(map[string]NodeStorageRetirement)
@@ -3579,6 +3646,7 @@ type fsmSnapshot struct {
 	volumes            []models.Volume
 	volumeAttachments  []models.VolumeAttachment
 	egressProfiles     []EgressProfileRecord
+	snapshotNodes      map[string]string
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3602,6 +3670,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		Volumes:            s.volumes,
 		VolumeAttachments:  s.volumeAttachments,
 		EgressProfiles:     s.egressProfiles,
+		SnapshotNodes:      s.snapshotNodes,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)

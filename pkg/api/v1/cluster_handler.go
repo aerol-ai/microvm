@@ -1326,6 +1326,23 @@ func (h *handlers) clusterInternalVolume(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// clusterInternalSnapshotNode answers an agent-role node's snapshot-home read
+// from this server node's replicated FSM. Writes never hit this path — they flow
+// through the generic apply endpoint.
+func (h *handlers) clusterInternalSnapshotNode(w http.ResponseWriter, r *http.Request) {
+	c := h.deps.Service.Cluster()
+	if c == nil {
+		apihttp.WriteError(w, http.StatusServiceUnavailable, "cluster: not enabled on this node")
+		return
+	}
+	node, found, err := c.SnapshotHomeNode(r.Context(), r.URL.Query().Get("name"))
+	if err != nil {
+		apihttp.WriteError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, cluster.SnapshotNodeQueryResponse{NodeID: node, Found: found})
+}
+
 func (h *handlers) clusterInternalPlacements(w http.ResponseWriter, r *http.Request) {
 	c := h.deps.Service.Cluster()
 	if c == nil {
