@@ -2,7 +2,10 @@ package docker
 
 import (
 	"slices"
+	"strings"
 	"testing"
+
+	"github.com/distribution/reference"
 )
 
 func TestLooksLikeImageID(t *testing.T) {
@@ -53,5 +56,57 @@ func TestEquivalentImageNames(t *testing.T) {
 				t.Errorf("%q: names %v miss %q", tc.ref, got, name)
 			}
 		}
+	}
+}
+
+// A snapshot's tag is a function of its name's canonical spelling: one tag
+// for every spelling of one name (the catalog's one snapshot), a different
+// tag for any other name, always in the snapshot namespace, local only, and
+// a valid reference.
+func TestSnapshotImageTag(t *testing.T) {
+	same := []string{"snap", "snap:latest", "docker.io/library/snap", " index.docker.io/library/snap:latest "}
+	tag := SnapshotImageTag(same[0])
+	for _, name := range same[1:] {
+		if got := SnapshotImageTag(name); got != tag {
+			t.Errorf("SnapshotImageTag(%q) = %q, want %q like %q", name, got, tag, same[0])
+		}
+	}
+	seen := map[string]string{}
+	for _, name := range []string{"snap", "snap:v1", "snap:v2", "Snap", "python", "runloop/0123:latest", "ghcr.io/org/snap", "x@sha256:" + strings.Repeat("a", 64)} {
+		got := SnapshotImageTag(name)
+		if other, dup := seen[got]; dup {
+			t.Errorf("%q and %q share %q", other, name, got)
+		}
+		seen[got] = name
+		if !IsSnapshotImageRef(got) || !IsLocalOnlyImageRef(got) {
+			t.Errorf("SnapshotImageTag(%q) = %q, not a local snapshot image", name, got)
+		}
+		if _, err := reference.ParseNormalizedNamed(got); err != nil {
+			t.Errorf("SnapshotImageTag(%q) = %q: %v", name, got, err)
+		}
+	}
+}
+
+// Every spelling the engine resolves to the snapshot namespace counts;
+// other registries, look-alike namespaces and the "snapshots/" names callers
+// already use do not.
+func TestIsSnapshotImageRef(t *testing.T) {
+	for ref, want := range map[string]bool{
+		"aerolvm-snapshot/abc:latest":                  true,
+		"docker.io/aerolvm-snapshot/abc":               true,
+		" index.docker.io/aerolvm-snapshot/abc:latest": true,
+		"ghcr.io/aerolvm-snapshot/abc":                 false,
+		"aerolvm-snapshots/abc":                        false,
+		"snapshots/demo:v1":                            false,
+		"python":                                       false,
+		"Not A Ref":                                    false,
+		"":                                             false,
+	} {
+		if got := IsSnapshotImageRef(ref); got != want {
+			t.Errorf("IsSnapshotImageRef(%q) = %v, want %v", ref, got, want)
+		}
+	}
+	if !IsLocalOnlyImageRef("snapshots/demo:v1") {
+		t.Error("snapshots committed under snapshots/ names must stay local only")
 	}
 }

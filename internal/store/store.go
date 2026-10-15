@@ -446,6 +446,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// rows that only wait out their replay window.
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_state ON request_idempotency(scope, state, fingerprint);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
+		// Serves GetSnapshotsByImage (authorizing a snapshot's own image
+		// when it is named directly) and HasActiveImageRef (the image
+		// janitors must not remove an image a snapshot still holds).
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_image ON sandbox_snapshots(image);`,
 		// Lookups by sandbox_id for ListCustomDomains and for the
 		// attachCustomDomainsBulk join. The PK on hostname already covers
 		// the ResolveCustomDomain hot path.
@@ -2449,23 +2453,30 @@ func (s *Store) attachPortsBulk(ctx context.Context, byID map[string]*models.San
 	return nil
 }
 
+const hasActiveImageRefSQL = `
+	SELECT 1 FROM sandboxes
+	WHERE image = ? AND status != ?
+	UNION ALL
+	SELECT 1 FROM sandbox_snapshots
+	WHERE image = ?
+	LIMIT 1`
+
 // HasActiveImageRef reports whether any sandbox row references image with a
-// status other than destroyed. Used by image GC: when this returns false the
-// caller may safely remove the image from Docker. Single indexed query —
-// constant cost regardless of how many destroyed rows have accumulated, so
-// 10k destroyed historical rows do not slow the destroy hot path. Returns
-// true on empty image as a conservative default (caller treats it as "still
-// in use, do not delete").
+// status other than destroyed, or any snapshot holds it. Used by image GC:
+// when this returns false the caller may safely remove the image from
+// Docker. A snapshot's image has no sandbox using it most of the time — a
+// sandbox started from it and since destroyed is what schedules it for GC —
+// yet removing it would leave the snapshot pointing at nothing. Two indexed
+// lookups — constant cost regardless of how many destroyed rows have
+// accumulated, so 10k destroyed historical rows do not slow the destroy hot
+// path. Returns true on empty image as a conservative default (caller
+// treats it as "still in use, do not delete").
 func (s *Store) HasActiveImageRef(ctx context.Context, image string) (bool, error) {
 	if image == "" {
 		return true, nil
 	}
 	var present int
-	err := s.db.QueryRowContext(ctx, `
-		SELECT 1 FROM sandboxes
-		WHERE image = ? AND status != ?
-		LIMIT 1
-	`, image, string(models.SandboxStatusDestroyed)).Scan(&present)
+	err := s.db.QueryRowContext(ctx, hasActiveImageRefSQL, image, string(models.SandboxStatusDestroyed), image).Scan(&present)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -3468,6 +3479,54 @@ func (s *Store) GetSnapshotByNames(ctx context.Context, names []string) (*models
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// maxSnapshotsByImage bounds GetSnapshotsByImage. One image backs one
+// committed snapshot plus whatever names were registered for it; a caller
+// only needs to find one it may see.
+const maxSnapshotsByImage = 64
+
+func snapshotsByImageSQL(images int) string {
+	return `
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error, owner_ref
+		FROM sandbox_snapshots
+		WHERE image IN (?` + strings.Repeat(", ?", images-1) + `)
+		ORDER BY name
+		LIMIT ?`
+}
+
+// GetSnapshotsByImage returns the snapshots whose image is any of images,
+// ordered by name: the snapshot an image was committed for, and any
+// registered under that image.
+func (s *Store) GetSnapshotsByImage(ctx context.Context, images []string) ([]*models.SandboxSnapshot, error) {
+	if len(images) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(images)+1)
+	for _, image := range images {
+		args = append(args, strings.TrimSpace(image))
+	}
+	args = append(args, maxSnapshotsByImage)
+	rows, err := s.db.QueryContext(ctx, snapshotsByImageSQL(len(images)), args...)
+	if err != nil {
+		return nil, fmt.Errorf("get snapshots by image: %w", err)
+	}
+	defer rows.Close()
+	var out []*models.SandboxSnapshot
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("get snapshots by image: %w", err)
+		}
+		out = append(out, snapshot)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get snapshots by image: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {

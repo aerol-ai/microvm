@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/caddy"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -783,8 +784,9 @@ func TestFirecrackerSnapshot_RoutesCommitToFirecrackerRuntime(t *testing.T) {
 	if len(fireRT.snapshotRefs) != 1 || fireRT.snapshotRefs[0] != sb.ID {
 		t.Fatalf("firecracker snapshot refs = %v, want [%s]", fireRT.snapshotRefs, sb.ID)
 	}
-	if len(fireRT.snapshotNames) != 1 || fireRT.snapshotNames[0] != "e2b/fc:default" {
-		t.Fatalf("firecracker snapshot names = %v, want [e2b/fc:default]", fireRT.snapshotNames)
+	// The runtime commits under the snapshot's own tag, not its name.
+	if want := docker.SnapshotImageTag("e2b/fc:default"); len(fireRT.snapshotNames) != 1 || fireRT.snapshotNames[0] != want || snapshot.Image != want {
+		t.Fatalf("firecracker snapshot names = %v, image %q; want [%s]", fireRT.snapshotNames, snapshot.Image, want)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/distribution/reference"
 )
@@ -39,16 +40,35 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 	if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "acme-outer", Image: "acme-later"}); err != nil {
 		t.Fatal(err)
 	}
-	// Globex later takes the name the chain ends on. Its image is Globex's,
-	// so the chain no longer resolves for acme, however many hops lead to
-	// it or how many times the request is normalized.
-	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{Name: "not-yet", Image: "not-yet", OwnerRef: "globex", CreatedAt: time.Now().UTC()}); err != nil {
+	// Globex later commits a snapshot under the name the chain ends on, the
+	// way snapshots were committed before they had tags of their own: the
+	// local image under that name is now Globex's, so the chain no longer
+	// resolves for acme, however many hops lead to it or how many times the
+	// request is normalized.
+	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{Name: "not-yet", Image: "not-yet", SourceSandboxID: "sb-globex", OwnerRef: "globex", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	for _, image := range []string{"acme-outer", "acme-later", "not-yet"} {
 		if _, err := normalize(acme, image); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("acme create from %q = %v; want not found", image, err)
 		}
+	}
+	// A snapshot committed now keeps its image under its own tag, so the
+	// name stays an ordinary image to everyone else: acme's chain ends on
+	// the name, never on Globex's image.
+	if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "acme-later-2", Image: "not-yet-2"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.CreateSnapshotWithOwnership(userCtx("globex"), "sb-globex", models.CreateSandboxSnapshotRequest{Name: "not-yet-2"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, image := range []string{"acme-later-2", "not-yet-2"} {
+		if req, err := normalize(acme, image); err != nil || req.Image != "not-yet-2" {
+			t.Fatalf("acme create from %q = %q, %v; want the ordinary image not-yet-2", image, req.Image, err)
+		}
+	}
+	if req, err := normalize(userCtx("globex"), "not-yet-2"); err != nil || req.Image != docker.SnapshotImageTag("not-yet-2") {
+		t.Fatalf("globex create from its snapshot = %q, %v", req.Image, err)
 	}
 
 	// A chain through one's own snapshots resolves to the committed image,
@@ -65,8 +85,8 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 		t.Fatal(err)
 	}
 	req, err := normalize(acme, "acme-alias-2")
-	if err != nil || req.Image != "acme-commit" || req.ImageDistributionMode != models.ImageDistributionLocalOnly {
-		t.Fatalf("own chain = %+v, %v; want acme-commit, local only", req, err)
+	if err != nil || req.Image != docker.SnapshotImageTag("acme-commit") || req.ImageDistributionMode != models.ImageDistributionLocalOnly {
+		t.Fatalf("own chain = %+v, %v; want acme-commit's image, local only", req, err)
 	}
 	again := req
 	if err := svc.NormalizeCreateImageDistribution(acme, &again); err != nil || again.Image != req.Image || again.ImageDistribution() != req.ImageDistribution() {
