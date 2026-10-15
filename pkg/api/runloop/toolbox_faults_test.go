@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -50,7 +51,7 @@ func TestSubmitFailureKeepsTheClaimUnlessRefused(t *testing.T) {
 		body := `{"command":"echo x","command_id":"s0"}`
 		expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute", body, nil), http.StatusBadRequest)
 		ref := execRef{session: plainSession(devbox.ID, "s0")}
-		if _, err := env.svc.GetIdempotentRequest(context.Background(), execLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
+		if _, err := env.svc.GetIdempotentRequest(context.Background(), service.ExecLedgerScope, ledgerKey(devbox.ID, ref)); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("claim after a refused session = %v; want it released", err)
 		}
 		env.toolbox.clearFaults()

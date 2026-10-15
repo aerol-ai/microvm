@@ -810,6 +810,17 @@ type Client interface {
 	PutVolumeAttachments(ctx context.Context, attachments []models.VolumeAttachment) error
 	DeleteVolumeAttachmentsForSandbox(ctx context.Context, sandboxID, incarnationID string) error
 
+	// RegisterSnapshotNode records which node holds a snapshot's image, so a
+	// snapshot-by-id GET/DELETE that lands on another node can be routed to it.
+	// Idempotent and move-safe (re-register overwrites). ForgetSnapshotNode
+	// drops the entry on delete. SnapshotHomeNode resolves the holder, or
+	// returns ok=false when there is no entry (serve locally). Snapshots live in
+	// per-node SQLite with no node column, so this replicated index is the only
+	// cluster-wide home lookup.
+	RegisterSnapshotNode(ctx context.Context, snapshotName, nodeID string) error
+	ForgetSnapshotNode(ctx context.Context, snapshotName string) error
+	SnapshotHomeNode(ctx context.Context, snapshotName string) (string, bool, error)
+
 	// RemoveMember explicitly removes nodeID from the raft configuration after
 	// marking it drained and orphaning any placements it owned. Unknown raft
 	// members return ErrUnknownMember. Live members require force=true so an

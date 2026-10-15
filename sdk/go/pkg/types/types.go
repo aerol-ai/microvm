@@ -21,6 +21,22 @@ type ExposedPort = models.ExposedPort
 type ExposeResult = models.ExposePortResponse
 type SandboxSnapshot = models.SandboxSnapshot
 
+// SnapshotList is one page of ListSnapshots. HasMore mirrors the wire
+// `has_more` flag — true when more snapshots remain after this page, so a
+// caller can keep paging by passing the last name as StartingAfter.
+type SnapshotList struct {
+	Snapshots []SandboxSnapshot `json:"snapshots"`
+	HasMore   bool              `json:"has_more"`
+}
+
+// ListSnapshotsOptions pages ListSnapshots by name. Both fields are optional:
+// Limit caps the page size and StartingAfter is the exclusive name cursor —
+// pass the last name of the previous page to fetch the next one.
+type ListSnapshotsOptions struct {
+	Limit         int
+	StartingAfter string
+}
+
 // Template is the server's Firecracker rootfs template row. Re-exported
 // verbatim from pkg/models so the SDK stays aligned with the wire format.
 type Template = models.Template

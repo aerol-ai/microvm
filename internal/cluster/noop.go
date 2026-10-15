@@ -112,6 +112,17 @@ func (n *Noop) RemoveCustomDomain(ctx context.Context, sandboxID, hostname strin
 func (n *Noop) CustomDomainsOf(sandboxID string) []string          { return nil }
 func (n *Noop) ResolveCustomDomain(hostname string) (string, bool) { return "", false }
 
+// Snapshot-home routing is a cluster concern; single-node serves every snapshot
+// locally, so the index writes are no-ops and the lookup always says "not
+// found" (serve locally — the local SQLite row is the sole source of truth).
+func (n *Noop) RegisterSnapshotNode(_ context.Context, snapshotName, nodeID string) error {
+	return nil
+}
+func (n *Noop) ForgetSnapshotNode(_ context.Context, snapshotName string) error { return nil }
+func (n *Noop) SnapshotHomeNode(_ context.Context, snapshotName string) (string, bool, error) {
+	return "", false, nil
+}
+
 func (n *Noop) DeletePlacement(_ context.Context, sandboxID string) error {
 	n.volMu.Lock()
 	defer n.volMu.Unlock()

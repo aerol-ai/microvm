@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -22,7 +23,7 @@ func TestWatcherSettlesLedgerWhenSessionIsGone(t *testing.T) {
 	if _, _, err := env.h.claimLedger(ctx, key); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.svc.SetIdempotentRequestTarget(ctx, execLedgerScope, key, execOutcome{Exit: 4}.encode()); err != nil {
+	if err := env.svc.SetIdempotentRequestTarget(ctx, service.ExecLedgerScope, key, service.ExecOutcome{Exit: 4}.Encode()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -64,7 +65,7 @@ func TestReadersFallBackToTheLedger(t *testing.T) {
 		if r.URL.Path == logsPath {
 			key := ledgerKey(devbox.ID, ref)
 			_, _, _ = env.h.claimLedger(ctx, key)
-			_ = env.h.completeLedger(ctx, key, execOutcome{Exit: 9, StdoutLen: 3}.encode())
+			_ = env.h.completeLedger(ctx, key, service.ExecOutcome{Exit: 9, StdoutLen: 3}.Encode())
 		}
 	})
 	env.toolbox.setFailNext(logsPath, http.StatusNotFound)

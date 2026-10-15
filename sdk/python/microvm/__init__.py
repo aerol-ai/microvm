@@ -32,6 +32,7 @@ from .types import (
     MicroVMConfig,
     RetryConfig,
     SandboxSnapshot,
+    SnapshotList,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     "MicroVMConfig",
     "RetryConfig",
     "SandboxSnapshot",
+    "SnapshotList",
 ]

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
 )
 
@@ -348,10 +349,10 @@ func TestLedgerFaultsHitOnlyTheirWrite(t *testing.T) {
 	run := map[string]func(fingerprint string) error{
 		"claim": func(fp string) error { _, _, err := env.h.claimLedger(ctx, fp); return err },
 		"outcome": func(fp string) error {
-			return env.svc.SetIdempotentRequestTarget(ctx, execLedgerScope, fp, execOutcome{}.encode())
+			return env.svc.SetIdempotentRequestTarget(ctx, service.ExecLedgerScope, fp, service.ExecOutcome{}.Encode())
 		},
-		"complete": func(fp string) error { return env.h.completeLedger(ctx, fp, execOutcome{}.encode()) },
-		"release":  func(fp string) error { return env.svc.DeleteIdempotentRequest(ctx, execLedgerScope, fp) },
+		"complete": func(fp string) error { return env.h.completeLedger(ctx, fp, service.ExecOutcome{}.Encode()) },
+		"release":  func(fp string) error { return env.svc.DeleteIdempotentRequest(ctx, service.ExecLedgerScope, fp) },
 	}
 	for _, fault := range steps {
 		clear := failLedger(t, env.store, fault)

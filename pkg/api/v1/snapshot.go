@@ -2,10 +2,13 @@ package v1
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
+	"github.com/aerol-ai/microvm/pkg/api/clusterroute"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -88,4 +91,75 @@ func (h *handlers) registerSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusCreated, registered)
+}
+
+// snapshotListResponse is the v1-native page shape for GET /v1/snapshots. It
+// pages in the store (keyset by name), so a list costs one bounded range scan
+// however large the catalogue is — never a whole-table read.
+type snapshotListResponse struct {
+	Snapshots []*models.SandboxSnapshot `json:"snapshots"`
+	HasMore   bool                      `json:"has_more"`
+}
+
+// listSnapshots is GET /v1/snapshots — one name-ordered page of the caller's
+// snapshots. starting_after is the exclusive name cursor; limit caps the page.
+func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			apihttp.WriteError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = n
+	}
+	limit = min(limit, clusterlist.MaxPageLimit)
+	after := strings.TrimSpace(r.URL.Query().Get("starting_after"))
+
+	// Read one extra row to decide has_more without a second count query.
+	rows, err := h.deps.Service.ListSnapshotPage(r.Context(), "", "", after, limit+1)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	snapshots := make([]*models.SandboxSnapshot, 0, len(rows))
+	for _, row := range rows {
+		snapshots = append(snapshots, row.Snapshot)
+	}
+	apihttp.WriteJSON(w, http.StatusOK, snapshotListResponse{Snapshots: snapshots, HasMore: hasMore})
+}
+
+// getSnapshot is GET /v1/snapshots/{id} — a snapshot looked up by name (or
+// image id). The route is wrapped so a cluster request reaches the node that
+// holds the image (B6); on a single node it reads the local store.
+func (h *handlers) getSnapshot(w http.ResponseWriter, r *http.Request) {
+	snapshot, err := h.deps.Service.GetSnapshot(r.Context(), r.PathValue("id"))
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	apihttp.WriteJSON(w, http.StatusOK, snapshot)
+}
+
+// deleteSnapshot is DELETE /v1/snapshots/{id}. Deleting a missing snapshot is a
+// 404 (via ErrNotFound); a successful delete is 204. Wrapped for home-node
+// routing so the image is removed on the node that holds it (B6).
+func (h *handlers) deleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if err := h.deps.Service.DeleteSnapshot(r.Context(), r.PathValue("id")); err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// snapshotForwardWrap routes a v1 snapshot-by-id request to the node holding the
+// image (B6). A v1 snapshot id is its name, so the resolver is the path value.
+func (h *handlers) snapshotForwardWrap(local http.Handler) http.Handler {
+	return clusterroute.WrapSnapshot(h.deps.Service, func(r *http.Request) string {
+		return r.PathValue("id")
+	}, apihttp.WriteError, local)
 }

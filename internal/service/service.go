@@ -3638,6 +3638,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
+	s.registerSnapshotHome(ctx, snapshot.Name)
 	return snapshot, nil
 }
 
@@ -3707,6 +3708,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
+	s.registerSnapshotHome(ctx, snapshot.Name)
 	return snapshot, true, nil
 }
 
@@ -3942,6 +3944,40 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 	return s.store.CountSnapshots(ctx, owner, scoped, sourceSandboxID)
 }
 
+// registerSnapshotHome records, best-effort, that this node holds the snapshot's
+// image, so a snapshot-by-id GET/DELETE that lands on another node can be routed
+// here (B6). A snapshot lives in per-node SQLite with no node column, so the
+// replicated name → node index is the only cluster-wide home lookup. A failure
+// costs only routing — the snapshot is still usable locally and a re-register
+// would fix it — so it never fails the create. It is a no-op single-node (the
+// Noop client). The write detaches from the request context so a client that
+// disconnected right after the commit still gets the snapshot registered.
+func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	self := c.SelfNodeID()
+	if self == "" {
+		return
+	}
+	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), name, self); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
+	}
+}
+
+// forgetSnapshotHome drops the snapshot's home entry after it is deleted.
+// Best-effort: a stale entry is also swept when its node leaves the cluster.
+func (s *Service) forgetSnapshotHome(ctx context.Context, name string) {
+	c := s.Cluster()
+	if c == nil {
+		return
+	}
+	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), name); err != nil && s.logger != nil {
+		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
+	}
+}
+
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if strings.TrimSpace(idOrName) == "" {
 		return store.ErrNotFound
@@ -3973,7 +4009,11 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	default:
 		s.schedulePendingImageGC(ctx, "", snapshot.Image)
 	}
-	return s.store.DeleteSnapshot(ctx, snapshot.Name)
+	if err := s.store.DeleteSnapshot(ctx, snapshot.Name); err != nil {
+		return err
+	}
+	s.forgetSnapshotHome(ctx, snapshot.Name)
+	return nil
 }
 
 // snapshotOwnsImage reports a snapshot whose image was committed for it:

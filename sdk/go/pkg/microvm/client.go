@@ -446,6 +446,26 @@ func (c *Client) RegisterSnapshotFromImage(ctx context.Context, name string, ima
 	return c.RegisterSnapshot(ctx, opts)
 }
 
+// GetSnapshot reads one named snapshot's metadata. Returns ErrNotFound (404)
+// when no snapshot by that name exists.
+func (c *Client) GetSnapshot(ctx context.Context, name string) (sdktypes.SandboxSnapshot, error) {
+	return c.inner.GetSnapshot(ctx, name)
+}
+
+// ListSnapshots reads one page of your snapshots ordered by name. Pass
+// opts.Limit to cap the page and opts.StartingAfter (the last name of the
+// previous page) to keep paging while the returned SnapshotList.HasMore is
+// true.
+func (c *Client) ListSnapshots(ctx context.Context, opts sdktypes.ListSnapshotsOptions) (sdktypes.SnapshotList, error) {
+	return c.inner.ListSnapshots(ctx, opts)
+}
+
+// DeleteSnapshot removes a named snapshot. Returns ErrNotFound (404) when no
+// snapshot by that name exists.
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
+	return c.inner.DeleteSnapshot(ctx, name)
+}
+
 func (c *Client) Destroy(ctx context.Context, id string) error {
 	return c.inner.Destroy(ctx, id)
 }
