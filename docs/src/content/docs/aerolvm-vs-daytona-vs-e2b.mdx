@@ -7,36 +7,36 @@ import { Aside } from '@astrojs/starlight/components';
 
 Daytona and E2B are two other products that run code in sandboxes. This page compares them with AerolVM, and explains why we built AerolVM.
 
-The Daytona and E2B columns describe those products as we understood them when we wrote this page. Check their own docs for the latest.
+The Daytona and E2B columns come from their own docs and code repositories, as we read them in October 2026. Check their docs for the latest.
 
 ## Side by side
 
 | | AerolVM | E2B | Daytona |
 |---|---|---|---|
-| **Where it runs** | Your own servers, or a managed multi-tenant service | E2B's cloud (managed, no self-hosting) | Self-hosted |
-| **Setup effort** | Easy on one server | No self-hosting | Very hard, even on one server |
-| **Runs on your laptop** | ✅ | ✗ | ✗ |
-| **Open source** | ✅ | ✗ | ✅ |
-| **Main use** | AI agents and short-lived CI jobs | Running code for AI agents | Developer workspaces |
+| **Where it runs** | Your own servers, or a managed multi-tenant service | E2B's cloud, a deployment E2B runs in your cloud account, or one machine you run yourself (E2B Embed) | Daytona's cloud. Bring your own compute (BYOC) adds your own machines, still managed by Daytona's control plane. |
+| **Setup effort** | Easy on one server | One Linux machine with KVM, with Docker Compose. More than one machine needs a deployment from E2B. | Nothing to set up on Daytona's cloud. The public version you could host yourself is no longer maintained. |
+| **Runs on your laptop** | ✅ | Linux laptops with KVM only | ✗ |
+| **Open source** | ✅ MIT | ✅ Apache-2.0 | Only up to v0.190.0 (AGPL-3.0). Development moved to a private codebase in June 2026. |
+| **Main use** | AI agents and short-lived CI jobs | Running code for AI agents | Sandboxes for AI agents |
 | **Sandbox start time (median)** | V8 isolate about 4 ms · WASM about 22 ms · Firecracker about 34 ms · containers on containerd about 189 ms | About 200 ms | Under 90 ms |
-| **Isolation options** | Containers (Docker or containerd), gVisor, Firecracker virtual machines, WebAssembly (WASM), V8 isolates | Firecracker | Docker |
+| **Isolation options** | Containers (Docker or containerd), gVisor, Firecracker virtual machines, WebAssembly (WASM), V8 isolates | Firecracker | Containers by default. Linux and Windows virtual machines, and macOS on Apple hardware. |
 | **Serverless sandboxes** | ✅ WASM and V8 isolates, in the style of AWS Lambda or Cloudflare Workers | ✗ | ✗ |
-| **Extra security layers** | gVisor, Firecracker, the isolate jail, WASM sandboxing | Firecracker | ✗ |
-| **Port isolation** | ✅ | ✗ | ✗ |
-| **Persistent sandboxes** | ✅ | ✗ | ✅ |
-| **Longest sandbox life** | No limit | 1 day | No limit |
-| **Clusters of many servers** | ✅ Shared placement records kept by Raft. Separate server, worker and ingress roles. | Managed for you (details not public) | ✗ |
-| **Failover when a server dies** | ✅ Copied placement records, detection of dead servers, and [reconcile](/reconcile/) (repair when the records and the running sandboxes disagree) | Managed for you | ✗ |
-| **Works with existing Daytona and E2B SDKs** | ✅ Compatibility APIs at `/daytona` and `/e2b`. You change the server URL, not your code. | ✗ | ✗ |
-| **Terminal sessions you can reconnect to** | ✅ Reconnect and see the output you missed | ✗ | ✗ |
-| **Cloud storage mounts** | S3, NFS, SSHFS, rclone | ✗ | ✗ |
-| **GPUs** | ✅ | ✗ | ✗ |
+| **Extra security layers** | gVisor, Firecracker, the isolate jail, WASM sandboxing | Firecracker | Virtual machine sandboxes |
+| **Port isolation** | ✅ | A sandbox's URLs can require a token (`allowPublicTraffic: false`) | Preview URLs need a token unless the sandbox is public |
+| **Persistent sandboxes** | ✅ | ✅ Pausing keeps the files and the memory | ✅ |
+| **Longest sandbox life** | No limit | No limit while paused. On E2B's cloud, up to 24 hours running at a stretch on the Pro plan, 1 hour on Hobby. | No limit |
+| **Clusters of many servers** | ✅ Shared placement records kept by Raft. Separate server, worker and ingress roles. | E2B's cloud, or a deployment E2B runs in your cloud account. E2B Embed is one machine. | Daytona's cloud, plus your own machines through BYOC |
+| **Failover when a server dies** | ✅ Copied placement records, detection of dead servers, and [reconcile](/reconcile/) (repair when the records and the running sandboxes disagree) | Managed for you | Not described in their docs |
+| **Works with existing Daytona, E2B and Runloop SDKs** | ✅ Compatibility APIs at `/daytona`, `/e2b` and `/runloop`. You change the server URL, not your code. | ✗ | ✗ |
+| **Terminal sessions you can reconnect to** | ✅ Reconnect and see the output you missed | Reconnect to a running command | Reconnect to a named terminal (PTY) session |
+| **Cloud storage mounts** | S3, NFS, SSHFS, rclone | Volumes. Buckets through FUSE in a custom template. | S3, Cloudflare R2, Google Cloud Storage, Azure Blob and more |
+| **GPUs** | ✅ | ✗ | ✅ NVIDIA and AMD |
 | **Raw TCP ports** | ✅ | ✗ | ✗ |
 | **TLS ports routed by hostname (SNI)** | ✅ | ✗ | ✗ |
-| **SSH access** | ✅ An Ed25519 key per sandbox, through a gateway | ✗ | ✅ |
-| **Outbound traffic rules per sandbox** | ✅ | ✗ | ✗ |
+| **SSH access** | ✅ An Ed25519 key per sandbox, through a gateway | Through a WebSocket proxy you add to a template | ✅ |
+| **Outbound traffic rules per sandbox** | ✅ | ✅ Allow and deny lists, including domain names | ✅ Block all, or allow lists of IP ranges and domain names |
 | **Network data caps per sandbox** | ✅ Byte limits for traffic in and out. Traffic is dropped once a limit is reached. | ✗ | ✗ |
-| **Tags for multi-tenant apps** | ✅ Filter the sandbox list by tags. A sandbox must match every tag you pass. | ✗ | ✗ |
+| **Tags for multi-tenant apps** | ✅ Filter the sandbox list by tags. A sandbox must match every tag you pass. | ✅ Metadata, with list filters | ✅ Labels, with list filters |
 | **Port allowlist** | ✅ Public traffic reaches a port only after you expose it | ✗ | ✗ |
 | **SDK languages** | TypeScript, Python, Go, Rust, Java | TypeScript, Python | TypeScript, Python, Ruby, Go, Java |
 | **Cost per month for 100 sandboxes running at once** (2 vCPU, 4 GB RAM and 16 GB disk each) | About $4,000 ([see the math](#how-we-worked-out-the-cost)) | About $12,000 | About $12,000 |
@@ -113,46 +113,47 @@ The 16 GB of disk per sandbox costs extra, but compute is the main cost here.
 
 ## AerolVM vs E2B
 
-E2B is a managed cloud service built for AI agent sandboxes. It is the fastest way to start if you do not want to run any servers. But the trade-offs add up:
+E2B is a cloud service built for AI agent sandboxes. It is the fastest way to start if you do not want to run any servers. Its runtime is open source (Apache-2.0), and E2B Embed runs the whole stack on one machine you own. The trade-offs:
 
-- **No self-hosting.** Your code, your customers' code and your data all run on E2B's servers. That rules out regulated workloads, air-gapped networks (networks with no link to the internet) and running in your own cloud account.
-- **You pay per sandbox-hour.** Cost grows with every sandbox you run. A team running more than 1,000 sandboxes can pay over $500 a month on E2B. With AerolVM, the same team could pay about $20 a month for one server.
-- **A one-day limit.** E2B sandboxes end after 1 day. AerolVM sandboxes have no time limit, and you can stop and start them without losing their files.
-- **Missing features.** E2B has no GPUs, cloud storage mounts, SSH, TCP ports, per-sandbox outbound traffic rules, network data caps or tags.
+- **Self-hosting stops at one machine.** E2B Embed runs on a single Linux host. Past one machine, E2B runs a dedicated deployment in your cloud account for you. AerolVM's clusters are part of the open-source server.
+- **Every host needs KVM.** Every E2B sandbox is a Firecracker virtual machine, so E2B needs Linux with KVM, the Linux feature for running virtual machines. That rules out macOS laptops, and cloud servers without KVM, such as standard AWS types like `t3` and `m5`. AerolVM's container and gVisor sandboxes need no KVM, and containers also run on macOS for local work.
+- **You pay per sandbox-second on E2B's cloud.** Cost grows with every sandbox you run. A team running more than 1,000 sandboxes can pay over $500 a month on E2B. With AerolVM, the same team could pay about $20 a month for one server.
+- **A limit on running time.** On E2B's cloud, a sandbox runs for at most 24 hours at a stretch on the Pro plan, and 1 hour on Hobby. Then it has to be paused, which keeps its files and memory. AerolVM sandboxes have no time limit.
+- **Missing features.** E2B has no GPUs, raw TCP ports, TLS ports routed by hostname or network data caps.
 
 **Already using the E2B SDK?** AerolVM has an `/e2b` compatibility API. Set three environment variables so the E2B SDK talks to your AerolVM server, and keep your code. See [Use the E2B SDK](/using-e2b-sdk/).
 
-AerolVM covers the same AI use case on your own servers. You get stronger isolation for untrusted code, and a fixed server bill instead of metered billing.
+AerolVM covers the same AI use case on your own servers. You pick the isolation for each sandbox, from containers to Firecracker, and pay a fixed server bill instead of metered billing.
 
 ## AerolVM vs Daytona
 
-Daytona focuses on long-lived developer workspaces: IDE integration, Git-based environments and dev containers. It is not built for the fast, frequent sandbox creation that AI agents need.
+Daytona runs sandboxes for AI agents as a cloud service. Sandboxes are containers by default, with virtual machine, GPU and macOS sandboxes as options.
 
-- **Start time.** AerolVM creates a Firecracker sandbox in about 34 ms and a V8 isolate in about 4 ms, measured inside the server. Plain containers take about 189 ms. That is the gap between an agent waiting on servers and an agent running code.
-- **Setup.** Daytona is hard to self-host. It has many parts, needs extra infrastructure and takes ongoing upkeep. AerolVM installs with a one-line script.
-- **Isolation.** Daytona has no kernel-level isolation, no per-sandbox outbound traffic rules and no port allowlist. It assumes you trust the people using your workspaces. AerolVM assumes you do not trust the code running inside the sandbox.
-- **Built for people, not programs.** Daytona's SDK and features suit humans editing code in an IDE. AerolVM's SDKs (TypeScript, Python, Go, Rust, Java) suit programs that create many sandboxes.
+- **No longer open source.** In June 2026 Daytona moved its core development to a private codebase. Its public repository stopped at v0.190.0 (AGPL-3.0) and gets no more fixes. AerolVM is MIT-licensed and developed in the open.
+- **Your machines, Daytona's control plane.** Bring your own compute (BYOC) runs sandboxes on your own machines, but Daytona's control plane still manages them. AerolVM runs entirely on your servers, from one binary, and installs with a one-line script.
+- **More isolation choices.** Daytona offers containers and virtual machines. AerolVM adds gVisor, WASM and V8 isolates. Its outbound rules can also limit a site to some methods and paths, keep an API key out of the sandbox, and let only some programs connect. See [Advanced network rules](/advanced-network-rules/).
 
 **Already using the Daytona SDK?** AerolVM has a `/daytona` compatibility API. Point the Daytona SDK at `https://your-host/daytona`, use your AerolVM token, and keep your code. See [Use the Daytona SDK](/using-daytona-sdk/).
 
-Both compatibility APIs sit in front of the same sandbox service as AerolVM's own API.
+All three compatibility APIs sit in front of the same sandbox service as AerolVM's own API.
 
 ```mermaid
 flowchart TB
     A["AerolVM SDKs"] -- "/v1" --> S["One sandbox service<br/>on your AerolVM server"]
     D["Daytona SDK"] -- "/daytona" --> S
     E["E2B SDK"] -- "/e2b" --> S
+    L["Runloop SDK"] -- "/runloop" --> S
     S --> R["Your sandboxes"]
 ```
 
 - Each compatibility API turns the other SDK's calls into AerolVM's own sandbox calls.
-- All three APIs are served by the same AerolVM server. There is no separate Daytona or E2B server to run.
+- All four APIs are served by the same AerolVM server. There is no separate Daytona, E2B or Runloop server to run.
 
-If developers SSH into one long-lived workspace a day, Daytona is a reasonable fit. If an agent starts 10,000 sandboxes an hour, runs untrusted code and deletes them, AerolVM is built for that.
+If you want a hosted service with virtual machine, GPU and macOS sandboxes and no servers to run, Daytona is a reasonable fit. If you need the whole stack on your own servers, under an open-source license, AerolVM is built for that.
 
 ## Growing past one server
 
-E2B (managed) and AerolVM are both built for heavy sandbox traffic. Daytona is not. The difference from E2B is how you grow. With AerolVM you run a [cluster](/cluster-setup/) on your own servers, instead of paying per sandbox-hour on someone else's.
+E2B, Daytona and AerolVM are all built for heavy sandbox traffic. The difference is who runs the servers. With AerolVM you run a [cluster](/cluster-setup/) on your own servers, instead of paying a vendor for every sandbox you run.
 
 - **Shared placement records.** Raft keeps a copy of where each sandbox lives on every `server` node. Any `server` node can answer "where is sandbox X?" without asking the leader.
 - **Separate roles.** Each server takes one or more roles: `server` (keeps the Raft records and votes), `worker` (runs sandboxes) or `ingress` (holds the public route table). You keep 3 or 5 `server` nodes however many workers you add. Kubernetes splits control-plane nodes from worker nodes the same way. See [Ingress nodes](/cluster-ingress/).
@@ -210,4 +211,4 @@ So we built AerolVM: a sandbox system you run on your own servers, with strong i
 - [Quickstart](/quick-start/): run your first sandbox in about five minutes.
 - [Choose a setup](/getting-started/): your computer, one server, or a cluster.
 - [Create and manage sandboxes](/sandboxes/): every option for creating a sandbox.
-- [Use the E2B SDK](/using-e2b-sdk/) or [Use the Daytona SDK](/using-daytona-sdk/): move existing code to AerolVM.
+- [Use the E2B SDK](/using-e2b-sdk/), [Use the Daytona SDK](/using-daytona-sdk/) or [Use the Runloop SDK](/using-runloop-sdk/): move existing code to AerolVM.

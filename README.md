@@ -50,37 +50,37 @@ AerolVM provides a complete surface for building sandbox-backed products and age
 
 ## Why AerolVM
 
-AerolVM beats the two most common alternatives on the axes that matter most for AI workloads: **isolation**, **cost**, and **operational simplicity**.
+How AerolVM compares with the two most common alternatives on the axes that matter most for AI workloads: **isolation choices**, **cost**, and **running it yourself**. The e2b and Daytona columns come from their own docs and repositories, as of October 2026.
 
 | | AerolVM | e2b | Daytona |
 | :--- | :--- | :--- | :--- |
-| **Deployment** | ✅ Self-host (single binary, one-line install) or managed multi-tenant SaaS | ✗ Cloud only | ✅ Self-host (complex multi-component setup) |
-| **Runs locally** | ✅ `--local` flag, no DNS needed | ✗ | ✗ |
+| **Deployment** | ✅ Self-host (single binary, one-line install) or managed multi-tenant SaaS | E2B Cloud, a deployment E2B runs in your cloud account, or self-host on one machine (E2B Embed) | Daytona Cloud, plus your own runner machines (BYOC) under Daytona's control plane |
+| **Runs locally** | ✅ `--local` flag, no DNS needed | Linux hosts with KVM only (E2B Embed) | ✗ |
 | **Sandbox startup (server p50)** | Isolate ~4ms · WASM ~22ms · Firecracker ~34ms · containerd ~189ms | ~200ms | < 90ms |
-| **Runtime isolation** | ✅ OCI (containerd default) / gVisor / Firecracker / WASM / V8 isolate | Firecracker (microVM) | Docker only |
-| **Sandbox lifetime** | Unlimited | 1 day | Unlimited |
+| **Runtime isolation** | ✅ OCI (containerd default) / gVisor / Firecracker / WASM / V8 isolate | Firecracker (microVM) | Containers by default; Linux, Windows and macOS VMs |
+| **Sandbox lifetime** | Unlimited | Unlimited while paused; 24h running at a stretch on E2B Cloud Pro (1h Hobby) | Unlimited |
 | **Serverless / Workers-style sandboxes** | ✅ WASM + V8 isolate | ✗ | ✗ |
 | **TCP + TLS port routing** | ✅ | ✗ | ✗ |
-| **Per-sandbox egress control** | ✅ | ✗ | ✗ |
-| **External storage** | ✅ S3 / NFS / SSHFS / rclone | ✗ | ✗ |
-| **GPU support** | ✅ | ✗ | ✗ |
-| **HA cluster mode** | ✅ Raft + SWIM gossip | Managed (opaque) | ✗ |
-| **Drop-in SDK compat** | ✅ `/daytona` and `/e2b` facades | ✗ | ✗ |
+| **Per-sandbox egress control** | ✅ Domain allowlists, filtering DNS, method/path rules, credential injection | ✅ Allow/deny lists incl. domains | ✅ Block all, CIDR and domain allowlists |
+| **External storage** | ✅ S3 / NFS / SSHFS / rclone | Volumes; buckets via FUSE in a template | ✅ S3 / R2 / GCS / Azure Blob and more |
+| **GPU support** | ✅ | ✗ | ✅ NVIDIA and AMD |
+| **HA cluster mode** | ✅ Raft + SWIM gossip | Managed by E2B; Embed is one machine | Managed by Daytona (failover not documented) |
+| **Drop-in SDK compat** | ✅ `/daytona`, `/e2b` and `/runloop` facades | ✗ | ✗ |
 | **Price (100 × 2vCPU/4GB sandboxes/mo)** | ~$4,000 on your infra | ~$12,000 | ~$12,000 |
 | **SDK languages** | TS, Python, Go, Rust, Java | TS, Python | TS, Python, Ruby, Go, Java |
-| **Open source** | ✅ MIT | ✗ | ✅ AGPL |
+| **Open source** | ✅ MIT | ✅ Apache-2.0 | ✗ Public repo frozen at v0.190.0 (AGPL) in June 2026; development is private |
 
 [See the full comparison →](https://microvm.aerol.ai/comparison)
 
 ### vs e2b
 
-e2b is the fastest managed path if you want zero infrastructure, but it means your code runs on someone else's hardware with no self-hosting option, per-sandbox-hour billing that compounds fast at scale, a hard 1-day sandbox lifetime cap, and a single isolation model. AerolVM covers the same AI execution use case on infrastructure you own — pick OCI on containerd, gVisor, Firecracker, WASM, or V8 isolates — with predictable fixed-cost pricing.
+e2b is the fastest managed path if you want zero infrastructure. Its runtime is open source (Apache-2.0), and E2B Embed self-hosts the whole stack on one Linux machine with KVM; past one machine, E2B runs a dedicated deployment for you. On E2B Cloud you pay per sandbox-second, and a sandbox runs at most 24 hours at a stretch before it must be paused. Every e2b sandbox is a Firecracker microVM, so every host needs KVM. AerolVM covers the same AI execution use case on infrastructure you own, with clusters in the open-source server — pick OCI on containerd, gVisor, Firecracker, WASM, or V8 isolates per sandbox — with predictable fixed-cost pricing.
 
 > **Already on the e2b SDK?** AerolVM's `/e2b` API facade means your existing code keeps working - just point `E2B_API_URL` at your AerolVM host.
 
 ### vs Daytona
 
-Daytona targets long-lived developer workspaces, not high-frequency ephemeral agent workloads. It requires multi-component infrastructure that is genuinely difficult to self-host and has no kernel-level isolation, no per-sandbox egress control, and no port allowlist. AerolVM is a single binary you install in 60 seconds.
+Daytona now runs agent sandboxes as a cloud service: containers by default, with VM, GPU and macOS sandboxes. In June 2026 its core development moved to a private codebase, and the public AGPL repository is frozen at v0.190.0. Its BYOC option runs sandboxes on your machines, but Daytona's control plane still manages them. AerolVM is MIT-licensed and runs entirely on your servers as a single binary you install in 60 seconds.
 
 > **Already on the Daytona SDK?** AerolVM's `/daytona` API facade lets you swap the backend without touching your SDK code - just update `DAYTONA_API_URL`.
 
@@ -247,14 +247,15 @@ Full examples for Rust and Java are in the [SDK Setup docs](https://microvm.aero
 
 ### Drop-in SDK Compatibility
 
-If you are already running the e2b or Daytona SDK, AerolVM has API facades that accept their wire format unchanged:
+If you are already running the e2b, Daytona or Runloop SDK, AerolVM has API facades that accept their wire format unchanged:
 
 | Existing SDK | AerolVM facade endpoint | Migration |
 | :--- | :--- | :--- |
 | `e2b` Python / TypeScript | `/e2b/...` | Set `E2B_API_URL=https://your-aerolvm-host` |
 | `daytona` Python / TypeScript | `/daytona/...` | Set `DAYTONA_API_URL=https://your-aerolvm-host` |
+| Runloop Python / TypeScript | `/runloop/...` | Set `RUNLOOP_BASE_URL=https://your-aerolvm-host/runloop` |
 
-[Using the e2b SDK →](https://microvm.aerol.ai/using-e2b-sdk) · [Using the Daytona SDK →](https://microvm.aerol.ai/using-daytona-sdk)
+[Using the e2b SDK →](https://microvm.aerol.ai/using-e2b-sdk) · [Using the Daytona SDK →](https://microvm.aerol.ai/using-daytona-sdk) · [Using the Runloop SDK →](https://microvm.aerol.ai/using-runloop-sdk)
 
 ## Installation
 

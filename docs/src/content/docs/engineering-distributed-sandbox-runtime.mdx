@@ -258,9 +258,9 @@ This table compares every similar project I could find. It is my best reading at
 
 | Project | Self-hostable | Multi-node | Raw TCP | HA stateful | SDKs | Notes |
 |---|---|---|---|---|---|---|
-| **AerolVM** | yes | yes | yes | yes | TS/Py/Go/Rust/Java + E2B + Daytona facades | This project. |
-| **E2B** | partial (lags cloud) | no (managed only) | no | no | TS/Py | Strongest cloud product. Self-host is an afterthought. |
-| **Daytona** | yes (AGPL) | unclear in OSS | no | no | TS/Py | Pivoted from dev-environment to agent runtime; managed-first. |
+| **AerolVM** | yes | yes | yes | yes | TS/Py/Go/Rust/Java + E2B + Daytona + Runloop facades | This project. |
+| **E2B** | yes, one machine (E2B Embed, Apache-2.0) | managed, or a deployment E2B runs in your cloud | no | no | TS/Py | Strongest cloud product. The runtime is open source; more than one machine means a deployment from E2B. |
+| **Daytona** | only the old public version (AGPL-3.0, frozen at v0.190.0) | managed; your own machines through BYOC | no | no | TS/Py/Ruby/Go/Java | Agent runtime, managed-first. Core development went private in June 2026. |
 | **Northflank** | no (BYOC) | yes (managed) | partial (managed addons) | yes (managed addons) | platform, not SDK | Strong product, not an OSS self-host story. |
 | **Modal** | no | no | no | no | Py | GPU-first, managed-only. |
 | **Beam** | yes | unclear | no | no | Py | runc/gVisor based, OSS, GPU-friendly. |
