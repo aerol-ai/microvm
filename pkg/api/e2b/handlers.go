@@ -570,41 +570,31 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 	}
 	sandboxFilter := strings.TrimSpace(r.URL.Query().Get("sandboxID"))
 
-	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	// Page the caller's catalogue in the store with the E2B alias joined per
+	// row, instead of loading every tenant's snapshots and alias rows and
+	// filtering in Go (D9). The sandbox filter is pushed into the store scan.
+	pageRows, err := h.deps.Service.ListOwnedSnapshots(r.Context(), sandboxFilter, models.FacadeE2B)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
-	}
-	aliases, err := h.deps.Service.ListSnapshotAliases(r.Context(), models.FacadeE2B)
-	if err != nil {
-		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	// Index aliases by native snapshot name for the per-snapshot join below.
-	aliasesByName := make(map[string]models.SnapshotAlias, len(aliases))
-	for _, alias := range aliases {
-		aliasesByName[strings.TrimSpace(alias.SnapshotName)] = alias
 	}
 
 	type snapshotRow struct {
 		response  snapshotInfoResponse
 		createdAt time.Time
 	}
-	rows := make([]snapshotRow, 0, len(snapshots))
-	for _, snapshot := range snapshots {
+	rows := make([]snapshotRow, 0, len(pageRows))
+	for _, pageRow := range pageRows {
+		snapshot := pageRow.Snapshot
 		if snapshot == nil {
 			continue
 		}
-		if sandboxFilter != "" && snapshot.SourceSandboxID != sandboxFilter {
-			continue
-		}
-		alias, ok := aliasesByName[strings.TrimSpace(snapshot.Name)]
 		response := snapshotInfoResponse{
 			SnapshotID: snapshotIDFromName(snapshot.Name),
 			Names:      []string{canonicalSnapshotName(snapshot.Name)},
 		}
 		createdAt := snapshot.CreatedAt
-		if ok {
+		if alias := pageRow.Alias; alias != nil {
 			if strings.TrimSpace(alias.Alias) != "" {
 				response.SnapshotID = strings.TrimSpace(alias.Alias)
 			}

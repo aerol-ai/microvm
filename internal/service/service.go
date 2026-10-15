@@ -3906,6 +3906,35 @@ func (s *Service) ListSnapshotPage(ctx context.Context, sourceSandboxID, aliasFa
 	})
 }
 
+// snapshotOwnedScanBatch is the page size ListOwnedSnapshots reads per store
+// round trip. It is well under maxSnapshotPageRows (1000) so one owner's
+// catalogue comes back in a few bounded scans rather than one unbounded read.
+const snapshotOwnedScanBatch = 200
+
+// ListOwnedSnapshots returns every snapshot the caller may see — optionally
+// narrowed to one source sandbox and joined with one facade's alias rows — by
+// paging the store's owner-scoped range scan. It exists so a facade that needs
+// its own sort order or page-number pagination (Daytona, E2B) can materialize
+// just the caller's snapshots instead of calling ListSnapshots, which reads
+// every tenant's rows and filters in Go (D9). Rows come back in the store's
+// keyset order (name ASC); the caller re-sorts as its wire API requires. Pass
+// aliasFacade "" when the caller does not join aliases.
+func (s *Service) ListOwnedSnapshots(ctx context.Context, sourceSandboxID, aliasFacade string) ([]store.SnapshotPageRow, error) {
+	var out []store.SnapshotPageRow
+	after := ""
+	for {
+		rows, err := s.ListSnapshotPage(ctx, sourceSandboxID, aliasFacade, after, snapshotOwnedScanBatch)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
+		if len(rows) < snapshotOwnedScanBatch {
+			return out, nil
+		}
+		after = rows[len(rows)-1].Snapshot.Name
+	}
+}
+
 // CountSnapshots counts the snapshots ListSnapshotPage would walk for the
 // caller with the same source filter.
 func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (int, error) {
