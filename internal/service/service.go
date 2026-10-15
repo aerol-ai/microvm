@@ -4773,6 +4773,16 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if err != nil {
 		return ToolboxEndpoint{}, err
 	}
+	// A stopped sandbox has no live toolbox. Only Firecracker clears ContainerIP
+	// on stop, so for Docker/containerd a stale ContainerIP would otherwise be
+	// dialed — and that address may have been reassigned to another container,
+	// which would then receive this sandbox's toolbox token (S12). Gate on the
+	// running state, which every caller has already ensured via
+	// EnsureSandboxAwakeForHTTP (a serverless sandbox is woken first; a
+	// manually-stopped one errors there). ErrSandboxNotRunning classifies to 409.
+	if sandbox.Status != models.SandboxStatusStarted {
+		return ToolboxEndpoint{}, ErrSandboxNotRunning
+	}
 	if sandbox.ContainerIP == "" {
 		return ToolboxEndpoint{}, errors.New("sandbox container IP is not available")
 	}
