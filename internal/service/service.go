@@ -4773,6 +4773,14 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 	if err != nil {
 		return ToolboxEndpoint{}, err
 	}
+	return s.toolboxEndpointForSandbox(ctx, sandbox)
+}
+
+// toolboxEndpointForSandbox builds the toolbox endpoint from an already-fetched,
+// owner-scoped sandbox. The toolbox dispatchers pass the sandbox the wake helper
+// already read, so the network path avoids re-reading the row (D15); it does not
+// touch the sandbox (ToolboxTarget and the dispatchers' TouchSandbox own that).
+func (s *Service) toolboxEndpointForSandbox(ctx context.Context, sandbox *models.Sandbox) (ToolboxEndpoint, error) {
 	// A stopped sandbox has no live toolbox. Only Firecracker clears ContainerIP
 	// on stop, so for Docker/containerd a stale ContainerIP would otherwise be
 	// dialed — and that address may have been reassigned to another container,
@@ -4794,6 +4802,16 @@ func (s *Service) ToolboxTarget(ctx context.Context, id string) (ToolboxEndpoint
 		URL:   "http://" + addr,
 		Token: sandbox.ToolboxToken,
 	}, nil
+}
+
+// toolboxEndpointForActiveCall is the dispatcher entry: it touches the sandbox
+// (coalesced last-active write) and builds the endpoint from the sandbox the
+// dispatcher already read, skipping ToolboxTarget's re-read (D15).
+func (s *Service) toolboxEndpointForActiveCall(ctx context.Context, sandbox *models.Sandbox) (ToolboxEndpoint, error) {
+	if err := s.TouchSandbox(ctx, sandbox.ID); err != nil {
+		return ToolboxEndpoint{}, err
+	}
+	return s.toolboxEndpointForSandbox(ctx, sandbox)
 }
 
 // toolboxAddress is the host:port sandboxd dials for the sandbox's toolboxd:
