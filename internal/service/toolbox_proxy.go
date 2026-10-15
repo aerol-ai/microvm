@@ -8,10 +8,12 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	pathpkg "path"
 	"strings"
 
 	isolateruntime "github.com/aerol-ai/microvm/internal/runtime/isolate"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -23,6 +25,9 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	// operator join the edge and owner halves of one forwarded SSH session.
 	if fid := r.Header.Get("X-Aerol-Ssh-Forward-Id"); fid != "" && s.logger != nil {
 		s.logger.Info("ssh forward: owner serving session", "sandbox_id", sandboxID, "forward_id", fid, "path", path)
+	}
+	if err := refuseToolboxAdminPath(path); err != nil {
+		return err
 	}
 	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
 		return err
@@ -92,8 +97,24 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	return nil
 }
 
+// refuseToolboxAdminPath answers not found for toolboxd's /admin endpoints.
+// They are the daemon's own controls (the port allowlist behind the
+// sandbox's public proxy route), reached with the toolbox token; the toolbox
+// proxies attach that token for every caller, so without this any caller
+// who may reach a sandbox's toolbox could change what the daemon set.
+func refuseToolboxAdminPath(toolboxPath string) error {
+	clean := pathpkg.Clean("/" + strings.TrimSpace(toolboxPath))
+	if clean == "/admin" || strings.HasPrefix(clean, "/admin/") {
+		return fmt.Errorf("%w: toolbox path %q", store.ErrNotFound, toolboxPath)
+	}
+	return nil
+}
+
 // RoundTripToolbox performs an HTTP round trip to the sandbox toolbox.
 func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path string, query url.Values, body io.Reader, headers http.Header) (*http.Response, error) {
+	if err := refuseToolboxAdminPath(path); err != nil {
+		return nil, err
+	}
 	if _, err := s.EnsureSandboxAwakeForHTTP(ctx, sandboxID); err != nil {
 		return nil, err
 	}
