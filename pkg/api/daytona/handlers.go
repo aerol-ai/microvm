@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"math"
 	"net/http"
 	"os"
@@ -20,7 +19,6 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
-	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -56,38 +54,19 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 	serviceReq, freshlyBuiltImage, err := h.translateCreateSandboxRequest(r.Context(), req)
 	if err != nil {
 		clustercreate.CancelReservationBestEffort(context.Background(), h.deps.Service, h.deps.Logger, decision.ReservationID)
-		// Image-build failures are operational, not user-input errors:
-		// reporting them as 400 would mislead retry/alerting (a transient
-		// daemon hiccup looks identical to bad client input). Distinguish
-		// timeouts (504) and build/registry failures (502) from validation
-		// errors that fail before BuildImage is reached (400).
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
-		case errors.Is(err, errBuildOperational):
-			apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-		case errors.Is(err, models.ErrPlatformVolumesDisabled):
-			apihttp.WriteError(w, http.StatusPreconditionFailed, err.Error())
-		default:
-			apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-		}
+		// Build failures map like every surface's (service.BuildImage):
+		// 504/502 for the daemon's, 400 for the caller's.
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
 	response, err := clustercreate.CreateOnSelectedNode(r.Context(), h.deps.Service, h.deps.Logger, serviceReq, decision.ReservationID, clustercreate.CreateOptions{PromoteWithSpec: true})
 	if err != nil {
-		// If we built the image in this request and the create failed, the
-		// image is now orphaned: no sandbox row references it, so the normal
-		// reference-counted GC (service.maybeRemoveImage on destroy) will
-		// never see it. Roll it back here so a build storm of failed creates
-		// doesn't fill the daemon's image store.
-		//
-		// Use context.Background so cancellation of r.Context() (e.g. client
-		// disconnect on the failure response) doesn't skip the cleanup.
-		if freshlyBuiltImage != "" && h.deps.Builder != nil {
-			if rmErr := h.deps.Builder.RemoveImage(context.Background(), freshlyBuiltImage); rmErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("daytona image rollback failed", "tag", freshlyBuiltImage, "error", rmErr)
-			}
+		// A build this request made is now orphaned: no sandbox row
+		// references it. Hand it back so a storm of failed creates does not
+		// fill the image store.
+		if freshlyBuiltImage != "" {
+			h.deps.Service.DiscardBuiltImage(r.Context(), freshlyBuiltImage)
 		}
 		// Native uniqueness constraint on sandboxes.name surfaces as
 		// ErrSandboxNameConflict — translate to Daytona's wire-shape
@@ -252,35 +231,9 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	var (
-		resolvedImage   string
-		freshlyBuiltTag string
-		err             error
-	)
-	if hasBuildInfo {
-		resolvedImage, freshlyBuiltTag, err = h.resolveBuildInfo(r.Context(), req.BuildInfo)
-		if err != nil {
-			// Mirror the createSandbox classification: timeouts and
-			// build/registry failures are operational (502/504); everything
-			// else is a 400 because it's a payload validation failure
-			// (e.g. contextHashes-without-flag).
-			switch {
-			case errors.Is(err, context.DeadlineExceeded):
-				apihttp.WriteError(w, http.StatusGatewayTimeout, err.Error())
-			case errors.Is(err, errBuildOperational):
-				apihttp.WriteError(w, http.StatusBadGateway, err.Error())
-			default:
-				apihttp.WriteError(w, http.StatusBadRequest, err.Error())
-			}
-			return
-		}
-	} else {
-		resolvedImage = imageName
-	}
-
 	snapshot := &models.SandboxSnapshot{
 		Name:       req.Name,
-		Image:      resolvedImage,
+		Image:      imageName,
 		Entrypoint: append([]string{}, req.Entrypoint...),
 		RegionID:   strings.TrimSpace(valueOrEmpty(req.RegionID)),
 		CPU:        float64(float32Value(req.CPU)),
@@ -288,16 +241,17 @@ func (h *handlers) createSnapshotFromImage(w http.ResponseWriter, r *http.Reques
 		MemoryMB:   int(float32Value(req.Memory)) * 1024,
 		DiskGB:     int(float32Value(req.Disk)),
 	}
-	registered, err := h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	var registered *models.SandboxSnapshot
+	var err error
+	if hasBuildInfo {
+		registered, err = h.deps.Service.RegisterSnapshotFromDockerfile(r.Context(), snapshot, service.BuildImageRequest{
+			Dockerfile:    valueOrEmpty(req.BuildInfo.DockerfileContent),
+			ContextHashes: req.BuildInfo.ContextHashes,
+		})
+	} else {
+		registered, err = h.deps.Service.RegisterSnapshot(r.Context(), snapshot)
+	}
 	if err != nil {
-		// We may have just freshly built a tag that's now orphaned (no
-		// snapshot row pointing to it). Roll it back so the built-image
-		// janitor doesn't leak the layer.
-		if freshlyBuiltTag != "" && h.deps.Builder != nil {
-			if rbErr := h.deps.Builder.RemoveImage(r.Context(), freshlyBuiltTag); rbErr != nil && h.deps.Logger != nil {
-				h.deps.Logger.Warn("daytona snapshot rollback failed", "tag", freshlyBuiltTag, "error", rbErr)
-			}
-		}
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -1306,122 +1260,24 @@ func (h *handlers) createImage(ctx context.Context, req createSandboxRequest) (s
 	return "ubuntu:22.04", "", nil
 }
 
-// resolveBuildInfo turns a Daytona-shaped buildInfo payload into a runnable
-// local image reference. Three cases:
-//
-//  1. Single-line `FROM <image>` Dockerfile, no context  → return the bare
-//     image string; the runtime layer will `docker pull` it as usual. This
-//     preserves the legacy fast path for callers (Daytona SDK with a string
-//     image) that don't need a real build.
-//  2. Multi-line Dockerfile, no context                  → build locally with
-//     docker.Client.BuildImage; tag is content-addressed for idempotent
-//     retries.
-//  3. Any payload with contextHashes                     → gated behind the
-//     SB_IMAGE_BUILD_CONTEXT_ENABLED operator flag. With the flag off, we
-//     return a clear error pointing operators at the flag. With the flag on,
-//     a hash-resolved context tar is supplied to BuildImage (today that
-//     resolver is not wired — the flag returns "not yet implemented" so the
-//     contract is honored at the type level without misleading users).
-//
-// resolveBuildInfo returns (imageTag, freshlyBuiltTag, error). freshlyBuiltTag
-// is non-empty only when this call actually invoked BuildImage and produced
-// a new image (cache hits return the tag in the first slot only). Callers
-// use freshlyBuiltTag to roll back the image if the downstream sandbox
-// create fails — see createSandbox.
+// resolveBuildInfo builds a Daytona buildInfo payload through the service
+// (Service.BuildImage, with the single-line FROM shortcut): the same owner
+// rule, tag scheme and errors as every other build. It returns the image to
+// start and, when this call built it fresh, the tag a failed create hands
+// back with Service.DiscardBuiltImage.
 func (h *handlers) resolveBuildInfo(ctx context.Context, info *buildInfoRequest) (string, string, error) {
 	dockerfile := strings.TrimSpace(valueOrEmpty(info.DockerfileContent))
 	if dockerfile == "" {
 		return "", "", errors.New("buildInfo is only supported when dockerfileContent is present")
 	}
-	if base, ok := singleLineFromImage(dockerfile); ok && len(info.ContextHashes) == 0 {
-		return base, "", nil
-	}
-	if len(info.ContextHashes) > 0 {
-		if !h.deps.Build.ContextEnabled {
-			return "", "", errors.New("buildInfo.contextHashes requires operator-side context upload support (set SB_IMAGE_BUILD_CONTEXT_ENABLED=true on the daemon)")
-		}
-		// Context-resolver wiring is a separate piece of work (needs an
-		// object store + registry push). Fail loud so callers don't think
-		// their COPY/ADD steps silently no-op.
-		return "", "", errors.New("buildInfo.contextHashes is enabled but no context resolver is configured on this daemon")
-	}
-	if h.deps.Builder == nil {
-		return "", "", errors.New("multi-line buildInfo Dockerfiles require an image builder; daemon was started without one")
-	}
-
-	tag := docker.BuildTagFor(dockerfile, info.ContextHashes)
-	exists, err := h.deps.Builder.ImageExists(ctx, tag)
+	built, err := h.deps.Service.BuildImage(ctx, service.BuildImageRequest{Dockerfile: dockerfile, ContextHashes: info.ContextHashes, BaseShortcut: true})
 	if err != nil {
-		return "", "", fmt.Errorf("%w: check built image cache: %v", errBuildOperational, err)
+		return "", "", err
 	}
-	if exists {
-		// Bump LastTagTime so the built-image janitor doesn't GC a tag we
-		// just handed back to the caller. Best-effort: a refresh failure
-		// only narrows the GC window for this tag, so we log and continue.
-		if rtErr := h.deps.Builder.RefreshTag(ctx, tag); rtErr != nil && h.deps.Logger != nil {
-			h.deps.Logger.Warn("daytona build cache refresh-tag failed", "tag", tag, "error", rtErr)
-		}
-		return tag, "", nil
+	if built.Fresh {
+		return built.Image, built.Image, nil
 	}
-
-	buildCtx, cancel := buildContextWithTimeout(ctx, h.deps.Build.Timeout)
-	defer cancel()
-	logger := h.deps.Logger
-	err = h.deps.Builder.BuildImage(buildCtx, docker.BuildImageRequest{
-		Tag:               tag,
-		DockerfileContent: dockerfile,
-		OnLog: func(line string) {
-			if logger != nil {
-				logger.Debug("daytona build", "tag", tag, "line", line)
-			}
-		},
-	})
-	if err != nil {
-		// Surface DeadlineExceeded and the build-operational marker so the
-		// caller can return 504 / 502 instead of 400. Wrap with both: %w
-		// only chains one error, so emit a fmt.Errorf that errors.Is sees
-		// errBuildOperational; if the underlying err is DeadlineExceeded,
-		// the caller's first switch arm catches that via the chain.
-		if errors.Is(err, context.DeadlineExceeded) {
-			return "", "", fmt.Errorf("build image timed out: %w", err)
-		}
-		return "", "", fmt.Errorf("%w: build image: %v", errBuildOperational, err)
-	}
-	return tag, tag, nil
-}
-
-// errBuildOperational marks errors that originate from the local Docker
-// daemon (build, image inspect) rather than from caller validation. The
-// daytona createSandbox handler maps it to HTTP 502 so that retries and
-// alerting can distinguish "daemon is sad" from "client sent garbage".
-var errBuildOperational = errors.New("build operational error")
-
-// singleLineFromImage detects the legacy `FROM <image>` shape and returns
-// the base image when matched. Comments and blank lines are ignored.
-func singleLineFromImage(dockerfile string) (string, bool) {
-	lines := make([]string, 0, 4)
-	for _, line := range strings.Split(dockerfile, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		lines = append(lines, trimmed)
-	}
-	if len(lines) != 1 {
-		return "", false
-	}
-	parts := strings.Fields(lines[0])
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "FROM") {
-		return "", false
-	}
-	return parts[1], true
-}
-
-func buildContextWithTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if timeout <= 0 {
-		return context.WithCancel(parent)
-	}
-	return context.WithTimeout(parent, timeout)
+	return built.Image, "", nil
 }
 
 func parsePositiveFloatQuery(r *http.Request, key string, fallback float32) (float32, error) {

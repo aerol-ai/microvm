@@ -236,6 +236,27 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 		WriteError(w, http.StatusConflict, "snapshot name already in use")
 		return
 	}
+	// Image builds (service.BuildImage): one status per failure on every
+	// surface that builds. A timeout or an engine failure is the daemon's
+	// (504/502, retryable); a missing builder is 503; unwired context
+	// uploads are 501; anything the caller can fix is 400.
+	switch {
+	case errors.Is(err, service.ErrBuildTimeout):
+		WriteError(w, http.StatusGatewayTimeout, err.Error())
+		return
+	case errors.Is(err, service.ErrBuildFailed):
+		WriteError(w, http.StatusBadGateway, err.Error())
+		return
+	case errors.Is(err, service.ErrBuilderUnavailable):
+		WriteError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	case errors.Is(err, service.ErrBuildNotImplemented):
+		WriteError(w, http.StatusNotImplemented, err.Error())
+		return
+	case errors.Is(err, service.ErrBuildInvalid):
+		WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	// Firecracker template sentinels (plans/snapshot-clone-fast-boot.md
 	// Phase 2). 409 on both: ErrTemplateIDConflict surfaces a PK collision
 	// when an operator POSTs the same explicit id twice (idempotency

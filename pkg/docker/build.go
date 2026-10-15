@@ -19,6 +19,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/distribution/reference"
 )
 
 // buildGroup deduplicates concurrent BuildImage calls. Two requests landing
@@ -61,6 +62,13 @@ type BuildImageRequest struct {
 	DockerfileContent string
 	ContextTar        []byte
 	OnLog             func(line string)
+	// ForcePull resolves every image the build names — FROM, COPY --from,
+	// a base image's ONBUILD triggers — from its registry, never from the
+	// images already on this node. A build for a tenant sets it: the node
+	// holds other tenants' snapshots and builds, and an image name (or a
+	// short image id, which the engine also resolves) in a Dockerfile must
+	// not reach them.
+	ForcePull bool
 }
 
 // BuildImage drives `POST /build` against the local Docker daemon and tags
@@ -101,6 +109,9 @@ func (c *Client) buildImageLocked(ctx context.Context, tag string, req BuildImag
 	query.Set("dockerfile", "Dockerfile")
 	query.Set("rm", "true")
 	query.Set("forcerm", "true")
+	if req.ForcePull {
+		query.Set("pull", "1")
+	}
 
 	target := "http://docker/build?" + query.Encode()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(contextTar))
@@ -252,6 +263,55 @@ func BuildTagForNode(dockerfile string, contextHashes []string, nodeID string) s
 		return base
 	}
 	return BuiltImageNamespace + "/node-" + encodedNode + "/" + digest
+}
+
+// BuildTagForOwner is BuildTagForNode for a build made for an owner: the
+// owner's namespace (a path segment like "tenant-<hash>") follows the node
+// segment, so one owner's build is never another's tag. The same Dockerfile
+// built for two owners gives two tags, and the build cache never hands one
+// owner's result to the other. An empty namespace is an operator build,
+// tagged as before.
+func BuildTagForOwner(dockerfile string, contextHashes []string, nodeID, ownerNamespace string) string {
+	tag := BuildTagForNode(dockerfile, contextHashes, nodeID)
+	ownerNamespace = strings.TrimSpace(ownerNamespace)
+	if ownerNamespace == "" {
+		return tag
+	}
+	cut := strings.LastIndexByte(tag, '/')
+	return tag[:cut+1] + ownerNamespace + tag[cut:]
+}
+
+// IsBuiltImageRef reports whether ref names an image in BuiltImageNamespace,
+// in any spelling the engine resolves to it ("aerolvm-build/x",
+// "docker.io/aerolvm-build/x", ...).
+func IsBuiltImageRef(ref string) bool {
+	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
+	if err != nil {
+		return false
+	}
+	return reference.Domain(named) == "docker.io" && strings.HasPrefix(reference.Path(named), BuiltImageNamespace+"/")
+}
+
+// BuiltImageOwnerNamespace returns the owner namespace of a built image's
+// tag (see BuildTagForOwner), or "" for a build with none: an operator's,
+// or one made before builds had owners.
+func BuiltImageOwnerNamespace(ref string) string {
+	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
+	if err != nil || reference.Domain(named) != "docker.io" {
+		return ""
+	}
+	parts := strings.Split(reference.Path(named), "/")
+	if len(parts) < 3 || parts[0] != BuiltImageNamespace {
+		return ""
+	}
+	parts = parts[1:]
+	if strings.HasPrefix(parts[0], "node-") {
+		parts = parts[1:]
+	}
+	if len(parts) >= 2 && strings.HasPrefix(parts[0], "tenant-") {
+		return parts[0]
+	}
+	return ""
 }
 
 // BuiltImagePlacementNode extracts the worker affinity from a tag produced by
@@ -477,8 +537,11 @@ type BuiltImage struct {
 // candidate is then individually inspected to read Metadata.LastTagTime,
 // which the cheaper /images/json list endpoint does not return.
 func (c *Client) ListBuiltImages(ctx context.Context) ([]BuiltImage, error) {
+	// The reference filter globs like path.Match, where "*" stops at "/",
+	// so each tag depth is its own pattern: plain, node-bound, and
+	// node-bound or not with an owner segment.
 	filters, err := json.Marshal(map[string][]string{
-		"reference": {BuiltImageNamespace + "/*"},
+		"reference": {BuiltImageNamespace + "/*", BuiltImageNamespace + "/*/*", BuiltImageNamespace + "/*/*/*"},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal filters: %w", err)
