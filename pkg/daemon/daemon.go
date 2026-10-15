@@ -32,6 +32,7 @@ import (
 	api "github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/api/ingressproxy"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -290,6 +291,19 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("start audit ingest: %w", err)
 	}
 	defer svc.StopAuditIngestServer()
+	// The open-source build's own witness (plans/open-audit-witness.md):
+	// SB_AUDIT_WITNESS_BACKEND fills the witness only when the provider
+	// brought none, the same precedence as the audit exporter below. It
+	// opens before the gate, so enterprise mode can be satisfied by the free
+	// download; with the setting unset nothing here talks to S3, and Open's
+	// boot checks refuse a bucket that would not really protect a head.
+	if !cp.HasExternalWitness() && cfg.AuditWitnessBackend != "" {
+		w, err := auditwitness.Open(ctx, cfg.AuditWitnessConfig())
+		if err != nil {
+			return fmt.Errorf("open audit witness: %w", err)
+		}
+		cp.Witness = w
+	}
 	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
 		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
 	}

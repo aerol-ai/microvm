@@ -144,8 +144,10 @@ type WitnessReceipt struct {
 	ReceiptID  string
 }
 
-// Witness records audit-chain heads off-node. No-op in the open-source build;
-// enterprise mode requires a real Witness (see SB_SECRET_AUDIT_EXTERNAL_WITNESS).
+// Witness records audit-chain heads off-node. No-op unless a provider or
+// SB_AUDIT_WITNESS_BACKEND supplies one (pkg/auditwitness: an S3 bucket with
+// Object Lock); a provider's witness wins. Enterprise mode requires a real
+// Witness (see SB_SECRET_AUDIT_EXTERNAL_WITNESS).
 type Witness interface {
 	WitnessHeads(ctx context.Context, heads []AuditHead) (WitnessReceipt, error)
 	// LastWitnessedHead returns the most recent head the witness recorded for
