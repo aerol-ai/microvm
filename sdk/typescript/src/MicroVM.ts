@@ -26,6 +26,8 @@ import type {
   ListOptions,
   MountSpecRedacted,
   RegisterSnapshotOptions,
+  ListSnapshotsOptions,
+  SnapshotList,
   ResizeOptions,
   Sandbox as SandboxData,
   SandboxSnapshot,
@@ -147,6 +149,21 @@ export class MicroVM {
     options: Omit<RegisterSnapshotOptions, "name" | "image" | "dockerfileContent"> = {},
   ): Promise<SandboxSnapshot> {
     return this.client.registerSnapshotFromImage(name, image, options);
+  }
+
+  /** Look a snapshot up by name. In a cluster the request is routed to the node holding the image. */
+  async getSnapshot(name: string): Promise<SandboxSnapshot> {
+    return this.client.getSnapshot(name);
+  }
+
+  /** List the caller's snapshots, one name-ordered page at a time. */
+  async listSnapshots(options: ListSnapshotsOptions = {}): Promise<SnapshotList> {
+    return this.client.listSnapshots(options);
+  }
+
+  /** Delete a snapshot by name (idempotent 404 if it does not exist). */
+  async deleteSnapshot(name: string): Promise<void> {
+    return this.client.deleteSnapshot(name);
   }
 
   async destroy(id: string): Promise<void> {

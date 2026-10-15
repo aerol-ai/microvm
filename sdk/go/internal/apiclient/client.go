@@ -732,6 +732,47 @@ func (c *Client) DeleteEgressProfile(ctx context.Context, name string) error {
 	return c.doJSON(ctx, http.MethodDelete, c.egressProfilePath(name), nil, nil)
 }
 
+func (c *Client) snapshotPath(name string) string {
+	return c.versionPrefix + "/snapshots/" + url.PathEscape(name)
+}
+
+// GetSnapshot reads one named snapshot's metadata.
+func (c *Client) GetSnapshot(ctx context.Context, name string) (SandboxSnapshot, error) {
+	var response models.SandboxSnapshot
+	err := c.doJSON(ctx, http.MethodGet, c.snapshotPath(name), nil, &response)
+	return response, err
+}
+
+// ListSnapshots reads one page of named snapshots. Limit and StartingAfter
+// map to the `limit` and `starting_after` query params; the wire `has_more`
+// flag is surfaced on SnapshotList.HasMore.
+func (c *Client) ListSnapshots(ctx context.Context, opts sdktypes.ListSnapshotsOptions) (sdktypes.SnapshotList, error) {
+	values := make(url.Values)
+	if opts.Limit > 0 {
+		values.Set("limit", strconv.Itoa(opts.Limit))
+	}
+	if opts.StartingAfter != "" {
+		values.Set("starting_after", opts.StartingAfter)
+	}
+	path := c.versioned("/snapshots")
+	if len(values) > 0 {
+		path += "?" + values.Encode()
+	}
+	var response sdktypes.SnapshotList
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &response); err != nil {
+		return sdktypes.SnapshotList{}, err
+	}
+	if response.Snapshots == nil {
+		response.Snapshots = []sdktypes.SandboxSnapshot{}
+	}
+	return response, nil
+}
+
+// DeleteSnapshot removes a named snapshot.
+func (c *Client) DeleteSnapshot(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.snapshotPath(name), nil, nil)
+}
+
 // GetAudit reads one page of a sandbox's audit log.
 func (c *Client) GetAudit(ctx context.Context, id string, opts sdktypes.AuditOptions) (sdktypes.AuditPage, error) {
 	values := make(url.Values)

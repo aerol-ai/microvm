@@ -55,6 +55,8 @@ export type {
   MountType,
   PlatformVolumeMount,
   RegisterSnapshotOptions,
+  ListSnapshotsOptions,
+  SnapshotList,
   RegistryAuth,
   ResizeOptions,
   Sandbox as SandboxData,

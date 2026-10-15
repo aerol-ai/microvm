@@ -39,7 +39,7 @@ func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	mux.Handle("PUT "+PathPrefix+"/sandboxes/{id}/network", d.Auth(h.clusterForwardWrap(http.HandlerFunc(h.updateNetwork))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshots", d.Auth(h.clusterForwardWrap(http.HandlerFunc(h.createSnapshot))))
 	mux.Handle("GET "+PathPrefix+"/snapshots", d.Auth(http.HandlerFunc(h.listSnapshots)))
-	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(http.HandlerFunc(h.deleteSnapshot)))
+	mux.Handle("DELETE "+PathPrefix+"/templates/{id}", d.Auth(h.snapshotForwardWrap(http.HandlerFunc(h.deleteSnapshot))))
 	// /runtime carries its sandbox id in the E2b-Sandbox-Id header, not a
 	// path value, so it forwards to the owner node by that header (plan B5).
 	// Unauthenticated like the rest of /runtime: the envd token guards it.
