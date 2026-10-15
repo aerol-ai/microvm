@@ -65,6 +65,7 @@ from .types import (
     Session,
     SessionAttachOptions,
     SetNetworkLimitsOptions,
+    SnapshotList,
     Template,
     WasmModule,
     PushWasmModuleOptions,
@@ -696,6 +697,40 @@ class MicroVM:
         resolved_options.pop("image", None)
         resolved_options["dockerfileContent"] = image.dockerfile
         return self.register_snapshot(resolved_options)
+
+    def get_snapshot(self, name: str) -> SandboxSnapshot:
+        """Look a snapshot up by name. In a cluster the request is routed to
+        the node holding the image."""
+        return _from_api_sandbox_snapshot(self._do_json("GET", self._snapshot_path(name), None) or {})
+
+    def list_snapshots(
+        self,
+        limit: Optional[int] = None,
+        starting_after: Optional[str] = None,
+    ) -> SnapshotList:
+        """List the caller's snapshots, one name-ordered page at a time.
+        ``starting_after`` is the exclusive name cursor — pass the last name of
+        the previous page to fetch the next one."""
+        params: Dict[str, str] = {}
+        if limit:
+            params["limit"] = str(int(limit))
+        if starting_after:
+            params["starting_after"] = str(starting_after)
+        path = self._versioned("/snapshots")
+        if params:
+            path += "?" + urllib.parse.urlencode(params)
+        payload = self._do_json("GET", path, None) or {}
+        return {
+            "snapshots": [_from_api_sandbox_snapshot(s) for s in payload.get("snapshots") or []],
+            "hasMore": bool(payload.get("has_more")),
+        }
+
+    def delete_snapshot(self, name: str) -> None:
+        """Delete a snapshot by name (idempotent 404 if it does not exist)."""
+        self._do_json("DELETE", self._snapshot_path(name), None)
+
+    def _snapshot_path(self, name: str) -> str:
+        return f"{self._version_prefix}/snapshots/{urllib.parse.quote(name, safe='')}"
 
     def destroy(self, sandbox_id: str) -> None:
         self._do_json("DELETE", f"{self._version_prefix}/sandboxes/{sandbox_id}", None)

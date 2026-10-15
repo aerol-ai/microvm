@@ -497,6 +497,21 @@ export interface SandboxSnapshot {
   diskGB?: number;
 }
 
+/** Options for {@link MicroVM.listSnapshots}: one name-ordered page. */
+export interface ListSnapshotsOptions {
+  /** Maximum snapshots to return in this page. */
+  limit?: number;
+  /** Exclusive name cursor — pass the last name of the previous page. */
+  startingAfter?: string;
+}
+
+/** One page of snapshots from {@link MicroVM.listSnapshots}. */
+export interface SnapshotList {
+  snapshots: SandboxSnapshot[];
+  /** True when more snapshots remain after this page. */
+  hasMore: boolean;
+}
+
 /**
  * Discriminated result from `exposePort`. Branch on `protocol` to access the
  * fields that are meaningful for the chosen wire protocol — only the raw-TCP
