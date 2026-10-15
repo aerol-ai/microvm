@@ -65,7 +65,7 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deterministicID := sandboxIDFromFingerprint(fingerprint)
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, WriteError, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, writeErrorCode, clustercreate.PrepareOptions{PreferredSandboxID: deterministicID})
 	if !ok {
 		return
 	}

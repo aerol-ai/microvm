@@ -115,7 +115,7 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 	// re-translates the original wire body, so put it back.
 	r.Body = io.NopCloser(bytes.NewReader(raw))
 	r.ContentLength = int64(len(raw))
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, WriteError, clustercreate.PrepareOptions{
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, serviceReq, writeErrorCode, clustercreate.PrepareOptions{
 		PreferredSandboxID: id,
 		MetricPrefix:       "runloop.create",
 		Logger:             h.deps.Logger,

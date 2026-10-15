@@ -164,7 +164,7 @@ func (h *handlers) clusterCreateWrap(w http.ResponseWriter, r *http.Request) {
 	// v1 keep calling SelectPlacementWithCandidates after the bounded
 	// selector landed — every create downloading one Member per eligible
 	// worker (~1.7 MB at 2k nodes) only to discard the slice.
-	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteError, clustercreate.PrepareOptions{
+	decision, ok := clustercreate.Prepare(w, r, h.deps.Service, req, apihttp.WriteErrorCode, clustercreate.PrepareOptions{
 		Normalize:      normalizeCreateRuntimeForPlacement,
 		OwnerRef:       service.OwnerRefForCreate(r.Context()),
 		SyncBody:       true,

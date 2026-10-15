@@ -5,13 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"strconv"
 
-	"github.com/aerol-ai/microvm/internal/cluster"
-	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/internal/store"
-	"github.com/aerol-ai/microvm/pkg/capacity"
-	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
 // errorResponse is the error body the Runloop SDKs read: TS surfaces
@@ -70,6 +65,12 @@ func retryable(status int) bool {
 	return status < http.StatusConflict
 }
 
+// writeErrorCode is the clustercreate.ErrorWriter for Runloop: the code is
+// dropped (Runloop's envelope has none) and WriteError adds x-should-retry.
+func writeErrorCode(w http.ResponseWriter, status int, _, message string) {
+	WriteError(w, status, message)
+}
+
 func writeKnownError(w http.ResponseWriter, err error) bool {
 	var reqErr requestError
 	if errors.As(err, &reqErr) {
@@ -79,52 +80,29 @@ func writeKnownError(w http.ResponseWriter, err error) bool {
 	return false
 }
 
-// writeStoreAwareError maps service errors onto statuses the SDK handles.
-// It mirrors apihttp.WriteStoreAwareError; the facade keeps its own writer
-// for the error body shape and the retry header.
+// writeStoreAwareError maps service errors onto statuses the SDK handles,
+// through the one shared classifier (apihttp.Classify). The facade keeps its
+// own WriteError for the error-body shape and the x-should-retry header.
 func writeStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error) {
 	if writeKnownError(w, err) {
 		return
 	}
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		WriteError(w, http.StatusNotFound, "not found")
-	case errors.Is(err, service.ErrSandboxManuallyStopped), errors.Is(err, service.ErrPublicTrafficDisabled):
-		WriteError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, service.ErrWakeCircuitOpen):
-		w.Header().Set("Retry-After", "60")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-	case errors.Is(err, service.ErrEgressOperatorConfigInvalid):
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
-		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-	case errors.Is(err, models.ErrRuntimeNotImplemented):
-		WriteError(w, http.StatusNotImplemented, err.Error())
-	case errors.Is(err, store.ErrSnapshotNameConflict):
-		WriteError(w, http.StatusConflict, "snapshot name already in use")
-	case errors.Is(err, models.ErrSandboxExists):
-		WriteError(w, http.StatusConflict, "devbox already exists")
-	case errors.Is(err, capacity.ErrCapacityExceeded), errors.Is(err, cluster.ErrCapacityExceeded):
-		if logger != nil {
-			logger.Info("capacity rejected", "error", err)
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-		WriteError(w, http.StatusServiceUnavailable, truncateMessage(err.Error()))
-	case errors.Is(err, cluster.ErrCreateBackpressure):
-		w.Header().Set("Retry-After", strconv.Itoa(cluster.CreateBackpressureRetryAfterSeconds))
-		WriteError(w, http.StatusTooManyRequests, err.Error())
-	case errors.Is(err, cluster.ErrNoPlacementTarget):
-		w.Header().Set("Retry-After", strconv.Itoa(cluster.CapacityRetryAfterSeconds))
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
-	case errors.Is(err, cluster.ErrInvalidTopology):
-		w.Header().Set("Retry-After", "300")
-		WriteError(w, http.StatusServiceUnavailable, err.Error())
+	c := apihttp.Classify(err)
+	c.Apply(logger, err)
+	c.SetRetryAfter(w)
+	WriteError(w, c.Status, runloopMessage(c))
+}
+
+// runloopMessage keeps the Runloop SDK's wording for the few errors it words
+// differently; everything else uses the shared classification message.
+func runloopMessage(c apihttp.Classification) string {
+	switch c.Kind {
+	case apihttp.ErrKindNotFound:
+		return "not found"
+	case apihttp.ErrKindSandboxExists:
+		return "devbox already exists"
 	default:
-		if logger != nil {
-			logger.Warn("runloop request failed", "error", err)
-		}
-		WriteError(w, http.StatusBadRequest, truncateMessage(err.Error()))
+		return c.Message
 	}
 }
 
