@@ -385,6 +385,12 @@ type Service struct {
 	// handler raced it through the cluster placement delete and failed on
 	// the placement the API path had just removed, once per destroy.
 	destroyLocks egressPolicyLocks
+	// lifecycleLocks serializes a sandbox's lifecycle transitions — pause,
+	// resume, and the read-modify-write of its Lifecycle timers (D7). Without
+	// it two facade calls that each read the Lifecycle, patch one field and
+	// write the whole struct back (E2B timeout/connect, Daytona idle timers)
+	// race, and the later writer clobbers the earlier one's field.
+	lifecycleLocks egressPolicyLocks
 	// egressBlocksPending holds sandboxes whose last gateway block write
 	// failed; they are re-applied from the store until one succeeds.
 	egressBlocksPending egressBlockPending
@@ -3989,15 +3995,27 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	if err := s.validateLifecycle(l); err != nil {
 		return nil, fmt.Errorf("invalid lifecycle: %w", err)
 	}
+	unlock := s.lifecycleLocks.lock(id)
+	defer unlock()
 	priorSandbox, err := s.scopedGet(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	updated, _, err := s.writeLifecycleLocked(ctx, id, l, priorSandbox)
+	return updated, err
+}
+
+// writeLifecycleLocked persists lifecycle l for id and replays the resulting
+// serverless route transition. The caller holds s.lifecycleLocks.lock(id) and
+// passes the scoped prior read so the whole read→write is one critical section
+// (D7); l is already validated. It reports whether the write ran (always true
+// here; the bool lets ApplyLifecyclePatch tell a no-op apart).
+func (s *Service) writeLifecycleLocked(ctx context.Context, id string, l models.Lifecycle, priorSandbox *models.Sandbox) (*models.Sandbox, bool, error) {
 	if s.testAfterLifecycleScopedGet != nil {
 		s.testAfterLifecycleScopedGet()
 	}
 	if err := s.store.UpdateLifecycle(ctx, id, l); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	lc := l
 	s.replicateSpecPatch(ctx, id, func(spec *models.CreateSandboxRequest) {
@@ -4005,7 +4023,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 	})
 	updated, err := s.store.Get(ctx, id)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// If Serverless flipped on a running sandbox, re-install exposed port
 	// routes in the matching shape. The install helpers own cleanup of the
@@ -4024,7 +4042,7 @@ func (s *Service) UpdateLifecycle(ctx context.Context, id string, l models.Lifec
 			}
 		}
 	}
-	return updated, nil
+	return updated, true, nil
 }
 
 // ExposePort publishes a sandbox container port through one of three caddy

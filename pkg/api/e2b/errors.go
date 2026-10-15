@@ -79,6 +79,10 @@ func e2bMessage(c apihttp.Classification) string {
 		return "Snapshot name already in use"
 	case apihttp.ErrKindSandboxExists:
 		return "Sandbox already exists"
+	case apihttp.ErrKindSandboxNotRunning:
+		return "Sandbox is not running"
+	case apihttp.ErrKindSandboxNotResumable:
+		return "Sandbox is not available for connect"
 	default:
 		return c.Message
 	}

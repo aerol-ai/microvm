@@ -27,6 +27,12 @@ const (
 	ErrKindSandboxNameConflict
 	ErrKindSnapshotNameConflict
 	ErrKindSandboxExists
+	// ErrKindSandboxNotRunning / ErrKindSandboxNotResumable are the two
+	// lifecycle-precondition 409s (pause a non-running sandbox, resume a
+	// non-stopped one); a facade words them for its own SDK ("devbox is not
+	// running" vs "Sandbox is not running").
+	ErrKindSandboxNotRunning
+	ErrKindSandboxNotResumable
 	// ErrKindUnclassified is the catch-all 400: an error no sentinel matched.
 	// A facade may keep its own default wording for it.
 	ErrKindUnclassified
@@ -73,6 +79,13 @@ func Classify(err error) Classification {
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.
 	case errors.Is(err, models.ErrContainerEngineNotRegistered):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: admissionRetryAfterSeconds, Message: "container engine for this sandbox is not available on this node; retry shortly"}
+
+	// Lifecycle-precondition conflicts (pause/resume). Each facade words them
+	// for its own SDK via the Kind.
+	case errors.Is(err, service.ErrSandboxNotRunning):
+		return Classification{Status: http.StatusConflict, Message: err.Error(), Kind: ErrKindSandboxNotRunning}
+	case errors.Is(err, service.ErrSandboxNotResumable):
+		return Classification{Status: http.StatusConflict, Message: err.Error(), Kind: ErrKindSandboxNotResumable}
 
 	// Wake-aware proxy sentinels.
 	case errors.Is(err, service.ErrSandboxManuallyStopped):

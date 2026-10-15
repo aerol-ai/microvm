@@ -33,6 +33,8 @@ func TestClassify(t *testing.T) {
 		{"cluster finalization", service.ErrClusterFinalizationUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"wake circuit open", service.ErrWakeCircuitOpen, http.StatusServiceUnavailable, 60, "", ErrKindOther},
 		{"manually stopped", service.ErrSandboxManuallyStopped, http.StatusConflict, 0, "", ErrKindOther},
+		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
+		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
 		{"build timeout", service.ErrBuildTimeout, http.StatusGatewayTimeout, 0, "", ErrKindOther},
 		{"build failed", service.ErrBuildFailed, http.StatusBadGateway, 0, "", ErrKindOther},
