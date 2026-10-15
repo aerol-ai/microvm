@@ -1500,8 +1500,9 @@ type Config struct {
 	// stay local-only — identical to pre-feature behavior. When true,
 	// snapshots whose distribution mode is `local_only` (sandbox commits
 	// and aerolvm-build/* tags) are pushed in the background to
-	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`,
-	// reusing the cluster PAT as the registry password. Requires
+	// `<MirrorPushHost|ImageDistributionAOCRHost>/cluster/<ClusterID>/snapshots/<name>`
+	// (a tenant's under `snapshots/tenant-<owner hash>/<name>`), reusing
+	// the cluster PAT as the registry password. Requires
 	// AutoImportClusterID and AutoImportClusterPATPath to be set —
 	// validated at startup. SB_SNAPSHOT_PUSH_ENABLED.
 	SnapshotPushEnabled bool

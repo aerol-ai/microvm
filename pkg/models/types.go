@@ -1221,6 +1221,12 @@ type SandboxSnapshot struct {
 	// PushError is populated only when PushState is "error" — the last error
 	// the reconciler saw, surfaced to the Daytona facade's errorReason field.
 	PushError string `json:"push_error,omitempty"`
+	// OwnerRef is the account the snapshot belongs to, with the same meaning
+	// and scoping rule as Sandbox.OwnerRef. It lives on the snapshot because
+	// a snapshot outlives the sandbox it was taken from: once the source is
+	// destroyed there is nothing else left to check ownership against. Never
+	// exposed over the wire.
+	OwnerRef string `json:"-"`
 }
 
 func (s SandboxSnapshot) ImageDistribution() ImageDistributionMetadata {
@@ -1362,6 +1368,7 @@ const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 const (
 	FacadeDaytona = "daytona"
 	FacadeE2B     = "e2b"
+	FacadeRunloop = "runloop"
 )
 
 // SandboxCompatState carries facade-private state that has no native
@@ -1385,8 +1392,11 @@ type SnapshotAlias struct {
 	SnapshotName string
 	Facade       string
 	ExtraNames   []string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// StateJSON is facade-private state for the snapshot, opaque to the
+	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
+	StateJSON string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Idempotent-request states for request_idempotency.state. Pending means

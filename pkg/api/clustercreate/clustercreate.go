@@ -322,6 +322,12 @@ func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Cl
 
 type CreateOptions struct {
 	PromoteWithSpec bool
+	// SandboxID is the id an UNRESERVED create uses. Prepare deliberately
+	// returns no reservation for local-only images (local snapshots, mapped
+	// built images), so a facade that derives a retry-stable id must not
+	// pass that id as reservationID — no reservation exists under it and
+	// the reserved path would refuse the create. Empty generates an id.
+	SandboxID string
 }
 
 func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slog.Logger, req models.CreateSandboxRequest, reservationID string, opts CreateOptions) (*models.CreateSandboxResponse, error) {
@@ -356,9 +362,20 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 	}
 
 	service.RecordCreateReservationState("self_local")
-	resp, err := svc.CreateSandbox(ctx, req)
+	var resp *models.CreateSandboxResponse
+	var err error
+	if id := strings.TrimSpace(opts.SandboxID); id != "" {
+		resp, err = svc.CreateSandboxWithID(ctx, req, id)
+	} else {
+		resp, err = svc.CreateSandbox(ctx, req)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if c == nil {
+		// No cluster client at all (embedded/test wiring): nothing to seal
+		// or promote, the same as OverlapCreateAndPromote's nil-cluster leg.
+		return resp, nil
 	}
 	if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
 		RollbackLocalCreate(context.Background(), svc, logger, resp.Sandbox.ID)

@@ -59,6 +59,13 @@ type Manager struct {
 	mu     sync.Mutex
 	byID   map[string]*Session // primary key
 	byName map[string]*Session // running, named-keyed; entry removed when session exits
+	// creating holds a GetOrCreate that is starting a session for a name
+	// and has not published it to byName yet. Starting a shell takes long
+	// enough that a second caller would otherwise miss byName, start its
+	// own shell, and also report created=true — and callers use that flag
+	// as an exclusive claim (the Runloop facade runs its command once per
+	// claim).
+	creating map[string]*pendingCreate
 
 	closeCh chan struct{}
 }
@@ -85,11 +92,12 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 	}
 
 	m := &Manager{
-		logger:  logger,
-		cfg:     cfg,
-		byID:    map[string]*Session{},
-		byName:  map[string]*Session{},
-		closeCh: make(chan struct{}),
+		logger:   logger,
+		cfg:      cfg,
+		byID:     map[string]*Session{},
+		byName:   map[string]*Session{},
+		creating: map[string]*pendingCreate{},
+		closeCh:  make(chan struct{}),
 	}
 	go m.runSweeper()
 	return m, nil
@@ -169,27 +177,59 @@ func (m *Manager) GetByName(name string) (*Session, error) {
 	return s, nil
 }
 
+// pendingCreate is one GetOrCreate starting the session for a name. done
+// closes once session/err are set.
+type pendingCreate struct {
+	done    chan struct{}
+	session *Session
+	err     error
+}
+
 // GetOrCreate returns the running session with the given Name (creating it
 // from req if absent). Used by SSH attach so `ssh sandbox+default@host`
-// idempotently lands on a single shared shell.
+// idempotently lands on a single shared shell. created is true for exactly
+// one of any number of concurrent callers for the same name: the others
+// wait for that caller's session instead of starting their own.
 func (m *Manager) GetOrCreate(ctx context.Context, req models.CreateSessionRequest) (*Session, bool, error) {
 	name := strings.TrimSpace(req.Name)
 	if name == "" {
 		return nil, false, errors.New("name is required for GetOrCreate")
 	}
 
-	m.mu.Lock()
-	if existing, ok := m.byName[name]; ok && !existing.exited.Load() {
+	for {
+		m.mu.Lock()
+		if existing, ok := m.byName[name]; ok && !existing.exited.Load() {
+			m.mu.Unlock()
+			return existing, false, nil
+		}
+		if pending, ok := m.creating[name]; ok {
+			m.mu.Unlock()
+			select {
+			case <-pending.done:
+			case <-ctx.Done():
+				return nil, false, ctx.Err()
+			}
+			if pending.err == nil {
+				return pending.session, false, nil
+			}
+			// The creator failed; the next pass lets one waiter try again.
+			continue
+		}
+		pending := &pendingCreate{done: make(chan struct{})}
+		m.creating[name] = pending
 		m.mu.Unlock()
-		return existing, false, nil
-	}
-	m.mu.Unlock()
 
-	created, err := m.Create(ctx, req)
-	if err != nil {
-		return nil, false, err
+		created, err := m.Create(ctx, req)
+		m.mu.Lock()
+		delete(m.creating, name)
+		pending.session, pending.err = created, err
+		close(pending.done)
+		m.mu.Unlock()
+		if err != nil {
+			return nil, false, err
+		}
+		return created, true, nil
 	}
-	return created, true, nil
 }
 
 // Create starts a new session. Always assigns a fresh ID.

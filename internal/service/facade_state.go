@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -46,23 +48,86 @@ func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[str
 	return s.store.UpdateTags(ctx, sandboxID, tags)
 }
 
+// Snapshot aliases are scoped through the snapshot they point at: an alias,
+// and the facade state stored on it, is visible to whoever may see its
+// snapshot, under the same owner rule as GetSnapshot.
+
+// UpsertSnapshotAlias writes an alias onto a snapshot the caller may see. An
+// existing row under the same alias must also point at a visible snapshot,
+// or a user token could retarget (and so take over) another tenant's alias.
 func (s *Service) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAlias) error {
+	if _, scoped := ownerScope(ctx); scoped {
+		if err := s.requireVisibleSnapshot(ctx, alias.SnapshotName); err != nil {
+			return err
+		}
+		existing, err := s.store.GetSnapshotAlias(ctx, alias.Alias)
+		switch {
+		case err == nil:
+			if err := s.requireVisibleSnapshot(ctx, existing.SnapshotName); err != nil {
+				return err
+			}
+		case !errors.Is(err, store.ErrNotFound):
+			return err
+		}
+	}
 	return s.store.UpsertSnapshotAlias(ctx, alias)
 }
 
+// GetSnapshotAlias returns the alias row when its snapshot is visible to the
+// caller, store.ErrNotFound otherwise.
 func (s *Service) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
-	return s.store.GetSnapshotAlias(ctx, alias)
+	got, err := s.store.GetSnapshotAlias(ctx, alias)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireVisibleSnapshot(ctx, got.SnapshotName); err != nil {
+		return nil, err
+	}
+	return got, nil
 }
 
+// ListSnapshotAliases returns the facade's alias rows whose snapshots the
+// caller may see. A user token's list is filtered in the store, so other
+// tenants' rows are never loaded.
 func (s *Service) ListSnapshotAliases(ctx context.Context, facade string) (map[string]models.SnapshotAlias, error) {
+	if owner, scoped := ownerScope(ctx); scoped {
+		return s.store.ListSnapshotAliasesForOwner(ctx, facade, owner)
+	}
 	return s.store.ListSnapshotAliases(ctx, facade)
 }
 
+// DeleteSnapshotAlias removes an alias whose snapshot the caller may see.
 func (s *Service) DeleteSnapshotAlias(ctx context.Context, alias string) error {
+	if _, scoped := ownerScope(ctx); scoped {
+		got, err := s.store.GetSnapshotAlias(ctx, alias)
+		if err != nil {
+			return err
+		}
+		if err := s.requireVisibleSnapshot(ctx, got.SnapshotName); err != nil {
+			return err
+		}
+	}
 	return s.store.DeleteSnapshotAlias(ctx, alias)
 }
 
+// requireVisibleSnapshot returns store.ErrNotFound unless the named snapshot
+// exists and the caller may see it. Unscoped callers skip the read.
+func (s *Service) requireVisibleSnapshot(ctx context.Context, name string) error {
+	if _, scoped := ownerScope(ctx); !scoped {
+		return nil
+	}
+	snapshot, err := s.store.GetSnapshot(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !snapshotVisible(ctx, snapshot) {
+		return store.ErrNotFound
+	}
+	return nil
+}
+
 func (s *Service) ClaimIdempotentRequest(ctx context.Context, scope, fingerprint string, now time.Time, pendingTTL time.Duration) (*models.IdempotentRequestRecord, bool, error) {
+	s.maybeSweepIdempotentRequests()
 	record, acquired, err := s.store.ClaimIdempotentRequest(ctx, scope, fingerprint, now, pendingTTL)
 	metricScope := idempotencyScope(scope)
 	if err == nil {

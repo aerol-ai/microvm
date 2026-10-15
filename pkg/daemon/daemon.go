@@ -950,6 +950,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		// keep-alive connections sitting between requests, so it can't
 		// kill an in-flight stream but does bound idle-connection buildup.
 		IdleTimeout: 2 * time.Minute,
+		Protocols:   apiListenerProtocols(),
 	}
 
 	go func() {

@@ -311,7 +311,8 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			image_registry_ref TEXT NOT NULL DEFAULT '',
 			image_verified_at DATETIME,
 			push_state TEXT NOT NULL DEFAULT 'active',
-			push_error TEXT NOT NULL DEFAULT ''
+			push_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT ''
 		);`,
 		// sandbox_compat_state holds opaque facade-private state that has
 		// no native meaning. One row per (sandbox, facade). state_json is
@@ -335,6 +336,7 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			snapshot_name TEXT NOT NULL,
 			facade TEXT NOT NULL,
 			extra_names_json TEXT NOT NULL DEFAULT '[]',
+			state_json TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			FOREIGN KEY (snapshot_name) REFERENCES sandbox_snapshots(name) ON DELETE CASCADE
@@ -439,6 +441,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_snapshot_name ON snapshot_aliases(snapshot_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_snapshot_aliases_facade ON snapshot_aliases(facade);`,
 		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_replay_until ON request_idempotency(replay_until);`,
+		// Serves ListIdempotentRequests: a restart walks one scope's pending
+		// rows by fingerprint without reading the (far more numerous) ready
+		// rows that only wait out their replay window.
+		`CREATE INDEX IF NOT EXISTS idx_request_idempotency_state ON request_idempotency(scope, state, fingerprint);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_source_sandbox_id ON sandbox_snapshots(source_sandbox_id);`,
 		// Lookups by sandbox_id for ListCustomDomains and for the
 		// attachCustomDomainsBulk join. The PK on hostname already covers
@@ -834,6 +840,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// 'pushing' to 'active' or 'error'.
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_state TEXT NOT NULL DEFAULT 'active';`,
 		`ALTER TABLE sandbox_snapshots ADD COLUMN push_error TEXT NOT NULL DEFAULT '';`,
+		// Tenant that owns the snapshot. A snapshot outlives its source
+		// sandbox, so owner scoping cannot be derived from the source row
+		// after that row is destroyed; the owner has to live on the snapshot
+		// itself. Pre-migration rows are backfilled from a still-existing
+		// source sandbox after this loop (backfillSnapshotOwners).
+		`ALTER TABLE sandbox_snapshots ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 		// auto_import_pending is set when the post-pull AOCR auto-import
 		// (F21) failed and a background reconciler should retry. It is
 		// local-node bookkeeping only — never replicated, never user-visible.
@@ -997,6 +1009,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// apply left behind (PR #622 review 3 findings 3 and 4). Empty: what
 		// the stored policy installs.
 		`ALTER TABLE sandbox_egress ADD COLUMN installed_egress_json TEXT NOT NULL DEFAULT '';`,
+		// Facade-private attributes of a snapshot, opaque to the store the
+		// same way sandbox_compat_state.state_json is: the Runloop facade
+		// keeps a snapshot's name, metadata and commit message here, which
+		// have no native column. It lives on the alias row rather than the
+		// source sandbox's compat state because a snapshot outlives the
+		// sandbox it was taken from.
+		`ALTER TABLE snapshot_aliases ADD COLUMN state_json TEXT NOT NULL DEFAULT '';`,
 		// Backfill an empty env row for every sandbox that predates the
 		// "always write a row" rule above. Without it a warm upgrade cannot
 		// tell an env-less sandbox from one whose sealed env was lost, and
@@ -1022,6 +1041,10 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	// owner_ref is a compatibility column, so the per-owner name index can
 	// only be built after the ALTER loop above.
 	if err := migrateSandboxNameIndex(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := backfillSnapshotOwners(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1348,6 +1371,32 @@ func migratePendingImageGCKey(db *sql.DB) error {
 // themselves.
 // Daytona, the v1 ?name= lookup and the aerolvm CLI resolve names through it.
 const sandboxNameIndexDDL = `CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(owner_ref, name) WHERE name <> '';`
+
+// backfillSnapshotOwners stamps pre-migration snapshot rows with the owner of
+// their source sandbox while that sandbox still exists. A row whose source is
+// already gone keeps an empty owner_ref (the operator namespace): nothing
+// durable records who took it. It runs on every open because it is cheap (only
+// unattributed rows with a tenant-owned source qualify) and idempotent, and the
+// owner index it pairs with can only be built once the ALTER has run.
+func backfillSnapshotOwners(db *sql.DB) error {
+	if _, err := db.Exec(`
+		UPDATE sandbox_snapshots
+		SET owner_ref = (SELECT owner_ref FROM sandboxes WHERE sandboxes.id = sandbox_snapshots.source_sandbox_id)
+		WHERE owner_ref = ''
+			AND EXISTS (
+				SELECT 1 FROM sandboxes
+				WHERE sandboxes.id = sandbox_snapshots.source_sandbox_id AND sandboxes.owner_ref <> ''
+			)
+	`); err != nil {
+		return fmt.Errorf("backfill snapshot owners: %w", err)
+	}
+	// Serves the owner-scoped catalogue page (ListSnapshotPage): one tenant's
+	// snapshots, walked by name.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_sandbox_snapshots_owner_name ON sandbox_snapshots(owner_ref, name);`); err != nil {
+		return fmt.Errorf("create sandbox_snapshots owner index: %w", err)
+	}
+	return nil
+}
 
 // migrateSandboxNameIndex moves idx_sandboxes_name from the old global
 // (name) form to (owner_ref, name), keeping the index NAME (CEO review CF7).
@@ -3027,18 +3076,20 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 		createdAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO snapshot_aliases (alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(alias) DO UPDATE SET
 			snapshot_name = excluded.snapshot_name,
 			facade = excluded.facade,
 			extra_names_json = excluded.extra_names_json,
+			state_json = excluded.state_json,
 			updated_at = excluded.updated_at
 	`,
 		strings.TrimSpace(alias.Alias),
 		strings.TrimSpace(alias.SnapshotName),
 		strings.TrimSpace(alias.Facade),
 		extraNamesJSON,
+		alias.StateJSON,
 		createdAt,
 		now,
 	)
@@ -3052,7 +3103,7 @@ func (s *Store) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAl
 // does not exist.
 func (s *Store) GetSnapshotAlias(ctx context.Context, alias string) (*models.SnapshotAlias, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+		SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 		FROM snapshot_aliases
 		WHERE alias = ?
 	`, strings.TrimSpace(alias))
@@ -3074,13 +3125,13 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	trimmed := strings.TrimSpace(facade)
 	if trimmed == "" {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 			FROM snapshot_aliases
 			ORDER BY created_at DESC, alias ASC
 		`)
 	} else {
 		rows, err = s.db.QueryContext(ctx, `
-			SELECT alias, snapshot_name, facade, extra_names_json, created_at, updated_at
+			SELECT alias, snapshot_name, facade, extra_names_json, state_json, created_at, updated_at
 			FROM snapshot_aliases
 			WHERE facade = ?
 			ORDER BY created_at DESC, alias ASC
@@ -3088,6 +3139,37 @@ func (s *Store) ListSnapshotAliases(ctx context.Context, facade string) (map[str
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list snapshot aliases: %w", err)
+	}
+	defer rows.Close()
+
+	items := map[string]models.SnapshotAlias{}
+	for rows.Next() {
+		alias, err := scanSnapshotAlias(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot alias: %w", err)
+		}
+		items[alias.Alias] = *alias
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot aliases: %w", err)
+	}
+	return items, nil
+}
+
+// ListSnapshotAliasesForOwner is ListSnapshotAliases narrowed to aliases whose
+// snapshot belongs to ownerRef. Owner-scoped callers use it so another
+// tenant's alias rows (and the facade state on them) never leave the store.
+func (s *Store) ListSnapshotAliasesForOwner(ctx context.Context, facade, ownerRef string) (map[string]models.SnapshotAlias, error) {
+	trimmed := strings.TrimSpace(facade)
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json, a.created_at, a.updated_at
+		FROM snapshot_aliases a
+		JOIN sandbox_snapshots s ON s.name = a.snapshot_name
+		WHERE s.owner_ref = ? AND (? = '' OR a.facade = ?)
+		ORDER BY a.created_at DESC, a.alias ASC
+	`, strings.TrimSpace(ownerRef), trimmed, trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot aliases for owner: %w", err)
 	}
 	defer rows.Close()
 
@@ -3294,8 +3376,8 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		INSERT INTO sandbox_snapshots (name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			push_state, push_error, owner_ref)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		strings.TrimSpace(snapshot.Name),
 		strings.TrimSpace(snapshot.Image),
@@ -3314,6 +3396,7 @@ func (s *Store) CreateSnapshot(ctx context.Context, snapshot *models.SandboxSnap
 		imageVerifiedAt,
 		pushState,
 		strings.TrimSpace(snapshot.PushError),
+		strings.TrimSpace(snapshot.OwnerRef),
 	)
 	if err != nil {
 		if isSQLiteUniqueConstraint(err) {
@@ -3329,7 +3412,7 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
+			push_state, push_error, owner_ref
 		FROM sandbox_snapshots
 		WHERE name = ?
 	`, strings.TrimSpace(name))
@@ -3343,12 +3426,56 @@ func (s *Store) GetSnapshot(ctx context.Context, name string) (*models.SandboxSn
 	return snapshot, nil
 }
 
+// GetSnapshotByNames returns the snapshot whose name is the earliest of names
+// that one exists for, in one primary-key lookup per name and one statement.
+// The create path resolves an image through it with every spelling the
+// engine treats as that image, so "snap:latest" cannot reach snapshot
+// "snap" without its owner check.
+func (s *Store) GetSnapshotByNames(ctx context.Context, names []string) (*models.SandboxSnapshot, error) {
+	if len(names) == 0 {
+		return nil, ErrNotFound
+	}
+	args := make([]any, len(names))
+	for i, name := range names {
+		args[i] = strings.TrimSpace(name)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, image, image_id, source_sandbox_id, created_at,
+			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
+			push_state, push_error, owner_ref
+		FROM sandbox_snapshots
+		WHERE name IN (?`+strings.Repeat(", ?", len(names)-1)+`)
+	`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("get snapshot by names: %w", err)
+	}
+	defer rows.Close()
+	found := map[string]*models.SandboxSnapshot{}
+	for rows.Next() {
+		snapshot, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, fmt.Errorf("get snapshot by names: %w", err)
+		}
+		found[snapshot.Name] = snapshot
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("get snapshot by names: %w", err)
+	}
+	for _, name := range args {
+		if snapshot, ok := found[name.(string)]; ok {
+			return snapshot, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
 func (s *Store) ListSnapshots(ctx context.Context) ([]*models.SandboxSnapshot, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
+			push_state, push_error, owner_ref
 		FROM sandbox_snapshots
 		ORDER BY created_at DESC, name ASC
 	`)
@@ -3381,6 +3508,210 @@ func (s *Store) DeleteSnapshot(ctx context.Context, name string) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// maxSnapshotPageRows bounds one ListSnapshotPage read. Callers page with
+// AfterName; nothing a caller sends can make one read allocate more.
+const maxSnapshotPageRows = 1000
+
+// SnapshotPageQuery selects one page of the snapshot catalogue, ordered by
+// name. Name is the primary key, so the cursor is stable across inserts and
+// deletes and each page is an index range scan rather than a sort of the
+// whole catalogue.
+type SnapshotPageQuery struct {
+	// OwnerRef / Scoped apply owner scoping: Scoped=false returns every
+	// owner's rows (operator and internal callers).
+	OwnerRef string
+	Scoped   bool
+	// SourceSandboxID, when set, keeps only snapshots taken from it.
+	SourceSandboxID string
+	// AliasFacade, when set, joins that facade's alias row onto each
+	// snapshot.
+	AliasFacade string
+	// AfterName is the exclusive cursor: rows with a greater name.
+	AfterName string
+	// Limit is the number of rows to return; callers ask for one more than
+	// they show to learn whether another page exists.
+	Limit int
+}
+
+// SnapshotPageRow is one snapshot with its alias for the queried facade.
+type SnapshotPageRow struct {
+	Snapshot *models.SandboxSnapshot
+	// Alias is nil when the snapshot has no alias for AliasFacade.
+	Alias *models.SnapshotAlias
+}
+
+// ListSnapshotPage returns one page of the catalogue. A snapshot with
+// several aliases for the same facade still yields exactly one row (its
+// smallest alias), so a page never holds duplicates.
+func (s *Store) ListSnapshotPage(ctx context.Context, q SnapshotPageQuery) ([]SnapshotPageRow, error) {
+	if q.Limit <= 0 {
+		return nil, fmt.Errorf("list snapshot page: limit must be positive")
+	}
+	query, args := snapshotPageSQL(q, min(q.Limit, maxSnapshotPageRows))
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshot page: %w", err)
+	}
+	defer rows.Close()
+
+	var items []SnapshotPageRow
+	for rows.Next() {
+		row, err := scanSnapshotPageRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan snapshot page row: %w", err)
+		}
+		items = append(items, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate snapshot page: %w", err)
+	}
+	return items, nil
+}
+
+// snapshotPageFilter renders the owner and source filters as plain equality
+// predicates, present only when they apply. A catch-all form such as
+// `(? = 0 OR owner_ref = ?)` reads the same but hides the column from the
+// planner, which then walks the whole catalogue by name and filters row by
+// row: a tenant with few snapshots would make every page examine everyone
+// else's. As equalities, a scoped walk seeks idx_sandbox_snapshots_owner_name
+// and a source walk idx_sandbox_snapshots_source_sandbox_id.
+func snapshotPageFilter(ownerRef string, scoped bool, sourceSandboxID string) (string, []any) {
+	var where []string
+	var args []any
+	if scoped {
+		where = append(where, "s.owner_ref = ?")
+		args = append(args, strings.TrimSpace(ownerRef))
+	}
+	if source := strings.TrimSpace(sourceSandboxID); source != "" {
+		where = append(where, "s.source_sandbox_id = ?")
+		args = append(args, source)
+	}
+	return strings.Join(where, " AND "), args
+}
+
+// snapshotPageSQL is ListSnapshotPage's statement, separate so a test can
+// check the plan SQLite picks for each filter combination.
+func snapshotPageSQL(q SnapshotPageQuery, limit int) (string, []any) {
+	filter, filterArgs := snapshotPageFilter(q.OwnerRef, q.Scoped, q.SourceSandboxID)
+	where := "s.name > ?"
+	if filter != "" {
+		where += " AND " + filter
+	}
+	// The alias subquery runs only for the rows the page returns, through
+	// idx_snapshot_aliases_snapshot_name.
+	query := `
+		SELECT s.name, s.image, s.image_id, s.source_sandbox_id, s.created_at,
+			s.entrypoint_json, s.region_id, s.cpu, s.memory_mb, s.disk_gb, s.gpu,
+			s.image_distribution_mode, s.image_digest, s.image_registry_ref, s.image_verified_at,
+			s.push_state, s.push_error, s.owner_ref,
+			a.alias, a.snapshot_name, a.facade, a.extra_names_json, a.state_json, a.created_at, a.updated_at
+		FROM sandbox_snapshots s
+		LEFT JOIN snapshot_aliases a ON a.alias = (
+			SELECT MIN(alias) FROM snapshot_aliases
+			WHERE snapshot_name = s.name AND facade = ? AND ? <> ''
+		)
+		WHERE ` + where + `
+		ORDER BY s.name ASC
+		LIMIT ?`
+	facade := strings.TrimSpace(q.AliasFacade)
+	args := append([]any{facade, facade, strings.TrimSpace(q.AfterName)}, filterArgs...)
+	return query, append(args, limit)
+}
+
+func countSnapshotsSQL(ownerRef string, scoped bool, sourceSandboxID string) (string, []any) {
+	query := `SELECT COUNT(*) FROM sandbox_snapshots s`
+	filter, args := snapshotPageFilter(ownerRef, scoped, sourceSandboxID)
+	if filter != "" {
+		query += ` WHERE ` + filter
+	}
+	return query, args
+}
+
+// CountSnapshots counts the snapshots a ListSnapshotPage walk with the same
+// owner and source filters would visit. Like the page, it counts through the
+// owner or source index rather than across the catalogue.
+func (s *Store) CountSnapshots(ctx context.Context, ownerRef string, scoped bool, sourceSandboxID string) (int, error) {
+	query, args := countSnapshotsSQL(ownerRef, scoped, sourceSandboxID)
+	var count int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count snapshots: %w", err)
+	}
+	return count, nil
+}
+
+func scanSnapshotPageRow(scanner interface {
+	Scan(dest ...any) error
+}) (SnapshotPageRow, error) {
+	var snapshot models.SandboxSnapshot
+	var entrypointJSON string
+	var imageVerifiedAt sql.NullTime
+	var aliasName, aliasSnapshot, aliasFacade, aliasExtraNames, aliasState sql.NullString
+	var aliasCreated, aliasUpdated sql.NullTime
+	err := scanner.Scan(
+		&snapshot.Name,
+		&snapshot.Image,
+		&snapshot.ImageID,
+		&snapshot.SourceSandboxID,
+		&snapshot.CreatedAt,
+		&entrypointJSON,
+		&snapshot.RegionID,
+		&snapshot.CPU,
+		&snapshot.MemoryMB,
+		&snapshot.DiskGB,
+		&snapshot.GPU,
+		&snapshot.ImageDistributionMode,
+		&snapshot.ImageDigest,
+		&snapshot.ImageRegistryRef,
+		&imageVerifiedAt,
+		&snapshot.PushState,
+		&snapshot.PushError,
+		&snapshot.OwnerRef,
+		&aliasName,
+		&aliasSnapshot,
+		&aliasFacade,
+		&aliasExtraNames,
+		&aliasState,
+		&aliasCreated,
+		&aliasUpdated,
+	)
+	if err != nil {
+		return SnapshotPageRow{}, err
+	}
+	if imageVerifiedAt.Valid {
+		verifiedAt := imageVerifiedAt.Time.UTC()
+		snapshot.ImageVerifiedAt = &verifiedAt
+	}
+	if entrypointJSON != "" && entrypointJSON != "[]" {
+		if err := json.Unmarshal([]byte(entrypointJSON), &snapshot.Entrypoint); err != nil {
+			return SnapshotPageRow{}, fmt.Errorf("decode snapshot entrypoint: %w", err)
+		}
+	}
+	row := SnapshotPageRow{Snapshot: &snapshot}
+	if !aliasName.Valid {
+		return row, nil
+	}
+	alias := &models.SnapshotAlias{
+		Alias:        aliasName.String,
+		SnapshotName: aliasSnapshot.String,
+		Facade:       aliasFacade.String,
+		StateJSON:    aliasState.String,
+		CreatedAt:    aliasCreated.Time.UTC(),
+		UpdatedAt:    aliasUpdated.Time.UTC(),
+		ExtraNames:   []string{},
+	}
+	if aliasExtraNames.String != "" {
+		if err := json.Unmarshal([]byte(aliasExtraNames.String), &alias.ExtraNames); err != nil {
+			return SnapshotPageRow{}, fmt.Errorf("decode snapshot alias extra names: %w", err)
+		}
+		if alias.ExtraNames == nil {
+			alias.ExtraNames = []string{}
+		}
+	}
+	row.Alias = alias
+	return row, nil
 }
 
 // CreateTemplate inserts a freshly-allocated template row. Callers set
@@ -4058,7 +4389,7 @@ func (s *Store) ListSnapshotsPendingPush(ctx context.Context) ([]*models.Sandbox
 		SELECT name, image, image_id, source_sandbox_id, created_at,
 			entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
 			image_distribution_mode, image_digest, image_registry_ref, image_verified_at,
-			push_state, push_error
+			push_state, push_error, owner_ref
 		FROM sandbox_snapshots
 		WHERE push_state IN ('pending', 'error')
 			OR (push_state = 'pushing' AND (push_claimed_at IS NULL OR push_claimed_at <= ?))
@@ -4763,6 +5094,7 @@ func scanSnapshotAlias(scanner interface {
 		&alias.SnapshotName,
 		&alias.Facade,
 		&extraNamesJSON,
+		&alias.StateJSON,
 		&alias.CreatedAt,
 		&alias.UpdatedAt,
 	)
@@ -4833,6 +5165,7 @@ func scanSnapshot(scanner interface {
 		&imageVerifiedAt,
 		&snapshot.PushState,
 		&snapshot.PushError,
+		&snapshot.OwnerRef,
 	)
 	if err != nil {
 		return nil, err

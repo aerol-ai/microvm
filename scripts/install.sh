@@ -1260,7 +1260,7 @@ EOF
 https://$DOMAIN:8443 {
 	bind 127.0.0.1
 ${tls_block}
-	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /mcp
+	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp
 	handle @api {
 		reverse_proxy 127.0.0.1:21212
 	}

@@ -22,6 +22,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
+	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
@@ -120,6 +121,12 @@ func (s *Server) routes() {
 		Service: s.service,
 		Logger:  s.logger,
 		Auth:    s.requireE2BAuth,
+	})
+
+	runloop.RegisterRoutes(s.mux, runloop.Deps{
+		Service: s.service,
+		Logger:  s.logger,
+		Auth:    s.requireRunloopAuth,
 	})
 
 	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
