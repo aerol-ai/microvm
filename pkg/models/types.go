@@ -602,6 +602,14 @@ type CreateSandboxRequest struct {
 	// sandbox. Used by facades that expose label-style metadata (Daytona
 	// labels, E2B metadata).
 	Tags map[string]string `json:"tags,omitempty"`
+	// CompatState carries each facade's per-sandbox compatibility state
+	// (sandbox_compat_state) on the FSM-replicated spec so a failover recreate
+	// can restore it — the rows are node-local and would otherwise be lost with
+	// the dead owner (B11). It is replication-internal: the create path strips
+	// any client-supplied value (normalizeCreateRequest), and only the service's
+	// own UpsertCompatState write-through populates it. Keyed by facade name →
+	// that facade's state JSON.
+	CompatState map[string]string `json:"compatState,omitempty"`
 	// Runtime selects the container runtime for this sandbox. Empty falls back
 	// to the host default (SB_CONTAINER_RUNTIME). Allowed values: "docker"
 	// (standard runc-backed Docker runtime, default), "gvisor" (runsc-backed

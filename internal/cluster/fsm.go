@@ -3729,6 +3729,7 @@ func cloneCreateSandboxRequest(in *models.CreateSandboxRequest) *models.CreateSa
 	out := *in
 	out.Env = cloneStringMap(in.Env)
 	out.Tags = cloneStringMap(in.Tags)
+	out.CompatState = cloneStringMap(in.CompatState)
 	if len(in.ContainerCommand) > 0 {
 		out.ContainerCommand = append([]string(nil), in.ContainerCommand...)
 	}

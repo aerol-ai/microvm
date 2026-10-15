@@ -1442,6 +1442,7 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 			return true, err
 		}
 		if attempted {
+			s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
 			s.logger.Info("cluster: recreated durable wasm sandbox after failover",
 				"sandbox_id", id, "replayed_ports", len(exposedPorts))
 		}
@@ -1483,12 +1484,27 @@ func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec mod
 	if _, err := s.CreateSandboxWithID(contextWithStoredSpecReplay(ctx), merged, id); err != nil {
 		return true, err
 	}
+	s.restoreCompatStateAfterRecreate(ctx, id, spec.CompatState)
 	if err := s.replayClusterExposedPorts(ctx, id, exposedPorts); err != nil {
 		return true, err
 	}
 	s.logger.Info("cluster: recreated sandbox after failover",
 		"sandbox_id", id, "replayed_ports", len(exposedPorts))
 	return true, nil
+}
+
+// restoreCompatStateAfterRecreate re-materializes the facade compat-state rows a
+// failover recreate inherited from the replicated spec (B11). The rows are
+// node-local, so the new owner rewrites them from spec.CompatState; a failure
+// only means a facade falls back to defaults until the next edit, so it logs
+// rather than failing the recreate.
+func (s *Service) restoreCompatStateAfterRecreate(ctx context.Context, id string, compat map[string]string) {
+	for facade, stateJSON := range compat {
+		if err := s.store.UpsertCompatState(ctx, id, facade, stateJSON); err != nil && s.logger != nil {
+			s.logger.Warn("cluster: restore facade compat state after recreate failed",
+				"sandbox_id", id, "facade", facade, "err", err)
+		}
+	}
 }
 
 func (s *Service) replayClusterExposedPorts(ctx context.Context, id string, exposedPorts map[int]cluster.ExposedPortRoute) error {
@@ -6836,6 +6852,11 @@ func l4ListenPort(listen string) int {
 }
 
 func normalizeCreateRequest(req models.CreateSandboxRequest) models.CreateSandboxRequest {
+	// CompatState is replication-internal (B11): it rides the FSM spec only
+	// through the service's own UpsertCompatState write-through, never from a
+	// client create body. Strip anything supplied so a caller cannot inject it
+	// (a failover recreate reads it off the raw replicated spec, before here).
+	req.CompatState = nil
 	if req.CPU <= 0 {
 		req.CPU = models.DefaultCPU
 	}
