@@ -639,6 +639,73 @@ variable "audit_export_file_path" {
   default     = "/var/log/aerol-audit-export.jsonl"
 }
 
+# S3 Object Lock audit witness (plans/open-audit-witness.md, audit_witness.tf).
+#
+# Off by default, so a production render is byte-identical and no bucket is
+# ever created for a deployment that did not ask for one. On, it creates the
+# locked bucket, grants both node roles the witness IAM, and sets
+# SB_AUDIT_WITNESS_BACKEND=s3 on every node. It does NOT turn on
+# SB_ENTERPRISE_MODE or SB_SECRET_AUDIT_EXTERNAL_WITNESS; set those through
+# extra_sandboxd_env.
+variable "audit_witness_enabled" {
+  description = "Create the S3 Object Lock audit-witness bucket, grant nodes the witness IAM, and set SB_AUDIT_WITNESS_* on every node."
+  type        = bool
+  default     = false
+}
+
+# One value feeds both the IAM resource paths and SB_AUDIT_WITNESS_S3_PREFIX,
+# so the grant and the keys the daemon writes cannot drift apart.
+variable "audit_witness_prefix" {
+  description = "SB_AUDIT_WITNESS_S3_PREFIX, and the key prefix the node-role IAM is scoped to."
+  type        = string
+  default     = "witness/"
+
+  validation {
+    # A leading slash would put every key under an empty path segment, and
+    # '*', '?' or '$' would turn the IAM resource into a wider wildcard or a
+    # policy variable than intended.
+    condition     = can(regex("^[^/*?$\\s][^*?$\\s]*$", var.audit_witness_prefix))
+    error_message = "audit_witness_prefix must be non-empty, must not start with '/', and must not contain whitespace, '*', '?' or '$'."
+  }
+}
+
+# COMPLIANCE: no one, the AWS account root included, can delete a head before
+# its lock ends. That is the claim production wants (founder F1). GOVERNANCE:
+# a principal with s3:BypassGovernanceRetention can, which is what makes a
+# trial or an integration bucket deletable (D13). The node role never holds
+# that permission, and the daemon's boot canary refuses a role that does.
+variable "witness_lock_mode" {
+  description = "Default Object Lock retention mode for the witness bucket: COMPLIANCE (production) or GOVERNANCE (trials, integration runs)."
+  type        = string
+  default     = "COMPLIANCE"
+
+  validation {
+    condition     = contains(["COMPLIANCE", "GOVERNANCE"], var.witness_lock_mode)
+    error_message = "witness_lock_mode must be COMPLIANCE or GOVERNANCE."
+  }
+}
+
+# Must be at least SB_SECRET_AUDIT_RETENTION_DAYS (daemon default 30) or the
+# daemon refuses to boot; audit_witness.tf checks that at plan time. Also the
+# noncurrent-version expiry, so it bounds how far back the offline verifier
+# can see witnessed heads.
+variable "witness_lock_days" {
+  description = "Default Object Lock retention, in days, for every witnessed head. Must be >= SB_SECRET_AUDIT_RETENTION_DAYS."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.witness_lock_days >= 1 && floor(var.witness_lock_days) == var.witness_lock_days
+    error_message = "witness_lock_days must be a whole number of days, at least 1."
+  }
+}
+
+variable "audit_witness_auditor_policy_enabled" {
+  description = "Also create an unattached read-only IAM policy (witness bucket, plus the audit-export bucket when audit_export_enabled) for whoever runs `aerolvm audit verify`."
+  type        = bool
+  default     = false
+}
+
 # Audit receiver fixture (plans/integration-test-security.md §6.4).
 #
 # One small binary, built by the same pipeline and shipped over the same

@@ -942,7 +942,7 @@ SB_SECRET_PROVIDER=awskms
 SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
 SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
 %{ endif ~}
-%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" ~}
+%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" || audit_witness_s3_bucket != "" ~}
 # One assignment for every AWS-backed sink. Pinned rather than left to the
 # SDK's IMDS region fallback: an absent region surfaces as an opaque timeout at
 # seal/ship time instead of a clear failure.
@@ -992,6 +992,24 @@ SB_AUDIT_EXPORT_S3_REGION=${aws_region}
 # per-node prefix would just repeat the node twice in every path.
 SB_AUDIT_EXPORT_S3_PREFIX=${audit_export_s3_prefix}
 %{ endif ~}
+%{ endif ~}
+%{ if audit_witness_s3_bucket != "" ~}
+# Managed by Terraform bootstrap: S3 Object Lock audit witness
+# (plans/open-audit-witness.md). Template vars audit_witness_s3_bucket ("" =
+# no witness) and audit_witness_s3_prefix are documented here, not in the
+# header, because user_data_replace_on_change means any byte rendered with the
+# witness off would replace every running node on the next apply.
+#
+# Independent of the export backend: the export carries the records, the
+# witness carries the chain heads that prove they were not rewritten later.
+# SB_NODE_ID, which the witness requires, is already in this file from
+# cluster-init/cluster-join (--node-id ${node_name}). The region is pinned for
+# the same reason as AWS_REGION above; no endpoint or path-style setting,
+# because those are for S3-compatible stores and this is an AWS bucket.
+SB_AUDIT_WITNESS_BACKEND=s3
+SB_AUDIT_WITNESS_S3_BUCKET=${audit_witness_s3_bucket}
+SB_AUDIT_WITNESS_S3_PREFIX=${audit_witness_s3_prefix}
+SB_AUDIT_WITNESS_S3_REGION=${aws_region}
 %{ endif ~}
 
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
