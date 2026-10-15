@@ -70,3 +70,32 @@ func fcDecode(t *testing.T, body []byte, out any) {
 		t.Fatalf("decode response: %v; body=%s", err, string(body))
 	}
 }
+
+// ownerAPI returns a local address that reaches sandboxd on the node that OWNS
+// sandboxID. It is the complement of nonOwnerAPI. A committed snapshot's row
+// lives only on its home (owner) node — snapshot rows are not replicated through
+// the FSM, and cluster-wide snapshot-list aggregation is a deferred feature — so
+// a facade list that must observe a committed snapshot has to be read on its
+// owner. (Get/delete by name/id still route cluster-wide via the home-node
+// index; only list does not aggregate yet.)
+func ownerAPI(t *testing.T, c *harness.Client, sandboxID string) string {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	owner := resolvePlacementOwner(t, c, sandboxID)
+	if owner == "" {
+		t.Fatal("no placement owner recorded for the sandbox")
+	}
+	for _, n := range targets.Nodes {
+		if _, ok := harness.SSHTarget(n); !ok {
+			continue
+		}
+		if heteroNodeID(t, c, targets, n.Name) == owner {
+			return "http://" + harness.SSHForward(t, n, "127.0.0.1:21212")
+		}
+	}
+	t.Skipf("owner node %s not SSH-reachable", owner)
+	return ""
+}

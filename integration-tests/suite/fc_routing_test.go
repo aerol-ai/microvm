@@ -117,11 +117,16 @@ func TestE2BTemplateDeleteRoutesFromNonOwner(t *testing.T) {
 	defer cancel()
 
 	name, sb := snapshotOnOwnedSandbox(t, c, ctx, "e2b-route")
-	// Resolve the E2B snapshot id from the catalogue (matches our name).
+	// Resolve the E2B snapshot id from the catalogue (matches our name). The
+	// committed snapshot's row lives on its home node and the cluster-wide
+	// snapshot list does not aggregate yet, so the list is read on the owner
+	// (where the row is). The id itself is name-derived and routes cluster-wide,
+	// so the delete below still goes through a NON-owner to prove routing.
+	ownerURL := ownerAPI(t, c, sb.ID)
 	var e2bID string
 	deadline := time.Now().Add(90 * time.Second)
 	for e2bID == "" && time.Now().Before(deadline) {
-		st, body := fcDo(t, ctx, http.MethodGet, "", "/e2b/snapshots?limit=500", nil, nil)
+		st, body := fcDo(t, ctx, http.MethodGet, ownerURL, "/e2b/snapshots?limit=500", nil, nil)
 		if st == http.StatusOK {
 			var items []e2bSnapshotInfo
 			fcDecode(t, body, &items)
@@ -211,8 +216,7 @@ func TestCreateFromSnapshotAcrossNodes(t *testing.T) {
 	snapName := fcSnapshotName(t, "xnode")
 	src := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t)})
 	waitRunning(t, src)
-	snap, err := c.SDK().CreateSnapshot(ctx, src.ID, snapName)
-	if err != nil {
+	if _, err := c.SDK().CreateSnapshot(ctx, src.ID, snapName); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
 	t.Cleanup(func() {
@@ -221,10 +225,15 @@ func TestCreateFromSnapshotAcrossNodes(t *testing.T) {
 		_ = c.SDK().DeleteSnapshot(cctx, snapName)
 	})
 
+	// Create from the snapshot by NAME: the name resolves to the owner-namespaced
+	// AOCR ref on whatever node the ingress and placement pick, so the snapshot's
+	// pushed copy is what makes it usable cluster-wide. (The committed
+	// aerolvm-snapshot/<hash> ref only resolves on the home node — see UC-260.)
 	var derived *microvm.Sandbox
+	var err error
 	deadline := time.Now().Add(4 * time.Minute)
 	for {
-		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: snap.Image, Name: harness.UniqueName(sc, t)})
+		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: snapName, Name: harness.UniqueName(sc, t)})
 		if err == nil {
 			break
 		}

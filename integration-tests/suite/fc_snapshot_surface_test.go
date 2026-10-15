@@ -180,8 +180,7 @@ func TestV1SnapshotCreateRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 	snapName := fcSnapshotName(t, "roundtrip")
-	snap, err := c.SDK().CreateSnapshot(ctx, src.ID, snapName)
-	if err != nil {
+	if _, err := c.SDK().CreateSnapshot(ctx, src.ID, snapName); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
 	t.Cleanup(func() {
@@ -190,12 +189,18 @@ func TestV1SnapshotCreateRoundTrip(t *testing.T) {
 		_ = c.SDK().DeleteSnapshot(cctx, snapName)
 	})
 
-	// Create from the snapshot, retrying the AOCR-propagation window in a
-	// cluster (mirrors UC-21).
+	// Create from the snapshot by its NAME, not the committed image ref
+	// (aerolvm-snapshot/<hash>) the commit returns. That reserved tag resolves
+	// only on the home node; off it there is no reverse map from hash to the
+	// pushed registry copy, so a non-home ingress leaves it as docker.io/... and
+	// the pull fails. The name resolves deterministically to the owner-namespaced
+	// AOCR ref on any node, which is the cluster-portable way to create from a
+	// snapshot. Retry rides out the post-commit AOCR push window.
 	var derived *microvm.Sandbox
-	deadline := time.Now().Add(3 * time.Minute)
+	var err error
+	deadline := time.Now().Add(4 * time.Minute)
 	for {
-		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: snap.Image, Name: harness.UniqueName(sc, t)})
+		derived, err = c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: snapName, Name: harness.UniqueName(sc, t)})
 		if err == nil {
 			break
 		}
