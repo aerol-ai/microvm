@@ -22,7 +22,16 @@ func (s *Service) GetCompatState(ctx context.Context, sandboxID, facade string) 
 	return s.store.GetCompatState(ctx, sandboxID, facade)
 }
 
+// ListCompatState returns the facade state for the caller's sandboxes. A user
+// token only ever joins this against its own (owner-scoped) sandbox list, so a
+// scoped caller reads just its own rows — not every tenant's — which both keeps
+// the owner check in this shared helper (D13) and avoids a fleet-wide scan on
+// each list at 100k sandboxes. Operator / internal callers (no owner scope) get
+// the full map, as the fleet-list paths need.
 func (s *Service) ListCompatState(ctx context.Context, facade string) (map[string]models.SandboxCompatState, error) {
+	if owner, scoped := ownerScope(ctx); scoped {
+		return s.store.ListCompatStateByOwner(ctx, facade, owner)
+	}
 	return s.store.ListCompatState(ctx, facade)
 }
 

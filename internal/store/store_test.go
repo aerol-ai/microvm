@@ -2704,3 +2704,54 @@ func TestSnapshotPushClaimLease(t *testing.T) {
 		t.Fatalf("finished snapshot listed %v, want none", rows)
 	}
 }
+
+// ListCompatStateByOwner returns only the given owner's sandboxes' facade
+// state, joining through sandboxes.owner_ref — the owner-scoped read the
+// service uses so a user token never scans another tenant's rows (D13).
+func TestListCompatStateByOwner(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	mk := func(id, owner, blob string) {
+		sb := sampleSandbox(id)
+		sb.OwnerRef = owner
+		if err := st.Create(ctx, sb); err != nil {
+			t.Fatalf("Create(%s): %v", id, err)
+		}
+		if err := st.UpsertCompatState(ctx, id, models.FacadeE2B, blob); err != nil {
+			t.Fatalf("UpsertCompatState(%s): %v", id, err)
+		}
+	}
+	mk("sb-a1", "acme", `{"v":"a1"}`)
+	mk("sb-a2", "acme", `{"v":"a2"}`)
+	mk("sb-g1", "globex", `{"v":"g1"}`)
+
+	acme, err := st.ListCompatStateByOwner(ctx, models.FacadeE2B, "acme")
+	if err != nil {
+		t.Fatalf("ListCompatStateByOwner: %v", err)
+	}
+	if len(acme) != 2 {
+		t.Fatalf("acme rows = %d, want 2: %v", len(acme), acme)
+	}
+	if _, leaked := acme["sb-g1"]; leaked {
+		t.Fatalf("acme leaked globex's row")
+	}
+	if acme["sb-a1"].StateJSON != `{"v":"a1"}` {
+		t.Fatalf("sb-a1 state = %q", acme["sb-a1"].StateJSON)
+	}
+
+	// A facade with no rows for this owner yields an empty (non-nil) map.
+	none, err := st.ListCompatStateByOwner(ctx, models.FacadeDaytona, "acme")
+	if err != nil {
+		t.Fatalf("ListCompatStateByOwner(daytona): %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("daytona rows = %d, want 0", len(none))
+	}
+
+	// A closed DB surfaces the query error rather than a nil map.
+	st.Close()
+	if _, err := st.ListCompatStateByOwner(ctx, models.FacadeE2B, "acme"); err == nil {
+		t.Fatal("ListCompatStateByOwner on a closed store returned no error")
+	}
+}
