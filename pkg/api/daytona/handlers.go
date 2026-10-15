@@ -174,10 +174,17 @@ func (h *handlers) listSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshots, err := h.deps.Service.ListSnapshots(r.Context())
+	// Page the caller's catalogue in the store instead of loading every
+	// tenant's rows and filtering in Go (D9). Daytona's name filter, arbitrary
+	// sort and page-number pagination then run over just this owner's rows.
+	rows, err := h.deps.Service.ListOwnedSnapshots(r.Context(), "", "")
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
+	}
+	snapshots := make([]*models.SandboxSnapshot, 0, len(rows))
+	for _, row := range rows {
+		snapshots = append(snapshots, row.Snapshot)
 	}
 
 	items := h.filteredSnapshots(r, snapshots, filters)
