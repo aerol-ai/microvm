@@ -1701,6 +1701,14 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if err := s.NormalizeCreateImageDistribution(ctx, &req); err != nil {
 		return nil, err
 	}
+	// An owner-scoped (validated user-token) caller must not be able to start
+	// another tenant's private image just because it is already in the shared
+	// local image cache: tell the runtime to authorize the image against its
+	// registry even on a cache hit. Operator/PAT and internal/failover callers
+	// are unscoped and keep the fast cache-trusting path.
+	if _, scoped := ownerScope(ctx); scoped {
+		req.VerifyRegistryAccess = true
+	}
 	if err := NormalizeCreateFailover(&req); err != nil {
 		return nil, err
 	}

@@ -573,7 +573,15 @@ type CreateSandboxRequest struct {
 	NetworkBlockAll  bool              `json:"network_block_all"`
 	Registry         *RegistryAuth     `json:"registry,omitempty"`
 	ContainerCommand []string          `json:"container_command,omitempty"`
-	Mounts           []MountSpec       `json:"mounts,omitempty"`
+	// VerifyRegistryAccess forces the runtime to authorize the image against
+	// its registry even when it is already cached on the node, instead of
+	// trusting the local image. The service sets it for owner-scoped (validated
+	// user-token) callers so one tenant cannot start another tenant's private
+	// image just because it is already in the shared local cache. Internal-only
+	// (json:"-"): never on the wire, re-derived on the owner node after a
+	// cluster forward from the re-authenticated caller.
+	VerifyRegistryAccess bool        `json:"-"`
+	Mounts               []MountSpec `json:"mounts,omitempty"`
 	// PlatformVolumes references named, operator-backed persistent volumes by
 	// name only — the user never supplies storage coordinates or credentials.
 	// The service translates each entry into a synthesized, tenant-scoped
