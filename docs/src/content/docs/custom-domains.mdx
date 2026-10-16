@@ -32,6 +32,8 @@ Add a TXT record (a DNS record that holds a line of text). The server reads it t
 
 Some providers want the full name, such as `_aerol-verify.api.acme.com`. The value stays the same.
 
+On a managed, multi-account deployment the value also carries a short token that is unique to your account, so one account cannot verify a domain with another account's record. The exact value to add is always the one the server lists for your domain (see [See the DNS records for a sandbox](#see-the-dns-records-for-a-sandbox)) — copy it from there rather than from the table above.
+
 The record belongs to the domain, not to one sandbox. Add it once and reuse it when you delete and recreate sandboxes. To check that it is live, run `dig TXT _aerol-verify.api.acme.com` in a terminal.
 
 ## Step 2: Point the domain at the server

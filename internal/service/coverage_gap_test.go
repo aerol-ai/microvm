@@ -80,13 +80,13 @@ func (dnsStringNotFoundResolver) LookupTXT(_ context.Context, _ string) ([]strin
 
 func TestVerifyCustomDomainOwnershipDNSErrors(t *testing.T) {
 	ctx := context.Background()
-	if err := verifyCustomDomainOwnership(ctx, dnsNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("not found err = %v", err)
 	}
-	if err := verifyCustomDomainOwnership(ctx, dnsGenericErrResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsGenericErrResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("generic err = %v", err)
 	}
-	if err := verifyCustomDomainOwnership(ctx, dnsStringNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify="); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
+	if err := verifyCustomDomainOwnership(ctx, dnsStringNotFoundResolver{}, "api.acme.com", "_aerol-verify", "aerol-verify=", ""); !errors.Is(err, models.ErrCustomDomainVerificationFailed) {
 		t.Fatalf("string not found err = %v", err)
 	}
 }

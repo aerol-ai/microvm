@@ -276,7 +276,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	// keyed to the hostname, not the sandbox ID, so users can provision it
 	// once and attach the hostname to any sandbox (including a recreated
 	// one with a new ID).
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainOwnerTokenFromContext(ctx)); err != nil {
 		return err
 	}
 
@@ -467,8 +467,9 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 	// them. Verify every hostname first, so a create takes all of its domains
 	// or none.
 	if _, scoped := ownerScope(ctx); scoped {
+		ownerToken := customDomainOwnerTokenFromContext(ctx)
 		for _, h := range hostnames {
-			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken); err != nil {
 				return err
 			}
 		}
