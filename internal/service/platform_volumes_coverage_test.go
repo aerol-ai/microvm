@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -96,11 +97,19 @@ func TestResolvePlatformVolumesForReplicationWave8(t *testing.T) {
 	if len(ok.Mounts) == 0 || len(ok.PlatformVolumes) != 0 {
 		t.Fatalf("mounts=%d platformVolumes=%d", len(ok.Mounts), len(ok.PlatformVolumes))
 	}
+	// A name with no row yet is a first use: it resolves to the mount the
+	// create will freeze, and writes no row (the create owns that).
 	miss := &models.CreateSandboxRequest{
 		PlatformVolumes: []models.PlatformVolumeMount{{Name: "missing", Path: "/w"}},
 	}
-	if err := s.ResolvePlatformVolumesForReplication(ctx, miss); err == nil {
-		t.Fatal("expected missing volume")
+	if err := s.ResolvePlatformVolumesForReplication(ctx, miss); err != nil {
+		t.Fatalf("first-use volume: %v", err)
+	}
+	if len(miss.Mounts) != 1 || !strings.HasSuffix(miss.Mounts[0].Source, "/missing") {
+		t.Fatalf("first-use mounts = %+v", miss.Mounts)
+	}
+	if _, err := s.GetPlatformVolumeByName(ctx, "missing"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("replication wrote a first-use row: %v", err)
 	}
 	empty := &models.CreateSandboxRequest{Image: "alpine"}
 	if err := s.ResolvePlatformVolumesForReplication(ctx, empty); err != nil {

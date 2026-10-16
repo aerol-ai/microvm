@@ -74,17 +74,12 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 				return nil, fmt.Errorf("generate platform volume id: %w", err)
 			}
 			// Freeze the backend coordinate at creation (see CreatePlatformVolume).
-			source, err := volumes.MountSource(backendFromConfig(pv), tenant, safeName)
+			row, err := firstUseVolumeRow(pv, tenant, safeName)
 			if err != nil {
 				return nil, fmt.Errorf("platform volume %q: %w", ref.Name, err)
 			}
-			vol, created, err := s.volumeMeta().GetOrCreate(ctx, &models.Volume{
-				ID:      id,
-				Tenant:  tenant,
-				Name:    safeName,
-				Backend: pv.Backend,
-				Source:  source,
-			}, pv.MaxPerTenant)
+			row.ID = id
+			vol, created, err := s.volumeMeta().GetOrCreate(ctx, row, pv.MaxPerTenant)
 			if err != nil {
 				if errors.Is(err, store.ErrVolumeQuotaExceeded) {
 					return nil, fmt.Errorf("%w: %v", models.ErrPlatformVolumeQuota, err)
@@ -122,12 +117,30 @@ func mountSpecForVolume(b volumes.Backend, vol *models.Volume, tenant, safeName,
 	return volumes.BuildMountSpec(b, tenant, safeName, target, readOnly)
 }
 
+// firstUseVolumeRow is the row resolvePlatformVolumes creates for a name the
+// tenant has not used yet (the caller sets ID). ResolvePlatformVolumesForReplication
+// derives a first-use mount from the same row, so the spec a cluster create
+// promotes and the row its local create freezes cannot drift apart.
+func firstUseVolumeRow(pv config.PlatformVolumesConfig, tenant, safeName string) (*models.Volume, error) {
+	source, err := volumes.MountSource(backendFromConfig(pv), tenant, safeName)
+	if err != nil {
+		return nil, err
+	}
+	return &models.Volume{Tenant: tenant, Name: safeName, Backend: pv.Backend, Source: source}, nil
+}
+
 // ResolvePlatformVolumesForReplication rewrites platform-volume references into
 // concrete MountSpecs for the cluster-replicated create spec. That preserves the
 // already-resolved tenant prefix across failover/recreate, where there is no
-// original user auth context to derive the tenant from. It intentionally does no
-// quota or volume-row writes; createSandbox already did those before the sandbox
-// was admitted.
+// original user auth context to derive the tenant from.
+//
+// It writes nothing: no volume row, no quota charge, no attachment. Those belong
+// to createSandbox's resolvePlatformVolumes, which also deletes a row it created
+// when the create fails. So a name with no row yet is not an error here. The
+// reserved cluster create calls this BEFORE its local create (the seal leg runs
+// alongside the create and needs the concrete mounts), and on a volume's first
+// use that create is what makes the row. The mount is then derived from
+// firstUseVolumeRow, the same coordinate the create freezes into the new row.
 func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req *models.CreateSandboxRequest) error {
 	if req == nil || len(req.PlatformVolumes) == 0 {
 		return nil
@@ -149,6 +162,9 @@ func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req 
 			return fmt.Errorf("platform volume %q: %w", ref.Name, err)
 		}
 		vol, err := s.volumeMeta().ByName(ctx, tenant, safeName)
+		if errors.Is(err, store.ErrNotFound) {
+			vol, err = firstUseVolumeRow(pv, tenant, safeName)
+		}
 		if err != nil {
 			return fmt.Errorf("get platform volume %q for replication: %w", ref.Name, err)
 		}

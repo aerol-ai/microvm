@@ -85,8 +85,9 @@ func (c *Client) StaticSandboxRoute(spec StaticRouteSpec) map[string]any {
 				},
 				// Taken whenever the responder answers NXDOMAIN: wake, 503,
 				// WASM/isolate mediators, masked hosts, unknown hosts.
-				"upstreams":      []map[string]any{{"dial": spec.RouterAddr}},
-				"flush_interval": -1,
+				"upstreams":          []map[string]any{{"dial": spec.RouterAddr}},
+				"flush_interval":     -1,
+				"stream_close_delay": streamCloseDelay,
 			},
 		},
 	}

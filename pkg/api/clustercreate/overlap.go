@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -124,6 +125,26 @@ func OverlapCreateAndPromote(
 		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
 	}
 
+	// Platform volumes: the seal and the promoted spec need concrete
+	// MountSpecs (a failover recreate has no caller identity to scope the
+	// tenant, and S3 keys must land in the sealed bag), but the create leg
+	// must keep the bare references. Its resolvePlatformVolumes is what makes
+	// a first-use volume's row under the tenant quota, records the attachment
+	// that stops an in-use volume being deleted, and removes the row again if
+	// the create fails. Resolving req in place here (as the callers used to)
+	// 404'd every first-use volume and skipped the attachment, so resolve a
+	// copy with its own Mounts array: the create leg appends to req.Mounts
+	// while the seal leg reads this one.
+	replicated := req
+	if len(req.PlatformVolumes) > 0 {
+		replicated.Mounts = slices.Clone(req.Mounts)
+		if err := svc.ResolvePlatformVolumesForReplication(ctx, &replicated); err != nil {
+			// Nothing local has started; release only the reservation.
+			cancelReservation(context.Background(), c, logger, reservationID)
+			return nil, err
+		}
+	}
+
 	// commitCtx is derived from the request so an overall deadline still
 	// bounds seal+promote, but we NEVER treat cancelling it as cleanup: a
 	// Raft apply can fail client-side and still land in the FSM (§2.2).
@@ -177,7 +198,7 @@ func OverlapCreateAndPromote(
 		}()
 		// HA creates: local seal only on this path; async fan-out is off-path
 		// (plans/secrets-hardening §3e). cluster_seal timing stays local seal.
-		sealed, err := svc.SealAndDistribute(sealCtx, reservationID, req, binding.Recipients)
+		sealed, err := svc.SealAndDistribute(sealCtx, reservationID, replicated, binding.Recipients)
 		if opts.Timing != nil {
 			opts.Timing.RecordStage("cluster_seal", time.Since(sealStart))
 		}
@@ -213,7 +234,7 @@ func OverlapCreateAndPromote(
 	promoteStart := time.Now()
 	var promoteErr error
 	if opts.PromoteWithSpec {
-		redacted := service.RedactClusterSecrets(req)
+		redacted := service.RedactClusterSecrets(replicated)
 		promoteErr = c.RecordPlacement(promoteCtx, reservationID, &redacted, sr.secrets)
 	} else {
 		promoteErr = c.RecordPlacement(promoteCtx, reservationID, nil, sr.secrets)

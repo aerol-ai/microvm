@@ -1600,9 +1600,12 @@ func TestCreateOnSelectedNode_ReservedResolvePlatformVolumesFailure(t *testing.T
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.Config{
-		EnableCaddy: false,
-		ToolboxPort: 2280,
-		PATToken:    "operator-pat",
+		// A reservation only exists in cluster mode; production never
+		// attaches a cluster client with EnableCluster off.
+		EnableCluster: true,
+		EnableCaddy:   false,
+		ToolboxPort:   2280,
+		PATToken:      "operator-pat",
 		PlatformVolumes: config.PlatformVolumesConfig{
 			Enabled:  true,
 			Backend:  config.PlatformVolumesBackendS3,
