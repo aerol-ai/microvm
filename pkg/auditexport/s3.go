@@ -95,7 +95,14 @@ func ObjectKey(prefix, nodeID, batchID string, shippedAt time.Time) string {
 	if safeBatch == "" {
 		safeBatch = fmt.Sprintf("%d", shippedAt.UnixNano())
 	}
-	return path.Join(prefix, "node="+node, shippedAt.Format("2006/01/02"), safeBatch+".jsonl")
+	return DayPrefix(prefix, node, shippedAt) + safeBatch + ".jsonl"
+}
+
+// DayPrefix is the listing prefix that holds nodeID's batches shipped on
+// day's UTC date. The offline verifier reads the export a day at a time
+// through it, so the layout stays defined in one place.
+func DayPrefix(prefix, nodeID string, day time.Time) string {
+	return path.Join(prefix, "node="+nodeID, day.UTC().Format("2006/01/02")) + "/"
 }
 
 func (b *s3Backend) Export(ctx context.Context, batch Batch) error {

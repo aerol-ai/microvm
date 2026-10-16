@@ -458,3 +458,38 @@ func TestChunkedLengthMismatch(t *testing.T) {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
 }
+
+// ListObjectsV2 shows current versions only, so a delete-marked key is
+// invisible to it: the fake must reproduce that, since the witness avoids
+// it for exactly this reason.
+func TestListObjectsV2(t *testing.T) {
+	s := New()
+	defer s.Close()
+	s.CreateBucket("b", BucketOptions{Versioning: true})
+	c := client(t, s)
+	for _, k := range []string{"p/a", "p/b", "p/c", "q/d"} {
+		put(t, c, "b", k, "x")
+	}
+	s.PutDeleteMarker("b", "p/b")
+	var keys []string
+	in := &s3.ListObjectsV2Input{Bucket: aws.String("b"), Prefix: aws.String("p/"), MaxKeys: aws.Int32(1)}
+	for page := 0; ; page++ {
+		out, err := c.ListObjectsV2(context.Background(), in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range out.Contents {
+			keys = append(keys, aws.ToString(o.Key))
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		if page > 5 {
+			t.Fatal("pagination does not end")
+		}
+		in.ContinuationToken = out.NextContinuationToken
+	}
+	if strings.Join(keys, ",") != "p/a,p/c" {
+		t.Fatalf("keys = %v", keys)
+	}
+}

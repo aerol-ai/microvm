@@ -499,9 +499,7 @@ func secretAuditIndexLastLineMatches(f *os.File, meta store.SecretAuditIndexMeta
 func (i *secretAuditIndexer) buildLocked(ctx context.Context, meta store.SecretAuditIndexMeta, lines []secretAuditIndexedLine) (store.SecretAuditIndexMeta, []store.SecretAuditIndexChunk, error) {
 	verifier := newSecretAuditChainVerifier()
 	if meta.IndexedThrough > 0 {
-		verifier.prev = meta.LastEventHash
-		verifier.allowBreak = meta.AllowBreak
-		verifier.started = true
+		verifier = auditlog.ResumeChainVerifier(meta.LastEventHash, meta.AllowBreak)
 	}
 	next := meta
 	if next.Generation == secretAuditEmptyGeneration && lines[0].offset == 0 {
@@ -537,7 +535,7 @@ func (i *secretAuditIndexer) buildLocked(ctx context.Context, meta store.SecretA
 			Kind:     secretAuditIndexKind(l.ev),
 		})
 	}
-	next.AllowBreak = verifier.allowBreak
+	next.AllowBreak = verifier.AllowBreak()
 	if len(order) == 0 {
 		return next, nil, nil
 	}
