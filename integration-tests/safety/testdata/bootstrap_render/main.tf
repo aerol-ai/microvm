@@ -114,6 +114,8 @@ locals {
     audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
     audit_export_s3_bucket = ""
     audit_export_s3_prefix  = "aerolvm-itest-x"
+    audit_witness_s3_bucket = ""
+    audit_witness_s3_prefix = "witness/"
     audit_receiver_url      = ""
     audit_receiver_port     = 9099
     audit_receiver_token    = ""
@@ -182,12 +184,15 @@ output "seed_public_ca" {
 # covered.
 # Audit export shipping to S3. Separate output because the backend is
 # single-valued: a node ships to file OR s3, never both, so each has to be
-# rendered on its own.
+# rendered on its own. The S3 audit witness rides on the same branch, as it
+# would on an enterprise node (records to the export, heads to the witness),
+# so its block is linted by the same `bash -n` pass.
 output "joiner_audit_s3" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
-    is_seed                = false
-    audit_export_backend   = "s3"
-    audit_export_s3_bucket = "aerolvm-itest-x-audit-abc123"
+    is_seed                 = false
+    audit_export_backend    = "s3"
+    audit_export_s3_bucket  = "aerolvm-itest-x-audit-abc123"
+    audit_witness_s3_bucket = "aerolvm-itest-x-witness-abc123"
   }))
 }
 

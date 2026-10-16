@@ -135,11 +135,11 @@ Without these checks, a witness on an ordinary bucket would look healthy while p
 | `s3:PutObject` and `s3:GetObject` on `<prefix>*` | `s3:DeleteObject` (blocks delete markers) and `s3:DeleteObjectVersion` |
 | `s3:GetObjectVersion` and `s3:ListBucketVersions` | `s3:PutObjectRetention`, `s3:PutObjectLegalHold` and `s3:BypassGovernanceRetention` |
 | `s3:GetBucketVersioning` and `s3:GetBucketObjectLockConfiguration` | `s3:PutBucketObjectLockConfiguration`, `s3:PutBucketVersioning`, `s3:PutLifecycleConfiguration` and `s3:PutBucketPolicy` |
-| `s3:ListBucket` on the bucket, with an `s3:prefix` condition of `<prefix>*` (D19) | |
+| `s3:ListBucket` on the bucket, with no `s3:prefix` condition (D19) | |
 
 The canary's `DeleteObject` call expects this denial. Denied by IAM or by the lock, both mean the evidence is safe.
 
-Object actions take the object ARN (`arn:aws:s3:::<bucket>/<prefix>*`). `s3:ListBucket`, `s3:ListBucketVersions` and the two bucket reads take the bucket ARN. `s3:ListBucket` is not optional: without it, S3 answers a GET for a missing key with 403 instead of 404, so a first boot on an empty bucket fails, and so does any boot after an idle midnight (D19).
+Object actions take the object ARN (`arn:aws:s3:::<bucket>/<prefix>*`). `s3:ListBucket`, `s3:ListBucketVersions` and the two bucket reads take the bucket ARN. `s3:ListBucket` is not optional: without it, S3 answers a GET for a missing key with 403 instead of 404, so a first boot on an empty bucket fails, and so does any boot after an idle midnight (D19). Leave it unconditioned: a GET carries no `s3:prefix` key, so a grant limited by an `s3:prefix` condition would not count, and S3 would still answer 403. Give the witness its own bucket instead.
 
 The auditor who runs `aerolvm audit verify` needs read access only: `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetObject` and `s3:GetObjectVersion` on the witness bucket, plus list and read on the export bucket. Phase 3's Terraform outputs this as an optional read-only policy (D22).
 
@@ -193,7 +193,7 @@ Cost control: add a lifecycle rule that expires **noncurrent** versions after th
 | `setup/prometheus/` | An alert rule on any increase of `aerolvm_secret_audit_witness_foreign_head_total` (D18) |
 | `internal/service/secret_audit.go` → `pkg/auditlog` | Move `secretAuditChainVerifier` and `recomputeChain`'s scan rules into `pkg/auditlog`, shared by the daemon and the verifier; existing tests move with them (D6) |
 | `cmd/aerolvm/` | `aerolvm audit verify`, the offline verifier (Phase 5; D5, D6, D15, D21, D22): `--since` (required), `--export s3://…` or `--export-dir`, `--local`, `--max-lag`; exit 0 PASS, 1 FAIL, 2 INCOMPLETE; export batches walked by chain linkage per UTC day |
-| `Terraform/` | An optional witness bucket: Object Lock, versioning, default retention, a noncurrent-version lifecycle rule, the IAM statements above (including `s3:ListBucket` with an `s3:prefix` condition, D19), an optional auditor read-only policy (D22), and variables `witness_lock_mode` (default `COMPLIANCE`) and `witness_lock_days` (default 30, ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`) (D13) |
+| `Terraform/` | An optional witness bucket: Object Lock, versioning, default retention, a noncurrent-version lifecycle rule, the IAM statements above (including an unconditioned `s3:ListBucket`, D19), an optional auditor read-only policy (D22), and variables `witness_lock_mode` (default `COMPLIANCE`) and `witness_lock_days` (default 30, ≥ `SB_SECRET_AUDIT_RETENTION_DAYS`) (D13) |
 | `integration-tests/` | A new single-node enterprise scenario plus all six existing enterprise scenarios on governance 1-day buckets; teardown empties the bucket with the bypass flag; then delete `cmd/sandboxd/provider_itest.go` and the `sandboxd-witness` build (D13, D17) |
 | `Ansible/`, `install.sh` | Pass the settings through, including `SB_NODE_ID`. The installer only documents them and never creates buckets. |
 | `setup/config-defaults.md`, `setup/runbooks/secrets-and-audit.md` | New settings, the bucket recipe, what to do on a witness mismatch, the rebuild-under-a-new-`SB_NODE_ID` procedure (D4), cross-node write attribution with CloudTrail (D8), and what a foreign-head alert does and does not prove (D23) |
@@ -1444,7 +1444,7 @@ Five approved decisions did not survive a closer read of the code and of AWS beh
 
 ### R18 / D19: The node role needs `s3:ListBucket`
 Finding: P1, confidence 9/10. The IAM table allowed `s3:GetObject`, `s3:GetObjectVersion` and `s3:ListBucketVersions`, but not `s3:ListBucket`. AWS documents that a GetObject on a missing key returns 403 AccessDenied, not 404 NoSuchKey, when the caller lacks `s3:ListBucket` (GetObject API reference, "Permissions"). The latest-head read falls back to `ListObjectVersions` only on NoSuchKey. So a first boot on an empty bucket would fail, and so would any boot after an idle midnight. The `httptest` fake always answered NoSuchKey, so no unit test would have seen it; only a Phase 4 run would.
-Decision: grant `s3:ListBucket` on the bucket ARN with an `s3:prefix` condition of `<prefix>*`. `Open` probes a random missing key under `<prefix>probe/` and refuses boot, naming the permission, on AccessDenied. The fake answers 403 for a missing key when its role lacks the permission. Boot grows by one call. Task T18.
+Decision: grant `s3:ListBucket` on the bucket ARN, with no `s3:prefix` condition (amended in Phase 3: a GetObject request carries no `s3:prefix` key, so a conditioned grant would not count when S3 picks 404 or 403; the bucket holds only witness objects). `Open` probes a random missing key under `<prefix>probe/` and refuses boot, naming the permission, on AccessDenied. The fake answers 403 for a missing key when its role lacks the permission. Boot grows by one call. Task T18.
 
 ### R19 / D20: Idle nodes never write today's key
 Finding: P1, confidence 9/10. `shipSecretAuditHeadNow` writes only when the head changes, and reads only when it doesn't (`internal/service/secret_audit_witness.go:203-218`). Under the day layout (D2), an idle node has no key for today after UTC midnight. Every tick then paid a missed GET, a LIST (billed at the PUT rate) and a second GET, so the cost section's "one GET" was wrong. The D5 "silent node" rule (newest head older than N intervals) would also flag every healthy idle node.
