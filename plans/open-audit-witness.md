@@ -1,10 +1,19 @@
 # Open audit witness: enterprise mode in the open-source build
 
-Status: founder decisions made 2026-10-11 (F1–F5, under "Decisions"); engineering review done 2026-10-11, and its decisions (D1–D18, in the review below) are folded into the sections below. A follow-up review on 2026-10-16 (D19–D24, in "Follow-up review" at the end of this file) corrected five of those decisions against the code and AWS behavior; its changes are folded in too. Founder decision: make enterprise mode usable in the free download.
+Status: founder decisions made 2026-10-11 (F1–F5, under "Decisions"); engineering review done 2026-10-11, and its decisions (D1–D18, in the review below) are folded into the sections below. A follow-up review on 2026-10-16 (D19–D24, in "Follow-up review" at the end of this file) corrected five of those decisions against the code and AWS behavior; its changes are folded in too. Founder decision: make enterprise mode usable in the free download. Shipped in v0.6.7 on 2026-10-16; see "Outcome".
 
 ## In one paragraph
 
 Enterprise mode needs a **witness**: a store outside the server that keeps the fingerprints (hash-chain heads) of the server's audit log. The open-source build ships only a placeholder witness, so `SB_ENTERPRISE_MODE=true` always refuses to start. This plan adds a real witness to the open-source build that writes each fingerprint to an S3 bucket with **Object Lock** turned on. Object Lock means a written object cannot be changed or deleted until its retention period ends, not even by the server that wrote it. With it, anyone can turn on enterprise mode with only the free download and an S3 bucket.
+
+## Outcome (2026-10-16)
+
+- **Shipped in v0.6.7.** Phases 1–5 merged as #710 (the phase PRs #704, #705, #706 and #707 were merged into it first), Phase 6 as #708 and Phase 7 as #709. This plan merged as #655.
+- **Release smoke (T24) passed** on the published v0.6.7: `integration-tests/run.sh single-node-secrets-enterprise --version v0.6.7` gave 128 pass, 0 fail, 144 skip, and the teardown left no bucket or instance.
+- **Live runs before the release** passed the witness and tamper cases (UC-143, UC-144, UC-263, UC-264, UC-265) on `single-node-secrets-enterprise`, `cluster-3-mixed-secrets-enterprise` and all five `cluster-hetero-*` scenarios. The details are in #706.
+- **Ordering deviation.** "Phases" below says Phases 6 and 7 merge only after the release is published and the release smoke passes. #708 and #709 merged at 10:44 and 10:49 UTC, before v0.6.7 was published at 10:58 UTC and before the smoke ran. Until the release workflow attached v0.6.7's files at 11:15 UTC, about half an hour, the docs described a download that did not exist yet. The release and the smoke have both since passed, so the merges were kept rather than reverted and redone.
+- **Found and fixed on the way,** as separate PRs into the same release: #711 (first-use platform volumes failed on the reserved cluster create, UC-81 to UC-84), #713 (Caddy reloads closed open WebSockets with code 1001, issue #712) and #714 (releases never shipped `cluster-sign-node.sh`, and `run.sh --version` could not supply the audit-receiver fixture, which T24 needed).
+- **Announced** in Discussions #716. The changelog was synced in #715.
 
 ## Why enterprise mode is closed today
 
@@ -1294,102 +1303,102 @@ Execution order: launch A, B and C together; B's last step waits for A's client 
 ## Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship. Effort assumes the default human ÷ CC ratios (features ~30x, tests ~50x, architecture ~5x).
 
-- [ ] **T1 (P1, human: ~1 day / CC: ~30 min)** — pkg/auditwitness — Day-partitioned keys with a `ListObjectVersions` fallback that errors on a delete marker
+- [x] **T1 (P1, human: ~1 day / CC: ~30 min)** — pkg/auditwitness — Day-partitioned keys with a `ListObjectVersions` fallback that errors on a delete marker
   - Surfaced by: Architecture A1 (D2) and Code Quality C2
   - Files: `pkg/auditwitness/s3.go`, `pkg/auditwitness/s3_test.go`
   - Verify: `go test ./pkg/auditwitness/...` (fallback and delete-marker rows)
-- [ ] **T2 (P1, human: ~2 h / CC: ~10 min)** — internal/config — Require `SB_NODE_ID` (not `standalone`) when a witness backend is set
+- [x] **T2 (P1, human: ~2 h / CC: ~10 min)** — internal/config — Require `SB_NODE_ID` (not `standalone`) when a witness backend is set
   - Surfaced by: Architecture A2 (D3)
   - Files: `internal/config/config.go`, its test file, `install.sh`, `Ansible/`
   - Verify: `go test ./internal/config/...`
-- [ ] **T3 (P1, human: ~0.5 day / CC: ~15 min)** — internal/service + runbook — Erasure error names the rebuild-under-a-new-`SB_NODE_ID` recovery
+- [x] **T3 (P1, human: ~0.5 day / CC: ~15 min)** — internal/service + runbook — Erasure error names the rebuild-under-a-new-`SB_NODE_ID` recovery
   - Surfaced by: Architecture A3 (D4)
   - Files: `internal/service/secret_audit_witness.go`, `setup/runbooks/secrets-and-audit.md`
   - Verify: `go test -run Erasure ./internal/service/...`
-- [ ] **T4 (P1, human: ~1 day / CC: ~30 min)** — pkg/auditlog — Move the streaming chain verifier out of `internal/service`
+- [x] **T4 (P1, human: ~1 day / CC: ~30 min)** — pkg/auditlog — Move the streaming chain verifier out of `internal/service`
   - Surfaced by: Architecture A5 (D6)
   - Files: `internal/service/secret_audit.go`, `pkg/auditlog/`
   - Verify: `go test ./internal/service/... ./pkg/auditlog/...` with unchanged assertions
-- [ ] **T5 (P1, human: ~3.5 days / CC: ~3.5 h)** — cmd/aerolvm — `aerolvm audit verify`: pairwise linkage over local and export, FAIL on a missing link, coverage window, silent ids, bounded-memory streaming (export order superseded by T20, window rules by T21)
+- [x] **T5 (P1, human: ~3.5 days / CC: ~3.5 h)** — cmd/aerolvm — `aerolvm audit verify`: pairwise linkage over local and export, FAIL on a missing link, coverage window, silent ids, bounded-memory streaming (export order superseded by T20, window rules by T21)
   - Surfaced by: Architecture A4 (D5) and Performance P1 (D15)
   - Files: `cmd/aerolvm/audit.go` (new), `pkg/auditlog/`
   - Verify: `go test ./cmd/aerolvm/... ./pkg/auditlog/...` (forged head, rollback, forged checkpoint, missing link, allocation rows); `TestDependencyGuard`
-- [ ] **T6 (P1, human: ~2 h / CC: ~15 min)** — pkg/daemon — Regression contract: zero-request tests and provider precedence
+- [x] **T6 (P1, human: ~2 h / CC: ~15 min)** — pkg/daemon — Regression contract: zero-request tests and provider precedence
   - Surfaced by: Test review T3 (D14)
   - Files: `pkg/daemon/daemon.go`, a new `pkg/daemon/*_test.go`
   - Verify: `go test ./pkg/daemon/...`; `misc_coverage_test.go:10` unchanged and green
-- [ ] **T7 (P2, human: ~2 days / CC: ~1 h)** — pkg/auditwitness — `httptest` S3 fake with S3 XML, checksum enforcement, bypass header and delete markers
+- [x] **T7 (P2, human: ~2 days / CC: ~1 h)** — pkg/auditwitness — `httptest` S3 fake with S3 XML, checksum enforcement, bypass header and delete markers
   - Surfaced by: Test review T1 (D12)
   - Files: `pkg/auditwitness/s3fake_test.go` (new)
   - Verify: every `pkg/auditwitness` test runs through the real client; coverage ≥ 85%
-- [ ] **T8 (P2, human: ~1 h / CC: ~5 min)** — pkg/auditwitness — Canary deletes with `BypassGovernanceRetention=true`; any non-AccessDenied result refuses boot
+- [x] **T8 (P2, human: ~1 h / CC: ~5 min)** — pkg/auditwitness — Canary deletes with `BypassGovernanceRetention=true`; any non-AccessDenied result refuses boot
   - Surfaced by: Architecture A6 (D7)
   - Files: `pkg/auditwitness/checks.go`
   - Verify: fake row for a bypass-holding role on a governance bucket
-- [ ] **T9 (P2, human: ~2 h / CC: ~15 min)** — internal/service + setup — Foreign-head counter, warning and alert rule
+- [x] **T9 (P2, human: ~2 h / CC: ~15 min)** — internal/service + setup — Foreign-head counter, warning and alert rule
   - Surfaced by: Failure modes F1 (D18)
   - Files: `internal/service/secret_audit_witness.go`, `setup/prometheus/`
   - Verify: table rows for foreign, missing and matching heads
-- [ ] **T10 (P2, human: ~0.5 day / CC: ~30 min)** — Terraform + harness — Lock mode and days variables; governance 1-day itest buckets emptied with the bypass flag
+- [x] **T10 (P2, human: ~0.5 day / CC: ~30 min)** — Terraform + harness — Lock mode and days variables; governance 1-day itest buckets emptied with the bypass flag
   - Surfaced by: Test review T2 (D13)
   - Files: `Terraform/` (new witness file, `variables.tf`, `iam.tf`), `integration-tests/run.sh`
   - Verify: `terraform plan` with and without the witness; the first Phase 4 run shows a clean `--destroy-only`
-- [ ] **T11 (P2, human: ~4 days + metal AWS time / CC: ~4 h + AWS time)** — integration-tests — New single-node enterprise scenario plus all six enterprise scenarios on S3, then delete the itest witness build
+- [x] **T11 (P2, human: ~4 days + metal AWS time / CC: ~4 h + AWS time)** — integration-tests — New single-node enterprise scenario plus all six enterprise scenarios on S3, then delete the itest witness build
   - Surfaced by: TODO review R16 (D17) and regression contract item 4
   - Files: `integration-tests/scenarios/`, `integration-tests/lib/build.sh`, `integration-tests/run.sh`, `cmd/sandboxd/provider_itest.go`
   - Verify: `make integration-*` runs green with tamper cases failing closed; `provider_itest.go` removed
-- [ ] **T12 (P2, human: ~1 h / CC: ~5 min)** — plan + runbook — Document the cross-node write limit and CloudTrail attribution
+- [x] **T12 (P2, human: ~1 h / CC: ~5 min)** — plan + runbook — Document the cross-node write limit and CloudTrail attribution
   - Surfaced by: Architecture A7 (D8)
   - Files: `setup/runbooks/secrets-and-audit.md`, `docs/`
   - Verify: docs checks pass; the `docs/` part ships in the Phase 6 PR, so it waits for the release too
-- [ ] **T13 (P2, human: ~30 min / CC: ~5 min)** — pkg/auditexport + pkg/auditwitness — Export `NewS3Client`; `Open` switches on the backend name, no registry
+- [x] **T13 (P2, human: ~30 min / CC: ~5 min)** — pkg/auditexport + pkg/auditwitness — Export `NewS3Client`; `Open` switches on the backend name, no registry
   - Surfaced by: Scope Challenge structure (D1)
   - Files: `pkg/auditexport/s3.go`, `pkg/auditwitness/open.go`
   - Verify: `go test ./pkg/auditexport/...`
-- [ ] **T14 (P3, human: ~1 h / CC: ~5 min)** — pkg/auditwitness — 30 s deadline on `Open`
+- [x] **T14 (P3, human: ~1 h / CC: ~5 min)** — pkg/auditwitness — 30 s deadline on `Open`
   - Surfaced by: Architecture A8 (D9)
   - Files: `pkg/auditwitness/open.go`
   - Verify: never-answers fake row
-- [ ] **T15 (P3, human: ~30 min / CC: ~5 min)** — pkg/auditwitness — `PutObject` only; `ReceiptID = VersionId`, zero `RecordedAt`
+- [x] **T15 (P3, human: ~30 min / CC: ~5 min)** — pkg/auditwitness — `PutObject` only; `ReceiptID = VersionId`, zero `RecordedAt`
   - Surfaced by: Architecture A9 (D10)
   - Files: `pkg/auditwitness/s3.go`
   - Verify: one-request-per-ship row
-- [ ] **T16 (P3, human: ~15 min / CC: ~2 min)** — pkg/auditwitness — Reject `len(heads) != 1`
+- [x] **T16 (P3, human: ~15 min / CC: ~2 min)** — pkg/auditwitness — Reject `len(heads) != 1`
   - Surfaced by: Code Quality C1 (D11)
   - Files: `pkg/auditwitness/s3.go`
   - Verify: table row
-- [ ] **T17 (P3, human: ~1 day / CC: ~1 h)** — docs — Blog post "Catching a rewritten audit log" (Phase 7)
+- [x] **T17 (P3, human: ~1 day / CC: ~1 h)** — docs — Blog post "Catching a rewritten audit log" (Phase 7)
   - Surfaced by: user request after the review (2026-10-12)
   - Files: `docs/src/content/docs/engineering-audit-witness.mdx` (new), `docs/src/content.config.ts`, `docs/src/content/docs/blog.mdx`, `docs/src/content/docs/engineering-security-overview.mdx`
   - Verify: `make docs-build`; the `sandbox.audit()` tabs match `sdk/*`; every number traced to the code or a Phase 4 report; merged only after the release
 
 Added by the follow-up review (2026-10-16). The Phases table names the phase for every task.
 
-- [ ] **T18 (P1, human: ~2 h / CC: ~15 min)** — pkg/auditwitness + Terraform — `s3:ListBucket` for the node role; `Open` probes a random missing key; the fake answers 403 without the permission
+- [x] **T18 (P1, human: ~2 h / CC: ~15 min)** — pkg/auditwitness + Terraform — `s3:ListBucket` for the node role; `Open` probes a random missing key; the fake answers 403 without the permission
   - Surfaced by: follow-up R18 (D19)
   - Files: `pkg/auditwitness/checks.go`, `pkg/auditwitness/s3fake_test.go`, the Terraform witness file
   - Verify: 403 and 404 fake rows; the Phase 4 first boot on an empty bucket
-- [ ] **T19 (P1, human: ~2 h / CC: ~15 min)** — internal/service — Re-ship an unchanged head on the first tick of each UTC day
+- [x] **T19 (P1, human: ~2 h / CC: ~15 min)** — internal/service — Re-ship an unchanged head on the first tick of each UTC day
   - Surfaced by: follow-up R19 (D20)
   - Files: `internal/service/secret_audit_witness.go` and its test
   - Verify: day-rollover rows (first tick re-ships, later ticks don't, not counted as foreign)
-- [ ] **T20 (P1, human: ~1 day / CC: ~1 h)** — pkg/auditlog + cmd/aerolvm — Walk export batches by chain linkage, one UTC day at a time
+- [x] **T20 (P1, human: ~1 day / CC: ~1 h)** — pkg/auditlog + cmd/aerolvm — Walk export batches by chain linkage, one UTC day at a time
   - Surfaced by: follow-up R20 (D21)
   - Files: `pkg/auditlog/`, `cmd/aerolvm/audit.go`
   - Verify: mid-day prune, re-send across midnight, overlapping re-export, `_` in node ids, and allocation rows
-- [ ] **T21 (P1, human: ~0.5 day / CC: ~30 min)** — cmd/aerolvm + Terraform — `--since`, pending and INCOMPLETE, `--export` / `--export-dir` / `--local` / `--max-lag`, witness version order, auditor read-only policy
+- [x] **T21 (P1, human: ~0.5 day / CC: ~30 min)** — cmd/aerolvm + Terraform — `--since`, pending and INCOMPLETE, `--export` / `--export-dir` / `--local` / `--max-lag`, witness version order, auditor read-only policy
   - Surfaced by: follow-up R21 (D22)
   - Files: `cmd/aerolvm/audit.go`, `pkg/auditlog/`, the Terraform witness file
   - Verify: removed-early-exports FAIL row, stalled-export INCOMPLETE row, same-second version row; `terraform plan` with the policy
-- [ ] **T22 (P2, human: ~2 h / CC: ~15 min)** — internal/service — Read the witness before every ship; count a foreign head on busy ticks; don't count read errors
+- [x] **T22 (P2, human: ~2 h / CC: ~15 min)** — internal/service — Read the witness before every ship; count a foreign head on busy ticks; don't count read errors
   - Surfaced by: follow-up R22 (D23); ships with T9
   - Files: `internal/service/secret_audit_witness.go` and its test
   - Verify: busy-tick foreign row, read-error row, matching-head row
-- [ ] **T23 (P3, human: ~30 min / CC: ~5 min)** — pkg/auditwitness — Answer the `standalone` id locally
+- [x] **T23 (P3, human: ~30 min / CC: ~5 min)** — pkg/auditwitness — Answer the `standalone` id locally
   - Surfaced by: follow-up R23 (D24)
   - Files: `pkg/auditwitness/s3.go`
   - Verify: zero-request row
-- [ ] **T24 (P2, human: ~0.5 day / CC: ~15 min + AWS time)** — integration-tests — Release smoke on the published artifact
+- [x] **T24 (P2, human: ~0.5 day / CC: ~15 min + AWS time)** — integration-tests — Release smoke on the published artifact
   - Surfaced by: follow-up review (acceptance item 1 was untested)
   - Files: none beyond the Phase 4 scenario
   - Verify: `integration-tests/run.sh <single-node enterprise scenario> --version <tag>` green; gates the Phase 6 and 7 merges
