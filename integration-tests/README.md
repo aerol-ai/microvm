@@ -429,8 +429,10 @@ The live suite is behind the `integration` build tag, so the everyday
 - **State:** `-backend-config=key=integration/<scenario>/...` + separate
   `TF_DATA_DIR`. The prod key (`prod/terraform.tfstate`) is never opened.
 - **Tripwires** (`lib/provision.sh check-safety`, unit-tested in `safety/`):
-  abort before any apply if the state key targets prod, the leased domain
-  collides with the prod domain, or `cluster_name` lacks the `itest` marker.
+  abort before any apply if the state key targets prod, the leased domain is
+  empty or collides with the prod domain, or `cluster_name` lacks the `itest`
+  marker. A domain scenario with no leased domain (e.g. `domains.yml` missing)
+  is refused before the tripwires even run.
 - **Config overlay:** generated at runtime from `config/cluster.yml` with AOCR
   auto-import + fleet **disabled** and the leased domain substituted — never a
   committed copy, so it can't drift.
