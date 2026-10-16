@@ -560,6 +560,28 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   mounts an extra data volume for Prometheus and is a usable template. Add
   one optional NVMe bench scenario for the stretch gate (≤25ms).
 
+## Per-node witness write scoping (v2 layout) (security, audit witness)
+
+- **What:** let IAM confine each node's witness writes to its own path by
+  putting the writer's AWS identity (`${aws:userid}`) in the witness key.
+- **Why:** the open audit witness shares one node role across a cluster, so
+  a compromised node can write into another node's witness history. The
+  victim refuses its next restart, the offline verifier blames the victim,
+  and attribution needs CloudTrail S3 data events. Accepted as a documented
+  v1 limit at eng review 2026-10-11 (`plans/open-audit-witness.md`, R7/D8).
+- **Pros:** closes the cross-node DoS structurally and gives attribution
+  without CloudTrail.
+- **Cons:** a v2 key layout with a dual-read migration, one more boot call
+  (`sts:GetCallerIdentity`), a data volume moved to a new instance fails
+  closed, and S3-compatible stores need a static writer segment.
+- **Start:** the cluster-join rendezvous already scopes writes with
+  `${aws:userid}` (`Terraform/iam.tf:97-112`). `witnessNodeIDCandidates`
+  (`internal/service/secret_audit_witness.go:522-549`) is the precedent for
+  reading an old and a new key during the migration.
+- **Effort / priority:** M, P3.
+- **Depends on:** open audit witness v1 (Phases 1–5 of
+  `plans/open-audit-witness.md`) shipped.
+
 ---
 
 ## Done
