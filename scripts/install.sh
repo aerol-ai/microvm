@@ -1262,7 +1262,15 @@ https://$DOMAIN:8443 {
 ${tls_block}
 	@api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp
 	handle @api {
-		reverse_proxy 127.0.0.1:21212
+		# stream_close_delay: every admin-API change reloads Caddy, and a
+		# reload closes each WebSocket this proxy carries (exec streams,
+		# aerolvm shell, session attach) with code 1001 unless a delay is set
+		# (#712). A stream that outlives a reload keeps the old config in
+		# memory until it closes or the delay ends. pkg/caddy sets the same
+		# value on the routes sandboxd writes.
+		reverse_proxy 127.0.0.1:21212 {
+			stream_close_delay 10m
+		}
 	}
 	handle {
 		respond "Sandbox API not found" 404
