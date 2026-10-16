@@ -41,9 +41,14 @@ func TestDependencyGuard(t *testing.T) {
 			}
 		}
 	}
-	build := exec.Command("go", "build", "-o", filepath.Join(t.TempDir(), "aerolvm"), ".")
-	build.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("CGO_ENABLED=0 go build: %v\n%s", err, out)
+	// Every release target, not only this host: a dependency that compiles
+	// on Linux and macOS but not on Windows (a unix-only syscall) would
+	// otherwise surface only when release.yml cross-compiles.
+	for _, target := range releaseTargets {
+		build := exec.Command("go", "build", "-o", filepath.Join(t.TempDir(), "aerolvm"), ".")
+		build.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS="+target.goos, "GOARCH="+target.goarch)
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("CGO_ENABLED=0 GOOS=%s GOARCH=%s go build: %v\n%s", target.goos, target.goarch, err, out)
+		}
 	}
 }

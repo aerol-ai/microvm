@@ -22,10 +22,17 @@ func TestRunDelegatesToDaemonRun(t *testing.T) {
 	orig := runDaemon
 	t.Cleanup(func() { runDaemon = orig })
 
-	runDaemon = func(ctx context.Context, l *slog.Logger, _ daemon.ProviderFactory) error {
+	runDaemon = func(ctx context.Context, l *slog.Logger, factory daemon.ProviderFactory) error {
 		called = true
 		if ctx == nil || l == nil {
 			t.Fatalf("expected non-nil ctx and logger")
+		}
+		// The shipped binary must hand daemon.Run no provider, so it uses
+		// controlplane.Noop() and enterprise mode boots only with a witness
+		// the operator configured (SB_AUDIT_WITNESS_BACKEND). A factory here
+		// would carry a provider seam into every release.
+		if factory != nil {
+			t.Fatal("run passed a non-nil provider factory; the open-source daemon must use controlplane.Noop()")
 		}
 		return nil
 	}

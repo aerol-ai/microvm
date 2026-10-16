@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"net"
 	"net/url"
 	"os"
@@ -1280,6 +1281,18 @@ type Config struct {
 	// SB_AUDIT_EXPORT_BUS_{BROKERS,TOPIC}.
 	AuditExportBusBrokers string
 	AuditExportBusTopic   string
+	// AuditWitness* let the open-source build supply the off-node audit
+	// witness enterprise mode requires: an S3 bucket with Object Lock
+	// (plans/open-audit-witness.md). Empty backend = no witness from here,
+	// and nothing talks to S3; a provider-supplied witness wins regardless.
+	// Credentials come from the default AWS chain, as for the S3 exporter.
+	// SB_AUDIT_WITNESS_{BACKEND,S3_BUCKET,S3_PREFIX,S3_ENDPOINT,S3_REGION,S3_PATH_STYLE}.
+	AuditWitnessBackend     string
+	AuditWitnessS3Bucket    string
+	AuditWitnessS3Prefix    string
+	AuditWitnessS3Endpoint  string
+	AuditWitnessS3Region    string
+	AuditWitnessS3PathStyle bool
 	// AuditDeletedGrace bounds how long the Raft FSM keeps a routing stub
 	// (owner_ref + evidence nodes) for a deleted sandbox so ingress can still
 	// route a post-delete audit read. It is a short grace, never history: 0
@@ -1882,6 +1895,12 @@ func Load() (Config, error) {
 		AuditExportS3Endpoint:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_ENDPOINT")),
 		AuditExportS3Region:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_S3_REGION")),
 		AuditExportS3PathStyle:        getEnvBool("SB_AUDIT_EXPORT_S3_PATH_STYLE", false),
+		AuditWitnessBackend:           strings.ToLower(strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_BACKEND"))),
+		AuditWitnessS3Bucket:          strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_BUCKET")),
+		AuditWitnessS3Prefix:          getEnv("SB_AUDIT_WITNESS_S3_PREFIX", auditwitness.DefaultPrefix),
+		AuditWitnessS3Endpoint:        strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_ENDPOINT")),
+		AuditWitnessS3Region:          strings.TrimSpace(os.Getenv("SB_AUDIT_WITNESS_S3_REGION")),
+		AuditWitnessS3PathStyle:       getEnvBool("SB_AUDIT_WITNESS_S3_PATH_STYLE", false),
 		AuditExportBusBrokers:         strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_BROKERS")),
 		AuditExportBusTopic:           strings.TrimSpace(os.Getenv("SB_AUDIT_EXPORT_BUS_TOPIC")),
 		AuditDeletedGrace:             getEnvDuration("SB_AUDIT_DELETED_GRACE", time.Hour),
@@ -2047,6 +2066,9 @@ func Load() (Config, error) {
 	}
 	if cfg.NodeID != "" && !models.ValidClusterNodeID(cfg.NodeID) {
 		return Config{}, errors.New("SB_NODE_ID must start with an alphanumeric character and contain only alphanumerics, dot, underscore, or hyphen (maximum 128 characters)")
+	}
+	if err := cfg.validateAuditWitness(); err != nil {
+		return Config{}, err
 	}
 
 	if err := cfg.PlatformVolumes.Validate(); err != nil {
@@ -3021,6 +3043,63 @@ func normalizeAdvertiseHost(value string) string {
 		return strings.Trim(value[:i], "[]")
 	}
 	return trimmed
+}
+
+// validateAuditWitness rejects witness settings that would open a witness
+// the backend would refuse later, at load time where the message names the
+// setting.
+//
+// SB_NODE_ID is required with a backend because heads are stored per node
+// id, and a single server without one witnesses as "standalone": two such
+// servers sharing a bucket would overwrite each other's heads, both would
+// keep "repairing" them, and whichever restarted next would refuse to boot
+// (D3). Uniqueness across servers stays the operator's job.
+func (c Config) validateAuditWitness() error {
+	switch c.AuditWitnessBackend {
+	case "":
+		return nil
+	case auditwitness.BackendS3:
+	default:
+		return fmt.Errorf("SB_AUDIT_WITNESS_BACKEND=%q is not supported; use %q or leave it empty", c.AuditWitnessBackend, auditwitness.BackendS3)
+	}
+	if c.AuditWitnessS3Bucket == "" {
+		return errors.New("SB_AUDIT_WITNESS_S3_BUCKET is required when SB_AUDIT_WITNESS_BACKEND=s3")
+	}
+	if c.AuditWitnessS3Endpoint != "" {
+		u, err := url.Parse(c.AuditWitnessS3Endpoint)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return errors.New("SB_AUDIT_WITNESS_S3_ENDPOINT must be an absolute http(s) URL")
+		}
+		// Request signing does not cover responses: over plain http a man in
+		// the middle could answer the boot read with any head it likes, and
+		// the canary with any verdict. Enterprise holds the witness to the
+		// same transport rule as the S3 exporter.
+		if c.EnterpriseMode && u.Scheme != "https" {
+			return errors.New("SB_AUDIT_WITNESS_S3_ENDPOINT must use https when SB_ENTERPRISE_MODE=true")
+		}
+	}
+	if c.NodeID == "" || c.NodeID == auditwitness.StandaloneNodeID {
+		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
+	}
+	return nil
+}
+
+// AuditWitnessConfig projects the witness settings into the shape
+// pkg/auditwitness opens. RetentionDays rides along because a witnessed
+// head must stay locked at least as long as the records it vouches for.
+func (c Config) AuditWitnessConfig() auditwitness.Config {
+	return auditwitness.Config{
+		Backend:       c.AuditWitnessBackend,
+		NodeID:        c.NodeID,
+		RetentionDays: c.SecretAuditRetentionDays,
+		S3: auditexport.S3Config{
+			Bucket:    c.AuditWitnessS3Bucket,
+			Prefix:    c.AuditWitnessS3Prefix,
+			Endpoint:  c.AuditWitnessS3Endpoint,
+			Region:    c.AuditWitnessS3Region,
+			PathStyle: c.AuditWitnessS3PathStyle,
+		},
+	}
 }
 
 // AuditExportConfig projects the audit connector settings into the

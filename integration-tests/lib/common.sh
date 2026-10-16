@@ -507,3 +507,83 @@ wait_for_grafana() {
   echo "grafana: ${url} not ready after ${timeout}s" >&2
   return 1
 }
+
+# empty_versioned_bucket <bucket> <aws command...>
+# Deletes every object version AND every delete marker in a versioned bucket,
+# sending the governance-bypass header with each batch, so that a following
+# `terraform destroy` can delete the bucket (S3 refuses while any entry is
+# left, a delete marker included).
+#
+# Exists for the S3 Object Lock audit witness (Terraform/audit_witness.tf). Its
+# heads are locked versions and the bucket has no force_destroy, on purpose;
+# the integration scenarios lock in GOVERNANCE mode for a day (D13), which a
+# principal holding s3:BypassGovernanceRetention can lift by sending the
+# bypass header with the delete. force_destroy is not known to send it.
+#
+# One listing page is one batch: S3 returns at most 1000 entries per page,
+# versions and markers counted together, which is also DeleteObjects' per-call
+# limit. The listing restarts from the top after each batch, since deleted
+# entries leave it, so the loop needs no continuation markers and a re-run
+# picks up wherever an interrupted one stopped. The batch goes through a file
+# because a 1000-key JSON argument passes Linux's 128 KiB limit on one argv
+# string. A bucket that is already empty or gone prints nothing.
+#
+# Returns non-zero, naming the first entry S3 kept and why, when anything
+# could not be deleted (a COMPLIANCE lock, credentials without the bypass
+# permission); a batch that deletes nothing would otherwise loop forever. The
+# round cap is the same guard for a failure that reports success: 1000 rounds
+# is a million entries, hundreds of times what a run's witness writes.
+empty_versioned_bucket() {
+  local bucket="$1"; shift
+  local -a awscli=("$@")
+  local tmp listing out n refused total=0 rounds=0
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/aerol-empty-bucket.XXXXXX")" || return 1
+  while :; do
+    rounds=$(( rounds + 1 ))
+    if (( rounds > 1000 )); then
+      echo "empty s3://${bucket}: still not empty after 1000 batches (${total} entries deleted); something keeps writing to it or a delete is not taking effect" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    if ! listing="$("${awscli[@]}" s3api list-object-versions --bucket "$bucket" \
+        --no-paginate --output json 2>"${tmp}/err")"; then
+      if grep -q 'NoSuchBucket' "${tmp}/err"; then
+        rm -rf "$tmp"
+        return 0
+      fi
+      echo "empty s3://${bucket}: list-object-versions failed: $(tr '\n' ' ' <"${tmp}/err")" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    if ! printf '%s' "$listing" | jq -c \
+        '{Objects: [((.Versions // [])[], (.DeleteMarkers // [])[]) | {Key, VersionId}], Quiet: true}' \
+        >"${tmp}/batch.json"; then
+      echo "empty s3://${bucket}: could not read the version listing" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    n="$(jq '.Objects | length' "${tmp}/batch.json")"
+    (( n > 0 )) || break
+    if ! out="$("${awscli[@]}" s3api delete-objects --bucket "$bucket" \
+        --bypass-governance-retention --delete "file://${tmp}/batch.json" \
+        --output json 2>"${tmp}/err")"; then
+      echo "empty s3://${bucket}: delete-objects failed: $(tr '\n' ' ' <"${tmp}/err")" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    # Quiet mode answers with errors only, so an empty answer is success.
+    refused="$(printf '%s' "$out" | jq -r \
+      '(.Errors // [])[0] | select(. != null) | "\(.Key) version \(.VersionId): \(.Code) \(.Message)"')"
+    if [[ -n "$refused" ]]; then
+      echo "empty s3://${bucket}: S3 kept ${refused}" >&2
+      rm -rf "$tmp"
+      return 1
+    fi
+    total=$(( total + n ))
+  done
+  rm -rf "$tmp"
+  if (( total > 0 )); then
+    echo "emptied s3://${bucket}: deleted ${total} object versions and delete markers (governance bypass)"
+  fi
+  return 0
+}

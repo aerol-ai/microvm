@@ -150,6 +150,8 @@ resource "aws_instance" "seed" {
     audit_export_file_path                   = var.audit_export_file_path
     audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
     audit_export_s3_prefix                   = var.cluster_name
+    audit_witness_s3_bucket                  = var.audit_witness_enabled ? aws_s3_bucket.witness[0].bucket : ""
+    audit_witness_s3_prefix                  = var.audit_witness_prefix
     audit_receiver_url                       = var.audit_receiver_url
     audit_receiver_port                      = var.audit_receiver_port
     audit_receiver_token                     = local.audit_receiver_token_value
@@ -373,6 +375,8 @@ resource "aws_instance" "joiner" {
     audit_export_file_path       = var.audit_export_file_path
     audit_export_s3_bucket       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
     audit_export_s3_prefix       = var.cluster_name
+    audit_witness_s3_bucket      = var.audit_witness_enabled ? aws_s3_bucket.witness[0].bucket : ""
+    audit_witness_s3_prefix      = var.audit_witness_prefix
     audit_receiver_url           = var.audit_receiver_url
     audit_receiver_port          = var.audit_receiver_port
     audit_receiver_token         = local.audit_receiver_token_value

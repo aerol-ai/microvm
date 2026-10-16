@@ -572,7 +572,7 @@ func TestS3BackendRealClientAgainstCompatibleEndpoint(t *testing.T) {
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 	t.Setenv("AWS_REGION", "us-east-1")
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	client, err := newS3Client(context.Background(), S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	client, err := NewS3Client(context.Background(), S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -664,5 +664,45 @@ func TestTemporaryWrapping(t *testing.T) {
 	}
 	if !IsTemporary(Temporary(errors.New("x"))) || IsTemporary(errors.New("x")) {
 		t.Fatal("classification")
+	}
+}
+
+// A GetObject without a response checksum must not make the SDK write to
+// stderr: the witness reads a head every interval.
+func TestS3ClientDoesNotLogSkippedChecksumValidation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"abc"`)
+		_, _ = w.Write([]byte("body"))
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	// The SDK's logger captures os.Stderr when the client is built, so the
+	// pipe goes in first.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = stderr }()
+	client, err := NewS3Client(context.Background(), S3Config{Endpoint: srv.URL, Region: "us-east-1", PathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, getErr := client.GetObject(context.Background(), &s3.GetObjectInput{Bucket: aws.String("b"), Key: aws.String("k")})
+	if getErr == nil {
+		_, _ = io.ReadAll(out.Body)
+		_ = out.Body.Close()
+	}
+	os.Stderr = stderr
+	_ = w.Close()
+	logged, _ := io.ReadAll(r)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if len(logged) != 0 {
+		t.Fatalf("the S3 client wrote to stderr: %q", logged)
 	}
 }

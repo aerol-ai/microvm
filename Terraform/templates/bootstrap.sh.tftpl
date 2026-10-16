@@ -334,9 +334,9 @@ echo "[bootstrap] seed CSR signer started (deadline ${seed_wait_max_seconds}s)"
 ###############################################################################
 # 2a-ter. Seed: audit receiver fixture (plans/integration-test-security.md §6.4)
 #
-# Webhook export and the audit-chain witness both need something listening.
-# Started BEFORE the ops-env block below points the daemon at it, so the first
-# export attempt is not a guaranteed failure that then has to back off.
+# Webhook export needs something listening. Started BEFORE the ops-env block
+# below points the daemon at it, so the first export attempt is not a
+# guaranteed failure that then has to back off.
 ###############################################################################
 curl_download '${audit_receiver_url}' -o /tmp/audit-receiver
 sudo install -m 0755 /tmp/audit-receiver /usr/local/bin/audit-receiver
@@ -942,7 +942,7 @@ SB_SECRET_PROVIDER=awskms
 SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
 SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
 %{ endif ~}
-%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" ~}
+%{ if secret_kms_key_arn != "" || audit_export_s3_bucket != "" || audit_witness_s3_bucket != "" ~}
 # One assignment for every AWS-backed sink. Pinned rather than left to the
 # SDK's IMDS region fallback: an absent region surfaces as an opaque timeout at
 # seal/ship time instead of a clear failure.
@@ -950,7 +950,7 @@ AWS_REGION=${aws_region}
 %{ endif ~}
 
 %{ if audit_receiver_endpoint != "" ~}
-# Managed by Terraform bootstrap: webhook audit export + witness target.
+# Managed by Terraform bootstrap: webhook audit export.
 #
 # The endpoint is a NAME, not an address: one certificate then serves the seed
 # (which maps it to loopback) and every joiner (which maps it to the seed's
@@ -963,13 +963,6 @@ SB_SECRET_AUDIT_EXPORT_URL=${audit_receiver_endpoint}/audit
 SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN=${audit_receiver_token}
 SB_AUDIT_EXPORT_WEBHOOK_HMAC_KEY=${audit_receiver_hmac_key}
 SB_AUDIT_EXPORT_WEBHOOK_CA_FILE=/etc/sandboxd/audit-receiver-ca.pem
-# Consumed ONLY by a daemon built with -tags itestwitness, which is how an
-# enterprise scenario gets the non-noop controlplane.Witness that pkg/daemon
-# requires. A stock sandboxd ignores these two entirely, so setting them
-# unconditionally costs nothing and keeps the enterprise and non-enterprise
-# renders identical.
-AEROL_ITEST_WITNESS_URL=${audit_receiver_endpoint}
-AEROL_ITEST_WITNESS_TOKEN=${audit_receiver_token}
 %{ endif ~}
 %{ if audit_export_backend != "" ~}
 # Managed by Terraform bootstrap: audit export sink.
@@ -992,6 +985,24 @@ SB_AUDIT_EXPORT_S3_REGION=${aws_region}
 # per-node prefix would just repeat the node twice in every path.
 SB_AUDIT_EXPORT_S3_PREFIX=${audit_export_s3_prefix}
 %{ endif ~}
+%{ endif ~}
+%{ if audit_witness_s3_bucket != "" ~}
+# Managed by Terraform bootstrap: S3 Object Lock audit witness
+# (plans/open-audit-witness.md). Template vars audit_witness_s3_bucket ("" =
+# no witness) and audit_witness_s3_prefix are documented here, not in the
+# header, because user_data_replace_on_change means any byte rendered with the
+# witness off would replace every running node on the next apply.
+#
+# Independent of the export backend: the export carries the records, the
+# witness carries the chain heads that prove they were not rewritten later.
+# SB_NODE_ID, which the witness requires, is already in this file from
+# cluster-init/cluster-join (--node-id ${node_name}). The region is pinned for
+# the same reason as AWS_REGION above; no endpoint or path-style setting,
+# because those are for S3-compatible stores and this is an AWS bucket.
+SB_AUDIT_WITNESS_BACKEND=s3
+SB_AUDIT_WITNESS_S3_BUCKET=${audit_witness_s3_bucket}
+SB_AUDIT_WITNESS_S3_PREFIX=${audit_witness_s3_prefix}
+SB_AUDIT_WITNESS_S3_REGION=${aws_region}
 %{ endif ~}
 
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this

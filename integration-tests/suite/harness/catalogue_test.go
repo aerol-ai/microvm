@@ -4,8 +4,9 @@ import "testing"
 
 func TestCatalogueRegistryWellFormed(t *testing.T) {
 	// 299 before the security programme; +61 SEC rows (UC-110..169 plus
-	// UC-145b). Bumped in the same commit that adds them, per §7.
-	const want = 360
+	// UC-145b); +3 for the open audit witness's Phase 4 (SEC-62..64,
+	// UC-263..265). Bumped in the same commit that adds them, per §7.
+	const want = 363
 	if len(CatalogueRegistry) != want {
 		t.Fatalf("catalogue rows = %d, want %d", len(CatalogueRegistry), want)
 	}
