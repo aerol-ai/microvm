@@ -475,6 +475,65 @@ const restoreTamperedAuditLogScript = `sudo bash -c '` + auditLogScript +
 	`[ -f "$log.itest-backup" ] || { echo NOBACKUP; exit 0; }; ` +
 	`cat "$log.itest-backup" > "$log" && rm -f "$log.itest-backup" && echo RESTORED'`
 
+// auditDirSnapshotScript copies the whole audit directory aside with cp -a
+// (owner, mode, timestamps and every sidecar), for a case about to tamper with
+// it while sandboxd is stopped (UC-264, UC-265).
+//
+// The whole directory, not secrets.jsonl alone: a refused boot is not
+// read-only. Booting on a deleted log creates an empty secrets.jsonl and
+// removes secrets.verified, so putting one file back would leave the node
+// different from how the case found it.
+//
+// A snapshot already there is never overwritten: it is left by a run whose
+// restore failed, and may be the only good copy of this node's evidence.
+func auditDirSnapshotScript(tag string) string {
+	return `sudo bash -c '` + auditLogScript + `snap="$dir.itest-` + tag + `"; ` +
+		`[ -f "$log" ] || { echo "NOLOG $log"; exit 0; }; ` +
+		`[ ! -e "$snap" ] || { echo "STALE $snap"; exit 0; }; ` +
+		`rm -rf "$snap-tampered" && cp -a "$dir" "$snap" && echo SNAPSHOT'`
+}
+
+// auditDirRestoreScript puts the snapshot back as the audit directory. Two
+// renames, so no step leaves the node with neither copy, and a re-run after
+// an interruption between them finishes the job. Only ever run with sandboxd
+// stopped: a running daemon would keep appending to the renamed-away inodes.
+func auditDirRestoreScript(tag string) string {
+	return `sudo bash -c '` + auditLogScript + `snap="$dir.itest-` + tag + `"; spoiled="$snap-tampered"; ` +
+		`[ -d "$snap" ] || { echo "NOSNAPSHOT $snap"; exit 0; }; ` +
+		`rm -rf "$spoiled"; ` +
+		`if [ -e "$dir" ]; then mv "$dir" "$spoiled" || exit 1; fi; ` +
+		`mv "$snap" "$dir" && rm -rf "$spoiled" && echo RESTORED'`
+}
+
+// editWitnessedAuditRecordScript changes the record whose event_hash is the
+// head this node last shipped to the witness (witness_tip.json), so the edit
+// is to history an external store has already vouched for. "tampered-" goes
+// in front of the result value, which keeps the line valid JSON whatever the
+// value is: a malformed line would test the parser, not the chain.
+//
+// Written through the existing inode with cat, so owner and mode stay the
+// daemon's. Prints EDITED, or NOTIP / NOTFOUND / NORESULT when there is
+// nothing witnessed to edit.
+const editWitnessedAuditRecordScript = `sudo bash -c '` + auditLogScript +
+	`tip=$(sed -n "s/.*\"head_hex\":\"\([0-9a-f]*\)\".*/\1/p" "$dir/witness_tip.json" 2>/dev/null); ` +
+	`[ -n "$tip" ] || { echo NOTIP; exit 0; }; ` +
+	`n=$(grep -n -F -- "\"event_hash\":\"$tip\"" "$log" | head -1 | cut -d: -f1); ` +
+	`[ -n "$n" ] || { echo "NOTFOUND $tip"; exit 0; }; ` +
+	`awk -v m="$n" '"'"'NR==m && !done { done = sub(/"result":"/, "\"result\":\"tampered-") } { print } END { exit !done }'"'"' "$log" > "$log.tmp" || { rm -f "$log.tmp"; echo "NORESULT line $n"; exit 0; }; ` +
+	`cat "$log.tmp" > "$log" && rm -f "$log.tmp" && echo "EDITED line $n $tip"'`
+
+// deleteAuditLogScript removes secrets.jsonl from the live audit directory
+// (the snapshot holds it), keeping witness_tip.json and the receipts: the
+// node must still remember that it had a chain.
+//
+// The spill files go too. The writer drains them into the fresh log the
+// refused boot creates, which would start a new chain and turn "erased" into
+// a generic mismatch: still refused, but not the case under test, and the
+// drained events would be lost when the snapshot goes back.
+const deleteAuditLogScript = `sudo bash -c '` + auditLogScript +
+	`[ -s "$dir/witness_tip.json" ] || { echo NOTIP; exit 0; }; ` +
+	`rm -f "$log" "$dir/secrets.spill.jsonl" "$dir/secrets.spill.jsonl.working" && echo DELETED'`
+
 // missingEventIDs returns the ids present in before but absent from after.
 func missingEventIDs(before, after []auditlog.Event) []string {
 	have := make(map[string]bool, len(after))

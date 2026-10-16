@@ -266,3 +266,48 @@ const versionHelp = `Print the aerolvm version.
 
 Usage: aerolvm version [--json]
 `
+
+const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked.
+
+Usage: aerolvm audit verify --witness s3://<bucket>[/<prefix>] --since <when>
+                            (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
+                            [--local <node-id>=<secrets.jsonl>]... [--node <id>]...
+
+Checks that every head the witness recorded since --since links to the next
+one through the audit records, in the order they were witnessed. Records
+come from the off-node export, then from a copy of the node's local log for
+records not exported yet. Run it anywhere but the node you are auditing.
+
+Results, per node and overall (the worst wins):
+  PASS        every head in the window links to the next one (exit 0)
+  FAIL        a head is forged or rolled back, a link is missing, the export
+              forks, or a head key was hidden (exit 1; also used when the
+              check cannot run)
+  INCOMPLETE  nothing contradicts the witness, but heads newer than the
+              evidence have waited longer than --max-lag (exit 3)
+
+Flags:
+  --witness URL     the witness bucket and prefix (SB_AUDIT_WITNESS_S3_*)
+  --since T         window start: an RFC3339 time, a duration (720h) or days
+                    (30d). Required; keep exports at least this long
+  --export URL      the S3 audit export (SB_AUDIT_EXPORT_S3_*)
+  --export-dir D    batches saved from a webhook or bus receiver, laid out as
+                    D/node=<id>/YYYY/MM/DD/<batch>.jsonl
+  --local N=PATH    a copy of node N's secrets.jsonl (repeatable; a bare PATH
+                    works with exactly one --node)
+  --node ID         check only this node (repeatable; default: every node in
+                    the witness)
+  --max-lag D       how long a head may wait for its records (default 15m)
+  --region R        AWS region for both buckets
+  --endpoint URL    S3-compatible endpoint
+  --path-style      path-style S3 addressing
+  --json            print the full report as JSON
+
+Credentials come from the standard AWS chain and need read access only.
+
+Examples:
+  aerolvm audit verify --witness s3://acme-witness/witness/ --since 30d \
+      --export s3://acme-audit/audit
+  aerolvm audit verify --witness s3://acme-witness --since 2026-10-01T00:00:00Z \
+      --export-dir ./audit --node node-1 --local ./node-1-secrets.jsonl
+`

@@ -88,6 +88,21 @@ output "bundle_bucket" {
   value       = aws_s3_bucket.bundle.bucket
 }
 
+output "audit_witness_bucket" {
+  description = "S3 Object Lock bucket holding each node's witnessed audit heads. Empty when audit_witness_enabled=false."
+  value       = var.audit_witness_enabled ? aws_s3_bucket.witness[0].bucket : ""
+}
+
+output "audit_witness_prefix" {
+  description = "Key prefix the nodes write witness heads under (SB_AUDIT_WITNESS_S3_PREFIX). Pass s3://<audit_witness_bucket>/<prefix> to aerolvm audit verify --witness."
+  value       = var.audit_witness_enabled ? var.audit_witness_prefix : ""
+}
+
+output "audit_witness_auditor_policy_arn" {
+  description = "Unattached read-only IAM policy for running aerolvm audit verify. Empty unless audit_witness_auditor_policy_enabled."
+  value       = var.audit_witness_enabled && var.audit_witness_auditor_policy_enabled ? aws_iam_policy.audit_witness_auditor[0].arn : ""
+}
+
 output "caddy_certs_bucket" {
   description = "Shared Caddy cert storage bucket name. Empty when shared storage is disabled. In BYO mode this echoes the operator-supplied bucket."
   value       = local.caddy_storage_s3.enabled ? local.caddy_storage_s3.bucket : ""

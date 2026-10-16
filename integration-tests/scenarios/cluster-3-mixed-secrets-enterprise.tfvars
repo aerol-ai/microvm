@@ -2,16 +2,15 @@
 # §6.2 and §6.4a). Enterprise mode changes BOOT behaviour, so it has to be
 # proven from a cold boot rather than flipped on a running cluster.
 #
-# Four constraints, all measured on a live box before this file was written:
+# Three constraints, all measured on a live box before this file was written:
 #   1. enterprise forces SB_SECRET_AUDIT_EXTERNAL_WITNESS, and pkg/daemon
-#      refuses to boot without a non-noop controlplane.Witness. The caps file
-#      advertises audit-witness, which makes run.sh provision the
-#      -tags itestwitness daemon.
+#      refuses to boot without a non-noop controlplane.Witness. The stock
+#      daemon gets one from SB_AUDIT_WITNESS_BACKEND=s3, which
+#      audit_witness_enabled sets below along with the Object Lock bucket;
+#      the caps file advertises audit-witness so the witness cases run.
 #   2. pkg/auditexport REJECTS the file/stdout backends under enterprise
 #      ("keeps audit evidence on this node"), so the sink must be off-node.
 #   3. the webhook URL must be https — the receiver serves TLS for this.
-#   4. the witness must be configured from FIRST boot (see the TODOS entry on
-#      the standalone-node-id mismatch; retrofitting it fails closed).
 cluster_name = "aerolvm-itest-cluster-3-mixed-secrets-enterprise"
 
 extra_tags = {
@@ -33,6 +32,15 @@ secret_kms_strict_boot = true
 audit_receiver_enabled = true
 audit_export_enabled   = true
 
+# The S3 Object Lock witness enterprise mode requires (plans/open-audit-witness.md,
+# D13/D17), written by the stock daemon. GOVERNANCE for one day, so run.sh's
+# teardown can empty the bucket with the bypass header before
+# `terraform destroy`; a COMPLIANCE or longer lock would leave a bucket nobody
+# can delete until the lock ends.
+audit_witness_enabled = true
+witness_lock_mode     = "GOVERNANCE"
+witness_lock_days     = 1
+
 # D6: S4 is the scenario that provisions the V8-isolate runtime AND its jail,
 # so UC-150/163/164 have somewhere to run. §6.2a flagged that no scenario set
 # this flag even though §6.1 lists the jail as an axis.
@@ -43,6 +51,10 @@ extra_sandboxd_env = {
   # The jail is the enterprise posture; the chroot-populate blocker that used
   # to force it off is closed (pkg/isolate/chroot.go PrepareJailBase).
   SB_ISOLATE_USE_JAIL = "true"
+  # The daemon refuses a witness that locks heads for less time than the
+  # local records they vouch for are kept, and enterprise refuses zero, so
+  # the one-day lock needs one-day retention (D13).
+  SB_SECRET_AUDIT_RETENTION_DAYS = "1"
 }
 
 nodes = {

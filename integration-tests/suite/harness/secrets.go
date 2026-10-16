@@ -1050,10 +1050,7 @@ func seedFirst(in []IntegrationNode) []IntegrationNode {
 // decision in the test process — and the receiver's control endpoints
 // (/_probe, /_stats, /_chaos) are deliberately unauthenticated, so not
 // exposing them to the internet is the point.
-const (
-	receiverEnvFile  = "/etc/aerol-audit-receiver/env"
-	receiverUnitFile = "/etc/systemd/system/aerol-audit-receiver.service"
-)
+const receiverUnitFile = "/etc/systemd/system/aerol-audit-receiver.service"
 
 // FindReceiverNode returns the node running the audit receiver.
 func FindReceiverNode(t *testing.T, targets *IntegrationTargets) (IntegrationNode, bool) {
@@ -1110,7 +1107,6 @@ type ReceiverStats struct {
 	Duplicates int `json:"duplicates"`
 	Rejected   int `json:"rejected"`
 	FailNext   int `json:"fail_next"`
-	Nodes      int `json:"nodes"`
 }
 
 // ReceiverStatsFor reads the receiver's counters.
@@ -1165,72 +1161,6 @@ func AwaitReceiverRecords(t *testing.T, node IntegrationNode, n int, timeout tim
 	}
 	t.Fatalf("the receiver never delivered records satisfying the predicate within %s (%d records seen)", timeout, len(last))
 	return last
-}
-
-// PlantWitnessHead records a chain head for nodeID at the audit receiver,
-// bypassing the node that would normally report it.
-//
-// This is the only honest way to test the witness boot gate (UC-144). The
-// gate calls Witness.LastWitnessedHead at boot and refuses to start when the
-// external record disagrees with the local chain, so the fault has to be
-// injected at the witness, not at the node. Faking it with a made-up env knob
-// would produce a case that skips forever — which the plan calls the worst of
-// the available options.
-//
-// The receiver's /witness endpoint takes the bearer token only (no HMAC), and
-// the token lives in the receiver's own 0600 env file, which is why this runs
-// over SSH on the receiver's host.
-func PlantWitnessHead(t *testing.T, receiverNode IntegrationNode, nodeID, headHex string) error {
-	t.Helper()
-	RequireNodeSSH(t, receiverNode)
-	target, ok := SSHTarget(receiverNode)
-	if !ok {
-		return fmt.Errorf("receiver node %s has no SSH address", receiverNode.Name)
-	}
-	body := fmt.Sprintf(`[{"NodeID":%q,"HeadHex":%q,"EventID":"itest-planted","Observed":%q}]`,
-		nodeID, headHex, time.Now().UTC().Format(time.RFC3339))
-	script := `sudo bash -c 'set -a; . ` + receiverEnvFile + `; set +a; ` +
-		`port=$(grep -o -- "--addr :[0-9]*" ` + receiverUnitFile + ` | head -1 | cut -d: -f2); ` +
-		`[ -n "$port" ] || { echo NOPORT >&2; exit 4; }; ` +
-		`curl -sS --insecure --max-time 30 -o /dev/null -w "%{http_code}" ` +
-		`-H "Authorization: Bearer $AEROL_RECEIVER_TOKEN" -H "Content-Type: application/json" ` +
-		`-X POST --data ` + shellSingleQuote(body) + ` "https://127.0.0.1:$port/witness"'`
-	out, err := SSHRun(t, target, script)
-	if err != nil {
-		return fmt.Errorf("plant witness head on %s: %w (%s)", receiverNode.Name, err, strings.TrimSpace(out))
-	}
-	if code := strings.TrimSpace(out); !strings.HasPrefix(code, "2") {
-		return fmt.Errorf("the receiver refused the planted head with status %s", code)
-	}
-	return nil
-}
-
-// WitnessedHeadFor reads what the receiver currently holds for nodeID.
-// Returns ok=false for a 404, which means "never recorded" and is distinct
-// from a transport error.
-func WitnessedHeadFor(t *testing.T, receiverNode IntegrationNode, nodeID string) (headHex string, ok bool, err error) {
-	t.Helper()
-	body, err := ReceiverRequest(t, receiverNode, "GET", "/witness/"+url.PathEscape(nodeID))
-	if err != nil {
-		return "", false, err
-	}
-	trimmed := strings.TrimSpace(body)
-	if trimmed == "" || strings.Contains(trimmed, "no head for node") {
-		return "", false, nil
-	}
-	var head struct {
-		HeadHex string `json:"HeadHex"`
-	}
-	if jerr := json.Unmarshal([]byte(trimmed), &head); jerr != nil {
-		return "", false, fmt.Errorf("decode witnessed head %q: %w", trimmed, jerr)
-	}
-	return head.HeadHex, head.HeadHex != "", nil
-}
-
-// shellSingleQuote wraps s for safe inclusion inside a single-quoted shell
-// word that is itself already inside one.
-func shellSingleQuote(s string) string {
-	return "'\"'\"'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'\"'\"'"
 }
 
 // sshReachable caches, per node, whether this machine can actually SSH in.

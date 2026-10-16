@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
@@ -230,9 +231,7 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 		}
 		verifier := newSecretAuditChainVerifier()
 		if offset > 0 {
-			verifier.prev = cursor.Head
-			verifier.allowBreak = cursor.AllowBreak
-			verifier.started = true
+			verifier = auditlog.ResumeChainVerifier(cursor.Head, cursor.AllowBreak)
 		}
 		sc := bufio.NewScanner(f)
 		sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -258,8 +257,8 @@ func (s *Service) exportSecretAuditBatchOnce(ctx context.Context) (int, error) {
 		if err := sc.Err(); err != nil {
 			return err
 		}
-		verifiedHead = verifier.prev
-		verifiedAllowBreak = verifier.allowBreak
+		verifiedHead = verifier.Head()
+		verifiedAllowBreak = verifier.AllowBreak()
 		return nil
 	})
 	if err != nil {

@@ -130,6 +130,36 @@ are no plaintext storage columns or compatibility flags for either path. A
 database containing the removed plaintext columns is rejected at boot; deploy
 this schema as a coordinated, one-way change.
 
+## Audit witness (SB_AUDIT_WITNESS_BACKEND)
+
+The witness keeps each node's audit hash-chain heads off the node, in an S3
+bucket with Object Lock, so a node that is taken over later cannot rewrite the
+history those heads vouch for (`plans/open-audit-witness.md`). A witness that a
+provider supplies (the managed build) always wins over these settings. With a
+witness in place the node ships its head every
+`SB_SECRET_AUDIT_WITNESS_INTERVAL` (30s) and checks it at every boot;
+`SB_SECRET_AUDIT_EXTERNAL_WITNESS=true`, which enterprise mode forces, also
+refuses to boot without one. Bucket recipe, boot errors and recovery: runbook
+secrets-and-audit, "S3 audit witness".
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_WITNESS_BACKEND` | (empty) | `s3`, or empty for none. Empty is off: zero S3 calls and the placeholder witness, exactly as before the setting existed. Off by default because it needs a bucket only the operator can create: Object Lock must be on from creation, and the lock mode (compliance or governance) and length decide whether anyone can ever delete what the bucket holds. That is not a choice a default should make. With `s3`, boot checks the bucket (versioning, Object Lock, a default retention of at least `SB_SECRET_AUDIT_RETENTION_DAYS`, a missing-key probe that needs `s3:ListBucket`, and a canary delete that must be refused) under a 30s deadline and refuses to start on any failure. Any other value is a config error. |
+| `SB_AUDIT_WITNESS_S3_BUCKET` | (empty) | The Object Lock bucket. Required with `s3`. Use a bucket for the witness alone: the lock default applies to every object in it. |
+| `SB_AUDIT_WITNESS_S3_PREFIX` | `witness/` | Key prefix; heads go to `<prefix>node=<id>/day=<UTC date>/head.json`. A fixed, non-empty default so the node-role IAM (`arn:aws:s3:::<bucket>/witness/*`) can be written before the first boot and never has to cover the whole bucket. A prefix without a trailing slash still works. Change it only together with the IAM. |
+| `SB_AUDIT_WITNESS_S3_REGION` | (empty: AWS config) | Empty leaves the region to the standard AWS chain, the same as the S3 export. Terraform pins it, because a missing region shows up as an opaque timeout instead of a clear error. |
+| `SB_AUDIT_WITNESS_S3_ENDPOINT` | (empty: AWS) | For S3-compatible stores. Only AWS is tested and documented in v1; a store without Object Lock fails the boot checks, so a wrong endpoint cannot pass silently. |
+| `SB_AUDIT_WITNESS_S3_PATH_STYLE` | `false` | Path-style addressing, for S3-compatible stores that need it. AWS uses virtual-hosted addressing. |
+| `SB_NODE_ID` (with a witness) | (empty: `standalone` on a single server) | **Required** once `SB_AUDIT_WITNESS_BACKEND` is set, and must not be `standalone`; config load fails and names `SB_NODE_ID` otherwise. Heads are filed under the node id, and every single server without one is `standalone`, so two servers sharing a bucket would overwrite each other's heads and refuse to restart. Must be unique among servers sharing the bucket. Cluster nodes already have one from `cluster-init.sh` / `cluster-join.sh`. Changing it later is a rebuild, not a config change (runbook: "Rebuild a node under a new SB_NODE_ID"). |
+
+Credentials come from the standard AWS chain (instance role, environment,
+profile), the same as the S3 export. The installer only documents these
+settings (commented out in `sandboxd.env`) and never creates a bucket;
+Terraform creates one with `audit_witness_enabled = true` (lock mode
+`witness_lock_mode`, default `COMPLIANCE`; length `witness_lock_days`, default
+30); Ansible passes the settings through from `sandboxd_audit_witness_*` and
+`sandboxd_node_id`.
+
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |
 |---|---|

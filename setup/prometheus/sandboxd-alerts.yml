@@ -497,6 +497,41 @@ groups:
           description: "The last POST /v1/audit/verify on this node reported ok=false. The response body carries the failing offset and reason. Treat the local log as untrusted evidence until reconciled with the export backend or witness."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
 
+      # Witness ships keep failing: the bucket is unreachable, the node's
+      # credentials or the bucket policy changed, or the bucket is throttling.
+      # Local records keep landing, but nothing new is anchored off the node,
+      # retention will not prune, and a restart now refuses to boot until the
+      # witness answers. Gated on the failure counter moving, so a node with
+      # no external witness (whose gauge is never set) stays quiet.
+      - alert: SandboxdAuditWitnessShipFailing
+        expr: aerolvm_secret_audit_witness_healthy == 0 and increase(aerolvm_secret_audit_witness_failures_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd has not shipped an audit head to its witness for 15 minutes"
+          description: "aerolvm_secret_audit_witness_healthy is 0 and aerolvm_secret_audit_witness_failures_total keeps rising. The daemon log line 'secret audit witness ship failed' names the error. Check the path to S3 (VPC endpoint or NAT), the node role's witness grants and the bucket policy. Do not restart the node until the witness answers: boot validation needs it."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+      # The witness held a head this node did not ship. Nothing can delete
+      # from an Object Lock witness and its reads are consistent, so another
+      # writer used this node's witness key: a cluster node through the
+      # shared node role, a second server given the same SB_NODE_ID, or
+      # tampering. The node re-ships its own head, so this alert is the only
+      # live signal; a write that lands between the node's read and its
+      # write is caught only by `aerolvm audit verify`.
+      - alert: SandboxdAuditWitnessForeignHead
+        expr: increase(aerolvm_secret_audit_witness_foreign_head_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          component: secrets-audit
+        annotations:
+          summary: "sandboxd found a head in its audit witness that it did not write"
+          description: "aerolvm_secret_audit_witness_foreign_head_total increased: the witness held a head this node neither shipped last nor holds now (the daemon log line 'secret audit witness holds a head this node did not ship' names both). Check for a second server with the same SB_NODE_ID, then attribute the write with CloudTrail S3 data events on the witness bucket. Run aerolvm audit verify for this node; a restart refuses to boot only while the foreign head is still the newest."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
       # Audit reads are being refused for lack of read slots. With the index
       # ready a slot is held for milliseconds; sustained busy rejections mean
       # the node is saturated or the index is off.
