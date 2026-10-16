@@ -43,8 +43,12 @@ func (s *Service) registerWasmModuleCatalogue(ctx context.Context, sandbox *mode
 		Digest:          sandbox.ModuleDigest,
 		Entrypoint:      entryExportFromSandbox(sandbox),
 		HasWarm:         s.cfg.WasmPoolEnabled,
-		CreatedAt:       now,
-		ReadyAt:         &now,
+		// The catalogue row inherits the sandbox's owner, so an auto-registered
+		// module is scoped to the tenant that created the sandbox — not left as
+		// "" (operator-published, visible to everyone).
+		OwnerRef:  sandbox.OwnerRef,
+		CreatedAt: now,
+		ReadyAt:   &now,
 	})
 }
 
