@@ -97,6 +97,22 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	cp = cp.WithDefaults()
 
+	// TEST-ONLY: the integration harness needs real scoped (non-PAT) tokens to
+	// exercise owner scoping end to end. SB_ITEST_IDENTITY_FILE maps bearer
+	// tokens to owner refs; when set, it replaces the (reject-all) Noop
+	// validator so those tokens authenticate as owner-scoped identities. This is
+	// deliberately NOT the managed identity feature (plans/identity-and-access.md)
+	// — it is throwaway test scaffolding, never wired in a normal deployment.
+	if path := strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")); path != "" {
+		tokens, lerr := loadITestIdentityFile(path)
+		if lerr != nil {
+			return fmt.Errorf("load SB_ITEST_IDENTITY_FILE: %w", lerr)
+		}
+		cp.Validator = itestStaticValidator{tokens: tokens}
+		logger.Warn("TEST-ONLY static identity validator enabled; not for production use",
+			"file", path, "tokens", len(tokens))
+	}
+
 	// Derive a cancellable child so a fatal failure in a background server
 	// goroutine (HTTP/ingress ListenAndServe) can trigger graceful shutdown by
 	// unblocking the <-ctx.Done() wait below — exactly as the old main() did
