@@ -13,12 +13,12 @@ timeline
     June 2026 : 4 releases : v0.5.1 to v0.5.4
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
-    October 2026 : 6 releases : v0.6.1 to v0.6.6
+    October 2026 : 7 releases : v0.6.1 to v0.6.7
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 7 | Sep 28, 2026 to Oct 15, 2026 | [v0.6.6](#v066-runloop-sdk-compatibility-and-aerolvm-shell) |
+| [0.6](#06-release-line) | 8 | Sep 28, 2026 to Oct 16, 2026 | [v0.6.7](#v067-enterprise-mode-with-the-free-download) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -26,6 +26,24 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.7: Enterprise mode with the free download
+
+*October 16, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.7)
+
+- **Enterprise mode works with the free download.** Set `SB_ENTERPRISE_MODE=true` and point the new `SB_AUDIT_WITNESS_*` settings at an S3 bucket with Object Lock. Each server then keeps the fingerprint of its audit log in that bucket, where the server cannot change or delete it. A server refuses to start on a bucket that would not protect what it stores, or when its local log disagrees with the bucket.
+- **`aerolvm audit verify`.** An auditor checks a server's audit history from any machine, against the bucket and the exported audit records. The result is PASS, FAIL or INCOMPLETE (exit 0, 1 or 3) for a time window the auditor chooses with `--since`.
+- **Terraform and Ansible set it up.** `audit_witness_enabled = true` creates the locked bucket and a node role that can write fingerprints but cannot delete them. Ansible and `install.sh` carry the settings.
+- **Open shells and exec streams survive route changes.** A sandbox exposing a port no longer disconnects every open `aerolvm shell`, exec stream and session attach on that node.
+- **Terraform cluster deploys on the default settings work again.** The release now ships `cluster-sign-node.sh`, which every seed node downloads.
+
+**Before you upgrade:**
+
+- **Nothing changes unless you set `SB_AUDIT_WITNESS_BACKEND`.** With it unset, no S3 request is made and boot is unchanged.
+- **A witness needs a unique `SB_NODE_ID` on every node,** single servers included. The default `standalone` is refused. Rebuilding a node means a new id, because Object Lock keeps the old fingerprints.
+- **Use a dedicated bucket with Object Lock enabled at creation,** in COMPLIANCE mode, with a default retention at least as long as `SB_SECRET_AUDIT_RETENTION_DAYS`. Enterprise mode needs an `https` endpoint.
+- **Keep audit exports for at least as long as the window you verify.**
+- **Re-run `install.sh` to pick up the Caddy change.** Routes written by an older sandboxd get the 10-minute delay when sandboxd next writes them.
 
 ### v0.6.6: Runloop SDK compatibility and aerolvm shell
 
