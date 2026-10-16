@@ -382,17 +382,11 @@ func CreateOnSelectedNode(ctx context.Context, svc *service.Service, logger *slo
 
 	// Reserved path: overlap CreateSandboxWithID with the secrets seal, then
 	// promote after both legs join (the row must stay Reserved during the
-	// create — see OverlapCreateAndPromote). Resolve platform volumes first —
-	// store lookups only, no container — so PromoteWithSpec carries concrete
-	// MountSpecs (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
+	// create — see OverlapCreateAndPromote, which also resolves platform
+	// volumes for the promoted spec without stripping them from the create)
+	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md).
 	if reservationID != "" {
 		service.RecordCreateReservationState("promote_local")
-		if err := svc.ResolvePlatformVolumesForReplication(ctx, &req); err != nil {
-			if c != nil {
-				cancelReservation(context.Background(), c, logger, reservationID)
-			}
-			return nil, err
-		}
 		return OverlapCreateAndPromote(ctx, svc, logger, req, reservationID, OverlapOptions{
 			PromoteWithSpec: opts.PromoteWithSpec,
 		})
