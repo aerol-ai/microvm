@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime/isolate"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/jsbundle"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -105,6 +106,17 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// left untouched for the driver to handle.
 	if s.isolateBundles != nil {
 		owner := ownerRefForCreate(ctx)
+		// A digest ref ("sha256:<hex>") resolves bytes by content regardless of
+		// tenant, so an owner-scoped caller must already own that digest —
+		// otherwise a tenant could boot a sandbox from another tenant's bundle
+		// (and co-own it) just by naming its digest. Name refs are already
+		// tenant-scoped by GetByName; file refs are operator/self-host. The
+		// driver's own by-digest resolve after create stays unscoped by design.
+		if digest, isDigest := jsbundle.AsDigest(bundleRef); isDigest {
+			if _, scoped := ownerScope(ctx); scoped && !s.isolateBundles.TenantOwns(owner, digest) {
+				return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, store.ErrNotFound)
+			}
+		}
 		resolved, resolveErr := jsbundle.NewResolver(s.isolateBundles).Resolve(ctx, owner, bundleRef)
 		if resolveErr != nil {
 			return nil, fmt.Errorf("resolve bundle %q: %w", bundleRef, resolveErr)

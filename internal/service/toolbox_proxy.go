@@ -77,9 +77,18 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		originalDirector(req)
 		req.URL.Path = path
 		req.Host = target.Host
+		// Never forward the CALLER's credential into the sandbox. toolboxd runs
+		// inside tenant-controlled space and authenticates only from
+		// Authorization, so we replace Authorization with the sandbox's own
+		// toolbox token and strip the WebSocket subprotocol smuggle
+		// ("sandbox.bearer, <token>") the SDK uses on handshakes — otherwise an
+		// operator PAT used against a tenant's sandbox would land inside tenant
+		// code. The subprotocol NAME is kept so the WS upgrade still negotiates.
+		req.Header.Del("Authorization")
 		if toolboxToken != "" {
 			req.Header.Set("Authorization", "Bearer "+toolboxToken)
 		}
+		stripSmuggledBearerSubprotocol(req.Header)
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
 		if s.logger != nil {
@@ -94,6 +103,40 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 	}
 	proxy.ServeHTTP(w, r)
 	return nil
+}
+
+// bearerSubprotocol is the WebSocket subprotocol marker the SDKs use to smuggle
+// a bearer token past the browser's inability to set Authorization on a
+// handshake: `Sec-WebSocket-Protocol: sandbox.bearer, <token>`.
+const bearerSubprotocol = "sandbox.bearer"
+
+// stripSmuggledBearerSubprotocol rewrites Sec-WebSocket-Protocol so the caller's
+// smuggled bearer token is removed before the request reaches the sandbox,
+// keeping only the subprotocol marker so the WebSocket upgrade still negotiates.
+// toolboxd authenticates from Authorization, so dropping the token element costs
+// nothing there while preventing the caller's credential from reaching
+// tenant-controlled code.
+func stripSmuggledBearerSubprotocol(h http.Header) {
+	const key = "Sec-WebSocket-Protocol"
+	vals := h.Values(key)
+	if len(vals) == 0 {
+		return
+	}
+	hasMarker := false
+	for _, raw := range vals {
+		for _, part := range strings.Split(raw, ",") {
+			if strings.TrimSpace(part) == bearerSubprotocol {
+				hasMarker = true
+			}
+		}
+	}
+	h.Del(key)
+	// Re-offer only the marker (never the token element after it). If the
+	// marker was absent the header carried no smuggle convention we recognize,
+	// so we drop it entirely rather than forward an unknown credential.
+	if hasMarker {
+		h.Set(key, bearerSubprotocol)
+	}
 }
 
 // refuseToolboxAdminPath answers not found for toolboxd's /admin endpoints.
