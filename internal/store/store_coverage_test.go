@@ -4186,7 +4186,7 @@ func TestSnapshotScanCorruptEntrypoint(t *testing.T) {
 	`, "{bad", "snap-e"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetSnapshot(ctx, "snap-e"); err == nil {
+	if _, err := st.GetSnapshot(ctx, "", "snap-e"); err == nil {
 		t.Fatal("GetSnapshot corrupt entrypoint")
 	}
 	if _, err := st.ListSnapshots(ctx); err == nil {

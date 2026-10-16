@@ -14,8 +14,8 @@ import (
 // without growing the reconciler's dependency surface.
 type SnapshotPushStore interface {
 	ListSnapshotsPendingPush(ctx context.Context) ([]*models.SandboxSnapshot, error)
-	SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error
-	UpdateSnapshotImageDistribution(ctx context.Context, name, mode, registryRef, digest string) error
+	SetSnapshotPushState(ctx context.Context, ownerRef, name, state, errMsg string) error
+	UpdateSnapshotImageDistribution(ctx context.Context, ownerRef, name, mode, registryRef, digest string) error
 }
 
 // SnapshotPushReconciler walks rows the snapshot-create path flagged
@@ -132,6 +132,7 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 		return snapshotPushSkipped
 	}
 	name := snapshot.Name
+	owner := snapshot.OwnerRef
 
 	// Defensive guard: a concurrent reconcile (or operator-cleared row)
 	// may have moved the snapshot to a terminal state between the scan
@@ -141,7 +142,7 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 		// Already non-local (e.g. someone re-registered with a remote ref).
 		// Treat as already-distributed; flip state to active so the
 		// reconciler stops picking it up.
-		if err := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStateActive, ""); err != nil {
+		if err := r.store.SetSnapshotPushState(ctx, owner, name, models.SnapshotPushStateActive, ""); err != nil {
 			r.logger.Warn("snapshot push: clear non-local row failed",
 				"snapshot", name, "error", err)
 		}
@@ -151,7 +152,7 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 	// Move to 'pushing' so a concurrent RunOnce won't double-claim. This
 	// is the moral equivalent of the AutoImporter's flag-clear-before-call:
 	// state machine guards against duplicate work.
-	if err := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStatePushing, ""); err != nil {
+	if err := r.store.SetSnapshotPushState(ctx, owner, name, models.SnapshotPushStatePushing, ""); err != nil {
 		r.logger.Warn("snapshot push: claim row failed",
 			"snapshot", name, "error", err)
 		return snapshotPushFailed
@@ -161,7 +162,7 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 	if err != nil {
 		// Persist the error so the operator can see why retries are
 		// failing (surfaced via the Daytona facade's errorReason field).
-		if setErr := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStateError, err.Error()); setErr != nil {
+		if setErr := r.store.SetSnapshotPushState(ctx, owner, name, models.SnapshotPushStateError, err.Error()); setErr != nil {
 			r.logger.Warn("snapshot push: record failure failed",
 				"snapshot", name, "error", setErr, "push_error", err)
 		}
@@ -176,10 +177,10 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 	// payload; older daemons may leave it empty, in which case we store ""
 	// rather than fabricating a value (downstream consumers treat absent
 	// digest as "ref is the source of truth").
-	if err := r.store.UpdateSnapshotImageDistribution(ctx, name, models.ImageDistributionAOCR, result.RegistryRef, result.Digest); err != nil {
+	if err := r.store.UpdateSnapshotImageDistribution(ctx, owner, name, models.ImageDistributionAOCR, result.RegistryRef, result.Digest); err != nil {
 		// Mark error so we re-attempt next tick rather than silently leaving
 		// the row in 'pushing' forever.
-		if setErr := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStateError, err.Error()); setErr != nil {
+		if setErr := r.store.SetSnapshotPushState(ctx, owner, name, models.SnapshotPushStateError, err.Error()); setErr != nil {
 			r.logger.Warn("snapshot push: record post-success metadata failure failed",
 				"snapshot", name, "error", setErr)
 		}
@@ -187,7 +188,7 @@ func (r *SnapshotPushReconciler) pushOne(ctx context.Context, snapshot *models.S
 			"snapshot", name, "error", err)
 		return snapshotPushFailed
 	}
-	if err := r.store.SetSnapshotPushState(ctx, name, models.SnapshotPushStateActive, ""); err != nil {
+	if err := r.store.SetSnapshotPushState(ctx, owner, name, models.SnapshotPushStateActive, ""); err != nil {
 		r.logger.Warn("snapshot push: succeeded but state-clear failed",
 			"snapshot", name, "error", err)
 		return snapshotPushFailed

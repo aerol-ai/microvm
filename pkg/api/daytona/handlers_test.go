@@ -497,7 +497,7 @@ func TestDeleteSnapshotRemovesStoredSnapshot(t *testing.T) {
 	if rt.removeHits != 1 || rt.lastRemoved != snapshot.Image {
 		t.Fatalf("unexpected remove image calls: hits=%d last=%q", rt.removeHits, rt.lastRemoved)
 	}
-	if _, err := st.GetSnapshot(ctx, snapshot.Name); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("expected ErrNotFound after delete, got %v", err)
 	}
 }

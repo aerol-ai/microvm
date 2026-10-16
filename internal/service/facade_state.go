@@ -93,6 +93,12 @@ func (s *Service) UpdateTags(ctx context.Context, sandboxID string, tags map[str
 // existing row under the same alias must also point at a visible snapshot,
 // or a user token could retarget (and so take over) another tenant's alias.
 func (s *Service) UpsertSnapshotAlias(ctx context.Context, alias models.SnapshotAlias) error {
+	// Snapshot names are per-owner, so the alias is stamped with the caller's
+	// owner — the account whose snapshot it points at (requireVisibleSnapshot
+	// below confirms the snapshot is that owner's). This keys the alias to a
+	// single snapshot and makes the (owner_ref, snapshot_name) FK cascade with
+	// the right one.
+	alias.OwnerRef = ownerRefForCreate(ctx)
 	if _, scoped := ownerScope(ctx); scoped {
 		if err := s.requireVisibleSnapshot(ctx, alias.SnapshotName); err != nil {
 			return err
@@ -153,7 +159,7 @@ func (s *Service) requireVisibleSnapshot(ctx context.Context, name string) error
 	if _, scoped := ownerScope(ctx); !scoped {
 		return nil
 	}
-	snapshot, err := s.store.GetSnapshot(ctx, name)
+	snapshot, err := s.store.GetSnapshot(ctx, ownerRefForCreate(ctx), name)
 	if err != nil {
 		return err
 	}

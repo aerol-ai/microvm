@@ -204,22 +204,25 @@ func TestBuildImageBaseShortcut(t *testing.T) {
 func TestTenantBuildsStartFromRegistryImages(t *testing.T) {
 	builder := &fakeBuilder{}
 	svc, st := newBuildService(t, config.Config{}, builder)
-	if err := st.CreateSnapshot(context.Background(), &models.SandboxSnapshot{Name: "snap-globex", Image: docker.SnapshotImageTag("snap-globex"), SourceSandboxID: "sb", OwnerRef: "globex", CreatedAt: time.Now()}); err != nil {
+	// A build cannot start from a snapshot the CALLER owns (snapshots are not
+	// buildable bases). Names are per-owner, so the by-name checks use acme's
+	// own snapshot; another tenant's name is just an unknown registry ref.
+	if err := st.CreateSnapshot(context.Background(), &models.SandboxSnapshot{Name: "snap-acme", Image: docker.SnapshotImageTag("snap-acme"), SourceSandboxID: "sb", OwnerRef: "acme", CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	refused := []string{
-		"FROM " + docker.SnapshotImageTag("snap-globex"),
+		"FROM " + docker.SnapshotImageTag("snap-acme"),
 		"FROM docker.io/aerolvm-snapshot/abc",
 		"FROM aerolvm-build/0123456789abcdef:latest",
 		"FROM snapshots/demo:v1",
 		"FROM sha256:" + strings.Repeat("a", 64),
 		"FROM 4f1a2b",
-		"FROM --platform=linux/amd64 snap-globex:latest AS x",
-		"FROM python:3.12\nCOPY --from=snap-globex / /x",
+		"FROM --platform=linux/amd64 snap-acme:latest AS x",
+		"FROM python:3.12\nCOPY --from=snap-acme / /x",
 		"FROM python:3.12\nRUN --mount=type=bind,from=aerolvm-build/abc,target=/x true",
 		"FROM python:3.12\nONBUILD COPY --from=4f1a / /x",
 		"# syntax=aerolvm-snapshot/frontend\nFROM python:3.12",
-		"FROM python:3.12\nCOPY \\\n  --from=snap-globex / /x",
+		"FROM python:3.12\nCOPY \\\n  --from=snap-acme / /x",
 	}
 	for _, dockerfile := range refused {
 		if _, err := svc.BuildImage(userCtx("acme"), BuildImageRequest{Dockerfile: dockerfile + "\nRUN true"}); !errors.Is(err, ErrBuildInvalid) {
@@ -285,11 +288,15 @@ func TestRegisterSnapshotFromDockerfile(t *testing.T) {
 	if base, err := svc.RegisterSnapshotFromDockerfile(userCtx("acme"), &models.SandboxSnapshot{Name: "py-base"}, BuildImageRequest{Dockerfile: "FROM python:3.12"}); err != nil || base.Image != "python:3.12" {
 		t.Fatalf("single-line register = %+v, %v", base, err)
 	}
-	if _, err := svc.RegisterSnapshotFromDockerfile(userCtx("globex"), &models.SandboxSnapshot{Name: "py-ready"}, BuildImageRequest{Dockerfile: dockerfile + "\nRUN true"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
+	// Same owner + same name + a different image is a per-owner conflict; the
+	// image that was built for the refused registration is scheduled for GC.
+	// (A different owner registering "py-ready" would NOT conflict — names are
+	// per-owner — so this must stay the same owner to exercise the rollback.)
+	if _, err := svc.RegisterSnapshotFromDockerfile(userCtx("acme"), &models.SandboxSnapshot{Name: "py-ready"}, BuildImageRequest{Dockerfile: dockerfile + "\nRUN true"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
 		t.Fatalf("taken name = %v", err)
 	}
 	pending, err := st.ListPendingImageGCDue(context.Background(), time.Now().Add(time.Hour), 10)
-	if err != nil || len(pending) != 1 || pending[0].Image != docker.BuildTagForOwner(dockerfile+"\nRUN true", nil, "", snapshotOwnerNamespace("globex")) {
+	if err != nil || len(pending) != 1 || pending[0].Image != docker.BuildTagForOwner(dockerfile+"\nRUN true", nil, "", snapshotOwnerNamespace("acme")) {
 		t.Fatalf("pending GC after a failed registration = %+v, %v", pending, err)
 	}
 	builds := len(builder.builds)

@@ -4720,7 +4720,7 @@ func TestCreateSnapshotWithOwnershipWave3(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "docker commit failed") {
 			t.Fatalf("error = %v, want runtime failure", err)
 		}
-		if _, getErr := st.GetSnapshot(ctx, "snapshots/fail:v1"); !errors.Is(getErr, store.ErrNotFound) {
+		if _, getErr := st.GetSnapshot(ctx, "", "snapshots/fail:v1"); !errors.Is(getErr, store.ErrNotFound) {
 			t.Fatalf("snapshot row leaked after runtime failure: %v", getErr)
 		}
 	})

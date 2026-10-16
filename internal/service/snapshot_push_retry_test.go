@@ -53,7 +53,7 @@ func (f *fakePushStore) ListSnapshotsPendingPush(_ context.Context) ([]*models.S
 	return out, nil
 }
 
-func (f *fakePushStore) SetSnapshotPushState(_ context.Context, name, state, errMsg string) error {
+func (f *fakePushStore) SetSnapshotPushState(_ context.Context, _ownerRef, name, state, errMsg string) error {
 	f.stateUpdates.Add(1)
 	if f.stateErr != nil {
 		if err := f.stateErr[state]; err != nil {
@@ -71,7 +71,7 @@ func (f *fakePushStore) SetSnapshotPushState(_ context.Context, name, state, err
 	return nil
 }
 
-func (f *fakePushStore) UpdateSnapshotImageDistribution(_ context.Context, name, mode, ref, digest string) error {
+func (f *fakePushStore) UpdateSnapshotImageDistribution(_ context.Context, _ownerRef, name, mode, ref, digest string) error {
 	f.distUpdates.Add(1)
 	if f.distErr != nil {
 		return f.distErr

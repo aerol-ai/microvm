@@ -182,17 +182,17 @@ func TestSnapshotPushLifecycle(t *testing.T) {
 		t.Fatalf("pending = %+v", pending)
 	}
 
-	if err := st.UpdateSnapshotImageDistribution(ctx, "snap-1", "aocr", "reg/ref", "sha256:abc"); err != nil {
+	if err := st.UpdateSnapshotImageDistribution(ctx, "", "snap-1", "aocr", "reg/ref", "sha256:abc"); err != nil {
 		t.Fatalf("UpdateSnapshotImageDistribution: %v", err)
 	}
-	if err := st.UpdateSnapshotImageDistribution(ctx, "missing", "aocr", "r", "d"); !errors.Is(err, ErrNotFound) {
+	if err := st.UpdateSnapshotImageDistribution(ctx, "", "missing", "aocr", "r", "d"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("UpdateSnapshotImageDistribution(missing) = %v", err)
 	}
 
-	if err := st.SetSnapshotPushState(ctx, "snap-1", "active", ""); err != nil {
+	if err := st.SetSnapshotPushState(ctx, "", "snap-1", "active", ""); err != nil {
 		t.Fatalf("SetSnapshotPushState: %v", err)
 	}
-	if err := st.SetSnapshotPushState(ctx, "missing", "active", ""); !errors.Is(err, ErrNotFound) {
+	if err := st.SetSnapshotPushState(ctx, "", "missing", "active", ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("SetSnapshotPushState(missing) = %v", err)
 	}
 
@@ -331,12 +331,12 @@ func runExtraCoverageWithCtx(ctx context.Context, st *Store) {
 
 	// Snapshots
 	_ = st.CreateSnapshot(ctx, &models.SandboxSnapshot{})
-	_ = st.DeleteSnapshot(ctx, "missing")
-	_, _ = st.GetSnapshot(ctx, "missing")
+	_ = st.DeleteSnapshot(ctx, "", "missing")
+	_, _ = st.GetSnapshot(ctx, "", "missing")
 	_, _ = st.ListSnapshots(ctx)
 	_, _ = st.ListSnapshotsPendingPush(ctx)
-	_ = st.SetSnapshotPushState(ctx, "missing", "a", "b")
-	_ = st.UpdateSnapshotImageDistribution(ctx, "missing", "a", "b", "c")
+	_ = st.SetSnapshotPushState(ctx, "", "missing", "a", "b")
+	_ = st.UpdateSnapshotImageDistribution(ctx, "", "missing", "a", "b", "c")
 
 	// Ports
 	_ = st.UpsertPort(ctx, models.ExposedPort{})

@@ -53,8 +53,8 @@ func newSnapshotOwnerServiceAt(t *testing.T) (*Service, *store.Store, *fakeSnaps
 		}
 	}
 	for _, alias := range []models.SnapshotAlias{
-		{Alias: "alias-acme", SnapshotName: "snap-acme", Facade: models.FacadeRunloop, StateJSON: `{"name":"acme"}`},
-		{Alias: "alias-globex", SnapshotName: "snap-globex", Facade: models.FacadeRunloop, StateJSON: `{"name":"globex"}`},
+		{Alias: "alias-acme", SnapshotName: "snap-acme", OwnerRef: "acme", Facade: models.FacadeRunloop, StateJSON: `{"name":"acme"}`},
+		{Alias: "alias-globex", SnapshotName: "snap-globex", OwnerRef: "globex", Facade: models.FacadeRunloop, StateJSON: `{"name":"globex"}`},
 	} {
 		if err := st.UpsertSnapshotAlias(ctx, alias); err != nil {
 			t.Fatalf("seed alias %s: %v", alias.Alias, err)
@@ -102,7 +102,12 @@ func TestGetSnapshotOwnerScoped(t *testing.T) {
 		{name: "other tenant by name", ctx: userCtx("acme"), lookup: "snap-globex", wantErr: true},
 		{name: "other tenant by image id", ctx: userCtx("acme"), lookup: "sha256:globex", wantErr: true},
 		{name: "operator row hidden from user", ctx: userCtx("acme"), lookup: "snap-shared", wantErr: true},
-		{name: "operator sees every row", ctx: operatorCtx(), lookup: "snap-globex"},
+		// Names are per-owner, so an operator resolves a bare name in its own
+		// ("") namespace; a tenant's snapshot is reachable by its image id
+		// (the fleet-wide fallback), not by its name.
+		{name: "operator sees its own namespace by name", ctx: operatorCtx(), lookup: "snap-shared"},
+		{name: "operator sees a tenant row by image id", ctx: operatorCtx(), lookup: "sha256:globex"},
+		{name: "operator tenant row not by name", ctx: operatorCtx(), lookup: "snap-globex", wantErr: true},
 		{name: "internal sees by image id", ctx: context.Background(), lookup: "sha256:globex"},
 	}
 	for _, tc := range tests {
@@ -180,13 +185,13 @@ func TestDeleteSnapshotOwnerScoped(t *testing.T) {
 	if rt.removeHits != 0 {
 		t.Fatalf("cross-tenant delete removed image %q", rt.lastRemoved)
 	}
-	if _, err := st.GetSnapshot(ctx, "snap-globex"); err != nil {
+	if _, err := st.GetSnapshot(ctx, "globex", "snap-globex"); err != nil {
 		t.Fatalf("cross-tenant delete removed the row: %v", err)
 	}
 	if err := svc.DeleteSnapshot(userCtx("acme"), "snap-acme"); err != nil {
 		t.Fatalf("owner delete: %v", err)
 	}
-	if _, err := st.GetSnapshot(ctx, "snap-acme"); !errors.Is(err, store.ErrNotFound) {
+	if _, err := st.GetSnapshot(ctx, "acme", "snap-acme"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("owner delete left the row: %v", err)
 	}
 }
@@ -199,7 +204,7 @@ func TestCreateSnapshotWithOwnershipOwnerScoped(t *testing.T) {
 	if err != nil || !isNew || created.OwnerRef != "globex" {
 		t.Fatalf("operator create = %+v, %v, %v; want owner globex", created, isNew, err)
 	}
-	if stored, err := st.GetSnapshot(context.Background(), "snap-new"); err != nil || stored.OwnerRef != "globex" {
+	if stored, err := st.GetSnapshot(context.Background(), "globex", "snap-new"); err != nil || stored.OwnerRef != "globex" {
 		t.Fatalf("stored owner = %+v, %v", stored, err)
 	}
 
@@ -209,12 +214,17 @@ func TestCreateSnapshotWithOwnershipOwnerScoped(t *testing.T) {
 		sandbox string
 		snap    string
 		wantErr error
+		wantNew bool // a fresh commit (true) vs a replay of the existing row (false)
 	}{
 		// The fast path runs before the source sandbox is loaded: it must not
 		// hand another tenant's snapshot to a caller naming its sandbox.
 		{name: "other tenant's retry", ctx: userCtx("acme"), sandbox: "sb-globex", snap: "snap-new", wantErr: store.ErrNotFound},
-		{name: "name taken by another source", ctx: userCtx("acme"), sandbox: "sb-acme", snap: "snap-new", wantErr: store.ErrSnapshotNameConflict},
+		// Names are per-owner, so acme committing its own sandbox under a name
+		// globex already uses is a NEW, distinct snapshot — not a conflict.
+		{name: "same name, different owner", ctx: userCtx("acme"), sandbox: "sb-acme", snap: "snap-new", wantNew: true},
 		{name: "owner's retry", ctx: userCtx("globex"), sandbox: "sb-globex", snap: "snap-new"},
+		// An operator/internal caller committing a tenant's sandbox resolves the
+		// conflict in the SANDBOX's owner namespace, so a retry replays.
 		{name: "internal retry", ctx: context.Background(), sandbox: "sb-globex", snap: "snap-new"},
 		{name: "cross-tenant new snapshot", ctx: userCtx("acme"), sandbox: "sb-globex", snap: "snap-fresh", wantErr: store.ErrNotFound},
 	}
@@ -227,13 +237,18 @@ func TestCreateSnapshotWithOwnershipOwnerScoped(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || isNew || got.Name != tc.snap {
-				t.Fatalf("CreateSnapshotWithOwnership = %+v, %v, %v; want replay", got, isNew, err)
+			if err != nil || isNew != tc.wantNew || got.Name != tc.snap {
+				t.Fatalf("CreateSnapshotWithOwnership = %+v, isNew=%v, %v; want isNew=%v", got, isNew, err, tc.wantNew)
 			}
 		})
 	}
-	if rt.hits != 1 {
-		t.Fatalf("runtime snapshot hits = %d, want 1 (only the first create commits)", rt.hits)
+	// globex's initial commit, acme's distinct same-named commit, and the
+	// internal retry: an operator/internal caller cannot know the source
+	// sandbox's owner before loading it, so the pre-load replay fast path
+	// misses and the runtime commit runs once more before the store conflict
+	// replays. The owner-scoped (tenant) retries replay without re-committing.
+	if rt.hits != 3 {
+		t.Fatalf("runtime snapshot hits = %d, want 3", rt.hits)
 	}
 }
 
@@ -245,10 +260,16 @@ func TestCreateSnapshotWithOwnershipConflictReread(t *testing.T) {
 		ctx     context.Context
 		race    *models.SandboxSnapshot
 		wantErr error
+		wantNew bool
 	}{
-		{name: "same source, visible", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-acme", OwnerRef: "acme"}},
-		{name: "same source, hidden", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-acme", OwnerRef: "globex"}, wantErr: store.ErrNotFound},
-		{name: "other source", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-globex", OwnerRef: "globex"}, wantErr: store.ErrSnapshotNameConflict},
+		// A racing insert by the SAME owner from the SAME source is a retry →
+		// replay the racing row.
+		{name: "same owner, same source", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-acme", OwnerRef: "acme"}},
+		// Same owner, different source → a real per-owner name conflict.
+		{name: "same owner, other source", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-globex", OwnerRef: "acme"}, wantErr: store.ErrSnapshotNameConflict},
+		// A racing insert by a DIFFERENT owner shares no primary key, so acme's
+		// commit succeeds as its own distinct snapshot.
+		{name: "different owner race", ctx: userCtx("acme"), race: &models.SandboxSnapshot{SourceSandboxID: "sb-globex", OwnerRef: "globex"}, wantNew: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -267,8 +288,8 @@ func TestCreateSnapshotWithOwnershipConflictReread(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || isNew || got == nil {
-				t.Fatalf("CreateSnapshotWithOwnership = %+v, %v, %v; want the racing row", got, isNew, err)
+			if err != nil || isNew != tc.wantNew || got == nil {
+				t.Fatalf("CreateSnapshotWithOwnership = %+v, isNew=%v, %v; want isNew=%v", got, isNew, err, tc.wantNew)
 			}
 		})
 	}
@@ -280,18 +301,24 @@ func TestRegisterSnapshotOwnerScoped(t *testing.T) {
 	if err != nil || registered.OwnerRef != "acme" {
 		t.Fatalf("register = %+v, %v; want owner acme", registered, err)
 	}
-	if stored, err := st.GetSnapshot(context.Background(), "reg-acme"); err != nil || stored.OwnerRef != "acme" {
+	if stored, err := st.GetSnapshot(context.Background(), "acme", "reg-acme"); err != nil || stored.OwnerRef != "acme" {
 		t.Fatalf("stored = %+v, %v", stored, err)
 	}
 	tests := []struct {
-		name    string
-		ctx     context.Context
-		image   string
-		wantErr bool
+		name      string
+		ctx       context.Context
+		image     string
+		wantErr   bool
+		wantOwner string
 	}{
-		{name: "owner retry", ctx: userCtx("acme"), image: "alpine:3.20"},
-		{name: "operator retry", ctx: operatorCtx(), image: "alpine:3.20"},
-		{name: "other tenant, same image", ctx: userCtx("globex"), image: "alpine:3.20", wantErr: true},
+		// Same owner + same name + same image replays the owner's row.
+		{name: "owner retry", ctx: userCtx("acme"), image: "alpine:3.20", wantOwner: "acme"},
+		// Names are per-owner: the operator and another tenant may register the
+		// same name independently — distinct rows, no conflict, no cross-owner
+		// replay.
+		{name: "operator same name", ctx: operatorCtx(), image: "alpine:3.20", wantOwner: ""},
+		{name: "other tenant, same name", ctx: userCtx("globex"), image: "alpine:3.20", wantOwner: "globex"},
+		// Same owner + same name + a DIFFERENT image is a real per-owner conflict.
 		{name: "owner, different image", ctx: userCtx("acme"), image: "alpine:3.21", wantErr: true},
 	}
 	for _, tc := range tests {
@@ -303,8 +330,8 @@ func TestRegisterSnapshotOwnerScoped(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || got.OwnerRef != "acme" {
-				t.Fatalf("RegisterSnapshot = %+v, %v; want the acme row", got, err)
+			if err != nil || got.OwnerRef != tc.wantOwner {
+				t.Fatalf("RegisterSnapshot = %+v, %v; want owner %q", got, err, tc.wantOwner)
 			}
 		})
 	}
@@ -352,7 +379,10 @@ func TestSnapshotAliasesOwnerScoped(t *testing.T) {
 		{name: "onto a missing snapshot", ctx: acme, alias: models.SnapshotAlias{Alias: "ghost", SnapshotName: "snap-missing", Facade: models.FacadeRunloop}, wantErr: true},
 		{name: "new alias on own snapshot", ctx: acme, alias: models.SnapshotAlias{Alias: "acme-2", SnapshotName: "snap-acme", Facade: models.FacadeRunloop}},
 		{name: "update own alias", ctx: acme, alias: models.SnapshotAlias{Alias: "alias-acme", SnapshotName: "snap-acme", Facade: models.FacadeRunloop, StateJSON: `{"name":"renamed"}`}},
-		{name: "operator writes anywhere", ctx: operatorCtx(), alias: models.SnapshotAlias{Alias: "op-alias", SnapshotName: "snap-globex", Facade: models.FacadeRunloop}},
+		// An operator alias lives in the operator ("") namespace, so it points
+		// at an operator snapshot. (Names are per-owner; an operator does not
+		// alias a tenant's snapshot by its bare name.)
+		{name: "operator writes its own namespace", ctx: operatorCtx(), alias: models.SnapshotAlias{Alias: "op-alias", SnapshotName: "snap-shared", Facade: models.FacadeRunloop}},
 	}
 	for _, tc := range upserts {
 		t.Run(tc.name, func(t *testing.T) {
@@ -405,7 +435,7 @@ func TestSnapshotAliasesOwnerScopedStoreErrors(t *testing.T) {
 // An existing alias row read failure (not "missing") stops the upsert.
 func TestUpsertSnapshotAliasExistingReadError(t *testing.T) {
 	svc, st, _, dbPath := newSnapshotOwnerServiceAt(t)
-	if err := st.UpsertSnapshotAlias(context.Background(), models.SnapshotAlias{Alias: "broken", SnapshotName: "snap-acme", Facade: models.FacadeRunloop}); err != nil {
+	if err := st.UpsertSnapshotAlias(context.Background(), models.SnapshotAlias{Alias: "broken", SnapshotName: "snap-acme", OwnerRef: "acme", Facade: models.FacadeRunloop}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	raw, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=5000")
@@ -444,6 +474,11 @@ func TestNormalizeCreateImageDistributionSnapshotOwner(t *testing.T) {
 		{name: "own snapshot by tag", ctx: userCtx("acme"), image: "snap-acme:latest", wantImage: "snap-acme"},
 		{name: "own snapshot by registry spelling", ctx: userCtx("acme"), image: "docker.io/library/snap-acme", wantImage: "snap-acme"},
 		{name: "own registry namespace", ctx: userCtx("acme"), image: registry("acme", "snap-acme")},
+		// Names are per-owner, but another tenant's COMMITTED snapshot whose
+		// local image is named by that name is still refused — resolving it
+		// would run that tenant's bytes. (A registered snapshot that merely
+		// redirects to a registry ref is treated as a plain image; see the #7
+		// test.) Image ids and cluster registry namespaces are refused too.
 		{name: "another tenant's snapshot", ctx: userCtx("acme"), image: "snap-globex", wantErr: true},
 		{name: "another tenant's by tag", ctx: userCtx("acme"), image: "snap-globex:latest", wantErr: true},
 		{name: "another tenant's by registry spelling", ctx: userCtx("acme"), image: "index.docker.io/library/snap-globex:latest", wantErr: true},
@@ -454,12 +489,12 @@ func TestNormalizeCreateImageDistributionSnapshotOwner(t *testing.T) {
 		{name: "operator registry namespace", ctx: userCtx("acme"), image: registry("", "snap-shared"), wantErr: true},
 		{name: "forged registry ref", ctx: userCtx("acme"), image: "ubuntu:22.04", registryRef: registry("globex", "snap-globex"), wantErr: true},
 		{name: "operator snapshot", ctx: userCtx("acme"), image: "snap-shared", wantErr: true},
-		// An unscoped (operator/no-Access) create resolves only operator-owned
-		// ("") snapshots by name — not a tenant's. This closes the hijack where
-		// a tenant registers a snapshot named after a default image and an
-		// operator/control-plane create on that default name boots the tenant's
-		// image (#7). Operators still manage a tenant's snapshots via the
-		// tenant's own token.
+		// An unscoped (operator/no-Access) create resolves names only in the
+		// operator ("") namespace and does not run a tenant's committed image by
+		// name, so a tenant's committed snapshot name is refused. (A tenant's
+		// REGISTERED snapshot named after a default image resolves to the real
+		// base image for the operator — the #7 fix — covered in
+		// TestSnapshotNamespace_UnscopedCreateDoesNotAdoptTenantSnapshot.)
 		{name: "operator caller, tenant snapshot", ctx: operatorCtx(), image: "snap-globex", wantErr: true},
 		{name: "operator caller, operator snapshot", ctx: operatorCtx(), image: "snap-shared"},
 		{name: "operator caller, image id", ctx: operatorCtx(), image: "sha256:globex", wantImage: "sha256:globex"},

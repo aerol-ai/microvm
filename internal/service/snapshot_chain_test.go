@@ -29,10 +29,11 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 		return req, err
 	}
 
-	// Pointing at another tenant's snapshot, directly or through one's own
-	// names, is refused when registering.
+	// Pointing at another tenant's COMMITTED snapshot (whose local image is that
+	// tenant's bytes) is refused when registering — acme cannot route to
+	// globex's image by naming it, even though names are per-owner.
 	if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "acme-to-globex", Image: "snap-globex:latest"}); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("register over another tenant's snapshot = %v; want not found", err)
+		t.Fatalf("register over another tenant's committed snapshot = %v; want not found", err)
 	}
 	if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: "acme-later", Image: "not-yet"}); err != nil {
 		t.Fatal(err)
@@ -140,9 +141,11 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 // plain image — for every caller, since none can be authorized.
 func TestSnapshotCatalogReadFailureFailsClosed(t *testing.T) {
 	svc, st, _ := newSnapshotOwnerService(t)
+	// Control: globex cannot resolve acme's committed snapshot by name (its
+	// local image is acme's bytes) — not found.
 	req := models.CreateSandboxRequest{Image: "snap-acme"}
 	if err := svc.NormalizeCreateImageDistribution(userCtx("globex"), &req); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("control: another tenant's snapshot = %v", err)
+		t.Fatalf("control: another tenant's committed snapshot = %v; want not found", err)
 	}
 	_ = st.Close()
 	for _, ctx := range []context.Context{userCtx("globex"), operatorCtx()} {
@@ -158,18 +161,21 @@ func TestSnapshotCatalogReadFailureFailsClosed(t *testing.T) {
 }
 
 // The engine treats "snap" and "snap:latest" as one image, so they are one
-// snapshot: another spelling of a taken name is a conflict when creating or
-// registering, and reads and deletes find the snapshot under any spelling —
-// never another tenant's.
+// snapshot WITHIN an owner: another spelling of the owner's own taken name is a
+// retry or a conflict, and reads and deletes find it under any spelling. Names
+// are per-owner, so another tenant never reaches it under any spelling.
 func TestEquivalentSnapshotNamesAreOneSnapshot(t *testing.T) {
 	svc, st, rt := newSnapshotOwnerService(t)
 	acme, globex := userCtx("acme"), userCtx("globex")
+	// globex already owns snap-globex (seeded). Every equivalent spelling is
+	// that same snapshot: a re-commit replays it, and a register under a
+	// different image conflicts — no new commit over the tag.
 	for _, name := range []string{"snap-globex:latest", "docker.io/library/snap-globex", "index.docker.io/library/snap-globex:latest"} {
-		if _, _, err := svc.CreateSnapshotWithOwnership(acme, "sb-acme", models.CreateSandboxSnapshotRequest{Name: name}); !errors.Is(err, store.ErrSnapshotNameConflict) {
-			t.Fatalf("acme snapshot %q = %v; want a conflict with globex's snap-globex", name, err)
+		if got, created, err := svc.CreateSnapshotWithOwnership(globex, "sb-globex", models.CreateSandboxSnapshotRequest{Name: name}); err != nil || created || got.Name != "snap-globex" {
+			t.Fatalf("globex retry %q = %+v, %v, %v; want the existing row", name, got, created, err)
 		}
-		if _, err := svc.RegisterSnapshot(acme, &models.SandboxSnapshot{Name: name, Image: "alpine:3.20"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
-			t.Fatalf("acme register %q = %v; want a conflict", name, err)
+		if _, err := svc.RegisterSnapshot(globex, &models.SandboxSnapshot{Name: name, Image: "alpine:3.20"}); !errors.Is(err, store.ErrSnapshotNameConflict) {
+			t.Fatalf("globex register %q = %v; want a conflict (different image)", name, err)
 		}
 	}
 	if rt.hits != 0 {
@@ -189,7 +195,7 @@ func TestEquivalentSnapshotNamesAreOneSnapshot(t *testing.T) {
 	if err := svc.DeleteSnapshot(acme, "snap-globex:latest"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("other tenant delete by another spelling = %v; want not found", err)
 	}
-	if _, err := st.GetSnapshot(context.Background(), "snap-globex"); err != nil || rt.removeHits != 0 {
+	if _, err := st.GetSnapshot(context.Background(), "globex", "snap-globex"); err != nil || rt.removeHits != 0 {
 		t.Fatalf("globex's snapshot after acme's delete = %v (removes %d); want it intact", err, rt.removeHits)
 	}
 	if err := svc.DeleteSnapshot(globex, "snap-globex:latest"); err != nil {
