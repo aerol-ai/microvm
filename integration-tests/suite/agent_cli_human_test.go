@@ -30,7 +30,7 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-// UC-217..232: the aerolvm CLI as a person uses it, against a live
+// UC-217..232 and UC-267: the aerolvm CLI as a person uses it, against a live
 // deployment: `shell` and `exec -it` in a real pseudo-terminal, `login` /
 // `logout` with a private config directory, and the remaining verbs (start,
 // stop, list, get, ls, logs, snapshot, health, version, mcp config). The CLI
@@ -1007,4 +1007,28 @@ func TestAerolvmShellSaysWhy(t *testing.T) {
 			t.Fatalf("shell with a revoked token = %d\n%s", code, sh.text())
 		}
 	})
+}
+
+// UC-267 — a shell attached before another sandbox's route changes still
+// answers afterwards (#712). The route change reloads Caddy, which used to
+// close the shell's WebSocket with 1001; aerolvm shell does not reconnect,
+// so the person saw "lost the connection" mid-session.
+func TestAerolvmShellSurvivesCaddyReload(t *testing.T) {
+	harness.Require(t, sc, "UC-267")
+	name := createCLISandbox(t, harness.DefaultImage)
+
+	sh := startTermCLI(t, tokenEnv(t, "TERM=xterm-256color"), 30, 100, "shell", name)
+	sh.expect(`new shell in ` + regexp.QuoteMeta(name))
+	sh.run(`export BEFORE=attached; echo armed-$((6*7))`, "armed-42")
+
+	changeSandboxRoute(t)
+
+	sh.run(`echo "got=$BEFORE" after-$((7*9))`, "after-63")
+	if !strings.Contains(sh.text(), "got=attached") {
+		t.Fatalf("input after the route change reached a different shell:\n%s", sh.text())
+	}
+	sh.send("exit\r")
+	if code := sh.wait(); code != 0 {
+		t.Fatalf("shell exit = %d, want 0\n%s", code, sh.text())
+	}
 }

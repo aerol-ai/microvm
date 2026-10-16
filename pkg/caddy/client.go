@@ -160,6 +160,24 @@ func (c *Client) TLSPublicEndpoint(id string, port int, l4Listen string) string 
 	return fmt.Sprintf("tls://%s-%d.%s:%s", id, port, c.domain, listenPort)
 }
 
+// streamCloseDelay is set on every reverse_proxy handler sandboxd writes
+// (#712). Every admin-API write that changes the config is a full Caddy
+// reload, and on reload reverse_proxy closes every upgraded connection it
+// carries (a WebSocket: an exec stream, aerolvm shell, a session attach, a
+// user app's socket on an exposed port) with close code 1001 unless this is
+// set. One user exposing a port then cut every other user's open streams on
+// that node. With the delay, a stream that outlives a reload stays open for
+// up to this long.
+//
+// The cost is memory: each such stream pins the config it started under
+// until it closes or the delay ends, so Caddy holds at most one old config
+// per reload in the last 10 minutes, and no more than there are such
+// streams. SB_INGRESS_PROXY_ROUTING removes the per-sandbox reloads that
+// make that number large. A constant, not a setting: no operator needs
+// another value yet. scripts/install.sh sets the same value on the API
+// site's reverse_proxy.
+const streamCloseDelay = "10m"
+
 // CustomHostnameRoute describes one operator-attached public hostname plus
 // the in-container TCP port traffic should dial. TargetPort=0 means "use the
 // toolbox port" (the pre-target-port default), so existing callers that only
@@ -203,6 +221,7 @@ func (c *Client) UpsertSandboxRoute(ctx context.Context, id, containerIP string,
 			"upstreams": []map[string]string{{
 				"dial": fmt.Sprintf("%s:%d", containerIP, toolboxPort),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -303,6 +322,7 @@ func (c *Client) UpsertSandboxRouteToPeer(ctx context.Context, id, peerHost stri
 			"upstreams": []map[string]string{{
 				"dial": net.JoinHostPort(peerHost, "80"),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -354,6 +374,7 @@ func reverseProxyHandle(dial string, opts HTTPRouteOptions) map[string]any {
 		"upstreams": []map[string]string{{
 			"dial": dial,
 		}},
+		"stream_close_delay": streamCloseDelay,
 	}
 	if mask := strings.TrimSpace(opts.MaskRequestHost); mask != "" {
 		handle["headers"] = map[string]any{
@@ -442,6 +463,7 @@ func (c *Client) UpsertPortRouteToPeer(ctx context.Context, id string, port int,
 			"upstreams": []map[string]string{{
 				"dial": net.JoinHostPort(peerHost, "80"),
 			}},
+			"stream_close_delay": streamCloseDelay,
 		}},
 		"terminal": true,
 	}
@@ -482,6 +504,7 @@ func (c *Client) UpsertWakeHTTPPortRoute(ctx context.Context, id, ingressAddr st
 				"upstreams": []map[string]string{{
 					"dial": ingressAddr,
 				}},
+				"stream_close_delay": streamCloseDelay,
 			},
 		},
 		"terminal": true,
