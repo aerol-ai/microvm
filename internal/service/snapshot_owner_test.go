@@ -454,11 +454,17 @@ func TestNormalizeCreateImageDistributionSnapshotOwner(t *testing.T) {
 		{name: "operator registry namespace", ctx: userCtx("acme"), image: registry("", "snap-shared"), wantErr: true},
 		{name: "forged registry ref", ctx: userCtx("acme"), image: "ubuntu:22.04", registryRef: registry("globex", "snap-globex"), wantErr: true},
 		{name: "operator snapshot", ctx: userCtx("acme"), image: "snap-shared", wantErr: true},
-		{name: "operator caller", ctx: operatorCtx(), image: "snap-globex"},
+		// An unscoped (operator/no-Access) create resolves only operator-owned
+		// ("") snapshots by name — not a tenant's. This closes the hijack where
+		// a tenant registers a snapshot named after a default image and an
+		// operator/control-plane create on that default name boots the tenant's
+		// image (#7). Operators still manage a tenant's snapshots via the
+		// tenant's own token.
+		{name: "operator caller, tenant snapshot", ctx: operatorCtx(), image: "snap-globex", wantErr: true},
 		{name: "operator caller, operator snapshot", ctx: operatorCtx(), image: "snap-shared"},
 		{name: "operator caller, image id", ctx: operatorCtx(), image: "sha256:globex", wantImage: "sha256:globex"},
 		{name: "operator caller, any namespace", ctx: operatorCtx(), image: registry("globex", "snap-globex")},
-		{name: "internal caller", ctx: context.Background(), image: "snap-globex"},
+		{name: "internal caller, tenant snapshot", ctx: context.Background(), image: "snap-globex", wantErr: true},
 		{name: "plain image", ctx: userCtx("acme"), image: "ubuntu:22.04"},
 	}
 	for _, tc := range tests {

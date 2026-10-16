@@ -67,7 +67,7 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 			t.Fatalf("acme create from %q = %q, %v; want the ordinary image not-yet-2", image, req.Image, err)
 		}
 	}
-	if req, err := normalize(userCtx("globex"), "not-yet-2"); err != nil || req.Image != docker.SnapshotImageTag("not-yet-2") {
+	if req, err := normalize(userCtx("globex"), "not-yet-2"); err != nil || req.Image != docker.SnapshotImageTagForOwner("globex", "not-yet-2") {
 		t.Fatalf("globex create from its snapshot = %q, %v", req.Image, err)
 	}
 
@@ -85,16 +85,18 @@ func TestSnapshotChainIsAuthorizedThroughout(t *testing.T) {
 		t.Fatal(err)
 	}
 	req, err := normalize(acme, "acme-alias-2")
-	if err != nil || req.Image != docker.SnapshotImageTag("acme-commit") || req.ImageDistributionMode != models.ImageDistributionLocalOnly {
+	if err != nil || req.Image != docker.SnapshotImageTagForOwner("acme", "acme-commit") || req.ImageDistributionMode != models.ImageDistributionLocalOnly {
 		t.Fatalf("own chain = %+v, %v; want acme-commit's image, local only", req, err)
 	}
 	again := req
 	if err := svc.NormalizeCreateImageDistribution(acme, &again); err != nil || again.Image != req.Image || again.ImageDistribution() != req.ImageDistribution() {
 		t.Fatalf("second normalize = %+v, %v; want %+v", again, err, req)
 	}
-	// An operator may start anything, through any chain.
-	if req, err := normalize(operatorCtx(), "acme-outer"); err != nil || req.Image != "not-yet" {
-		t.Fatalf("operator chain = %+v, %v", req, err)
+	// An unscoped (operator/no-Access) create does NOT follow a tenant's
+	// snapshot chain (#7): the name stays a plain image rather than resolving
+	// through acme's registered snapshots to acme's committed image.
+	if req, err := normalize(operatorCtx(), "acme-outer"); err != nil || req.Image != "acme-outer" {
+		t.Fatalf("operator chain = %+v, %v; want the plain name, unresolved", req, err)
 	}
 
 	// Registration cannot close a loop, and a chain too long to follow

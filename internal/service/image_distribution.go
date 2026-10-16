@@ -168,8 +168,15 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 			switch {
 			case err != nil:
 				return nil, "", err
-			case snapshot != nil && snapshotVisible(ctx, snapshot):
+			case snapshot != nil && snapshotResolvableForCreate(ctx, snapshot):
 				return snapshot, snapshot.Image, nil
+			case snapshot != nil:
+				// A committed snapshot the caller may not resolve owns this very
+				// tag (a local image that is the owner's bytes). Returning it as
+				// a plain image would start that owner's image, so answer
+				// not-found — for an unscoped caller too, closing the hijack
+				// where naming another tenant's committed tag boots its bytes.
+				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			case scoped:
 				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			}
@@ -182,7 +189,12 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 		if err != nil {
 			return nil, "", err
 		}
-		if !snapshotVisible(ctx, snapshot) {
+		if !snapshotResolvableForCreate(ctx, snapshot) {
+			// An unscoped create must not adopt a tenant's snapshot by name
+			// (the #7 hijack), and a user token must not adopt another
+			// account's. If that snapshot owns the very image name asked for
+			// (a pre-tag commit), answer not-found rather than leak it as a
+			// plain image; otherwise treat the name as an ordinary image.
 			if snapshot.SourceSandboxID != "" && slices.Contains(names, strings.TrimSpace(snapshot.Image)) {
 				return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
 			}
@@ -216,7 +228,7 @@ func (s *Service) snapshotCommittedAs(ctx context.Context, images []string) (*mo
 		return nil, err
 	}
 	for _, snapshot := range holders {
-		if strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name) {
+		if snapshotImageIsOwnedTag(snapshot) {
 			return snapshot, nil
 		}
 	}
@@ -263,7 +275,7 @@ func (s *Service) NormalizeCreateImageDistribution(ctx context.Context, req *mod
 			snapshot, err = s.snapshotCommittedAs(ctx, docker.EquivalentImageNames(req.Image))
 			switch {
 			case err != nil:
-			case snapshot != nil && !snapshotVisible(ctx, snapshot):
+			case snapshot != nil && !snapshotResolvableForCreate(ctx, snapshot):
 				err = fmt.Errorf("%w: image %q", store.ErrNotFound, req.Image)
 			case snapshot != nil:
 				image = snapshot.Image

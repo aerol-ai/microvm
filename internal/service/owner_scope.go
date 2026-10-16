@@ -67,6 +67,28 @@ func snapshotVisible(ctx context.Context, snapshot *models.SandboxSnapshot) bool
 	return snapshot != nil && snapshot.OwnerRef == owner
 }
 
+// snapshotResolvableForCreate reports whether a snapshot may be silently
+// resolved by NAME when a create request names it (the implicit create path),
+// as opposed to snapshotVisible which governs explicit reads.
+//
+// It is STRICTER than snapshotVisible for an unscoped caller: an operator may
+// READ every snapshot, but a create must NOT implicitly resolve a TENANT's
+// snapshot by name — that is how a tenant who registers a snapshot named after
+// a common/default image ("ubuntu:22.04") hijacks an operator/no-Access create
+// onto their own image (#7). So an unscoped create resolves only
+// operator-published ("") snapshots; a tenant resolves only its own (matching
+// snapshotVisible, which does not expose "" snapshots to a tenant).
+func snapshotResolvableForCreate(ctx context.Context, snapshot *models.SandboxSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	owner, scoped := ownerScope(ctx)
+	if !scoped {
+		return snapshot.OwnerRef == ""
+	}
+	return snapshot.OwnerRef == owner
+}
+
 // ownerRefForCreate returns the owner_ref to stamp on a sandbox created by the
 // current request: the caller's account for a validated user token, or "" for
 // operator/PAT and internal creates (which carry no owner). It never errors —

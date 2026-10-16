@@ -18,7 +18,7 @@ import (
 func TestSnapshotCommitsUnderItsOwnTag(t *testing.T) {
 	svc, _, rt := newSnapshotOwnerService(t)
 	globex := userCtx("globex")
-	tag := docker.SnapshotImageTag("python")
+	tag := docker.SnapshotImageTagForOwner("globex", "python")
 	snap, created, err := svc.CreateSnapshotWithOwnership(globex, "sb-globex", models.CreateSandboxSnapshotRequest{Name: "python"})
 	if err != nil || !created || snap.Image != tag || rt.lastImg != tag {
 		t.Fatalf("commit = %+v, %v, %v (runtime got %q); want image %q", snap, created, err, rt.lastImg, tag)
@@ -34,7 +34,7 @@ func TestSnapshotCommitsUnderItsOwnTag(t *testing.T) {
 	}{
 		{"another tenant", userCtx("acme"), "python"},
 		{"the owner", globex, tag},
-		{"an operator", operatorCtx(), tag},
+		{"an operator", operatorCtx(), "python"}, // unscoped create no longer adopts a tenant's snapshot (#7)
 	} {
 		req := models.CreateSandboxRequest{Image: "python"}
 		if err := svc.NormalizeCreateImageDistribution(tc.ctx, &req); err != nil || req.Image != tc.want {
@@ -53,7 +53,7 @@ func TestSnapshotTagIsReachableOnlyThroughItsSnapshot(t *testing.T) {
 	if _, _, err := svc.CreateSnapshotWithOwnership(userCtx("globex"), "sb-globex", models.CreateSandboxSnapshotRequest{Name: "g-commit"}); err != nil {
 		t.Fatal(err)
 	}
-	tag := docker.SnapshotImageTag("g-commit")
+	tag := docker.SnapshotImageTagForOwner("globex", "g-commit")
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{Name: "acme-points-at-g", Image: tag, OwnerRef: "acme", CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
@@ -62,13 +62,27 @@ func TestSnapshotTagIsReachableOnlyThroughItsSnapshot(t *testing.T) {
 		err := svc.NormalizeCreateImageDistribution(ctx, &req)
 		return req.Image, err
 	}
-	for _, image := range []string{tag, "docker.io/" + tag, "index.docker.io/" + tag, "acme-points-at-g"} {
+	// Naming globex's committed TAG directly (any spelling): a tenant is
+	// refused, and an unscoped (operator/no-Access) create is refused too —
+	// resolving it would boot globex's bytes (#7), so it is not left to run as
+	// a plain local image.
+	for _, image := range []string{tag, "docker.io/" + tag, "index.docker.io/" + tag} {
 		if _, err := normalize(userCtx("acme"), image); !errors.Is(err, store.ErrNotFound) {
 			t.Errorf("acme create from %q = %v; want not found", image, err)
 		}
-		if got, err := normalize(operatorCtx(), image); err != nil || got != tag {
-			t.Errorf("operator create from %q = %q, %v; want %q", image, got, err, tag)
+		if _, err := normalize(operatorCtx(), image); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("operator create from %q = %v; want not found (another tenant's committed tag)", image, err)
 		}
+	}
+	// acme-points-at-g is acme's own registered alias for globex's tag: acme
+	// cannot follow it to globex's image (not found), and an unscoped create
+	// does not follow another tenant's alias — the name stays a plain image
+	// (an ordinary not-found-at-pull name, no resolution).
+	if _, err := normalize(userCtx("acme"), "acme-points-at-g"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("acme create from its alias = %v; want not found", err)
+	}
+	if got, err := normalize(operatorCtx(), "acme-points-at-g"); err != nil || got != "acme-points-at-g" {
+		t.Errorf("operator create from acme's alias = %q, %v; want the plain name, unresolved", got, err)
 	}
 	if got, err := normalize(userCtx("globex"), "docker.io/"+tag); err != nil || got != tag {
 		t.Fatalf("owner create from its tag = %q, %v", got, err)
@@ -105,7 +119,7 @@ func TestReservedSnapshotNamesAreRefused(t *testing.T) {
 	if rt.hits != 0 {
 		t.Fatalf("a reserved name reached the runtime %d times", rt.hits)
 	}
-	if snap, _, err := svc.CreateSnapshotWithOwnership(userCtx("acme"), "sb-acme", models.CreateSandboxSnapshotRequest{Name: "snapshots/demo:v1"}); err != nil || snap.Image != docker.SnapshotImageTag("snapshots/demo:v1") {
+	if snap, _, err := svc.CreateSnapshotWithOwnership(userCtx("acme"), "sb-acme", models.CreateSandboxSnapshotRequest{Name: "snapshots/demo:v1"}); err != nil || snap.Image != docker.SnapshotImageTagForOwner("acme", "snapshots/demo:v1") {
 		t.Fatalf("snapshots/demo:v1 = %+v, %v", snap, err)
 	}
 }
@@ -185,10 +199,13 @@ func TestFailoverReplayDoesNotResolveNames(t *testing.T) {
 			t.Errorf("replay of %q = %q, %v; want %q", image, req.Image, err, want)
 		}
 	}
-	// Outside a replay an unscoped caller resolves the name, as before.
+	// Outside a replay the OWNER still resolves its own snapshot by name. An
+	// unscoped non-replay caller no longer resolves a tenant's snapshot (#7) —
+	// it gets the plain base image, covered by
+	// TestSnapshotNamespace_UnscopedCreateDoesNotAdoptTenantSnapshot.
 	req := models.CreateSandboxRequest{Image: "python"}
-	if err := svc.NormalizeCreateImageDistribution(context.Background(), &req); err != nil || req.Image != docker.SnapshotImageTag("python") {
-		t.Fatalf("internal create of python = %q, %v", req.Image, err)
+	if err := svc.NormalizeCreateImageDistribution(userCtx("globex"), &req); err != nil || req.Image != docker.SnapshotImageTagForOwner("globex", "python") {
+		t.Fatalf("owner create of python = %q, %v", req.Image, err)
 	}
 }
 
