@@ -51,21 +51,34 @@ func (h *handlers) currentView(ctx context.Context, id string) (devboxView, bool
 	if !errors.Is(err, store.ErrNotFound) {
 		return devboxView{}, false, err
 	}
-	if f, ok := h.creates.get(id); ok && visibleTo(ctx, f.meta.owner) {
-		if !f.isDone() {
-			return provisioningView(f.id, f.started, f.meta.blob, f.meta.metadata), true, nil
-		}
-		if f.err != nil {
-			view := provisioningView(f.id, f.started, f.meta.blob, f.meta.metadata)
-			view.Status = statusFailure
-			view.FailureReason = stringPtr("execution_failed")
-			return view, false, nil
-		}
+	if view, ok := h.flightView(ctx, id); ok {
+		return view, view.Status == statusProvisioning, nil
 	}
 	if view, ok := h.shutdownTombstone(ctx, id); ok {
 		return view, false, nil
 	}
 	return devboxView{}, false, store.ErrNotFound
+}
+
+// flightView answers for a devbox from this node's create of it, if that
+// create still speaks for it: provisioning while it runs, failure for
+// failedFlightRetention after it failed. A create that succeeded (even
+// between the lookup and the check here) has written its row and state, so
+// those answer for it instead.
+func (h *handlers) flightView(ctx context.Context, id string) (devboxView, bool) {
+	f, ok := h.creates.get(id)
+	// Read once: a create finishing between two reads must not be taken
+	// for a failure.
+	done := ok && f.isDone()
+	if !ok || !visibleTo(ctx, f.meta.owner) || (done && f.err == nil) {
+		return devboxView{}, false
+	}
+	view := provisioningView(f.id, f.started, f.meta.blob, f.meta.metadata)
+	if done {
+		view.Status = statusFailure
+		view.FailureReason = stringPtr("execution_failed")
+	}
+	return view, true
 }
 
 // visibleTo applies the service's owner scoping to state the facade keeps
@@ -77,7 +90,18 @@ func visibleTo(ctx context.Context, owner string) bool {
 	return caller == "" || caller == owner
 }
 
+// devboxView renders a sandbox row the caller has just read. runCreate
+// stores the row, already started, before the facade state with the name,
+// blueprint and launch parameters, and can still roll the row back after
+// that; so while the create is in this node's tracker it answers, not the
+// row. The order of reads is what makes this hold: the caller read the row
+// (which only exists once the create was claimed), the flight is checked
+// next, and the state is read last, because a successful create leaves the
+// tracker only after its state is written.
 func (h *handlers) devboxView(ctx context.Context, sandbox *models.Sandbox) (devboxView, error) {
+	if view, ok := h.flightView(ctx, sandbox.ID); ok {
+		return view, nil
+	}
 	state, err := h.deps.Service.GetCompatState(ctx, sandbox.ID, models.FacadeRunloop)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return devboxView{}, err
@@ -203,6 +227,17 @@ func (h *handlers) listDevboxes(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// Creates are checked between reading the rows and reading the states:
+	// the order devboxView keeps, for the same reason.
+	var creating map[string]devboxView
+	for _, sandbox := range sandboxes {
+		if view, ok := h.flightView(r.Context(), sandbox.ID); ok {
+			if creating == nil {
+				creating = make(map[string]devboxView)
+			}
+			creating[sandbox.ID] = view
+		}
+	}
 	states, err := h.deps.Service.ListCompatState(r.Context(), models.FacadeRunloop)
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
@@ -215,14 +250,17 @@ func (h *handlers) listDevboxes(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		var blob devboxBlob
-		if state, ok := states[sandbox.ID]; ok {
-			if blob, err = decodeDevboxBlob(&state); err != nil {
-				writeStoreAwareError(h.deps.Logger, w, err)
-				return
+		view, ok := creating[sandbox.ID]
+		if !ok {
+			var blob devboxBlob
+			if state, ok := states[sandbox.ID]; ok {
+				if blob, err = decodeDevboxBlob(&state); err != nil {
+					writeStoreAwareError(h.deps.Logger, w, err)
+					return
+				}
 			}
+			view = newDevboxView(sandbox, blob)
 		}
-		view := newDevboxView(sandbox, blob)
 		if statusFilter != "" && view.Status != statusFilter {
 			continue
 		}

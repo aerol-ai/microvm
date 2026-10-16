@@ -176,6 +176,114 @@ func TestCreateHoldReturnsProvisioningAndWaitTracksIt(t *testing.T) {
 	}
 }
 
+// stopCreateBetweenWrites leaves a devbox where runCreate is between its two
+// writes: the create's flight is claimed and its sandbox row (already
+// started) is in the store, but the facade state carrying the name,
+// blueprint and launch parameters is not written yet.
+func stopCreateBetweenWrites(t *testing.T, env *testEnv, id string, blob devboxBlob, metadata map[string]string) (*flight[createMeta, *models.Sandbox], *models.Sandbox) {
+	t.Helper()
+	f, started := env.h.creates.claim(id, createMeta{blob: blob, metadata: metadata})
+	if !started {
+		t.Fatalf("claim %s joined an existing flight", id)
+	}
+	resp, err := env.svc.CreateSandboxWithID(context.Background(), models.CreateSandboxRequest{Image: "python:3.12", Tags: metadata}, id)
+	if err != nil {
+		t.Fatalf("CreateSandboxWithID: %v", err)
+	}
+	return f, &resp.Sandbox
+}
+
+// A create's sandbox row lands, already running, before the facade state
+// does, so until the create finishes every read answers from the create:
+// provisioning, with the name, blueprint and metadata it accepted. Reading
+// the row in between is how TestCreateHoldReturnsProvisioningAndWaitTracksIt
+// once got a running devbox with no name from wait_for_status in CI.
+func TestCreateBetweenRowAndStateAnswersFromTheCreate(t *testing.T) {
+	env := newTestEnv(t)
+	old := createHold
+	createHold = 50 * time.Millisecond
+	t.Cleanup(func() { createHold = old })
+
+	body := `{"name":"slow","blueprint_name":"python","metadata":{"team":"sdk"}}`
+	id := devboxIDForRequest("", "req-window", []byte(body))
+	blob := devboxBlob{Name: "slow", BlueprintID: "python"}
+	f, sandbox := stopCreateBetweenWrites(t, env, id, blob, map[string]string{"team": "sdk"})
+
+	// Every path is checked before failing, so a regression names them all.
+	wantProvisioning := func(where string, view devboxView) {
+		t.Helper()
+		if view.ID != id || view.Status != statusProvisioning || view.Name == nil || *view.Name != "slow" ||
+			view.BlueprintID == nil || *view.BlueprintID != "python" || view.Metadata["team"] != "sdk" {
+			t.Errorf("%s between the row and the state = %+v, want provisioning with the create's fields", where, view)
+		}
+	}
+	var got devboxView
+	expectStatus(t, env.do(t, http.MethodGet, "/"+id, nil, &got), http.StatusOK)
+	wantProvisioning("retrieve", got)
+	// The long-poll keeps holding rather than return the row as running.
+	if rr := env.do(t, http.MethodPost, "/"+id+"/wait_for_status", `{"statuses":["running"],"timeout_seconds":0.05}`, nil); rr.Code != http.StatusRequestTimeout {
+		t.Errorf("wait_for_status between the row and the state = %d %s, want 408", rr.Code, rr.Body.String())
+	}
+	var page listDevboxesResponse
+	expectStatus(t, env.do(t, http.MethodGet, "", nil, &page), http.StatusOK)
+	if len(page.Devboxes) != 1 {
+		t.Fatalf("list = %+v, want the one devbox", page)
+	}
+	wantProvisioning("list", page.Devboxes[0])
+	// A retry of the create joins it instead of answering from the row.
+	var retry devboxView
+	expectStatus(t, env.do(t, http.MethodPost, "", body, &retry, "X-Request-Id", "req-window"), http.StatusOK)
+	wantProvisioning("create retry", retry)
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	// The create finishes: the state is written, then the flight retires.
+	state, err := encodeDevboxBlob(blob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.svc.UpsertCompatState(context.Background(), id, models.FacadeRunloop, state); err != nil {
+		t.Fatalf("UpsertCompatState: %v", err)
+	}
+	env.h.creates.finish(f, sandbox, nil)
+	var done devboxView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+id+"/wait_for_status", `{"statuses":["running"],"timeout_seconds":5}`, &done), http.StatusOK)
+	if done.Status != statusRunning || done.Name == nil || *done.Name != "slow" || done.BlueprintID == nil || *done.BlueprintID != "python" {
+		t.Fatalf("after create = %+v", done)
+	}
+	if env.runtime.creates != 1 {
+		t.Fatalf("runtime creates = %d, want 1: the retry must not start another", env.runtime.creates)
+	}
+}
+
+// A create that fails after its row landed rolls the row back before its
+// flight reports the failure, so a row still read next to a failed flight
+// is one the rollback is removing (or failed to remove). It answers as the
+// failure the create returned, never as a running devbox.
+func TestFailedCreateOutranksItsLeftoverRow(t *testing.T) {
+	env := newTestEnv(t)
+	id := devboxIDForRequest("", "req-failed", []byte(`{"name":"doomed"}`))
+	f, _ := stopCreateBetweenWrites(t, env, id, devboxBlob{Name: "doomed"}, nil)
+	env.h.creates.finish(f, nil, errors.New("record placement failed"))
+
+	var got devboxView
+	expectStatus(t, env.do(t, http.MethodGet, "/"+id, nil, &got), http.StatusOK)
+	if got.Status != statusFailure || got.FailureReason == nil || got.Name == nil || *got.Name != "doomed" {
+		t.Fatalf("retrieve = %+v, want the create's failure", got)
+	}
+	var done devboxView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+id+"/wait_for_status", `{"statuses":["running"],"timeout_seconds":5}`, &done), http.StatusOK)
+	if done.Status != statusFailure {
+		t.Fatalf("wait_for_status = %+v, want failure", done)
+	}
+	var page listDevboxesResponse
+	expectStatus(t, env.do(t, http.MethodGet, "", nil, &page), http.StatusOK)
+	if len(page.Devboxes) != 1 || page.Devboxes[0].Status != statusFailure {
+		t.Fatalf("list = %+v, want the failed devbox", page)
+	}
+}
+
 func TestCreateFailureAfterHoldReportsFailure(t *testing.T) {
 	env := newTestEnv(t)
 	old := createHold
