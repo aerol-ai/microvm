@@ -23,13 +23,15 @@ flowchart TB
     E --> H["Your webhook<br/>batches signed with HMAC"]
     E --> B["Your S3 bucket"]
     H --> SIEM["Your SIEM"]
+    C -- "newest fingerprint,<br/>every 30 seconds" --> WIT[("Witness: an S3 bucket<br/>with Object Lock")]
     V -- "chain broken" --> A["The server refuses to start,<br/>and an alert fires"]
 ```
 
 A SIEM (security information and event management system) is where many companies collect and search security records.
 
 - **Every secret open is recorded:** when a sandbox starts, when it is rebuilt, and when someone asks for its variables.
-- **Records are chained.** Each record holds a fingerprint (hash) of the one before, so a changed or deleted record breaks the chain. Someone with root on a server could rebuild that server's chain, which is why the copy you export matters.
+- **Records are chained.** Each record holds a fingerprint (hash) of the one before, so a changed or deleted record breaks the chain. Someone with root on a server could rebuild that server's chain. The copy you export and the witness are what catch that.
+- **The witness keeps fingerprints off the server.** With [enterprise mode](/enterprise/enterprise-mode/), each server stores its newest fingerprint in an S3 bucket with Object Lock. No server can change or delete what is stored there, so a rebuilt chain no longer matches.
 - **Shipping never drops a batch.** If your receiver is down, the server keeps the records, retries, and raises an alert when it falls behind.
 - **Gaps are visible.** If records ever have to be skipped, the log writes a marker with the number skipped.
 
@@ -68,7 +70,9 @@ flowchart LR
 | Evidence | What it shows | Where to get it |
 |---|---|---|
 | Audit records | Every time a secret is opened, and the outbound connections the filter refuses | `sandbox.audit()` in every SDK. See [below](#read-a-sandboxs-audit-history). |
-| A hash chain | Each record holds a hash of the one before, so a changed or deleted record breaks the chain. Someone with root on the server could rebuild the whole chain, so keep a copy off the server. | The operator can check the whole chain on demand. Bundled alerts fire when it breaks. |
+| A hash chain | Each record holds a hash of the one before, so a changed or deleted record breaks the chain. Someone with root on the server could rebuild the whole chain, so keep a copy off the server and turn on the witness. | The operator can check the whole chain on demand. Bundled alerts fire when it breaks. |
+| Witnessed fingerprints | Each server's newest fingerprint, stored every 30 seconds when it changes, in a bucket where no server can change it. A rewritten history no longer links to them. | Your witness bucket, set up with [enterprise mode](/enterprise/enterprise-mode/) |
+| A verification report | Every fingerprint in a time window links to the exported records. The result is PASS, FAIL or INCOMPLETE. | `aerolvm audit verify`, run by you or your auditor. See [Check the whole history](/enterprise/enterprise-mode/#check-the-whole-history). |
 | Records kept off the server | A copy a server that is taken over cannot rewrite | `SB_AUDIT_EXPORT_BACKEND` set to `webhook` (signed with HMAC) or `s3`. `file` and `stdout` also work, but stay on the server. |
 | Release checksums | A download is the official build | `checksums.txt` in each release |
 | Build provenance | How and where a release was built | The signed SLSA provenance file in each release (`<version>.intoto.jsonl`) |
@@ -96,7 +100,7 @@ This mapping is a starting point for your assessor, not a certification. Most of
 | AC‑6 Least Privilege | Inject rules, secrets left out of reads, privileged mode off | DP‑2, DP‑3, WI‑6 |
 | AU‑2 Event Logging | Secret reads and refused connections are recorded | LT‑1, LT‑2 |
 | AU‑3 Content of Audit Records | Time, server, sandbox, secret or destination, and result | LT‑1 |
-| AU‑9 Protection of Audit Information | A hash chain, files only the server can read, and export off the server | LT‑3, LT‑4 |
+| AU‑9 Protection of Audit Information | A hash chain, files only the server can read, and export off the server. Fingerprints sit in a locked bucket no server can change, and `aerolvm audit verify` checks them. | LT‑3, LT‑4, LT‑8 |
 | AU‑11 Audit Record Retention | 30 days on the server, and as long as you like in your own store | LT‑5 |
 | CM‑7 Least Functionality | Turn off SSH and runtimes you do not use | IM‑3, WI‑1 |
 | CP‑9 System Backup | Back up the database and the server key at the same time, and store them apart | BR‑1 |
@@ -117,13 +121,16 @@ This mapping is a starting point for your assessor, not a certification. Most of
 
 ```mermaid
 flowchart LR
-    A["1. Turn on export"] --> B["2. Keep records<br/>for your period"] --> C["3. Collect evidence"] --> D["4. Map controls"]
+    A["1. Turn on export<br/>and the witness"] --> B["2. Keep records<br/>for your period"] --> C["3. Verify<br/>the history"] --> D["4. Collect evidence"] --> E["5. Map controls"]
 ```
 
-1. **Turn on export** on every server, to a webhook or an S3 bucket you control.
+1. **Turn on export and the witness** on every server. Export goes to a webhook or an S3 bucket you control. The witness needs [enterprise mode](/enterprise/enterprise-mode/) and an S3 bucket with Object Lock.
 2. **Keep records** in your own store for as long as your policy needs. The server keeps 30 days.
-3. **Collect evidence** from the table above: records, release files and the project's security documents.
-4. **Map controls** with the table above, and add your own processes around them.
+3. **Verify the history.** Run `aerolvm audit verify` with `--since` set to your retention period, such as `--since 30d`. PASS means every fingerprint in that window links to the exported records. Keep the report with your evidence.
+4. **Collect evidence** from the table above: records, the verification report, release files and the project's security documents.
+5. **Map controls** with the table above, and add your own processes around them.
+
+Keep exported records at least as long as the window you verify. If records inside the window are gone, the result is FAIL. The export bucket that this project's Terraform creates deletes objects after 3 days. That suits tests, but is far too short for an audit. Use your own bucket, or give it a longer lifecycle rule.
 
 ## Read a sandbox's audit history
 
@@ -180,5 +187,6 @@ Every SDK reads one sandbox's records, from whichever server ran it:
 ## Next steps
 
 - [Security baseline](/enterprise/security-controls/): every control behind this mapping.
+- [Enterprise mode](/enterprise/enterprise-mode/): set up the witness and run `aerolvm audit verify`.
 - [Hardening guide](/enterprise/hardening/): the settings to send records off the server.
 - [Shared responsibility](/enterprise/responsibility/): what the evidence does not cover.
