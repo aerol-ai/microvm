@@ -373,12 +373,17 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      # Terraform's seed bootstrap downloads cluster-sign-node.sh from
+      # /releases/latest/download/ (Terraform/variables.tf), so every script a
+      # Terraform default names must ship here; integration-tests/safety
+      # TestTerraformReleaseURLsNameShippedAssets keeps the two in step.
       - name: Copy install scripts
         run: |
           cp scripts/install.sh dist/install.sh
           cp scripts/cluster-init.sh dist/cluster-init.sh
           cp scripts/cluster-join.sh dist/cluster-join.sh
-          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh
+          cp scripts/cluster-sign-node.sh dist/cluster-sign-node.sh
+          chmod 0755 dist/install.sh dist/cluster-init.sh dist/cluster-join.sh dist/cluster-sign-node.sh
 
       - name: Generate CycloneDX SBOM
         run: go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0 mod -json -output dist/sbom.cdx.json

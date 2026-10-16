@@ -733,6 +733,37 @@ install_script_url      = "${base}/install.sh"
 cluster_init_script_url = "${base}/cluster-init.sh"
 cluster_join_script_url = "${base}/cluster-join.sh"
 EOF
+      # Two files a pinned release may not carry come from the working tree's
+      # build instead; the product binaries still come from the release.
+      #   - cluster-sign-node.sh: every seed downloads it, and releases before
+      #     v0.6.7 never shipped it (Terraform's default 404'd).
+      #   - audit-receiver: a test fixture, never a release asset. A scenario
+      #     with audit_receiver_enabled points webhook export at it, so without
+      #     it every export case fails on a pinned release.
+      local need_local=()
+      if curl -fsIL -o /dev/null --max-time 20 "${base}/cluster-sign-node.sh"; then
+        printf 'cluster_sign_node_script_url = "%s"\n' "${base}/cluster-sign-node.sh" >>"$out"
+      else
+        need_local+=(cluster_sign_node_script_url)
+      fi
+      if grep -Eq '^[[:space:]]*audit_receiver_enabled[[:space:]]*=[[:space:]]*true' "${HERE}/scenarios/${scenario}.tfvars"; then
+        need_local+=(audit_receiver_url)
+      fi
+      if (( ${#need_local[@]} > 0 )); then
+        echo "=== artifacts: ${need_local[*]} from the working tree's build (${PIN_VERSION} does not ship it) ==="
+        local urls
+        # stderr stays visible: if this fails for a reason other than "not
+        # published yet", that message is the only clue.
+        if ! urls=$("$BUILD_SH" urls --with-receiver); then
+          "$BUILD_SH" build --with-receiver >/dev/null
+          urls=$("$BUILD_SH" publish --with-receiver)
+        fi
+        local key
+        for key in "${need_local[@]}"; do
+          grep -E "^${key}[[:space:]]*=" <<<"$urls" >>"$out" \
+            || { echo "run.sh: the working-tree build published no ${key}" >&2; return 1; }
+        done
+      fi
       export AEROL_BUILD_MODE="version"
       export AEROL_BUILD_VERSION="$PIN_VERSION"
       return 0
