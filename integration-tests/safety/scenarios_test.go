@@ -173,16 +173,36 @@ func TestScenarioBucketPrefixesAreUnique(t *testing.T) {
 	}
 }
 
-// A scenario that advertises audit-witness gets the -tags itestwitness
-// daemon (run.sh derives it from this capability). Enterprise forces
-// SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon refuses to boot without a
-// non-noop Witness, so enterprise WITHOUT audit-witness is a scenario that
-// cannot start at all — and it would fail 15 minutes into provisioning.
-func TestEnterpriseScenariosRequestTheWitnessDaemon(t *testing.T) {
+// Enterprise forces SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon refuses to
+// boot without a non-noop Witness, so an enterprise scenario WITHOUT the S3
+// witness cannot start at all, and it would fail 15 minutes into
+// provisioning. The capability and the bucket travel together both ways: a
+// scenario advertising audit-witness with no bucket fails every witness case
+// for a reason that is the scenario's, not the product's.
+//
+// The bucket must also be one teardown can delete (D13). Every head is an
+// Object Lock version, and run.sh can remove one early only in GOVERNANCE mode
+// with the bypass header; COMPLIANCE, or a lock longer than a day, leaves a
+// bucket nobody can delete for the lock period after every run. Retention must
+// fit inside the lock or the daemon refuses the bucket at boot: Terraform's
+// precondition catches that at plan time, this at `make test`.
+//
+// And the bucket name: audit_witness.tf names it <cluster_name>-witness-<6 hex>
+// without shortening the cluster name, and S3 refuses names over 63 characters
+// at apply, after the scenario's VPC already exists.
+func TestWitnessScenariosUseADeletableS3Witness(t *testing.T) {
+	const witnessSuffixLen = len("-witness-") + 6 // random_id.witness_suffix, 3 bytes as hex
+	enabledRe := regexp.MustCompile(`(?m)^\s*audit_witness_enabled\s*=\s*true\s*$`)
+	nameRe := regexp.MustCompile(`(?m)^\s*cluster_name\s*=\s*"([^"]+)"`)
+	required := []struct{ re, why string }{
+		{`(?m)^\s*witness_lock_mode\s*=\s*"GOVERNANCE"\s*$`, `witness_lock_mode = "GOVERNANCE" (teardown can lift only a governance lock)`},
+		{`(?m)^\s*witness_lock_days\s*=\s*1\s*$`, "witness_lock_days = 1 (a longer lock outlives the run it belongs to)"},
+		{`(?m)^\s*SB_SECRET_AUDIT_RETENTION_DAYS\s*=\s*"1"\s*$`, `SB_SECRET_AUDIT_RETENTION_DAYS = "1" in extra_sandboxd_env (the daemon refuses a lock shorter than retention, and the default is 30)`},
+	}
+	checked := 0
 	for _, f := range capsFiles(t) {
-		caps := capsList(t, f)
 		hasEnterprise, hasWitness := false, false
-		for _, c := range caps {
+		for _, c := range capsList(t, f) {
 			switch c {
 			case "enterprise":
 				hasEnterprise = true
@@ -190,10 +210,41 @@ func TestEnterpriseScenariosRequestTheWitnessDaemon(t *testing.T) {
 				hasWitness = true
 			}
 		}
+		base := filepath.Base(f)
 		if hasEnterprise && !hasWitness {
-			t.Errorf("%s advertises enterprise without audit-witness; the daemon would refuse to boot",
-				filepath.Base(f))
+			t.Errorf("%s advertises enterprise without audit-witness; the daemon would refuse to boot", base)
 		}
+		tfvars := strings.TrimSuffix(f, ".caps.yml") + ".tfvars"
+		raw, err := os.ReadFile(tfvars)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(raw)
+		enabled := enabledRe.MatchString(body)
+		switch {
+		case hasWitness && !enabled:
+			t.Errorf("%s advertises audit-witness but %s does not set audit_witness_enabled = true: no bucket exists for the witness cases to read",
+				base, filepath.Base(tfvars))
+		case enabled && !hasWitness:
+			t.Errorf("%s sets audit_witness_enabled = true but %s does not advertise audit-witness, so the witness cases skip on a scenario that could run them",
+				filepath.Base(tfvars), base)
+		}
+		if !enabled {
+			continue
+		}
+		checked++
+		for _, r := range required {
+			if !regexp.MustCompile(r.re).MatchString(body) {
+				t.Errorf("%s enables the witness but lacks %s", filepath.Base(tfvars), r.why)
+			}
+		}
+		if m := nameRe.FindStringSubmatch(body); m != nil && len(m[1])+witnessSuffixLen > 63 {
+			t.Errorf("%s: the witness bucket %s-witness-xxxxxx is %d characters, over S3's 63",
+				filepath.Base(tfvars), m[1], len(m[1])+witnessSuffixLen)
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no scenario enables the witness; this guard would pass having checked nothing")
 	}
 }
 

@@ -123,6 +123,44 @@ the metal (`*-fc`) and arm64 scenarios request containerd on hardware where the
 containerd bootstrap has not yet been live-proven — validate those on a `--keep`
 run before relying on them.
 
+## Enterprise scenarios and the audit witness
+
+Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
+external witness for the audit chain. Every scenario that advertises the
+`audit-witness` capability — `single-node-secrets-enterprise`,
+`cluster-3-mixed-secrets-enterprise` and the five `cluster-hetero-*` security
+scenarios — gets one the way an operator would: Terraform creates an S3 Object
+Lock bucket (`audit_witness_enabled = true`) and the **stock** daemon writes
+its chain heads there. No scenario uses a test build of `sandboxd`.
+
+- **Lock:** `GOVERNANCE` for 1 day, with `SB_SECRET_AUDIT_RETENTION_DAYS=1`,
+  because the daemon refuses a lock shorter than retention. A `COMPLIANCE` or
+  longer lock would leave a bucket nobody can delete until it expires.
+  `make test` (`safety/`) refuses a scenario that drifts from this.
+- **Suite:** `run.sh` exports `AEROL_AUDIT_WITNESS_BUCKET` and
+  `AEROL_AUDIT_WITNESS_PREFIX` (from the scenario's `terraform output`) and
+  `AEROL_AUDIT_WITNESS_REGION`, and sets `AWS_PROFILE` to `aws_profile` from
+  `config/terraform.tfvars` when that is set. UC-143 reads heads, UC-144
+  plants a disagreeing head and buries it again, and UC-263 checks each
+  node's boot canary, all directly in the bucket with your credentials.
+  UC-264 and UC-265 edit, then delete, the same victim's local audit log,
+  require a refused boot, and put the log back.
+- **Teardown:** the bucket has no `force_destroy`. Before `terraform destroy`,
+  teardown (and `--destroy-only`) deletes every version and delete marker with
+  `--bypass-governance-retention`, and empties it again if the destroy fails,
+  since the nodes keep shipping heads until they are terminated. Your AWS
+  identity needs `s3:ListBucketVersions`, `s3:DeleteObjectVersion` and
+  `s3:BypassGovernanceRetention`. If emptying fails, teardown says so and
+  destroys everything else; fix the credentials and run
+  `integration-tests/run.sh <scenario> --destroy-only`. `make integration-reap`
+  terminates instances only and never empties a bucket.
+- **Single server:** `make integration-secrets-enterprise-single` runs
+  `single-node-secrets-enterprise`, which is also the scenario the release
+  smoke (T24 in `plans/open-audit-witness.md`) runs on a published tag. Note
+  that `--version`/`--released` provision no audit-receiver binary (releases
+  do not ship the fixture), so until T24 wires one in, the export cases fail
+  there while the witness cases still run.
+
 ## Persistent cert store (avoid Let's Encrypt re-issuance)
 
 Every domain scenario provisions a fresh box whose Caddy issues a `*.<domain>`

@@ -22,7 +22,8 @@
 #            cluster-3-mixed-gvisor | cluster-3-mixed-gvisor-docker |
 #            cluster-3-mixed-wasm | cluster-hetero | cluster-hetero-lite |
 #            single-node-fc | single-node-fc-arm64 | cluster-arm64
-# Security matrix (§6.2): single-node-secrets | cluster-3-mixed-secrets |
+# Security matrix (§6.2): single-node-secrets | single-node-secrets-enterprise |
+#            cluster-3-mixed-secrets |
 #            cluster-3-mixed-secrets-kms | cluster-3-mixed-secrets-enterprise |
 #            cluster-hetero-secrets | cluster-hetero-secrets-kms |
 #            cluster-hetero-lite-secrets | cluster-hetero-lite-kms |
@@ -295,6 +296,65 @@ EOF
   echo "cert-store: ${scenario} reuses s3://${bucket}/${prefix} (byo, region ${region})"
 }
 
+# witness_bucket_of echoes the scenario's S3 Object Lock audit-witness bucket
+# from its own Terraform state, or nothing when the scenario has none (the
+# common case) or never applied. Read from state, never recomputed: the name
+# ends in a random suffix.
+witness_bucket_of() {
+  local scenario="$1" bucket
+  bucket=$(TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
+    terraform -chdir="${REPO_ROOT}/Terraform" output -raw audit_witness_bucket 2>/dev/null) || bucket=""
+  # A bucket name or nothing: a terraform warning must never reach the aws
+  # CLI as a bucket to empty.
+  if [[ "$bucket" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+    printf '%s\n' "$bucket"
+  fi
+}
+
+# empty_witness_bucket empties a scenario's witness bucket so that
+# `terraform destroy` can delete it (D13). The bucket deliberately has no
+# force_destroy; lib/common.sh's empty_versioned_bucket says why the harness
+# has to do it. It runs as the identity Terraform provisioned with: the same
+# profile and region, from the same var-file chain.
+empty_witness_bucket() {
+  local scenario="$1" bucket="$2" profile region
+  local -a chain=("$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars" "${HERE}/.tf/${scenario}/override.tfvars")
+  profile=$(tfvar_from_files aws_profile "${chain[@]}")
+  region=$(tfvar_from_files aws_region "${chain[@]}")
+  local -a awscli=(aws --region "${region:-us-east-1}")
+  if [[ -n "$profile" ]]; then
+    awscli+=(--profile "$profile")
+  fi
+  if empty_versioned_bucket "$bucket" "${awscli[@]}"; then
+    return 0
+  fi
+  cat >&2 <<EOF
+teardown: could not empty the audit-witness bucket s3://${bucket}, so terraform
+  destroy cannot delete it; everything else in ${scenario} is still destroyed.
+  Its objects are Object Lock versions. The integration scenarios lock in
+  GOVERNANCE mode, which these AWS credentials can lift only with
+  s3:ListBucketVersions, s3:DeleteObjectVersion and
+  s3:BypassGovernanceRetention on the bucket. A COMPLIANCE lock lifts for
+  nobody until it expires (witness_lock_days). Fix that, then run:
+    integration-tests/run.sh ${scenario} --destroy-only
+  which empties the bucket before it destroys what is left.
+EOF
+  return 1
+}
+
+# destroy_scenario runs terraform destroy with the exact variable set the
+# scenario applied with.
+destroy_scenario() {
+  local scenario="$1"
+  # shellcheck disable=SC2046
+  TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
+    terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
+    $(tf_varfile_args "$scenario") \
+    -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
+    -var="force_on_demand=$(on_demand_tfvar)" \
+    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
+}
+
 teardown() {
   local scenario="$1"
   # Always reap the SSH tunnel, even under --keep: the forward is a local
@@ -309,13 +369,26 @@ teardown() {
     return
   fi
   echo "teardown: destroying ${scenario}"
-  # shellcheck disable=SC2046
-  if TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
-    terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
-    $(tf_varfile_args "$scenario") \
-    -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
-    -var="force_on_demand=$(on_demand_tfvar)" \
-    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"; then
+  # A witness bucket is emptied before the destroy and, if the destroy then
+  # fails, once more before a second destroy. The nodes keep shipping heads
+  # until the destroy terminates them, so a version can land between the
+  # first emptying and the bucket's deletion; by the second pass the
+  # instances and their role grants are gone and nothing can write to it.
+  # A failed first emptying is not retried: it already said why.
+  local witness emptied=0 destroyed=0
+  witness=$(witness_bucket_of "$scenario")
+  if [[ -n "$witness" ]] && empty_witness_bucket "$scenario" "$witness"; then
+    emptied=1
+  fi
+  if destroy_scenario "$scenario"; then
+    destroyed=1
+  elif [[ "$emptied" == "1" ]] && empty_witness_bucket "$scenario" "$witness"; then
+    echo "teardown: destroying ${scenario} again, now that nothing is left to write to s3://${witness}"
+    if destroy_scenario "$scenario"; then
+      destroyed=1
+    fi
+  fi
+  if [[ "$destroyed" == "1" ]]; then
     rm -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/.leased-domain"
   else
     echo "teardown: destroy returned non-zero for ${scenario} — run 'make integration-reap'" >&2
@@ -697,17 +770,10 @@ prepare_artifacts() {
   out="$(artifacts_tfvars_path "$scenario")"
   mkdir -p "$(dirname "$out")"
 
-  # A scenario that advertises audit-witness needs the -tags itestwitness
-  # daemon: enterprise forces SB_SECRET_AUDIT_EXTERNAL_WITNESS and pkg/daemon
-  # refuses to boot without a non-noop controlplane.Witness. Derived from the
-  # capability rather than a separate knob, so the scenario cannot claim the
-  # capability and silently get a daemon that cannot honour it.
-  local witness_flag=()
-  local caps="${HERE}/scenarios/${scenario}.caps.yml"
-  if [[ -f "$caps" ]] && yq -r '.capabilities | contains(["audit-witness"])' "$caps" | grep -q true; then
-    witness_flag=(--witness-daemon)
-    echo "scenario ${scenario} advertises audit-witness: using the -tags itestwitness daemon" >&2
-  fi
+  # Every scenario, enterprise ones included, provisions sandboxd built the way
+  # a release builds it, with no build tags. Enterprise gets its witness from
+  # SB_AUDIT_WITNESS_BACKEND=s3 and the scenario's Object Lock bucket
+  # (audit_witness_enabled), not from a test-only build.
 
   case "$BUILD_MODE" in
     released)
@@ -761,10 +827,10 @@ EOF
     # stderr is NOT suppressed: if the failure is something other than a
     # missing build (bad credentials, an unreachable bucket) that message is
     # the only clue, and the fallback build would fail for the same reason.
-    if ! "$BUILD_SH" urls --with-receiver "${witness_flag[@]}" >"$out"; then
+    if ! "$BUILD_SH" urls --with-receiver >"$out"; then
       echo "=== --no-build: ${build_id} is not published; building and publishing it now ===" >&2
-      build_id=$("$BUILD_SH" build --with-receiver "${witness_flag[@]}")
-      "$BUILD_SH" publish --with-receiver "${witness_flag[@]}" >"$out"
+      build_id=$("$BUILD_SH" build --with-receiver)
+      "$BUILD_SH" publish --with-receiver >"$out"
     fi
   else
     echo "=== artifacts: building locally ==="
@@ -772,8 +838,8 @@ EOF
     # the alternative is a scenario that enables the receiver discovering at
     # apply time that this build did not produce one. Skipped automatically on
     # refs that predate it.
-    build_id=$("$BUILD_SH" build --with-receiver "${witness_flag[@]}")
-    "$BUILD_SH" publish --with-receiver "${witness_flag[@]}" >"$out"
+    build_id=$("$BUILD_SH" build --with-receiver)
+    "$BUILD_SH" publish --with-receiver >"$out"
   fi
 
   export AEROL_BUILD_MODE="local"
@@ -1279,6 +1345,27 @@ run_one() {
     echo "test filter: -run ${AEROL_TEST_RUN} (PARTIAL pass; the report covers only these tests)" >&2
   fi
 
+  # The S3 Object Lock audit witness, when the scenario has one (empty values
+  # otherwise). The witness cases (UC-143, UC-144, UC-263) read and plant heads
+  # in the bucket directly, never through a node: the witness exists so a
+  # node's account of its history can be checked against a store it cannot
+  # rewrite.
+  local witness_bucket witness_prefix witness_region
+  witness_bucket=$(witness_bucket_of "$scenario")
+  witness_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+    output -raw audit_witness_prefix 2>/dev/null) || witness_prefix=""
+  witness_region=$(tfvar_from_files aws_region "$PROD_TFVARS" "$tfvars_file" "${sdir}/override.tfvars")
+  # The suite's own AWS calls (those witness reads and plants, and the EC2
+  # stop/start helpers) use the SDK's default credential chain. Point it at
+  # the profile Terraform provisioned with, when terraform.tfvars names one,
+  # so the suite acts as the identity that owns the bucket. Exported only when
+  # set: an EMPTY AWS_PROFILE makes the aws CLI look for a profile named "".
+  local suite_aws_profile
+  suite_aws_profile=$(tfvar_from_files aws_profile "$PROD_TFVARS" "$tfvars_file" "${sdir}/override.tfvars")
+  if [[ -n "$suite_aws_profile" ]]; then
+    export AWS_PROFILE="$suite_aws_profile"
+  fi
+
     # 150m, not 60m: the 8-member hetero suite runs every disruptive case
     # with real rejoin waits, and T18's first scenario was killed by the 60m
     # timeout one file before UC-170 — the case the run existed to prove. A
@@ -1292,6 +1379,9 @@ run_one() {
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_INTEGRATION_TARGETS="${targets}" \
+    AEROL_AUDIT_WITNESS_BUCKET="${witness_bucket}" \
+    AEROL_AUDIT_WITNESS_PREFIX="${witness_prefix}" \
+    AEROL_AUDIT_WITNESS_REGION="${witness_region:-us-east-1}" \
     AEROL_ALLOW_DISRUPTIVE="${allow_disruptive}" \
     AEROL_BENCH="${AEROL_BENCH:-}" \
     AEROL_BENCH_OUT="${bench_out}" \

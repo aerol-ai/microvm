@@ -126,7 +126,7 @@ func (w *s3Witness) checkMissingKeyProbe(ctx context.Context) error {
 // newest head. Denied by IAM or by the lock, both mean the evidence is safe;
 // anything else is not proof that it is.
 func (w *s3Witness) checkCanary(ctx context.Context) error {
-	key := path.Join(cleanPrefix(w.prefix), "canary", "node="+w.nodeID)
+	key := CanaryKey(w.prefix, w.nodeID)
 	body := fmt.Appendf(nil, `{"node_id":%q,"canary":%q}`, w.nodeID, w.now().UTC().Format(time.RFC3339))
 	out, err := w.put(ctx, key, body)
 	if err != nil {

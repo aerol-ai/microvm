@@ -1,6 +1,8 @@
 // audit-receiver is the off-node sink the security scenarios export to
-// (plans/integration-test-security.md §6.4). Webhook audit export and the
-// audit-chain witness both need something listening; this is that something.
+// (plans/integration-test-security.md §6.4). Webhook audit export needs
+// something listening; this is that something. It is not a witness: the
+// enterprise scenarios witness chain heads in an S3 Object Lock bucket, with
+// the same daemon a release ships (plans/open-audit-witness.md, Phase 4).
 //
 // It is a TEST FIXTURE. It lives under integration-tests/ and never under
 // pkg/, it keeps everything in memory plus one append-only file, and it is
@@ -35,7 +37,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/auditexport"
-	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 func main() {
@@ -113,9 +114,6 @@ type receiver struct {
 	duplicates int
 	rejected   int
 	failNext   int
-	// heads is the witness store: node id -> most recent head, mirroring
-	// controlplane.Witness.LastWitnessedHead.
-	heads map[string]controlplane.AuditHead
 
 	logFile *os.File
 }
@@ -125,7 +123,6 @@ func newReceiver(token, hmacKey, logPath string, failNext int) (*receiver, error
 		token:    token,
 		hmacKey:  hmacKey,
 		seen:     map[string]int{},
-		heads:    map[string]controlplane.AuditHead{},
 		failNext: failNext,
 	}
 	if logPath != "" {
@@ -141,8 +138,6 @@ func newReceiver(token, hmacKey, logPath string, failNext int) (*receiver, error
 func (r *receiver) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /audit", r.handleAudit)
-	mux.HandleFunc("POST /witness", r.handleWitness)
-	mux.HandleFunc("GET /witness/{node}", r.handleLastHead)
 	mux.HandleFunc("GET /_probe/{n}", r.handleProbe)
 	mux.HandleFunc("POST /_chaos/fail", r.handleChaos)
 	mux.HandleFunc("GET /_stats", r.handleStats)
@@ -238,48 +233,6 @@ func splitNDJSON(body []byte) []json.RawMessage {
 	return out
 }
 
-func (r *receiver) handleWitness(w http.ResponseWriter, req *http.Request) {
-	if !r.authorized(req) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	var heads []controlplane.AuditHead
-	if err := json.NewDecoder(io.LimitReader(req.Body, 1<<20)).Decode(&heads); err != nil {
-		http.Error(w, "decode heads", http.StatusBadRequest)
-		return
-	}
-	now := time.Now().UTC()
-	r.mu.Lock()
-	for _, h := range heads {
-		if h.NodeID == "" {
-			continue
-		}
-		r.heads[h.NodeID] = h
-	}
-	n := len(r.heads)
-	r.mu.Unlock()
-
-	writeJSON(w, http.StatusOK, controlplane.WitnessReceipt{
-		RecordedAt: now,
-		ReceiptID:  fmt.Sprintf("rcpt-%d-%d", now.UnixNano(), n),
-	})
-}
-
-// handleLastHead mirrors controlplane.Witness.LastWitnessedHead: 404 means the
-// witness has never recorded a head for that node, which is distinct from a
-// transport error and is what a scenario asserts before the first interval.
-func (r *receiver) handleLastHead(w http.ResponseWriter, req *http.Request) {
-	node := req.PathValue("node")
-	r.mu.Lock()
-	h, ok := r.heads[node]
-	r.mu.Unlock()
-	if !ok {
-		http.Error(w, "no head for node", http.StatusNotFound)
-		return
-	}
-	writeJSON(w, http.StatusOK, h)
-}
-
 func (r *receiver) handleProbe(w http.ResponseWriter, req *http.Request) {
 	n, err := strconv.Atoi(req.PathValue("n"))
 	if err != nil || n < 0 {
@@ -315,7 +268,6 @@ func (r *receiver) handleStats(w http.ResponseWriter, _ *http.Request) {
 		"duplicates": r.duplicates,
 		"rejected":   r.rejected,
 		"fail_next":  r.failNext,
-		"nodes":      len(r.heads),
 	}
 	r.mu.Unlock()
 	writeJSON(w, http.StatusOK, stats)
