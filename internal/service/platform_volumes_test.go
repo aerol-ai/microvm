@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -163,6 +164,85 @@ func TestResolvePlatformVolumesForReplication(t *testing.T) {
 	}
 	if err := s.ResolvePlatformVolumesForReplication(ctx, nil); err != nil {
 		t.Fatalf("nil req: %v", err)
+	}
+}
+
+// The reserved cluster create resolves the replicated spec before its local
+// create makes a first-use volume's row (UC-81..84 regression). Replication
+// must then derive exactly the mount resolvePlatformVolumes freezes, and must
+// not write the row, charge quota, or drop the S3 keys the seal leg needs.
+func TestResolvePlatformVolumesForReplication_FirstUse(t *testing.T) {
+	cases := []struct {
+		name      string
+		pv        config.PlatformVolumesConfig
+		wantCreds bool
+		wantErr   string
+	}{
+		{
+			name: "s3_with_static_keys",
+			pv: config.PlatformVolumesConfig{
+				Enabled: true, Backend: config.PlatformVolumesBackendS3,
+				S3Bucket: "aerol-volumes", S3Prefix: "volumes",
+				S3AccessKeyID: "AKIAEXAMPLE", S3SecretAccessKey: "example-secret",
+			},
+			wantCreds: true,
+		},
+		{
+			name: "nfs",
+			pv: config.PlatformVolumesConfig{
+				Enabled: true, Backend: config.PlatformVolumesBackendNFS,
+				NFSServer: "nfs.internal", NFSExport: "/exports/volumes",
+			},
+		},
+		{
+			name:    "first_use_with_unusable_backend_still_fails",
+			pv:      config.PlatformVolumesConfig{Enabled: true, Backend: config.PlatformVolumesBackendS3},
+			wantErr: "bucket",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := volumesTestStore(t)
+			s := &Service{cfg: config.Config{PATToken: "operator-pat", PlatformVolumes: tc.pv}, store: st}
+			ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
+				Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
+			})
+			refs := []models.PlatformVolumeMount{{Name: "Data", Path: "/workspace", ReadOnly: true}}
+
+			replicated := models.CreateSandboxRequest{PlatformVolumes: refs}
+			err := s.ResolvePlatformVolumesForReplication(ctx, &replicated)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolvePlatformVolumesForReplication: %v", err)
+			}
+			tenant, err := tenantScopeForTest(s, ctx)
+			if err != nil {
+				t.Fatalf("tenant scope: %v", err)
+			}
+			if n, err := st.CountVolumes(ctx, tenant); err != nil || n != 0 {
+				t.Fatalf("replication wrote volume rows: count=%d err=%v", n, err)
+			}
+			if len(replicated.PlatformVolumes) != 0 {
+				t.Fatalf("PlatformVolumes not cleared: %+v", replicated.PlatformVolumes)
+			}
+
+			created := models.CreateSandboxRequest{PlatformVolumes: refs}
+			attachments, err := s.resolvePlatformVolumes(ctx, &created, models.RuntimeDocker)
+			if err != nil || len(attachments) != 1 || !attachments[0].CreatedVolume {
+				t.Fatalf("create-path resolve = %+v, %v; want one created volume", attachments, err)
+			}
+			if len(replicated.Mounts) != 1 || !reflect.DeepEqual(replicated.Mounts[0], created.Mounts[0]) {
+				t.Fatalf("replicated mount = %+v, create froze %+v", replicated.Mounts, created.Mounts)
+			}
+			if got := len(replicated.Mounts[0].Credentials) > 0; got != tc.wantCreds {
+				t.Fatalf("replicated mount carries credentials = %v, want %v", got, tc.wantCreds)
+			}
+		})
 	}
 }
 
