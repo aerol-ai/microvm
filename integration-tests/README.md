@@ -143,6 +143,8 @@ its chain heads there. No scenario uses a test build of `sandboxd`.
   `config/terraform.tfvars` when that is set. UC-143 reads heads, UC-144
   plants a disagreeing head and buries it again, and UC-263 checks each
   node's boot canary, all directly in the bucket with your credentials.
+  UC-264 and UC-265 edit, then delete, the same victim's local audit log,
+  require a refused boot, and put the log back.
 - **Teardown:** the bucket has no `force_destroy`. Before `terraform destroy`,
   teardown (and `--destroy-only`) deletes every version and delete marker with
   `--bypass-governance-retention`, and empties it again if the destroy fails,

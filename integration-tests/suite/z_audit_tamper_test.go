@@ -2,11 +2,18 @@
 
 package suite
 
-// Group E, disruptive half — UC-132, 134, 135, and the witness boot gate
-// UC-144. Each corrupts evidence or kills a node, so they sort last.
+// Group E, disruptive half — UC-132, 134, 135, the witness boot gate UC-144
+// and the local-evidence tamper cases UC-264 and UC-265. Each corrupts
+// evidence or kills a node, so they sort last.
+//
+// Nothing in the suite calls t.Parallel, so these run one after another in
+// file order. UC-144, UC-264 and UC-265 refuse the boot of the same victim
+// (pickTamperVictim) and depend on that: each starts from a node the one
+// before it has put back and restarted.
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -313,14 +320,7 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	witness := harness.RequireWitnessBucket(t)
 	c := client(t)
 
-	// Pick a non-seed victim where possible: refusing the seed's boot on a
-	// cluster costs the rendezvous every joiner needs. A single server has no
-	// rendezvous to lose, and the single-node enterprise scenario exists to
-	// prove this gate on one box, so there the seed is the victim.
-	victim, ok := pickNonSeedNode(targets)
-	if !ok && !sc.Has(harness.CapCluster) {
-		victim, ok = harness.PickRestartableNode(targets)
-	}
+	victim, ok := pickTamperVictim(targets)
 	if !ok {
 		t.Skip("no SSH-reachable node to refuse")
 	}
@@ -328,6 +328,7 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 	// victim below takes the API down with it.
 	victimNodeID := heteroNodeID(t, c, targets, victim.Name)
 	victimTarget, _ := harness.SSHTarget(victim)
+	witnessVictim(t, c, victim, victimNodeID)
 
 	// Stop the victim BEFORE planting. Its ship loop reads the witness before
 	// every ship, and a head it did not ship is counted as foreign and then
@@ -404,4 +405,206 @@ func TestWitnessDisagreementRefusesEnterpriseBoot(t *testing.T) {
 		}
 		t.Logf("UC-144 PASS: enterprise boot refused on witness disagreement")
 	})
+}
+
+// pickTamperVictim chooses the node whose boot the witness and tamper cases
+// refuse (UC-144, UC-264, UC-265). A non-seed node where there is one:
+// refusing the seed's boot on a cluster costs the rendezvous every joiner
+// needs. A single server has no rendezvous to lose, and the single-node
+// enterprise scenario exists to prove these gates on one box, so there the
+// seed is the victim.
+func pickTamperVictim(targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
+	victim, ok := pickNonSeedNode(targets)
+	if !ok && !sc.Has(harness.CapCluster) {
+		victim, ok = harness.PickRestartableNode(targets)
+	}
+	return victim, ok
+}
+
+// witnessVictim makes sure the victim has shipped a head before a case
+// tampers with it. These cases used to rely on earlier cases having put
+// audit records on the victim, so run on their own (AEROL_TEST_RUN) against
+// a fresh cluster they found an empty chain, nothing witnessed, and could
+// only skip. Records come from sandboxes the victim owns: on a cluster,
+// sandboxes are created until placement lands one there. Call it while the
+// victim is still serving.
+func witnessVictim(t *testing.T, c *harness.Client, victim harness.IntegrationNode, victimNodeID string) {
+	t.Helper()
+	target, _ := harness.SSHTarget(victim)
+	if victimHasWitnessTip(t, target) {
+		return
+	}
+	owned := false
+	for attempt := 0; attempt < 8 && !owned; attempt++ {
+		sandboxID, _ := generateAuditRecords(t, c, fmt.Sprintf("witness-seed-%d", attempt), 2)
+		owned = !sc.Has(harness.CapCluster) || resolvePlacementOwner(t, c, sandboxID) == victimNodeID
+	}
+	if !owned {
+		t.Skipf("placement never put an audit sandbox on %s in 8 tries, so it has no records to tamper with", victim.Name)
+	}
+	// The ship loop runs every SB_SECRET_AUDIT_WITNESS_INTERVAL (30s by
+	// default); allow several ticks for the first head and its receipt.
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		if victimHasWitnessTip(t, target) {
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	t.Fatalf("%s owns fresh audit records but shipped no head to the witness within 3m", victim.Name)
+}
+
+func victimHasWitnessTip(t *testing.T, target string) bool {
+	t.Helper()
+	out, err := harness.SSHRun(t, target, nodeWitnessTipScript)
+	return err == nil && len(lastNonEmptyLineSuite(out)) == 64
+}
+
+// UC-264 — editing a record the witness has already vouched for refuses the
+// boot, and the untouched log boots again.
+//
+// The record edited is the one whose hash is this node's last witnessed head,
+// so the edit rewrites history an external store holds a fingerprint of. The
+// boot's full chain scan finds the record no longer hashes to its event_hash
+// and strict boot refuses before the witness is even consulted: a node that
+// started on an edited log would be serving evidence it can no longer prove.
+func TestEditedWitnessedAuditRecordRefusesBoot(t *testing.T) {
+	harness.Require(t, sc, "UC-264")
+	runAuditTamperBootCase(t, "uc264", editWitnessedAuditRecordScript, "EDITED", func(res harness.NodeBootResult) {
+		if !res.RefusedWith("secret audit chain") {
+			t.Fatalf("the node refused to start, but not on the audit chain check — an edited log must be refused for the edit, not for an unrelated failure:\n%s",
+				tailLines(res.Journal, 40))
+		}
+		t.Logf("UC-264 PASS: an edited witnessed record refused the boot")
+	})
+}
+
+// UC-265 — deleting the local audit log refuses the boot, and the refusal
+// names the recovery: a node whose log is gone comes back under a new
+// SB_NODE_ID, because the Object Lock witness keeps its old heads.
+//
+// An empty log is the cheapest tamper there is. The node still holds its
+// witness tip and the bucket still holds its heads, so either one proves a
+// chain existed (the erasure rule), and the daemon must say what to do about
+// it: the generic mismatch text once sent operators to clear the witnessed
+// head, which a locked bucket forbids.
+func TestDeletedAuditLogRefusesBootNamingNewNodeID(t *testing.T) {
+	harness.Require(t, sc, "UC-265")
+	runAuditTamperBootCase(t, "uc265", deleteAuditLogScript, "DELETED", func(res harness.NodeBootResult) {
+		if !res.RefusedWith("secret audit witness mismatch") {
+			t.Fatalf("the node refused to start, but not on the witness check — a deleted log must be refused as erased evidence:\n%s",
+				tailLines(res.Journal, 40))
+		}
+		if !res.RefusedWith("new SB_NODE_ID") {
+			t.Fatalf("the boot was refused, but the error does not name the new-SB_NODE_ID recovery, so an operator is left to try clearing a head the bucket will not let go of:\n%s",
+				tailLines(res.Journal, 40))
+		}
+		t.Logf("UC-265 PASS: a deleted log refused the boot and named the new-SB_NODE_ID recovery")
+	})
+}
+
+// runAuditTamperBootCase stops the victim, snapshots its audit directory,
+// applies tamperScript, starts the node and hands the refused boot to
+// assertRefusal; then it puts the snapshot back, starts the node again and
+// requires it to boot and serve with a chain that verifies.
+//
+// The restore is never skipped. A node left with an edited or empty log can
+// never boot under its node id again: the witness remembers what the log used
+// to say, and Object Lock forbids forgetting it. So the restore is registered
+// as a cleanup the moment the snapshot exists, runs again from inside the
+// boot callback before WithNodeEnv restarts the node, and reports a failure
+// as RESTORE FAILED, the way UC-144 does. It stops sandboxd first every time,
+// because a daemon that came up would keep writing to the directory being
+// swapped out.
+func runAuditTamperBootCase(t *testing.T, tag, tamperScript, tampered string, assertRefusal func(harness.NodeBootResult)) {
+	t.Helper()
+	if !harness.DisruptiveAllowed() {
+		t.Skip("disruptive tests disabled: this deliberately refuses a node's boot")
+	}
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	victim, ok := pickTamperVictim(targets)
+	if !ok {
+		t.Skip("no SSH-reachable node to refuse")
+	}
+	harness.RequireNodeSSH(t, victim)
+	target, _ := harness.SSHTarget(victim)
+	c := client(t)
+	witnessVictim(t, c, victim, heteroNodeID(t, c, targets, victim.Name))
+
+	// The chain must verify before the tamper, or a refusal could be for a
+	// break that was already there.
+	if pre := verifyAuditChainOn(t, target); !pre.OK {
+		t.Fatalf("the audit chain on %s was already broken before the tamper (%s); this case would prove nothing", victim.Name, pre.Error)
+	}
+
+	// Stopped for everything below, so the directory holds still while it is
+	// copied and changed. Registered first so it runs last: the node is only
+	// started again once the evidence is back.
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
+
+	out, err := harness.SSHRun(t, target, auditDirSnapshotScript(tag))
+	switch {
+	case strings.Contains(out, "STALE"):
+		t.Fatalf("an earlier run's snapshot of %s's audit directory is still there (%s): that run's restore failed, so it may be the only good copy. Put it back as the audit directory by hand, then re-run",
+			victim.Name, strings.TrimSpace(out))
+	case strings.Contains(out, "NOLOG"):
+		// The node served audited reads a moment ago (the verify above), so a
+		// missing log is the harness looking in the wrong place or lost
+		// evidence; either way, not a skip.
+		t.Fatalf("no audit log on %s where one must exist: %s", victim.Name, strings.TrimSpace(out))
+	case err != nil || !strings.Contains(out, "SNAPSHOT"):
+		t.Fatalf("snapshot %s's audit directory before tampering: %v (%s)", victim.Name, err, strings.TrimSpace(out))
+	}
+
+	restored := false
+	restore := func() bool {
+		if restored {
+			return true
+		}
+		rout, rerr := harness.SSHRun(t, target,
+			"sudo systemctl stop sandboxd && { sudo systemctl reset-failed sandboxd 2>/dev/null || true; } && "+auditDirRestoreScript(tag))
+		if rerr != nil || !strings.Contains(rout, "RESTORED") {
+			t.Errorf("RESTORE FAILED: %s's audit directory is still tampered and the node can never boot under its id until the snapshot (audit.itest-%s next to it) is put back by hand: %v\n%s",
+				victim.Name, tag, rerr, strings.TrimSpace(rout))
+			return false
+		}
+		restored = true
+		return true
+	}
+	t.Cleanup(func() { restore() })
+
+	out, err = harness.SSHRun(t, target, tamperScript)
+	if strings.Contains(out, "NOTIP") || strings.Contains(out, "NOTFOUND") {
+		// Not a product failure: a node that never shipped a head has no
+		// witnessed history to tamper with. The cleanups put the untouched
+		// snapshot back and start it.
+		t.Skipf("%s has no witnessed record to tamper with: %s", victim.Name, strings.TrimSpace(out))
+	}
+	if err != nil || !strings.Contains(out, tampered) {
+		t.Fatalf("tamper with %s's audit evidence: %v (%s)", victim.Name, err, strings.TrimSpace(out))
+	}
+	t.Logf("tampered with %s: %s", victim.Name, lastNonEmptyLineSuite(out))
+
+	// WithNodeEnv with no variables starts the node and always restarts it
+	// afterwards. The restore runs inside the callback, before that restart,
+	// so the restart is the second boot this case asserts on.
+	harness.WithNodeEnv(t, victim, nil, func(res harness.NodeBootResult) {
+		defer restore()
+		if res.Started {
+			t.Fatalf("node %s started on tampered audit evidence: the boot gate failed OPEN", victim.Name)
+		}
+		assertRefusal(res)
+	})
+
+	// Boots and serves: the node answers its own audit verify, on the chain
+	// that was put back.
+	if !restored {
+		t.Fatalf("%s's audit directory was not restored; see RESTORE FAILED above", victim.Name)
+	}
+	if post := verifyAuditChainOn(t, target); !post.OK {
+		t.Fatalf("%s came back on its restored audit directory, but the chain does not verify (%s)", victim.Name, post.Error)
+	}
 }

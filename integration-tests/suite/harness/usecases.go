@@ -530,7 +530,7 @@ var Registry = []UseCase{
 	{ID: "UC-140", Title: "s3 backend: objects land under the prefix and reconstruct the chain", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
 	{ID: "UC-141", Title: "webhook backend: the receiver sees records with a valid HMAC and bearer token", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
 	{ID: "UC-142", Title: "Backoff / at-least-once: a failing sink is retried until every record lands", Requires: []Capability{CapSecrets, CapAuditExport}, Implemented: true},
-	{ID: "UC-143", Title: "Witness: chain heads reach the receiver, receipts persist, the health gauge is 1", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-143", Title: "Witness: chain heads reach the S3 Object Lock bucket, receipts persist, the health gauge is 1", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
 	{ID: "UC-144", Title: "Witness fail-closed at boot: a receipt disagreeing with the local chain refuses the node", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
 	{ID: "UC-145", Title: "Ingest endpoint: a tokened event is accepted, an untokened one refused, listener loopback-only", Requires: []Capability{CapSecrets, CapCluster, CapEnterprise}, Implemented: true},
 	{ID: "UC-145b", Title: "Retention prune holds while export lags, then verifies across the checkpoint boundary", Requires: []Capability{CapSecrets, CapAuditWitness, CapEnterprise}, Implemented: true},
@@ -538,6 +538,11 @@ var Registry = []UseCase{
 	// with the witness cases. Needs only the witness: the canary runs on every
 	// boot with SB_AUDIT_WITNESS_BACKEND set, enterprise or not.
 	{ID: "UC-263", Title: "Witness canary: every node's boot left a locked canary version and no delete marker, so the node role can neither delete nor hide a head", Requires: []Capability{CapAuditWitness}, Implemented: true},
+	// The local half of the tamper cases: the evidence on the node is edited
+	// or deleted, and the boot must refuse. Disruptive, like UC-144, and run
+	// after it against the same victim.
+	{ID: "UC-264", Title: "Witness tamper: editing an already-witnessed record in the local audit log refuses the boot; the untouched log boots again", Requires: []Capability{CapAuditWitness, CapEnterprise}, Implemented: true},
+	{ID: "UC-265", Title: "Witness tamper: deleting the local audit log refuses the boot and names the new-SB_NODE_ID recovery; the log put back boots again", Requires: []Capability{CapAuditWitness, CapEnterprise}, Implemented: true},
 
 	// G. Quota, rate limits, overflow (F8).
 	{ID: "UC-146", Title: "Per-identity audit rate limit returns 429 with Retry-After; a second identity is unaffected", Requires: []Capability{CapSecrets}, Implemented: true},

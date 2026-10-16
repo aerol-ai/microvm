@@ -169,11 +169,15 @@ func TestDisruptiveCasesChooseANonSeedVictim(t *testing.T) {
 			if name := strings.TrimSpace(strings.SplitN(strings.TrimPrefix(sig, "func "), "(", 2)[0]); seedVictimCases[name] {
 				continue
 			}
-			// Any of the three is a deliberate choice: the two pickers
-			// exclude the seed themselves, and an explicit .Seed test is the
-			// hand-rolled equivalent.
+			// Any of these is a deliberate choice: the pickers exclude the
+			// seed themselves, and an explicit .Seed test is the hand-rolled
+			// equivalent. pickTamperVictim falls back to the seed only on a
+			// scenario without the cluster capability, where the seed is the
+			// only node and there is no rendezvous to lose; the witness and
+			// tamper gates exist to be proven on exactly that box.
 			if !strings.Contains(body, "PickRestartableNode") &&
 				!strings.Contains(body, "pickNonSeedNode") &&
+				!strings.Contains(body, "pickTamperVictim") &&
 				!strings.Contains(body, "requireNonSeedVictim") &&
 				!strings.Contains(body, ".Seed") {
 				t.Errorf("%s: %s takes a daemon down without excluding the seed; stopping the seed takes the whole cluster down, and every later case then fails for a reason that has nothing to do with what it tests",
