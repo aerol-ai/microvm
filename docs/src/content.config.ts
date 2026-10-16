@@ -168,6 +168,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-sandbox-filesystem', '- What a sandbox sees on disk'),
       link('/engineering-network-defenses', '- Fencing the network'),
       link('/engineering-secret-handling', '- Keeping API keys out'),
+      link('/engineering-audit-witness', '- Catching a rewritten audit log'),
       link('/engineering-snapshot-correctness', '- Correct snapshot clones'),
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
