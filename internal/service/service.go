@@ -1597,6 +1597,20 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	if len(mounts) > models.MaxMountsPerSandbox {
 		return fmt.Errorf("too many mounts: max %d", models.MaxMountsPerSandbox)
 	}
+	// Raw mounts run host-side as the daemon user, OUTSIDE the microVM
+	// isolation boundary: Source, NFS opts and S3 extra_args are passed
+	// verbatim into mount commands, and a credential-less network mount uses
+	// the host's ambient (instance-role) identity. pr-review.md §5 treats
+	// these inputs as trusted only because "PAT holder == host operator". A
+	// validated user token is NOT an operator, so for an owner-scoped caller a
+	// raw mount is a host attack surface (reach another tenant's export root,
+	// borrow the host S3 role, inject mount flags). Until the mount helper is
+	// isolated (§5: low-priv user, scoped netns, seccomp) raw mounts stay an
+	// operator-only capability; tenants use owner-namespaced platform volumes.
+	// Operator/PAT and internal replay/failover callers are unscoped and pass.
+	if _, scoped := ownerScope(ctx); scoped && len(mounts) > 0 {
+		return models.ErrMountOperatorOnly
+	}
 	for i := range mounts {
 		if err := mounts[i].Validate(s.cfg.ToolboxMountPath); err != nil {
 			return fmt.Errorf("mount %d: %w", i, err)

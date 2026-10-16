@@ -180,6 +180,8 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
 	case errors.Is(err, models.ErrCustomDomainVerificationFailed):
 		return Classification{Status: http.StatusForbidden, Message: err.Error()}
+	case errors.Is(err, models.ErrMountOperatorOnly):
+		return Classification{Status: http.StatusForbidden, Message: err.Error()}
 
 	// WASM module resolution taxonomy.
 	case errors.Is(err, wasmmod.ErrModuleNotFound):
