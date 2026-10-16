@@ -3660,7 +3660,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
 	return snapshot, nil
 }
 
@@ -3732,7 +3732,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
 	return snapshot, true, nil
 }
 
@@ -3976,7 +3976,7 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 // would fix it — so it never fails the create. It is a no-op single-node (the
 // Noop client). The write detaches from the request context so a client that
 // disconnected right after the commit still gets the snapshot registered.
-func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
+func (s *Service) registerSnapshotHome(ctx context.Context, ownerRef, name string) {
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -3985,19 +3985,23 @@ func (s *Service) registerSnapshotHome(ctx context.Context, name string) {
 	if self == "" {
 		return
 	}
-	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), name, self); err != nil && s.logger != nil {
+	// Key the home entry by (owner, name) so a tenant cannot overwrite another
+	// tenant's same-named entry and hijack its routing (#11).
+	key := cluster.SnapshotHomeKey(ownerRef, name)
+	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
 		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
 	}
 }
 
 // forgetSnapshotHome drops the snapshot's home entry after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
-func (s *Service) forgetSnapshotHome(ctx context.Context, name string) {
+func (s *Service) forgetSnapshotHome(ctx context.Context, ownerRef, name string) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), name); err != nil && s.logger != nil {
+	key := cluster.SnapshotHomeKey(ownerRef, name)
+	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
 		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
 	}
 }
@@ -4036,7 +4040,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err := s.store.DeleteSnapshot(ctx, snapshot.Name); err != nil {
 		return err
 	}
-	s.forgetSnapshotHome(ctx, snapshot.Name)
+	s.forgetSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
 	return nil
 }
 
