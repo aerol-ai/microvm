@@ -166,7 +166,8 @@ func newDevboxView(sandbox *models.Sandbox, blob devboxBlob) devboxView {
 }
 
 // provisioningView answers for a devbox whose create is still in flight:
-// the sandbox row does not exist yet, so only the request is known.
+// the sandbox row may not exist yet, or exist without its facade state, so
+// only the request is known.
 func provisioningView(id string, created time.Time, blob devboxBlob, metadata map[string]string) devboxView {
 	return devboxView{
 		ID:               id,

@@ -97,17 +97,19 @@ func (h *handlers) handleCreate(w http.ResponseWriter, r *http.Request) {
 		id = devboxIDForRequest(service.OwnerRefForCreate(r.Context()), requestID, raw)
 	}
 
+	// Retry of a create still running on this node: join it. This comes
+	// before the row, which lands while the create is still running.
+	if f, ok := h.creates.get(id); ok && !f.isDone() {
+		h.awaitCreate(w, r, f)
+		return
+	}
 	// Retry of a create that already finished: answer from the row.
+	// writeDevbox still defers to a create that claimed the id meanwhile.
 	if sandbox, err := h.deps.Service.GetSandbox(r.Context(), id); err == nil {
 		h.writeDevbox(w, r, sandbox)
 		return
 	} else if !errors.Is(err, store.ErrNotFound) {
 		writeStoreAwareError(h.deps.Logger, w, err)
-		return
-	}
-	// Retry of a create still running on this node: join it.
-	if f, ok := h.creates.get(id); ok && !f.isDone() {
-		h.awaitCreate(w, r, f)
 		return
 	}
 
