@@ -3,7 +3,7 @@ title: aerolvm CLI
 description: Create sandboxes, run commands, copy files and share ports from your terminal. Scripts and AI agents can use it too.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 `aerolvm` lets you work with sandboxes from your terminal. You can create a sandbox, run commands in it, copy files in and out, and share a web server from it. It talks to the same server as the SDKs, so it works with a local install, one server or a cluster.
 
@@ -21,10 +21,6 @@ Other ways to install:
 
 - **With Go:** `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest`
 - **By hand, including on Windows:** download the file for your system from [GitHub releases](https://github.com/aerol-ai/microvm/releases). Check it against `checksums.txt`, then put it in a folder on your `PATH`.
-
-<Aside type="caution" title="Some commands need the newest build">
-`aerolvm shell`, `aerolvm login`, `aerolvm logout`, `aerolvm exec -it` and `aerolvm audit verify` came after the latest release, v0.6.5. To use them now, install with `go install github.com/aerol-ai/microvm/cmd/aerolvm@main`. Everything else on this page works with v0.6.5.
-</Aside>
 
 ## Sign in
 
