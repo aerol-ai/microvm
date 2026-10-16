@@ -174,7 +174,12 @@ resolve_build_id() {
     return
   fi
   local sha delta
-  sha=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD)
+  # Every caller runs this inside $(…), where bash clears errexit, so a failed
+  # rev-parse (not a checkout, or git's "dubious ownership" refusal) used to
+  # print an EMPTY id with status 0. cmd_build then ran `rm -rf "${BUILD_ROOT}/"`
+  # and wiped the whole build cache, .worktrees included.
+  sha=$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD) && [[ -n "$sha" ]] \
+    || die "cannot resolve HEAD in ${REPO_ROOT}; refusing to build under an empty id"
   delta=$(tree_delta)
   if [[ -n "$delta" ]]; then
     printf '%s-dirty-%s\n' "$sha" "$(printf '%s' "$delta" | sha256_stdin | cut -c1-12)"

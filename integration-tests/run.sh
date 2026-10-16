@@ -493,6 +493,8 @@ lease_domain_for_scenario() {
   pin="${sdir}/.leased-domain"
 
   if [[ "$KEEP" == "1" ]]; then
+    # -s alone would trust a pin holding only a newline, which is what a failed
+    # lease used to leave behind; the trimmed name has to be non-empty too.
     if [[ -s "$pin" ]]; then
       domain=$(tr -d '[:space:]' < "$pin")
       if [[ -n "$domain" ]]; then
@@ -521,7 +523,17 @@ lease_domain_for_scenario() {
     fi
   fi
 
-  domain=$(lease_domain "$pin")
+  # The `|| return 1` is load-bearing. This function runs inside run_one's
+  # $(…), and bash clears errexit in command substitutions, so a failed lease
+  # does not stop anything on its own. Without it a missing domains.yml wrote
+  # an EMPTY pin, echoed nothing and returned 0, and a domain scenario went on
+  # toward Terraform with no test domain (2026-10-16). A blank pool entry is no
+  # lease either, so the pin is written only once there is a name to put in it.
+  domain=$(lease_domain "$pin") || return 1
+  if [[ -z "$domain" || "$domain" == "null" ]]; then
+    echo "scenario ${scenario}: ${DOMAINS_FILE} handed out a blank entry; refusing to lease it" >&2
+    return 1
+  fi
   mkdir -p "$sdir"
   printf '%s\n' "$domain" > "$pin"
   echo "$domain"
@@ -715,7 +727,14 @@ wait_for_download_url() {
 # provision that would otherwise work; only a definitive "zone absent" aborts.
 verify_leased_zone() {
   local domain="$1"
-  [[ -n "$domain" ]] || return 0
+  # An empty name is a failure, not "nothing to check". run_one calls this only
+  # for domain scenarios (local-mode never gets here), so an empty argument can
+  # only mean a lease that went wrong upstream. This used to return 0, and was
+  # one of the gates that let the 2026-10-16 run through with no domain.
+  if [[ -z "$domain" ]]; then
+    echo "zone precheck: no leased domain to check; refusing to provision a domain scenario without one" >&2
+    return 1
+  fi
 
   local token
   token=$(yq -r '.cloudflare.api_token // ""' "${REPO_ROOT}/config/secrets.yml" 2>/dev/null || echo "")
@@ -1011,7 +1030,21 @@ run_one() {
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
   caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
-    leased=$(lease_domain_for_scenario "$scenario")
+    # Refused by hand, not left to errexit. The lease runs inside $(…), where
+    # bash clears -e, and errexit in run_one itself is off whenever a caller
+    # wraps it in `if` or `||`. An empty name used to flow on as the local-mode
+    # placeholder at the safety gate, a skipped zone precheck and an empty
+    # ingress.domain_name in the overlay: that is how a domain scenario reached
+    # the edge of a Terraform apply on 2026-10-16 with no test domain at all.
+    leased=$(lease_domain_for_scenario "$scenario") || leased=""
+    if [[ -z "$leased" ]]; then
+      echo "scenario ${scenario}: needs a test domain but none was leased; refusing to provision." >&2
+      echo "  The pool is ${DOMAINS_FILE}" >&2
+      echo "  It is gitignored, so a fresh clone or worktree has none: copy" >&2
+      echo "  scenarios/domains.example.yml there and list test FQDNs you control." >&2
+      echo "  Any other reason the lease failed is printed above." >&2
+      return 1
+    fi
   else
     leased="" # local-mode: no domain
   fi
@@ -1022,8 +1055,17 @@ run_one() {
   # picks it up for both the apply and the teardown/destroy that share it.
   emit_cert_storage_tfvars "$scenario" "$sdir" "$caps_domain"
 
-  # SAFETY GATE — before any apply.
-  bash "$PROVISION" check-safety "$state_key" "${leased:-none.itest.invalid}" "$prod_domain" "$cluster_name"
+  # SAFETY GATE — before any apply. A domain scenario is checked against the
+  # name it is about to point DNS at. The .invalid placeholder is only for a
+  # scenario with no domain at all (local-mode): the collision tripwire still
+  # needs a name, and a reserved TLD can never collide with prod. Picking it by
+  # capability, not by `${leased:-…}`, keeps an empty lease from passing the
+  # gate under the placeholder's name.
+  local safety_domain="none.itest.invalid"
+  if [[ "$caps_domain" == "true" ]]; then
+    safety_domain="$leased"
+  fi
+  bash "$PROVISION" check-safety "$state_key" "$safety_domain" "$prod_domain" "$cluster_name"
   if [[ "$caps_domain" == "true" ]]; then
     verify_leased_zone "$leased"
   fi
