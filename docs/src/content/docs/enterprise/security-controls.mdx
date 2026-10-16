@@ -23,7 +23,7 @@ flowchart LR
     B --> IM["IM: Identity and access<br/>6 controls"]
     B --> WI["WI: Workload isolation<br/>6 controls"]
     B --> DP["DP: Data protection<br/>7 controls"]
-    B --> LT["LT: Logging and threat detection<br/>7 controls"]
+    B --> LT["LT: Logging and threat detection<br/>8 controls"]
     B --> PV["PV: Posture and vulnerability management<br/>4 controls"]
     B --> BR["BR: Backup and recovery<br/>3 controls"]
 ```
@@ -121,11 +121,12 @@ Each step to the right puts more between the code and the server's kernel. WebAs
 |---|---|---|---|---|
 | LT‑1 | Record every secret read | Yes | AerolVM | Read records with `sandbox.audit()` in every SDK |
 | LT‑2 | Record refused connections | Yes, for sandboxes with a policy | AerolVM | Up to 25 records a second for each sandbox |
-| LT‑3 | Chain check at start | Yes | Shared | The server refuses to start on a broken chain. Keep a copy off the server, because someone with root could rebuild the chain. |
+| LT‑3 | Chain check at start | Yes | Shared | The server refuses to start on a broken chain. Someone with root could rebuild the chain, so keep a copy off the server and turn on LT‑8. |
 | LT‑4 | Export off the server | No | You | `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3` |
 | LT‑5 | Retention | 30 days on the server | You | `SB_SECRET_AUDIT_RETENTION_DAYS`. Keep longer in your own store. |
 | LT‑6 | Metrics and traces | Metrics yes, with the token. Traces off. | You | Scrape `/v1/metrics`. Turn on OpenTelemetry with its settings. |
 | LT‑7 | Alerts and runbooks | Shipped as files | You | Load the bundled Prometheus alerts. Each links to a [runbook](/operational-runbooks/). |
+| LT‑8 | Tamper evidence off the server | No | You | `SB_AUDIT_WITNESS_BACKEND=s3` with an S3 bucket that has Object Lock. The server stores its log's fingerprints there, where it cannot change them. Required by enterprise mode. See [Enterprise mode](/enterprise/enterprise-mode/). |
 
 ## Posture and vulnerability management
 
@@ -150,7 +151,7 @@ Each step to the right puts more between the code and the server's kernel. WebAs
 pie showData
     "AerolVM enforces it" : 14
     "Shared" : 9
-    "You turn it on or run it" : 16
+    "You turn it on or run it" : 17
     "Proposed" : 2
 ```
 

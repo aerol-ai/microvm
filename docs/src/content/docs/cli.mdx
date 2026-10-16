@@ -3,7 +3,7 @@ title: aerolvm CLI
 description: Create sandboxes, run commands, copy files and share ports from your terminal. Scripts and AI agents can use it too.
 ---
 
-import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 `aerolvm` lets you work with sandboxes from your terminal. You can create a sandbox, run commands in it, copy files in and out, and share a web server from it. It talks to the same server as the SDKs, so it works with a local install, one server or a cluster.
 
@@ -21,10 +21,6 @@ Other ways to install:
 
 - **With Go:** `go install github.com/aerol-ai/microvm/cmd/aerolvm@latest`
 - **By hand, including on Windows:** download the file for your system from [GitHub releases](https://github.com/aerol-ai/microvm/releases). Check it against `checksums.txt`, then put it in a folder on your `PATH`.
-
-<Aside type="caution" title="Some commands need the newest build">
-`aerolvm shell`, `aerolvm login`, `aerolvm logout` and `aerolvm exec -it` came after the latest release, v0.6.5. To use them now, install with `go install github.com/aerol-ai/microvm/cmd/aerolvm@main`. Everything else on this page works with v0.6.5.
-</Aside>
 
 ## Sign in
 
@@ -182,6 +178,8 @@ Check the `code` field. It does not change between versions. Common codes are `n
 
 `exec` and `shell` exit with the remote command's own code instead. It is `128+n` when signal `n` killed the command, and `125` when `aerolvm` itself failed. `exec` exits with `124` when `--timeout` fires, and `shell` with `0` when you detach.
 
+`audit verify` exits with `3` when the result is INCOMPLETE. See [Check an audit log against its witness](#check-an-audit-log-against-its-witness).
+
 ### Safe to repeat
 
 - **`create`** returns the sandbox that already has the name. With `--json`, it reports `"created": false`. Without `--name`, the CLI picks a name (`agent-` and random characters) before the first try, so a retry finds the same sandbox.
@@ -200,6 +198,38 @@ Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`. Find them w
 
 - **WebAssembly sandboxes** run a command and print the output when it ends. They pass no input, and `-i`, `-t` and `shell` are refused.
 - **V8 isolate sandboxes** run one request handler, with no shell and no files. `shell`, `exec`, `cp` and `ls` fail with `unsupported_runtime`. Call the handler from an SDK instead. See [V8 isolate](/isolate-sandbox/).
+
+### Check an audit log against its witness
+
+```bash
+aerolvm audit verify --witness s3://my-audit-witness --since 30d --export s3://my-audit-export
+```
+
+This is for servers in [enterprise mode](/enterprise/enterprise-mode/). Each server stores its audit log's newest fingerprint in a locked S3 bucket, called the witness. `audit verify` checks that every fingerprint stored since `--since` links to the next one through the audit records.
+
+- It needs no server and no token. It reads the buckets with your usual AWS credentials, and read access is enough.
+- Run it on a machine outside the cluster you are checking.
+- It checks every server in the bucket, one by one. The worst result wins.
+
+| Flag | What it does |
+|---|---|
+| `--witness s3://<bucket>[/<prefix>]` | The witness bucket. Required. The prefix defaults to `witness/`. |
+| `--since <when>` | Where the window starts. Required. Give a time such as `2026-10-01T00:00:00Z`, a duration such as `720h`, or days such as `30d`. |
+| `--export s3://<bucket>[/<prefix>]` | The S3 audit export. Give this or `--export-dir`, not both. |
+| `--export-dir <dir>` | Batches saved from a webhook or bus receiver, laid out as `<dir>/node=<id>/YYYY/MM/DD/<batch>.jsonl`. |
+| `--local <id>=<path>` | A copy of one server's `secrets.jsonl`, for records not exported yet. Repeat it for more servers. A bare path works with exactly one `--node`. |
+| `--node <id>` | Check only this server. Repeat it for more. By default, every server in the bucket. |
+| `--max-lag <duration>` | How long a fingerprint may wait for its records. Default `15m`. |
+| `--region`, `--endpoint`, `--path-style` | S3 client settings, used for both buckets. |
+| `--json` | Print the full report as JSON. |
+
+| Result | Exit code | Meaning |
+|---|---|---|
+| PASS | `0` | Every fingerprint in the window links to the records. |
+| FAIL | `1` | A fingerprint does not link: a rewritten history, a rollback, or missing records. Also used when the check cannot run. |
+| INCOMPLETE | `3` | Nothing contradicts the witness, but some fingerprints have waited longer than `--max-lag` for their records. The export is behind. Never read this as PASS. |
+
+Keep exported records at least as long as your `--since` window, or the result is FAIL. [Check the whole history](/enterprise/enterprise-mode/#check-the-whole-history) explains how to pick the window.
 
 ### Debugging
 
