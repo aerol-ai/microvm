@@ -693,6 +693,13 @@ var Registry = []UseCase{
 	{ID: "UC-260", Title: "A v1-registered snapshot creates a working sandbox (catalogue round-trip with exec)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-261", Title: "Snapshot home-node routing works across heterogeneous runtime nodes (B6 on hetero)", Requires: []Capability{CapDocker, CapCluster, CapFirecracker}, Implemented: true},
 	{ID: "UC-262", Title: "Create-from-snapshot works across nodes: snapshot on one node, new sandbox placed and running (B6 + distribution)", Requires: []Capability{CapDocker, CapCluster}, Implemented: true},
+
+	// Streams across a Caddy reload (#712): a route change on the node serving
+	// the API reloads Caddy, which used to close every proxied WebSocket with
+	// close code 1001. Domain mode only: without a domain the SDK talks to
+	// sandboxd directly and no Caddy sits on the stream's path.
+	{ID: "UC-266", Title: "An exec stream opened before another sandbox's route changes still carries stdin/stdout and its exit code afterwards (Caddy reload, stream_close_delay)", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+	{ID: "UC-267", Title: "An aerolvm shell attached before another sandbox's route changes still answers afterwards (Caddy reload, stream_close_delay)", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

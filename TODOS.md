@@ -219,6 +219,11 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   close with zero bytes: the old http server's graceful shutdown closing
   connections that have not sent a request yet. The T19 notes are in
   `plans/integration-test-security.md` §7.12.
+- **Established WebSockets too (#712):** each reload also closed every
+  WebSocket a `reverse_proxy` carried (exec streams, `aerolvm shell`, session
+  attach) with code 1001 (UC-68 on `cluster-hetero-lite-secrets`,
+  2026-10-16). The #712 fix sets `stream_close_delay 10m` on every proxy. The
+  flag still matters: each stream that outlives a reload pins the old config.
 
 ## First boot Caddy config lacks S3 certificate storage
 
