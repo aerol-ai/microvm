@@ -238,6 +238,11 @@ func (s *Service) cleanupPlatformVolumeAttachments(ctx context.Context, attachme
 // callerFromContext maps the authenticated request context to the tenant
 // identity volumes.TenantScope needs. Background/internal calls (no auth edge)
 // surface as HasAccess=false and fall back to the operator-token scope.
+//
+// Operator here is scope, not power (eng review D3): a fleet-wide caller
+// creates its sandboxes with owner "", exactly as the PAT does, so its
+// volumes live in the same operator namespace those sandboxes mount from.
+// Who may create or delete a volume is decided by the route's permission.
 func callerFromContext(ctx context.Context, patToken string) volumes.Caller {
 	access, ok := controlplane.AccessFromContext(ctx)
 	return volumes.Caller{

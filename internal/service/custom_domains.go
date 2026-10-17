@@ -276,7 +276,7 @@ func (s *Service) AddCustomDomain(ctx context.Context, sandboxID, hostname strin
 	// keyed to the hostname, not the sandbox ID, so users can provision it
 	// once and attach the hostname to any sandbox (including a recreated
 	// one with a new ID).
-	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainOwnerTokenFromContext(ctx)); err != nil {
+	if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, canonical, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, customDomainProofToken(ctx, sandbox.OwnerRef)); err != nil {
 		return err
 	}
 
@@ -458,16 +458,16 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 	// domain (and on-demand TLS issued a cert for it). Verify every hostname
 	// first so a create either takes all of its domains or none.
 	//
-	// Only an owner-scoped (validated user-token) caller must prove control:
-	// that is the untrusted principal who could squat another tenant's
-	// hostname. Operator/PAT callers are trusted to control DNS (pr-review.md
-	// §5), and a stored-spec replay (failover recreate) is unscoped too — its
-	// hostname was proven at the original create and the recreate has no caller
-	// who could provision DNS. Both are unscoped, so gating on scope covers
-	// them. Verify every hostname first, so a create takes all of its domains
-	// or none.
-	if _, scoped := ownerScope(ctx); scoped {
-		ownerToken := customDomainOwnerTokenFromContext(ctx)
+	// Every caller but a host-capable one must prove control: a tenant could
+	// squat another tenant's hostname, and so could a runner bound to every
+	// team. Operator/PAT and admin callers are trusted to control DNS
+	// (pr-review.md §5), and a stored-spec replay (failover recreate) carries
+	// no Access — its hostname was proven at the original create and the
+	// recreate has no caller who could provision DNS. hostCapable covers all
+	// three (eng review D3). Verify every hostname first, so a create takes
+	// all of its domains or none.
+	if !hostCapable(ctx) {
+		ownerToken := customDomainProofToken(ctx, ownerRefForCreate(ctx))
 		for _, h := range hostnames {
 			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix, ownerToken); err != nil {
 				return err

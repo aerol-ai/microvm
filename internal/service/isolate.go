@@ -88,10 +88,11 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// file:// and bare-path bundle refs read a file off the HOST filesystem as
 	// the daemon user. That is an operator/self-host convenience, not something
 	// a scoped tenant may drive — otherwise module_ref:"file:///etc/…" turns
-	// create into an arbitrary host-file read. Gate it to unscoped callers;
-	// scoped callers must upload via POST /v1/js-bundles and reference a digest
-	// or name.
-	if _, scoped := ownerScope(ctx); scoped && jsbundle.IsFileRef(bundleRef) {
+	// create into an arbitrary host-file read. Gate it to host-capable callers
+	// (operator, admin, internal); everyone else, a runner bound to every team
+	// included, must upload via POST /v1/js-bundles and reference a digest or
+	// name.
+	if !hostCapable(ctx) && jsbundle.IsFileRef(bundleRef) {
 		return nil, fmt.Errorf("runtime %q: file:// bundle refs are operator-only; upload via /v1/js-bundles and reference the digest or name", req.Runtime)
 	}
 

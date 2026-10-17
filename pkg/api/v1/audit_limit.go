@@ -129,10 +129,22 @@ func writeAuditRateLimited(w http.ResponseWriter, retry time.Duration) {
 	apihttp.WriteError(w, http.StatusTooManyRequests, "audit rate limit exceeded")
 }
 
+// auditIdentityKey picks the caller's bucket. The operator's bucket (the
+// higher operator rate) is for the PAT and cluster nodes only; any other
+// fleet-wide caller (an auditor, a viewer bound to every team) gets its own
+// bucket at the identity rate, so a read-only token cannot spend the
+// operator's audit budget.
 func auditIdentityKey(r *http.Request) string {
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || access.Fleet {
+	if !ok {
 		return auditRateLimitIdentityKey
+	}
+	if access.Fleet {
+		switch access.Principal.Kind {
+		case controlplane.PrincipalOperator, controlplane.PrincipalNode, "":
+			return auditRateLimitIdentityKey
+		}
+		return "principal:" + access.Principal.ID
 	}
 	if ref := access.Identity.OwnerRef; ref != "" {
 		return ref

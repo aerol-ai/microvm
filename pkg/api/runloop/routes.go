@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 const PathPrefix = "/runloop"
@@ -26,12 +28,39 @@ const devboxesPath = PathPrefix + "/v1/devboxes"
 type Deps struct {
 	Service *service.Service
 	Logger  *slog.Logger
-	Auth    func(http.Handler) http.Handler
+	// Auth authenticates a request (pkg/api). The facade never calls it
+	// directly: RouteBy composes it with the permission check.
+	Auth func(http.Handler) http.Handler
+	// Audit is the seam task T5 fills with kind "api" records
+	// (apihttp.AuditHook). nil records nothing.
+	Audit apihttp.AuditHook
 	// BlueprintMapJSON maps blueprint names/ids → images
 	// (SB_RUNLOOP_BLUEPRINT_MAP_JSON), read once in config; the facade parses
 	// it and applies its own defaults.
 	BlueprintMapJSON string
 }
+
+// RouteBy returns h behind authenticate → authorize → audit seam
+// (plans/identity-and-access.md §5.3), with the permission chosen per
+// request: the facade dispatches every verb below one mux pattern.
+func (d Deps) RouteBy(tag string, classify func(*http.Request) controlplane.Permission, h http.Handler) http.Handler {
+	return apihttp.Router{Authenticate: d.Auth, Deny: writeForbidden, Audit: d.Audit}.RouteBy(tag, classify, h)
+}
+
+// writeForbidden keeps Runloop's {"message"} body; a token or OIDC caller's
+// D9 hint rides in the message.
+func writeForbidden(w http.ResponseWriter, _ *http.Request, d apihttp.Denial) {
+	WriteError(w, http.StatusForbidden, d.Message())
+}
+
+const (
+	permRead  = controlplane.PermSandboxRead
+	permWrite = controlplane.PermSandboxWrite
+	permExec  = controlplane.PermSandboxExec
+)
+
+// permissionTag is the registry tag of the facade's two mux patterns.
+const permissionTag = "runloop: per call (runloop.permissionFor)"
 
 type handlers struct {
 	deps       Deps
@@ -60,23 +89,80 @@ func newHandlers(d Deps) *handlers {
 // go, and ServeMux panics at registration on pairs such as
 // "POST .../disk_snapshots/{sid}" vs "POST .../{id}/shutdown", which
 // match the same path with neither more specific.
-func RegisterRoutes(mux *http.ServeMux, d Deps) {
+func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	h := newHandlers(d)
 	// Executions a previous process left running still owe their session
 	// cleanup; re-attach watchers to them off the boot path.
 	h.recoverExecutionsInBackground()
-	mux.Handle(devboxesPath, d.Auth(http.HandlerFunc(h.route)))
-	mux.Handle(devboxesPath+"/", d.Auth(http.HandlerFunc(h.route)))
+	mux.Handle(devboxesPath, d.RouteBy(permissionTag, h.permissionFor, http.HandlerFunc(h.route)))
+	mux.Handle(devboxesPath+"/", d.RouteBy(permissionTag, h.permissionFor, http.HandlerFunc(h.route)))
+}
+
+// devboxSegments splits the path below /v1/devboxes. ServeMux has already
+// redirected any non-clean path, so no segment is empty.
+func devboxSegments(r *http.Request) []string {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, devboxesPath), "/")
+	if rest == "" {
+		return nil
+	}
+	return strings.Split(rest, "/")
+}
+
+// permissionFor is the permission a call needs, read off the same segments
+// route() dispatches on and the same devboxActions table, so the check and
+// the dispatch cannot disagree. It runs on the edge, before a call is
+// forwarded to the devbox's owner (which checks again). A path route()
+// does not serve needs sandbox.exec, the strictest team verb, so a caller
+// that could not run the call never learns whether it exists.
+func (h *handlers) permissionFor(r *http.Request) controlplane.Permission {
+	segs := devboxSegments(r)
+	switch {
+	case len(segs) == 0:
+		return readOrWrite(r, http.MethodPost)
+	case segs[0] == "create_and_await_running" && len(segs) == 1:
+		return permWrite
+	case segs[0] == "disk_snapshots":
+		return snapshotPermission(segs[1:])
+	case segs[0] == "evictions":
+		return permRead
+	}
+	rest := segs[1:]
+	switch {
+	case len(rest) == 0:
+		return readOrWrite(r, http.MethodPost)
+	case rest[0] == "executions":
+		return permExec
+	case len(rest) == 1:
+		if action, ok := h.devboxActions()[rest[0]]; ok {
+			return action.perm
+		}
+	}
+	return permExec
+}
+
+// readOrWrite: the method that changes state needs sandbox.write; any
+// other is a read.
+func readOrWrite(r *http.Request, writeMethod string) controlplane.Permission {
+	if r.Method == writeMethod {
+		return permWrite
+	}
+	return permRead
+}
+
+// snapshotPermission classifies /v1/devboxes/disk_snapshots/...: the list
+// and a status poll read, everything else (update, delete) writes.
+func snapshotPermission(segs []string) controlplane.Permission {
+	switch {
+	case len(segs) == 0:
+		return permRead
+	case len(segs) == 2 && segs[1] == "status":
+		return permRead
+	}
+	return permWrite
 }
 
 func (h *handlers) route(w http.ResponseWriter, r *http.Request) {
-	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, devboxesPath), "/")
-	// ServeMux has already redirected any non-clean path, so no segment
-	// here is empty.
-	var segs []string
-	if rest != "" {
-		segs = strings.Split(rest, "/")
-	}
+	segs := devboxSegments(r)
 
 	switch {
 	case len(segs) == 0:
@@ -115,44 +201,54 @@ func (h *handlers) routeDevbox(w http.ResponseWriter, r *http.Request, id string
 		WriteError(w, http.StatusNotFound, "not found")
 		return
 	}
-	posts := map[string]func(http.ResponseWriter, *http.Request, string){
-		"shutdown":             h.shutdownDevbox,
-		"suspend":              h.suspendDevbox,
-		"resume":               h.resumeDevbox,
-		"keep_alive":           h.keepAlive,
-		"wait_for_status":      h.waitForDevboxStatus,
-		"execute":              h.execute,
-		"execute_async":        h.executeAsync,
-		"execute_sync":         h.executeSync,
-		"read_file_contents":   h.readFileContents,
-		"write_file_contents":  h.writeFileContents,
-		"upload_file":          h.uploadFile,
-		"download_file":        h.downloadFile,
-		"snapshot_disk":        h.snapshotDisk,
-		"snapshot_disk_async":  h.snapshotDiskAsync,
-		"enable_tunnel":        h.unsupported("tunnels"),
-		"remove_tunnel":        h.unsupported("tunnels"),
-		"create_pty_tunnel":    h.unsupported("PTY tunnels"),
-		"create_ssh_key":       h.unsupported("devbox SSH keys"),
-		"create_gateway_token": h.unsupported("agent gateways"),
-		"create_mcp_token":     h.unsupported("MCP hub tokens"),
-	}
-	gets := map[string]func(http.ResponseWriter, *http.Request, string){
-		"logs":  h.unsupported("devbox logs"),
-		"usage": h.unsupported("devbox usage reports"),
-	}
-	action := segs[0]
-	post, isPost := posts[action]
-	get, isGet := gets[action]
+	action, ok := h.devboxActions()[segs[0]]
 	switch {
-	case isPost && r.Method == http.MethodPost:
-		post(w, r, id)
-	case isGet && r.Method == http.MethodGet:
-		get(w, r, id)
-	case isPost || isGet:
+	case ok && r.Method == action.method:
+		action.run(w, r, id)
+	case ok:
 		WriteError(w, http.StatusMethodNotAllowed, "method not allowed")
 	default:
 		WriteError(w, http.StatusNotFound, "not found")
+	}
+}
+
+// devboxAction is one call below /v1/devboxes/{id}/: the method it answers,
+// the permission it needs, and its handler.
+type devboxAction struct {
+	method string
+	perm   controlplane.Permission
+	run    func(http.ResponseWriter, *http.Request, string)
+}
+
+// devboxActions is the one table routeDevbox dispatches on and
+// permissionFor classifies on. Lifecycle calls write; commands, file
+// contents and shells exec (files can hold secrets); a status poll reads.
+// Unsupported calls carry the permission the real call would need.
+func (h *handlers) devboxActions() map[string]devboxAction {
+	post := http.MethodPost
+	return map[string]devboxAction{
+		"shutdown":             {post, permWrite, h.shutdownDevbox},
+		"suspend":              {post, permWrite, h.suspendDevbox},
+		"resume":               {post, permWrite, h.resumeDevbox},
+		"keep_alive":           {post, permWrite, h.keepAlive},
+		"wait_for_status":      {post, permRead, h.waitForDevboxStatus},
+		"execute":              {post, permExec, h.execute},
+		"execute_async":        {post, permExec, h.executeAsync},
+		"execute_sync":         {post, permExec, h.executeSync},
+		"read_file_contents":   {post, permExec, h.readFileContents},
+		"write_file_contents":  {post, permExec, h.writeFileContents},
+		"upload_file":          {post, permExec, h.uploadFile},
+		"download_file":        {post, permExec, h.downloadFile},
+		"snapshot_disk":        {post, permWrite, h.snapshotDisk},
+		"snapshot_disk_async":  {post, permWrite, h.snapshotDiskAsync},
+		"enable_tunnel":        {post, permWrite, h.unsupported("tunnels")},
+		"remove_tunnel":        {post, permWrite, h.unsupported("tunnels")},
+		"create_pty_tunnel":    {post, permExec, h.unsupported("PTY tunnels")},
+		"create_ssh_key":       {post, permExec, h.unsupported("devbox SSH keys")},
+		"create_gateway_token": {post, permExec, h.unsupported("agent gateways")},
+		"create_mcp_token":     {post, permExec, h.unsupported("MCP hub tokens")},
+		"logs":                 {http.MethodGet, permExec, h.unsupported("devbox logs")},
+		"usage":                {http.MethodGet, permRead, h.unsupported("devbox usage reports")},
 	}
 }
 

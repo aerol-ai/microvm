@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -317,7 +318,14 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, h.toSandboxDetailResponse(r, sandbox, meta))
+	detail := h.toSandboxDetailResponse(r, sandbox, meta)
+	if !apihttp.CallerCan(r.Context(), controlplane.PermSandboxExec) {
+		// The envd token opens the sandbox's toolbox (/e2b/runtime), so a
+		// caller that may read the sandbox but not exec in it (a viewer or
+		// auditor) gets the detail without it.
+		detail.EnvdAccessToken = ""
+	}
+	writeJSON(w, http.StatusOK, detail)
 }
 
 func (h *handlers) deleteSandbox(w http.ResponseWriter, r *http.Request) {

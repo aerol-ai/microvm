@@ -1607,8 +1607,10 @@ func (s *Service) validateCreateMounts(ctx context.Context, mounts []models.Moun
 	// borrow the host S3 role, inject mount flags). Until the mount helper is
 	// isolated (§5: low-priv user, scoped netns, seccomp) raw mounts stay an
 	// operator-only capability; tenants use owner-namespaced platform volumes.
-	// Operator/PAT and internal replay/failover callers are unscoped and pass.
-	if _, scoped := ownerScope(ctx); scoped && len(mounts) > 0 {
+	// Operator/PAT, admin and internal replay/failover callers pass. A runner
+	// bound to every team is unscoped but not a host operator, so it is
+	// refused like a tenant (hostCapable, eng review D3).
+	if !hostCapable(ctx) && len(mounts) > 0 {
 		return models.ErrMountOperatorOnly
 	}
 	for i := range mounts {

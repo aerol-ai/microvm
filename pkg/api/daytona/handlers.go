@@ -807,13 +807,11 @@ func (h *handlers) hydrateEnvIfRequested(r *http.Request, sandbox *models.Sandbo
 	return nil
 }
 
+// includeEnvRequested is the parse the route's permission classifier uses
+// (apihttp.ReadOrSecrets), so any spelling that returns env needed
+// sandbox.secrets to get here.
 func includeEnvRequested(r *http.Request) bool {
-	switch strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env"))) {
-	case "true", "1", "yes":
-		return true
-	default:
-		return false
-	}
+	return apihttp.IncludeEnvRequested(r)
 }
 
 func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models.Sandbox, string, error) {

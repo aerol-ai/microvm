@@ -569,11 +569,12 @@ func TestWriteStoreAwareErrorMapsBuildErrors(t *testing.T) {
 	}
 }
 
-// RequireOperator passes an operator and refuses everyone else: a scoped
-// user token (403) and a request the auth edge never stamped (403).
-func TestRequireOperator(t *testing.T) {
+// A fleet.admin route passes an operator and refuses everyone else: a scoped
+// user token (403) and a request the auth edge never stamped (403), as the
+// operator gate it replaced did.
+func TestFleetAdminRouteRefusesNonOperators(t *testing.T) {
 	var reached bool
-	h := RequireOperator(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := Router{}.Route(controlplane.PermFleetAdmin, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		reached = true
 		w.WriteHeader(http.StatusOK)
 	}))

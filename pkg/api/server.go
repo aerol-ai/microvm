@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/version"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/api/daytona"
 	"github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
@@ -44,6 +45,12 @@ type Server struct {
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
 	// default PAT-then-provider chain.
 	authChain []authLink
+
+	// audit is the one seam task T5 fills with kind "api" chain records
+	// (apihttp.AuditHook). registerRoutes hands it to every surface's Route,
+	// so setting it here covers every permission-tagged route. nil (T2)
+	// records nothing.
+	audit apihttp.AuditHook
 
 	// Facade config, read once from config.Config (not per request in the
 	// facades). Each facade parses its own format.
@@ -116,7 +123,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 			Logger:         logger,
 		}, s.Handler)
 	}
-	s.routes()
+	s.registerRoutes(s.mux)
 	s.root = loggingMiddleware(s.logger, s.clusterControlHeaderGuard(s.mux))
 	return s
 }
@@ -129,53 +136,78 @@ func (s *Server) Handler() http.Handler {
 	return s.root
 }
 
-func (s *Server) routes() {
+// registerRoutes mounts every route on mux. Every one goes through a
+// surface's Route (authenticate → authorize → audit seam) except the public
+// allowlist in route_registry_test.go: /health, /ui and the E2B runtime
+// proxy. NewServer passes the real mux; the registry test a recording one.
+func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// /health is unversioned: it is meant for liveness probes (k8s, load
 	// balancers) which should keep working across API version rollouts.
-	s.mux.HandleFunc("GET /health", s.handleHealth)
+	// Public by design.
+	mux.Handle("GET /health", http.HandlerFunc(s.handleHealth))
 
 	// Each registered version owns its own URL prefix and is responsible for
-	// every route under it. Auth is shared across versions via Deps.Auth.
-	daytona.RegisterRoutes(s.mux, daytona.Deps{
+	// every route under it. Authentication is shared across versions via
+	// Deps.Auth, which each package's Route composes with its permission.
+	daytona.RegisterRoutes(mux, daytona.Deps{
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
+		Audit:           s.audit,
 		ContainerEngine: s.containerEngine,
 		DefaultImage:    s.daytonaDefaultImage,
 	})
 
-	e2b.RegisterRoutes(s.mux, e2b.Deps{
+	e2b.RegisterRoutes(mux, e2b.Deps{
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireE2BAuth,
+		Audit:           s.audit,
 		TemplateMapJSON: s.e2bTemplateMapJSON,
 		ClientID:        s.e2bClientID,
 	})
 
-	runloop.RegisterRoutes(s.mux, runloop.Deps{
+	runloop.RegisterRoutes(mux, runloop.Deps{
 		Service:          s.service,
 		Logger:           s.logger,
 		Auth:             s.requireRunloopAuth,
+		Audit:            s.audit,
 		BlueprintMapJSON: s.runloopBlueprintMapJSON,
 	})
 
-	apiv1.RegisterRoutes(s.mux, apiv1.Deps{
+	apiv1.RegisterRoutes(mux, apiv1.Deps{
 		Service:         s.service,
 		Logger:          s.logger,
 		Auth:            s.requireAuth,
+		Audit:           s.audit,
 		AuditLimiter:    s.auditLimiter,
 		ContainerEngine: s.containerEngine,
 	})
 
-	// Remote MCP (opt-in, SB_MCP_ENABLED). Its tools call back into this
-	// same handler in-process with the caller's token.
+	// Remote MCP (opt-in, SB_MCP_ENABLED). /mcp needs only a valid principal
+	// (pseudo-permission authenticated); its tools call back into this same
+	// handler in-process with the caller's token, so each tool's inner API
+	// call is authorized by that route's own permission. The origin and host
+	// checks still run before authentication, as before.
 	if s.mcp != nil {
-		s.mux.Handle(remotemcp.Path, s.mcp.Wrap(s.requireAuth))
+		var authed http.Handler
+		outer := s.mcp.Wrap(func(next http.Handler) http.Handler {
+			authed = s.route(controlplane.PermAuthenticated, next)
+			return authed
+		})
+		mux.Handle(remotemcp.Path, apihttp.PreAuth(outer, authed))
 	}
 
-	// Operator dashboard + expvar. /ui is unauth (static HTML; PAT prompted
-	// in-page), /debug/vars is PAT-gated. See pkg/api/dashboard.go.
-	s.registerDashboard()
+	// Operator dashboard + expvar. /ui is public (static HTML; the token is
+	// asked for in-page), the metrics endpoints are permission-gated. See
+	// pkg/api/dashboard.go.
+	s.registerDashboard(mux)
+}
+
+// route is Route for the routes pkg/api mounts itself (/mcp and the
+// dashboard's metrics): v1 authentication and the v1 403 body.
+func (s *Server) route(perm controlplane.Permission, next http.Handler) http.Handler {
+	return apihttp.Router{Authenticate: s.requireAuth, Audit: s.audit}.Route(perm, next)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
