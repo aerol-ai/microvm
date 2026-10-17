@@ -21,7 +21,8 @@ import (
 //	aerolvm_auth_failures_total{key=<kind>,key2=<reason>}
 //	  kind:   none | unknown | controlplane (token, oidc from T3/T6)
 //	  reason: missing | rejected | no_owner | bad_role | bad_team |
-//	          team_not_bound | a D17 reason (expired, wrong_audience, ...)
+//	          team_not_bound | stale (token mirror out of date, 503) |
+//	          a D17 reason (expired, wrong_audience, ...)
 //
 // Every label value comes from a fixed set, never from the request, so a
 // caller cannot grow the series count.
@@ -52,6 +53,7 @@ const (
 	authResultUnauthorized = "unauthorized"
 	authResultForbidden    = "forbidden"
 	authResultBadRequest   = "bad_request"
+	authResultUnavailable  = "unavailable"
 )
 
 // observeAuth records one authentication decision: a metric, attributes on
@@ -91,6 +93,8 @@ func authResultFor(status int) string {
 		return authResultForbidden
 	case http.StatusBadRequest:
 		return authResultBadRequest
+	case http.StatusServiceUnavailable:
+		return authResultUnavailable
 	}
 	return authResultUnauthorized
 }

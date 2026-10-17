@@ -160,7 +160,7 @@ func TestAuthSpanAttributes(t *testing.T) {
 }
 
 func TestAuthResultFor(t *testing.T) {
-	for status, want := range map[int]string{401: "unauthorized", 403: "forbidden", 400: "bad_request", 503: "unauthorized"} {
+	for status, want := range map[int]string{401: "unauthorized", 403: "forbidden", 400: "bad_request", 503: "unavailable", 500: "unauthorized"} {
 		if got := authResultFor(status); got != want {
 			t.Errorf("authResultFor(%d) = %q, want %q", status, got, want)
 		}
