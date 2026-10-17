@@ -56,6 +56,23 @@ func wireIdentityFile(ctx context.Context, cfg config.Config, rec identityRecord
 			}
 			return nil
 		}),
+		// OAuth for remote MCP (§5.14): the RFC 9728 metadata and the /mcp
+		// 401 challenge follow the file in force. Only used with
+		// SB_MCP_ENABLED as well.
+		api.WithMCPResource(func() api.MCPResource { return mcpResource(w.Current()) }),
+	}
+}
+
+// mcpResource is the /mcp OAuth resource a loaded identity file names, or
+// none while no good file has loaded.
+func mcpResource(c *identity.Config) api.MCPResource {
+	if c == nil {
+		return api.MCPResource{}
+	}
+	return api.MCPResource{
+		Resource:             c.MCPResource,
+		AuthorizationServers: c.MCPAuthorizationServers(),
+		Scopes:               c.MCPScopes,
 	}
 }
 
