@@ -232,6 +232,9 @@ type fileAuditSink struct {
 	// egressQuota is the per-sandbox egress evidence budget, applied on the
 	// writer goroutine at every funnel a record can take. nil = unbounded.
 	egressQuota *egressAuditQuota
+	// apiFlood merges and budgets kind "api" records (api_audit_flood.go),
+	// on the writer goroutine next to egressQuota. nil = no flood control.
+	apiFlood *apiFloodControl
 	// spillVerify / spillActor / spillOwnerRef authenticate and stamp
 	// worker-written spill lines on drain; see fileAuditSinkOptions.
 	spillVerify   func(capability string, now time.Time) (sandboxID, incarnationID string, err error)
@@ -251,6 +254,9 @@ type fileAuditSinkOptions struct {
 	egressRate        float64
 	egressBurst       int
 	egressMarkerDelay time.Duration
+	// apiFlood is the api record flood control; nil leaves api records
+	// unmerged and unbudgeted.
+	apiFlood *apiFloodControl
 	// spillVerify authenticates an egress spill line the same way the HTTP
 	// ingest authenticates a POST: it returns the sandbox and incarnation the
 	// line's capability is bound to, or an error. The drain never trusts the
@@ -308,6 +314,7 @@ func newFileAuditSinkFrom(auditDir string, opts fileAuditSinkOptions) (*fileAudi
 		spillEnabled:     spillEnabled,
 		bootVerify:       bootVerify,
 		egressQuota:      newEgressAuditQuota(opts.egressRate, opts.egressBurst, opts.egressMarkerDelay),
+		apiFlood:         opts.apiFlood,
 		spillVerify:      opts.spillVerify,
 		spillActor:       opts.spillActor,
 		spillOwnerRef:    opts.spillOwnerRef,
@@ -759,6 +766,7 @@ func (s *fileAuditSink) loop() {
 				for s.drainSpill() {
 				}
 				s.flushEgressQuotaMarkers(true)
+				s.flushAPIFlood(true)
 				flushGap()
 				_ = s.syncFile()
 				return
@@ -789,6 +797,7 @@ func (s *fileAuditSink) loop() {
 				// Sync must observe spilled events: flush spillCh → spill file → JSONL.
 				flushSpill()
 				s.flushEgressQuotaMarkers(false)
+				s.flushAPIFlood(true)
 				flushGap()
 				next.sync <- s.syncFile()
 				continue
@@ -806,6 +815,7 @@ func (s *fileAuditSink) loop() {
 					if control.sync != nil {
 						flushSpill()
 						s.flushEgressQuotaMarkers(false)
+						s.flushAPIFlood(true)
 						flushGap()
 						control.sync <- s.syncFile()
 					} else {
@@ -819,9 +829,17 @@ func (s *fileAuditSink) loop() {
 					durable = durable || queued[end].durable != nil
 					end++
 				}
-				events := make([]SecretAuditEvent, end)
+				// The api flood control takes the calls it merges or
+				// budgets first. It never takes a durable record, so every
+				// durable request below is still in events, at idx.
+				events := make([]SecretAuditEvent, 0, end)
+				idx := make([]int, 0, end)
 				for i := range end {
-					events[i] = queued[i].ev
+					if queued[i].durable == nil && s.apiFlood.absorb(queued[i].ev) {
+						continue
+					}
+					events = append(events, queued[i].ev)
+					idx = append(idx, i)
 				}
 				// The budget decides here, at the funnel, so a record refused
 				// on one path cannot re-enter on another; a durable caller
@@ -831,20 +849,26 @@ func (s *fileAuditSink) loop() {
 				if len(kept) > 0 {
 					err = s.writeEventBatch(kept, durable, true)
 				}
-				for i := range end {
+				for j, i := range idx {
 					if queued[i].durable == nil {
 						continue
 					}
-					if suppressed != nil && suppressed[i] {
+					if suppressed != nil && suppressed[j] {
 						queued[i].durable <- errAuditRateLimited
 					} else {
 						queued[i].durable <- err
 					}
 				}
 				queued = queued[end:]
+				// Merges whose one-second window closed are written as soon
+				// as the writer is next awake, not a ticker later.
+				if merged := s.apiFlood.dueMerged(); len(merged) > 0 {
+					_ = s.writeEventBatch(merged, false, true)
+				}
 			}
 		case <-ticker.C:
 			s.flushEgressQuotaMarkers(false)
+			s.flushAPIFlood(false)
 			flushGap()
 			_ = s.syncFile()
 		}
@@ -860,6 +884,17 @@ func (s *fileAuditSink) flushEgressQuotaMarkers(force bool) {
 		return
 	}
 	_ = s.writeEventBatch(markers, false, true)
+}
+
+// flushAPIFlood writes the api records the flood control owes: merged calls
+// whose window closed and rate_limited summaries (all of them when force is
+// set, for Sync and shutdown). Writer goroutine only.
+func (s *fileAuditSink) flushAPIFlood(force bool) {
+	records := s.apiFlood.owed(force)
+	if len(records) == 0 {
+		return
+	}
+	_ = s.writeEventBatch(records, false, true)
 }
 
 // appendSpill durable-appends a batch under the audit flock when the
@@ -2083,6 +2118,7 @@ func (s *Service) ensureSecretAuditSink() {
 		sink, err := newFileAuditSinkFrom(filepath.Join(dataDir, "audit"), fileAuditSinkOptions{
 			buffer: buf, spillEnabled: spill, bootVerify: s.cfg.SecretAuditBootVerify,
 			egressRate: s.cfg.AuditEgressSandboxRate, egressBurst: s.cfg.AuditEgressSandboxBurst,
+			apiFlood: s.newAPIFloodControlFor(),
 			// Worker spill lines are authenticated with the same key that
 			// scopes their ingest capabilities. Resolved per drain, not at
 			// construction: the sink drains at boot, before the ingest server
@@ -2113,6 +2149,7 @@ func (s *Service) ensureSecretAuditSink() {
 		secretAuditSinkHealthy.Set(1)
 		s.secretAudit = sink
 		s.secretAuditFile = sink
+		s.startAPIFloodEvaluator()
 		if r := sink.bootRepair; r != nil && s.logger != nil {
 			s.logger.Warn("secret audit torn tail repaired at boot; gap marker chained",
 				"offset", r.Offset, "bytes_cut", r.Bytes, "dropped_at_least", r.Dropped, "path", sink.path)
@@ -2280,6 +2317,8 @@ func (s *Service) CloseSecretAuditSink() {
 		s.secretAuditPruneStop = nil
 		s.secretAuditPruneDone.Wait()
 	}
+	// Before the writer: the evaluator may still emit a mode-change record.
+	s.stopAPIFloodEvaluator()
 	if f := s.secretAuditFile; f != nil {
 		f.Close()
 	}
