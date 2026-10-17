@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/btree"
@@ -53,7 +54,8 @@ const (
 	// opReportStorageObligations = 26: owner delete-outbox snapshots folded by
 	// the leader (storage_obligations.go).
 	// 26 is opReportStorageObligations (storage_obligations.go); 27/28 are the
-	// egress-profile ops (fsm_egress_profiles.go). Next free codes are 29/30.
+	// egress-profile ops (fsm_egress_profiles.go); 31/32 are the API-token
+	// ops (fsm_tokens.go). The next free code is 33.
 	opRegisterSnapshotNode opCode = 29 // record which node holds a snapshot's image (name → node, cluster-wide)
 	opForgetSnapshotNode   opCode = 30 // drop a snapshot's name → node entry (on delete / node death)
 )
@@ -198,6 +200,11 @@ type command struct {
 	// which a snapshot's local-only SQLite catalogue row cannot answer after
 	// the request lands elsewhere.
 	SnapshotName string `json:"snapshot_name,omitempty"`
+	// APIToken carries the record for opPutAPIToken (its secret hash, never
+	// the secret); APITokenID names the token opDeleteAPIToken removes
+	// (fsm_tokens.go).
+	APIToken   *identity.TokenRecord `json:"api_token,omitempty"`
+	APITokenID string                `json:"api_token_id,omitempty"`
 }
 
 type reservationCommand struct {
@@ -522,6 +529,11 @@ type placementFSM struct {
 	// rebuilt on Restore from the rows.
 	egressProfiles    map[EgressProfileKey]*EgressProfileRecord
 	egressProfileRefs map[EgressProfileKey]map[string]struct{}
+	// tokens is the replicated API-token table and its change ring
+	// (fsm_tokens.go, snapshotted rows, node-local ring). It has its own
+	// lock: token reads on the request path never take mu.
+	tokens       *apiTokenState
+	apiTokenInit sync.Once
 
 	// subMu guards subscribers. Separate from mu so a slow subscriber accept
 	// can't block FSM reads — Apply takes mu briefly to write, releases it,
@@ -609,6 +621,7 @@ func newPlacementFSMWithRecoveryStore(store placementRecoveryStore) *placementFS
 		volumeAttachmentsBySandbox:   make(map[string]map[string]struct{}),
 		egressProfiles:               make(map[EgressProfileKey]*EgressProfileRecord),
 		egressProfileRefs:            make(map[EgressProfileKey]map[string]struct{}),
+		tokens:                       newAPITokenState(),
 	}
 }
 
@@ -1729,6 +1742,17 @@ func (f *placementFSM) apply(log *raft.Log) interface{} {
 		return result
 	case opDeleteEgressProfile:
 		if err := f.applyDeleteEgressProfileLocked(cmd); err != nil {
+			return err
+		}
+		return nil
+	case opPutAPIToken:
+		result, err := f.applyPutAPITokenLocked(cmd)
+		if err != nil {
+			return err
+		}
+		return result
+	case opDeleteAPIToken:
+		if err := f.applyDeleteAPITokenLocked(cmd); err != nil {
 			return err
 		}
 		return nil
@@ -3338,6 +3362,10 @@ type fsmSnapshotPayload struct {
 	// Optional; an older snapshot decodes it as nil, which reads as "no
 	// snapshot-home entries" and routing falls back to local serving.
 	SnapshotNodes map[string]string
+	// APITokens is the replicated API-token table (hashes, never secrets).
+	// Optional; an older snapshot decodes it as nil, which reads as "no
+	// tokens". An older build decoding a newer snapshot ignores the field.
+	APITokens []identity.TokenRecord
 }
 
 type placementSnapshotRow struct {
@@ -3416,6 +3444,7 @@ func (f *placementFSM) Snapshot() (raft.FSMSnapshot, error) {
 		volumeAttachments:  f.volumeAttachmentsSnapshotLocked(),
 		egressProfiles:     f.egressProfilesSnapshotLocked(),
 		snapshotNodes:      snapshotNodes,
+		apiTokens:          f.apiTokens().snapshot(),
 		recoveryStore:      f.recoveryStore,
 		recoveryRefs:       recoveryRefs,
 	}, nil
@@ -3496,6 +3525,7 @@ func (f *placementFSM) Restore(rc io.ReadCloser) (err error) {
 	f.customHostnameIndex = make(map[string]string)
 	f.egressProfileRefs = make(map[EgressProfileKey]map[string]struct{})
 	f.restoreEgressProfilesLocked(payload.EgressProfiles)
+	f.apiTokens().restore(payload.APITokens, payload.Version)
 	f.auditACLs = make(map[string]AuditACL, len(payload.AuditACLs))
 	f.auditACLLatest = make(map[string]string)
 	f.auditACLBySandbox = make(map[string]map[string]struct{})
@@ -3647,6 +3677,7 @@ type fsmSnapshot struct {
 	volumeAttachments  []models.VolumeAttachment
 	egressProfiles     []EgressProfileRecord
 	snapshotNodes      map[string]string
+	apiTokens          []identity.TokenRecord
 	recoveryStore      placementRecoveryStore
 	recoveryRefs       []string
 }
@@ -3671,6 +3702,7 @@ func (s *fsmSnapshot) Persist(sink raft.SnapshotSink) (err error) {
 		VolumeAttachments:  s.volumeAttachments,
 		EgressProfiles:     s.egressProfiles,
 		SnapshotNodes:      s.snapshotNodes,
+		APITokens:          s.apiTokens,
 	}); err != nil {
 		_ = sink.Cancel()
 		return fmt.Errorf("fsmSnapshot: encode: %w", err)
