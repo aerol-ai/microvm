@@ -6,10 +6,10 @@ package api
 // they read the credential and how they word a refusal.
 //
 //	credential ─► authenticators, in order; the first that matches decides
-//	               pat ─► apiToken (T3) ─► [jwt T6] ─► provider
+//	               pat ─► apiToken (T3) ─► jwt (internal/identity) ─► provider
 //	           ─► post-match steps: forward attribution, surface rule,
 //	               team selection
-//	           ─► refusals: reason mapping (401 / 403 / 400) per surface
+//	           ─► refusals: reason mapping (401 / 403 / 400 / 503) per surface
 
 import (
 	"context"
@@ -62,6 +62,7 @@ type ServerOption func(*serverOptions)
 
 type serverOptions struct {
 	credentials []authLink
+	discovery   func() []identitywire.DiscoveryIssuer
 }
 
 // WithCredentialAuthenticator adds a named-credential authenticator: the avm_
@@ -274,27 +275,55 @@ var headerTeamKey = http.CanonicalHeaderKey(HeaderTeam)
 var errBadTeamHeader = errors.New("invalid " + HeaderTeam + " header: a team name is 1 to 63 characters of a-z, 0-9 and -")
 
 // teamNotBoundError refuses a team the credential has no binding for. The
-// message names only the caller's own role and team (D9).
+// message names only the caller's own bindings (D9): what `whoami` and the
+// caller's own token already say.
 type teamNotBoundError struct {
-	team  string
-	role  controlplane.Role
-	bound string
+	team     string
+	bindings []controlplane.TeamBinding
 }
+
+// maxHintBindings caps how many of the caller's bindings a 403 lists.
+const maxHintBindings = 10
 
 func (e *teamNotBoundError) Error() string {
-	if e.bound == controlplane.FleetTeam {
-		return HeaderTeam + ": " + e.team + " is not one of this credential's teams (it holds role " + string(e.role) +
+	if len(e.bindings) == 1 && e.bindings[0].Team == controlplane.FleetTeam {
+		return HeaderTeam + ": " + e.team + " is not one of this credential's teams (it holds role " + string(e.bindings[0].Role) +
 			" on all teams); send no " + HeaderTeam + " header to act on every team"
 	}
-	return HeaderTeam + ": " + e.team + " is not one of this credential's teams (it holds role " + string(e.role) +
-		" on team " + e.bound + "); ask an admin for a binding on team " + e.team
+	holds := make([]string, 0, min(len(e.bindings), maxHintBindings)+1)
+	for i, b := range e.bindings {
+		if i == maxHintBindings {
+			holds = append(holds, "and "+strconv.Itoa(len(e.bindings)-i)+" more")
+			break
+		}
+		holds = append(holds, "role "+string(b.Role)+" on "+teamPhrase(b.Team))
+	}
+	return HeaderTeam + ": " + e.team + " is not one of this credential's teams (it holds " + strings.Join(holds, ", ") +
+		"); ask an admin for a binding on team " + e.team
 }
 
-// selectTeam is team selection. The header selects among the teams the
-// verified credential is already bound to; it never grants one. A credential
-// in T1 has exactly one binding, so the header must name it; T6 extends this
-// to the several bindings an OIDC token can match. The PAT, node and managed
-// callers ignore the header entirely (L8: their behavior is unchanged).
+func teamPhrase(team string) string {
+	if team == controlplane.FleetTeam {
+		return "all teams"
+	}
+	return "team " + team
+}
+
+// selectTeam is team selection (§5.3, D13). The header selects among the
+// bindings the verified credential already holds; it never grants one.
+// Without the header the first binding stands (Access arrives scoped to
+// it). An OIDC token can match several identity-file bindings and selects
+// the first whose team the header names; an avm_ token has one binding, so
+// the header must name it. Naming a team only a fleet binding covers is
+// refused rather than silently narrowed: a fleet binding's team is "*",
+// never a team name (design review DR2). The PAT, node and managed callers
+// ignore the header entirely (L8: their behavior is unchanged).
+//
+// Selection runs per request, after any cache: the verified-token cache
+// stores the binding set, never the selected team (eng review E7). A
+// forwarded request carries the team the edge resolved
+// (cluster.StampForward), so the owner node re-applies the same selection
+// offline (L2).
 func selectTeam(r *http.Request, a controlplane.Access) (controlplane.Access, error) {
 	header := r.Header.Get(headerTeamKey)
 	if header == "" {
@@ -309,12 +338,16 @@ func selectTeam(r *http.Request, a controlplane.Access) (controlplane.Access, er
 	if !identitywire.ValidTeamName(team) {
 		return a, errBadTeamHeader
 	}
-	// A fleet credential's team is "*", which is never a valid team name, so
-	// naming a team on it refuses rather than silently narrowing.
-	if bound := a.Team(); team != bound {
-		return a, &teamNotBoundError{team: team, role: a.Role, bound: bound}
+	bindings := a.Bindings
+	if len(bindings) == 0 {
+		bindings = []controlplane.TeamBinding{{Role: a.Role, Team: a.Team()}}
 	}
-	return a, nil
+	for _, b := range bindings {
+		if b.Team == team {
+			return b.Apply(a), nil
+		}
+	}
+	return a, &teamNotBoundError{team: team, bindings: bindings}
 }
 
 // authFailure is a refused request, after reason mapping.
@@ -335,16 +368,30 @@ type authFailure struct {
 	// not the credential, refused the request; hasCaller says it is set.
 	caller    controlplane.Access
 	hasCaller bool
+	// noBinding is set on a "no binding" 403 for a verified OIDC token: v1
+	// adds its fields (reason, issuer, name, groups) to the body (DR8).
+	noBinding *controlplane.NoBindingError
 }
 
 // identityStaleRetryAfter is the Retry-After of a stale-mirror 503: about
 // one mirror poll, after which the node may have synced.
 const identityStaleRetryAfter = 5
 
-// mapAuthFailure is reason mapping (D17 for 401s, D9 for 403s). Only an avm_
-// token or a JWT refusal with a known reason tells the caller why. The PAT,
-// the managed provider and an unrecognised bearer keep today's bare 401,
-// even if a provider returns a CredentialError.
+// identityUnavailableMessage is the 503 text for a JWT this node cannot
+// check right now (the identity file is invalid, or the issuer's keys could
+// not be fetched). It names no detail: the caller is unauthenticated, and
+// the operator has the log line and the metrics.
+const identityUnavailableMessage = "sign-in with an identity provider is unavailable on this server right now; retry shortly, or use an API token"
+
+// identityUnavailableRetryAfter is the Retry-After on that 503, in seconds:
+// about half the JWKS refetch gap.
+const identityUnavailableRetryAfter = 30
+
+// mapAuthFailure is reason mapping (D17 for 401s, D9 for 403s, 503 when this
+// node cannot vouch for a named credential right now). Only an avm_ token or
+// a JWT refusal with a known reason tells the caller why. The PAT, the
+// managed provider and an unrecognised bearer keep today's bare 401, even if
+// a provider returns a CredentialError.
 func mapAuthFailure(linkKind string, err error) *authFailure {
 	if ce, ok := controlplane.AsCredentialError(err); ok {
 		switch ce.Kind {
@@ -355,6 +402,9 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		}
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "rejected"}
 	}
+	if nb, ok := controlplane.AsNoBindingError(err); ok {
+		return &authFailure{status: http.StatusForbidden, kind: linkKind, reason: nb.Reason(), message: noBindingMessage(nb), noBinding: nb}
+	}
 	var notBound *teamNotBoundError
 	switch {
 	case errors.Is(err, controlplane.ErrIdentityStale):
@@ -362,6 +412,11 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		// now (§5.4): the credential may be fine, so 503, not 401.
 		return &authFailure{status: http.StatusServiceUnavailable, kind: linkKind, reason: "stale",
 			message: "identity data is stale on this node; retry shortly", retryAfter: identityStaleRetryAfter}
+	case errors.Is(err, controlplane.ErrIdentityUnavailable):
+		// No good identity file, or the issuer's keys could not be fetched
+		// (§5.5, §11): the token may be fine, so 503, not 401.
+		return &authFailure{status: http.StatusServiceUnavailable, kind: linkKind, reason: "unavailable",
+			message: identityUnavailableMessage, retryAfter: identityUnavailableRetryAfter}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
@@ -383,6 +438,10 @@ type authSurface struct {
 	// write writes status with message; reason is non-empty only for a D17
 	// 401 and adds the body's `reason` field.
 	write func(w http.ResponseWriter, status int, message, reason string)
+	// writeNoBinding, when set, writes the "no binding" 403 with its
+	// structured fields (DR8). Surfaces without it (the E2B and Runloop
+	// facades) keep their own body shape and carry the hint in the message.
+	writeNoBinding func(w http.ResponseWriter, message string, nb *controlplane.NoBindingError)
 }
 
 var (
@@ -395,6 +454,15 @@ var (
 				return
 			}
 			apihttp.WriteJSON(w, status, models.ErrorResponse{Error: message, Reason: reason})
+		},
+		writeNoBinding: func(w http.ResponseWriter, message string, nb *controlplane.NoBindingError) {
+			apihttp.WriteJSON(w, http.StatusForbidden, models.ErrorResponse{
+				Error:  message,
+				Reason: nb.Reason(),
+				Issuer: nb.Issuer,
+				Name:   nb.Name,
+				Groups: nb.Groups,
+			})
 		},
 	}
 	e2bSurface = authSurface{
@@ -467,6 +535,10 @@ func withCorrelationID(ctx context.Context, r *http.Request) context.Context {
 func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure) {
 	if f.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(f.retryAfter))
+	}
+	if f.noBinding != nil && surface.writeNoBinding != nil {
+		surface.writeNoBinding(w, f.message, f.noBinding)
+		return
 	}
 	if f.status != http.StatusUnauthorized {
 		surface.write(w, f.status, f.message, "")

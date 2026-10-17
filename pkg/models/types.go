@@ -1360,8 +1360,10 @@ type ErrorResponse struct {
 	// Reason is the standard refusal reason on a 401 for an avm_ token or a
 	// JWT (expired, not_yet_valid, wrong_audience, ...; plans/
 	// identity-and-access.md D17), mirrored in the RFC 6750 WWW-Authenticate
-	// error_description. Absent on every other error, including the operator
-	// token's 401, so those bodies are byte for byte unchanged.
+	// error_description. On a 403 for a verified OIDC token that matched no
+	// role binding it is no_binding or group_overage (design review DR8).
+	// Absent on every other error, including the operator token's 401, so
+	// those bodies are byte for byte unchanged.
 	Reason string `json:"reason,omitempty"`
 	// RequiredPermission and Role are set only on a 403 for an avm_ token or
 	// an OIDC caller (plans/identity-and-access.md §5.3, D9): the permission
@@ -1370,6 +1372,15 @@ type ErrorResponse struct {
 	// are byte for byte unchanged.
 	RequiredPermission string `json:"required_permission,omitempty"`
 	Role               string `json:"role,omitempty"`
+	// Issuer, Name and Groups are set only on the "no binding" 403 (Reason
+	// no_binding or group_overage): the identity-file name of the issuer
+	// the caller signed in through, the caller's display name, and the
+	// groups the caller's token carried (none on group_overage). All three
+	// are the caller's own claims, so the dashboard and the CLI can show
+	// what an admin needs to add a binding (D9, DR8).
+	Issuer string   `json:"issuer,omitempty"`
+	Name   string   `json:"name,omitempty"`
+	Groups []string `json:"groups,omitempty"`
 }
 
 // WhoAmI is the body of GET /v1/whoami: the caller's own resolved identity
