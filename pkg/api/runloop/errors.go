@@ -13,6 +13,10 @@ import (
 // `message`, Python prints the whole body.
 type errorResponse struct {
 	Message string `json:"message"`
+	// Reason is set only on a 401 for a refused avm_ token or JWT
+	// (plans/identity-and-access.md D17); every other body omits it, so
+	// existing responses are byte for byte unchanged.
+	Reason string `json:"reason,omitempty"`
 }
 
 type requestError struct {
@@ -44,12 +48,19 @@ func notImplemented(message string) error {
 // Without it a 501 or a permanent conflict costs the caller ~30s of
 // pointless retries before the error surfaces.
 func WriteError(w http.ResponseWriter, status int, message string) {
+	WriteErrorReason(w, status, message, "")
+}
+
+// WriteErrorReason is WriteError with the D17 refusal reason in the body
+// (omitted when empty). The API edge sets the matching WWW-Authenticate
+// header before calling it.
+func WriteErrorReason(w http.ResponseWriter, status int, message, reason string) {
 	if !retryable(status) {
 		w.Header().Set("x-should-retry", "false")
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{Message: message})
+	_ = json.NewEncoder(w).Encode(errorResponse{Message: message, Reason: reason})
 }
 
 // retryable reports whether a status the SDKs would retry is worth

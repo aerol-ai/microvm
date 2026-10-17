@@ -40,6 +40,11 @@ type Server struct {
 	root            http.Handler
 	mcp             *remotemcp.Handler
 
+	// authChain is the ordered authenticator list authenticate() tries
+	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
+	// default PAT-then-provider chain.
+	authChain []authLink
+
 	// Facade config, read once from config.Config (not per request in the
 	// facades). Each facade parses its own format.
 	daytonaDefaultImage     string
@@ -52,6 +57,8 @@ type Server struct {
 // validation path; pass controlplane.Noop().Validator (or any rejecting
 // validator) for the open-source PAT-only behavior. A nil validator is treated
 // as reject-all so callers can't accidentally open the door by omission.
+// opts adds named-credential authenticators (WithCredentialAuthenticator),
+// which take effect only with cfg.IdentityEnabled.
 //
 // builder is the image builder the service builds with (every surface's
 // builds go through service.BuildImage). On the dockerd engine this is the
@@ -59,9 +66,18 @@ type Server struct {
 // buildkit-backed builder. A nil builder falls back to dockerClient so
 // existing docker-only callers are unaffected; when both are nil the build
 // endpoints return 503 (builder not configured).
-func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder service.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator) *Server {
+func NewServer(logger *slog.Logger, service *service.Service, dockerClient *docker.Client, builder service.ImageBuilder, cfg config.Config, patToken string, validator controlplane.Validator, opts ...ServerOption) *Server {
 	if validator == nil {
 		validator = controlplane.Noop().Validator
+	}
+	var options serverOptions
+	for _, opt := range opts {
+		opt(&options)
+	}
+	if !cfg.IdentityEnabled {
+		// Identity off is byte for byte the pre-identity server (L8): no
+		// avm_ or JWT authenticator, whatever the caller passed.
+		options.credentials = nil
 	}
 	// A nil *docker.Client wrapped in the interface would be a non-nil
 	// interface holding a nil pointer, defeating the handlers' `Builder == nil`
@@ -78,6 +94,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
+		authChain:       buildAuthChain(patToken, validator, options.credentials),
 		clusterEnabled:  cfg.EnableCluster,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,

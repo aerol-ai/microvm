@@ -4209,7 +4209,7 @@ func TestRefanoutReconcileAndAuthorizeWave32(t *testing.T) {
 	if _, err := svc.AuthorizeSandboxAuditAccess(foreign, "sb-auth32", "inc-a"); err == nil {
 		t.Fatal("foreign owner was authorized")
 	}
-	op := controlplane.ContextWithAccess(ctx, controlplane.Access{Operator: true})
+	op := controlplane.ContextWithAccess(ctx, controlplane.Access{Fleet: true})
 	if _, err := svc.AuthorizeSandboxAuditAccess(op, "missing-auth32", "inc-a"); err == nil {
 		t.Fatal("operator authorized a missing sandbox")
 	}

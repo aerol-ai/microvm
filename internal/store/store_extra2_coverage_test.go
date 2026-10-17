@@ -249,8 +249,8 @@ func TestStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListReadyWasmModuleRefs(ctx)
 	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
 	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")
-	_, _ = st.GetWasmModule(ctx, "id")
+	_, _ = st.GetWasmModule(ctx, "", "id")
 	_, _ = st.ListWasmModules(ctx)
-	_ = st.DeleteWasmModule(ctx, "id")
+	_ = st.DeleteWasmModule(ctx, "", "id")
 	_ = st.CompareCloneGeneration(ctx, "sb", "gen")
 }

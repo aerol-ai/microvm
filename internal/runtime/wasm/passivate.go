@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	wasmengine "github.com/aerol-ai/microvm/pkg/wasm"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 // RehydrateSandbox reloads a passivated sandbox from mem.snap (§4.3).
@@ -51,8 +52,9 @@ func (d *Driver) RehydrateSandbox(ctx context.Context, sandbox *models.Sandbox, 
 	moduleRef := sandbox.ModuleRef
 	if d.resolver != nil && moduleRef != "" {
 		// Rehydrate the digest pinned at create, not the current alias/tag
-		// target (codex C2). Fails loudly on drift with no frozen copy.
-		resolved, resolveErr := d.resolvePinned(ctx, moduleRef, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
+		// target (codex C2). Fails loudly on drift with no frozen copy. A
+		// catalogue id resolves in the sandbox owner's namespace.
+		resolved, resolveErr := d.resolvePinned(wasmmod.WithCatalogueOwner(ctx, sandbox.OwnerRef), moduleRef, sandbox.ModuleDigest, moduleAuthFromSandbox(sandbox))
 		if resolveErr != nil {
 			return nil, resolveErr
 		}

@@ -128,7 +128,7 @@ func TransportFromCluster(c cluster.Client) Transport {
 // OwnerRefFromContext returns the tenant OwnerRef for non-operator callers.
 func OwnerRefFromContext(ctx context.Context) string {
 	access, ok := controlplane.AccessFromContext(ctx)
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return ""
 	}
 	return strings.TrimSpace(access.Identity.OwnerRef)

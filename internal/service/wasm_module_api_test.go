@@ -101,7 +101,7 @@ func TestRegisterWasmModuleCatalogueSkipsEmptyPath(t *testing.T) {
 		ModuleRef:    "python",
 		ModuleDigest: "pydigest",
 	}, "", 0)
-	if _, err := st.GetWasmModule(ctx, "python"); err == nil {
+	if _, err := st.GetWasmModule(ctx, "", "python"); err == nil {
 		t.Fatal("catalogue row with empty path must not be registered")
 	}
 }
@@ -414,7 +414,7 @@ func TestWasmModuleAPIEdgeBranches(t *testing.T) {
 	if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ID: "failed", ModuleRef: "file:///tmp/fail.wasm"}); err == nil || !strings.Contains(err.Error(), "resolve wasm module") {
 		t.Fatalf("resolver failure = %v", err)
 	}
-	failed, err := st.GetWasmModule(ctx, "failed")
+	failed, err := st.GetWasmModule(ctx, "", "failed")
 	if err != nil {
 		t.Fatalf("GetWasmModule failed row: %v", err)
 	}

@@ -20,7 +20,7 @@ import (
 // the "no Access ⇒ unscoped" default lives in a single audited spot.
 func ownerScope(ctx context.Context) (owner string, scoped bool) {
 	access, ok := controlplane.AccessFromContext(ctx)
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return "", false
 	}
 	return access.Identity.OwnerRef, true

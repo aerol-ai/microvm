@@ -21,7 +21,7 @@ func TestWithAuthOperatorNilAuthAndTenant(t *testing.T) {
 	}
 
 	okReq := httptest.NewRequest(http.MethodGet, "/", nil)
-	okReq = okReq.WithContext(controlplane.ContextWithAccess(okReq.Context(), controlplane.Access{Operator: true}))
+	okReq = okReq.WithContext(controlplane.ContextWithAccess(okReq.Context(), controlplane.Access{Fleet: true}))
 	okRR := httptest.NewRecorder()
 	h.ServeHTTP(okRR, okReq)
 	if okRR.Code != http.StatusNoContent {

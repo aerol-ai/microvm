@@ -123,7 +123,7 @@ func TestUpsertWasmModuleUpdatesExisting(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertWasmModule update: %v", err)
 	}
-	got, err := st.GetWasmModule(ctx, "mod-up")
+	got, err := st.GetWasmModule(ctx, "", "mod-up")
 	if err != nil {
 		t.Fatalf("GetWasmModule: %v", err)
 	}
@@ -442,9 +442,9 @@ func TestWasmStoreClosedDBErrors(t *testing.T) {
 	_, _ = st.ListReadyWasmModuleRefs(ctx)
 	_, _ = st.ListWasmModulesOlderThan(ctx, time.Now())
 	_, _ = st.IsWasmDigestCatalogued(ctx, "dig")
-	_, _ = st.GetWasmModule(ctx, "id")
+	_, _ = st.GetWasmModule(ctx, "", "id")
 	_, _ = st.ListWasmModules(ctx)
-	_ = st.DeleteWasmModule(ctx, "id")
+	_ = st.DeleteWasmModule(ctx, "", "id")
 	_, _ = st.IsWasmModuleReferenced(ctx, "id", "ref", "dig")
 	_, _ = st.WasmDigestsInUse(ctx, []string{"dig"})
 	_, _ = st.ReleaseOrphanedFirecrackerVMMSlots(ctx, time.Now())

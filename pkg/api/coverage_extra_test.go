@@ -68,7 +68,7 @@ func TestRequireE2BAuthAcceptsUserToken(t *testing.T) {
 	handler := server.requireE2BAuth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		access, ok := controlplane.AccessFromContext(r.Context())
-		if !ok || access.Operator || access.Identity.OwnerRef != "tenant-1" {
+		if !ok || access.Fleet || access.Identity.OwnerRef != "tenant-1" {
 			t.Fatalf("unexpected access: %+v ok=%v", access, ok)
 		}
 		w.WriteHeader(http.StatusNoContent)

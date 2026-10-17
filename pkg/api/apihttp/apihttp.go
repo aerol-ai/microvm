@@ -125,9 +125,14 @@ func WriteStoreAwareError(logger *slog.Logger, w http.ResponseWriter, err error)
 // inside an auth middleware, which marks PAT and cluster-peer calls as the
 // operator; a user token authenticates but is scoped to its account, so it
 // never reaches what this wraps: fleet-wide and cluster-internal routes.
+//
+// It checks Access.Fleet. Today only the PAT's operator and node principals
+// are fleet-wide, so this is the same gate as before the rename. Task T2
+// replaces it with the fleet.admin permission before any non-admin fleet
+// principal (a viewer or auditor bound to "*") can exist.
 func RequireOperator(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if access, ok := controlplane.AccessFromContext(r.Context()); !ok || !access.Operator {
+		if access, ok := controlplane.AccessFromContext(r.Context()); !ok || !access.Fleet {
 			WriteError(w, http.StatusForbidden, "operator authorization required")
 			return
 		}

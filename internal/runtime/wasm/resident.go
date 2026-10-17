@@ -73,10 +73,17 @@ func createWantsPublicExpose(req models.CreateSandboxRequest) bool {
 }
 
 // ownerRefFromCreateCtx mirrors service.ownerRefForCreate without importing
-// internal/service: non-operator Access → OwnerRef; operator/empty → "".
+// internal/service: non-operator Access → OwnerRef; operator/empty → "". The
+// owner the service pinned for the create (wasmmod.WithCatalogueOwner) wins:
+// it is the owner the sandbox row will carry, which a caller-less failover
+// recreate knows only from its placement, and it must not land that tenant's
+// instance in the operator's shared bucket.
 func ownerRefFromCreateCtx(ctx context.Context) string {
+	if owner, ok := wasmmod.CatalogueOwner(ctx); ok {
+		return owner
+	}
 	access, ok := controlplane.AccessFromContext(ctx)
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return ""
 	}
 	return strings.TrimSpace(access.Identity.OwnerRef)
