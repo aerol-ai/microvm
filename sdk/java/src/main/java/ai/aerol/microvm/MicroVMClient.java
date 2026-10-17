@@ -27,6 +27,10 @@ import ai.aerol.microvm.internal.StreamingWebSocket;
 import ai.aerol.microvm.internal.StreamingWebSocketListener;
 import ai.aerol.microvm.internal.WebSocketConnector;
 import ai.aerol.microvm.internal.api.v1.Paths;
+import ai.aerol.microvm.model.ApiTokenList;
+import ai.aerol.microvm.model.CreateApiTokenOptions;
+import ai.aerol.microvm.model.CreatedApiToken;
+import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
 import ai.aerol.microvm.model.EgressProfile;
 import ai.aerol.microvm.model.EgressProfileList;
@@ -80,7 +84,12 @@ import ai.aerol.microvm.model.WasmModule;
 public class MicroVMClient {
     static final String DEFAULT_API_URL = "http://127.0.0.1:21212";
     static final String DEFAULT_API_VERSION = "v1";
-    static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
+    static final String AUTH_REQUIRED_ERROR_MESSAGE = "PAT token is required. Set patToken, SB_PAT_TOKEN or SB_API_TOKEN.";
+    /**
+     * The request header that selects which of a credential's teams a request
+     * acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+     */
+    public static final String TEAM_HEADER = "X-AerolVM-Team";
     private static final int STREAM_PREFIX_STDOUT = 0x01;
     private static final int STREAM_PREFIX_STDERR = 0x02;
 
@@ -90,6 +99,7 @@ public class MicroVMClient {
 
     private final String apiUrl;
     private final String patToken;
+    private final String team;
     private final String apiVersion;
     private final String versionPrefix;
     private final HttpClient httpClient;
@@ -120,10 +130,17 @@ public class MicroVMClient {
         String configuredPatToken = trimToNull(effectiveConfig.patToken);
         String configuredApiUrl = trimToNull(effectiveConfig.apiUrl);
         String configuredApiVersion = trimToNull(effectiveConfig.apiVersion);
+        // SB_API_TOKEN is an alias of SB_PAT_TOKEN for any bearer; SB_PAT_TOKEN
+        // wins when both are set, so existing setups keep the token they had.
         String envPatToken = trimToNull(environment.get("SB_PAT_TOKEN"));
+        if (envPatToken == null) {
+            envPatToken = trimToNull(environment.get("SB_API_TOKEN"));
+        }
         String envApiUrl = trimToNull(environment.get("SB_API_URL"));
+        String configuredTeam = trimToNull(effectiveConfig.team);
 
         this.patToken = configuredPatToken != null ? configuredPatToken : envPatToken != null ? envPatToken : "";
+        this.team = configuredTeam != null ? configuredTeam : trimToNull(environment.get("SB_TEAM"));
         this.apiUrl = normalizeUrl(configuredApiUrl != null ? configuredApiUrl : envApiUrl != null ? envApiUrl : DEFAULT_API_URL);
         this.apiVersion = configuredApiVersion != null ? configuredApiVersion : DEFAULT_API_VERSION;
         String prefix = PATH_PREFIXES.get(this.apiVersion);
@@ -156,6 +173,79 @@ public class MicroVMClient {
 
     public String getPatToken() {
         return patToken;
+    }
+
+    /** The team sent as {@code X-AerolVM-Team}, or null when none is. */
+    public String getTeam() {
+        return team;
+    }
+
+    /**
+     * Who the server says the caller is: principal, role, team and when the
+     * credential expires. Every valid credential may ask.
+     */
+    public WhoAmI whoami() {
+        WhoAmI who = doJson("GET", versioned("/whoami"), null, WhoAmI.class);
+        if (who == null) {
+            who = new WhoAmI();
+        }
+        if (who.principal == null) {
+            who.principal = new ai.aerol.microvm.model.WhoAmIPrincipal();
+        }
+        return who;
+    }
+
+    /** Scoped API tokens ({@code avm_…}) for services and CI: {@code client.tokens().create/list/revoke}. */
+    public Tokens tokens() {
+        return new Tokens();
+    }
+
+    /**
+     * Scoped API tokens, reached through {@link MicroVMClient#tokens()}.
+     * Creating and revoking needs an admin credential; listing needs an
+     * auditor or an admin.
+     */
+    public final class Tokens {
+        private Tokens() {
+        }
+
+        /**
+         * Mints a token. The result's {@code token} is the secret, returned
+         * this once and never again. A 409 means the name is taken, possibly
+         * by an earlier attempt whose reply was lost; that secret cannot be
+         * recovered, so revoke the token and create it again.
+         */
+        public CreatedApiToken create(CreateApiTokenOptions options) {
+            CreateApiTokenOptions body = options == null ? new CreateApiTokenOptions() : options;
+            return doJson("POST", versioned("/tokens"), body, CreatedApiToken.class);
+        }
+
+        /**
+         * Lists every token, expired ones included ({@code expired} is true)
+         * until the server removes them 30 days after expiry. Never a secret.
+         */
+        public ApiTokenList list() {
+            ApiTokenList list = doJson("GET", versioned("/tokens"), null, ApiTokenList.class);
+            if (list == null) {
+                list = new ApiTokenList();
+            }
+            if (list.tokens == null) {
+                list.tokens = new ArrayList<>();
+            }
+            return list;
+        }
+
+        /**
+         * Revokes a token by id ({@code tok_…}). Revoking one that is already
+         * gone succeeds, so a retried revoke is safe.
+         */
+        public void revoke(String id) {
+            String trimmed = trimToNull(id);
+            if (trimmed == null) {
+                throw new MicroVMException("token id is required");
+            }
+            doNoContent("DELETE", versioned("/tokens/" + encodePathSegment(trimmed)), null);
+        }
     }
 
     public Sandbox create(CreateOptions options) {
@@ -1018,7 +1108,7 @@ public class MicroVMClient {
             }
         };
 
-        StreamingWebSocket socket = webSocketConnector.connect(webSocketUri(sandboxPath(sandboxId) + "/toolbox/process/exec/stream"), authorizationHeaderValue(), listener);
+        StreamingWebSocket socket = webSocketConnector.connect(webSocketUri(sandboxPath(sandboxId) + "/toolbox/process/exec/stream"), webSocketHeaders(), listener);
         socketRef.set(socket);
         socket.sendText(JsonSupport.write(effective));
         return new ExecStreamHandle(socket, completion);
@@ -1138,7 +1228,7 @@ public class MicroVMClient {
 
         StreamingWebSocket socket = webSocketConnector.connect(
             webSocketUri(sandboxPath(sandboxId) + "/sessions/" + encodePathSegment(sessionId) + "/attach"),
-            authorizationHeaderValue(),
+            webSocketHeaders(),
             listener
         );
         socketRef.set(socket);
@@ -1265,6 +1355,9 @@ public class MicroVMClient {
                 }
             }
             builder.header("Authorization", authorizationHeaderValue());
+            if (team != null) {
+                builder.header(TEAM_HEADER, team);
+            }
 
             try {
                 HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
@@ -1339,6 +1432,16 @@ public class MicroVMClient {
 
     private String authorizationHeaderValue() {
         return "Bearer " + patToken;
+    }
+
+    /** The WebSocket handshake headers: the same credential and team as every HTTP request. */
+    private Map<String, String> webSocketHeaders() {
+        Map<String, String> headers = new java.util.LinkedHashMap<>();
+        headers.put("Authorization", authorizationHeaderValue());
+        if (team != null) {
+            headers.put(TEAM_HEADER, team);
+        }
+        return headers;
     }
 
     private String sandboxPath(String sandboxId) {
