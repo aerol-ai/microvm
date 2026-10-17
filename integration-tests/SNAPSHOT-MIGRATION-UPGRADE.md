@@ -66,22 +66,35 @@ ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP \
 ### 4. Back up, then upgrade the binary in place
 
 ```bash
-# pre-upgrade backup (rollback floor — the migration is one-way)
-ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP \
-  "sudo bash -s" < ../scripts/sandboxd-backup.sh --out /tmp/pre-upgrade.tar.gz
+# Stop the daemon first so the DB is quiesced (a clean stop checkpoints the WAL,
+# so state.db alone is a complete copy).
+ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP "sudo systemctl stop sandboxd"
 
-# build the new sandboxd from the release candidate (this branch's main) and copy it
-make build                                      # -> bin/sandboxd
-scp -i ~/.ssh/suman-saurabh-aws.pem bin/sandboxd ubuntu@$IP:/tmp/sandboxd.new
+# pre-upgrade backup (rollback floor — the migration is one-way). /var/lib/sandboxd
+# is root-only (0700), so the glob must expand AS ROOT (sudo bash -c), not as the
+# login user, or it silently matches nothing.
+ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP \
+  "sudo bash -c 'mkdir -p /tmp/pre-upgrade && cp -a /var/lib/sandboxd/state.db* /tmp/pre-upgrade/'"
+
+# Build a LINUX/AMD64 sandboxd (the node's arch) — NOT `make build`, which builds
+# for the host (e.g. darwin/arm64). itest-build cross-compiles via zig and drops
+# the binary under integration-tests/.build/<build-id>/.
+make itest-build
+BIN=$(ls -t integration-tests/.build/*/sandboxd_linux_amd64 | head -1)
+file "$BIN"                                      # expect: ELF 64-bit ... x86-64
+scp -i ~/.ssh/suman-saurabh-aws.pem "$BIN" ubuntu@$IP:/tmp/sandboxd.new
 ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP '
-  sudo systemctl stop sandboxd &&
   sudo install -m0755 /tmp/sandboxd.new /usr/local/bin/sandboxd &&
   sudo systemctl start sandboxd &&
-  sleep 3 && sudo systemctl is-active sandboxd'
+  sleep 6 && sudo systemctl is-active sandboxd'
 ```
 
 > Match the binary's GOARCH to the node (amd64 vs arm64). For arm64 metal use the
 > cross-compile recipe in `project_containerd_engine_shipped` / `lib/build.sh`.
+> The node may not ship `sqlite3`; `sudo apt-get install -y sqlite3` once for the
+> schema checks below. `sandboxd --version` loads config (needs `SB_PAT_TOKEN`),
+> so confirm the starting point from the schema (old = `name` PK, no alias
+> `owner_ref`), not from the binary.
 
 ### 5. Verify the rebuild preserved everything
 
@@ -110,7 +123,8 @@ ssh -i ~/.ssh/suman-saurabh-aws.pem ubuntu@$IP \
 Then prove behaviour end to end against the API:
 - `GET /v1/snapshots/{name}` for each seeded name → 200
 - `GET /v1/snapshots` lists all of them
-- create a sandbox `{"image": "<seeded snapshot name>"}` → reaches running
+- create a sandbox `{"image": "<seeded snapshot name>"}` → reaches `running`/`started`
+  (proves the name resolves under the rebuilt `(owner_ref, name)` PK)
 - `DELETE /v1/snapshots/{name}` → 204, then `GET` → 404
 
 ### 6. Idempotency
