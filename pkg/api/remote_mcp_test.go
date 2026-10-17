@@ -108,12 +108,14 @@ func TestRemoteMCPThroughRealAPI(t *testing.T) {
 // installers write must list it.
 // The stock Caddy configs answer anything outside their @api matcher with a
 // 404 of their own, so every surface sandboxd mounts must be listed there —
-// each facade's prefix and everything under it, and the two public
-// discovery documents (§5.6 sign-in discovery; §5.14 RFC 9728 metadata, in
-// both its root and path forms, through one prefix matcher).
+// each facade's prefix and everything under it, the two public discovery
+// documents (§5.6 sign-in discovery; §5.14 RFC 9728 metadata, in both its
+// root and path forms, through one prefix matcher), and the dashboard, so
+// https://<api-domain>/ui is an address identity providers accept as a
+// sign-in redirect (CEO review D18).
 func TestCaddyForwardsEverySurface(t *testing.T) {
 	want := []string{remotemcp.Path, identitywire.AuthDiscoveryPath, "/.well-known/oauth-protected-resource*"}
-	for _, prefix := range []string{v1.PathPrefix, daytona.PathPrefix, e2b.PathPrefix, runloop.PathPrefix} {
+	for _, prefix := range []string{v1.PathPrefix, daytona.PathPrefix, e2b.PathPrefix, runloop.PathPrefix, dashboardPath} {
 		want = append(want, prefix, prefix+"/*")
 	}
 	for _, file := range []string{"../../scripts/install.sh", "../../packaging/Caddyfile.template"} {
