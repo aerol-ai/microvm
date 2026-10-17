@@ -57,7 +57,8 @@ type ModuleResolver struct {
 	// per-tenant override can be passed to ResolveWithAuth (failover, BYO).
 	Auth ModuleAuth
 	// CatalogueLookup resolves a BYO catalogue id to an already-local path +
-	// digest. Optional; nil disables step 3.
+	// digest. Optional; nil disables step 3. Catalogue ids are per owner, so
+	// the lookup reads the namespace from ctx (see WithCatalogueOwner).
 	CatalogueLookup func(ctx context.Context, id string) (path, digest string, ok bool)
 
 	// pullGroup collapses concurrent oci:// blob downloads of the same manifest
@@ -67,6 +68,24 @@ type ModuleResolver struct {
 	// Keyed on the manifest digest, NOT the ref, so each caller has already
 	// passed its own credentialed manifest resolve before joining the group.
 	pullGroup singleflight.Group
+}
+
+type catalogueOwnerKey struct{}
+
+// WithCatalogueOwner pins the owner namespace a CatalogueLookup resolves a
+// catalogue id in. Booting an existing sandbox (start, rehydrate, failover
+// recreate) often runs on an internal context with no caller identity, yet
+// must resolve the id in the namespace of the sandbox's owner, not the
+// operator's. Only in-process code sets it; no request field reaches it.
+func WithCatalogueOwner(ctx context.Context, ownerRef string) context.Context {
+	return context.WithValue(ctx, catalogueOwnerKey{}, strings.TrimSpace(ownerRef))
+}
+
+// CatalogueOwner returns the namespace pinned by WithCatalogueOwner, and
+// false when none was pinned (the lookup then uses the caller's identity).
+func CatalogueOwner(ctx context.Context) (string, bool) {
+	owner, ok := ctx.Value(catalogueOwnerKey{}).(string)
+	return owner, ok
 }
 
 // NewModuleResolver builds a chokepoint over modulesDir. cacheDir defaults to

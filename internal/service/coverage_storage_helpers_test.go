@@ -379,7 +379,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		svc.registerWasmModuleCatalogue(ctx, nil, "/module", 1)
 		svc.registerWasmModuleCatalogue(ctx, &models.Sandbox{ID: "sb-docker", Runtime: models.RuntimeDocker, ModuleRef: "file:///tmp/x"}, "/module", 1)
 		svc.registerWasmModuleCatalogue(ctx, &models.Sandbox{ID: "sb-empty", Runtime: models.RuntimeWasm}, "/module", 1)
-		if _, err := st.GetWasmModule(ctx, "sb-docker"); err == nil {
+		if _, err := st.GetWasmModule(ctx, "", "sb-docker"); err == nil {
 			t.Fatal("registerWasmModuleCatalogue should not write non-WASM row")
 		}
 
@@ -391,7 +391,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 			ModuleDigest:     "sha256:abc",
 			ContainerCommand: []string{"entry"},
 		}, "/module", 42)
-		rec, err := st.GetWasmModule(ctx, "sha256:abc")
+		rec, err := st.GetWasmModule(ctx, "", "sha256:abc")
 		if err != nil {
 			t.Fatalf("GetWasmModule: %v", err)
 		}
@@ -422,7 +422,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		if _, err := enabled.CreateWasmModule(ctx, models.CreateWasmModuleRequest{ID: "explicit", ModuleRef: "file:///tmp/mod.wasm"}); err == nil {
 			t.Fatal("CreateWasmModule should fail on resolver error")
 		}
-		if rec, err := st.GetWasmModule(ctx, "explicit"); err != nil || rec.Status != string(models.WasmModuleStatusFailed) {
+		if rec, err := st.GetWasmModule(ctx, "", "explicit"); err != nil || rec.Status != string(models.WasmModuleStatusFailed) {
 			t.Fatalf("failed module row = %+v, %v", rec, err)
 		}
 
@@ -494,7 +494,7 @@ func TestStorageAndWasmHelperCoverage(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		svc.runWasmModuleGC(ctx, time.Now().UTC())
 
-		if _, err := st.GetWasmModule(ctx, "mod-1"); !errors.Is(err, store.ErrNotFound) {
+		if _, err := st.GetWasmModule(ctx, "", "mod-1"); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("module row still exists after GC: %v", err)
 		}
 	})

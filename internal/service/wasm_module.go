@@ -45,7 +45,9 @@ func (s *Service) registerWasmModuleCatalogue(ctx context.Context, sandbox *mode
 		HasWarm:         s.cfg.WasmPoolEnabled,
 		// The catalogue row inherits the sandbox's owner, so an auto-registered
 		// module is scoped to the tenant that created the sandbox — not left as
-		// "" (operator-published, visible to everyone).
+		// "" (operator-published, visible to everyone). Rows are keyed by
+		// (owner, id), so this upsert can only refresh the owner's own row,
+		// never rewrite another owner's row that shares the digest id.
 		OwnerRef:  sandbox.OwnerRef,
 		CreatedAt: now,
 		ReadyAt:   &now,

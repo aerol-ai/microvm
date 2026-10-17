@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -98,6 +100,61 @@ func TestWireWasmRuntime_CatalogueLookupNotReady(t *testing.T) {
 	}, testLogger(), svc, st)
 	if _, _, ok := resolver.CatalogueLookup(ctx, "pending-1"); ok {
 		t.Fatal("pending catalogue row must not resolve")
+	}
+}
+
+// T0b through the wired resolver: a catalogue id resolves in the booting
+// owner's namespace first, then to the operator-published row, and never to
+// another owner's row; a pinned sandbox owner wins on a caller-less context.
+func TestWireWasmRuntime_CatalogueLookupPerOwner(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	modulesDir := t.TempDir()
+	now := time.Now().UTC()
+	for _, rec := range []store.WasmModuleRecord{
+		{OwnerRef: "", ID: "shared", Digest: "d-op"},
+		{OwnerRef: "acct-a", ID: "shared", Digest: "d-a"},
+		{OwnerRef: "acct-b", ID: "b-only", Digest: "d-b"},
+	} {
+		rec.Status, rec.CreatedAt, rec.UpdatedAt = "ready", now, now
+		rec.ModulePath = wasmmod.WriteMinimalWasm(t, modulesDir, rec.Digest+".wasm")
+		if err := st.UpsertWasmModule(ctx, rec); err != nil {
+			t.Fatalf("UpsertWasmModule: %v", err)
+		}
+	}
+	var resolver *wasmmod.ModuleResolver
+	wasmWiringTestHook = func(r *wasmmod.ModuleResolver) { resolver = r }
+	t.Cleanup(func() { wasmWiringTestHook = nil })
+	_ = wireWasmRuntime(ctx, config.Config{WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir()}, testLogger(), svc, st)
+
+	tenant := func(owner string) context.Context {
+		return controlplane.ContextWithAccess(ctx, controlplane.Access{Identity: controlplane.Identity{OwnerRef: owner}})
+	}
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		id         string
+		wantDigest string // "" means not found
+	}{
+		{"own row first", tenant("acct-a"), "shared", "d-a"},
+		{"operator row fallback", tenant("acct-b"), "shared", "d-op"},
+		{"other owner's row", tenant("acct-a"), "b-only", ""},
+		{"pinned sandbox owner", wasmmod.WithCatalogueOwner(ctx, "acct-b"), "b-only", "d-b"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolver.Resolve(tc.ctx, tc.id)
+			if tc.wantDigest == "" {
+				if !errors.Is(err, wasmmod.ErrModuleNotFound) {
+					t.Fatalf("Resolve = %+v, %v; want ErrModuleNotFound", got, err)
+				}
+				return
+			}
+			if err != nil || got.Digest != tc.wantDigest {
+				t.Fatalf("Resolve = %+v, %v; want digest %s", got, err, tc.wantDigest)
+			}
+		})
 	}
 }
 
