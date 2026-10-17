@@ -83,7 +83,7 @@ func ownerRefFromCreateCtx(ctx context.Context) string {
 		return owner
 	}
 	access, ok := controlplane.AccessFromContext(ctx)
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return ""
 	}
 	return strings.TrimSpace(access.Identity.OwnerRef)

@@ -170,7 +170,7 @@ func (s *Server) requireRunloopAuth(next http.Handler) http.Handler {
 // withOperatorAccess stamps the PAT/operator marker onto the request context so
 // the service layer bypasses owner scoping.
 func (s *Server) withOperatorAccess(r *http.Request) *http.Request {
-	return r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{Operator: true}))
+	return r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{Fleet: true}))
 }
 
 // authenticateUserToken validates a non-PAT token via the control plane. On

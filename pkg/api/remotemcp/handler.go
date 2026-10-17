@@ -173,7 +173,7 @@ func (h *Handler) serverFor(r *http.Request) *mcp.Server {
 // they can hold file contents and secrets.
 func (h *Handler) instrument(reqCtx context.Context) agentmcp.Instrument {
 	ownerRef := ""
-	if access, ok := controlplane.AccessFromContext(reqCtx); ok && !access.Operator {
+	if access, ok := controlplane.AccessFromContext(reqCtx); ok && !access.Fleet {
 		ownerRef = access.Identity.OwnerRef
 	}
 	return func(ctx context.Context, tool string) (context.Context, func(string, error)) {

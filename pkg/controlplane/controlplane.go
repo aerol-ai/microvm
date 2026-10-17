@@ -45,18 +45,19 @@ type Identity struct {
 }
 
 // Access is the authenticated caller context attached by the API auth
-// middleware and read by the service layer to enforce owner scoping. Operator
-// is true for the PAT path (operator/admin: bypasses scoping, sees the whole
-// fleet); for a validated user token Operator is false and Identity.OwnerRef is
-// the tenant the request is scoped to.
+// middleware and read by the service layer to enforce owner scoping. Fleet is
+// true for the PAT path (unscoped: sees the whole fleet); for a validated user
+// token Fleet is false and Identity.OwnerRef is the tenant the request is
+// scoped to. Fleet was named Operator; the field is scope, not power
+// (plans/identity-and-access.md §5.1).
 //
 // Background loops and internal calls run with no Access in context. The
 // service layer treats "no Access present" as unscoped (fleet-wide) so those
-// paths are never accidentally constrained — only an explicit non-operator
+// paths are never accidentally constrained — only an explicit non-fleet
 // Access narrows visibility.
 type Access struct {
 	Identity Identity
-	Operator bool
+	Fleet    bool
 }
 
 type accessCtxKey struct{}

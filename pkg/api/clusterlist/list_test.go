@@ -293,7 +293,7 @@ func TestTransportOwnerContextAndSelectPeersHelpers(t *testing.T) {
 	if got := OwnerRefFromContext(context.Background()); got != "" {
 		t.Fatalf("unscoped owner = %q", got)
 	}
-	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true})
+	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true})
 	if got := OwnerRefFromContext(operator); got != "" {
 		t.Fatalf("operator owner = %q", got)
 	}

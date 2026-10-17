@@ -14,7 +14,7 @@ func TestAuditRateLimiterIdentityAndEvict(t *testing.T) {
 	// OwnerRef is the per-tenant bucket key; operator/anonymous collapse so
 	// PAT callers share one ceiling instead of one bucket per missing identity.
 	opReq := httptest.NewRequest(http.MethodGet, "/v1/sandboxes/x/audit", nil)
-	opReq = opReq.WithContext(controlplane.ContextWithAccess(opReq.Context(), controlplane.Access{Operator: true}))
+	opReq = opReq.WithContext(controlplane.ContextWithAccess(opReq.Context(), controlplane.Access{Fleet: true}))
 	if got := auditIdentityKey(opReq); got != auditRateLimitIdentityKey {
 		t.Fatalf("operator key = %q", got)
 	}
