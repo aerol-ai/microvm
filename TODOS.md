@@ -469,15 +469,25 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   baked into the Prometheus config on `obs1` and into Terraform state. Any
   real Prometheus deployment wants this too: a leaked scrape token should
   not be able to create or destroy sandboxes.
-- **Status:** still open. `/v1/metrics` is registered with full auth in
-  `pkg/api/dashboard.go:27`. `requireAuth` (`pkg/api/middleware.go:103`)
-  accepts the PAT (full operator access) or a control-plane user token. The
-  open-source `controlplane.Noop()` rejects the latter, so open-source builds
-  are PAT-only.
-- **Caveat (why deferred):** eng review 2026-07-19 (Arch-4) accepted the
-  PAT-at-rest risk for the disposable itest cluster.
-- **Start:** `pkg/api/middleware.go` + the token model. The obs scrape is the
-  first consumer.
+- **Status: RESOLVED by the identity-and-access stack**
+  (`plans/identity-and-access.md`, CEO review D6), **with a caveat.**
+  `/v1/metrics` now needs the `metrics.read` permission, which every role
+  holds when it is bound to every team (`*`). The scrape credential is a
+  `viewer` API token on `*`
+  (`aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`),
+  set as the optional Terraform `cluster.metrics_token`; when it is empty
+  the scrape keeps using the PAT (`setup/obs/prometheus.yml.tftpl`).
+  `/debug/vars` stays admin-only. A stale token mirror still accepts
+  `metrics.read`, so worker metrics keep flowing through a server-tier
+  outage (D16).
+- **Caveat (D6): the credential is read-only, not metrics-only.** A `viewer`
+  on `*` can also read every team's sandbox metadata and audit records. It
+  can never create, exec, delete or read env. A true metrics-only scope
+  would need a fifth role or per-route scopes, which the plan rules out for
+  v1 (four fixed roles). Reopen only if a buyer needs a scrape credential
+  that cannot read audit records.
+- **Docs:** `docs/src/content/docs/enterprise/access-control.mdx`,
+  `setup/obs/README.md`, `setup/runbooks/identity-and-access.md`.
 
 ## Native per-runtime metric labels (observability, `internal/service` + `internal/pool`)
 
