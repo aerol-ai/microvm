@@ -36,7 +36,7 @@ func TestRegisteredNamesCannotReachAnotherTenantsSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	private := snap.Image
-	if private != docker.SnapshotImageTag("private-source") {
+	if private != docker.SnapshotImageTagForOwner("a", "private-source") {
 		t.Fatalf("snapshot committed as %q", private)
 	}
 

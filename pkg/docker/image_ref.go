@@ -23,11 +23,24 @@ const SnapshotImageNamespace = "aerolvm-snapshot"
 // catalog treats as one snapshot) gets one tag, and a retried commit lands
 // on the tag the first attempt used.
 func SnapshotImageTag(name string) string {
+	return SnapshotImageTagForOwner("", name)
+}
+
+// SnapshotImageTagForOwner is SnapshotImageTag scoped to an owner: the hash
+// folds in the owning tenant, so two tenants that commit a same-named snapshot
+// on one node get DIFFERENT local tags instead of colliding on one image (a
+// tenant could otherwise boot, or fail over onto, another tenant's committed
+// bytes). owner "" reproduces the legacy owner-agnostic tag, so operator and
+// pre-existing snapshots are unchanged.
+func SnapshotImageTagForOwner(owner, name string) string {
 	canonical := strings.TrimSpace(name)
 	if named, err := reference.ParseNormalizedNamed(canonical); err == nil {
 		if _, digested := named.(reference.Digested); !digested {
 			canonical = reference.TagNameOnly(named).String()
 		}
+	}
+	if owner = strings.TrimSpace(owner); owner != "" {
+		canonical = owner + "\x00" + canonical
 	}
 	sum := sha256.Sum256([]byte(canonical))
 	return SnapshotImageNamespace + "/" + hex.EncodeToString(sum[:])[:32] + ":latest"

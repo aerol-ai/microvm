@@ -3698,7 +3698,9 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	// The image goes under a tag of the snapshot's own, never under its
 	// name: a name is the caller's choice, and as a tag it would replace
 	// whatever image already had it on this node — "python" for everyone.
-	image := docker.SnapshotImageTag(name)
+	// The tag is scoped to the snapshot's owner so two tenants committing a
+	// same-named snapshot on one node do not collide on one local image.
+	image := docker.SnapshotImageTagForOwner(sandbox.OwnerRef, name)
 	imageID, err := rt.CreateSnapshot(ctx, s.runtimeRef(sandbox), image)
 	if err != nil {
 		return nil, false, err
@@ -4042,7 +4044,20 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 // one taken from a sandbox (only a commit records its source, see
 // RegisterSnapshot), or one under its own tag.
 func snapshotOwnsImage(snapshot *models.SandboxSnapshot) bool {
-	return snapshot.SourceSandboxID != "" || strings.TrimSpace(snapshot.Image) == docker.SnapshotImageTag(snapshot.Name)
+	return snapshot.SourceSandboxID != "" || snapshotImageIsOwnedTag(snapshot)
+}
+
+// snapshotImageIsOwnedTag reports whether a snapshot's image is its own
+// committed tag. It accepts both the owner-scoped tag (new commits) and the
+// legacy owner-agnostic tag so snapshots committed before the tag was scoped
+// still classify as owning their image.
+func snapshotImageIsOwnedTag(snapshot *models.SandboxSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	img := strings.TrimSpace(snapshot.Image)
+	return img == docker.SnapshotImageTagForOwner(snapshot.OwnerRef, snapshot.Name) ||
+		img == docker.SnapshotImageTag(snapshot.Name)
 }
 
 func (s *Service) ResizeSandbox(ctx context.Context, id string, req models.ResizeSandboxRequest) (*models.Sandbox, error) {
