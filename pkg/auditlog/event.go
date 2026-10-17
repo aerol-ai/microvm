@@ -47,6 +47,33 @@ type Event struct {
 	// WitnessedThrough is set on retention_checkpoint records to record the
 	// last externally witnessed head that prune dropped (optional MVP field).
 	WitnessedThrough string `json:"witnessed_through,omitempty"`
+	// Caller is who caused the record (plans/identity-and-access.md §5.8).
+	// It stays LAST and omitempty: the hash covers json.Marshal of this
+	// struct in field order, so moving it, or writing it without omitempty,
+	// would change the hash of every record written before it existed. A nil
+	// pointer is omitted, so those records re-marshal byte for byte and
+	// still verify. A binary that predates the field drops it on decode and
+	// computes a different hash, which is why writers gate it on every
+	// cluster member advertising support (internal/cluster's audit caller
+	// gate) and why rolling back below the release that writes it fails
+	// strict boot verification.
+	Caller *Caller `json:"caller,omitempty"`
+}
+
+// Caller names who made the request behind a record, or which daemon
+// subsystem acted when no request did. Kind and ID are the principal
+// (controlplane.Principal: "operator", "node:n3", "tok_…", "oidc:…",
+// "controlplane:…", "system:reconcile"); Name is the display name when it
+// adds something to ID (an email, a token name); Team is the team a
+// team-bound credential acted for; Via is the edge node that forwarded the
+// request to the node that wrote the record, taken from the verified mTLS
+// peer, never from a header. Field order is part of the hash: append only.
+type Caller struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+	Team string `json:"team,omitempty"`
+	Via  string `json:"via,omitempty"`
 }
 
 var fallbackSequence atomic.Uint64
