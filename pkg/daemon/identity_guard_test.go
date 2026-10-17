@@ -42,6 +42,44 @@ func TestIdentityBootGuard(t *testing.T) {
 	}
 }
 
+// TestEnterpriseCredentialChecks is UC-283's offline half
+// (plans/identity-and-access.md §5.12, L7, D5): open-source enterprise mode
+// refuses identity off, then refuses SB_PAT_SCOPE=any, each with its own
+// error naming the fix, and boots with identity on (tokens-only is enough)
+// and host scope. A managed provider that validates its own tokens already
+// enforces named credentials, so its enterprise boot is unchanged (L8).
+func TestEnterpriseCredentialChecks(t *testing.T) {
+	managed := controlplane.Provider{Validator: acceptingValidator{}}.WithDefaults()
+	cases := []struct {
+		name     string
+		cfg      config.Config
+		provider controlplane.Provider
+		want     error
+	}{
+		{name: "enterprise, identity off", cfg: config.Config{EnterpriseMode: true, PATScope: config.PATScopeHost},
+			provider: controlplane.Noop(), want: config.ErrEnterpriseNeedsNamedCredentials},
+		{name: "enterprise, identity on, scope any", cfg: config.Config{EnterpriseMode: true, IdentityEnabled: true, PATScope: config.PATScopeAny},
+			provider: controlplane.Noop(), want: config.ErrEnterpriseNeedsHostPATScope},
+		{name: "enterprise, identity on (tokens only), host scope", cfg: config.Config{EnterpriseMode: true, IdentityEnabled: true, PATScope: config.PATScopeHost},
+			provider: controlplane.Noop()},
+		{name: "enterprise under a managed validator keeps today's boot", cfg: config.Config{EnterpriseMode: true, PATScope: config.PATScopeAny},
+			provider: managed},
+		{name: "not enterprise: identity off and scope any boot", cfg: config.Config{PATScope: config.PATScopeAny}, provider: controlplane.Noop()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := identityBootGuard(tc.cfg, tc.provider)
+			if tc.want == nil && err != nil || tc.want != nil && !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	if !strings.Contains(config.ErrEnterpriseNeedsHostPATScope.Error(), "SB_PUBLIC_API_SOCKET") ||
+		!strings.Contains(config.ErrEnterpriseNeedsHostPATScope.Error(), "named token or SSO") {
+		t.Fatal("the scope refusal must name both migration steps (D5)")
+	}
+}
+
 // TestRunIdentityBootGuards drives the real boot: a refused combination
 // stops Run before anything starts, with an error naming the conflict.
 func TestRunIdentityBootGuards(t *testing.T) {

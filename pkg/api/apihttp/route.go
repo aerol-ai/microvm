@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+	oteltrace "go.opentelemetry.io/otel/trace"
+
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -171,6 +174,11 @@ func stampRoutePermission(classify func(*http.Request) controlplane.Permission, 
 func authorize(classify func(*http.Request) controlplane.Permission, deny DenyWriter, audit AuditHook, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		perm := classify(r)
+		if span := oteltrace.SpanFromContext(r.Context()); span.IsRecording() {
+			// §5.15: the permission the route asked for, next to the
+			// principal attributes authentication set on the same span.
+			span.SetAttributes(attribute.String("aerolvm.permission", string(perm)))
+		}
 		access, ok := controlplane.AccessFromContext(r.Context())
 		call := RouteCall{Permission: perm, Access: access, HasAccess: ok}
 		if ok {

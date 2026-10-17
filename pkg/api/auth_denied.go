@@ -2,9 +2,7 @@ package api
 
 import (
 	"expvar"
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -24,10 +22,11 @@ import (
 //     record carries how many 401s from that address it stands for. Every
 //     401 is also counted in aerolvm_auth_failures_total.
 //
-// The source address is the TCP peer. T10 replaces it with the
-// X-AerolVM-Client-IP Caddy sets once the L4 fallback speaks PROXY
-// protocol (CEO review D12); until then requests through Caddy show the
-// loopback address.
+// The source address is Server.clientAddress (pat_scope.go): the TCP peer,
+// or with SB_L4_FALLBACK_PROXY_PROTOCOL on, the X-AerolVM-Client-IP Caddy
+// sets from the address the caddy-l4 PROXY header gave it (CEO review
+// D12), trusted only from Caddy's socket or a loopback peer. With the flag
+// off, requests through Caddy show the loopback address, as before.
 
 const (
 	authDeniedWindow = time.Minute
@@ -95,14 +94,6 @@ func (l *authDeniedLimiter) sweep(now time.Time) {
 	}
 }
 
-// sourceAddress is the request's client address without the port.
-func sourceAddress(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return strings.TrimSpace(r.RemoteAddr)
-}
-
 // recordAuthFailure writes the evidence of a refused request (see above).
 func (s *Server) recordAuthFailure(r *http.Request, f *authFailure) {
 	if s.service == nil || s.audit == nil || !s.service.APIAuditPolicy().Enabled {
@@ -121,7 +112,7 @@ func (s *Server) recordAuthFailure(r *http.Request, f *authFailure) {
 		})
 		return
 	}
-	source := sourceAddress(r)
+	source := s.clientAddress(r)
 	ok, count := s.authDenied.admit(source)
 	if !ok {
 		return

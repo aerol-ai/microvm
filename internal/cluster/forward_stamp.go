@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/aerol-ai/microvm/pkg/auditlog"
@@ -22,7 +23,35 @@ const (
 	// HeaderCorrelationID ties the records one API call writes on every
 	// node together (H3).
 	HeaderCorrelationID = "X-Correlation-ID"
+	// HeaderPATOrigin says where the edge accepted a forwarded operator
+	// token: PATOriginHost (a loopback peer, or a cluster peer acting for
+	// itself) or PATOriginPublic (anything else). An owner under
+	// SB_PAT_SCOPE=host refuses a forwarded PAT unless it says host, so one
+	// node left on scope "any" cannot launder a remote PAT through a
+	// forward (plans/identity-and-access.md §5.11). Like every X-Cluster-*
+	// header it is honoured only from a live mTLS peer.
+	HeaderPATOrigin = "X-Cluster-PAT-Origin"
 )
+
+// PAT origins carried in HeaderPATOrigin.
+const (
+	PATOriginHost   = "host"
+	PATOriginPublic = "public"
+)
+
+type patOriginCtxKey struct{}
+
+// ContextWithPATOrigin records where the API edge accepted the operator
+// token of this request, for StampForward to carry to the peer.
+func ContextWithPATOrigin(ctx context.Context, origin string) context.Context {
+	return context.WithValue(ctx, patOriginCtxKey{}, origin)
+}
+
+// PATOriginFromContext is the origin ContextWithPATOrigin recorded, or "".
+func PATOriginFromContext(ctx context.Context) string {
+	origin, _ := ctx.Value(patOriginCtxKey{}).(string)
+	return origin
+}
 
 // StampForward marks out, an outbound request that carries a user's request
 // to a peer, as a forward, and copies what the peer needs to treat it as the
@@ -48,13 +77,17 @@ const (
 //     refuses a team the credential is not bound to.
 //   - HeaderCorrelationID, from the request context the API edge filled, so
 //     the peer's records share the edge's id instead of minting their own.
+//   - HeaderPATOrigin, for an operator-token caller: where the edge accepted
+//     the PAT, from ContextWithPATOrigin. A PAT forward with no recorded
+//     origin says public, the value an owner under host scope refuses: an
+//     unknown origin must never pass as the host.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
 // the one record and the edge writes none (§5.9, "Forwarding").
 //
-// Later tasks add their markers here (X-Cluster-PAT-Origin, T10;
-// X-Cluster-Surface, T13), so no forward path can miss them.
+// Later tasks add their markers here (X-Cluster-Surface, T13), so no
+// forward path can miss them.
 func StampForward(out *http.Request, access controlplane.Access) {
 	if out == nil {
 		return
@@ -65,6 +98,18 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	out.Header.Set(HeaderForwarded, "1")
 	if team := forwardTeam(access); team != "" {
 		out.Header.Set(HeaderTeam, team)
+	}
+	switch access.Principal.Kind {
+	case controlplane.PrincipalOperator, controlplane.PrincipalNode:
+		origin := PATOriginPublic
+		if PATOriginFromContext(out.Context()) == PATOriginHost {
+			origin = PATOriginHost
+		}
+		out.Header.Set(HeaderPATOrigin, origin)
+	default:
+		// Only the PAT has an origin rule; a stale marker copied from the
+		// inbound request must not ride along on another credential.
+		out.Header.Del(HeaderPATOrigin)
 	}
 	if id := auditlog.CorrelationIDFromContext(out.Context()); id != "" {
 		out.Header.Set(HeaderCorrelationID, id)

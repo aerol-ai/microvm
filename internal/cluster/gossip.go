@@ -53,6 +53,21 @@ type nodeMeta struct {
 	// every fallback tier that keeps RaftAddr: dropping it would block those
 	// writes, never allow them early.
 	FSMOpsVersion int `json:"fv,omitempty"`
+	// PATScope is the gossiped SB_PAT_SCOPE: "host", or empty for the
+	// default "any". Empty is omitted, so a default node's meta is byte for
+	// byte what it was. Peers compare it with their own for the
+	// aerolvm_pat_scope_drift gauge; it grants nothing, since an owner under
+	// host scope checks each forwarded PAT's origin itself.
+	PATScope string `json:"ps,omitempty"`
+}
+
+// GossipPATScope is the value a node gossips for its SB_PAT_SCOPE: "host",
+// or "" for anything else (the default "any").
+func GossipPATScope(scope string) string {
+	if scope == "host" {
+		return "host"
+	}
+	return ""
 }
 
 // gossipDelegate implements memberlist.Delegate. Its job is to publish this
@@ -70,6 +85,7 @@ type gossipDelegate struct {
 	internalURL   string
 	role          string
 	publicHost    string
+	patScope      string
 }
 
 func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, internalURL, role, publicHost string, admitter *capacity.Admitter) *gossipDelegate {
@@ -88,13 +104,25 @@ func newGossipDelegate(nodeID, nodeName, apiURL, dataPlaneHost, raftAddr, intern
 	return d
 }
 
+// setPATScope sets the gossiped PAT scope (GossipPATScope) and rebuilds the
+// metadata blob.
+func (d *gossipDelegate) setPATScope(scope string) {
+	d.mu.Lock()
+	d.patScope = GossipPATScope(scope)
+	d.mu.Unlock()
+	d.refreshMeta()
+}
+
 // refreshMeta rebuilds the encoded metadata blob. memberlist's NodeMeta()
 // must return a stable byte slice, so we double-buffer.
 func (d *gossipDelegate) refreshMeta() {
+	d.mu.RLock()
+	patScope := d.patScope
+	d.mu.RUnlock()
 	meta := nodeMeta{
 		NodeID: d.nodeID, NodeName: d.nodeName, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost,
 		RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, PublicHost: d.publicHost,
-		FSMOpsVersion: fsmOpsVersion,
+		FSMOpsVersion: fsmOpsVersion, PATScope: patScope,
 	}
 	enc, err := json.Marshal(meta)
 	if err != nil {
@@ -123,8 +151,10 @@ func (d *gossipDelegate) NodeMeta(limit int) []byte {
 			// PublicHost dropped first — DNS-helper feature degrades cleanly
 			// (the node just doesn't show up as a target) whereas
 			// raft/identity loss breaks voter join and cross-node routing.
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion},
-			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
+			// PATScope rides the first two tiers: dropping it only raises a
+			// false drift alert, never widens access.
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, InternalURL: d.internalURL, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope},
+			{NodeID: d.nodeID, APIURL: d.apiURL, DataPlaneHost: d.dataPlaneHost, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion, PATScope: d.selfMeta.PATScope},
 			{NodeID: d.nodeID, APIURL: d.apiURL, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, Role: d.role, FSMOpsVersion: fsmOpsVersion},
 			{NodeID: d.nodeID, RaftAddr: d.raftAddr, FSMOpsVersion: fsmOpsVersion},
@@ -194,6 +224,10 @@ type gossipMemberIndex struct {
 	// members.
 	liveFloor atomic.Int64
 	liveCount atomic.Int64
+	// selfPATScope is this node's gossiped PAT scope (GossipPATScope). Set
+	// once before memberlist starts delivering events; the drift gauge
+	// counts alive members that gossip a different one.
+	selfPATScope string
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
@@ -247,11 +281,11 @@ func (i *gossipMemberIndex) upsert(m Member) {
 	i.mu.Unlock()
 }
 
-// recordFeatureFloorLocked refreshes liveFloor and liveCount. Caller holds
-// the write lock. Dead members do not count: one that returns is alive again
-// and lowers the floor on that same update.
+// recordFeatureFloorLocked refreshes liveFloor, liveCount and the PAT-scope
+// drift gauge. Caller holds the write lock. Dead members do not count: one
+// that returns is alive again and lowers the floor on that same update.
 func (i *gossipMemberIndex) recordFeatureFloorLocked() {
-	floor, alive := int64(-1), int64(0)
+	floor, alive, drift := int64(-1), int64(0), int64(0)
 	for _, m := range i.members {
 		if !m.Alive {
 			continue
@@ -260,9 +294,13 @@ func (i *gossipMemberIndex) recordFeatureFloorLocked() {
 		if v := int64(m.FSMOpsVersion); floor < 0 || v < floor {
 			floor = v
 		}
+		if GossipPATScope(m.PATScope) != i.selfPATScope {
+			drift++
+		}
 	}
 	i.liveFloor.Store(floor)
 	i.liveCount.Store(alive)
+	patScopeDrift.Set(drift)
 }
 
 // featureFloor returns the lowest fv among alive members (-1 with none
@@ -500,6 +538,8 @@ type gossipSetupConfig struct {
 	// remembered so a restart can rejoin without SB_CLUSTER_PEERS. Empty
 	// disables the cache (tests, and any caller without durable state).
 	PeerCacheDir string
+	// PATScope is this node's SB_PAT_SCOPE, gossiped for the drift gauge.
+	PATScope string
 }
 
 func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slog.Logger) (*gossipNode, error) {
@@ -521,7 +561,9 @@ func setupGossip(cfg gossipSetupConfig, admitter *capacity.Admitter, logger *slo
 	}
 
 	delegate := newGossipDelegate(cfg.NodeID, cfg.NodeName, cfg.APIURL, cfg.DataPlaneHost, cfg.RaftAddr, cfg.InternalURL, cfg.Role, cfg.PublicHost, admitter)
+	delegate.setPATScope(cfg.PATScope)
 	memberIndex := newGossipMemberIndex()
+	memberIndex.selfPATScope = GossipPATScope(cfg.PATScope)
 	mlCfg.Delegate = delegate
 	mlCfg.Events = &indexedEventDelegate{index: memberIndex, logger: logger, next: cfg.Events, onLeave: cfg.OnLeave}
 	if len(cfg.SecretKey) > 0 {
@@ -796,6 +838,7 @@ func memberFromMemberlistNode(n *memberlist.Node) Member {
 			m.Role = meta.Role
 			m.PublicHost = meta.PublicHost
 			m.FSMOpsVersion = meta.FSMOpsVersion
+			m.PATScope = meta.PATScope
 			// m.Capacity stays zero here — capacity no longer travels in
 			// nodeMeta (see the type comment). Cluster.Members and
 			// SelectPlacement overlay fresh capacity leases later.
@@ -829,6 +872,7 @@ func (g *gossipNode) selfMember() Member {
 		Role:          meta.Role,
 		PublicHost:    meta.PublicHost,
 		FSMOpsVersion: meta.FSMOpsVersion,
+		PATScope:      meta.PATScope,
 		Alive:         true,
 		Capacity:      snap,
 	}

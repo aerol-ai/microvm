@@ -68,6 +68,14 @@ func TestAPITokenWritesGate(t *testing.T) {
 	if err != nil || len(list) != 2 {
 		t.Fatalf("list = %d %v", len(list), err)
 	}
+	// aerolvm_api_tokens reads the FSM in place: both runners are live,
+	// and none is once both have expired.
+	if counts := c.CountAPITokens(time.Now()); counts[controlplane.RoleRunner] != 2 || len(counts) != 1 {
+		t.Fatalf("live counts = %v, want 2 runners", counts)
+	}
+	if counts := c.CountAPITokens(second.ExpiresAt.Add(time.Hour)); len(counts) != 0 {
+		t.Fatalf("counts after expiry = %v, want none", counts)
+	}
 	if _, err := c.WriteAPIToken(ctx, APITokenWriteRequest{Delete: true, ID: rec.ID}); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
@@ -188,6 +196,9 @@ func TestAPITokensWithoutPlacementState(t *testing.T) {
 		}
 		if _, found, fresh := c.LookupToken("tok_aaaaaaaaaaaa"); found || fresh {
 			t.Fatal("no FSM: never fresh")
+		}
+		if counts := c.CountAPITokens(time.Now()); counts != nil {
+			t.Fatal("no FSM: no token count")
 		}
 		if resp, changed := c.APITokenChanges(0); !changed || !resp.Resnapshot {
 			t.Fatal("no FSM: resnapshot")

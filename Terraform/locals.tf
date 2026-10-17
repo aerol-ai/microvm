@@ -41,6 +41,13 @@ locals {
   custom_domain_txt_prefix       = local.cluster_ops.ingress.custom_domain_txt_prefix
   custom_domain_txt_value_prefix = local.cluster_ops.ingress.custom_domain_txt_value_prefix
   pat_token                      = local.cluster_secrets.cluster.pat_token
+  # Optional read-only scrape credential (plans/identity-and-access.md
+  # §5.11): an avm_ viewer token bound to every team ("*"), which holds
+  # metrics.read. Empty (or the key absent) keeps the Prometheus scrape on
+  # the PAT, so a default cluster loses nothing. It is required once nodes
+  # run SB_PAT_SCOPE=host, which refuses the PAT from the obs host: bring the
+  # cluster up, mint the token on a node with the PAT, set it, re-apply.
+  metrics_token = try(coalesce(local.cluster_secrets.cluster.metrics_token), "")
 
   # Cloudflare provider credential. Lives in config/secrets.yml under
   # cloudflare.api_token (NOT in config/terraform.tfvars) so the rule
@@ -410,6 +417,13 @@ resource "terraform_data" "validate_cluster_ops" {
     precondition {
       condition     = local.pat_token != ""
       error_message = "cluster.pat_token in config/secrets.yml must be set (shared SB_PAT_TOKEN used by every node for operator/SDK API auth)."
+    }
+
+    precondition {
+      # The pkg/identitywire APITokenPattern: a typo here would leave every
+      # scrape answering 401 instead of failing the plan.
+      condition     = local.metrics_token == "" || can(regex("^avm_[0-9A-Za-z]{12}_[0-9A-Za-z_-]{43}_[0-9A-Za-z]{6}$", local.metrics_token))
+      error_message = "cluster.metrics_token in config/secrets.yml must be empty (scrape with the PAT) or an avm_ API token, e.g. from `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`."
     }
 
     precondition {

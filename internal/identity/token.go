@@ -177,3 +177,17 @@ func (s *TokenSet) Len() int {
 	defer s.mu.RUnlock()
 	return len(s.byID)
 }
+
+// CountAPITokens counts the unexpired tokens by role, for the
+// aerolvm_api_tokens gauge.
+func (s *TokenSet) CountAPITokens(now time.Time) map[controlplane.Role]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[controlplane.Role]int, 4)
+	for _, rec := range s.byID {
+		if !rec.Expired(now) {
+			out[rec.Role]++
+		}
+	}
+	return out
+}

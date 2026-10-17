@@ -796,6 +796,7 @@ func (mismatchWitness) LastWitnessedHead(context.Context, string) (string, bool,
 func TestCoverage95LiftEnterpriseWitnessMismatch(t *testing.T) {
 	_ = setBaseRunEnv(t)
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	setEnterpriseCredentialEnv(t)
 	t.Setenv("SB_PAT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
 	err := runWithAutoCancel(t, 800*time.Millisecond, func(context.Context, FleetConfig) (controlplane.Provider, error) {
@@ -807,6 +808,9 @@ func TestCoverage95LiftEnterpriseWitnessMismatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected witness verification failure")
 	}
+	if errors.Is(err, config.ErrEnterpriseNeedsNamedCredentials) || errors.Is(err, config.ErrEnterpriseNeedsHostPATScope) {
+		t.Fatalf("refused before the witness check: %v", err)
+	}
 }
 
 func TestCoverage95LiftEnterpriseNeedsExporter(t *testing.T) {
@@ -814,6 +818,7 @@ func TestCoverage95LiftEnterpriseNeedsExporter(t *testing.T) {
 	// fails closed so JSONL-only nodes cannot claim tamper-evidence.
 	_ = setBaseRunEnv(t)
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	setEnterpriseCredentialEnv(t)
 	t.Setenv("SB_PAT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
 	err := runWithAutoCancel(t, 800*time.Millisecond, func(context.Context, FleetConfig) (controlplane.Provider, error) {
@@ -821,6 +826,9 @@ func TestCoverage95LiftEnterpriseNeedsExporter(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected enterprise exporter requirement")
+	}
+	if errors.Is(err, config.ErrEnterpriseNeedsNamedCredentials) || errors.Is(err, config.ErrEnterpriseNeedsHostPATScope) {
+		t.Fatalf("refused before the exporter check: %v", err)
 	}
 }
 

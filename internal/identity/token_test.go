@@ -137,3 +137,21 @@ func TestTokenSet(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestTokenSetCountAPITokens feeds aerolvm_api_tokens: unexpired tokens by
+// role, an expired one not counted.
+func TestTokenSetCountAPITokens(t *testing.T) {
+	var s TokenSet
+	if got := s.CountAPITokens(testNow); len(got) != 0 {
+		t.Fatalf("an empty set counts %v", got)
+	}
+	_, a := mint(t, "a", "payments", controlplane.RoleRunner)
+	_, b := mint(t, "b", "checkout", controlplane.RoleRunner)
+	_, c := mint(t, "c", controlplane.FleetTeam, controlplane.RoleAdmin)
+	c.ExpiresAt = testNow.Add(-time.Second)
+	s.Replace([]TokenRecord{a, b, c})
+	got := s.CountAPITokens(testNow)
+	if len(got) != 1 || got[controlplane.RoleRunner] != 2 {
+		t.Fatalf("counts = %v, want two runners and no expired admin", got)
+	}
+}

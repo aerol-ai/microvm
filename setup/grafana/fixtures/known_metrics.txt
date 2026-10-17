@@ -118,3 +118,17 @@ aerolvm_worker_leases_total
 aerolvm_mcp_tool_calls_total
 aerolvm_mcp_tool_latency_ms_total
 aerolvm_mcp_requests_total
+# Identity and access (plans/identity-and-access.md §5.15). Each is also
+# checked against the Go tree by TestIdentityRowMetricsAreRegistered.
+aerolvm_api_tokens
+aerolvm_audit_api_flood_mode
+aerolvm_audit_api_rate_limited_total
+aerolvm_audit_api_records_total
+aerolvm_auth_failures_total
+aerolvm_auth_requests_total
+aerolvm_identity_file_info
+aerolvm_identity_file_load_errors_total
+aerolvm_identity_jwks_fetch_total
+aerolvm_identity_jwks_last_success_timestamp
+aerolvm_identity_mirror_age_seconds
+aerolvm_pat_scope_drift
