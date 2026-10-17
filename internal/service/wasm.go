@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 	"go.opentelemetry.io/otel/attribute"
 )
 
@@ -160,7 +161,11 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
-	state, err := s.wasm.Create(ctx, req, sandboxID, toolboxToken, binds)
+	// A catalogue id in module_ref resolves in the namespace of the owner the
+	// row will carry, which a failover recreate knows only from its placement
+	// (its context has no caller). Computed once, here, and reused below.
+	ownerRef := s.ownerRefForCreateOrRecreate(ctx, sandboxID)
+	state, err := s.wasm.Create(wasmmod.WithCatalogueOwner(ctx, ownerRef), req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		releaseAdmission()
@@ -228,7 +233,7 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 			})
 		}
 	}
-	sandbox.OwnerRef = s.ownerRefForCreateOrRecreate(ctx, sandboxID)
+	sandbox.OwnerRef = ownerRef
 
 	// Private sandboxes skip caddy on the boot path; see the docker path.
 	if sandboxAllowsPublicTraffic(sandbox) {
