@@ -2,7 +2,10 @@ package service
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -323,5 +326,47 @@ func TestEffectiveAPIFloodMode(t *testing.T) {
 	nilControl.setMode(apiFloodBoth)
 	if nilControl.currentMode() != 0 || nilControl.absorb(apiCall("sb", "t", execRoute, "", 200)) || nilControl.owed(true) != nil || nilControl.dueMerged() != nil {
 		t.Error("a nil control writes everything and owes nothing")
+	}
+}
+
+// TestSpillOverflowAppliesAPIFlood: in enterprise mode a full queue sends
+// records down the in-process overflow path, which is exactly when a flood
+// is happening; the budget applies there too.
+func TestSpillOverflowAppliesAPIFlood(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, secretAuditFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	clk := newFloodClock()
+	sink := &fileAuditSink{
+		file:     f,
+		path:     path,
+		lockPath: auditlog.SpillFileIn(dir).LockPath,
+		gapPath:  filepath.Join(dir, "secrets.gap"),
+		spillCh:  make(chan SecretAuditEvent, 64),
+		apiFlood: floodControl(apiFloodBudget, 1, 2, clk),
+	}
+	for i := 0; i < 9; i++ {
+		sink.spillCh <- apiCall("sb-1", "tok_flood", execRoute, fmt.Sprint(i), 200)
+	}
+	sink.spillQueued(apiCall("sb-1", "tok_flood", execRoute, "first", 200))
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(raw), "\n"); n != 2 {
+		t.Fatalf("overflow wrote %d records, want the burst of 2", n)
+	}
+	// A batch the budget takes entirely writes nothing.
+	sink.spillQueued(apiCall("sb-1", "tok_flood", execRoute, "again", 200))
+	if again, _ := os.ReadFile(path); len(again) != len(raw) {
+		t.Fatal("a fully budgeted overflow batch wrote records")
+	}
+	clk.advance(5 * time.Second)
+	if m := sink.apiFlood.owed(false); len(m) != 1 || m[0].Dropped != 9 {
+		t.Fatalf("markers = %+v, want one for the 9 over budget", m)
 	}
 }

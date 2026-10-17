@@ -946,6 +946,19 @@ func (s *fileAuditSink) spillQueued(first SecretAuditEvent) {
 		}
 		break
 	}
+	// Overflow is exactly when an api flood is happening, so the api flood
+	// control sees these records too (only Emit overflows here; durable
+	// requests never do).
+	kept := batch[:0]
+	for _, ev := range batch {
+		if !s.apiFlood.absorb(ev) {
+			kept = append(kept, ev)
+		}
+	}
+	batch = kept
+	if len(batch) == 0 {
+		return
+	}
 	if err := s.writeEventBatch(batch, true, true); err != nil {
 		// writeEventBatch already accounts the drop when accountFailure is set.
 		return
