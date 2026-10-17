@@ -88,6 +88,21 @@ CADDY_STORAGE_S3_ACCESS_KEY=""
 CADDY_STORAGE_S3_SECRET_KEY=""
 CADDY_STORAGE_S3_ENCRYPTION_KEY=""
 
+# Operator-token confinement and the real client address through Caddy
+# (plans/identity-and-access.md §5.11). Both default off, so a default
+# install writes exactly what it always did.
+#   --pat-scope host     SB_PAT_SCOPE=host; Caddy proxies to the public
+#                        Unix socket, where every request is public.
+#   --l4-proxy-protocol  caddy-l4's fallback sends PROXY v2 to the 8443
+#                        site, which gets the proxy_protocol listener
+#                        wrapper; Caddy forwards the client address to
+#                        sandboxd in X-AerolVM-Client-IP. Both halves are
+#                        written in this one step: the flag without the
+#                        wrapper breaks every HTTPS handshake.
+PAT_SCOPE="any"
+PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
+L4_PROXY_PROTOCOL="false"
+
 usage() {
 	cat <<'EOF'
 Usage: install.sh [options]
@@ -229,7 +244,23 @@ Options:
                                SAME value on every node. Required when
                                --caddy-storage-s3 is set; losing it
                                renders stored certs unrecoverable.
-  --local                      Local development mode. The server binds to
+  --pat-scope <any|host>       Where the operator token (PAT) works. "any"
+                               (default) keeps today's behavior. "host"
+                               accepts it only from this host
+                               (127.0.0.1:21212) and from cluster peers, so
+                               remote people must use SSO or a named token;
+                               Caddy then proxies to the public socket
+                               /run/sandboxd-public/api.sock. Enterprise
+                               mode requires "host". Turn it on only after
+                               every node runs a release that has it.
+  --l4-proxy-protocol          Domain mode: send the real client address
+                               from caddy-l4 to the HTTPS site (PROXY
+                               protocol v2) and on to sandboxd, so audit
+                               records and the "operator token used from
+                               outside" alert see it instead of 127.0.0.1.
+                               Writes the Caddy listener wrapper and
+                               SB_L4_FALLBACK_PROXY_PROTOCOL=true together.
+  --local                     Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. No domain name required.
                                Linux: run with sudo; Docker Engine is installed
@@ -613,6 +644,14 @@ while [[ $# -gt 0 ]]; do
 			CADDY_STORAGE_S3_ENCRYPTION_KEY="$2"
 			shift 2
 			;;
+		--pat-scope)
+			PAT_SCOPE="$2"
+			shift 2
+			;;
+		--l4-proxy-protocol)
+			L4_PROXY_PROTOCOL="true"
+			shift
+			;;
 		--help)
 			usage
 			exit 0
@@ -724,6 +763,20 @@ if [[ -n "$DNS_PROVIDER" || (-n "$DOMAIN" && "$TLS_ISSUER" == "internal") ]]; th
 	L4_TLS_LISTEN_DEFAULT=":443"
 else
 	L4_TLS_LISTEN_DEFAULT=""
+fi
+
+case "$PAT_SCOPE" in
+any | host) ;;
+*)
+	echo "--pat-scope must be any or host, got '$PAT_SCOPE'." >&2
+	exit 1
+	;;
+esac
+# PROXY protocol rides caddy-l4's SNI fallback to the 8443 site, which only
+# exists in domain mode.
+if [[ "$L4_PROXY_PROTOCOL" == "true" && -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+	echo "--l4-proxy-protocol requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+	exit 1
 fi
 
 # Shared cert storage validation. The feature only makes sense alongside
@@ -1111,6 +1164,17 @@ EOF
 	if [[ "$TLS_ISSUER" != "acme" ]]; then
 		echo "SB_TLS_ISSUER=$TLS_ISSUER" >> /etc/sandboxd/sandboxd.env
 	fi
+	# Written only when asked for, so a default install's env is unchanged.
+	# write_caddyfile writes the matching Caddy half in the same run.
+	if [[ "$PAT_SCOPE" == "host" ]]; then
+		{
+			echo "SB_PAT_SCOPE=host"
+			echo "SB_PUBLIC_API_SOCKET=$PUBLIC_API_SOCKET"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
+	if [[ "$L4_PROXY_PROTOCOL" == "true" ]]; then
+		echo "SB_L4_FALLBACK_PROXY_PROTOCOL=true" >> /etc/sandboxd/sandboxd.env
+	fi
 	# gVisor has no SB_ENABLE_* flag of its own: registering runsc in
 	# /etc/docker/daemon.json lets a sandbox opt into runtime:"runsc", but
 	# the daemon still defaults SB_HOST_RUNTIMES to {"docker"} and only
@@ -1274,13 +1338,31 @@ EOF
 		storage_block+=$'\n\t\tencryption_key {env.SB_CADDY_S3_ENCRYPTION_KEY}'
 		storage_block+=$'\n\t}'
 	fi
+	# --pat-scope host: Caddy reaches sandboxd on the public socket, where
+	# every request is public, instead of on 127.0.0.1:21212, where a
+	# loopback peer may present the operator token.
+	local api_upstream="127.0.0.1:21212"
+	if [[ "$PAT_SCOPE" == "host" ]]; then
+		api_upstream="unix/${PUBLIC_API_SOCKET}"
+	fi
+	# --l4-proxy-protocol: the 8443 server accepts the PROXY v2 header
+	# caddy-l4's fallback sends (only from 127.0.0.1; a connection with no
+	# header is still accepted, so this half can land first), and the API
+	# proxy stamps the client address it learned. {remote_host} replaces
+	# whatever the client sent in that header, so it cannot be forged.
+	local servers_block=""
+	local client_ip_line=""
+	if [[ "$L4_PROXY_PROTOCOL" == "true" ]]; then
+		servers_block=$'\n\tservers 127.0.0.1:8443 {\n\t\tlistener_wrappers {\n\t\t\tproxy_protocol {\n\t\t\t\tallow 127.0.0.1/32\n\t\t\t}\n\t\t\ttls\n\t\t}\n\t}'
+		client_ip_line=$'\n\t\t\theader_up X-AerolVM-Client-IP {remote_host}'
+	fi
 	cat > /etc/caddy/Caddyfile <<EOF
 {
 	admin localhost:2019${email_line}
 	# caddy-l4 owns :443; the HTTPS sites below run on 127.0.0.1:8443 and
 	# only receive traffic forwarded from caddy-l4's SNI fallback route.
 	# Disable Caddy's auto-managed :80 -> :443 redirect since :443 isn't ours.
-	auto_https disable_redirects${storage_block}
+	auto_https disable_redirects${storage_block}${servers_block}
 }
 
 https://$DOMAIN:8443 {
@@ -1294,8 +1376,8 @@ ${tls_block}
 		# (#712). A stream that outlives a reload keeps the old config in
 		# memory until it closes or the delay ends. pkg/caddy sets the same
 		# value on the routes sandboxd writes.
-		reverse_proxy 127.0.0.1:21212 {
-			stream_close_delay 10m
+		reverse_proxy ${api_upstream} {
+			stream_close_delay 10m${client_ip_line}
 		}
 	}
 	handle {

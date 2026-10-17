@@ -26,7 +26,11 @@ type Client struct {
 	enabled       bool
 	l4TLSListen   string
 	l4TLSFallback string
-	httpClient    *http.Client
+	// l4FallbackProxyProtocol makes every tls-mux route that hands a
+	// connection to l4TLSFallback send a PROXY v2 header first
+	// (SB_L4_FALLBACK_PROXY_PROTOCOL, CEO review D12).
+	l4FallbackProxyProtocol bool
+	httpClient              *http.Client
 
 	// gate/batch route admin requests into an open Batch (batch.go).
 	// batchMu serializes batches.
@@ -52,10 +56,11 @@ func New(cfg config.Config) *Client {
 		// DNS RR, etc.) so SDK-returned URLs resolve there rather than at
 		// this specific node. EffectivePublicHost falls back to PublicHost so
 		// single-node and pre-cluster deployments stay byte-identical.
-		publicHost:    cfg.EffectivePublicHost(),
-		enabled:       cfg.EnableCaddy,
-		l4TLSListen:   cfg.L4TLSListen,
-		l4TLSFallback: cfg.L4TLSFallback,
+		publicHost:              cfg.EffectivePublicHost(),
+		enabled:                 cfg.EnableCaddy,
+		l4TLSListen:             cfg.L4TLSListen,
+		l4TLSFallback:           cfg.L4TLSFallback,
+		l4FallbackProxyProtocol: cfg.L4FallbackProxyProtocol,
 		onDemandIssuer: TLSIssuer{Internal: cfg.TLSIssuer == config.TLSIssuerInternal,
 			CA: cfg.TLSACMECA, TrustedRoot: cfg.TLSACMECARoot},
 		// Every admin call rides this client, so the instrumenting transport
@@ -1120,9 +1125,9 @@ func (c *Client) ensureLayer4Locked(ctx context.Context, tlsListen, tlsFallback 
 	}
 	needsPut := true
 	if !exists {
-		server = newTLSMuxServer(tlsListen, tlsFallback)
+		server = newTLSMuxServer(tlsListen, tlsFallback, c.l4FallbackProxyProtocol)
 	} else {
-		server, needsPut = ensureTLSMuxFallback(server, tlsListen, tlsFallback)
+		server, needsPut = ensureTLSMuxFallback(server, tlsListen, tlsFallback, c.l4FallbackProxyProtocol)
 	}
 	if !needsPut {
 		return nil
@@ -1147,14 +1152,18 @@ func (c *Client) ensureLayer4Locked(ctx context.Context, tlsListen, tlsFallback 
 	return nil
 }
 
-func newTLSMuxServer(tlsListen, tlsFallback string) map[string]any {
+func newTLSMuxServer(tlsListen, tlsFallback string, proxyProtocol bool) map[string]any {
 	return map[string]any{
 		"listen": []string{tlsListen},
-		"routes": []any{tlsMuxFallbackRoute(tlsFallback)},
+		"routes": []any{tlsMuxFallbackRoute(tlsFallback, proxyProtocol)},
 	}
 }
 
-func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string) (map[string]any, bool) {
+// ensureTLSMuxFallback puts the fallback route last, in its current shape.
+// A changed PROXY-protocol flag changes the route, so the next EnsureLayer4
+// after a restart with the flag flipped rewrites tls-mux once; with the flag
+// unchanged the server compares equal and nothing is written.
+func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string, proxyProtocol bool) (map[string]any, bool) {
 	before, _ := json.Marshal(server)
 
 	server["listen"] = []string{tlsListen}
@@ -1171,7 +1180,7 @@ func ensureTLSMuxFallback(server map[string]any, tlsListen, tlsFallback string) 
 	// routes array; per-sandbox SNI routes inserted via UpsertTLSSNIRoute go
 	// to routes/0, so they always win over the fallback. Only connections
 	// whose SNI doesn't match any sandbox subdomain hit the proxy below.
-	server["routes"] = append(filtered, tlsMuxFallbackRoute(tlsFallback))
+	server["routes"] = append(filtered, tlsMuxFallbackRoute(tlsFallback, proxyProtocol))
 
 	after, _ := json.Marshal(server)
 	return server, !bytes.Equal(before, after)
@@ -1200,14 +1209,31 @@ func isTLSMuxFallbackRoute(route map[string]any) bool {
 	return !hasMatch
 }
 
-func tlsMuxFallbackRoute(tlsFallback string) map[string]any {
+func tlsMuxFallbackRoute(tlsFallback string, proxyProtocol bool) map[string]any {
 	return map[string]any{
-		"@id": tlsFallbackRouteID,
-		"handle": []map[string]any{{
-			"handler":   "proxy",
-			"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
-		}},
+		"@id":    tlsFallbackRouteID,
+		"handle": []map[string]any{tlsFallbackProxy(tlsFallback, proxyProtocol)},
 	}
+}
+
+// tlsFallbackProxy is the layer4 handler that hands a connection to the
+// local HTTPS site. caddy-l4 dials that site from 127.0.0.1, so without a
+// PROXY header Caddy, and sandboxd behind it, see every public caller as
+// 127.0.0.1 (CEO review D12). With proxyProtocol the handler first sends a
+// PROXY v2 header naming the real client. The site must then run the
+// proxy_protocol listener wrapper (install.sh writes both in one step): its
+// default policy also accepts a connection with no header, so the wrapper
+// can go in before the flag, and the flag must go off before the wrapper is
+// removed.
+func tlsFallbackProxy(tlsFallback string, proxyProtocol bool) map[string]any {
+	handler := map[string]any{
+		"handler":   "proxy",
+		"upstreams": []map[string]any{{"dial": []string{tlsFallback}}},
+	}
+	if proxyProtocol {
+		handler["proxy_protocol"] = "v2"
+	}
+	return handler
 }
 
 // UpsertTCPRoute creates (or replaces) the layer4 server bound to hostPort.

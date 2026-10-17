@@ -2,6 +2,7 @@ package caddy
 
 import (
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -70,7 +71,9 @@ func TestCaddyfileProxiesKeepStreamsAcrossReloads(t *testing.T) {
 			if !strings.HasPrefix(trimmed, "reverse_proxy ") {
 				continue
 			}
-			if strings.HasPrefix(trimmed, "reverse_proxy 127.0.0.1:21212") {
+			// install.sh names the upstream through ${api_upstream}:
+			// 127.0.0.1:21212, or the public socket with --pat-scope host.
+			if strings.HasPrefix(trimmed, "reverse_proxy 127.0.0.1:21212") || strings.HasPrefix(trimmed, "reverse_proxy ${api_upstream}") {
 				apiProxies++
 			}
 			if !strings.HasSuffix(trimmed, "{") || !slices.Contains(caddyfileBlock(lines[i+1:]), want) {
@@ -85,12 +88,17 @@ func TestCaddyfileProxiesKeepStreamsAcrossReloads(t *testing.T) {
 
 // caddyfileBlock returns the directives of the Caddyfile block whose opening
 // brace ends the line just before lines, up to its closing brace. Comments
-// are skipped.
+// are skipped, and so is a trailing install.sh placeholder such as
+// ${client_ip_line}, which adds an optional directive after a line and is
+// empty by default (TestInstallWritesPATScopeAndProxyProtocolTogether
+// renders it).
+var installPlaceholderSuffix = regexp.MustCompile(`\$\{[a-z_]+\}$`)
+
 func caddyfileBlock(lines []string) []string {
 	var out []string
 	depth := 1
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		trimmed := installPlaceholderSuffix.ReplaceAllString(strings.TrimSpace(line), "")
 		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
