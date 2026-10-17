@@ -175,6 +175,26 @@ func TestRouteByClassifiesEachRequest(t *testing.T) {
 	}
 }
 
+// The authenticator sees the route's permission (for RouteBy, the one this
+// request needs): the token mirror's stale rule depends on it (D16).
+func TestRouteStampsPermissionForTheAuthenticator(t *testing.T) {
+	var seen []controlplane.Permission
+	peek := func(next http.Handler) http.Handler {
+		inner := as(controlplane.OperatorAccess())(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p, _ := controlplane.RoutePermissionFromContext(r.Context())
+			seen = append(seen, p)
+			inner.ServeHTTP(w, r)
+		})
+	}
+	var c reached
+	Router{Authenticate: peek}.Route(controlplane.PermMetricsRead, c.handler()).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/metrics", nil))
+	Router{Authenticate: peek}.RouteBy(ReadOrSecretsTag, ReadOrSecrets, c.handler()).ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x?include_env=1", nil))
+	if len(seen) != 2 || seen[0] != controlplane.PermMetricsRead || seen[1] != controlplane.PermSandboxSecrets || c.n != 2 {
+		t.Fatalf("authenticator saw %v (handler reached %d times)", seen, c.n)
+	}
+}
+
 func TestRouteOfFollowsPreAuth(t *testing.T) {
 	route := Router{}.Route(controlplane.PermAuthenticated, http.NotFoundHandler())
 	var outerRan bool
