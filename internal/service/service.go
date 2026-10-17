@@ -33,6 +33,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -188,6 +189,9 @@ type Service struct {
 	secretAuditBootVerify  sync.WaitGroup
 	secretAuditInitErr     error // retained so daemon boot can fail closed
 	secretAuditOnce        sync.Once
+	// apiFlood is the api record flood control and its shared-node
+	// evaluator (api_audit.go, api_audit_flood.go).
+	apiFlood               apiFloodState
 	secretAuditPruneStop   chan struct{}
 	secretAuditPruneDone   sync.WaitGroup
 	auditWitnessMu         sync.Mutex
@@ -1179,7 +1183,23 @@ func (s *Service) EnsureClusterReady(ctx context.Context) error {
 }
 
 func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {
-	return s.createSandbox(ctx, req, "")
+	resp, err := s.createSandbox(ctx, req, "")
+	s.noteSandboxCreated(ctx, resp)
+	return resp, err
+}
+
+// noteSandboxCreated tells the API edge's record which sandbox the create
+// made (its route has no id), with the lifecycle and owner the record is
+// stamped with, so the create record names the sandbox, its creator can be
+// found from it, and writing it needs no lookup; and nudges the api
+// flood-mode evaluator, since the node may now host a second owner. Both are
+// in-memory: a context lookup under a mutex and a non-blocking send.
+func (s *Service) noteSandboxCreated(ctx context.Context, resp *models.CreateSandboxResponse) {
+	if resp == nil {
+		return
+	}
+	auditlog.NoteSandboxIdentity(ctx, resp.Sandbox.ID, resp.Sandbox.AuditIncarnationID, resp.Sandbox.OwnerRef)
+	s.NoteLocalOwnersChanged()
 }
 
 // CreateSandboxWithID is the failover-recreate entry point: it behaves like
@@ -1204,9 +1224,12 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		}
 		// Already present locally — recreate is a no-op. The watcher tick that
 		// noticed the FSM-only entry must have raced with a local create.
+		auditlog.NoteSandboxIdentity(ctx, id, existing.AuditIncarnationID, existing.OwnerRef)
 		return &models.CreateSandboxResponse{Sandbox: *existing}, nil
 	}
-	return s.createSandbox(ctx, req, id)
+	resp, err := s.createSandbox(ctx, req, id)
+	s.noteSandboxCreated(ctx, resp)
+	return resp, err
 }
 
 // reconcileStaleOwnership destroys local materializations whose authoritative
@@ -3449,6 +3472,7 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if s.logger != nil {
 		s.logger.Info("audit sandbox destroyed", "sandbox_id", id, "image", sandbox.Image)
 	}
+	s.NoteLocalOwnersChanged()
 	if !s.isWasmSandbox(sandbox) {
 		s.schedulePendingImageGC(ctx, models.SandboxEngine(sandbox), sandbox.Image)
 	}
@@ -5669,6 +5693,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
+			// The reap's record (caller system:reconcile) is written once the
+			// row is gone; the identity is resolved now, while it exists.
+			reaped := s.beginSystemAction(ctx, sandbox.ID, systemActionReap)
 			// Container is gone (manual `docker rm`, OOM kill, host reboot,
 			// previous reconcile pass already destroyed it via events). Tear
 			// down all our state and delete the row outright. Cascades through
@@ -5775,6 +5802,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 					"image", sandbox.Image,
 				)
 			}
+			reaped(nil)
+			s.NoteLocalOwnersChanged()
 			continue
 		}
 
@@ -5936,6 +5965,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if !s.confirmedOrphan(ctx, sandboxID) {
 				continue
 			}
+			orphanDone := s.beginSystemAction(ctx, sandboxID, systemActionOrphanReap)
 			s.logger.Warn("removing orphan runtime instance",
 				"sandbox_id", sandboxID,
 				"runtime", runtimeName,
@@ -5949,7 +5979,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				Runtime:     runtimeName,
 				Engine:      engine,
 			}
-			if err := rt.Destroy(ctx, stub); err != nil {
+			err := rt.Destroy(ctx, stub)
+			orphanDone(err)
+			if err != nil {
 				s.logger.Warn("orphan runtime removal failed",
 					"sandbox_id", sandboxID,
 					"runtime", runtimeName,
@@ -6213,7 +6245,10 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 		floor := s.activityFloorFor(sandbox, netstatsFallback)
 		switch lifecycleActionForWithFloor(sandbox, now, globalIdle, floor) {
 		case lifecycleDestroy:
-			if err := s.DestroySandbox(ctx, sandbox.ID); err != nil {
+			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoDelete)
+			err := s.DestroySandbox(ctx, sandbox.ID)
+			done(err)
+			if err != nil {
 				s.logger.Warn("auto-destroy failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
 				s.logger.Info("audit lifecycle auto-destroy", "sandbox_id", sandbox.ID)
@@ -6222,7 +6257,10 @@ func (s *Service) runLifecycleSweep(ctx context.Context) {
 			// Lifecycle stop: pass mode=stopModeLifecycle so serverless
 			// sandboxes arm wake (the next inbound HTTP request will
 			// resurrect the sandbox transparently).
-			if _, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle); err != nil {
+			done := s.beginSystemAction(ctx, sandbox.ID, systemActionAutoStop)
+			_, err := s.stopSandboxInternal(ctx, sandbox.ID, stopModeLifecycle)
+			done(err)
+			if err != nil {
 				s.logger.Warn("auto-stop failed", "sandbox_id", sandbox.ID, "error", err)
 			} else {
 				s.logger.Info("audit lifecycle auto-stop",

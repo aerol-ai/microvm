@@ -31,6 +31,16 @@ type SandboxLookup interface {
 	TouchSandbox(ctx context.Context, id string) error
 }
 
+// SessionRecorder is the slice of *service.Service that writes an SSH
+// session's audit record (plans/identity-and-access.md §5.9, CEO review D3):
+// SSH runs commands in a sandbox without touching the API, so without it
+// SSH would be the one way to run a command that leaves no record. The
+// gateway checks for it on its SandboxLookup, so a lookup that does not
+// implement it (tests) records nothing.
+type SessionRecorder interface {
+	RecordSSHSession(ctx context.Context, sandboxID, session string)
+}
+
 // DockerExec is the slice of *docker.Client the gateway needs. It exists so
 // the gateway can be tested with a fake.
 type DockerExec interface {
@@ -190,8 +200,24 @@ func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 			g.logger.Warn("ssh channel accept failed", "error", err)
 			continue
 		}
+		g.recordSession(ctx, sandboxID, mode, sessionName)
 		go g.handleSession(ctx, sandboxID, mode, sessionName, remoteOwned, channel, requests)
 	}
+}
+
+// recordSession writes one audit record per opened session channel, naming
+// the sandbox key that authenticated it and the toolbox session it attaches
+// to ("" for a one-shot exec). The record is buffered: opening the session
+// never waits on disk.
+func (g *Gateway) recordSession(ctx context.Context, sandboxID, mode, sessionName string) {
+	rec, ok := g.svc.(SessionRecorder)
+	if !ok || sandboxID == "" {
+		return
+	}
+	if mode != "session" {
+		sessionName = ""
+	}
+	rec.RecordSSHSession(ctx, sandboxID, sessionName)
 }
 
 // parseSSHUser splits the SSH username into (sandbox_id, mode, name).

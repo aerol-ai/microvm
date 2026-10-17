@@ -93,7 +93,7 @@ func (a *app) verbGroups() []verbGroup {
 			{"snapshot", "Snapshot a sandbox as a reusable image", snapshotHelp, runSnapshot},
 		}},
 		{"Audit", []verb{
-			{"audit", "Verify nodes' audit logs against their S3 witness", auditHelp, runAudit},
+			{"audit", "Verify or search nodes' audit logs", auditHelp, runAudit},
 		}},
 		{"Access", []verb{
 			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},

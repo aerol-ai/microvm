@@ -40,8 +40,10 @@ func runAudit(ctx context.Context, a *app, args []string) int {
 	switch args[0] {
 	case "verify":
 		return runAuditVerify(ctx, a, args[1:])
+	case "search":
+		return runAuditSearch(ctx, a, args[1:])
 	default:
-		return a.usageError(nil, "audit", "unknown audit command %q (want verify)", args[0])
+		return a.usageError(nil, "audit", "unknown audit command %q (want verify or search)", args[0])
 	}
 }
 
@@ -251,38 +253,11 @@ func verifyAudit(ctx context.Context, opts auditVerifyOptions, now time.Time) (a
 type exportFactory func() (auditlog.ExportSource, func(), error)
 
 func verifyAuditNode(ctx context.Context, reader *auditwitness.Reader, export exportFactory, opts auditVerifyOptions, nodeID string, now time.Time) (auditlog.NodeReport, error) {
-	hist, err := reader.History(ctx, nodeID, opts.since)
-	if err != nil {
-		return auditlog.NodeReport{}, err
-	}
-	in := auditlog.NodeInput{
-		NodeID:           nodeID,
-		Since:            opts.since,
-		Now:              now,
-		MaxLag:           opts.maxLag,
-		HiddenKeys:       hist.HiddenKeys,
-		NewestWitnessDay: hist.NewestDay,
-	}
-	for _, h := range hist.Heads {
-		in.Heads = append(in.Heads, auditlog.WitnessedHead{HeadHex: h.HeadHex, At: h.LastModified, Ref: h.Key + "@" + h.VersionID})
-	}
-	if p := hist.Prior; p != nil {
-		in.Prior = &auditlog.WitnessedHead{HeadHex: p.HeadHex, At: p.LastModified, Ref: p.Key + "@" + p.VersionID}
-	}
-	src, done, err := export()
+	in, done, err := auditNodeInput(ctx, reader, export, opts, nodeID, now)
 	if err != nil {
 		return auditlog.NodeReport{}, err
 	}
 	defer done()
-	in.Export = src
-	if p, ok := opts.local[nodeID]; ok {
-		f, err := os.Open(p)
-		if err != nil {
-			return auditlog.NodeReport{}, fmt.Errorf("open the local log: %w", err)
-		}
-		defer f.Close()
-		in.Local = f
-	}
 	return auditlog.VerifyNode(ctx, in)
 }
 

@@ -122,3 +122,44 @@ func TestForwardHTTPStampsTheForward(t *testing.T) {
 		}
 	}
 }
+
+// TestForwardMarksTheEdgeRecord is the regression test for the api-record
+// forward dedupe (plans/identity-and-access.md §5.9): the reverse-proxy
+// Director marks the edge's call state forwarded, so only the owner records
+// the call; a forward that never reaches the owner (a wrong peer
+// certificate here, the 502 path) also marks it failed, so the edge records
+// the failure instead. Fan-out clients reach the same mark through
+// StampForward itself.
+func TestForwardMarksTheEdgeRecord(t *testing.T) {
+	srv, client := newNodeBoundForwardServer(t, "edge-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	c := newForwardingCluster(t, client.Transport)
+	c.nodeID = "edge-1"
+	forward := func(target Endpoint) (*auditlog.CallState, int) {
+		ctx, st := auditlog.ContextWithCallState(controlplane.ContextWithAccess(context.Background(), teamToken("payments")))
+		in := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb-1/stop", nil).WithContext(ctx)
+		rr := httptest.NewRecorder()
+		c.ForwardHTTP(target, rr, in)
+		return st, rr.Code
+	}
+	st, code := forward(Endpoint{NodeID: "owner-1", InternalURL: srv.URL})
+	if code != http.StatusNoContent || !st.Forwarded() || st.ForwardFailed() {
+		t.Fatalf("reached owner: code %d forwarded %v failed %v", code, st.Forwarded(), st.ForwardFailed())
+	}
+	st, code = forward(Endpoint{NodeID: "owner-2", InternalURL: srv.URL})
+	if code != http.StatusBadGateway || !st.Forwarded() || !st.ForwardFailed() {
+		t.Fatalf("failed forward: code %d forwarded %v failed %v", code, st.Forwarded(), st.ForwardFailed())
+	}
+
+	// A fan-out client builds a fresh request on the inbound context.
+	ctx, fan := auditlog.ContextWithCallState(context.Background())
+	out, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://peer/v1/sandboxes", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	StampForward(out, controlplane.OperatorAccess())
+	if !fan.Forwarded() {
+		t.Fatal("StampForward did not mark the fan-out's call state")
+	}
+}

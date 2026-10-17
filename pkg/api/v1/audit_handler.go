@@ -94,6 +94,7 @@ func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 	q := service.SecretAuditQuery{
 		Cursor:        strings.TrimSpace(r.URL.Query().Get("cursor")),
 		Kind:          strings.TrimSpace(r.URL.Query().Get("kind")),
+		Caller:        strings.TrimSpace(r.URL.Query().Get("caller")),
 		IncarnationID: strings.TrimSpace(r.URL.Query().Get("incarnation_id")),
 	}
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {

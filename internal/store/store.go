@@ -2497,6 +2497,21 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 	return sandbox, nil
 }
 
+// CountDistinctSandboxOwners counts the distinct owner_ref values among this
+// node's sandboxes ("" — operator-owned — counts as one), stopping at max:
+// the api-record flood control only needs to know whether a node is shared
+// (plans/identity-and-access.md §5.9, D14), so it asks for 2 and the
+// query never reads past the second owner.
+func (s *Store) CountDistinctSandboxOwners(ctx context.Context, max int) (int, error) {
+	if max < 1 {
+		max = 1
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM (SELECT DISTINCT owner_ref FROM sandboxes LIMIT ?)`, max).Scan(&n)
+	return n, err
+}
+
 func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,

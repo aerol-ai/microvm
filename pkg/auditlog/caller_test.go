@@ -163,6 +163,7 @@ func TestEventFieldOrderIsFrozen(t *testing.T) {
 		"time", "actor", "sandbox_id", "ref", "result", "reason", "correlation_id", "event_id",
 		"node_id", "kind", "destination", "network", "bytes_in", "bytes_out", "incarnation_id",
 		"owner_ref", "dropped", "prev_hash", "event_hash", "witnessed_through", "caller",
+		"request",
 	}
 	if got := jsonFieldNames(reflect.TypeOf(Event{})); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Event field order = %v\nwant %v (append new fields at the end)", got, want)
@@ -170,10 +171,15 @@ func TestEventFieldOrderIsFrozen(t *testing.T) {
 	if got := jsonFieldNames(reflect.TypeOf(Caller{})); !reflect.DeepEqual(got, []string{"kind", "id", "name", "team", "via"}) {
 		t.Fatalf("Caller field order = %v (append new fields at the end)", got)
 	}
-	for _, name := range []string{"Caller"} {
+	if got := jsonFieldNames(reflect.TypeOf(Request{})); !reflect.DeepEqual(got, []string{
+		"method", "route", "status", "digest", "count", "surface", "argv", "target", "routes", "source", "grant",
+	}) {
+		t.Fatalf("Request field order = %v (append new fields at the end)", got)
+	}
+	for _, name := range []string{"Caller", "Request"} {
 		f, _ := reflect.TypeOf(Event{}).FieldByName(name)
 		if !strings.Contains(f.Tag.Get("json"), ",omitempty") {
-			t.Fatalf("Event.%s must be omitempty, or every pre-caller record changes hash", name)
+			t.Fatalf("Event.%s must be omitempty, or every record written before it changes hash", name)
 		}
 	}
 }

@@ -30,7 +30,7 @@ type boundedAuditFetcher struct {
 	delay  time.Duration
 }
 
-func (f *boundedAuditFetcher) FetchSandboxAuditFromPeer(ctx context.Context, _ string, _ string, _ int, _, _, _ string) (cluster.AuditPeerPage, error) {
+func (f *boundedAuditFetcher) FetchSandboxAuditFromPeer(ctx context.Context, _ string, _ string, _ int, _, _, _, _ string) (cluster.AuditPeerPage, error) {
 	active := f.active.Add(1)
 	defer f.active.Add(-1)
 	for observed := f.max.Load(); active > observed && !f.max.CompareAndSwap(observed, active); observed = f.max.Load() {
@@ -45,7 +45,7 @@ func (f *boundedAuditFetcher) FetchSandboxAuditFromPeer(ctx context.Context, _ s
 	}
 }
 
-func (f *fakeAuditFetcher) FetchSandboxAuditFromPeer(_ context.Context, nodeID, _ string, _ int, _, _, _ string) (cluster.AuditPeerPage, error) {
+func (f *fakeAuditFetcher) FetchSandboxAuditFromPeer(_ context.Context, nodeID, _ string, _ int, _, _, _, _ string) (cluster.AuditPeerPage, error) {
 	if err, ok := f.errs[nodeID]; ok {
 		return cluster.AuditPeerPage{}, err
 	}
