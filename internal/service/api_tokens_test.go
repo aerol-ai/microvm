@@ -518,4 +518,19 @@ func TestAPITokenGauge(t *testing.T) {
 	if worker.apiTokenCounter() != nil {
 		t.Fatal("a worker holds only a mirror and publishes no token count")
 	}
+
+	server := newTokenService(t, true)
+	server.cfg.EnableCluster = true
+	server.cluster = countingTokenServer{Noop: cluster.NewNoop("node-s", "http://node-s", "")}
+	counter := server.apiTokenCounter()
+	if counter == nil || counter.CountAPITokens(tokenSvcNow)[controlplane.RoleAuditor] != 3 {
+		t.Fatal("a Raft server counts its FSM's tokens")
+	}
+}
+
+// countingTokenServer stands in for a Raft server's CountAPITokens.
+type countingTokenServer struct{ *cluster.Noop }
+
+func (countingTokenServer) CountAPITokens(time.Time) map[controlplane.Role]int {
+	return map[controlplane.Role]int{controlplane.RoleAuditor: 3}
 }

@@ -165,6 +165,23 @@ func TestListenPublicAPISocketPermissions(t *testing.T) {
 			t.Fatalf("err = %v, want the group named", err)
 		}
 	})
+	t.Run("a group this process may not chown to", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root may chown to any group")
+		}
+		old := lookupPublicAPISocketGroup
+		lookupPublicAPISocketGroup = func(string) (*user.Group, error) { return &user.Group{Gid: "0", Name: "caddy"}, nil }
+		t.Cleanup(func() { lookupPublicAPISocketGroup = old })
+		if _, err := listenPublicAPISocket(filepath.Join(shortDir(t), "pub", "api.sock"), "caddy"); err == nil || !strings.Contains(err.Error(), "chown") {
+			t.Fatalf("err = %v, want the chown refusal", err)
+		}
+	})
+	t.Run("a socket path too long to listen on", func(t *testing.T) {
+		path := filepath.Join(shortDir(t), strings.Repeat("a", 120)+".sock")
+		if _, err := listenPublicAPISocket(path, group); err == nil {
+			t.Fatal("want the listen error")
+		}
+	})
 	t.Run("a group with a non-numeric gid", func(t *testing.T) {
 		old := lookupPublicAPISocketGroup
 		lookupPublicAPISocketGroup = func(string) (*user.Group, error) { return &user.Group{Gid: "x", Name: "caddy"}, nil }
