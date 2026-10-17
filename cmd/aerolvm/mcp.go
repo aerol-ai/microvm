@@ -74,7 +74,7 @@ func runMCP(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.optionError(c, err)
 	}
-	conn, err := a.connection()
+	conn, err := a.resolve(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -82,11 +82,12 @@ func runMCP(ctx context.Context, a *app, args []string) int {
 		APIURL: conn.apiURL,
 		Token:  conn.token,
 		Source: agenttools.SourceMCP,
+		// The team header, and an SSO login renewed for as long as the
+		// server runs (HTTP calls; a WebSocket dial carries the token it
+		// started with).
+		HTTPClient: a.apiHTTPClient(c, conn),
 		// stdout is the JSON-RPC channel: every notice goes to stderr.
 		Warn: func(s string) { a.note("aerolvm mcp: %s", s) },
-	}
-	if c.debug {
-		cfg.HTTPClient = debugHTTPClient(a.stderr)
 	}
 	tools, err := a.newTools(cfg)
 	if err != nil {
