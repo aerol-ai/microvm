@@ -274,6 +274,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
+      link(`${ent}/access-control`, '- Access control'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),
       link(`${ent}/responsibility`, '- Shared responsibility'),
     ],
