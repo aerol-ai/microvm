@@ -210,3 +210,79 @@ func TestForwardMarksTheEdgeRecord(t *testing.T) {
 		t.Fatal("StampForward did not mark the fan-out's call state")
 	}
 }
+
+// TestStampForwardMCPSurface: a remote MCP tool's inner call (its context
+// carries auditlog.SurfaceMCP, which only the in-process transport sets) is
+// forwarded with X-Cluster-Surface: mcp, so the owner accepts the caller's
+// MCP-only access token there and records the call as MCP (§5.14). Any other
+// forward carries no marker, even one that arrived with a stale header.
+func TestStampForwardMCPSurface(t *testing.T) {
+	mcpOnly := teamToken("payments")
+	mcpOnly.Principal = controlplane.Principal{Kind: controlplane.PrincipalOIDC, ID: "oidc:okta:00u1"}
+	mcpOnly.MCPOnly = true
+	cases := []struct {
+		name    string
+		surface string
+		stale   string
+		access  controlplane.Access
+		want    string
+	}{
+		{name: "MCP inner call with an MCP-only token", surface: auditlog.SurfaceMCP, access: mcpOnly, want: "mcp"},
+		{name: "MCP inner call with the PAT", surface: auditlog.SurfaceMCP, access: controlplane.OperatorAccess(), want: "mcp"},
+		{name: "ordinary call", access: teamToken("payments")},
+		{name: "ordinary call drops a stale marker", stale: "mcp", access: teamToken("payments")},
+		{name: "another surface is not MCP", surface: auditlog.SurfaceSSH, stale: "mcp", access: teamToken("payments")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.surface != "" {
+				ctx = auditlog.ContextWithSurface(ctx, tc.surface)
+			}
+			out, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://peer/v1/sandboxes/sb-1/exec", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.stale != "" {
+				out.Header.Set(HeaderSurface, tc.stale)
+			}
+			StampForward(out, tc.access)
+			if got := out.Header.Get(HeaderSurface); got != tc.want {
+				t.Fatalf("%s = %q, want %q", HeaderSurface, got, tc.want)
+			}
+			if out.Header.Get(HeaderForwarded) != "1" {
+				t.Fatal("the surface marker never travels without the forwarded marker")
+			}
+		})
+	}
+}
+
+// TestForwardHTTPStampsMCPSurface drives the reverse-proxy Director over a
+// real node-bound mTLS hop with an MCP inner call's context: the owner sees
+// the caller's own bearer and the surface marker next to the forwarded one.
+func TestForwardHTTPStampsMCPSurface(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	srv, client := newNodeBoundForwardServer(t, "edge-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	c := newForwardingCluster(t, client.Transport)
+	c.nodeID = "edge-1"
+
+	in := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb-1/exec", nil)
+	in.Header.Set("Authorization", "Bearer eyJ.access.token")
+	ctx := controlplane.ContextWithAccess(in.Context(), teamToken("payments"))
+	in = in.WithContext(auditlog.ContextWithSurface(ctx, auditlog.SurfaceMCP))
+
+	rr := httptest.NewRecorder()
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: srv.URL}, rr, in)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("forward status = %d body %s", rr.Code, rr.Body.String())
+	}
+	h := <-seen
+	for name, value := range map[string]string{"Authorization": "Bearer eyJ.access.token", HeaderForwarded: "1", HeaderSurface: "mcp"} {
+		if got := h.Get(name); got != value {
+			t.Errorf("owner saw %s = %q, want %q", name, got, value)
+		}
+	}
+}
