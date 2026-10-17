@@ -1322,6 +1322,34 @@ type Config struct {
 	// the file whenever they disagree. Off means every page scans the file.
 	// SB_AUDIT_INDEX_ENABLED. Default true.
 	AuditIndexEnabled bool
+	// AuditAPIRecords is which API calls write a kind "api" chain record
+	// (plans/identity-and-access.md §5.9): "mutations" (default) records
+	// every non-GET call, every toolbox call, every refused call and token
+	// listing; "all" adds plain GETs; "off" records none (refused in
+	// enterprise mode). SB_AUDIT_API_RECORDS.
+	AuditAPIRecords string
+	// AuditAPIFloodControl is how a flood of api records is bounded (CEO
+	// review D14): "budget" (default) is a token bucket per (sandbox,
+	// caller), with calls over it counted into one rate_limited record;
+	// "coalesce" merges identical calls made within one second; "both"
+	// coalesces, then budgets. A node hosting sandboxes of more than one
+	// owner always budgets, so "coalesce" runs as "both" there.
+	// SB_AUDIT_API_FLOOD_CONTROL.
+	AuditAPIFloodControl string
+	// AuditAPIRate / AuditAPIBurst are that budget: records per second per
+	// (sandbox, caller), and the burst. SB_AUDIT_API_RATE (20),
+	// SB_AUDIT_API_BURST (100).
+	AuditAPIRate  float64
+	AuditAPIBurst int
+	// AuditExecCommand is what an exec record says about the command:
+	// "digest" (default) is the SHA-256 of the request body only, because
+	// commands carry secrets; "full" also records the argv, never the
+	// environment. SB_AUDIT_EXEC_COMMAND.
+	AuditExecCommand string
+	// AuditAPIDurable makes token create, token revoke and sandbox delete
+	// wait for their record to reach disk. Default false; true in enterprise
+	// mode, which refuses false. SB_AUDIT_API_DURABLE.
+	AuditAPIDurable bool
 
 	// IdentityEnabled turns on sandboxd's own named credentials: scoped API
 	// tokens (avm_…) and SSO through OIDC (plans/identity-and-access.md).
@@ -1958,6 +1986,11 @@ func Load() (Config, error) {
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
 		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
+		AuditAPIRecords:               strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_API_RECORDS", AuditAPIRecordsMutations))),
+		AuditAPIFloodControl:          strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_API_FLOOD_CONTROL", AuditAPIFloodBudget))),
+		AuditAPIRate:                  getEnvFloat("SB_AUDIT_API_RATE", 20),
+		AuditAPIBurst:                 getEnvInt("SB_AUDIT_API_BURST", 100),
+		AuditExecCommand:              strings.ToLower(strings.TrimSpace(getEnv("SB_AUDIT_EXEC_COMMAND", AuditExecCommandDigest))),
 		IdentityEnabled:               getEnvBool("SB_IDENTITY_ENABLED", false),
 		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
 		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
@@ -2589,6 +2622,9 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("SB_TOKEN_MAX_TTL: %w", err)
 		}
 		cfg.TokenMaxTTL = ttl
+	}
+	if err := cfg.loadAuditAPIConfig(); err != nil {
+		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
