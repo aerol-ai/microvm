@@ -53,6 +53,26 @@ const apexFlatteningNote = "Apex domain: add only ONE of these, whichever your D
 // on hostname insert.
 // `txtNamePrefix` and `txtValuePrefix` allow customizing the verification TXT records.
 func ComposeDNSRecords(hostnames []string, target IngressTarget, txtNamePrefix, txtValuePrefix string) []DNSRecord {
+	return ComposeDNSRecordsForOwner(hostnames, target, txtNamePrefix, txtValuePrefix, "")
+}
+
+// CustomDomainTXTValue is the expected verification TXT value for a hostname.
+// An empty ownerToken yields the legacy, owner-agnostic `<prefix><host>` value
+// (operator deployments and backward compatibility). A non-empty ownerToken —
+// an opaque, stable hash of the owning tenant — binds the proof to that tenant
+// as `<prefix><ownerToken>=<host>`, so one tenant cannot pass verification for
+// a hostname using another tenant's still-published record.
+func CustomDomainTXTValue(txtValuePrefix, ownerToken, host string) string {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if strings.TrimSpace(ownerToken) == "" {
+		return txtValuePrefix + host
+	}
+	return txtValuePrefix + ownerToken + "=" + host
+}
+
+// ComposeDNSRecordsForOwner is ComposeDNSRecords with a tenant owner token
+// folded into the TXT verification value (see CustomDomainTXTValue).
+func ComposeDNSRecordsForOwner(hostnames []string, target IngressTarget, txtNamePrefix, txtValuePrefix, ownerToken string) []DNSRecord {
 	if len(hostnames) == 0 {
 		return nil
 	}
@@ -129,7 +149,7 @@ func ComposeDNSRecords(hostnames []string, target IngressTarget, txtNamePrefix, 
 			Hostname: host,
 			Type:     "TXT",
 			Name:     fmt.Sprintf("%s.%s", txtNamePrefix, name),
-			Value:    fmt.Sprintf("%s%s", txtValuePrefix, host),
+			Value:    CustomDomainTXTValue(txtValuePrefix, ownerToken, host),
 			Notes:    "Required for domain ownership verification.",
 		})
 	}
