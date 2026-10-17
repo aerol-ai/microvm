@@ -3,8 +3,6 @@ package config
 import (
 	"errors"
 	"fmt"
-	"github.com/aerol-ai/microvm/pkg/auditexport"
-	"github.com/aerol-ai/microvm/pkg/auditwitness"
 	"net"
 	"net/url"
 	"os"
@@ -15,6 +13,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/auditexport"
+	"github.com/aerol-ai/microvm/pkg/auditwitness"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -1327,11 +1329,19 @@ type Config struct {
 	// With it on the daemon refuses to boot next to a provider that brings
 	// its own token Validator. SB_IDENTITY_ENABLED.
 	IdentityEnabled bool
-	// ITestIdentityFile is the TEST-ONLY static token map read from
-	// SB_ITEST_IDENTITY_FILE (pkg/daemon/itest_identity.go). Load refuses it
-	// with IdentityEnabled or EnterpriseMode (eng review D4); task T3 deletes
-	// it in favour of real avm_ tokens minted at scenario setup.
-	ITestIdentityFile string
+	// IdentitySyncInterval is how often a cluster node without Raft state
+	// polls the server tier for token changes (the token mirror). A poll
+	// that finds nothing new is a 304 from an in-memory compare.
+	// SB_IDENTITY_SYNC_INTERVAL. Default 5s.
+	IdentitySyncInterval time.Duration
+	// IdentityMaxStale is how long a token mirror may go without a sync
+	// before the node refuses API tokens with 503 (metrics.read routes
+	// excepted, CEO review D16). SB_IDENTITY_MAX_STALE. Default 60s.
+	IdentityMaxStale time.Duration
+	// TokenMaxTTL caps an API token's lifetime: every token expires.
+	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
+	// enterprise mode, which refuses anything longer.
+	TokenMaxTTL time.Duration
 
 	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
 	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
@@ -1688,20 +1698,29 @@ func (p PlatformVolumesConfig) Validate() error {
 	return nil
 }
 
-// validateITestIdentityFile holds the interim guards on the test-only static
-// token file until task T3 deletes it (eng review D4). The file maps
-// plaintext tokens to owners in every release binary, so it must never sit
-// next to sandboxd's real identity (two sources sharing one owner namespace),
-// and the hardened enterprise profile refuses it outright.
-func validateITestIdentityFile(cfg Config) error {
-	if cfg.ITestIdentityFile == "" {
-		return nil
+// Token lifetime caps (plans/identity-and-access.md §5.4, §12 I10).
+const (
+	defaultTokenMaxTTL    = 365 * 24 * time.Hour
+	enterpriseTokenMaxTTL = 90 * 24 * time.Hour
+)
+
+// validateIdentity checks the identity settings. Enterprise mode lowers the
+// token lifetime default to 90 days and refuses a longer cap.
+func validateIdentity(cfg *Config) error {
+	if cfg.IdentitySyncInterval <= 0 {
+		return errors.New("SB_IDENTITY_SYNC_INTERVAL must be > 0")
 	}
-	if cfg.IdentityEnabled {
-		return errors.New("SB_ITEST_IDENTITY_FILE is test-only and cannot be combined with SB_IDENTITY_ENABLED=true: mint avm_ tokens with the operator token instead")
+	if cfg.IdentityMaxStale < cfg.IdentitySyncInterval {
+		return errors.New("SB_IDENTITY_MAX_STALE must be at least SB_IDENTITY_SYNC_INTERVAL: a mirror needs time for one poll before it counts as stale")
 	}
-	if cfg.EnterpriseMode {
-		return errors.New("SB_ITEST_IDENTITY_FILE is test-only and is refused when SB_ENTERPRISE_MODE=true: it accepts plaintext tokens from a file")
+	if cfg.TokenMaxTTL == 0 {
+		cfg.TokenMaxTTL = defaultTokenMaxTTL
+		if cfg.EnterpriseMode {
+			cfg.TokenMaxTTL = enterpriseTokenMaxTTL
+		}
+	}
+	if cfg.EnterpriseMode && cfg.TokenMaxTTL > enterpriseTokenMaxTTL {
+		return fmt.Errorf("SB_TOKEN_MAX_TTL must be at most %s when SB_ENTERPRISE_MODE=true", enterpriseTokenMaxTTL)
 	}
 	return nil
 }
@@ -1940,7 +1959,8 @@ func Load() (Config, error) {
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
 		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
 		IdentityEnabled:               getEnvBool("SB_IDENTITY_ENABLED", false),
-		ITestIdentityFile:             strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")),
+		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
+		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -2561,7 +2581,16 @@ func Load() (Config, error) {
 	if cfg.AuditDeletedIndexMax < 0 {
 		return Config{}, errors.New("SB_AUDIT_DELETED_INDEX_MAX must be >= 0")
 	}
-	if err := validateITestIdentityFile(cfg); err != nil {
+	if raw := strings.TrimSpace(os.Getenv("SB_TOKEN_MAX_TTL")); raw != "" {
+		// Parsed strictly (and with days, "90d"): a cap that silently fell
+		// back to the default would mint year-long tokens.
+		ttl, err := identitywire.ParseTokenTTL(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("SB_TOKEN_MAX_TTL: %w", err)
+		}
+		cfg.TokenMaxTTL = ttl
+	}
+	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.EnterpriseMode {

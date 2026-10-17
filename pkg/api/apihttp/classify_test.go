@@ -47,6 +47,10 @@ func TestClassify(t *testing.T) {
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, 0, "", ErrKindSnapshotNameConflict},
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, 0, "", ErrKindSandboxExists},
+		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
+		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
+		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},
+		{"token store unavailable", service.ErrAPITokensUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
 		{"unclassified", errors.New("boom"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 	}
 	for _, tc := range cases {

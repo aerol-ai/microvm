@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"errors"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -43,61 +42,33 @@ func TestIdentityBootGuard(t *testing.T) {
 	}
 }
 
-// TestRunIdentityBootGuards drives the real boot: each refused combination
+// TestRunIdentityBootGuards drives the real boot: a refused combination
 // stops Run before anything starts, with an error naming the conflict.
 func TestRunIdentityBootGuards(t *testing.T) {
-	itestFile := filepath.Join(t.TempDir(), "identity")
-	if err := os.WriteFile(itestFile, []byte("tok-a acct-a\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	managed := func(context.Context, FleetConfig) (controlplane.Provider, error) {
 		return controlplane.Provider{Validator: acceptingValidator{}}, nil
 	}
-	cases := []struct {
-		name     string
-		env      map[string]string
-		provider ProviderFactory
-		wantErr  string
-	}{
-		{
-			name:     "identity on next to a managed validator",
-			env:      map[string]string{"SB_IDENTITY_ENABLED": "true"},
-			provider: managed,
-			wantErr:  "two identity sources",
-		},
-		{
-			name:    "identity on plus SB_ITEST_IDENTITY_FILE",
-			env:     map[string]string{"SB_IDENTITY_ENABLED": "true", "SB_ITEST_IDENTITY_FILE": itestFile},
-			wantErr: "cannot be combined with SB_IDENTITY_ENABLED=true",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_ = setBaseRunEnv(t)
-			for k, v := range tc.env {
-				t.Setenv(k, v)
-			}
-			err := runWithAutoCancel(t, 500*time.Millisecond, tc.provider)
-			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
-				t.Fatalf("Run err = %v, want %q", err, tc.wantErr)
-			}
-		})
+	_ = setBaseRunEnv(t)
+	t.Setenv("SB_IDENTITY_ENABLED", "true")
+	err := runWithAutoCancel(t, 500*time.Millisecond, managed)
+	if err == nil || !strings.Contains(err.Error(), "two identity sources") {
+		t.Fatalf("Run err = %v, want the two-identity-sources refusal", err)
 	}
 }
 
-// With identity off the test-only file keeps working until T3 deletes it.
-func TestRunITestIdentityFileStillBootsWithIdentityOff(t *testing.T) {
-	_ = setBaseRunEnv(t)
-	itestFile := filepath.Join(t.TempDir(), "identity")
-	if err := os.WriteFile(itestFile, []byte("tok-a acct-a\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("SB_ITEST_IDENTITY_FILE", itestFile)
-	if err := runWithAutoCancel(t, 300*time.Millisecond, nil); err != nil {
-		t.Fatalf("Run with the itest file and identity off: %v", err)
-	}
-	t.Setenv("SB_ITEST_IDENTITY_FILE", filepath.Join(t.TempDir(), "missing"))
-	if err := runWithAutoCancel(t, 300*time.Millisecond, nil); err == nil || !strings.Contains(err.Error(), "load SB_ITEST_IDENTITY_FILE") {
-		t.Fatalf("Run with a missing itest file = %v", err)
+// The test-only static token file (SB_ITEST_IDENTITY_FILE) is gone (eng
+// review D4): the variable is ignored, so a file that does not exist no
+// longer stops the boot, with identity on or off, and nothing reads it.
+func TestRunIgnoresRetiredITestIdentityFile(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	for _, identity := range []string{"false", "true"} {
+		t.Run("identity="+identity, func(t *testing.T) {
+			_ = setBaseRunEnv(t)
+			t.Setenv("SB_IDENTITY_ENABLED", identity)
+			t.Setenv("SB_ITEST_IDENTITY_FILE", missing)
+			if err := runWithAutoCancel(t, 300*time.Millisecond, nil); err != nil {
+				t.Fatalf("Run with SB_ITEST_IDENTITY_FILE set: %v", err)
+			}
+		})
 	}
 }
