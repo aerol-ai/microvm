@@ -1330,6 +1330,103 @@ impl Default for RetryConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ClientConfig {
     pub api_url: Option<String>,
+    /// The bearer every request carries: the operator PAT, an `avm_` API
+    /// token or an OIDC ID token. `None` (or blank) falls back to
+    /// `SB_PAT_TOKEN`, then to its alias `SB_API_TOKEN`; when both are set,
+    /// `SB_PAT_TOKEN` wins.
     pub pat_token: Option<String>,
     pub retry: Option<RetryConfig>,
+    /// The team requests act for, sent as the `X-AerolVM-Team` header on
+    /// every request, WebSocket handshakes included. `None` (or blank) falls
+    /// back to `SB_TEAM`; with neither, no header is sent and the server
+    /// uses the credential's first matching binding. The header only chooses
+    /// among teams the credential is already bound to: a team it does not
+    /// hold is refused (403), and the operator PAT ignores it.
+    #[serde(default)]
+    pub team: Option<String>,
+}
+
+/// Who the caller is, as [`crate::Client::whoami`] reports it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WhoAmIPrincipal {
+    /// `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ...
+    pub kind: String,
+    /// Stable id: `"operator"`, `"tok_…"`, `"oidc:<issuer>:<sub>"`, ...
+    pub id: String,
+    /// Display name; empty when the server has none.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+/// The body of `GET /v1/whoami`: the caller's own resolved identity.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct WhoAmI {
+    pub principal: WhoAmIPrincipal,
+    /// `viewer`, `runner`, `auditor` or `admin`.
+    pub role: String,
+    /// `"*"` for every team, a team name, or `None` for a managed account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// When the credential stops working (RFC 3339); `None` if it never does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+/// One scoped API token as `client.tokens().list()` returns it. Never the
+/// secret.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiToken {
+    /// Public id (`tok_…`): what `tokens().revoke` takes and audit records
+    /// name.
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    /// A team name, or `"*"` for every team.
+    pub team: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: String,
+    /// Expired tokens no longer work; they stay listed for 30 days.
+    #[serde(default)]
+    pub expired: bool,
+}
+
+/// `client.tokens().create()`'s result: the stored token plus `token`, the
+/// secret (`avm_…`), returned this once and never stored by the server.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreatedApiToken {
+    #[serde(flatten)]
+    pub api_token: ApiToken,
+    pub token: String,
+}
+
+/// The body of `client.tokens().create()`. All four fields are required.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateApiTokenOptions {
+    /// 1 to 64 of `A-Z a-z 0-9 . _ -`, unique among the team's tokens.
+    pub name: String,
+    /// `viewer`, `runner`, `auditor` or `admin`.
+    pub role: String,
+    /// A team name, or `"*"` for every team. `auditor` and `admin` require
+    /// `"*"`.
+    pub team: String,
+    /// The lifetime: `"90d"`, `"720h"` or any Go duration.
+    pub expires_in: String,
+}
+
+/// `client.tokens().list()`'s result.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiTokenList {
+    #[serde(default, deserialize_with = "null_as_empty_tokens")]
+    pub tokens: Vec<ApiToken>,
+}
+
+fn null_as_empty_tokens<'de, D>(d: D) -> Result<Vec<ApiToken>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<ApiToken>>::deserialize(d)?.unwrap_or_default())
 }
