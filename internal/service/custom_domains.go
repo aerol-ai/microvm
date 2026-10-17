@@ -451,6 +451,28 @@ func (s *Service) persistCustomDomainsOnCreate(ctx context.Context, sandboxID st
 	if len(hostnames) == 0 {
 		return nil
 	}
+	// Prove zone control (TXT record) for each hostname BEFORE inserting any
+	// row — the same gate AddCustomDomain applies. Without this, a create with
+	// custom_domains claimed a hostname the caller does not own: once the real
+	// owner pointed DNS at the ingress, the squatter's sandbox served their
+	// domain (and on-demand TLS issued a cert for it). Verify every hostname
+	// first so a create either takes all of its domains or none.
+	//
+	// Only an owner-scoped (validated user-token) caller must prove control:
+	// that is the untrusted principal who could squat another tenant's
+	// hostname. Operator/PAT callers are trusted to control DNS (pr-review.md
+	// §5), and a stored-spec replay (failover recreate) is unscoped too — its
+	// hostname was proven at the original create and the recreate has no caller
+	// who could provision DNS. Both are unscoped, so gating on scope covers
+	// them. Verify every hostname first, so a create takes all of its domains
+	// or none.
+	if _, scoped := ownerScope(ctx); scoped {
+		for _, h := range hostnames {
+			if err := verifyCustomDomainOwnership(ctx, s.dnsResolver, h, s.cfg.CustomDomainVerifyPrefix, s.cfg.CustomDomainVerifyValuePrefix); err != nil {
+				return err
+			}
+		}
+	}
 	added := make([]string, 0, len(hostnames))
 	rollback := func() {
 		for _, prev := range added {
