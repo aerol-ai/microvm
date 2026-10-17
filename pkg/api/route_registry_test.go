@@ -30,8 +30,8 @@ func (m recordingMux) Handle(pattern string, h http.Handler) {
 // is a security decision a reviewer must see.
 var publicRoutes = map[string]string{
 	"GET /health":   "liveness probes; reports only daemon health",
-	"GET /ui":       "the static dashboard page; the token is asked for in-page",
-	"GET /ui/":      "the static dashboard page; the token is asked for in-page",
+	"GET /ui":       "the static dashboard page; sign-in happens in the page",
+	"GET /ui/":      "the static dashboard page; sign-in happens in the page",
 	"/e2b/runtime":  "envd runtime proxy: the sandbox's own envd token guards it",
 	"/e2b/runtime/": "envd runtime proxy: the sandbox's own envd token guards it",
 }
