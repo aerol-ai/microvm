@@ -1359,6 +1359,29 @@ type ErrorResponse struct {
 	Code string `json:"code,omitempty"`
 }
 
+// WhoAmI is the body of GET /v1/whoami: the caller's own resolved identity
+// (plans/identity-and-access.md §5.2). It only ever describes the caller.
+type WhoAmI struct {
+	Principal WhoAmIPrincipal `json:"principal"`
+	// Role is viewer, runner, auditor or admin.
+	Role string `json:"role"`
+	// Team is "*" for a caller that acts on every team, the team name for a
+	// team-bound credential, and absent for a managed account.
+	Team string `json:"team,omitempty"`
+	// ExpiresAt is when the presented credential stops working; absent for
+	// one that does not expire (the operator token).
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// WhoAmIPrincipal names who the caller is. ID is stable ("operator",
+// "node:n3", "controlplane:<subject>", later "tok_…" or "oidc:<issuer>:<sub>");
+// Name is for display only.
+type WhoAmIPrincipal struct {
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
 // ErrorCodeArtifactNodeUnavailable is returned (503) when an operation needs
 // a node-bound artifact — a js-bundle or a node-built image — and the one
 // worker holding it is not available. Such artifacts are single-copy; the
