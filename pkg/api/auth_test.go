@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -171,7 +172,7 @@ func TestPrincipalInvariants(t *testing.T) {
 			if rec.Code != http.StatusNoContent || !c.ok {
 				t.Fatalf("status %d, access attached %v; body %s", rec.Code, c.ok, rec.Body.String())
 			}
-			if c.access != tc.want {
+			if !reflect.DeepEqual(c.access, tc.want) {
 				t.Fatalf("access =\n %+v\nwant\n %+v", c.access, tc.want)
 			}
 		})
@@ -382,11 +383,11 @@ func TestPostMatchSteps(t *testing.T) {
 }
 
 func TestTeamNotBoundMessageNamesOnlyTheCaller(t *testing.T) {
-	team := (&teamNotBoundError{team: "checkout", role: controlplane.RoleViewer, bound: "payments"}).Error()
+	team := (&teamNotBoundError{team: "checkout", bindings: []controlplane.TeamBinding{{Role: controlplane.RoleViewer, Team: "payments"}}}).Error()
 	if !strings.Contains(team, "role viewer on team payments") || !strings.Contains(team, "binding on team checkout") {
 		t.Fatalf("team message = %q", team)
 	}
-	fleet := (&teamNotBoundError{team: "checkout", role: controlplane.RoleRunner, bound: controlplane.FleetTeam}).Error()
+	fleet := (&teamNotBoundError{team: "checkout", bindings: []controlplane.TeamBinding{{Role: controlplane.RoleRunner, Team: controlplane.FleetTeam}}}).Error()
 	if !strings.Contains(fleet, "role runner on all teams") || !strings.Contains(fleet, "send no "+HeaderTeam) {
 		t.Fatalf("fleet message = %q", fleet)
 	}
@@ -416,7 +417,10 @@ func TestMapAuthFailure(t *testing.T) {
 		{name: "provider rejection", linkKind: "controlplane", err: controlplane.ErrTokenRejected, wantStatus: 401, wantKind: "controlplane", wantReason: "rejected"},
 		{name: "account-less identity", linkKind: "controlplane", err: controlplane.ErrIdentityNoOwner, wantStatus: 401, wantKind: "controlplane", wantReason: "no_owner"},
 		{name: "fleet role from a provider", linkKind: "controlplane", err: controlplane.ErrIdentityRole, wantStatus: 401, wantKind: "controlplane", wantReason: "bad_role"},
-		{name: "team not bound", linkKind: "token", err: &teamNotBoundError{team: "x", role: controlplane.RoleRunner, bound: "y"}, wantStatus: 403, wantKind: "token", wantReason: "team_not_bound"},
+		{name: "team not bound", linkKind: "token", err: &teamNotBoundError{team: "x", bindings: []controlplane.TeamBinding{{Role: controlplane.RoleRunner, Team: "y"}}}, wantStatus: 403, wantKind: "token", wantReason: "team_not_bound"},
+		{name: "no binding", linkKind: "oidc", err: &controlplane.NoBindingError{Issuer: "okta", Name: "ana@acme.com"}, wantStatus: 403, wantKind: "oidc", wantReason: "no_binding"},
+		{name: "group overage", linkKind: "oidc", err: &controlplane.NoBindingError{Issuer: "entra", Name: "ana@acme.com", Overage: true}, wantStatus: 403, wantKind: "oidc", wantReason: "group_overage"},
+		{name: "identity unavailable", linkKind: "oidc", err: controlplane.ErrIdentityUnavailable, wantStatus: 503, wantKind: "oidc", wantReason: "unavailable"},
 		{name: "bad team header", linkKind: "token", err: errBadTeamHeader, wantStatus: 400, wantKind: "token", wantReason: "bad_team"},
 		{name: "anything else", linkKind: "unknown", err: errors.New("boom"), wantStatus: 401, wantKind: "unknown", wantReason: "rejected"},
 	}

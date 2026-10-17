@@ -14,8 +14,24 @@
 //     chain: checksum, local lookup, constant-time hash compare, expiry, and
 //     the stale-mirror rule (CEO review D16).
 //
+// Task T6 puts SSO through OIDC here. sandboxd is a resource server, the
+// same model as the Kubernetes API server with --oidc-issuer-url (§5.0,
+// L1–L8): the company's identity provider logs the person in, and every
+// node verifies the provider's token itself from the provider's published
+// keys. There is no login service and no session.
+//
+//   - Config and Watcher: the identity file (SB_IDENTITY_FILE) with its
+//     issuers, bindings and deny list, strictly loaded and hot-reloaded.
+//   - Verifier, the jwt link in the same chain: offline signature and claim
+//     checks, the bindings a token matches, and a verified-token cache that
+//     holds the binding set, never a selected team (eng review E7).
+//   - Summary and Diff: the identity_config evidence a file change writes
+//     (CEO review D20).
+//
 // Nothing on the request path makes a network call or touches SQLite (L2,
-// D21): an unknown or malformed token is a local miss.
+// D21): an unknown or malformed token is a local miss. The verifier's only
+// traffic is the issuer's JWKS, fetched at start, hourly, and at most once a
+// minute per issuer on an unknown key id.
 //
 // The package is a leaf of the server tree. internal/cluster and
 // internal/store import it for the record type; it imports neither.

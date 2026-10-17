@@ -84,6 +84,14 @@ type Access struct {
 	// is one of an issuer's mcp_audiences, §5.14). The API edge refuses it
 	// everywhere else. No T1 authenticator sets it.
 	MCPOnly bool
+	// Bindings is every role binding the credential matched, first match
+	// first (an OIDC token can match several identity-file bindings, §5.3).
+	// Role, Fleet and Identity.OwnerRef describe the one team selection
+	// picked: the first, unless X-AerolVM-Team names another. Empty for a
+	// credential with exactly one binding (the PAT, a node, a managed
+	// account, an avm_ token). The slice is shared with the verified-token
+	// cache: read it, never write it.
+	Bindings []TeamBinding
 }
 
 type accessCtxKey struct{}

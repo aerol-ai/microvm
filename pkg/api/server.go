@@ -27,6 +27,7 @@ import (
 	apiv1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
 type Server struct {
@@ -45,6 +46,12 @@ type Server struct {
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
 	// default PAT-then-provider chain.
 	authChain []authLink
+
+	// Sign-in discovery (discovery.go): whether identity is on, the
+	// issuers to publish, and SB_DOMAIN for ui_url.
+	identityEnabled bool
+	discovery       func() []identitywire.DiscoveryIssuer
+	domain          string
 
 	// audit is the one seam that writes kind "api" chain records
 	// (apihttp.AuditHook, api_audit.go). registerRoutes hands it to every
@@ -87,8 +94,10 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	}
 	if !cfg.IdentityEnabled {
 		// Identity off is byte for byte the pre-identity server (L8): no
-		// avm_ or JWT authenticator, whatever the caller passed.
+		// avm_ or JWT authenticator, whatever the caller passed, and no
+		// issuer in the discovery document.
 		options.credentials = nil
+		options.discovery = nil
 	}
 	// A nil *docker.Client wrapped in the interface would be a non-nil
 	// interface holding a nil pointer, defeating the handlers' `Builder == nil`
@@ -106,6 +115,9 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		patToken:        patToken,
 		validator:       validator,
 		authChain:       buildAuthChain(patToken, validator, options.credentials),
+		identityEnabled: cfg.IdentityEnabled,
+		discovery:       options.discovery,
+		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
 			IdentityRate: cfg.AuditRateLimitIdentity,
@@ -148,13 +160,18 @@ func (s *Server) Handler() http.Handler {
 
 // registerRoutes mounts every route on mux. Every one goes through a
 // surface's Route (authenticate → authorize → audit seam) except the public
-// allowlist in route_registry_test.go: /health, /ui and the E2B runtime
-// proxy. NewServer passes the real mux; the registry test a recording one.
+// allowlist in route_registry_test.go: /health, /ui, the sign-in discovery
+// document and the E2B runtime proxy. NewServer passes the real mux; the
+// registry test a recording one.
 func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// /health is unversioned: it is meant for liveness probes (k8s, load
 	// balancers) which should keep working across API version rollouts.
 	// Public by design.
 	mux.Handle("GET /health", http.HandlerFunc(s.handleHealth))
+
+	// Sign-in discovery (§5.6): public by design, since a person reads it
+	// before holding any credential. It lists no issuer with identity off.
+	mux.Handle("GET "+identitywire.AuthDiscoveryPath, http.HandlerFunc(s.handleAuthDiscovery))
 
 	// Each registered version owns its own URL prefix and is responsible for
 	// every route under it. Authentication is shared across versions via

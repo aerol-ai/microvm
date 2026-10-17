@@ -16,13 +16,15 @@ import (
 // the _total suffix types them as counters:
 //
 //	aerolvm_auth_requests_total{key=<principal kind>,key2=<origin>}
-//	  kind:   operator | node | controlplane (token, oidc from T3/T6)
+//	  kind:   operator | node | controlplane | token | oidc
 //	  origin: host | peer | public (see authOrigin)
 //	aerolvm_auth_failures_total{key=<kind>,key2=<reason>}
-//	  kind:   none | unknown | controlplane (token, oidc from T3/T6)
+//	  kind:   none | unknown | controlplane | token | oidc
 //	  reason: missing | rejected | no_owner | bad_role | bad_team |
 //	          team_not_bound | stale (token mirror out of date, 503) |
-//	          a D17 reason (expired, wrong_audience, ...)
+//	          a D17 reason (expired, wrong_audience, ...) |
+//	          no_binding | group_overage (a verified OIDC token, 403) |
+//	          unavailable (a JWT this node cannot check now, 503)
 //
 // Every label value comes from a fixed set, never from the request, so a
 // caller cannot grow the series count.

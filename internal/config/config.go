@@ -1370,6 +1370,13 @@ type Config struct {
 	// SB_TOKEN_MAX_TTL. Default 8760h (365 days); 2160h (90 days) in
 	// enterprise mode, which refuses anything longer.
 	TokenMaxTTL time.Duration
+	// IdentityFile is the identity file (plans/identity-and-access.md
+	// §5.5): the OIDC issuers this node trusts and the group-to-role
+	// bindings. Empty with IdentityEnabled is tokens-only mode (avm_ tokens,
+	// no SSO). It needs IdentityEnabled: Load refuses it alone, so an
+	// operator never believes SSO and the deny list are on when they are
+	// not. SB_IDENTITY_FILE.
+	IdentityFile string
 
 	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
 	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
@@ -1753,6 +1760,19 @@ func validateIdentity(cfg *Config) error {
 	return nil
 }
 
+// validateIdentityFile refuses SB_IDENTITY_FILE without SB_IDENTITY_ENABLED.
+// The file names the issuers people sign in with and the emergency deny
+// list; with identity off the daemon reads neither, and a deploy that set
+// one without the other would believe SSO and the deny list were in force.
+// The file's content is checked when it loads (an invalid file at boot
+// keeps OIDC at 503, not the daemon down, as the egress operator file does).
+func validateIdentityFile(cfg Config) error {
+	if cfg.IdentityFile != "" && !cfg.IdentityEnabled {
+		return errors.New("SB_IDENTITY_FILE needs SB_IDENTITY_ENABLED=true: with identity off the identity file is never read")
+	}
+	return nil
+}
+
 func Load() (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
@@ -1994,6 +2014,7 @@ func Load() (Config, error) {
 		IdentityEnabled:               getEnvBool("SB_IDENTITY_ENABLED", false),
 		IdentitySyncInterval:          getEnvDuration("SB_IDENTITY_SYNC_INTERVAL", 5*time.Second),
 		IdentityMaxStale:              getEnvDuration("SB_IDENTITY_MAX_STALE", 60*time.Second),
+		IdentityFile:                  strings.TrimSpace(os.Getenv("SB_IDENTITY_FILE")),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -2627,6 +2648,9 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateIdentityFile(cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.EnterpriseMode {
