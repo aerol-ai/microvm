@@ -1,5 +1,11 @@
 # Release gate: per-owner snapshot-namespace migration (warm upgrade)
 
+> **Automated:** `integration-tests/run.sh <scenario> --upgrade-from <tag>`
+> (e.g. `run.sh single-node --upgrade-from v0.6.7`) runs this whole gate —
+> provision the old release, seed, upgrade every node in place, verify no row
+> loss, tear down. `upgrade-gate.sh` is the orchestrator. This document is the
+> manual runbook it mirrors; follow it by hand to debug a failed gate.
+
 **When to run:** before cutting the first release that contains the per-owner
 snapshot namespace (`sandbox_snapshots` PK → `(owner_ref, name)`,
 `snapshot_aliases.owner_ref` + composite FK, `migrateSnapshotOwnerPK`). That
