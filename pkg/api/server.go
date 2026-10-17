@@ -227,8 +227,8 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		mux.Handle(remotemcp.Path, apihttp.PreAuth(outer, authed))
 	}
 
-	// Operator dashboard + expvar. /ui is public (static HTML; the token is
-	// asked for in-page), the metrics endpoints are permission-gated. See
+	// Operator dashboard + expvar. /ui is public (static HTML; sign-in
+	// happens in the page), the metrics endpoints are permission-gated. See
 	// pkg/api/dashboard.go.
 	s.registerDashboard(mux)
 }

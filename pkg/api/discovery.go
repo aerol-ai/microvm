@@ -26,12 +26,21 @@ func (s *Server) handleAuthDiscovery(w http.ResponseWriter, _ *http.Request) {
 		Issuers:         []identitywire.DiscoveryIssuer{},
 		UIURL:           identitywire.UIURL(s.domain),
 	}
-	if s.identityEnabled && s.discovery != nil {
-		if issuers := s.discovery(); issuers != nil {
-			doc.Issuers = issuers
-		}
+	if issuers := s.signInIssuers(); issuers != nil {
+		doc.Issuers = issuers
 	}
 	// A reload must show at once, and the body is a few hundred bytes.
 	w.Header().Set("Cache-Control", "no-store")
 	apihttp.WriteJSON(w, http.StatusOK, doc)
+}
+
+// signInIssuers is the identity file's current sign-in issuers, read per
+// call so a reload shows at once: the discovery document lists them and the
+// dashboard's CSP allows calls to them. Identity off lists none, and never
+// reads the file.
+func (s *Server) signInIssuers() []identitywire.DiscoveryIssuer {
+	if !s.identityEnabled || s.discovery == nil {
+		return nil
+	}
+	return s.discovery()
 }
