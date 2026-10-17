@@ -647,44 +647,69 @@ func (s *Server) fillVersionPage(b *bucket, res *listVersionsResult) {
 // listObjectsV2 lists current versions only: a key whose newest version is
 // a delete marker is left out, which is exactly why the witness must not use
 // it to find a node's newest day (C2). The continuation token is the last
-// key returned.
+// key (or common prefix) returned. With a delimiter, keys that continue past
+// it below the prefix roll up into one common prefix each, as S3 does
+// (aerolvm audit search lists an export's node=<id>/ prefixes this way).
 func (s *Server) listObjectsV2(w http.ResponseWriter, bucketName string, b *bucket, q url.Values) {
-	prefix, after := q.Get("prefix"), q.Get("continuation-token")
+	prefix, after, delimiter := q.Get("prefix"), q.Get("continuation-token"), q.Get("delimiter")
 	maxKeys := 1000
 	if mk, err := strconv.Atoi(q.Get("max-keys")); err == nil && mk > 0 && mk < maxKeys {
 		maxKeys = mk
 	}
 	keys := make([]string, 0, len(b.objects))
 	for k, versions := range b.objects {
-		if strings.HasPrefix(k, prefix) && k > after && !versions[len(versions)-1].DeleteMarker {
-			keys = append(keys, k)
+		if !strings.HasPrefix(k, prefix) || k <= after || versions[len(versions)-1].DeleteMarker {
+			continue
 		}
+		if delimiter != "" && strings.HasSuffix(after, delimiter) && strings.HasPrefix(k, after) {
+			continue // under a common prefix an earlier page returned
+		}
+		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	res := listBucketResult{Name: bucketName, Prefix: prefix, MaxKeys: maxKeys, ContinuationToken: after}
-	for i, k := range keys {
-		if i == maxKeys {
+	res := listBucketResult{Name: bucketName, Prefix: prefix, Delimiter: delimiter, MaxKeys: maxKeys, ContinuationToken: after}
+	seen := map[string]bool{}
+	last := ""
+	for _, k := range keys {
+		entry := k
+		if delimiter != "" {
+			if i := strings.Index(k[len(prefix):], delimiter); i >= 0 {
+				entry = k[:len(prefix)+i+len(delimiter)]
+			}
+		}
+		if seen[entry] {
+			continue
+		}
+		if len(res.Contents)+len(res.CommonPrefixes) == maxKeys {
 			res.IsTruncated = true
-			res.NextContinuationToken = keys[i-1]
+			res.NextContinuationToken = last
 			break
+		}
+		seen[entry] = true
+		last = entry
+		if entry != k {
+			res.CommonPrefixes = append(res.CommonPrefixes, commonPrefix{Prefix: entry})
+			continue
 		}
 		v := b.objects[k][len(b.objects[k])-1]
 		res.Contents = append(res.Contents, objectEntry{Key: k, LastModified: s3Time(v.LastModified), ETag: v.ETag, Size: int64(len(v.Body)), StorageClass: "STANDARD"})
 	}
-	res.KeyCount = len(res.Contents)
+	res.KeyCount = len(res.Contents) + len(res.CommonPrefixes)
 	writeXML(w, res)
 }
 
 type listBucketResult struct {
-	XMLName               xml.Name      `xml:"ListBucketResult"`
-	Name                  string        `xml:"Name"`
-	Prefix                string        `xml:"Prefix"`
-	MaxKeys               int           `xml:"MaxKeys"`
-	KeyCount              int           `xml:"KeyCount"`
-	IsTruncated           bool          `xml:"IsTruncated"`
-	ContinuationToken     string        `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string        `xml:"NextContinuationToken,omitempty"`
-	Contents              []objectEntry `xml:"Contents"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	KeyCount              int            `xml:"KeyCount"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+	Contents              []objectEntry  `xml:"Contents"`
+	CommonPrefixes        []commonPrefix `xml:"CommonPrefixes"`
 }
 
 type objectEntry struct {
