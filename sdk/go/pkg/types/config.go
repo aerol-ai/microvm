@@ -3,9 +3,20 @@ package types
 import "net/http"
 
 type MicroVMConfig struct {
+	// PATToken is the bearer every request carries: the operator PAT, an
+	// avm_ API token or an OIDC ID token. Empty falls back to SB_PAT_TOKEN,
+	// then to its alias SB_API_TOKEN; when both are set, SB_PAT_TOKEN wins.
 	PATToken   string
 	APIUrl     string
 	HTTPClient *http.Client
+	// Team selects which of the credential's teams requests act for. It is
+	// sent as the X-AerolVM-Team header on every request, WebSocket
+	// handshakes included. Empty falls back to SB_TEAM; when both are empty
+	// no header is sent and the server uses the credential's first matching
+	// binding. The header only chooses among teams the credential is
+	// already bound to: a team it does not hold is refused (403), and the
+	// operator PAT ignores it.
+	Team string
 	// APIVersion pins which wire version of the sandbox daemon API the
 	// client speaks. Empty defaults to the SDK's pinned default ("v1"
 	// today). The Go SDK's package version and the wire version evolve

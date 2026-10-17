@@ -63,9 +63,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, options ExecStreamOp
 	}
 
 	requestHeader := http.Header{}
-	if c.patToken != "" {
-		requestHeader.Set("Authorization", "Bearer "+c.patToken)
-	}
+	c.setAuthHeaders(requestHeader)
 
 	conn, resp, err := websocket.DefaultDialer.DialContext(ctx, wsURL, requestHeader)
 	if err != nil {
