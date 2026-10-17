@@ -55,7 +55,6 @@ func TestEmitSecretAuditNilSinkNoPanic(t *testing.T) {
 	emitSecretAudit(nil, "sb", "ref", "node-a", "", "", nil)
 	var sink SecretAuditSink
 	emitSecretAudit(sink, "sb", "ref", "node-a", "", "", secrets.ErrNotFound)
-	beginSecretAudit(nil, "sb", "ref", "node-a", "")(nil)
 }
 
 func TestSecretAuditStrictBootAndUnavailableSink(t *testing.T) {
@@ -162,7 +161,7 @@ func TestSecretAuditDecryptFailedClass(t *testing.T) {
 		secretAudit: mem,
 		cluster:     cluster.NewNoop("node-a", "", ""),
 	}
-	_, err := s.UnsealRegistry("sb-reg", []byte("not-valid-ciphertext"))
+	_, err := s.UnsealRegistry(context.Background(), "sb-reg", []byte("not-valid-ciphertext"))
 	if err == nil {
 		t.Fatal("expected decrypt failure")
 	}

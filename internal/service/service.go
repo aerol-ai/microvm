@@ -1424,6 +1424,9 @@ func (s *Service) RecreateSandbox(ctx context.Context, id string, spec models.Cr
 // idempotent route replay work is already healthy. This keeps the failover
 // recreate counter from becoming a constant five-second polling rate.
 func (s *Service) RecreateSandboxReport(ctx context.Context, id string, spec models.CreateSandboxRequest, secrets cluster.PlacementSecrets, exposedPorts map[int]cluster.ExposedPortRoute) (bool, error) {
+	// The owner watcher calls this for a placement that failed over to us;
+	// no request is behind it.
+	ctx = withAuditSubsystem(ctx, auditSubsystemFailover)
 	// The replicated spec holds the owner-qualified name key; the local row
 	// gets the user's name back (names are unique per owner in the store).
 	// A malformed legacy "owner:" name decodes to itself and never fails.
@@ -2696,12 +2699,12 @@ func (s *Service) sealRegistry(auth *models.RegistryAuth) ([]byte, error) {
 // when the input is empty (no credentials persisted). Exported for the
 // boot-time backfill in cmd/sandboxd that rebuilds CreateSandboxRequest from
 // the persisted Sandbox row. sandboxID is audit-only (ref registry:{id}).
-func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
+func (s *Service) UnsealRegistry(ctx context.Context, sandboxID string, sealed []byte) (auth *models.RegistryAuth, err error) {
 	if len(sealed) == 0 {
 		return nil, nil
 	}
 	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, registryAuditRef(sandboxID), s.auditActor(), "", auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, registryAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s == nil || s.cipher == nil {
 		return nil, fmt.Errorf("%w: registry auth cipher is not configured", secrets.ErrDecryptFailed)
@@ -2723,11 +2726,11 @@ func (s *Service) UnsealRegistry(sandboxID string, sealed []byte) (auth *models.
 // Fail closed when persisted credentials cannot be opened. Falling through to
 // the node's ambient registry identity would cross the tenant authorization
 // boundary and make credential revocation ineffective.
-func (s *Service) attachWasmRegistryAuth(sandbox *models.Sandbox) error {
+func (s *Service) attachWasmRegistryAuth(ctx context.Context, sandbox *models.Sandbox) error {
 	if sandbox == nil || len(sandbox.RegistryAuthSealed) == 0 {
 		return nil
 	}
-	auth, err := s.UnsealRegistry(sandbox.ID, sandbox.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(ctx, sandbox.ID, sandbox.RegistryAuthSealed)
 	if err != nil {
 		return fmt.Errorf("wasm: unseal registry auth for %s: %w", sandbox.ID, err)
 	}
@@ -2795,7 +2798,7 @@ func (s *Service) sealEnv(sandboxID, incarnationID string, env map[string]string
 // loadEnv reads the sealed sandbox_env row. Explicit loads are audited (D9 / T6).
 func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) (env map[string]string, err error) {
 	sealed, envPresent, auditIncarnationID, auditOwnerRef, getErr := s.store.GetEnvWithIdentity(ctx, sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, envAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, envAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 
 	if getErr == nil {
@@ -2936,7 +2939,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 		return nil, nil
 	}
 	auditIncarnationID, auditOwnerRef := s.auditIdentityFor(sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, mountsAuditRef(sandboxID), s.auditActor(), correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, mountsAuditRef(sandboxID), s.auditActor(), auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if s.cipher == nil {
 		return nil, fmt.Errorf("%w: mounts cipher is not configured", secrets.ErrDecryptFailed)
@@ -3198,7 +3201,7 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 			// Unseal per-tenant registry creds so a private oci:// module
 			// re-pulls under the tenant's identity if this node lacks it
 			// (codex C4). Transient: never persisted or serialized.
-			if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+			if err := s.attachWasmRegistryAuth(ctx, sandbox); err != nil {
 				_ = s.mounts.UnmountAll(id)
 				releaseAdmission()
 				_ = s.store.UpdateStatus(ctx, id, models.SandboxStatusError, err.Error())
@@ -5463,6 +5466,7 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	if s.admitter == nil {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemBootRestore)
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
 		s.logger.Warn("replay reservations: list failed", "error", err)
@@ -5507,6 +5511,9 @@ func (s *Service) reconcileGoneContainerConfirmed(ctx context.Context, sandbox *
 }
 
 func (s *Service) Reconcile(ctx context.Context) error {
+	// The admin reconcile route keeps its caller: a request's Access wins
+	// over the subsystem tag.
+	ctx = withAuditSubsystem(ctx, auditSubsystemReconcile)
 	// Topology heartbeat: surface a cluster that has crossed the
 	// 10-ingress-node sharding threshold without operator opt-in to
 	// SB_CLUSTER_SHARD_AWARE_INGRESS. /health also reports this, but the
@@ -6168,7 +6175,7 @@ func (s *Service) startPeriodic(ctx context.Context, interval, timeout time.Dura
 }
 
 func (s *Service) StartLifecycleSweep(ctx context.Context) {
-	s.startPeriodic(ctx, time.Minute, 30*time.Second, s.runLifecycleSweep)
+	s.startPeriodic(withAuditSubsystem(ctx, auditSubsystemLifecycle), time.Minute, 30*time.Second, s.runLifecycleSweep)
 }
 
 func (s *Service) runLifecycleSweep(ctx context.Context) {
@@ -6604,6 +6611,7 @@ func (s *Service) StartBuiltImageGC(ctx context.Context) {
 	if !s.cfg.ImageBuildGCEnabled {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemImageGC)
 	interval := s.cfg.ImageBuildGCInterval
 	if interval <= 0 {
 		return
@@ -6669,6 +6677,7 @@ func (s *Service) StartPendingImageGC(ctx context.Context) {
 	if !s.cfg.ImageBuildGCEnabled {
 		return
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemImageGC)
 	interval := s.cfg.ImageBuildGCInterval
 	if interval <= 0 {
 		return
@@ -6826,6 +6835,7 @@ func (s *Service) ReconcileClusterIngress(ctx context.Context) error {
 	if !s.cfg.EnableCluster || !s.caddy.Enabled() {
 		return nil
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemReconcile)
 	// Peer-forwarding routes belong to the ingress tier. A dedicated worker or
 	// server reconciling them downloaded a placement view it never installs
 	// anything from.

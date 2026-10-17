@@ -513,6 +513,9 @@ func (s *Service) forgetWakeFlight(id string) {
 // the wave of HTTP requests waking the same sandbox collapses to one
 // StartSandbox; waves to different sandboxes proceed concurrently.
 func (s *Service) EnsureSandboxAwakeForHTTP(ctx context.Context, id string) (*models.Sandbox, error) {
+	// Traffic to a sandbox route wakes it with no API caller behind it; the
+	// toolbox proxy also lands here, and its request's Access wins.
+	ctx = withAuditSubsystem(ctx, auditSubsystemWake)
 	finish := beginWakeMetric()
 	sandbox, err := s.scopedGet(ctx, id)
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 // FSM. It is the local-store -> global-index repair path used at boot and by
 // the periodic reconciler after Docker confirms a container still exists.
 func (s *Service) ReplayClusterOwnership(ctx context.Context) (int, error) {
+	ctx = withAuditSubsystem(ctx, auditSubsystemBootRestore)
 	sandboxes, err := s.store.List(ctx)
 	if err != nil {
 		return 0, err
@@ -301,7 +302,7 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 		spec.Failover = nil
 	}
 
-	auth, err := s.UnsealRegistry(sb.ID, sb.RegistryAuthSealed)
+	auth, err := s.UnsealRegistry(ctx, sb.ID, sb.RegistryAuthSealed)
 	if err != nil {
 		return nil, fmt.Errorf("unseal registry auth for ownership replay %s: %w", sb.ID, err)
 	}

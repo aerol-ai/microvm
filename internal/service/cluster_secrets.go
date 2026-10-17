@@ -111,7 +111,7 @@ func (s *Service) OpenClusterSecretsForNode(ctx context.Context, sandboxID strin
 		auditIncarnationID = parsed.IncarnationID
 	}
 	_, auditOwnerRef := s.auditIdentityFor(sandboxID)
-	done := beginSecretAuditOwned(s.secretAuditSink(), sandboxID, placement.Ref, actor, correlationIDFromContext(ctx), auditIncarnationID, auditOwnerRef)
+	done := s.beginSecretAuditFor(ctx, sandboxID, placement.Ref, actor, auditIncarnationID, auditOwnerRef)
 	defer func() { done(err) }()
 	if parseErr != nil || placement.Version != secrets.RefVersion || placement.SealGeneration <= 0 || placementIncarnationID == "" ||
 		parsed.SandboxID != sandboxID || parsed.IncarnationID != placementIncarnationID || parsed.Version != placement.Version {
