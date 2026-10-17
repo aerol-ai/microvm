@@ -25,6 +25,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 pub use image::Image;
 pub use types::CreateSandboxResponse;
 use types::{CustomDomainListWire, ExposePortResponseWire};
+pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{
     AddCustomDomainOptions, AuditCoverage, AuditEvent, AuditOptions, AuditPage, BuildImageOptions,
     EgressInject, EgressProfile, EgressProfileList, EgressProfileOptions, EgressProfileRef, EgressRule,
@@ -47,6 +48,11 @@ pub use types::{
 };
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:21212";
+
+/// The request header that selects which of a credential's teams a request
+/// acts for. Keep in sync with `pkg/api.HeaderTeam` on the server.
+pub const TEAM_HEADER: &str = "X-AerolVM-Team";
+
 const STREAM_PREFIX_STDOUT: u8 = 0x01;
 const STREAM_PREFIX_STDERR: u8 = 0x02;
 
@@ -95,7 +101,7 @@ impl fmt::Display for Error {
             Error::Reqwest(err) => write!(f, "HTTP error: {}", err),
             Error::MissingToken => write!(
                 f,
-                "PAT token is required. Set SB_PAT_TOKEN or pass pat_token."
+                "PAT token is required. Set SB_PAT_TOKEN or SB_API_TOKEN, or pass pat_token."
             ),
             Error::Api(message) => write!(f, "API error: {}", message),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
@@ -166,6 +172,105 @@ mod api_v1 {
     pub const PATH_PREFIX: &str = "/v1";
 }
 
+/// The bearer a client sends: the explicit value, else `SB_PAT_TOKEN`, else
+/// its alias `SB_API_TOKEN`. A blank value counts as unset. `SB_PAT_TOKEN`
+/// wins over the alias so a setup that already exports it keeps its token.
+fn resolve_token(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set = |value: &String| !value.trim().is_empty();
+    explicit
+        .filter(set)
+        .or_else(|| env("SB_PAT_TOKEN").filter(set))
+        .or_else(|| env("SB_API_TOKEN").filter(set))
+}
+
+/// The team a client sends in [`TEAM_HEADER`]: the explicit value, else
+/// `SB_TEAM`, trimmed; `None` (no header) when both are blank.
+fn resolve_team(explicit: Option<String>, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let trimmed = |value: String| Some(value.trim().to_string()).filter(|v| !v.is_empty());
+    explicit
+        .and_then(trimmed)
+        .or_else(|| env("SB_TEAM").and_then(trimmed))
+}
+
+/// Adds the client's credential and team selection to a request. Every HTTP
+/// call goes through it, so a client built with a team never sends a
+/// request that acts for another one.
+trait Authorize {
+    fn authorize(self, client: &Client) -> Self;
+}
+
+impl Authorize for reqwest::blocking::RequestBuilder {
+    fn authorize(self, client: &Client) -> Self {
+        let builder = self.bearer_auth(&client.pat_token);
+        match &client.team {
+            Some(team) => builder.header(TEAM_HEADER, team),
+            None => builder,
+        }
+    }
+}
+
+/// The WebSocket handshake for `ws_url`, carrying the same credential and
+/// team header as every HTTP request.
+fn websocket_request(
+    ws_url: String,
+    pat_token: &str,
+    team: Option<&str>,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, Error> {
+    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
+    request.headers_mut().insert(
+        http::header::AUTHORIZATION,
+        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
+            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
+    );
+    if let Some(team) = team {
+        request.headers_mut().insert(
+            TEAM_HEADER,
+            http::HeaderValue::from_str(team)
+                .map_err(|err| Error::Api(format!("invalid {} header: {}", TEAM_HEADER, err)))?,
+        );
+    }
+    Ok(request)
+}
+
+/// Scoped API tokens (`avm_…`) for services and CI, reached through
+/// [`Client::tokens`]. Creating and revoking needs an admin credential;
+/// listing needs an auditor or an admin.
+pub struct Tokens<'a> {
+    client: &'a Client,
+}
+
+impl Tokens<'_> {
+    fn path(&self, suffix: &str) -> String {
+        format!("{}/tokens{}", self.client.version_prefix(), suffix)
+    }
+
+    /// Mints a token. The result's `token` is the secret, returned this once
+    /// and never again. A 409 means the name is taken, possibly by an
+    /// earlier attempt whose reply was lost; that secret cannot be
+    /// recovered, so revoke the token and create it again.
+    pub fn create(&self, opts: CreateApiTokenOptions) -> Result<CreatedApiToken, Error> {
+        self.client
+            .do_json::<CreateApiTokenOptions, CreatedApiToken>(Method::POST, &self.path(""), Some(&opts))
+    }
+
+    /// Lists every token, expired ones included (`expired` is true) until
+    /// the server removes them 30 days after expiry. Never a secret.
+    pub fn list(&self) -> Result<ApiTokenList, Error> {
+        self.client.do_json::<(), ApiTokenList>(Method::GET, &self.path(""), None)
+    }
+
+    /// Revokes a token by id (`tok_…`). Revoking one that is already gone
+    /// succeeds, so a retried revoke is safe.
+    pub fn revoke(&self, id: &str) -> Result<(), Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Api("token id is required".to_string()));
+        }
+        let path = self.path(&format!("/{}", urlencoding::encode(id)));
+        self.client.do_json::<(), ()>(Method::DELETE, &path, None)
+    }
+}
+
 /// Bounds only the TCP/TLS connect, which no legitimate call needs long for.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -229,6 +334,7 @@ impl RetryPolicy {
 pub struct Client {
     api_url: String,
     pat_token: String,
+    team: Option<String>,
     api_version: ApiVersion,
     inner: HttpClient,
     retry_config: RetryConfig,
@@ -604,6 +710,7 @@ impl Client {
             api_url: api_url.map(String::from),
             pat_token: pat_token.map(String::from),
             retry: None,
+            team: None,
         }, api_version)
     }
 
@@ -611,15 +718,9 @@ impl Client {
         config: ClientConfig,
         api_version: ApiVersion,
     ) -> Result<Self, Error> {
-        let token = config.pat_token
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::env::var("SB_PAT_TOKEN")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            });
-
-        let pat_token = token.ok_or(Error::MissingToken)?;
+        let env = |name: &str| std::env::var(name).ok();
+        let pat_token = resolve_token(config.pat_token, env).ok_or(Error::MissingToken)?;
+        let team = resolve_team(config.team, env);
         let api_url = config.api_url
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim().trim_end_matches('/').to_string())
@@ -634,6 +735,7 @@ impl Client {
         Ok(Client {
             api_url,
             pat_token,
+            team,
             api_version,
             inner: build_http_client(None)?,
             retry_config: config.retry.unwrap_or_default(),
@@ -729,7 +831,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::POST, self.full_url(&path))
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .json(&BuildImageRequest {
                 dockerfile_content: image.dockerfile(),
                 push: push_body,
@@ -1182,7 +1284,7 @@ impl Client {
         let mut builder = self
             .inner
             .post(&url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .header("Content-Type", "application/octet-stream")
             .header("X-Registry-Token", &opts.registry_token)
             .body(opts.module);
@@ -1334,6 +1436,21 @@ impl Client {
         self.do_json::<(), ()>(Method::DELETE, &self.egress_profile_path(name), None)
     }
 
+    /// Who the server says the caller is: principal, role, team and when
+    /// the credential expires. Every valid credential may ask.
+    pub fn whoami(&self) -> Result<WhoAmI, Error> {
+        self.do_json::<(), WhoAmI>(
+            Method::GET,
+            &format!("{}/whoami", self.version_prefix()),
+            None,
+        )
+    }
+
+    /// Scoped API tokens: `client.tokens().create/list/revoke`.
+    pub fn tokens(&self) -> Tokens<'_> {
+        Tokens { client: self }
+    }
+
     pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
         let mut path = format!("{}/sandboxes/{}/audit", self.version_prefix(), id);
         if let Some(kind) = &opts.kind {
@@ -1483,7 +1600,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1501,7 +1618,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1519,6 +1636,7 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
         let session_id = session_id.to_string();
@@ -1530,6 +1648,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     session_id,
                     options,
@@ -1559,6 +1678,7 @@ impl Client {
         let (done_tx, done_rx) = mpsc::channel();
         let api_url = self.api_url.clone();
         let pat_token = self.pat_token.clone();
+        let team = self.team.clone();
         let api_version = self.api_version;
         let sandbox_id = id.to_string();
 
@@ -1569,6 +1689,7 @@ impl Client {
                     api_url,
                     api_version,
                     pat_token,
+                    team,
                     sandbox_id,
                     options,
                     control_rx,
@@ -1614,7 +1735,7 @@ impl Client {
         let response = self
             .inner
             .request(Method::GET, &url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .send()?;
         self.handle_response(response)?
             .bytes()
@@ -1788,7 +1909,7 @@ impl Client {
             let mut builder = self
                 .inner
                 .request(method.clone(), &url)
-                .bearer_auth(&self.pat_token);
+                .authorize(self);
             if let Some(body) = payload {
                 builder = builder.json(body);
             }
@@ -1829,7 +1950,7 @@ impl Client {
         let response = self
             .inner
             .post(&url)
-            .bearer_auth(&self.pat_token)
+            .authorize(self)
             .multipart(form)
             .send()?;
         self.handle_response(response).map(|_| ())
@@ -1858,6 +1979,7 @@ async fn run_exec_stream(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     options: ExecStreamOptions,
     mut control_rx: tokio::sync::mpsc::UnboundedReceiver<ControlMessage>,
@@ -1870,12 +1992,7 @@ async fn run_exec_stream(
             urlencoding::encode(&sandbox_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -1953,6 +2070,7 @@ async fn run_session_attach(
     api_url: String,
     api_version: ApiVersion,
     pat_token: String,
+    team: Option<String>,
     sandbox_id: String,
     session_id: String,
     options: SessionAttachOptions,
@@ -1967,12 +2085,7 @@ async fn run_session_attach(
             urlencoding::encode(&session_id)
         ),
     )?;
-    let mut request = ws_url.into_client_request().map_err(Error::WebSocket)?;
-    request.headers_mut().insert(
-        http::header::AUTHORIZATION,
-        http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
-    );
+    let request = websocket_request(ws_url, &pat_token, team.as_deref())?;
 
     let (stream, _) = connect_async(request)
         .await
@@ -2251,6 +2364,7 @@ mod tests {
                     base_delay_ms: Some(1),
                     max_delay_ms: Some(5),
                 }),
+                ..Default::default()
             },
             ApiVersion::V1,
         )
@@ -2664,6 +2778,7 @@ mod tests {
                     base_delay_ms: Some(40),
                     max_delay_ms: Some(1000),
                 }),
+                ..Default::default()
             },
             ApiVersion::V1,
         )
@@ -5021,5 +5136,247 @@ mod tests {
 
         assert!(dns.records.is_empty());
         assert_eq!(dns.target.hostname.as_deref(), Some("ingress.example.com"));
+    }
+
+    fn env_from(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    // SB_API_TOKEN is an alias of SB_PAT_TOKEN; SB_PAT_TOKEN wins when both
+    // are set, and an explicit pat_token beats both.
+    #[test]
+    fn resolve_token_prefers_option_then_pat_then_alias() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("pat only", None, vec![("SB_PAT_TOKEN", "pat")], Some("pat")),
+            ("alias only", None, vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("pat beats alias", None, vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("pat")),
+            ("blank pat falls through", None, vec![("SB_PAT_TOKEN", "  "), ("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("option beats both", Some("opt"), vec![("SB_PAT_TOKEN", "pat"), ("SB_API_TOKEN", "avm_alias")], Some("opt")),
+            ("blank option falls through", Some(" "), vec![("SB_API_TOKEN", "avm_alias")], Some("avm_alias")),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_token(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn resolve_team_trims_and_falls_back_to_sb_team() {
+        let cases: Vec<(&str, Option<&str>, Vec<(&str, &str)>, Option<&str>)> = vec![
+            ("SB_TEAM", None, vec![("SB_TEAM", " payments ")], Some("payments")),
+            ("option beats SB_TEAM", Some("ml"), vec![("SB_TEAM", "payments")], Some("ml")),
+            ("blank option falls through", Some("  "), vec![("SB_TEAM", "payments")], Some("payments")),
+            ("blank SB_TEAM is no header", None, vec![("SB_TEAM", "   ")], None),
+            ("nothing set", None, vec![], None),
+        ];
+        for (name, explicit, env, want) in cases {
+            let got = resolve_team(explicit.map(String::from), env_from(&env));
+            assert_eq!(got.as_deref(), want, "{}", name);
+        }
+    }
+
+    #[test]
+    fn missing_token_error_names_the_alias() {
+        assert!(Error::MissingToken.to_string().contains("SB_API_TOKEN"));
+    }
+
+    /// Serves `count` requests, answering each by its request line from
+    /// `routes` (404 otherwise), and hands back every raw request.
+    fn spawn_route_server(
+        routes: Vec<(&'static str, &'static str, String)>,
+        count: usize,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().expect("server should accept");
+                let request = read_http_request(&mut stream);
+                let line = request.lines().next().unwrap_or_default().to_string();
+                let (status, body) = routes
+                    .iter()
+                    .find(|(prefix, _, _)| line.starts_with(prefix))
+                    .map(|(_, status, body)| (*status, body.clone()))
+                    .unwrap_or(("404 Not Found", r#"{"error":"unexpected"}"#.to_string()));
+                let head = if status.starts_with("204") {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        body.len(),
+                        body
+                    )
+                };
+                stream.write_all(head.as_bytes()).expect("response should write");
+                request_tx.send(request).expect("request should be sent");
+            }
+        });
+        (format!("http://{}", addr), request_rx)
+    }
+
+    fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request
+            .lines()
+            .take_while(|line| !line.is_empty())
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim())
+    }
+
+    fn team_client(url: &str, team: Option<&str>) -> Client {
+        let mut client = Client::with_config(
+            ClientConfig {
+                api_url: Some(url.to_string()),
+                pat_token: Some("avm_admin".to_string()),
+                team: team.map(String::from),
+                retry: Some(RetryConfig { max_retries: Some(0), base_delay_ms: Some(1), max_delay_ms: Some(1) }),
+            },
+            ApiVersion::V1,
+        )
+        .expect("client should build");
+        // Pin the team so an SB_TEAM in the test environment can't leak in.
+        client.team = team.map(String::from);
+        client
+    }
+
+    #[test]
+    fn whoami_and_tokens_round_trip_with_the_team_header() {
+        let token = serde_json::json!({
+            "id": "tok_abc123def456",
+            "name": "ci",
+            "role": "runner",
+            "team": "payments",
+            "created_by": "operator",
+            "created_at": "2026-10-17T09:00:00Z",
+            "expires_at": "2027-01-02T03:04:05Z",
+            "expired": false
+        });
+        let mut created = token.clone();
+        created["token"] = serde_json::json!("avm_secret");
+        let mut expired = token.clone();
+        expired["expired"] = serde_json::json!(true);
+        let routes = vec![
+            (
+                "GET /v1/whoami ",
+                "200 OK",
+                serde_json::json!({
+                    "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+                    "role": "runner",
+                    "team": "payments",
+                    "expires_at": "2027-01-02T03:04:05Z"
+                })
+                .to_string(),
+            ),
+            ("POST /v1/tokens ", "201 Created", created.to_string()),
+            ("GET /v1/tokens ", "200 OK", serde_json::json!({ "tokens": [expired] }).to_string()),
+            ("DELETE /v1/tokens/", "204 No Content", String::new()),
+        ];
+        let (url, request_rx) = spawn_route_server(routes, 6);
+        let client = team_client(&url, Some("ops"));
+
+        let who = client.whoami().expect("whoami should succeed");
+        assert_eq!(who.principal.id, "tok_abc123def456");
+        assert_eq!(who.principal.name, "ci");
+        assert_eq!(who.role, "runner");
+        assert_eq!(who.team.as_deref(), Some("payments"));
+        assert_eq!(who.expires_at.as_deref(), Some("2027-01-02T03:04:05Z"));
+
+        let made = client
+            .tokens()
+            .create(CreateApiTokenOptions {
+                name: "ci".into(),
+                role: "runner".into(),
+                team: "payments".into(),
+                expires_in: "90d".into(),
+            })
+            .expect("create should succeed");
+        assert_eq!(made.token, "avm_secret");
+        assert_eq!(made.api_token.id, "tok_abc123def456");
+        assert_eq!(made.api_token.created_by, "operator");
+
+        let list = client.tokens().list().expect("list should succeed");
+        assert_eq!(list.tokens.len(), 1);
+        assert!(list.tokens[0].expired);
+
+        // A repeat revoke is another 204; the id is one escaped path segment.
+        client.tokens().revoke("tok_abc123def456").expect("revoke should succeed");
+        client.tokens().revoke(" tok_abc123def456 ").expect("repeat revoke should succeed");
+        client.tokens().revoke("../sandboxes").expect("revoke should succeed");
+        assert!(client.tokens().revoke("  ").is_err(), "a blank id must fail before sending");
+
+        let requests: Vec<String> = (0..6).map(|_| request_rx.recv().expect("request")).collect();
+        let lines: Vec<&str> = requests.iter().map(|r| r.lines().next().unwrap_or_default()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "GET /v1/whoami HTTP/1.1",
+                "POST /v1/tokens HTTP/1.1",
+                "GET /v1/tokens HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/tok_abc123def456 HTTP/1.1",
+                "DELETE /v1/tokens/..%2Fsandboxes HTTP/1.1",
+            ]
+        );
+        let body = requests[1].split("\r\n\r\n").nth(1).unwrap_or_default();
+        let body: Value = serde_json::from_str(body).expect("create body is JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "ci", "role": "runner", "team": "payments", "expires_in": "90d"})
+        );
+        for request in &requests {
+            assert_eq!(header_value(request, TEAM_HEADER), Some("ops"), "{}", request);
+            assert_eq!(header_value(request, "authorization"), Some("Bearer avm_admin"));
+        }
+    }
+
+    #[test]
+    fn no_team_header_without_a_team() {
+        let (url, request_rx) = spawn_route_server(
+            vec![("GET /v1/tokens ", "200 OK", r#"{"tokens":null}"#.to_string())],
+            1,
+        );
+        let client = team_client(&url, None);
+        let list = client.tokens().list().expect("list should succeed");
+        assert!(list.tokens.is_empty(), "a null list decodes as empty");
+        let request = request_rx.recv().expect("request");
+        assert_eq!(header_value(&request, TEAM_HEADER), None, "{}", request);
+    }
+
+    #[test]
+    fn token_refusal_keeps_the_server_message() {
+        let (url, _request_rx) = spawn_route_server(
+            vec![(
+                "POST /v1/tokens ",
+                "403 Forbidden",
+                r#"{"error":"role viewer on team payments cannot token.write","required_permission":"token.write","role":"viewer"}"#.to_string(),
+            )],
+            1,
+        );
+        let err = team_client(&url, None)
+            .tokens()
+            .create(CreateApiTokenOptions::default())
+            .expect_err("a viewer cannot create tokens");
+        assert!(err.to_string().contains("cannot token.write"), "{}", err);
+    }
+
+    #[test]
+    fn websocket_request_carries_the_team() {
+        let request = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("payments"))
+            .expect("request should build");
+        assert_eq!(request.headers().get("authorization").unwrap(), "Bearer pat");
+        assert_eq!(request.headers().get(TEAM_HEADER).unwrap(), "payments");
+
+        let bare = websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", None)
+            .expect("request should build");
+        assert!(bare.headers().get(TEAM_HEADER).is_none());
+
+        assert!(websocket_request("wss://sandbox.example.com/v1/x".into(), "pat", Some("bad\nteam")).is_err());
     }
 }

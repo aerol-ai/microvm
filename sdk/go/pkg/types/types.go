@@ -218,6 +218,31 @@ type ListEgressProfilesOptions struct {
 	Limit  int
 }
 
+// WhoAmI is Client.WhoAmI: the caller's own principal, role, team ("*" for
+// every team, absent for a managed account) and credential expiry (nil for
+// one that does not expire, such as the operator token).
+type WhoAmI = models.WhoAmI
+
+// WhoAmIPrincipal names the caller: a Kind such as "operator", "token" or
+// "oidc", a stable ID ("operator", "tok_…") and a display Name.
+type WhoAmIPrincipal = models.WhoAmIPrincipal
+
+// APIToken is one scoped API token as Tokens().List returns it. It never
+// carries the secret.
+type APIToken = models.APIToken
+
+// CreatedAPIToken is Tokens().Create's result: the stored token plus Token,
+// the secret, which the server returns this once and never stores.
+type CreatedAPIToken = models.CreatedAPIToken
+
+// CreateAPITokenOptions is the body of Tokens().Create. Role is viewer,
+// runner, auditor or admin; Team is a team name or "*" (auditor and admin
+// require "*"); ExpiresIn is required ("90d", "720h", any Go duration).
+type CreateAPITokenOptions = models.CreateAPITokenRequest
+
+// APITokenList is Tokens().List's result.
+type APITokenList = models.APITokenList
+
 // AuditEvent is one record from a sandbox's audit log (Sandbox.Audit). Kind
 // "egress" covers outbound connections and denials; a denial has Result
 // "failure" and the policy Reason ("host_not_allowed", "sni_not_allowed", …).

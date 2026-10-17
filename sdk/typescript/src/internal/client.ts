@@ -10,9 +10,13 @@ import {
 import { Image } from "../Image.js";
 import type {
   AddCustomDomainOptions,
+  APIToken,
+  APITokenList,
   BinaryLike,
   BuildImageOptions,
   BuildImageResult,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -72,9 +76,16 @@ import type {
   TemplateStatus,
   WasmModule,
   WasmModuleStatus,
+  WhoAmI,
 } from "../types.js";
 
 type FetchLike = typeof fetch;
+
+/**
+ * The request header that selects which of a credential's teams a request
+ * acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+ */
+export const TEAM_HEADER = "X-AerolVM-Team";
 
 /**
  * Wire version of the v1-style sandbox endpoints (`/v1/sandboxes`, etc.) this
@@ -123,6 +134,11 @@ export interface RetryConfig {
 export interface APIClientConfig {
   baseURL: string;
   patToken?: string;
+  /**
+   * Sent as the {@link TEAM_HEADER} header on every HTTP request. Empty or
+   * absent sends no header.
+   */
+  team?: string;
   fetch?: FetchLike;
   /**
    * Wire version to call. Defaults to "v1". Pin this if you need a specific
@@ -138,6 +154,48 @@ export interface APIClientConfig {
    * 429/503. Pass `{ maxRetries: 0 }` to disable retry entirely.
    */
   retry?: RetryConfig;
+}
+
+interface ApiWhoAmI {
+  principal: { kind: string; id: string; name?: string };
+  role: string;
+  team?: string;
+  expires_at?: string;
+}
+
+interface ApiAPIToken {
+  id: string;
+  name: string;
+  role: string;
+  team: string;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  expired: boolean;
+}
+
+function fromApiWhoAmI(w: ApiWhoAmI): WhoAmI {
+  const out: WhoAmI = {
+    principal: { kind: w.principal.kind, id: w.principal.id },
+    role: w.role,
+  };
+  if (w.principal.name) out.principal.name = w.principal.name;
+  if (w.team) out.team = w.team;
+  if (w.expires_at) out.expiresAt = w.expires_at;
+  return out;
+}
+
+function fromApiAPIToken(t: ApiAPIToken): APIToken {
+  return {
+    id: t.id,
+    name: t.name,
+    role: t.role,
+    team: t.team,
+    createdBy: t.created_by,
+    createdAt: t.created_at,
+    expiresAt: t.expires_at,
+    expired: t.expired === true,
+  };
 }
 
 interface ApiExposedPort {
@@ -533,6 +591,7 @@ export class APIClient {
   readonly apiVersion: APIVersion;
 
   private readonly patToken: string;
+  private readonly team: string;
   private readonly fetchFn: FetchLike;
   private readonly versionPrefix: string;
   private readonly retryConfig: Required<RetryConfig>;
@@ -540,6 +599,7 @@ export class APIClient {
   constructor(config: APIClientConfig) {
     this.baseURL = stripTrailingSlashes(config.baseURL);
     this.patToken = config.patToken ?? "";
+    this.team = (config.team ?? "").trim();
     this.fetchFn = config.fetch ?? fetch;
     this.apiVersion = config.apiVersion ?? DEFAULT_API_VERSION;
     this.versionPrefix = PATH_PREFIXES[this.apiVersion];
@@ -1185,6 +1245,33 @@ export class APIClient {
     return fromApiTemplate(response);
   }
 
+  async whoami(): Promise<WhoAmI> {
+    return fromApiWhoAmI(await this.doJSON<ApiWhoAmI>("GET", this.versioned("/whoami")));
+  }
+
+  async createAPIToken(options: CreateAPITokenOptions): Promise<CreatedAPIToken> {
+    const response = await this.doJSON<ApiAPIToken & { token: string }>("POST", this.versioned("/tokens"), {
+      name: options.name,
+      role: options.role,
+      team: options.team,
+      expires_in: options.expiresIn,
+    });
+    return { ...fromApiAPIToken(response), token: response.token };
+  }
+
+  async listAPITokens(): Promise<APITokenList> {
+    const response = await this.doJSON<{ tokens: ApiAPIToken[] | null }>("GET", this.versioned("/tokens"));
+    return { tokens: (response.tokens ?? []).map(fromApiAPIToken) };
+  }
+
+  async revokeAPIToken(id: string): Promise<void> {
+    const trimmed = id.trim();
+    if (trimmed === "") {
+      throw new Error("token id is required");
+    }
+    await this.doJSON<void>("DELETE", this.versioned(`/tokens/${encodeURIComponent(trimmed)}`));
+  }
+
   private wrap(sandbox: ApiSandbox): SandboxResource {
     return new SandboxResource(this, fromApiSandbox(sandbox));
   }
@@ -1235,6 +1322,9 @@ export class APIClient {
     const headers = new Headers(init.headers);
     if (this.patToken !== "") {
       headers.set("Authorization", `Bearer ${this.patToken}`);
+    }
+    if (this.team !== "") {
+      headers.set(TEAM_HEADER, this.team);
     }
 
     const url = `${this.baseURL}${path}`;

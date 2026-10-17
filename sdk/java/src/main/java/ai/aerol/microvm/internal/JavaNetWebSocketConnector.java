@@ -7,6 +7,7 @@ import java.net.http.HttpResponse;
 import java.net.http.WebSocket;
 import java.net.http.WebSocketHandshakeException;
 import java.nio.ByteBuffer;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletionStage;
@@ -22,10 +23,14 @@ public final class JavaNetWebSocketConnector implements WebSocketConnector {
     }
 
     @Override
-    public StreamingWebSocket connect(URI uri, String authorizationHeader, StreamingWebSocketListener listener) {
+    public StreamingWebSocket connect(URI uri, Map<String, String> headers, StreamingWebSocketListener listener) {
         WebSocket.Builder builder = httpClient.newWebSocketBuilder();
-        if (authorizationHeader != null && !authorizationHeader.isEmpty()) {
-            builder.header("Authorization", authorizationHeader);
+        if (headers != null) {
+            for (Map.Entry<String, String> header : headers.entrySet()) {
+                if (header.getValue() != null && !header.getValue().isEmpty()) {
+                    builder.header(header.getKey(), header.getValue());
+                }
+            }
         }
 
         try {

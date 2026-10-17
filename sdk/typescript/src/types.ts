@@ -793,6 +793,65 @@ export interface EgressProfileList {
   nextCursor?: string;
 }
 
+/** Who the caller is, as `microvm.whoami()` reports it. */
+export interface WhoAmIPrincipal {
+  /** `"operator"`, `"token"`, `"oidc"`, `"controlplane"`, ... */
+  kind: string;
+  /** Stable id: `"operator"`, `"tok_…"`, `"oidc:<issuer>:<sub>"`, ... */
+  id: string;
+  /** Display name; absent when the server has none. */
+  name?: string;
+}
+
+/** The body of `microvm.whoami()`: the caller's own resolved identity. */
+export interface WhoAmI {
+  principal: WhoAmIPrincipal;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** `"*"` for every team, a team name, or absent for a managed account. */
+  team?: string;
+  /** When the credential stops working (RFC 3339); absent if it never does. */
+  expiresAt?: string;
+}
+
+/** One scoped API token as `microvm.tokens.list()` returns it. Never the secret. */
+export interface APIToken {
+  /** Public id (`tok_…`): what `tokens.revoke` takes and audit records name. */
+  id: string;
+  name: string;
+  role: string;
+  /** A team name, or `"*"` for every team. */
+  team: string;
+  createdBy: string;
+  createdAt: string;
+  expiresAt: string;
+  /** Expired tokens no longer work; they stay listed for 30 days. */
+  expired: boolean;
+}
+
+/** `microvm.tokens.create()`'s result: the token plus its secret. */
+export interface CreatedAPIToken extends APIToken {
+  /** The secret (`avm_…`), returned this once and never stored by the server. */
+  token: string;
+}
+
+/** The body of `microvm.tokens.create()`. */
+export interface CreateAPITokenOptions {
+  /** 1 to 64 of `A-Z a-z 0-9 . _ -`, unique among the team's tokens. */
+  name: string;
+  /** `"viewer"`, `"runner"`, `"auditor"` or `"admin"`. */
+  role: string;
+  /** A team name, or `"*"` for every team. `auditor` and `admin` require `"*"`. */
+  team: string;
+  /** Required lifetime: `"90d"`, `"720h"` or any Go duration. */
+  expiresIn: string;
+}
+
+/** `microvm.tokens.list()`'s result. */
+export interface APITokenList {
+  tokens: APIToken[];
+}
+
 /** One destination a learn-mode sandbox reached. */
 export interface NetworkLearnedEntry {
   host: string;

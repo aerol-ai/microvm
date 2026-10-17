@@ -48,9 +48,15 @@ type ExposeResult = models.ExposePortResponse
 type SandboxSnapshot = models.SandboxSnapshot
 type HealthStatus = models.HealthStatus
 
+// HeaderTeam is the request header that selects which of a credential's
+// teams a request acts for. Keep in sync with pkg/api.HeaderTeam on the
+// server.
+const HeaderTeam = "X-AerolVM-Team"
+
 type Client struct {
 	baseURL       string
 	patToken      string
+	team          string
 	httpClient    *http.Client
 	apiVersion    APIVersion
 	versionPrefix string
@@ -58,7 +64,11 @@ type Client struct {
 }
 
 type ClientOptions struct {
-	PATToken   string
+	PATToken string
+	// Team is sent as the HeaderTeam header on every request and WebSocket
+	// handshake. Empty sends no header, so the server picks the
+	// credential's first matching binding.
+	Team       string
 	HTTPClient *http.Client
 	// APIVersion pins the wire version this client speaks. Empty defaults to
 	// the SDK's pinned default (v1 today). Pass APIVersionV1 explicitly to
@@ -110,6 +120,7 @@ func NewClient(baseURL string, config ClientOptions) *Client {
 	client := &Client{
 		baseURL:       strings.TrimRight(baseURL, "/"),
 		patToken:      config.PATToken,
+		team:          strings.TrimSpace(config.Team),
 		httpClient:    httpClient,
 		apiVersion:    version,
 		versionPrefix: prefix,
@@ -1320,8 +1331,18 @@ func (c *Client) doWithRetry(ctx context.Context, policy retryPolicy, makeReq fu
 }
 
 func (c *Client) addAuth(request *http.Request) {
+	c.setAuthHeaders(request.Header)
+}
+
+// setAuthHeaders writes the credential and the team selection. Every HTTP
+// request and WebSocket handshake goes through it, so a client built with a
+// team never sends a request that acts for another one.
+func (c *Client) setAuthHeaders(header http.Header) {
 	if c.patToken != "" {
-		request.Header.Set("Authorization", "Bearer "+c.patToken)
+		header.Set("Authorization", "Bearer "+c.patToken)
+	}
+	if c.team != "" {
+		header.Set(HeaderTeam, c.team)
 	}
 }
 

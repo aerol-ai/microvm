@@ -2,9 +2,12 @@ import { APIClient, stripTrailingSlashes, type APIVersion, type RetryConfig } fr
 import { Sandbox } from "./Sandbox.js";
 import { Image } from "./Image.js";
 import type {
+  APITokenList,
   BuildImageOptions,
   BuildImageResult,
   CloneGeneration,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
   CreateOptions,
   CreateSessionOptions,
   CreateTemplateOptions,
@@ -36,16 +39,47 @@ import type {
   SessionAttachOptions,
   Template,
   WasmModule,
+  WhoAmI,
 } from "./types.js";
 
 const defaultAPIURL = "http://127.0.0.1:21212";
-const authRequiredErrorMessage = "PAT token is required. Set patToken or SB_PAT_TOKEN.";
+const authRequiredErrorMessage = "PAT token is required. Set patToken, SB_PAT_TOKEN or SB_API_TOKEN.";
 
 type FetchLike = typeof fetch;
 
+/** Scoped API token calls, reached as `microvm.tokens`. */
+export interface Tokens {
+  /**
+   * Mint a token (admin only). The result's `token` is the secret, returned
+   * this once and never again. A 409 means the name is taken, possibly by an
+   * earlier attempt whose reply was lost; that secret cannot be recovered,
+   * so revoke the token and create it again.
+   */
+  create(options: CreateAPITokenOptions): Promise<CreatedAPIToken>;
+  /** List every token (auditor or admin); expired ones stay listed for 30 days. */
+  list(): Promise<APITokenList>;
+  /** Revoke a token by id (admin only). Revoking one already gone succeeds. */
+  revoke(id: string): Promise<void>;
+}
+
 export interface MicroVMConfig {
+  /**
+   * The bearer every request carries: the operator PAT, an `avm_` API token
+   * or an OIDC ID token. Defaults to `SB_PAT_TOKEN`, then its alias
+   * `SB_API_TOKEN`; when both are set, `SB_PAT_TOKEN` wins.
+   */
   patToken?: string;
   apiUrl?: string;
+  /**
+   * The team requests act for, sent as the `X-AerolVM-Team` header on every
+   * HTTP request. Defaults to `SB_TEAM`; with neither, no header is sent and
+   * the server uses the credential's first matching binding. The header only
+   * chooses among teams the credential is already bound to (a team it does
+   * not hold is refused with 403), and the operator PAT ignores it.
+   * WebSocket streams (`execStream`, `attachSession`) cannot carry custom
+   * headers from a browser or Node, so they go without it.
+   */
+  team?: string;
   fetch?: FetchLike;
   /**
    * Wire version of the sandbox daemon API to call. Defaults to the SDK's
@@ -68,12 +102,15 @@ export interface MicroVMConfig {
 export class MicroVM {
   readonly apiUrl: string;
   readonly patToken: string;
+  /** The team sent as `X-AerolVM-Team`, or `""` when none is. */
+  readonly team: string;
 
   private readonly client: APIClient;
 
   constructor(config: MicroVMConfig = {}) {
-    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? "";
+    const patToken = config.patToken ?? readEnv("SB_PAT_TOKEN") ?? readEnv("SB_API_TOKEN") ?? "";
     const apiUrl = normalizeURL(config.apiUrl ?? readEnv("SB_API_URL") ?? defaultAPIURL);
+    const team = (config.team ?? readEnv("SB_TEAM") ?? "").trim();
 
     if (patToken === "") {
       throw new Error(authRequiredErrorMessage);
@@ -81,9 +118,11 @@ export class MicroVM {
 
     this.apiUrl = apiUrl;
     this.patToken = patToken;
+    this.team = team;
     this.client = new APIClient({
       baseURL: apiUrl,
       patToken,
+      team,
       fetch: config.fetch,
       apiVersion: config.apiVersion,
       retry: config.retry,
@@ -365,6 +404,28 @@ export class MicroVM {
     const client = this.client;
     return {
       target: () => client.ingressDNS(),
+    };
+  }
+
+  /**
+   * Who the server says the caller is: principal, role, team and when the
+   * credential expires. Every valid credential may ask.
+   */
+  async whoami(): Promise<WhoAmI> {
+    return this.client.whoami();
+  }
+
+  /**
+   * Scoped API tokens (`avm_…`) for services and CI, as
+   * `microvm.tokens.create/list/revoke`. Same namespaced shape as
+   * {@link MicroVM.dns}.
+   */
+  get tokens(): Tokens {
+    const client = this.client;
+    return {
+      create: (options) => client.createAPIToken(options),
+      list: () => client.listAPITokens(),
+      revoke: (id) => client.revokeAPIToken(id),
     };
   }
 
