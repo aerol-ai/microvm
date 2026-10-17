@@ -163,7 +163,7 @@ func TestEventFieldOrderIsFrozen(t *testing.T) {
 		"time", "actor", "sandbox_id", "ref", "result", "reason", "correlation_id", "event_id",
 		"node_id", "kind", "destination", "network", "bytes_in", "bytes_out", "incarnation_id",
 		"owner_ref", "dropped", "prev_hash", "event_hash", "witnessed_through", "caller",
-		"request",
+		"request", "identity_config",
 	}
 	if got := jsonFieldNames(reflect.TypeOf(Event{})); !reflect.DeepEqual(got, want) {
 		t.Fatalf("Event field order = %v\nwant %v (append new fields at the end)", got, want)
@@ -176,7 +176,7 @@ func TestEventFieldOrderIsFrozen(t *testing.T) {
 	}) {
 		t.Fatalf("Request field order = %v (append new fields at the end)", got)
 	}
-	for _, name := range []string{"Caller", "Request"} {
+	for _, name := range []string{"Caller", "Request", "IdentityConfig"} {
 		f, _ := reflect.TypeOf(Event{}).FieldByName(name)
 		if !strings.Contains(f.Tag.Get("json"), ",omitempty") {
 			t.Fatalf("Event.%s must be omitempty, or every record written before it changes hash", name)
