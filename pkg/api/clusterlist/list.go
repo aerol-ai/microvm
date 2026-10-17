@@ -77,13 +77,11 @@ type Options struct {
 	// APIKeyHeader is the caller's X-API-KEY, for facades (E2B) whose inbound
 	// auth accepts it instead of Authorization. Forwarded on the same mTLS hop
 	// so an X-API-KEY-only caller's remote sandboxes are not dropped (B9).
-	APIKeyHeader         string
-	RawQuery             string
-	Path                 string
-	ForwardedHeaderName  string
-	ForwardedHeaderValue string
-	Local                []*models.Sandbox
-	Transport            Transport
+	APIKeyHeader string
+	RawQuery     string
+	Path         string
+	Local        []*models.Sandbox
+	Transport    Transport
 	// SelfNodeID is stamped on X-Cluster-Peer-Node-ID for inbound mTLS binding.
 	SelfNodeID string
 	// Limit/PageToken drive PlacementPage-backed peer selection.
@@ -327,14 +325,6 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 	if path == "" {
 		path = "/v1/sandboxes"
 	}
-	fwdName := opts.ForwardedHeaderName
-	if fwdName == "" {
-		fwdName = "X-Cluster-Forwarded"
-	}
-	fwdVal := opts.ForwardedHeaderValue
-	if fwdVal == "" {
-		fwdVal = "1"
-	}
 	// Acquire the semaphore before spawning so we never create unbounded
 	// goroutines under a large owner fan-out.
 	sem := make(chan struct{}, MaxConcurrentPeerReads)
@@ -351,7 +341,7 @@ func Merge(ctx context.Context, peers []cluster.Member, opts Options) Result {
 		started++
 		go func() {
 			defer func() { <-sem }()
-			sbs, err := fetchPeerSandboxes(mergeCtx, peer, path, fwdName, fwdVal, opts)
+			sbs, err := fetchPeerSandboxes(mergeCtx, peer, path, opts)
 			results <- peerResult{nodeID: peer.NodeID, sandboxes: sbs, err: err}
 		}()
 	}
@@ -416,14 +406,6 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 	}
 	results := make(chan peerResult, len(peers))
 	path := opts.Path
-	fwdName := opts.ForwardedHeaderName
-	if fwdName == "" {
-		fwdName = "X-Cluster-Forwarded"
-	}
-	fwdVal := opts.ForwardedHeaderValue
-	if fwdVal == "" {
-		fwdVal = "1"
-	}
 	sem := make(chan struct{}, MaxConcurrentPeerReads)
 	started := 0
 	for _, peer := range peers {
@@ -438,7 +420,7 @@ func MergeJSON[T any](ctx context.Context, peers []cluster.Member, local []T, id
 		started++
 		go func() {
 			defer func() { <-sem }()
-			raw, err := fetchPeerJSON(mergeCtx, peer, path, fwdName, fwdVal, opts)
+			raw, err := fetchPeerJSON(mergeCtx, peer, path, opts)
 			if err != nil {
 				results <- peerResult{nodeID: peer.NodeID, err: err}
 				return
@@ -518,7 +500,7 @@ func StripFacadePagination(rawQuery string) string {
 // means the cold-start small-fleet fallback intentionally requested the full
 // tenant-scoped local list; an explicitly empty ids key denies every row.
 func PeerWantIDs(r *http.Request) (map[string]struct{}, error) {
-	if r == nil || r.Header.Get("X-Cluster-Forwarded") != "1" {
+	if r == nil || r.Header.Get(cluster.HeaderForwarded) != "1" {
 		return nil, nil
 	}
 	values, present := r.URL.Query()["ids"]
@@ -559,8 +541,8 @@ func WriteCoverageHeaders(w http.ResponseWriter, cov Coverage, nextPageToken str
 	}
 }
 
-func fetchPeerSandboxes(ctx context.Context, peer cluster.Member, path, fwdName, fwdVal string, opts Options) ([]*models.Sandbox, error) {
-	raw, err := fetchPeerJSON(ctx, peer, path, fwdName, fwdVal, opts)
+func fetchPeerSandboxes(ctx context.Context, peer cluster.Member, path string, opts Options) ([]*models.Sandbox, error) {
+	raw, err := fetchPeerJSON(ctx, peer, path, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -571,7 +553,7 @@ func fetchPeerSandboxes(ctx context.Context, peer cluster.Member, path, fwdName,
 	return sbs, nil
 }
 
-func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdVal string, opts Options) ([]byte, error) {
+func fetchPeerJSON(ctx context.Context, peer cluster.Member, path string, opts Options) ([]byte, error) {
 	client, base, err := dialPeer(peer, opts.Transport)
 	if err != nil {
 		return nil, err
@@ -592,7 +574,13 @@ func fetchPeerJSON(ctx context.Context, peer cluster.Member, path, fwdName, fwdV
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set(fwdName, fwdVal)
+	// The forwarded marker, plus the caller's selected team and the
+	// request's correlation id: a fresh request copies no header by itself,
+	// so without them a multi-team caller's page was answered for its first
+	// team on every peer, and each peer minted its own correlation id (E6,
+	// H3). ctx descends from the inbound request, which holds both.
+	access, _ := controlplane.AccessFromContext(ctx)
+	cluster.StampForward(req, access)
 	// mTLS-only: forward the caller's credential so tenant scope is preserved
 	// on the peer. Never substitute the fleet PAT (that was the cross-tenant
 	// enumeration hole). Forward whichever credential the caller used —

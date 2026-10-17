@@ -12,6 +12,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/capacity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -141,6 +142,10 @@ func (h *handlers) runImageBuildOnTarget(c cluster.Client, parent *http.Request,
 		return 0, nil, nil, err
 	}
 	req.Header.Set(clusterImageBuildRoutedHeader, "1")
+	// The caller's own credential follows; StampForward adds the
+	// forwarded marker, the selected team and the correlation id.
+	access, _ := controlplane.AccessFromContext(parent.Context())
+	cluster.StampForward(req, access)
 	cluster.SetPeerNodeIDHeader(req, c.SelfNodeID())
 	if auth := parent.Header.Get("Authorization"); auth != "" {
 		req.Header.Set("Authorization", auth)

@@ -25,7 +25,7 @@ type FacadeListOptions struct {
 // forwarded peer hop. It is the single definition E2B, Daytona and Runloop used
 // to each copy (the per-facade clusterListMode).
 func ListMode(c cluster.Client, r *http.Request) bool {
-	if c == nil || r == nil || r.Header.Get("X-Cluster-Forwarded") == "1" {
+	if c == nil || r == nil || r.Header.Get(cluster.HeaderForwarded) == "1" {
 		return false
 	}
 	if _, ok := c.(*cluster.Noop); ok {

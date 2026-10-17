@@ -106,8 +106,5 @@ func parseSecretAuditQuery(r *http.Request) service.SecretAuditQuery {
 
 // correlationIDFromRequest prefers X-Correlation-ID, then X-Request-ID.
 func correlationIDFromRequest(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("X-Correlation-ID")); v != "" {
-		return v
-	}
-	return strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	return apihttp.CorrelationID(r)
 }
