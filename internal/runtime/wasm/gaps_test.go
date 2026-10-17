@@ -566,21 +566,42 @@ func TestSyncGuestListenPorts(t *testing.T) {
 	}
 }
 
+// holdInvokeClient blocks inside Invoke until release is closed. Deduping is only
+// defined while the first _start is still in flight; a client that returns
+// immediately lets the background goroutine clear guestServeGen before the
+// second call, which the race detector schedules often enough to flake.
+type holdInvokeClient struct {
+	recordingWorkerClient
+	arrived chan struct{}
+	release chan struct{}
+}
+
+func (c *holdInvokeClient) Invoke(string, string) error {
+	c.arrived <- struct{}{}
+	<-c.release
+	return nil
+}
+
 func TestStartGuestEntryAsyncDedupes(t *testing.T) {
 	d := New(Config{ModulesDir: t.TempDir()}, nil)
-	invokeCh := make(chan string, 2)
-	client := &invokeWorkerClient{invokeCh: invokeCh}
+	client := &holdInvokeClient{
+		arrived: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	defer close(client.release)
 	inst := &sandboxInstance{sandboxID: "sb", entryExport: "_start"}
 	inst.bumpRunGeneration()
 	d.startGuestEntryAsync(inst, client)
-	d.startGuestEntryAsync(inst, client)
 	select {
-	case <-invokeCh:
+	case <-client.arrived:
 	case <-time.After(time.Second):
 		t.Fatal("expected one invoke")
 	}
+	// Overlaps the in-flight _start. guestServeGen is still this generation,
+	// so the second call must return without starting another invoke.
+	d.startGuestEntryAsync(inst, client)
 	select {
-	case <-invokeCh:
+	case <-client.arrived:
 		t.Fatal("expected deduped second invoke")
 	case <-time.After(50 * time.Millisecond):
 	}
