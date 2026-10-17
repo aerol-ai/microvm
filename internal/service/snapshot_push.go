@@ -262,6 +262,32 @@ func snapshotRefNamespace(ref string) (namespace string, ok bool) {
 	return "", true
 }
 
+// isClusterImportedRef reports whether ref points into a cluster's auto-import
+// registry namespace (`[host/]cluster/<id>/_imported/...`), where the post-pull
+// auto-import re-homes tenants' private upstream images. The daemon pulls this
+// namespace with the cluster PAT, so a tenant must never be allowed to name a
+// ref here — it would borrow the cluster credential to pull another tenant's
+// imported image. Tenants reference the ORIGINAL upstream ref; the auto-import
+// rewrite to this namespace is server-side only.
+func isClusterImportedRef(ref string) bool {
+	// String parsing, mirroring docker.AOCRPullAuth: the "_imported" path
+	// component starts with an underscore, which reference.ParseNormalizedNamed
+	// rejects, so the ref cannot be parsed as a normal image name. Strip an
+	// optional transport scheme and registry host, then match the cluster path.
+	ref = strings.TrimSpace(ref)
+	if _, after, ok := strings.Cut(ref, "://"); ok {
+		ref = after
+	}
+	rest := ref
+	if i := strings.IndexByte(ref, '/'); i >= 0 {
+		if first := ref[:i]; strings.ContainsAny(first, ".:") || first == "localhost" {
+			rest = ref[i+1:]
+		}
+	}
+	parts := strings.Split(rest, "/")
+	return len(parts) >= 4 && parts[0] == "cluster" && parts[2] == "_imported"
+}
+
 // snapshotAOCRRef is the AOCR destination convention for cluster-local
 // snapshots: `<host>/cluster/<id>/snapshots/[<owner namespace>/]<repo>:latest<arch><suffix>`.
 // Mirrors the auto-import path's `cluster/<id>/_imported/...` namespace

@@ -82,6 +82,13 @@ func authorizeTenantImageRef(owner string, refs ...string) error {
 		if namespace, ok := snapshotRefNamespace(ref); ok && namespace != snapshotOwnerNamespace(owner) {
 			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
 		}
+		// The cluster auto-import namespace is pulled with the cluster PAT, so
+		// a tenant naming a ref there would borrow that credential to pull
+		// another tenant's re-homed private image. Tenants name the original
+		// upstream ref; the re-home is server-side only.
+		if isClusterImportedRef(ref) {
+			return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)
+		}
 		if docker.IsBuiltImageRef(ref) {
 			if namespace := docker.BuiltImageOwnerNamespace(ref); namespace != "" && namespace != snapshotOwnerNamespace(owner) {
 				return fmt.Errorf("%w: image %q", store.ErrNotFound, ref)

@@ -162,7 +162,16 @@ func (s *Service) DeleteJSBundle(ctx context.Context, digest string) error {
 	if err != nil {
 		return fmt.Errorf("check bundle references: %w", err)
 	}
+	_, scoped := ownerScope(ctx)
 	for _, sb := range sandboxes {
+		// Delete is owner-scoped and ref-counted: a tenant's delete only drops
+		// that tenant's ownership, so only its OWN live sandboxes can block it.
+		// Another tenant's sandbox using the shared blob is irrelevant here —
+		// and naming it would leak that tenant's sandbox id. Operator/internal
+		// callers (unscoped) drop the blob outright, so they check every tenant.
+		if scoped && sb.OwnerRef != owner {
+			continue
+		}
 		if sb.ModuleDigest == digest {
 			return fmt.Errorf("bundle %s is in use by sandbox %s: %w", digest, sb.ID, store.ErrJSBundleInUse)
 		}
