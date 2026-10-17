@@ -155,10 +155,14 @@ Do not delete `secrets.verified` to "force" a full check — set the mode to
 ### Rolling back below the audit-caller release
 
 Records carry a hash-covered `caller` (who caused the record, and `via`, the
-edge node a forwarded request came through). A binary from before that
-release drops the field when it reads a record, computes a different hash,
-and so fails boot verification on any log holding one; an older
-`aerolvm audit verify` fails the same way. Upgrade the CLI first.
+edge node a forwarded request came through) and, on API action records, a
+hash-covered `request` (the call: method, route, status, digest). The same
+release writes new record kinds: `api`, `auth_denied` and `api_flood_mode`.
+A binary from before that release drops the fields when it reads a record,
+computes a different hash, and so fails boot verification on any log holding
+one; an older `aerolvm audit verify` or `aerolvm audit search` fails the same
+way. Upgrade the CLI first. The fields and the kinds share one gate, so
+everything below applies to all of them.
 
 - **When a node starts writing it.** A single node: from its first secret
   open after the upgrade. A cluster node: only once every live gossip member

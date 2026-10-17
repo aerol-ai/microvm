@@ -130,6 +130,32 @@ are no plaintext storage columns or compatibility flags for either path. A
 database containing the removed plaintext columns is rejected at boot; deploy
 this schema as a coordinated, one-way change.
 
+## API action records (SB_AUDIT_API_RECORDS)
+
+Create, delete, exec, file, port, snapshot and token calls each write one
+hash-chained `api` record naming the caller (`plans/identity-and-access.md`
+§5.9): `ref` is the route pattern, `request` holds the method, status, the
+exec body's SHA-256, and the object a non-sandbox route acts on. Only the node
+that runs the handler records; a forwarded call is recorded by its owner with
+the edge as `caller.via`. Refused calls are records too: a 403 is an `api`
+record with `result: denied`; a refused credential (401) is an `auth_denied`
+record, at most one per source address per minute, its `dropped` counting the
+401s folded into it. SSH session opens and the daemon's own destructive work
+(lifecycle auto-stop and auto-delete, the reconcile reap, the orphan delete)
+write `api` records with `caller: sandbox_key` and `caller: system:<subsystem>`.
+Records are buffered (no fsync on the request path) and, like every new
+record field, written only once every cluster member runs the release. At
+10k calls/s fleet-wide that is ~5 records/s per node, ~170 MB per node per day
+before flood control, inside the existing retention and export.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_AUDIT_API_RECORDS` | `mutations` | `mutations` records every non-GET call, every toolbox call (file reads too: files can hold secrets), token listing and every refused call. `all` adds plain GETs. `off` records none and costs nothing per request (refused in enterprise mode). `cluster.internal` traffic, `/health` and the outer `/mcp` request are never recorded; each MCP tool's inner call records itself with `request.surface: mcp`. |
+| `SB_AUDIT_API_FLOOD_CONTROL` | `budget` | `budget`: a token bucket per (sandbox, caller); calls over it are counted into one `rate_limited` record naming the caller, the count (`dropped`) and the routes. `coalesce`: identical calls (same caller, route, sandbox, status, digest) within one second become one record with `request.count`; different commands never merge, and nothing is capped. `both`: coalesce, then budget. A node hosting sandboxes of more than one owner always budgets: `coalesce` runs as `both` there, and every change of the effective mode writes an `api_flood_mode` record. Gauge: `aerolvm_audit_api_flood_mode{key=<configured>,key2=<effective>}`. Records with no sandbox (token and cluster admin calls), durable records, secret opens and gap markers are never budgeted. |
+| `SB_AUDIT_API_RATE` / `SB_AUDIT_API_BURST` | `20` / `100` | The budget above, per (sandbox, caller): a caller keeps one record per call for bursts up to the burst size, then this rate. `aerolvm_audit_api_rate_limited_total` counts the calls folded into `rate_limited` records. |
+| `SB_AUDIT_EXEC_COMMAND` | `digest` | `digest` records the SHA-256 of an exec request body, hashed as it streams (never buffered): it proves which command ran without recording it, because commands carry secrets. `full` also records the argv (never the environment), read from the first 64 KiB of the body. |
+| `SB_AUDIT_API_DURABLE` | `false` (`true` in enterprise mode, which refuses `false`) | Token create, token revoke and sandbox delete wait for their record to reach disk. Off by default to keep fsync off the request path. Without it, an unclean crash can lose the records of the last sync interval (1 s), the same window secret-open records have. |
+
 ## Audit witness (SB_AUDIT_WITNESS_BACKEND)
 
 The witness keeps each node's audit hash-chain heads off the node, in an S3
