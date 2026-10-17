@@ -60,11 +60,15 @@ const (
 // name, and the groups their token carried, so they can tell their admin
 // what is missing. Overage means the provider left the groups out (Entra
 // sends an overage pointer instead above 200 groups); Groups is then empty.
+// Principal is who the verified token names (oidc:<issuer>:<sub>): they
+// hold no role, but they are known, so the refusal is an api record naming
+// them rather than an anonymous auth_denied (§5.5, finding 2.3).
 type NoBindingError struct {
-	Issuer  string
-	Name    string
-	Groups  []string
-	Overage bool
+	Principal Principal
+	Issuer    string
+	Name      string
+	Groups    []string
+	Overage   bool
 }
 
 func (e *NoBindingError) Error() string { return noBindingErrMessage }

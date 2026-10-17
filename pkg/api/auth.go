@@ -190,7 +190,14 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 			}
 		}
 		if err != nil {
-			return controlplane.Access{}, mapAuthFailure(link.kind, err)
+			f := mapAuthFailure(link.kind, err)
+			if f.noBinding != nil {
+				// A verified token that matched no binding: the caller holds
+				// no role but is known, so the 403 is an api record naming
+				// them, like the wrong-team 403 above (§5.5, finding 2.3).
+				f.caller, f.hasCaller = controlplane.Access{Principal: f.noBinding.Principal}, true
+			}
+			return controlplane.Access{}, f
 		}
 		return access, nil
 	}

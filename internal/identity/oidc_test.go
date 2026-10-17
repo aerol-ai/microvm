@@ -248,7 +248,7 @@ func TestVerifierNoBinding(t *testing.T) {
 	if !ok {
 		t.Fatalf("err = %v, want NoBindingError", err)
 	}
-	if nb.Issuer != "test" || nb.Name != "00u7@acme.com" || !reflect.DeepEqual(nb.Groups, []string{"marketing", "red"}) || nb.Overage || nb.Reason() != "no_binding" {
+	if nb.Issuer != "test" || nb.Name != "00u7@acme.com" || nb.Principal.ID != "oidc:test:00u7" || nb.Principal.Kind != controlplane.PrincipalOIDC || !reflect.DeepEqual(nb.Groups, []string{"marketing", "red"}) || nb.Overage || nb.Reason() != "no_binding" {
 		t.Fatalf("no binding = %+v", nb)
 	}
 

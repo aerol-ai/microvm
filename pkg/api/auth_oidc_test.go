@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/identity/identitytest"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -271,6 +273,91 @@ func TestOIDCTeamSelection(t *testing.T) {
 	if c.access.Fleet || c.access.Role != controlplane.RoleRunner || c.access.Team() != "payments" {
 		t.Fatalf("admin selecting payments: %+v", c.access)
 	}
+}
+
+// TestOIDCDeniedRecords is §5.5 + finding 2.3 on T5's record path: a
+// verified token that matched no binding, and one that named a team it is
+// not bound to, each write one api record with result denied naming the
+// caller; a JWT that fails verification is an anonymous auth_denied; a 503
+// (no good identity file) writes nothing.
+func TestOIDCDeniedRecords(t *testing.T) {
+	iss := identitytest.New(t)
+	cfg, err := identity.Parse([]byte(oidcFile(t, iss)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current atomic.Pointer[identity.Config]
+	current.Store(cfg)
+	v := identity.NewVerifier(current.Load, identity.VerifierOptions{HTTPClient: iss.Client()})
+	st := storeWith(t, "oidc-audit")
+	svc := service.New(config.Config{}, discardLogger(), st, nil, nil, nil, nil, nil, nil)
+	sink := &recSink{}
+	svc.UseAuditSinkForTest(sink)
+	srv := NewServer(discardLogger(), svc, nil, nil, config.Config{IdentityEnabled: true}, "pat-token", nil,
+		WithCredentialAuthenticator(controlplane.PrincipalOIDC, v))
+	mint := func(groups ...string) string { return iss.Mint(t, iss.Claims(time.Now(), "cli", "ana", groups...)) }
+
+	cases := []struct {
+		name       string
+		bearer     string
+		header     map[string]string
+		wantStatus int
+		wantTeam   string
+	}{
+		{name: "no binding", bearer: mint("marketing"), wantStatus: http.StatusForbidden},
+		{name: "group overage", bearer: func() string {
+			c := iss.Claims(time.Now(), "cli", "ana")
+			c["_claim_names"] = map[string]any{"groups": "src1"}
+			c["_claim_sources"] = map[string]any{"src1": map[string]any{"endpoint": "https://graph.microsoft.com/x"}}
+			return iss.Mint(t, c)
+		}(), wantStatus: http.StatusForbidden},
+		{name: "a team it is not bound to", bearer: mint("payments-eng"), header: map[string]string{HeaderTeam: "checkout"},
+			wantStatus: http.StatusForbidden, wantTeam: "payments"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink.reset()
+			rec := do(t, srv, "POST", "/v1/sandboxes/sb-1/stop", tc.bearer, "", tc.header)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status %d, want %d: %s", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			got := sink.records()
+			want := &auditlog.Caller{Kind: "oidc", ID: "oidc:okta:ana", Name: "ana@acme.com", Team: tc.wantTeam}
+			if len(got) != 1 || got[0].Kind != auditlog.KindAPI || got[0].Result != auditlog.APIResultDenied ||
+				got[0].Ref != "POST /v1/sandboxes/{id}/stop" || got[0].SandboxID != "sb-1" ||
+				!reflect.DeepEqual(got[0].Caller, want) || got[0].Request == nil || got[0].Request.Status != tc.wantStatus {
+				t.Fatalf("records = %+v (caller %+v)", got, callerOf(got))
+			}
+		})
+	}
+
+	sink.reset()
+	forged := mint("payments-eng")
+	forged = forged[:strings.LastIndexByte(forged, '.')+1] + "c2ln"
+	if rec := do(t, srv, "POST", "/v1/sandboxes/sb-1/stop", forged, "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("forged signature = %d", rec.Code)
+	}
+	if got := sink.records(); len(got) != 1 || got[0].Kind != auditlog.KindAuthDenied || got[0].Reason != "invalid_signature" ||
+		(got[0].Caller != nil && got[0].Caller.Kind == "oidc") {
+		t.Fatalf("a refused JWT must be an anonymous auth_denied: %+v", got)
+	}
+
+	sink.reset()
+	current.Store(nil)
+	if rec := do(t, srv, "POST", "/v1/sandboxes/sb-1/stop", mint("payments-eng"), "", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no identity file = %d", rec.Code)
+	}
+	if got := sink.records(); len(got) != 0 {
+		t.Fatalf("a 503 wrote records: %+v", got)
+	}
+}
+
+func callerOf(evs []auditlog.Event) []*auditlog.Caller {
+	out := make([]*auditlog.Caller, 0, len(evs))
+	for _, ev := range evs {
+		out = append(out, ev.Caller)
+	}
+	return out
 }
 
 // TestTeamNotBoundMessageManyBindings: the D9 hint lists at most ten of the

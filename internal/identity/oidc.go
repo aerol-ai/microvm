@@ -1,14 +1,8 @@
-// Package identity is sandboxd's own named-credential machinery
-// (plans/identity-and-access.md): the identity file and its bindings, and
-// the OIDC verifier that checks an identity provider's signed token offline.
-//
-// sandboxd is a resource server, the same model as the Kubernetes API server
-// with --oidc-issuer-url (§5.0, L1–L8): the company's identity provider logs
-// the person in, and every node verifies the provider's token itself from
-// the provider's published keys. There is no login service, no session and
-// no per-request call out: the only network traffic is the JWKS fetch at
-// start, hourly, and at most once a minute per issuer on an unknown key id.
 package identity
+
+// The OIDC verifier (plans/identity-and-access.md §5.5): an identity
+// provider's token checked on the node from the provider's published keys.
+// The package overview is in doc.go.
 
 import (
 	"context"
@@ -287,7 +281,7 @@ func (v *Verifier) Authenticate(r *http.Request, bearer string) (controlplane.Ac
 	}
 	if len(tok.bindings) == 0 {
 		return controlplane.Access{}, true, &controlplane.NoBindingError{
-			Issuer: tok.issuer, Name: tok.principal.Name, Groups: tok.groups, Overage: tok.overage,
+			Principal: tok.principal, Issuer: tok.issuer, Name: tok.principal.Name, Groups: tok.groups, Overage: tok.overage,
 		}
 	}
 	return controlplane.OIDCAccess(tok.principal, tok.bindings, tok.expires), true, nil
