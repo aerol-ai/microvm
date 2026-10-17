@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,6 +67,7 @@ issuers:
     audiences: [entra-cli]
 bindings:
   - {issuer: okta, group: payments-eng, role: runner, team: payments}
+  - {issuer: okta, group: billing-eng, role: runner, team: billing}
 `, iss.URL, withMCP, mcpTestAudience, mcpTestTenant, jwks)
 	if withMCP {
 		doc += "mcp:\n  resource: " + mcpTestResource + "\n  scopes: [\"api://aerolvm-mcp/mcp\"]\n"
@@ -573,5 +575,197 @@ func TestEntraV1TokenHint(t *testing.T) {
 	rec = do(t, env.server, http.MethodGet, "/v1/whoami", mint("https://evil.example"), "", nil)
 	if rec.Body.String() != `{"error":"unauthorized","reason":"unknown_issuer"}`+"\n" {
 		t.Fatalf("another unknown issuer: %q", rec.Body.String())
+	}
+}
+
+// stampCapturingCluster is an edge whose every sandbox lives on owner-1: its
+// ForwardHTTP stamps the outbound request the way the reverse-proxy
+// Director does, keeps the headers the owner would have seen, and answers
+// 404 instead of delivering it.
+type stampCapturingCluster struct {
+	*cluster.Noop
+	mu   sync.Mutex
+	seen []http.Header
+}
+
+func (c *stampCapturingCluster) AuditCallerWritesAllowed() bool { return true }
+func (c *stampCapturingCluster) OwnerOf(string) (cluster.OwnerInfo, error) {
+	return cluster.OwnerInfo{NodeID: "owner-1", InternalURL: "https://owner-1.internal"}, nil
+}
+func (c *stampCapturingCluster) ForwardHTTP(_ cluster.Endpoint, w http.ResponseWriter, r *http.Request) {
+	out := r.Clone(r.Context())
+	access, _ := controlplane.AccessFromContext(r.Context())
+	cluster.StampForward(out, access)
+	c.mu.Lock()
+	c.seen = append(c.seen, out.Header.Clone())
+	c.mu.Unlock()
+	apihttp.WriteError(w, http.StatusNotFound, "sandbox not found")
+}
+
+func (c *stampCapturingCluster) forwards() []http.Header {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]http.Header(nil), c.seen...)
+}
+
+// stampCapturingEdge is a cluster-mode edge with remote MCP on, over c.
+func stampCapturingEdge(t *testing.T, cfg config.Config, c *stampCapturingCluster, opts ...ServerOption) *httptest.Server {
+	t.Helper()
+	svc := service.New(config.Config{EnableCluster: true}, discardLogger(), storeWith(t, "capture-edge"), nil, nil, nil, nil, nil, nil)
+	svc.AttachCluster(c)
+	cfg.EnableCluster, cfg.MCPEnabled, cfg.MCPRateLimit = true, true, 100
+	srv := httptest.NewServer(NewServer(discardLogger(), svc, nil, nil, cfg, "pat-token", nil, opts...).Handler())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// teamTransport sends the bearer and an X-AerolVM-Team on every request, as
+// a connector configured for one of the caller's teams would.
+type teamTransport struct{ token, team string }
+
+func (b teamTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+b.token)
+	r.Header.Set(HeaderTeam, b.team)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestMCPInnerCallTeamIsTheCallers: an inner call acts for the team the
+// caller selected on /mcp (here the second of two bindings), never for the
+// team in sandboxd's own SB_TEAM, which the Go SDK client falls back to
+// when its Team is empty (T9). Locally the hand-off carries the selection;
+// on a forward, StampForward puts exactly that team on the wire.
+func TestMCPInnerCallTeamIsTheCallers(t *testing.T) {
+	t.Setenv("SB_TEAM", "daemon-team")
+	connect := func(t *testing.T, url, sandbox, bearer string) *mcp.ClientSession {
+		t.Helper()
+		transport := &mcp.StreamableClientTransport{
+			Endpoint:   url + "/mcp?sandbox=" + sandbox,
+			HTTPClient: &http.Client{Transport: teamTransport{token: bearer, team: "billing"}},
+		}
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "t"}, nil).Connect(context.Background(), transport, nil)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		t.Cleanup(func() { _ = cs.Close() })
+		return cs
+	}
+
+	t.Run("local sandbox: the hand-off carries the selected team", func(t *testing.T) {
+		sb := mcpSandbox("sb-00000000000000cc")
+		sb.OwnerRef = controlplane.TeamOwnerRef("billing")
+		svc := service.New(config.Config{}, discardLogger(), storeWith(t, "team-local", sb), nil, nil,
+			caddy.New(config.Config{HTTPClientTimeout: time.Second}), nil, nil, nil)
+		sink := &recSink{}
+		svc.UseAuditSinkForTest(sink)
+		env := newMCPOAuthEnv(t, config.Config{MCPEnabled: true, MCPRateLimit: 100}, svc)
+		srv := httptest.NewServer(env.server.Handler())
+		defer srv.Close()
+		// Bound to payments first, billing second: without the selection
+		// (or with the daemon's team) the billing sandbox is not visible.
+		cs := connect(t, srv.URL, "agent", env.accessToken(t, "payments-eng", "billing-eng"))
+		if res, text := toolText(t, cs, "exec", map[string]any{"command": "echo"}); !res.IsError || !strings.Contains(text, "isolate sandboxes have no shell") {
+			t.Fatalf("exec on the selected team's sandbox = %q", text)
+		}
+		sink.reset()
+		toolText(t, cs, "expose_port", map[string]any{"port": 8080})
+		if got := sink.records(); len(got) != 1 || got[0].Caller == nil || got[0].Caller.Team != "billing" {
+			t.Fatalf("the inner call's record must name team billing: %+v", got)
+		}
+	})
+
+	t.Run("forwarded sandbox: the wire carries the selected team", func(t *testing.T) {
+		env := newMCPOAuthEnv(t, config.Config{MCPEnabled: true}, nil)
+		c := &stampCapturingCluster{Noop: cluster.NewNoop("edge-1", "", "")}
+		srv := stampCapturingEdge(t, config.Config{IdentityEnabled: true}, c, env.options()...)
+		cs := connect(t, srv.URL, "sb-00000000000000dd", env.accessToken(t, "payments-eng", "billing-eng"))
+		toolText(t, cs, "exec", map[string]any{"command": "echo"})
+		forwards := c.forwards()
+		if len(forwards) == 0 {
+			t.Fatal("the inner call on another node's sandbox was never forwarded")
+		}
+		for i, h := range forwards {
+			if got := h.Values(HeaderTeam); len(got) != 1 || got[0] != "billing" {
+				t.Fatalf("forward %d carried %s = %q, want exactly [billing]", i, HeaderTeam, got)
+			}
+			if h.Get(cluster.HeaderSurface) != auditlog.SurfaceMCP {
+				t.Fatalf("forward %d has no MCP surface marker: %v", i, h)
+			}
+		}
+	})
+}
+
+// TestMCPForwardKeepsThePATOrigin is T10's laundering rule through remote
+// MCP: a forwarded inner call says where /mcp itself accepted the operator
+// token. A PAT that Caddy relayed from a public client (X-AerolVM-Client-IP
+// with PROXY protocol on) stays public on the forward, even though the inner
+// call reaches the API in-process from a loopback address; a PAT from a
+// loopback client stays host.
+func TestMCPForwardKeepsThePATOrigin(t *testing.T) {
+	cases := []struct {
+		name     string
+		clientIP string
+		want     string
+	}{
+		{"PAT relayed by Caddy from a public client", "203.0.113.9", cluster.PATOriginPublic},
+		{"PAT from a loopback client on the host", "", cluster.PATOriginHost},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &stampCapturingCluster{Noop: cluster.NewNoop("edge-1", "", "")}
+			srv := stampCapturingEdge(t, config.Config{L4FallbackProxyProtocol: true}, c)
+			headers := map[string]string{"Authorization": "Bearer pat-token"}
+			if tc.clientIP != "" {
+				headers[HeaderClientIP] = tc.clientIP
+			}
+			transport := &mcp.StreamableClientTransport{
+				Endpoint:   srv.URL + "/mcp?sandbox=sb-00000000000000ee",
+				HTTPClient: &http.Client{Transport: headerSetTransport{headers}},
+			}
+			cs, err := mcp.NewClient(&mcp.Implementation{Name: "t"}, nil).Connect(context.Background(), transport, nil)
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			defer cs.Close()
+			toolText(t, cs, "exec", map[string]any{"command": "echo"})
+			forwards := c.forwards()
+			if len(forwards) == 0 {
+				t.Fatal("the inner call was never forwarded")
+			}
+			for i, h := range forwards {
+				if got := h.Get(cluster.HeaderPATOrigin); got != tc.want {
+					t.Fatalf("forward %d: %s = %q, want %q", i, cluster.HeaderPATOrigin, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// TestMCPOAuthOnThePublicSocket: under SB_PAT_SCOPE=host Caddy reaches
+// sandboxd through the public socket (PublicHandler), so the RFC 9728
+// metadata and the /mcp challenge must be served there too; a PAT on /mcp
+// there is refused with the host-scope text, still with the challenge.
+func TestMCPOAuthOnThePublicSocket(t *testing.T) {
+	env := newMCPOAuthEnv(t, config.Config{MCPEnabled: true, PATScope: config.PATScopeHost}, nil)
+	public := env.server.PublicHandler()
+	serve := func(method, path, bearer string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.RemoteAddr = "@"
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		rec := httptest.NewRecorder()
+		public.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := serve(http.MethodGet, remotemcp.MetadataPath+remotemcp.Path, ""); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), mcpTestResource) {
+		t.Fatalf("metadata on the public socket = %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(http.MethodPost, "/mcp?sandbox=agent", ""); rec.Code != http.StatusUnauthorized || rec.Header().Get("WWW-Authenticate") != mcpTestChallenge {
+		t.Fatalf("/mcp with no token on the public socket = %d %v", rec.Code, rec.Header())
+	}
+	rec := serve(http.MethodPost, "/mcp?sandbox=agent", "pat-token")
+	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), patScopeMessage) || rec.Header().Get("WWW-Authenticate") != mcpTestChallenge {
+		t.Fatalf("PAT on /mcp through the public socket = %d %v %s", rec.Code, rec.Header(), rec.Body.String())
 	}
 }

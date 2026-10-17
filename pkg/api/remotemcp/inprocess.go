@@ -38,6 +38,13 @@ type inProcessTransport struct {
 	// call gets the edge's 500 (finding 2.5).
 	access    controlplane.Access
 	hasAccess bool
+	// patOrigin is where /mcp's own request had its operator token accepted
+	// (cluster.PATOriginFromContext), "" for any other credential. A
+	// forwarded inner call must carry that origin, not one worked out from
+	// the in-process request: that request comes from a loopback address
+	// with none of the client's headers, so a PAT Caddy relayed from a
+	// public client would pass as the host (§5.11).
+	patOrigin string
 }
 
 func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -46,14 +53,18 @@ func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// Only this transport sets the marker; nothing on the wire can.
 	ctx := auditlog.ContextWithSurface(req.Context(), auditlog.SurfaceMCP)
 	ctx = contextWithHandoff(ctx, t.access, t.hasAccess)
+	if t.patOrigin != "" {
+		ctx = cluster.ContextWithPATOrigin(ctx, t.patOrigin)
+	}
 	in := req.Clone(ctx)
 	in.RequestURI = req.URL.RequestURI()
 	in.RemoteAddr = t.remoteAddr
 	// The team is the hand-off's, resolved when /mcp authenticated. A team
-	// header here could only come from the SDK client's own defaults
-	// (SB_TEAM in sandboxd's environment, once the SDKs read it, T9), which
-	// is the daemon's setting, never the caller's. A forward gets the team
-	// back from cluster.StampForward, taken from the hand-off Access.
+	// header here could only come from the SDK client's own default, SB_TEAM
+	// in sandboxd's environment (the Go SDK reads it when Team is empty,
+	// T9), which is the daemon's setting, never the caller's. A forward
+	// gets the caller's team back from cluster.StampForward, taken from the
+	// hand-off Access.
 	in.Header.Del(cluster.HeaderTeam)
 	if in.Body == nil {
 		in.Body = http.NoBody

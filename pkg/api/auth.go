@@ -630,8 +630,14 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 		switch access.Principal.Kind {
 		case controlplane.PrincipalOperator, controlplane.PrincipalNode:
 			// Where this node accepted the PAT, for the
-			// X-Cluster-PAT-Origin every forward of it carries (§5.11).
-			ctx = cluster.ContextWithPATOrigin(ctx, patOrigin(r, s.l4ProxyProtocol))
+			// X-Cluster-PAT-Origin every forward of it carries (§5.11). A
+			// remote MCP inner call keeps the origin of /mcp's own request,
+			// which the in-process transport copied onto its context: worked
+			// out from the in-process request (a loopback address, none of
+			// the client's headers) a public PAT would pass as the host.
+			if _, inner, _ := remotemcp.Handoff(r.Context()); !inner {
+				ctx = cluster.ContextWithPATOrigin(ctx, patOrigin(r, s.l4ProxyProtocol))
+			}
 		}
 		next.ServeHTTP(w, r.WithContext(withCorrelationID(ctx, r)))
 	})

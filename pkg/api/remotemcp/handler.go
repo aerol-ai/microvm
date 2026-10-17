@@ -29,6 +29,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/agentmcp"
 	"github.com/aerol-ai/microvm/internal/agenttools"
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/observability"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
@@ -169,6 +170,7 @@ func (h *Handler) serverFor(r *http.Request) *mcp.Server {
 		Source: agenttools.SourceMCP,
 		HTTPClient: &http.Client{Transport: &inProcessTransport{
 			handler: h.api(), remoteAddr: r.RemoteAddr, access: access, hasAccess: hasAccess,
+			patOrigin: cluster.PATOriginFromContext(r.Context()),
 		}},
 	})
 	if err != nil {

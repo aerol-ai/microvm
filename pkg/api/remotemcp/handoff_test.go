@@ -56,6 +56,7 @@ func TestInProcessTransportCarriesHandoff(t *testing.T) {
 		surface        string
 		auth, team     string
 		remote, target string
+		patOrigin      string
 	}
 	var got seen
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,15 +64,22 @@ func TestInProcessTransportCarriesHandoff(t *testing.T) {
 		got.surface = auditlog.SurfaceFromContext(r.Context())
 		got.auth, got.team = r.Header.Get("Authorization"), r.Header.Get(cluster.HeaderTeam)
 		got.remote, got.target = r.RemoteAddr, r.RequestURI
+		got.patOrigin = cluster.PATOriginFromContext(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	})
 	for _, tc := range []struct {
 		name      string
 		hasAccess bool
-	}{{"with the caller's Access", true}, {"without one (a bug the edge answers with 500)", false}} {
+		patOrigin string
+	}{
+		{name: "with the caller's Access", hasAccess: true},
+		{name: "a PAT caller keeps the origin /mcp accepted it from", hasAccess: true, patOrigin: cluster.PATOriginPublic},
+		{name: "without one (a bug the edge answers with 500)", hasAccess: false},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got = seen{}
-			client := &http.Client{Transport: &inProcessTransport{handler: handler, remoteAddr: "203.0.113.9:1234", access: mcpCaller(), hasAccess: tc.hasAccess}}
+			client := &http.Client{Transport: &inProcessTransport{handler: handler, remoteAddr: "203.0.113.9:1234",
+				access: mcpCaller(), hasAccess: tc.hasAccess, patOrigin: tc.patOrigin}}
 			req, _ := http.NewRequest(http.MethodGet, "http://in-process/v1/sandboxes?name=agent", nil)
 			req.Header.Set("Authorization", "Bearer caller-token")
 			req.Header.Set(cluster.HeaderTeam, "daemon-default-team")
@@ -92,6 +100,9 @@ func TestInProcessTransportCarriesHandoff(t *testing.T) {
 			if req.Header.Get(cluster.HeaderTeam) != "daemon-default-team" {
 				t.Fatal("the transport must not modify the SDK's own request")
 			}
+			if got.patOrigin != tc.patOrigin {
+				t.Fatalf("PAT origin = %q, want %q", got.patOrigin, tc.patOrigin)
+			}
 		})
 	}
 }
@@ -104,15 +115,16 @@ type innerRecorder struct {
 }
 
 type innerCall struct {
-	auth      string
-	access    controlplane.Access
-	inner, ok bool
+	auth, team string
+	access     controlplane.Access
+	inner, ok  bool
 }
 
 func (rec *innerRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	access, inner, ok := Handoff(r.Context())
 	rec.mu.Lock()
-	rec.calls = append(rec.calls, innerCall{auth: r.Header.Get("Authorization"), access: access, inner: inner, ok: ok})
+	rec.calls = append(rec.calls, innerCall{auth: r.Header.Get("Authorization"), team: r.Header.Get(cluster.HeaderTeam),
+		access: access, inner: inner, ok: ok})
 	rec.mu.Unlock()
 	rec.next.ServeHTTP(w, r)
 }
@@ -148,9 +160,12 @@ func handoffEndpoint(t *testing.T, bearerless bool) (*endpoint, *innerRecorder) 
 
 // TestRemoteToolCallsUseTheHandoff is ET7's inner-call identity test: every
 // inner API call a tool makes carries the Access /mcp resolved and the
-// caller's own bearer, never the daemon's SB_PAT_TOKEN (eng review E4).
+// caller's own bearer, never the daemon's SB_PAT_TOKEN (eng review E4), and
+// never the team in the daemon's SB_TEAM, which the Go SDK client sends
+// when its Team is empty (T9): the caller's team is the hand-off's.
 func TestRemoteToolCallsUseTheHandoff(t *testing.T) {
 	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	t.Setenv("SB_TEAM", "daemon-team")
 	e, rec := handoffEndpoint(t, false)
 	e.fake.AddSandbox(models.Sandbox{Name: "agent"})
 	cs := e.connect("sandbox=agent")
@@ -167,6 +182,9 @@ func TestRemoteToolCallsUseTheHandoff(t *testing.T) {
 		}
 		if c.auth != "Bearer "+agenttoolstest.Token || strings.Contains(c.auth, "operator-pat") {
 			t.Fatalf("inner call %d carried %q, want the caller's own bearer", i, c.auth)
+		}
+		if c.team != "" || c.access.Team() != "payments" {
+			t.Fatalf("inner call %d: team header %q, hand-off team %q; want no header and the caller's team", i, c.team, c.access.Team())
 		}
 	}
 }
