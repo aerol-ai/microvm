@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -171,7 +172,7 @@ func TestPrincipalInvariants(t *testing.T) {
 			if rec.Code != http.StatusNoContent || !c.ok {
 				t.Fatalf("status %d, access attached %v; body %s", rec.Code, c.ok, rec.Body.String())
 			}
-			if c.access != tc.want {
+			if !reflect.DeepEqual(c.access, tc.want) {
 				t.Fatalf("access =\n %+v\nwant\n %+v", c.access, tc.want)
 			}
 		})
