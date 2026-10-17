@@ -7,6 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 // proxyCache caches one ReverseProxy per peer identity and URL. The transport
@@ -87,6 +89,9 @@ func (pc *proxyCache) getForPeer(nodeID, baseURL string, rt http.RoundTripper) (
 		},
 		Transport: rt,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			// The peer never ran the call, so it wrote no record: the edge
+			// records the failed forward instead (§5.9).
+			auditlog.MarkForwardFailed(r.Context())
 			http.Error(w, "cluster: forward to "+baseURL+" failed: "+err.Error(), http.StatusBadGateway)
 		},
 	}

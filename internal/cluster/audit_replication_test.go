@@ -31,7 +31,7 @@ func TestFetchSandboxAuditFromPeerOK(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "peer", APIURL: srv.URL, InternalURL: srv.URL, Alive: true})
 	c := &Cluster{nodeID: "caller", internalClient: internalClient, patToken: "pat", gossip: &gossipNode{memberIndex: index}}
-	page, err := c.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", "")
+	page, err := c.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", "", "")
 	if err != nil {
 		t.Fatalf("FetchSandboxAuditFromPeer: %v", err)
 	}
@@ -40,11 +40,11 @@ func TestFetchSandboxAuditFromPeerOK(t *testing.T) {
 	}
 
 	a := &Agent{nodeID: "caller", internalClient: internalClient, patToken: "pat", gossip: &gossipNode{memberIndex: index}}
-	if _, err := a.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", ""); err != nil {
+	if _, err := a.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", "", ""); err != nil {
 		t.Fatalf("Agent fetch: %v", err)
 	}
 
-	if _, err := NewNoop("n", "", "").FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", ""); err == nil {
+	if _, err := NewNoop("n", "", "").FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", "", ""); err == nil {
 		t.Fatal("expected Noop fetch error")
 	}
 }
@@ -56,19 +56,19 @@ func TestFetchSandboxAuditFromPeerErrorStatus(t *testing.T) {
 	index := newGossipMemberIndex()
 	index.upsert(Member{NodeID: "peer", APIURL: srv.URL, InternalURL: srv.URL, Alive: true})
 	c := &Cluster{nodeID: "caller", internalClient: internalClient, patToken: "pat", gossip: &gossipNode{memberIndex: index}}
-	if _, err := c.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", ""); err == nil {
+	if _, err := c.FetchSandboxAuditFromPeer(context.Background(), "peer", "sb-1", 10, "", "", "", ""); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestFetchSandboxAuditFromPeerValidationAndResponseVariants(t *testing.T) {
-	if _, err := fetchSandboxAuditFromPeer(context.Background(), nil, "", "self", "https://peer", "sb", 0, "", "", ""); err == nil {
+	if _, err := fetchSandboxAuditFromPeer(context.Background(), nil, "", "self", "https://peer", "sb", 0, "", "", "", ""); err == nil {
 		t.Fatal("expected nil-client error")
 	}
-	if _, err := fetchSandboxAuditFromPeer(context.Background(), http.DefaultClient, "", "self", "https://peer", " ", 0, "", "", ""); err == nil {
+	if _, err := fetchSandboxAuditFromPeer(context.Background(), http.DefaultClient, "", "self", "https://peer", " ", 0, "", "", "", ""); err == nil {
 		t.Fatal("expected empty-sandbox error")
 	}
-	if _, err := fetchSandboxAuditFromPeer(context.Background(), http.DefaultClient, "", "self", " ", "sb", 0, "", "", ""); err == nil {
+	if _, err := fetchSandboxAuditFromPeer(context.Background(), http.DefaultClient, "", "self", " ", "sb", 0, "", "", "", ""); err == nil {
 		t.Fatal("expected empty-peer-url error")
 	}
 
@@ -82,14 +82,14 @@ func TestFetchSandboxAuditFromPeerValidationAndResponseVariants(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
-	page, err := fetchSandboxAuditFromPeer(context.Background(), srv.Client(), "pat", "self", srv.URL, "sb/a", 25, "cursor/value", "egress", "inc-1")
+	page, err := fetchSandboxAuditFromPeer(context.Background(), srv.Client(), "pat", "self", srv.URL, "sb/a", 25, "cursor/value", "egress", "inc-1", "tok_ana")
 	if err != nil {
 		t.Fatalf("empty success response: %v", err)
 	}
 	if len(page.Events) != 0 || page.NextCursor != "" {
 		t.Fatalf("empty page = %+v", page)
 	}
-	for _, want := range []string{"limit=25", "cursor=cursor%2Fvalue", "kind=egress", "incarnation_id=inc-1"} {
+	for _, want := range []string{"limit=25", "cursor=cursor%2Fvalue", "kind=egress", "incarnation_id=inc-1", "caller=tok_ana"} {
 		if !strings.Contains(gotQuery, want) {
 			t.Fatalf("query %q missing %q", gotQuery, want)
 		}
@@ -99,7 +99,7 @@ func TestFetchSandboxAuditFromPeerValidationAndResponseVariants(t *testing.T) {
 		_, _ = w.Write([]byte("{"))
 	}))
 	defer badJSON.Close()
-	if _, err := fetchSandboxAuditFromPeer(context.Background(), badJSON.Client(), "", "self", badJSON.URL, "sb", 0, "", "", ""); err == nil || !strings.Contains(err.Error(), "peer audit decode") {
+	if _, err := fetchSandboxAuditFromPeer(context.Background(), badJSON.Client(), "", "self", badJSON.URL, "sb", 0, "", "", "", ""); err == nil || !strings.Contains(err.Error(), "peer audit decode") {
 		t.Fatalf("decode error = %v", err)
 	}
 }

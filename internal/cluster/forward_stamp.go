@@ -49,6 +49,10 @@ const (
 //   - HeaderCorrelationID, from the request context the API edge filled, so
 //     the peer's records share the edge's id instead of minting their own.
 //
+// It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
+// only the node that runs the handler records the call, so the peer writes
+// the one record and the edge writes none (§5.9, "Forwarding").
+//
 // Later tasks add their markers here (X-Cluster-PAT-Origin, T10;
 // X-Cluster-Surface, T13), so no forward path can miss them.
 func StampForward(out *http.Request, access controlplane.Access) {
@@ -65,6 +69,7 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	if id := auditlog.CorrelationIDFromContext(out.Context()); id != "" {
 		out.Header.Set(HeaderCorrelationID, id)
 	}
+	auditlog.MarkForwarded(out.Context())
 }
 
 // stampForwardFromContext is StampForward for the reverse-proxy Director,
