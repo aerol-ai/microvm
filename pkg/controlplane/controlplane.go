@@ -37,19 +37,30 @@ var ErrAdmissionDenied = errors.New("controlplane: admission denied")
 var ErrAdmissionUnavailable = errors.New("controlplane: admission temporarily unavailable")
 
 // Identity is the account a caller token resolves to. OwnerRef is the stable
-// account key stamped onto sandboxes and usage samples; ExternalID is
-// informational only.
+// account key stamped onto sandboxes and usage samples; ExternalID is the
+// provider's subject, used as the principal id (controlplane:<ExternalID>).
+//
+// Role and Name are optional. A managed provider may set Role to viewer or
+// runner only, never a fleet role; empty means runner, which is exactly the
+// owner-scoped verb set every managed caller had before roles existed
+// (plans/identity-and-access.md §5.1, CEO review finding 1.4).
 type Identity struct {
 	ExternalID string
 	OwnerRef   string
+	Role       Role
+	Name       string
 }
 
 // Access is the authenticated caller context attached by the API auth
-// middleware and read by the service layer to enforce owner scoping. Fleet is
-// true for the PAT path (unscoped: sees the whole fleet); for a validated user
-// token Fleet is false and Identity.OwnerRef is the tenant the request is
-// scoped to. Fleet was named Operator; the field is scope, not power
-// (plans/identity-and-access.md §5.1).
+// middleware and read by the service layer to enforce owner scoping
+// (plans/identity-and-access.md §5.1: who, what, where).
+//
+// Fleet is scope, not power: true means the caller is unscoped and sees every
+// owner (the PAT, a cluster peer, later a role bound to "*"); false means
+// Identity.OwnerRef is the one owner the request is fenced to. Fleet was named
+// Operator before roles existed, when the one bit meant both "unscoped" and
+// "operator powers"; an auditor needs the first without the second, so the
+// powers move to Role and Principal (task T2's permission checks).
 //
 // Background loops and internal calls run with no Access in context. The
 // service layer treats "no Access present" as unscoped (fleet-wide) so those
@@ -58,6 +69,21 @@ type Identity struct {
 type Access struct {
 	Identity Identity
 	Fleet    bool
+	Role     Role
+	// Principal is who made the request; its ID is what audit records and
+	// trace attributes name.
+	Principal Principal
+	// Via is the edge node's id when a peer forwarded the request over mTLS.
+	// It comes from the verified peer certificate, never from a header.
+	Via string
+	// ExpiresAt is when the presented credential stops working; zero for
+	// credentials that do not expire (the PAT, managed provider tokens).
+	ExpiresAt time.Time
+	// MCPOnly marks a credential that is valid only on /mcp or on a forward a
+	// peer marked X-Cluster-Surface: mcp (an OAuth access token whose audience
+	// is one of an issuer's mcp_audiences, §5.14). The API edge refuses it
+	// everywhere else. No T1 authenticator sets it.
+	MCPOnly bool
 }
 
 type accessCtxKey struct{}
@@ -241,6 +267,25 @@ func (p Provider) WithDefaults() Provider {
 		p.EnforcementFor = func(FleetController) Enforcement { return noopEnforcement{} }
 	}
 	return p
+}
+
+// HasExternalValidator reports whether p.Validator is a non-noop
+// implementation, i.e. whether the provider brings its own caller login.
+// sandboxd's own identity (SB_IDENTITY_ENABLED) refuses to boot next to one:
+// two identity sources would have to share one owner namespace.
+func (p Provider) HasExternalValidator() bool {
+	return !IsNoopValidator(p.Validator)
+}
+
+// IsNoopValidator reports whether v rejects every token: nil or the no-op
+// validator. The API edge uses it to label refusals "unknown" rather than
+// "controlplane" when no provider is wired.
+func IsNoopValidator(v Validator) bool {
+	if v == nil {
+		return true
+	}
+	_, isNoop := v.(noopValidator)
+	return isNoop
 }
 
 // HasExternalWitness reports whether p.Witness is a non-noop implementation.
