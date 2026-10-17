@@ -22,6 +22,14 @@ const (
 	// HeaderCorrelationID ties the records one API call writes on every
 	// node together (H3).
 	HeaderCorrelationID = "X-Correlation-ID"
+	// HeaderSurface marks a forward of a remote MCP tool's inner API call
+	// (§5.14). Its one value is auditlog.SurfaceMCP. On that forward, and
+	// only there, the owner also accepts the caller's MCP-only access token
+	// (an mcp_audiences audience), and records the call with surface mcp.
+	// Like every X-Cluster-* header it is honoured only from a live mTLS
+	// peer, and it widens where a verified credential is accepted; it never
+	// supplies an identity.
+	HeaderSurface = "X-Cluster-Surface"
 )
 
 // StampForward marks out, an outbound request that carries a user's request
@@ -48,13 +56,19 @@ const (
 //     refuses a team the credential is not bound to.
 //   - HeaderCorrelationID, from the request context the API edge filled, so
 //     the peer's records share the edge's id instead of minting their own.
+//   - HeaderSurface, when the request is a remote MCP tool's inner call
+//     (the in-process transport marked its context with auditlog.SurfaceMCP;
+//     nothing on the wire can). Without it the owner would refuse an
+//     MCP-only access token and record the call without surface mcp. Any
+//     other request has the header removed, so the marker always follows
+//     the context and never a header that came in with the request.
 //
 // It also marks the edge's api record as forwarded (auditlog.MarkForwarded):
 // only the node that runs the handler records the call, so the peer writes
 // the one record and the edge writes none (§5.9, "Forwarding").
 //
-// Later tasks add their markers here (X-Cluster-PAT-Origin, T10;
-// X-Cluster-Surface, T13), so no forward path can miss them.
+// Later tasks add their markers here (X-Cluster-PAT-Origin, T10), so no
+// forward path can miss them.
 func StampForward(out *http.Request, access controlplane.Access) {
 	if out == nil {
 		return
@@ -68,6 +82,11 @@ func StampForward(out *http.Request, access controlplane.Access) {
 	}
 	if id := auditlog.CorrelationIDFromContext(out.Context()); id != "" {
 		out.Header.Set(HeaderCorrelationID, id)
+	}
+	if auditlog.SurfaceFromContext(out.Context()) == auditlog.SurfaceMCP {
+		out.Header.Set(HeaderSurface, auditlog.SurfaceMCP)
+	} else {
+		out.Header.Del(HeaderSurface)
 	}
 	auditlog.MarkForwarded(out.Context())
 }
