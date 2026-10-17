@@ -59,6 +59,21 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			local.ServeHTTP(w, r)
 			return
 		}
+		// An owner-scoped (validated user-token) caller must not learn that
+		// another tenant's sandbox exists through the routing states below — a
+		// 410 (owner died) or a 503 naming the owner node, versus a plain 404
+		// for an unknown id, is an existence oracle (#15). When the global
+		// placement says this id belongs to a different tenant, hand it to the
+		// local handler, which answers 404 via owner scoping, exactly as it
+		// would for an id that does not exist. Operator/unscoped callers
+		// (empty owner) route fleet-wide as before; name-based routes are
+		// already resolved in the caller's own namespace (OwnerOfName).
+		if callerOwner := strings.TrimSpace(service.OwnerRefForCreate(r.Context())); callerOwner != "" {
+			if p, ok := c.PlacementOf(id); ok && strings.TrimSpace(p.OwnerRef) != callerOwner {
+				local.ServeHTTP(w, r)
+				return
+			}
+		}
 		owner, err := c.OwnerOf(id)
 		if errors.Is(err, cluster.ErrUnknownSandbox) && opts.ResolveName {
 			// Per-owner name, resolved in the caller's namespace — the same
