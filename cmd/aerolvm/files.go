@@ -41,7 +41,7 @@ func runCp(ctx context.Context, a *app, args []string) int {
 	case srcRemote == dstRemote:
 		return a.usageError(c, "cp", "one side must be <sandbox>:<path>")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -166,7 +166,7 @@ func runLs(ctx context.Context, a *app, args []string) int {
 	if !ok {
 		ref, dir = pos[0], ""
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}

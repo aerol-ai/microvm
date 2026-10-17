@@ -16,9 +16,11 @@ const overviewTail = `
 Sandboxes are addressed as <id-or-name>: sb-<16 hex> is an ID, anything else
 is a name (names are unique per account).
 
-Environment (both override "aerolvm login"):
+Environment (these override "aerolvm login"):
   SB_API_URL       sandboxd URL (default: your login, else http://127.0.0.1:21212)
   SB_PAT_TOKEN     API token (required unless you ran "aerolvm login")
+  SB_API_TOKEN     the same as SB_PAT_TOKEN; SB_PAT_TOKEN wins if both are set
+  SB_TEAM          the team to act for, when your sign-in has several
   AEROLVM_OUTPUT   set to "json" to make --json the default
 
 Output: stdout is data, stderr is everything else. With --json, errors are
@@ -230,30 +232,79 @@ Usage: aerolvm health [--json]
 Says which credentials it used: SB_PAT_TOKEN or the saved login.
 `
 
-const loginHelp = `Save the sandboxd URL and API token, so commands work without
+const loginHelp = `Sign in to sandboxd and save the login, so commands work without
 SB_API_URL and SB_PAT_TOKEN.
 
-Usage: aerolvm login [<url>] [--token-stdin]
+Usage: aerolvm login [<url>] [--sso] [--device] [--issuer NAME] [--team TEAM]
+       aerolvm login [<url>] --token-stdin [--team TEAM]
 
 Asks for the URL (default: SB_API_URL, your last login, or the local
-setup's http://127.0.0.1:21212), then the token, with typing hidden. The
-token is checked against sandboxd before it is saved, readable only by you,
-in ~/.config/aerolvm/config.json ($XDG_CONFIG_HOME/aerolvm when set,
-%AppData%\aerolvm on Windows). A bare host gets https://, or http:// for
+setup's http://127.0.0.1:21212). A bare host gets https://, or http:// for
 localhost. Logging in again replaces the saved login.
 
-The token is the SB_PAT_TOKEN sandboxd runs with; the local setup prints it
-when it installs. SB_PAT_TOKEN in the environment still wins over the login,
-and the saved token is only ever sent to the URL it was saved for.
+When sandboxd offers single sign-on, login opens your browser to sign in
+with your company account (asking which one when there are several). Over
+SSH, --device prints a URL and a code to enter on any device instead. The
+login renews itself while your provider allows; when it can't, sign in
+again with "aerolvm login --sso <url>". Otherwise login asks for an API
+token, with typing hidden, and checks it against sandboxd.
+
+The login is saved readable only by you in ~/.config/aerolvm/config.json
+($XDG_CONFIG_HOME/aerolvm when set, %AppData%\aerolvm on Windows).
+SB_PAT_TOKEN (or SB_API_TOKEN) in the environment still wins over it, and
+the saved credential is only ever sent to the URL it was saved for.
 
 Flags:
-  --token-stdin   read the token from stdin instead of asking (scripts, CI)
-  --json          print {"api_url","config_path","server_version"}
+  --sso                   sign in with single sign-on; fail if it isn't offered
+  --device                sign in with a code on another device (SSH sessions)
+  --issuer NAME           the sign-in provider, when sandboxd offers several
+  --team TEAM             the team to act for when you belong to several; sent
+                          with every request (SB_TEAM overrides it)
+  --client-secret-stdin   read the provider app's client secret from stdin and
+                          save it with the login (Google desktop apps need one;
+                          your AerolVM admin hands it out)
+  --token-stdin           read an API token from stdin instead (scripts, CI)
+  --json                  print {"api_url","config_path","server_version"}
 
 Examples:
-  aerolvm login
   aerolvm login https://sandbox.example.com
+  aerolvm login https://sandbox.example.com --device
+  aerolvm login https://sandbox.example.com --team payments
   aerolvm login https://sandbox.example.com --token-stdin < token.txt
+`
+
+const whoamiHelp = `Show who sandboxd takes you for: your name, role, team, how you signed in
+and when that expires.
+
+Usage: aerolvm whoami [--explain] [--json]
+
+With a sign-in that matches no access rule, whoami says so and lists the
+groups your sign-in carried, so you can tell your admin what to add.
+
+Flags:
+  --explain   also show which access rule (binding) gave you this role, and
+              the claims of your own sign-in it was matched against
+  --json      print sandboxd's answer: {"principal":{"kind","id","name"},
+              "role","team","expires_at"}, plus "explain" with --explain
+
+Examples:
+  aerolvm whoami
+  aerolvm whoami --explain
+`
+
+const authHelp = `Print a fresh bearer token for scripts and SDKs.
+
+Usage: aerolvm auth token [--json]
+
+Prints the credential aerolvm would send, on stdout: your SSO login's ID
+token (renewed first when it is about to expire), the saved API token, or
+SB_PAT_TOKEN. An ID token lasts about an hour; run it again for a new one.
+
+Flags:
+  --json   print {"api_url","token","expires_at"}
+
+Examples:
+  SB_PAT_TOKEN=$(aerolvm auth token) python agent.py
 `
 
 const tokenHelp = `Create, list and revoke scoped API tokens (avm_...) for services and CI.

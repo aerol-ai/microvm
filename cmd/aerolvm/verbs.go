@@ -54,7 +54,7 @@ func runCreate(ctx context.Context, a *app, args []string) int {
 	if stopIdle > 0 || destroy > 0 {
 		spec.Lifecycle = &models.Lifecycle{StopIfIdleFor: stopIdle, DestroyIfIdleFor: destroy}
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -105,7 +105,7 @@ func runList(ctx context.Context, a *app, args []string) int {
 	if limit < 0 {
 		return a.usageError(c, "list", "--limit must be positive")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -158,7 +158,7 @@ func runGet(ctx context.Context, a *app, args []string) int {
 	if len(pos) != 1 {
 		return a.usageError(c, "get", "expected one sandbox")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -214,7 +214,7 @@ func (a *app) eachSandbox(ctx context.Context, verbName string, args []string, o
 	if len(pos) == 0 {
 		return a.usageError(c, verbName, "name at least one sandbox")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -275,7 +275,7 @@ func runExpose(ctx context.Context, a *app, args []string) int {
 	if err != nil || port <= 0 || port > 65535 {
 		return a.usageError(c, "expose", "port must be 1-65535, got %q", pos[1])
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -312,7 +312,7 @@ func runSnapshot(ctx context.Context, a *app, args []string) int {
 	if len(pos) != 2 || strings.TrimSpace(pos[1]) == "" {
 		return a.usageError(c, "snapshot", "expected <sandbox> <name>")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
@@ -341,7 +341,7 @@ func runHealth(ctx context.Context, a *app, args []string) int {
 	if len(pos) > 0 {
 		return a.usageError(c, "health", "unexpected argument %q", pos[0])
 	}
-	conn, err := a.connection()
+	conn, err := a.resolve(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}

@@ -44,6 +44,7 @@ require (
 	github.com/opencontainers/runtime-spec v1.3.0
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/time v0.16.0
 )
 
@@ -83,7 +84,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	golang.org/x/exp v0.0.0-20241108190413-2d47ceb2692f // indirect
-	golang.org/x/oauth2 v0.36.0 // indirect
 )
 
 require (

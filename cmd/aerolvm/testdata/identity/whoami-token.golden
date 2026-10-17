@@ -1,0 +1,5 @@
+ci-deploy
+role     runner
+team     payments
+via      API token "ci-deploy"
+expires  in 89 days (2027-01-15)

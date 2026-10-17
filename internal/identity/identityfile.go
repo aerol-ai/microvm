@@ -155,6 +155,9 @@ type Issuer struct {
 	// bindings are this issuer's bindings in file order, so matching a
 	// token scans only its own issuer's rules.
 	bindings []*Binding
+	// claimNames is shared by every Access this issuer verifies, for
+	// `whoami --explain`: a pointer per request, never a copy.
+	claimNames *controlplane.ClaimNames
 }
 
 // Binding grants Role on Team (or every team, controlplane.FleetTeam) to a
@@ -170,6 +173,12 @@ type Binding struct {
 	claimKeys []string
 	Role      controlplane.Role
 	Team      string
+	// index is the binding's 1-based position in the file's bindings list
+	// and line its canonical String(), computed once at load so a match
+	// carries them to `whoami --explain` without formatting anything on
+	// the verify path.
+	index int
+	line  string
 }
 
 // Load reads and validates path, refusing a file over MaxFileBytes before
@@ -248,6 +257,7 @@ func Parse(raw []byte) (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("identity file: bindings[%d]: %w", i, err)
 		}
+		b.index, b.line = i+1, b.String()
 		c.Bindings = append(c.Bindings, b)
 		iss := c.byName[b.Issuer]
 		iss.bindings = append(iss.bindings, b)
@@ -363,6 +373,7 @@ func parseIssuer(fi FileIssuer, mcpResource string) (*Issuer, error) {
 		}
 		iss.MaxTokenLifetime = d
 	}
+	iss.claimNames = &controlplane.ClaimNames{Issuer: iss.Name, Username: iss.UsernameClaim, Groups: iss.GroupsClaim, Roles: iss.RolesClaim}
 	return iss, nil
 }
 
