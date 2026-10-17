@@ -24,6 +24,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	v1 "github.com/aerol-ai/microvm/pkg/api/v1"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -107,9 +108,11 @@ func TestRemoteMCPThroughRealAPI(t *testing.T) {
 // installers write must list it.
 // The stock Caddy configs answer anything outside their @api matcher with a
 // 404 of their own, so every surface sandboxd mounts must be listed there —
-// each facade's prefix and everything under it.
+// each facade's prefix and everything under it, and the two public
+// discovery documents (§5.6 sign-in discovery; §5.14 RFC 9728 metadata, in
+// both its root and path forms, through one prefix matcher).
 func TestCaddyForwardsEverySurface(t *testing.T) {
-	want := []string{remotemcp.Path}
+	want := []string{remotemcp.Path, identitywire.AuthDiscoveryPath, "/.well-known/oauth-protected-resource*"}
 	for _, prefix := range []string{v1.PathPrefix, daytona.PathPrefix, e2b.PathPrefix, runloop.PathPrefix} {
 		want = append(want, prefix, prefix+"/*")
 	}
