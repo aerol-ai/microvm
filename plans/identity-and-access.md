@@ -174,6 +174,12 @@ type Identity struct {
 | Managed provider token | `{OwnerRef, Identity.Role or runner, controlplane:<ExternalID>}` | `Access{Identity}`: same verbs (§5.3 runner = today's owner-scoped set) |
 | No `Access` (background) | unscoped; caller in audit = `system:<subsystem>` | unchanged |
 
+**Scope is not power (eng review D3).** `Fleet` (unscoped) answers only *which owners a caller sees*. It no longer implies operator powers.
+- Operator-only capabilities ask a separate, explicit predicate, `hostCapable(ctx)`. It is true for the PAT/operator, `node:` principals, internal calls with no `Access`, and the `admin` role. It is false for `viewer`, `runner` (team or `*`), `auditor` and managed identities.
+- The capabilities: raw host-side mounts, `file://` bundle refs, and custom domains without the DNS proof. Four existing gates move from `!scoped` to `hostCapable`: `service.go:1611`, `isolate.go:94`, `custom_domains.go:469`, `dns_verify.go:37-39`.
+- `facade_state.go:159` (`requireVisibleSnapshot`) is a visibility check, so it keeps following `Fleet` (eng review D7). A fleet runner may alias and see any team's snapshots, consistent with its cross-team writes.
+- A call-site test lists every `ownerScope` use and fails on an unreviewed new `!scoped` capability check.
+
 Teams are owners. A token or OIDC binding for team `payments` gets `OwnerRef = "team:payments"`. The `team:` prefix keeps open-source teams out of the managed build's account namespace. Fleet-scoped principals create sandboxes with owner `""`, exactly as the PAT does today.
 
 ### 5.2 One authentication function
@@ -187,7 +193,9 @@ authenticate(r) (Access, error)
   5. otherwise                      → provider Validator (managed build; Noop rejects)
 ```
 
-**Where it runs (L2).** `authenticate` runs on the ingress node that received the request. It runs again on the owner node when the request is forwarded, because the internal listener mounts the same handler (§2.2) and the original credential travels with the request. Both checks are local: a constant-time compare (PAT), an in-memory mirror lookup (`avm_`), or an offline signature check (JWT). No identity header is read. Four markers matter, and all are accepted only from a live mTLS peer: `X-Cluster-Forwarded`, the mTLS peer id, `X-Cluster-PAT-Origin` (§5.11) and `X-Cluster-Surface` (§5.14). They decide three things: whether a PAT caller is shown as `operator` or `node:`, whether a forwarded PAT is allowed under `host` scope, and whether `mcp_audiences` is accepted. None of them supplies an identity, and none grants anything the credential doesn't already carry. Every forward path sets them through one helper, `cluster.StampForward(req, access)` (Section 1, finding 1.2).
+**Code shape (eng review D6).** One entry point tries an ordered list of authenticators: `pat`, `apiToken`, `jwt`, `provider`. Each implements `Authenticate(r, bearer) (controlplane.Access, matched bool, err error)`, and the first `matched` wins. Then three separate steps run, in order: the surface rule (`mcp_audiences` only on `/mcp` or a marked forward), team selection (`X-AerolVM-Team`), and 401/403 reason mapping (D9, D17). Adding a credential kind means appending one authenticator.
+
+**Where it runs (L2).** `authenticate` runs on the ingress node that received the request. It runs again on the owner node when the request is forwarded, because the internal listener mounts the same handler (§2.2) and the original credential travels with the request. Both checks are local: a constant-time compare (PAT), an in-memory mirror lookup (`avm_`), or an offline signature check (JWT). No identity header is read. Four markers matter, and all are accepted only from a live mTLS peer: `X-Cluster-Forwarded`, the mTLS peer id, `X-Cluster-PAT-Origin` (§5.11) and `X-Cluster-Surface` (§5.14). They decide three things: whether a PAT caller is shown as `operator` or `node:`, whether a forwarded PAT is allowed under `host` scope, and whether `mcp_audiences` is accepted. None of them supplies an identity, and none grants anything the credential doesn't already carry. Every forward path sets them through one helper, `cluster.StampForward(req, access)` (Section 1, finding 1.2). On fan-out clients that build fresh requests (`clusterlist/list.go:591-606`, `clusterlist/facade_list.go`, the build and template fan-outs), the same helper also copies `X-AerolVM-Team` (D13) and `X-Correlation-ID` (H3). Today those clients copy only `Authorization` and `X-API-KEY`, so a multi-team caller's list would be answered for different teams on different peers (eng review E6).
 
 **Why a 401 failed (CEO review D17).** For `avm_` and JWT failures, the 401 carries RFC 6750 `WWW-Authenticate: Bearer error="invalid_token", error_description="<reason>"`, and the JSON body carries the same `reason`.
 - The reasons: `expired`, `not_yet_valid` (clock skew), `unknown_issuer`, `wrong_audience`, `too_long_lived`, `invalid_signature`, `malformed`, and `unknown_or_revoked`. An `avm_` token can't tell those last two apart.
@@ -195,7 +203,12 @@ authenticate(r) (Access, error)
 - PAT, managed and unclassified bearer failures keep today's 401 byte for byte (L8).
 - `aerolvm_auth_failures_total{kind,reason}` counts each reason, and a debug log names the issuer.
 
-The three `require*Auth` wrappers become one function plus three error writers (H5). Steps 3 and 4 run only with `SB_IDENTITY_ENABLED=true`. **The daemon refuses to boot** if identity is on and the provider supplies a non-noop `Validator`. Two identity sources would have to share one owner namespace, and the managed build already has its own login. This mirrors how a provider-supplied witness wins (`plans/open-audit-witness.md`, "Where it plugs in").
+The three `require*Auth` wrappers become one function plus three error writers (H5). Token extraction moves to one shared `apihttp.BearerToken(r)`, used by `authenticate` and by remote MCP's `serverFor` (eng review D5). It matches the scheme case-insensitively (RFC 7235), trims, then reads the `sandbox.bearer, <token>` subprotocol. So the token that authenticated is always the token the MCP tools use. Steps 3 and 4 run only with `SB_IDENTITY_ENABLED=true`. **The daemon refuses to boot** if identity is on and the provider supplies a non-noop `Validator`. Two identity sources would have to share one owner namespace, and the managed build already has its own login. This mirrors how a provider-supplied witness wins (`plans/open-audit-witness.md`, "Where it plugs in").
+
+**The test-only static validator is retired (eng review D4).** `SB_ITEST_IDENTITY_FILE` (b4e152b1, `pkg/daemon/daemon.go:100-114`) maps plaintext tokens to owners in every release binary.
+- **Until T3 lands,** T1 adds two guards: identity on plus that env var → boot error, and enterprise mode refuses the env var.
+- **T3 then deletes** the env path, `pkg/daemon/itest_identity.go` and its test.
+- The harness mints real `avm_` tokens with the PAT at scenario setup, and uses the T12 test issuer for OIDC.
 
 `GET /v1/whoami` returns the resolved principal, role, team and token expiry. The CLI, the dashboard and support tickets all use it.
 
@@ -230,11 +243,11 @@ The three `require*Auth` wrappers become one function plus three error writers (
 | `metrics.read` | fleet, only when bound to `*` | fleet, only when bound to `*` | fleet | fleet |
 
 - `runner` is exactly today's owner-scoped set. That is what keeps the managed build unchanged.
-- `auditor` and `admin` must be bound fleet-wide. `viewer` and `runner` may be bound to a team or to `*`.
+- `auditor` and `admin` must be bound fleet-wide. `viewer` and `runner` may be bound to a team or to `*`. A `runner` on `*` creates and runs sandboxes for every team, but never gets operator-only capabilities: those require `hostCapable` (admin or operator), per eng review D3.
 - One team per principal (§12 I2). A person in several teams picks one at login (`--team`). The choice travels on each request as the header `X-AerolVM-Team: <name>` (CEO review D13), because a provider token can't carry it and there is no session.
   - The header **selects among the bindings the verified token already matches**. It never grants: a team not among them gets 403 with the D9 hint, and without the header the first matching binding wins.
   - It is an ordinary header, so a forward keeps it and the owner node re-applies the same selection offline (L2).
-  - The CLI saves the team per login, the dashboard shows a team picker to multi-team users, and the five SDKs read `SB_TEAM` or a client option (T9).
+  - The CLI saves the team per login, and the five SDKs read `SB_TEAM` or a client option (T9). The dashboard sends no team header (design review DR2): only fleet-bound admins use it (DR1), so they have no team to pick.
   - `caller` in audit records also names the selected team. This keeps `ownerScope` single-valued, so no store query or fan-out changes shape.
 - **Status codes:** another team's sandbox → **404**, as today (no probing). Your own team's sandbox but a missing verb → **403**, naming the permission. For `token` and `oidc` principals only, it also names the caller's own role and team, and the role that would allow it (CEO review D9): "role viewer on team payments cannot sandbox.exec; ask an admin for role runner on team payments". v1 adds `required_permission` and `role` fields to the 403 body. The facades keep their own body shape and carry the hint in the message. A 404 never carries a hint. PAT and managed (`controlplane`) callers get exactly today's body, for example `operator authorization required` (`pkg/api/apihttp/apihttp.go:131`); a test pins it (L8). A fleet route without `fleet.admin` → 403, as `RequireOperator` already does.
 - **v1 soft-freeze:** PAT and managed callers see no new status codes. 403 is new only for principals that did not exist before. This is called out in the T2 PR.
@@ -290,6 +303,7 @@ The node then maps claims to a team and role through bindings. There is no sessi
 version: 1
 issuers:
   - name: okta                         # stable; part of the principal id
+    display_name: Acme Okta            # dashboard button label (design review DR3)
     url: https://acme.okta.com/oauth2/default
     audiences: [0oa1cli, 0oa1dash]     # client ids of the CLI and dashboard apps
     clients: { cli: 0oa1cli, dashboard: 0oa1dash }   # published in discovery
@@ -298,6 +312,7 @@ issuers:
     mcp: true                          # listed in RFC 9728 metadata (§5.14)
     mcp_audiences: [api://aerolvm-mcp] # access-token audiences accepted only on /mcp
   - name: google
+    display_name: Google
     kind: google                       # dashboard uses Google Identity Services (§5.7)
     url: https://accounts.google.com
     audiences: [123-cli.apps.googleusercontent.com, 123-dash.apps.googleusercontent.com]
@@ -328,6 +343,7 @@ mcp:
 |---|---|---|
 | `version` | int, required | `1` |
 | `issuers[].name` | string, required, `[a-z0-9-]` | Stable; part of every principal id |
+| `issuers[].display_name` | string, optional, 1–40 characters, control characters stripped | The dashboard button label, "Sign in with <display_name>"; falls back to `name`. Published in `/.well-known/aerolvm-auth`. Never used in principal ids or audit records (design review DR3). |
 | `issuers[].kind` | `oidc` (default) or `google` | `google` switches the dashboard to Google Identity Services (§5.7) |
 | `issuers[].url` | URL, required | Must equal the token's `iss` |
 | `issuers[].jwks_file` | path, optional | A static JWKS instead of discovery, for issuers the nodes cannot reach |
@@ -337,7 +353,7 @@ mcp:
 | `issuers[].claims.username` / `.groups` / `.roles` | claim names | `roles` is for Entra app roles (see overage below) |
 | `issuers[].max_token_lifetime` | duration, default `24h` | Tokens whose `exp − iat` exceeds it are refused. The default fits provider ID tokens (about 1 h), GitHub Actions tokens (minutes) and projected service-account tokens (1 h by default), and refuses long-lived workload tokens unless an operator raises it per issuer (Section 9, finding 9.1). |
 | `issuers[].mcp` | bool | Listed in RFC 9728 `authorization_servers` |
-| `bindings[]` | `{issuer, group \| app_role \| claim: {…}, role, team}` | First match wins. `group` matches the `groups` claim, `app_role` matches the `roles` claim, and `role` is the AerolVM role granted. `team` is a name or `*`. |
+| `bindings[]` | `{issuer, group \| app_role \| claim: {…}, role, team}` | First match wins. `group` matches the `groups` claim, `app_role` matches the `roles` claim, and `role` is the AerolVM role granted. `team` is a name or `*`. List fleet bindings (`admin`, `auditor`) above team bindings. A person matched by both resolves to the first one, and the dashboard sends no team header to pick another (design review DR2). |
 | `deny_subjects[]` | `"<issuer>:<sub>"` | Refused on every request after reload |
 | `mcp.resource` | URL | The single protected-resource URL for `/mcp` |
 
@@ -359,7 +375,7 @@ The file can't say who edited it. The record points at the hash, and the operato
   - A cluster whose issuer is not reachable from the AerolVM nodes can publish its JWKS as a static file (`jwks_file:` in place of discovery).
 
 - **Principal:** `oidc:<issuer>:<sub>`. `sub` is stable and the email is only the display `Name`, so renaming an email does not split one person's audit history.
-- **No binding matched:** 403 with "no role binding for ana@acme.com", and an `api` audit record with `result: denied` (Section 2, finding 2.3). The message also names the issuer and the groups the token carried (D9). These are the caller's own claims, so the person can tell IT what is missing.
+- **No binding matched:** 403 with "no role binding for ana@acme.com", and an `api` audit record with `result: denied` (Section 2, finding 2.3). The message also names the issuer and the groups the token carried (D9). These are the caller's own claims, so the person can tell IT what is missing. The v1 body also carries them as fields for the dashboard (design review DR8): `reason` (`no_binding` or `group_overage`), `issuer`, `name` and `groups[]`. The facades keep their body shape.
 - **JWKS:** fetched at daemon start with the lazy-bootstrap latch (`atomic.Bool` plus mutex single-flight, CLAUDE.md rule 3), then hourly.
   - On an unknown `kid`, at most one refetch per issuer per minute, single-flight. The request waits up to 2 s for it.
   - If the provider is unreachable at boot, OIDC tokens get 503 until the first fetch succeeds. API tokens and the PAT are unaffected.
@@ -378,11 +394,12 @@ The file can't say who edited it. The record points at the hash, and the operato
   - If SSO is offered, it runs the authorization-code flow with PKCE and a loopback redirect (RFC 8252). `--device` uses the device flow (RFC 8628) for SSH sessions.
   - It saves the ID token and refresh token in the existing config file, mode 0600. `--token-stdin` keeps working for PATs and `avm_` tokens.
 - **Refresh:** every command refreshes the ID token when less than 60 s is left. Precedence is unchanged: `SB_PAT_TOKEN` wins, and a saved credential is sent only to its own URL (`login.go:121-152`).
+- **Wording (design review DR15).** The DR15 table in the design review is the contract for every message these commands print: the issuer choice by display name, the browser and device prompts, success, no binding, refresh failure, the expiry warning and the `whoami` layout. Notes go to stderr in the existing `aerolvm:` style, and `--json` output is unchanged.
 - **`aerolvm auth token`** prints a fresh bearer for scripts and SDKs (`SB_PAT_TOKEN=$(aerolvm auth token)`), like `gcloud auth print-access-token`. **`aerolvm whoami`** prints the principal, role, team and expiry.
 - **Expiry warnings** (CEO review D8):
   - When the saved `avm_` token has less than 7 days left, the CLI prints one warning line on stderr. The expiry is cached from `whoami` at login and refreshed at most daily.
   - **Tokens from the environment** (`SB_PAT_TOKEN` or `SB_API_TOKEN` holding an `avm_` token, the CI case): the CLI checks `whoami` at most once a day per token id, cached under `$XDG_CACHE_HOME/aerolvm`. A fresh CI runner checks once per run (CEO review D15).
-  - When an SSO refresh fails, the CLI says `sign in again with aerolvm login --sso`.
+  - When an SSO refresh fails, the CLI says "aerolvm: your sign-in to <url> expired and couldn't be renewed. Sign in again: aerolvm login --sso <url>" (design review DR15).
   - Tokens no CLI uses, such as the scrape token, are covered by `aerolvm access review` ("expiring within 30 d") and by the runbook's rotation step: mint a replacement, swap it, revoke the old one (T10). No server metric is added (D8 is CLI-only).
   - Never in stdout, `--json` or MCP output. No server header is added (v1 soft-freeze).
 - **`aerolvm mcp`** (local) uses the CLI connection, so MCP clients inherit SSO for free.
@@ -396,7 +413,32 @@ The file can't say who edited it. The record points at the hash, and the operato
 
 ### 5.7 Dashboard
 
-- **Sign in:** `/ui` shows one "Sign in with <issuer>" button per discovered issuer, plus a "use a token" fallback (today's paste box). The browser runs code flow with PKCE against the provider and keeps the ID token in `sessionStorage`, as it keeps the PAT today, and sends it as a bearer. No cookies means no CSRF surface.
+- **Sign in:** `/ui` shows one "Sign in with <display_name>" button per issuer that has `clients.dashboard`, in identity-file order, plus a "use a token" fallback (today's paste box). Workload issuers (no dashboard client id) get no button, because a browser sign-in can't start without one (design review DR3). The browser runs code flow with PKCE against the provider and keeps the ID token in `sessionStorage`, as it keeps the PAT today, and sends it as a bearer. No cookies means no CSRF surface.
+- **Sign-in box layout (design review DR4).** The box keeps its 360 px width and the dashboard's tokens.
+  - **Heading.** "AerolVM", then the page's host in muted text. The old "sandboxd" heading is gone, so the box matches the page header.
+  - **Line under it.** "Sign in with your company account." With no SSO button, it reads "Sign in with an API token."
+  - **SSO buttons.** Full width, stacked, in DR3 order. Every button matches Google's geometry (design review DR11).
+    - **Google's button.** `google.accounts.id.renderButton` with `theme: "filled_black"`, `size: "large"` (40 px), `shape: "rectangular"`, `text: "signin_with"`, `logo_alignment: "left"` and `width` set to the box's measured inner width: 312 px on desktop, 200–400 px as GIS allows, re-rendered on resize (design review DR12).
+    - **Other providers.** 40 px tall, `width: 100%` (312 px on desktop), radius 4 px, 14 px text, in the existing `button` look (`--panel2` fill, hover `--accent`). No accent fill, so every provider has equal weight. The border is 1 px `--muted2` (3.76:1 against the box), close to Google's own stroke, instead of `--border` (1.34:1) (design review DR14).
+  - **Token box.** After an "or" divider, behind a `<details>` labelled "Use an API token instead". It is closed when any SSO button shows. When none do, it is open and is the only content (identity off, no dashboard issuers, or plain HTTP).
+  - **Token field.** A visible `<label for="pat-input">API token</label>`, with the hint "An avm_ token or the server's PAT." The placeholder is no longer the only label.
+  - PAT sign-in behaves exactly as today (L8). Only the box's text and order change.
+
+  ```
+  ┌────────────────────────────────────┐
+  │ AerolVM                            │
+  │ api.acme.dev                (muted)│
+  │ Sign in with your company account. │
+  │ ┌────────────────────────────────┐ │
+  │ │    Sign in with Acme Okta      │ │
+  │ └────────────────────────────────┘ │
+  │ ┌────────────────────────────────┐ │
+  │ │  (Google Identity button)      │ │
+  │ └────────────────────────────────┘ │
+  │ ────────────── or ──────────────── │
+  │ ▸ Use an API token instead         │
+  └────────────────────────────────────┘
+  ```
 - **Okta, Entra ID and Keycloak** run the browser flow as a public SPA client: PKCE, no secret anywhere.
 - **Google** (CEO review D2, 2026-10-16). Google's token endpoint wants a client secret for web clients even with PKCE, so the dashboard does not use the code flow for Google. It uses **Google Identity Services**: `google.accounts.id.initialize({client_id, nonce, callback})` in popup mode.
   - The browser receives Google's signed ID token directly, and sandboxd checks it offline like any other issuer.
@@ -406,15 +448,83 @@ The file can't say who edited it. The record points at the hash, and the operato
     - A Google dashboard session is the ID token's lifetime, about 1 h. GIS auto-select re-issues it silently while the Google session lives.
   - Selected by `kind: google` on the issuer entry. Every other issuer uses the generic SPA path.
 - **Address (CEO review D18).** Caddy's `@api` matcher gains `/ui /ui/*` (`scripts/install.sh:1289`, `packaging/Caddyfile.template`), so the dashboard is served at `https://<api-domain>/ui`. That URL is what operators register as the redirect URI and JS origin.
-  - Sign-in buttons appear only when the page is served over HTTPS or from a localhost origin (an SSH tunnel). On plain `http` from another host, the page says "open https://<domain>/ui to sign in".
+  - Sign-in buttons appear only when the page is served over HTTPS or from a localhost origin (an SSH tunnel). On plain `http` from another host, the page says "SSO sign-in needs a secure connection. Open <ui_url>". `ui_url` comes from discovery, which publishes `https://<SB_DOMAIN>/ui` when `SB_DOMAIN` is set (design review DR9). Without a domain, it says "… Reach this page through an SSH tunnel to localhost:21212."
   - The existing token-paste box stays (L8), with a warning line on plain HTTP.
 - **Content-Security-Policy (CEO review D19).** `/ui` sends `default-src 'none'; script-src 'sha256-<inline script>' https://accounts.google.com/gsi/client; style-src 'unsafe-inline'; connect-src 'self' <issuer token-endpoint origins>; frame-src https://accounts.google.com; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`.
   - The script hash is computed at boot from the embedded page, so it can't drift.
   - `connect-src` is rebuilt from the current identity file on each `/ui` request.
   - Inline event handlers stay banned; the page has none today.
   - `style-src` has no hash, because a hash would make browsers ignore `'unsafe-inline'` and block the page's one `style=` attribute.
-- **Expiry mid-session (Section 4, finding 4.2):** on a 401 with `reason: expired`, the page re-runs sign-in silently once (GIS auto-select; SPA providers re-authorize with `prompt=none`). If that fails, it shows "sign in again" and keeps the current view.
-- **Role-aware:** the page calls `whoami` and hides drain, uncordon and orphan buttons unless the caller is an admin. The server enforces this regardless.
+- **Expiry mid-session (Section 4, finding 4.2; design review DR6).** The plan first said "re-run sign-in silently with `prompt=none`". For SPA providers that can't work in a hidden iframe: the CSP blocks it, and browsers block the provider's cookie there. So renewal works like this:
+  - **When.** At `exp − 120 s` while the tab is visible, and on any 401 with `reason: expired`. A background tab renews when it becomes visible.
+  - **One at a time.** Only one renewal runs. Auto-refresh pauses, and other API calls wait for it, so four panels' 401s start one renewal, not four.
+  - **Okta, Entra, Keycloak.** A full-page redirect with `prompt=none`.
+    - First the page saves the view in `sessionStorage`: the placements filter and page, the auto-refresh setting, open `<details>` and the scroll position. It restores them on return.
+    - If a request or a confirm prompt is in progress, the redirect waits for it.
+    - The browser only ever holds the ID token (about 1 h). There is no refresh token in the browser.
+  - **Google.** GIS auto-select, inside the allowed `accounts.google.com` frame, with no reload.
+  - **On failure** (`login_required`, an error, or auto-select declined): a banner at the top, "Your sign-in expired. [Sign in again]", with `role="alert"`. The view stays, and Sign in again restores it the same way.
+- **Who the console is for (design review DR1).** Every data panel except Health reads a `fleet.admin` route (`dashboard.html:551,552,634,733`), so the console is for admins.
+  - After sign-in the page calls `whoami`. The `admin` role and PAT/operator callers get the overview.
+  - Every other role (viewer, runner, auditor, including `*`-bound ones) gets one **signed-in screen** instead: their name, role and team, the line "This console shows fleet health and needs the admin role.", a CLI pointer (`aerolvm login https://<host>`, then `aerolvm list`; design review DR10), and Sign out.
+  - The overview's panels never load for those callers, so no 403 ever reaches a panel. Admins and operators hold every permission, so the overview needs no per-button hiding. The server enforces every route regardless.
+  - The signed-in screen reuses the sign-in box (same width and tokens), with this content in this order:
+
+  ```
+  ┌────────────────────────────────────┐
+  │ AerolVM                            │
+  │ api.acme.dev                (muted)│
+  │ Signed in as alice@acme.com        │
+  │ Role viewer · team payments        │
+  │ This console shows fleet health    │
+  │ and needs the admin role.          │
+  │ From a terminal:                   │
+  │ aerolvm login https://api.acme.dev │
+  │ aerolvm list                       │
+  │                        [ Sign out ]│
+  └────────────────────────────────────┘
+  ```
+- **Keyboard focus (design review DR13).**
+  - **Where focus starts.** On the first focusable element in the box that isn't Google's iframe, which a script can't reliably focus. In order: an SSO button, else "Use a different account", else the token disclosure's summary, else the token field when it is the only content. The no-access screen focuses its heading (DR8).
+  - **No autofocus.** The token field's `autofocus` attribute (`dashboard.html:156`) is removed, so focus is never stolen.
+  - **Focus ring.** New elements get `:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }`. `--accent` on `--panel` is 7.21:1.
+  - **Tab order** follows visual order. The overview is `hidden` while a box shows, so no focus trap is needed.
+- **Narrow screens (design review DR12).** The new screens fit a 320 px viewport with no horizontal scroll.
+  - **Header.** Below 720 px it wraps to two rows: brand and node summary, then identity and controls. The name's `max-width` drops to 140 px.
+  - **Boxes.** Below 400 px they keep `max-width: 92vw` and use 16 px padding.
+  - **Banner.** Below 480 px its text wraps and "Sign in again" drops below it.
+  - **Overview tables.** They keep today's horizontal scroll inside `.card .body`.
+- **State wording (design review DR9).** The DR9 wording table and the Pass 2 consolidated state table in the design review are T8's acceptance criteria for every sign-in state. Reason codes appear in parentheses so support can match them. The PAT's rejection text is unchanged (L8).
+- **Sign out and switching accounts (design review DR7).**
+  - **Sign out** clears the stored token and the DR6 saved view, and calls `google.accounts.id.disableAutoSelect()`. Without that call, Google's auto-select signs the person straight back in.
+    - Auto-select resumes only after the next explicit Google sign-in, so DR6's silent renewal still works afterwards.
+    - The page returns to the sign-in box with a muted "Signed out." line. Focus follows the DR13 rule.
+  - **No provider sign-out.** The person stays signed in to their company account, as with other SSO apps.
+  - **"Use a different account".** A link under the SSO buttons. It sends `prompt=select_account` when the issuer's discovery lists it in `prompt_values_supported`, and `prompt=login` otherwise. For Google it opens the GIS account chooser.
+- **No access screen (design review DR8).** When `whoami` returns the "no binding" 403, the box shows:
+
+  ```
+  ┌────────────────────────────────────┐
+  │ AerolVM                            │
+  │ api.acme.dev                (muted)│
+  │ You're signed in, but you don't    │
+  │ have access here.                  │
+  │ alice@acme.com · Acme Okta         │
+  │ No access rule on this server      │
+  │ matches your account. Ask your     │
+  │ AerolVM admin to add one for a     │
+  │ group you're in.                   │
+  │ ▸ Groups your sign-in carried (12) │
+  │ Use a different account  [Sign out]│
+  └────────────────────────────────────┘
+  ```
+  - **Groups.** The toggle lists up to 50 groups, then "and N more". With no groups claim, the toggle is replaced by "Your sign-in carried no groups."
+  - **Entra overage** (`reason: group_overage`). No list. It says "Your sign-in carried too many groups to list. Ask your admin to bind an Entra app role instead."
+  - **Announcement.** Focus moves to the heading, and the box has `role="alert"`. Every value renders through `textContent` (Section 3, finding 3.6).
+- **Header identity (design review DR5).** On the overview's right side, before auto-refresh, Refresh and Sign out:
+  - **Name and role.** The `whoami` display name (`max-width: 200px`, ellipsis, full value in `title`), then a muted role pill: `admin`.
+  - **PAT or operator session.** "Server token" with an `operator` pill.
+  - **Warning color, identity on only.** With identity on, the `operator` pill uses `--warn` text, and its `title` reads "Actions are recorded as the server, not a person." With identity off, the pill stays muted. A default install has nothing to steer people toward, and L8 keeps identity-off behavior as it is today.
 
 ### 5.8 The caller in audit records
 
@@ -592,6 +702,7 @@ This pulls the MCP plan's Phase 4 into this plan, at the founder's choice (D10).
   - With this plan, `/mcp` authenticates once. The transport then carries the resolved `Access` under a context key that only the in-process transport sets; it can never come from the wire.
   - `authenticate` (§5.2) uses that `Access` for inner calls instead of re-checking a bearer. So an `/mcp`-audience token never has to be valid on `/v1`, and `/v1` refuses one that arrives from outside.
   - Each inner call is still authorized by its route permission and recorded once (§5.9).
+  - **Never the operator by accident** (eng review E4; keeps b374ec3d). The `agenttools` client is always built with the caller's own bearer, carried for forwarding, plus the hand-off `Access`. An empty bearer still gets 400 before any tool runs, because the SDK client falls back to `SB_PAT_TOKEN` on an empty token. No inner call may run with the SDK's environment default.
   - **Across nodes.** An inner call on a sandbox owned by another node is forwarded like any API call, with the caller's original bearer attached, so the owner can verify it offline (L2).
     - The edge marks the forward with `X-Cluster-Surface: mcp` through `cluster.StampForward`, on every forward path, including the `clusterlist` fan-out an MCP list tool triggers. Like every `X-Cluster-*` header, it is accepted only from a live mTLS peer.
     - On that forwarded request, and only there, the owner also accepts `mcp_audiences` for the token's issuer. Signature, issuer, expiry and bindings are checked exactly as on the edge.
@@ -639,25 +750,26 @@ This pulls the MCP plan's Phase 4 into this plan, at the founder's choice (D10).
 
 ## 7. Phasing: stacked PRs, merge nothing until the stack is green
 
-T0 shipped on its own as #724 (H1 is fixed in main). Everything else stacks on `plans/identity-and-access`, each branch on the one before.
+T0 shipped on its own as #724 (H1 is fixed in main). T0b (per-owner module ids, eng review D8) joins the stack ahead of T1. Everything else stacks on `plans/identity-and-access`, each branch on the one before.
 
 | Task | Content | Tests | Size |
 |---|---|---|---|
-| **T0** | **Shipped as #724** (merged 2026-10-17, part of the `xtenant` series). It added a single `wasm_modules.owner_ref` column and backfilled existing rows to `""` (operator-published: readable by everyone, writable only by the operator). Create idempotency echoes only a row the caller may write; otherwise `ErrWasmModuleIDConflict`. **Residual, not in this stack:** the catalogue id defaults to the module's content digest, so a second tenant registering identical bytes without an explicit id gets that conflict instead of its own row. | `TestWasmModuleCatalogue_OwnerScoping` (in #724) | done |
-| **T1** | `Principal`, `Access.Fleet`, `Role`, `Via`; one `authenticate`; node vs forwarded-operator split; `GET /v1/whoami`; 401 reasons for `avm_` and JWT failures (D17); principal trace attributes and auth metrics (D22). The managed path maps to `runner`. Behavior identical. | the §5.1 invariant table as a test; the existing middleware tests unchanged; a per-reason 401 table, with the PAT 401 body byte for byte unchanged (D17); `BenchmarkAuthenticate{PAT,Token,JWTCached,JWTCold}` with CI budgets (p99 ≤ 50 µs on cached paths) and `FuzzParseAPIToken`/`FuzzJWTHeader` (D21) | M |
-| **T2** | Permissions, built-in roles, `d.Route(perm, …)` on every v1, facade, MCP and dashboard route; `withAuthOperator` removed; the registry test (H4). | registry test; a per-role matrix test over a recording mux, including `metrics.read` (D6); facade tests; per-surface 403 hint tests, and a test that a 404 carries no hint (D9) | M |
-| **T3** | Token store (SQLite plus FSM ops 31 and 32, snapshot, restore, `fv` gate, change ring, worker mirror, GC sweep); token format and validation in `pkg/apitoken`; the mirror on the existing `Agent.doControlPlaneJSON` helper (5.2); `/v1/tokens`; `aerolvm token`. | `fsm_tokens_test.go` (apply, snapshot, restore, old snapshot); mirror staleness (a stale mirror refuses `sandbox.read` but accepts `metrics.read`, D16); checksum fuzz; a paused page walk racing a revoke never resurrects the token (4.4); a mirror page over 12 MiB is refused (5.5); a token spray at 10k req/s of malformed and unknown tokens makes zero server-tier calls (D21); 5,000 creates in a minute stay inside the ring, so no mirror resnapshots; forced resnapshots spread over ≥ 30 s (7.3); idempotency (409, 204) | L |
-| **T4** | `Caller` field; ctx-based event construction; system caller contexts; cluster `fv` write gate; `via`; correlation forward in list fan-out (H3); `cluster.StampForward` and its use on every forward path (finding 1.2). | old-chain verify golden test; mixed-version gate test; forwarded attribution test; call-site test that every forward path calls `StampForward` | M |
+| **T0** | **Shipped as #724** (merged 2026-10-17, part of the `xtenant` series). It added a single `wasm_modules.owner_ref` column and backfilled existing rows to `""` (operator-published: readable by everyone, writable only by the operator). Create idempotency echoes only a row the caller may write; otherwise `ErrWasmModuleIDConflict`. **Residual, now T0b (eng review D8):** the catalogue id defaults to the module's content digest, so a second tenant registering identical bytes without an explicit id gets that conflict instead of its own row. | `TestWasmModuleCatalogue_OwnerScoping` (in #724) | done |
+| **T0b** | **Per-owner WASM module ids** (eng review D8; follows the #731 snapshot-namespace pattern).<br>• **Identity:** a module's identity becomes `(owner_ref, id)`, via an idempotent store migration (`/add-store-column`). Rows backfilled by #724 keep `owner_ref = ""`.<br>• **Create:** `CreateWasmModule` defaults the id to the digest *within the caller's namespace*, so a second owner registering identical bytes gets its own row and no cross-owner conflict or existence signal.<br>• **Read, boot and delete:** reads and create-time boots resolve the caller's own namespace first, then operator-published (`""`). `ResolveOwnedWasmModule` and the warm-pool and inventory keys carry the owner. Delete acts only inside the caller's namespace.<br>• The catalogue is per host (no Raft change). | two owners with identical bytes → two rows; each sees its own row plus `""` rows, never the other's; a create-time boot picks the own row before `""`; a warm-upgrade migration test (old rows intact, idempotent rerun); the existing `TestWasmModuleCatalogue_OwnerScoping` stays green; UC-294 | M |
+| **T1** | `Principal`, `Access.Fleet`, `Role`, `Via`; one `authenticate` over an ordered authenticator list (`pat`, `apiToken`, `jwt`, `provider`) with post-match steps (D6); `apihttp.BearerToken` shared with `remotemcp.serverFor`, replacing `extractBearerToken` and `remotemcp.bearerToken` (D5); node vs forwarded-operator split; `GET /v1/whoami`; 401 reasons for `avm_` and JWT failures (D17); interim guards for `SB_ITEST_IDENTITY_FILE`: identity on → boot error, enterprise mode → refused (D4); principal trace attributes and auth metrics (D22). The managed path maps to `runner`. Behavior identical. | the §5.1 invariant table as a test; the existing middleware tests unchanged; a per-reason 401 table, with the PAT 401 body byte for byte unchanged (D17); `BenchmarkAuthenticate{PAT,Token,JWTCached,JWTCold}` with CI budgets (p99 ≤ 50 µs on cached paths) and `FuzzParseAPIToken`/`FuzzJWTHeader` (D21); a boot-guard table for `SB_ITEST_IDENTITY_FILE` (D4); a `BearerToken` table: case, whitespace, subprotocol, empty, E2B `X-API-KEY` fallthrough (D5); one table per authenticator plus a post-match-steps table (D6) | M |
+| **T2** | Permissions, built-in roles, `d.Route(perm, …)` on every v1, facade, MCP and dashboard route; `withAuthOperator` removed; `hostCapable(ctx)` replaces `!scoped` on the four operator-only gates (D3, D7); the registry test (H4). | registry test; `hostCapable` table (each principal kind × each of the four gates: only operator, node, internal and admin pass) plus a row where runner@* upserts an alias onto a team snapshot (D7); the `ownerScope` call-site test (D3); a `runner@*` create stamps owner `""` and resolves only `""` snapshots (§5.1 with `snapshotResolvableForCreate`, `owner_scope.go:70-90`); a per-role matrix test over a recording mux, including `metrics.read` (D6); facade tests; per-surface 403 hint tests, and a test that a 404 carries no hint (D9) | M |
+| **T3** | Token store (SQLite plus FSM ops 31 and 32, snapshot, restore, `fv` gate, change ring, worker mirror, GC sweep); token format and validation in `pkg/identitywire`; the mirror on the existing `Agent.doControlPlaneJSON` helper (5.2); `/v1/tokens`; `aerolvm token`; delete `SB_ITEST_IDENTITY_FILE`, `pkg/daemon/itest_identity.go` and its test (D4). | `fsm_tokens_test.go` (apply, snapshot, restore, old snapshot); mirror staleness (a stale mirror refuses `sandbox.read` but accepts `metrics.read`, D16); checksum fuzz; a paused page walk racing a revoke never resurrects the token (4.4); a mirror page over 12 MiB is refused (5.5); a token spray at 10k req/s of malformed and unknown tokens makes zero server-tier calls (D21); 5,000 creates in a minute stay inside the ring, so no mirror resnapshots; forced resnapshots spread over ≥ 30 s (7.3); idempotency (409, 204) | L |
+| **T4** | `Caller` field; ctx-based event construction; system caller contexts; cluster `fv` write gate; `via`; correlation forward in list fan-out (H3); `cluster.StampForward` and its use on every forward path (finding 1.2). | old-chain verify golden test; mixed-version gate test; forwarded attribution test; call-site test that every forward path calls `StampForward`; a list fan-out from a multi-team principal with `X-AerolVM-Team` returns only that team from every peer, with one correlation id (E6) | M |
 | **T5** | `api` and `auth_denied` records, coalescing, exec digest via tee, forward dedupe, system destructive actions, SSH session record, `caller` filter, `aerolvm audit search`. | record-per-route table; flood control in all three modes (D14): budget table (burst, refill, marker names caller/count/routes, secret-open exempt, per-caller isolation), coalesce table (different digests never merge), both, and a node gaining a second owner switching `coalesce` to `both`, with its chain record; edge-skip-on-forward; one record per MCP tool call; SSH gateway test: session open emits one record (D3, UC-287); search over a fixture export; `BenchmarkAPIRecordEmit` (≤ 5 µs, D21); `request.target` on token, snapshot, profile, module, bundle and template routes; `cluster.internal` writes no record (7.1, 7.2) | L |
 | **T5b** | `aerolvm access review` (D7): token list joined with the verified export; Markdown and CSV output; unused, expiring, admin and denied flags. | golden-file tests over a fixture export and token list; a tampered batch → FAIL; `cmd/aerolvm/deps_test.go` stays green | M |
-| **T6** | OIDC verifier, identity file and watcher, bindings, deny list, JWKS latch and rate limit, verified-token cache, `/.well-known/aerolvm-auth`, Caddy matcher. | an httptest issuer: `alg:none`, HS256, wrong aud and iss, expired, nbf, kid rotation, lifetime cap, first-match bindings, reload, deny; the "no binding" 403 hint lists only the caller's own claims (D9); Entra group overage → explicit refusal; `X-AerolVM-Team` selects among matching bindings, a non-matching team → 403 with the hint, and a forwarded request keeps the selection; reload writes one `identity_config` record with the correct diff, an unchanged reload writes none, and a boot with a changed file writes one (D20); an empty file is invalid (4.3); over-cap JWT, identity file or JWKS refused (5.5); `jku`/`x5u`/`jwk` headers ignored and HS256/none refused (3.5); `FuzzIdentityFile` (D21) | L |
-| **T7** | CLI: `login --sso` (PKCE loopback, `--device`), refresh, `auth token`, `whoami`, `--team` saved per login and sent as `X-AerolVM-Team` (D13), expiry warnings and the refresh-failure hint (D8), `whoami --explain` (D22). | fake issuer end to end; refresh edge; precedence unchanged; 6 d → warning, 8 d → none, `--json` stdout unchanged; env token with no cache → one `whoami`, cached → none (D15); golden `whoami --explain` output (D22) | M |
-| **T8** | Dashboard sign-in: generic SPA code flow with PKCE, a Google Identity Services path for `kind: google` issuers (D2), role-aware UI, a team picker for multi-team users that sends `X-AerolVM-Team` (D13). No relay endpoint. `/ui /ui/*` in Caddy's `@api` matcher, plus HTTPS-or-localhost sign-in (D18); the `/ui` CSP with a boot-computed script hash (D19); the Section 11 state table and accessibility rules as acceptance criteria. | dashboard token-handling tests (nonce, `aud`, expiry); a `/browse` check on a local daemon; Caddyfile render test; buttons hidden on non-local plain HTTP; UC-290; CSP header test (the hash matches the served script); `/browse` check that the dashboard loads and signs in with the CSP on; a 401 `expired` mid-session triggers one silent re-sign-in, then the "sign in again" prompt keeping the view (4.2) | M |
+| **T6** | OIDC verifier, identity file and watcher, bindings, deny list, JWKS latch and rate limit, verified-token cache, `/.well-known/aerolvm-auth`, Caddy matcher. | an httptest issuer: `alg:none`, HS256, wrong aud and iss, expired, nbf, kid rotation, lifetime cap, first-match bindings, reload, deny; the "no binding" 403 hint lists only the caller's own claims (D9), and the v1 body carries `reason`, `issuer`, `name` and `groups[]` with overage → `reason: group_overage` and no groups (DR8); Entra group overage → explicit refusal; `X-AerolVM-Team` selects among matching bindings, a non-matching team → 403 with the hint, and a forwarded request keeps the selection; reload writes one `identity_config` record with the correct diff, an unchanged reload writes none, and a boot with a changed file writes one (D20); an empty file is invalid (4.3); `display_name` over 40 characters or with control characters is stripped or refused at load, and discovery publishes it (DR3); discovery publishes `ui_url` = `https://<SB_DOMAIN>/ui` and omits it when `SB_DOMAIN` is empty (DR9); over-cap JWT, identity file or JWKS refused (5.5); `jku`/`x5u`/`jwk` headers ignored and HS256/none refused (3.5); `FuzzIdentityFile` (D21); the same cached JWT with two different `X-AerolVM-Team` values resolves two teams, so the LRU never pins a team (E7); `BenchmarkAuthenticate{JWTCached}` stays within D21's budget with a 10k-binding identity file (cache the matched binding set, not the selected team; E8) | L |
+| **T7** | CLI: `login --sso` (PKCE loopback, `--device`), refresh, `auth token`, `whoami`, `--team` saved per login and sent as `X-AerolVM-Team` (D13), expiry warnings and the refresh-failure hint (D8), `whoami --explain` (D22). | fake issuer end to end; refresh edge; precedence unchanged; 6 d → warning, 8 d → none, `--json` stdout unchanged; env token with no cache → one `whoami`, cached → none (D15); golden `whoami --explain` output (D22); golden fixtures for every DR15 message: issuer choice, browser and device prompts, success with role and team, no binding with the 10-group cap and overage wording, refresh failure, expiry warning, `whoami` text layout (DR15) | M |
+| **T8** | Dashboard sign-in: generic SPA code flow with PKCE, a Google Identity Services path for `kind: google` issuers (D2), the admin-only console with a signed-in screen for every other role (design review DR1); no team picker and no `X-AerolVM-Team` from the dashboard (DR2). No relay endpoint. `/ui /ui/*` in Caddy's `@api` matcher, plus HTTPS-or-localhost sign-in (D18); the `/ui` CSP with a boot-computed script hash (D19); the design review's consolidated state table (Pass 2), the DR9 wording and the Pass 6 accessibility rules as acceptance criteria (they replace the Section 11 table). | dashboard token-handling tests (nonce, `aud`, expiry); a `/browse` check on a local daemon; Caddyfile render test; buttons hidden on non-local plain HTTP; with the §5.5 example file, exactly two buttons render ("Sign in with Acme Okta", "Sign in with Google") and none for `github-actions` or `eks-prod` (DR3); the token disclosure is closed with buttons and open with none, the heading reads "AerolVM", and the token field has a visible label (DR4); the Google button renders with the DR11 options and every SSO button is 40 px tall and as wide as the box (DR11); at 320 px and 375 px viewports the new screens have no horizontal scroll and the Google button fits its box, and below 720 px the header wraps to two rows (DR12); keyboard focus starts on the first non-Google element (Okta when Google is listed first; "Use a different account" when Google is the only issuer), the token field has no `autofocus`, and new elements show the accent focus ring (DR13); non-Google SSO buttons have a `--muted2` border (DR14); the header shows the name and an `admin` pill for an SSO admin, and "Server token" with an `operator` pill for the PAT, in `--warn` only with identity on (DR5); after Sign out, Google auto-select does not fire and the box says "Signed out."; "Use a different account" sends `prompt=select_account` or `prompt=login` per the issuer's discovery (DR7); the no-access screen renders the heading, the group toggle with its count, the 50 cap, the overage and no-groups wording, and moves focus to the heading (DR8); UC-290; CSP header test (the hash matches the served script); `/browse` check that the dashboard loads and signs in with the CSP on; four simultaneous 401 `expired` responses start exactly one renewal; at `exp − 120 s` an SPA issuer gets a `prompt=none` redirect that restores the saved view; the redirect waits for an in-flight request; a failed renewal shows the "Your sign-in expired" banner and keeps the view (4.2, DR6); `/browse` check that a viewer token gets the signed-in screen, with the two-line CLI pointer naming the page's host, and the page makes no `/v1/cluster/*` or `/debug/vars` request (DR1, DR10) | M |
 | **T9** | SDK parity in all 5 SDKs: `whoami`, `tokens.create/list/revoke` (`/add-sdk-method`); `SB_API_TOKEN` as an alias of `SB_PAT_TOKEN`; `SB_TEAM` / a client option that sends `X-AerolVM-Team` (D13). | per-SDK unit tests | M |
 | **T10** | `SB_PAT_TOKEN_PREVIOUS`, `SB_OPERATOR_VOLUME_SCOPE`, `SB_PAT_SCOPE=host` with the public socket and the install.sh/Caddyfile wiring (D4), PROXY protocol on the L4 fallback plus the 8443 listener wrapper and `X-AerolVM-Client-IP` (D12), Terraform `metrics_token` (`Terraform/locals.tf:411`, `Terraform/obs.tf:130`, `config/secrets.example.yml`) with PAT fallback, the Caddy `header_up X-AerolVM-Client-IP {remote_host}` line, enterprise-mode checks, the §5.15 alerts, the Grafana row in `d9-security-isolation.json` and the per-alert runbook entries (D22), `setup/runbooks/identity-and-access.md`. | config tests; volume scope stable across rotation; listener split (PAT refused on the public socket and from a non-loopback peer on 21212, accepted from a loopback peer and from mTLS peers); socket directory permissions; the forwarded-PAT origin rule; the scope-drift metric; `layer4_bootstrap_test.go`: the fallback route carries `proxy_protocol` only with the flag on; UC-288 | M |
-| **T11** | Docs: new `enterprise/access-control.mdx` (five-tab examples, `/add-docs-page`, Security group in `content.config.ts`); `cli.mdx`, `dashboard.mdx`, `mcp.mdx`; matrix rows in `enterprise/index.mdx`; rows in `responsibility.mdx`; the control mapping in `audit-evidence.mdx` (CC6.1–6.3, CC7.2); `setup/config-defaults.md`; `DESIGN.md`'s actor and action tables (Section 1, finding 1.7); the two mermaid diagrams and the credential tables in `enterprise/architecture.mdx` that show "apps hold the API token" (stale-diagram audit); the crash-window claim wording (4.1); the Prometheus scrape config (`setup/obs/prometheus.yml.tftpl`) using `metrics_token` when set and the PAT otherwise. `audit-evidence.mdx` discloses that `caller.name` holds email addresses and how retention bounds them (Section 3, finding 3.7). The TODOS.md "Metrics-scoped read-only token" item is marked resolved with a caveat (D6): the scrape credential is **read-only**, not metrics-only, because a `viewer` on `*` can also read every team's sandbox metadata and audit records. replies on #646, #647 and #649. | `make docs-build` with npm 10 | M |
-| **T12** | Integration: an in-harness test issuer (discovery, JWKS, mint), UC-268–UC-293, live `single-node` and `cluster-3-mixed`; chaos UCs 291–293 and the token-spray test (D21). | §8 | M |
-| **T13** | OAuth for remote MCP (§5.14, D10): RFC 9728 metadata, the `/mcp` 401 challenge, `mcp_audiences` checks, the in-process `Access` hand-off in `pkg/api/remotemcp`, the identity-file fields, the Caddy matcher, per-provider connector docs, and a runbook entry for the live connector check. | metadata and challenge handler tests; access-token verify table (wrong `aud`, opaque → refused, overlapping audiences → load error); `mcp_audiences` token refused on `/v1`; inner calls use the hand-off on the edge, and a missing hand-off returns 500 without ever falling back to the bearer (finding 2.5); a cross-node forward with `X-Cluster-Surface: mcp` is accepted, and the same marker from a non-peer gets 403 in cluster mode (`clusterControlHeaderGuard`, `pkg/api/middleware.go:47-56`) and is stripped on a single node; an Entra v1 token gets the hint; UC-286; manual claude.ai and ChatGPT runs | M |
+| **T11** | Docs: new `enterprise/access-control.mdx` (five-tab examples, `/add-docs-page`, Security group in `content.config.ts`; states the fleet-bindings-first rule, design review DR2); `cli.mdx`, `dashboard.mdx` (the console is admin-only, other roles get the signed-in screen; issuer `display_name` and `ui_url`; design review DR1, DR3, DR9), `mcp.mdx`; matrix rows in `enterprise/index.mdx`; rows in `responsibility.mdx`; the control mapping in `audit-evidence.mdx` (CC6.1–6.3, CC7.2); `setup/config-defaults.md`; `DESIGN.md`'s actor and action tables (Section 1, finding 1.7); the two mermaid diagrams and the credential tables in `enterprise/architecture.mdx` that show "apps hold the API token" (stale-diagram audit); the crash-window claim wording (4.1); the Prometheus scrape config (`setup/obs/prometheus.yml.tftpl`) using `metrics_token` when set and the PAT otherwise. `audit-evidence.mdx` discloses that `caller.name` holds email addresses and how retention bounds them (Section 3, finding 3.7). The TODOS.md "Metrics-scoped read-only token" item is marked resolved with a caveat (D6): the scrape credential is **read-only**, not metrics-only, because a `viewer` on `*` can also read every team's sandbox metadata and audit records. replies on #646, #647 and #649. | `make docs-build` with npm 10 | M |
+| **T12** | Integration: an in-harness test issuer (discovery, JWKS, mint), UC-268–UC-294, live `single-node` and `cluster-3-mixed`; cross-tenant scenarios mint team `avm_` tokens at setup instead of a static token file (D4); chaos UCs 291–293 and the token-spray test (D21). | §8 | M |
+| **T13** | OAuth for remote MCP (§5.14, D10): RFC 9728 metadata, the `/mcp` 401 challenge, `mcp_audiences` checks, the in-process `Access` hand-off in `pkg/api/remotemcp`, the identity-file fields, the Caddy matcher, per-provider connector docs, and a runbook entry for the live connector check. | metadata and challenge handler tests; access-token verify table (wrong `aud`, opaque → refused, overlapping audiences → load error); `mcp_audiences` token refused on `/v1`; inner calls use the hand-off on the edge, and a missing hand-off returns 500 without ever falling back to the bearer (finding 2.5); a cross-node forward with `X-Cluster-Surface: mcp` is accepted, and the same marker from a non-peer gets 403 in cluster mode (`clusterControlHeaderGuard`, `pkg/api/middleware.go:47-56`) and is stripped on a single node; an Entra v1 token gets the hint; an empty bearer on `/mcp` → 400, and no inner call ever reaches the SDK's `SB_PAT_TOKEN` fallback (E4); UC-286; manual claude.ai and ChatGPT runs | M |
 
 Coverage: every new package and file ships with tests that keep its package at or above 85% (`/maintain-coverage` before each PR).
 
@@ -691,6 +803,7 @@ Coverage: every new package and file ships with tests that keep its package at o
 | 291 | chaos: partition one worker from the server tier for 90 s on `cluster-3-mixed` | after 60 s: `avm_` → 503 `identity data is stale`; `metrics.read` scrape keeps working (D16); OIDC and PAT unaffected; after heal the mirror resyncs within one poll |
 | 292 | chaos: kill the Raft leader during a burst of 50 token creates | no two live tokens share a name; every 201 returned a secret for a token that exists; every 503 left a token that is either absent or listed (never a secret for an unapplied token) |
 | 293 | chaos: rotate the test issuer's signing key under 1k req/s | ≤ 1 JWKS refetch per minute per node; no 5xx beyond the unknown-kid wait; requests signed with the new key succeed within one refetch |
+| 294 | two teams register the same WASM module bytes with no explicit id (T0b) | each gets its own catalogue row; neither sees nor can delete the other's; neither gets an id conflict; a sandbox boot by catalogue id resolves the caller's own row, then an operator-published one |
 
 ## 9. pr-review.md axes (pre-filled)
 
@@ -820,7 +933,7 @@ Coverage: every new package and file ships with tests that keep its package at o
 | E-DENYHINT (founder) | §5.3 403 names only the permission | 403 names the caller's role and team and the allowing role; "no binding" lists the caller's claims; 404 bare (§5.3, §5.5, T2) | — | approved | D9 answered 2026-10-16: "Add to this plan's scope (recommended)". Scope: 403 messages and the v1 403 body fields (T2), and the "no binding" hint (T6); facades keep their body shape. |
 | E-MCPOAUTH (founder) | The MCP CEO review (2026-10-04, D2) kept OAuth at Phase 4 behind a demand checkpoint. Changed assumption: §5.5 makes sandboxd an OIDC resource server. | §5.14 and T13 in this plan; removed from §13 | — | approved | D10 answered 2026-10-16: "Add to this plan's scope" (against the Defer recommendation). Scope: §5.14 and T13 as written, and UC-286. It reopens the MCP plan's Phase 4 timing; no other MCP plan decision changes. |
 | A1 (founder, Section 1) | Finding 1.1: the caddy-l4 fallback hides the client IP (`pkg/caddy/client.go:1203-1210`) | PROXY v2 on the fallback plus the 8443 listener wrapper, gated by `SB_L4_FALLBACK_PROXY_PROTOCOL` set by install.sh (§5.9, §5.11, T10, §9.5, §10, §11, UC-288) | — | approved | D12 answered 2026-10-16: "PROXY protocol on the fallback (recommended)". Scope: the fallback route, the listener wrapper, the flag, the regression test and the call-out. |
-| A3 (founder, Section 1) | Finding 1.3: `--team` has no wire mechanism (I2) | `X-AerolVM-Team` selects among matching bindings, never grants (§5.3, T6–T9, §10) | — | approved | D13 answered 2026-10-16: "Team-selection header (recommended)". Scope: the header, its selection rule, the CLI/dashboard/SDK senders, and the audit team field. |
+| A3 (founder, Section 1) | Finding 1.3: `--team` has no wire mechanism (I2) | `X-AerolVM-Team` selects among matching bindings, never grants (§5.3, T6–T9, §10) | — | approved | D13 answered 2026-10-16: "Team-selection header (recommended)". Scope: the header, its selection rule, the CLI/dashboard/SDK senders, and the audit team field. Amended 2026-10-17 by design review DR2: the dashboard sender is dropped; CLI and SDK senders unchanged. |
 | A5 (founder, Section 1) | Finding 1.5 / 0G HOLD 1: two flood controls | `SB_AUDIT_API_FLOOD_CONTROL=budget\|coalesce\|both`, default `budget`; a node with more than one owner always budgets (`coalesce` → `both`) (§5.9, §6, §10, T5, UC-289) | — | approved | D14 answered 2026-10-16 (custom): "Build all three flood controls, and let me choose per customer install. Default is the existing audit budget… On a node that hosts more than one customer, budget always applies. Coalesce-only is honored only when that customer has the node to themselves… Document the setting and test all three. Default installs, including identity off, use budget." Interpretation recorded: a customer is a sandbox owner; on a shared node `coalesce` runs as `both`. |
 | A6 (founder, Section 1) | Finding 1.6: the env-token expiry check exceeds D8's scope | kept: one `whoami` per token per day, stderr only (§5.6, T7) | — | approved | D15 answered 2026-10-16: "Keep the CI warning (recommended)". Scope: the env-token check and its T7 test. |
 | S2a (founder, Section 2) | Finding 2.1: worker scrapes fail once the mirror is stale | stale mirror still accepts `metrics.read`-only routes; counted and logged (§5.4, T3) | — | approved | D16 answered 2026-10-16: "Keep metrics flowing (recommended)". Scope: the `metrics.read` exception, its metric and log, and the T3 tests. |
@@ -1418,7 +1531,7 @@ The before and after dependency graph is the architecture diagram above, minus t
 |---|---|---|---|
 | `GET /v1/whoami` | any principal | own principal, role, team, expiry | nothing |
 | `POST/GET/DELETE /v1/tokens` | admin (write); auditor or admin (read) | token metadata; the secret once on create | token set |
-| `GET /.well-known/aerolvm-auth` | anyone | issuer URLs, client ids | nothing |
+| `GET /.well-known/aerolvm-auth` | anyone | issuer URLs, client ids, display names (DR3), `ui_url` when `SB_DOMAIN` is set (DR9) | nothing |
 | `GET /.well-known/oauth-protected-resource*` | anyone | resource URL, issuers | nothing |
 | `GET /v1/cluster/internal/tokens` | `node:` principal over mTLS | hashes and metadata (never secrets) | nothing |
 | public socket | Caddy only (`root:caddy 0750`) | same as the API | same as the API |
@@ -1974,7 +2087,7 @@ Rely on the customer's config history alone. Effort S, risk low, zero work.
 
 | # | Severity | Finding | Disposition |
 |---|---|---|---|
-| 5.1 | WARNING | **`authenticate()` branches well over 5 times** (PAT and scope, `avm_`, JWT with an unknown-kid refetch, provider, team header, surface rules), so a single function would be the plan's hardest code to review. | **pending: owner T1 / `/plan-eng-review`.** One option: one entry point over an ordered list of authenticators (`pat`, `apiToken`, `jwt`, `provider`), each returning `(Access, matched, error)`, with team selection and surface rules as separate steps after a match. It is non-blocking and behavior-neutral; it must keep the §5.1 invariant test green. |
+| 5.1 | WARNING → **resolved by eng review D6** | **`authenticate()` branches well over 5 times** (PAT and scope, `avm_`, JWT with an unknown-kid refetch, provider, team header, surface rules), so a single function would be the plan's hardest code to review. | **pending: owner T1 / `/plan-eng-review`.** One option: one entry point over an ordered list of authenticators (`pat`, `apiToken`, `jwt`, `provider`), each returning `(Access, matched, error)`, with team selection and surface rules as separate steps after a match. It is non-blocking and behavior-neutral; it must keep the §5.1 invariant test green. |
 | 5.2 | OK | **Reuse for the token mirror.** Worker-to-server calls already have a retrying, server-tier-aware helper (`Agent.doControlPlaneJSON`/`doControlPlaneBytes`, `internal/cluster/agent.go:1428-1471`). | **correction:** T3's mirror uses it instead of a new client |
 | 5.3 | WARNING | **Package layout is unnamed**, and the CLI cannot import server packages (learning `aerolvm-cli-dep-guard`). | **correction:** see the layout below |
 | 5.4 | WARNING | **`SB_IDENTITY_ALLOW_INSECURE_ISSUER` (added during review) is a test-only switch shipped in production config**, a footgun. | **correction:** remove it. Unit tests inject an `*http.Client` that trusts the `httptest` TLS cert. The harness installs its test CA into the node's trust store. Private-cloud issuers with an internal CA use the system trust store, as every other TLS client on the host does. |
@@ -1985,8 +2098,8 @@ Rely on the customer's config history alone. Effort S, risk low, zero work.
 **Package layout (correction 5.3):**
 
 ```
-  pkg/apitoken/         avm_ format, checksum, parse        (shared: server + CLI)
-  pkg/identitydoc/      /.well-known/aerolvm-auth + RFC 9728 document types (shared)
+  pkg/identitywire/     avm_ format, checksum, parse; /.well-known/aerolvm-auth + RFC 9728
+                        document types (shared: server + CLI; eng review D2 merged two packages)
   pkg/auditlog/         + Caller, Request, kind constants; search/review readers (shared)
   internal/identity/    token store interface, mirror, OIDC verifier, identity file + watcher, bindings
   internal/cluster/     + FSM ops 31/32, change ring, internal tokens route, StampForward
@@ -2291,6 +2404,8 @@ Scoped to the dashboard changes the plan approves (D2, D9, D13, D18, D19), per t
         └── 403 on an action ──► inline D9 hint next to the action
 ```
 
+> Superseded in part by design review DR1 and DR2 (2026-10-17): callers without the `admin` role get a signed-in screen, not the overview (§5.7). The dashboard has no team picker, so the "several teams" branch and the Team picker state row no longer apply.
+
 **State coverage:**
 
 | Feature | Loading | Empty | Error | Success | Partial |
@@ -2499,7 +2614,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Verify: reload tests (diff; unchanged → none; changed boot → one)
 - [ ] **CR11 (P1, human: ~3 d / CC: ~2 h)** — tests — benchmarks with CI budgets, fuzz targets, the token spray, chaos UCs 291–293 [T1, T3, T5, T6, T12]
   - Surfaced by: Section 6, finding 6.4 (D21)
-  - Files: `pkg/apitoken/`, `internal/identity/`, `pkg/api/`, `integration-tests/suite/`
+  - Files: `pkg/identitywire/`, `internal/identity/`, `pkg/api/`, `integration-tests/suite/`
   - Verify: `go test -bench . ./pkg/api/...`; `go test -fuzz` targets; live `cluster-3-mixed` run
 - [ ] **CR12 (P1, human: ~2 d / CC: ~1.5 h)** — obs — the §5.15 pack: metrics, six alerts, the Grafana row, runbook entries, trace attributes, logs, `whoami --explain` [T1, T7, T10]
   - Surfaced by: Section 8, finding 8.1 (D22)
@@ -2519,7 +2634,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Verify: 5,000-create burst test; resnapshot spread ≥ 30 s
 - [ ] **CR16 (P2, human: ~1 d / CC: ~45 min)** — security — input validation, `X-AerolVM-Client-IP` trust rule, JWT key rules, size caps [T3, T6, T10]
   - Surfaced by: Section 3, findings 3.4–3.6; Section 5, finding 5.5
-  - Files: `pkg/api/`, `internal/identity/`, `pkg/apitoken/`
+  - Files: `pkg/api/`, `internal/identity/`, `pkg/identitywire/`
   - Verify: validation tables; fuzz targets
 - [ ] **CR17 (P2, human: ~4 h / CC: ~30 min)** — docs — `DESIGN.md` actors, `architecture.mdx` diagrams, PII disclosure, crash-window wording [T11]
   - Surfaced by: Section 1, finding 1.7; Section 3, finding 3.7; Section 4, finding 4.1; the stale-diagram audit
@@ -2580,18 +2695,1306 @@ Synthesized from this review's findings. Each task derives from a specific findi
 - 5.1: how `authenticate` is structured. One function, or an ordered list of authenticators. Behavior-neutral; owner T1 / `/plan-eng-review`.
 - ~~9.2~~: resolved by #724 (merged 2026-10-17): existing rows were backfilled to `""`.
 
+
+---
+
+# Eng review: `/plan-eng-review` 2026-10-17
+
+**Target (fixed):** `plans/identity-and-access.md` (PR #734, branch `plans/identity-and-access`, rebased on `main` at `ed6d8814`). **Report file:** this plan. **Design reference:** `DESIGN.md`. **Settled inputs:** §5.0 L1–L8 (founder-locked), and CEO-review answers D1–D24 (ledger above). Neither is reopened here without new evidence.
+
+## Eng Scope Challenge
+
+### A. Assessment
+
+- **What already solves each sub-problem.** The §5.13 reuse map and the CEO-review "What already exists" table still hold. Three things landed on `main` after the CEO review (the `xtenant` series, #719–#733) and bear on this plan:
+  - `pkg/daemon/itest_identity.go` plus `pkg/daemon/daemon.go:100-114`: a test-only static validator, `SB_ITEST_IDENTITY_FILE` (finding E2).
+  - `internal/service/owner_scope.go:70-90`: `snapshotResolvableForCreate`, which treats "unscoped" as "operator" (finding E1).
+  - `pkg/api/remotemcp/handler.go`: `bearerToken` re-implements `extractBearerToken` and must "stay in lockstep" (finding E3). The b374ec3d guarantee also matters: an empty token never reaches `agenttools`, whose SDK client otherwise falls back to `SB_PAT_TOKEN` (finding E4).
+- **FSM op numbers:** still free at 31/32 (`internal/cluster/fsm.go:57-58` ends at 30).
+- **Minimum changes for the goal.** The founder's CEO review approved scope (D1–D24, recorded as an active decision). No cut is proposed: each piece maps to a questionnaire row, a locked rule, or an approved remedy.
+- **Complexity:**
+  - About 130 changed files (estimate).
+  - New components: `internal/identity` (token store interface, mirror, OIDC verifier, identity-file watcher, bindings), `pkg/identitywire`, the `api` recorder on the existing budget, `cluster.StampForward`, and the access-review reader.
+  - The gate trips (≥ 8 files, ≥ 2 new components).
+- **Search check:** the OIDC resource-server model (KEP-3331), PROXY protocol and CSP were researched in the CEO review (sources there). The new check is how `go-oidc` `RemoteKeySet` refetches keys: its docs say keys are cached by `Cache-Control`. A minimum interval between unknown-kid refetches is **not confirmed**. T6 must verify it or wrap the key set with its own 1-per-minute limiter; T6 and UC-293 already test the requirement.
+- **TODOS cross-reference:** "Metrics-scoped read-only token" is resolved by D6 (T11). Nothing in TODOS.md blocks this plan.
+- **Distribution:** no new binary or artifact. CLI changes ship in the existing `aerolvm` release path; alerts and dashboards ship in `setup/`.
+- **Retrospective:** the auth edge has needed repeated fixes (`d6b865d9` edge-auth gaps S6–S10, `b374ec3d` MCP operator fallback, and twelve `xtenant` PRs). The recurring cause is owner and capability checks scattered across about 30 `ownerScope` call sites. This is the architectural concern behind E1.
+
+### B. Complexity selectors
+
+No feature cuts proposed (scope approved in the CEO review). The structure question follows.
+
+**Scope record:**
+- **Feature answers:** none asked (no cuts proposed; the CEO-review scope D1–D24 stands).
+- **Structure:** B, "Smaller arrangement (recommended)" (D2, 2026-10-17).
+- **Accepted scope:** the CLI-shared token-format and discovery-document packages become one package, `pkg/identitywire`. Every reference in this plan is updated. Features, PR count (T1–T13 + T5b remaining), contracts and tests are unchanged.
+- **Pending remedies:** E1, E2, E3, E4.
+
+### C. Findings
+
+The Scope Challenge's own findings are the structure item above (resolved by D2) and the search-check note on `go-oidc` (a verification already owned by T6 and UC-293; no new choice). Findings E1–E4 come from the `main` changes and are architecture and code-quality items, resolved in Sections 1 and 2.
+
+**Scope Challenge result:** scope accepted as-is. The smaller arrangement preserves scope; it is not a reduction.
+
+## Eng Section 1: Architecture
+
+**Findings** (most severe first):
+- `[P1] (confidence: 9/10) internal/service/service.go:1611` — **E1.** Operator-only capabilities are gated on "unscoped", and the plan makes non-admin principals unscoped.
+  - Quoted: `if _, scoped := ownerScope(ctx); scoped && len(mounts) > 0 { return models.ErrMountOperatorOnly }`.
+  - The same pattern: `isolate.go:94` (`scoped && jsbundle.IsFileRef(bundleRef)` → file:// bundles, an arbitrary host-file read); `custom_domains.go:469` and `dns_verify.go:37-39` (DNS TXT proof skipped when unscoped); `facade_state.go:159` (`if _, scoped := ownerScope(ctx); !scoped { return nil }`, which skips snapshot visibility).
+  - The plan's §5.1 sets `Fleet` (unscoped) for any role bound to `*`, and §5.3 allows `runner` on `*`. A `runner@*` token would therefore get raw host-side mounts (pr-review §5: verbatim inputs run as the daemon user), host-file bundle reads, and custom domains without the DNS proof.
+- `[P1] (confidence: 9/10) pkg/daemon/daemon.go:100-114` — **E2.** A test-only static validator ships in release binaries, gated only by an env var.
+  - Quoted: `if path := strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")); path != "" { … cp.Validator = itestStaticValidator{tokens: tokens} …`.
+  - It maps plaintext tokens to owners from a file (`pkg/daemon/itest_identity.go`).
+  - It collides with §5.2's boot rule: identity on plus a non-noop provider validator must refuse to boot. So the harness can't test identity while it uses this file.
+  - Enterprise mode does not refuse it.
+- `[P2] (confidence: 8/10) pkg/api/remotemcp/handler.go` (`serverFor`) — **E4.** Since b374ec3d, remote MCP refuses an empty token "rather than escalate", because the `agenttools` SDK client falls back to `SB_PAT_TOKEN` (the operator PAT) on an empty token. D10's in-process `Access` hand-off (§5.14) must keep that guarantee: inner calls act only as the caller, never as the SDK's default credential.
+
+**Architecture checks** (beyond the CEO review's Section 1, which stands):
+- **Boundaries:** unchanged.
+- **New coupling from `main`:** about 30 `ownerScope` call sites now (the `xtenant` series added about 10). T1's `Operator → Fleet` rename touches all of them; sizing stays M.
+- **Per-owner snapshot namespaces** (#731) give each team its own snapshot names for free. Fleet principals create in the operator namespace (`""`), as the PAT does.
+- **Distribution:** none new.
+
+## Eng review decision ledger
+
+### E1: what fleet-scoped non-admin principals may do
+Finding: E1, P1, confidence 9/10, `internal/service/service.go:1611`, `isolate.go:94`, `custom_domains.go:469`, `dns_verify.go:37-39` (and, as first written, `facade_state.go:159`), reviewer: Claude (eng review)
+Plan baseline: D3 approved "Explicit operator predicate": keep runner@*; `hostCapable(ctx)` on **five** gates, including `facade_state.go:159`.
+Runtime evidence (new, reason for reopening): `facade_state.go:156-165` `requireVisibleSnapshot` is a **visibility** check, not an operator power. It is skipped for unscoped callers because they see every owner's snapshots. Its caller, `UpsertSnapshotAlias` (`facade_state.go:92-112`), uses it so a *team-scoped* token cannot retarget another team's alias. A fleet runner already writes across every team by design, so gating this on `hostCapable` would wrongly limit fleet runners and viewers to operator-namespace (`""`) snapshots. The other four sites are real host or trust powers: raw host mounts, `file://` host reads, and skipping the DNS ownership proof (`custom_domains.go:456-468`: "Operator/PAT callers are trusted to control DNS").
+Comparison grid:
+
+| Choice | Current (D3 as approved) | A | B |
+|---|---|---|---|
+| Predicate approach and runner@* | `hostCapable`, runner@* kept (D3) | unchanged | unchanged |
+| Gates switched to `hostCapable` | five: `service.go:1611`, `isolate.go:94`, `custom_domains.go:469`, `dns_verify.go:37-39`, `facade_state.go:159` | **four** (`facade_state.go:159` keeps following `Fleet` visibility) | five, as approved |
+| Fleet runner/viewer and snapshot aliases | limited to operator-namespace snapshots | may alias and see any team's snapshots (consistent with cross-team writes) | limited to `""` snapshots |
+| Tests | predicate table over five gates | over four gates, plus a row: runner@* may upsert an alias onto a team snapshot | over five gates |
+
+Question D7:
+D7 — E1 (reopened): One of the five "operator-only" spots I listed is actually a visibility check. Switch four of them, not five?
+Project/branch/task: plans/identity-and-access.md §5.1 / T2 (PR #734); reopening D3's list only. The predicate and runner@* stay as you chose.
+ELI10: You chose to make machine-level powers ask "are you an admin or the operator?". I listed five places in the code for that, but one is wrong. The snapshot-alias check at `facade_state.go:159` doesn't guard a machine power. It stops one team's token from taking over another team's snapshot nickname. A fleet-wide runner is allowed to work across every team anyway, so putting that check behind admin would block fleet runners from aliasing team snapshots for no security gain. The other four (raw host mounts, reading host files, skipping the domain-ownership proof) are real machine-level powers and stay behind the new check.
+Stakes if we pick wrong: Keep five, and fleet-wide runners and viewers can only see and alias operator snapshots, which contradicts their cross-team role. Switch four, and nothing about host safety changes.
+Recommendation: A because the alias check is about which team's data you can see, which fleet scope already answers, while the other four are the real host powers D3 was meant to protect.
+Note: options differ in kind, not coverage — no completeness score.
+Net: You are deciding whether a visibility check wrongly rides along with the host-power fix.
+Header: Gate list
+Options:
+A) Four gates (recommended)
+Switch `service.go:1611`, `isolate.go:94`, `custom_domains.go:469` and `dns_verify.go:37-39` to `hostCapable`; leave `facade_state.go:159` on fleet visibility; add a test row for a fleet runner aliasing a team snapshot. Effort S (human ~15 min / CC ~2 min of plan change), risk low, maintenance: none extra.
+✅ Host powers stay admin-or-operator only, exactly as D3 intended
+✅ Fleet runners and viewers keep consistent cross-team visibility for snapshots and aliases
+❌ One more row in the predicate test to explain why that call site is deliberately excluded
+B) Five gates, as approved
+Keep D3's list unchanged, including `facade_state.go:159`. Effort S, risk low, zero change.
+✅ No change to the recorded D3 scope
+✅ Fleet runners get the narrowest snapshot-alias reach
+❌ Fleet runners and viewers can't see or alias team snapshots, contradicting their cross-team role
+
+State: approved
+Actual answer: A) "Four gates (recommended)" (D7, 2026-10-17), refining D3's A) "Explicit operator predicate"
+Accepted scope: keep `runner` on `*`; `hostCapable(ctx)` (operator/PAT, `node:`, no-Access internal, `admin`) on **four** gates (`service.go:1611`, `isolate.go:94`, `custom_domains.go:469`, `dns_verify.go:37-39`); `facade_state.go:159` keeps following `Fleet` visibility; the predicate table over four gates plus the fleet-runner alias row, and the `ownerScope` call-site test, in T2.
+History: D3 (2026-10-17) approved A) "Explicit operator predicate" with five gates. Previous payload: the D3 question as recorded in this file's earlier save, the grid shown below, and the accepted scope "keep `runner` on `*`; add `hostCapable(ctx)` … switch the five gates … predicate table and the `ownerScope` call-site test in T2". Reopened 2026-10-17 because the `facade_state.go:156-165` evidence contradicts that one call site's classification.
+
+<details><summary>Superseded D3 grid</summary>
+
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| `runner` on `*` | allowed (§5.3) | allowed | **refused** at binding/token creation (fleet scope only for viewer, auditor, admin) | **refused** |
+| Operator-only capability gate | `!scoped` | new predicate `hostCapable(ctx)`: PAT/operator, `node:`, no-Access internal callers, `admin`; the five gates switch to it | unchanged `!scoped` (safe because the only unscoped writers left are operator, node, internal, admin) | `hostCapable(ctx)` on all five gates |
+| Future capability checks | ad hoc | must use `hostCapable`; a test lists every `!scoped` use and fails on unreviewed new ones | rely on the binding rule | both |
+| Platform automation creating sandboxes for every team | runner@* | runner@* | needs `admin` | needs `admin` |
+| Tests | — | predicate table (each principal kind × each gate) + call-site test | binding validation test (runner@* refused at file load and token create) | both |
+| Effort | — | human ~1 d / CC ~45 min | human ~2 h / CC ~15 min | human ~1.5 d / CC ~1 h |
+
+
+
+Superseded D3 brief (as asked): "D3 — E1: Fleet-wide runner tokens would get operator-only powers. How should the plan close that?" Options:
+- A) Explicit operator predicate: keep runner@*; add `hostCapable(ctx)` and switch the five gates to it, with a predicate table and a call-site test.
+- B) No fleet-wide runners: refuse `runner` on `*`.
+- C) Both (recommended): refuse runner@* and add `hostCapable(ctx)` on all five gates.
+
+Answer: A) "Explicit operator predicate".
+</details>
+
+### E2: the test-only static validator (`SB_ITEST_IDENTITY_FILE`)
+Finding: E2, P1, confidence 9/10, `pkg/daemon/daemon.go:100-114` and `pkg/daemon/itest_identity.go`, reviewer: Claude (eng review)
+Plan baseline: not mentioned by the plan (landed on `main` after the CEO review in b4e152b1). §5.2 says the daemon refuses to boot when identity is on and a non-noop provider validator is present.
+Runtime evidence: `if path := strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")); path != "" { … cp.Validator = itestStaticValidator{tokens: tokens} …` in every release binary. Tokens are plaintext in the file. `git grep` finds no reference in `integration-tests/`, `scripts/`, `Terraform/` or `Ansible/`, so nothing in the tree drives it today. Enterprise mode does not refuse it.
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| `SB_ITEST_IDENTITY_FILE` path in release binaries | honored | **removed** in T3 (daemon wiring, `itest_identity.go`, its test) | moved behind a build tag `itestidentity`; release builds ignore it | honored |
+| How the harness gets scoped tokens | static file | real `avm_` tokens minted with the PAT at scenario setup (T3), OIDC via the T12 test issuer | the tagged static validator | static file |
+| Interim (before T3 lands) | — | T1: identity on + this env → boot error; enterprise mode refuses the env | T1: same two guards | none |
+| Collision with §5.2's boot rule | yes | gone | handled by the guard | yes |
+| Tests | — | boot-guard table (T1); scenarios use `avm_` tokens (T12) | boot-guard table; build-tag test | — |
+| Effort | — | human ~4 h / CC ~20 min | human ~3 h / CC ~15 min | none |
+
+Question D4:
+D4 — E2: A test-only "static token file" ships in every release binary. Retire it, hide it behind a build flag, or leave it?
+Project/branch/task: plans/identity-and-access.md (PR #734); the code landed on `main` in b4e152b1 (`pkg/daemon/daemon.go:100-114`, `pkg/daemon/itest_identity.go`).
+ELI10: Last night's cross-tenant fixes added a shortcut for testing. If one environment variable points at a file, the server accepts the plaintext tokens listed in it as logins. It's meant only for tests, but every release binary honors it. It also clashes with this plan: once real identity is on, the server must refuse a second identity source, so tests couldn't use both. This plan's own service tokens can do the same job for tests, properly hashed. So the shortcut can go, or at least be compiled out of release builds.
+Stakes if we pick wrong: Leave it, and production servers keep a second, unhashed login path that enterprise mode doesn't block. Tests can't exercise the real identity feature through it either.
+Recommendation: A because the plan's own `avm_` tokens replace it with the real, hashed path, nothing in the tree uses it yet, and one identity path is easier to secure than two.
+Completeness: A=10/10, B=8/10, C=3/10
+Net: You are trading a little harness work against keeping a second, plaintext login path in production binaries.
+Header: Test tokens
+Options:
+A) Retire it (recommended)
+Remove the env path, `itest_identity.go` and its test in T3; the harness mints real `avm_` tokens at setup and uses the T12 test issuer for OIDC; T1 adds an interim boot error (identity on + this env) and an enterprise-mode refusal. Effort S (human ~4 h / CC ~20 min), risk low, maintenance: none afterwards.
+✅ One identity path: tests exercise the same hashed, expiring tokens customers use
+✅ Production binaries lose a plaintext login shortcut that enterprise mode never blocked
+❌ The cross-tenant itest has to mint tokens at setup instead of reading a static file
+B) Build-tag it
+Keep the static validator but compile it only with `-tags itestidentity`, so release binaries ignore the env; T1 adds the same interim guards. Effort S (human ~3 h / CC ~15 min), risk low, maintenance: a tagged test path to keep building.
+✅ Release binaries can no longer honor it, with no harness change
+✅ Keeps a dead-simple token source for tests that don't need the full feature
+❌ Two identity paths to maintain, and tests built with the tag don't exercise the real feature
+C) Leave it
+Ship the plan as written; the env stays honored in release builds. Effort S, risk medium, zero work.
+✅ No change to last night's test scaffolding
+✅ Nothing to coordinate with the harness
+❌ A plaintext token path stays in production binaries and collides with §5.2's boot rule
+
+State: approved
+Actual answer: A) "Retire it (recommended)" (D4, 2026-10-17)
+Accepted scope: T1 adds the interim guards (identity on + `SB_ITEST_IDENTITY_FILE` → boot error; enterprise mode refuses the env var) with a boot-guard table. T3 deletes the env path, `pkg/daemon/itest_identity.go` and its test. T12's cross-tenant scenarios mint team `avm_` tokens at setup and use the test issuer for OIDC.
+History: restored 2026-10-17 after an editing slip removed it from this file during the E1 reopen; content and answer are unchanged.
+
+### Eng Section 1 dispositions
+
+- **E1:** accepted. D3 answered "Explicit operator predicate" (runner@* kept). D7, reopened with new evidence, answered "Four gates": `facade_state.go:159` stays a fleet-visibility check.
+- **E2:** accepted. D4 answered "Retire it": interim guards in T1, deletion in T3, harness on `avm_` tokens.
+- **E4:** accepted as a correction under D10's approved behavior (inner calls act only as the caller). §5.14 and the T13 test updated; no new choice.
+
+
+## Eng Section 2: Code quality
+
+**Findings** (most severe first):
+- `[P2] (confidence: 9/10) pkg/api/middleware.go:75-93` and `pkg/api/remotemcp/handler.go:237-253` — **E3.** Bearer extraction is implemented twice, and the copies have drifted.
+  - Middleware: `const prefix = "Bearer "` … `if strings.HasPrefix(authorization, prefix)` (case-sensitive, untrimmed).
+  - Remote MCP: `const prefix = "bearer "` … `strings.EqualFold(auth[:len(prefix)], prefix)` … `strings.TrimSpace(auth[len(prefix):])` (case-insensitive, trimmed).
+  - The MCP copy's own comment says the two "must stay in lockstep", or the tools act as a different identity than the one that authenticated.
+  - Today the stricter middleware fails first, so it is safe by accident. T1 rewrites the middleware, which is exactly when that accident can flip.
+- `[P2] (confidence: 8/10)` plan §5.2 / CEO-review finding 5.1 — **E5.** How `authenticate()` is structured is still open (the only unresolved item handed over by the CEO review). It covers five credential kinds plus scope rules, surface rules, team selection and 401 reasons, well over 5 branches in one function.
+
+**Other checks:**
+- **Organization** matches the D2 layout (`pkg/identitywire`, `internal/identity`).
+- **The `Operator → Fleet` rename** is a field rename, so the compiler forces every one of the ~30 sites to be revisited. Good.
+- **Error handling** is mapped in the CEO review's Section 2 (no new gaps).
+- **ASCII diagrams in touched files:** `internal/cluster/agent_placement_feed.go:11-26` is reused unchanged and still accurate. `pkg/api/middleware.go` has no diagram.
+
+### E3: one bearer-extraction function
+Finding: E3, P2, confidence 9/10, `pkg/api/middleware.go:75-93` and `pkg/api/remotemcp/handler.go:237-253`, reviewer: Claude (eng review)
+Plan baseline: §5.2 "one authenticate()" (approved scope), silent on remote MCP's own copy.
+Runtime evidence: two implementations with different scheme matching and trimming (quoted above).
+Shared-code rubric:
+- **Callers:** two verified first-party callers: `extractBearerToken` (`requireAuth`, `requireRunloopAuth`, `requireE2BAuth`) and `remotemcp.bearerToken` (`serverFor`).
+- **Destination:** `pkg/api/apihttp.BearerToken(r *http.Request) string`; both import `apihttp` already.
+- **Contract:** RFC 7235 makes the scheme case-insensitive, so `EqualFold` "bearer", then trim; then the `sandbox.bearer, <token>` subprotocol.
+- **Lines:** about 19 removed, about 18 added (net about −1), plus a shared table test (~40). Total growth ~+40.
+- **Value:** reliability, not size. The auth and the tools can no longer see different tokens.
+- **Blast radius:** every authenticated request, so the table test covers case, whitespace, subprotocol, empty and an E2B `X-API-KEY` fallthrough.
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| Implementations | 2 (drifted) | 1: `apihttp.BearerToken` | 2 | 2 |
+| Scheme match | middleware case-sensitive; MCP case-insensitive | case-insensitive everywhere (RFC 7235) | unchanged | unchanged |
+| Lockstep guarantee | comment only | by construction | an agreement test feeding both the same table | none |
+| Behavior change for callers | — | `bearer tok` (lowercase) now authenticates in the middleware; today it gets 401 | none | none |
+| Tests | — | shared table test; both callers' existing tests stay green | agreement table test | — |
+| Effort | — | human ~2 h / CC ~10 min | human ~1 h / CC ~5 min | none |
+
+Question D5:
+D5 — E3: Two copies of "read the caller's token from the request" have drifted. Merge them into one?
+Project/branch/task: plans/identity-and-access.md §5.2 / T1 (PR #734); `pkg/api/middleware.go:75-93` and `pkg/api/remotemcp/handler.go:237-253`.
+ELI10: The server reads a caller's token in two places: once to check who they are, and again in the MCP tool runner to act as them. The copies differ: one ignores capital letters and extra spaces, the other doesn't. Its own comment says they must match, or the tools could act as someone other than the person who was checked. Today the stricter copy fails first, so nothing is wrong yet. But this plan rewrites the first copy, which is exactly when that luck can run out. One shared function removes the risk.
+Stakes if we pick wrong: Keep two copies, and a future edit to either can make the MCP tools act as a different identity than the one that authenticated. Merge, and lowercase "bearer" starts working where it used to get 401.
+Recommendation: A because a single function makes "the tools act as the authenticated caller" true by construction, at the exact moment T1 rewrites this code.
+Completeness: A=10/10, B=8/10, C=4/10
+Net: You are trading one tiny behavior change (lowercase "bearer" accepted, per the HTTP spec) against two copies that must be kept identical by hand.
+Header: Token parse
+Options:
+A) One shared function (recommended)
+Move extraction to `apihttp.BearerToken` (case-insensitive scheme per RFC 7235, trimmed, then the WebSocket subprotocol); the middleware and remote MCP both call it; a shared table test. Effort S (human ~2 h / CC ~10 min), risk low, maintenance: one function.
+✅ The token that authenticated is always the token the MCP tools use, by construction
+✅ Follows the HTTP spec: `bearer` and `Bearer` both work, and stray spaces are trimmed
+❌ Lowercase `bearer` requests that get 401 today start authenticating
+B) Keep two, test agreement
+Leave both functions; add one table test that feeds both the same inputs and requires identical output. Effort S (human ~1 h / CC ~5 min), risk low, maintenance: two functions plus the test.
+✅ No behavior change at all for current callers
+✅ The agreement test catches drift in CI
+❌ The copies already disagree, so this test first forces a choice of behavior anyway, and two copies remain
+C) Do nothing
+Keep both copies as they are. Effort S, risk medium, zero work.
+✅ No change
+✅ Safe today, because the stricter copy fails first
+❌ T1's rewrite of the middleware can silently break the lockstep the comment depends on
+
+State: approved
+Actual answer: A) "One shared function (recommended)" (D5, 2026-10-17)
+Accepted scope: `apihttp.BearerToken` (case-insensitive scheme, trimmed, then subprotocol) replaces `extractBearerToken` and `remotemcp.bearerToken`; both callers migrate; shared table test in T1. Lowercase `bearer` now authenticates (RFC 7235).
+History: none
+
+
+### E5: how `authenticate()` is structured (CEO-review open item 5.1)
+Finding: E5, P2, confidence 8/10, plan §5.2 and CEO-review Section 5 finding 5.1, reviewer: Claude (eng review)
+Plan baseline: §5.2 lists the classification order (PAT → `avm_` → JWT → provider). CEO-review 5.1 left the code structure to this review.
+Runtime evidence: none yet (proposed code). Today's three wrappers are straight-line (`pkg/api/middleware.go:115-168`).
+Comparison grid:
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Shape | 3 copied wrappers | one entry point over an ordered list of authenticators (`pat`, `apiToken`, `jwt`, `provider`), each `Authenticate(r, bearer) (controlplane.Access, matched bool, err error)`; the first `matched` wins | one function with a `switch` on credential shape, calling a helper per kind |
+| After a match | — | separate steps in order: surface rule (`mcp_audiences` only on `/mcp` or a marked forward), team selection (`X-AerolVM-Team`), 401/403 reason mapping (D9, D17) | the same logic inline in the switch arms |
+| Adding a credential kind later | — | append one authenticator | add a switch arm and touch shared code |
+| Tests | — | one table per authenticator plus one table for the post-match steps; the §5.1 invariant table runs through the entry point | one large table through the function |
+| Behavior | — | identical (the §5.1 invariant test must stay green) | identical |
+| Effort | — | human ~1 d / CC ~40 min | human ~1 d / CC ~40 min |
+
+Question D6:
+D6 — E5: How should the new sign-in check be organized in code?
+Project/branch/task: plans/identity-and-access.md §5.2 / T1 (PR #734); the open item 5.1 the CEO review handed to this review.
+ELI10: One function will decide who every request is. It handles five kinds of credential (the operator token, service tokens, sign-in tokens, managed logins, node-to-node calls). After that it applies the team choice, the MCP-only token rule and the error messages. Written as one big function, that's a lot of branches in the most security-critical spot in the server. The alternative is a short list of small checkers, one per credential kind, tried in order, with the shared rules applied afterwards. The behavior is identical either way.
+Stakes if we pick wrong: One big function is harder to review and test, and every new credential type means editing the riskiest code. The list adds one small interface.
+Recommendation: A because small per-credential checkers are each testable in isolation and keep the shared rules in one place, which matters most in the code every request passes through.
+Note: options differ in kind, not coverage — no completeness score.
+Net: You are trading one small interface against a single many-branch function on every request's path.
+Header: Auth shape
+Options:
+A) Ordered list of checkers (recommended)
+One entry point tries `pat`, `apiToken`, `jwt`, `provider` in order (each returns Access, matched, error); then surface rule, team selection and reason mapping run as separate steps. Effort M (human ~1 d / CC ~40 min), risk low, maintenance: one small interface.
+✅ Each credential kind is a small unit with its own table test, easy to review
+✅ A future credential type is one appended checker, not an edit to shared branching
+❌ One more small interface and a list to keep in the right order
+B) One function with a switch
+A single `authenticate` with a switch on the credential's shape and a helper per kind; shared rules inline. Effort M (human ~1 d / CC ~40 min), risk low, maintenance: one larger function.
+✅ Everything about sign-in reads top to bottom in one place
+✅ No new interface or indirection
+❌ Well over five branches in the riskiest function, and every new kind edits it
+
+State: approved
+Actual answer: A) "Ordered list of checkers (recommended)" (D6, 2026-10-17)
+Accepted scope: one `authenticate` entry point over an ordered authenticator list (`pat`, `apiToken`, `jwt`, `provider`), each returning (Access, matched, error), with surface rule, team selection and reason mapping as separate post-match steps; per-authenticator tables plus a post-match table in T1; behavior identical (the §5.1 invariant test stays green).
+History: none
+
+### Eng Section 2 dispositions
+
+- **E3:** accepted. D5 answered "One shared function": `apihttp.BearerToken`.
+- **E5:** accepted. D6 answered "Ordered list of checkers". This closes CEO-review open item 5.1.
+
+
+## Eng Section 3: Test review
+
+**Framework.** Go (`go.mod`). `CLAUDE.md` "Build, test, format" is authoritative: `make test` (offline), per-package `go test`, a coverage bar of ~85% per touched package, tag-gated live tests in `integration-tests/` (`integration` tag), and table-driven style. The SDKs use their own runners (`npm test`, `unittest`, `cargo test`, `mvn test`). No LLM or prompt files are touched, so no eval scope applies.
+
+**Existing tests touching changed code** (read in this review):
+- `pkg/api/middleware_test.go`: `TestExtractBearerToken` (147).
+- `pkg/api/auth_token_test.go`: `TestRequireAuthSecondTokenPath` (26), `TestRequireAuthNoopValidatorRejectsUserTokens` (88).
+- `pkg/api/edge_auth_test.go`: `TestMetricsAreOperatorOnly` (16), `TestUserTokenWithoutAnAccountIsRefused` (36), `TestSingleNodeDropsClusterControlHeaders` (52).
+- `pkg/api/runloop_auth_test.go`: `TestRequireRunloopAuth` (15).
+- `pkg/api/remote_mcp_test.go`: `TestRemoteMCPSubprotocolTokenIsNotOperator` (146).
+- `internal/service/owner_scope_test.go`: `TestOwnerScope`, `TestEnforceOwner`, `TestFilterByOwnerScope`, `TestOwnerRefForCreate`.
+- The gates: `TestValidateCreateMounts_RawMountsAreOperatorOnly` (`mount_owner_policy_test.go:22`), `TestCreateIsolateSandboxScopedFileRefRejected` (`isolate_coverage_test.go:78`), `TestPersistCustomDomainsOnCreate_OwnerScopedRequiresTXT` (`custom_domains_create_owner_test.go:26`), and the `dns_verify_test.go` set.
+- `requireVisibleSnapshot` has no direct test.
+
+**Coverage diagram** (proposed paths are `[PLANNED]` with the task that owns the test; `[GAP]` was missing before this review):
+
+```
+CODE PATHS                                                   USER FLOWS
+[+] authenticate() (T1, D6)                                  [+] People
+  ├── apihttp.BearerToken  [★★★ PLANNED T1, D5]               ├── [★★★ PLANNED T7] aerolvm login --sso / --device → whoami
+  ├── pat authenticator    [★★★ PLANNED T1] + existing        ├── [★★★ PLANNED T8, UC-290] dashboard sign-in (HTTPS) → overview
+  │     TestRequireAuth*, TestExtractBearerToken (→ replaced) ├── [★★★ PLANNED T8] token expiry mid-session → silent re-sign-in
+  ├── apiToken authent.    [★★★ PLANNED T3] mirror, stale,     ├── [★★★ PLANNED T6/T7] multi-team --team → X-AerolVM-Team
+  │                          metrics.read exception (D16)     └── [GAP→FIXED E6] [→E2E] multi-team list across peers
+  ├── jwt authenticator    [★★★ PLANNED T6] alg/iss/aud/      [+] Services and CI
+  │                          kid/lifetime/overage/size caps    ├── [★★★ PLANNED T3, UC-268/271] token create → use → revoke
+  │     └── LRU vs team    [GAP→FIXED E7] cached JWT, 2 teams ├── [★★★ PLANNED UC-275/284] GH Actions / k8s workload token
+  ├── provider authent.    [★★★ existing TestRequireAuth*]     └── [★★★ PLANNED T7, D15] CI env token expiry warning
+  └── post-match steps     [★★★ PLANNED T1/T6/T13]            [+] Operators and auditors
+        surface, team, 401/403 reasons (D9, D17)                ├── [★★★ PLANNED T5b, UC-279] aerolvm access review
+[+] hostCapable (T2, D3/D7)                                     ├── [★★★ PLANNED T10, UC-285] SB_PAT_SCOPE=host
+  ├── raw mounts           [★★★ existing + PLANNED row]        └── [★★★ PLANNED UC-291..293] chaos (partition, leader, keys)
+  ├── file:// bundles      [★★★ existing + PLANNED row]       [+] Error states
+  ├── DNS proof skip       [★★★ existing + PLANNED row]        ├── [★★★ PLANNED T1] 401 reason per kind; PAT body unchanged
+  └── alias visibility     [★★  PLANNED row D7] (no direct     ├── [★★★ PLANNED T2/T6] 403 hint; 404 bare
+                             test today)                        └── [★★★ PLANNED T13] /mcp empty bearer → 400 (E4)
+[+] runner@* create owner  [GAP→FIXED] owner "" + "" snapshots
+[+] itest validator guard  [★★★ PLANNED T1, D4] → deleted T3
+[+] StampForward + fan-out [★★★ PLANNED T4] + E6 header copy
+[+] token store/mirror     [★★★ PLANNED T3] FSM, ring, tombstone, spray
+[+] api records + floods   [★★★ PLANNED T5, D14] three modes, shared node
+[+] caller fields + fv     [★★★ PLANNED T4, UC-281] mixed-version gate
+
+COVERAGE (planned, value-weighted): 38/38 paths have a ★★/★★★ planned test after this review's three additions
+QUALITY: ★★★ 37  ★★ 1 (alias visibility row)  |  GAPS found: 3 (E6, E7, runner@* create owner), all now planned
+```
+
+**Regression contracts carried forward** (no new answer needed):
+- **L8 (founder-locked):** PAT and managed-provider behavior is unchanged. `TestRequireAuthNoopValidatorRejectsUserTokens`, `TestUserTokenWithoutAnAccountIsRefused`, `TestRequireRunloopAuth`, the owner-scope tests and the four gate tests must pass **unmodified** after the `Operator → Fleet` rename (T1) and the `hostCapable` switch (T2). Only the rows D3/D7 add are new.
+- **D5 changes one behavior on purpose:** lowercase `bearer` now authenticates. `TestExtractBearerToken` is replaced by the `apihttp.BearerToken` table, not deleted.
+- **D6:** `TestMetricsAreOperatorOnly` keeps its managed-caller and team-caller assertions (403). It gains the fleet-viewer row (200) and the `/debug/vars` row (403).
+
+**Tests made obsolete by this plan** (proposal; retire with a card at implementation time):
+- `pkg/daemon/itest_identity_test.go`, with the validator (D4, T3).
+- `TestExtractBearerToken` (`pkg/api/middleware_test.go:147`), superseded by the `apihttp.BearerToken` table (D5).
+
+**Value cards for this review's additions:**
+- E6. Value: protects=a multi-team caller's cluster list shows one team on every peer; fails_when=a fan-out client drops X-AerolVM-Team; why_new=clusterlist builds fresh requests (list.go:591-606) outside the ReverseProxy path; seam=none
+- E7. Value: protects=team selection is per request, never cached; fails_when=the JWT LRU stores the selected team with the claims; why_new=no test pairs the cache with D13's header; seam=none
+- runner@* create. Value: protects=fleet runner creates land in the operator namespace and resolve only operator snapshots; fails_when=Fleet create stamps a team owner or resolves a tenant snapshot by name (#7); why_new=TestOwnerRefForCreate covers PAT and tenant only; seam=none
+
+**Findings:**
+- `[P1] (confidence: 9/10) pkg/api/clusterlist/list.go:601-606` — **E6.** The fan-out copies only `if opts.AuthHeader != "" { req.Header.Set("Authorization", …) }` and `X-API-KEY`, so D13's `X-AerolVM-Team` (and H3's correlation id) never reach peers. A multi-team caller's list is answered for the first-matching team on every peer. **Correction** under D13 ("an ordinary header, so a forward keeps it") and H3: `StampForward` copies both on fan-out clients; T4 test added.
+- `[P2] (confidence: 8/10)` plan §5.5 verified-token LRU plus D13 — **E7.** The cache key is `SHA-256(jwt)`. If the selected team were cached with the claims, a second request with a different `X-AerolVM-Team` would reuse the first team. D6 already makes team selection a post-match step, so the required proof is one test; added to T6.
+- `[P2] (confidence: 8/10) internal/service/owner_scope.go:70-90` — **runner@* create owner.** The §5.1 behavior (fleet creates stamp `""`) and #7's `snapshotResolvableForCreate` have no test for a fleet-scoped *non-operator* principal. Added to T2 as required proof of approved behavior.
+
+**Dispositions:** E6 is a correction (D13, H3), applied. E7 and the runner@* create test are required proof of approved behavior (D13 + D6; §5.1), applied. No new test-depth choice was needed, because D21 already settled load, fuzz and chaos depth.
+
+
+## Eng Section 4: Performance
+
+On the per-request path:
+- `apihttp.BearerToken` (D5): a string scan.
+- The authenticator list (D6): the first match wins; PAT is a constant-time compare, `avm_` is a map lookup plus SHA-256 of 32 B, and a JWT is an LRU hit or an RS256 verify (~50 µs, first time only).
+- `hostCapable` (D3/D7): field reads.
+- `StampForward` header copies (E6): a few `Header.Set`s per forward.
+
+None adds I/O, locks or a server-tier call, and `CreateSandbox` still gains only µs. Memory bounds are unchanged from the CEO review's Section 7 (mirror ~2 MB, LRU ≤ 16 MB, ring ≤ 13 MB on servers).
+
+**Findings:**
+- `[P3] (confidence: 6/10)` plan §5.5 bindings plus D13 — **E8.** Medium confidence; verify at implementation.
+  - Team selection runs after the cached JWT match, so the bindings list is scanned on every request.
+  - The identity file is capped at 1 MiB, which is roughly 10k bindings at worst. A linear scan per request (~10k comparisons) could break D21's p99 ≤ 50 µs budget for cached paths.
+  - **Scale:** unknown until real identity files exist. Typical files have tens of bindings.
+  - **Disposition:** no new choice. D21's budget (`BenchmarkAuthenticate{JWTCached}`) is the approved contract, and the implementation owner (T6) must meet it.
+  - The natural way: cache the caller's *matched binding set* with the claims in the LRU, and run team selection over that short list. That keeps E7, because the selected team is never cached.
+
+No other issues found: no N+1 or unbounded queries (tokens are in memory; SQLite is touched only on token writes), and no new caches beyond those already bounded.
+
+**Dispositions:** E8 is covered by D21's approved budget, with an implementation note for T6. No question needed.
+
+
+## Eng outside voice
+
+Codex preflight: `CODEX_MODE: model_unusable` (the configured model id is invalid; fix with `GSTACK_CODEX_MODEL=<supported-model>` or the `config.toml` model). No Codex call was made. The native fallback needs `TaskOutput`, which this session lacks, so the outside voice is **unavailable**. That is missing coverage, not a clean review, and it was logged as `unavailable`.
+
+## Eng TODO choices
+
+### E9: TODO — per-owner WASM module ids (residual from #724)
+Finding: E9, P2, confidence 9/10, `internal/service/wasm_module_api.go:176-188`, reviewer: Claude (eng review)
+Plan baseline: T0 (shipped as #724) notes the residual as "not in this stack".
+Runtime evidence: `id := explicitID; if id == "" { id = strings.TrimSpace(resolved.Digest) }` … `if existing, err := s.store.GetWasmModule(ctx, id); err == nil { if … wasmModuleWritable(ctx, existing) { … } return nil, store.ErrWasmModuleIDConflict }`.
+TODO content:
+- **What:** give WASM module catalogue ids a per-owner namespace (or ref-counted ownership like `jsbundle.TenantOwns`), so a second owner registering identical module bytes without an explicit id gets its own row instead of `ErrWasmModuleIDConflict`.
+- **Why:**
+  - Today the id defaults to the content digest, which is a global key. A team uploading a module another team (or the operator) already registered is refused.
+  - The conflict also confirms that a module with that digest exists, a small cross-owner existence signal.
+  - Teams (this plan) make same-module uploads common.
+- **Pros:** teams can register the same standard modules independently, and the existence signal disappears.
+- **Cons:** a store identity change (`(owner_ref, id)`, like #731 did for snapshots) with a migration and create-time resolution changes. It touches the resolver's catalogue lookup (`ResolveOwnedWasmModule`).
+- **Context:** #724 added `wasm_modules.owner_ref` with backfill `""`. #731 is the precedent for per-owner name spaces. Start at `CreateWasmModule` (`wasm_module_api.go:127-200`) and `ResolveOwnedWasmModule` (`pkg/daemon/wasm_wiring.go`).
+- **Effort:** human M / CC S. **Priority:** P2.
+- **Depends on / blocked by:** nothing; independent of this stack.
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| Residual tracked | only in T0's note | TODOS.md entry with the content above | not tracked | built in this stack as a new task (T0b) |
+| Stack size | 14 PRs | unchanged | unchanged | +1 PR (M) |
+
+Question D8:
+D8 — E9: Track the "second team can't register the same WASM module" residual from #724 as a TODO?
+Project/branch/task: plans/identity-and-access.md T0 (PR #734); the code is `internal/service/wasm_module_api.go:176-188` on `main`.
+ELI10: Last night's fix gave WASM modules an owner. But a module's id is still its content fingerprint, and that id is shared by everyone. If team B uploads the exact same module team A already uploaded, B gets an "id conflict" error instead of its own copy. The error also tells B that someone already has that module. Teams make this more likely. The fix is to make ids per-owner, the way last night's snapshot fix did.
+Stakes if we pick wrong: Skip it, and teams hit confusing conflicts uploading common modules. Build it now, and this already large stack grows by one more PR.
+Recommendation: A because it's real but independent of identity and access, and the snapshot fix (#731) gives a clear template to do it separately.
+Note: options differ in kind, not coverage — no completeness score.
+Net: You are choosing where this residual lives: the backlog, nowhere, or this stack.
+Header: WASM ids TODO
+Options:
+A) Add to TODOS.md (recommended)
+Record the What/Why/Pros/Cons/Context above as a P2 entry; this stack is unchanged. Effort S (human ~10 min / CC ~2 min), risk low.
+✅ The residual is written down with its root cause and the #731 template, ready for anyone
+✅ This stack stays focused on identity and access
+❌ Teams can still hit the conflict until someone picks it up
+B) Skip — not valuable enough
+Leave it only as T0's one-line note. Effort S, risk low, zero work.
+✅ No new backlog item
+✅ Nothing to maintain
+❌ The root cause and fix direction are easy to lose; the next person re-derives them
+C) Build it now in this stack
+Add a task T0b (per-owner `(owner_ref, id)` with migration, like #731) to this stack. Effort M (human ~1–2 d / CC ~1 h), risk medium.
+✅ Teams never hit the conflict when identity ships
+✅ Removes the cross-owner existence signal at the same time
+❌ Adds a store-identity migration to an already large stack
+
+State: approved
+Actual answer: C) "Build it now in this stack" (D8, 2026-10-17; the recommendation was A)
+Accepted scope: new task T0b (per-owner `(owner_ref, id)` WASM module ids with an idempotent migration, own-then-`""` resolution, owner-keyed resolver and warm pool, delete within namespace) with its tests and UC-294; no TODOS.md entry.
+History: none
+
+
+### Eng approval readiness
+
+Each accepted remedy is cited to its own answer:
+- Structure: D2 (Smaller arrangement).
+- E1: D3, reopened and refined by D7 (Four gates).
+- E2: D4 (Retire it). E3: D5 (One shared function). E5: D6 (Ordered list of checkers). E9: D8 (Build it now, T0b).
+
+Corrections without a new question implement already-approved behavior:
+- E4, under D10 (inner MCP calls act only as the caller);
+- E6, under D13 ("a forward keeps it") and H3 (correlation id);
+- E7 and the runner@* create test: required proof of D13 + D6 and §5.1;
+- E8: implementation note under D21's budget.
+
+No setup, mode or navigation answer is used as approval.
+
+Approval readiness: PASS. Checked: D2, E1 (D3, D7), E2 (D4), E3 (D5), E5 (D6), E9 (D8); corrections E4, E6, E7, E8 cited above.
+
+## Eng review outputs
+
+### NOT in scope
+
+Nothing was deferred in this review. E9 was pulled into the stack as T0b (D8) instead of deferred. The plan's §13 list stands unchanged.
+
+### What already exists
+
+| Existing code | Reuse in this review's changes |
+|---|---|
+| `ownerScope` / `ownerRefForCreate` / `snapshotResolvableForCreate` (`internal/service/owner_scope.go`) | kept for visibility and stamping; `hostCapable` is a new sibling predicate, not a rebuild (D3/D7) |
+| Gate tests (`mount_owner_policy_test.go:22`, `isolate_coverage_test.go:78`, `custom_domains_create_owner_test.go:26`, `dns_verify_test.go`) | the L8 regression suite, unmodified; D3/D7 rows are added beside them |
+| `extractBearerToken` / `remotemcp.bearerToken` | collapsed into `apihttp.BearerToken` (D5); moved code is counted on both sides (≈ −19 / +18 lines) |
+| `itestStaticValidator` (`pkg/daemon/itest_identity.go`) | retired; replaced by real `avm_` tokens (D4) |
+| #731 per-owner snapshot namespace | the template for T0b's per-owner WASM ids (D8) |
+| `clusterlist` fan-out client (`list.go:591-606`) | gains the team and correlation headers through `StampForward` (E6), not a new client |
+
+### Diagrams
+
+**`authenticate()` after D5/D6:**
+
+```
+  request ─► apihttp.BearerToken(r) ──► bearer ("" → 401, never the SDK's PAT fallback: E4)
+                │
+                ▼  ordered authenticators (first matched wins)
+        ┌──── pat ──────┐  ┌── apiToken ───┐  ┌──── jwt ─────┐  ┌── provider ──┐
+        │ const-time,   │  │ checksum →    │  │ LRU(sha256)→ │  │ managed      │
+        │ scope rule,   │  │ mirror[id] →  │  │ sig/iss/aud/ │  │ Validator    │
+        │ origin marker │  │ sha256, exp,  │  │ exp/lifetime │  │ (Noop in OSS)│
+        └──────┬────────┘  │ stale rule    │  │ → matched    │  └──────┬───────┘
+               │           └──────┬────────┘  │   bindings   │         │
+               │                  │           └──────┬───────┘         │
+               └──────────────────┴──────┬───────────┴─────────────────┘
+                                         ▼  post-match steps (never cached: E7)
+                        surface rule ─► team selection (X-AerolVM-Team) ─► reason mapping
+                                         ▼
+                        Access{Principal, Role, Fleet, Via} ─► route permission (d.Route)
+                                         ▼
+                        service: ownerScope (what you see)   hostCapable (host powers, D3/D7)
+```
+
+**Scope vs. power:**
+
+```
+                    Fleet (sees all owners)?     hostCapable (raw mounts, file://, DNS-proof skip)?
+  PAT / operator    yes                          yes
+  node:<id>         yes                          yes
+  internal (no Access) yes                       yes
+  admin             yes                          yes
+  auditor           yes (read routes only)       no
+  viewer@* / runner@* yes                        no   ← D3 closes the gap here
+  viewer/runner@team no                          no
+  managed identity  no                           no
+```
+
+### Failure modes (new paths in this review)
+
+| Path | Realistic failure | Test / handling | User sees |
+|---|---|---|---|
+| `hostCapable` | a new capability check copies `!scoped` | `ownerScope` call-site test fails the build | (prevented) |
+| `hostCapable` | a principal kind misclassified | predicate table over four gates | 403 `ErrMountOperatorOnly` / file-ref refusal |
+| fan-out headers | a fan-out client drops `X-AerolVM-Team` | T4 multi-team list test (E6) | before the fix, the wrong team's sandboxes, silently; now covered |
+| JWT LRU | team pinned in the cache | T6 two-team test (E7) | (prevented) |
+| `SB_ITEST_IDENTITY_FILE` | set together with identity on | T1 boot guard | daemon refuses to start, naming the conflict |
+| `BearerToken` | auth and MCP disagree | impossible by construction (D5) plus table | — |
+| authenticator order | JWT tried before `avm_` on a token-shaped bearer | per-authenticator tables plus the order test | 401 with reason |
+| T0b migration | warm upgrade with existing rows | idempotent migration test | boot proceeds; rows intact |
+
+**Critical gaps: 0.** The only silent row (E6) is fixed and tested.
+
+### Worktree parallelization strategy
+
+| Step | Modules touched | Depends on |
+|---|---|---|
+| T0b WASM ids | `internal/store`, `internal/service` (wasm), `pkg/daemon` | — |
+| T1 principal + authenticate | `pkg/controlplane`, `pkg/api`, `pkg/api/apihttp`, `pkg/api/remotemcp`, `internal/service` (owner_scope) | — |
+| T2 permissions + hostCapable | `pkg/api` (routes, facades), `internal/service` (gates) | T1 |
+| T3 tokens + mirror | `internal/store`, `internal/cluster`, `internal/identity`, `pkg/identitywire`, `pkg/api`, `cmd/aerolvm`, `pkg/daemon` | T1 |
+| T4 caller fields + StampForward | `pkg/auditlog`, `internal/service` (audit), `internal/cluster`, `pkg/api/clusterroute`, `pkg/api/clusterlist` | T1 |
+| T5 api records (+ T5b review) | `internal/service` (audit quota), `pkg/api`, `pkg/sshgateway`, `cmd/aerolvm`, `pkg/auditlog` | T2, T4 (T5b also T3) |
+| T6 OIDC | `internal/identity`, `pkg/identitywire`, `pkg/api` | T1, T3 |
+| T7 CLI SSO | `cmd/aerolvm` | T3, T6 |
+| T8 dashboard | `pkg/api` (dashboard), `scripts/install.sh`, `packaging` | T6 |
+| T9 SDKs | `sdk/*` | T1, T3, T6 |
+| T10 PAT scope + PROXY + obs | `pkg/caddy`, `internal/service` (L4), `scripts/install.sh`, `packaging`, `Terraform`, `setup` | T1, T3 |
+| T13 MCP OAuth | `pkg/api/remotemcp`, `internal/identity` | T4, T6 |
+| T11 docs, T12 harness | `docs`, `DESIGN.md`, `integration-tests` | all |
+
+**Parallel lanes** (develop in parallel worktrees; merge as one stack in order, per the no-partial-merge rule):
+- **Lane A:** T0b (independent; can start now).
+- **Lane B:** T1, then T2, then T5 (shared `pkg/api`; sequential).
+- **Lane C:** T3, then T6, then (T7 ∥ T9 ∥ T13).
+- **Lane D:** T4. It shares `pkg/api/cluster*` with lane B, so coordinate.
+- **Lane E:** T10, after T1 and T3. It shares `scripts/install.sh` with T8, so sequence T8 after T10.
+
+**Execution order:**
+1. Launch A and B (T1).
+2. Once T1 lands in the stack, launch B's T2, C's T3 and D's T4.
+3. Then T5, T6, T10.
+4. Then T7, T8, T9, T13, T5b.
+5. Last, T11 and T12.
+
+**Conflict flags:**
+- `pkg/api/clusterroute` and `pkg/api/clusterlist` (T2 vs T4);
+- `scripts/install.sh` (T8 vs T10);
+- `internal/identity` (T3 vs T6 vs T13);
+- `cmd/aerolvm` (T3, T5, T5b, T7).
+
+### Unresolved decisions
+
+None in this review. The CEO review's open items are closed: 5.1 by D6, 9.2 by #724.
+
+## Eng implementation tasks
+
+Synthesized from this review's findings. Each derives from a finding above. Run with Claude Code or Codex; checkbox as you ship. Effort assumes features ~30×, tests ~50×, architecture ~5× (human ÷ CC).
+
+- [ ] **ET1 (P1, human: ~1.5 d / CC: ~1 h)** — store/wasm — Per-owner WASM module ids `(owner_ref, id)` with migration and own-then-`""` resolution (T0b)
+  - Surfaced by: TODO choices, E9 (D8), `internal/service/wasm_module_api.go:176-188`
+  - Files: `internal/store/store.go`, `internal/service/wasm_module_api.go`, `internal/service/wasm_module.go`, `pkg/daemon/wasm_wiring.go`
+  - Verify: `go test -run Wasm ./internal/store/ ./internal/service/ ./pkg/daemon/`; UC-294
+- [ ] **ET2 (P1, human: ~1 d / CC: ~45 min)** — service/auth — `hostCapable(ctx)` on the four operator-only gates, plus the `ownerScope` call-site test (T2)
+  - Surfaced by: Section 1, E1 (D3, D7)
+  - Files: `internal/service/service.go`, `internal/service/isolate.go`, `internal/service/custom_domains.go`, `internal/service/dns_verify.go`, `internal/service/owner_scope.go`
+  - Verify: `go test ./internal/service/...` (predicate table, alias row, call-site test)
+- [ ] **ET3 (P1, human: ~4 h / CC: ~20 min)** — daemon/harness — Retire `SB_ITEST_IDENTITY_FILE`: interim guards (T1), deletion (T3), harness on `avm_` tokens (T12)
+  - Surfaced by: Section 1, E2 (D4)
+  - Files: `pkg/daemon/daemon.go`, `pkg/daemon/itest_identity.go`, `pkg/daemon/itest_identity_test.go`, `internal/config/config.go`
+  - Verify: boot-guard table; `go test ./pkg/daemon/...`
+- [ ] **ET4 (P2, human: ~2 h / CC: ~10 min)** — api — `apihttp.BearerToken` shared by `authenticate` and `remotemcp.serverFor` (T1)
+  - Surfaced by: Section 2, E3 (D5)
+  - Files: `pkg/api/apihttp/apihttp.go`, `pkg/api/middleware.go`, `pkg/api/remotemcp/handler.go`
+  - Verify: `BearerToken` table; `go test ./pkg/api/...`
+- [ ] **ET5 (P2, human: ~1 d / CC: ~40 min)** — api — `authenticate` as an ordered authenticator list with post-match steps (T1)
+  - Surfaced by: Section 2, E5 (D6)
+  - Files: `pkg/api/middleware.go` (to be split into an auth file, to be determined)
+  - Verify: per-authenticator tables; §5.1 invariant test unchanged
+- [ ] **ET6 (P1, human: ~3 h / CC: ~15 min)** — cluster — `StampForward` copies `X-AerolVM-Team` and `X-Correlation-ID` on fan-out clients (T4)
+  - Surfaced by: Section 3, E6
+  - Files: `internal/cluster/forward.go`, `pkg/api/clusterlist/list.go`, `pkg/api/clusterlist/facade_list.go`
+  - Verify: multi-team list fan-out test
+- [ ] **ET7 (P2, human: ~1 h / CC: ~5 min)** — mcp — the hand-off never reaches the SDK's `SB_PAT_TOKEN` fallback (T13)
+  - Surfaced by: Section 1, E4
+  - Files: `pkg/api/remotemcp/handler.go`, `pkg/api/remotemcp/inprocess.go`
+  - Verify: empty bearer → 400; inner-call identity test
+- [ ] **ET8 (P2, human: ~3 h / CC: ~15 min)** — identity — JWT LRU caches the matched bindings, never the team; stays within D21's budget (T6)
+  - Surfaced by: Section 3, E7; Section 4, E8
+  - Files: `internal/identity/` (to be determined)
+  - Verify: two-team cached-JWT test; `BenchmarkAuthenticateJWTCached` with a 10k-binding file
+- [ ] **ET9 (P2, human: ~1 h / CC: ~5 min)** — service — test that a `runner@*` create stamps `""` and resolves only `""` snapshots (T2)
+  - Surfaced by: Section 3, runner@* create gap
+  - Files: `internal/service/owner_scope_test.go`
+  - Verify: `go test -run OwnerRefForCreate ./internal/service/`
+- [ ] **ET10 (P2, human: ~30 min / CC: ~5 min)** — layout — one CLI-shared package, `pkg/identitywire` (T3/T6)
+  - Surfaced by: Scope Challenge structure (D2)
+  - Files: `pkg/identitywire/` (new), `cmd/aerolvm/deps_test.go` (guard stays green)
+  - Verify: `go test ./cmd/aerolvm/...` (dependency guard)
+
+### Completion summary
+
+- Step 0: Scope Challenge — scope accepted as-is (structure: smaller arrangement, D2).
+- Architecture Review: 3 issues found (E1 P1, E2 P1, E4 P2).
+- Code Quality Review: 2 issues found (E3, E5).
+- Test Review: diagram produced, 3 gaps identified (E6, E7, runner@* create), all now planned.
+- Performance Review: 1 issue found (E8, P3).
+- NOT in scope: written (nothing deferred).
+- What already exists: written.
+- TODOS.md updates: 1 item proposed (E9), built in-stack as T0b instead.
+- Failure modes: 0 critical gaps flagged.
+- Unresolved decisions: 0 in this review.
+- Outside voice: codex unavailable (`model_unusable`); native fallback unavailable (no `TaskOutput`).
+- Parallelization: 5 lanes, 3 parallel at peak / 2 sequential chains.
+- Lake Score: 2/3 (D4 and D5 chose the 10/10 option; D3 chose 8/10).
+
+
+---
+
+# Design review: `/plan-design-review` 2026-10-17
+
+**Target:** `plans/identity-and-access.md` (PR #734). **UI scope:**
+- `/ui` dashboard: SSO sign-in, Google Identity Services button, token fallback, HTTPS-only sign-in (D18), CSP (D19), identity header, team picker (D13), role-aware actions, the 403 "no binding" screen (D9), re-sign-in on expiry.
+- Secondary: CLI output for `login --sso`, `whoami --explain` and the expiry warnings.
+
+**Design system:** `DESIGN.md` exists but is the actor model, not a visual system. The de facto visual system is the dashboard's own CSS (`pkg/api/dashboard.html:10-28`):
+- colors `--bg #0b0d11`, `--panel #14171d`, `--border #2a2f3a`, `--text #e4e7ee`, `--muted #8b95a7`, `--accent #7aa2ff`, `--ok/--warn/--bad`;
+- a system font stack at 13 px;
+- a 360 px login overlay (`:136-162`).
+
+New UI is calibrated to those tokens. No prior design reviews exist. **Mockups:** none (the designer needs an OpenAI API key; 0 images saved).
+
+**Step 0 rating: 5/10.** The flow, state table and accessibility basics exist (CEO-review Section 11). The hierarchy, copy, team-picker data, Google-button styling, non-admin experience and responsive behavior are unspecified. Focus: all 7 dimensions (D1).
+
+## Design outside voices
+
+Codex: unavailable (invalid model id; no call made). The Claude design subagent completed, so this pass is `[single-model]`.
+
+```
+DESIGN OUTSIDE VOICES — LITMUS SCORECARD:
+═══════════════════════════════════════════════════════════════
+  Check                                    Claude  Codex  Consensus
+  ─────────────────────────────────────── ─────── ─────── ─────────
+  1. Brand unmistakable in first screen?   NO      —      single-model (box says "sandboxd", header "AerolVM")
+  2. One strong visual anchor?             NOT SPEC'D —   —
+  3. Scannable by headlines only?          NOT SPEC'D —   —
+  4. Each section has one job?             NO      —      single-model (admin panels error for non-admins)
+  5. Cards actually necessary?             N/A     —      no cards proposed
+  6. Motion improves hierarchy?            N/A     —      no motion proposed
+  7. Premium without decorative shadows?   NOT SPEC'D —   —
+  ─────────────────────────────────────── ─────── ─────── ─────────
+  Hard rejections triggered:               none    —      —
+═══════════════════════════════════════════════════════════════
+```
+
+The subagent's 11 findings are confirmed against code where they cite it (`dashboard.html:468-733` calls only `/health` and `fleet.admin` routes; `:754-764` uses `confirm()`/`alert()`) and are folded into the passes below.
+
+
+**Prior learning applied:** `acebot-no-ui-scope-creep` (confidence 10/10, from 2026-09-20). Findings stay scoped to the screens this feature changes. The rest of the dashboard (KPI tiles, tables, 13 px base type, palette) is existing UI and out of scope unless the identity work breaks it.
+
+## Design Pass 1: Information architecture
+
+**Initial rating: 4/10.** The CEO-review flow (Section 11) says where a person goes after sign-in, but not what they see there.
+- **The overview assumes an admin.** Health uses `/health`, which is public. Nodes, Placements and Metrics call `/v1/cluster/leader`, `/v1/cluster/members`, `/v1/cluster/sandbox-index` and `/debug/vars` (`dashboard.html:551,552,634,733`). §5.3 puts all four under `fleet.admin`. So only admin, PAT and operator callers can load them, and every other role gets 403s on three of the four panels.
+- **Missing pieces:** the order of the sign-in screen, the issuer labels, where the identity sits in the header, and the team picker's data source.
+
+A 10 here would define, for each role, what the first screen shows, which panels load, and the order of items in the sign-in box and the header.
+
+## Design review decision ledger
+
+### DR1: what a signed-in non-admin sees
+Finding: subagent finding 1, CRITICAL, confidence 9/10, `pkg/api/dashboard.html:551,552,634,733` against §5.3 `fleet.admin`, reviewer: Claude design subagent (confirmed in code).
+Plan baseline: §5.7 "Role-aware: the page calls `whoami` and hides drain, uncordon and orphan buttons unless the caller is an admin." The Section 11 flow sends every bound caller to "overview".
+Gap: viewer, runner and auditor callers reach the overview and get 403s on Nodes, Placements and Metrics. Only Health renders. Team-bound viewers and runners, the only callers with a team, can never load a data panel. That leaves the D13 dashboard team picker with nobody to serve, which DR2 takes up next.
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| Non-admin after sign-in | overview with three 403 panels | one "signed in" screen: name, role, team, what the console needs, CLI pointer, sign out | overview; each admin panel replaced by one muted line "Needs the admin role" | overview with a new team-scoped "Sandboxes" panel (`GET /v1/sandboxes`, `sandbox.read`); admin panels hidden |
+| Admin, PAT, operator | full overview | unchanged | unchanged | unchanged |
+| New panels or routes | — | none | none | one panel; list route already exists |
+| Dashboard team picker (D13) | planned | no audience; DR2 | no audience (no team data shown); DR2 | needed (selects whose sandboxes) |
+| Effort | — | S (human ~2 h / CC ~10 min) | S (human ~3 h / CC ~15 min) | M (human ~1.5 d / CC ~45 min) |
+
+State: approved
+Actual answer: A) "Admin-only console (recommended)" (D3, 2026-10-17)
+Accepted scope: §5.7 "Who the console is for". `admin` and PAT/operator callers get the overview. Every other role gets the signed-in screen: name, role, team, the console line, the CLI pointer and Sign out, with no panel requests. T8 adds a `/browse` check for a viewer token. The Section 11 flow carries a superseded note.
+Consequence recorded: subagent finding 10 (role-aware hiding misses the placement Start, Stop and Delete buttons) no longer applies. Only callers with every permission see those buttons. The page's existing `alert()`/`confirm()` calls are existing UI and are listed under NOT in scope.
+
+**Pass 1 re-rate after DR1: 6/10.** Every role now has a defined first screen. Still open: the team picker's audience (DR2), the issuer list and labels, the sign-in box order, and the header layout.
+
+### DR2: the dashboard team picker
+Finding: subagent finding 2, CRITICAL, confidence 9/10, §5.2 `whoami` (one resolved team), §5.3 D13, reviewer: Claude design subagent.
+Plan baseline: D13 approved "Team-selection header". Its scope covers "the header, its selection rule, the CLI/dashboard/SDK senders, and the audit team field". T8 lists "a team picker for multi-team users".
+New evidence (why D13's dashboard part is reopened): after DR1, only `admin` and PAT/operator callers see the console. §5.3 requires `admin` to be bound to `*`, so nobody who can use the console has a team to pick. `whoami` also returns only the single resolved team, so the picker has no list to show. One edge remains. A person can match both `admin` on `*` and a team binding listed above it. First match wins, so they resolve to the team binding and get the signed-in screen. Nothing in the plan lets a request select the fleet binding.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Dashboard team picker | planned, no data source | removed; the dashboard sends no `X-AerolVM-Team` | kept; a native `<select>` in the header, shown only when the token matches more than one binding |
+| `whoami` | one resolved team | unchanged | adds `bindings[]`: each matching binding's role and team |
+| Selecting the fleet binding | impossible | stays impossible; docs say "list admin bindings first", as the §5.5 example does | `X-AerolVM-Team: *` selects the matching fleet binding (§5.3, CLI `--team '*'`, SDKs) |
+| D13 elsewhere (CLI, SDKs, audit) | approved | unchanged | unchanged, plus `*` |
+| Effort | — | S, removes work (human ~1 h / CC ~5 min) | S–M (human ~1 d / CC ~30 min) |
+
+State: approved
+Actual answer: A) "Drop the dashboard picker (recommended)" (D4, 2026-10-17)
+Accepted scope:
+- The dashboard sends no `X-AerolVM-Team`, and T8 has no picker. §5.3 says so.
+- The §5.5 `bindings[]` row tells operators to list fleet bindings above team bindings. T11's `access-control.mdx` repeats that rule.
+- The Section 11 note and the test-coverage diagram are updated. D13's CLI, SDK and audit parts are unchanged, and the A3 ledger row records the amendment.
+History: D13 (2026-10-16) approved "Team-selection header (recommended)", covering "the header, its selection rule, the CLI/dashboard/SDK senders, and the audit team field". Reopened for the dashboard sender only, because of the DR1 evidence above.
+
+**Pass 1 re-rate after DR2: 7/10.** No control lacks a data source now. Still open: which issuers get a sign-in button and how they are labelled, the order inside the sign-in box, and the header identity layout.
+
+### DR3: which issuers get a sign-in button, and what it says
+Finding: subagent finding 3, HIGH, confidence 9/10, §5.7 "one 'Sign in with <issuer>' button per discovered issuer", §5.5 identity-file example, reviewer: Claude design subagent.
+Plan baseline: one button per discovered issuer, labelled with the issuer.
+Gap: the §5.5 example has four issuers. Two of them, `github-actions` and `eks-prod`, are workload issuers with no dashboard client id. Read literally, the plan shows "Sign in with github-actions" and "Sign in with eks-prod" buttons that can't start a browser sign-in. The label source is `issuers[].name`, a lowercase slug (`[a-z0-9-]`), so people would read "Sign in with okta".
+Shared by every option: only issuers with `clients.dashboard` set get a button, because a browser sign-in can't start without that client id. Buttons follow identity-file order.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Buttons shown | every issuer | issuers with `clients.dashboard` | issuers with `clients.dashboard` |
+| Label | "Sign in with <name>" | "Sign in with <display_name>"; new optional `issuers[].display_name` (1–40 chars, control characters stripped), falling back to `name` | "Sign in with <name>" (slug as written) |
+| Discovery (`/.well-known/aerolvm-auth`) | issuer URLs, client ids | adds `display_name` | unchanged |
+| Effort | — | S (human ~2 h / CC ~10 min) | S (human ~30 min / CC ~3 min) |
+
+State: approved
+Actual answer: A) "Optional display_name (recommended)" (D5, 2026-10-17)
+Accepted scope:
+- Buttons render only for issuers with `clients.dashboard`, in file order.
+- New optional `issuers[].display_name` (schema row, §5.5 example), published in discovery.
+- T6 validates and publishes the field. T8 checks the two-button render for the example file.
+
+**Pass 1 re-rate after DR3: 8/10.** The sign-in screen now lists only real, readable choices. Still open: the order inside the sign-in box (brand, buttons, token fallback) and the header identity layout.
+
+### DR4: the order inside the sign-in box
+Finding: subagent finding 11, MEDIUM, confidence 8/10, `pkg/api/dashboard.html:151-162` (box heading "sandboxd", placeholder-only token field), header brand "AerolVM" (`:166-169`), §5.7, reviewer: Claude design subagent.
+Plan baseline: Section 11 sketch `[Sign in with Okta] [Sign in with Google] [use a token ▾]`. Nothing fixes the heading, the order, or the relative weight of the buttons and the token box.
+Gap:
+- **Brand.** The first screen says "sandboxd" and the page header says "AerolVM", so the first screen names a process, not the product.
+- **Order and weight.** No rule decides whether SSO or the token box comes first, or how much space each gets.
+- **Token field label.** Its only label is the placeholder "Personal access token", which disappears once you type (a universal hard rule).
+Shared by every option: the token field gets a visible `<label>` ("API token"), with the hint "An avm_ token or the server's PAT." Buttons are full width and stacked, in DR3 order.
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| Heading | "sandboxd" | "AerolVM", then the page's host in muted text | "sandboxd" | "AerolVM", then the host |
+| Line under it | "Sign in with `SB_PAT_TOKEN` to view this node." | "Sign in with your company account." | same as A | same as A |
+| SSO buttons | — | first, full width | first, full width | first, full width |
+| Token box | the whole box | behind a "Use an API token instead" disclosure, after an "or" divider. Closed when any SSO button shows; open, and the only content, when none do. | as A | always visible under the buttons, equal weight |
+| Effort | — | S (human ~2 h / CC ~10 min) | S | S |
+
+State: approved
+Actual answer: A) "AerolVM, SSO first (recommended)" (D6, 2026-10-17)
+Accepted scope: the §5.7 "Sign-in box layout" bullet and its wireframe: the heading and host, the two line variants, SSO buttons first, the token disclosure rule, and the visible token label. T8 checks the disclosure state, the heading and the label.
+
+**Pass 1 re-rate after DR4: 9/10.** The sign-in screen has a fixed order. Still open: the header identity treatment.
+
+### DR5: who you are, in the header
+Finding: subagent finding 9, MEDIUM, confidence 8/10, Section 11 sketch "header: name · role · team ▾ · sign out", `pkg/api/dashboard.html:164-175`, reviewer: Claude design subagent.
+Plan baseline: the CEO review's Section 11 approved showing the name and role in the header. DR2 removed the team. There is no rule for where the identity goes, how long names behave, or what a PAT session shows.
+Gap: after DR1, everyone who sees the header is an `admin` or a PAT/operator caller. The useful difference is between a named admin and a shared-token session, because shared-token actions are recorded as the server, not a person. Long OIDC emails and token names have no width rule.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Position | — | right side, before auto-refresh / Refresh / Sign out | right side, before the controls |
+| Content | — | display name, plus a muted role pill (`admin`) | display name only |
+| PAT/operator session | — | "Server token" with an `operator` pill in `--warn` text. Its `title` reads "Actions are recorded as the server, not a person." | "Server token" |
+| Long names | — | `max-width: 200px`, ellipsis, full value in `title` | same |
+| Effort | — | S (human ~1 h / CC ~5 min) | S (human ~45 min / CC ~4 min) |
+
+State: approved
+Actual answer: A) "Name + role pill (recommended)" (D7, 2026-10-17)
+Accepted scope: the §5.7 "Header identity" bullet and its T8 check. L8 sets one constraint: the `--warn` color appears only with identity on. On a default install the pill is muted, because there is no SSO to steer toward and identity-off behavior stays as today.
+
+**Pass 1 re-rate after DR5: 10/10.** Every role has a defined first screen. The sign-in box, the signed-in screen and the header each have a fixed order, wireframes for the two boxes, and no control without a data source.
+
+## Design Pass 2: Interaction state coverage
+
+**Initial rating: 5/10.** The CEO review's Section 11 state table covers sign-in, the team picker, role-aware actions and expiry. DR1 and DR2 retired two of those rows. Four gaps remain:
+- **Expiry renewal.** It can't be built as written (DR6).
+- **Sign-out.** It signs Google users straight back in (DR7). DR8's buttons depend on it, so it is asked first.
+- **The "no binding" screen.** It has no content spec (DR8).
+- **State wording.** Seven states have no words at all (DR9).
+
+### DR6: renewing an expired sign-in
+Finding: subagent finding 6, HIGH, confidence 8/10, §5.7 "Expiry mid-session", the §5.7 CSP (`frame-src https://accounts.google.com` only), reviewer: Claude design subagent.
+Plan baseline: "on a 401 with `reason: expired`, the page re-runs sign-in silently once (GIS auto-select; SPA providers re-authorize with `prompt=none`). If that fails, it shows 'sign in again' and keeps the current view."
+Gap:
+- **Okta, Entra and Keycloak.** A silent `prompt=none` re-authorization runs in a hidden iframe or a full-page redirect.
+  - The CSP blocks iframes to those providers, and Safari and Chrome now block the provider's cookie inside a third-party iframe, so the iframe route fails.
+  - A redirect reloads the page, and nothing says how the view survives that.
+- **Parallel 401s.** The page polls four panels. When the token expires, four 401s arrive at once, and nothing stops four renewals from starting.
+- **Google.** GIS auto-select is unaffected (its frame is allowed).
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| When | on the first 401 `expired` | proactively at `exp − 120 s` while the tab is visible, and on any 401 `expired` | same as B | on a 401 `expired` |
+| Okta, Entra, Keycloak | `prompt=none` (iframe, blocked) | a refresh-token grant from the browser. The sign-in asks for `offline_access`, and the provider's rotating refresh token sits in `sessionStorage` next to the ID token. Operators must enable SPA refresh tokens at the provider. | a full-page redirect with `prompt=none`. The view (open panel, filters, page) is saved in `sessionStorage` first and restored on return. If a request or a confirm prompt is in progress, the redirect waits for it. | none |
+| Google | GIS auto-select | GIS auto-select | GIS auto-select | none |
+| Concurrency | unspecified | one renewal at a time; auto-refresh pauses and API calls wait for it | same | — |
+| On failure | "sign in again", view kept | a top banner, "Your sign-in expired. [Sign in again]" (`role="alert"`), view kept | same banner | same banner, every time a token expires (about hourly) |
+| What the browser holds | ID token (about 1 h) | ID token, plus a refresh token living up to the provider's limit (Entra SPA: 24 h) | ID token only | ID token only |
+| Effort | — | M (human ~1.5 d / CC ~40 min) | M (human ~1 d / CC ~30 min) | S (human ~2 h / CC ~10 min) |
+
+State: approved
+Actual answer: "Redirect, save the view (recommended)" (D8, 2026-10-17). This is grid column **B**. The question listed it first.
+Accepted scope: the §5.7 "Expiry mid-session" rewrite: proactive plus on-401 timing, single-flight, the `prompt=none` full-page redirect with the view saved and restored, GIS auto-select for Google, and the failure banner. There is no browser refresh token, and the CSP is unchanged. T8 tests single-flight, the redirect, waiting for an in-flight action, and the banner.
+
+### DR7: signing out, and switching accounts
+Finding: subagent finding 5, HIGH, confidence 9/10, `pkg/api/dashboard.html` Sign out (clears `sessionStorage`), §5.7 Google path ("GIS auto-select re-issues it silently"), reviewer: Claude design subagent.
+Plan baseline: Sign out clears the stored token and shows the sign-in box. There is no account-switch path.
+Gap:
+- **Google signs you straight back in.** GIS auto-select is on so renewal can be silent (DR6). After Sign out, the next page load or button click auto-selects the same Google account, so Sign out looks broken.
+- **No way to switch accounts.** For every provider, clicking the button again silently reuses the provider's session. A person who signed in with the wrong account (personal vs work Google, a second Entra tenant) can't switch.
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| Local sign-out | clear the stored token | clear the token and the DR6 saved view; call `google.accounts.id.disableAutoSelect()` | same as A | same as A |
+| After sign-out | sign-in box | the sign-in box with a muted "Signed out." line, focus on the first button | same as A | same as A |
+| Switch account | none | a "Use a different account" link under the buttons: `prompt=select_account` where the issuer's discovery lists it, else `prompt=login`; for Google, GIS account chooser | same as A | none |
+| Provider sign-out | none | none: the person stays signed in to their company account, as with other SSO apps | also redirect to the issuer's `end_session_endpoint`, signing them out at the provider | none |
+| Effort | — | S (human ~3 h / CC ~15 min) | S–M (human ~5 h / CC ~20 min) | S (human ~1 h / CC ~5 min) |
+
+State: approved
+Actual answer: A) "Local sign-out + switch link (recommended)" (D9, 2026-10-17)
+Accepted scope: the §5.7 "Sign out and switching accounts" bullet (local sign-out, `disableAutoSelect()`, the "Signed out." state and the switch link with the `prompt` rule) and its T8 checks. There is no provider sign-out.
+
+### DR8: the "no binding" screen
+Finding: subagent finding 7, HIGH, confidence 9/10, §5.5 "No binding matched" (403, message names the issuer and the caller's groups), Section 11 flow "403 screen with the D9 hint … + [sign out]", reviewer: Claude design subagent.
+Plan baseline: a 403 screen showing the D9 hint and Sign out. The hint is one message string: "no role binding for ana@acme.com", plus the issuer and groups.
+Gap:
+- **No content spec.** The screen has no heading, no wording and no announcement.
+- **Long group lists.** People commonly carry 20 to 150 groups, and the plan would print them inline as one string.
+- **Overage and empty cases.** The Entra overage case ("group overage: bind on Entra app roles") and the no-groups case have no wording.
+- **No structured data.** `whoami` itself returns this 403, so the screen must render from the 403 body, but the body has no structured fields to render from.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Heading | — | "You're signed in, but you don't have access here." | none: the hint text as the box body |
+| Who and where | inside the hint string | "alice@acme.com · Acme Okta" (DR3 display name) | inside the hint string |
+| Guidance | inside the hint string | "No access rule on this server matches your account. Ask your AerolVM admin to add one for a group you're in." | none |
+| Groups | inline in the string | `<details>` "Groups your sign-in carried (N)", up to 50 shown, then "and N more". "Your sign-in carried no groups." when there are none. | inline in the string |
+| Entra overage | "group overage: bind on Entra app roles" | "Your sign-in carried too many groups to list. Ask your admin to bind an Entra app role instead." (no list) | the hint string |
+| Actions | Sign out | Use a different account (DR7) · Sign out | Sign out |
+| Announcement | — | focus moves to the heading; the box has `role="alert"` | — |
+| v1 403 body | message only | adds `reason` (`no_binding` or `group_overage`), `issuer`, `name` and `groups[]`, all the caller's own claims. The facades are unchanged. | unchanged |
+| Effort | — | S (human ~4 h / CC ~20 min) | S (human ~1 h / CC ~5 min) |
+
+State: approved
+Actual answer: A) "Structured screen (recommended)" (D10, 2026-10-17)
+Accepted scope:
+- The §5.7 "No access screen" bullet and its wireframe.
+- The four v1 403 body fields in §5.5. The facades are unchanged, and PAT and managed bodies are unchanged (L8).
+- T6 body tests and T8 render tests.
+
+### DR9: words for every sign-in state
+Finding: subagent finding 8, MEDIUM, confidence 8/10, Section 11 state table, §5.7 HTTPS rule, §5.2 D17 reasons, `dashboard.html:330` ("Invalid or expired token. Sign in again."), reviewer: Claude design subagent.
+Plan baseline: Section 11 gives wording for only two states ("redirecting to <issuer>…", "sign in again"). §5.7 says the plain-HTTP page shows "open https://<domain>/ui to sign in", but the page has no source for `<domain>`.
+Gap: these states have no words, so each engineer would invent them:
+- loading the sign-in options, and the discovery fetch failing;
+- returning from the provider;
+- a provider `?error=`, and a stale state or nonce;
+- a blocked Google pop-up;
+- the D17 401 reasons;
+- a `whoami` 503;
+- the HTTPS pointer, and the plain-HTTP token warning.
+
+Proposed wording. All lines go in the approved `aria-live="polite"` region, and reason codes are shown in parentheses so support can match them:
+
+| State | What the person sees |
+|---|---|
+| Loading sign-in options | muted "Loading sign-in options…" where the buttons go |
+| Discovery fetch failed | "Couldn't load sign-in options. You can still use an API token." plus Retry; the token disclosure opens |
+| Leaving for the provider | the clicked button reads "Opening Acme Okta…"; all buttons disabled |
+| Back from the provider | only "Signing you in…" until `whoami` answers |
+| Provider `?error=` | "Acme Okta didn't sign you in (access_denied). Try again, or use a different account." The URL is cleaned with `history.replaceState`. |
+| Stale state or nonce | "That sign-in attempt expired. Please try again." |
+| Google pop-up blocked | "Your browser blocked the Google sign-in window. Allow pop-ups for this site, then try again." |
+| 401 `not_yet_valid` | "Your computer's clock is more than a minute off. Fix the clock, then sign in again." |
+| 401 `wrong_audience`, `unknown_issuer`, `too_long_lived` | "This server doesn't accept sign-ins from that app (wrong_audience). Ask your AerolVM admin to check the dashboard client id." |
+| 401 `invalid_signature`, `malformed`, `unknown_or_revoked` | "That sign-in couldn't be verified (invalid_signature). Try again. If it keeps failing, tell your AerolVM admin." |
+| `whoami` 503 (identity file or keys unavailable) | "Sign-in is unavailable on this server right now. Try again in a minute, or use an API token." plus Retry; the token disclosure opens |
+| Plain HTTP from another host | buttons replaced by "SSO sign-in needs a secure connection. Open https://api.acme.dev/ui". With no domain: "… Reach this page through an SSH tunnel to localhost:21212." |
+| Token field on plain HTTP | a `--warn` line: "This connection isn't encrypted. Your token will cross the network in plain text." |
+| PAT rejected | unchanged: "Invalid or expired token. Sign in again." (L8) |
+| `avm_` token rejected | "That token has expired." or "That token isn't valid or was revoked." (D17 reason) |
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Wording table above | none | adopted as T8 acceptance criteria | adopted |
+| HTTPS pointer's domain | no source | discovery adds `ui_url` (`https://<SB_DOMAIN>/ui`, omitted when `SB_DOMAIN` is empty) | no domain: always "Open this page at https://<your API domain>/ui, or through an SSH tunnel to localhost:21212." |
+| Effort | — | S (human ~4 h / CC ~20 min) | S (human ~3 h / CC ~15 min) |
+
+State: approved
+Actual answer: A) "Table + ui_url (recommended)" (D11, 2026-10-17)
+Accepted scope: the wording table above as T8 acceptance criteria; discovery `ui_url` from `SB_DOMAIN` (T6 test); the §5.7 HTTPS bullet and "State wording" bullet.
+
+### Pass 2 consolidated state table
+
+This restates DR1 and DR6–DR9 in one place for T8. It replaces the CEO review's Section 11 table and adds no new decision.
+
+| Feature | Loading | Empty | Error | Success | Partial |
+|---|---|---|---|---|---|
+| Sign-in options | "Loading sign-in options…" | no dashboard issuers, or identity off → token disclosure open, "Sign in with an API token." | discovery failed → message plus Retry, token disclosure open | buttons in DR3 order | plain HTTP → buttons replaced by the `ui_url` pointer; token field with the warning |
+| SSO sign-in | "Opening Acme Okta…" then "Signing you in…" | — | provider `?error=`, stale state, pop-up blocked, the D17 401 reasons, `whoami` 503 → DR9 wording | admin or operator → overview; other roles → signed-in screen (DR1) | no binding → no-access screen (DR8) |
+| Token sign-in | button disabled while checking | — | PAT → today's text; `avm_` → reason text | same routing as SSO | — |
+| Session renewal | none visible (Google); the page reloads and restores the view (SPA providers) | — | "Your sign-in expired. [Sign in again]" banner, view kept | same view | auto-refresh paused during renewal |
+| Sign out | — | — | — | "Signed out." in the sign-in box | — |
+
+**Pass 2 re-rate: 10/10.** Every state the identity work adds has words, a place in the table and a T8 test. The overview's own `alert()`/`confirm()` prompts are existing UI that this plan doesn't change, so they are recorded under NOT in scope.
+
+## Design Pass 3: User journey and emotional arc
+
+**Initial rating: 6/10.** Section 11 drew the flow, but no persona was walked through it, and nothing said what each step should feel like. The storyboard below follows the decisions already approved (DR1–DR9) and adds no new treatment.
+
+| Step | User does | User feels | Plan specifies? |
+|---|---|---|---|
+| **Admin, first SSO day** | | | |
+| 1 | Opens `https://api.acme.dev/ui` | Oriented: "this is our AerolVM" | yes: "AerolVM" plus the host, one clear button (DR4) |
+| 2 | Clicks "Sign in with Acme Okta" | Something is happening | yes: "Opening Acme Okta…", then "Signing you in…" (DR9) |
+| 3 | Lands on the overview | Recognized and accountable | yes: name and `admin` pill in the header (DR5) |
+| 4 | Keeps working past the hour | Doesn't notice | yes: one quick reload that restores the view, or none for Google (DR6) |
+| 5 | Clicks Sign out | Done, and trusts it | yes: "Signed out.", no Google auto sign-back-in (DR7) |
+| **New hire with no binding** | | | |
+| 6 | Signs in | Blocked, but not broken | yes: plain heading, next step, groups behind a toggle (DR8) |
+| 7 | Realizes it was the personal Google account | Relief: there's a way out | yes: "Use a different account" (DR7) |
+| **Team viewer** | | | |
+| 8 | Signs in | Clear about why there's no data | yes: the signed-in screen names role and team (DR1) |
+| 9 | Follows the CLI pointer | Expects it to work | **partly**: the pointer says `aerolvm list`, but a fresh CLI isn't signed in, so the first command fails (DR10) |
+| **Operator with the PAT, identity on** | | | |
+| 10 | Opens the token disclosure and pastes the PAT | Reminded their clicks aren't tied to them | yes: "Server token" with a `--warn` `operator` pill (DR5) |
+| **Visitor on plain HTTP** | | | |
+| 11 | Opens `http://10.0.0.5:21212/ui` | Pointed somewhere useful, not stuck | yes: link to `ui_url` (DR9) |
+
+**Time horizons:**
+- **5 seconds.** The product name, the host and one prominent button.
+- **5 minutes.** Sign in, see yourself in the header, work, and renewal never interrupts.
+- **5 years.** Every audit record names a person, and the warning pill keeps shared-token use visible until teams retire the PAT (D4, D5).
+
+### DR10: the signed-in screen's CLI pointer
+Finding: Pass 3 storyboard step 9, MEDIUM, confidence 9/10, §5.7 signed-in screen (`aerolvm list`), §5.6 (`aerolvm login <url>` reads discovery and runs SSO), reviewer: Claude (design review).
+Plan baseline: DR1 approved "a CLI pointer" and wrote it as `aerolvm list`.
+New evidence: a person who just signed in to the dashboard usually has no CLI login on that machine, so `aerolvm list` fails first with "not logged in". The working path is two commands: `aerolvm login https://api.acme.dev` (SSO, §5.6), then `aerolvm list`.
+
+| Choice | Current (DR1) | A | B |
+|---|---|---|---|
+| Pointer on the signed-in screen | `aerolvm list` | two lines: `aerolvm login https://<host>` then `aerolvm list`, the host filled from the page | `aerolvm list` (unchanged) |
+| Effort | — | S (human ~15 min / CC ~2 min) | none |
+
+State: approved
+Actual answer: A) "Show login, then list (recommended)" (D12, 2026-10-17), refining D3's CLI pointer
+Accepted scope: the signed-in screen shows `aerolvm login https://<host>` then `aerolvm list`, with the host taken from the page. The §5.7 text, the wireframe and the T8 check are updated.
+History: D3 approved "a CLI pointer (aerolvm sandbox list)", recorded as `aerolvm list` after checking `cmd/aerolvm/help.go:93-95`. Reopened because of storyboard step 9.
+
+**Pass 3 re-rate: 10/10.** Every persona's steps are specified, and no step leads to a dead end.
+
+## Design Pass 4: AI slop risk
+
+**Classifier: OPERATE (app UI).** The win is "signed in and acting as myself", so the App UI rules apply: calm surfaces, utility copy, few colors.
+
+**Initial rating: 6/10.** DR4 already fixed the brand, so the new screens are one box each, with utility copy and no decoration. The one undecided visual is the Google button. Google renders it in its own iframe, so the plan doesn't control its look by default.
+
+**Hard rejections:** none triggered by the new screens. The overview's KPI tile grid and stacked cards are existing UI that this plan doesn't change (NOT in scope).
+
+**Litmus** (new screens, after DR1–DR10):
+
+| Check | Answer | Evidence |
+|---|---|---|
+| 1. Brand unmistakable in the first screen? | YES | "AerolVM" plus the host heads every box (DR4) |
+| 2. One strong visual anchor? | YES | the full-width SSO button stack (DR4) |
+| 3. Scannable by headlines only? | YES | each box opens with one plain heading (DR1, DR8) |
+| 4. Each section has one job? | YES | one screen per outcome: sign in, signed in without access, no binding (DR1, DR8) |
+| 5. Cards actually necessary? | YES | the single box is the form itself |
+| 6. Motion improves hierarchy? | N/A | none proposed |
+| 7. Premium without decorative shadows? | YES | border-only box, as today |
+
+**AI slop blacklist:** item 11 (system UI font as the primary face) matches the dashboard's existing `--sans` stack. That is existing UI and NOT in scope (prior learning `acebot-no-ui-scope-creep`). Nothing else matches.
+
+### DR11: the Google button and the other SSO buttons
+Finding: subagent finding 4, HIGH, confidence 8/10, §5.7 Google path (GIS renders its own button in an iframe), `dashboard.html:39-42` (button: `--panel2`, 1 px `--border`, radius 4 px), reviewer: Claude design subagent.
+Plan baseline: nothing on button look. By default GIS draws a white, pill-ish button of its own width.
+Gap:
+- **It won't match.** On the dark box, the default Google button is a bright white block of a different height and width from the Okta button.
+- **It can't be restyled.** Google's rendered button is the only supported way to get an ID token with no server secret (D2), so the other buttons have to match Google's geometry, not the other way round.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Google button | GIS defaults (white) | `renderButton` with `theme: "filled_black"`, `size: "large"` (40 px), `shape: "rectangular"`, `text: "signin_with"`, `logo_alignment: "left"`, `width: 312` (the box's inner width) | GIS defaults |
+| Other SSO buttons | the page's default button (4 px × 10 px padding) | matched to Google: 40 px tall, full width (312 px), radius 4 px, the existing `button` look (`--panel2`, 1 px `--border`, hover `--accent`), 14 px text, no accent fill | the page's accent-colored primary button |
+| Effect | mismatched stack | one even stack, Google indistinguishable in size and weight | a white Google block next to a blue Okta button |
+| Effort | — | S (human ~1 h / CC ~5 min) | none |
+
+State: approved
+Actual answer: A) "Match Google's dark button (recommended)" (D13, 2026-10-17)
+Accepted scope: the GIS `renderButton` options and the matched geometry for the other SSO buttons in §5.7 "Sign-in box layout", plus the T8 check.
+
+**Pass 4 re-rate: 10/10.** The new screens use specific, intentional treatments: one box, utility copy, an even button stack and existing tokens. No hard rejection or slop pattern is introduced. The existing dashboard's font stack and card layout stay out of scope.
+
+## Design Pass 5: Design system alignment
+
+`DESIGN.md` is the actor model, not a visual system, so this pass rates the plan's explicit tokens against the dashboard's own CSS (`pkg/api/dashboard.html:10-147`).
+
+**Initial rating: 7/10.** Earlier decisions mapped most new elements to existing styles. The pills (DR5), the banner (DR6), the "or" divider (DR4), the inline error lines (DR9) and the token warning (DR9) were approved as elements but had no token named.
+
+**Token map.** Each row applies an existing class or token to an element an earlier decision already approved. No new visual choice is made, so no question was needed:
+
+| Element (approved by) | Existing token or class |
+|---|---|
+| Sign-in, signed-in and no-access boxes (DR1, DR4, DR8) | `#login .box`: `--panel`, 1 px `--border`, radius 8 px, 24 px padding, 360 px |
+| Heading "AerolVM" (DR4) | `#login h1` (18 px) |
+| Host line, "Signed out.", loading lines (DR4, DR7, DR9) | `--muted`, `#login p` |
+| SSO buttons (DR11, DR12, DR14) | `button` (`--panel2` fill, hover `--accent`) with a 1 px `--muted2` border, 40 px tall, as wide as the box |
+| "or" divider (DR4) | 1 px `--border-soft` rules with `--muted` text, 12 px |
+| Token disclosure, groups toggle (DR4, DR8) | `details > summary` (`--muted`, 12 px) |
+| Role pill `admin` (DR5) | `.pill.muted` |
+| `operator` pill with identity on (DR5) | `.pill.warn` |
+| Inline error lines (DR9) | `.error` (`--bad`), `#login .error` (12 px) |
+| Plain-HTTP token warning (DR9) | `--warn` text, 12 px |
+| "Your sign-in expired" banner (DR6) | the `.pill.warn` palette (`#231e10` background, `#5a4a1c` border, `--warn` text) as a full-width bar under the header, 8 px × 16 px padding, with Sign in again as a standard `button` |
+
+**New components:** none. Every element is built from the classes above.
+
+**Pass 5 re-rate: 10/10.** Every new element names an existing token or class. Turning `DESIGN.md` into a visual system (`/design-consultation`) is out of this feature's scope and recorded under NOT in scope.
+
+## Design Pass 6: Responsive and accessibility
+
+**Initial rating: 4/10.**
+- **Section 11's rules.** Real `<button>`s labelled with the issuer, focus on the first button, errors in `aria-live="polite"`, and "reflow at phone width like the rest of `/ui`".
+- **Responsive gaps (DR12).** `dashboard.html` has no `@media` rule at all, so "like the rest" specifies nothing. DR11's 312 px Google button overflows a 320 px phone, because the box shrinks to 92vw.
+- **Accessibility gaps.** Focus can't start on Google's button, which lives in an iframe (DR13). No focus ring is themed. The SSO button border is 1.34:1 against the box (DR14).
+
+Already passing, measured from the tokens:
+- **Text contrast:** `--muted` on `--panel` 5.94:1, `--text` 14.5:1, `--bad` 6.09:1, `--warn` on its pill 9.94:1.
+- **Target size:** 40 px buttons meet WCAG 2.2 AA target size (24 px). Google's large button is fixed at 40 px, so 44 px (AAA) is not reachable for it.
+- **Alerts:** `role="alert"` on the banner and the no-access box (DR6, DR8).
+
+### DR12: narrow screens
+Finding: subagent finding 9 (wrap below 720 px) and Pass 6 review, MEDIUM, confidence 8/10, `dashboard.html:68,142` (`max-width: 92vw`, no `@media`), §5.7 DR11 (`width: 312`), reviewer: Claude design subagent and Claude (design review).
+Plan baseline: Section 11 says "reflow at phone width like the rest of `/ui`".
+Gap: there is no reflow to copy.
+- On a 375 px phone, the header holds the brand, node summary, name, pill, auto-refresh, Refresh and Sign out in one row and overflows.
+- On a 320 px phone, the box is 294 px wide, and the fixed 312 px Google button overflows it.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Header below 720 px | overflows | wraps to two rows: brand and node summary, then identity and controls; the name's `max-width` drops to 140 px | unspecified (desktop target) |
+| Boxes below 400 px | 92vw, 24 px padding | 92vw, 16 px padding | unchanged |
+| Google button width | fixed 312 px | the box's measured inner width (GIS allows 200–400 px), re-rendered on resize; other SSO buttons `width: 100%` | fixed 312 px |
+| Banner below 480 px | — | text wraps, and "Sign in again" drops below it | unspecified |
+| Stated support | — | the new screens fit 320 px with no horizontal scroll; overview tables keep today's horizontal scroll (`.card .body`) | `/ui` targets ≥ 1024 px; phones unsupported |
+| Effort | — | S (human ~2 h / CC ~10 min) | S (docs line only) |
+
+State: approved
+Actual answer: A) "Specify narrow behavior (recommended)" (D14, 2026-10-17)
+Accepted scope: the §5.7 "Narrow screens" bullet, the DR11 width rule switched to the measured width, and the T8 viewport checks at 320 and 375 px.
+
+### DR13: keyboard focus
+Finding: subagent finding 4 (focus) and Pass 6 review, MEDIUM, confidence 8/10, Section 11 "keyboard focus lands on the first one", DR7 "focus on the first button", `dashboard.html` (no `:focus` or `:focus-visible` rule; `autofocus` on the token field at `:156`), reviewer: Claude design subagent and Claude (design review).
+Plan baseline: focus starts on the first sign-in button, and the browser's default focus ring is used.
+Gap:
+- **Focus can't always start on the first button.** When Google is the first issuer, the first button is Google's iframe, which a script can't reliably focus. The rule fails, and keyboard users start nowhere.
+- **The ring is unthemed.** The default ring on the dark box is a thin blue or black outline that varies by browser, often under 3:1 against `--panel`.
+- **Stale autofocus.** The token field's `autofocus` would steal focus from the SSO buttons when the disclosure is closed.
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Where focus starts | "first button" | the first focusable element in the box that isn't Google's iframe: an SSO button, else "Use a different account", else the token disclosure's summary, else the token field when it's the only content. On the no-access screen, the heading (DR8). | first button, whatever it is |
+| Token field `autofocus` | always | removed; focus is set by the rule above | kept |
+| Focus ring | browser default | `:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px }` on the new elements (`--accent` on `--panel` is 7.21:1) | browser default |
+| Tab order | — | visual order; the overview is `hidden` while a box shows, so no focus trap is needed | — |
+| Effort | — | S (human ~1 h / CC ~5 min) | none |
+
+State: approved
+Actual answer: A) "Focus rule + accent ring (recommended)" (D15, 2026-10-17)
+Accepted scope:
+- The §5.7 "Keyboard focus" bullet: the start rule, `autofocus` removed, the themed ring and tab order.
+- DR7's "focus on the first button" now points to the DR13 rule. The Section 11 accessibility rule is superseded on this point.
+- T8 checks the start rule with Google listed first and with Google as the only issuer.
+
+### DR14: SSO button edges
+Finding: Pass 6 review, MEDIUM, confidence 7/10, `dashboard.html:39-42` (`button` border `--border` #2a2f3a; background `--panel2`), the box `--panel` #14171d, Google's dark button style (fill #131314, 1 px stroke #8E918F, per Google's sign-in branding guidelines), reviewer: Claude (design review).
+Plan baseline: DR11 gives the other SSO buttons the existing `button` look.
+Gap:
+- **Our button edges are nearly invisible.** The existing border is 1.34:1 against the box, and the button fill is barely lighter than the box.
+- **Google's edge is not.** Its button carries a light gray stroke at 5.64:1.
+- **The result.** The Okta button reads as text floating in the box, beside a clearly outlined Google button. DR11's even stack breaks. The labels identify the controls, so WCAG 1.4.11 is technically met, but the primary action loses its shape.
+
+| Choice | Current (DR11) | A | B |
+|---|---|---|---|
+| SSO button border in the boxes | `--border` (1.34:1) | `--muted2` #6a7385 (3.76:1), close to Google's stroke; hover stays `--accent` | `--border` |
+| Other buttons on the page | unchanged | unchanged | unchanged |
+| Effort | — | S (human ~10 min / CC ~1 min) | none |
+
+State: approved
+Actual answer: A) "Visible border (recommended)" (D16, 2026-10-17)
+Accepted scope: SSO buttons in the boxes use a 1 px `--muted2` border, with hover still `--accent`, in §5.7, the Pass 5 token map and the T8 check. Other buttons are unchanged.
+
+**Pass 6 re-rate: 10/10.**
+- **Narrow screens.** The new screens have explicit layouts down to 320 px (DR12).
+- **Keyboard.** Focus starts somewhere usable, with a themed ring (DR13).
+- **Contrast.** Control edges are 3:1 or better (DR14), text contrast is 5.5:1 or better, and the targets meet WCAG 2.2 AA.
+- **Announcements.** Errors use the polite live region, and the expiry and no-access states use `role="alert"`.
+
+## Design Pass 7: Unresolved design decisions
+
+Earlier passes left no dashboard decision open: DR1–DR14 are approved. One in-scope surface is still unspecified: the CLI text that T7 adds. It is listed under the review's secondary scope.
+
+| Decision needed | If deferred, what happens |
+|---|---|
+| CLI wording for SSO sign-in, `whoami`, the no-binding case, the refresh failure and the expiry warning (DR15) | T7's golden tests lock in whatever an engineer writes first, and the CLI's words drift from the dashboard's (DR8, DR9) |
+
+### DR15: CLI words for the identity commands
+Finding: Pass 7, MEDIUM, confidence 8/10, §5.6 (`aerolvm login <url>`, refresh, `whoami`, expiry warnings, the refresh hint "sign in again with `aerolvm login --sso`"), T7 golden tests, `cmd/aerolvm/login.go:316-319` (house style: `aerolvm:` notes on stderr, e.g. "aerolvm: logged in to %s (sandboxd %s). The token is saved in %s, readable only by you."), reviewer: Claude (design review).
+Plan baseline: §5.6 names the commands and one hint string. There is no wording for the issuer choice, the browser and device prompts, success, no binding, the expiry warning, or the `whoami` layout.
+
+Proposed wording (stderr notes in the existing `aerolvm:` style; `--json` output unchanged):
+
+| Moment | Text |
+|---|---|
+| More than one issuer with a CLI client | `aerolvm: sign in with  [1] Acme Okta  [2] Google` then `Choose [1]: ` (DR3 display names) |
+| Browser flow | `aerolvm: opening your browser to sign in with Acme Okta. If it doesn't open, visit: <url>` |
+| Device flow (`--device`) | `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…` |
+| Success | `aerolvm: logged in to https://api.acme.dev as alice@acme.com (role runner, team payments) through Acme Okta. The login is saved in <path>, readable only by you.` |
+| No binding | `aerolvm: signed in as alice@acme.com through Acme Okta, but no access rule on https://api.acme.dev matches your account. Ask your AerolVM admin to add one for a group you're in. Your sign-in carried: <up to 10 groups> (and N more).` The Entra overage case uses DR8's wording. |
+| Refresh failed | `aerolvm: your sign-in to https://api.acme.dev expired and couldn't be renewed. Sign in again: aerolvm login --sso https://api.acme.dev` |
+| `avm_` token expiring (D8, D15) | `aerolvm: warning: the API token "ci-deploy" expires in 6 days (2026-10-23). Ask an admin for a new one before then.` |
+| `aerolvm whoami` | first line: the name; then aligned `role`, `team` (or `all teams`), `via` (display name, or `API token "ci-deploy"`, or `server token`), `expires` (`in 54m (15:04 UTC)` or `never`) |
+
+| Choice | Current | A | B |
+|---|---|---|---|
+| Wording | one hint string | the table above, as T7's golden-test fixtures | left to the T7 implementer; golden tests record what ships |
+| Effort | — | S (human ~1 h / CC ~5 min) | none |
+
+State: approved
+Actual answer: A) "Adopt the CLI table (recommended)" (D17, 2026-10-17)
+Accepted scope: the table above as T7's golden fixtures, the §5.6 "Wording" bullet, and the refresh-failure line rewritten in §5.6. `--json` output is unchanged.
+
+**Pass 7 result:** 1 decision surfaced, 1 resolved, 0 deferred.
+
+## Design review outputs
+
+### NOT in scope
+
+- **Restyling the existing overview** (KPI tiles, cards, tables). Existing UI that identity doesn't change (prior learning `acebot-no-ui-scope-creep`).
+- **The dashboard's 13 px type scale and system font stack (`--sans`).** Below the 16 px body guideline and on the slop list, but existing. The new boxes follow them so the page stays consistent.
+- **Replacing the overview's `alert()`/`confirm()` prompts** (`dashboard.html:754-764`). Existing, and after DR1 only admins and operators see them.
+- **A phone layout for the overview's tables.** They keep today's horizontal scroll (DR12 covers only the new screens and the header).
+- **A team-facing dashboard view.** DR1 option C, declined in D3. Team users get the CLI pointer.
+- **Remembering the last-used issuer** (subagent finding 11). A convenience beyond the feature.
+- **Signing out at the provider.** DR7 option B, declined in D9.
+- **Browser refresh tokens.** DR6's refresh-token option, declined in D8.
+- **A visual `DESIGN.md`** (`/design-consultation`). `DESIGN.md` stays the actor model, and this feature uses the dashboard's CSS as its system.
+- **An expiry countdown and a "copy whoami" button.** Left out by the CEO review's Section 11, and still out.
+
+### What already exists
+
+- **`#login .box`** (`dashboard.html:136-147`). Reused for the sign-in, signed-in and no-access boxes (DR1, DR4, DR8).
+- **Existing styles and tokens.** `button`, `.pill.muted`, `.pill.warn`, `.error`, `details > summary`; `--panel`, `--panel2`, `--muted`, `--muted2`, `--accent`, `--warn`, `--bad` (Pass 5 token map).
+- **Bearer in `sessionStorage`** (`dashboard.html:266,300`). It keeps holding the bearer, now the ID token.
+- **The CLI's house style.** `aerolvm:` notes (`cmd/aerolvm/login.go:316-319`) and `aerolvm list` (`cmd/aerolvm/help.go:93-95`) (DR10, DR15).
+- **Google's rendered button** and its dark-theme options (DR11).
+- **`/.well-known/aerolvm-auth`** (T6). Extended with `display_name` and `ui_url` (DR3, DR9).
+- **The D9 403 hint and the D17 401 reasons.** The dashboard and CLI wording renders them, and the reason codes appear in parentheses.
+
+### TODOS.md updates
+
+None proposed. The NOT-in-scope items are existing UI choices or options you declined, not debt this feature creates.
+
+### Implementation tasks (design review)
+
+Synthesized from this review's findings. Each folds into the stack task named in brackets. Effort assumes features at ~30× and tests at ~50× (human ÷ CC).
+
+- [ ] **DT1 (P1, human: ~3h / CC: ~15min)** — dashboard [T8] — Admin-only console, plus a signed-in screen with the two-line CLI pointer
+  - Surfaced by: Pass 1 DR1, Pass 3 DR10
+  - Files: `pkg/api/dashboard.html`
+  - Verify: `/browse` with a viewer token. The signed-in screen shows, and no `/v1/cluster/*` or `/debug/vars` request is made.
+- [ ] **DT2 (P1, human: ~4h / CC: ~20min)** — dashboard [T8] — The sign-in box:
+  - Issuer filter and display names.
+  - AerolVM heading, SSO first, token disclosure, visible label.
+  - Google's dark button, matched buttons with a `--muted2` border.
+  - Surfaced by: Pass 1 DR3, DR4; Pass 4 DR11; Pass 6 DR14
+  - Files: `pkg/api/dashboard.html`
+  - Verify: `/browse` with the §5.5 example file: two 40 px buttons, the disclosure closed, the label present.
+- [ ] **DT3 (P1, human: ~3h / CC: ~15min)** — dashboard [T8] — Header identity pills; sign-out with `disableAutoSelect()`; "Use a different account"
+  - Surfaced by: Pass 1 DR5, Pass 2 DR7
+  - Files: `pkg/api/dashboard.html`
+  - Verify: T8 checks. An SSO admin and the PAT render their pills. After Sign out, Google doesn't sign the person back in.
+- [ ] **DT4 (P1, human: ~1d / CC: ~30min)** — dashboard [T8] — Renewal:
+  - at `exp − 120 s` and on any 401, one at a time;
+  - a `prompt=none` redirect that saves and restores the view;
+  - GIS auto-select for Google;
+  - the expiry banner.
+  - Surfaced by: Pass 2 DR6
+  - Files: `pkg/api/dashboard.html`
+  - Verify: T8 tests. Four 401s start one renewal, the view is restored, the redirect waits for an in-flight action, the banner shows on failure.
+- [ ] **DT5 (P1, human: ~5h / CC: ~25min)** — dashboard [T8] — No-access screen and the full state-wording table
+  - Surfaced by: Pass 2 DR8, DR9
+  - Files: `pkg/api/dashboard.html`
+  - Verify: T8 render tests for every row of the DR9 table and the consolidated state table.
+- [ ] **DT6 (P1, human: ~3h / CC: ~15min)** — dashboard [T8] — Narrow-screen rules and the keyboard focus rule with its accent ring
+  - Surfaced by: Pass 6 DR12, DR13
+  - Files: `pkg/api/dashboard.html`
+  - Verify: `/browse` at 320 and 375 px shows no horizontal scroll. A keyboard Tab test runs with Google listed first and with Google as the only issuer.
+- [ ] **DT7 (P1, human: ~4h / CC: ~20min)** — identity [T6] — `issuers[].display_name`; discovery `display_name` and `ui_url`; the v1 no-binding 403 fields (`reason`, `issuer`, `name`, `groups[]`)
+  - Surfaced by: Pass 1 DR3, Pass 2 DR8, DR9
+  - Files: `internal/identity/`, `pkg/identitywire/`, `pkg/api/`
+  - Verify: `go test ./internal/identity/... ./pkg/identitywire/... ./pkg/api/...`
+- [ ] **DT8 (P1, human: ~3h / CC: ~15min)** — cli [T7] — DR15 wording and golden fixtures
+  - Surfaced by: Pass 7 DR15
+  - Files: `cmd/aerolvm/login.go`, `cmd/aerolvm/testdata/`
+  - Verify: `go test ./cmd/aerolvm/...`
+- [ ] **DT9 (P2, human: ~1h / CC: ~5min)** — docs [T11] — The fleet-bindings-first rule; `display_name` and `ui_url`; the admin-only console in `dashboard.mdx`
+  - Surfaced by: Pass 1 DR2, DR3; Pass 2 DR9; Pass 1 DR1
+  - Files: `docs/src/content/docs/enterprise/access-control.mdx`, `docs/src/content/docs/dashboard.mdx`
+  - Verify: `make docs-build` with npm 10
+
+### Completion summary
+
+```
+  +====================================================================+
+  |         DESIGN PLAN REVIEW — COMPLETION SUMMARY                    |
+  +====================================================================+
+  | System Audit         | DESIGN.md = actor model (no visual system);  |
+  |                      | UI scope: /ui sign-in + console, CLI text    |
+  | Step 0               | 5/10, all 7 dimensions (D1)                  |
+  | Pass 1  (Info Arch)  | 4/10 → 10/10 after fixes                     |
+  | Pass 2  (States)     | 5/10 → 10/10 after fixes                     |
+  | Pass 3  (Journey)    | 6/10 → 10/10 after fixes                     |
+  | Pass 4  (AI Slop)    | 6/10 → 10/10 after fixes                     |
+  | Pass 5  (Design Sys) | 7/10 → 10/10 after fixes                     |
+  | Pass 6  (Responsive) | 4/10 → 10/10 after fixes                     |
+  | Pass 7  (Decisions)  | 1 resolved, 0 deferred                       |
+  +--------------------------------------------------------------------+
+  | NOT in scope         | written (10 items)                           |
+  | What already exists  | written                                      |
+  | TODOS.md updates     | 0 items proposed                             |
+  | Approved Mockups     | 0 generated, 0 approved (no OpenAI key)      |
+  | Decisions made       | 15 added to plan (DR1–DR15, asked D3–D17)    |
+  | Decisions deferred   | 0                                            |
+  | Overall design score | 4/10 → 10/10                                 |
+  +====================================================================+
+```
+
+**Outside voice:** Codex unavailable (invalid model id). The Claude design subagent's 11 findings were all handled:
+- 9 by their own decision: findings 1–9 map to DR1, DR2, DR3, DR11, DR7, DR6, DR8, DR9 and DR5/DR12.
+- Finding 10 became moot under DR1.
+- Finding 11 was split: the brand and order became DR4, and "remember the last issuer" is NOT in scope.
+
+Plan is design-complete. Run `/design-review` after implementation for visual QA.
+
+### Unresolved decisions (design review)
+
+None. All 15 design findings were asked and answered (D3–D17).
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN | 7 proposals, 7 accepted, 0 deferred |
-| Outside Review | codex (`/plan-ceo-review` outside voice) | Independent 2nd opinion | 1 | unavailable | Codex `model_unusable` (invalid model id); native fallback unavailable (no TaskOutput); no completed external review |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
-| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| Outside Review | codex (outside voice in `/plan-ceo-review` and `/plan-eng-review`) | Independent 2nd opinion | 2 | unavailable | Codex `model_unusable` (invalid model id) both times; native fallback unavailable (no TaskOutput); no completed external review |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 9 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 1 | CLEAR | score: 4/10 → 10/10, 15 decisions |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **OUTSIDE COVERAGE:** codex, plan-review phase, unavailable. No completed external review.
-- **VERDICT:** no review is CLEAR yet. The CEO review is ISSUES OPEN, with 1 decision (5.1) handed to eng review; 9.2 was resolved by #724. Eng review required.
+- **OUTSIDE COVERAGE:**
+  - **Codex, plan-review phase:** unavailable in both the CEO and the eng review.
+  - **Codex, design phase:** unavailable. The in-host Claude design subagent completed with 11 findings, all resolved (DR1–DR15). It is native, so it is not outside coverage. No completed external review exists.
+- **Staleness:**
+  - The CEO review was recorded at `0d8e51f9`.
+  - The eng and design reviews were recorded at `57a0f499`, plus uncommitted edits to this file (the eng-review and design-review records).
+  - The design review adds server-visible fields that the eng review never saw:
+    - `issuers[].display_name`;
+    - discovery `display_name` and `ui_url`;
+    - the v1 no-binding 403 fields `reason`, `issuer`, `name` and `groups[]`.
+  - It also drops the dashboard's `X-AerolVM-Team` sender.
+- **VERDICT:**
+  - **DESIGN CLEARED.**
+  - **Eng review: ISSUES OPEN.** It found 9 issues, all resolved into accepted changes and tasks, with 0 unresolved decisions and 0 critical gaps. Eng review required. A quick eng re-check of the new fields above is recommended.
 
 **UNRESOLVED DECISIONS:**
-- 5.1: structure of `authenticate()` (one function vs. an ordered authenticator list). Behavior-neutral; owner T1 / `/plan-eng-review`.
+- + 2 unresolved from prior reviews
