@@ -294,6 +294,60 @@ Examples:
   aerolvm token revoke tok_7Hq2aBcDeFgH
 `
 
+const accessHelp = `Review who holds access and what they did with it: the evidence for a
+quarterly access review (SOC 2 CC6.2/6.3).
+
+Usage: aerolvm access review --since <when> (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
+                             [--format md|csv] [--witness s3://<bucket>[/<prefix>]]
+
+access review joins the token list (GET /v1/tokens, which needs an auditor or
+admin) with the audit export into one report:
+
+  - every token: name, role, team, creator, expiry, its last recorded action
+    and its calls by kind;
+  - every token created or revoked in the window, and who did it;
+  - every other principal the records name (people, the operator token,
+    nodes, daemon subsystems, sandbox SSH keys): last action, calls by kind;
+  - refused credentials (401s) by source address;
+  - each node's verdict and what its records cover.
+
+Flags on rows: admin, admin_grant (a token minted with the admin role),
+expired (not yet swept), expiring (within 30 days), revoked, not_listed (a
+token that acted but is gone), no_recorded_action (no api record names the
+token in the window), denied (403s), refused (401s) and rate_limited (calls
+the audit flood budget summarized). Plain reads leave a record only with
+SB_AUDIT_API_RECORDS=all; the report says what the records show, so
+no_recorded_action is not read as "unused".
+
+The export is read the way audit verify reads it, so every record counted
+links into its node's chain. A tampered batch fails the review: nothing is
+printed on stdout and the verdict goes to stderr (exit 1). INCOMPLETE
+evidence prints the report with a warning (exit 3), and so does an export
+with no batches (exit 3, no report).
+
+Flags:
+  --since T         window start: an RFC3339 time, a duration (2160h) or days
+                    (90d). Required
+  --export URL      the S3 audit export (SB_AUDIT_EXPORT_S3_*)
+  --export-dir D    batches saved from a webhook or bus receiver, laid out as
+                    D/node=<id>/YYYY/MM/DD/<batch>.jsonl
+  --format F        md (default) or csv
+  --witness URL     also check the witnessed heads, as audit verify does;
+                    nodes then come from the witness
+  --max-lag D       how long a head may wait for its records (default 15m)
+  --region R        AWS region for the buckets
+  --endpoint URL    S3-compatible endpoint
+  --path-style      path-style S3 addressing
+  --json            print the report as JSON instead
+
+Markdown special characters in names are escaped, and a CSV cell that starts
+with =, +, - or @ gets a leading ' so a spreadsheet does not run it.
+
+Examples:
+  aerolvm access review --export s3://acme-audit/audit --since 90d > access-review.md
+  aerolvm access review --export-dir ./audit-export --since 2026-07-01T00:00:00Z --format csv > review.csv
+`
+
 const logoutHelp = `Forget the saved login. The token only leaves this machine; it keeps
 working on sandboxd until an operator revokes it.
 

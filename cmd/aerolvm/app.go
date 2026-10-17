@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -42,6 +43,9 @@ type app struct {
 	// conn is the connection the command's tools use, so a refused token
 	// can be named in the error.
 	conn *connection
+	// now is the clock a report is dated by; nil means time.Now. Tests pin
+	// it so a golden report does not drift with the calendar.
+	now func() time.Time
 }
 
 func newApp() *app {
@@ -97,6 +101,7 @@ func (a *app) verbGroups() []verbGroup {
 		}},
 		{"Access", []verb{
 			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},
+			{"access", "Review who holds access and what they did with it", accessHelp, runAccess},
 		}},
 		{"Setup", []verb{
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
@@ -348,3 +353,11 @@ func signalExit(sig os.Signal) int {
 }
 
 func versionString() string { return version.Version }
+
+// clock is the time a command reads as "now", in UTC.
+func (a *app) clock() time.Time {
+	if a.now != nil {
+		return a.now().UTC()
+	}
+	return time.Now().UTC()
+}
