@@ -18,6 +18,11 @@ from typing import Any, Dict, Iterator, List, Optional, Union
 from ._internal.api.v1.paths import PATH_PREFIX as _V1_PATH_PREFIX
 from .image import Image
 from .types import (
+    APIToken,
+    APITokenList,
+    CreateAPITokenOptions,
+    CreatedAPIToken,
+    WhoAmI,
     BuildImagePushOptions,
     BuildImageResult,
     CloneGeneration,
@@ -104,14 +109,68 @@ def _read_env(name: str) -> Optional[str]:
     return value if value not in (None, "") else None
 
 
+# The request header that selects which of a credential's teams a request
+# acts for. Keep in sync with pkg/api.HeaderTeam on the server.
+TEAM_HEADER = "X-AerolVM-Team"
+
+
 class MicroVMError(Exception):
     pass
 
 
 class MicroVMHTTPError(MicroVMError):
-    def __init__(self, status_code: int, message: str) -> None:
+    """An HTTP error response from sandboxd. ``str(err)`` is the server's
+    message. The other attributes are empty unless the server sent them:
+
+    - ``code``: a stable error code a client can act on.
+    - ``reason``: why an avm_ API token or an OIDC token was refused
+      (``expired``, ``unknown_or_revoked``, ``no_binding``, ...).
+    - ``required_permission`` and ``role``: on a 403 for an API token or an
+      OIDC caller, the permission the route needs and the role held.
+    - ``issuer``, ``name`` and ``groups``: on the 403 an OIDC caller gets
+      when no role binding matches, the caller's own claims.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str = "",
+        reason: str = "",
+        required_permission: str = "",
+        role: str = "",
+        issuer: str = "",
+        name: str = "",
+        groups: Optional[List[str]] = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
+        self.reason = reason
+        self.required_permission = required_permission
+        self.role = role
+        self.issuer = issuer
+        self.name = name
+        self.groups: List[str] = list(groups or [])
+
+
+def _http_error(status_code: int, data: Any, fallback: str) -> MicroVMHTTPError:
+    """Builds the error for a decoded JSON error body."""
+    if not isinstance(data, dict):
+        return MicroVMHTTPError(status_code, fallback)
+    groups = data.get("groups")
+    return MicroVMHTTPError(
+        status_code,
+        str(data.get("error", fallback)),
+        code=str(data.get("code") or ""),
+        reason=str(data.get("reason") or ""),
+        required_permission=str(data.get("required_permission") or ""),
+        role=str(data.get("role") or ""),
+        issuer=str(data.get("issuer") or ""),
+        name=str(data.get("name") or ""),
+        groups=[str(g) for g in groups] if isinstance(groups, list) else None,
+    )
 
 
 class ExecStreamHandle:
@@ -477,7 +536,7 @@ class Sandbox:
 
 class MicroVM:
     default_api_url = "http://127.0.0.1:21212"
-    auth_required_error_message = "PAT token is required. Set pat_token or SB_PAT_TOKEN."
+    auth_required_error_message = "PAT token is required. Set pat_token, SB_PAT_TOKEN or SB_API_TOKEN."
 
     def __init__(
         self,
@@ -486,13 +545,28 @@ class MicroVM:
         *,
         api_version: str = _DEFAULT_API_VERSION,
         config: Optional[MicroVMConfig] = None,
+        team: Optional[str] = None,
     ) -> None:
+        """``pat_token`` is the bearer every request carries: the operator
+        PAT, an avm_ API token or an OIDC ID token. It defaults to
+        ``SB_PAT_TOKEN``, then its alias ``SB_API_TOKEN``; when both are set,
+        ``SB_PAT_TOKEN`` wins.
+
+        ``team`` (default ``SB_TEAM``) is sent as the ``X-AerolVM-Team``
+        header on every request, WebSocket handshakes included. With
+        neither, no header is sent and the server uses the credential's
+        first matching binding. The header only chooses among teams the
+        credential is already bound to: a team it does not hold is refused
+        (403), and the operator PAT ignores it.
+        """
         if config is not None:
             api_url = api_url or config.get("apiUrl")
             pat_token = pat_token or config.get("patToken")
-        
+            team = team or config.get("team")
+
         self.api_url = _normalize_url(api_url or _read_env("SB_API_URL") or self.default_api_url)
-        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or ""
+        self.pat_token = pat_token or _read_env("SB_PAT_TOKEN") or _read_env("SB_API_TOKEN") or ""
+        self.team = (team or _read_env("SB_TEAM") or "").strip()
 
         retry_cfg: RetryConfig = config.get("retry", {}) if config else {}
         self._retry_config = {
@@ -1019,6 +1093,17 @@ class MicroVM:
     def _egress_profile_path(self, name: str) -> str:
         return f"{self._version_prefix}/egress-profiles/{urllib.parse.quote(name, safe='')}"
 
+    def whoami(self) -> WhoAmI:
+        """Who the server says the caller is: principal, role, team and when
+        the credential expires. Every valid credential may ask."""
+        return _from_api_whoami(self._do_json("GET", self._versioned("/whoami"), None) or {})
+
+    @property
+    def tokens(self) -> "Tokens":
+        """Scoped API tokens (avm_…) for services and CI:
+        ``client.tokens.create/list/revoke``."""
+        return Tokens(self)
+
     def exec(self, sandbox_id: str, request: ExecRequest) -> ExecResult:
         # Not idempotent: a re-sent POST runs the user's command again, so a
         # timeout or reset after the request went out surfaces instead of
@@ -1038,7 +1123,7 @@ class MicroVM:
 
         websocket_module = _load_websocket_module()
         ws_url = _to_websocket_url(self.api_url, f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/toolbox/process/exec/stream")
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "exec stream")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "exec stream")
         ws.send(json.dumps(_to_api_exec_stream_request(options)))
         return ExecStreamHandle(websocket_module, ws, options)
 
@@ -1084,7 +1169,7 @@ class MicroVM:
             self.api_url,
             f"{self._version_prefix}/sandboxes/{urllib.parse.quote(sandbox_id, safe='')}/sessions/{urllib.parse.quote(session_id, safe='')}/attach",
         )
-        ws = _connect_websocket(websocket_module, ws_url, self.pat_token, "session attach")
+        ws = _connect_websocket(websocket_module, ws_url, self._websocket_headers(), "session attach")
 
         cols = _first_of(attach_options, "cols")
         rows = _first_of(attach_options, "rows")
@@ -1216,6 +1301,12 @@ class MicroVM:
     def _url(self, path: str) -> str:
         return f"{self.api_url}{path}"
 
+    def _websocket_headers(self) -> List[str]:
+        headers = [f"Authorization: Bearer {self.pat_token}"]
+        if self.team:
+            headers.append(f"{TEAM_HEADER}: {self.team}")
+        return headers
+
     def _request(
         self,
         method: str,
@@ -1258,6 +1349,8 @@ class MicroVM:
         for attempt in range(max_retries + 1):
             request = urllib.request.Request(url, data=body, method=method)
             request.add_header("Authorization", f"Bearer {self.pat_token}")
+            if self.team:
+                request.add_header(TEAM_HEADER, self.team)
             if content_type is not None:
                 request.add_header("Content-Type", content_type)
             for header_key, header_val in (extra_headers or {}).items():
@@ -1279,9 +1372,9 @@ class MicroVM:
                         exc.close()
                     try:
                         data = json.loads(payload.decode("utf-8"))
-                        raise MicroVMHTTPError(exc.code, str(data.get("error", exc.reason))) from exc
                     except (ValueError, TypeError):
                         raise MicroVMHTTPError(exc.code, str(exc.reason)) from exc
+                    raise _http_error(exc.code, data, str(exc.reason)) from exc
             except urllib.error.URLError as exc:
                 last_exc = exc
                 if attempt >= max_retries or not (idempotent or _request_never_sent(exc)):
@@ -1352,11 +1445,83 @@ class MicroVM:
         self._request("POST", self._url(path), body.getvalue(), f"multipart/form-data; boundary={boundary}")
 
 
+class Tokens:
+    """Scoped API tokens (avm_…) for services and CI, reached as
+    ``client.tokens``. Creating and revoking needs an admin credential;
+    listing needs an auditor or an admin."""
+
+    def __init__(self, client: MicroVM) -> None:
+        self._client = client
+
+    def create(self, options: Optional[CreateAPITokenOptions] = None, **fields: Any) -> CreatedAPIToken:
+        """Mint a token. Takes ``name``, ``role``, ``team`` and ``expiresIn``
+        (or ``expires_in``) as a dict or as keywords. The result's ``token``
+        is the secret, returned this once and never again.
+
+        A 409 means the name is taken, possibly by an earlier attempt whose
+        reply was lost; that secret cannot be recovered, so revoke the token
+        and create it again.
+        """
+        resolved: Dict[str, Any] = {**(options or {}), **fields}
+        body = {
+            "name": str(_first_of(resolved, "name") or ""),
+            "role": str(_first_of(resolved, "role") or ""),
+            "team": str(_first_of(resolved, "team") or ""),
+            "expires_in": str(_first_of(resolved, "expiresIn", "expires_in") or ""),
+        }
+        payload = self._client._do_json("POST", self._client._versioned("/tokens"), body) or {}
+        created: CreatedAPIToken = {**_from_api_api_token(payload), "token": str(payload.get("token") or "")}  # type: ignore[typeddict-item]
+        return created
+
+    def list(self) -> APITokenList:
+        """Every token, expired ones included (``expired`` is True) until the
+        server removes them 30 days after expiry. Never a secret."""
+        payload = self._client._do_json("GET", self._client._versioned("/tokens"), None) or {}
+        tokens = payload.get("tokens") if isinstance(payload, dict) else None
+        return {"tokens": [_from_api_api_token(t) for t in tokens or [] if isinstance(t, dict)]}
+
+    def revoke(self, token_id: str) -> None:
+        """Revoke a token by id (tok_…). Revoking one that is already gone
+        succeeds, so a retried revoke is safe."""
+        trimmed = (token_id or "").strip()
+        if not trimmed:
+            raise ValueError("token id is required")
+        self._client._do_json("DELETE", self._client._versioned(f"/tokens/{urllib.parse.quote(trimmed, safe='')}"), None)
+
+
+def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
+    principal = payload.get("principal") or {}
+    result: WhoAmI = {
+        "principal": {"kind": str(principal.get("kind") or ""), "id": str(principal.get("id") or "")},
+        "role": str(payload.get("role") or ""),
+    }
+    if principal.get("name"):
+        result["principal"]["name"] = str(principal["name"])
+    if payload.get("team"):
+        result["team"] = str(payload["team"])
+    if payload.get("expires_at"):
+        result["expiresAt"] = str(payload["expires_at"])
+    return result
+
+
+def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:
+    return {
+        "id": str(payload.get("id") or ""),
+        "name": str(payload.get("name") or ""),
+        "role": str(payload.get("role") or ""),
+        "team": str(payload.get("team") or ""),
+        "createdBy": str(payload.get("created_by") or ""),
+        "createdAt": str(payload.get("created_at") or ""),
+        "expiresAt": str(payload.get("expires_at") or ""),
+        "expired": bool(payload.get("expired", False)),
+    }
+
+
 def _load_websocket_module() -> Any:
     return importlib.import_module("websocket")
 
 
-def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label: str) -> Any:
+def _connect_websocket(websocket_module: Any, ws_url: str, headers: List[str], label: str) -> Any:
     """create_connection wrapper that surfaces HTTP status/body on bad
     handshake. websocket-client raises WebSocketBadStatusException for non-101
     responses, which carries .status_code and .resp_body but stringifies as
@@ -1367,7 +1532,7 @@ def _connect_websocket(websocket_module: Any, ws_url: str, pat_token: str, label
     try:
         return websocket_module.create_connection(
             ws_url,
-            header=[f"Authorization: Bearer {pat_token}"],
+            header=headers,
             enable_multithread=True,
         )
     except Exception as exc:

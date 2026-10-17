@@ -1,6 +1,7 @@
 import http.client
 import http.server
 import json
+import os
 import socket
 import threading
 import unittest
@@ -2135,3 +2136,231 @@ class CloneGenerationTest(unittest.TestCase):
         )
         self.assertEqual(gen.generation, "2d0d8c69")
         self.assertEqual(gen.resumedAt, 1700000000000000000)
+
+
+class _IdentityServer:
+    """A local sandboxd stand-in for the identity routes. Records each
+    request's method, path, auth and team headers and JSON body."""
+
+    def __init__(self, routes):
+        self.routes = routes
+        self.requests = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _serve(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b""
+                outer.requests.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "team": self.headers.get_all(client_module.TEAM_HEADER),
+                        "body": json.loads(raw) if raw else None,
+                    }
+                )
+                status, body = outer.routes.get((self.command, self.path), (404, {"error": "unexpected"}))
+                self.send_response(status)
+                if body is None:
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = json.dumps(body).encode("utf-8")
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = _serve
+            do_POST = _serve
+            do_DELETE = _serve
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_port
+        # A short poll interval keeps shutdown() from adding 0.5 s per test.
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+_WHOAMI_BODY = {
+    "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+    "role": "runner",
+    "team": "payments",
+    "expires_at": "2027-01-02T03:04:05Z",
+}
+
+_TOKEN_BODY = {
+    "id": "tok_abc123def456",
+    "name": "ci",
+    "role": "runner",
+    "team": "payments",
+    "created_by": "operator",
+    "created_at": "2026-10-17T09:00:00Z",
+    "expires_at": "2027-01-02T03:04:05Z",
+    "expired": False,
+}
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.server = _IdentityServer({("GET", "/v1/whoami"): (200, _WHOAMI_BODY)})
+        self.addCleanup(self.server.close)
+
+    def _env(self, **values):
+        """Patches the three identity env vars: the given ones set, the rest unset."""
+        env = {k: v for k, v in os.environ.items() if k not in ("SB_PAT_TOKEN", "SB_API_TOKEN", "SB_TEAM")}
+        env.update(values)
+        return unittest.mock.patch.dict(os.environ, env, clear=True)
+
+    def test_token_and_team_resolution(self):
+        cases = [
+            ("SB_PAT_TOKEN only", {}, {"SB_PAT_TOKEN": "pat"}, "Bearer pat", None),
+            ("SB_API_TOKEN alias", {}, {"SB_API_TOKEN": "avm_alias"}, "Bearer avm_alias", None),
+            ("SB_PAT_TOKEN beats the alias", {}, {"SB_PAT_TOKEN": "pat", "SB_API_TOKEN": "avm_alias"}, "Bearer pat", None),
+            ("option beats both", {"pat_token": "opt"}, {"SB_PAT_TOKEN": "pat", "SB_API_TOKEN": "avm_alias"}, "Bearer opt", None),
+            ("config patToken beats both", {"config": {"patToken": "cfg"}}, {"SB_PAT_TOKEN": "pat"}, "Bearer cfg", None),
+            ("SB_TEAM sends the header", {}, {"SB_API_TOKEN": "avm_alias", "SB_TEAM": " payments "}, "Bearer avm_alias", ["payments"]),
+            ("team option beats SB_TEAM", {"team": "ml"}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "payments"}, "Bearer pat", ["ml"]),
+            ("config team beats SB_TEAM", {"config": {"team": "ml"}}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "payments"}, "Bearer pat", ["ml"]),
+            ("blank SB_TEAM sends nothing", {}, {"SB_PAT_TOKEN": "pat", "SB_TEAM": "   "}, "Bearer pat", None),
+        ]
+        for name, kwargs, env, want_auth, want_team in cases:
+            with self.subTest(name), self._env(**env):
+                self.server.requests.clear()
+                client = MicroVM(self.server.url, **kwargs)
+                client.whoami()
+                self.assertEqual(self.server.requests[0]["authorization"], want_auth)
+                self.assertEqual(self.server.requests[0]["team"], want_team)
+                self.assertEqual(client.team, (want_team or [""])[0])
+
+    def test_missing_token_names_the_alias(self):
+        with self._env():
+            with self.assertRaisesRegex(MicroVMError, "SB_API_TOKEN"):
+                MicroVM(self.server.url)
+
+    def test_whoami_maps_the_identity(self):
+        client = MicroVM(self.server.url, "avm_x")
+        self.assertEqual(
+            client.whoami(),
+            {
+                "principal": {"kind": "token", "id": "tok_abc123def456", "name": "ci"},
+                "role": "runner",
+                "team": "payments",
+                "expiresAt": "2027-01-02T03:04:05Z",
+            },
+        )
+        self.server.routes[("GET", "/v1/whoami")] = (200, {"principal": {"kind": "operator", "id": "operator"}, "role": "admin"})
+        self.assertEqual(client.whoami(), {"principal": {"kind": "operator", "id": "operator"}, "role": "admin"})
+
+    def test_tokens_create_list_revoke(self):
+        self.server.routes.update(
+            {
+                ("POST", "/v1/tokens"): (201, {**_TOKEN_BODY, "token": "avm_secret"}),
+                ("GET", "/v1/tokens"): (200, {"tokens": [{**_TOKEN_BODY, "expired": True}]}),
+                ("DELETE", "/v1/tokens/tok_abc123def456"): (204, None),
+                ("DELETE", "/v1/tokens/..%2Fsandboxes"): (204, None),
+            }
+        )
+        client = MicroVM(self.server.url, "avm_admin", team="ops")
+
+        created = client.tokens.create(name="ci", role="runner", team="payments", expires_in="90d")
+        self.assertEqual(created["token"], "avm_secret")
+        self.assertEqual(created["id"], "tok_abc123def456")
+        self.assertEqual(created["createdBy"], "operator")
+        self.assertFalse(created["expired"])
+        self.assertEqual(self.server.requests[0]["body"], {"name": "ci", "role": "runner", "team": "payments", "expires_in": "90d"})
+        # The dict spelling sends the same body.
+        client.tokens.create({"name": "ci", "role": "runner", "team": "payments", "expiresIn": "90d"})
+        self.assertEqual(self.server.requests[1]["body"], self.server.requests[0]["body"])
+
+        listed = client.tokens.list()
+        self.assertEqual(len(listed["tokens"]), 1)
+        self.assertTrue(listed["tokens"][0]["expired"])
+        self.assertNotIn("token", listed["tokens"][0])
+
+        # A repeat revoke is another 204; the id stays one escaped path segment.
+        client.tokens.revoke("tok_abc123def456")
+        client.tokens.revoke(" tok_abc123def456 ")
+        client.tokens.revoke("../sandboxes")
+        with self.assertRaisesRegex(ValueError, "token id is required"):
+            client.tokens.revoke("  ")
+
+        self.assertEqual(
+            [(r["method"], r["path"]) for r in self.server.requests],
+            [
+                ("POST", "/v1/tokens"),
+                ("POST", "/v1/tokens"),
+                ("GET", "/v1/tokens"),
+                ("DELETE", "/v1/tokens/tok_abc123def456"),
+                ("DELETE", "/v1/tokens/tok_abc123def456"),
+                ("DELETE", "/v1/tokens/..%2Fsandboxes"),
+            ],
+        )
+        for request in self.server.requests:
+            self.assertEqual(request["team"], ["ops"], request)
+
+    def test_tokens_list_normalizes_null(self):
+        self.server.routes[("GET", "/v1/tokens")] = (200, {"tokens": None})
+        self.assertEqual(MicroVM(self.server.url, "pat").tokens.list(), {"tokens": []})
+
+    def test_http_errors_carry_identity_fields(self):
+        cases = [
+            (
+                "name taken",
+                409,
+                {"error": 'token name already used in this team: "ci"'},
+                {"code": "", "reason": "", "required_permission": "", "role": "", "issuer": "", "name": "", "groups": []},
+            ),
+            (
+                "expired token",
+                401,
+                {"error": "unauthorized", "reason": "expired"},
+                {"reason": "expired", "required_permission": "", "groups": []},
+            ),
+            (
+                "missing permission",
+                403,
+                {"error": "role viewer on team payments cannot token.write", "required_permission": "token.write", "role": "viewer"},
+                {"reason": "", "required_permission": "token.write", "role": "viewer"},
+            ),
+            (
+                "no binding",
+                403,
+                {"error": "no binding matches", "reason": "no_binding", "issuer": "okta", "name": "Ada", "groups": ["eng", "oncall"]},
+                {"reason": "no_binding", "issuer": "okta", "name": "Ada", "groups": ["eng", "oncall"]},
+            ),
+        ]
+        client = MicroVM(self.server.url, "avm_x", config={"retry": {"maxRetries": 0}})
+        for name, status, body, want in cases:
+            with self.subTest(name):
+                self.server.routes[("POST", "/v1/tokens")] = (status, body)
+                with self.assertRaises(MicroVMHTTPError) as ctx:
+                    client.tokens.create(name="ci", role="runner", team="payments", expiresIn="90d")
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertEqual(str(ctx.exception), body["error"])
+                for attr, value in want.items():
+                    self.assertEqual(getattr(ctx.exception, attr), value, attr)
+
+    def test_websocket_handshakes_carry_the_team(self):
+        for team, want in (("payments", ["Authorization: Bearer pat", "X-AerolVM-Team: payments"]), (None, ["Authorization: Bearer pat"])):
+            with self.subTest(team=team), self._env():
+                exec_module = FakeWebSocketModule(FakeWebSocket([json.dumps({"type": "exit", "code": 0})]))
+                attach_module = FakeWebSocketModule(FakeWebSocket([json.dumps({"type": "exit", "code": 0})]))
+                original_loader = client_module._load_websocket_module
+                try:
+                    client = MicroVM("https://sandbox.example.com", "pat", team=team)
+                    client_module._load_websocket_module = lambda: exec_module
+                    client.exec_stream("sb-1", {"command": "true"}).wait(1)
+                    client_module._load_websocket_module = lambda: attach_module
+                    client.attach_session("sb-1", "ses-1").wait(1)
+                finally:
+                    client_module._load_websocket_module = original_loader
+                self.assertEqual(exec_module.calls[0][1], want)
+                self.assertEqual(attach_module.calls[0][1], want)
