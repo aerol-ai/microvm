@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/service"
-	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
@@ -117,7 +116,7 @@ func (s *Server) recordAuthFailure(r *http.Request, f *authFailure) {
 		s.service.RecordAPICall(withCorrelationID(ctx, r), service.APICall{
 			Method: r.Method, Route: route.route, Status: f.status,
 			SandboxID: route.sandboxID, Target: route.target, Denied: true,
-			Surface: auditlog.SurfaceFromContext(ctx),
+			Surface: requestSurface(r),
 		})
 		return
 	}

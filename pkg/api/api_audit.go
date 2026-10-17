@@ -77,7 +77,7 @@ func (s *Server) recordRoute(w http.ResponseWriter, r *http.Request, call apihtt
 			s.service.RecordAPICall(r.Context(), service.APICall{
 				Method: r.Method, Route: desc.route, Status: http.StatusForbidden,
 				SandboxID: desc.sandboxID, Target: desc.target, Denied: true,
-				Surface: auditlog.SurfaceFromContext(r.Context()),
+				Surface: requestSurface(r),
 			})
 		}
 		return
@@ -88,13 +88,15 @@ func (s *Server) recordRoute(w http.ResponseWriter, r *http.Request, call apihtt
 	}
 	ctx, state := auditlog.ContextWithCallState(r.Context())
 	desc := describeRoute(r)
+	// requestSurface: a peer's MCP forward is recorded with surface mcp on
+	// the owner, the node that runs it (X-Cluster-Surface from a live peer).
 	rec := &pendingAPIRecord{
 		svc:     s.service,
 		ctx:     ctx,
 		state:   state,
 		method:  r.Method,
 		desc:    desc,
-		surface: auditlog.SurfaceFromContext(ctx),
+		surface: requestSurface(r),
 		durable: policy.Durable && (desc.deletesSandbox || call.Permission == controlplane.PermTokenWrite),
 	}
 	if desc.deletesSandbox && desc.sandboxID != "" {

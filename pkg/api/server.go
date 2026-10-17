@@ -52,6 +52,9 @@ type Server struct {
 	identityEnabled bool
 	discovery       func() []identitywire.DiscoveryIssuer
 	domain          string
+	// mcpResource is the identity file's /mcp OAuth resource (mcp_oauth.go);
+	// nil with identity off or without an identity file.
+	mcpResource func() MCPResource
 
 	// audit is the one seam that writes kind "api" chain records
 	// (apihttp.AuditHook, api_audit.go). registerRoutes hands it to every
@@ -94,10 +97,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 	}
 	if !cfg.IdentityEnabled {
 		// Identity off is byte for byte the pre-identity server (L8): no
-		// avm_ or JWT authenticator, whatever the caller passed, and no
-		// issuer in the discovery document.
+		// avm_ or JWT authenticator, whatever the caller passed, no issuer
+		// in the discovery document, and no OAuth metadata or challenge on
+		// /mcp.
 		options.credentials = nil
 		options.discovery = nil
+		options.mcpResource = nil
 	}
 	// A nil *docker.Client wrapped in the interface would be a non-nil
 	// interface holding a nil pointer, defeating the handlers' `Builder == nil`
@@ -117,6 +122,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		authChain:       buildAuthChain(patToken, validator, options.credentials),
 		identityEnabled: cfg.IdentityEnabled,
 		discovery:       options.discovery,
+		mcpResource:     options.mcpResource,
 		domain:          cfg.Domain,
 		clusterEnabled:  cfg.EnableCluster,
 		auditLimiter: apiv1.NewAuditRateLimiter(apiv1.AuditRateLimiterConfig{
@@ -161,8 +167,8 @@ func (s *Server) Handler() http.Handler {
 // registerRoutes mounts every route on mux. Every one goes through a
 // surface's Route (authenticate → authorize → audit seam) except the public
 // allowlist in route_registry_test.go: /health, /ui, the sign-in discovery
-// document and the E2B runtime proxy. NewServer passes the real mux; the
-// registry test a recording one.
+// document, the RFC 9728 metadata and the E2B runtime proxy. NewServer
+// passes the real mux; the registry test a recording one.
 func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// /health is unversioned: it is meant for liveness probes (k8s, load
 	// balancers) which should keep working across API version rollouts.
@@ -213,18 +219,23 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 
 	// Remote MCP (opt-in, SB_MCP_ENABLED). /mcp needs only a valid principal
 	// (pseudo-permission authenticated); its tools call back into this same
-	// handler in-process with the caller's token, so each tool's inner API
-	// call is authorized by that route's own permission. The origin and host
-	// checks still run before authentication, as before. The outer request
-	// writes no api record: each tool's inner call writes its own, so one
-	// tool call is one record (§5.9).
+	// handler in-process with the caller's Access handed over (remotemcp
+	// handoff.go), so each tool's inner API call is authorized by that
+	// route's own permission. The origin and host checks still run before
+	// authentication, as before. The outer request writes no api record:
+	// each tool's inner call writes its own, so one tool call is one record
+	// (§5.9). With identity on and an MCP resource in the identity file,
+	// the RFC 9728 metadata is public and the 401 points at it (§5.14).
 	if s.mcp != nil {
 		var authed http.Handler
 		outer := s.mcp.Wrap(func(next http.Handler) http.Handler {
-			authed = apihttp.Router{Authenticate: s.requireAuth}.Route(controlplane.PermAuthenticated, next)
+			authed = apihttp.Router{Authenticate: s.requireMCPAuth}.Route(controlplane.PermAuthenticated, next)
 			return authed
 		})
 		mux.Handle(remotemcp.Path, apihttp.PreAuth(outer, authed))
+		if s.mcpResource != nil {
+			s.registerMCPMetadata(mux)
+		}
 	}
 
 	// Operator dashboard + expvar. /ui is public (static HTML; the token is

@@ -55,7 +55,15 @@ type authLink struct {
 const (
 	authKindNone    = "none"    // no credential at all
 	authKindUnknown = "unknown" // nothing recognised the credential
+	// authKindMCPHandoff is a remote MCP inner call that reached the edge
+	// without the Access hand-off (finding 2.5): a bug, never a caller's
+	// mistake.
+	authKindMCPHandoff = "mcp_handoff"
 )
+
+// noHandoffMessage is the 500 text for that bug. It names no detail: the
+// fix is in sandboxd, and the log line and metric tell the operator.
+const noHandoffMessage = "internal error: a remote MCP tool call reached the API without its caller"
 
 // ServerOption configures NewServer.
 type ServerOption func(*serverOptions)
@@ -63,6 +71,7 @@ type ServerOption func(*serverOptions)
 type serverOptions struct {
 	credentials []authLink
 	discovery   func() []identitywire.DiscoveryIssuer
+	mcpResource func() MCPResource
 }
 
 // WithCredentialAuthenticator adds a named-credential authenticator: the avm_
@@ -169,7 +178,21 @@ var postMatchSteps = []postMatchStep{attributeForward, enforceSurface, selectTea
 // header: the credential, the verified mTLS peer and the request path are the
 // only inputs, and the X-Cluster-* markers it reads are themselves accepted
 // only from a live mTLS peer (clusterControlHeaderGuard).
+//
+// A remote MCP tool's inner call is decided first, by the Access hand-off
+// alone (§5.14): /mcp already authenticated the caller, ran the surface rule
+// and selected the team, so none of that runs again, and the bearer the
+// call also carries (for forwards) is never looked at here. An inner call
+// without the hand-off is a bug, answered 500 (finding 2.5); falling back to
+// the bearer would hold an /mcp-only token to /v1's rules.
 func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Access, *authFailure) {
+	if access, inner, ok := remotemcp.Handoff(r.Context()); inner {
+		if !ok {
+			return controlplane.Access{}, &authFailure{status: http.StatusInternalServerError, kind: authKindMCPHandoff,
+				reason: "no_handoff", message: noHandoffMessage}
+		}
+		return access, nil
+	}
 	if bearer == "" {
 		return controlplane.Access{}, &authFailure{status: http.StatusUnauthorized, kind: authKindNone, reason: "missing"}
 	}
@@ -248,7 +271,7 @@ func attributeForward(r *http.Request, a controlplane.Access) (controlplane.Acce
 // headerClusterSurface marks a peer's forward of a remote MCP tool call
 // (§5.14). Like every X-Cluster-* header it is honoured only from a live
 // mTLS peer.
-const headerClusterSurface = "X-Cluster-Surface"
+const headerClusterSurface = cluster.HeaderSurface
 
 // enforceSurface is the surface rule: an MCP-only credential (an OAuth access
 // token for an mcp_audiences audience) is accepted on /mcp and on a forward a
@@ -261,12 +284,37 @@ func enforceSurface(r *http.Request, a controlplane.Access) (controlplane.Access
 	if r.URL.Path == remotemcp.Path {
 		return a, nil
 	}
-	if r.Header.Get(headerClusterSurface) == "mcp" {
-		if _, ok := mtlsPeer(r); ok {
-			return a, nil
-		}
+	if mcpForward(r) {
+		return a, nil
 	}
 	return a, &controlplane.CredentialError{Kind: a.Principal.Kind, Reason: controlplane.RejectWrongAudience}
+}
+
+// mcpForward reports whether a live peer forwarded r as a remote MCP tool's
+// inner call: cluster.StampForward sets the surface marker and the forwarded
+// marker together, and both count only over a verified mTLS connection
+// (clusterControlHeaderGuard refuses them from anyone else in cluster mode
+// and drops them on a single node).
+func mcpForward(r *http.Request) bool {
+	if r.Header.Get(headerClusterSurface) != auditlog.SurfaceMCP || !isForwarded(r) {
+		return false
+	}
+	_, ok := mtlsPeer(r)
+	return ok
+}
+
+// requestSurface is the surface an api or denied record names: the one the
+// in-process transport put on the context (an edge's MCP inner call), or
+// mcp for a peer's MCP forward, so the owner that runs a forwarded inner
+// call records it as the MCP call it is (§5.9).
+func requestSurface(r *http.Request) string {
+	if surface := auditlog.SurfaceFromContext(r.Context()); surface != "" {
+		return surface
+	}
+	if mcpForward(r) {
+		return auditlog.SurfaceMCP
+	}
+	return ""
 }
 
 // HeaderTeam selects which of a credential's teams a request acts for (CEO
@@ -366,6 +414,9 @@ type authFailure struct {
 	// invalidToken is set only for a D17 refusal of an avm_ token or a JWT:
 	// the 401 then carries it in WWW-Authenticate and the body's `reason`.
 	invalidToken controlplane.RejectReason
+	// hint is that refusal's fixed setting hint (an Entra v1 access token,
+	// §5.14), added to the 401 text after the surface's own words.
+	hint string
 	// message is the 400/403/503 text. A 401 always uses the surface's own
 	// fixed text, so PAT and managed 401 bodies stay byte for byte as before.
 	message string
@@ -404,7 +455,7 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		switch ce.Kind {
 		case controlplane.PrincipalToken, controlplane.PrincipalOIDC:
 			if ce.Reason.Valid() {
-				return &authFailure{status: http.StatusUnauthorized, kind: string(ce.Kind), reason: string(ce.Reason), invalidToken: ce.Reason}
+				return &authFailure{status: http.StatusUnauthorized, kind: string(ce.Kind), reason: string(ce.Reason), invalidToken: ce.Reason, hint: ce.Hint}
 			}
 		}
 		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "rejected"}
@@ -449,6 +500,9 @@ type authSurface struct {
 	// structured fields (DR8). Surfaces without it (the E2B and Runloop
 	// facades) keep their own body shape and carry the hint in the message.
 	writeNoBinding func(w http.ResponseWriter, message string, nb *controlplane.NoBindingError)
+	// oauthChallenge marks /mcp: its 401 names the RFC 9728 metadata, so an
+	// OAuth connector learns where to sign in (§5.14).
+	oauthChallenge bool
 }
 
 var (
@@ -484,6 +538,12 @@ var (
 		unauthorized: "unauthorized: check RUNLOOP_API_KEY",
 		write:        runloop.WriteErrorReason,
 	}
+	// mcpSurface is v1's, plus the OAuth challenge on a 401.
+	mcpSurface = func() authSurface {
+		s := v1Surface
+		s.oauthChallenge = true
+		return s
+	}()
 )
 
 // e2bCredential reads the E2B surface's credential. The E2B SDKs send
@@ -513,7 +573,11 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 		access, failure := s.authenticate(r, surface.credential(s, r))
 		s.observeAuth(r, access, failure)
 		if failure != nil {
-			writeAuthFailure(w, surface, failure)
+			challenge := ""
+			if surface.oauthChallenge && failure.status == http.StatusUnauthorized {
+				challenge = s.mcpChallengeParams()
+			}
+			writeAuthFailure(w, surface, failure, challenge)
 			s.recordAuthFailure(r, failure)
 			return
 		}
@@ -539,7 +603,10 @@ func withCorrelationID(ctx context.Context, r *http.Request) context.Context {
 	return auditlog.ContextWithCorrelationID(ctx, auditlog.NewCorrelationID())
 }
 
-func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure) {
+// writeAuthFailure writes f in the surface's shape. challenge, set only for
+// a /mcp 401 with an OAuth resource configured, is the RFC 9728 auth-params
+// (resource_metadata, scope) the Bearer challenge leads with.
+func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure, challenge string) {
 	if f.retryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(f.retryAfter))
 	}
@@ -551,18 +618,39 @@ func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure
 		surface.write(w, f.status, f.message, "")
 		return
 	}
+	params := challenge
 	if f.invalidToken != "" {
 		// RFC 6750 §3.1. The reason is one of the fixed D17 values, so it
 		// needs no quoting beyond the surrounding quotes.
-		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+string(f.invalidToken)+`"`)
+		if params != "" {
+			params += ", "
+		}
+		params += `error="invalid_token", error_description="` + string(f.invalidToken) + `"`
 	}
-	surface.write(w, f.status, surface.unauthorized, string(f.invalidToken))
+	if params != "" {
+		// A request with no credential at all gets the challenge without an
+		// error code (RFC 6750 §3.1): that is how a connector first learns
+		// where to sign in.
+		w.Header().Set("WWW-Authenticate", "Bearer "+params)
+	}
+	message := surface.unauthorized
+	if f.hint != "" {
+		message += " (" + f.hint + ")"
+	}
+	surface.write(w, f.status, message, string(f.invalidToken))
 }
 
-// requireAuth wraps next with authentication for v1, Daytona, remote MCP and
-// the metrics endpoints. All API versions share it through Deps.Auth.
+// requireAuth wraps next with authentication for v1, Daytona and the metrics
+// endpoints. All API versions share it through Deps.Auth.
 func (s *Server) requireAuth(next http.Handler) http.Handler {
 	return s.withAuth(v1Surface, next)
+}
+
+// requireMCPAuth is v1 authentication for /mcp, whose 401 also carries the
+// RFC 9728 challenge when the identity file names an MCP resource (§5.14).
+// With identity off, or no mcp.resource, it is requireAuth byte for byte.
+func (s *Server) requireMCPAuth(next http.Handler) http.Handler {
+	return s.withAuth(mcpSurface, next)
 }
 
 // requireE2BAuth is authentication with the E2B credential headers and body.

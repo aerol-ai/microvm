@@ -19,12 +19,14 @@ import (
 //	  kind:   operator | node | controlplane | token | oidc
 //	  origin: host | peer | public (see authOrigin)
 //	aerolvm_auth_failures_total{key=<kind>,key2=<reason>}
-//	  kind:   none | unknown | controlplane | token | oidc
+//	  kind:   none | unknown | controlplane | token | oidc | mcp_handoff
 //	  reason: missing | rejected | no_owner | bad_role | bad_team |
 //	          team_not_bound | stale (token mirror out of date, 503) |
 //	          a D17 reason (expired, wrong_audience, ...) |
 //	          no_binding | group_overage (a verified OIDC token, 403) |
-//	          unavailable (a JWT this node cannot check now, 503)
+//	          unavailable (a JWT this node cannot check now, 503) |
+//	          no_handoff (kind mcp_handoff: a remote MCP inner call
+//	          without its caller, 500; a bug, finding 2.5)
 //
 // Every label value comes from a fixed set, never from the request, so a
 // caller cannot grow the series count.
@@ -56,6 +58,7 @@ const (
 	authResultForbidden    = "forbidden"
 	authResultBadRequest   = "bad_request"
 	authResultUnavailable  = "unavailable"
+	authResultError        = "error"
 )
 
 // observeAuth records one authentication decision: a metric, attributes on
@@ -82,11 +85,22 @@ func (s *Server) observeAuth(r *http.Request, access controlplane.Access, failur
 	if span.IsRecording() {
 		span.SetAttributes(attribute.String("aerolvm.auth.result", authResultFor(failure.status)))
 	}
-	if s.logger != nil {
-		s.logger.Debug("authentication refused",
-			"status", failure.status, "kind", failure.kind, "reason", failure.reason,
-			"origin", authOrigin(r), "path", r.URL.Path)
+	if s.logger == nil {
+		return
 	}
+	if failure.status == http.StatusInternalServerError {
+		// Not a caller's mistake: sandboxd itself lost the remote MCP
+		// hand-off (finding 2.5), so every tool call fails until it is fixed.
+		s.logger.Error("remote MCP inner call reached the API without the Access hand-off; refused with 500",
+			"kind", failure.kind, "reason", failure.reason, "path", r.URL.Path)
+		return
+	}
+	fields := []any{"status", failure.status, "kind", failure.kind, "reason", failure.reason,
+		"origin", authOrigin(r), "path", r.URL.Path}
+	if failure.hint != "" {
+		fields = append(fields, "hint", failure.hint)
+	}
+	s.logger.Debug("authentication refused", fields...)
 }
 
 func authResultFor(status int) string {
@@ -97,6 +111,8 @@ func authResultFor(status int) string {
 		return authResultBadRequest
 	case http.StatusServiceUnavailable:
 		return authResultUnavailable
+	case http.StatusInternalServerError:
+		return authResultError
 	}
 	return authResultUnauthorized
 }
