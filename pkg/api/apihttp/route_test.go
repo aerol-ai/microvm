@@ -241,6 +241,21 @@ func TestForbiddenBodies(t *testing.T) {
 	}
 }
 
+// BenchmarkRouteAuthorize is the per-request cost Route adds on top of
+// authentication: one context lookup and the role-table check.
+func BenchmarkRouteAuthorize(b *testing.B) {
+	next := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	h := Router{}.Route(controlplane.PermSandboxExec, next)
+	req := httptest.NewRequest(http.MethodPost, "/x", nil)
+	req = req.WithContext(controlplane.ContextWithAccess(req.Context(), tokenOn("payments", controlplane.RoleRunner)))
+	w := httptest.NewRecorder()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.ServeHTTP(w, req)
+	}
+}
+
 func TestCallerCan(t *testing.T) {
 	if !CallerCan(context.Background(), controlplane.PermFleetAdmin) {
 		t.Fatal("no Access is an internal call: it holds everything")
