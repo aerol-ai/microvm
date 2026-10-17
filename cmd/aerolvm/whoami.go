@@ -217,6 +217,8 @@ func (a *app) formatExplain(conn connection, who whoAmIResponse) string {
 	case kind == controlplane.PrincipalOperator:
 		b.WriteString("  the server token (sandboxd's SB_PAT_TOKEN) acts as admin on all teams;\n" +
 			"  no binding is involved.\n")
+	case who.Explain != nil && who.Explain.Note != "":
+		fmt.Fprintf(&b, "  %s.\n", printable(who.Explain.Note))
 	default:
 		fmt.Fprintf(&b, "  %s sets the role; no binding is involved.\n", viaLabel(conn, who.WhoAmI))
 	}

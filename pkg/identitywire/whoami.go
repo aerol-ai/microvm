@@ -21,9 +21,15 @@ const WhoAmIExplainQuery = "explain"
 // describes only the caller: the bindings its own claims matched and the
 // claims that were considered, never another principal's (D22).
 type WhoAmIExplain struct {
+	// BindingsApply is true for an identity-provider token, whose role
+	// comes from identity-file bindings. It is false for a credential that
+	// carries its own role (the operator token, an API token, a managed
+	// account), and Note then says where the role comes from.
+	BindingsApply bool   `json:"bindings_apply"`
+	Note          string `json:"note,omitempty"`
 	// Matched lists every identity-file binding the caller's claims
-	// matched, in file order. Empty for a credential that carries its own
-	// role (an API token, the operator token) and when nothing matched.
+	// matched, in file order, one per role and team granted. Empty when
+	// bindings don't apply.
 	Matched []ExplainBinding `json:"matched"`
 	// Claims are the caller's own claims the bindings were matched against.
 	// Absent for a credential that is not an identity-provider token.

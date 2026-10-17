@@ -192,6 +192,9 @@ func TestVerifierClaimChecks(t *testing.T) {
 
 func TestVerifierAccessAndFirstMatchBindings(t *testing.T) {
 	env := newVerifierEnv(t, "")
+	// Each matched binding carries its 1-based place in the file and its
+	// canonical line, for whoami --explain (D22).
+	payments := controlplane.TeamBinding{Role: "runner", Team: "payments", Index: 2, Rule: `test group="payments-eng" -> runner/payments`}
 	cases := []struct {
 		name   string
 		groups []string
@@ -199,14 +202,19 @@ func TestVerifierAccessAndFirstMatchBindings(t *testing.T) {
 		claims map[string]any
 		want   []controlplane.TeamBinding
 	}{
-		{name: "one team", groups: []string{"payments-eng"}, want: []controlplane.TeamBinding{{Role: "runner", Team: "payments"}}},
+		{name: "one team", groups: []string{"payments-eng"}, want: []controlplane.TeamBinding{payments}},
 		{name: "file order, not claim order", groups: []string{"billing-eng", "payments-eng"},
-			want: []controlplane.TeamBinding{{Role: "runner", Team: "payments"}, {Role: "viewer", Team: "billing"}}},
+			want: []controlplane.TeamBinding{payments, {Role: "viewer", Team: "billing", Index: 3, Rule: `test group="billing-eng" -> viewer/billing`}}},
 		{name: "fleet binding listed first wins", groups: []string{"payments-eng", "admins"},
-			want: []controlplane.TeamBinding{{Role: "admin", Team: "*"}, {Role: "runner", Team: "payments"}}},
-		{name: "app role", roles: []string{"AerolVM.Runner"}, want: []controlplane.TeamBinding{{Role: "runner", Team: "checkout"}}},
+			want: []controlplane.TeamBinding{{Role: "admin", Team: "*", Index: 1, Rule: `test group="admins" -> admin/*`}, payments}},
+		{name: "app role", roles: []string{"AerolVM.Runner"},
+			want: []controlplane.TeamBinding{{Role: "runner", Team: "checkout", Index: 4, Rule: `test app_role="AerolVM.Runner" -> runner/checkout`}}},
+		// The later claim binding grants the same role and team: the first
+		// binding is the one kept, and the one whoami --explain names.
 		{name: "claim binding, deduplicated with a group binding", groups: []string{"payments-eng"}, claims: map[string]any{"repository": "acme/payments"},
-			want: []controlplane.TeamBinding{{Role: "runner", Team: "payments"}}},
+			want: []controlplane.TeamBinding{payments}},
+		{name: "claim binding alone", claims: map[string]any{"repository": "acme/payments"},
+			want: []controlplane.TeamBinding{{Role: "runner", Team: "payments", Index: 5, Rule: `test claim:repository="acme/payments" -> runner/payments`}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,6 +238,9 @@ func TestVerifierAccessAndFirstMatchBindings(t *testing.T) {
 			}
 			if a.Principal != (controlplane.Principal{Kind: controlplane.PrincipalOIDC, ID: "oidc:test:00u1", Name: "00u1@acme.com"}) {
 				t.Fatalf("principal = %+v", a.Principal)
+			}
+			if a.ClaimNames == nil || *a.ClaimNames != (controlplane.ClaimNames{Issuer: "test", Username: "email", Groups: "groups", Roles: "roles"}) {
+				t.Fatalf("claim names = %+v", a.ClaimNames)
 			}
 			if !a.ExpiresAt.Equal(time.Unix(c["exp"].(int64), 0)) {
 				t.Fatalf("expires = %v", a.ExpiresAt)

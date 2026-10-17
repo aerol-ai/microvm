@@ -18,26 +18,27 @@ func TestWhoAmIExplainWireShape(t *testing.T) {
 	}{
 		{
 			name: "an API token",
-			doc:  WhoAmIExplain{Matched: []ExplainBinding{}},
-			want: `{"matched":[]}`,
+			doc:  WhoAmIExplain{Note: "an API token carries its own role and team", Matched: []ExplainBinding{}},
+			want: `{"bindings_apply":false,"note":"an API token carries its own role and team","matched":[]}`,
 		},
 		{
 			name: "an SSO caller with two matches",
 			doc: WhoAmIExplain{
+				BindingsApply: true,
 				Matched: []ExplainBinding{
 					{Index: 3, Text: `okta group="payments-eng" -> runner/payments`, InEffect: true},
 					{Index: 5, Text: `okta group="everyone" -> viewer/*`},
 				},
 				Claims: &ExplainClaims{Issuer: "okta", Username: "alice@acme.com", Groups: []string{"everyone", "payments-eng"}},
 			},
-			want: `{"matched":[{"index":3,"text":"okta group=\"payments-eng\" -> runner/payments","in_effect":true},` +
+			want: `{"bindings_apply":true,"matched":[{"index":3,"text":"okta group=\"payments-eng\" -> runner/payments","in_effect":true},` +
 				`{"index":5,"text":"okta group=\"everyone\" -> viewer/*"}],` +
 				`"claims":{"issuer":"okta","username":"alice@acme.com","groups":["everyone","payments-eng"]}}`,
 		},
 		{
 			name: "overage",
-			doc:  WhoAmIExplain{Matched: []ExplainBinding{}, Claims: &ExplainClaims{Issuer: "entra", Roles: []string{"AerolVM.Runner"}, GroupOverage: true}},
-			want: `{"matched":[],"claims":{"issuer":"entra","roles":["AerolVM.Runner"],"group_overage":true}}`,
+			doc:  WhoAmIExplain{BindingsApply: true, Matched: []ExplainBinding{}, Claims: &ExplainClaims{Issuer: "entra", Roles: []string{"AerolVM.Runner"}, GroupOverage: true}},
+			want: `{"bindings_apply":true,"matched":[],"claims":{"issuer":"entra","roles":["AerolVM.Runner"],"group_overage":true}}`,
 		},
 	}
 	for _, tc := range cases {

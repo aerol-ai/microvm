@@ -451,8 +451,14 @@ func (s *fakeSandboxd) serveWhoAmI(w http.ResponseWriter, r *http.Request, beare
 		return
 	}
 	out := whoAmIResponse{WhoAmI: who}
-	if r.URL.Query().Get(identitywire.WhoAmIExplainQuery) == "1" && who.Principal.Kind == "oidc" {
+	if r.URL.Query().Get(identitywire.WhoAmIExplainQuery) == "1" {
+		// As pkg/api/v1's whoami answers: the configured explanation for an
+		// SSO caller (nil plays a sandboxd that predates it), and a note for
+		// a credential that carries its own role.
 		out.Explain = explain
+		if who.Principal.Kind != "oidc" && explain != nil {
+			out.Explain = &identitywire.WhoAmIExplain{Note: "binding matching doesn't apply to a " + who.Principal.Kind + " credential", Matched: []identitywire.ExplainBinding{}}
+		}
 	}
 	_ = json.NewEncoder(w).Encode(out)
 }

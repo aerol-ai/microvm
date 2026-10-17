@@ -31,20 +31,24 @@ type verifiedToken struct {
 	// means "verified, but no binding": the caller gets the D9/DR8 403.
 	bindings []controlplane.TeamBinding
 	// issuer, groups and overage feed the "no binding" 403; groups is kept
-	// only when bindings is empty.
-	issuer  string
-	groups  []string
-	overage bool
-	expires time.Time
+	// only when bindings is empty. claimNames is the issuer's, for
+	// `whoami --explain`: the caller's claims are read back out of the
+	// bearer on that rare call rather than held here for every token.
+	issuer     string
+	claimNames *controlplane.ClaimNames
+	groups     []string
+	overage    bool
+	expires    time.Time
 	// keys and gen pin the key-set generation the signature verified
 	// under: a later fetch that withdraws a key makes the entry stale.
 	keys *keySet
 	gen  uint64
 }
 
-// size estimates the entry's memory for the byte bound.
+// size estimates the entry's memory for the byte bound. A binding's Rule
+// shares the loaded file's string, so only its slice element counts.
 func (t *verifiedToken) size() int {
-	n := 256 + len(t.principal.ID) + len(t.principal.Name) + len(t.issuer) + 48*len(t.bindings)
+	n := 256 + len(t.principal.ID) + len(t.principal.Name) + len(t.issuer) + 64*len(t.bindings)
 	for _, b := range t.bindings {
 		n += len(b.Team)
 	}

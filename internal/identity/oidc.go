@@ -284,7 +284,9 @@ func (v *Verifier) Authenticate(r *http.Request, bearer string) (controlplane.Ac
 			Principal: tok.principal, Issuer: tok.issuer, Name: tok.principal.Name, Groups: tok.groups, Overage: tok.overage,
 		}
 	}
-	return controlplane.OIDCAccess(tok.principal, tok.bindings, tok.expires), true, nil
+	a := controlplane.OIDCAccess(tok.principal, tok.bindings, tok.expires)
+	a.ClaimNames = tok.claimNames
+	return a, true, nil
 }
 
 // jwtHeader is the part of the JOSE header read before any key is touched.
@@ -369,12 +371,13 @@ func (v *Verifier) verify(ctx context.Context, st *verifierState, raw string, no
 			ID:   string(controlplane.PrincipalOIDC) + ":" + iss.Name + ":" + claims.sub,
 			Name: displayNameClaim(claims, iss),
 		},
-		bindings: m.bindings,
-		issuer:   iss.Name,
-		overage:  m.overage,
-		expires:  claims.exp,
-		keys:     iv.keys,
-		gen:      gen,
+		bindings:   m.bindings,
+		issuer:     iss.Name,
+		claimNames: iss.claimNames,
+		overage:    m.overage,
+		expires:    claims.exp,
+		keys:       iv.keys,
+		gen:        gen,
 	}
 	if len(m.bindings) == 0 {
 		tok.groups = sanitizeGroups(m.groups)

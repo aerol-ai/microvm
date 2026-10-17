@@ -255,7 +255,10 @@ func TestWhoAmIExplain(t *testing.T) {
 	w := newSSOWorld(t)
 	h := w.h
 	w.seedLogin(t, day0.Add(54*time.Minute))
+	// The shape pkg/api/v1's whoami sends (TestWhoAmIExplainThroughTheEdge
+	// pins the server side of it).
 	explain := &identitywire.WhoAmIExplain{
+		BindingsApply: true,
 		Matched: []identitywire.ExplainBinding{
 			{Index: 3, Text: `okta group="payments-eng" -> runner/payments`, InEffect: true},
 			{Index: 5, Text: `okta group="everyone" -> viewer/*`},
@@ -275,6 +278,20 @@ func TestWhoAmIExplain(t *testing.T) {
 	if got.Explain == nil || len(got.Explain.Matched) != 2 || got.Role != "runner" {
 		t.Fatalf("whoami --explain --json = %+v", got)
 	}
+	if !got.Explain.BindingsApply {
+		t.Fatal("bindings_apply was dropped on the way through --json")
+	}
+
+	// A managed account: sandboxd's note says where the role comes from.
+	w.server.set(func(s *fakeSandboxd) {
+		s.tokens["managed-token"] = models.WhoAmI{Principal: models.WhoAmIPrincipal{Kind: "controlplane", ID: "controlplane:u1", Name: "Ana"}, Role: "runner"}
+	})
+	h.env["SB_PAT_TOKEN"], h.env["SB_API_URL"] = "managed-token", w.server.URL
+	if code := h.run("whoami", "--explain"); code != exitOK || !strings.HasSuffix(h.stdout.String(), "\nWhy:\n  binding matching doesn't apply to a controlplane credential.\n") {
+		t.Fatalf("managed explain = %d %q", code, h.stdout.String())
+	}
+	delete(h.env, "SB_PAT_TOKEN")
+	delete(h.env, "SB_API_URL")
 
 	// A sandboxd that predates the explanation: the caller's own token.
 	w.server.set(func(s *fakeSandboxd) { s.explain = nil })

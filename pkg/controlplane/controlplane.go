@@ -92,6 +92,9 @@ type Access struct {
 	// account, an avm_ token). The slice is shared with the verified-token
 	// cache: read it, never write it.
 	Bindings []TeamBinding
+	// ClaimNames, for an OIDC caller, names its issuer's claims, for
+	// `whoami --explain` (D22). nil for every other credential.
+	ClaimNames *ClaimNames
 }
 
 type accessCtxKey struct{}

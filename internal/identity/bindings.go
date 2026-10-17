@@ -91,7 +91,14 @@ func (iss *Issuer) match(c *tokenClaims) matchResult {
 		res.groups = nil
 	}
 	var groupSet, roleSet map[string]struct{}
-	seen := map[controlplane.TeamBinding]struct{}{}
+	// Deduplicated by what a binding grants: a later binding for the same
+	// role and team adds nothing to select, and the first one is the one
+	// `whoami --explain` names.
+	type grant struct {
+		role controlplane.Role
+		team string
+	}
+	seen := map[grant]struct{}{}
 	for _, b := range iss.bindings {
 		var hit bool
 		switch {
@@ -112,12 +119,12 @@ func (iss *Issuer) match(c *tokenClaims) matchResult {
 		if !hit {
 			continue
 		}
-		tb := controlplane.TeamBinding{Role: b.Role, Team: b.Team}
-		if _, dup := seen[tb]; dup {
+		g := grant{b.Role, b.Team}
+		if _, dup := seen[g]; dup {
 			continue
 		}
-		seen[tb] = struct{}{}
-		res.bindings = append(res.bindings, tb)
+		seen[g] = struct{}{}
+		res.bindings = append(res.bindings, controlplane.TeamBinding{Role: b.Role, Team: b.Team, Index: b.index, Rule: b.line})
 	}
 	return res
 }
