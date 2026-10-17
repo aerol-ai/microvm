@@ -408,6 +408,21 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err != nil {
 			return nil, fmt.Errorf("inspect image: %w", err)
 		}
+	} else if req.VerifyRegistryAccess && registryRefNeedsTenantAuth(req) {
+		// The image is already cached, but an owner-scoped caller must prove it
+		// may pull this (private) registry image — otherwise a tenant could
+		// start another tenant's image straight from the shared local cache
+		// with no credentials. A pull of a cached image contacts the registry
+		// for the manifest and authorizes there, reusing cached layers, so this
+		// is a manifest round-trip rather than a re-download. A private image
+		// without valid creds 401s here and the create fails; a public image
+		// authorizes anonymously. Boot-path cost: one manifest round-trip on a
+		// tenant create of a cached plain-registry image (pr-review §2).
+		pullCtx := WithSandboxID(ctx, sandboxID)
+		if pullErr := c.pullImageDedup(pullCtx, req.Image, req.Registry); pullErr != nil {
+			return nil, fmt.Errorf("verify image access: %w", pullErr)
+		}
+		imageSource = "verified"
 	}
 	CreateTimingFrom(ctx).RecordStageDesc("docker_image", time.Since(imageStart), imageSource)
 
@@ -1397,6 +1412,30 @@ func IsLocalOnlyImageRef(imageRef string) bool {
 	imageRef = strings.TrimSpace(imageRef)
 	return strings.HasPrefix(imageRef, BuiltImageNamespace+"/") || strings.HasPrefix(imageRef, SnapshotImageNamespace+"/") ||
 		strings.HasPrefix(imageRef, "snapshots/")
+}
+
+// registryRefNeedsTenantAuth reports whether a cached image should be
+// re-authorized against its registry for an owner-scoped caller (the
+// VerifyRegistryAccess path). Only plain external-registry refs qualify:
+//   - local-only refs (built images, local snapshot commits) have no registry
+//     to authorize against;
+//   - the LocalOnly distribution mode is node-local by definition;
+//   - cluster AOCR refs are pulled with the cluster PAT and are already
+//     authorized per-tenant at the service layer (authorizeTenantImageRef),
+//     so re-pulling them here would add a round-trip with no security gain.
+func registryRefNeedsTenantAuth(req models.CreateSandboxRequest) bool {
+	if req.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return false
+	}
+	image := strings.TrimSpace(req.Image)
+	if image == "" || IsLocalOnlyImageRef(image) || IsBuiltImageRef(image) {
+		return false
+	}
+	// A cluster AOCR ref ("[host/]cluster/<id>/...") is authorized elsewhere.
+	if _, rest := splitHostRepo(image); rest == "cluster" || strings.HasPrefix(rest, "cluster/") {
+		return false
+	}
+	return true
 }
 
 func (c *Client) waitForRuntime(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
