@@ -443,6 +443,24 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			PRIMARY KEY (sandbox_id, profile)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_sandbox_egress_profiles_ref ON sandbox_egress_profiles(owner_ref, profile);`,
+		// api_tokens are scoped API tokens (plans/identity-and-access.md
+		// §5.4): this table is the single-node store, a cluster keeps them
+		// in the Raft FSM. Only SHA-256 of the secret is stored, never the
+		// secret. owner_ref is team:<name>, or '' for a token bound to every
+		// team; names are unique per team, which UNIQUE(owner_ref, name)
+		// enforces, so two concurrent creates of one name can't both land.
+		// Times are unix nanoseconds, compared in Go, never by SQLite.
+		`CREATE TABLE IF NOT EXISTS api_tokens (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			role TEXT NOT NULL,
+			owner_ref TEXT NOT NULL DEFAULT '',
+			created_by TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			expires_at INTEGER NOT NULL,
+			secret_hash BLOB NOT NULL,
+			UNIQUE (owner_ref, name)
+		);`,
 		`CREATE INDEX IF NOT EXISTS idx_cluster_secrets_sandbox_id ON cluster_secrets(sandbox_id);`,
 		// Reconcile and retention are ordered bounded scans. These composite
 		// indexes avoid temp B-trees/full scans when the fleet has millions of

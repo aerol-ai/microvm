@@ -86,6 +86,12 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// Who the caller is (identity-and-access §5.2): needs only a valid
 	// principal, describes only the caller, never forwarded.
 	mux.Handle("GET "+PathPrefix+"/whoami", d.Route(controlplane.PermAuthenticated, http.HandlerFunc(h.whoami)))
+	// Scoped API tokens (identity-and-access §5.4): admin mints and
+	// revokes, auditor and admin list. Not sandbox-scoped, never forwarded;
+	// in a cluster the service writes them through Raft.
+	mux.Handle("POST "+PathPrefix+"/tokens", d.Route(controlplane.PermTokenWrite, http.HandlerFunc(h.createToken)))
+	mux.Handle("GET "+PathPrefix+"/tokens", d.Route(controlplane.PermTokenRead, http.HandlerFunc(h.listTokens)))
+	mux.Handle("DELETE "+PathPrefix+"/tokens/{id}", d.Route(controlplane.PermTokenWrite, http.HandlerFunc(h.revokeToken)))
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Route(permRead, http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", d.Route(permFleet, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Route(permWrite, http.HandlerFunc(h.clusterBuildImageWrap)))
@@ -251,6 +257,9 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("POST "+cluster.PublicInternalArtifactCatalogEpochPath, internalOp(http.HandlerFunc(h.clusterInternalArtifactCatalogEpoch)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileWritePath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileWrite)))
 	mux.Handle("POST "+cluster.PublicInternalEgressProfileReadPath, internalOp(http.HandlerFunc(h.clusterInternalEgressProfileRead)))
+	mux.Handle("POST "+cluster.PublicInternalAPITokenWritePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenWrite)))
+	mux.Handle("GET "+cluster.PublicInternalAPITokenChangesPath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenChanges)))
+	mux.Handle("GET "+cluster.PublicInternalAPITokenPagePath, internalOp(http.HandlerFunc(h.clusterInternalAPITokenPage)))
 	mux.Handle("GET "+cluster.PublicInternalAuditACLPath+"{id}", internalOp(http.HandlerFunc(h.clusterInternalAuditACL)))
 	mux.Handle("GET "+cluster.PublicInternalRecoveryPath+"{ref}", internalOp(http.HandlerFunc(h.clusterInternalRecoveryGet)))
 	mux.Handle("POST "+cluster.PublicInternalSelectPlacementPath, internalOp(http.HandlerFunc(h.clusterInternalSelectPlacement)))

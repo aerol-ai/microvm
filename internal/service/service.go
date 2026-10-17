@@ -26,6 +26,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/netsplice"
 	"github.com/aerol-ai/microvm/internal/runtime"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
@@ -453,6 +454,15 @@ type Service struct {
 	// egressProfiles stores named egress profiles; nil is the local store
 	// (single node). A cluster swaps in its Raft-backed store.
 	egressProfiles egressProfileBackend
+
+	// API tokens (api_tokens.go). apiTokenSet is the single-node in-memory
+	// index the request path reads; apiTokenMirror is the token copy on a
+	// cluster node without Raft state (nil elsewhere). apiTokenEntropy and
+	// apiTokenClock are nil in production (crypto/rand, time.Now).
+	apiTokenSet     identity.TokenSet
+	apiTokenMirror  *identity.TokenMirror
+	apiTokenEntropy io.Reader
+	apiTokenClock   func() time.Time
 
 	// netstatsReady latches the lazy bootstrap of the per-sandbox network
 	// byte-counter poller. Same pattern as l4Ready: atomic fast-path on the

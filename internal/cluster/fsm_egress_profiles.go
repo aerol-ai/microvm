@@ -31,11 +31,13 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 2
+	fsmOpsVersion              = 3
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
 	auditCallerFSMOpsVersion = 2
+	// apiTokenFSMOpsVersion: opPutAPIToken, opDeleteAPIToken (fsm_tokens.go).
+	apiTokenFSMOpsVersion = 3
 )
 
 var (

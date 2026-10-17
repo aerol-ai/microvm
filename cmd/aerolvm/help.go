@@ -256,6 +256,44 @@ Examples:
   aerolvm login https://sandbox.example.com --token-stdin < token.txt
 `
 
+const tokenHelp = `Create, list and revoke scoped API tokens (avm_...) for services and CI.
+
+Usage: aerolvm token create --name N --role R --team T --expires-in D
+       aerolvm token list
+       aerolvm token revoke <token-id>
+
+A token acts with one role (viewer, runner, auditor or admin) on one team,
+or on every team with --team '*'. auditor and admin need --team '*'. Every
+token expires; --expires-in takes days (90d) or a duration (720h), up to
+the server's SB_TOKEN_MAX_TTL. sandboxd needs SB_IDENTITY_ENABLED=true to
+accept the tokens it mints.
+
+create prints the token on stdout. It is shown this once and sandboxd keeps
+only its hash: store it now. A name is unique in its team, so running the
+same create twice fails the second time (exit 1, http_status 409); revoke
+the first and create it again if its token was lost.
+
+revoke takes the token id (tok_...) or the token itself. It succeeds also
+when the token is already gone. Other nodes stop accepting it within
+seconds.
+
+create and revoke need an admin; list needs an auditor or admin.
+
+Flags (create):
+  --name N         1 to 64 characters of A-Z, a-z, 0-9, '.', '_' and '-'
+  --role R         viewer, runner, auditor or admin
+  --team T         a team name (a-z, 0-9, '-'), or '*' for every team
+  --expires-in D   lifetime, e.g. 90d
+  --json           print the created token object, token included
+                   (list: {"tokens":[...]}; revoke: {"revoked":"tok_..."})
+
+Examples:
+  aerolvm token create --name ci-deploy --role runner --team payments --expires-in 90d
+  aerolvm token create --name prom-scrape --role viewer --team '*' --expires-in 90d --json
+  aerolvm token list
+  aerolvm token revoke tok_7Hq2aBcDeFgH
+`
+
 const logoutHelp = `Forget the saved login. The token only leaves this machine; it keeps
 working on sandboxd until an operator revokes it.
 

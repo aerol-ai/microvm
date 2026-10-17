@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -113,6 +114,32 @@ func NodeAccess(nodeID string) Access {
 		Principal: Principal{Kind: PrincipalNode, ID: id, Name: id},
 	}
 }
+
+// TokenAccess is a scoped API token (avm_…, plans/identity-and-access.md
+// §5.4): the token's role, bound to one team or, for team FleetTeam, to
+// every team. A team-bound token is fenced to owner team:<team>; a fleet
+// token is unscoped and creates sandboxes with owner "", exactly as the PAT
+// does. The principal id is the token's public id (tok_…), which is also
+// the audit caller id; the name is the token's name, for people only.
+func TokenAccess(id, name string, role Role, team string, expiresAt time.Time) Access {
+	a := Access{
+		Role:      role,
+		Principal: Principal{Kind: PrincipalToken, ID: id, Name: SanitizeDisplayName(name)},
+		ExpiresAt: expiresAt,
+	}
+	if team == FleetTeam {
+		a.Fleet = true
+	} else {
+		a.Identity.OwnerRef = TeamOwnerRef(team)
+	}
+	return a
+}
+
+// ErrIdentityStale refuses a named credential this node cannot check
+// because its copy of the replicated token list is older than
+// SB_IDENTITY_MAX_STALE (§5.4). The API edge answers 503 with Retry-After:
+// the credential may be perfectly good, the node just cannot vouch for it.
+var ErrIdentityStale = errors.New("controlplane: identity data is stale")
 
 // ErrIdentityNoOwner is returned for a managed identity with an empty
 // OwnerRef. Scoped to owner "", it would see every operator-created sandbox

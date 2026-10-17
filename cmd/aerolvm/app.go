@@ -95,6 +95,9 @@ func (a *app) verbGroups() []verbGroup {
 		{"Audit", []verb{
 			{"audit", "Verify nodes' audit logs against their S3 witness", auditHelp, runAudit},
 		}},
+		{"Access", []verb{
+			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},
+		}},
 		{"Setup", []verb{
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
 			{"logout", "Forget the saved login", logoutHelp, runLogout},
