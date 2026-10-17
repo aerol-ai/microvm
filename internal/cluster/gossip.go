@@ -187,10 +187,19 @@ type gossipMemberIndex struct {
 	// subset is small and changes only on membership churn, so it is kept
 	// alongside the map instead of being re-derived per call.
 	controlPlane []Member
+	// liveFloor is the lowest fv any alive member advertises and liveCount
+	// how many members are alive, both recomputed on membership churn. The
+	// audit caller gate reads them on every audit record, so they are
+	// atomics: the hot read never takes the index lock or walks 2,000
+	// members.
+	liveFloor atomic.Int64
+	liveCount atomic.Int64
 }
 
 func newGossipMemberIndex() *gossipMemberIndex {
-	return &gossipMemberIndex{members: make(map[string]Member), seen: make(map[string]int64)}
+	i := &gossipMemberIndex{members: make(map[string]Member), seen: make(map[string]int64)}
+	i.liveFloor.Store(-1)
+	return i
 }
 
 // rebuildControlPlaneLocked refreshes the server-role index. Caller holds the
@@ -233,8 +242,36 @@ func (i *gossipMemberIndex) upsert(m Member) {
 	}
 	i.members[m.NodeID] = m
 	i.rebuildControlPlaneLocked()
+	i.recordFeatureFloorLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
+}
+
+// recordFeatureFloorLocked refreshes liveFloor and liveCount. Caller holds
+// the write lock. Dead members do not count: one that returns is alive again
+// and lowers the floor on that same update.
+func (i *gossipMemberIndex) recordFeatureFloorLocked() {
+	floor, alive := int64(-1), int64(0)
+	for _, m := range i.members {
+		if !m.Alive {
+			continue
+		}
+		alive++
+		if v := int64(m.FSMOpsVersion); floor < 0 || v < floor {
+			floor = v
+		}
+	}
+	i.liveFloor.Store(floor)
+	i.liveCount.Store(alive)
+}
+
+// featureFloor returns the lowest fv among alive members (-1 with none
+// alive) and the number of alive members.
+func (i *gossipMemberIndex) featureFloor() (floor int64, alive int64) {
+	if i == nil {
+		return -1, 0
+	}
+	return i.liveFloor.Load(), i.liveCount.Load()
 }
 
 func (i *gossipMemberIndex) replace(members []Member) {
@@ -266,6 +303,7 @@ func (i *gossipMemberIndex) replace(members []Member) {
 	i.recordLeaseLossesLocked(next)
 	i.members = next
 	i.rebuildControlPlaneLocked()
+	i.recordFeatureFloorLocked()
 	i.recordMetricsLocked(now)
 	i.mu.Unlock()
 }

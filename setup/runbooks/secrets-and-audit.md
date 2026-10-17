@@ -152,6 +152,26 @@ operator can request with `POST /v1/audit/verify` in the background:
 Do not delete `secrets.verified` to "force" a full check — set the mode to
 `full` for one boot, or call `POST /v1/audit/verify`.
 
+### Rolling back below the audit-caller release
+
+Records carry a hash-covered `caller` (who caused the record, and `via`, the
+edge node a forwarded request came through). A binary from before that
+release drops the field when it reads a record, computes a different hash,
+and so fails boot verification on any log holding one; an older
+`aerolvm audit verify` fails the same way. Upgrade the CLI first.
+
+- **When a node starts writing it.** A single node: from its first secret
+  open after the upgrade. A cluster node: only once every live gossip member
+  (servers, workers and ingress) advertises the release, and never while it
+  knows only itself and still has peers to join. During a rolling upgrade no
+  node writes it, so rolling the first nodes back is safe.
+- **Rolling back once it is written** is not supported. The older binary
+  refuses to boot under `SB_SECRET_AUDIT_STRICT_BOOT=true` (always the case
+  in enterprise mode). With strict boot off it starts, but its audit writer
+  stays unavailable and every record is dropped and counted in
+  `aerolvm_audit_events_dropped_total` until the node runs the newer release
+  again. Roll back no further than this release.
+
 An **empty** local chain is a failure, not a clean bill of health, whenever
 something still remembers a chain: the external witness holds a head for this
 node, or `witness_receipts.jsonl` records a head this node shipped. Deleting

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -2289,56 +2288,63 @@ func (s *Service) CloseSecretAuditSink() {
 	s.secretAuditBootVerify.Wait()
 }
 
-// beginSecretAudit records decrypt latency/error metrics and emits one audit
-// event when the returned closure runs. Never blocks on audit I/O.
-// correlationID may be empty — a fresh id is generated.
-func beginSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID string) func(error) {
-	return beginSecretAuditInc(sink, sandboxID, ref, actor, correlationID, "")
-}
-
-func beginSecretAuditInc(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string) func(error) {
-	return beginSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, "")
-}
-
-// beginSecretAuditOwned stamps the tenant owner so the record authorizes and
-// describes itself without a Raft lookup (plans/audit-export-connectors.md).
-func beginSecretAuditOwned(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef string) func(error) {
-	metricDone := beginClusterSecretOpen()
-	return func(err error) {
-		metricDone(err)
-		emitSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef, err)
-	}
-}
-
 func emitSecretAudit(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID string, err error) {
 	emitSecretAuditOwned(sink, sandboxID, ref, actor, correlationID, incarnationID, "", err)
 }
 
 func emitSecretAuditOwned(sink SecretAuditSink, sandboxID, ref, actor, correlationID, incarnationID, ownerRef string, err error) {
-	if sink == nil {
-		return
-	}
-	if strings.TrimSpace(correlationID) == "" {
-		correlationID = newSecretAuditCorrelationID()
-	}
-	ev := SecretAuditEvent{
-		Time:          time.Now().UTC(),
+	emitSecretOpenEvent(sink, secretOpenEvent(sandboxID, ref, actor, correlationID, incarnationID, ownerRef), err)
+}
+
+// secretOpenEvent is a secret-open record before its outcome is known.
+// actor and node_id keep meaning the writing node; who asked is Caller.
+func secretOpenEvent(sandboxID, ref, actor, correlationID, incarnationID, ownerRef string) SecretAuditEvent {
+	return SecretAuditEvent{
 		Actor:         actor,
 		SandboxID:     sandboxID,
 		Ref:           ref,
-		Result:        secretAuditResultSuccess,
-		Reason:        secretAuditReasonOK,
-		CorrelationID: correlationID,
+		CorrelationID: strings.TrimSpace(correlationID),
 		NodeID:        actor,
 		IncarnationID: strings.TrimSpace(incarnationID),
 		OwnerRef:      strings.TrimSpace(ownerRef),
 		Kind:          secretAuditKindSecretOpen,
 	}
+}
+
+// emitSecretOpenEvent stamps the outcome and time on ev and hands it to sink.
+func emitSecretOpenEvent(sink SecretAuditSink, ev SecretAuditEvent, err error) {
+	if sink == nil {
+		return
+	}
+	if ev.CorrelationID == "" {
+		ev.CorrelationID = newSecretAuditCorrelationID()
+	}
+	ev.Time = time.Now().UTC()
+	ev.Result, ev.Reason = secretAuditResultSuccess, secretAuditReasonOK
 	if err != nil {
 		ev.Result = secretAuditResultFailure
 		ev.Reason = classifySecretAuditReason(err)
 	}
 	sink.Emit(ev)
+}
+
+// beginSecretAuditFor records decrypt latency/error metrics and emits one
+// secret-open record when the returned closure runs; it never blocks on
+// audit I/O. The tenant owner makes the record authorize and describe itself
+// without a Raft lookup (plans/audit-export-connectors.md). The correlation
+// id and the caller come from ctx (plans/identity-and-access.md §5.8), so
+// every open names the request or the subsystem behind it; with no id in
+// ctx a fresh one is minted. The caller is resolved when the open starts,
+// through the rolling-upgrade gate.
+func (s *Service) beginSecretAuditFor(ctx context.Context, sandboxID, ref, actor, incarnationID, ownerRef string) func(error) {
+	ev := secretOpenEvent(sandboxID, ref, actor, correlationIDFromContext(ctx), incarnationID, ownerRef)
+	ev.Caller = s.auditCaller(ctx)
+	sink := s.secretAuditSink()
+	metricDone := beginClusterSecretOpen()
+	return func(err error) {
+		metricDone(err)
+		emitSecretOpenEvent(sink, ev, err)
+	}
 }
 
 // emitEgressAudit records a host-mediated egress destination for sandboxID.
@@ -2386,33 +2392,19 @@ func (s *Service) EgressAuditObserver() func(sandboxID, network, destination str
 }
 
 func newSecretAuditCorrelationID() string {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
-	}
-	return fmt.Sprintf("%d-%x", time.Now().UnixNano(), b[:])
+	return auditlog.NewCorrelationID()
 }
 
-type secretAuditCorrelationKey struct{}
-
 // ContextWithSecretAuditCorrelation attaches correlationID for audited loads
-// (include_env, etc.). Empty id is a no-op.
+// (include_env, etc.). Empty id is a no-op. It is the same context key the
+// API edge fills for every authenticated request and the cluster forward
+// helper sends to peers, so one call's records share one id on every node.
 func ContextWithSecretAuditCorrelation(ctx context.Context, correlationID string) context.Context {
-	correlationID = strings.TrimSpace(correlationID)
-	if ctx == nil || correlationID == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, secretAuditCorrelationKey{}, correlationID)
+	return auditlog.ContextWithCorrelationID(ctx, correlationID)
 }
 
 func correlationIDFromContext(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	if v, ok := ctx.Value(secretAuditCorrelationKey{}).(string); ok {
-		return strings.TrimSpace(v)
-	}
-	return ""
+	return auditlog.CorrelationIDFromContext(ctx)
 }
 
 func classifySecretAuditReason(err error) string {

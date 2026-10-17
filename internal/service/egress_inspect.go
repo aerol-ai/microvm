@@ -366,6 +366,7 @@ func (s *Service) egressSecrets(ctx context.Context, sb *models.Sandbox) map[str
 	if len(keys) == 0 {
 		return nil
 	}
+	ctx = withAuditSubsystem(ctx, auditSubsystemEgress)
 	env := sb.Env
 	if requireInjectKeys(env, keys) != nil {
 		loaded, err := s.loadEnv(ctx, sb.ID, sb.AuditIncarnationID)
