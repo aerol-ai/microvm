@@ -100,6 +100,11 @@ type NodeInput struct {
 	HiddenKeys []string
 	// NewestWitnessDay is the newest day with any witnessed version.
 	NewestWitnessDay string
+	// NoWitness says the caller has no witness to compare against (an
+	// `aerolvm audit search` without --witness): the walk still proves every
+	// record links to the one before it, but no head is checked and the
+	// node is not reported silent for having none.
+	NoWitness bool
 }
 
 // PendingHead is a head newer than the evidence.
@@ -137,10 +142,17 @@ type NodeReport struct {
 // VerifyNode checks one node. An error means the inputs could not be read;
 // a contradiction in what was read is a FAIL in the report instead.
 func VerifyNode(ctx context.Context, in NodeInput) (NodeReport, error) {
+	return walkNode(ctx, in, nil)
+}
+
+// walkNode is VerifyNode with a hook: onRecord sees every record the walk
+// proved links into the chain, in chain order, exactly once.
+func walkNode(ctx context.Context, in NodeInput, onRecord func(Event)) (NodeReport, error) {
 	if in.Now.IsZero() {
 		in.Now = time.Now()
 	}
 	v := newNodeVerifier(in)
+	v.onRecord = onRecord
 	if in.Export != nil {
 		if err := v.walkExport(ctx); err != nil {
 			return v.rep, err
@@ -182,6 +194,9 @@ type nodeVerifier struct {
 	// peakIndexed is the most batches held in one day's index: the memory
 	// bound the tests pin.
 	peakIndexed int
+
+	// onRecord, when set (SearchNode), sees each record that linked.
+	onRecord func(Event)
 }
 
 func newNodeVerifier(in NodeInput) *nodeVerifier {
@@ -214,6 +229,10 @@ func newNodeVerifier(in NodeInput) *nodeVerifier {
 	v.reached = make([]bool, len(v.heads))
 	for _, k := range in.HiddenKeys {
 		v.fail("%s carries a delete marker: the daemon never deletes, so someone tried to hide a witnessed head", k)
+	}
+	if in.NoWitness {
+		v.warn("no witness given: every record was checked to link to the one before it, but no witnessed head was checked, so a node that rewrote its whole history would pass")
+		return v
 	}
 	if day := in.NewestWitnessDay; day == "" || day < in.Now.UTC().AddDate(0, 0, -1).Format("2006-01-02") {
 		// A running node writes at least one head a day (D20), so a node
@@ -294,6 +313,9 @@ func (v *nodeVerifier) feed(ev Event, where string) bool {
 	}
 	v.rep.RecordsChecked++
 	v.match(ev.EventHash)
+	if v.onRecord != nil {
+		v.onRecord(ev)
+	}
 	return true
 }
 
