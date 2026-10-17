@@ -1,10 +1,16 @@
 export { MicroVM } from "./MicroVM.js";
 export { Sandbox } from "./Sandbox.js";
 export { Image } from "./Image.js";
-export type { MicroVMConfig } from "./MicroVM.js";
+export type { MicroVMConfig, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
   AddCustomDomainOptions,
+  APIToken,
+  APITokenList,
+  CreateAPITokenOptions,
+  CreatedAPIToken,
+  WhoAmI,
+  WhoAmIPrincipal,
   AuditEvent,
   AuditOptions,
   AuditPage,
