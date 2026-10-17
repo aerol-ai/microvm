@@ -138,9 +138,22 @@ func (h *Handler) serverFor(r *http.Request) *mcp.Server {
 	if !ok {
 		return nil // the SDK answers 400
 	}
+	// The tools MUST act as exactly the credential that authenticated this
+	// request. bearerToken reads the same two places as the API's auth
+	// middleware (Authorization, then the Sec-WebSocket-Protocol smuggle),
+	// so a caller who authenticated via the subprotocol is scoped to their
+	// own token here too. An empty token must never reach agenttools: the
+	// SDK client falls back to SB_PAT_TOKEN (the daemon's operator PAT) on
+	// an empty token, which would silently run every tool as the operator.
+	// Auth has already passed by this point, so a non-empty token is
+	// guaranteed; refuse rather than escalate if that ever changes.
+	token := bearerToken(r)
+	if token == "" {
+		return nil // the SDK answers 400; never fall through to the operator PAT
+	}
 	tools, err := agenttools.New(agenttools.Config{
 		APIURL:     inProcessBaseURL,
-		Token:      bearerToken(r),
+		Token:      token,
 		Source:     agenttools.SourceMCP,
 		HTTPClient: &http.Client{Transport: &inProcessTransport{handler: h.api(), remoteAddr: r.RemoteAddr}},
 	})
@@ -214,10 +227,27 @@ func spanError(outcome string, err error) error {
 	return nil
 }
 
+// bearerToken extracts the caller credential the SAME way the API's auth
+// middleware (extractBearerToken) does: the Authorization header, or the
+// WebSocket Sec-WebSocket-Protocol smuggle (`sandbox.bearer, <token>`) that
+// browsers use because they cannot set Authorization on a handshake. These
+// must stay in lockstep: if auth accepts a token here that this function does
+// not return, the tools run with a different (empty → operator) identity than
+// the one that authenticated. See pkg/api/middleware.go extractBearerToken.
 func bearerToken(r *http.Request) string {
+	const prefix = "bearer "
 	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	if len(auth) > 7 && strings.EqualFold(auth[:7], "bearer ") {
-		return strings.TrimSpace(auth[7:])
+	if len(auth) > len(prefix) && strings.EqualFold(auth[:len(prefix)], prefix) {
+		return strings.TrimSpace(auth[len(prefix):])
+	}
+	for _, raw := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, part := range strings.Split(raw, ",") {
+			candidate := strings.TrimSpace(part)
+			if candidate == "" || candidate == "sandbox.bearer" {
+				continue
+			}
+			return candidate
+		}
 	}
 	return ""
 }

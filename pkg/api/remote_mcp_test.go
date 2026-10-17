@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
 	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	v1 "github.com/aerol-ai/microvm/pkg/api/v1"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -132,4 +133,78 @@ func TestCaddyForwardsEverySurface(t *testing.T) {
 			t.Errorf("%s has no @api path matcher; the check would pass vacuously", file)
 		}
 	}
+}
+
+// TestRemoteMCPSubprotocolTokenIsNotOperator is a regression test for the
+// privilege-escalation bug where a customer token sent via
+// Sec-WebSocket-Protocol passed auth but the MCP handler read only the
+// Authorization header, handed the tools an empty token, and the SDK then fell
+// back to SB_PAT_TOKEN (the daemon's operator PAT) — running every tool as the
+// operator against any sandbox the caller could name. The tools must act as the
+// caller's own (owner-scoped) identity, so a user token can never resolve
+// another tenant's sandbox by id.
+func TestRemoteMCPSubprotocolTokenIsNotOperator(t *testing.T) {
+	// A real daemon always has SB_PAT_TOKEN in its environment.
+	t.Setenv("SB_PAT_TOKEN", "pat-token")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	st, err := store.Open(filepath.Join(t.TempDir(), "mcp.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	now := time.Now().UTC()
+	const victimID = "sb-00000000000000aa"
+	if err := st.Create(context.Background(), &models.Sandbox{
+		ID: victimID, Name: "victim", OwnerRef: "acct-A", Image: "alpine", Status: models.SandboxStatusStarted,
+		Runtime: models.RuntimeIsolate, CreatedAt: now, UpdatedAt: now, LastActiveAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, nil)
+	validator := stubValidator{accept: "tok-b", identity: controlplane.Identity{ExternalID: "user-b", OwnerRef: "acct-B"}}
+	srv := httptest.NewServer(NewServer(logger, svc, nil, nil, config.Config{MCPEnabled: true, MCPRateLimit: 100}, "pat-token", validator).Handler())
+	defer srv.Close()
+
+	call := func(headers map[string]string) string {
+		t.Helper()
+		transport := &mcp.StreamableClientTransport{
+			Endpoint:   srv.URL + "/mcp?sandbox=" + victimID,
+			HTTPClient: &http.Client{Transport: headerSetTransport{headers}},
+		}
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "t"}, nil).Connect(context.Background(), transport, nil)
+		if err != nil {
+			t.Fatalf("connect: %v", err)
+		}
+		defer cs.Close()
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "exec", Arguments: map[string]any{"command": "echo"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res.Content[0].(*mcp.TextContent).Text
+	}
+
+	// Baseline: B via the Authorization header is owner-scoped and cannot see A's sandbox.
+	hdr := call(map[string]string{"Authorization": "Bearer tok-b"})
+	if strings.Contains(hdr, "isolate sandboxes have no shell") {
+		t.Fatalf("B via Authorization resolved A's sandbox: %q", hdr)
+	}
+	// Regression: the same token via the subprotocol must also be owner-scoped —
+	// it must NOT reach A's sandbox (which would prove it ran as the operator).
+	sub := call(map[string]string{"Sec-WebSocket-Protocol": "sandbox.bearer, tok-b"})
+	if strings.Contains(sub, "isolate sandboxes have no shell") {
+		t.Fatalf("subprotocol token escalated to operator and reached A's sandbox: %q", sub)
+	}
+	if !strings.Contains(sub, "does not exist") {
+		t.Fatalf("expected B to get a not-found for A's sandbox, got %q", sub)
+	}
+}
+
+type headerSetTransport struct{ headers map[string]string }
+
+func (h headerSetTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	for k, v := range h.headers {
+		r.Header.Set(k, v)
+	}
+	return http.DefaultTransport.RoundTrip(r)
 }
