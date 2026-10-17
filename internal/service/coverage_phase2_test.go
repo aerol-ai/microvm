@@ -251,7 +251,7 @@ func TestRegisterSnapshotAndKickReconciler(t *testing.T) {
 		t.Fatal("nil snapshot should fail")
 	}
 
-	row, err := st.GetSnapshot(ctx, "snap-reg")
+	row, err := st.GetSnapshot(ctx, "", "snap-reg")
 	if err != nil || row == nil {
 		t.Fatalf("GetSnapshot: %v", err)
 	}
@@ -425,11 +425,11 @@ type claimFailPushStore struct {
 	claimErr error
 }
 
-func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, name, state, errMsg string) error {
+func (f *claimFailPushStore) SetSnapshotPushState(ctx context.Context, ownerRef, name, state, errMsg string) error {
 	if state == models.SnapshotPushStatePushing && f.claimErr != nil {
 		return f.claimErr
 	}
-	return f.fakePushStore.SetSnapshotPushState(ctx, name, state, errMsg)
+	return f.fakePushStore.SetSnapshotPushState(ctx, ownerRef, name, state, errMsg)
 }
 
 func TestPushOneClaimFailure(t *testing.T) {

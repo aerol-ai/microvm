@@ -266,7 +266,7 @@ func (s *Service) checkTenantBuildRefs(ctx context.Context, dockerfile string) e
 		}
 		local := docker.LooksLikeImageID(ref) || docker.IsSnapshotImageRef(ref) || docker.IsBuiltImageRef(ref) || docker.IsLocalOnlyImageRef(ref)
 		if !local {
-			_, err := s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(ref))
+			_, err := s.store.GetSnapshotByNames(ctx, ownerRefForCreate(ctx), docker.EquivalentImageNames(ref))
 			switch {
 			case err == nil:
 				local = true

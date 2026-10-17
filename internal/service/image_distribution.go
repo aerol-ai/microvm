@@ -182,8 +182,24 @@ func (s *Service) resolveSnapshotChain(ctx context.Context, image, stop string) 
 			}
 			return last, image, nil
 		}
-		snapshot, err := s.store.GetSnapshotByNames(ctx, names)
+		snapshot, err := s.store.GetSnapshotByNames(ctx, ownerRefForCreate(ctx), names)
 		if errors.Is(err, store.ErrNotFound) {
+			// The name is not the caller's snapshot. Before treating it as a
+			// plain image, make sure it is not ANOTHER owner's committed-under-
+			// its-name image (a legacy pre-tag commit whose Image == name):
+			// running that local image would leak another tenant's bytes. The
+			// owner-scoped lookup above cannot see that row, so this cross-owner
+			// image check restores the guard. New commits use owner-scoped tags,
+			// so this only matters for pre-existing legacy rows.
+			holders, hErr := s.store.GetSnapshotsByImage(ctx, names)
+			if hErr != nil {
+				return nil, "", hErr
+			}
+			for _, h := range holders {
+				if h.SourceSandboxID != "" && slices.Contains(names, strings.TrimSpace(h.Image)) && !snapshotResolvableForCreate(ctx, h) {
+					return nil, "", fmt.Errorf("%w: image %q", store.ErrNotFound, image)
+				}
+			}
 			return last, image, nil
 		}
 		if err != nil {

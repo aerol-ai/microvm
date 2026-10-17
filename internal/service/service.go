@@ -3725,7 +3725,11 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 	}
 	if err := s.store.CreateSnapshot(ctx, snapshot); err != nil {
 		if errors.Is(err, store.ErrSnapshotNameConflict) {
-			if existing, getErr := s.getSnapshotAnySpelling(ctx, name); getErr == nil {
+			// A commit's snapshot belongs to the SANDBOX's owner, which may
+			// differ from the caller (an operator/internal caller committing a
+			// tenant's sandbox). Resolve the conflicting row in that owner's
+			// namespace, not the caller's, so a legitimate retry replays.
+			if existing, getErr := s.store.GetSnapshotByNames(ctx, snapshot.OwnerRef, docker.EquivalentImageNames(name)); getErr == nil {
 				return replayExistingSnapshot(ctx, existing, sandboxID)
 			}
 		}
@@ -3785,7 +3789,11 @@ func replayExistingSnapshot(ctx context.Context, existing *models.SandboxSnapsho
 // reading and deleting a snapshot all go through it, as resolving one for a
 // create does, so no spelling reaches a snapshot the others would not.
 func (s *Service) getSnapshotAnySpelling(ctx context.Context, name string) (*models.SandboxSnapshot, error) {
-	return s.store.GetSnapshotByNames(ctx, docker.EquivalentImageNames(name))
+	// Snapshot names are per-owner, so look within the caller's namespace: a
+	// user token in its own account, operator/internal ("") in the operator
+	// namespace. This scopes the register-conflict check and by-name resolution
+	// so one tenant can neither see nor collide with another's names.
+	return s.store.GetSnapshotByNames(ctx, ownerRefForCreate(ctx), docker.EquivalentImageNames(name))
 }
 
 // initialSnapshotPushState picks the push_state value to write for a
@@ -4037,7 +4045,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	default:
 		s.schedulePendingImageGC(ctx, "", snapshot.Image)
 	}
-	if err := s.store.DeleteSnapshot(ctx, snapshot.Name); err != nil {
+	if err := s.store.DeleteSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); err != nil {
 		return err
 	}
 	s.forgetSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)

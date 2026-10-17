@@ -28,7 +28,7 @@ func TestSnapshotOwnerRefRoundTrip(t *testing.T) {
 	if err := st.CreateSnapshot(ctx, &models.SandboxSnapshot{Name: "snap-own", Image: "snap-own", SourceSandboxID: "sb-own", OwnerRef: " acme ", PushState: models.SnapshotPushStatePending}); err != nil {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
-	got, err := st.GetSnapshot(ctx, "snap-own")
+	got, err := st.GetSnapshot(ctx, "acme", "snap-own")
 	if err != nil || got.OwnerRef != "acme" {
 		t.Fatalf("GetSnapshot = %+v, %v; want owner acme", got, err)
 	}
@@ -78,9 +78,42 @@ func TestSnapshotOwnerRefWarmUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sql.Open: %v", err)
 	}
+	// Rebuild sandbox_snapshots into its pre-migration shape: name is the sole
+	// primary key and owner_ref is an ordinary column (empty except an
+	// already-attributed row), so reopen exercises both the owner backfill and
+	// the (owner_ref, name) PK rebuild. owner_ref cannot be dropped once it is
+	// part of the primary key, so the column stays but is cleared.
 	for _, stmt := range []string{
 		`DROP INDEX IF EXISTS idx_sandbox_snapshots_owner_name;`,
-		`ALTER TABLE sandbox_snapshots DROP COLUMN owner_ref;`,
+		`ALTER TABLE sandbox_snapshots RENAME TO sandbox_snapshots_legacy;`,
+		`CREATE TABLE sandbox_snapshots (
+			name TEXT PRIMARY KEY,
+			image TEXT NOT NULL,
+			image_id TEXT NOT NULL DEFAULT '',
+			source_sandbox_id TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			entrypoint_json TEXT NOT NULL DEFAULT '[]',
+			region_id TEXT NOT NULL DEFAULT '',
+			cpu REAL NOT NULL DEFAULT 0,
+			memory_mb INTEGER NOT NULL DEFAULT 0,
+			disk_gb INTEGER NOT NULL DEFAULT 0,
+			gpu REAL NOT NULL DEFAULT 0,
+			image_distribution_mode TEXT NOT NULL DEFAULT '',
+			image_digest TEXT NOT NULL DEFAULT '',
+			image_registry_ref TEXT NOT NULL DEFAULT '',
+			image_verified_at DATETIME,
+			push_state TEXT NOT NULL DEFAULT 'active',
+			push_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT ''
+		);`,
+		`INSERT INTO sandbox_snapshots
+			SELECT name, image, image_id, source_sandbox_id, created_at,
+				entrypoint_json, region_id, cpu, memory_mb, disk_gb, gpu,
+				image_distribution_mode, image_digest, image_registry_ref,
+				image_verified_at, push_state, push_error,
+				CASE WHEN name = 'snap-kept' THEN 'globex' ELSE '' END
+			FROM sandbox_snapshots_legacy;`,
+		`DROP TABLE sandbox_snapshots_legacy;`,
 	} {
 		if _, err := raw.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
@@ -110,7 +143,7 @@ func TestSnapshotOwnerRefWarmUpgrade(t *testing.T) {
 		"snap-orphan":   "",
 		"snap-kept":     "globex",
 	} {
-		got, err := st.GetSnapshot(ctx, name)
+		got, err := st.GetSnapshot(ctx, want, name)
 		if err != nil {
 			t.Fatalf("GetSnapshot %s: %v", name, err)
 		}
@@ -140,12 +173,12 @@ func seedSnapshotCatalogue(t *testing.T, st *Store) {
 		}
 	}
 	for _, alias := range []models.SnapshotAlias{
-		{Alias: "rl-1b", SnapshotName: "snap-1", Facade: models.FacadeRunloop, StateJSON: `{"name":"b"}`},
+		{Alias: "rl-1b", SnapshotName: "snap-1", OwnerRef: "acme", Facade: models.FacadeRunloop, StateJSON: `{"name":"b"}`},
 		// A second runloop alias on the same snapshot: the page must still
 		// carry snap-1 once, joined with the smallest alias.
-		{Alias: "rl-1a", SnapshotName: "snap-1", Facade: models.FacadeRunloop, StateJSON: `{"name":"a"}`, ExtraNames: []string{"extra"}},
-		{Alias: "e2b-3", SnapshotName: "snap-3", Facade: models.FacadeE2B},
-		{Alias: "rl-4", SnapshotName: "snap-4", Facade: models.FacadeRunloop},
+		{Alias: "rl-1a", SnapshotName: "snap-1", OwnerRef: "acme", Facade: models.FacadeRunloop, StateJSON: `{"name":"a"}`, ExtraNames: []string{"extra"}},
+		{Alias: "e2b-3", SnapshotName: "snap-3", OwnerRef: "acme", Facade: models.FacadeE2B},
+		{Alias: "rl-4", SnapshotName: "snap-4", OwnerRef: "acme", Facade: models.FacadeRunloop},
 	} {
 		if err := st.UpsertSnapshotAlias(ctx, alias); err != nil {
 			t.Fatalf("UpsertSnapshotAlias %s: %v", alias.Alias, err)
@@ -309,31 +342,36 @@ func TestGetSnapshotByNames(t *testing.T) {
 	ctx := context.Background()
 	seedSnapshotCatalogue(t, st)
 	for _, tc := range []struct {
+		owner string
 		names []string
 		want  string
 	}{
-		{[]string{"snap-3", "snap-1"}, "snap-3"},
-		{[]string{"missing", "snap-4", "snap-2"}, "snap-4"},
-		{[]string{" snap-5 "}, "snap-5"},
+		{"acme", []string{"snap-3", "snap-1"}, "snap-3"},
+		{"acme", []string{"missing", "snap-4", "snap-2"}, "snap-4"},
+		{"", []string{" snap-5 "}, "snap-5"},
 	} {
-		got, err := st.GetSnapshotByNames(ctx, tc.names)
+		got, err := st.GetSnapshotByNames(ctx, tc.owner, tc.names)
 		if err != nil || got.Name != tc.want {
-			t.Errorf("GetSnapshotByNames(%v) = %v, %v; want %s", tc.names, got, err, tc.want)
+			t.Errorf("GetSnapshotByNames(%q, %v) = %v, %v; want %s", tc.owner, tc.names, got, err, tc.want)
 		}
 	}
+	// Another owner's name is not found in this owner's namespace.
+	if _, err := st.GetSnapshotByNames(ctx, "acme", []string{"snap-2"}); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetSnapshotByNames(acme, snap-2 [globex's]) = %v, want ErrNotFound", err)
+	}
 	for _, names := range [][]string{nil, {"missing", "also-missing"}} {
-		if _, err := st.GetSnapshotByNames(ctx, names); !errors.Is(err, ErrNotFound) {
+		if _, err := st.GetSnapshotByNames(ctx, "acme", names); !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetSnapshotByNames(%v) = %v, want ErrNotFound", names, err)
 		}
 	}
 	if _, err := st.db.ExecContext(ctx, `UPDATE sandbox_snapshots SET entrypoint_json = '{' WHERE name = 'snap-2'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetSnapshotByNames(ctx, []string{"snap-2"}); err == nil || errors.Is(err, ErrNotFound) {
+	if _, err := st.GetSnapshotByNames(ctx, "globex", []string{"snap-2"}); err == nil || errors.Is(err, ErrNotFound) {
 		t.Fatalf("corrupt row = %v, want the scan error", err)
 	}
 	_ = st.Close()
-	if _, err := st.GetSnapshotByNames(ctx, []string{"snap-1"}); err == nil || errors.Is(err, ErrNotFound) {
+	if _, err := st.GetSnapshotByNames(ctx, "acme", []string{"snap-1"}); err == nil || errors.Is(err, ErrNotFound) {
 		t.Fatalf("closed store = %v", err)
 	}
 }
@@ -372,17 +410,22 @@ func TestSnapshotPageAndCountSeekTheirIndex(t *testing.T) {
 		name  string
 		query SnapshotPageQuery
 		index string
+		// allowScan: the composite (owner_ref, name) primary key leads with
+		// owner_ref, so an UNSCOPED page (every owner, ordered by name) can no
+		// longer seek a name index — it scans the owner index and sorts. That
+		// is operator-only and not a hot path; scoped pages still seek.
+		allowScan bool
 	}{
-		{"scoped", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, AliasFacade: models.FacadeRunloop}, "idx_sandbox_snapshots_owner_name"},
-		{"scoped operator namespace", SnapshotPageQuery{Scoped: true}, "idx_sandbox_snapshots_owner_name"},
-		{"one source", SnapshotPageQuery{SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_source_sandbox_id"},
-		{"scoped one source", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_"},
-		{"unscoped", SnapshotPageQuery{AfterName: "snap-2"}, "sqlite_autoindex_sandbox_snapshots_1 (name>?)"},
+		{"scoped", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, AliasFacade: models.FacadeRunloop}, "idx_sandbox_snapshots_owner_name", false},
+		{"scoped operator namespace", SnapshotPageQuery{Scoped: true}, "idx_sandbox_snapshots_owner_name", false},
+		{"one source", SnapshotPageQuery{SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_source_sandbox_id", false},
+		{"scoped one source", SnapshotPageQuery{OwnerRef: "acme", Scoped: true, SourceSandboxID: "sb-a1"}, "idx_sandbox_snapshots_", false},
+		{"unscoped", SnapshotPageQuery{AfterName: "snap-2"}, "idx_sandbox_snapshots_owner_name", true},
 	} {
 		page, args := snapshotPageSQL(tc.query, 10)
 		plan := queryPlan(t, st, page, args)
-		if !strings.Contains(plan, tc.index) || strings.Contains(plan, "SCAN s") {
-			t.Errorf("%s page plan %q, want a seek of %s", tc.name, plan, tc.index)
+		if !strings.Contains(plan, tc.index) || (!tc.allowScan && strings.Contains(plan, "SCAN s")) {
+			t.Errorf("%s page plan %q, want index %s", tc.name, plan, tc.index)
 		}
 		count, countArgs := countSnapshotsSQL(tc.query.OwnerRef, tc.query.Scoped, tc.query.SourceSandboxID)
 		if plan := queryPlan(t, st, count, countArgs); tc.query.Scoped || tc.query.SourceSandboxID != "" {

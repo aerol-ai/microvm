@@ -1406,8 +1406,12 @@ type SandboxCompatState struct {
 type SnapshotAlias struct {
 	Alias        string
 	SnapshotName string
-	Facade       string
-	ExtraNames   []string
+	// OwnerRef is the tenant that owns the snapshot this alias points at.
+	// Snapshot names are unique per owner, so the alias carries the owner to
+	// name a single snapshot and to cascade-delete with the right one.
+	OwnerRef   string
+	Facade     string
+	ExtraNames []string
 	// StateJSON is facade-private state for the snapshot, opaque to the
 	// store (the snapshot counterpart of SandboxCompatState.StateJSON).
 	StateJSON string

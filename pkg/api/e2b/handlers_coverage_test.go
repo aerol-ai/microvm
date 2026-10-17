@@ -578,7 +578,7 @@ func TestDeleteSnapshotResolveAndAliasErrors(t *testing.T) {
 		t.Fatalf("UpsertSnapshotAlias: %v", err)
 	}
 
-	if err := st.DeleteSnapshot(ctx, "del-snap:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "del-snap:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {
@@ -896,7 +896,7 @@ func TestDeleteSnapshotAliasCleanupStoreError(t *testing.T) {
 	if err := json.NewDecoder(rr.Body).Decode(&snap); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if err := st.DeleteSnapshot(ctx, "alias-del:default"); err != nil {
+	if err := st.DeleteSnapshot(ctx, "", "alias-del:default"); err != nil {
 		t.Fatalf("DeleteSnapshot: %v", err)
 	}
 	if err := st.Close(); err != nil {

@@ -330,7 +330,7 @@ func TestListSnapshotsEqualCreatedAtSorting(t *testing.T) {
 	for _, s := range snaps {
 		if s != nil {
 			s.CreatedAt = fixedTime
-			_ = st.DeleteSnapshot(ctx, s.Name)
+			_ = st.DeleteSnapshot(ctx, s.OwnerRef, s.Name)
 			_ = st.CreateSnapshot(ctx, s)
 		}
 	}

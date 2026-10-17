@@ -762,7 +762,7 @@ func TestStoreCases(t *testing.T) {
 				}); err != nil {
 					t.Fatalf("UpsertSnapshotAlias() error = %v", err)
 				}
-				if err := st.DeleteSnapshot(ctx, snapshotName); err != nil {
+				if err := st.DeleteSnapshot(ctx, "", snapshotName); err != nil {
 					t.Fatalf("DeleteSnapshot() error = %v", err)
 				}
 				if _, err := st.GetSnapshotAlias(ctx, aliasID); !errors.Is(err, ErrNotFound) {
@@ -916,7 +916,7 @@ func TestStoreCases(t *testing.T) {
 				if err := st.CreateSnapshot(ctx, snapshot); err != nil {
 					t.Fatalf("CreateSnapshot() error = %v", err)
 				}
-				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				got, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot() error = %v", err)
 				}
@@ -960,7 +960,7 @@ func TestStoreCases(t *testing.T) {
 				if err := st.Delete(ctx, sandbox.ID); err != nil {
 					t.Fatalf("Delete() error = %v", err)
 				}
-				got, err := st.GetSnapshot(ctx, snapshot.Name)
+				got, err := st.GetSnapshot(ctx, snapshot.OwnerRef, snapshot.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot() after delete error = %v", err)
 				}
@@ -1007,13 +1007,13 @@ func TestStoreCases(t *testing.T) {
 					t.Fatalf("unexpected snapshot order: %+v", items)
 				}
 
-				if err := st.DeleteSnapshot(ctx, newer.Name); err != nil {
+				if err := st.DeleteSnapshot(ctx, newer.OwnerRef, newer.Name); err != nil {
 					t.Fatalf("DeleteSnapshot() error = %v", err)
 				}
-				if _, err := st.GetSnapshot(ctx, newer.Name); !errors.Is(err, ErrNotFound) {
+				if _, err := st.GetSnapshot(ctx, newer.OwnerRef, newer.Name); !errors.Is(err, ErrNotFound) {
 					t.Fatalf("expected ErrNotFound after delete, got %v", err)
 				}
-				remaining, err := st.GetSnapshot(ctx, older.Name)
+				remaining, err := st.GetSnapshot(ctx, older.OwnerRef, older.Name)
 				if err != nil {
 					t.Fatalf("GetSnapshot(older) error = %v", err)
 				}
@@ -2670,7 +2670,7 @@ func TestSnapshotPushClaimLease(t *testing.T) {
 		t.Fatalf("CreateSnapshot: %v", err)
 	}
 
-	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStatePushing, ""); err != nil {
+	if err := st.SetSnapshotPushState(ctx, snap.OwnerRef, snap.Name, models.SnapshotPushStatePushing, ""); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 	rows, err := st.ListSnapshotsPendingPush(ctx)
@@ -2693,7 +2693,7 @@ func TestSnapshotPushClaimLease(t *testing.T) {
 		t.Fatalf("expired claim listed %v, want the row back", rows)
 	}
 
-	if err := st.SetSnapshotPushState(ctx, snap.Name, models.SnapshotPushStateActive, ""); err != nil {
+	if err := st.SetSnapshotPushState(ctx, snap.OwnerRef, snap.Name, models.SnapshotPushStateActive, ""); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
 	rows, err = st.ListSnapshotsPendingPush(ctx)
