@@ -47,6 +47,8 @@ type APICall struct {
 	Digest  string
 	Argv    []string
 	Surface string
+	// Grant is the role and team a token create handed out.
+	Grant *auditlog.Grant
 	// Denied is a refused call (403, or a 400/403 from authentication).
 	Denied bool
 	// Durable waits for the record to reach disk (SB_AUDIT_API_DURABLE).
@@ -154,6 +156,7 @@ func (s *Service) apiEvent(ctx context.Context, call APICall) SecretAuditEvent {
 			Surface: call.Surface,
 			Argv:    call.Argv,
 			Target:  strings.TrimSpace(call.Target),
+			Grant:   call.Grant,
 		},
 	}
 	if ev.CorrelationID == "" {

@@ -223,6 +223,20 @@ func TestAuditSearchUsageAndErrors(t *testing.T) {
 	}
 }
 
+// TestFormatAuditRecordTokenCreate: a token create's line names the token
+// it minted and what it can do.
+func TestFormatAuditRecordTokenCreate(t *testing.T) {
+	ev := auditlog.Event{
+		Time: time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC), Kind: auditlog.KindAPI, Result: auditlog.APIResultOK,
+		Ref: "POST /v1/tokens", Caller: &auditlog.Caller{Kind: "operator", ID: "operator"},
+		Request: &auditlog.Request{Method: "POST", Route: "/v1/tokens", Status: 201, Target: "tok_7Hq2abcdEFGH", Grant: &auditlog.Grant{Role: "admin", Team: "*"}},
+	}
+	want := `2026-10-17T09:00:00Z  node-a  api  ok  caller=operator  "POST /v1/tokens"  status=201  target=tok_7Hq2abcdEFGH  grant_role=admin  grant_team=*`
+	if got := formatAuditRecord("node-a", ev); got != want {
+		t.Fatalf("line =\n  %s\nwant\n  %s", got, want)
+	}
+}
+
 // TestAuditSearchIncompleteAndLocal: a witnessed head newer than the
 // evidence past --max-lag makes the search INCOMPLETE (exit 3), as audit
 // verify does; a local log copy supplies the records not exported yet.

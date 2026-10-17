@@ -99,6 +99,17 @@ type Request struct {
 	Routes []string `json:"routes,omitempty"`
 	// Source is the client address of an auth_denied record.
 	Source string `json:"source,omitempty"`
+	// Grant is the role and team a token create gave the token it minted
+	// (Target is its id), so "who minted this admin token" survives the
+	// token row's deletion (§5.9; T5b's access review reads it).
+	Grant *Grant `json:"grant,omitempty"`
+}
+
+// Grant is what a credential-minting call handed out. Field order is part
+// of the hash: append only.
+type Grant struct {
+	Role string `json:"role"`
+	Team string `json:"team"`
 }
 
 // CallState is what one API request's record learns while the request
@@ -116,6 +127,7 @@ type CallState struct {
 	incarnationID string
 	ownerRef      string
 	target        string
+	grant         *Grant
 }
 
 type callStateKey struct{}
@@ -200,6 +212,19 @@ func NoteTarget(ctx context.Context, target string) {
 	st.mu.Unlock()
 }
 
+// NoteCreatedToken records the token a token create minted: its id as the
+// record's target and the role and team it carries as the record's grant.
+func NoteCreatedToken(ctx context.Context, id, role, team string) {
+	st := CallStateFromContext(ctx)
+	if st == nil {
+		return
+	}
+	NoteTarget(ctx, id)
+	st.mu.Lock()
+	st.grant = &Grant{Role: strings.TrimSpace(role), Team: strings.TrimSpace(team)}
+	st.mu.Unlock()
+}
+
 // Forwarded reports whether a forward path handed the call to a peer.
 func (s *CallState) Forwarded() bool { return s != nil && s.forwarded.Load() }
 
@@ -231,6 +256,20 @@ func (s *CallState) Target() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.target
+}
+
+// Grant is the grant NoteCreatedToken recorded, or nil.
+func (s *CallState) Grant() *Grant {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.grant == nil {
+		return nil
+	}
+	g := *s.grant
+	return &g
 }
 
 type surfaceKey struct{}

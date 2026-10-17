@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -174,6 +175,69 @@ func TestAPIRecordPerRoute(t *testing.T) {
 				t.Fatal("record without a correlation id")
 			}
 		})
+	}
+}
+
+// durableRecSink is a recSink that also takes durable records, so a test
+// can see which calls waited for disk.
+type durableRecSink struct {
+	recSink
+	durable []string
+}
+
+func (s *durableRecSink) EmitDurable(ev auditlog.Event) error {
+	s.mu.Lock()
+	s.durable = append(s.durable, ev.Ref)
+	s.mu.Unlock()
+	s.Emit(ev)
+	return nil
+}
+
+// TestAPIRecordTokenRoutes is the token half of the request.target table
+// (finding 7.1, needed by D7's access review): a create names the token it
+// minted and the role and team it carries, never the secret; a revoke names
+// the token it revoked; a list is always recorded and names none. With
+// SB_AUDIT_API_DURABLE the create and the revoke wait for disk.
+func TestAPIRecordTokenRoutes(t *testing.T) {
+	st := storeWith(t, "tokens")
+	svc := service.New(config.Config{IdentityEnabled: true, AuditAPIDurable: true}, discardLogger(), st, nil, nil, nil, nil, nil, nil)
+	sink := &durableRecSink{}
+	svc.UseAuditSinkForTest(sink)
+	srv := NewServer(discardLogger(), svc, nil, nil, config.Config{IdentityEnabled: true}, "pat-token", nil)
+
+	rec := do(t, srv, "POST", "/v1/tokens", "pat-token", `{"name":"ci-admin","role":"admin","team":"*","expires_in":"30d"}`, nil)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create = %d %s", rec.Code, rec.Body.String())
+	}
+	var created models.CreatedAPIToken
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.ID, "tok_") {
+		t.Fatalf("create body: %v %s", err, rec.Body.String())
+	}
+	do(t, srv, "GET", "/v1/tokens", "pat-token", "", nil)
+	if rec := do(t, srv, "DELETE", "/v1/tokens/"+created.ID, "pat-token", "", nil); rec.Code != http.StatusNoContent {
+		t.Fatalf("revoke = %d %s", rec.Code, rec.Body.String())
+	}
+
+	got := sink.records()
+	if len(got) != 3 {
+		t.Fatalf("token calls wrote %d records, want 3: %+v", len(got), got)
+	}
+	create, list, revoke := got[0], got[1], got[2]
+	if create.Ref != "POST /v1/tokens" || create.Request.Target != created.ID || create.Request.Status != http.StatusCreated ||
+		create.Request.Grant == nil || *create.Request.Grant != (auditlog.Grant{Role: "admin", Team: "*"}) || create.Caller.ID != "operator" {
+		t.Fatalf("create record = %+v (request %+v)", create, create.Request)
+	}
+	if raw, _ := json.Marshal(create); strings.Contains(string(raw), created.Token) {
+		t.Fatal("the create record carries the token's secret")
+	}
+	if list.Ref != "GET /v1/tokens" || list.Request.Target != "" || list.Request.Grant != nil {
+		t.Fatalf("list record = %+v (request %+v)", list, list.Request)
+	}
+	if revoke.Ref != "DELETE /v1/tokens/{id}" || revoke.Request.Target != created.ID || revoke.Request.Status != http.StatusNoContent {
+		t.Fatalf("revoke record = %+v (request %+v)", revoke, revoke.Request)
+	}
+	if want := []string{"POST /v1/tokens", "DELETE /v1/tokens/{id}"}; !slices.Equal(sink.durable, want) {
+		t.Fatalf("durable records = %v, want %v", sink.durable, want)
 	}
 }
 

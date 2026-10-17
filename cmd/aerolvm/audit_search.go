@@ -386,6 +386,9 @@ func formatAuditRecord(nodeID string, ev auditlog.Event) string {
 		if r.Source != "" {
 			parts = append(parts, "source="+r.Source)
 		}
+		if g := r.Grant; g != nil {
+			parts = append(parts, "grant_role="+g.Role, "grant_team="+g.Team)
+		}
 	}
 	if ev.CorrelationID != "" {
 		parts = append(parts, "correlation_id="+ev.CorrelationID)

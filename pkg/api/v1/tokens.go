@@ -9,6 +9,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -32,6 +33,9 @@ func (h *handlers) createToken(w http.ResponseWriter, r *http.Request) {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	// The call's api record names the token it minted and what it can do,
+	// never the secret (plans/identity-and-access.md §5.9).
+	auditlog.NoteCreatedToken(r.Context(), created.ID, created.Role, created.Team)
 	// The body holds a credential: never cache it anywhere on the way.
 	w.Header().Set("Cache-Control", "no-store")
 	apihttp.WriteJSON(w, http.StatusCreated, created)

@@ -172,7 +172,7 @@ func TestEventFieldOrderIsFrozen(t *testing.T) {
 		t.Fatalf("Caller field order = %v (append new fields at the end)", got)
 	}
 	if got := jsonFieldNames(reflect.TypeOf(Request{})); !reflect.DeepEqual(got, []string{
-		"method", "route", "status", "digest", "count", "surface", "argv", "target", "routes", "source",
+		"method", "route", "status", "digest", "count", "surface", "argv", "target", "routes", "source", "grant",
 	}) {
 		t.Fatalf("Request field order = %v (append new fields at the end)", got)
 	}

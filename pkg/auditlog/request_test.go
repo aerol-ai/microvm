@@ -85,6 +85,7 @@ func TestRequestIsCoveredByTheHash(t *testing.T) {
 		func(r *Request) { r.Target = "u" },
 		func(r *Request) { r.Routes = []string{"x"} },
 		func(r *Request) { r.Source = "10.0.0.1" },
+		func(r *Request) { r.Grant = &Grant{Role: "admin", Team: "*"} },
 	}
 	for i, tamper := range tampers {
 		forged := with
@@ -184,6 +185,14 @@ func TestCallState(t *testing.T) {
 	}
 	if _, _, owner := none.SandboxIdentity(); owner != "" {
 		t.Fatal("a nil state has no identity")
+	}
+	if st.Grant() != nil || none.Grant() != nil {
+		t.Fatal("no grant until a token create notes one")
+	}
+	NoteCreatedToken(bare, "tok_x", "admin", "*")
+	NoteCreatedToken(ctx, "tok_new", " admin ", "*")
+	if g := st.Grant(); g == nil || *g != (Grant{Role: "admin", Team: "*"}) || st.Target() != "tok_new" {
+		t.Fatalf("created token = %q %+v", st.Target(), g)
 	}
 	// A nested request (a remote MCP tool's inner call) gets its own state:
 	// marking it leaves the outer one alone.

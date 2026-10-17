@@ -173,6 +173,7 @@ func (p *pendingAPIRecord) emit(status int) {
 		if t := p.state.Target(); t != "" {
 			call.Target = t
 		}
+		call.Grant = p.state.Grant()
 		if p.body != nil {
 			call.Digest = p.body.digest()
 			call.Argv = p.body.argv()
