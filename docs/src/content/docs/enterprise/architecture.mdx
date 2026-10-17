@@ -19,6 +19,7 @@ This page describes how an AerolVM deployment is put together from a security po
 | Runtime | The server | Containers, gVisor, Firecracker, WebAssembly or V8 isolates. It builds the wall around each sandbox. | Trusted |
 | Sandbox | Inside the runtime | Your code and everything it starts, plus a small agent that runs commands and moves files | **Untrusted** |
 | Other servers | Your network | Cluster members, only in cluster mode | Trusted after they prove who they are |
+| Identity provider | Your company | Okta, Entra ID, Google, Keycloak, GitHub Actions or a Kubernetes cluster, named in the identity file. It signs people in and signs their tokens. | Trusted for what it signs |
 
 ## Trust boundaries
 
@@ -27,7 +28,8 @@ A trust boundary is a line where data passes between parts that trust each other
 ```mermaid
 flowchart TB
     Visitors["Visitors on the internet<br/>not trusted"]
-    Apps["Your apps and agents<br/>hold the API token"]
+    Apps["People, apps and agents<br/>each hold their own credential"]
+    IdP["Your identity provider"]
     subgraph Host["AerolVM server: trusted"]
         Edge["Caddy"] --> Core["sandboxd, network filter,<br/>database and audit log"]
         subgraph Box["Sandbox: not trusted"]
@@ -37,7 +39,8 @@ flowchart TB
     Peers["Other cluster servers<br/>trusted after mutual TLS"]
     Systems["Your audit store,<br/>monitoring and KMS"]
     Visitors -- "B1: shared links only" --> Edge
-    Apps -- "B2: HTTPS and the token" --> Edge
+    Apps -- "B2: HTTPS and a named credential" --> Edge
+    IdP -. "B7: public keys only" .-> Core
     Core -- "B3: runtime wall" --> Code
     Code -- "B4: outbound policy" --> Core
     Core <-- "B5: mutual TLS" --> Peers
@@ -47,11 +50,12 @@ flowchart TB
 | Boundary | Between | Control |
 |---|---|---|
 | B1 | Visitors and the server | Only ports you shared have a route. New sandboxes are private. |
-| B2 | Your apps and the API | HTTPS in domain mode, and an API token checked in constant time |
+| B2 | People, apps and the API | HTTPS in domain mode. A credential every server checks on its own: a scoped API token, a company sign-in, or the server token. A role on one team limits what it can do. |
 | B3 | The server and a sandbox | The runtime's wall, resource limits, and no privileged mode |
 | B4 | A sandbox and the network | The outbound policy, the name filter and the private-address guard |
 | B5 | One server and another | Mutual TLS with certificates from the cluster's own authority, plus an encrypted membership channel |
 | B6 | The server and your systems | Audit batches over HTTPS, signed with HMAC for webhooks |
+| B7 | The server and your identity provider | The server fetches only the provider's public keys over HTTPS, at start and hourly. It never sends a password or calls the provider per request. |
 
 ## Data flows
 
@@ -69,7 +73,7 @@ flowchart LR
 
 | # | Flow | Data | Protection |
 |---|---|---|---|
-| 1 | Your app to Caddy | API calls, commands, files | HTTPS in domain mode, and the API token |
+| 1 | Your app to Caddy | API calls, commands, files | HTTPS in domain mode, and the caller's own credential |
 | 2 | Caddy to `sandboxd` | The same API calls | Stays inside the server. Caddy forwards only API paths. |
 | 3 | `sandboxd` to a sandbox | Commands, files, and environment variables at start | Stays inside the server |
 | 4 | Sandbox to the network filter | Outbound traffic | The sandbox's policy decides what passes |
@@ -111,6 +115,8 @@ flowchart TB
 The API on port `21212` speaks plain HTTP. In production, let only Caddy reach it, so HTTPS is the only way in. See [Hardening](/enterprise/hardening/).
 </Aside>
 
+With `SB_PAT_SCOPE=host`, Caddy reaches the API through a private Unix socket instead (`/run/sandboxd-public/api.sock`). The server token is then refused on that socket and from any other machine on port `21212`. It still works from the server itself and between cluster servers.
+
 ## Encryption
 
 ### In transit
@@ -138,7 +144,9 @@ The API on port `21212` speaks plain HTTP. In production, let only Caddy reach i
 
 ```mermaid
 flowchart TB
-    App["Your app"] -- "API token" --> API["The API"]
+    App["A service or CI job"] -- "its own scoped API token,<br/>or a workload token" --> API["The API"]
+    User["A person"] -- "a sign-in from your<br/>identity provider" --> API
+    Op["The operator"] -- "the server token,<br/>for emergencies" --> API
     Person["A person using SSH"] -- "that sandbox's own key" --> SSH["SSH gateway"]
     Server["A cluster server"] -- "certificate named node:id" --> Peer["Another cluster server"]
     Worker["A WebAssembly worker"] -- "a signed pass for its own sandbox" --> Audit["Audit collector"]
@@ -147,13 +155,14 @@ flowchart TB
 
 | Who | Proves identity with | Notes |
 |---|---|---|
-| Your apps and agents | The API token | Required. The server will not start without one. |
-| The operator | The same token | Some actions, such as cluster changes and audit checks, are operator-only. |
+| Services and CI jobs | A scoped API token (`avm_…`), or a GitHub Actions or Kubernetes workload token | Each has one role on one team. API tokens expire and can be revoked. Workload tokens need no stored secret. |
+| People | A sign-in from your identity provider | About an hour long, renewed by the CLI and the dashboard. Their role and team come from the identity file's rules. |
+| The operator | The server token (`SB_PAT_TOKEN`) | Required. The server will not start without one. It acts as an admin on every team. With `SB_PAT_SCOPE=host` it works only on the server and between cluster servers. |
 | SSH users | A key pair made for one sandbox | The server stores only the public half. |
 | Cluster servers | A certificate signed by the cluster's authority | Lasts 90 days. Its name must match the server's ID. |
 | Your audit receiver | The HMAC signature on each batch | You hold the shared secret |
 
-Single sign-on and roles are not built yet. Both are [proposed](https://github.com/aerol-ai/microvm/discussions/646) and open for discussion.
+With access control off, the default, the server token is the only API credential. [Access control](/enterprise/access-control/) turns on API tokens, company sign-in and roles.
 
 ## Keys
 
@@ -171,7 +180,7 @@ flowchart TB
 
 ## Connect your apps securely
 
-Use your HTTPS address, and read the token from a secret manager or an environment variable instead of writing it in code:
+Use your HTTPS address. Give each app its own scoped API token, and read it from a secret manager or an environment variable instead of writing it in code:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -180,7 +189,7 @@ Use your HTTPS address, and read the token from a secret manager or an environme
 
     const client = new MicroVM({
       apiUrl: "https://sandbox.example.com",
-      patToken: process.env.SB_PAT_TOKEN,
+      patToken: process.env.SB_API_TOKEN,
     });
     ```
   </TabItem>
@@ -191,7 +200,7 @@ Use your HTTPS address, and read the token from a secret manager or an environme
 
     client = MicroVM(
         api_url="https://sandbox.example.com",
-        pat_token=os.environ["SB_PAT_TOKEN"],
+        pat_token=os.environ["SB_API_TOKEN"],
     )
     ```
   </TabItem>
@@ -199,7 +208,7 @@ Use your HTTPS address, and read the token from a secret manager or an environme
     ```go
     client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
         APIUrl:   "https://sandbox.example.com",
-        PATToken: os.Getenv("SB_PAT_TOKEN"),
+        PATToken: os.Getenv("SB_API_TOKEN"),
     })
     if err != nil {
         log.Fatal(err)
@@ -210,7 +219,7 @@ Use your HTTPS address, and read the token from a secret manager or an environme
     ```rust
     use aerolvm_sdk::Client;
 
-    let token = std::env::var("SB_PAT_TOKEN")?;
+    let token = std::env::var("SB_API_TOKEN")?;
     let client = Client::new(Some("https://sandbox.example.com"), Some(token.as_str()))?;
     ```
   </TabItem>
@@ -222,7 +231,7 @@ Use your HTTPS address, and read the token from a secret manager or an environme
     MicroVMClient client = new MicroVMClient(
         new MicroVMConfig()
             .setApiUrl("https://sandbox.example.com")
-            .setPatToken(System.getenv("SB_PAT_TOKEN"))
+            .setPatToken(System.getenv("SB_API_TOKEN"))
     );
     ```
   </TabItem>

@@ -23,8 +23,8 @@ AerolVM's design follows four principles, the same ideas behind Zero Trust secur
 | Principle | What it means in AerolVM |
 |---|---|
 | **Isolate by default** | Each sandbox runs behind a runtime wall. A new sandbox is private, and only ports you share can be reached. |
-| **Verify explicitly** | Every API call carries a token that is checked in constant time. Cluster servers prove who they are with certificates. |
-| **Least privilege** | Inject rules keep real API keys out of sandboxes. Secrets are left out of normal answers, and cluster changes are operator-only. |
+| **Verify explicitly** | Every API call carries a credential that every server checks on its own: a scoped API token, a company sign-in, or the server token. Cluster servers prove who they are with certificates. |
+| **Least privilege** | Each person and service gets one role on one team. Inject rules keep real API keys out of sandboxes. Secrets are left out of normal answers, and cluster changes need the admin role. |
 | **Assume breach** | Secrets are sealed at rest. Every secret read is recorded in a hash-chained log that you can copy off the server, and alerts fire when something looks wrong. |
 
 ## Defense in depth
@@ -34,7 +34,7 @@ No single control is perfect, so AerolVM stacks them. To reach your data, an att
 ```mermaid
 flowchart TB
     A["An attacker"] --> L1["Layer 1: Network edge<br/>HTTPS, private by default, shared ports only"]
-    L1 --> L2["Layer 2: Identity<br/>API token, an SSH key per sandbox, cluster certificates"]
+    L1 --> L2["Layer 2: Identity<br/>SSO and scoped tokens with roles, an SSH key per sandbox, cluster certificates"]
     L2 --> L3["Layer 3: Workload isolation<br/>runtime walls, resource limits, network policy"]
     L3 --> L4["Layer 4: Data<br/>sealed secrets, inject rules"]
     W["Detect and respond<br/>audit log, export, alerts, runbooks"] -.-> L1
@@ -47,7 +47,8 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Apps["Your apps<br/>and AI agents"] -- "HTTPS and<br/>the API token" --> Caddy["Caddy<br/>HTTPS front door"]
+    Apps["People, apps<br/>and AI agents"] -- "HTTPS and a<br/>named credential" --> Caddy["Caddy<br/>HTTPS front door"]
+    IdP["Your identity provider"] -. "public keys" .-> D
     Caddy --> D["sandboxd<br/>the AerolVM server"]
     D --> S["Sandboxes behind<br/>runtime walls"]
     D --> Vault[("Sealed secrets")]
@@ -79,10 +80,13 @@ Each feature is **Default** (on with no setup), **You turn it on**, or **Propose
 | Operations | Clusters with failover and mutual TLS | You turn it on | [Reference architectures](/enterprise/deployment/) |
 | Operations | Metrics, traces, dashboards and alerts with runbooks | You turn it on | [Runbooks](/operational-runbooks/) |
 | Supply chain | Checksums, a bill of materials and a signed build record with every release | Default | [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) |
-| Identity | Single sign-on (SSO) | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/647) |
-| Identity | Scoped API tokens and roles | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/646) |
+| Identity | Single sign-on (SSO) with Okta, Entra ID, Google, Keycloak or any OIDC provider, in the CLI and the dashboard | You turn it on | [Access control](/enterprise/access-control/) |
+| Identity | Scoped API tokens and four roles, per team | You turn it on | [Access control](/enterprise/access-control/) |
+| Identity | CI sign-in with GitHub Actions or Kubernetes, with no stored secret | You turn it on | [Access control](/enterprise/access-control/#sign-in-from-ci-with-no-stored-secret) |
+| Identity | Named credentials enforced: the server token works only on the server | You turn it on (required by enterprise mode) | [Access control](/enterprise/access-control/#step-5-limit-the-server-token-to-the-server) |
+| Audit | The API caller's name in audit records, for every change, command and refused call | Default | [Audit and compliance](/enterprise/audit-evidence/) |
+| Audit | Access review report for SOC 2 | You turn it on | [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) |
 | Operations | Quotas per team | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/648) |
-| Audit | The API caller's name in audit records | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/649) |
 | Supply chain | Image signature checks | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/650) |
 
 Need a proposed feature sooner? A company can [sponsor it](/enterprise/maintainer/). It is built in the open and ships to everyone.
@@ -111,8 +115,8 @@ flowchart LR
 | Who can reach a new sandbox? | No one, until you share a port. | [Network security](/enterprise/security-controls/#network-security) |
 | Where do secrets live? | Sealed on the server. Every time one is opened, a record is written. | [Data protection](/enterprise/security-controls/#data-protection) |
 | Can an AI agent leak an API key? | Not with an inject rule. The sandbox only ever holds a placeholder. | [Data protection](/enterprise/security-controls/#data-protection) |
-| Who can call the API? | Anyone with the server's API token. | [Identity and access](/enterprise/security-controls/#identity-and-access) |
-| What gets recorded? | Every secret read, and the outbound connections the filter refuses. You can keep a copy off the server. | [Audit and compliance](/enterprise/audit-evidence/) |
+| Who can call the API? | Anyone with the server token, by default. With access control on, each person signs in with your company account and each service gets its own token, each with one role on one team. Enterprise mode limits the server token to the server. | [Access control](/enterprise/access-control/) |
+| What gets recorded? | Every change, command and refused call, with the caller's name. Every secret read, and the outbound connections the filter refuses. You can keep a copy off the server. | [Audit and compliance](/enterprise/audit-evidence/) |
 | Can someone who takes over a server rewrite the log? | Not without being caught, once the audit witness is on. It keeps the log's fingerprints in a locked S3 bucket. Only the newest 30 seconds of records stay open to a rewrite. | [Enterprise mode](/enterprise/enterprise-mode/) |
 | Who handles what? | AerolVM enforces the controls. You run the servers and choose the settings. | [Shared responsibility](/enterprise/responsibility/) |
 
