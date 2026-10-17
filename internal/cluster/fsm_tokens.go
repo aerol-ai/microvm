@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/identity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // Scoped API tokens in the Raft FSM (plans/identity-and-access.md §5.4).
@@ -145,6 +146,19 @@ func (s *apiTokenState) all() []identity.TokenRecord {
 	}
 	s.mu.RUnlock()
 	identity.SortTokenRecords(out)
+	return out
+}
+
+// countLive counts the unexpired tokens by role, without copying records.
+func (s *apiTokenState) countLive(now time.Time) map[controlplane.Role]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[controlplane.Role]int, 4)
+	for _, rec := range s.byID {
+		if !rec.Expired(now) {
+			out[rec.Role]++
+		}
+	}
 	return out
 }
 

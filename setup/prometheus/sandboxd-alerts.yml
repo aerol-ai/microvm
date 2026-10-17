@@ -809,3 +809,110 @@ groups:
           summary: "egress operator file failed to load"
           description: "The operator file on {{ $labels.instance }} did not validate. A node that booted with it refuses every create (503 egress_operator_config_invalid); a running node keeps its last good file. The sandboxd log names the field."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/egress-gateway.md#operatorfile"
+
+  # Identity and access (plans/identity-and-access.md §5.15). The auth
+  # metrics are expvar maps, so their labels are key/key2: key is the
+  # principal kind (or the issuer), key2 the origin, reason or result.
+  - name: sandboxd.identity-and-access
+    interval: 30s
+    rules:
+      # The shared operator token was used, or tried, from outside the host
+      # and the cluster: accepted from a public origin (SB_PAT_SCOPE=any), or
+      # refused by SB_PAT_SCOPE=host. People should use SSO or a named
+      # token; the PAT is the break-glass credential. Under scope "any" the
+      # origin needs SB_L4_FALLBACK_PROXY_PROTOCOL to tell Caddy's traffic
+      # from the host's own.
+      - alert: SandboxdBreakGlassPATUse
+        expr: |
+          sum by (instance) (increase(aerolvm_auth_requests_total{key="operator",key2="public"}[5m])) > 0
+          or
+          sum by (instance) (increase(aerolvm_auth_failures_total{key="operator",key2=~"pat_scope|pat_origin"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "the operator token was used from outside the host"
+          description: "{{ $labels.instance }} saw the shared operator token (PAT) from a public origin in the last 5 minutes. Find the caller in the auth_denied and api records, move it to SSO or a named token, and rotate the PAT if it leaked."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#breakglasspatuse"
+
+      # A node gossips a different SB_PAT_SCOPE: owners under "host" refuse
+      # its forwarded public PAT calls, and it accepts the PAT remotely.
+      - alert: SandboxdPATScopeDrift
+        expr: max by (instance) (aerolvm_pat_scope_drift) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "cluster nodes disagree on SB_PAT_SCOPE"
+          description: "{{ $labels.instance }} sees {{ $value }} live members whose SB_PAT_SCOPE differs from its own. Set the same scope on every node (Terraform or Ansible) and restart the odd ones."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#patscopedrift"
+
+      # The token mirror on a worker or ingress node has not synced from
+      # the server tier. Past SB_IDENTITY_MAX_STALE (60s) the node refuses
+      # API tokens with 503; metrics.read scrapes keep working (D16).
+      - alert: SandboxdIdentityMirrorStale
+        expr: max by (instance) (aerolvm_identity_mirror_age_seconds) > 30
+        for: 2m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "API token mirror is falling behind"
+          description: "The token mirror on {{ $labels.instance }} is {{ $value }}s old (it polls every 5s). At 60s the node refuses API tokens with 503."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#mirrorstale"
+
+      - alert: SandboxdIdentityMirrorRefusingTokens
+        expr: max by (instance) (aerolvm_identity_mirror_age_seconds) > 60
+        for: 1m
+        labels:
+          severity: critical
+          component: identity
+        annotations:
+          summary: "API tokens are refused on a node: its token mirror is stale"
+          description: "The token mirror on {{ $labels.instance }} is {{ $value }}s old, past SB_IDENTITY_MAX_STALE. Every avm_ token gets 503 there except metrics scrapes; SSO and the PAT still work."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#mirrorstale"
+
+      # Signing keys for an issuer could not be fetched for 15 minutes with
+      # no success in between. Tokens signed with a cached key still verify;
+      # a new key id (rotation) or a node with no keys gets 503.
+      - alert: SandboxdIdentityJWKSFailing
+        expr: |
+          (sum by (instance, key) (increase(aerolvm_identity_jwks_fetch_total{key2=~"error|too_large"}[15m])) > 0)
+          unless on (instance, key)
+          (sum by (instance, key) (increase(aerolvm_identity_jwks_fetch_total{key2="ok"}[15m])) > 0)
+        for: 15m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "an identity provider's signing keys cannot be fetched"
+          description: "{{ $labels.instance }} has failed to fetch the JWKS of issuer {{ $labels.key }} for 15 minutes. SSO sign-ins with a rotated or uncached key get 503 on that node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#jwksfailing"
+
+      # Nodes run different identity files, so the same person can hold a
+      # different role depending on which node serves the request.
+      - alert: SandboxdIdentityFileDrift
+        expr: count(count by (key) (aerolvm_identity_file_info)) > 1
+        for: 10m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "nodes are running different identity files"
+          description: "aerolvm_identity_file_info reports {{ $value }} distinct identity-file hashes across the fleet. Ship the same SB_IDENTITY_FILE to every node."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#identityfiledrift"
+
+      # An identity file did not load. At boot SSO answers 503 until it is
+      # fixed; on reload the node keeps its last good file.
+      - alert: SandboxdIdentityFileLoadErrors
+        expr: increase(aerolvm_identity_file_load_errors_total[10m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          component: identity
+        annotations:
+          summary: "the identity file failed to load"
+          description: "The identity file on {{ $labels.instance }} did not validate. A node that booted with it answers SSO with 503 (API tokens and the PAT still work); a running node keeps its last good file. The sandboxd log names the error."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#identityfileloaderrors"

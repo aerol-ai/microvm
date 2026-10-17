@@ -58,7 +58,7 @@ secrets → `secrets.yml`, Terraform-only inputs → `terraform.tfvars`**.
 | `config/terraform.tfvars` | Terraform-only inputs: `aws_region`, `aws_profile`, `ssh_key_name`, `default_*`, `nodes = {...}`, `firecracker = {...}`, `caddy_shared_cert_storage`, `cloudflare_zone_id`, `extra_tags`. | gitignored |
 | `config/terraform.tfvars.example` | Drop-in starter for the above. | committed |
 | `config/cluster.yml` | Shared non-secret cluster ops env both Terraform (day-0) and Ansible (day-2) read: `ingress.domain_name`, `ingress.acme_email`, `mirror.*`, `auto_import.*`, `fleet_control_plane.*`, `otel.*`, `image_pull.*`, `image_build_gc.*`. | committed |
-| `config/secrets.yml` | Shared cluster secrets both Terraform and Ansible read: `cluster.pat_token`, `cloudflare.api_token`, `aocr.upstream_wrap_key`, `aocr.cluster_pat`, `fleet.token`. | gitignored |
+| `config/secrets.yml` | Shared cluster secrets both Terraform and Ansible read: `cluster.pat_token`, `cluster.metrics_token` (optional read-only Prometheus scrape token; empty scrapes with the PAT), `cloudflare.api_token`, `aocr.upstream_wrap_key`, `aocr.cluster_pat`, `fleet.token`. | gitignored |
 | `config/secrets.example.yml` | Empty template for the above. | committed |
 
 Outputs include every node's public IP, the seed's SSH command, and the

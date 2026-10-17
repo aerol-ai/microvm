@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"strings"
 	"time"
@@ -292,7 +293,60 @@ func (s *Service) StartAPITokens(ctx context.Context) error {
 	if _, sweeper := s.Cluster().(apiTokenSweeper); sweeper || !s.ClusterEnabled() {
 		go s.runAPITokenSweep(ctx, apiTokenSweepInterval)
 	}
+	if counter := s.apiTokenCounter(); counter != nil {
+		go s.runAPITokenGauge(ctx, counter, apiTokenGaugeInterval)
+	}
 	return nil
+}
+
+// apiTokensByRole is aerolvm_api_tokens{key=<role>} (plans/identity-and-
+// access.md §5.15): unexpired tokens by role, on a node that holds the
+// token store (a single node, or a Raft server; every server reports the
+// whole fleet's count). Empty, so absent from /v1/metrics, with identity off
+// and on workers.
+var apiTokensByRole = expvar.NewMap("aerolvm_api_tokens")
+
+// apiTokenGaugeInterval is how often the gauge recounts: a scan of an
+// in-memory map of at most a few thousand records.
+const apiTokenGaugeInterval = 30 * time.Second
+
+// apiTokenCounter counts a node's stored tokens by role: identity.TokenSet
+// on a single node, *cluster.Cluster on a Raft server.
+type apiTokenCounter interface {
+	CountAPITokens(now time.Time) map[controlplane.Role]int
+}
+
+func (s *Service) apiTokenCounter() apiTokenCounter {
+	if !s.ClusterEnabled() {
+		return &s.apiTokenSet
+	}
+	if c, ok := s.Cluster().(apiTokenCounter); ok {
+		return c
+	}
+	return nil
+}
+
+func (s *Service) runAPITokenGauge(ctx context.Context, counter apiTokenCounter, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		setAPITokenGauge(counter.CountAPITokens(s.apiTokenNow()))
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// setAPITokenGauge publishes every role, zeros included, so a role whose
+// last token was revoked reads 0 rather than its stale count.
+func setAPITokenGauge(counts map[controlplane.Role]int) {
+	for _, role := range []controlplane.Role{controlplane.RoleViewer, controlplane.RoleRunner, controlplane.RoleAuditor, controlplane.RoleAdmin} {
+		v := new(expvar.Int)
+		v.Set(int64(counts[role]))
+		apiTokensByRole.Set(string(role), v)
+	}
 }
 
 // apiTokenSweeper is a cluster client that can delete expired tokens; only

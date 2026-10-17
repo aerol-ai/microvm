@@ -193,6 +193,259 @@
       ],
       "title": "Live Sandboxes by Isolation Type",
       "type": "bargauge"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "id": 6,
+      "panels": [],
+      "title": "Identity and access",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Accepted credentials by principal kind (key) and origin (key2: host, peer, public). operator/public is break-glass PAT use (alert SandboxdBreakGlassPATUse). Runbook: setup/runbooks/identity-and-access.md.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "sum by (key, key2) (rate(aerolvm_auth_requests_total[5m]))",
+          "legendFormat": "{{key}} from {{key2}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Requests by credential kind and origin",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Refused credentials by kind (key) and reason (key2): a D17 reason, stale (token mirror, 503), unavailable (keys or identity file, 503), no_binding, team_not_bound, pat_scope/pat_origin (SB_PAT_SCOPE=host).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "id": 8,
+      "targets": [
+        {
+          "expr": "sum by (key, key2) (rate(aerolvm_auth_failures_total[5m]))",
+          "legendFormat": "{{key}}: {{key2}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Auth failures by reason",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "How old each worker or ingress node's copy of the API token list is (0 on Raft servers and single nodes). Warning above 30s, tokens refused above 60s (SB_IDENTITY_MAX_STALE).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 37
+      },
+      "id": 9,
+      "targets": [
+        {
+          "expr": "max by (instance) (aerolvm_identity_mirror_age_seconds)",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Token mirror age per node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Seconds since each issuer's signing keys (JWKS) were last fetched, per node and issuer (key), and failed fetches in the last hour. Keys refresh hourly.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 37
+      },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "time() - max by (instance, key) (aerolvm_identity_jwks_last_success_timestamp)",
+          "legendFormat": "{{key}} on {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (key) (increase(aerolvm_identity_jwks_fetch_total{key2!=\"ok\"}[1h]))",
+          "legendFormat": "{{key}} failed fetches (1h)",
+          "refId": "B"
+        }
+      ],
+      "title": "JWKS health per issuer",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Distinct identity-file hashes across the fleet (1 is healthy), invalid loads in the last hour, and live members whose SB_PAT_SCOPE differs (aerolvm_pat_scope_drift, 0 is healthy).",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 37
+      },
+      "id": 11,
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "expr": "count(count by (key) (aerolvm_identity_file_info))",
+          "legendFormat": "identity-file hashes",
+          "refId": "A",
+          "instant": true
+        },
+        {
+          "expr": "sum(increase(aerolvm_identity_file_load_errors_total[1h]))",
+          "legendFormat": "load errors (1h)",
+          "refId": "B",
+          "instant": true
+        },
+        {
+          "expr": "max(aerolvm_pat_scope_drift)",
+          "legendFormat": "PAT scope drift",
+          "refId": "C",
+          "instant": true
+        }
+      ],
+      "title": "Config drift",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "api chain records written by result (key: ok, denied, error), calls folded into rate_limited records, and live API tokens by role (key) on the server tier.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 45
+      },
+      "id": 12,
+      "targets": [
+        {
+          "expr": "sum by (key) (rate(aerolvm_audit_api_records_total[5m]))",
+          "legendFormat": "api records {{key}}/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(aerolvm_audit_api_rate_limited_total[5m]))",
+          "legendFormat": "rate-limited calls/s",
+          "refId": "B"
+        },
+        {
+          "expr": "max by (key) (aerolvm_api_tokens)",
+          "legendFormat": "{{key}} tokens",
+          "refId": "C"
+        }
+      ],
+      "title": "API records and tokens",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "The api-record flood control each node runs: configured mode (key) and effective mode (key2). A node with sandboxes of more than one owner runs coalesce as both.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 45
+      },
+      "id": 13,
+      "targets": [
+        {
+          "expr": "max by (instance, key, key2) (aerolvm_audit_api_flood_mode) == 1",
+          "legendFormat": "{{instance}}: {{key}} runs as {{key2}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Audit flood mode per node",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

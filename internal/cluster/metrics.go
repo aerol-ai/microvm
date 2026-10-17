@@ -82,6 +82,12 @@ var (
 	clusterMTLSCANotAfterUnix   = expvar.NewInt("aerolvm_cluster_mtls_ca_not_after_unix")
 )
 
+// patScopeDrift counts live members whose gossiped SB_PAT_SCOPE differs
+// from this node's (plans/identity-and-access.md §5.11). Any value above 0
+// fires SandboxdPATScopeDrift: an owner under host scope refuses the
+// drifting node's forwarded public PAT calls. 0 on a single node.
+var patScopeDrift = expvar.NewInt("aerolvm_pat_scope_drift")
+
 func recordClusterTLSExpiry(certExpiry, caExpiry time.Time) {
 	if !certExpiry.IsZero() {
 		clusterMTLSCertNotAfterUnix.Set(certExpiry.Unix())
