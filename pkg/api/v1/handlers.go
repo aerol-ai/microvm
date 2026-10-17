@@ -38,10 +38,12 @@ func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	snapshot := h.deps.Service.Capacity()
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || !access.Fleet {
-		// Template administration is operator-only. Capacity remains useful to
-		// managed callers, but template identifiers can encode internal workload
+	if !ok || !access.Can(controlplane.PermFleetAdmin) {
+		// Template administration is fleet.admin. Capacity remains useful to
+		// every reader, but template identifiers can encode internal workload
 		// names and must not leak through this otherwise tenant-visible endpoint.
+		// Fleet scope alone is not enough: a viewer or auditor bound to every
+		// team reads capacity without administering templates.
 		snapshot.LocalTemplateInventoryKnown = false
 		snapshot.LocalTemplateIDs = nil
 		snapshot.LocalTemplateCatalogInventoryKnown = false
@@ -227,10 +229,12 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 	apihttp.WriteJSON(w, http.StatusOK, sandbox)
 }
 
-// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive).
+// parseIncludeEnv accepts include_env=true|1|yes (case-insensitive). It is
+// the same parse the route's permission classifier uses
+// (apihttp.ReadOrSecrets), so any spelling that returns env needed
+// sandbox.secrets to get here.
 func parseIncludeEnv(r *http.Request) bool {
-	v := strings.TrimSpace(strings.ToLower(r.URL.Query().Get("include_env")))
-	return v == "true" || v == "1" || v == "yes"
+	return apihttp.IncludeEnvRequested(r)
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {
