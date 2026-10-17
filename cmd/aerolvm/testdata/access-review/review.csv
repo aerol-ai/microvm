@@ -1,0 +1,27 @@
+row,id,name,kind,role,team,created_by,created_at,expires_at,last_seen,last_action,node,calls,denied,rate_limited,flags,detail
+review,,,,,,,,,,,,,,,,result=PASS; window_start=2026-10-16T00:00:00Z; generated_at=2026-10-17T12:00:00Z; witnessed=false; api_read_records=mixed; tokens=6
+node,node-a,,,,,,,,,,node-a,13,,,,result=PASS; evidence_from=2026-10-15T23:50:00Z; evidence_to=2026-10-16T10:00:00Z; batches=3; api_read_records=mutations; records_lost=7
+node,node-b,,,,,,,,,,node-b,14,,,,result=PASS; evidence_from=2026-10-16T09:04:00Z; evidence_to=2026-10-16T09:58:00Z; batches=3; api_read_records=all; records_lost=0; notes=1 re-sent or overlapping batch
+node,node-c,,,,,,,,,,node-c,0,,,,result=PASS; evidence_from=; evidence_to=; batches=0; api_read_records=none; records_lost=0; notes=no records in the window
+token,tok_0ldC10000000,'-legacy-ci,token,runner,checkout,operator,2026-06-01T00:00:00Z,2026-10-10T00:00:00Z,,,,0,0,0,expired;no_recorded_action,
+token,tok_Aud1tQ4xYz00,auditor-q4,token,auditor,*,tok_Adm1nQ4xYz00,2026-10-16T09:15:00Z,2026-12-31T00:00:00Z,2026-10-16T09:31:00Z,DELETE /v1/sandboxes/{id},node-b,2,1,0,denied,api=2
+token,tok_CkOut0000000,ci-deploy,token,runner,checkout,operator,2026-10-16T09:05:00Z,2027-01-14T09:05:00Z,,,,0,0,0,no_recorded_action,
+token,tok_7Hq2abcdEFGH,ci-deploy,token,runner,payments,operator,2026-09-01T08:00:00Z,2026-11-30T08:00:00Z,2026-10-16T09:30:00Z,rate_limited POST /v1/sandboxes/{id}/toolbox/{path...},node-a,414,0,412,rate_limited,api=413; secret_open=1
+token,tok_Adm1nQ4xYz00,platform-admin,token,admin,*,oidc:okta:00u1ana,2026-10-16T09:05:00Z,2027-01-14T09:05:00Z,2026-10-16T09:45:00Z,DELETE /v1/tokens/{id},node-a,2,0,0,admin,api=2
+token,tok_Prom5crape00,prom-scrape,token,viewer,*,operator,2026-07-20T10:00:00Z,2026-10-30T00:00:00Z,,,,0,0,0,expiring;no_recorded_action,
+token_created,tok_Adm1nQ4xYz00,,token,admin,*,,,,2026-10-16T09:05:00Z,,node-a,,,,admin_grant,by=ana@acme.com (oidc:okta:00u1ana)
+token_created,tok_CkOut0000000,,token,runner,checkout,,,,2026-10-16T09:05:00Z,,node-b,,,,,by=operator
+token_created,tok_Aud1tQ4xYz00,,token,auditor,*,,,,2026-10-16T09:15:00Z,,node-b,,,,,by=platform-admin (tok_Adm1nQ4xYz00)
+token_revoked,tok_Gone7Rv0ked0,,token,,,,,,2026-10-16T09:45:00Z,,node-a,,,,revoked,by=platform-admin (tok_Adm1nQ4xYz00)
+principal,node:node-b,,node,,,,,,2026-10-16T10:00:00Z,DELETE /v1/sandboxes/{id},node-a,1,0,0,admin,api=1
+principal,oidc:okta:00u1ana,ana@acme.com,oidc,,*,,,,2026-10-16T09:58:00Z,rate_limited POST /v1/sandboxes/{id}/toolbox/{path...},node-b,26,0,20,rate_limited,api=26
+principal,oidc:okta:00u2bob,Bob | <b>*admin*</b> [click](https://evil.example) www.evil.example,oidc,,payments,,,,2026-10-16T09:11:00Z,POST /v1/sandboxes/{id}/toolbox/{path...},node-a,1,1,0,denied,api=1
+principal,oidc:okta:00u9eve,"'=HYPERLINK(""https://evil.example"",""report"")",oidc,,checkout,,,,2026-10-16T09:40:00Z,POST /v1/sandboxes,node-b,1,1,0,denied,api=1
+principal,operator,,operator,,,,,,2026-10-16T09:50:00Z,POST /v1/sandboxes,node-b,2,0,0,admin,api=2
+principal,sb-3,,sandbox_key,,,,,,2026-10-16T09:12:00Z,ssh,node-b,1,0,0,,api=1
+principal,system:audit,,system,,,,,,2026-10-16T09:04:00Z,api_flood_mode coalesce:coalesce,node-b,1,0,0,,api_flood_mode=1
+principal,system:lifecycle,,system,,,,,,2026-10-16T09:40:00Z,SYSTEM lifecycle.auto_stop,node-a,1,0,0,,api=1
+principal,tok_Gone7Rv0ked0,old-deploy,token,,payments,,,,2026-10-16T09:35:00Z,POST /v1/sandboxes/{id}/toolbox/{path...},node-b,1,0,0,not_listed,api=1
+principal,tok_Swept0ld0000,old-runner,token,,payments,,,,2026-10-16T09:55:00Z,GET /v1/sandboxes/{id}/toolbox/{path...},node-b,1,0,0,not_listed,api=1
+refused_source,203.0.113.9,,auth_denied,,,,,,2026-10-16T09:45:00Z,POST /v1/sandboxes,node-b,5,,,refused,expired=4; malformed=1
+refused_source,198.51.100.7,,auth_denied,,,,,,2026-10-16T09:46:00Z,POST /v1/sandboxes,node-b,2,,,refused,expired=2

@@ -113,6 +113,7 @@ func (a *app) verbGroups() []verbGroup {
 			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},
 			{"whoami", "Show who sandboxd takes you for: role, team, expiry", whoamiHelp, runWhoAmI},
 			{"auth", "Print a fresh bearer token for scripts and SDKs", authHelp, runAuth},
+			{"access", "Review who holds access and what they did with it", accessHelp, runAccess},
 		}},
 		{"Setup", []verb{
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
