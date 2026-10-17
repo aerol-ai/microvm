@@ -40,7 +40,13 @@ func (c *Config) Summary() Summary {
 		s.Issuers = append(s.Issuers, iss.String())
 	}
 	if c.MCPResource != "" {
-		s.Issuers = append(s.Issuers, fmt.Sprintf("mcp.resource=%q", c.MCPResource))
+		line := fmt.Sprintf("mcp.resource=%q", c.MCPResource)
+		if len(c.MCPScopes) > 0 {
+			// The scopes decide which token a connector asks for, so a
+			// change to them is evidence like the resource itself.
+			line += fmt.Sprintf(" mcp.scopes=%q", c.MCPScopes)
+		}
+		s.Issuers = append(s.Issuers, line)
 	}
 	for _, b := range c.Bindings {
 		s.Bindings = append(s.Bindings, b.String())

@@ -245,6 +245,13 @@ func (v *Verifier) maintainKeys(ctx context.Context) {
 // is always decided here: an Access, a *controlplane.CredentialError with a
 // D17 reason, a *controlplane.NoBindingError (403), or
 // controlplane.ErrIdentityUnavailable (503).
+//
+// An OAuth access token for one of the issuer's mcp_audiences (§5.14) comes
+// back with Access.MCPOnly set; the API edge's surface rule then refuses it
+// everywhere but /mcp and a peer's MCP forward. That rule runs per request
+// after this, so the cache can hold MCP-only tokens like any other: whether
+// a token is MCP-only is a property of its aud, never of the route it was
+// first seen on.
 func (v *Verifier) Authenticate(r *http.Request, bearer string) (controlplane.Access, bool, error) {
 	if !looksLikeJWT(bearer) {
 		return controlplane.Access{}, false, nil
@@ -286,6 +293,7 @@ func (v *Verifier) Authenticate(r *http.Request, bearer string) (controlplane.Ac
 	}
 	a := controlplane.OIDCAccess(tok.principal, tok.bindings, tok.expires)
 	a.ClaimNames = tok.claimNames
+	a.MCPOnly = tok.mcpOnly
 	return a, true, nil
 }
 
@@ -313,7 +321,8 @@ func (v *Verifier) verify(ctx context.Context, st *verifierState, raw string, no
 	}
 	iss, ok := st.cfg.issuerForIss(claims.iss)
 	if !ok {
-		return nil, reject(controlplane.RejectUnknownIssuer)
+		return nil, &controlplane.CredentialError{Kind: controlplane.PrincipalOIDC, Reason: controlplane.RejectUnknownIssuer,
+			Hint: st.cfg.entraV1Hint(claims.iss)}
 	}
 	iv := st.issuers[iss]
 	if !iv.keys.ready.Load() {
@@ -337,7 +346,8 @@ func (v *Verifier) verify(ctx context.Context, st *verifierState, raw string, no
 		}
 		return nil, reject(controlplane.RejectInvalidSignature)
 	}
-	if !iss.acceptsAudience(claims.aud) {
+	accepted, mcpOnly := iss.acceptsAudience(claims.aud)
+	if !accepted {
 		return nil, reject(controlplane.RejectWrongAudience)
 	}
 	if now.After(claims.exp.Add(clockLeeway)) {
@@ -375,6 +385,7 @@ func (v *Verifier) verify(ctx context.Context, st *verifierState, raw string, no
 		issuer:     iss.Name,
 		claimNames: iss.claimNames,
 		overage:    m.overage,
+		mcpOnly:    mcpOnly,
 		expires:    claims.exp,
 		keys:       iv.keys,
 		gen:        gen,
@@ -385,13 +396,24 @@ func (v *Verifier) verify(ctx context.Context, st *verifierState, raw string, no
 	return tok, nil
 }
 
-func (iss *Issuer) acceptsAudience(aud []string) bool {
+// acceptsAudience reports whether aud names one of the issuer's audiences,
+// and mcpOnly when it names only an mcp_audiences one (§5.14). An access
+// token is told apart from an ID token by audience alone: typ at+jwt is not
+// required, because Entra and Keycloak don't send it. The two lists never
+// overlap (the identity-file load refuses it), so an aud that names an ID
+// audience is an ordinary token wherever else it points.
+func (iss *Issuer) acceptsAudience(aud []string) (accepted, mcpOnly bool) {
 	for _, a := range aud {
 		if _, ok := iss.audiences[a]; ok {
-			return true
+			return true, false
 		}
 	}
-	return false
+	for _, a := range aud {
+		if _, ok := iss.mcpAudiences[a]; ok {
+			return true, true
+		}
+	}
+	return false, false
 }
 
 // decodeUnverified reads the header and claims before the signature is

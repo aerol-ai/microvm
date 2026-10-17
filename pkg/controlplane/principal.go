@@ -249,6 +249,12 @@ func (r RejectReason) Valid() bool {
 type CredentialError struct {
 	Kind   PrincipalKind
 	Reason RejectReason
+	// Hint, when set, is a fixed sentence naming the setting that would make
+	// this credential work (an Entra v1 access token: "set
+	// accessTokenAcceptedVersion: 2 on the API app", §5.14). The 401 body
+	// carries it after the surface's text. Like Reason it must never carry a
+	// claim value, a key id or anything from the credential itself.
+	Hint string
 }
 
 func (e *CredentialError) Error() string {

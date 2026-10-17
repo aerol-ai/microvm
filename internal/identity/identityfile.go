@@ -108,7 +108,8 @@ type FileBinding struct {
 
 // FileMCP is the remote-MCP section (§5.14, task T13).
 type FileMCP struct {
-	Resource string `yaml:"resource"`
+	Resource string   `yaml:"resource"`
+	Scopes   []string `yaml:"scopes"`
 }
 
 // Config is a validated identity file. It is immutable once Parse returns:
@@ -119,6 +120,13 @@ type Config struct {
 	Bindings []*Binding
 	// MCPResource is the one protected-resource URL for /mcp (RFC 9728).
 	MCPResource string
+	// MCPScopes are the scopes an MCP connector asks its provider for, sent
+	// as RFC 9728 scopes_supported and in the /mcp 401 challenge. Optional:
+	// Okta and Keycloak mint a token for the configured audience without
+	// one, but Entra mints a custom-API token only for a requested scope
+	// ("api://<app>/<scope>"), and a connector has no other way to learn
+	// it. They decide nothing about which tokens are accepted.
+	MCPScopes []string
 
 	deny   map[string]struct{} // "<issuer>:<sub>"
 	byName map[string]*Issuer
@@ -151,7 +159,8 @@ type Issuer struct {
 	MaxTokenLifetime time.Duration
 	MCP              bool
 
-	audiences map[string]struct{}
+	audiences    map[string]struct{}
+	mcpAudiences map[string]struct{}
 	// bindings are this issuer's bindings in file order, so matching a
 	// token scans only its own issuer's rules.
 	bindings []*Binding
@@ -229,13 +238,11 @@ func Parse(raw []byte) (*Config, error) {
 		hash:   hex.EncodeToString(sum[:]),
 	}
 	if f.MCP != nil {
-		res := strings.TrimSpace(f.MCP.Resource)
-		if res != "" {
-			if err := checkHTTPSURL(res); err != nil {
-				return nil, fmt.Errorf("identity file: mcp.resource: %w", err)
-			}
+		res, scopes, err := parseMCP(f.MCP)
+		if err != nil {
+			return nil, fmt.Errorf("identity file: %w", err)
 		}
-		c.MCPResource = res
+		c.MCPResource, c.MCPScopes = res, scopes
 	}
 	for i := range f.Issuers {
 		iss, err := parseIssuer(f.Issuers[i], c.MCPResource)
@@ -276,6 +283,69 @@ func Parse(raw []byte) (*Config, error) {
 	return c, nil
 }
 
+// mcpPath is where sandboxd serves remote MCP (pkg/api/remotemcp.Path). The
+// resource URL must name it: the /mcp 401 points a connector at the RFC 9728
+// metadata for that URL's path, which sandboxd serves only for /mcp.
+const mcpPath = "/mcp"
+
+// Bounds on mcp.scopes: a handful of scope strings, each short enough for a
+// header parameter.
+const (
+	maxMCPScopes     = 16
+	maxMCPScopeBytes = 256
+)
+
+func parseMCP(fm *FileMCP) (string, []string, error) {
+	res := strings.TrimSpace(fm.Resource)
+	if res != "" {
+		if err := checkHTTPSURL(res); err != nil {
+			return "", nil, fmt.Errorf("mcp.resource: %w", err)
+		}
+		if u, _ := url.Parse(res); u.Path != mcpPath {
+			return "", nil, fmt.Errorf("mcp.resource %q: the path must be %s, where sandboxd serves remote MCP", res, mcpPath)
+		}
+	}
+	if len(fm.Scopes) == 0 {
+		return res, nil, nil
+	}
+	if res == "" {
+		return "", nil, errors.New("mcp.scopes: needs mcp.resource")
+	}
+	if len(fm.Scopes) > maxMCPScopes {
+		return "", nil, fmt.Errorf("mcp.scopes: %d scopes, at most %d", len(fm.Scopes), maxMCPScopes)
+	}
+	scopes := make([]string, 0, len(fm.Scopes))
+	seen := make(map[string]struct{}, len(fm.Scopes))
+	for _, raw := range fm.Scopes {
+		scope := strings.TrimSpace(raw)
+		if !validScope(scope) {
+			return "", nil, fmt.Errorf("mcp.scopes: %q: want 1 to %d printable characters with no space, quote or backslash", raw, maxMCPScopeBytes)
+		}
+		if _, dup := seen[scope]; dup {
+			return "", nil, fmt.Errorf("mcp.scopes: %q is listed twice", scope)
+		}
+		seen[scope] = struct{}{}
+		scopes = append(scopes, scope)
+	}
+	return res, scopes, nil
+}
+
+// validScope is RFC 6749 §3.3's scope-token: printable ASCII except space,
+// double quote and backslash. A scope lands inside a quoted WWW-Authenticate
+// parameter, so the same exclusions keep that header well formed.
+func validScope(s string) bool {
+	if s == "" || len(s) > maxMCPScopeBytes {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x21 || c > 0x7e || c == '"' || c == '\\' {
+			return false
+		}
+	}
+	return true
+}
+
 func parseIssuer(fi FileIssuer, mcpResource string) (*Issuer, error) {
 	iss := &Issuer{
 		Name:            strings.TrimSpace(fi.Name),
@@ -289,6 +359,7 @@ func parseIssuer(fi FileIssuer, mcpResource string) (*Issuer, error) {
 		RolesClaim:      claimName(fi.Claims.Roles, defaultRolesClaim),
 		MCP:             fi.MCP,
 		audiences:       map[string]struct{}{},
+		mcpAudiences:    map[string]struct{}{},
 	}
 	if !validSlug(iss.Name, maxIssuerNameLen) {
 		return nil, fmt.Errorf("name %q: want 1 to %d characters of a-z, 0-9 and -", fi.Name, maxIssuerNameLen)
@@ -325,7 +396,6 @@ func parseIssuer(fi FileIssuer, mcpResource string) (*Issuer, error) {
 		iss.audiences[a] = struct{}{}
 		iss.Audiences = append(iss.Audiences, a)
 	}
-	mcpSeen := map[string]struct{}{}
 	for _, a := range fi.MCPAudiences {
 		a = strings.TrimSpace(a)
 		if a == "" {
@@ -336,10 +406,10 @@ func parseIssuer(fi FileIssuer, mcpResource string) (*Issuer, error) {
 		if _, overlap := iss.audiences[a]; overlap {
 			return nil, fmt.Errorf("issuer %s: mcp_audiences: %q is also in audiences; the two must not overlap", iss.Name, a)
 		}
-		if _, dup := mcpSeen[a]; dup {
+		if _, dup := iss.mcpAudiences[a]; dup {
 			return nil, fmt.Errorf("issuer %s: mcp_audiences: %q is listed twice", iss.Name, a)
 		}
-		mcpSeen[a] = struct{}{}
+		iss.mcpAudiences[a] = struct{}{}
 		iss.MCPAudiences = append(iss.MCPAudiences, a)
 	}
 	if iss.MCP {
@@ -484,6 +554,55 @@ func (c *Config) DiscoveryIssuers() []identitywire.DiscoveryIssuer {
 		})
 	}
 	return out
+}
+
+// MCPAuthorizationServers is RFC 9728's authorization_servers for /mcp: the
+// URLs of the issuers that set mcp: true, in file order. A nil Config
+// (no good file loaded yet) publishes none.
+func (c *Config) MCPAuthorizationServers() []string {
+	if c == nil {
+		return nil
+	}
+	var out []string
+	for _, iss := range c.Issuers {
+		if iss.MCP {
+			out = append(out, iss.URL)
+		}
+	}
+	return out
+}
+
+// Entra's two access-token formats (§5.14). A custom API's access tokens
+// come in the v1 format, iss https://sts.windows.net/<tenant>/, unless the
+// API app's manifest sets accessTokenAcceptedVersion: 2. An issuer written
+// with the tenant's v2 URL then never matches, and a bare unknown_issuer
+// would leave the admin guessing.
+const (
+	entraV1IssuerPrefix = "https://sts.windows.net/"
+	entraV2IssuerPrefix = "https://login.microsoftonline.com/"
+	// EntraV1Hint is that refusal's hint. It names a provider setting,
+	// never a claim value, so it is safe to send next to the D17 reason.
+	EntraV1Hint = "Entra issued a v1 access token; set accessTokenAcceptedVersion: 2 on the API app"
+)
+
+// entraV1Hint returns EntraV1Hint when iss is Entra's v1 issuer for a tenant
+// this file trusts through its v2 URL, and "" otherwise: a v1 token from a
+// tenant the file does not name is just an unknown issuer. The claims are
+// unverified here (there are no keys for an unknown issuer), which is fine:
+// the hint only words a refusal, it never accepts anything.
+func (c *Config) entraV1Hint(iss string) string {
+	tenant, ok := strings.CutPrefix(iss, entraV1IssuerPrefix)
+	if !ok {
+		return ""
+	}
+	tenant = strings.TrimSuffix(tenant, "/")
+	if tenant == "" || strings.ContainsAny(tenant, "/?#") {
+		return ""
+	}
+	if _, ok := c.byURL[entraV2IssuerPrefix+tenant+"/v2.0"]; ok {
+		return EntraV1Hint
+	}
+	return ""
 }
 
 func checkHTTPSURL(raw string) error {
