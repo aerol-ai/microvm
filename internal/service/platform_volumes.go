@@ -48,7 +48,7 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 		return nil, fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
 	}
 
-	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken, s.cfg.OperatorVolumeScope))
 	if err != nil {
 		return nil, fmt.Errorf("scope platform volume: %w", err)
 	}
@@ -152,7 +152,7 @@ func (s *Service) ResolvePlatformVolumesForReplication(ctx context.Context, req 
 	if s.store == nil {
 		return errors.New("platform volume store is not configured")
 	}
-	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+	tenant, err := volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken, s.cfg.OperatorVolumeScope))
 	if err != nil {
 		return fmt.Errorf("scope platform volume for replication: %w", err)
 	}
@@ -243,13 +243,18 @@ func (s *Service) cleanupPlatformVolumeAttachments(ctx context.Context, attachme
 // creates its sandboxes with owner "", exactly as the PAT does, so its
 // volumes live in the same operator namespace those sandboxes mount from.
 // Who may create or delete a volume is decided by the route's permission.
-func callerFromContext(ctx context.Context, patToken string) volumes.Caller {
+//
+// operatorScope is SB_OPERATOR_VOLUME_SCOPE: when pinned, the operator
+// namespace no longer hashes the PAT, so it stays put across a rotation
+// (plans/identity-and-access.md §5.11, H2).
+func callerFromContext(ctx context.Context, patToken, operatorScope string) volumes.Caller {
 	access, ok := controlplane.AccessFromContext(ctx)
 	return volumes.Caller{
-		OwnerRef:  access.Identity.OwnerRef,
-		Operator:  access.Fleet,
-		HasAccess: ok,
-		PATToken:  patToken,
+		OwnerRef:      access.Identity.OwnerRef,
+		Operator:      access.Fleet,
+		HasAccess:     ok,
+		PATToken:      patToken,
+		OperatorScope: operatorScope,
 	}
 }
 

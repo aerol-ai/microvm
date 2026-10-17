@@ -160,7 +160,7 @@ func (s *Service) deleteVolumeRowIfUnattached(ctx context.Context, vol models.Vo
 // volumeTenant resolves the calling tenant's scope segment from the request
 // context, falling back to the operator scope for the PAT path.
 func (s *Service) volumeTenant(ctx context.Context) (string, error) {
-	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken))
+	return volumes.TenantScope(callerFromContext(ctx, s.cfg.PATToken, s.cfg.OperatorVolumeScope))
 }
 
 // volumeBackendFor builds the volumes.Backend for a stored volume's backend.

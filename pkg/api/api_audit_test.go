@@ -367,7 +367,7 @@ func TestAuthDeniedLimiterBounds(t *testing.T) {
 	if ok, n := l.admit("192.0.2.1"); !ok || n != 1 {
 		t.Fatalf("after the sweep: %v %d", ok, n)
 	}
-	if got := sourceAddress(&http.Request{RemoteAddr: "pipe"}); got != "pipe" {
+	if got := tcpPeerAddress(&http.Request{RemoteAddr: "pipe"}); got != "pipe" {
 		t.Fatalf("source of a portless address = %q", got)
 	}
 }

@@ -101,6 +101,7 @@ func TestAuditWitnessBackendLetsEnterpriseBoot(t *testing.T) {
 	_ = setBaseRunEnv(t)
 	fake := witnessFake(t)
 	t.Setenv("SB_ENTERPRISE_MODE", "true")
+	setEnterpriseCredentialEnv(t)
 	t.Setenv("SB_PAT_TOKEN", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
 	t.Setenv("SB_SECRET_AUDIT_STRICT_BOOT", "true")
 	t.Setenv("SB_AUDIT_WITNESS_BACKEND", "s3")
