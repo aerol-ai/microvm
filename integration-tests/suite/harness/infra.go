@@ -80,17 +80,33 @@ func LookupIntegrationNode(targets *IntegrationTargets, name string) (Integratio
 	return IntegrationNode{}, false
 }
 
+// awsRegionArgs returns ["--region", <region>] when a region is set in the
+// environment, else nil. terraform reads its region from the var-file, not from
+// AWS_*, so the aws CLI the suite shells out to has no region unless one is
+// exported — run.sh exports AWS_REGION for exactly this. Passing it explicitly
+// also makes a manual `go test` with AWS_REGION set work, and is harmless when
+// unset (the CLI then falls back to its own config as before).
+func awsRegionArgs() []string {
+	for _, k := range []string{"AWS_REGION", "AWS_DEFAULT_REGION"} {
+		if r := strings.TrimSpace(os.Getenv(k)); r != "" {
+			return []string{"--region", r}
+		}
+	}
+	return nil
+}
+
 // EC2InstanceState runs `aws ec2 describe-instances` for one instance id.
 func EC2InstanceState(t *testing.T, instanceID string) string {
 	t.Helper()
 	if instanceID == "" {
 		return ""
 	}
-	out, err := exec.Command("aws", "ec2", "describe-instances",
+	args := append([]string{"ec2", "describe-instances",
 		"--instance-ids", instanceID,
 		"--query", "Reservations[0].Instances[0].State.Name",
 		"--output", "text",
-	).CombinedOutput()
+	}, awsRegionArgs()...)
+	out, err := exec.Command("aws", args...).CombinedOutput()
 	if err != nil {
 		t.Logf("aws describe-instances %s: %v (%s)", instanceID, err, strings.TrimSpace(string(out)))
 		return ""
@@ -99,7 +115,9 @@ func EC2InstanceState(t *testing.T, instanceID string) string {
 }
 
 // SetEC2InstanceRunning stops or starts an EC2 instance via the AWS CLI.
-// region/profile follow the ambient AWS_* env (same as terraform apply).
+// Region/profile follow the ambient AWS_* env (run.sh exports both for the
+// suite); awsRegionArgs makes the region explicit so the node-kill failover
+// helpers don't fail with "You must specify a region".
 func SetEC2InstanceRunning(t *testing.T, instanceID string, running bool) {
 	t.Helper()
 	if instanceID == "" {
@@ -109,7 +127,8 @@ func SetEC2InstanceRunning(t *testing.T, instanceID string, running bool) {
 	if running {
 		verb = "start-instances"
 	}
-	out, err := exec.Command("aws", "ec2", verb, "--instance-ids", instanceID).CombinedOutput()
+	args := append([]string{"ec2", verb, "--instance-ids", instanceID}, awsRegionArgs()...)
+	out, err := exec.Command("aws", args...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("aws ec2 %s %s: %v (%s)", verb, instanceID, err, strings.TrimSpace(string(out)))
 	}

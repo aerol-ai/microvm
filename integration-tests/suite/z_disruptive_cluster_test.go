@@ -125,16 +125,19 @@ func TestRecreateViaFailover(t *testing.T) {
 }
 
 // UC-58d — A snapshot-backed sandbox survives owner failover under the per-owner
-// snapshot identity. A committed snapshot is pushed to an owner-namespaced copy
-// that is usable cluster-wide (see UC-262), so it must still resolve after the
-// home node dies. This is the one live exercise of the #13 snapshot-namespace
-// rebuild (sandbox_snapshots PK -> (owner_ref, name) + the owner-scoped committed
-// tag) on the cluster recreate path: a fresh-provisioned run otherwise only ever
-// touches those tables on the create path, never through a failover re-resolve.
+// snapshot identity. The sandbox is created FROM a registered snapshot (resolved
+// by name, under the #13 (owner_ref, name) identity), given a recreate failover
+// policy, pinned to worker-x, and worker-x is killed; the sandbox must recreate
+// on a peer. This exercises the rebuilt snapshot tables on the cluster recreate
+// path, which a fresh-provisioned run otherwise only touches on the create path.
 //
-// Flow: pin a Recreate sandbox created FROM a committed snapshot to worker-x, kill
-// worker-x, and require (a) the sandbox recreates on a peer and (b) the snapshot
-// is still resolvable cluster-wide afterward.
+// The snapshot is an image-registered (portable) snapshot on purpose: a
+// committed, local-only snapshot is intentionally refused by recreate failover
+// ("requires a portable image; local-only images cannot be recreated on another
+// node"), so the snapshot-backed failover path is only reachable with a portable
+// one. Whether the snapshot name stays resolvable after the home node dies is
+// logged, not asserted — the catalogue is home-node-local (B6), so that is not a
+// guarantee this test should pin.
 func TestSnapshotBackedFailover(t *testing.T) {
 	harness.Require(t, sc, "UC-58d")
 	if !harness.DisruptiveAllowed() {
@@ -174,8 +177,18 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
+	// Register a PORTABLE snapshot (an external-registry image ref) so a recreate
+	// sandbox is allowed to be created from it. A committed local-only snapshot
+	// would be refused by the recreate portability check before failover.
+	if _, err := c.SDK().RegisterSnapshot(ctx, sdktypes.RegisterSnapshotOptions{
+		Name:  snapName,
+		Image: "alpine:3.20",
+	}); err != nil {
+		t.Fatalf("RegisterSnapshot(%q): %v", snapName, err)
+	}
+
 	// Pin placement to worker-x: drain the failover peers and the spare so the
-	// seed sandbox and the sandbox-under-test both land on the victim.
+	// sandbox-under-test lands on the victim.
 	for name, nodeID := range failoverPeerNodeIDs {
 		if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/drain", nil, nil); err != nil {
 			t.Fatalf("drain %s (%s): %v", name, nodeID, err)
@@ -185,24 +198,12 @@ func TestSnapshotBackedFailover(t *testing.T) {
 		t.Fatalf("drain worker-w (%s): %v", extraDrainedNodeID, err)
 	}
 
-	// Seed a plain sandbox on worker-x and commit a snapshot from it. The commit
-	// pushes an owner-namespaced copy that other nodes can pull, so the snapshot
-	// outlives the home node. Destroy the seed; the snapshot is GC-protected.
-	seed := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
-		Name:    harness.UniqueName(sc, t),
-		Runtime: "docker",
-	})
-	waitRunning(t, seed)
-	if _, err := c.SDK().CreateSnapshot(ctx, seed.ID, snapName); err != nil {
-		t.Fatalf("CreateSnapshot(%q): %v", snapName, err)
-	}
-	_ = c.SDK().Destroy(ctx, seed.ID)
-
 	// Same docker-only reasoning as UC-58b: recreate-via-failover needs >=2
-	// workers advertising the runtime, and docker runs on all four workers.
+	// workers advertising the runtime, and docker runs on all four workers. The
+	// image is the snapshot's NAME, so create resolves it under (owner_ref, name).
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 		Name:     harness.UniqueName(sc, t),
-		Image:    snapName, // resolve the sandbox image by the snapshot's name
+		Image:    snapName,
 		Runtime:  "docker",
 		Failover: &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
 	})
@@ -230,14 +231,16 @@ func TestSnapshotBackedFailover(t *testing.T) {
 		newOwner := resolvePlacementOwner(t, c, sb.ID)
 		if newOwner != "" && newOwner != victimNodeID && slices.Contains(failoverPeerNodeIDList, newOwner) {
 			waitRunning(t, sb)
-			// The recreate on the peer had to re-resolve the snapshot under the
-			// per-owner identity; confirm the snapshot is still addressable after
-			// the home node died (not stranded on the dead owner's store).
+			// Observational only (not a guarantee this test pins): the catalogue
+			// is home-node-local, so after the home node dies the name may or may
+			// not still resolve from a survivor. Log whichever it is.
 			if _, err := c.SDK().GetSnapshot(ctx, snapName); err != nil {
-				t.Fatalf("snapshot %q not resolvable after owner failover: %v", snapName, err)
+				t.Logf("note: snapshot %q not resolvable after owner death (home-node-local catalogue): %v", snapName, err)
+			} else {
+				t.Logf("snapshot %q still resolvable after failover", snapName)
 			}
-			t.Logf("snapshot-backed sandbox %s recreated on %s after killing %s/%s; snapshot %q still resolvable",
-				sb.ID, newOwner, heteroVictimWorker, victimNodeID, snapName)
+			t.Logf("snapshot-backed sandbox %s recreated on %s after killing %s/%s",
+				sb.ID, newOwner, heteroVictimWorker, victimNodeID)
 			return
 		}
 		time.Sleep(10 * time.Second)

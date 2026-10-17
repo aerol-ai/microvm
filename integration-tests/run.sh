@@ -1438,6 +1438,15 @@ run_one() {
   if [[ -n "$suite_aws_profile" ]]; then
     export AWS_PROFILE="$suite_aws_profile"
   fi
+  # terraform takes its region from the var-file, not AWS_*, so the suite's own
+  # aws CLI calls (the EC2 stop/start failover helpers, the witness S3 reads)
+  # have no region unless we export one. Without this every node-kill failover
+  # case (UC-58b/c/d) fails with "You must specify a region". witness_region is
+  # the scenario's aws_region.
+  if [[ -n "$witness_region" ]]; then
+    export AWS_REGION="${AWS_REGION:-$witness_region}"
+    export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$witness_region}"
+  fi
 
     # 150m, not 60m: the 8-member hetero suite runs every disruptive case
     # with real rejoin waits, and T18's first scenario was killed by the 60m
