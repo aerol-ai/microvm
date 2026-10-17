@@ -1321,6 +1321,18 @@ type Config struct {
 	// SB_AUDIT_INDEX_ENABLED. Default true.
 	AuditIndexEnabled bool
 
+	// IdentityEnabled turns on sandboxd's own named credentials: scoped API
+	// tokens (avm_…) and SSO through OIDC (plans/identity-and-access.md).
+	// Off by default, and off is byte for byte the PAT-only server (L8).
+	// With it on the daemon refuses to boot next to a provider that brings
+	// its own token Validator. SB_IDENTITY_ENABLED.
+	IdentityEnabled bool
+	// ITestIdentityFile is the TEST-ONLY static token map read from
+	// SB_ITEST_IDENTITY_FILE (pkg/daemon/itest_identity.go). Load refuses it
+	// with IdentityEnabled or EnterpriseMode (eng review D4); task T3 deletes
+	// it in favour of real avm_ tokens minted at scenario setup.
+	ITestIdentityFile string
+
 	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
 	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
 	// public surface, and operators opt in like every other new listener
@@ -1676,6 +1688,24 @@ func (p PlatformVolumesConfig) Validate() error {
 	return nil
 }
 
+// validateITestIdentityFile holds the interim guards on the test-only static
+// token file until task T3 deletes it (eng review D4). The file maps
+// plaintext tokens to owners in every release binary, so it must never sit
+// next to sandboxd's real identity (two sources sharing one owner namespace),
+// and the hardened enterprise profile refuses it outright.
+func validateITestIdentityFile(cfg Config) error {
+	if cfg.ITestIdentityFile == "" {
+		return nil
+	}
+	if cfg.IdentityEnabled {
+		return errors.New("SB_ITEST_IDENTITY_FILE is test-only and cannot be combined with SB_IDENTITY_ENABLED=true: mint avm_ tokens with the operator token instead")
+	}
+	if cfg.EnterpriseMode {
+		return errors.New("SB_ITEST_IDENTITY_FILE is test-only and is refused when SB_ENTERPRISE_MODE=true: it accepts plaintext tokens from a file")
+	}
+	return nil
+}
+
 func Load() (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
@@ -1909,6 +1939,8 @@ func Load() (Config, error) {
 		AuditRateLimitOperator:        getEnvFloat("SB_AUDIT_RATE_LIMIT_OPERATOR", 50),
 		AuditRateLimitNode:            getEnvFloat("SB_AUDIT_RATE_LIMIT_NODE", 50),
 		AuditIndexEnabled:             getEnvBool("SB_AUDIT_INDEX_ENABLED", true),
+		IdentityEnabled:               getEnvBool("SB_IDENTITY_ENABLED", false),
+		ITestIdentityFile:             strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")),
 		MCPEnabled:                    getEnvBool("SB_MCP_ENABLED", false),
 		MCPAllowedOrigins:             splitEnvList("SB_MCP_ALLOWED_ORIGINS"),
 		MCPAllowedHosts:               splitEnvList("SB_MCP_ALLOWED_HOSTS"),
@@ -2528,6 +2560,9 @@ func Load() (Config, error) {
 	}
 	if cfg.AuditDeletedIndexMax < 0 {
 		return Config{}, errors.New("SB_AUDIT_DELETED_INDEX_MAX must be >= 0")
+	}
+	if err := validateITestIdentityFile(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.EnterpriseMode {
 		// Enterprise tamper-evidence requires both reconstructable event export
