@@ -33,7 +33,7 @@ func (r *ownerRecordingResolver) Resolve(ctx context.Context, _ string) (*wasmmo
 // that tenant's bucket rather than the operator's shared one.
 func TestOwnerRefFromCreateCtx(t *testing.T) {
 	tenant := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: " acct-a "}})
-	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true, Identity: controlplane.Identity{OwnerRef: "ignored"}})
+	operator := controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true, Identity: controlplane.Identity{OwnerRef: "ignored"}})
 	tests := []struct {
 		name string
 		ctx  context.Context
