@@ -128,10 +128,20 @@ run before relying on them.
 The per-owner snapshot namespace (`sandbox_snapshots` PK → `(owner_ref, name)`)
 ships a destructive one-time migration that only runs on a pre-existing old-schema
 DB, so a fresh-provisioned run never exercises it. Before the first release that
-carries it, run the warm-upgrade gate in
-[`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) and the failover
-exercise `UC-58d` (`TestSnapshotBackedFailover`, part of
-`make integration-cluster-hetero`).
+carries it, run the warm-upgrade gate and the failover exercise `UC-58d`
+(`TestSnapshotBackedFailover`, part of `make integration-cluster-hetero`).
+
+The warm-upgrade gate is automated — it provisions the old release, seeds
+snapshots, upgrades every node in place to the local build, and verifies the
+migration lost no rows:
+
+```bash
+integration-tests/run.sh single-node --upgrade-from v0.6.7     # minimum gate
+integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
+```
+
+[`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
+runbook the automation mirrors (use it to debug a failed gate).
 
 ## Enterprise scenarios and the audit witness
 
