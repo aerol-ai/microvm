@@ -12,6 +12,10 @@ import (
 type errorResponse struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	// Reason is set only on a 401 for a refused avm_ token or JWT
+	// (plans/identity-and-access.md D17); every other body omits it, so
+	// existing responses are byte for byte unchanged.
+	Reason string `json:"reason,omitempty"`
 }
 
 type requestError struct {
@@ -39,9 +43,16 @@ func notImplemented(message string) error {
 
 // WriteError writes the E2B error envelope shape expected by the SDK.
 func WriteError(w http.ResponseWriter, status int, message string) {
+	WriteErrorReason(w, status, message, "")
+}
+
+// WriteErrorReason is WriteError with the D17 refusal reason in the body
+// (omitted when empty). The API edge sets the matching WWW-Authenticate
+// header before calling it.
+func WriteErrorReason(w http.ResponseWriter, status int, message, reason string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(errorResponse{Code: status, Message: message})
+	_ = json.NewEncoder(w).Encode(errorResponse{Code: status, Message: message, Reason: reason})
 }
 
 // writeErrorCode is the clustercreate.ErrorWriter for E2B: its envelope has

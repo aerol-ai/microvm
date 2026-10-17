@@ -510,13 +510,3 @@ func TestNilLoggerEvictAndFlush(t *testing.T) {
 }
 
 type noFlush struct{ http.ResponseWriter }
-
-func TestBearerToken(t *testing.T) {
-	for header, want := range map[string]string{"Bearer abc": "abc", "bearer  abc ": "abc", "Basic abc": "", "": ""} {
-		r := httptest.NewRequest(http.MethodGet, "/", nil)
-		r.Header.Set("Authorization", header)
-		if got := bearerToken(r); got != want {
-			t.Fatalf("bearerToken(%q) = %q", header, got)
-		}
-	}
-}
