@@ -16,6 +16,12 @@ import (
 // the team a request selected (eng review E7): team selection runs per
 // request over that short list, so a 10k-binding file costs nothing on a
 // cache hit (E8). A reload builds a new cache with the new bindings.
+//
+// MCP-only access tokens (§5.14) are cached too, with mcpOnly set. The cache
+// never decides where a token may be used: the API edge's surface rule reads
+// Access.MCPOnly on every request, hit or miss, so a token first seen on
+// /mcp is still refused on /v1 from the cache. mcpOnly depends only on the
+// token's aud, which the key (the token's own hash) already fixes.
 
 // Cache bounds.
 const (
@@ -35,6 +41,9 @@ type verifiedToken struct {
 	issuer  string
 	groups  []string
 	overage bool
+	// mcpOnly: the token's aud named only an mcp_audiences audience, so it
+	// is an OAuth access token for /mcp (§5.14), refused everywhere else.
+	mcpOnly bool
 	expires time.Time
 	// keys and gen pin the key-set generation the signature verified
 	// under: a later fetch that withdraws a key makes the entry stale.

@@ -28,6 +28,14 @@
 //   - Summary and Diff: the identity_config evidence a file change writes
 //     (CEO review D20).
 //
+// Task T13 adds OAuth for remote MCP (§5.14). An issuer's mcp_audiences are
+// OAuth access-token audiences: the Verifier accepts such a token offline
+// like an ID token and marks its Access MCPOnly, and the API edge accepts
+// it only on /mcp and on a peer's forward marked X-Cluster-Surface: mcp.
+// The file's mcp: section (resource, scopes) and its mcp: true issuers are
+// what /mcp publishes as RFC 9728 metadata. An Entra v1 access token for a
+// trusted tenant is refused with a hint naming the manifest setting.
+//
 // Nothing on the request path makes a network call or touches SQLite (L2,
 // D21): an unknown or malformed token is a local miss. The verifier's only
 // traffic is the issuer's JWKS, fetched at start, hourly, and at most once a
