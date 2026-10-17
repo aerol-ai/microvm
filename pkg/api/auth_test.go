@@ -320,9 +320,14 @@ func TestPostMatchSteps(t *testing.T) {
 		// Surface rule.
 		{name: "ordinary credential on any route", access: payments, req: req{path: "/v1/sandboxes"}, wantNoErr: true},
 		{name: "MCP-only credential on /mcp", access: mcpOnly, req: req{path: "/mcp"}, wantNoErr: true},
-		{name: "MCP-only credential on a peer's MCP forward", access: mcpOnly, req: req{path: "/v1/sandboxes/sb-1/exec", peer: true, surface: "mcp"}, wantNoErr: true},
+		{name: "MCP-only credential on a peer's MCP forward", access: mcpOnly, req: req{path: "/v1/sandboxes/sb-1/exec", peer: true, forwarded: true, surface: "mcp"},
+			wantVia: "peer-test", wantNoErr: true},
 		{name: "MCP-only credential off /mcp is wrong_audience", access: mcpOnly, req: req{path: "/v1/sandboxes"}, wantErr: &controlplane.CredentialError{}},
-		{name: "MCP surface marker without a peer is ignored", access: mcpOnly, req: req{path: "/v1/sandboxes", surface: "mcp"}, wantErr: &controlplane.CredentialError{}},
+		{name: "MCP surface marker without a peer is ignored", access: mcpOnly, req: req{path: "/v1/sandboxes", forwarded: true, surface: "mcp"}, wantErr: &controlplane.CredentialError{}},
+		{name: "MCP surface marker from a peer that is not forwarding is ignored", access: mcpOnly, req: req{path: "/v1/sandboxes", peer: true, surface: "mcp"},
+			wantErr: &controlplane.CredentialError{}},
+		{name: "another surface value is ignored", access: mcpOnly, req: req{path: "/v1/sandboxes", peer: true, forwarded: true, surface: "ssh"},
+			wantErr: &controlplane.CredentialError{}},
 		// Team selection.
 		{name: "token naming its own team", access: payments, req: req{team: "payments"}, wantNoErr: true},
 		{name: "token header is trimmed", access: payments, req: req{team: " payments "}, wantNoErr: true},

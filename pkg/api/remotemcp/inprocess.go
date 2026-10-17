@@ -7,14 +7,22 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // inProcessTransport hands each Go SDK request straight to sandboxd's own
-// API handler, carrying the MCP caller's Authorization header. A remote tool
-// call therefore goes through exactly the same auth, tenant scoping, cluster
-// forwarding and idempotency as a direct API call: there is no second authz
-// path and no loopback listener to configure.
+// API handler. A remote tool call therefore goes through the same route
+// permission, tenant scoping, audit record, cluster forwarding and
+// idempotency as a direct API call: there is no second authz path and no
+// loopback listener to configure.
+//
+// Who the call is from travels as the Access hand-off (handoff.go): the
+// Access /mcp authenticated, which the API edge uses instead of checking a
+// bearer again. The request also keeps the caller's own Authorization
+// header, which a forward to the owning node carries so the owner can verify
+// it offline.
 //
 // The response streams back through an io.Pipe. A recorder that buffered
 // the whole body would hold an arbitrarily large response (a big file, a
@@ -25,6 +33,11 @@ import (
 type inProcessTransport struct {
 	handler    http.Handler
 	remoteAddr string
+	// access is the outer /mcp request's Access; hasAccess is false only if
+	// /mcp was somehow served without authentication, and then every inner
+	// call gets the edge's 500 (finding 2.5).
+	access    controlplane.Access
+	hasAccess bool
 }
 
 func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -32,9 +45,16 @@ func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error
 	// tool call, attributed to the MCP caller, with surface "mcp" (§5.9).
 	// Only this transport sets the marker; nothing on the wire can.
 	ctx := auditlog.ContextWithSurface(req.Context(), auditlog.SurfaceMCP)
+	ctx = contextWithHandoff(ctx, t.access, t.hasAccess)
 	in := req.Clone(ctx)
 	in.RequestURI = req.URL.RequestURI()
 	in.RemoteAddr = t.remoteAddr
+	// The team is the hand-off's, resolved when /mcp authenticated. A team
+	// header here could only come from the SDK client's own defaults
+	// (SB_TEAM in sandboxd's environment, once the SDKs read it, T9), which
+	// is the daemon's setting, never the caller's. A forward gets the team
+	// back from cluster.StampForward, taken from the hand-off Access.
+	in.Header.Del(cluster.HeaderTeam)
 	if in.Body == nil {
 		in.Body = http.NoBody
 	} else if in.ContentLength == 0 && in.Body != http.NoBody {
