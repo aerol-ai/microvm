@@ -89,7 +89,10 @@ The server checks these rules when it starts. If one is missing, it refuses to s
 
 | Rule | What the server needs |
 |---|---|
-| Strong tokens | An `SB_PAT_TOKEN` of at least 32 bytes. `SB_AUDIT_INGEST_TOKEN` and the webhook export token need 32 bytes too, when you set them. |
+| Strong tokens | An `SB_PAT_TOKEN` of at least 32 bytes. `SB_AUDIT_INGEST_TOKEN`, the webhook export token and `SB_PAT_TOKEN_PREVIOUS` need 32 bytes too, when you set them. |
+| Named credentials | `SB_IDENTITY_ENABLED=true` and `SB_PAT_SCOPE=host`. People and services sign in with SSO or a scoped API token. The shared server token works only on the server itself and between cluster servers. SSO is not required: tokens-only mode, with no identity file, works on air-gapped networks. See [Access control](/enterprise/access-control/). |
+| Tokens that expire | API tokens last at most 90 days (`SB_TOKEN_MAX_TTL`). |
+| Every change recorded | API action records stay on (`SB_AUDIT_API_RECORDS` is not `off`). Token create, token revoke and sandbox delete wait until their record is on disk (`SB_AUDIT_API_DURABLE`). |
 | Locked-down sandboxes | Privileged mode off (`SB_CONTAINER_PRIVILEGED`). Resource limits on, so `SB_RESOURCE_LIMITS_DISABLED` stays unset. |
 | A healthy audit log | The log must open at start (`SB_SECRET_AUDIT_STRICT_BOOT=true`). Audit and delete-record retention must be above zero. So must the per-sandbox audit rate, `SB_AUDIT_EGRESS_SANDBOX_RATE`. |
 | Records copied off the server | `SB_AUDIT_EXPORT_BACKEND` set to `webhook`, `s3` or `bus`. A webhook needs `https` plus a bearer token, an HMAC key or a client certificate. An S3 endpoint needs `https`. |
@@ -177,7 +180,11 @@ SB_AUDIT_WITNESS_S3_BUCKET=my-audit-witness
 SB_AUDIT_WITNESS_S3_REGION=us-east-1
 SB_AUDIT_EXPORT_BACKEND=s3
 SB_AUDIT_EXPORT_S3_BUCKET=my-audit-export
+SB_IDENTITY_ENABLED=true
+SB_PAT_SCOPE=host
 ```
+
+`SB_PAT_SCOPE=host` also needs Caddy to reach the server through its private socket. Re-run the installer with `--pat-scope host` on each server: it writes that setting and the Caddy change together. Before you do, move every remote tool that uses the server token (the dashboard, remote MCP, SDK scripts, a Prometheus scrape) to SSO or a named API token. [Access control](/enterprise/access-control/) shows how, including how to make the first admin token.
 
 AWS credentials come from the usual places: the server's instance role, environment variables or a profile. The Terraform setup sets the witness settings for you. Set `SB_ENTERPRISE_MODE` yourself, through `extra_sandboxd_env`.
 
@@ -207,6 +214,10 @@ A refusal means the server cannot prove its audit log is intact. The error names
 | A canary error other than "access denied" | The server cannot prove deletes are blocked | Fix the cause in the message. An unknown answer is never treated as safe. |
 | A check that timed out after 30 seconds | S3 did not answer | Fix the network path, the region or the endpoint |
 | `SB_NODE_ID` | The id is missing or `standalone` | Set a unique `SB_NODE_ID` |
+| `requires SB_IDENTITY_ENABLED=true` | Named credentials are off | Set `SB_IDENTITY_ENABLED=true`. An identity file is optional. |
+| `requires SB_PAT_SCOPE=host` | The server token still works from anywhere | Re-run the installer with `--pat-scope host`, after moving remote tools off the server token |
+| `SB_TOKEN_MAX_TTL must be at most` | API tokens could last longer than 90 days | Lower `SB_TOKEN_MAX_TTL`, or unset it |
+| `SB_AUDIT_API_RECORDS=off` or `SB_AUDIT_API_DURABLE` | API calls would go unrecorded, or token and delete records could be lost in a crash | Unset both. Enterprise mode picks safe values. |
 | An empty local log, while the witness holds a head | The log was deleted, or the server was rebuilt on an empty disk | [Rebuild under a new id](#rebuild-a-server-under-a-new-id), or treat it as tampering |
 | `secret audit witness mismatch` | The newest head in the bucket is not in the local log | Change nothing, copy the audit folder and follow the [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#witness-mismatch) |
 | A delete marker on the newest head | Someone with wider rights tried to hide a head | Treat it as tampering, and find the caller in CloudTrail |

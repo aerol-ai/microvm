@@ -23,12 +23,12 @@ Every claim here was checked against the code. Where a protection stops, the pos
 
 ## In short
 
-- One API token guards the API. It is checked in constant time, so its timing reveals nothing.
+- Every API call carries a credential, and every server checks it on its own. By default that is the server's one token, checked in constant time. With [access control](/enterprise/access-control/) on, people sign in with their company account and services get their own tokens, each with one role on one team.
 - A new sandbox is private. Nobody can reach it until you share a port.
 - Secrets are encrypted with AES-256-GCM before they touch the disk. Environment variables are also bound to their own sandbox, so a copy cannot be opened for another one.
 - Servers in a cluster prove who they are with certificates signed by the cluster's own authority.
-- Every time a secret is opened, a record goes into a hash-chained logbook. The server checks the whole chain each time it starts.
-- Metrics need the API token. Traces and request logs leave out request bodies and headers, so the commands and secrets you send stay out of them.
+- Every time a secret is opened, and every time an API call changes something, a record goes into a hash-chained logbook, naming who did it. The server checks the whole chain each time it starts.
+- Metrics need a credential. Traces and request logs leave out request bodies and headers, so the commands and secrets you send stay out of them.
 - Each release ships with checksums, a bill of materials and a signed build record.
 
 ## The big picture
@@ -70,7 +70,7 @@ Security starts with a simple question: who is trusted with what?
 ```mermaid
 flowchart TB
     A["The internet<br/>not trusted"] --> B["Code in a sandbox<br/>not trusted"]
-    B --> C["Your apps<br/>hold the API token"]
+    B --> C["Your people and apps<br/>hold their own credentials"]
     C --> D["Cluster servers<br/>hold a badge"]
     D --> E["The server<br/>fully trusted"]
 ```
@@ -81,11 +81,11 @@ Each step down is trusted with more.
 |---|---|---|
 | The internet | Nothing | Open the links and ports you shared. Nothing else. |
 | Code in a sandbox | Its own files and processes | Whatever you allowed that one sandbox to do |
-| Your apps | The API token | Create sandboxes, run commands, read files |
+| Your people and apps | A company sign-in, their own API token, or the server token | What their role allows: read, run, audit or administer, on their own team or on every team |
 | Other cluster servers | A signed certificate and the gossip key | Join the cluster and pass work along |
 | The server and its operators | Everything | Everything. AerolVM protects the server from sandboxes, not sandboxes from their own server. |
 
-That last row matters. Whoever controls the server, or holds its API token, is on the trusted side. Protect both like the keys to the building.
+That last row matters. Whoever controls the server, or holds its server token, is on the trusted side. Protect both like the keys to the building.
 
 ## The doors into a server
 
@@ -93,8 +93,8 @@ A port is a numbered door that network traffic can come through. Here are AerolV
 
 | Door | Port | Who uses it | The guard |
 |---|---|---|---|
-| HTTPS | `443` | Your apps and visitors | TLS, then the API token for API calls |
-| The API | `21212` | Caddy, and your apps on a private network | The API token, compared in constant time |
+| HTTPS | `443` | Your apps and visitors | TLS, then a credential for API calls |
+| The API | `21212` | Caddy, and your apps on a private network | A credential: a company sign-in, an API token, or the server token compared in constant time |
 | Sandbox ports | `22000` to `23000` | Database clients and other TCP tools | Open only for ports you shared |
 | SSH | `2220` | People and tools using SSH | That sandbox's own key, and no other |
 | Cluster | `7000`, `7001`, `7002` | Other servers in your cluster | A cluster certificate, or the gossip key |
@@ -122,7 +122,9 @@ Every API call must carry the token. The server compares it in constant time. A 
 
 The API itself speaks plain HTTP. In domain mode, Caddy (the web server in front of AerolVM) adds HTTPS, so the token travels encrypted. Keep port `21212` private, so HTTPS is the only way in. The [Hardening](/enterprise/hardening/) checklist shows how.
 
-A few calls are for the operator only, such as checking the audit chain and changing the cluster. Two pages are open on purpose: a health check for load balancers, and the dashboard's web page. The dashboard page holds no data itself. You type the token into it, and every data call it makes still needs the token.
+With access control on, people and services stop sharing that token. A person signs in with their company account through `aerolvm login` or the dashboard. The company's identity provider signs a short-lived token, and every AerolVM server checks that signature with the provider's public keys, with no call to a login service. A service gets its own API token, which an admin creates and can revoke. Each credential carries one role on one team, and another team's sandbox looks like it does not exist. The [access control](/enterprise/access-control/) page explains it.
+
+A few calls need the admin role, such as changing the cluster. Two pages are open on purpose: a health check for load balancers, and the dashboard's web page. The dashboard page holds no data itself. You sign in to it, and every data call it makes still needs your credential.
 
 ### The journey of an API call
 
@@ -132,10 +134,10 @@ sequenceDiagram
     participant C as Caddy
     participant S as sandboxd
     participant B as Sandbox
-    App->>C: HTTPS request with the token
+    App->>C: HTTPS request with its credential
     Note over C: TLS decrypts the request
     C->>S: forwards API paths only
-    Note over S: checks the token<br/>in constant time
+    Note over S: checks the credential<br/>and the caller's role
     S->>B: runs the command
     B-->>S: output
     S-->>App: answer, back over HTTPS
@@ -143,12 +145,12 @@ sequenceDiagram
 
 1. Your app sends the request over HTTPS. Anyone watching the network sees only scrambled bytes.
 2. Caddy decrypts it and forwards only the API paths to `sandboxd`.
-3. `sandboxd` checks the token. A wrong token gets `401 Unauthorized` and goes no further.
+3. `sandboxd` checks the credential. A bad one gets `401 Unauthorized`, and a role that is too small gets `403 Forbidden`. Neither goes further.
 4. The command runs inside the one sandbox the call named.
 
 ### Public links and shared ports
 
-Sometimes you want visitors to reach a sandbox, for example to see a web app it runs. That is a public link. Visitors do not have your API token, so these doors work differently.
+Sometimes you want visitors to reach a sandbox, for example to see a web app it runs. That is a public link. Visitors do not have an API credential, so these doors work differently.
 
 ```mermaid
 flowchart TB
@@ -363,7 +365,7 @@ The server can send every record to your own systems: a webhook, an S3 bucket, a
 ### What the logbook does not do
 
 - **It does not stop someone with full control of the server.** That person could rebuild the whole chain from scratch. A copy in your own store helps. The outside witness, now in the free version, is what catches it: see [Catching a rewritten audit log](/engineering-audit-witness/).
-- **Records name the server, not the API caller.** A [proposal](https://github.com/aerol-ai/microvm/discussions/649) to add the caller is open for discussion.
+- **Plain reads are not recorded by default.** Every change, command and refused call is, with the caller's name. `SB_AUDIT_API_RECORDS=all` records reads too.
 - **Recording never blocks the work.** If the logbook falls far behind, it skips records and writes a marker with the count, rather than slow your sandboxes down.
 
 ### See it for yourself
@@ -424,13 +426,13 @@ You cannot protect what you cannot see. AerolVM reports how it is doing, without
 
 ```mermaid
 flowchart LR
-    S["sandboxd"] -- "metrics, needs the token" --> P["Prometheus"]
+    S["sandboxd"] -- "metrics, needs a credential" --> P["Prometheus"]
     S -- "traces and metrics,<br/>off until you turn them on" --> O["OpenTelemetry collector"]
     P --> G["Grafana dashboards"]
     P --> A["Alerts"] --> R["Runbooks"]
 ```
 
-- **Metrics need the API token.** Both the Prometheus page and the raw counters page check it.
+- **Metrics need a credential.** The Prometheus page accepts a `viewer` token bound to every team, or the server token. The raw counters page needs the admin role.
 - **Traces are off by default.** When you turn them on, they follow each request from your app into AerolVM, so you can see where time went.
 - **No secrets in the cameras.** Metrics are counts and timings. Traces and request logs carry the method, the path without its query, the status and the time taken, plus IDs. They never include request bodies or headers, so the commands and variables you send stay out of them.
 - **Ready-made alarms.** Alerts cover a broken audit chain, skipped records, audit shipping that falls behind, cluster badges about to expire and a failing KMS check. Each alert links to a step-by-step [runbook](/operational-runbooks/).
@@ -475,7 +477,7 @@ No single guard is perfect. Security comes from layers, so one failure does not 
 
 AerolVM protects your server from sandboxes. It cannot protect against everything:
 
-- **A stolen API token** works anywhere the API can be reached. Keep it in a secret manager and keep the API port private.
+- **A stolen token** works until it expires or is revoked. A scoped token limits the damage to one role on one team. Keep the server token in a secret manager, keep the API port private, and limit the server token to the server with `SB_PAT_SCOPE=host`.
 - **The server and its operators** are trusted. Whoever controls the server controls AerolVM.
 - **The kernel and the hardware** sit below every wall. Pick gVisor or Firecracker for code you do not trust.
 

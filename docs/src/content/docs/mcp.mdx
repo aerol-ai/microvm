@@ -12,7 +12,7 @@ MCP, the [Model Context Protocol](https://modelcontextprotocol.io), is a standar
 ## Before you start
 
 - **Install the aerolvm CLI.** See [Install](/cli/#install).
-- **Have your server's address and token ready.** They are the same ones the SDKs use. After the [Quickstart](/quick-start/), the address is `http://localhost:21212` and the token is the one you picked.
+- **Have your server's address and token ready.** They are the same ones the SDKs use. After the [Quickstart](/quick-start/), the address is `http://localhost:21212` and the token is the one you picked. If your server uses [access control](/enterprise/access-control/), use your own API token, or sign in once with `aerolvm login` and skip the token (see [Use your saved login](#use-your-saved-login)).
 
 ## Set up your AI tool
 
@@ -160,13 +160,15 @@ Change these with `--stop-if-idle`, `--destroy-if-idle` and `--max-creates` (`0`
 
 ### Use your saved login
 
-If you ran [`aerolvm login`](/cli/#sign-in) on this machine, the MCP server reads that login. Then no token goes in your tool's config. In Claude Code that is:
+If you ran [`aerolvm login`](/cli/#save-your-login) on this machine, the MCP server reads that login. Then no token goes in your tool's config. In Claude Code that is:
 
 ```bash
 claude mcp add aerolvm -- aerolvm mcp
 ```
 
-`aerolvm login` needs the newest CLI build. See [Install](/cli/#install).
+- **Company sign-in works too.** If you signed in with SSO, the MCP server uses that sign-in and renews it for as long as it runs. One exception: `exec` streams its output over a connection that uses the sign-in the server started with. If `exec` starts failing with `unauthorized` after about an hour, restart your AI tool's MCP server.
+- **The agent acts as you.** Its calls carry your role and team, and audit records name you. A team you chose with `aerolvm login --team` or `SB_TEAM` applies to its calls too.
+- `aerolvm login` needs the newest CLI build. See [Install](/cli/#install).
 
 ### More about pinned mode
 
@@ -218,10 +220,32 @@ Send your API token as a bearer token. For example, in Claude Code:
 claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox=my-agent&create_if_missing=true" --header "Authorization: Bearer $SB_PAT_TOKEN"
 ```
 
+With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts about an hour. The server token works only if the operator has not limited it to the server.
+
 - **Any server in a cluster can answer.** The endpoint keeps nothing between requests.
 - **Each call runs with your token's permissions,** through the same checks as a direct API call.
 - **The first call that creates the sandbox says so** in its result.
 - **`exec` always waits for the command to finish** here, on every sandbox type, with the 4 MB limit above.
+
+### Sign in with OAuth
+
+Hosted AI products, such as claude.ai and ChatGPT, connect to remote MCP servers with OAuth instead of a pasted token. With access control on, the web endpoint supports this. Your company's identity provider signs the person in, and AerolVM checks the token it issues, the same way it checks every other sign-in.
+
+<Aside type="caution" title="Not verified with any connector yet">
+Each provider and connector pair is checked by hand before these docs claim it works. No pair has passed that check yet: not claude.ai or ChatGPT, with Okta, Entra ID or Keycloak. ChatGPT may not accept a client you register yourself. The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#live-connector-check) records each run.
+</Aside>
+
+How a connector signs in:
+
+1. Its first call to `/mcp` has no token. The `401` answer points to a document at `/.well-known/oauth-protected-resource/mcp`.
+2. That document names your `/mcp` address and the identity providers people can sign in with.
+3. The connector sends the person to that provider, and gets back a token made for `/mcp`.
+4. AerolVM checks the token's signature, issuer, expiry and audience, then applies your role rules unchanged.
+
+- **The token works only on `/mcp`.** Sent anywhere else, it gets `401` with reason `wrong_audience`. Tool calls still work, because `/mcp` passes the checked caller to them inside the server.
+- **Each tool call is checked and recorded on its own,** with the person's role, and with `surface: mcp` in its audit record.
+- **Google cannot be used.** Its access tokens cannot be checked without calling Google on every request.
+- **You register the connector at your provider,** not at AerolVM. AerolVM hosts no sign-in or registration page.
 
 ### For server operators
 
@@ -234,10 +258,109 @@ claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox
 
 The server counts tool calls by tool and result in the `aerolvm_mcp_tool_calls_total` metric. It writes one log line per call, with the tool, sandbox, owner, result and time taken. It never logs arguments or output.
 
+To turn on [OAuth sign-in](#sign-in-with-oauth), set `SB_IDENTITY_ENABLED=true`, an identity file, and `SB_MCP_ENABLED=true` on every server. Then add these to the [identity file](/enterprise/access-control/#step-2-write-the-identity-file):
+
+```yaml
+issuers:
+  - name: okta
+    url: https://acme.okta.com/oauth2/aus1mcp   # the authorization server's issuer
+    audiences: [0oa1cli]                        # sign-in tokens for the CLI and dashboard
+    claims: { username: email, groups: groups }
+    mcp: true                                   # list this provider in the OAuth document
+    mcp_audiences: [api://aerolvm-mcp]          # tokens for /mcp only
+mcp:
+  resource: https://api.acme.dev/mcp            # your /mcp address; the path must be /mcp
+  scopes: [api://aerolvm-mcp/mcp]               # optional; Entra ID needs one
+```
+
+- `mcp_audiences` must not overlap `audiences`. That is how the server tells an MCP token from a sign-in token.
+- Make sure the provider puts the groups or app roles your rules use into access tokens, not only into sign-in tokens.
+- In a cluster, upgrade every server before you add `mcp_audiences`. A server without this release refuses the token on calls it owns.
+- Check it by opening `https://<your-domain>/.well-known/oauth-protected-resource/mcp` in a browser. A `404` means no `mcp.resource` is in force.
+
+The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#oauth-connectors-claudeai-chatgpt) has the steps for Okta, Entra ID and Keycloak, the live check, and a troubleshooting table.
+
+
+## Same thing from the SDK
+
+Each tool call is an ordinary API call, made with your credential. This is what `sandbox_create` and `exec` do, in code:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    const sandbox = await client.create({ image: "python:3.12" });
+    const result = await sandbox.exec("python -V");
+    console.log(result.stdout);
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    sandbox = client.create(image="python:3.12")
+    result = sandbox.exec("python -V")
+    print(result["stdout"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12"})
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    result, err := sandbox.ExecCommand(ctx, "python -V")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".into(),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("python -V")?;
+    print!("{}", result.stdout);
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.ExecResult;
+
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12"));
+    ExecResult result = sandbox.exec("python -V");
+    System.out.print(result.stdout);
+    ```
+  </TabItem>
+</Tabs>
 
 ## Next steps
 
 - [aerolvm CLI](/cli/): the same program, used by hand from your terminal.
+- [Access control](/enterprise/access-control/): give each agent its own token, with a role and a team.
 - [Allow only some websites](/network-access/#allow-only-some-websites): limit where an agent's sandbox can connect.
 - [Create and manage sandboxes](/sandboxes/): set idle timers like the ones MCP uses.
 - [Run commands](/exec-streaming/): what `exec` does under the hood.

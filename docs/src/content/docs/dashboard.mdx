@@ -5,7 +5,7 @@ description: Open the built-in web page that shows node health, cluster members,
 
 import { Aside } from '@astrojs/starlight/components';
 
-Every AerolVM server has a built-in dashboard for operators. It is one web page, served by `sandboxd` (the AerolVM server program) itself. You sign in with your `SB_PAT_TOKEN` (the server's access token). The page then shows server health, the nodes in your cluster, where each sandbox runs, and the server's internal counters.
+Every AerolVM server has a built-in dashboard for operators. It is one web page, served by `sandboxd` (the AerolVM server program) itself. You sign in with your `SB_PAT_TOKEN` (the server's access token), an admin API token, or, when [access control](/enterprise/access-control/) is on, your company account. The page then shows server health, the nodes in your cluster, where each sandbox runs, and the server's internal counters.
 
 There is nothing to install. If the server is running, the dashboard is there.
 
@@ -28,9 +28,7 @@ time=... level=INFO msg="dashboard available" url=http://0.0.0.0:21212/ui
 
 The log is at `~/.aerolvm/logs/sandboxd.log` on macOS. On Linux, read it with `journalctl -u sandboxd`.
 
-<Aside type="caution" title="Your domain does not serve the dashboard">
-On a server with a domain, the domain forwards only API paths (such as `/health` and `/v1/...`). `/ui` is not one of them, so `https://your-domain/ui` returns "not found". Open the dashboard on port 21212 instead.
-</Aside>
+On a server with a domain, the dashboard is also at `https://<your-domain>/ui`. That is the address to use for company sign-in, which needs HTTPS. If it returns "not found", the server was installed before the domain served the dashboard. Run the [installer](/getting-started/installer-options/#change-or-upgrade-an-install) again to add it.
 
 On a remote server, the safest way in is an SSH tunnel: a secure link from your computer to the server. It keeps your token off the open internet. Leave this running:
 
@@ -44,11 +42,34 @@ The dashboard works on every node: server, worker or ingress (a node that takes 
 
 ## Sign in
 
-The page shows a short sign-in form. Paste the `SB_PAT_TOKEN` of the server you are connecting to, then click **Sign in**.
+The sign-in box shows one **Sign in with ...** button for each company sign-in your operator set up, such as "Sign in with Acme Okta" or Google's own button. Below them, **Use an API token instead** opens a field for a token. With no sign-in buttons, the token field is all you see.
 
-The page keeps your token in the browser tab's `sessionStorage` (memory that lasts only as long as the tab). It never writes the token to `localStorage` or disk. It sends the token only to the AerolVM server. Closing the tab or clicking **Sign out** clears it.
+- **With a token:** paste the `SB_PAT_TOKEN` of the server, or an API token (`avm_…`), then click **Sign in**.
+- **With your company account:** click your provider's button and sign in there. You come back to the dashboard signed in.
+
+The page keeps your sign-in in the browser tab's `sessionStorage` (memory that lasts only as long as the tab). It never writes it to `localStorage` or disk. It sends it only to the AerolVM server. Closing the tab or clicking **Sign out** clears it.
 
 If the token is wrong, the form says so and asks you to sign in again. A wrong token changes nothing on the server.
+
+### Company sign-in needs HTTPS
+
+The sign-in buttons appear only when the page is served over HTTPS, or from `localhost` (for example through an SSH tunnel). On plain HTTP from another computer, the box says "SSO sign-in needs a secure connection" and links to your server's HTTPS address. A token still works there, with a warning that it crosses the network unencrypted.
+
+### Who sees the console
+
+The console shows fleet health, and almost every panel needs the `admin` role. So after you sign in:
+
+- **An admin, or the server token,** gets the console.
+- **Every other role** (`viewer`, `runner`, `auditor`) gets a short "Signed in as ..." screen instead. It shows your name, role and team, and the two commands to use from a terminal: `aerolvm login <this server>` and `aerolvm list`.
+- **No matching rule:** "You're signed in, but you don't have access here." It lists up to 50 of the groups your sign-in carried, so you can tell your admin what to add. Entra ID sign-ins with too many groups to list say to bind an Entra app role instead.
+
+The header shows who you are: your name and an `admin` badge, or "Server token" with an `operator` badge. With access control on, that badge is in a warning color, because actions taken with the server token are recorded as the server, not a person.
+
+### Staying signed in, and signing out
+
+- **A company sign-in lasts about an hour.** The page renews it on its own about two minutes before it ends. For Okta, Entra ID and Keycloak, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
+- **Sign out** clears the tab and stops Google from signing you straight back in. It does not sign you out of your company account, the same as other company apps.
+- **Use a different account** asks your provider to let you pick another account.
 
 ## What the page shows
 
@@ -85,7 +106,7 @@ The page refreshes itself every five seconds while you are looking at it. It pau
 
 ## Actions you can take
 
-The dashboard has a few operator buttons. Each one asks you to confirm first and shows the API call it will make. Each button only calls an existing API endpoint.
+The dashboard has a few operator buttons. Only admins and the server token reach the console, so only they see them. Each one asks you to confirm first and shows the API call it will make. Each button only calls an existing API endpoint.
 
 | Button | Where | Endpoint | What it does |
 |---|---|---|---|
@@ -104,7 +125,9 @@ There are no buttons to create or resize sandboxes. Do that with the [SDKs](/sdk
 Two different things are involved:
 
 - **The page itself (`GET /ui`) needs no login.** It is plain HTML and JavaScript. It holds no passwords and no server data. The sign-in form asks for your token before the page calls any API. This is how a normal login page works.
-- **Every API call the page makes needs your token.** That includes `GET /health`, `GET /v1/...`, `GET /debug/vars`, `GET /v1/metrics` and the buttons. The page sends the token as `Authorization: Bearer <token>`, and the server checks it like any SDK call. `/debug/vars` needs the token too, because its counters reveal how the system is running (lease state, queue lengths, secret decrypt failures).
+- **Every API call the page makes needs your credential.** That includes `GET /health`, `GET /v1/...`, `GET /debug/vars`, `GET /v1/metrics` and the buttons. The page sends it as `Authorization: Bearer <token>`, and the server checks it like any SDK call, with the same role checks. `/debug/vars` needs the `admin` role, because its counters reveal how the system is running (lease state, queue lengths, secret decrypt failures).
+- **Company sign-in happens between your browser and your provider.** The server holds no client secret and keeps no session. The browser keeps only the provider's sign-in token, never a refresh token.
+- **The page sends a strict Content-Security-Policy.** Only the page's own script, Google's sign-in script, and your providers' addresses are allowed. Nothing can frame the page.
 
 The dashboard is protected by whatever protects the API port: TLS (HTTPS encryption), a login proxy in front, or an IP allow list. To keep it on a trusted network only, limit who can reach that port.
 
@@ -116,7 +139,7 @@ The Metrics panel is the exception. It shows only the counters of the server you
 
 ## Collect metrics with Prometheus
 
-Prometheus is a monitoring tool that pulls numbers from servers on a schedule. Each AerolVM server offers its `aerolvm_*` counters for it at `GET /v1/metrics`, in Prometheus's text format. That endpoint needs the token too.
+Prometheus is a monitoring tool that pulls numbers from servers on a schedule. Each AerolVM server offers its `aerolvm_*` counters for it at `GET /v1/metrics`, in Prometheus's text format. That endpoint needs a credential too.
 
 Like the Metrics panel, this is per server. Scrape every server, worker and ingress node on its own:
 
@@ -124,12 +147,14 @@ Like the Metrics panel, this is per server. Scrape every server, worker and ingr
 scrape_configs:
   - job_name: sandboxd
     metrics_path: /v1/metrics
-    bearer_token: "<SB_PAT_TOKEN>"
+    bearer_token: "<a viewer API token on every team, or SB_PAT_TOKEN>"
     static_configs:
       - targets:
           - server-1.example.com:21212
           - worker-1.example.com:21212
 ```
+
+With [access control](/enterprise/access-control/) on, use a `viewer` token bound to every team instead of the server token: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. It cannot create, run or delete anything. It is read-only, not metrics-only: it can also read every team's sandbox details and audit records. A server that briefly loses contact with the cluster's token list still accepts it for metrics.
 
 Good first alerts to set up:
 
@@ -166,13 +191,35 @@ By default the server keeps 5% of the traces it starts itself (`0.05`). That way
 Grafana is a tool that draws charts from Prometheus data. The repository has ready-made files you can load:
 
 - **Grafana dashboard:** [`setup/grafana/sandboxd-slo-dashboard.json`](https://github.com/aerol-ai/microvm/blob/main/setup/grafana/sandboxd-slo-dashboard.json). It covers create queue depth, create latency, worker pressure and worker leases. It also shows route lag, shard health, Raft (cluster agreement) errors and the size of Raft's saved state. And it tracks data-plane errors, secret decrypt health and image-pull storms. More dashboards are in the same folder.
-- **Prometheus alert rules:** [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml). They cover Raft health, stale worker leases, create backlog, worker pressure, ingress route lag, Caddy errors, forwarding errors, image-pull storms and secret decrypt failures.
+- **Prometheus alert rules:** [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml). They cover Raft health, stale worker leases, create backlog, worker pressure, ingress route lag, Caddy errors, forwarding errors, image-pull storms, secret decrypt failures, and identity and access (the server token used from outside, a stale token list, failing key fetches).
 - **Alertmanager example:** [`setup/alertmanager/sandboxd-alertmanager-example.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/alertmanager/sandboxd-alertmanager-example.yml), which shows how to route those alerts.
 
 Each alert links straight to a step-by-step runbook. See [Runbooks](/operational-runbooks/) for the full list.
 
+## Set up sign-in for the dashboard
+
+This section is for the server operator. Company sign-in on the dashboard needs [access control](/enterprise/access-control/) on, and an identity file with a dashboard app for each provider you want as a button.
+
+1. **Register a dashboard app at your provider.** Make it a single-page app, a public client with no secret, using the authorization code flow with PKCE.
+2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui`.
+3. **Ask for the scopes `openid email profile`,** and put the groups claim in the ID token.
+4. **Add the app's client ID** to the issuer's `audiences` and as `clients.dashboard` in the identity file. Set `display_name` to the button label.
+
+Only issuers with `clients.dashboard` get a button, in the order of the identity file. Workload issuers, such as GitHub Actions, get none. Only the first Google issuer gets a button, because Google allows one sign-in client per page.
+
+| Provider | What to set |
+|---|---|
+| Okta | A Single-Page app with Authorization Code and PKCE. Add `https://<api-domain>` as a Trusted Origin for CORS. Add a groups claim to the ID token. |
+| Entra ID | An app registration with the "Single-page application" platform and the `/ui` redirect URI. Above 200 groups, Entra leaves the groups out, so bind on app roles. |
+| Keycloak | A public client with the standard flow and PKCE. Set Web origins to `https://<api-domain>`, and add a Group Membership mapper to the ID token. |
+| Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
+
+- **The browser talks to your provider directly.** It reads the provider's discovery document and trades the sign-in code for a token. So your provider must allow cross-origin requests from your dashboard's address, and its token endpoint must be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
+- **The discovery document** at `https://<api-domain>/.well-known/aerolvm-auth` lists the buttons and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.
+
 ## Next steps
 
+- [Access control](/enterprise/access-control/): roles, teams, API tokens and SSO.
 - [Runbooks](/operational-runbooks/): what to do when an alert fires.
 - [Cluster setup](/cluster-setup/): create a cluster to watch.
 - [Reconcile](/reconcile/): fix sandbox counts that no longer match reality.
