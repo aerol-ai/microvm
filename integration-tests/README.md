@@ -123,6 +123,16 @@ the metal (`*-fc`) and arm64 scenarios request containerd on hardware where the
 containerd bootstrap has not yet been live-proven — validate those on a `--keep`
 run before relying on them.
 
+## Release gate: snapshot-namespace migration
+
+The per-owner snapshot namespace (`sandbox_snapshots` PK → `(owner_ref, name)`)
+ships a destructive one-time migration that only runs on a pre-existing old-schema
+DB, so a fresh-provisioned run never exercises it. Before the first release that
+carries it, run the warm-upgrade gate in
+[`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) and the failover
+exercise `UC-58d` (`TestSnapshotBackedFailover`, part of
+`make integration-cluster-hetero`).
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
