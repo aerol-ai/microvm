@@ -93,7 +93,7 @@ func decodeError(response *http.Response) error {
 	if secs, err := strconv.Atoi(strings.TrimSpace(response.Header.Get("Retry-After"))); err == nil && secs > 0 {
 		apiErr.RetryAfter = time.Duration(secs) * time.Second
 	}
-	var payload errorBody
+	var payload models.ErrorResponse
 	if err := json.NewDecoder(response.Body).Decode(&payload); err == nil && payload.Error != "" {
 		apiErr.Message = payload.Error
 		apiErr.Code = payload.Code
@@ -105,17 +105,4 @@ func decodeError(response *http.Response) error {
 		apiErr.Groups = payload.Groups
 	}
 	return apiErr
-}
-
-// errorBody is models.ErrorResponse plus the three fields of the "no
-// binding" 403 an OIDC caller gets (plans/identity-and-access.md DR8).
-// Declaring them here keeps the SDK decoding them whether or not the
-// server-side struct it embeds carries them yet; once it does, the outer
-// fields win (encoding/json prefers the shallower field), with the same
-// JSON names, so nothing changes.
-type errorBody struct {
-	models.ErrorResponse
-	Issuer string   `json:"issuer,omitempty"`
-	Name   string   `json:"name,omitempty"`
-	Groups []string `json:"groups,omitempty"`
 }
