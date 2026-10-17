@@ -93,3 +93,44 @@ func TestOwnerRefForCreate(t *testing.T) {
 		t.Fatalf("user create owner = %q, want acme", got)
 	}
 }
+
+// TestOwnerRefForCreateFleetRunner (eng review ET9, plan §5.1): a runner
+// bound to every team creates exactly as the PAT does. Its sandboxes carry
+// owner "", and a create resolves only operator-published ("") snapshots by
+// name, never a team's (snapshotResolvableForCreate, #7), although it can
+// SEE every team's snapshot.
+func TestOwnerRefForCreateFleetRunner(t *testing.T) {
+	fleetRunner := boundCtx(controlplane.PrincipalToken, controlplane.RoleRunner, controlplane.FleetTeam)
+	if got := ownerRefForCreate(fleetRunner); got != "" {
+		t.Fatalf("fleet runner create owner = %q, want empty", got)
+	}
+	team := &models.SandboxSnapshot{Name: "s", OwnerRef: controlplane.TeamOwnerRef("payments")}
+	operator := &models.SandboxSnapshot{Name: "s"}
+	if snapshotResolvableForCreate(fleetRunner, team) || !snapshotResolvableForCreate(fleetRunner, operator) {
+		t.Fatal("a fleet runner's create must resolve only operator-published snapshots by name")
+	}
+	if !snapshotVisible(fleetRunner, team) {
+		t.Fatal("a fleet runner sees every team's snapshots")
+	}
+
+	// Through the create path: a tenant that registered a snapshot named
+	// after a public image does not capture the fleet runner's create.
+	svc, _, _ := newSnapshotOwnerService(t)
+	if _, err := svc.RegisterSnapshot(userCtx("globex"), &models.SandboxSnapshot{Name: "ubuntu:22.04", Image: "ghcr.io/globex/backdoor:latest"}); err != nil {
+		t.Fatal(err)
+	}
+	req := models.CreateSandboxRequest{Image: "ubuntu:22.04"}
+	if err := svc.NormalizeCreateImageDistribution(fleetRunner, &req); err != nil || req.Image != "ubuntu:22.04" {
+		t.Fatalf("fleet runner create image = %q, %v; want the plain base image", req.Image, err)
+	}
+
+	// And the sandbox row it creates carries owner "".
+	created, st, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
+	if _, err := created.CreateSandboxWithID(fleetRunner, models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-fleet-runner"); err != nil {
+		t.Fatalf("fleet runner create: %v", err)
+	}
+	row, err := st.Get(context.Background(), "sb-fleet-runner")
+	if err != nil || row.OwnerRef != "" {
+		t.Fatalf("fleet runner sandbox = %+v, %v; want owner \"\"", row, err)
+	}
+}
