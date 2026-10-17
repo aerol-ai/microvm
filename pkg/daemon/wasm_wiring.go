@@ -45,24 +45,14 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 		Username: cfg.WasmRegistryUsername,
 		PATPath:  cfg.WasmRegistryPATPath,
 	}
-	if st != nil {
-		// Wire step-3 of the resolution precedence: a BYO catalogue id
-		// (returned by CreateWasmModule) maps to its already-local, already
-		// validated path + pinned digest. Only "ready" rows with a real path
-		// resolve — a pending/failed row must fall through to a 404 rather than
-		// boot a half-staged artifact. Lookup is read-only and goes through the
-		// single-writer store like every other query.
-		resolver.CatalogueLookup = func(ctx context.Context, id string) (path, digest string, ok bool) {
-			rec, err := st.GetWasmModule(ctx, id)
-			if err != nil {
-				return "", "", false
-			}
-			if !strings.EqualFold(rec.Status, "ready") || strings.TrimSpace(rec.ModulePath) == "" {
-				return "", "", false
-			}
-			return rec.ModulePath, rec.Digest, true
-		}
-	}
+	// Wire step-3 of the resolution precedence: a BYO catalogue id (returned by
+	// CreateWasmModule) maps to its already-local, already-validated path +
+	// pinned digest. The lookup is owner-scoped (Service.ResolveOwnedWasmModule)
+	// so a tenant cannot boot a sandbox from another tenant's catalogued module
+	// by naming its id; only "ready" rows the caller may see resolve, and a
+	// pending/failed/foreign row falls through to a 404 rather than booting a
+	// half-staged or someone else's artifact.
+	resolver.CatalogueLookup = svc.ResolveOwnedWasmModule
 	supervisor := worker.NewSupervisor(worker.DefaultSpawner)
 	driver.SetModuleResolver(resolver)
 	driver.SetWorkerSupervisor(supervisor)

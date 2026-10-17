@@ -135,10 +135,15 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	if moduleRef == "" {
 		return nil, errors.New("module_ref is required")
 	}
+	owner := ownerRefForCreate(ctx)
 	explicitID := strings.TrimSpace(req.ID)
 	if explicitID != "" {
 		if existing, err := s.store.GetWasmModule(ctx, explicitID); err == nil {
-			if strings.TrimSpace(existing.ModuleRef) == moduleRef {
+			// A row the caller cannot write (another tenant's, or an
+			// operator-published "" row when the caller is a tenant) is not
+			// theirs to echo back or adopt — report the id as taken, never
+			// leak the owner's ref/path.
+			if strings.TrimSpace(existing.ModuleRef) == moduleRef && wasmModuleWritable(ctx, existing) {
 				// Re-registering an already-catalogued module re-arms the warm
 				// pool: pool targets live in memory, so after a daemon restart
 				// the catalogue row exists but the pool has forgotten it.
@@ -160,6 +165,7 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 				ModuleRef: moduleRef,
 				Status:    string(models.WasmModuleStatusFailed),
 				LastError: err.Error(),
+				OwnerRef:  owner,
 				CreatedAt: now,
 				UpdatedAt: now,
 			})
@@ -175,7 +181,7 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 		return nil, errors.New("resolved module has empty digest")
 	}
 	if existing, err := s.store.GetWasmModule(ctx, id); err == nil {
-		if strings.TrimSpace(existing.ModuleRef) == moduleRef {
+		if strings.TrimSpace(existing.ModuleRef) == moduleRef && wasmModuleWritable(ctx, existing) {
 			s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
 			return wasmModuleFromRecord(existing), nil
 		}
@@ -198,6 +204,7 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 		Digest:          resolved.Digest,
 		Entrypoint:      entrypoint,
 		HasWarm:         s.cfg.WasmPoolEnabled,
+		OwnerRef:        owner,
 		CreatedAt:       now,
 		UpdatedAt:       now,
 		ReadyAt:         &now,
@@ -222,6 +229,11 @@ func (s *Service) ListWasmModules(ctx context.Context) ([]*models.WasmModule, er
 	}
 	out := make([]*models.WasmModule, 0, len(records))
 	for _, rec := range records {
+		// A tenant sees only operator-published ("") and its own rows; an
+		// operator/internal caller sees everything.
+		if !wasmModuleVisible(ctx, rec) {
+			continue
+		}
 		r := wasmModuleFromRecord(rec)
 		out = append(out, r)
 	}
@@ -236,6 +248,11 @@ func (s *Service) GetWasmModule(ctx context.Context, id string) (*models.WasmMod
 	if err != nil {
 		return nil, err
 	}
+	// 404 (not 403) for a module the caller cannot see, so a tenant cannot
+	// probe ids to learn which modules (and registry refs) other tenants hold.
+	if !wasmModuleVisible(ctx, rec) {
+		return nil, store.ErrNotFound
+	}
 	return wasmModuleFromRecord(rec), nil
 }
 
@@ -247,6 +264,15 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	rec, err := s.store.GetWasmModule(ctx, id)
 	if err != nil {
 		return err
+	}
+	// A tenant may delete only its own rows. An operator-published ("") row is
+	// read-only to tenants and writable only by the operator. Invisible rows
+	// 404 so delete is not an existence oracle either.
+	if !wasmModuleVisible(ctx, rec) {
+		return store.ErrNotFound
+	}
+	if !wasmModuleWritable(ctx, rec) {
+		return store.ErrNotFound
 	}
 	referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
 	if err != nil {
@@ -265,6 +291,49 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	}
 	s.invalidateWasmModuleInventoryCache()
 	return nil
+}
+
+// wasmModuleVisible reports whether the caller may read a catalogue row.
+// Operator/internal callers (unscoped) see every row. A tenant sees only
+// operator-published rows (OwnerRef == "") and its own. The "" rule keeps
+// standard/operator-pushed modules usable fleet-wide, as before owner scoping.
+func wasmModuleVisible(ctx context.Context, rec store.WasmModuleRecord) bool {
+	owner, scoped := ownerScope(ctx)
+	if !scoped {
+		return true
+	}
+	return rec.OwnerRef == "" || rec.OwnerRef == owner
+}
+
+// wasmModuleWritable reports whether the caller may delete/overwrite a row.
+// It is stricter than visibility: an operator-published ("") row is read-only
+// to a tenant, so a tenant can write only rows it owns. Operator/internal
+// callers may write anything.
+func wasmModuleWritable(ctx context.Context, rec store.WasmModuleRecord) bool {
+	owner, scoped := ownerScope(ctx)
+	if !scoped {
+		return true
+	}
+	return rec.OwnerRef != "" && rec.OwnerRef == owner
+}
+
+// ResolveOwnedWasmModule is the owner-scoped create-time catalogue lookup wired
+// into the module resolver (step 3 of ref resolution). A BYO catalogue id
+// resolves to its local path + digest only when the caller may see the row,
+// so a tenant cannot boot a sandbox from another tenant's catalogued module by
+// naming its id. Only "ready" rows with a real path resolve.
+func (s *Service) ResolveOwnedWasmModule(ctx context.Context, id string) (path, digest string, ok bool) {
+	rec, err := s.store.GetWasmModule(ctx, id)
+	if err != nil {
+		return "", "", false
+	}
+	if !wasmModuleVisible(ctx, rec) {
+		return "", "", false
+	}
+	if !strings.EqualFold(rec.Status, "ready") || strings.TrimSpace(rec.ModulePath) == "" {
+		return "", "", false
+	}
+	return rec.ModulePath, rec.Digest, true
 }
 
 func wasmModuleFromRecord(rec store.WasmModuleRecord) *models.WasmModule {

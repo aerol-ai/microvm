@@ -46,6 +46,11 @@ func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 		snapshot.LocalTemplateIDs = nil
 		snapshot.LocalTemplateCatalogInventoryKnown = false
 		snapshot.LocalTemplateCatalogIDs = nil
+		// WASM module refs encode tenant registry paths (e.g. a private
+		// registry host + repo) across every tenant on the node, so they must
+		// not leak through this tenant-visible endpoint either.
+		snapshot.LocalWasmModuleInventoryKnown = false
+		snapshot.LocalWasmModuleIDs = nil
 	}
 	apihttp.WriteJSON(w, http.StatusOK, snapshot)
 }

@@ -650,6 +650,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			entrypoint TEXT NOT NULL DEFAULT '_start',
 			has_warm INTEGER NOT NULL DEFAULT 0,
 			last_error TEXT NOT NULL DEFAULT '',
+			-- Tenant that owns the catalogue row. "" is an operator-published
+			-- module: readable by every tenant, writable only by the operator.
+			-- A validated user token stamps its OwnerRef here, and list/get/
+			-- delete fence on it so one tenant cannot see, use or remove
+			-- another's module (and its registry ref / host path).
+			owner_ref TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
 			ready_at DATETIME
@@ -1044,6 +1050,12 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		// sandboxes. INSERT OR IGNORE keeps it idempotent across restarts.
 		`INSERT OR IGNORE INTO sandbox_env (sandbox_id, sealed_blob, created_at)
 			SELECT id, X'', CURRENT_TIMESTAMP FROM sandboxes;`,
+		// Tenant owner for WASM catalogue rows (cross-tenant hardening). Warm
+		// upgrade rows predate owner scoping; they backfill to "" (operator-
+		// published, readable by all) which preserves the pre-migration
+		// behaviour for existing modules while new rows carry their creator's
+		// owner_ref.
+		`ALTER TABLE wasm_modules ADD COLUMN owner_ref TEXT NOT NULL DEFAULT '';`,
 	}
 	for _, stmt := range migrations {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -8299,9 +8311,13 @@ type WasmModuleRecord struct {
 	Entrypoint      string
 	HasWarm         bool
 	LastError       string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-	ReadyAt         *time.Time
+	// OwnerRef is the tenant that owns this catalogue row. "" means an
+	// operator-published module (readable by all tenants, writable only by the
+	// operator). See the wasm_modules.owner_ref column comment.
+	OwnerRef  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	ReadyAt   *time.Time
 }
 
 // UpsertWasmModule inserts or updates a wasm_modules catalogue row.
@@ -8314,8 +8330,8 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO wasm_modules (
 			id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			module_ref = excluded.module_ref,
 			status = excluded.status,
@@ -8325,6 +8341,7 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 			entrypoint = excluded.entrypoint,
 			has_warm = excluded.has_warm,
 			last_error = excluded.last_error,
+			owner_ref = excluded.owner_ref,
 			updated_at = excluded.updated_at,
 			ready_at = excluded.ready_at
 	`,
@@ -8337,6 +8354,7 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 		rec.Entrypoint,
 		boolToInt(rec.HasWarm),
 		rec.LastError,
+		strings.TrimSpace(rec.OwnerRef),
 		rec.CreatedAt.UTC(),
 		rec.UpdatedAt.UTC(),
 		nullableTime(rec.ReadyAt),
@@ -8789,7 +8807,7 @@ func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
 func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) ([]WasmModuleRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
 		WHERE updated_at < ?
 		ORDER BY updated_at ASC`, cutoff.UTC())
@@ -8924,7 +8942,7 @@ func scanWasmModule(row interface {
 	var readyAt sql.NullTime
 	if err := row.Scan(
 		&rec.ID, &rec.ModuleRef, &rec.Status, &rec.ModulePath, &rec.ModuleSizeBytes,
-		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError,
+		&rec.Digest, &rec.Entrypoint, &hasWarm, &rec.LastError, &rec.OwnerRef,
 		&rec.CreatedAt, &rec.UpdatedAt, &readyAt,
 	); err != nil {
 		return WasmModuleRecord{}, err
@@ -8945,7 +8963,7 @@ func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord,
 	}
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules WHERE id = ?`, id)
 	rec, err := scanWasmModule(row)
 	if err != nil {
@@ -8961,7 +8979,7 @@ func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord,
 func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
-			entrypoint, has_warm, last_error, created_at, updated_at, ready_at
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
 		ORDER BY created_at DESC, id ASC`)
 	if err != nil {
