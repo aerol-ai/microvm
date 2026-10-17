@@ -46,7 +46,7 @@ flowchart TB
 2. Caddy forwards API calls to `sandboxd`. In this architecture, `sandboxd` listens only on the server itself (`SB_API_HOST=127.0.0.1`), so HTTPS is the only way in.
 3. `sandboxd` starts each sandbox behind its runtime wall, and seals its secrets in the database.
 4. The audit log is shipped to your own S3 bucket or webhook.
-5. Your monitoring scrapes metrics with the API token.
+5. Your monitoring scrapes metrics with a read-only API token (a `viewer` on every team), or with the server token when access control is off.
 
 **Components**
 
@@ -59,7 +59,7 @@ flowchart TB
 
 **Considerations**
 
-- **Security:** keep port `21212` private and the token in a secret manager. Work through the [Hardening guide](/enterprise/hardening/).
+- **Security:** keep port `21212` private and the server token in a secret manager. Give people SSO and services their own tokens with [access control](/enterprise/access-control/). Work through the [Hardening guide](/enterprise/hardening/).
 - **Reliability:** one server is one point of failure. If it dies, its sandboxes stop. Back up the database and the server key at the same time, and store the key's copy apart from the database's copy.
 - **Operations:** room is limited to one machine's CPU, memory and disk. Moving to a cluster later keeps your code the same.
 
@@ -156,7 +156,7 @@ Keep the API port and the cluster ports in the private zone. [Security architect
 
 ## Point your apps at it
 
-The SDKs read the server's address from `SB_API_URL` and its token from `SB_PAT_TOKEN`. Both work the same for every architecture. In a cluster, ask for failover when you create a sandbox:
+The SDKs read the server's address from `SB_API_URL` and the credential from `SB_PAT_TOKEN` or `SB_API_TOKEN`: the server token, or with [access control](/enterprise/access-control/) on, the app's own API token. Both work the same for every architecture. In a cluster, ask for failover when you create a sandbox:
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">

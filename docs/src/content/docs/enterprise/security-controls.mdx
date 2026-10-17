@@ -20,10 +20,10 @@ Each control has an ID, such as **NS-2**. Use the IDs in your own reviews, ticke
 ```mermaid
 flowchart LR
     B["AerolVM security baseline"] --> NS["NS: Network security<br/>8 controls"]
-    B --> IM["IM: Identity and access<br/>6 controls"]
+    B --> IM["IM: Identity and access<br/>7 controls"]
     B --> WI["WI: Workload isolation<br/>6 controls"]
     B --> DP["DP: Data protection<br/>7 controls"]
-    B --> LT["LT: Logging and threat detection<br/>8 controls"]
+    B --> LT["LT: Logging and threat detection<br/>9 controls"]
     B --> PV["PV: Posture and vulnerability management<br/>4 controls"]
     B --> BR["BR: Backup and recovery<br/>3 controls"]
 ```
@@ -39,7 +39,7 @@ These facts shape how AerolVM should be secured.
 | Stores data at rest | Sandbox files on the server's disk. Records and sealed secrets in a SQLite database. |
 | Exposed to the network | The HTTPS API and public links, shared TCP ports, SSH if on, and cluster ports in a cluster |
 | Runs as root on the server | Yes. `sandboxd` manages containers, virtual machines, firewall rules and mounts. |
-| Identity model | One API token per server, and certificates between cluster servers |
+| Identity model | One server token by default. With access control on: company sign-in (OIDC) for people, scoped API tokens for services, four roles bound to teams. Certificates between cluster servers. |
 | Hosting | Self-hosted only. You run the servers. |
 
 ## Network security
@@ -75,12 +75,13 @@ flowchart TB
 
 | ID | Control | On by default | Owner | How to configure |
 |---|---|---|---|---|
-| IM‑1 | API authentication | Required. The server will not start without a token. | AerolVM | Keep `SB_PAT_TOKEN` in a secret manager. The token is checked in constant time. |
-| IM‑2 | Operator-only actions | Yes | AerolVM | Cluster changes, templates and audit checks need the operator token |
+| IM‑1 | API authentication | Required. The server will not start without a token. | AerolVM | Keep `SB_PAT_TOKEN` in a secret manager. Every server checks every credential on its own; the server token is checked in constant time. |
+| IM‑2 | Permission on every route | Yes | AerolVM | Each route needs a permission. Cluster changes, templates and the debug counters need the `admin` role or the server token. |
 | IM‑3 | A separate SSH key for each sandbox | Yes, when SSH is on | AerolVM | The private key is returned once and never stored. Set `SB_ENABLE_SSH_GATEWAY=false` if you do not use SSH. |
 | IM‑4 | Cluster server identity | Required in cluster mode | Shared | Keep the cluster authority's key safe, and renew certificates before their 90 days end |
-| IM‑5 | Single sign-on | Not supported yet |  | [Proposed](https://github.com/aerol-ai/microvm/discussions/647) |
-| IM‑6 | Scoped tokens and roles | Not supported yet |  | [Proposed](https://github.com/aerol-ai/microvm/discussions/646) |
+| IM‑5 | Single sign-on | No | You | `SB_IDENTITY_ENABLED=true` and an identity file naming your provider. See [Access control](/enterprise/access-control/). |
+| IM‑6 | Scoped tokens and roles | No | You | `SB_IDENTITY_ENABLED=true`. Tokens expire, and each has one role on one team. Required by enterprise mode. |
+| IM‑7 | Server token limited to the server | No | You | `SB_PAT_SCOPE=host` (`install.sh --pat-scope host`), so remote callers must use named credentials. Required by enterprise mode. |
 
 ## Workload isolation
 
@@ -124,9 +125,10 @@ Each step to the right puts more between the code and the server's kernel. WebAs
 | LT‑3 | Chain check at start | Yes | Shared | The server refuses to start on a broken chain. Someone with root could rebuild the chain, so keep a copy off the server and turn on LT‑8. |
 | LT‑4 | Export off the server | No | You | `SB_AUDIT_EXPORT_BACKEND` set to `webhook` or `s3` |
 | LT‑5 | Retention | 30 days on the server | You | `SB_SECRET_AUDIT_RETENTION_DAYS`. Keep longer in your own store. |
-| LT‑6 | Metrics and traces | Metrics yes, with the token. Traces off. | You | Scrape `/v1/metrics`. Turn on OpenTelemetry with its settings. |
+| LT‑6 | Metrics and traces | Metrics yes, with a credential. Traces off. | You | Scrape `/v1/metrics` with a `viewer` token on every team, or the server token. Turn on OpenTelemetry with its settings. |
 | LT‑7 | Alerts and runbooks | Shipped as files | You | Load the bundled Prometheus alerts. Each links to a [runbook](/operational-runbooks/). |
 | LT‑8 | Tamper evidence off the server | No | You | `SB_AUDIT_WITNESS_BACKEND=s3` with an S3 bucket that has Object Lock. The server stores its log's fingerprints there, where it cannot change them. Required by enterprise mode. See [Enterprise mode](/enterprise/enterprise-mode/). |
+| LT‑9 | Record every API change, command and refused call, with its caller | Yes | AerolVM | `SB_AUDIT_API_RECORDS` (`mutations` by default, `all` adds plain reads). See [Audit and compliance](/enterprise/audit-evidence/). |
 
 ## Posture and vulnerability management
 
@@ -149,10 +151,9 @@ Each step to the right puts more between the code and the server's kernel. WebAs
 
 ```mermaid
 pie showData
-    "AerolVM enforces it" : 14
+    "AerolVM enforces it" : 15
     "Shared" : 9
-    "You turn it on or run it" : 17
-    "Proposed" : 2
+    "You turn it on or run it" : 20
 ```
 
 Most controls you own are settings to turn on, not systems to build. [Shared responsibility](/enterprise/responsibility/) splits the work in full, and the [Hardening guide](/enterprise/hardening/) turns this baseline into checklists.

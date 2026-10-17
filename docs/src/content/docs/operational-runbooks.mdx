@@ -26,6 +26,7 @@ Most runbooks follow the same pattern: how serious the problem is, safety rules,
 | [Isolate jail](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/isolate-jail.md) | You need to check or debug the lock-down around `workerd` for V8 isolates. |
 | [Isolate workerd upgrade](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/isolate-workerd-upgrade.md) | You upgrade, or roll back, the fixed `workerd` version that V8 isolates use. |
 | [Remote MCP](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md) | Agents that use the server's remote MCP endpoint (`/mcp`) report failures, or `SandboxdRemoteMCPErrorRate` fires. |
+| [Identity and access](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md) | An identity alert fires (the server token used from outside, a stale token list, failing key fetches, identity files that differ), your identity provider is down, or you rotate the server token or the metrics scrape token, make the first admin token, or limit the server token to the server. |
 
 An SLO (service level objective) is a target your service should meet, such as how fast creates finish. Quorum means a majority of the voting servers. See the [Glossary](/cluster-glossary/) for other cluster words.
 
