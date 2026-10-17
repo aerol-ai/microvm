@@ -322,8 +322,12 @@ func (a *app) tools(ctx context.Context, c *commonFlags) (*agenttools.Tools, err
 // one, which would bypass connection's rules.
 func (a *app) toolsFor(c *commonFlags, conn connection) (*agenttools.Tools, error) {
 	cfg := agenttools.Config{
-		APIURL:     conn.apiURL,
-		Token:      conn.token,
+		APIURL: conn.apiURL,
+		Token:  conn.token,
+		// The SDK sends the team on every request and on the WebSocket
+		// handshakes of streamed exec and shell attach, which no HTTP
+		// client reaches.
+		Team:       conn.team,
 		Source:     agenttools.SourceCLI,
 		HTTPClient: a.apiHTTPClient(c, conn),
 		Warn:       func(s string) { a.note("aerolvm: %s", s) },

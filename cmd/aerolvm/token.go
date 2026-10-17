@@ -20,9 +20,9 @@ import (
 )
 
 // aerolvm token create|list|revoke manages scoped API tokens
-// (plans/identity-and-access.md §5.4, §5.6). It calls /v1/tokens directly:
-// the SDKs gain tokens.create/list/revoke in task T9. Admin only for create
-// and revoke, auditor or admin for list; sandboxd decides.
+// (plans/identity-and-access.md §5.4, §5.6). It calls /v1/tokens through
+// callAPI, the same path as whoami. Admin only for create and revoke,
+// auditor or admin for list; sandboxd decides.
 
 // tokenRequestTimeout bounds one token call; a create is one Raft apply.
 const tokenRequestTimeout = 30 * time.Second
@@ -182,10 +182,13 @@ type apiRefusal struct {
 
 func (e *apiRefusal) Unwrap() error { return e.APIError }
 
-// callAPI makes one /v1 call the SDK has no method for yet (the SDKs gain
-// tokens and whoami in task T9). A refusal becomes the same error the SDK
-// would return, so a.fail words it like every other verb's (including the
-// "sign in again" hint on a 401).
+// callAPI makes one identity call (/v1/whoami, /v1/tokens) directly rather
+// than through the SDK's WhoAmI and Tokens: it keeps the refusal body's
+// identity fields (the "no binding" 403's reason, issuer, name and groups;
+// a 401's reason) and can ask whoami to explain itself, neither of which
+// the SDK's surface carries. A refusal becomes the same error the SDK would
+// return, so a.fail words it like every other verb's (including the "sign
+// in again" hint on a 401).
 func (a *app) callAPI(ctx context.Context, c *commonFlags, conn connection, method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {

@@ -1433,3 +1433,71 @@ func TestSSOEdges(t *testing.T) {
 		t.Fatalf("unwritable login = %d %q", code, h.stderr.String())
 	}
 }
+
+// TestStreamsCarryTheTeam: streamed exec and shell attach open WebSockets,
+// which no HTTP client reaches; the SDK's Team option puts the login's
+// --team (or SB_TEAM) on their handshakes too, so a person in several
+// teams execs into their selected team's sandbox (D13).
+func TestStreamsCarryTheTeam(t *testing.T) {
+	w := newSSOWorld(t)
+	w.server.upstream.AddSandbox(models.Sandbox{Name: "box"})
+	h := w.h
+	h.app.stdinIsTTY = false
+	h.app.stdin = strings.NewReader(agenttoolstest.Token)
+	if code := h.run("login", w.server.URL, "--token-stdin", "--team", "payments"); code != exitOK {
+		t.Fatalf("login = %d %q", code, h.stderr.String())
+	}
+	handshakes := func(suffix string) []seenRequest {
+		var out []seenRequest
+		for _, r := range w.server.requests() {
+			if strings.HasSuffix(r.path, suffix) {
+				out = append(out, r)
+			}
+		}
+		return out
+	}
+
+	if code := h.run("exec", "box", "--", "echo", "hi"); code != 0 || h.stdout.String() != "hi\n" {
+		t.Fatalf("exec = %d %q %q", code, h.stdout.String(), h.stderr.String())
+	}
+	if got := handshakes("/toolbox/process/exec/stream"); len(got) != 1 || got[0].team != "payments" {
+		t.Fatalf("exec stream handshakes = %+v, want one carrying team payments", got)
+	}
+
+	w.server.upstream.Observe(func(s *agenttoolstest.Server) {
+		s.LiveAttach = true
+		s.ExecFunc = miniShell
+	})
+	h.app.stdinIsTTY, h.app.stdoutIsTTY, h.app.term = true, true, fakeTerm{}
+	keys := h.keyboard()
+	done := h.runAsync("shell", "box")
+	typeKeys(t, keys, "exit 0\n")
+	if code := h.wait(done); code != 0 {
+		t.Fatalf("shell = %d %q", code, h.stderr.String())
+	}
+	if got := handshakes("/attach"); len(got) != 1 || got[0].team != "payments" {
+		t.Fatalf("shell attach handshakes = %+v, want one carrying team payments", got)
+	}
+
+	// SB_TEAM picks another team for one command, handshake included.
+	h.env["SB_TEAM"] = "checkout"
+	w.server.upstream.Observe(func(s *agenttoolstest.Server) { s.LiveAttach, s.ExecFunc = false, nil })
+	h.app.stdinIsTTY, h.app.stdoutIsTTY = false, false
+	h.app.stdin = strings.NewReader("")
+	if code := h.run("exec", "box", "--", "echo", "hi"); code != 0 {
+		t.Fatalf("exec with SB_TEAM = %d %q", code, h.stderr.String())
+	}
+	if got := handshakes("/toolbox/process/exec/stream"); len(got) != 2 || got[1].team != "checkout" {
+		t.Fatalf("exec stream handshakes = %+v, want the second carrying team checkout", got)
+	}
+
+	// aerolvm mcp hands the SDK the same team.
+	var mcpTeam string
+	h.app.newTools = func(cfg agenttools.Config) (*agenttools.Tools, error) {
+		mcpTeam = cfg.Team
+		return agenttools.New(cfg)
+	}
+	if code := h.run("mcp"); code != exitOK || mcpTeam != "checkout" {
+		t.Fatalf("mcp = %d, team %q; stderr %q", code, mcpTeam, h.stderr.String())
+	}
+}

@@ -81,10 +81,11 @@ func runMCP(ctx context.Context, a *app, args []string) int {
 	cfg := agenttools.Config{
 		APIURL: conn.apiURL,
 		Token:  conn.token,
+		// The team on every request, WebSocket handshakes included.
+		Team:   conn.team,
 		Source: agenttools.SourceMCP,
-		// The team header, and an SSO login renewed for as long as the
-		// server runs (HTTP calls; a WebSocket dial carries the token it
-		// started with).
+		// An SSO login renewed for as long as the server runs (HTTP calls;
+		// a WebSocket dial carries the token the server started with).
 		HTTPClient: a.apiHTTPClient(c, conn),
 		// stdout is the JSON-RPC channel: every notice goes to stderr.
 		Warn: func(s string) { a.note("aerolvm mcp: %s", s) },

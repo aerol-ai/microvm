@@ -921,9 +921,10 @@ func lockFile(ctx context.Context, path string) (unlock func(), err error) {
 	}
 }
 
-// credentialTransport adds what the SDK has no option for: the team header
-// (D13), and an SSO login's current ID token, renewed when it is about to
-// expire.
+// credentialTransport adds an SSO login's current ID token, renewed when it
+// is about to expire, which the SDK (a fixed bearer) has no option for. It
+// also sets the team header (D13) for the CLI's own /v1 calls (callAPI);
+// the SDK sets the same header itself, WebSocket handshakes included.
 type credentialTransport struct {
 	base http.RoundTripper
 	team string
