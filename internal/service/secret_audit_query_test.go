@@ -122,7 +122,10 @@ func TestListSecretAuditLocalPaginatesOutOfOrderInput(t *testing.T) {
 	s := &Service{cfg: config.Config{DBPath: dbPath}, store: st}
 	t.Cleanup(s.CloseSecretAuditSink)
 	sink := s.secretAuditSink().(*fileAuditSink)
-	base := time.Unix(1_800_000_000, 0).UTC()
+	// Relative to the real clock, not a fixed date: the sink keeps records
+	// by their age against the real clock, so a fixed base drops out of the
+	// window once real time passes it.
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 	for i := 49; i >= 0; i-- {
 		sink.Emit(SecretAuditEvent{
 			Time:          base.Add(time.Duration(i) * time.Second),
