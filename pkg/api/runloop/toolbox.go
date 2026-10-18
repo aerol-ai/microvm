@@ -218,14 +218,11 @@ func (h *handlers) runOneShot(ctx context.Context, devboxID, command string) (*m
 // the toolbox could not be reached or failed: 502, which the SDK retries.
 func (h *handlers) writeToolboxError(w http.ResponseWriter, err error) {
 	var tbErr *toolboxError
-	switch {
-	case errors.As(err, &tbErr) && tbErr.status >= 400 && tbErr.status < 500:
+	if errors.As(err, &tbErr) && tbErr.status >= 400 && tbErr.status < 500 {
 		WriteError(w, tbErr.status, tbErr.message)
 		return
-	case errors.As(err, new(requestError)),
-		errors.Is(err, store.ErrNotFound),
-		errors.Is(err, service.ErrSandboxManuallyStopped),
-		errors.Is(err, service.ErrWakeCircuitOpen):
+	}
+	if !toolboxUnavailable(err) {
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
@@ -233,4 +230,21 @@ func (h *handlers) writeToolboxError(w http.ResponseWriter, err error) {
 		h.deps.Logger.Warn("runloop toolbox request failed", "error", err)
 	}
 	WriteError(w, http.StatusBadGateway, "devbox toolbox unavailable")
+}
+
+// toolboxUnavailable reports whether writeToolboxError answers err with its
+// 502: the toolbox could not be reached or failed, rather than refusing the
+// request (a toolbox 4xx) or the devbox being unknown, stopped or behind an
+// open wake circuit.
+func toolboxUnavailable(err error) bool {
+	var tbErr *toolboxError
+	switch {
+	case errors.As(err, &tbErr) && tbErr.status >= 400 && tbErr.status < 500,
+		errors.As(err, new(requestError)),
+		errors.Is(err, store.ErrNotFound),
+		errors.Is(err, service.ErrSandboxManuallyStopped),
+		errors.Is(err, service.ErrWakeCircuitOpen):
+		return false
+	}
+	return true
 }

@@ -546,3 +546,28 @@ func TestExecTrackerEdges(t *testing.T) {
 		t.Fatal("forgetDevbox left results behind")
 	}
 }
+
+// TestExecuteAsyncAnswersRunningWhenTheWatcherSawTheFailureFirst: execute_async
+// submits, then reads the execution's state. When the toolbox starts failing
+// right after the submit, the watcher the submit started can see that before
+// the read does, and the answer must not depend on which got there first.
+// The hook puts the watcher first every time. Before the fix this was a 502
+// "devbox toolbox unavailable", which CI hit under -race in
+// TestExecutionHandlerFaults; the failure still shows on the next read.
+func TestExecuteAsyncAnswersRunningWhenTheWatcherSawTheFailureFirst(t *testing.T) {
+	env := newTestEnv(t)
+	devbox := env.mustCreate(t, "")
+	session := plainSession(devbox.ID, "w9")
+	env.toolbox.failAlways("GET /process/session/"+session, http.StatusInternalServerError)
+	env.h.testAfterSubmit = func(devboxID string, ref execRef) {
+		waitFor(t, "the watcher to see the failure", func() bool { return !env.h.execs.running(resultKey(devboxID, ref.id())) })
+	}
+	var got executionView
+	expectStatus(t, env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"echo x"}`, &got, "X-Request-Id", "w9"), http.StatusOK)
+	env.h.testAfterSubmit = nil
+	if got.ExecutionID != session || got.Status != "running" {
+		t.Fatalf("execute_async after the watcher saw the failure = %+v, want %s running", got, session)
+	}
+	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+session, nil, nil), http.StatusBadGateway)
+	env.toolbox.clearFaults()
+}
