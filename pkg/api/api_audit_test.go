@@ -497,7 +497,7 @@ func TestAPIRecordOnePerMCPToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := sink.records()
+	got := sink.waitRecords(t, 1)
 	if len(got) != 1 {
 		t.Fatalf("one tool call wrote %d records, want 1: %+v (tool result %+v)", len(got), got, res.Content[0])
 	}

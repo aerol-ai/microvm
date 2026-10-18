@@ -538,10 +538,13 @@ func TestMCPForwardRecordedOnOwner(t *testing.T) {
 	ownerSink.reset()
 	edgeSink.reset()
 	toolText(t, cs, "expose_port", map[string]any{"port": 8080})
+	// The owner writes the record after the response it streams back, so
+	// wait for it; the edge is checked after that wait, so a record it
+	// wrongly wrote has had time to land too.
+	got := ownerSink.waitRecords(t, 1)
 	if got := edgeSink.records(); len(got) != 0 {
 		t.Fatalf("the edge recorded a call it forwarded: %+v", got)
 	}
-	got := ownerSink.records()
 	if len(got) != 1 {
 		t.Fatalf("owner records = %d, want 1: %+v", len(got), got)
 	}
