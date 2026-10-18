@@ -221,8 +221,11 @@ credentials end to end (plans/identity-and-access.md §8, task T12).
 - **Team tokens, not a token file.** The cross-tenant cases mint real team
   `avm_` tokens with the operator credential at setup (`POST /v1/tokens`) and
   revoke them on cleanup; `SB_ITEST_IDENTITY_FILE` is gone (D4). A token
-  minted on one node reaches a worker without Raft state within one mirror
-  sync, so the cases retry `unknown_or_revoked` briefly before asserting.
+  minted on one node reaches a worker or ingress node (no Raft state) within
+  one mirror sync, and a request forwarded there is authenticated again, so
+  `mintToken` waits until the API domain AND every worker and ingress node
+  accept the token (one SSH tunnel per node per case) before the case uses
+  it. A node the suite cannot reach over SSH is logged and not waited on.
 - **The test issuer.** The nodes cannot reach the operator's machine, so they
   never fetch keys from it. The suite generates the keys, writes the issuer's
   JWKS and an identity file whose `issuers[].jwks_file` names it, installs
@@ -263,7 +266,8 @@ credentials end to end (plans/identity-and-access.md §8, task T12).
   `SB_PAT_SCOPE=any`, UC-289 restarts the single enterprise node with
   `SB_AUDIT_API_FLOOD_CONTROL=coalesce`, UC-291 partitions a worker from the
   server tier for 90 s (iptables, with a dead-man heal on the node), UC-292
-  kills the Raft leader during 50 token creates, and UC-293 rotates the
+  kills the Raft leader during 50 token creates (it skips when the leader is
+  the seed, which on a fresh fleet it usually is), and UC-293 rotates the
   issuer's key under load.
 
 | Env var | Default | Purpose |

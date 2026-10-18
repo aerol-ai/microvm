@@ -39,16 +39,17 @@ type mintedToken struct {
 }
 
 // mintToken creates an API token with the operator credential, revokes it
-// when the test ends, and waits until the API domain accepts it. This is
-// the D4 replacement for the deleted static token file.
+// when the test ends, and waits until every node that will authenticate it
+// accepts it. This is the D4 replacement for the deleted static token file.
 func mintToken(t *testing.T, prefix, role, team string) mintedToken {
 	t.Helper()
 	return mintTokenFor(t, operatorAPI(), prefix, role, team, "2h", true)
 }
 
 // mintTokenFor mints through admin (any address, any minting credential)
-// with a chosen lifetime; await waits until the API domain accepts it, which
-// a token meant to expire at once must not do.
+// with a chosen lifetime; await waits until the token is accepted wherever
+// it will be used (awaitTokenWhereUsed), which a token meant to expire at
+// once must not do.
 func mintTokenFor(t *testing.T, admin *harness.APIClient, prefix, role, team, expiresIn string, await bool) mintedToken {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -68,11 +69,56 @@ func mintTokenFor(t *testing.T, admin *harness.APIClient, prefix, role, team, ex
 	})
 	tok := mintedToken{ID: created.ID, Secret: created.Token, API: harness.NewAPIClient(sc.BaseURL, created.Token)}
 	if await {
-		if _, err := harness.AwaitAccepted(ctx, tok.API, tokenPropagation); err != nil {
-			t.Fatalf("the fresh %s token never worked on the API domain: %v", role, err)
-		}
+		awaitTokenWhereUsed(ctx, t, tok, role)
 	}
 	return tok
+}
+
+// awaitTokenWhereUsed waits until a fresh token works on the API domain AND
+// on every node that reads tokens from the mirror (harness.TokenMirrorNodes).
+// A create the API domain places on a worker, or a read or exec forwarded to
+// a sandbox's owner, is authenticated again on that node, which learns the
+// token one mirror poll (~5 s) after the API domain does. Waiting on the API
+// domain alone is how UC-268, UC-273, UC-284 and UC-287 failed on the
+// hetero demo run: 401 unknown_or_revoked from the worker that owned the
+// request. A node this machine cannot reach over SSH is logged and left
+// out, so the case still runs, with the old, weaker wait for that node.
+func awaitTokenWhereUsed(ctx context.Context, t *testing.T, tok mintedToken, role string) {
+	t.Helper()
+	if _, err := harness.AwaitAccepted(ctx, tok.API, tokenPropagation); err != nil {
+		t.Fatalf("the fresh %s token never worked on the API domain: %v", role, err)
+	}
+	for _, node := range harness.TokenMirrorNodes(harness.LoadIntegrationTargets()) {
+		if !harness.NodeSSHReachable(t, node) {
+			t.Logf("no SSH to %s: not waiting for the fresh %s token there, so a request it answers may see one mirror poll of 401", node.Name, role)
+			continue
+		}
+		if _, err := harness.AwaitAccepted(ctx, tok.API.At(tokenWaitBase(t, node)), tokenPropagation); err != nil {
+			t.Fatalf("the fresh %s token never worked on %s, which authenticates the requests forwarded to it: %v", role, node.Name, err)
+		}
+	}
+}
+
+// tokenWaitBases holds one forwarded address per test and node, so a case
+// that mints several tokens opens one SSH tunnel per node, not one per
+// token. Each tunnel lives as long as the test that opened it.
+var tokenWaitBases sync.Map
+
+type tokenWaitKey struct {
+	t    *testing.T
+	node string
+}
+
+func tokenWaitBase(t *testing.T, node harness.IntegrationNode) string {
+	t.Helper()
+	key := tokenWaitKey{t: t, node: node.Name}
+	if base, ok := tokenWaitBases.Load(key); ok {
+		return base.(string)
+	}
+	base := nodeBase(t, node)
+	tokenWaitBases.Store(key, base)
+	t.Cleanup(func() { tokenWaitBases.Delete(key) })
+	return base
 }
 
 // sdkFor is the Go SDK presenting bearer: the suite doubles as SDK coverage,

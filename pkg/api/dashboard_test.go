@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -294,6 +295,74 @@ func TestDashboardPageMarkup(t *testing.T) {
 //
 // Node is installed on the CI runners; a machine without it skips this
 // test, and `node --test` can run the file by hand (see its header).
+// dashboardFetchRE finds every same-origin request the page's script makes:
+// the panels' apiJSON and S.api, the node and sandbox actions' postAction,
+// and the direct window.fetch calls. A template literal is cut at its first
+// ${...}, which stands for one dynamic path segment.
+var dashboardFetchRE = regexp.MustCompile("(?:apiJSON|S\\.api|window\\.fetch)\\(\\s*[\"`](/[^\"`$]*)|postAction\\(\"[A-Z]+\",\\s*[\"`](/[^\"`$]*)")
+
+// caddyForwards reports whether a Caddy path matcher's patterns match path:
+// an exact path, or a prefix ending in *, the two forms the stock configs use.
+func caddyForwards(patterns []string, path string) bool {
+	for _, p := range patterns {
+		if prefix, glob := strings.CutSuffix(p, "*"); glob && strings.HasPrefix(path, prefix) || p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDashboardFetchesOnlyPathsCaddyForwards: on a domain install the page
+// is served at https://<api-domain>/ui through Caddy, which answers every
+// path outside its @api matcher with a 404 of its own. The metrics panel
+// once polled /debug/vars, which no stock config forwards, so the panel
+// stayed empty with a console error on every domain install. Every path the
+// script requests must be one both stock Caddyfiles forward.
+func TestDashboardFetchesOnlyPathsCaddyForwards(t *testing.T) {
+	script := string(servedScriptRE.FindSubmatch(dashboardHTML)[1])
+	var paths []string
+	for _, m := range dashboardFetchRE.FindAllStringSubmatch(script, -1) {
+		path := m[1] + m[2]
+		if strings.HasSuffix(path, "/") {
+			path += "x" // a template literal's dynamic segment
+		}
+		paths = append(paths, path)
+	}
+	if m := regexp.MustCompile(`const DISCOVERY_PATH = "([^"]+)"`).FindStringSubmatch(script); m != nil {
+		paths = append(paths, m[1])
+	} else {
+		t.Error("DISCOVERY_PATH is gone from the page; this check no longer covers the discovery fetch")
+	}
+	for _, want := range []string{"/health", "/v1/metrics", "/v1/cluster/members", "/v1/whoami", "/v1/cluster/nodes/x"} {
+		if !slices.Contains(paths, want) {
+			t.Fatalf("the page's requests %v do not include %s; the extraction no longer sees every panel", paths, want)
+		}
+	}
+	if slices.Contains(paths, "/debug/vars") {
+		t.Fatal("the page requests /debug/vars, which Caddy never forwards from the API domain")
+	}
+	for _, file := range []string{"../../scripts/install.sh", "../../packaging/Caddyfile.template"} {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var patterns []string
+		for _, line := range strings.Split(string(raw), "\n") {
+			if fields := strings.Fields(line); len(fields) > 2 && fields[0] == "@api" && fields[1] == "path" {
+				patterns = append(patterns, fields[2:]...)
+			}
+		}
+		if len(patterns) == 0 {
+			t.Fatalf("%s has no @api path matcher; the check would pass vacuously", file)
+		}
+		for _, path := range paths {
+			if !caddyForwards(patterns, path) {
+				t.Errorf("%s: the dashboard requests %s, which its @api matcher does not forward to sandboxd", file, path)
+			}
+		}
+	}
+}
+
 func TestDashboardPageLogic(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -345,14 +346,16 @@ func TestVerifierKeyWithdrawal(t *testing.T) {
 	}
 }
 
-// TestVerifierWithdrawnKeyUntilNextFetch pins what the identity runbook's
+// TestVerifierReloadRefetchesKeys pins what the identity runbook's
 // KeyCompromise entry tells operators (Keycloak live check O1). A key the
-// provider withdrew stays trusted until this node's next fetch: an identity
-// file reload (SIGHUP) keeps the fetched key set when the issuer's source is
-// unchanged, and so does rewriting a jwks_file in place. A restart fetches
-// afresh, and so does pointing jwks_file at a new path.
-func TestVerifierWithdrawnKeyUntilNextFetch(t *testing.T) {
-	t.Run("discovery: a reload keeps the key, a restart drops it", func(t *testing.T) {
+// provider withdrew is trusted until this node's next fetch, and every
+// identity-file reload is one: the daemon runs RefetchKeys after each
+// reload (Watcher.OnReload), whatever the refetch gap. A reload that only
+// rebuilds the verifier, with no refetch, still verifies with the key set
+// it already holds, which is why the hook matters. A restart fetches afresh,
+// and so does pointing jwks_file at a new path.
+func TestVerifierReloadRefetchesKeys(t *testing.T) {
+	t.Run("discovery: the reload's refetch drops the key, a restart does too", func(t *testing.T) {
 		env := newVerifierEnv(t, "")
 		withdrawn := env.iss.Mint(t, env.claims("00u1", "payments-eng"))
 		if _, _, err := env.auth(withdrawn); err != nil {
@@ -360,13 +363,22 @@ func TestVerifierWithdrawnKeyUntilNextFetch(t *testing.T) {
 		}
 		env.iss.Publish(env.iss.Rotate(t, jose.RS256)) // the provider withdraws the old key
 		env.load(t, testIdentityFile(env.iss.URL, "deny_subjects: [\"test:someone-else\"]\n"))
-		env.clock.Advance(2 * time.Minute)
-		hits := env.iss.JWKSHits.Load()
 		if _, _, err := env.auth(withdrawn); err != nil {
-			t.Fatalf("after a reload, a withdrawn key is still trusted until the next fetch: %v", err)
+			t.Fatalf("a rebuild alone keeps the key set it holds until a fetch: %v", err)
 		}
-		if env.iss.JWKSHits.Load() != hits {
-			t.Fatal("a reload refetched the keys")
+		// The clock has not moved, so the refetch gap would refuse any
+		// other fetch: the reload's refetch is not subject to it.
+		hits := env.iss.JWKSHits.Load()
+		env.v.RefetchKeys()
+		awaitKeyFetches(t, env.v)
+		if got := env.iss.JWKSHits.Load() - hits; got != 1 {
+			t.Fatalf("the reload made %d JWKS fetches, want exactly 1", got)
+		}
+		if _, _, err := env.auth(withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
+			t.Fatalf("after the reload's refetch, a token signed with the withdrawn key: %v", err)
+		}
+		if _, _, err := env.auth(env.iss.Mint(t, env.claims("00u2", "payments-eng"))); err != nil {
+			t.Fatalf("a token signed with the provider's current key: %v", err)
 		}
 		restarted := NewVerifier(env.cfg.Load, VerifierOptions{HTTPClient: env.iss.Client(), Now: env.clock.Now})
 		if _, _, err := restarted.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
@@ -374,7 +386,7 @@ func TestVerifierWithdrawnKeyUntilNextFetch(t *testing.T) {
 		}
 	})
 
-	t.Run("jwks_file: rewriting in place waits, a new path applies at once", func(t *testing.T) {
+	t.Run("jwks_file: rewriting in place applies on the reload, a new path at once", func(t *testing.T) {
 		iss := identitytest.New(t)
 		dir := t.TempDir()
 		write := func(name string) string {
@@ -405,18 +417,209 @@ func TestVerifierWithdrawnKeyUntilNextFetch(t *testing.T) {
 		}
 		iss.Publish(iss.Rotate(t, jose.RS256))
 		load(write("jwks-a.json"), "deny_subjects: [\"eks:someone-else\"]\n")
-		clock.Advance(2 * time.Minute)
 		if err := auth(withdrawn); err != nil {
-			t.Fatalf("same jwks_file path after a reload: %v", err)
+			t.Fatalf("same jwks_file path, rebuilt without a refetch: %v", err)
 		}
+		v.RefetchKeys()
+		awaitKeyFetches(t, v)
+		if err := auth(withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
+			t.Fatalf("same jwks_file path after the reload's refetch: %v", err)
+		}
+		fresh := iss.Mint(t, iss.Claims(clock.Now(), "aerolvm", "ci"))
+		if err := auth(fresh); err != nil {
+			t.Fatalf("a token signed with the new key: %v", err)
+		}
+
+		withdrawn = fresh
+		iss.Publish(iss.Rotate(t, jose.RS256))
 		load(write("jwks-b.json"), "")
 		if err := auth(withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
 			t.Fatalf("new jwks_file path: %v", err)
 		}
 		if err := auth(iss.Mint(t, iss.Claims(clock.Now(), "aerolvm", "ci"))); err != nil {
-			t.Fatalf("a token signed with the new key: %v", err)
+			t.Fatalf("a token signed with the newest key: %v", err)
 		}
 	})
+}
+
+// TestVerifierSIGHUPDropsWithdrawnKey is the KeyCompromise flow end to end
+// inside the package: the provider withdraws a key, the operator changes
+// nothing in the identity file and sends SIGHUP (Watcher.Reload), and the
+// reload hook's refetch refuses a token signed with the withdrawn key at
+// once, including one the token cache already held, while the provider's
+// current key keeps working.
+func TestVerifierSIGHUPDropsWithdrawnKey(t *testing.T) {
+	iss := identitytest.New(t)
+	path := filepath.Join(t.TempDir(), "identity.yaml")
+	writeIdentityFile(t, path, testIdentityFile(iss.URL, ""))
+	w := NewWatcher(path, nil)
+	clock := newFakeClock()
+	v := NewVerifier(w.Current, VerifierOptions{HTTPClient: iss.Client(), Now: clock.Now})
+	w.OnReload(v.RefetchKeys)
+	auth := func(token string) error {
+		_, _, err := v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), token)
+		return err
+	}
+
+	withdrawn := iss.Mint(t, iss.Claims(clock.Now(), "cli", "00u1", "payments-eng"))
+	if err := auth(withdrawn); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := v.current()
+	if st.cache.len() != 1 {
+		t.Fatalf("cache entries = %d, want the token cached", st.cache.len())
+	}
+	before := w.Current()
+	iss.Publish(iss.Rotate(t, jose.RS256))
+	if err := w.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if w.Current() != before {
+		t.Fatal("an unchanged file must not swap the config, or this test proves nothing about the hook")
+	}
+	awaitKeyFetches(t, v)
+	if err := auth(withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
+		t.Fatalf("a cached token signed with the withdrawn key after SIGHUP: %v", err)
+	}
+	if err := auth(iss.Mint(t, iss.Claims(clock.Now(), "cli", "00u2", "payments-eng"))); err != nil {
+		t.Fatalf("a token signed with the provider's current key: %v", err)
+	}
+	if got := iss.JWKSHits.Load(); got != 2 {
+		t.Fatalf("JWKS fetches = %d, want 2 (the first token, the SIGHUP)", got)
+	}
+}
+
+// TestVerifierReloadRefetchFailureKeepsKeys: a provider that is down when a
+// reload refetches leaves the keys already held in force, so nothing that
+// was accepted is refused, and the failure is counted.
+func TestVerifierReloadRefetchFailureKeepsKeys(t *testing.T) {
+	env := newVerifierEnv(t, "")
+	if _, _, err := env.auth(env.iss.Mint(t, env.claims("00u1", "payments-eng"))); err != nil {
+		t.Fatal(err)
+	}
+	errorsBefore := jwksFetchCount("test", fetchError)
+	env.iss.FailJWKS.Store(true)
+	env.v.RefetchKeys()
+	awaitKeyFetches(t, env.v)
+	if got := jwksFetchCount("test", fetchError) - errorsBefore; got != 1 {
+		t.Fatalf("aerolvm_identity_jwks_fetch_total{error} grew by %d, want 1", got)
+	}
+	if _, _, err := env.auth(env.iss.Mint(t, env.claims("00u2", "payments-eng"))); err != nil {
+		t.Fatalf("a token signed with a key held before the failed refetch: %v", err)
+	}
+}
+
+// TestKeySetRefetchJoinsOrFollows: a reload while a fetch runs joins it
+// when the fetch started at or after the reload; otherwise the running
+// fetch may have read the provider before the change the reload is for, so
+// exactly one more fetch follows it, however many reloads came in between.
+// A reload's refetch ignores the refetch gap; an unknown key id's does not.
+func TestKeySetRefetchJoinsOrFollows(t *testing.T) {
+	iss := identitytest.New(t)
+	gate := make(chan struct{}, 4)
+	clock := newFakeClock()
+	cfg, err := Parse([]byte(testIdentityFile(iss.URL, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := VerifierOptions{
+		HTTPClient: &http.Client{Transport: gatedJWKS{base: iss.Client().Transport, gate: gate}},
+		Now:        clock.Now,
+	}.withDefaults()
+	ks := newKeySet(cfg.Issuers[0], &opts)
+	idle := func() bool {
+		ks.mu.Lock()
+		defer ks.mu.Unlock()
+		return ks.inflight == nil
+	}
+	followUpMarked := func() bool {
+		ks.mu.Lock()
+		defer ks.mu.Unlock()
+		return !ks.refetchAfter.IsZero()
+	}
+
+	if err := ks.refresh(context.Background(), 0); !errors.Is(err, errKeyWaitTimeout) {
+		t.Fatalf("start a fetch without waiting: %v", err)
+	}
+	ks.refetch(clock.Now()) // started at the same instant: joined
+	if followUpMarked() {
+		t.Fatal("a fetch that started at the reload must be joined, not followed")
+	}
+	clock.Advance(time.Second)
+	ks.refetch(clock.Now()) // started before this reload: followed
+	ks.refetch(clock.Now()) // a burst still makes one follow-up
+	if !followUpMarked() {
+		t.Fatal("a fetch that started before the reload must be followed by another")
+	}
+	gate <- struct{}{}
+	waitFor(t, "the first fetch to reach the provider", func() bool { return iss.JWKSHits.Load() == 1 })
+	// run() starts the follow-up under the lock it clears the first fetch
+	// with, so the key set is never idle in between.
+	gate <- struct{}{}
+	waitFor(t, "the follow-up fetch to finish", func() bool { return idle() && iss.JWKSHits.Load() == 2 })
+	if got := iss.JWKSHits.Load(); got != 2 {
+		t.Fatalf("JWKS fetches = %d, want 2 (the first, one follow-up)", got)
+	}
+	if !ks.ready.Load() || followUpMarked() {
+		t.Fatalf("after the follow-up: ready %v, follow-up still marked %v", ks.ready.Load(), followUpMarked())
+	}
+
+	ks.refetch(clock.Now()) // within the refetch gap of the last fetch
+	gate <- struct{}{}
+	waitFor(t, "the gap-free refetch to finish", func() bool { return idle() && iss.JWKSHits.Load() == 3 })
+	if err := ks.refresh(context.Background(), time.Second); !errors.Is(err, errKeysRateLimited) {
+		t.Fatalf("an unknown-kid refresh right after a reload's refetch: %v, want rate-limited", err)
+	}
+}
+
+// gatedJWKS holds every JWKS request until the test sends on gate, so a
+// fetch can be kept in flight; discovery passes straight through.
+type gatedJWKS struct {
+	base http.RoundTripper
+	gate chan struct{}
+}
+
+func (g gatedJWKS) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path == "/jwks" {
+		<-g.gate
+	}
+	return g.base.RoundTrip(req)
+}
+
+// awaitKeyFetches waits until no key set of v has a fetch in flight, so a
+// test sees the result of a refetch RefetchKeys started without waiting.
+func awaitKeyFetches(t *testing.T, v *Verifier) {
+	t.Helper()
+	waitFor(t, "the key fetches to finish", func() bool {
+		v.mu.Lock()
+		sets := make([]*keySet, 0, len(v.keySets))
+		for _, ks := range v.keySets {
+			sets = append(sets, ks)
+		}
+		v.mu.Unlock()
+		for _, ks := range sets {
+			ks.mu.Lock()
+			busy := ks.inflight != nil
+			ks.mu.Unlock()
+			if busy {
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// jwksFetchCount reads aerolvm_identity_jwks_fetch_total{issuer,result}.
+func jwksFetchCount(issuer, result string) int64 {
+	inner, ok := jwksFetchTotal.Get(issuer).(*expvar.Map)
+	if !ok {
+		return 0
+	}
+	n, ok := inner.Get(result).(*expvar.Int)
+	if !ok {
+		return 0
+	}
+	return n.Value()
 }
 
 // TestVerifierHeadersIgnored is finding 3.5: jku, x5u and an embedded jwk
@@ -499,6 +702,10 @@ func TestVerifierUnavailableWithoutFile(t *testing.T) {
 	}
 	v.Bootstrap(context.Background())
 	v.maintainKeys(context.Background())
+	v.RefetchKeys() // a reload of a file that never loaded: nothing to fetch
+	if len(v.keySets) != 0 {
+		t.Fatal("no identity file must mean no key sets")
+	}
 }
 
 func TestVerifierNotAJWT(t *testing.T) {

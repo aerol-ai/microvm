@@ -125,7 +125,11 @@ func accessReviewFixture() []fixtureBatch {
 	}
 	gap := rec("node-a", at(d16, "09:50:00"), auditKindGap, "gap", "", "", nil, nil)
 	gap.Dropped = 7
-	floodMode := rec("node-b", at(d16, "09:04:00"), auditlog.KindAPIFloodMode, auditlog.APIResultOK, "coalesce:coalesce", "", &auditlog.Caller{Kind: "system", ID: "system:audit"}, nil)
+	// The flood-mode record shares its second with the identity change before
+	// it, as two records written at one daemon start do, so the re-sent batch
+	// below starts in the same second as the batch it overlaps: the walk must
+	// still start at the identity change.
+	floodMode := rec("node-b", at(d16, "09:03:00"), auditlog.KindAPIFloodMode, auditlog.APIResultOK, "coalesce:coalesce", "", &auditlog.Caller{Kind: "system", ID: "system:audit"}, nil)
 	floodMode.Reason = "single_owner"
 	ssh := rec("node-b", at(d16, "09:12:00"), auditlog.KindAPI, auditlog.APIResultOK, auditlog.RefSSH, "sb-3", &auditlog.Caller{Kind: "sandbox_key", ID: "sb-3"},
 		&auditlog.Request{Method: "SSH", Route: auditlog.RefSSH, Surface: auditlog.SurfaceSSH, Target: "default"})
@@ -209,8 +213,9 @@ func accessReviewFixture() []fixtureBatch {
 	link("node-a", nodeA)
 	link("node-b", nodeB)
 	link("node-c", nodeC)
-	// node-b's exporter re-sent the tail of its first batch under another
-	// name: verified as already-checked records, never counted twice.
+	// node-b's exporter re-sent the tail of its first batch under a name that
+	// sorts before it, starting in the same second: verified as
+	// already-checked records, never counted twice, never the walk's start.
 	out = append(out, fixtureBatch{node: "node-b", day: "2026/10/16", name: "node-b_0-resent.jsonl", evs: nodeB[0][1:]})
 	return out
 }

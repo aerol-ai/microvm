@@ -131,6 +131,31 @@ func TestAwaitAcceptedRidesOutPropagationOnly(t *testing.T) {
 	}
 }
 
+// TestTokenMirrorNodes: a fresh token is awaited on every node that reads
+// tokens from the mirror (workers and ingress, whatever the case of the
+// role), never on Raft members, and on none when there are no targets.
+func TestTokenMirrorNodes(t *testing.T) {
+	targets := &IntegrationTargets{Nodes: []IntegrationNode{
+		{Name: "server-1", Role: "server", Seed: true},
+		{Name: "server-2", Role: "server"},
+		{Name: "ingress-1", Role: "ingress"},
+		{Name: "worker-w", Role: "worker"},
+		{Name: "worker-x", Role: " Worker "},
+		{Name: "node3", Role: "mixed"},
+		{Name: "solo", Role: ""},
+	}}
+	var got []string
+	for _, n := range TokenMirrorNodes(targets) {
+		got = append(got, n.Name)
+	}
+	if want := []string{"ingress-1", "worker-w", "worker-x"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("TokenMirrorNodes = %v, want %v", got, want)
+	}
+	if TokenMirrorNodes(nil) != nil {
+		t.Fatal("no targets must mean no nodes to wait on")
+	}
+}
+
 func TestAwaitRefusedMeasuresTheRevoke(t *testing.T) {
 	shortPropagationPoll(t)
 	var calls atomic.Int32

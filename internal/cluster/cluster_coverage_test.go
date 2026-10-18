@@ -259,6 +259,18 @@ func TestAgentPlacementMutationsViaControlPlane(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{SandboxID: id, Placement: p})
+		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath && r.URL.Query().Get("authoritative") == "true":
+			// CancelReservation's leader read.
+			var req placementsByIDsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			out := map[string]Placement{}
+			for _, id := range req.IDs {
+				if p, ok := placements[id]; ok {
+					out[id] = p
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(out)
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
 			http.Error(w, "batch unavailable", http.StatusServiceUnavailable)
 		default:

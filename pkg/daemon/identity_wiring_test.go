@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,13 +11,17 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 
+	jose "github.com/go-jose/go-jose/v4"
+
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/identity"
+	"github.com/aerol-ai/microvm/internal/identity/identitytest"
 	"github.com/aerol-ai/microvm/pkg/api"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
@@ -187,4 +192,116 @@ func TestWireIdentityFileMCPResource(t *testing.T) {
 	if got := mcpResource(nil); got.Resource != "" || got.AuthorizationServers != nil || got.Scopes != nil {
 		t.Fatalf("no file loaded = %+v, want none", got)
 	}
+}
+
+// TestWireIdentityFileSIGHUPRefetchesKeys: the daemon registers the
+// verifier's refetch as the watcher's reload hook, so a SIGHUP with an
+// unchanged identity file re-reads a jwks_file rewritten in place, and a
+// token signed with the key the rewrite dropped is refused at once (the
+// runbook's KeyCompromise entry) while the current key keeps working.
+// Before the hook, the dropped key stayed trusted until the hourly refresh.
+func TestWireIdentityFileSIGHUPRefetchesKeys(t *testing.T) {
+	logs := &logRecorder{}
+	logger := slog.New(logs)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	iss := identitytest.New(t)
+	dir := t.TempDir()
+	jwks := filepath.Join(dir, "jwks.json")
+	writeJWKS := func() {
+		t.Helper()
+		if err := os.WriteFile(jwks, iss.JWKS(), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeJWKS()
+	path := filepath.Join(dir, "identity.yaml")
+	doc := fmt.Sprintf("version: 1\nissuers:\n  - {name: eks, url: %q, jwks_file: %q, audiences: [aerolvm]}\n"+
+		"bindings:\n  - {issuer: eks, claim: {sub: ci}, role: runner, team: payments}\n", iss.URL, jwks)
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Our own SIGHUP registration first, so the signal sent below can
+	// never fall through to the default action (exit).
+	guard := make(chan os.Signal, 16)
+	signal.Notify(guard, syscall.SIGHUP)
+	t.Cleanup(func() { signal.Stop(guard) })
+
+	cfg := config.Config{IdentityEnabled: true, IdentityFile: path}
+	server := api.NewServer(logger, nil, nil, nil, cfg, "pat-token", nil, wireIdentityFile(ctx, cfg, &fakeIdentityRecorder{}, logger)...)
+	whoami := func(token string) int {
+		req := httptest.NewRequest(http.MethodGet, "/v1/whoami", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rr := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	withdrawn := iss.Mint(t, iss.Claims(time.Now(), "aerolvm", "ci"))
+	deadline := time.Now().Add(5 * time.Second)
+	for whoami(withdrawn) != http.StatusOK {
+		if time.Now().After(deadline) {
+			t.Fatalf("a token from the jwks_file issuer = %d, want 200", whoami(withdrawn))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	iss.Publish(iss.Rotate(t, jose.RS256))
+	writeJWKS() // in place: the identity file is untouched
+	for whoami(withdrawn) != http.StatusUnauthorized {
+		if time.Now().After(deadline) {
+			t.Fatal("after a SIGHUP, a token signed with the key the jwks_file dropped is still accepted")
+		}
+		_ = syscall.Kill(os.Getpid(), syscall.SIGHUP)
+		time.Sleep(20 * time.Millisecond)
+	}
+	current := iss.Mint(t, iss.Claims(time.Now(), "aerolvm", "ci"))
+	if code := whoami(current); code != http.StatusOK {
+		t.Fatalf("a token signed with the current key after the SIGHUP = %d, want 200", code)
+	}
+
+	// A SIGHUP over a broken edit keeps the last good file, logs it, and
+	// still refetches the keys of the file in force: nothing that worked
+	// stops working.
+	if err := os.WriteFile(path, []byte("version: 1\nbogus: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for !logs.saw("identity file reload failed") {
+		if time.Now().After(deadline) {
+			t.Fatal("a SIGHUP over an invalid identity file was never reported")
+		}
+		_ = syscall.Kill(os.Getpid(), syscall.SIGHUP)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if code := whoami(current); code != http.StatusOK {
+		t.Fatalf("after a SIGHUP over an invalid file, a token that worked = %d, want 200", code)
+	}
+}
+
+// logRecorder is a slog handler that remembers every message, so a test can
+// wait for a log line written on another goroutine.
+type logRecorder struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (l *logRecorder) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, r.Message)
+	return nil
+}
+func (l *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *logRecorder) WithGroup(string) slog.Handler      { return l }
+
+func (l *logRecorder) saw(prefix string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.msgs {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
 }

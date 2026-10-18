@@ -541,7 +541,7 @@ test("four simultaneous 401 expired responses start exactly one renewal", async 
   const gates = [deferred(), deferred(), deferred(), deferred()];
   let i = 0;
   const h = renewalHarness({ fetch: () => gates[i++].promise });
-  const calls = ["/health", "/v1/cluster/leader", "/v1/cluster/members", "/debug/vars"].map((p) => h.api(p));
+  const calls = ["/health", "/v1/cluster/leader", "/v1/cluster/members", "/v1/metrics"].map((p) => h.api(p));
   calls.forEach((c) => c.catch(() => {}));
   await flush();
   assert.equal(h.tracker.count(), 4, "all four panels are in flight");
@@ -802,4 +802,30 @@ test("the overview's capacity roll-up is unchanged", () => {
   assert.equal(agg.drained, 1);
   assert.equal(agg.sandboxes, 3);
   assert.equal(agg.availableCPU, 6);
+});
+
+test("the metrics panel reads /v1/metrics: unlabeled samples by name, comments dropped", () => {
+  // The shape writePrometheusExpvars renders (pkg/api/prometheus.go).
+  const text = [
+    "# HELP aerolvm_gossip_members_alive AerolVM expvar metric aerolvm_gossip_members_alive.",
+    "# TYPE aerolvm_gossip_members_alive gauge",
+    "aerolvm_gossip_members_alive 8",
+    "# HELP aerolvm_identity_jwks_fetch_total AerolVM expvar metric aerolvm_identity_jwks_fetch_total.",
+    "# TYPE aerolvm_identity_jwks_fetch_total counter",
+    "aerolvm_identity_jwks_fetch_total{key=\"keycloak\",key2=\"ok\"} 3",
+    "aerolvm_raft_apply_last_nanos 1.5e+06",
+    "aerolvm_raft_apply_total 42",
+    "aerolvm_broken_sample not-a-number",
+    "",
+  ].join("\n");
+  const { values, lines } = D.parsePrometheusText(text);
+  assert.deepEqual(JSON.parse(JSON.stringify(values)), {
+    aerolvm_gossip_members_alive: 8,
+    aerolvm_raft_apply_last_nanos: 1500000,
+    aerolvm_raft_apply_total: 42,
+  });
+  assert.equal(lines.length, 5, "every sample line, labeled or not, is kept for the raw view");
+  assert.ok(lines.every((l) => !l.startsWith("#")), "no HELP or TYPE comment in the raw view");
+  assert.deepEqual(JSON.parse(JSON.stringify(D.parsePrometheusText(""))), { values: {}, lines: [] });
+  assert.deepEqual(JSON.parse(JSON.stringify(D.parsePrometheusText(undefined))), { values: {}, lines: [] });
 });
