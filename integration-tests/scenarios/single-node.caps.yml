@@ -13,6 +13,17 @@ capabilities:
   # starts the aerolvm-egress-gateway units and SB_EGRESS_FQDN_ENABLED defaults
   # on, so UC-180..182 run here.
   - egress-fqdn
+  # Identity and access (T12): SB_IDENTITY_ENABLED=true (avm_ tokens) and
+  # SB_IDENTITY_FILE at the path the suite installs the test issuer to.
+  - identity
+  - identity-oidc
+  # SB_MCP_ENABLED=true, for UC-286's OAuth connector flow.
+  - remote-mcp
+  # Identity-stack features above T12's base branch, present at the top of
+  # the stack: `aerolvm login --sso --device` (T7) and the dashboard's
+  # sign-in (T8).
+  - sso-cli
+  - dashboard-sso
   # NOTE: UC-35/36 additionally require external-dns-zone, which this scenario
   # does NOT advertise. A real custom domain must live OUTSIDE the base domain
   # (the API rejects hosts under the wildcard) and prove ownership via a TXT

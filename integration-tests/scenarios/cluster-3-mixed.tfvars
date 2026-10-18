@@ -26,7 +26,17 @@ caddy_shared_cert_storage = {
 # final sandboxd restart, so no extra restart is needed.
 extra_sandboxd_env = {
   SB_MCP_ENABLED = "true"
+  # Identity and access (T12): named credentials on, and the identity file
+  # the suite installs on every node (see single-node.tfvars).
+  SB_IDENTITY_ENABLED = "true"
+  SB_IDENTITY_FILE    = "/etc/sandboxd/itest-identity.yaml"
 }
+
+# Audit export to the scenario's S3 bucket (force_destroy, 3-day expiry), so
+# `aerolvm audit search` and `aerolvm access review` run over a real export
+# (UC-279). run.sh exports the bucket from the audit_export_bucket output.
+audit_export_enabled = true
+audit_export_backend = "s3"
 
 nodes = {
   node1 = { role = "mixed", seed = true, spot = true }
