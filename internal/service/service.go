@@ -5187,8 +5187,14 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 
 	// "disabled" is distinct from "ok" / failure — it tells the operator
 	// "we didn't probe this on purpose" rather than masking a real fault.
+	// A node whose role does not run the gateway (a server-only node in a
+	// role-split cluster) reports "disabled" too, even with
+	// SB_ENABLE_SSH_GATEWAY on: the daemon never starts one there
+	// (Config.RunsSSHGateway), so probing it could only fail. The wording is
+	// the existing one on purpose: the dashboard, the SDKs and every other
+	// reader of ssh_gateway already treat "disabled" as "not run here".
 	sshStatus := "disabled"
-	if s.cfg.EnableSSHGateway {
+	if s.cfg.RunsSSHGateway() {
 		if err := probeSSHGateway(ctx, s.cfg.SSHListenAddr); err != nil {
 			sshStatus = err.Error()
 		} else {
@@ -5266,7 +5272,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		status = "degraded"
 	}
 	// SSH gateway being down only degrades health when it's expected to be up.
-	if s.cfg.EnableSSHGateway && sshStatus != "ok" {
+	if s.cfg.RunsSSHGateway() && sshStatus != "ok" {
 		status = "degraded"
 	}
 

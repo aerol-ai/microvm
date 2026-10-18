@@ -2921,6 +2921,31 @@ func (c Config) IsWorker() bool { return c.hasRole(NodeRoleWorker) }
 // hybrid that includes "ingress" return true.
 func (c Config) IsIngress() bool { return c.hasRole(NodeRoleIngress) }
 
+// RunsSSHGateway reports whether this node binds the per-sandbox SSH gateway:
+// SB_ENABLE_SSH_GATEWAY on a node whose role needs one. Workers run it
+// because they own sandboxes locally. The ingress runs it too: the public SSH
+// endpoint (SB_SSH_LISTEN_ADDR, default :2220) and the wildcard DNS both
+// point at the ingress, so without a gateway there every
+// `ssh sandbox.<domain>` lands on a closed port (cluster-hetero UC-43/67:
+// "connection refused"). An ingress-hosted gateway bridges to the owning node
+// via sshgateway.Config.RemoteAPIBaseURL exactly like the worker path. A
+// server-only node owns no sandboxes and is not the public endpoint, so it
+// never runs one.
+//
+// The daemon decides whether to start the gateway with this, and /health
+// decides whether to probe it with this too. They used to disagree: health
+// probed whenever the flag was on, so every server-only node of a
+// role-split cluster reported "degraded" for a gateway it was never meant
+// to run.
+//
+// Multi-ingress note: every ingress that binds the gateway must present the
+// same SSH host key (SB_SSH_HOST_KEY_PATH material shared across ingress
+// nodes) or clients see host-key churn as they round-robin between ingress
+// IPs.
+func (c Config) RunsSSHGateway() bool {
+	return c.EnableSSHGateway && (c.IsWorker() || c.IsIngress())
+}
+
 // EffectivePublicHost returns the hostname or IP that should appear in
 // SDK-facing sandbox URLs. In cluster mode, operators set
 // SB_INGRESS_ADVERTISE_HOST to whatever fronts the ingress tier (cloud NLB,
