@@ -718,17 +718,28 @@ func TestLowercaseBearerAuthenticates(t *testing.T) {
 
 func TestAuthOrigin(t *testing.T) {
 	cases := []struct {
-		remote string
-		peer   bool
-		want   string
+		remote   string
+		peer     bool
+		socket   bool   // arrived on the public Unix socket
+		clientIP string // X-AerolVM-Client-IP
+		trust    bool   // SB_L4_FALLBACK_PROXY_PROTOCOL
+		want     string
 	}{
-		{"127.0.0.1:5000", false, "host"},
-		{"[::1]:5000", false, "host"},
-		{"127.0.0.1", false, "host"},
-		{"10.0.0.7:5000", false, "public"},
-		{"203.0.113.9:443", false, "public"},
-		{"not-an-address", false, "public"},
-		{"10.0.0.7:5000", true, "peer"},
+		{remote: "127.0.0.1:5000", want: "host"},
+		{remote: "[::1]:5000", want: "host"},
+		{remote: "127.0.0.1", want: "host"},
+		{remote: "10.0.0.7:5000", want: "public"},
+		{remote: "203.0.113.9:443", want: "public"},
+		{remote: "not-an-address", want: "public"},
+		{remote: "10.0.0.7:5000", peer: true, want: "peer"},
+		// The public socket is public whatever its peer address says.
+		{remote: "", socket: true, want: "public"},
+		{remote: "127.0.0.1:5000", socket: true, want: "public"},
+		// Caddy on loopback TCP relaying a public caller (flag on).
+		{remote: "127.0.0.1:5000", clientIP: "203.0.113.9", trust: true, want: "public"},
+		// Flag off: Caddy sets no header, so the header means nothing.
+		{remote: "127.0.0.1:5000", clientIP: "203.0.113.9", want: "host"},
+		{remote: "10.0.0.7:5000", peer: true, clientIP: "203.0.113.9", trust: true, want: "peer"},
 	}
 	for _, tc := range cases {
 		r := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -736,8 +747,14 @@ func TestAuthOrigin(t *testing.T) {
 		if tc.peer {
 			r.TLS = peerTLS("n1")
 		}
-		if got := authOrigin(r); got != tc.want {
-			t.Errorf("authOrigin(%q, peer=%v) = %q, want %q", tc.remote, tc.peer, got, tc.want)
+		if tc.socket {
+			r = r.WithContext(context.WithValue(r.Context(), publicListenerKey{}, true))
+		}
+		if tc.clientIP != "" {
+			r.Header.Set(HeaderClientIP, tc.clientIP)
+		}
+		if got := (&Server{l4ProxyProtocol: tc.trust}).authOrigin(r); got != tc.want {
+			t.Errorf("authOrigin(%+v) = %q, want %q", tc, got, tc.want)
 		}
 	}
 }

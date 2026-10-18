@@ -84,6 +84,53 @@ func TestStampForward(t *testing.T) {
 	})
 }
 
+// TestStampForwardPATOrigin is the forwarded-PAT origin rule's sending half
+// (plans/identity-and-access.md §5.11): a forward of an operator-token call
+// says where the edge accepted the PAT, an unknown origin says public (the
+// value an owner under host scope refuses), and no other credential carries
+// the marker, even one copied from the inbound request.
+func TestStampForwardPATOrigin(t *testing.T) {
+	cases := []struct {
+		name   string
+		access controlplane.Access
+		origin string // what the API edge recorded; "" = nothing
+		stale  string // a marker already on the outbound request
+		want   string
+	}{
+		{name: "operator from a loopback peer", access: controlplane.OperatorAccess(), origin: PATOriginHost, want: PATOriginHost},
+		{name: "operator from the public side", access: controlplane.OperatorAccess(), origin: PATOriginPublic, want: PATOriginPublic},
+		{name: "operator with no recorded origin is public", access: controlplane.OperatorAccess(), want: PATOriginPublic},
+		{name: "an unknown origin value is public", access: controlplane.OperatorAccess(), origin: "somewhere", want: PATOriginPublic},
+		{name: "node acting for itself", access: controlplane.NodeAccess("n3"), origin: PATOriginHost, want: PATOriginHost},
+		{name: "a stale public marker is replaced", access: controlplane.OperatorAccess(), origin: PATOriginHost, stale: PATOriginPublic, want: PATOriginHost},
+		{name: "a token carries no origin", access: teamToken("payments"), origin: PATOriginHost, want: ""},
+		{name: "a stale marker never rides on a token", access: teamToken("payments"), stale: PATOriginHost, want: ""},
+		{name: "no access carries no origin", access: controlplane.Access{}, stale: PATOriginHost, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.origin != "" {
+				ctx = ContextWithPATOrigin(ctx, tc.origin)
+			}
+			out, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://peer/v1/sandboxes", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.stale != "" {
+				out.Header.Set(HeaderPATOrigin, tc.stale)
+			}
+			StampForward(out, tc.access)
+			if got := out.Header.Values(HeaderPATOrigin); (tc.want == "" && len(got) != 0) || (tc.want != "" && (len(got) != 1 || got[0] != tc.want)) {
+				t.Fatalf("%s = %v, want %q", HeaderPATOrigin, got, tc.want)
+			}
+		})
+	}
+	if got := PATOriginFromContext(context.Background()); got != "" {
+		t.Fatalf("an empty context has origin %q", got)
+	}
+}
+
 // TestForwardHTTPStampsTheForward drives the reverse-proxy Director behind
 // ForwardHTTP over a real node-bound mTLS hop: the owner receives the
 // caller's own credential untouched plus the StampForward markers, taken

@@ -94,9 +94,12 @@ func (c *Client) StaticSandboxRoute(spec StaticRouteSpec) map[string]any {
 }
 
 // StaticIngressRoutes are the tls-mux routes, in order (see the file comment).
+// Routes 0 and 1 hand the connection to the same HTTPS site the tls-mux
+// fallback does, so they send the same PROXY header when the flag is on:
+// route 1 carries every API request on an ingress-proxy-routing node.
 func (c *Client) StaticIngressRoutes(spec StaticRouteSpec) []map[string]any {
 	fallback := func() []map[string]any {
-		return []map[string]any{{"handler": "proxy", "upstreams": []map[string]any{{"dial": []string{c.l4TLSFallback}}}}}
+		return []map[string]any{tlsFallbackProxy(c.l4TLSFallback, c.l4FallbackProxyProtocol)}
 	}
 	return []map[string]any{
 		{

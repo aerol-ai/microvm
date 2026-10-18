@@ -260,6 +260,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		Events:         &voterAutoJoinDelegate{c: c},
 		OnLeave:        c.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
+		PATScope:       cfg.PATScope,
 	}, admitter, logger)
 	if err != nil {
 		if c.internalServer != nil {

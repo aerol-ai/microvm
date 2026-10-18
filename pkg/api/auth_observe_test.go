@@ -120,11 +120,12 @@ func TestAuthSpanAttributes(t *testing.T) {
 	}{
 		{bearer: "avm_payments", want: map[string]string{
 			"aerolvm.auth.result": "ok", "aerolvm.principal.kind": "token", "aerolvm.principal.id": "tok_7Hq2", "aerolvm.team": "payments",
+			"aerolvm.permission": "authenticated",
 		}},
 		{bearer: "pat-token", want: map[string]string{
 			"aerolvm.auth.result": "ok", "aerolvm.principal.kind": "operator", "aerolvm.principal.id": "operator", "aerolvm.team": "*",
 		}},
-		{bearer: "avm_expired", want: map[string]string{"aerolvm.auth.result": "unauthorized"}, absent: []string{"aerolvm.principal.id"}},
+		{bearer: "avm_expired", want: map[string]string{"aerolvm.auth.result": "unauthorized"}, absent: []string{"aerolvm.principal.id", "aerolvm.permission"}},
 		{bearer: "avm_payments", team: "checkout", want: map[string]string{"aerolvm.auth.result": "forbidden"}},
 		{bearer: "avm_payments", team: "BAD", want: map[string]string{"aerolvm.auth.result": "bad_request"}},
 	}

@@ -16,7 +16,6 @@ import (
 	"crypto/subtle"
 	"errors"
 	"net/http"
-	"net/netip"
 	"strconv"
 	"strings"
 
@@ -85,7 +84,7 @@ func WithCredentialAuthenticator(kind controlplane.PrincipalKind, a Authenticato
 // buildAuthChain orders the authenticators: pat, the named credentials, then
 // the managed provider, which is last because it claims every non-empty
 // bearer nothing before it recognised.
-func buildAuthChain(patToken string, validator controlplane.Validator, credentials []authLink) []authLink {
+func buildAuthChain(pat patAuthenticator, validator controlplane.Validator, credentials []authLink) []authLink {
 	providerKind := string(controlplane.PrincipalControlPlane)
 	if controlplane.IsNoopValidator(validator) {
 		// The open-source build has no provider: a refusal there means
@@ -96,7 +95,7 @@ func buildAuthChain(patToken string, validator controlplane.Validator, credentia
 		validator = controlplane.Noop().Validator
 	}
 	links := make([]authLink, 0, len(credentials)+2)
-	links = append(links, authLink{kind: string(controlplane.PrincipalOperator), auth: patAuthenticator{token: patToken}})
+	links = append(links, authLink{kind: string(controlplane.PrincipalOperator), auth: pat})
 	links = append(links, credentials...)
 	return append(links, authLink{kind: providerKind, auth: providerAuthenticator{validator: validator}})
 }
@@ -107,18 +106,39 @@ func (s *Server) authLinks() []authLink {
 	if s.authChain != nil {
 		return s.authChain
 	}
-	return buildAuthChain(s.patToken, s.validator, nil)
+	return buildAuthChain(s.patAuth(), s.validator, nil)
 }
 
-// patAuthenticator recognises the operator token (PAT). It never refuses: a
-// credential that is not the PAT may be any other kind, so it passes on.
-type patAuthenticator struct{ token string }
+// patAuth is the server's PAT authenticator.
+func (s *Server) patAuth() patAuthenticator {
+	return patAuthenticator{token: s.patToken, previous: s.patTokenPrevious, hostOnly: s.patScopeHost, trustClientIP: s.l4ProxyProtocol}
+}
+
+// patAuthenticator recognises the operator token (PAT).
+type patAuthenticator struct {
+	token string
+	// previous is SB_PAT_TOKEN_PREVIOUS: during a rolling rotation the old
+	// token keeps working on every node until it is removed (§5.11, H2).
+	previous string
+	// hostOnly is SB_PAT_SCOPE=host: the PAT is accepted only from a
+	// loopback TCP peer and from mTLS cluster peers (CEO review D4).
+	hostOnly bool
+	// trustClientIP is SB_L4_FALLBACK_PROXY_PROTOCOL: Caddy's
+	// X-AerolVM-Client-IP then marks its loopback traffic as public.
+	trustClientIP bool
+}
 
 // matches compares in constant time: the PAT grants fleet-wide access, so a
 // byte-wise == would leak the matching prefix length as a timing signal.
+// Both tokens are always compared, so the time taken does not say which
+// one matched, or whether a previous token is configured.
 func (p patAuthenticator) matches(candidate string) bool {
-	return candidate != "" && p.token != "" &&
-		subtle.ConstantTimeCompare([]byte(candidate), []byte(p.token)) == 1
+	if candidate == "" {
+		return false
+	}
+	current := p.token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.token)) == 1
+	previous := p.previous != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(p.previous)) == 1
+	return current || previous
 }
 
 // Authenticate splits the PAT into its two principals (§5.1). A cluster peer
@@ -127,9 +147,26 @@ func (p patAuthenticator) matches(candidate string) bool {
 // forwarding a user's PAT request, is the operator; forward attribution then
 // records the edge node in Via. Both get today's powers; only the name
 // differs.
+//
+// Under SB_PAT_SCOPE=host it also refuses a PAT from a public origin (the
+// public socket, or a TCP peer that is not loopback), and a PAT a peer
+// forwarded unless the edge marked it X-Cluster-PAT-Origin: host. A missing
+// marker is refused too, so host scope is turned on only once every node
+// runs this release (the runbook's order). Under the default scope "any"
+// nothing here changes (L8).
 func (p patAuthenticator) Authenticate(r *http.Request, bearer string) (controlplane.Access, bool, error) {
 	if !p.matches(bearer) {
 		return controlplane.Access{}, false, nil
+	}
+	if p.hostOnly {
+		switch requestOrigin(r, p.trustClientIP) {
+		case originPublic:
+			return controlplane.Access{}, true, errPATScope
+		case originPeer:
+			if isForwarded(r) && r.Header.Get(cluster.HeaderPATOrigin) != cluster.PATOriginHost {
+				return controlplane.Access{}, true, errPATOrigin
+			}
+		}
 	}
 	if !isForwarded(r) {
 		if peer, ok := mtlsPeer(r); ok {
@@ -366,8 +403,10 @@ type authFailure struct {
 	// invalidToken is set only for a D17 refusal of an avm_ token or a JWT:
 	// the 401 then carries it in WWW-Authenticate and the body's `reason`.
 	invalidToken controlplane.RejectReason
-	// message is the 400/403/503 text. A 401 always uses the surface's own
-	// fixed text, so PAT and managed 401 bodies stay byte for byte as before.
+	// message is the 400/403/503 text. A 401 uses the surface's own fixed
+	// text, so PAT and managed 401 bodies stay byte for byte as before; the
+	// one exception is a PAT refused by SB_PAT_SCOPE=host, which exists only
+	// with that opt-in and says to sign in instead.
 	message string
 	// retryAfter is the Retry-After seconds of a 503.
 	retryAfter int
@@ -424,6 +463,11 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 		// (§5.5, §11): the token may be fine, so 503, not 401.
 		return &authFailure{status: http.StatusServiceUnavailable, kind: linkKind, reason: "unavailable",
 			message: identityUnavailableMessage, retryAfter: identityUnavailableRetryAfter}
+	case errors.Is(err, errPATScope):
+		// SB_PAT_SCOPE=host: the one 401 that names what to use instead.
+		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_scope", message: patScopeMessage}
+	case errors.Is(err, errPATOrigin):
+		return &authFailure{status: http.StatusUnauthorized, kind: linkKind, reason: "pat_origin", message: patScopeMessage}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
@@ -500,9 +544,10 @@ func (s *Server) e2bCredential(r *http.Request) string {
 	return apiKey
 }
 
-// isPATToken reports whether candidate is the operator PAT (constant time).
+// isPATToken reports whether candidate is the operator PAT, current or
+// previous (constant time).
 func (s *Server) isPATToken(candidate string) bool {
-	return patAuthenticator{token: s.patToken}.matches(candidate)
+	return s.patAuth().matches(candidate)
 }
 
 // withAuth is the one auth middleware; the three surfaces below are the
@@ -518,6 +563,12 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 			return
 		}
 		ctx := controlplane.ContextWithAccess(r.Context(), access)
+		switch access.Principal.Kind {
+		case controlplane.PrincipalOperator, controlplane.PrincipalNode:
+			// Where this node accepted the PAT, for the
+			// X-Cluster-PAT-Origin every forward of it carries (§5.11).
+			ctx = cluster.ContextWithPATOrigin(ctx, patOrigin(r, s.l4ProxyProtocol))
+		}
 		next.ServeHTTP(w, r.WithContext(withCorrelationID(ctx, r)))
 	})
 }
@@ -556,7 +607,11 @@ func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure
 		// needs no quoting beyond the surrounding quotes.
 		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="`+string(f.invalidToken)+`"`)
 	}
-	surface.write(w, f.status, surface.unauthorized, string(f.invalidToken))
+	message := surface.unauthorized
+	if f.message != "" {
+		message = f.message
+	}
+	surface.write(w, f.status, message, string(f.invalidToken))
 }
 
 // requireAuth wraps next with authentication for v1, Daytona, remote MCP and
@@ -573,24 +628,4 @@ func (s *Server) requireE2BAuth(next http.Handler) http.Handler {
 // requireRunloopAuth is authentication with the Runloop error body.
 func (s *Server) requireRunloopAuth(next http.Handler) http.Handler {
 	return s.withAuth(runloopSurface, next)
-}
-
-// authOrigin is the aerolvm_auth_requests_total origin label: "peer" for an
-// mTLS cluster peer, "host" for a loopback TCP peer, "public" otherwise.
-// Caddy also connects from loopback, so its traffic counts as "host" until
-// the PROXY-protocol change (T10, D12) gives sandboxd the real client.
-func authOrigin(r *http.Request) string {
-	if _, ok := mtlsPeer(r); ok {
-		return "peer"
-	}
-	if addr, err := netip.ParseAddrPort(r.RemoteAddr); err == nil {
-		if addr.Addr().Unmap().IsLoopback() {
-			return "host"
-		}
-		return "public"
-	}
-	if addr, err := netip.ParseAddr(r.RemoteAddr); err == nil && addr.Unmap().IsLoopback() {
-		return "host"
-	}
-	return "public"
 }

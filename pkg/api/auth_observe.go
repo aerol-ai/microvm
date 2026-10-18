@@ -17,14 +17,17 @@ import (
 //
 //	aerolvm_auth_requests_total{key=<principal kind>,key2=<origin>}
 //	  kind:   operator | node | controlplane | token | oidc
-//	  origin: host | peer | public (see authOrigin)
+//	  origin: host | peer | public (see requestOrigin in pat_scope.go);
+//	          operator from public is break-glass PAT use, alerted on
 //	aerolvm_auth_failures_total{key=<kind>,key2=<reason>}
-//	  kind:   none | unknown | controlplane | token | oidc
+//	  kind:   none | unknown | operator | controlplane | token | oidc
 //	  reason: missing | rejected | no_owner | bad_role | bad_team |
 //	          team_not_bound | stale (token mirror out of date, 503) |
 //	          a D17 reason (expired, wrong_audience, ...) |
 //	          no_binding | group_overage (a verified OIDC token, 403) |
-//	          unavailable (a JWT this node cannot check now, 503)
+//	          unavailable (a JWT this node cannot check now, 503) |
+//	          pat_scope | pat_origin (an operator token refused by
+//	          SB_PAT_SCOPE=host, 401)
 //
 // Every label value comes from a fixed set, never from the request, so a
 // caller cannot grow the series count.
@@ -64,7 +67,7 @@ const (
 func (s *Server) observeAuth(r *http.Request, access controlplane.Access, failure *authFailure) {
 	span := oteltrace.SpanFromContext(r.Context())
 	if failure == nil {
-		addAuthCount(authRequests, string(access.Principal.Kind), authOrigin(r))
+		addAuthCount(authRequests, string(access.Principal.Kind), s.authOrigin(r))
 		if span.IsRecording() {
 			attrs := []attribute.KeyValue{
 				attribute.String("aerolvm.auth.result", authResultOK),
@@ -85,7 +88,7 @@ func (s *Server) observeAuth(r *http.Request, access controlplane.Access, failur
 	if s.logger != nil {
 		s.logger.Debug("authentication refused",
 			"status", failure.status, "kind", failure.kind, "reason", failure.reason,
-			"origin", authOrigin(r), "path", r.URL.Path)
+			"origin", s.authOrigin(r), "path", r.URL.Path)
 	}
 }
 

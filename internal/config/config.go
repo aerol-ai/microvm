@@ -1378,6 +1378,32 @@ type Config struct {
 	// not. SB_IDENTITY_FILE.
 	IdentityFile string
 
+	// PATTokenPrevious is also accepted as the PAT during a rotation, in
+	// constant time; nodes always send PATToken. Set it on every node with
+	// the new token as SB_PAT_TOKEN, restart in turn, then remove it.
+	// SB_PAT_TOKEN_PREVIOUS (plans/identity-and-access.md §5.11).
+	PATTokenPrevious string
+	// PATScope is where the PAT is accepted: PATScopeAny (default, as
+	// before) or PATScopeHost (a loopback TCP peer on the API listener and
+	// mTLS cluster peers only). SB_PAT_SCOPE.
+	PATScope string
+	// PublicAPISocket is the Unix socket sandboxd opens for Caddy under
+	// PATScopeHost: every request on it is public, so a PAT there is
+	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
+	PublicAPISocket string
+	// OperatorVolumeScope pins the scope segment of the operator's platform
+	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
+	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
+	OperatorVolumeScope string
+	// L4FallbackProxyProtocol makes the caddy-l4 SNI fallback route send a
+	// PROXY v2 header to the 8443 HTTPS site, so Caddy, and through its
+	// X-AerolVM-Client-IP header sandboxd, see the real client address
+	// (CEO review D12). On only together with the site's proxy_protocol
+	// listener wrapper, which install.sh writes in the same step: on without
+	// it, every public HTTPS handshake fails. Default false.
+	// SB_L4_FALLBACK_PROXY_PROTOCOL.
+	L4FallbackProxyProtocol bool
+
 	// MCPEnabled mounts the remote MCP endpoint (/mcp) on the API server
 	// (plans/mcp-server-and-agent-cli.md §5.7). Off by default: it is a new
 	// public surface, and operators opt in like every other new listener
@@ -2645,6 +2671,9 @@ func Load() (Config, error) {
 		cfg.TokenMaxTTL = ttl
 	}
 	if err := cfg.loadAuditAPIConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadPATScopeConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {

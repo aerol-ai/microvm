@@ -260,6 +260,7 @@ func NewAgent(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitte
 		Events:         nil,
 		OnLeave:        a.invalidatePeerClient,
 		PeerCacheDir:   cfg.RaftDataDir,
+		PATScope:       cfg.PATScope,
 	}, admitter, logger)
 	if err != nil {
 		if a.internalServer != nil {

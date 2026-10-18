@@ -108,6 +108,63 @@ func TestTenantScope(t *testing.T) {
 	}
 }
 
+// TestOperatorScopeStableAcrossPATRotation is H2 (plans/identity-and-access.md
+// §5.11): unpinned, a new PAT moves every operator volume; pinned to the
+// value the boot log printed, the old and the new PAT (and a background call
+// with no access at all) resolve the same scope, while tenants are untouched.
+func TestOperatorScopeStableAcrossPATRotation(t *testing.T) {
+	legacy, err := OperatorScope("", "old-pat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rotated, _ := OperatorScope("", "new-pat"); rotated == legacy {
+		t.Fatal("the legacy scope hashes the PAT, so a rotation must change it (that is the bug pinning fixes)")
+	}
+	callers := []Caller{
+		{HasAccess: true, Operator: true, PATToken: "old-pat", OperatorScope: legacy},
+		{HasAccess: true, Operator: true, PATToken: "new-pat", OperatorScope: legacy},
+		{HasAccess: false, PATToken: "new-pat", OperatorScope: legacy},
+		{HasAccess: true, Operator: true, OperatorScope: legacy}, // a pinned scope needs no token
+	}
+	for i, c := range callers {
+		got, err := TenantScope(c)
+		if err != nil || got != legacy {
+			t.Fatalf("caller %d: scope = %q, %v; want the pinned %q", i, got, err, legacy)
+		}
+	}
+	tenant := Caller{HasAccess: true, OwnerRef: "team:payments", OperatorScope: legacy}
+	if got, _ := TenantScope(tenant); got == legacy || !strings.HasPrefix(got, "t-") {
+		t.Fatalf("a pinned operator scope must not reach a tenant: %q", got)
+	}
+}
+
+func TestValidateOperatorScope(t *testing.T) {
+	cases := []struct {
+		scope string
+		ok    bool
+	}{
+		{"op-1a2b3c4d5e6f7a8b", true},
+		{"op-self-host", true},
+		{"op-a.b_c", true},
+		{"op-" + strings.Repeat("a", MaxVolumeNameLen-3), true},
+		{"op-" + strings.Repeat("a", MaxVolumeNameLen-2), false}, // over the segment cap
+		{"op-", false},                                           // nothing after the prefix
+		{"t-1a2b3c4d5e6f7a8b", false},                            // the tenant namespace
+		{"1a2b3c4d5e6f7a8b", false},                              // no prefix
+		{"OP-UPPER", false},                                      // would be lowercased, so not what was pinned
+		{"op-a/b", false},
+	}
+	for _, tc := range cases {
+		err := ValidateOperatorScope(tc.scope)
+		if (err == nil) != tc.ok {
+			t.Errorf("ValidateOperatorScope(%q) = %v, want ok=%v", tc.scope, err, tc.ok)
+		}
+		if _, err := OperatorScope(tc.scope, "pat"); (err == nil) != tc.ok {
+			t.Errorf("OperatorScope(%q) = %v, want ok=%v", tc.scope, err, tc.ok)
+		}
+	}
+}
+
 // UC-01/25/27: S3 backend synthesizes a valid bucket/prefix/tenant/name source
 // with operator creds, region/endpoint options, and read-only propagation; the
 // result passes the existing MountSpec.Validate.

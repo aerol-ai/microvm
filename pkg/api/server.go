@@ -47,6 +47,14 @@ type Server struct {
 	// default PAT-then-provider chain.
 	authChain []authLink
 
+	// The PAT settings (pat_scope.go, plans/identity-and-access.md §5.11):
+	// the previous token accepted during a rotation, SB_PAT_SCOPE=host, and
+	// SB_L4_FALLBACK_PROXY_PROTOCOL, which makes Caddy's
+	// X-AerolVM-Client-IP trustworthy.
+	patTokenPrevious string
+	patScopeHost     bool
+	l4ProxyProtocol  bool
+
 	// Sign-in discovery (discovery.go): whether identity is on, the
 	// issuers to publish, and SB_DOMAIN for ui_url.
 	identityEnabled bool
@@ -114,7 +122,6 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		containerEngine: cfg.ContainerEngine,
 		patToken:        patToken,
 		validator:       validator,
-		authChain:       buildAuthChain(patToken, validator, options.credentials),
 		identityEnabled: cfg.IdentityEnabled,
 		discovery:       options.discovery,
 		domain:          cfg.Domain,
@@ -131,6 +138,10 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		mux:                     http.NewServeMux(),
 		authDenied:              newAuthDeniedLimiter(),
 	}
+	s.patTokenPrevious = cfg.PATTokenPrevious
+	s.patScopeHost = cfg.PATScopeHostOnly()
+	s.l4ProxyProtocol = cfg.L4FallbackProxyProtocol
+	s.authChain = buildAuthChain(s.patAuth(), validator, options.credentials)
 	if service != nil && service.APIRecordsConfigured() {
 		// Before registerRoutes: every surface captures the hook when it
 		// mounts its routes.

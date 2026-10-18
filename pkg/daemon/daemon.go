@@ -973,6 +973,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.EnableCluster {
 		svc.Cluster().AttachInternalHandler(server.Handler())
 	}
+	logPATBootSettings(logger, cfg)
+	// SB_PAT_SCOPE=host: Caddy's own listener, where every request is public
+	// (plans/identity-and-access.md §5.11). Opened before the API listener
+	// so a socket that cannot be made with its owners and modes fails the
+	// boot cleanly. Off (the default), nothing is opened.
+	var publicServer *http.Server
+	var publicLn net.Listener
+	if cfg.PATScopeHostOnly() {
+		publicLn, err = listenPublicAPISocket(cfg.PublicAPISocket, publicAPISocketGroup)
+		if err != nil {
+			return err
+		}
+		publicServer = newPublicAPIServer(server.PublicHandler())
+	}
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr(),
 		Handler:           server.Handler(),
@@ -991,6 +1005,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			cancel()
 		}
 	}()
+	if publicServer != nil {
+		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
+		go func() {
+			if err := publicServer.Serve(publicLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("public API socket stopped unexpectedly", "error", err)
+				cancel()
+			}
+		}()
+	}
 
 	// Wake-aware HTTP ingress proxy: a loopback-only listener Caddy
 	// dials when forwarding a wake-aware port route. Stood up when
@@ -1111,6 +1134,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Warn("graceful shutdown failed", "error", err)
+	}
+	if publicServer != nil {
+		if err := publicServer.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("public API socket graceful shutdown failed", "error", err)
+		}
 	}
 	if ingressServer != nil {
 		if err := ingressServer.Shutdown(shutdownCtx); err != nil {

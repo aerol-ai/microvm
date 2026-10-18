@@ -497,6 +497,10 @@ type Member struct {
 	// missing or too old for placement admission.
 	CapacityUpdatedUnix int64 `json:"capacity_updated_unix,omitempty"`
 	CapacityStale       bool  `json:"capacity_stale,omitempty"`
+	// PATScope is the peer's gossiped SB_PAT_SCOPE: "host", or empty for
+	// the default "any" (and for older builds). It feeds the
+	// aerolvm_pat_scope_drift gauge and grants nothing.
+	PATScope string `json:"pat_scope,omitempty"`
 }
 
 // LocalSandboxState is one entry in the boot-time AssertOwnership payload.

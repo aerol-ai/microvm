@@ -467,3 +467,70 @@ func TestRunAPITokenSweepStops(t *testing.T) {
 		t.Fatal("the default clock is time.Now")
 	}
 }
+
+// TestAPITokenGauge is aerolvm_api_tokens{key=<role>} (§5.15): unexpired
+// tokens by role on a node that holds the store, every role published
+// (zeros included), recounted on its tick; a worker publishes nothing.
+func TestAPITokenGauge(t *testing.T) {
+	svc := newTokenService(t, true)
+	if svc.apiTokenCounter() == nil {
+		t.Fatal("a single node counts its own tokens")
+	}
+	ctx := adminCtx()
+	for _, req := range []models.CreateAPITokenRequest{
+		createReq("ci-a", "runner", "payments", "30d"),
+		createReq("ci-b", "runner", "checkout", "30d"),
+		createReq("scrape", "viewer", "*", "30d"),
+	} {
+		if _, err := svc.CreateAPIToken(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One more that has already expired: it is listed but not live.
+	svc.apiTokenSet.Put(identity.TokenRecord{ID: "tok_expired", Role: controlplane.RoleAdmin, ExpiresAt: tokenSvcNow.Add(-time.Minute)})
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc.runAPITokenGauge(runCtx, svc.apiTokenCounter(), time.Millisecond); close(done) }()
+	want := map[string]string{"viewer": "1", "runner": "2", "auditor": "0", "admin": "0"}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ok := true
+		for role, n := range want {
+			if v := apiTokensByRole.Get(role); v == nil || v.String() != n {
+				ok = false
+			}
+		}
+		if ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("aerolvm_api_tokens = %s, want %v", apiTokensByRole.String(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	worker := newTokenService(t, true)
+	worker.cfg.EnableCluster = true
+	worker.cluster = fakeTokenWorker{newFakeTokenCluster()}
+	if worker.apiTokenCounter() != nil {
+		t.Fatal("a worker holds only a mirror and publishes no token count")
+	}
+
+	server := newTokenService(t, true)
+	server.cfg.EnableCluster = true
+	server.cluster = countingTokenServer{Noop: cluster.NewNoop("node-s", "http://node-s", "")}
+	counter := server.apiTokenCounter()
+	if counter == nil || counter.CountAPITokens(tokenSvcNow)[controlplane.RoleAuditor] != 3 {
+		t.Fatal("a Raft server counts its FSM's tokens")
+	}
+}
+
+// countingTokenServer stands in for a Raft server's CountAPITokens.
+type countingTokenServer struct{ *cluster.Noop }
+
+func (countingTokenServer) CountAPITokens(time.Time) map[controlplane.Role]int {
+	return map[controlplane.Role]int{controlplane.RoleAuditor: 3}
+}

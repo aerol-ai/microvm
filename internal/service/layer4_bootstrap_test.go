@@ -119,6 +119,88 @@ func TestEnsureLayer4ReadyDisabledCaddyLatchesImmediately(t *testing.T) {
 	}
 }
 
+// TestEnsureLayer4ReadyFallbackProxyProtocolOnlyWithFlag is the regression
+// test for CEO review D12 (plans/identity-and-access.md §5.11, §9.5): the
+// tls-mux fallback route EnsureLayer4 creates carries "proxy_protocol": "v2"
+// only with SB_L4_FALLBACK_PROXY_PROTOCOL on. Off (the default, and every
+// binary-only upgrade) it is byte for byte the route this path always wrote,
+// because the 8443 site accepts a PROXY header only after install.sh adds
+// its listener wrapper. The latch behaves the same either way.
+func TestEnsureLayer4ReadyFallbackProxyProtocolOnlyWithFlag(t *testing.T) {
+	const want = `{"listen":[":443"],"routes":[{"@id":"tls-mux-fallback","handle":[{"handler":"proxy","upstreams":[{"dial":["127.0.0.1:8443"]}]}]}]}`
+	const wantProxy = `{"listen":[":443"],"routes":[{"@id":"tls-mux-fallback","handle":[{"handler":"proxy","proxy_protocol":"v2","upstreams":[{"dial":["127.0.0.1:8443"]}]}]}]}`
+	for _, tc := range []struct {
+		name string
+		flag bool
+		want string
+	}{
+		{name: "flag off: no PROXY header (today's route)", flag: false, want: want},
+		{name: "flag on: PROXY v2 to the 8443 site", flag: true, want: wantProxy},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var (
+				mu      sync.Mutex
+				created string
+				puts    int
+			)
+			mux := http.NewServeMux()
+			mux.HandleFunc("/config/apps/layer4", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			})
+			mux.HandleFunc("/config/apps/layer4/servers/tls-mux", func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					http.Error(w, "not found", http.StatusNotFound)
+				case http.MethodPut:
+					body, _ := io.ReadAll(r.Body)
+					mu.Lock()
+					created, puts = string(body), puts+1
+					mu.Unlock()
+					w.WriteHeader(http.StatusOK)
+				default:
+					t.Fatalf("unexpected method %s on %s", r.Method, r.URL.Path)
+				}
+			})
+			server := httptest.NewServer(mux)
+			t.Cleanup(server.Close)
+
+			cfg := config.Config{
+				CaddyAdminURL:           server.URL,
+				EnableCaddy:             true,
+				HTTPClientTimeout:       time.Second,
+				L4TLSListen:             ":443",
+				L4TLSFallback:           "127.0.0.1:8443",
+				L4FallbackProxyProtocol: tc.flag,
+			}
+			svc := &Service{
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				caddy:  caddy.New(cfg),
+				cfg:    cfg,
+			}
+			for i := 0; i < 3; i++ {
+				if err := svc.EnsureLayer4Ready(context.Background()); err != nil {
+					t.Fatalf("EnsureLayer4Ready %d: %v", i, err)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if puts != 1 {
+				t.Fatalf("tls-mux created %d times, want once (the latch must still hold)", puts)
+			}
+			if strings.TrimSpace(created) != tc.want {
+				t.Fatalf("tls-mux server =\n %s\nwant\n %s", created, tc.want)
+			}
+			if !svc.l4Ready.Load() {
+				t.Fatal("a successful bootstrap latches ready")
+			}
+		})
+	}
+}
+
 func TestRepairLayer4ReadyBypassesSuccessLatch(t *testing.T) {
 	var repairPosts atomic.Int32
 

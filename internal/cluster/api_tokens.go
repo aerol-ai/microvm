@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/raft"
 
 	"github.com/aerol-ai/microvm/internal/identity"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // API tokens over the cluster (plans/identity-and-access.md §5.4).
@@ -138,6 +139,16 @@ func (c *Cluster) LookupToken(id string) (identity.TokenRecord, bool, bool) {
 	}
 	rec, ok := c.fsm.apiTokens().lookup(id)
 	return rec, ok, true
+}
+
+// CountAPITokens counts this server's unexpired tokens by role, for the
+// aerolvm_api_tokens gauge. Every server holds the whole FSM, so each
+// reports the fleet's count.
+func (c *Cluster) CountAPITokens(now time.Time) map[controlplane.Role]int {
+	if c == nil || c.fsm == nil {
+		return nil
+	}
+	return c.fsm.apiTokens().countLive(now)
 }
 
 // ListAPITokens returns every stored token, sorted by team and name.
