@@ -26,7 +26,7 @@ https://{{ROOT_SITE_ADDRESS}} {
     tls {
         dns {{DNS_PROVIDER}} {env.SB_DNS_API_TOKEN}
     }
-    @api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp
+    @api path /health /v1 /v1/* /daytona /daytona/* /e2b /e2b/* /runloop /runloop/* /mcp /.well-known/aerolvm-auth /.well-known/oauth-protected-resource*
     handle @api {
         # stream_close_delay: a Caddy reload closes each WebSocket this proxy
         # carries (exec streams, aerolvm shell, session attach) with code

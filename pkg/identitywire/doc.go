@@ -1,7 +1,9 @@
 // Package identitywire holds the identity formats that sandboxd and the
 // aerolvm CLI must agree on byte for byte (plans/identity-and-access.md,
-// eng review D2): the avm_ API token format with its checksum, and the
-// names and lifetimes a token request carries.
+// eng review D2): the avm_ API token format with its checksum, the names
+// and lifetimes a token request carries, and the sign-in discovery document
+// (GET /.well-known/aerolvm-auth) the CLI and the dashboard read before
+// they hold any credential.
 //
 // It is the one identity package the CLI may import. It depends only on the
 // standard library, so it never drags a server package (containerd, Raft,

@@ -13,28 +13,26 @@ package api
 // The Token benchmark runs the real avm_ authenticator (T3,
 // internal/identity.TokenAuthenticator) over an in-memory token index, the
 // same map read a worker's mirror does: checksum, lookup, SHA-256 of the
-// secret, a constant-time compare and the expiry check. The OIDC verifier
-// arrives in T6; until then the JWT benchmarks run a stand-in that does the
-// work the plan budgets for it (§6): a cached JWT is SHA-256 of the token
-// and a map hit; a cold JWT verifies an RS256 signature. T6 replaces it and
-// keeps the names.
+// secret, a constant-time compare and the expiry check. The JWT benchmarks
+// run the real OIDC verifier (T6) with a 10k-binding identity file (eng
+// review E8): the cached path is SHA-256 of the token, an LRU hit and team
+// selection over the token's own matched bindings, and must stay inside the
+// budget however large the file is.
 
 import (
-	"crypto"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/identity"
+	"github.com/aerol-ai/microvm/internal/identity/identitytest"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
@@ -56,59 +54,37 @@ func newBenchToken(tb testing.TB) (*identity.TokenAuthenticator, string) {
 	return identity.NewTokenAuthenticator(&set, nil), tok.Plaintext()
 }
 
-// benchJWT is a verifier stand-in. With a warm cache it costs what T6's
-// verified-token LRU hit costs; cold, it verifies an RS256 signature.
-type benchJWT struct {
-	key   *rsa.PublicKey
-	sig   []byte
-	cold  bool
-	mu    sync.Mutex
-	cache map[[32]byte]controlplane.Access
-}
+// benchBindings is the identity file size eng review E8 budgets for: a
+// 1 MiB file holds about 10k bindings. The cached path must not scan them.
+const benchBindings = 10_000
 
-func newBenchJWT(b testing.TB, cold bool) (*benchJWT, string) {
-	b.Helper()
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+// newBenchJWT is the real OIDC verifier (T6) against an in-process test
+// issuer and a 10k-binding identity file, and a token whose groups match
+// twenty of those bindings. Cold disables the verified-token cache (a byte
+// bound smaller than any entry), so every request verifies the RS256
+// signature and scans the bindings.
+func newBenchJWT(tb testing.TB, cold bool) (*identity.Verifier, string) {
+	tb.Helper()
+	iss := identitytest.New(tb)
+	var file strings.Builder
+	fmt.Fprintf(&file, "version: 1\nissuers:\n  - {name: okta, url: %q, audiences: [cli], claims: {username: email}}\nbindings:\n", iss.URL)
+	for i := 0; i < benchBindings; i++ {
+		fmt.Fprintf(&file, "  - {issuer: okta, group: g%d, role: runner, team: t%d}\n", i, i%500)
+	}
+	cfg, err := identity.Parse([]byte(file.String()))
 	if err != nil {
-		b.Fatal(err)
+		tb.Fatal(err)
 	}
-	signingInput := "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIwMHUxYWIiLCJpc3MiOiJodHRwczovL2lkcCJ9"
-	digest := sha256.Sum256([]byte(signingInput))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, digest[:])
-	if err != nil {
-		b.Fatal(err)
+	opts := identity.VerifierOptions{HTTPClient: iss.Client()}
+	if cold {
+		opts.CacheBytes = 1
 	}
-	j := &benchJWT{key: &priv.PublicKey, sig: sig, cold: cold, cache: map[[32]byte]controlplane.Access{}}
-	jwt := signingInput + ".c2lnbmF0dXJl"
-	if !cold {
-		access := tokenAccess("payments", controlplane.RoleRunner)
-		access.Principal = controlplane.Principal{Kind: controlplane.PrincipalOIDC, ID: "oidc:okta:00u1ab"}
-		j.cache[sha256.Sum256([]byte(jwt))] = access
+	v := identity.NewVerifier(func() *identity.Config { return cfg }, opts)
+	groups := make([]string, 0, 20)
+	for i := 0; i < 20; i++ {
+		groups = append(groups, "g"+strconv.Itoa(i*499))
 	}
-	return j, jwt
-}
-
-func (j *benchJWT) Authenticate(_ *http.Request, bearer string) (controlplane.Access, bool, error) {
-	if strings.Count(bearer, ".") != 2 {
-		return controlplane.Access{}, false, nil
-	}
-	key := sha256.Sum256([]byte(bearer))
-	if !j.cold {
-		j.mu.Lock()
-		access, ok := j.cache[key]
-		j.mu.Unlock()
-		if ok {
-			return access, true, nil
-		}
-	}
-	signingInput := bearer[:strings.LastIndexByte(bearer, '.')]
-	digest := sha256.Sum256([]byte(signingInput))
-	if err := rsa.VerifyPKCS1v15(j.key, crypto.SHA256, digest[:], j.sig); err != nil {
-		return controlplane.Access{}, true, &controlplane.CredentialError{Kind: controlplane.PrincipalOIDC, Reason: controlplane.RejectInvalidSignature}
-	}
-	access := tokenAccess("payments", controlplane.RoleRunner)
-	access.Principal = controlplane.Principal{Kind: controlplane.PrincipalOIDC, ID: "oidc:okta:00u1ab"}
-	return access, true, nil
+	return v, iss.Mint(tb, iss.Claims(time.Now(), "cli", "00u1ab", groups...))
 }
 
 // authBenchCase builds the middleware and request one path exercises.

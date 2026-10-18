@@ -956,8 +956,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if err := svc.StartAPITokens(ctx); err != nil {
 		return err
 	}
-	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator,
-		api.WithCredentialAuthenticator(controlplane.PrincipalToken, identity.NewTokenAuthenticator(svc.APITokenLookup(), logger)))
+	// The chain runs the avm_ token authenticator before the OIDC verifier
+	// (§5.2). The verifier and the sign-in discovery issuers are wired only
+	// when an identity file is configured (SB_IDENTITY_FILE).
+	serverOpts := []api.ServerOption{
+		api.WithCredentialAuthenticator(controlplane.PrincipalToken, identity.NewTokenAuthenticator(svc.APITokenLookup(), logger)),
+	}
+	serverOpts = append(serverOpts, wireIdentityFile(ctx, cfg, svc, logger)...)
+	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator, serverOpts...)
 	logger.Info("dashboard available", "url", "http://"+cfg.ListenAddr()+"/ui")
 	// Mount the same API handler onto the cluster-internal mTLS listener so
 	// peers can reverse-proxy owner API calls over the cert-pinned channel
