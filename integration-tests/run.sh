@@ -80,6 +80,7 @@ NO_BUILD=0
 BENCH_ONLY=0
 DESTROY_ONLY=0
 OBS_SNAPSHOT_ONLY=0
+UPGRADE_FROM=""
 SCENARIO=""
 # PID of the local-mode SSH port-forward, so teardown can reap it. Without this
 # the `ssh -fN` forks leak: each leftover keeps local :21212 bound, so the next
@@ -123,12 +124,32 @@ while [[ $# -gt 0 ]]; do
     # Render Grafana dashboard PNGs from a keep-provisioned obs stack and pull
     # them into integration-tests/reports/obs/ (Phase 5 snapshot pipeline).
     --obs-snapshot-only) OBS_SNAPSHOT_ONLY=1 ;;
+    # Warm-upgrade release gate: provision on an OLD released tag, upgrade the
+    # daemon in place to the local build, and verify the schema migration kept
+    # every row. Delegates to upgrade-gate.sh (it orchestrates its own run.sh
+    # provision + teardown), so it short-circuits the normal flow below.
+    --upgrade-from)
+      shift
+      [[ $# -gt 0 ]] || { echo "--upgrade-from needs a release tag (e.g. --upgrade-from v0.6.7)" >&2; exit 2; }
+      UPGRADE_FROM="$1"
+      ;;
+    --upgrade-from=*) UPGRADE_FROM="${arg#--upgrade-from=}" ;;
     -*) echo "unknown flag: $arg" >&2; exit 2 ;;
     *) SCENARIO="$arg" ;;
   esac
   shift
 done
-[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--no-build]" >&2; exit 2; }
+[[ -n "$SCENARIO" ]] || { echo "usage: run.sh <scenario|all> [--keep] [--prod-tls] [--metal-on-demand] [--no-disruptive] [--collect-logs-only] [--bench-only] [--destroy-only] [--obs-snapshot-only] [--released|--version <tag>] [--upgrade-from <tag>] [--no-build]" >&2; exit 2; }
+# --upgrade-from hands off to the warm-upgrade gate before any normal
+# provisioning. It runs its own old-tag provision and teardown, so returning
+# here afterwards would double-provision; exec replaces this process.
+if [[ -n "${UPGRADE_FROM:-}" ]]; then
+  if [[ "$KEEP" == 1 ]]; then
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM" --keep
+  else
+    exec "${HERE}/upgrade-gate.sh" "$SCENARIO" --from "$UPGRADE_FROM"
+  fi
+fi
 # A pinned tag and "reuse the last local build" describe different artifact
 # sources; silently honouring one would provision something the operator did
 # not ask for.

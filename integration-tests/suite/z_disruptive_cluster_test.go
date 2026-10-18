@@ -32,62 +32,34 @@ func TestOwnerFailover(t *testing.T) {
 	t.Skip("driven by infra fault injection; see plans/integration-tests.md Phase 2 follow-up")
 }
 
-// UC-58b — Recreate-via-failover preserves sandbox identity. Kills worker-x on
-// the cluster-hetero topology (after pinning placement there) and expects the
-// sandbox to be recreated on worker-y or worker-z.
+// UC-58b — Recreate-via-failover preserves sandbox identity. Creates a
+// recreate-policy sandbox, kills whichever node owns it, and expects it to
+// reappear under the same id on a live peer.
+//
+// The kill is a daemon stop over SSH (harness.KillNodeDaemon), not an EC2
+// stop-instances: a graceful instance shutdown lets the node flap in gossip and
+// delays SWIM dead-detection past the window, which is why the earlier
+// EC2-stop version never recreated in time. The daemon stop is also the fault
+// these cases model — SWIM marks the owner dead and placement reassigns — and
+// leaves the box reachable for a reliable restore.
 func TestRecreateViaFailover(t *testing.T) {
 	harness.Require(t, sc, "UC-58b")
 	if !harness.DisruptiveAllowed() {
 		t.Skip("disruptive tests disabled (use default make integration-cluster-hetero, or drop --no-disruptive)")
 	}
 	if sc.Name != "cluster-hetero" {
-		t.Skip("recreate failover kill test requires cluster-hetero worker-x/y/z topology")
+		t.Skip("recreate failover kill test requires the cluster-hetero worker topology")
 	}
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	victim, ok := harness.LookupIntegrationNode(targets, heteroVictimWorker)
-	if !ok || victim.InstanceID == "" {
-		t.Fatalf("%s missing from integration targets (instance_id required)", heteroVictimWorker)
-	}
 
 	c := client(t)
-	victimNodeID := heteroNodeID(t, c, targets, heteroVictimWorker)
-	failoverPeerNodeIDs := heteroNodeIDs(t, c, targets, heteroFailoverPeers...)
-	failoverPeerNodeIDList := mapValues(failoverPeerNodeIDs)
-	extraDrainedNodeID := heteroNodeID(t, c, targets, "worker-w")
 
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		for _, nodeID := range append(append([]string{}, failoverPeerNodeIDList...), extraDrainedNodeID) {
-			_ = c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/uncordon", nil, nil)
-		}
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state == "stopped" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	for name, nodeID := range failoverPeerNodeIDs {
-		if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/drain", nil, nil); err != nil {
-			t.Fatalf("drain %s (%s): %v", name, nodeID, err)
-		}
-	}
-	// worker-w stays schedulable but is not a failover assertion target; drain
-	// it too so the pinned sandbox must land on worker-x.
-	if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+extraDrainedNodeID+"/drain", nil, nil); err != nil {
-		t.Fatalf("drain worker-w (%s): %v", extraDrainedNodeID, err)
-	}
-
-	// Must stay on docker. Recreate-via-failover needs >=2 workers advertising
-	// the runtime so the sandbox can land on a peer after worker-x dies; docker
-	// runs on all four workers. Do NOT switch this to firecracker: only worker-z
-	// is bare metal, so an FC sandbox has no failover peer on hetero (a second
-	// x86 *.metal is blocked on the metal vCPU quota). FC failover lives in
-	// cluster-arm64 instead.
+	// Docker runs on every hetero worker, so a recreate-policy sandbox always has
+	// a peer to land on after its owner dies. Do NOT switch to firecracker: only
+	// worker-z is bare metal, so an FC sandbox has no FC failover peer on hetero.
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 		Name:     harness.UniqueName(sc, t),
 		Runtime:  "docker",
@@ -96,40 +68,28 @@ func TestRecreateViaFailover(t *testing.T) {
 	waitRunning(t, sb)
 
 	owner := resolvePlacementOwner(t, c, sb.ID)
-	if owner != victimNodeID {
-		t.Fatalf("initial placement on %q, want %q/%s (failover peers should be drained)", owner, heteroVictimWorker, victimNodeID)
+	if owner == "" {
+		t.Fatal("no placement owner recorded; there is nothing to kill")
+	}
+	victim, ok := nodeForClusterID(t, c, targets, owner)
+	if !ok {
+		t.Skipf("owner %s is not a node this suite can reach", owner)
 	}
 
-	for name, nodeID := range failoverPeerNodeIDs {
-		if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/uncordon", nil, nil); err != nil {
-			t.Fatalf("uncordon %s (%s): %v", name, nodeID, err)
-		}
-	}
-	if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+extraDrainedNodeID+"/uncordon", nil, nil); err != nil {
-		t.Fatalf("uncordon worker-w (%s): %v", extraDrainedNodeID, err)
-	}
+	t.Logf("killing owner %s (%s); expect recreate on a peer", owner, victim.Name)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
-
-	deadline := time.Now().Add(4 * time.Minute)
-	for time.Now().Before(deadline) {
-		newOwner := resolvePlacementOwner(t, c, sb.ID)
-		if newOwner != "" && newOwner != victimNodeID && slices.Contains(failoverPeerNodeIDList, newOwner) {
-			waitRunning(t, sb)
-			t.Logf("sandbox %s recreated on %s after killing %s/%s", sb.ID, newOwner, heteroVictimWorker, victimNodeID)
-			return
-		}
-		time.Sleep(10 * time.Second)
-	}
-	t.Fatalf("sandbox %s did not recreate on %v within timeout", sb.ID, failoverPeerNodeIDs)
+	newOwner := awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
+	waitRunning(t, sb)
+	t.Logf("sandbox %s recreated under the same id on %s after killing %s", sb.ID, newOwner, owner)
 }
 
 // UC-58d — A snapshot-backed sandbox survives owner failover under the per-owner
 // snapshot identity. The sandbox is created FROM a registered snapshot (resolved
 // by name, under the #13 (owner_ref, name) identity), given a recreate failover
-// policy, pinned to worker-x, and worker-x is killed; the sandbox must recreate
-// on a peer. This exercises the rebuilt snapshot tables on the cluster recreate
-// path, which a fresh-provisioned run otherwise only touches on the create path.
+// policy; whichever node owns it is killed (daemon stop), and the sandbox must
+// recreate on a peer. This exercises the rebuilt snapshot tables on the cluster
+// recreate path, which a fresh-provisioned run otherwise only touches on create.
 //
 // The snapshot is an image-registered (portable) snapshot on purpose: a
 // committed, local-only snapshot is intentionally refused by recreate failover
@@ -144,38 +104,17 @@ func TestSnapshotBackedFailover(t *testing.T) {
 		t.Skip("disruptive tests disabled (use default make integration-cluster-hetero, or drop --no-disruptive)")
 	}
 	if sc.Name != "cluster-hetero" {
-		t.Skip("snapshot-backed failover test requires cluster-hetero worker-x/y/z topology")
+		t.Skip("snapshot-backed failover test requires the cluster-hetero worker topology")
 	}
 	targets := harness.LoadIntegrationTargets()
 	if targets == nil {
 		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
 	}
-	victim, ok := harness.LookupIntegrationNode(targets, heteroVictimWorker)
-	if !ok || victim.InstanceID == "" {
-		t.Fatalf("%s missing from integration targets (instance_id required)", heteroVictimWorker)
-	}
 
 	c := client(t)
-	victimNodeID := heteroNodeID(t, c, targets, heteroVictimWorker)
-	failoverPeerNodeIDs := heteroNodeIDs(t, c, targets, heteroFailoverPeers...)
-	failoverPeerNodeIDList := mapValues(failoverPeerNodeIDs)
-	extraDrainedNodeID := heteroNodeID(t, c, targets, "worker-w")
-	snapName := fcSnapshotName(t, "ha58d")
-
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		_ = c.SDK().DeleteSnapshot(ctx, snapName)
-		for _, nodeID := range append(append([]string{}, failoverPeerNodeIDList...), extraDrainedNodeID) {
-			_ = c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/uncordon", nil, nil)
-		}
-		if state := harness.EC2InstanceState(t, victim.InstanceID); state == "stopped" {
-			harness.SetEC2InstanceRunning(t, victim.InstanceID, true)
-		}
-	})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), failoverOpenTimeout+3*time.Minute)
 	defer cancel()
+	snapName := fcSnapshotName(t, "ha58d")
 
 	// Register a PORTABLE snapshot (an external-registry image ref) so a recreate
 	// sandbox is allowed to be created from it. A committed local-only snapshot
@@ -186,21 +125,14 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RegisterSnapshot(%q): %v", snapName, err)
 	}
+	t.Cleanup(func() {
+		cctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		_ = c.SDK().DeleteSnapshot(cctx, snapName)
+	})
 
-	// Pin placement to worker-x: drain the failover peers and the spare so the
-	// sandbox-under-test lands on the victim.
-	for name, nodeID := range failoverPeerNodeIDs {
-		if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/drain", nil, nil); err != nil {
-			t.Fatalf("drain %s (%s): %v", name, nodeID, err)
-		}
-	}
-	if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+extraDrainedNodeID+"/drain", nil, nil); err != nil {
-		t.Fatalf("drain worker-w (%s): %v", extraDrainedNodeID, err)
-	}
-
-	// Same docker-only reasoning as UC-58b: recreate-via-failover needs >=2
-	// workers advertising the runtime, and docker runs on all four workers. The
-	// image is the snapshot's NAME, so create resolves it under (owner_ref, name).
+	// Create the sandbox FROM the snapshot's NAME (resolved under (owner_ref,
+	// name)), with a recreate failover policy. docker runs on every hetero worker.
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 		Name:     harness.UniqueName(sc, t),
 		Image:    snapName,
@@ -210,42 +142,30 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	waitRunning(t, sb)
 
 	owner := resolvePlacementOwner(t, c, sb.ID)
-	if owner != victimNodeID {
-		t.Fatalf("initial placement on %q, want %q/%s (failover peers should be drained)", owner, heteroVictimWorker, victimNodeID)
+	if owner == "" {
+		t.Fatal("no placement owner recorded; there is nothing to kill")
+	}
+	victim, ok := nodeForClusterID(t, c, targets, owner)
+	if !ok {
+		t.Skipf("owner %s is not a node this suite can reach", owner)
 	}
 
-	// Let the peers back in so the sandbox has somewhere to land after the kill.
-	for name, nodeID := range failoverPeerNodeIDs {
-		if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+nodeID+"/uncordon", nil, nil); err != nil {
-			t.Fatalf("uncordon %s (%s): %v", name, nodeID, err)
-		}
-	}
-	if err := c.PostJSON(ctx, "/v1/cluster/nodes/"+extraDrainedNodeID+"/uncordon", nil, nil); err != nil {
-		t.Fatalf("uncordon worker-w (%s): %v", extraDrainedNodeID, err)
-	}
+	// Kill the owner's daemon (SWIM dead-detection; box stays up for restore).
+	t.Logf("killing owner %s (%s) of snapshot-backed sandbox %s", owner, victim.Name, sb.ID)
+	t.Cleanup(harness.KillNodeDaemon(t, victim))
 
-	harness.SetEC2InstanceRunning(t, victim.InstanceID, false)
+	newOwner := awaitNewOwner(t, c, sb.ID, owner, failoverOpenTimeout)
+	waitRunning(t, sb)
 
-	deadline := time.Now().Add(5 * time.Minute)
-	for time.Now().Before(deadline) {
-		newOwner := resolvePlacementOwner(t, c, sb.ID)
-		if newOwner != "" && newOwner != victimNodeID && slices.Contains(failoverPeerNodeIDList, newOwner) {
-			waitRunning(t, sb)
-			// Observational only (not a guarantee this test pins): the catalogue
-			// is home-node-local, so after the home node dies the name may or may
-			// not still resolve from a survivor. Log whichever it is.
-			if _, err := c.SDK().GetSnapshot(ctx, snapName); err != nil {
-				t.Logf("note: snapshot %q not resolvable after owner death (home-node-local catalogue): %v", snapName, err)
-			} else {
-				t.Logf("snapshot %q still resolvable after failover", snapName)
-			}
-			t.Logf("snapshot-backed sandbox %s recreated on %s after killing %s/%s",
-				sb.ID, newOwner, heteroVictimWorker, victimNodeID)
-			return
-		}
-		time.Sleep(10 * time.Second)
+	// Observational only (not a guarantee this test pins): the catalogue is
+	// home-node-local, so after the owner dies the name may or may not still
+	// resolve from a survivor. Log whichever it is.
+	if _, err := c.SDK().GetSnapshot(ctx, snapName); err != nil {
+		t.Logf("note: snapshot %q not resolvable after owner death (home-node-local catalogue): %v", snapName, err)
+	} else {
+		t.Logf("snapshot %q still resolvable after failover", snapName)
 	}
-	t.Fatalf("snapshot-backed sandbox %s did not recreate on %v within timeout", sb.ID, failoverPeerNodeIDList)
+	t.Logf("snapshot-backed sandbox %s recreated under the same id on %s after killing %s", sb.ID, newOwner, owner)
 }
 
 // UC-58c — Kill owner mid secret fan-out (GAP-1 chaos). Creates an HA sandbox
