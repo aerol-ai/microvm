@@ -38,11 +38,20 @@ witness_lock_days     = 1
 
 extra_sandboxd_env = {
   SB_ENTERPRISE_MODE = "true"
+  # Enterprise mode requires named credentials (identity on) and a PAT
+  # confined to the host (plans/identity-and-access.md §5.12, T10); pat_scope
+  # below installs the matching Caddy half. Tokens-only: no identity file.
+  SB_IDENTITY_ENABLED = "true"
   # The daemon refuses a witness that locks heads for less time than the
   # local records they vouch for are kept, and enterprise refuses zero, so
   # the one-day lock needs one-day retention (D13).
   SB_SECRET_AUDIT_RETENTION_DAYS = "1"
 }
+
+# install.sh --pat-scope host (T10): Caddy proxies to the public Unix socket and
+# the PAT works only from a loopback peer and mTLS peers. run.sh mints an admin
+# avm_ token on the seed for every remote call (capability pat-scope-host).
+pat_scope = "host"
 
 nodes = {
   server-1  = { role = "server", seed = true, instance_type = "t3.medium", volume_size_gb = 20, spot = false }

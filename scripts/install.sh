@@ -103,6 +103,16 @@ PAT_SCOPE="any"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 
+# A re-run restarts a running sandboxd when it changed the daemon's settings
+# file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
+# fills the two state variables before anything is written.
+SANDBOXD_ENV_FILE="/etc/sandboxd/sandboxd.env"
+SANDBOXD_UNIT_FILE="/etc/systemd/system/sandboxd.service"
+SANDBOXD_HEALTH_URL="http://127.0.0.1:21212/health"
+SANDBOXD_READY_TRIES=60
+SANDBOXD_WAS_ACTIVE="false"
+SANDBOXD_CONFIG_BEFORE=""
+
 usage() {
 	cat <<'EOF'
 Usage: install.sh [options]
@@ -1549,6 +1559,62 @@ WantedBy=multi-user.target
 EOF
 }
 
+# sandboxd_config_fingerprint identifies the two files a running sandboxd
+# read when it started and install.sh rewrites: its settings file and its
+# unit. cksum, not sha256sum, because it is POSIX; it only has to notice a
+# change. On a fresh install neither file exists yet, and under pipefail a
+# failing cat would abort the install, hence the `|| true`.
+sandboxd_config_fingerprint() {
+	{ cat "$SANDBOXD_ENV_FILE" "$SANDBOXD_UNIT_FILE" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+}
+
+# record_sandboxd_state notes, before any file is written, whether sandboxd
+# is running and what its settings were.
+record_sandboxd_state() {
+	SANDBOXD_WAS_ACTIVE="false"
+	if systemctl is-active --quiet sandboxd 2>/dev/null; then
+		SANDBOXD_WAS_ACTIVE="true"
+	fi
+	SANDBOXD_CONFIG_BEFORE="$(sandboxd_config_fingerprint)"
+}
+
+# wait_for_sandboxd_ready waits until sandboxd answers /health and, under
+# --pat-scope host, has made the public socket Caddy proxies to.
+wait_for_sandboxd_ready() {
+	local try
+	for ((try = 0; try < SANDBOXD_READY_TRIES; try++)); do
+		if curl -fsS --max-time 2 -o /dev/null "$SANDBOXD_HEALTH_URL" 2>/dev/null &&
+			{ [[ "$PAT_SCOPE" != "host" ]] || [[ -S "$PUBLIC_API_SOCKET" ]]; }; then
+			return 0
+		fi
+		sleep 1
+	done
+	return 1
+}
+
+# restart_sandboxd_if_reconfigured restarts sandboxd when it was running
+# before this run and the run changed its settings file or unit.
+# `systemctl enable --now` only starts a stopped unit, so before this a
+# re-run left the old process on its old settings. Under --pat-scope host
+# that was an outage: Caddy, restarted onto the public socket, proxied to a
+# socket the old process never made. It runs before Caddy starts, and waits
+# for the restarted sandboxd (and its socket) so Caddy never points at a
+# socket that is not there yet. A fresh install, a stopped unit or a run
+# that changed nothing is left to `enable --now`, as before.
+restart_sandboxd_if_reconfigured() {
+	if [[ "$SANDBOXD_WAS_ACTIVE" != "true" ]]; then
+		return 0
+	fi
+	if [[ "$(sandboxd_config_fingerprint)" == "$SANDBOXD_CONFIG_BEFORE" ]]; then
+		return 0
+	fi
+	echo "sandboxd settings changed; restarting sandboxd before Caddy"
+	systemctl restart sandboxd
+	if ! wait_for_sandboxd_ready; then
+		echo "warning: sandboxd is not answering ${SANDBOXD_HEALTH_URL} (or has not made ${PUBLIC_API_SOCKET}) ${SANDBOXD_READY_TRIES}s after its restart; starting Caddy anyway. Check: journalctl -u sandboxd" >&2
+	fi
+}
+
 write_healthcheck_script() {
 	cat > "$INSTALL_PREFIX/sandboxd-healthcheck" <<'EOF'
 #!/usr/bin/env bash
@@ -2306,6 +2372,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 		exit 1
 	fi
 	install_binaries
+	record_sandboxd_state
 	write_local_environment
 	# The local unit hard-Requires docker.service; on Linux we must install
 	# the engine here since this branch skips install_packages.
@@ -2316,6 +2383,7 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	write_healthcheck_units
 	systemctl daemon-reload
 	systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+	restart_sandboxd_if_reconfigured
 	systemctl enable --now sandboxd sandboxd-healthcheck.timer
 	echo "AerolVM installed (local mode)"
 	echo "PAT token: $PAT_TOKEN"
@@ -2354,6 +2422,7 @@ fi
 # trip to the Caddy build server.
 install_custom_caddy "$DNS_PROVIDER"
 install_binaries
+record_sandboxd_state
 write_environment
 write_caddy_env
 write_caddy_systemd_dropin
@@ -2366,6 +2435,10 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
+# Before Caddy: a re-run that changed sandboxd's settings restarts it and
+# waits for it, so Caddy starts in front of a sandboxd (and, under
+# --pat-scope host, a public socket) that is already there.
+restart_sandboxd_if_reconfigured
 systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
 
 echo "AerolVM installed"

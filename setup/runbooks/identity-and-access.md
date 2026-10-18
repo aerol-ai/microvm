@@ -90,9 +90,9 @@ forwards (`aerolvm_auth_failures_total{key="operator",key2="pat_origin"}`).
 
 1. Find the odd node: the drift gauge is above 0 on every node, so compare
    `SB_PAT_SCOPE` in `/etc/sandboxd/sandboxd.env` across nodes.
-2. Set the same value everywhere through Terraform or Ansible, re-run
+2. Set the same value everywhere through Terraform or Ansible, and re-run
    install.sh with the same `--pat-scope` on the odd node (Caddy's upstream
-   must match), and restart it. Read [Re-running install.sh](#re-running-installsh)
+   must match); the re-run restarts it. Read [Re-running install.sh](#re-running-installsh)
    first: the re-run rewrites the node's settings file.
 
 ## MirrorStale
@@ -241,12 +241,12 @@ Enterprise mode requires it.
    ([RotateScrapeToken](#rotatescrapetoken)).
 3. On every node re-run install.sh with `--pat-scope host` (optionally with
    `--l4-proxy-protocol`), following [Re-running install.sh](#re-running-installsh):
-   pass every original flag and the current `--pat-token`, put back the
-   settings you added by hand (`SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE`
-   and the rest), then `systemctl restart sandboxd`. The re-run sets
-   `SB_PAT_SCOPE=host` and points Caddy at the public socket
-   `/run/sandboxd-public/api.sock`. Any other reverse proxy on the host must
-   use that socket too.
+   move the settings you added by hand (`SB_IDENTITY_ENABLED`,
+   `SB_ENTERPRISE_MODE` and the rest) into `/etc/sandboxd/local.env` first,
+   then pass every original flag and the current `--pat-token`. The re-run
+   sets `SB_PAT_SCOPE=host`, restarts sandboxd, waits for the public socket
+   `/run/sandboxd-public/api.sock`, and only then starts Caddy on it. Any
+   other reverse proxy on the host must use that socket too.
 4. Check: `stat /run/sandboxd-public /run/sandboxd-public/api.sock` shows
    `root:caddy`, `drwxr-x---` and `srw-rw----`. sandboxd refuses to boot if
    it cannot make them. A PAT through the public domain now gets 401 "the
@@ -275,25 +275,39 @@ installed. On Linux a re-run does three things that are easy to miss:
   `SB_IDENTITY_ENABLED` gone it refuses every API token and SSO sign-in.
 - **Without `--pat-token` it makes a new random PAT** (`openssl rand -hex 24`),
   and every client and peer still holding the old one is refused.
-- **It does not restart a running sandboxd.** `systemctl enable --now` only
-  starts a stopped unit. Caddy is restarted (the run replaces its binary), so
-  it picks up the new Caddyfile at once. Under `--pat-scope host` that means
-  Caddy proxies to `/run/sandboxd-public/api.sock` before the old sandboxd
-  process has created it, and public API calls fail until sandboxd restarts.
+- **It restarts a running sandboxd when it changed the settings file or
+  the unit** (`restart_sandboxd_if_reconfigured`), so the restart happens
+  during the run, with whatever the new file holds. It runs before Caddy
+  starts, and waits until sandboxd answers `/health` and, under
+  `--pat-scope host`, has made `/run/sandboxd-public/api.sock`, so Caddy
+  never proxies to a socket that is not there. A run that changes neither
+  file leaves sandboxd running, even when it installed a new binary; restart
+  it yourself after such an upgrade. A fresh install, or a stopped unit, is
+  started as before.
 
 So, on each node:
 
-1. Save the current settings: `sudo cp /etc/sandboxd/sandboxd.env /root/sandboxd.env.before`.
+1. Keep the settings you added by hand out of the file the installer
+   rewrites, once: put them in `/etc/sandboxd/local.env` and load it with a
+   drop-in the installer never touches.
+
+   ```bash
+   sudo cp /etc/sandboxd/sandboxd.env /root/sandboxd.env.before
+   # copy each line you added by hand (SB_IDENTITY_ENABLED, SB_ENTERPRISE_MODE, ...) into /etc/sandboxd/local.env
+   sudo mkdir -p /etc/systemd/system/sandboxd.service.d
+   printf '[Service]\nEnvironmentFile=/etc/sandboxd/local.env\n' | sudo tee /etc/systemd/system/sandboxd.service.d/local.conf
+   sudo systemctl daemon-reload && sudo systemctl restart sandboxd
+   ```
+
+   A key in `local.env` wins over the same key in `sandboxd.env`.
 2. Re-run install.sh with every flag the node was installed with, the
    current PAT (`--pat-token "$(sudo grep '^SB_PAT_TOKEN=' /root/sandboxd.env.before | cut -d= -f2-)"`),
-   and the new flag (`--pat-scope host`, `--l4-proxy-protocol`, …).
-3. Put back what the installer did not write: compare the files
-   (`sudo diff /root/sandboxd.env.before /etc/sandboxd/sandboxd.env`) and
-   append each missing line, such as `SB_IDENTITY_ENABLED=true` and
-   `SB_ENTERPRISE_MODE=true`. If a key appears twice, systemd uses the last
-   one.
-4. `sudo systemctl restart sandboxd`, then check `journalctl -u sandboxd` for
-   a clean boot (enterprise mode names any rule that is missing).
+   and the new flag (`--pat-scope host`, `--l4-proxy-protocol`, …). It
+   restarts sandboxd if the settings changed and prints
+   `sandboxd settings changed; restarting sandboxd before Caddy`.
+3. Check `journalctl -u sandboxd` for a clean boot (enterprise mode names
+   any rule that is missing). A warning that sandboxd is not answering
+   means the restart did not come up within 60 s; the journal says why.
 
 Clusters built with the project's Terraform set extra settings through its
 `extra_sandboxd_env` variable (or a node's `sandboxd_env`); keep them there,

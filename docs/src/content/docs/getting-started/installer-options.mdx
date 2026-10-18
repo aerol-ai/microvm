@@ -32,10 +32,23 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 Run the installer again with the options you want. This also upgrades AerolVM to the newest release.
 
 <Aside type="caution">
-Each run rewrites the settings file, `/etc/sandboxd/sandboxd.env`, from scratch. Pass every option again, including `--pat-token`. Without it, the installer makes a new random token, and your apps stop working until you update them. Settings you added to the file by hand are lost too, such as `SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE` or the audit witness settings. Save a copy of the file first, and add those lines back afterwards.
+Each run rewrites the settings file, `/etc/sandboxd/sandboxd.env`, from scratch. Pass every option again, including `--pat-token`. Without it, the installer makes a new random token, and your apps stop working until you update them. Settings you added to the file by hand are lost too, such as `SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE` or the audit witness settings. Keep them in a file of your own instead (see below).
 
-A run does not restart a server that is already running. Run `sudo systemctl restart sandboxd` afterwards, so the new settings and program take effect.
+If a run changes the settings file and the server is running, the installer restarts it. It waits until the server answers, and only then starts Caddy. A run that changes no setting leaves the running server alone, even when it installed a newer release. After an upgrade like that, run `sudo systemctl restart sandboxd` to start the new version.
 </Aside>
+
+### Keep your own settings
+
+The installer never touches a second settings file that you load with a systemd drop-in. Put the settings you add by hand in `/etc/sandboxd/local.env`, one `NAME=value` per line, and load it once:
+
+```bash
+sudo mkdir -p /etc/systemd/system/sandboxd.service.d
+printf '[Service]\nEnvironmentFile=/etc/sandboxd/local.env\n' | sudo tee /etc/systemd/system/sandboxd.service.d/local.conf
+sudo systemctl daemon-reload
+sudo systemctl restart sandboxd
+```
+
+When a setting is in both files, the one in `local.env` wins. Do this before you run the installer again, so the restart it does already has your settings.
 
 ## Add more kinds of sandbox
 
@@ -101,7 +114,7 @@ IP mode has no HTTPS. Your token and data cross the network unencrypted. Use it 
 ### What the installer sets up
 
 - Puts `sandboxd` (the server) and `toolboxd` (the helper inside each sandbox) in `/usr/local/bin`. Change the folder with `--install-prefix`.
-- Writes settings to `/etc/sandboxd/sandboxd.env`, readable only by root. After you edit it, run `sudo systemctl restart sandboxd`.
+- Writes settings to `/etc/sandboxd/sandboxd.env`, readable only by root. After you edit it, run `sudo systemctl restart sandboxd`. A later run rewrites it, so keep your own settings in [a file of your own](#keep-your-own-settings).
 - Keeps state in `/var/lib/sandboxd`.
 - Installs a custom Caddy build with TCP routing (`caddy-l4`) and the Cloudflare DNS plugin. Caddy is the web server that gets the certificates and sends each link to the right sandbox. Its config is `/etc/caddy/Caddyfile`. The Cloudflare token goes in `/etc/default/caddy`.
 - Registers the systemd services `sandboxd`, `caddy` and `aerolvm-egress-gateway`, which handles sandboxes' outbound traffic. If `sandboxd` crashes, systemd restarts it after 5 seconds, up to 10 times in 5 minutes.

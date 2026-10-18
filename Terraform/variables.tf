@@ -762,6 +762,31 @@ variable "extra_sandboxd_env" {
   }
 }
 
+# Where the operator token works, and the client address through Caddy
+# (plans/identity-and-access.md §5.11). These are install.sh flags, not env
+# vars, because each writes a Caddy half that must match its sandboxd half:
+# --pat-scope host points Caddy's API proxy at the public Unix socket, and
+# --l4-proxy-protocol adds the PROXY listener wrapper on the 8443 site. Set
+# through extra_sandboxd_env alone, the sandboxd half would run against a
+# Caddyfile that undoes it. Both default off, so a default render is
+# byte-identical to before.
+variable "pat_scope" {
+  description = "install.sh --pat-scope: \"any\" (default) accepts the PAT from any peer; \"host\" accepts it only from this host's loopback and from mTLS cluster peers, with Caddy on the public socket. Enterprise mode requires \"host\". Needs a release whose install.sh has the flag."
+  type        = string
+  default     = "any"
+
+  validation {
+    condition     = contains(["any", "host"], var.pat_scope)
+    error_message = "pat_scope must be \"any\" or \"host\"."
+  }
+}
+
+variable "l4_proxy_protocol" {
+  description = "install.sh --l4-proxy-protocol: caddy-l4's fallback sends PROXY v2 to the HTTPS site and Caddy forwards the client address to sandboxd, so audit records see the real caller. Domain mode only. Needs a release whose install.sh has the flag."
+  type        = bool
+  default     = false
+}
+
 # Locally-built artifact overrides (integration harness, plans/integration-test-security.md §4.3).
 #
 # All three default to "" so a production render is byte-identical to before
