@@ -733,8 +733,76 @@ class RetryConfig(TypedDict, total=False):
 
 class MicroVMConfig(TypedDict, total=False):
     apiUrl: str
+    # The bearer every request carries: the operator PAT, an avm_ API token
+    # or an OIDC ID token. Defaults to SB_PAT_TOKEN, then its alias
+    # SB_API_TOKEN; when both are set, SB_PAT_TOKEN wins.
     patToken: str
+    # The team requests act for, sent as the X-AerolVM-Team header on every
+    # request. Defaults to SB_TEAM; with neither, no header is sent.
+    team: str
     retry: RetryConfig
+
+
+class WhoAmIPrincipal(TypedDict, total=False):
+    """Who the caller is: ``kind`` ("operator", "token", "oidc", ...), a
+    stable ``id`` ("operator", "tok_…") and a display ``name``."""
+
+    kind: str
+    id: str
+    name: str
+
+
+class WhoAmI(TypedDict, total=False):
+    """The result of :meth:`MicroVM.whoami`: the caller's own identity."""
+
+    principal: WhoAmIPrincipal
+    # viewer, runner, auditor or admin.
+    role: str
+    # "*" for every team, a team name, or absent for a managed account.
+    team: str
+    # When the credential stops working (RFC 3339); absent if it never does.
+    expiresAt: str
+
+
+class APIToken(TypedDict):
+    """One scoped API token as ``client.tokens.list()`` returns it. Never
+    the secret."""
+
+    # Public id (tok_…): what tokens.revoke takes and audit records name.
+    id: str
+    name: str
+    role: str
+    # A team name, or "*" for every team.
+    team: str
+    createdBy: str
+    createdAt: str
+    expiresAt: str
+    # Expired tokens no longer work; they stay listed for 30 days.
+    expired: bool
+
+
+class CreatedAPIToken(APIToken):
+    """The result of ``client.tokens.create()``: the token plus ``token``,
+    the secret (avm_…), returned this once and never stored by the server."""
+
+    token: str
+
+
+class CreateAPITokenOptions(TypedDict, total=False):
+    """The body of ``client.tokens.create()``. All four fields are required."""
+
+    # 1 to 64 of A-Z a-z 0-9 . _ -, unique among the team's tokens.
+    name: str
+    # viewer, runner, auditor or admin.
+    role: str
+    # A team name, or "*" for every team. auditor and admin require "*".
+    team: str
+    # The lifetime: "90d", "720h" or any Go duration.
+    expiresIn: str
+
+
+class APITokenList(TypedDict):
+    tokens: List[APIToken]
 
 
 # Firecracker rootfs templates. The lifecycle mirrors the daemon's

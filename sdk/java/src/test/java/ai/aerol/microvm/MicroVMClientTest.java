@@ -1728,6 +1728,205 @@ class MicroVMClientTest {
             () -> new MicroVMClient(new MicroVMConfig(), HttpClient.newHttpClient(), new FakeWebSocketConnector(), name -> null)
         );
         assertTrue(error.getMessage().contains("PAT token is required"));
+        assertTrue(error.getMessage().contains("SB_API_TOKEN"));
+    }
+
+    // SB_API_TOKEN is an alias of SB_PAT_TOKEN, which wins when both are set;
+    // the team header comes from the option, then SB_TEAM, and is absent with
+    // neither.
+    @Test
+    void resolvesTokenAliasAndTeamFromOptionsAndEnvironment() throws Exception {
+        AtomicReference<String> authorization = new AtomicReference<>();
+        AtomicReference<List<String>> team = new AtomicReference<>();
+        HttpServer server = startServer(exchange -> {
+            authorization.set(exchange.getRequestHeaders().getFirst("Authorization"));
+            team.set(exchange.getRequestHeaders().get(MicroVMClient.TEAM_HEADER));
+            writeJson(exchange, 200, mapOf("principal", mapOf("kind", "operator", "id", "operator"), "role", "admin"));
+        });
+        try {
+            String apiUrl = serverUrl(server);
+            Object[][] cases = {
+                // name, option token, option team, env, want auth, want team (null = no header)
+                {"SB_PAT_TOKEN only", null, null, Map.of("SB_PAT_TOKEN", "pat"), "Bearer pat", null},
+                {"SB_API_TOKEN alias", null, null, Map.of("SB_API_TOKEN", "avm_alias"), "Bearer avm_alias", null},
+                {"SB_PAT_TOKEN beats the alias", null, null, Map.of("SB_PAT_TOKEN", "pat", "SB_API_TOKEN", "avm_alias"), "Bearer pat", null},
+                {"blank SB_PAT_TOKEN falls through", null, null, Map.of("SB_PAT_TOKEN", " ", "SB_API_TOKEN", "avm_alias"), "Bearer avm_alias", null},
+                {"option beats both", "opt", null, Map.of("SB_PAT_TOKEN", "pat", "SB_API_TOKEN", "avm_alias"), "Bearer opt", null},
+                {"SB_TEAM sends the header", null, null, Map.of("SB_API_TOKEN", "avm_alias", "SB_TEAM", " payments "), "Bearer avm_alias", "payments"},
+                {"team option beats SB_TEAM", null, "ml", Map.of("SB_PAT_TOKEN", "pat", "SB_TEAM", "payments"), "Bearer pat", "ml"},
+                {"blank SB_TEAM sends nothing", null, null, Map.of("SB_PAT_TOKEN", "pat", "SB_TEAM", "  "), "Bearer pat", null},
+            };
+            for (Object[] tc : cases) {
+                @SuppressWarnings("unchecked")
+                Map<String, String> env = (Map<String, String>) tc[3];
+                MicroVMClient client = new MicroVMClient(
+                    new MicroVMConfig().setApiUrl(apiUrl).setPatToken((String) tc[1]).setTeam((String) tc[2]),
+                    HttpClient.newHttpClient(),
+                    new FakeWebSocketConnector(),
+                    env::get
+                );
+                client.whoami();
+                assertEquals(tc[4], authorization.get(), (String) tc[0]);
+                if (tc[5] == null) {
+                    assertNull(team.get(), (String) tc[0]);
+                    assertNull(client.getTeam(), (String) tc[0]);
+                } else {
+                    assertEquals(List.of(tc[5]), team.get(), (String) tc[0]);
+                    assertEquals(tc[5], client.getTeam(), (String) tc[0]);
+                }
+            }
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void whoamiMapsTheIdentity() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            assertEquals("GET", exchange.getRequestMethod());
+            assertEquals("/v1/whoami", exchange.getRequestURI().getPath());
+            writeJson(exchange, 200, mapOf(
+                "principal", mapOf("kind", "token", "id", "tok_abc123def456", "name", "ci"),
+                "role", "runner",
+                "team", "payments",
+                "expires_at", "2027-01-02T03:04:05Z"
+            ));
+        });
+        try {
+            ai.aerol.microvm.model.WhoAmI who = clientFor(server).whoami();
+            assertEquals("token", who.principal.kind);
+            assertEquals("tok_abc123def456", who.principal.id);
+            assertEquals("ci", who.principal.name);
+            assertEquals("runner", who.role);
+            assertEquals("payments", who.team);
+            assertEquals("2027-01-02T03:04:05Z", who.expiresAt);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void tokensCreateListRevokeSendTheTeamOnEveryCall() throws Exception {
+        List<String> requests = java.util.Collections.synchronizedList(new ArrayList<>());
+        AtomicReference<Map<String, Object>> createBody = new AtomicReference<>();
+        Map<String, Object> stored = mapOf(
+            "id", "tok_abc123def456",
+            "name", "ci",
+            "role", "runner",
+            "team", "payments",
+            "created_by", "operator",
+            "created_at", "2026-10-17T09:00:00Z",
+            "expires_at", "2027-01-02T03:04:05Z",
+            "expired", false
+        );
+        HttpServer server = startServer(exchange -> {
+            String route = exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath();
+            requests.add(route + " team=" + exchange.getRequestHeaders().getFirst(MicroVMClient.TEAM_HEADER));
+            if (route.equals("POST /v1/tokens")) {
+                createBody.set(castMap(JsonSupport.read(exchange.getRequestBody().readAllBytes(), Map.class)));
+                Map<String, Object> created = new HashMap<>(stored);
+                created.put("token", "avm_secret");
+                writeJson(exchange, 201, created);
+            } else if (route.equals("GET /v1/tokens")) {
+                Map<String, Object> expired = new HashMap<>(stored);
+                expired.put("expired", true);
+                writeJson(exchange, 200, mapOf("tokens", List.of(expired)));
+            } else if (route.startsWith("DELETE /v1/tokens/")) {
+                exchange.sendResponseHeaders(204, -1);
+            } else {
+                writeJson(exchange, 404, mapOf("error", "unexpected " + route));
+            }
+        });
+        try {
+            MicroVMClient client = new MicroVMClient(
+                new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("avm_admin").setTeam("ops"),
+                HttpClient.newHttpClient(),
+                new FakeWebSocketConnector(),
+                name -> null
+            );
+
+            ai.aerol.microvm.model.CreatedApiToken created = client.tokens().create(
+                new ai.aerol.microvm.model.CreateApiTokenOptions().setName("ci").setRole("runner").setTeam("payments").setExpiresIn("90d")
+            );
+            assertEquals("avm_secret", created.token);
+            assertEquals("tok_abc123def456", created.id);
+            assertEquals("operator", created.createdBy);
+            assertEquals(mapOf("name", "ci", "role", "runner", "team", "payments", "expires_in", "90d"), createBody.get());
+
+            ai.aerol.microvm.model.ApiTokenList list = client.tokens().list();
+            assertEquals(1, list.tokens.size());
+            assertTrue(list.tokens.get(0).expired);
+
+            // A repeat revoke is another 204; the id stays one escaped path segment.
+            client.tokens().revoke("tok_abc123def456");
+            client.tokens().revoke(" tok_abc123def456 ");
+            client.tokens().revoke("../sandboxes");
+            MicroVMException blank = assertThrows(MicroVMException.class, () -> client.tokens().revoke("  "));
+            assertTrue(blank.getMessage().contains("token id is required"));
+
+            assertEquals(List.of(
+                "POST /v1/tokens team=ops",
+                "GET /v1/tokens team=ops",
+                "DELETE /v1/tokens/tok_abc123def456 team=ops",
+                "DELETE /v1/tokens/tok_abc123def456 team=ops",
+                "DELETE /v1/tokens/..%2Fsandboxes team=ops"
+            ), requests);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void tokensListNormalizesNullAndRefusalKeepsTheServerMessage() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            if ("GET".equals(exchange.getRequestMethod())) {
+                writeResponse(exchange, 200, "application/json", "{\"tokens\":null}".getBytes(StandardCharsets.UTF_8));
+                return;
+            }
+            writeJson(exchange, 403, mapOf(
+                "error", "role viewer on team payments cannot token.write",
+                "required_permission", "token.write",
+                "role", "viewer"
+            ));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            assertTrue(client.tokens().list().tokens.isEmpty());
+            MicroVMException refused = assertThrows(MicroVMException.class, () -> client.tokens().create(null));
+            assertEquals("role viewer on team payments cannot token.write", refused.getMessage());
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void webSocketHandshakesCarryTheTeam() {
+        FakeWebSocketConnector withTeam = new FakeWebSocketConnector();
+        new MicroVMClient(
+            new MicroVMConfig().setApiUrl("https://api.example.com").setPatToken("pat").setTeam("payments"),
+            HttpClient.newHttpClient(),
+            withTeam,
+            name -> null
+        ).execStream("sb-1", new ExecStreamOptions().setCommand("true"));
+        assertEquals(Map.of("Authorization", "Bearer pat", MicroVMClient.TEAM_HEADER, "payments"), withTeam.headers);
+
+        FakeWebSocketConnector attach = new FakeWebSocketConnector();
+        new MicroVMClient(
+            new MicroVMConfig().setApiUrl("https://api.example.com").setPatToken("pat").setTeam("payments"),
+            HttpClient.newHttpClient(),
+            attach,
+            name -> null
+        ).attachSession("sb-1", "ses-1", new SessionAttachOptions());
+        assertEquals("payments", attach.headers.get(MicroVMClient.TEAM_HEADER));
+
+        FakeWebSocketConnector noTeam = new FakeWebSocketConnector();
+        new MicroVMClient(
+            new MicroVMConfig().setApiUrl("https://api.example.com").setPatToken("pat"),
+            HttpClient.newHttpClient(),
+            noTeam,
+            name -> null
+        ).execStream("sb-1", new ExecStreamOptions().setCommand("true"));
+        assertEquals(Map.of("Authorization", "Bearer pat"), noTeam.headers);
     }
 
     // Mirrors pkg/api/v1/list_filter_test.go: tag-filter list calls must
@@ -2552,13 +2751,15 @@ class MicroVMClientTest {
     private static final class FakeWebSocketConnector implements WebSocketConnector {
         private URI uri;
         private String authorizationHeader;
+        private Map<String, String> headers;
         private FakeStreamingWebSocket socket;
         private StreamingWebSocketListener listener;
 
         @Override
-        public StreamingWebSocket connect(URI uri, String authorizationHeader, StreamingWebSocketListener listener) {
+        public StreamingWebSocket connect(URI uri, Map<String, String> headers, StreamingWebSocketListener listener) {
             this.uri = uri;
-            this.authorizationHeader = authorizationHeader;
+            this.headers = headers;
+            this.authorizationHeader = headers.get("Authorization");
             this.listener = listener;
             this.socket = new FakeStreamingWebSocket();
             return socket;

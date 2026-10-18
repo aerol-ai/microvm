@@ -550,10 +550,205 @@ test("MicroVM reads PAT token and API URL from environment", async () => {
   }
 });
 
-test("MicroVM requires a PAT token", () => {
-  assert.throws(() => {
-    new MicroVM({ apiUrl: "https://api.example.com" });
-  }, /PAT token is required/);
+test("MicroVM requires a PAT token", async () => {
+  await withEnv({ SB_PAT_TOKEN: undefined, SB_API_TOKEN: undefined }, () => {
+    assert.throws(() => {
+      new MicroVM({ apiUrl: "https://api.example.com" });
+    }, /PAT token is required.*SB_API_TOKEN/);
+  });
+});
+
+/** Runs fn with these env vars set (undefined unsets), then restores them. */
+async function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
+  const saved: Record<string, string | undefined> = {};
+  for (const [name, value] of Object.entries(vars)) {
+    saved[name] = process.env[name];
+    if (value === undefined) {
+      delete process.env[name];
+    } else {
+      process.env[name] = value;
+    }
+  }
+  try {
+    await fn();
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+  }
+}
+
+/** A fetch that records every request's auth and team headers and answers from `reply`. */
+function recordingFetch(reply: (request: Request) => Response | Promise<Response>) {
+  const seen: Array<{ method: string; url: string; authorization: string | null; team: string | null; body: unknown }> = [];
+  const fetchFn = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const request = new Request(input, init);
+    const text = await request.clone().text();
+    seen.push({
+      method: request.method,
+      url: request.url,
+      authorization: request.headers.get("authorization"),
+      team: request.headers.get("x-aerolvm-team"),
+      body: text === "" ? undefined : JSON.parse(text),
+    });
+    return reply(request);
+  };
+  return { seen, fetchFn };
+}
+
+function jsonResponse(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
+
+const whoamiBody = {
+  principal: { kind: "token", id: "tok_abc123def456", name: "ci" },
+  role: "runner",
+  team: "payments",
+  expires_at: "2027-01-02T03:04:05Z",
+};
+
+test("MicroVM resolves the token and team from options and the environment", async () => {
+  const cases: Array<{
+    name: string;
+    config: { patToken?: string; team?: string };
+    env: Record<string, string | undefined>;
+    wantAuthorization: string;
+    wantTeam: string | null;
+  }> = [
+    { name: "SB_PAT_TOKEN only", config: {}, env: { SB_PAT_TOKEN: "pat" }, wantAuthorization: "Bearer pat", wantTeam: null },
+    { name: "SB_API_TOKEN alias", config: {}, env: { SB_API_TOKEN: "avm_alias" }, wantAuthorization: "Bearer avm_alias", wantTeam: null },
+    { name: "SB_PAT_TOKEN beats SB_API_TOKEN", config: {}, env: { SB_PAT_TOKEN: "pat", SB_API_TOKEN: "avm_alias" }, wantAuthorization: "Bearer pat", wantTeam: null },
+    { name: "option beats both", config: { patToken: "opt" }, env: { SB_PAT_TOKEN: "pat", SB_API_TOKEN: "avm_alias" }, wantAuthorization: "Bearer opt", wantTeam: null },
+    { name: "SB_TEAM sends the header", config: {}, env: { SB_API_TOKEN: "avm_alias", SB_TEAM: " payments " }, wantAuthorization: "Bearer avm_alias", wantTeam: "payments" },
+    { name: "team option beats SB_TEAM", config: { team: "ml" }, env: { SB_PAT_TOKEN: "pat", SB_TEAM: "payments" }, wantAuthorization: "Bearer pat", wantTeam: "ml" },
+    { name: "an empty team option overrides SB_TEAM", config: { team: "" }, env: { SB_PAT_TOKEN: "pat", SB_TEAM: "payments" }, wantAuthorization: "Bearer pat", wantTeam: null },
+    { name: "blank SB_TEAM sends nothing", config: {}, env: { SB_PAT_TOKEN: "pat", SB_TEAM: "   " }, wantAuthorization: "Bearer pat", wantTeam: null },
+  ];
+  for (const tc of cases) {
+    await withEnv({ SB_PAT_TOKEN: undefined, SB_API_TOKEN: undefined, SB_TEAM: undefined, ...tc.env }, async () => {
+      const { seen, fetchFn } = recordingFetch(() => jsonResponse(200, whoamiBody));
+      const sdk = new MicroVM({ ...tc.config, apiUrl: "https://api.example.com", fetch: fetchFn });
+      await sdk.whoami();
+      assert.equal(seen[0]?.authorization, tc.wantAuthorization, tc.name);
+      assert.equal(seen[0]?.team, tc.wantTeam, tc.name);
+      assert.equal(sdk.team, tc.wantTeam ?? "", tc.name);
+    });
+  }
+});
+
+test("MicroVM.whoami maps the principal, role, team and expiry", async () => {
+  const { seen, fetchFn } = recordingFetch((request) =>
+    new URL(request.url).pathname === "/v1/whoami" && request.method === "GET"
+      ? jsonResponse(200, whoamiBody)
+      : jsonResponse(404, { error: "unexpected" }),
+  );
+  const sdk = new MicroVM({ patToken: "avm_x", apiUrl: "https://api.example.com", fetch: fetchFn });
+  assert.deepEqual(await sdk.whoami(), {
+    principal: { kind: "token", id: "tok_abc123def456", name: "ci" },
+    role: "runner",
+    team: "payments",
+    expiresAt: "2027-01-02T03:04:05Z",
+  });
+
+  // The operator has no team and a credential that never expires.
+  const operator = new MicroVM({
+    patToken: "pat",
+    apiUrl: "https://api.example.com",
+    fetch: async () => jsonResponse(200, { principal: { kind: "operator", id: "operator" }, role: "admin" }),
+  });
+  assert.deepEqual(await operator.whoami(), { principal: { kind: "operator", id: "operator" }, role: "admin" });
+  assert.equal(seen.length, 1);
+});
+
+test("MicroVM.tokens create/list/revoke hit /v1/tokens and send the team on every call", async () => {
+  const stored = {
+    id: "tok_abc123def456",
+    name: "ci",
+    role: "runner",
+    team: "payments",
+    created_by: "operator",
+    created_at: "2026-10-17T09:00:00Z",
+    expires_at: "2027-01-02T03:04:05Z",
+    expired: false,
+  };
+  const { seen, fetchFn } = recordingFetch((request) => {
+    const path = new URL(request.url).pathname;
+    if (request.method === "POST" && path === "/v1/tokens") return jsonResponse(201, { ...stored, token: "avm_secret" });
+    if (request.method === "GET" && path === "/v1/tokens") return jsonResponse(200, { tokens: [{ ...stored, expired: true }] });
+    if (request.method === "DELETE" && path.startsWith("/v1/tokens/")) return new Response(null, { status: 204 });
+    return jsonResponse(404, { error: "unexpected" });
+  });
+  const sdk = new MicroVM({ patToken: "avm_admin", apiUrl: "https://api.example.com", team: "ops", fetch: fetchFn });
+
+  const created = await sdk.tokens.create({ name: "ci", role: "runner", team: "payments", expiresIn: "90d" });
+  assert.deepEqual(created, {
+    id: "tok_abc123def456",
+    name: "ci",
+    role: "runner",
+    team: "payments",
+    createdBy: "operator",
+    createdAt: "2026-10-17T09:00:00Z",
+    expiresAt: "2027-01-02T03:04:05Z",
+    expired: false,
+    token: "avm_secret",
+  });
+  assert.deepEqual(seen[0]?.body, { name: "ci", role: "runner", team: "payments", expires_in: "90d" });
+
+  const list = await sdk.tokens.list();
+  assert.equal(list.tokens.length, 1);
+  assert.equal(list.tokens[0]?.expired, true);
+  assert.equal("token" in (list.tokens[0] ?? {}), false);
+
+  // A repeat revoke is another 204; the id is one escaped path segment.
+  await sdk.tokens.revoke("tok_abc123def456");
+  await sdk.tokens.revoke("tok_abc123def456");
+  await sdk.tokens.revoke("../sandboxes");
+  await assert.rejects(sdk.tokens.revoke("  "), /token id is required/);
+
+  assert.deepEqual(
+    seen.map((r) => `${r.method} ${new URL(r.url).pathname}`),
+    [
+      "POST /v1/tokens",
+      "GET /v1/tokens",
+      "DELETE /v1/tokens/tok_abc123def456",
+      "DELETE /v1/tokens/tok_abc123def456",
+      "DELETE /v1/tokens/..%2Fsandboxes",
+    ],
+  );
+  for (const r of seen) {
+    assert.equal(r.team, "ops", `${r.method} ${r.url} must carry the team`);
+  }
+});
+
+test("MicroVM.tokens.list normalizes a null list", async () => {
+  const sdk = new MicroVM({
+    patToken: "pat",
+    apiUrl: "https://api.example.com",
+    fetch: async () => jsonResponse(200, { tokens: null }),
+  });
+  assert.deepEqual(await sdk.tokens.list(), { tokens: [] });
+});
+
+test("MicroVM.tokens surfaces the server's refusal message", async () => {
+  const sdk = new MicroVM({
+    patToken: "avm_viewer",
+    apiUrl: "https://api.example.com",
+    retry: { maxRetries: 0 },
+    fetch: async () =>
+      jsonResponse(403, {
+        error: "role viewer on team payments cannot token.write; ask an admin for role admin on all teams",
+        required_permission: "token.write",
+        role: "viewer",
+      }),
+  });
+  await assert.rejects(
+    sdk.tokens.create({ name: "ci", role: "runner", team: "payments", expiresIn: "90d" }),
+    /role viewer on team payments cannot token\.write/,
+  );
 });
 
 // Mirrors pkg/api/v1/list_filter_test.go: every supplied tag must land in the
