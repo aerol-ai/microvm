@@ -1195,6 +1195,20 @@ func RequireNodeSSH(t *testing.T, node IntegrationNode) {
 	}
 }
 
+// NodeSSHReachable reports whether node answers SSH from here, without the
+// skip RequireNodeSSH does: for a case that can still run without that
+// node, only with a weaker check (a fresh token awaited on the API domain
+// alone, say).
+func NodeSSHReachable(t *testing.T, node IntegrationNode) bool {
+	t.Helper()
+	target, ok := SSHTarget(node)
+	if !ok {
+		return false
+	}
+	reachable, _, _ := probeNodeSSH(t, target)
+	return reachable
+}
+
 // probeNodeSSH runs the reachability probe once per target and caches the
 // answer. Separated from RequireNodeSSH so the decision can be tested without
 // a t.Skip, which a parent test cannot observe.

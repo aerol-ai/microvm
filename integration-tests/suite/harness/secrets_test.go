@@ -865,6 +865,28 @@ func TestRequireNodeSSHSkipsWhenUnreachable(t *testing.T) {
 	}
 }
 
+// NodeSSHReachable answers the same probe without skipping: false for a node
+// with no address or one that refuses the key, true for one that answers.
+func TestNodeSSHReachable(t *testing.T) {
+	if NodeSSHReachable(t, IntegrationNode{Name: "no-address"}) {
+		t.Fatal("a node with no address is not reachable")
+	}
+	prev := sshRunner
+	sshRunner = func(*testing.T, string, string) (string, error) {
+		return "Permission denied (publickey).", errors.New("exit status 255")
+	}
+	resetSSHReachability()
+	t.Cleanup(func() { sshRunner = prev; resetSSHReachability() })
+	if NodeSSHReachable(t, IntegrationNode{Name: "node1", PublicIP: "203.0.113.11"}) {
+		t.Fatal("a node refusing the key was reported reachable")
+	}
+	fake := &fakeSSH{active: "active"}
+	fake.install(t)
+	if !NodeSSHReachable(t, IntegrationNode{Name: "node2", PublicIP: "203.0.113.12"}) {
+		t.Fatal("a node answering the probe was reported unreachable")
+	}
+}
+
 // And a reachable node must not skip.
 func TestRequireNodeSSHPassesWhenReachable(t *testing.T) {
 	fake := &fakeSSH{active: "active"}

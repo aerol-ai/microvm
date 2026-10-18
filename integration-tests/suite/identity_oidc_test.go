@@ -264,10 +264,24 @@ func TestIdentityRemoteMCPOAuth(t *testing.T) {
 		t.Fatalf("token endpoint = %d", tresp.StatusCode)
 	}
 
-	// 4. The client works, as runner on payments.
+	// 4. The client works, as runner on payments. Sandbox names are unique
+	// per owner, so the connector's sandbox is found by name only in the
+	// payments team's namespace: the operator credential's ?name= lookup
+	// returns nothing for it (which also leaked it on cleanup). Look it up
+	// and clean it up as payments, and destroy it by id.
 	name := harness.UniqueName(sc, t)
 	c := client(t)
-	destroyByNameOnCleanup(t, c, name)
+	payments := mintToken(t, "uc286-pay", "runner", harness.TeamPayments)
+	paymentsSDK := sdkFor(t, payments.Secret)
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer ccancel()
+		if sb, err := paymentsSDK.GetByName(cctx, name); err == nil {
+			if err := c.SDK().Destroy(cctx, sb.ID); err != nil {
+				t.Logf("cleanup: destroy the connector's sandbox %s: %v", sb.ID, err)
+			}
+		}
+	})
 	cs, err := connectRemoteMCPAs(t, sc.BaseURL, issued.AccessToken, name, url.Values{"create_if_missing": {"true"}, "image": {agentImage}})
 	if err != nil {
 		t.Fatalf("connect to /mcp with the OAuth access token: %v", err)
@@ -281,11 +295,10 @@ func TestIdentityRemoteMCPOAuth(t *testing.T) {
 	if ex.ExitCode != 0 || strings.TrimSpace(ex.Stdout) != "uc286" {
 		t.Fatalf("exec through MCP = %+v", ex)
 	}
-	sb, err := c.SDK().GetByName(ctx, name)
+	sb, err := paymentsSDK.GetByName(ctx, name)
 	if err != nil {
-		t.Fatalf("the MCP-created sandbox: %v", err)
+		t.Fatalf("the MCP-created sandbox, looked up by name as the payments team: %v", err)
 	}
-	payments := mintToken(t, "uc286-pay", "runner", harness.TeamPayments)
 	if r := statusAs(t, payments.API, http.MethodGet, "/v1/sandboxes/"+sb.ID, nil); r.Status != http.StatusOK {
 		t.Fatalf("the sandbox the connector made is not the payments team's: %s", r)
 	}

@@ -218,6 +218,28 @@ func propagating(resp *APIResponse) bool {
 	return false
 }
 
+// TokenMirrorNodes are the nodes that learn a new avm_ token from the token
+// mirror's next poll (~5 s) instead of from Raft state of their own:
+// workers, which own every sandbox on a role-separated cluster, and ingress
+// nodes. A request the API domain forwards to one of them (a create placed
+// on a worker, a read or exec on the sandbox's owner) is authenticated
+// again there, so a token the API domain already accepts can still get 401
+// unknown_or_revoked on the node that answers. Servers and mixed nodes hold
+// Raft state and see a token once its create commits.
+func TokenMirrorNodes(targets *IntegrationTargets) []IntegrationNode {
+	if targets == nil {
+		return nil
+	}
+	var out []IntegrationNode
+	for _, n := range targets.Nodes {
+		switch strings.ToLower(strings.TrimSpace(n.Role)) {
+		case "worker", "ingress":
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // tokenPropagationPoll is how often AwaitAccepted retries. A var so the
 // offline tests can shrink it.
 var tokenPropagationPoll = time.Second

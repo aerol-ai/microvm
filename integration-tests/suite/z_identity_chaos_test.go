@@ -310,6 +310,11 @@ func TestIdentityLeaderKilledDuringTokenCreates(t *testing.T) {
 	requireDisruptive(t, "this kills the Raft leader")
 	targets := identityTargets(t)
 	leader := leaderNode(t, targets)
+	// The case cannot choose its victim, it must kill whoever leads, and
+	// killing the seed costs the cluster its rendezvous rather than one
+	// member. On a fresh fleet the seed usually leads, so this runs once an
+	// earlier case has moved leadership; the skip says which happened.
+	requireNonSeedVictim(t, leader)
 	prefix := harness.TokenName("uc292")
 	const names = 25
 
@@ -726,7 +731,13 @@ func TestIdentityFloodControlModeSwitch(t *testing.T) {
 		t.Skip("needs one node, so both teams' sandboxes share it; a cluster's placement cannot be steered")
 	}
 	targets := identityTargets(t)
-	node := targets.Nodes[0]
+	// One node (the case skips on a cluster), so this is the seed; the
+	// picker says so on purpose rather than by list order. WithNodeEnv
+	// restores the node and waits for it to rejoin (harness.NodeRejoinCheck).
+	node, ok := harness.PickRestartableNode(targets)
+	if !ok {
+		t.Skip("no SSH-reachable node")
+	}
 	harness.WithNodeEnv(t, node, map[string]string{"SB_AUDIT_API_FLOOD_CONTROL": "coalesce"}, func(res harness.NodeBootResult) {
 		if !res.Started {
 			t.Fatalf("the node did not start in coalesce mode:\n%s", tailLines(res.Journal, 30))
@@ -837,14 +848,6 @@ func TestIdentityFloodControlModeSwitch(t *testing.T) {
 	})
 }
 
-// upgradeScript replaces the sandboxd binary the unit runs with the build
-// at the URL on stdin, after checking its SHA-256, and restarts the unit.
-const upgradeScript = `set -e; read -r url; read -r sum; ` +
-	`bin=$(systemctl show -p ExecStart --value sandboxd | sed -n 's/.*path=\([^ ;]*\).*/\1/p'); [ -n "$bin" ] || bin=/usr/local/bin/sandboxd; ` +
-	`curl -fsSL "$url" -o /tmp/sandboxd.itest-upgrade; ` +
-	`echo "$sum  /tmp/sandboxd.itest-upgrade" | sha256sum -c - >/dev/null; ` +
-	`sudo install -m 0755 /tmp/sandboxd.itest-upgrade "$bin"; sudo systemctl restart sandboxd; echo UPGRADED`
-
 // auditLineCountScript prints how many lines the node's audit log holds.
 const auditLineCountScript = `sudo bash -c 'set -a; . /etc/sandboxd/sandboxd.env 2>/dev/null || true; set +a; db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; f="$(dirname "$db")/audit/secrets.jsonl"; [ -f "$f" ] && wc -l < "$f" || echo 0'`
 
@@ -870,10 +873,28 @@ func TestIdentityRollingUpgradeGate(t *testing.T) {
 	if _, resp, err := operatorAPI().WhoAmI(ctx); err == nil && resp.Status == http.StatusOK {
 		t.Skip("the fleet already answers /v1/whoami, so it already runs the identity build; provision from an older release with --version")
 	}
+	// upgradeScript replaces the sandboxd binary the unit runs with the
+	// build at the URL on stdin, after checking its SHA-256, and restarts
+	// the unit. It lives inside this function so the restart guards in
+	// restart_node_test.go check the function that runs it.
+	const upgradeScript = `set -e; read -r url; read -r sum; ` +
+		`bin=$(systemctl show -p ExecStart --value sandboxd | sed -n 's/.*path=\([^ ;]*\).*/\1/p'); [ -n "$bin" ] || bin=/usr/local/bin/sandboxd; ` +
+		`curl -fsSL "$url" -o /tmp/sandboxd.itest-upgrade; ` +
+		`echo "$sum  /tmp/sandboxd.itest-upgrade" | sha256sum -c - >/dev/null; ` +
+		`sudo install -m 0755 /tmp/sandboxd.itest-upgrade "$bin"; sudo systemctl restart sandboxd; echo UPGRADED`
 	nodes := sshNodes(t, targets)
 	// Joiners first, the seed last: the order an operator rolls a fleet.
-	order := append([]harness.IntegrationNode(nil), nodes[1:]...)
-	order = append(order, nodes[0])
+	// The seed is upgraded on purpose, because the gate is about every
+	// member; it goes last so the fleet keeps its rendezvous throughout.
+	var order, seeds []harness.IntegrationNode
+	for _, n := range nodes {
+		if n.Seed {
+			seeds = append(seeds, n)
+		} else {
+			order = append(order, n)
+		}
+	}
+	order = append(order, seeds...)
 	c := client(t)
 
 	traffic := func() {
@@ -920,6 +941,12 @@ func TestIdentityRollingUpgradeGate(t *testing.T) {
 			t.Fatalf("upgrade %s: %v %s", node.Name, err, out)
 		}
 		assertNodeBackInService(t, c, targets, node)
+		// Back in the member list is not yet usable: the next node's
+		// upgrade and the traffic below need a leader and the node's
+		// InternalURL advertised again.
+		if err := waitNodeRejoined(t, node); err != nil {
+			t.Fatalf("after upgrading %s: %v", node.Name, err)
+		}
 		traffic()
 		time.Sleep(20 * time.Second)
 		last := i == len(order)-1
