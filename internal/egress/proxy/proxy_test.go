@@ -275,7 +275,12 @@ func TestBlockedAndCaps(t *testing.T) {
 		_ = tls.Client(first, &tls.Config{ServerName: "pypi.org", InsecureSkipVerify: true}).Handshake()
 	}()
 	select {
-	case <-backend:
+	case held := <-backend:
+		// Keep the backend's end referenced: dropped, the garbage
+		// collector's finalizer closes it, the proxy's splice ends, and the
+		// first connection stops counting against the cap before the
+		// second one arrives.
+		defer held.Close()
 	case <-time.After(2 * time.Second):
 		t.Fatal("first connection never reached the backend")
 	}
