@@ -249,7 +249,10 @@ func yamlQuote(s string) string {
 // TestFileSizeCap is finding 5.5: a file over 1 MiB is refused, by Parse
 // and by Load, which stops reading at the cap.
 func TestFileSizeCap(t *testing.T) {
-	before := oversizeTotal.Get(oversizeIdentityFile)
+	// A count, not the *expvar.Int: the map hands back the same variable on
+	// every call, so holding it would compare the live value with itself
+	// and fail every run after the first under -count.
+	before := oversizeCount(oversizeIdentityFile)
 	big := []byte(minimalIssuer + "# " + strings.Repeat("x", MaxFileBytes) + "\n")
 	if _, err := Parse(big); !errors.Is(err, ErrFileTooLarge) {
 		t.Fatalf("Parse err = %v, want ErrFileTooLarge", err)
@@ -261,8 +264,8 @@ func TestFileSizeCap(t *testing.T) {
 	if _, err := Load(path); !errors.Is(err, ErrFileTooLarge) {
 		t.Fatalf("Load err = %v, want ErrFileTooLarge", err)
 	}
-	if after := oversizeTotal.Get(oversizeIdentityFile); after == nil || (before != nil && after.String() == before.String()) {
-		t.Fatalf("oversize metric did not move: before %v after %v", before, after)
+	if after := oversizeCount(oversizeIdentityFile); after <= before {
+		t.Fatalf("oversize metric did not move: before %d after %d", before, after)
 	}
 	if _, err := Load(filepath.Join(t.TempDir(), "missing.yaml")); err == nil {
 		t.Fatal("Load of a missing file must fail")
