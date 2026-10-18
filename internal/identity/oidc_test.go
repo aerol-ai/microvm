@@ -899,6 +899,12 @@ func TestVerifierReloadAddsDeny(t *testing.T) {
 func TestVerifierBootstrapAndMaintain(t *testing.T) {
 	env := newVerifierEnv(t, "")
 	env.v.Bootstrap(context.Background())
+	// Bootstrap skips a key set whose latch is already set, so it can return
+	// after the boot fetch published its keys but before the fetch goroutine
+	// cleared its in-flight call. The hourly refresh below would then join
+	// that finished call instead of starting a fetch, and the test would wait
+	// for a JWKS hit that never comes (CI run 39163300348).
+	awaitKeyFetches(t, env.v)
 	if env.iss.JWKSHits.Load() != 1 {
 		t.Fatalf("bootstrap JWKS hits = %d", env.iss.JWKSHits.Load())
 	}
