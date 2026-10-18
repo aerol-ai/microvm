@@ -90,8 +90,12 @@ func (e *verifierEnv) claims(sub string, groups ...string) map[string]any {
 	return e.iss.Claims(e.clock.Now(), "cli", sub, groups...)
 }
 
+// auth returns once any key fetch the call started has finished
+// (settleKeyFetches), so the test's next step never joins it.
 func (e *verifierEnv) auth(bearer string) (controlplane.Access, bool, error) {
-	return e.v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), bearer)
+	a, matched, err := e.v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), bearer)
+	settleKeyFetches(e.v)
+	return a, matched, err
 }
 
 func reasonOf(err error) controlplane.RejectReason {
@@ -408,6 +412,7 @@ func TestVerifierReloadRefetchesKeys(t *testing.T) {
 		v := NewVerifier(cfg.Load, VerifierOptions{Now: clock.Now, HTTPClient: &http.Client{Transport: failingTransport{}}})
 		auth := func(token string) error {
 			_, _, err := v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), token)
+			settleKeyFetches(v)
 			return err
 		}
 		load(write("jwks-a.json"), "")
@@ -458,6 +463,7 @@ func TestVerifierSIGHUPDropsWithdrawnKey(t *testing.T) {
 	w.OnReload(v.RefetchKeys)
 	auth := func(token string) error {
 		_, _, err := v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), token)
+		settleKeyFetches(v)
 		return err
 	}
 
@@ -590,23 +596,41 @@ func (g gatedJWKS) RoundTrip(req *http.Request) (*http.Response, error) {
 // test sees the result of a refetch RefetchKeys started without waiting.
 func awaitKeyFetches(t *testing.T, v *Verifier) {
 	t.Helper()
-	waitFor(t, "the key fetches to finish", func() bool {
-		v.mu.Lock()
-		sets := make([]*keySet, 0, len(v.keySets))
-		for _, ks := range v.keySets {
-			sets = append(sets, ks)
+	waitFor(t, "the key fetches to finish", func() bool { return keyFetchesIdle(v) })
+}
+
+// settleKeyFetches is awaitKeyFetches for helpers that have no *testing.T:
+// it waits up to 5 s, and a fetch still running then fails the assertion
+// that follows instead.
+//
+// A fetch publishes its keys a moment before its goroutine clears the
+// in-flight call. A request that finds the keys already published returns
+// without waiting for that, and a refresh, a reload's refetch or the
+// hourly maintenance run in the gap joins the finished fetch instead of
+// starting one, so a test that next counts JWKS hits or expects new keys
+// must not race it.
+func settleKeyFetches(v *Verifier) {
+	for deadline := time.Now().Add(5 * time.Second); !keyFetchesIdle(v) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func keyFetchesIdle(v *Verifier) bool {
+	v.mu.Lock()
+	sets := make([]*keySet, 0, len(v.keySets))
+	for _, ks := range v.keySets {
+		sets = append(sets, ks)
+	}
+	v.mu.Unlock()
+	for _, ks := range sets {
+		ks.mu.Lock()
+		busy := ks.inflight != nil
+		ks.mu.Unlock()
+		if busy {
+			return false
 		}
-		v.mu.Unlock()
-		for _, ks := range sets {
-			ks.mu.Lock()
-			busy := ks.inflight != nil
-			ks.mu.Unlock()
-			if busy {
-				return false
-			}
-		}
-		return true
-	})
+	}
+	return true
 }
 
 // jwksFetchCount reads aerolvm_identity_jwks_fetch_total{issuer,result}.
@@ -899,6 +923,12 @@ func TestVerifierReloadAddsDeny(t *testing.T) {
 func TestVerifierBootstrapAndMaintain(t *testing.T) {
 	env := newVerifierEnv(t, "")
 	env.v.Bootstrap(context.Background())
+	// Bootstrap skips a key set whose latch is already set, so it can return
+	// after the boot fetch published its keys but before the fetch goroutine
+	// cleared its in-flight call. The hourly refresh below would then join
+	// that finished call instead of starting a fetch, and the test would wait
+	// for a JWKS hit that never comes (CI run 39163300348).
+	awaitKeyFetches(t, env.v)
 	if env.iss.JWKSHits.Load() != 1 {
 		t.Fatalf("bootstrap JWKS hits = %d", env.iss.JWKSHits.Load())
 	}

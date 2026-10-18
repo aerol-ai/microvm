@@ -14,13 +14,22 @@ import (
 
 func writeIdentityFile(t *testing.T, path, body string) {
 	t.Helper()
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+	// Write a sibling and rename it into place, so a Watcher.Run poll
+	// running alongside sees the new body and its final mtime at once.
+	// Writing in place showed it two changes (the write's own mtime, then
+	// the Chtimes below) and it reloaded twice, so a test counting reloads
+	// could skip past the count it waited for.
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	// Bump the mtime past the last poll so the change is seen even on a
 	// filesystem with a coarse clock.
 	future := time.Now().Add(time.Duration(len(body)) * time.Millisecond)
-	if err := os.Chtimes(path, future, future); err != nil {
+	if err := os.Chtimes(tmp, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
 		t.Fatal(err)
 	}
 }

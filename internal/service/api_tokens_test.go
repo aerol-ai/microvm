@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,8 +35,27 @@ func newTokenService(t *testing.T, identityOn bool) *Service {
 		store:  openSealTestStore(t),
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	svc.apiTokenClock = func() time.Time { return tokenSvcNow }
+	// The clock is installed once and moved with advanceTokenClock: once
+	// StartAPITokens runs, the token gauge goroutine reads it, so swapping
+	// the function afterwards is a data race.
+	offset := new(atomic.Int64)
+	tokenClockOffsets.Store(svc, offset)
+	t.Cleanup(func() { tokenClockOffsets.Delete(svc) })
+	svc.apiTokenClock = func() time.Time { return tokenSvcNow.Add(time.Duration(offset.Load())) }
 	return svc
+}
+
+// tokenClockOffsets holds each test service's clock offset from tokenSvcNow.
+var tokenClockOffsets sync.Map // *Service -> *atomic.Int64
+
+// advanceTokenClock sets svc's token clock to tokenSvcNow plus d.
+func advanceTokenClock(t *testing.T, svc *Service, d time.Duration) {
+	t.Helper()
+	v, ok := tokenClockOffsets.Load(svc)
+	if !ok {
+		t.Fatal("advanceTokenClock needs a service from newTokenService")
+	}
+	v.(*atomic.Int64).Store(int64(d))
 }
 
 func adminCtx() context.Context {
@@ -157,7 +177,7 @@ func TestAPITokenLifecycleSingleNode(t *testing.T) {
 		t.Fatalf("a malformed id is refused, never silently revoked: %v", err)
 	}
 	// Listing flags expired tokens without removing them.
-	svc.apiTokenClock = func() time.Time { return tokenSvcNow.Add(31 * 24 * time.Hour) }
+	advanceTokenClock(t, svc, 31*24*time.Hour)
 	list, _ = svc.ListAPITokens(ctx)
 	if len(list.Tokens) != 1 || !list.Tokens[0].Expired {
 		t.Fatalf("expired flag: %+v", list.Tokens)
@@ -224,7 +244,7 @@ func TestAPITokenSweepSingleNode(t *testing.T) {
 	old, _ := svc.CreateAPIToken(ctx, createReq("old", "viewer", "payments", "1d"))
 	recent, _ := svc.CreateAPIToken(ctx, createReq("recent", "viewer", "payments", "10d"))
 	// 32 days on: "old" expired 31 days ago, "recent" 22 days ago.
-	svc.apiTokenClock = func() time.Time { return tokenSvcNow.Add(32 * 24 * time.Hour) }
+	advanceTokenClock(t, svc, 32*24*time.Hour)
 	if n := svc.SweepExpiredAPITokens(ctx); n != 1 {
 		t.Fatalf("swept %d, want 1", n)
 	}

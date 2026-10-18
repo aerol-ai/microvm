@@ -60,6 +60,21 @@ func (s *recSink) reset() {
 	s.mu.Unlock()
 }
 
+// waitRecords returns the records once at least n have arrived (or after 5 s).
+// The service writes them on its audit writer goroutine, so an MCP tool's
+// result can reach the client before the inner call's record lands in the
+// sink. It then waits a moment longer so a test that wants exactly n still
+// sees any extra record.
+func (s *recSink) waitRecords(t *testing.T, n int) []auditlog.Event {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(s.records()) < n && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	return s.records()
+}
+
 // auditServer is a single-node API server over a real store whose audit
 // records land in a recSink.
 func auditServer(t *testing.T, svcCfg config.Config, sandboxes ...*models.Sandbox) (*Server, *recSink, *service.Service) {
@@ -482,7 +497,7 @@ func TestAPIRecordOnePerMCPToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := sink.records()
+	got := sink.waitRecords(t, 1)
 	if len(got) != 1 {
 		t.Fatalf("one tool call wrote %d records, want 1: %+v (tool result %+v)", len(got), got, res.Content[0])
 	}

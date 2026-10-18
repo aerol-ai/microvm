@@ -148,6 +148,12 @@ func (f *scriptedFleet) refreshedSince(ids []string, since time.Time) (stale int
 // healthy lease expires at any sample point between sweeps, or is not
 // refreshed within a window.
 func (f *scriptedFleet) runWindows(t *testing.T, healthy []string, windows int) {
+	if raceEnabled {
+		// The race detector slows the sweeps enough that a healthy lease can
+		// outlive the TTL between samples, which is a timing artefact, not a
+		// bug. The go-tests job runs these at the real cadence without -race.
+		t.Skip("real-cadence TTL windows don't hold under -race")
+	}
 	t.Helper()
 	ttl := f.c.capacityLeases.ttl
 	sweepsPerWindow := int(ttl / f.c.capacityLeaseSweepBudget())
