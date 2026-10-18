@@ -34,7 +34,7 @@ principal,oidc:okta:00u2bob,Bob | <b>*admin*</b> [click](https://evil.example) w
 principal,oidc:okta:00u9eve,"'=HYPERLINK(""https://evil.example"",""report"")",oidc,,checkout,,,,2026-10-16T09:40:00Z,POST /v1/sandboxes,node-b,1,1,0,denied,api=1
 principal,operator,,operator,,,,,,2026-10-16T09:50:00Z,POST /v1/sandboxes,node-b,2,0,0,admin,api=2
 principal,sb-3,,sandbox_key,,,,,,2026-10-16T09:12:00Z,ssh,node-b,1,0,0,,api=1
-principal,system:audit,,system,,,,,,2026-10-16T09:04:00Z,api_flood_mode coalesce:coalesce,node-b,1,0,0,,api_flood_mode=1
+principal,system:audit,,system,,,,,,2026-10-16T09:03:00Z,api_flood_mode coalesce:coalesce,node-b,1,0,0,,api_flood_mode=1
 principal,system:identity-file,,system,,,,,,2026-10-16T09:57:00Z,identity_config,node-b,3,0,0,,identity_config=3
 principal,system:lifecycle,,system,,,,,,2026-10-16T09:40:00Z,SYSTEM lifecycle.auto_stop,node-a,1,0,0,,api=1
 principal,tok_Gone7Rv0ked0,old-deploy,token,,payments,,,,2026-10-16T09:35:00Z,POST /v1/sandboxes/{id}/toolbox/{path...},node-b,1,0,0,not_listed,api=1

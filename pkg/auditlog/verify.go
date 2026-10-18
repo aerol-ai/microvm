@@ -394,7 +394,6 @@ func (v *nodeVerifier) walkDay(ctx context.Context, day string) error {
 	}
 	var infos []*batchInfo
 	byPrev := map[string][]*batchInfo{}
-	linkedTo := map[string]bool{}
 	for _, name := range names {
 		b, err := v.indexBatch(ctx, day, name)
 		if err != nil {
@@ -405,7 +404,6 @@ func (v *nodeVerifier) walkDay(ctx context.Context, day string) error {
 		}
 		infos = append(infos, b)
 		byPrev[b.firstPrev] = append(byPrev[b.firstPrev], b)
-		linkedTo[b.lastHash] = true
 	}
 	v.rep.ExportBatches += len(infos)
 	if len(infos) > v.peakIndexed {
@@ -423,10 +421,14 @@ func (v *nodeVerifier) walkDay(ctx context.Context, day string) error {
 		from := 0
 		switch {
 		case !v.started:
-			next = firstRoot(infos, linkedTo)
+			r, err := v.firstRoot(ctx, day, infos)
+			if err != nil {
+				return err
+			}
+			next = r
 		default:
 			if cands := unconsumed(byPrev[v.tip]); len(cands) > 0 {
-				next = v.pick(cands, day)
+				next = v.pick(cands, day, v.tip)
 				break
 			}
 			b, at, err := v.findContaining(ctx, day, infos)
@@ -440,7 +442,11 @@ func (v *nodeVerifier) walkDay(ctx context.Context, day string) error {
 			// Records newer than the tip that do not link to it: the export
 			// is missing what joins them. Resume there so later heads are
 			// still checked, and remember the gap.
-			if r := firstNewer(infos, v.tipTime); r != nil {
+			r, err := v.firstNewer(ctx, day, infos)
+			if err != nil {
+				return err
+			}
+			if r != nil {
 				if !v.tipTime.Before(v.in.Since) {
 					v.warn("export for node %s has a gap on %s: nothing links record %s (%s) to the batches after it", v.in.NodeID, day, short(v.tip), v.tipTime.UTC().Format(time.RFC3339))
 					v.gapPending = true
@@ -474,37 +480,131 @@ func unconsumed(bs []*batchInfo) []*batchInfo {
 	return out
 }
 
-// firstRoot is where evidence starts: the earliest batch that no other batch
-// of the day leads into.
-func firstRoot(infos []*batchInfo, linkedTo map[string]bool) *batchInfo {
+// firstRoot is where evidence starts: the batch of the day that holds the
+// earliest records (see chainStart).
+func (v *nodeVerifier) firstRoot(ctx context.Context, day string, infos []*batchInfo) (*batchInfo, error) {
+	var all, pool []*batchInfo
 	for _, b := range infos {
-		if !b.consumed && !b.startsWithCheckpoint && !linkedTo[b.firstPrev] {
-			return b
+		if b.consumed {
+			continue
 		}
+		all = append(all, b)
+		if !b.startsWithCheckpoint {
+			pool = append(pool, b)
+		}
+	}
+	if b, err := v.chainStart(ctx, day, pool, all); b != nil || err != nil {
+		return b, err
 	}
 	// Evidence that starts with a checkpoint (a generation re-exported from
 	// its first byte) still starts somewhere: feed steps over the
 	// checkpoint and the chain begins at the record after it.
-	for _, b := range infos {
-		if !b.consumed {
-			return b
-		}
+	if len(all) > 0 {
+		return all[0], nil
 	}
-	return nil
+	return nil, nil
 }
 
-// firstNewer is the earliest unconsumed batch whose records start after t.
-// Older ones are re-sends of records already checked, not new evidence.
-func firstNewer(infos []*batchInfo, t time.Time) *batchInfo {
+// firstNewer is where the walk resumes after a gap: the batch holding the
+// earliest of the records that start after the tip (see chainStart). Older
+// batches are re-sends of records already checked, not new evidence.
+func (v *nodeVerifier) firstNewer(ctx context.Context, day string, infos []*batchInfo) (*batchInfo, error) {
+	var pool []*batchInfo
 	for _, b := range infos {
-		if !b.consumed && !b.startsWithCheckpoint && b.firstTime.After(t) {
-			return b
+		if !b.consumed && !b.startsWithCheckpoint && b.firstTime.After(v.tipTime) {
+			pool = append(pool, b)
 		}
 	}
-	return nil
+	b, err := v.chainStart(ctx, day, pool, pool)
+	if b == nil && err == nil && len(pool) > 0 {
+		b = pool[0]
+	}
+	return b, err
 }
 
-// pick chooses among batches that all continue from the tip. Honest
+// chainStart returns the batch of pool (sorted earliest first) where the
+// records begin: the earliest that neither continues a batch of all from
+// that batch's last record nor starts inside one. Time alone cannot tell:
+// a re-send that starts one record into a batch can share that batch's
+// first second, or precede it when the node's clock stepped back, and a
+// walk started there skips the record before it, counts the batch holding
+// it as an already-checked re-send, and passes. Only a witnessed head on
+// that record caught it.
+//
+// The day's index knows every batch's ends, so continuations cost nothing.
+// Telling a batch that starts inside another from one that follows a gap
+// needs the records: they are read again only when more than one batch
+// could start the evidence from different records (an overlapping re-send
+// or a gap; an honest day has one start), and only to collect the hashes
+// those starts follow. Batches that start from the same record go through
+// pick when their first records differ, so a fork at the start of the
+// evidence fails as it does anywhere else on the walk.
+func (v *nodeVerifier) chainStart(ctx context.Context, day string, pool, all []*batchInfo) (*batchInfo, error) {
+	ends := make(map[string]bool, len(all))
+	for _, b := range all {
+		ends[b.lastHash] = true
+	}
+	var starts []*batchInfo
+	follows := map[string]bool{}
+	for _, b := range pool {
+		if !ends[b.firstPrev] {
+			starts = append(starts, b)
+			follows[b.firstPrev] = true
+		}
+	}
+	if len(starts) == 0 {
+		return nil, nil
+	}
+	if len(follows) > 1 {
+		inside, err := v.heldIn(ctx, day, all, follows)
+		if err != nil {
+			return nil, err
+		}
+		var outside []*batchInfo
+		for _, b := range starts {
+			if !inside[b.firstPrev] {
+				outside = append(outside, b)
+			}
+		}
+		if len(outside) > 0 {
+			starts = outside
+		}
+	}
+	first := starts[0]
+	same := []*batchInfo{first}
+	forked := false
+	for _, b := range starts[1:] {
+		if b.firstPrev == first.firstPrev {
+			same = append(same, b)
+			forked = forked || b.firstHash != first.firstHash
+		}
+	}
+	if forked {
+		return v.pick(same, day, first.firstPrev), nil
+	}
+	return first, nil
+}
+
+// heldIn reports which of the hashes in want are records some batch of
+// bs holds.
+func (v *nodeVerifier) heldIn(ctx context.Context, day string, bs []*batchInfo, want map[string]bool) (map[string]bool, error) {
+	found := map[string]bool{}
+	for _, b := range bs {
+		err := v.readBatch(ctx, day, b.name, func(_ int, ev Event) bool {
+			if ev.Kind != KindRetentionCheckpoint && want[ev.EventHash] {
+				found[ev.EventHash] = true
+			}
+			return true
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	return found, nil
+}
+
+// pick chooses among batches that all continue from the record after, the
+// tip (or, at the start of the evidence, the record before it). Honest
 // batches that share a predecessor carry the same records (a re-send, or a
 // re-export cut at other offsets), so the longest covers the rest. Two that
 // start with different records are a fork: someone exported a second
@@ -515,7 +615,7 @@ func firstNewer(infos []*batchInfo, t time.Time) *batchInfo {
 // is used when nothing else continues the chain (a generation re-exported
 // from its first byte), and is otherwise left for findContaining, since it
 // may hold records the chosen batch does not.
-func (v *nodeVerifier) pick(cands []*batchInfo, day string) *batchInfo {
+func (v *nodeVerifier) pick(cands []*batchInfo, day, after string) *batchInfo {
 	var best, fallback *batchInfo
 	for _, b := range cands {
 		switch {
@@ -536,7 +636,7 @@ func (v *nodeVerifier) pick(cands []*batchInfo, day string) *batchInfo {
 		case b.firstHash == best.firstHash:
 			b.consumed = true
 		default:
-			v.fail("export for node %s forks on %s: batches %s and %s both follow record %s with different records", v.in.NodeID, day, best.name, b.name, short(v.tip))
+			v.fail("export for node %s forks on %s: batches %s and %s both follow record %s with different records", v.in.NodeID, day, best.name, b.name, short(after))
 		}
 	}
 	return best

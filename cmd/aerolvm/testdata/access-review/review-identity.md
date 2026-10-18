@@ -107,7 +107,7 @@ Listed tokens are in the table above and not repeated here.
 | oidc:okta:00u9eve | oidc | =HYPERLINK("https\://evil.example","report") | checkout | 2026-10-16T09:40:00Z POST /v1/sandboxes on node-b | api 1 | denied |
 | operator | operator | - | - | 2026-10-16T09:50:00Z POST /v1/sandboxes on node-b | api 2 | admin |
 | sb-3 | sandbox\_key | - | - | 2026-10-16T09:12:00Z ssh on node-b | api 1 | - |
-| system:audit | system | - | - | 2026-10-16T09:04:00Z api\_flood\_mode coalesce:coalesce on node-b | api\_flood\_mode 1 | - |
+| system:audit | system | - | - | 2026-10-16T09:03:00Z api\_flood\_mode coalesce:coalesce on node-b | api\_flood\_mode 1 | - |
 | system:identity-file | system | - | - | 2026-10-16T09:57:00Z identity\_config on node-b | identity\_config 3 | - |
 | system:lifecycle | system | - | - | 2026-10-16T09:40:00Z SYSTEM lifecycle.auto\_stop on node-a | api 1 | - |
 | tok\_Gone7Rv0ked0 | token | old-deploy | payments | 2026-10-16T09:35:00Z POST /v1/sandboxes/{id}/toolbox/{path...} on node-b | api 1 | not\_listed |

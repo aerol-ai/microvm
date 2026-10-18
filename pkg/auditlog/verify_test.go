@@ -19,6 +19,8 @@ type memExport struct {
 	days    map[string]map[string][]byte
 	opens   int
 	openErr error
+	// failOpen, when set, fails only that open (1-based).
+	failOpen int
 }
 
 func newMemExport() *memExport { return &memExport{days: map[string]map[string][]byte{}} }
@@ -63,6 +65,9 @@ func (m *memExport) Open(_ context.Context, _, day, name string) (io.ReadCloser,
 	m.opens++
 	if m.openErr != nil {
 		return nil, m.openErr
+	}
+	if m.failOpen > 0 && m.opens == m.failOpen {
+		return nil, errors.New("s3 down")
 	}
 	b, ok := m.days[day][name]
 	if !ok {
@@ -574,5 +579,227 @@ func TestVerifyCapsTheProblemList(t *testing.T) {
 	wantResult(t, rep, ResultFail, "and 10 more problems")
 	if len(rep.Problems) != maxProblems+1 {
 		t.Fatalf("problems listed = %d", len(rep.Problems))
+	}
+}
+
+// chainAt builds linked records after prev, one per entry of at.
+func chainAt(prev string, at []time.Time, tag string) []Event {
+	evs := make([]Event, len(at))
+	for i := range evs {
+		ev := Event{Time: at[i], EventID: fmt.Sprintf("%s-%d", tag, i), SandboxID: "sb", Result: "success"}
+		LinkEvent(prev, &ev)
+		prev = ev.EventHash
+		evs[i] = ev
+	}
+	return evs
+}
+
+// An exporter re-send that overlaps a batch mid-way, or a batch that
+// continues another, must never be where the walk starts or resumes when
+// the batch holding the earlier records ties with it on time (records a
+// second apart share the second; a node whose clock stepped back stamps a
+// later record earlier). The walk used to pick by time and name, began at
+// the re-send, never read the record before it, and still said PASS with
+// "1 re-sent or overlapping batch": only a witnessed head could catch it.
+func TestVerifyOverlappingResendReadsEveryRecord(t *testing.T) {
+	sec := t0.Add(9 * time.Hour)
+	seconds := func(n int) []time.Time {
+		at := make([]time.Time, n)
+		for i := range at {
+			at[i] = sec.Add(time.Duration(i) * time.Second)
+		}
+		return at
+	}
+	day := sec.Format("2006-01-02")
+	cases := []struct {
+		name   string
+		at     func() []time.Time
+		export func(ex *memExport, evs []Event)
+		// read is how many records an honest walk checks: all of them.
+		read      int
+		unreached int
+		// gap: records the export never got sit between two heads.
+		gap bool
+	}{
+		{
+			name: "a re-send starts in the same second as the batch it overlaps",
+			at: func() []time.Time {
+				at := seconds(10)
+				at[1] = at[0]
+				return at
+			},
+			export: func(ex *memExport, evs []Event) {
+				ex.put(day, "node-a_0.jsonl", evs[0:5])
+				ex.put(day, "node-a_0-resent.jsonl", evs[1:5]) // sorts first
+				ex.put(day, "node-a_1.jsonl", evs[5:10])
+			},
+			read: 10, unreached: 1,
+		},
+		{
+			name: "a re-send's first record is stamped earlier: the clock stepped back",
+			at: func() []time.Time {
+				at := seconds(10)
+				at[1] = at[0].Add(-3 * time.Second)
+				return at
+			},
+			export: func(ex *memExport, evs []Event) {
+				ex.put(day, "node-a_0.jsonl", evs[0:5])
+				ex.put(day, "zz-resent.jsonl", evs[1:5])
+				ex.put(day, "node-a_1.jsonl", evs[5:10])
+			},
+			read: 10, unreached: 1,
+		},
+		{
+			name: "after a gap, a re-send ties with the batch it overlaps",
+			at: func() []time.Time {
+				at := seconds(12)
+				at[8] = at[7]
+				return at
+			},
+			export: func(ex *memExport, evs []Event) {
+				ex.put(day, "node-a_0.jsonl", evs[0:5])
+				// records 5 and 6 never reached the export
+				ex.put(day, "node-a_2.jsonl", evs[7:12])
+				ex.put(day, "node-a_2-resent.jsonl", evs[8:12])
+			},
+			read: 10, unreached: 1, gap: true,
+		},
+		{
+			name: "after a gap, a batch that continues another ties with it",
+			at: func() []time.Time {
+				at := seconds(13)
+				for i := 8; i < 13; i++ {
+					at[i] = at[7]
+				}
+				return at
+			},
+			export: func(ex *memExport, evs []Event) {
+				ex.put(day, "node-a_0.jsonl", evs[0:5])
+				ex.put(day, "z-node-a_2.jsonl", evs[7:10])
+				ex.put(day, "a-node-a_3.jsonl", evs[10:13])
+			},
+			read: 11, gap: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			evs := chainAt(GenesisPrevHash, c.at(), "r")
+			ex := newMemExport()
+			c.export(ex, evs)
+			last := evs[len(evs)-1]
+			base := NodeInput{NodeID: "node-a", Since: t0, Now: last.Time.Add(time.Minute), MaxLag: time.Hour, Export: ex, NewestWitnessDay: day}
+
+			// Without a witness: every record is read, and search hands each
+			// one back exactly once, starting from the first.
+			in := base
+			in.NoWitness = true
+			var seen []string
+			rep, err := SearchNode(context.Background(), in, SearchFilter{}, func(ev Event) { seen = append(seen, ev.EventID) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantResult(t, rep, ResultPass, "")
+			if rep.RecordsChecked != int64(c.read) || len(seen) != c.read || seen[0] != "r-0" {
+				t.Fatalf("checked %d records and searched %v; want all %d from r-0", rep.RecordsChecked, seen, c.read)
+			}
+			if rep.UnreachedBatches != c.unreached {
+				t.Fatalf("unreached batches = %d, want %d", rep.UnreachedBatches, c.unreached)
+			}
+
+			// With a witness that saw the first record: the first head is
+			// linked rather than reported missing.
+			in = base
+			in.Heads = []WitnessedHead{headAt(evs, 0, time.Second, "first"), headAt(evs, 4, time.Second, "fifth"), headAt(evs, len(evs)-1, time.Second, "last")}
+			rep = verify(t, in)
+			if c.gap {
+				wantResult(t, rep, ResultFail, "no records link")
+			} else {
+				wantResult(t, rep, ResultPass, "")
+			}
+			if rep.HeadsLinked != 3 {
+				t.Fatalf("linked %d of 3 heads; problems %q", rep.HeadsLinked, rep.Problems)
+			}
+		})
+	}
+}
+
+// Two batches that both start the evidence from the same record but hold
+// different records are a fork, exactly as they are anywhere else on the
+// walk: one node exported two histories.
+func TestVerifyExportForkAtTheFirstBatch(t *testing.T) {
+	evs := chainFrom(GenesisPrevHash, 10, t0.Add(9*time.Hour), time.Second, "r")
+	forged := chainFrom(GenesisPrevHash, 3, t0.Add(9*time.Hour), time.Second, "forged")
+	ex := newMemExport()
+	day := evs[0].Time.Format("2006-01-02")
+	ex.put(day, "node-a_0.jsonl", evs[:5])
+	ex.put(day, "node-a_1.jsonl", evs[5:])
+	ex.put(day, "a-forged.jsonl", forged)
+	in := NodeInput{NodeID: "node-a", Since: t0, Now: evs[9].Time.Add(time.Minute), MaxLag: time.Hour, Export: ex, NewestWitnessDay: day, NoWitness: true}
+	rep := verify(t, in)
+	wantResult(t, rep, ResultFail, "forks")
+	if rep.RecordsChecked != 10 {
+		t.Fatalf("checked %d records, want the 10 of the longer history", rep.RecordsChecked)
+	}
+}
+
+// Finding where the evidence starts, or resumes after a gap, re-reads
+// batches when a re-send overlaps another. A read that fails there, or
+// anywhere else on the walk, is an error, never a verdict on the node.
+func TestVerifyReadFailureAnywhereIsAnError(t *testing.T) {
+	sec := t0.Add(9 * time.Hour)
+	at := make([]time.Time, 12)
+	for i := range at {
+		at[i] = sec.Add(time.Duration(i) * time.Second)
+	}
+	at[1], at[8] = at[0], at[7]
+	evs := chainAt(GenesisPrevHash, at, "r")
+	day := sec.Format("2006-01-02")
+	ex := newMemExport()
+	ex.put(day, "node-a_0.jsonl", evs[0:5])
+	ex.put(day, "node-a_0-resent.jsonl", evs[1:5])
+	ex.put(day, "node-a_2.jsonl", evs[7:12])
+	ex.put(day, "node-a_2-resent.jsonl", evs[8:12])
+	in := NodeInput{NodeID: "node-a", Since: t0, Now: evs[11].Time.Add(time.Minute), MaxLag: time.Hour, Export: ex, NewestWitnessDay: day, NoWitness: true}
+	verify(t, in)
+	total := ex.opens
+	if total < 8 {
+		t.Fatalf("only %d opens: the start and the resume should each re-read the day", total)
+	}
+	for n := 1; n <= total; n++ {
+		ex.opens, ex.failOpen = 0, n
+		if _, err := VerifyNode(context.Background(), in); err == nil || !strings.Contains(err.Error(), "s3 down") {
+			t.Fatalf("open %d of %d failed, err = %v", n, total, err)
+		}
+	}
+}
+
+// An attacker with export write access controls every field, including the
+// hashes a batch's ends name. Batches whose ends were forged to name each
+// other have no start; they are still read, and fail to link.
+func TestVerifyForgedBatchEndsThatLoop(t *testing.T) {
+	evs := chainFrom(GenesisPrevHash, 3, t0.Add(9*time.Hour), time.Minute, "r")
+	day := evs[0].Time.Format("2006-01-02")
+	ex := newMemExport()
+	ex.put(day, "node-a_0.jsonl", evs)
+	later := evs[2].Time.Add(time.Hour)
+	ex.put(day, "x.jsonl", []Event{{Time: later, EventID: "x", PrevHash: "loop-b", EventHash: "loop-a"}})
+	ex.put(day, "y.jsonl", []Event{{Time: later, EventID: "y", PrevHash: "loop-a", EventHash: "loop-b"}})
+	in := NodeInput{NodeID: "node-a", Since: t0, Now: later.Add(time.Minute), MaxLag: time.Hour, Export: ex, NewestWitnessDay: day, NoWitness: true}
+	wantResult(t, verify(t, in), ResultFail, "does not link")
+}
+
+// Evidence that holds nothing but a retention checkpoint proves nothing
+// and contradicts nothing: its hash is checked and no record is counted.
+func TestVerifyEvidenceThatIsOnlyACheckpoint(t *testing.T) {
+	cp := Event{Time: t0.Add(9 * time.Hour), EventID: "cp", Kind: KindRetentionCheckpoint, Result: "success"}
+	LinkEvent(GenesisPrevHash, &cp)
+	day := cp.Time.Format("2006-01-02")
+	ex := newMemExport()
+	ex.put(day, "only.jsonl", []Event{cp})
+	in := NodeInput{NodeID: "node-a", Since: t0, Now: cp.Time.Add(time.Minute), MaxLag: time.Hour, Export: ex, NewestWitnessDay: day, NoWitness: true}
+	rep := verify(t, in)
+	wantResult(t, rep, ResultPass, "")
+	if rep.RecordsChecked != 0 || rep.UnreachedBatches != 0 {
+		t.Fatalf("records = %d, unreached = %d", rep.RecordsChecked, rep.UnreachedBatches)
 	}
 }
