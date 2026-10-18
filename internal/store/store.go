@@ -648,9 +648,9 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS idx_firecracker_templates_updated_at
 			ON firecracker_templates(updated_at);`,
 		// wasm_modules mirrors firecracker_templates for WASM module catalogue
-		// (plans/wasm-runtime.md Phase 6). One row per registered module ref.
+		// (plans/wasm-runtime.md Phase 6). One row per (owner, catalogue id).
 		`CREATE TABLE IF NOT EXISTS wasm_modules (
-			id TEXT PRIMARY KEY,
+			id TEXT NOT NULL,
 			module_ref TEXT NOT NULL,
 			status TEXT NOT NULL,
 			module_path TEXT NOT NULL DEFAULT '',
@@ -667,7 +667,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 			owner_ref TEXT NOT NULL DEFAULT '',
 			created_at DATETIME NOT NULL,
 			updated_at DATETIME NOT NULL,
-			ready_at DATETIME
+			ready_at DATETIME,
+			-- A catalogue id is unique per owner, not per host: the id defaults
+			-- to the module's content digest, so two tenants registering the
+			-- same bytes must each get their own row rather than a conflict
+			-- that also confirms the other holds them. The owner leads the key
+			-- so the own-then-operator lookup is two probes of one index.
+			PRIMARY KEY (owner_ref, id)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at
 			ON wasm_modules(updated_at);`,
@@ -1101,6 +1107,13 @@ func open(path string, secretCipher *secrets.Cipher) (*Store, error) {
 	// this rebuilds sandbox_snapshots and snapshot_aliases (whose FK depends on
 	// it). Idempotent: a no-op once the composite key is in place.
 	if err := migrateSnapshotOwnerPK(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// Widen the WASM catalogue key from (id) to (owner_ref, id) so a second
+	// tenant registering the same module bytes gets its own digest-id row.
+	// Runs after the migrations loop, which adds owner_ref to pre-#724 tables.
+	if err := migrateWasmModuleOwnerPK(db); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -1558,6 +1571,102 @@ func migrateSnapshotOwnerPK(db *sql.DB) error {
 		return fmt.Errorf("commit snapshot PK migration: %w", err)
 	}
 	return nil
+}
+
+// migrateWasmModuleOwnerPK rebuilds wasm_modules with PRIMARY KEY
+// (owner_ref, id). Idempotent: it returns early once owner_ref is part of the
+// primary key, so every open after the first costs one PRAGMA read.
+//
+// SQLite cannot widen a primary key in place, so the rows are copied into a
+// rekeyed twin and the tables swapped inside one transaction; a crash part way
+// rolls back to the old table and the next open retries. Every row keeps its
+// owner_ref: rows #724 backfilled stay "" (operator-published) and tenant rows
+// keep their tenant. Pre-migration ids were unique per host, so the copy
+// cannot collide. No table references wasm_modules, so foreign keys need no
+// toggling. The index list must match the wasm_modules indexes in open.
+func migrateWasmModuleOwnerPK(db *sql.DB) error {
+	ownerInKey, err := columnInPrimaryKey(db, "wasm_modules", "owner_ref")
+	if err != nil {
+		return err
+	}
+	if ownerInKey {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin wasm module PK migration: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		`CREATE TABLE wasm_modules_rekeyed (
+			id TEXT NOT NULL,
+			module_ref TEXT NOT NULL,
+			status TEXT NOT NULL,
+			module_path TEXT NOT NULL DEFAULT '',
+			module_size_bytes INTEGER NOT NULL DEFAULT 0,
+			digest TEXT NOT NULL DEFAULT '',
+			entrypoint TEXT NOT NULL DEFAULT '_start',
+			has_warm INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			owner_ref TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			ready_at DATETIME,
+			PRIMARY KEY (owner_ref, id)
+		);`,
+		`INSERT INTO wasm_modules_rekeyed (
+			id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		)
+		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+		FROM wasm_modules;`,
+		`DROP TABLE wasm_modules;`,
+		`ALTER TABLE wasm_modules_rekeyed RENAME TO wasm_modules;`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_updated_at ON wasm_modules(updated_at);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_status_ref ON wasm_modules(status, module_ref);`,
+		`CREATE INDEX IF NOT EXISTS idx_wasm_modules_digest ON wasm_modules(digest) WHERE digest <> '';`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			head := strings.TrimSpace(stmt)
+			if i := strings.IndexByte(head, '\n'); i > 0 {
+				head = head[:i]
+			}
+			return fmt.Errorf("wasm module PK migration %q: %w", head, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit wasm module PK migration: %w", err)
+	}
+	return nil
+}
+
+// columnInPrimaryKey reports whether column is part of table's primary key.
+func columnInPrimaryKey(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`SELECT name, pk FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, fmt.Errorf("inspect %s: %w", table, err)
+	}
+	defer rows.Close()
+	inKey := false
+	for rows.Next() {
+		var (
+			name string
+			pk   int
+		)
+		if err := rows.Scan(&name, &pk); err != nil {
+			return false, fmt.Errorf("scan %s column: %w", table, err)
+		}
+		if name == column && pk > 0 {
+			inKey = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate %s columns: %w", table, err)
+	}
+	return inKey, nil
 }
 
 func backfillSnapshotOwners(db *sql.DB) error {
@@ -8473,7 +8582,9 @@ type WasmModuleRecord struct {
 	ReadyAt   *time.Time
 }
 
-// UpsertWasmModule inserts or updates a wasm_modules catalogue row.
+// UpsertWasmModule inserts or updates a wasm_modules catalogue row. The row is
+// keyed by (rec.OwnerRef, rec.ID), so an upsert only ever rewrites a row in
+// the record's own namespace and never another owner's row with the same id.
 func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) error {
 	now := time.Now().UTC()
 	if rec.CreatedAt.IsZero() {
@@ -8485,7 +8596,7 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 			id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		ON CONFLICT(owner_ref, id) DO UPDATE SET
 			module_ref = excluded.module_ref,
 			status = excluded.status,
 			module_path = excluded.module_path,
@@ -8494,11 +8605,10 @@ func (s *Store) UpsertWasmModule(ctx context.Context, rec WasmModuleRecord) erro
 			entrypoint = excluded.entrypoint,
 			has_warm = excluded.has_warm,
 			last_error = excluded.last_error,
-			owner_ref = excluded.owner_ref,
 			updated_at = excluded.updated_at,
 			ready_at = excluded.ready_at
 	`,
-		rec.ID,
+		strings.TrimSpace(rec.ID),
 		strings.TrimSpace(rec.ModuleRef),
 		rec.Status,
 		rec.ModulePath,
@@ -8935,10 +9045,13 @@ func (s *Store) UpdateWasmRegistryPush(ctx context.Context, sandboxID, incarnati
 	return affected > 0, nil
 }
 
-// ListReadyWasmModuleRefs returns module_ref values for ready catalogue rows.
+// ListReadyWasmModuleRefs returns the distinct module_ref values of ready
+// catalogue rows. It is a per-host placement inventory ("which module bytes
+// can this node boot"), so it spans every owner's namespace; DISTINCT keeps two
+// owners' rows for the same ref from doubling the gossiped list.
 func (s *Store) ListReadyWasmModuleRefs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT module_ref FROM wasm_modules
+		SELECT DISTINCT module_ref FROM wasm_modules
 		WHERE status = 'ready' AND module_ref != ''
 		ORDER BY module_ref`)
 	if err != nil {
@@ -8986,14 +9099,29 @@ func (s *Store) ListWasmModulesOlderThan(ctx context.Context, cutoff time.Time) 
 // would yank a digest still in use by another sandbox (codex C5). A blank
 // moduleDigest simply contributes no extra match.
 func (s *Store) IsWasmModuleReferenced(ctx context.Context, moduleID, moduleRef, moduleDigest string) (bool, error) {
+	return s.wasmModuleReferenced(ctx, false, "", moduleID, moduleRef, moduleDigest)
+}
+
+// IsWasmModuleReferencedByOwner is IsWasmModuleReferenced narrowed to the
+// sandboxes ownerRef owns. A tenant's catalogue row can only be resolved by
+// that tenant's own creates, so only its sandboxes can depend on the row; a
+// delete gated on this check never tells the tenant that another owner runs
+// the same bytes.
+func (s *Store) IsWasmModuleReferencedByOwner(ctx context.Context, ownerRef, moduleID, moduleRef, moduleDigest string) (bool, error) {
+	return s.wasmModuleReferenced(ctx, true, ownerRef, moduleID, moduleRef, moduleDigest)
+}
+
+func (s *Store) wasmModuleReferenced(ctx context.Context, byOwner bool, ownerRef, moduleID, moduleRef, moduleDigest string) (bool, error) {
 	moduleID = strings.TrimSpace(moduleID)
 	moduleRef = strings.TrimSpace(moduleRef)
 	moduleDigest = strings.TrimSpace(moduleDigest)
 	row := s.db.QueryRowContext(ctx, `
 		SELECT 1 FROM sandboxes
-		WHERE module_ref = ? OR module_ref = ? OR module_digest = ? OR
-		      (? <> '' AND module_digest = ?)
-		LIMIT 1`, moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
+		WHERE (? = 0 OR owner_ref = ?) AND
+		      (module_ref = ? OR module_ref = ? OR module_digest = ? OR
+		       (? <> '' AND module_digest = ?))
+		LIMIT 1`, boolToInt(byOwner), strings.TrimSpace(ownerRef),
+		moduleRef, moduleID, moduleID, moduleDigest, moduleDigest)
 	var one int
 	err := row.Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -9022,6 +9150,36 @@ func (s *Store) IsWasmDigestCatalogued(ctx context.Context, digest string) (bool
 	}
 	if err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+// wasmDigestCataloguedElsewhereSQL probes the digest index. The redundant
+// non-empty-digest term is what lets the planner use the partial
+// idx_wasm_modules_digest instead of scanning the catalogue.
+const wasmDigestCataloguedElsewhereSQL = `
+	SELECT 1 FROM wasm_modules
+	WHERE digest = ? AND digest <> '' AND NOT (owner_ref = ? AND id = ?)
+	LIMIT 1`
+
+// IsWasmDigestCataloguedElsewhere reports whether any catalogue row other than
+// (ownerRef, id) pins digest. Catalogue ids are per owner but the bytes behind
+// them are content-addressed and shared on the host (one cache file, one warm
+// pool target per digest), so removing one owner's row must leave the bytes
+// and the warm target in place while another row still points at them.
+func (s *Store) IsWasmDigestCataloguedElsewhere(ctx context.Context, ownerRef, id, digest string) (bool, error) {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return false, nil
+	}
+	row := s.db.QueryRowContext(ctx, wasmDigestCataloguedElsewhereSQL, digest, strings.TrimSpace(ownerRef), strings.TrimSpace(id))
+	var one int
+	err := row.Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("wasm digest catalogued elsewhere: %w", err)
 	}
 	return true, nil
 }
@@ -9108,8 +9266,10 @@ func scanWasmModule(row interface {
 	return rec, nil
 }
 
-// GetWasmModule returns one wasm_modules row by catalogue id.
-func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord, error) {
+// GetWasmModule returns the catalogue row id in exactly ownerRef's namespace
+// ("" is the operator namespace). It never falls back to another namespace:
+// create's id-conflict check and delete must only ever see the caller's rows.
+func (s *Store) GetWasmModule(ctx context.Context, ownerRef, id string) (WasmModuleRecord, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return WasmModuleRecord{}, errors.New("get wasm module: id required")
@@ -9117,7 +9277,7 @@ func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord,
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
-		FROM wasm_modules WHERE id = ?`, id)
+		FROM wasm_modules WHERE owner_ref = ? AND id = ?`, strings.TrimSpace(ownerRef), id)
 	rec, err := scanWasmModule(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -9128,13 +9288,47 @@ func (s *Store) GetWasmModule(ctx context.Context, id string) (WasmModuleRecord,
 	return rec, nil
 }
 
-// ListWasmModules returns all catalogue rows newest-first.
+// wasmModuleResolveSQL reads the owner's row and the operator's row for one id
+// through the (owner_ref, id) primary key; the ORDER BY sorts the operator row
+// last, so the owner's row wins when both exist.
+const wasmModuleResolveSQL = `
+	SELECT id, module_ref, status, module_path, module_size_bytes, digest,
+		entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
+	FROM wasm_modules
+	WHERE owner_ref IN (?, '') AND id = ?
+	ORDER BY owner_ref = '' ASC
+	LIMIT 1`
+
+// ResolveWasmModule returns ownerRef's own row for id, else the
+// operator-published ("") row for id: the order reads and create-time boots
+// resolve a catalogue id in. An own row wins even when it is not ready, so a
+// failed registration never silently boots the operator's different bytes.
+// One statement (two probes of the (owner_ref, id) key) so the create-time
+// lookup costs the same single query it did before ids were per owner.
+func (s *Store) ResolveWasmModule(ctx context.Context, ownerRef, id string) (WasmModuleRecord, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return WasmModuleRecord{}, errors.New("resolve wasm module: id required")
+	}
+	row := s.db.QueryRowContext(ctx, wasmModuleResolveSQL, strings.TrimSpace(ownerRef), id)
+	rec, err := scanWasmModule(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WasmModuleRecord{}, ErrNotFound
+		}
+		return WasmModuleRecord{}, fmt.Errorf("resolve wasm module: %w", err)
+	}
+	return rec, nil
+}
+
+// ListWasmModules returns all catalogue rows, every namespace, newest-first.
+// Callers filter by owner; the same id may appear once per namespace.
 func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, module_ref, status, module_path, module_size_bytes, digest,
 			entrypoint, has_warm, last_error, owner_ref, created_at, updated_at, ready_at
 		FROM wasm_modules
-		ORDER BY created_at DESC, id ASC`)
+		ORDER BY created_at DESC, id ASC, owner_ref ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list wasm modules: %w", err)
 	}
@@ -9150,13 +9344,14 @@ func (s *Store) ListWasmModules(ctx context.Context) ([]WasmModuleRecord, error)
 	return out, rows.Err()
 }
 
-// DeleteWasmModule removes a wasm_modules catalogue row.
-func (s *Store) DeleteWasmModule(ctx context.Context, id string) error {
+// DeleteWasmModule removes the catalogue row id in ownerRef's namespace only;
+// another owner's row with the same id is never touched.
+func (s *Store) DeleteWasmModule(ctx context.Context, ownerRef, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return errors.New("delete wasm module: id required")
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE id = ?`, id)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM wasm_modules WHERE owner_ref = ? AND id = ?`, strings.TrimSpace(ownerRef), id)
 	if err != nil {
 		return fmt.Errorf("delete wasm module: %w", err)
 	}

@@ -47,9 +47,10 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	}
 	// Wire step-3 of the resolution precedence: a BYO catalogue id (returned by
 	// CreateWasmModule) maps to its already-local, already-validated path +
-	// pinned digest. The lookup is owner-scoped (Service.ResolveOwnedWasmModule)
-	// so a tenant cannot boot a sandbox from another tenant's catalogued module
-	// by naming its id; only "ready" rows the caller may see resolve, and a
+	// pinned digest. Catalogue ids are per owner (Service.ResolveOwnedWasmModule):
+	// the id resolves in the booting owner's namespace, then to an
+	// operator-published row, so a tenant cannot boot a sandbox from another
+	// tenant's catalogued module by naming its id. Only "ready" rows resolve; a
 	// pending/failed/foreign row falls through to a 404 rather than booting a
 	// half-staged or someone else's artifact.
 	resolver.CatalogueLookup = svc.ResolveOwnedWasmModule

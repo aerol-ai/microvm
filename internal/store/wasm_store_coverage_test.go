@@ -30,7 +30,7 @@ func TestWasmModuleCatalogueCRUD(t *testing.T) {
 		t.Fatalf("UpsertWasmModule: %v", err)
 	}
 
-	got, err := st.GetWasmModule(ctx, "mod-a")
+	got, err := st.GetWasmModule(ctx, "", "mod-a")
 	if err != nil {
 		t.Fatalf("GetWasmModule: %v", err)
 	}
@@ -87,19 +87,19 @@ func TestWasmModuleCatalogueCRUD(t *testing.T) {
 		t.Fatalf("missing digest = %v err=%v", catalogued, err)
 	}
 
-	if err := st.DeleteWasmModule(ctx, "mod-a"); err != nil {
+	if err := st.DeleteWasmModule(ctx, "", "mod-a"); err != nil {
 		t.Fatalf("DeleteWasmModule: %v", err)
 	}
-	if _, err := st.GetWasmModule(ctx, "mod-a"); !errors.Is(err, ErrNotFound) {
+	if _, err := st.GetWasmModule(ctx, "", "mod-a"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetWasmModule after delete = %v, want ErrNotFound", err)
 	}
-	if err := st.DeleteWasmModule(ctx, "gone"); !errors.Is(err, ErrNotFound) {
+	if err := st.DeleteWasmModule(ctx, "", "gone"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("DeleteWasmModule missing = %v, want ErrNotFound", err)
 	}
-	if _, err := st.GetWasmModule(ctx, ""); err == nil {
+	if _, err := st.GetWasmModule(ctx, "", ""); err == nil {
 		t.Fatal("GetWasmModule empty id should error")
 	}
-	if err := st.DeleteWasmModule(ctx, ""); err == nil {
+	if err := st.DeleteWasmModule(ctx, "", ""); err == nil {
 		t.Fatal("DeleteWasmModule empty id should error")
 	}
 }

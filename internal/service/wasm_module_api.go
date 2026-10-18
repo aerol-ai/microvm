@@ -121,9 +121,14 @@ func (s *Service) noteWasmWarmModule(digest, modulePath string) {
 	s.wasmWarmPool.NoteModule(digest, modulePath)
 }
 
-// CreateWasmModule resolves module_ref on this host and upserts the catalogue.
-// Idempotent when the caller supplies an explicit id that already points at
-// the same module_ref; conflicting ids return ErrWasmModuleIDConflict.
+// CreateWasmModule resolves module_ref on this host and upserts the catalogue
+// row in the caller's own namespace (a tenant's account, or "" for operator and
+// internal callers). The id defaults to the module's content digest, so two
+// owners registering identical bytes each get their own row: rows in other
+// namespaces are never read here, which is what keeps another owner's module
+// from surfacing as a conflict. Idempotent when the caller re-registers an id
+// it already holds for the same module_ref; the same id bound to a different
+// module_ref in the caller's namespace returns ErrWasmModuleIDConflict.
 func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmModuleRequest) (*models.WasmModule, error) {
 	if !s.cfg.EnableWasm {
 		return nil, fmt.Errorf("wasm module create requires SB_ENABLE_WASM: %w", models.ErrRuntimeNotImplemented)
@@ -138,21 +143,8 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	owner := ownerRefForCreate(ctx)
 	explicitID := strings.TrimSpace(req.ID)
 	if explicitID != "" {
-		if existing, err := s.store.GetWasmModule(ctx, explicitID); err == nil {
-			// A row the caller cannot write (another tenant's, or an
-			// operator-published "" row when the caller is a tenant) is not
-			// theirs to echo back or adopt — report the id as taken, never
-			// leak the owner's ref/path.
-			if strings.TrimSpace(existing.ModuleRef) == moduleRef && wasmModuleWritable(ctx, existing) {
-				// Re-registering an already-catalogued module re-arms the warm
-				// pool: pool targets live in memory, so after a daemon restart
-				// the catalogue row exists but the pool has forgotten it.
-				s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
-				return wasmModuleFromRecord(existing), nil
-			}
-			return nil, store.ErrWasmModuleIDConflict
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return nil, err
+		if existing, done, err := s.replayOwnWasmModule(ctx, owner, explicitID, moduleRef); done {
+			return existing, err
 		}
 	}
 
@@ -180,14 +172,8 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	if id == "" {
 		return nil, errors.New("resolved module has empty digest")
 	}
-	if existing, err := s.store.GetWasmModule(ctx, id); err == nil {
-		if strings.TrimSpace(existing.ModuleRef) == moduleRef && wasmModuleWritable(ctx, existing) {
-			s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
-			return wasmModuleFromRecord(existing), nil
-		}
-		return nil, store.ErrWasmModuleIDConflict
-	} else if !errors.Is(err, store.ErrNotFound) {
-		return nil, err
+	if existing, done, err := s.replayOwnWasmModule(ctx, owner, id, moduleRef); done {
+		return existing, err
 	}
 
 	entrypoint := strings.TrimSpace(req.Entrypoint)
@@ -219,6 +205,30 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 	return wasmModuleFromRecord(rec), nil
 }
 
+// replayOwnWasmModule checks id in owner's namespace before a create writes
+// it. done=false means the id is free there and the create proceeds. An
+// existing row for the same module_ref is echoed back (the idempotent retry);
+// one for a different module_ref is ErrWasmModuleIDConflict. Only the
+// caller's namespace is consulted, so the answer never depends on, or reveals,
+// what another owner registered.
+func (s *Service) replayOwnWasmModule(ctx context.Context, owner, id, moduleRef string) (mod *models.WasmModule, done bool, err error) {
+	existing, err := s.store.GetWasmModule(ctx, owner, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	if strings.TrimSpace(existing.ModuleRef) != moduleRef {
+		return nil, true, store.ErrWasmModuleIDConflict
+	}
+	// Re-registering an already-catalogued module re-arms the warm pool: pool
+	// targets live in memory, so after a daemon restart the catalogue row
+	// exists but the pool has forgotten it.
+	s.noteWasmWarmModule(existing.Digest, existing.ModulePath)
+	return wasmModuleFromRecord(existing), true, nil
+}
+
 func (s *Service) ListWasmModules(ctx context.Context) ([]*models.WasmModule, error) {
 	if !s.cfg.EnableWasm {
 		return nil, fmt.Errorf("wasm modules require SB_ENABLE_WASM: %w", models.ErrRuntimeNotImplemented)
@@ -244,53 +254,80 @@ func (s *Service) GetWasmModule(ctx context.Context, id string) (*models.WasmMod
 	if !s.cfg.EnableWasm {
 		return nil, fmt.Errorf("wasm modules require SB_ENABLE_WASM: %w", models.ErrRuntimeNotImplemented)
 	}
-	rec, err := s.store.GetWasmModule(ctx, id)
+	// The caller's own row first, then the operator-published one. Another
+	// owner's row with this id is never read, so a tenant probing ids gets the
+	// same 404 whether or not someone else registered it.
+	rec, err := s.store.ResolveWasmModule(ctx, ownerRefForCreate(ctx), id)
 	if err != nil {
 		return nil, err
-	}
-	// 404 (not 403) for a module the caller cannot see, so a tenant cannot
-	// probe ids to learn which modules (and registry refs) other tenants hold.
-	if !wasmModuleVisible(ctx, rec) {
-		return nil, store.ErrNotFound
 	}
 	return wasmModuleFromRecord(rec), nil
 }
 
-// DeleteWasmModule removes a catalogue row when no sandbox references it.
+// DeleteWasmModule removes the caller's own catalogue row when no sandbox
+// that resolves through it remains. Delete acts only inside the caller's
+// namespace: another owner's row with the same id is out of reach, and an
+// operator-published ("") row is read-only to a tenant, so both 404 like an
+// id that does not exist.
 func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	if !s.cfg.EnableWasm {
 		return fmt.Errorf("wasm modules require SB_ENABLE_WASM: %w", models.ErrRuntimeNotImplemented)
 	}
-	rec, err := s.store.GetWasmModule(ctx, id)
+	rec, err := s.store.GetWasmModule(ctx, ownerRefForCreate(ctx), id)
 	if err != nil {
 		return err
 	}
-	// A tenant may delete only its own rows. An operator-published ("") row is
-	// read-only to tenants and writable only by the operator. Invisible rows
-	// 404 so delete is not an existence oracle either.
-	if !wasmModuleVisible(ctx, rec) {
-		return store.ErrNotFound
-	}
-	if !wasmModuleWritable(ctx, rec) {
-		return store.ErrNotFound
-	}
-	referenced, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
+	referenced, err := s.wasmModuleRowInUse(ctx, rec)
 	if err != nil {
 		return err
 	}
 	if referenced {
 		return store.ErrWasmModuleInUse
 	}
-	if s.wasm != nil {
+	shared, err := s.wasmModuleBytesShared(ctx, rec)
+	if err != nil {
+		return err
+	}
+	if !shared && s.wasm != nil {
 		if err := s.wasm.RemoveImage(ctx, rec.ModuleRef); err != nil {
 			return err
 		}
 	}
-	if err := s.store.DeleteWasmModule(ctx, id); err != nil {
+	if err := s.store.DeleteWasmModule(ctx, rec.OwnerRef, rec.ID); err != nil {
 		return err
 	}
 	s.invalidateWasmModuleInventoryCache()
 	return nil
+}
+
+// wasmModuleRowInUse reports whether a sandbox can still resolve through rec,
+// which blocks deleting it. Only an owner's own creates resolve its rows, so a
+// tenant row is checked against that tenant's sandboxes alone: another owner
+// running the same bytes neither blocks the delete nor learns of it through
+// a 409. Every namespace falls back to operator-published rows, so a "" row is
+// checked against every sandbox on the host.
+func (s *Service) wasmModuleRowInUse(ctx context.Context, rec store.WasmModuleRecord) (bool, error) {
+	if rec.OwnerRef == "" {
+		return s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
+	}
+	return s.store.IsWasmModuleReferencedByOwner(ctx, rec.OwnerRef, rec.ID, rec.ModuleRef, rec.Digest)
+}
+
+// wasmModuleBytesShared reports whether rec's bytes must outlive rec. Ids are
+// per owner but the bytes are content-addressed and shared on the host (one
+// cache file and one warm-pool target per digest), so they stay while any
+// sandbox or any other catalogue row still uses them. It only decides whether
+// the bytes go; the row delete succeeds either way, so nothing about other
+// owners reaches the caller.
+func (s *Service) wasmModuleBytesShared(ctx context.Context, rec store.WasmModuleRecord) (bool, error) {
+	if rec.OwnerRef != "" {
+		// The row gate looked at this owner's sandboxes only.
+		inUse, err := s.store.IsWasmModuleReferenced(ctx, rec.ID, rec.ModuleRef, rec.Digest)
+		if err != nil || inUse {
+			return inUse, err
+		}
+	}
+	return s.store.IsWasmDigestCataloguedElsewhere(ctx, rec.OwnerRef, rec.ID, rec.Digest)
 }
 
 // wasmModuleVisible reports whether the caller may read a catalogue row.
@@ -305,35 +342,35 @@ func wasmModuleVisible(ctx context.Context, rec store.WasmModuleRecord) bool {
 	return rec.OwnerRef == "" || rec.OwnerRef == owner
 }
 
-// wasmModuleWritable reports whether the caller may delete/overwrite a row.
-// It is stricter than visibility: an operator-published ("") row is read-only
-// to a tenant, so a tenant can write only rows it owns. Operator/internal
-// callers may write anything.
-func wasmModuleWritable(ctx context.Context, rec store.WasmModuleRecord) bool {
-	owner, scoped := ownerScope(ctx)
-	if !scoped {
-		return true
-	}
-	return rec.OwnerRef != "" && rec.OwnerRef == owner
-}
-
 // ResolveOwnedWasmModule is the owner-scoped create-time catalogue lookup wired
 // into the module resolver (step 3 of ref resolution). A BYO catalogue id
-// resolves to its local path + digest only when the caller may see the row,
-// so a tenant cannot boot a sandbox from another tenant's catalogued module by
-// naming its id. Only "ready" rows with a real path resolve.
+// resolves in the booting owner's namespace first, then to an
+// operator-published ("") row, so a tenant cannot boot a sandbox from another
+// tenant's catalogued module by naming its id, and an own row shadows an
+// operator row with the same id. Only "ready" rows with a real path resolve.
 func (s *Service) ResolveOwnedWasmModule(ctx context.Context, id string) (path, digest string, ok bool) {
-	rec, err := s.store.GetWasmModule(ctx, id)
+	rec, err := s.store.ResolveWasmModule(ctx, wasmCatalogueNamespace(ctx), id)
 	if err != nil {
-		return "", "", false
-	}
-	if !wasmModuleVisible(ctx, rec) {
 		return "", "", false
 	}
 	if !strings.EqualFold(rec.Status, "ready") || strings.TrimSpace(rec.ModulePath) == "" {
 		return "", "", false
 	}
 	return rec.ModulePath, rec.Digest, true
+}
+
+// wasmCatalogueNamespace is the owner namespace a create-time boot resolves a
+// catalogue id in: the owner pinned with wasmmod.WithCatalogueOwner (the owner
+// of the sandbox being booted), else the caller's own. An operator or internal
+// caller with no pin resolves only operator-published rows. That is stricter
+// than its fleet-wide read access on purpose: a tenant must not be able to
+// register an id that an operator create names and so hijack that boot onto
+// its own bytes (the same rule as snapshotResolvableForCreate).
+func wasmCatalogueNamespace(ctx context.Context) string {
+	if owner, ok := wasmmod.CatalogueOwner(ctx); ok {
+		return owner
+	}
+	return ownerRefForCreate(ctx)
 }
 
 func wasmModuleFromRecord(rec store.WasmModuleRecord) *models.WasmModule {

@@ -116,6 +116,44 @@ func TestResolveCatalogueID(t *testing.T) {
 	}
 }
 
+// The catalogue owner pinned on ctx reaches CatalogueLookup unchanged
+// (trimmed), and an unpinned ctx reports no owner rather than "".
+func TestCatalogueOwnerContext(t *testing.T) {
+	tests := []struct {
+		name      string
+		ctx       context.Context
+		wantOwner string
+		wantOK    bool
+	}{
+		{name: "unpinned", ctx: context.Background(), wantOwner: "", wantOK: false},
+		{name: "operator namespace", ctx: WithCatalogueOwner(context.Background(), ""), wantOwner: "", wantOK: true},
+		{name: "tenant trimmed", ctx: WithCatalogueOwner(context.Background(), " acct-a "), wantOwner: "acct-a", wantOK: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			owner, ok := CatalogueOwner(tc.ctx)
+			if owner != tc.wantOwner || ok != tc.wantOK {
+				t.Fatalf("CatalogueOwner = (%q, %v), want (%q, %v)", owner, ok, tc.wantOwner, tc.wantOK)
+			}
+		})
+	}
+
+	mr := newTestModuleResolver(t)
+	path := WriteMinimalWasm(t, mr.file.ModulesDir, "owned.wasm")
+	mr.CatalogueLookup = func(ctx context.Context, id string) (string, string, bool) {
+		if owner, _ := CatalogueOwner(ctx); owner == "acct-a" && id == "mod" {
+			return path, "d-a", true
+		}
+		return "", "", false
+	}
+	if got, err := mr.Resolve(WithCatalogueOwner(context.Background(), "acct-a"), "mod"); err != nil || got.Digest != "d-a" {
+		t.Fatalf("pinned resolve = %+v, %v; want digest d-a", got, err)
+	}
+	if _, err := mr.Resolve(WithCatalogueOwner(context.Background(), "acct-b"), "mod"); !errors.Is(err, ErrModuleNotFound) {
+		t.Fatalf("other owner resolve = %v, want ErrModuleNotFound", err)
+	}
+}
+
 // classifyRegistryErr maps auth-ish failures to terminal, others to retryable.
 func TestClassifyRegistryErr(t *testing.T) {
 	if err := classifyRegistryErr(errors.New("401 unauthorized")); !errors.Is(err, ErrRegistryAuth) {
