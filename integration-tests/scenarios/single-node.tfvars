@@ -25,6 +25,18 @@ caddy_shared_cert_storage = {
   enabled = false
 }
 
+# Identity and access (plans/identity-and-access.md, task T12): named
+# credentials on, and the identity file the suite installs (capabilities
+# identity and identity-oidc). The file is absent at boot, which sandboxd
+# treats as "OIDC answers 503 until a good file loads" while the PAT and avm_
+# tokens work; the suite writes it, with the test issuer's static JWKS, before
+# the first OIDC use case. Remote MCP is on for UC-286's OAuth flow.
+extra_sandboxd_env = {
+  SB_IDENTITY_ENABLED = "true"
+  SB_IDENTITY_FILE    = "/etc/sandboxd/itest-identity.yaml"
+  SB_MCP_ENABLED      = "true"
+}
+
 nodes = {
   node1 = {
     role = "mixed"

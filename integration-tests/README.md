@@ -203,6 +203,84 @@ exactly once per cert lifetime. Staging and `--prod-tls` runs never collide
 stored certs — save it like any root credential; losing or rotating it orphans
 every stored cert. See [`setup/multi-node-cert-sharing.md`](../setup/multi-node-cert-sharing.md).
 
+## Identity and access (UC-268..UC-294)
+
+`suite/identity_*_test.go` and `suite/z_identity_chaos_test.go` cover named
+credentials end to end (plans/identity-and-access.md §8, task T12).
+
+- **Team tokens, not a token file.** The cross-tenant cases mint real team
+  `avm_` tokens with the operator credential at setup (`POST /v1/tokens`) and
+  revoke them on cleanup; `SB_ITEST_IDENTITY_FILE` is gone (D4). A token
+  minted on one node reaches a worker without Raft state within one mirror
+  sync, so the cases retry `unknown_or_revoked` briefly before asserting.
+- **The test issuer.** The nodes cannot reach the operator's machine, so they
+  never fetch keys from it. The suite generates the keys, writes the issuer's
+  JWKS and an identity file whose `issuers[].jwks_file` names it, installs
+  both on every node over SSH (`/etc/sandboxd/itest-identity.yaml`, the path
+  the scenarios' `SB_IDENTITY_FILE` names), reloads with SIGHUP, and mints ID,
+  workload, Kubernetes service-account and MCP access tokens locally
+  (`suite/harness/identity_issuer.go`, built on T6's `identitytest`). The
+  file is absent at boot, which sandboxd treats as "OIDC answers 503 until a
+  good file loads". The issuer also serves discovery, a device endpoint and a
+  token endpoint on `https://127.0.0.1:<port>`, for the two clients that
+  discover it: the remote-MCP OAuth client (UC-286, in the suite) and
+  `aerolvm login --sso --device` (UC-282), which runs on a node and reaches
+  the issuer through an SSH reverse forward on the same port.
+- **Capabilities.** `identity` (SB_IDENTITY_ENABLED) and `identity-oidc` (the
+  test issuer) are on `single-node`, `cluster-3-mixed`, the two
+  `*-secrets-enterprise` scenarios and `cluster-hetero-lite-secrets`;
+  `single-node-wasm` and the other enterprise hetero scenarios have
+  `identity` only. `audit-export-s3` (cluster-3-mixed exports to its S3
+  bucket; run.sh exports `AEROL_AUDIT_EXPORT_BUCKET`/`_PREFIX`) feeds
+  UC-279. `token-mirror` marks a role-separated topology (UC-291, UC-272b).
+- **Host-scoped PAT (`pat-scope-host`).** Enterprise mode requires
+  `SB_PAT_SCOPE=host` (T10), so every enterprise scenario installs with
+  `pat_scope = "host"` (Terraform → `install.sh --pat-scope host`). Through
+  Caddy the PAT is then a 401, so run.sh mints an admin `avm_` token on the
+  seed's loopback (`mint_suite_token`, the PAT on curl's stdin) and uses it
+  for the health probes, the member wait and the whole suite (`AEROL_PAT`);
+  the PAT itself goes to the suite as `AEROL_OPERATOR_PAT` for the cases that
+  present it on a node's loopback.
+- **Deployment capabilities.** `pat-scope-host` and `l4-proxy-protocol` say
+  how a scenario was installed (run.sh mints the suite's token for the
+  first); `pat-rotation` opts a scenario into UC-277's two rolling restarts.
+  The CLI cases (UC-279's `aerolvm audit search` and `access review`,
+  UC-282's `aerolvm login --sso --device`) run the `aerolvm` the suite
+  builds from the working tree.
+- **Disruptive cases** (`disruptive: true` scenarios only): UC-277 rotates
+  the PAT on every node (`SB_PAT_TOKEN_PREVIOUS`, `SB_OPERATOR_VOLUME_SCOPE`),
+  UC-283 refuses an enterprise boot without identity and with
+  `SB_PAT_SCOPE=any`, UC-289 restarts the single enterprise node with
+  `SB_AUDIT_API_FLOOD_CONTROL=coalesce`, UC-291 partitions a worker from the
+  server tier for 90 s (iptables, with a dead-man heal on the node), UC-292
+  kills the Raft leader during 50 token creates, and UC-293 rotates the
+  issuer's key under load.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `AEROL_TOKEN_SPRAY_RPS` / `AEROL_TOKEN_SPRAY_SECONDS` | `2000` / `10` | UC-272b's spray at one worker (the plan's 10k/s is the offline benchmark's figure) |
+| `AEROL_IDENTITY_CHAOS_RPS` | `1000` | UC-293's load while the key rotates |
+| `AEROL_WASM_REGISTER_REF` | *(unset)* | UC-294's module ref (as UC-51); skips without it |
+| `AEROL_UPGRADE_SANDBOXD_URL` / `AEROL_UPGRADE_SANDBOXD_SHA256` | *(unset)* | UC-281: the new build to roll onto a fleet provisioned from an older release; skips without them |
+
+```bash
+make integration-identity-gate                      # all five identity scenarios, cheapest first
+make integration-single                             # tokens, SSO, MCP OAuth, CLI device login, dashboard
+make integration-cluster-mixed                      # + forwards, fan-out, revoke propagation, audit search/review
+make integration-secrets-enterprise-single          # + host-scoped PAT, PROXY protocol, enterprise boot gates, flood control
+make integration-secrets-enterprise                 # + PAT rotation, leader-kill and key-rotation chaos
+make integration-secrets-hetero-lite                # + worker-partition chaos, token spray
+make integration-identity-only SCENARIO=cluster-3-mixed   # re-run the identity cases on a kept scenario
+```
+
+UC-281 needs a fleet on an older release and the new build's URL:
+
+```bash
+make itest-build && make itest-publish   # prints presigned tfvars: sandboxd_url, and checksums_url (its sandboxd line is the sha256)
+AEROL_UPGRADE_SANDBOXD_URL=... AEROL_UPGRADE_SANDBOXD_SHA256=... AEROL_TEST_RUN='^TestIdentityRollingUpgradeGate$' \
+  AEROL_ALLOW_DISRUPTIVE=1 integration-tests/run.sh cluster-3-mixed --version <tag before the identity stack>
+```
+
 ## Egress domain filtering (UC-179..UC-204)
 
 `suite/egress_fqdn_test.go`, `suite/egress_phase2_test.go`,

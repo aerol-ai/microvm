@@ -372,6 +372,35 @@ direct_resolve_ip() {
   dig +short A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | tail -1
 }
 
+# mint_suite_token <ssh_target> <pat> <scenario> [timeout_s]
+# Under SB_PAT_SCOPE=host (capability pat-scope-host; identity-and-access
+# T10) the PAT works only from a loopback peer and from mTLS cluster peers,
+# so the health probes, the member wait and the whole suite need a named
+# credential. This mints an admin avm_ token on the seed's loopback with the
+# PAT and prints it. An admin is bound to every team and holds fleet.admin,
+# so it passes every gate the PAT passed. The PAT goes to curl on stdin
+# (-H @-), never into an argv a remote `ps` or the sudo log would show.
+# Retries while the daemon is still coming up.
+mint_suite_token() {
+  local target="$1" pat="$2" scenario="$3" timeout="${4:-${AEROL_HEALTH_TIMEOUT:-600}}"
+  local deadline=$(( $(date +%s) + timeout ))
+  local body out="" token=""
+  body=$(printf '{"name":"itest-harness-%s-%s","role":"admin","team":"*","expires_in":"24h"}' "$scenario" "$(date +%s)")
+  while (( $(date +%s) < deadline )); do
+    out=$(printf 'Authorization: Bearer %s\n' "$pat" | ssh "${SSH_OPTS[@]}" "$target" \
+      "curl -sS -m 20 -X POST -H @- -H 'Content-Type: application/json' --data '${body}' http://127.0.0.1:21212/v1/tokens" 2>/dev/null) || out=""
+    token=$(printf '%s' "$out" | jq -r '.token // empty' 2>/dev/null || true)
+    if [[ "$token" == avm_* ]]; then
+      echo "mint_suite_token: admin token minted on ${target}" >&2
+      printf '%s\n' "$token"
+      return 0
+    fi
+    sleep 5
+  done
+  echo "mint_suite_token: no admin token from ${target} within ${timeout}s (last answer: ${out:0:200})" >&2
+  return 1
+}
+
 # wait_for_health <base_url> <pat> [timeout_s]
 # Polls /v1/capacity (authenticated) until HTTP 200 or timeout.
 # Default 600s, override with AEROL_HEALTH_TIMEOUT. 300s was too tight on a

@@ -171,6 +171,52 @@ const (
 	// §5.7). Advertisement + provisioning only, like CapGvisor: the scenario's
 	// tfvars turn it on. Gates UC-178.
 	CapRemoteMCP Capability = "remote-mcp"
+
+	// Identity and access (plans/identity-and-access.md, task T12; the use
+	// cases are UC-268..UC-294, §8 of the plan).
+	//
+	// CapIdentity means every node runs SB_IDENTITY_ENABLED=true: scoped
+	// avm_ API tokens work, minted at setup with the operator credential
+	// (D4; SB_ITEST_IDENTITY_FILE is gone). Set through extra_sandboxd_env.
+	CapIdentity Capability = "identity"
+	// CapIdentityOIDC means SB_IDENTITY_FILE names harness.IdentityFilePath
+	// on every node, and the suite installs the in-harness test issuer there
+	// (static JWKS, since the nodes cannot reach the operator's machine)
+	// before the first OIDC case. Needs CapIdentity.
+	CapIdentityOIDC Capability = "identity-oidc"
+	// CapTokenMirror means the cluster has worker nodes without Raft state,
+	// which check avm_ tokens against the token mirror (role-separated
+	// topologies). UC-291's partition and the token spray need one: on a
+	// 3x mixed cluster every node is a voter and there is no mirror.
+	CapTokenMirror Capability = "token-mirror"
+	// CapAuditExportS3 means the nodes export audit records to the scenario's
+	// S3 bucket (audit_export_backend = "s3") and run.sh exports its name
+	// (AEROL_AUDIT_EXPORT_BUCKET/PREFIX), so `aerolvm audit search` and
+	// `aerolvm access review` can read it with the operator's credentials.
+	// Distinct from CapAuditExport, whose cases read the receiver fixture.
+	CapAuditExportS3 Capability = "audit-export-s3"
+	// CapRollingUpgrade marks the scenario UC-281's mixed-version gate runs
+	// on. The case itself also needs AEROL_UPGRADE_SANDBOXD_URL (the new
+	// build) and a fleet provisioned from an older release (--version), and
+	// skips with that reason otherwise.
+	CapRollingUpgrade Capability = "rolling-upgrade"
+	// CapPATScopeHost: nodes run SB_PAT_SCOPE=host, installed with
+	// --pat-scope host (Terraform pat_scope = "host"), so Caddy reaches
+	// sandboxd on the public socket and the PAT works only from a loopback
+	// peer and mTLS peers. A deployment property, not a feature switch:
+	// run.sh mints an admin avm_ token on the seed and the suite uses it
+	// remotely (Scenario.PAT); Scenario.OperatorPAT is the PAT. Enterprise
+	// mode requires it.
+	CapPATScopeHost Capability = "pat-scope-host"
+	// CapL4ProxyProtocol: installed with --l4-proxy-protocol (Terraform
+	// l4_proxy_protocol = true): caddy-l4 sends PROXY v2 to the HTTPS site
+	// and Caddy forwards the client address to sandboxd (UC-288).
+	CapL4ProxyProtocol Capability = "l4-proxy-protocol"
+	// CapPATRotation opts a scenario into UC-277, which rotates the PAT
+	// (SB_PAT_TOKEN_PREVIOUS, SB_OPERATOR_VOLUME_SCOPE) on every node and
+	// restarts each one twice. Opt-in for its cost, like CapBenchmark: on an
+	// 8-node hetero cluster that is two rolling restarts of the fleet.
+	CapPATRotation Capability = "pat-rotation"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -217,6 +263,9 @@ var KnownCapabilities = map[Capability]bool{
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
 	CapClusterMTLS: true, CapAuditExport: true, CapAuditWitness: true,
 	CapRemoteMCP: true, CapEgressFQDN: true, CapPrivateCloud: true,
+	CapIdentity: true, CapIdentityOIDC: true, CapTokenMirror: true,
+	CapAuditExportS3: true, CapRollingUpgrade: true, CapPATScopeHost: true,
+	CapL4ProxyProtocol: true, CapPATRotation: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -714,6 +763,38 @@ var Registry = []UseCase{
 	// sandboxd directly and no Caddy sits on the stream's path.
 	{ID: "UC-266", Title: "An exec stream opened before another sandbox's route changes still carries stdin/stdout and its exit code afterwards (Caddy reload, stream_close_delay)", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
 	{ID: "UC-267", Title: "An aerolvm shell attached before another sandbox's route changes still answers afterwards (Caddy reload, stream_close_delay)", Requires: []Capability{CapDocker, CapDomain}, Implemented: true},
+
+	// Identity and access (plans/identity-and-access.md §8, task T12). The
+	// titles carry the plan's "pass when". UC-272b is the D21 token spray,
+	// which the plan lists with the chaos cases but gives no row of its own.
+	{ID: "UC-268", Title: "A runner token for team payments creates, execs and deletes; the sandbox is owned by team:payments and three api records name the token", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-269", Title: "The payments token reading a team-checkout sandbox gets 404, not 403", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-270", Title: "A viewer token's exec is a 403 naming sandbox.exec, and a denied api record names the token", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-271", Title: "A token revoked through node A is refused on another node within 15 s", Requires: []Capability{CapIdentity, CapCluster}, Implemented: true},
+	{ID: "UC-272", Title: "An expired token is a 401 expired; a token with a bad checksum is a 401 malformed, refused without a lookup", Requires: []Capability{CapIdentity}, Implemented: true},
+	{ID: "UC-272b", Title: "Token spray (D21): malformed and unknown avm_ tokens at volume on a worker are refused there with 401, never 5xx, with no lookup on any other node and no mirror resnapshot", Requires: []Capability{CapIdentity, CapCluster, CapTokenMirror}, Implemented: true},
+	{ID: "UC-273", Title: "An exec through edge E for a sandbox owned by O: O's api record names the token with via=E; E writes none", Requires: []Capability{CapDocker, CapIdentity, CapCluster}, Implemented: true},
+	{ID: "UC-274", Title: "An include_env list by a team token: every owner's secret_open names the token, all with one correlation id", Requires: []Capability{CapDocker, CapIdentity, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-275", Title: "A test-issuer JWT in group payments-eng is runner on payments in whoami; a wrong audience is a 401; an unknown kid triggers exactly one key fetch", Requires: []Capability{CapIdentityOIDC}, Implemented: true},
+	{ID: "UC-276", Title: "A sub added to deny_subjects is refused on every node after a SIGHUP, or within one poll without one", Requires: []Capability{CapIdentityOIDC}, Implemented: true},
+	{ID: "UC-277", Title: "PAT rotation with SB_PAT_TOKEN_PREVIOUS: old and new both work on every node, peers keep calling, and operator volumes still mount", Requires: []Capability{CapPATRotation, CapCluster}, Implemented: true},
+	{ID: "UC-278", Title: "auditor reads audit and lists sandboxes but exec, env and create are 403; viewer on * scrapes /v1/metrics, viewer on a team gets 403; /debug/vars is 403 for all three", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-279", Title: "aerolvm audit search over the S3 export finds a runner token's actions and verifies the chain; aerolvm access review lists the token's last action, flags an expired token and lists every admin", Requires: []Capability{CapDocker, CapIdentity, CapAuditExportS3}, Implemented: true},
+	{ID: "UC-280", Title: "The E2B, Daytona and Runloop facades with a team token make sandboxes owned by the team, and their records name the token", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-281", Title: "Rolling upgrade with mixed fv: no caller or request field and no api, auth_denied or identity_config record until every member is upgraded; no verify failure; writes start after the last", Requires: []Capability{CapIdentity, CapCluster, CapRollingUpgrade}, Implemented: true},
+	{ID: "UC-282", Title: "aerolvm login --sso --device against the test issuer: the saved login works, and refreshes after the ID token expires", Requires: []Capability{CapIdentityOIDC}, Implemented: true},
+	{ID: "UC-283", Title: "Enterprise mode refuses to boot with identity off, and with SB_PAT_SCOPE=any, each with a clear error; with identity on, host scope and no identity file it boots and avm_ tokens work", Requires: []Capability{CapEnterprise, CapIdentity, CapPATScopeHost}, Implemented: true},
+	{ID: "UC-284", Title: "A projected Kubernetes service-account token from the test k8s issuer is runner on the bound team, with no call to any Kubernetes API", Requires: []Capability{CapIdentityOIDC}, Implemented: true},
+	{ID: "UC-285", Title: "SB_PAT_SCOPE=host: the PAT is a 401 through Caddy and from a remote peer on 21212, works from loopback across nodes; SSO and avm_ tokens work everywhere; a viewer on * scrapes 21212", Requires: []Capability{CapIdentity, CapPATScopeHost, CapDomain}, Implemented: true},
+	{ID: "UC-286", Title: "Remote MCP OAuth: the 401 names resource_metadata, a client discovers the issuer, gets a /mcp-audience token and lists tools as runner; wrong-audience and opaque tokens are refused; the MCP token is refused on /v1", Requires: []Capability{CapIdentityOIDC, CapRemoteMCP, CapDomain}, Implemented: true},
+	{ID: "UC-287", Title: "An SSH session writes one api record with ref ssh and caller kind sandbox_key; the sandbox's create record names its creator", Requires: []Capability{CapDocker, CapIdentity, CapDomain}, Implemented: true},
+	{ID: "UC-288", Title: "A bad token from a remote host through Caddy with PROXY protocol on: the auth_denied record and origin=public carry the remote IP, not 127.0.0.1; a preview site still serves", Requires: []Capability{CapDocker, CapIdentity, CapL4ProxyProtocol, CapDomain}, Implemented: true},
+	{ID: "UC-289", Title: "Flood control coalesce: a lone team's identical execs merge uncapped; once a second team shares the node the mode is both, the flood is capped with a rate_limited record, and the second team's records are never lost", Requires: []Capability{CapDocker, CapIdentity}, Implemented: true},
+	{ID: "UC-290", Title: "The dashboard over HTTPS with the test issuer: discovery names /ui and the issuer, a dashboard ID token's whoami shows the bound role, and /ui carries its CSP", Requires: []Capability{CapIdentityOIDC, CapDomain}, Implemented: true},
+	{ID: "UC-291", Title: "Chaos: a worker partitioned from the server tier for 90 s refuses avm_ with 503 stale after 60 s while metrics.read, OIDC and the PAT keep working; after heal the mirror resyncs within one poll", Requires: []Capability{CapIdentity, CapIdentityOIDC, CapCluster, CapTokenMirror}, Implemented: true},
+	{ID: "UC-292", Title: "Chaos: the Raft leader killed during 50 token creates: no two live tokens share a name, every 201 names a token that exists and works, no 503 ever returned a secret", Requires: []Capability{CapIdentity, CapCluster}, Implemented: true},
+	{ID: "UC-293", Title: "Chaos: the test issuer's key rotated under load: at most one key refetch per minute per node, no 5xx, new-key tokens accepted within one refetch", Requires: []Capability{CapIdentityOIDC, CapCluster}, Implemented: true},
+	{ID: "UC-294", Title: "Two teams register the same WASM bytes with no id: each gets its own row, neither sees or deletes the other's, no conflict; a boot by id resolves the caller's row", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

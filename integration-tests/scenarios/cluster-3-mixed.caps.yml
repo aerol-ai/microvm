@@ -14,6 +14,15 @@ capabilities:
   # node and SB_EGRESS_FQDN_ENABLED defaults on, so the egress use cases run
   # here, each on whichever node owns its sandbox (UC-216 needs two).
   - egress-fqdn
+  # Identity and access (T12): avm_ tokens and the test issuer on every node.
+  - identity
+  - identity-oidc
+  # Every node exports audit records to the scenario's S3 bucket (UC-279).
+  - audit-export-s3
+  # UC-281's mixed-version gate runs here when the fleet is provisioned from
+  # an older release with --version and AEROL_UPGRADE_SANDBOXD_URL is set;
+  # otherwise it skips and says so.
+  - rolling-upgrade
 
 # Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
 expected_members: 3

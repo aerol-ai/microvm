@@ -27,6 +27,12 @@ caddy_shared_cert_storage = {
   enabled = false
 }
 
+# Named credentials on (T12) for UC-294: two teams' avm_ tokens register the
+# same module bytes.
+extra_sandboxd_env = {
+  SB_IDENTITY_ENABLED = "true"
+}
+
 nodes = {
   node1 = {
     role = "mixed"
