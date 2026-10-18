@@ -91,8 +91,8 @@ func TestWireIdentityFile(t *testing.T) {
 
 	cfg := config.Config{IdentityEnabled: true, IdentityFile: path}
 	opts := wireIdentityFile(ctx, cfg, rec, logger)
-	if len(opts) != 2 {
-		t.Fatalf("options = %d, want the verifier and discovery", len(opts))
+	if len(opts) != 3 {
+		t.Fatalf("options = %d, want the verifier, discovery and the MCP resource", len(opts))
 	}
 	server := api.NewServer(logger, nil, nil, nil, cfg, "pat-token", nil, opts...)
 	doc := discoveryOf(t, server)
@@ -148,5 +148,43 @@ func TestWireIdentityFileInvalidAtBoot(t *testing.T) {
 	server.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("JWT with an invalid identity file = %d, want 503", rr.Code)
+	}
+}
+
+// TestWireIdentityFileMCPResource: with remote MCP on, the RFC 9728
+// metadata follows the identity file in force (§5.14): the file's
+// mcp.resource, its mcp: true issuers and its scopes. With no good file it
+// is a 404, and so is every metadata path with MCP off.
+func TestWireIdentityFileMCPResource(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	path := filepath.Join(t.TempDir(), "identity.yaml")
+	doc := wiringIdentityFile(t, "Acme Okta") + "    mcp: true\n    mcp_audiences: [api://aerolvm-mcp]\n" +
+		"mcp:\n  resource: https://api.acme.dev/mcp\n  scopes: [api://aerolvm-mcp/mcp]\n"
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	get := func(s *api.Server) (int, string) {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil))
+		return rec.Code, rec.Body.String()
+	}
+	cfg := config.Config{IdentityEnabled: true, IdentityFile: path, MCPEnabled: true}
+	server := api.NewServer(logger, nil, nil, nil, cfg, "pat-token", nil, wireIdentityFile(ctx, cfg, &fakeIdentityRecorder{}, logger)...)
+	want := `{"resource":"https://api.acme.dev/mcp","authorization_servers":["https://acme.okta.com"],` +
+		`"scopes_supported":["api://aerolvm-mcp/mcp"],"bearer_methods_supported":["header"]}` + "\n"
+	if code, body := get(server); code != http.StatusOK || body != want {
+		t.Fatalf("metadata = %d %s", code, body)
+	}
+
+	off := cfg
+	off.MCPEnabled = false
+	if code, _ := get(api.NewServer(logger, nil, nil, nil, off, "pat-token", nil, wireIdentityFile(ctx, off, &fakeIdentityRecorder{}, logger)...)); code != http.StatusNotFound {
+		t.Fatalf("metadata with MCP off = %d, want 404", code)
+	}
+
+	if got := mcpResource(nil); got.Resource != "" || got.AuthorizationServers != nil || got.Scopes != nil {
+		t.Fatalf("no file loaded = %+v, want none", got)
 	}
 }
