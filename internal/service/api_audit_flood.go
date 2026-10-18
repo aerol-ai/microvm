@@ -124,6 +124,10 @@ type apiCoalesceKey struct {
 type apiCoalesceEntry struct {
 	first auditlog.Event
 	at    time.Time // when the first call arrived, on the control's clock
+	// seq is the arrival order. Two calls can share a clock reading (a
+	// coarse clock, or a burst within one tick), and the records must still
+	// leave in the order the calls came, not in map order.
+	seq   uint64
 	count int64
 }
 
@@ -140,6 +144,8 @@ type apiFloodControl struct {
 
 	window  time.Duration
 	pending map[apiCoalesceKey]*apiCoalesceEntry
+	// nextSeq numbers pending entries in arrival order (apiCoalesceEntry.seq).
+	nextSeq uint64
 	// nextDue is when the oldest pending merge's window closes, so the
 	// per-batch check skips the map until something is due.
 	nextDue time.Time
@@ -208,7 +214,8 @@ func (c *apiFloodControl) absorb(ev auditlog.Event) bool {
 			return true
 		}
 		if len(c.pending) < apiCoalesceMaxPending {
-			c.pending[key] = &apiCoalesceEntry{first: ev, at: now, count: 1}
+			c.nextSeq++
+			c.pending[key] = &apiCoalesceEntry{first: ev, at: now, seq: c.nextSeq, count: 1}
 			if at := now.Add(c.window); c.nextDue.IsZero() || at.Before(c.nextDue) {
 				c.nextDue = at
 			}
@@ -329,8 +336,14 @@ func (c *apiFloodControl) dueMergedAt(now time.Time, force bool) []auditlog.Even
 			c.nextDue = at
 		}
 	}
-	// Map order is random; the chain should not be.
-	sort.SliceStable(due, func(i, j int) bool { return due[i].at.Before(due[j].at) })
+	// Map order is random; the chain should not be. Arrival order breaks a
+	// tie on the clock, which a stable sort over map order cannot.
+	sort.Slice(due, func(i, j int) bool {
+		if !due[i].at.Equal(due[j].at) {
+			return due[i].at.Before(due[j].at)
+		}
+		return due[i].seq < due[j].seq
+	})
 	budget := c.currentMode().budgets()
 	out := make([]auditlog.Event, 0, len(due))
 	for _, e := range due {

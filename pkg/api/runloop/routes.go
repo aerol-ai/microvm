@@ -70,6 +70,10 @@ type handlers struct {
 	snapshots  *snapshotTracker
 	homes      *homeCache
 	recovery   execRecovery
+	// testAfterSubmit, when set, runs in executeAsync between the submit and
+	// the first read of its state. Tests only: it lets one put the watcher
+	// ahead of that read without relying on scheduling. Nil in production.
+	testAfterSubmit func(devboxID string, ref execRef)
 }
 
 func newHandlers(d Deps) *handlers {

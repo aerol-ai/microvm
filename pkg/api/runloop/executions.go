@@ -398,10 +398,23 @@ func (h *handlers) executeAsync(w http.ResponseWriter, r *http.Request, devboxID
 		h.writeToolboxError(w, err)
 		return
 	}
+	if h.testAfterSubmit != nil {
+		h.testAfterSubmit(devboxID, ref)
+	}
 	state, err := h.executionState(r.Context(), devboxID, ref)
 	if err != nil {
-		h.writeToolboxError(w, err)
-		return
+		// The submit went through; only the read right after it failed. The
+		// watcher startExecution started owns the outcome and the next read
+		// reports it, so answer what the read answers while that watcher is
+		// still running: "running". Whether this read lost the race to the
+		// watcher seeing the toolbox fail must not decide between 200 and
+		// 502 for the same request. A lost execution, an unknown or stopped
+		// devbox and a toolbox refusal still surface as before.
+		if errors.Is(err, errExecutionLost) || !toolboxUnavailable(err) || r.Context().Err() != nil {
+			h.writeToolboxError(w, err)
+			return
+		}
+		state = execState{ref: ref}
 	}
 	state.shellName = trimPtr(req.ShellName)
 	writeJSON(w, http.StatusOK, executionViewFor(devboxID, state, defaultLastN))

@@ -313,6 +313,23 @@ func waitForLeader(t *testing.T, c *Cluster, max time.Duration) {
 	t.Fatalf("cluster %q never elected a leader within %s", c.SelfNodeID(), max)
 }
 
+// waitForFollowerToReachLeader blocks until follower can forward a write to
+// leaderID: its Raft has heard from that leader, and gossip has brought it
+// the leader's internal URL. waitForVoter only proves the leader's side; a
+// follower promoted a moment ago may not have had a heartbeat yet, and then
+// a forward fails with ErrNotLeader on a slow runner.
+func waitForFollowerToReachLeader(t *testing.T, follower *Cluster, leaderID string, max time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		if follower.Leader() == leaderID && follower.gossip.peerInternalURL(leaderID) != "" {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("follower %q never learned leader %q and its internal URL within %s (knows %q)", follower.SelfNodeID(), leaderID, max, follower.Leader())
+}
+
 // waitForVoter blocks until nodeID appears in the leader's raft configuration
 // as a voter (i.e. the auto-voter promotion has fired), or fails the test.
 func waitForVoter(t *testing.T, leader *Cluster, nodeID string, max time.Duration) {

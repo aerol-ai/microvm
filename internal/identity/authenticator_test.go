@@ -156,8 +156,11 @@ func TestTokenAuthenticatorStaleAcceptAccounting(t *testing.T) {
 	if n := strings.Count(logs.String(), "stale token mirror"); n != 2 {
 		t.Fatalf("stale accept logged %d times, want 2 (once a minute):\n%s", n, logs.String())
 	}
-	// Without a logger it still counts and never panics.
+	// Without a logger it still counts and never panics. It reads the same
+	// test clock: the token was minted at testNow and expires a day later,
+	// so the real clock would refuse it as expired once that day passed.
 	quiet := NewTokenAuthenticator(lookup, nil)
+	quiet.now = a.now
 	if _, _, err := quiet.Authenticate(r, tok.Plaintext()); err != nil {
 		t.Fatal(err)
 	}

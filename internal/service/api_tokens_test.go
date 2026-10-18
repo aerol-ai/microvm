@@ -21,7 +21,11 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-var tokenSvcNow = time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+// tokenSvcNow is the service's token clock in these tests. It follows the
+// real clock (to the second, as the store keeps it) rather than a fixed date:
+// some cases hand a minted token to an authenticator that reads the real
+// clock, and a fixed date turns those into failures the day it passes.
+var tokenSvcNow = time.Now().UTC().Truncate(time.Second)
 
 func newTokenService(t *testing.T, identityOn bool) *Service {
 	t.Helper()

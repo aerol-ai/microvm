@@ -39,6 +39,13 @@ func TestAPITokenWritesGate(t *testing.T) {
 	if err := c.raft.raft.AddNonvoter("tok-gate-b", "127.0.0.1:1", 0, 0).Error(); err != nil {
 		t.Fatal(err)
 	}
+	// The test plays gossip for tok-gate-b by writing its member record into
+	// the index. Stop the real refresh loop first: its next tick rewrites the
+	// index from memberlist, which has never heard of tok-gate-b, and the gate
+	// then reads it as an unknown (fv 0) server. Under -race the case runs
+	// long enough to cross a tick, which is how CI saw "server tok-gate-b
+	// reports FSM ops version 0" at the final sweep.
+	stopGossipRefresh(t, c)
 	second := newTokenRecord(t, "ci-2", "payments", controlplane.RoleRunner)
 	if _, err := c.WriteAPIToken(ctx, APITokenWriteRequest{Token: second}); !errors.Is(err, ErrClusterVersion) {
 		t.Fatalf("a server unknown to gossip counts as an old build: %v", err)
@@ -69,8 +76,10 @@ func TestAPITokenWritesGate(t *testing.T) {
 		t.Fatalf("list = %d %v", len(list), err)
 	}
 	// aerolvm_api_tokens reads the FSM in place: both runners are live,
-	// and none is once both have expired.
-	if counts := c.CountAPITokens(time.Now()); counts[controlplane.RoleRunner] != 2 || len(counts) != 1 {
+	// and none is once both have expired. "Live" is asked at a time inside
+	// the records' fixed validity window, not the real clock, which passes
+	// their fixed expiry.
+	if counts := c.CountAPITokens(second.ExpiresAt.Add(-time.Hour)); counts[controlplane.RoleRunner] != 2 || len(counts) != 1 {
 		t.Fatalf("live counts = %v, want 2 runners", counts)
 	}
 	if counts := c.CountAPITokens(second.ExpiresAt.Add(time.Hour)); len(counts) != 0 {

@@ -1747,3 +1747,36 @@ func TestLoadFacadeConfig(t *testing.T) {
 		t.Fatalf("expected empty facade config when unset, got %+v", cfg)
 	}
 }
+
+// TestRunsSSHGateway is the one rule the daemon (start) and /health (probe)
+// share: the gateway runs on workers and the ingress when it is enabled, and
+// never on a server-only node, which owns no sandboxes and is not the public
+// SSH endpoint.
+func TestRunsSSHGateway(t *testing.T) {
+	cases := []struct {
+		name    string
+		enabled bool
+		role    string
+		want    bool
+	}{
+		{"worker", true, NodeRoleWorker, true},
+		{"ingress", true, NodeRoleIngress, true},
+		{"mixed", true, NodeRoleMixed, true},
+		{"empty role is mixed", true, "", true},
+		{"worker+ingress hybrid", true, "ingress,worker", true},
+		{"server+ingress hybrid", true, "ingress,server", true},
+		{"server+worker hybrid", true, "server,worker", true},
+		{"server-only", true, NodeRoleServer, false},
+		{"gateway off on a worker", false, NodeRoleWorker, false},
+		{"gateway off on the ingress", false, NodeRoleIngress, false},
+		{"gateway off on a server", false, NodeRoleServer, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Config{EnableSSHGateway: tc.enabled, NodeRole: tc.role}
+			if got := c.RunsSSHGateway(); got != tc.want {
+				t.Fatalf("RunsSSHGateway(enabled=%v, role=%q) = %v, want %v", tc.enabled, tc.role, got, tc.want)
+			}
+		})
+	}
+}
