@@ -18,6 +18,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/api/clusterlist"
 	"github.com/aerol-ai/microvm/pkg/api/facadeutil"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -834,6 +835,9 @@ func (h *handlers) resolveSandbox(ctx context.Context, idOrName string) (*models
 	if err != nil {
 		return nil, "", err
 	}
+	// The path named the sandbox by its name: the call's api record must
+	// carry the id, or the sandbox's own audit history would not find it.
+	auditlog.NoteSandbox(ctx, sandbox.ID)
 	return sandbox, sandbox.ID, nil
 }
 

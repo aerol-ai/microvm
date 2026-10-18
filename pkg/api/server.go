@@ -46,11 +46,15 @@ type Server struct {
 	// default PAT-then-provider chain.
 	authChain []authLink
 
-	// audit is the one seam task T5 fills with kind "api" chain records
-	// (apihttp.AuditHook). registerRoutes hands it to every surface's Route,
-	// so setting it here covers every permission-tagged route. nil (T2)
-	// records nothing.
+	// audit is the one seam that writes kind "api" chain records
+	// (apihttp.AuditHook, api_audit.go). registerRoutes hands it to every
+	// surface's Route, so setting it here covers every permission-tagged
+	// route. NewServer sets it to recordRoute unless SB_AUDIT_API_RECORDS
+	// is off; nil records nothing.
 	audit apihttp.AuditHook
+	// authDenied rate-limits auth_denied records to one per source address
+	// per minute (auth_denied.go).
+	authDenied *authDeniedLimiter
 
 	// Facade config, read once from config.Config (not per request in the
 	// facades). Each facade parses its own format.
@@ -113,6 +117,12 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 		e2bClientID:             cfg.E2BClientID,
 		runloopBlueprintMapJSON: cfg.RunloopBlueprintMapJSON,
 		mux:                     http.NewServeMux(),
+		authDenied:              newAuthDeniedLimiter(),
+	}
+	if service != nil && service.APIRecordsConfigured() {
+		// Before registerRoutes: every surface captures the hook when it
+		// mounts its routes.
+		s.audit = s.recordRoute
 	}
 	if cfg.MCPEnabled {
 		s.mcp = remotemcp.New(remotemcp.Config{
@@ -188,11 +198,13 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 	// (pseudo-permission authenticated); its tools call back into this same
 	// handler in-process with the caller's token, so each tool's inner API
 	// call is authorized by that route's own permission. The origin and host
-	// checks still run before authentication, as before.
+	// checks still run before authentication, as before. The outer request
+	// writes no api record: each tool's inner call writes its own, so one
+	// tool call is one record (§5.9).
 	if s.mcp != nil {
 		var authed http.Handler
 		outer := s.mcp.Wrap(func(next http.Handler) http.Handler {
-			authed = s.route(controlplane.PermAuthenticated, next)
+			authed = apihttp.Router{Authenticate: s.requireAuth}.Route(controlplane.PermAuthenticated, next)
 			return authed
 		})
 		mux.Handle(remotemcp.Path, apihttp.PreAuth(outer, authed))

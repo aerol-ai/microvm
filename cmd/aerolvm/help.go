@@ -305,11 +305,18 @@ const versionHelp = `Print the aerolvm version.
 Usage: aerolvm version [--json]
 `
 
-const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked.
+const auditHelp = `Verify nodes' audit logs against the heads their S3 witness locked, or
+search them for what a caller did.
 
 Usage: aerolvm audit verify --witness s3://<bucket>[/<prefix>] --since <when>
                             (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
                             [--local <node-id>=<secrets.jsonl>]... [--node <id>]...
+       aerolvm audit search --since <when> (--export ... | --export-dir <dir>)
+                            [--caller <id-or-name>] [--kind <kind>] [--sandbox <id>]
+                            [--result <result>] [--until <when>] [--witness ...]
+                            [--local ...] [--node <id>]... [--limit N]
+
+audit verify
 
 Checks that every head the witness recorded since --since links to the next
 one through the audit records, in the order they were witnessed. Records
@@ -343,9 +350,30 @@ Flags:
 
 Credentials come from the standard AWS chain and need read access only.
 
+audit search
+
+Prints every record in the window that matches the filters, then each node's
+verdict. The records are read the way audit verify reads them, so every one
+printed links into its node's chain; with --witness the heads are checked
+too, without it only the links. Exit codes are audit verify's.
+
+  --caller C        the caller's id (tok_..., operator, system:lifecycle) or
+                    display name (an email, ignoring case)
+  --kind K          api, secret_open, egress, auth_denied, ...
+  --sandbox ID      records about one sandbox
+  --result R        ok, denied, error (api records); success, failure
+  --until T         window end, same forms as --since (default: now)
+  --limit N         print at most N matches (default 1000, 0 = all); the
+                    walk and the verdict always cover the whole window
+  --witness URL     also check the witnessed heads, as audit verify does
+  --node, --local, --export, --export-dir, --since, --max-lag, --region,
+  --endpoint, --path-style, --json   as for audit verify
+
 Examples:
   aerolvm audit verify --witness s3://acme-witness/witness/ --since 30d \
       --export s3://acme-audit/audit
   aerolvm audit verify --witness s3://acme-witness --since 2026-10-01T00:00:00Z \
       --export-dir ./audit --node node-1 --local ./node-1-secrets.jsonl
+  aerolvm audit search --export s3://acme-audit/audit --caller ana@acme.com --since 7d
+  aerolvm audit search --export-dir ./audit --kind api --result denied --since 30d
 `

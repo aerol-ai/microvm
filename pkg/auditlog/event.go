@@ -58,6 +58,12 @@ type Event struct {
 	// gate) and why rolling back below the release that writes it fails
 	// strict boot verification.
 	Caller *Caller `json:"caller,omitempty"`
+	// Request describes the API call behind a kind "api" record (§5.9).
+	// Same rules as Caller, for the same reason: appended after it, a nil
+	// pointer omitted so every record written before it existed re-marshals
+	// byte for byte, never reordered, and written only behind the same
+	// cluster gate.
+	Request *Request `json:"request,omitempty"`
 }
 
 // Caller names who made the request behind a record, or which daemon

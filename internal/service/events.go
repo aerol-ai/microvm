@@ -339,6 +339,7 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 			"image", sandbox.Image,
 		)
 	}
+	s.NoteLocalOwnersChanged()
 	return nil
 }
 

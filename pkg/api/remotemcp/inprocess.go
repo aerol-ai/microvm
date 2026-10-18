@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 )
 
 // inProcessTransport hands each Go SDK request straight to sandboxd's own
@@ -26,7 +28,10 @@ type inProcessTransport struct {
 }
 
 func (t *inProcessTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	ctx := req.Context()
+	// The inner call is recorded as the tool call it is: one api record per
+	// tool call, attributed to the MCP caller, with surface "mcp" (§5.9).
+	// Only this transport sets the marker; nothing on the wire can.
+	ctx := auditlog.ContextWithSurface(req.Context(), auditlog.SurfaceMCP)
 	in := req.Clone(ctx)
 	in.RequestURI = req.URL.RequestURI()
 	in.RemoteAddr = t.remoteAddr

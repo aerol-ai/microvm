@@ -178,7 +178,15 @@ func (s *Server) authenticate(r *http.Request, bearer string) (controlplane.Acce
 			continue
 		}
 		if err == nil {
-			access, err = runPostMatchSteps(r, access)
+			if access, err = runPostMatchSteps(r, access); err != nil {
+				// The credential itself was good: a post-match step refused
+				// the request (a team it is not bound to). The caller is
+				// known, so the refusal can name them (§5.9: a 403 is an api
+				// record, not an anonymous auth_denied).
+				f := mapAuthFailure(link.kind, err)
+				f.caller, f.hasCaller = access, true
+				return controlplane.Access{}, f
+			}
 		}
 		if err != nil {
 			return controlplane.Access{}, mapAuthFailure(link.kind, err)
@@ -323,6 +331,10 @@ type authFailure struct {
 	message string
 	// retryAfter is the Retry-After seconds of a 503.
 	retryAfter int
+	// caller is the verified credential's Access when a post-match step,
+	// not the credential, refused the request; hasCaller says it is set.
+	caller    controlplane.Access
+	hasCaller bool
 }
 
 // identityStaleRetryAfter is the Retry-After of a stale-mirror 503: about
@@ -427,6 +439,7 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 		s.observeAuth(r, access, failure)
 		if failure != nil {
 			writeAuthFailure(w, surface, failure)
+			s.recordAuthFailure(r, failure)
 			return
 		}
 		ctx := controlplane.ContextWithAccess(r.Context(), access)
