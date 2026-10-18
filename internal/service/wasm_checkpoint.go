@@ -356,7 +356,7 @@ func (s *Service) rehydrateWasmIfNeeded(ctx context.Context, sandbox *models.San
 	}
 	// Unseal per-tenant registry creds so a failover peer re-pulls a private
 	// oci:// base module under the tenant's identity (codex C4).
-	if err := s.attachWasmRegistryAuth(sandbox); err != nil {
+	if err := s.attachWasmRegistryAuth(ctx, sandbox); err != nil {
 		return nil, err
 	}
 	state, err := host.RehydrateSandbox(ctx, sandbox, hostMounts)

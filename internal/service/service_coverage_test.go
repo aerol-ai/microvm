@@ -585,10 +585,10 @@ func TestAttachWasmRegistryAuth(t *testing.T) {
 	}
 	svc := &Service{cipher: cipher, logger: harness.logger}
 
-	if err := svc.attachWasmRegistryAuth(nil); err != nil {
+	if err := svc.attachWasmRegistryAuth(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.attachWasmRegistryAuth(&models.Sandbox{}); err != nil {
+	if err := svc.attachWasmRegistryAuth(context.Background(), &models.Sandbox{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -597,7 +597,7 @@ func TestAttachWasmRegistryAuth(t *testing.T) {
 		t.Fatalf("sealRegistry: %v", err)
 	}
 	sb := &models.Sandbox{ID: "sb-wasm-auth", RegistryAuthSealed: sealed}
-	if err := svc.attachWasmRegistryAuth(sb); err != nil {
+	if err := svc.attachWasmRegistryAuth(context.Background(), sb); err != nil {
 		t.Fatal(err)
 	}
 	if sb.RegistryAuth == nil || sb.RegistryAuth.Password != "p" {
@@ -607,7 +607,7 @@ func TestAttachWasmRegistryAuth(t *testing.T) {
 	// Corrupt persisted credentials fail closed; callers must not fall through
 	// to the node's ambient registry identity.
 	bad := &models.Sandbox{ID: "sb-bad", RegistryAuthSealed: []byte("not-sealed")}
-	if err := svc.attachWasmRegistryAuth(bad); err == nil {
+	if err := svc.attachWasmRegistryAuth(context.Background(), bad); err == nil {
 		t.Fatal("corrupt registry credential should fail closed")
 	}
 	if bad.RegistryAuth != nil {
@@ -1263,7 +1263,7 @@ func TestSealMountsNilCipherWave12(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected sealMounts nil cipher failure")
 	}
-	_, err = svc.UnsealRegistry("sb", []byte{1, 2, 3})
+	_, err = svc.UnsealRegistry(context.Background(), "sb", []byte{1, 2, 3})
 	if err == nil {
 		t.Fatal("expected unseal failure")
 	}
@@ -1924,7 +1924,7 @@ func TestStartReconcileLoopErrorWave14(t *testing.T) {
 func TestSealUnsealRegistryFailWave14(t *testing.T) {
 	svc, _, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	svc.cipher = newTestCipher(t)
-	_, err := svc.UnsealRegistry("sb", []byte("not-a-valid-sealed-blob"))
+	_, err := svc.UnsealRegistry(context.Background(), "sb", []byte("not-a-valid-sealed-blob"))
 	if err == nil {
 		t.Fatal("expected unseal fail")
 	}

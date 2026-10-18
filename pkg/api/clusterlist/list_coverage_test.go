@@ -152,7 +152,7 @@ func TestFilterLocalMergeAndFetchGaps(t *testing.T) {
 		_, _ = io.Copy(w, io.LimitReader(neverEnding{}, 8<<20+64))
 	}))
 	t.Cleanup(huge.Close)
-	if _, err := fetchPeerJSON(context.Background(), cluster.Member{NodeID: "h", Alive: true, InternalURL: huge.URL}, "/v1/sandboxes", "X-Cluster-Forwarded", "1", Options{
+	if _, err := fetchPeerJSON(context.Background(), cluster.Member{NodeID: "h", Alive: true, InternalURL: huge.URL}, "/v1/sandboxes", Options{
 		Transport: Transport{InternalClient: huge.Client(), PeerClient: func(string) *http.Client { return huge.Client() }},
 	}); err == nil || !strings.Contains(err.Error(), "8MiB") {
 		t.Fatalf("oversize body = %v", err)

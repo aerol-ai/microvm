@@ -25,9 +25,17 @@ const (
 // meta ("fv"). An old build fails an op it doesn't know, so a leader accepts
 // a write that needs a newer op only once every Raft server reports at least
 // that version (egressProfileWritesAllowed).
+//
+// fv is also the build's cross-node format version: a feature that writes
+// something an older build cannot read back gates on it the same way. Bump
+// it once per release that adds such a feature, and give the feature its
+// own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 1
+	fsmOpsVersion              = 2
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
+	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
+	// field (AuditCallerWritesAllowed).
+	auditCallerFSMOpsVersion = 2
 )
 
 var (

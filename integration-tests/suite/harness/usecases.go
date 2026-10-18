@@ -470,7 +470,7 @@ var Registry = []UseCase{
 	// "secret.seal" audit event. No such event exists. internal/service emits
 	// on OPEN, not on seal: the stored kinds are secret_open, egress, gap,
 	// retention_checkpoint and retention_redacted (secret_audit.go:51-58), and
-	// the only emitter is beginSecretAuditOwned, called from the env, mounts,
+	// the only emitter is beginSecretAuditFor, called from the env, mounts,
 	// registry and cluster-placement DECRYPT paths. Asserting on a seal event
 	// would have been a test of something the product never writes. UC-110
 	// therefore asserts the observable equivalent: material sealed at create is

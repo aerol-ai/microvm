@@ -1747,7 +1747,7 @@ func TestCB96ServiceHelperBranches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (&Service{cipher: cipher, secretAudit: &cb96Sink{}}).UnsealRegistry("sb", garbage); !errors.Is(err, secrets.ErrDecryptFailed) {
+	if _, err := (&Service{cipher: cipher, secretAudit: &cb96Sink{}}).UnsealRegistry(context.Background(), "sb", garbage); !errors.Is(err, secrets.ErrDecryptFailed) {
 		t.Fatalf("unseal garbage = %v", err)
 	}
 

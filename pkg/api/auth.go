@@ -12,6 +12,7 @@ package api
 //	           ─► refusals: reason mapping (401 / 403 / 400) per surface
 
 import (
+	"context"
 	"crypto/subtle"
 	"errors"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	apie2b "github.com/aerol-ai/microvm/pkg/api/e2b"
 	"github.com/aerol-ai/microvm/pkg/api/remotemcp"
 	"github.com/aerol-ai/microvm/pkg/api/runloop"
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -197,7 +199,7 @@ func runPostMatchSteps(r *http.Request, access controlplane.Access) (controlplan
 // isForwarded reports whether a peer reverse-proxied this request on a
 // user's behalf (cluster.ForwardHTTP's Director sets the marker).
 func isForwarded(r *http.Request) bool {
-	return r.Header.Get("X-Cluster-Forwarded") == "1"
+	return r.Header.Get(cluster.HeaderForwarded) == "1"
 }
 
 // mtlsPeer returns the node id proven by the request's verified mTLS leaf.
@@ -250,9 +252,10 @@ func enforceSurface(r *http.Request, a controlplane.Access) (controlplane.Access
 }
 
 // HeaderTeam selects which of a credential's teams a request acts for (CEO
-// review D13). It is an ordinary header, so a forward keeps it and the owner
-// node applies the same selection offline.
-const HeaderTeam = "X-AerolVM-Team"
+// review D13). It is an ordinary header: a reverse-proxied forward keeps it,
+// a fan-out request gets it from cluster.StampForward, and the owner node
+// applies the same selection offline.
+const HeaderTeam = cluster.HeaderTeam
 
 // headerTeamKey is HeaderTeam in Go's canonical form. Header.Get with a
 // non-canonical key allocates a canonical copy on every request.
@@ -429,8 +432,26 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 			writeAuthFailure(w, surface, failure)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(controlplane.ContextWithAccess(r.Context(), access)))
+		ctx := controlplane.ContextWithAccess(r.Context(), access)
+		next.ServeHTTP(w, r.WithContext(withCorrelationID(ctx, r)))
 	})
+}
+
+// withCorrelationID gives every authenticated request one correlation id
+// (plans/identity-and-access.md §5.8, H3): the caller's X-Correlation-ID or
+// X-Request-ID; else one already on the context (an in-process remote MCP
+// call inside an outer request); else a fresh one. Every record the request
+// writes carries it, and cluster.StampForward sends it to each peer the
+// request is forwarded or fanned out to, so one call can be followed across
+// nodes. Minting costs one 8-byte crypto/rand read per request, no I/O.
+func withCorrelationID(ctx context.Context, r *http.Request) context.Context {
+	if id := apihttp.CorrelationID(r); id != "" {
+		return auditlog.ContextWithCorrelationID(ctx, id)
+	}
+	if auditlog.CorrelationIDFromContext(ctx) != "" {
+		return ctx
+	}
+	return auditlog.ContextWithCorrelationID(ctx, auditlog.NewCorrelationID())
 }
 
 func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure) {
