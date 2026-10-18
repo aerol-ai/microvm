@@ -163,6 +163,8 @@ USER app
 | HV‑11 | Load the bundled alerts and dashboards | 2, 3 | LT‑7 |
 | HV‑12 | Encrypt the server's disks | 3 | DP‑7 |
 | HV‑13 | Turn on [enterprise mode](#enterprise-mode) with the audit witness | 3 | LT‑8 |
+| HV‑14 | Turn on [access control](/enterprise/access-control/): SSO for people, a scoped API token for each service, and the smallest role that works | 2, 3 | IM‑5, IM‑6 |
+| HV‑15 | Limit the server token to the server with `SB_PAT_SCOPE=host` (`install.sh --pat-scope host`), after moving remote tools to named credentials | 3 | IM‑7 |
 
 ### Firewall
 
@@ -198,6 +200,8 @@ Enterprise mode is one server setting, `SB_ENTERPRISE_MODE=true`. It turns much 
 It needs:
 
 - An `SB_PAT_TOKEN` of at least 32 bytes.
+- Named credentials: `SB_IDENTITY_ENABLED=true` and `SB_PAT_SCOPE=host` (HV‑14, HV‑15). API tokens last at most 90 days. SSO is optional, so tokens-only mode works on air-gapped networks.
+- API action records on, with token and delete records written to disk before the call returns.
 - Privileged mode off and resource limits on (HV‑6).
 - The audit log sent off the server, to a webhook, S3 or a message bus (HV‑10). A webhook must use `https`.
 - An audit witness: an S3 bucket with Object Lock, plus a unique `SB_NODE_ID` on each server.

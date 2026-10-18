@@ -61,7 +61,9 @@ Every SDK needs two things:
 | Setting | What it is | Default |
 |---|---|---|
 | `SB_API_URL` | The address of your AerolVM server. | `http://127.0.0.1:21212` |
-| `SB_PAT_TOKEN` | The secret token you chose when you installed the server. | None. You must set it. |
+| `SB_PAT_TOKEN` | The secret token you chose when you installed the server. | None. You must set it, or `SB_API_TOKEN`. |
+| `SB_API_TOKEN` | The same as `SB_PAT_TOKEN`, for any credential: the server token, your own API token (`avm_…`), or a sign-in token from `aerolvm auth token`. `SB_PAT_TOKEN` wins if both are set. | None |
+| `SB_TEAM` | With [access control](/enterprise/access-control/) on, the team to act for when your credential belongs to several. | None: your first team |
 
 The easiest way is to set them in your terminal before you run your code:
 
@@ -171,7 +173,7 @@ This lists your sandboxes. If the address or token is wrong, it fails with a cle
 
 | Error | Fix |
 |---|---|
-| `PAT token is required` | Set `SB_PAT_TOKEN`, or pass the token in code. |
+| `PAT token is required` | Set `SB_PAT_TOKEN` or `SB_API_TOKEN`, or pass the token in code. |
 | `unauthorized` | The token does not match the one the server was installed with. |
 | `Connection refused` | The server is not running, or `SB_API_URL` points to the wrong address. |
 

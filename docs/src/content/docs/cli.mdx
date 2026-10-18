@@ -37,7 +37,7 @@ Then check that the CLI can reach your server:
 aerolvm health
 ```
 
-To skip the `export` lines in every new terminal, run `aerolvm login` once. It asks for the address and the token and saves them. See [Save your login](#save-your-login).
+To skip the `export` lines in every new terminal, run `aerolvm login` once. It asks for the address and the token and saves them. If your server offers single sign-on (SSO), it opens your browser to sign in with your company account instead. See [Save your login](#save-your-login).
 
 ## Your first sandbox
 
@@ -137,12 +137,127 @@ Everything else is refused. An entry can be a site name, a `*.` wildcard, `host:
 aerolvm login https://sandbox.example.com
 ```
 
-- It asks for your token with typing hidden, checks it with the server, then saves it in `~/.config/aerolvm/config.json`. Only you can read that file.
+What happens next depends on the server:
+
+- **The server offers SSO:** your browser opens your company's sign-in page. If the server offers several providers, the CLI asks which one. Afterwards the CLI prints who you are, your role and your team.
+- **No SSO:** it asks for a token with typing hidden, checks it with the server, then saves it.
+
+Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you can read that file.
+
 - With no address, it asks for one. The default is the local install, `http://127.0.0.1:21212`.
-- `SB_API_URL` and `SB_PAT_TOKEN` still win over the saved login when they are set.
-- The saved token is only ever sent to the address it was saved for.
-- In CI, pipe the token in: `aerolvm login <url> --token-stdin`.
-- `aerolvm logout` forgets the login on this machine. The token keeps working on the server.
+- `SB_API_URL` and `SB_PAT_TOKEN` (or `SB_API_TOKEN`) still win over the saved login when they are set.
+- The saved login is only ever sent to the address it was saved for.
+- An SSO login renews itself while your company allows it. When it cannot, the CLI says so: sign in again with `aerolvm login --sso <url>`.
+- In CI, pipe a token in: `aerolvm login <url> --token-stdin`.
+- `aerolvm logout` forgets the login on this machine. A token keeps working on the server.
+
+| Flag | What it does |
+|---|---|
+| `--sso` | Sign in with SSO, and fail if the server does not offer it. |
+| `--device` | Sign in with a code on another device. Use it over SSH, where no browser can open. |
+| `--issuer <name>` | Pick the sign-in provider by name, when the server offers several. |
+| `--team <team>` | The team to act for, when you belong to several. It is sent with every request. `SB_TEAM` overrides it. |
+| `--client-secret-stdin` | Read the provider app's client secret from stdin, and save it with the login. Only Google needs this. Your admin gives you the value. |
+| `--token-stdin` | Read an API token from stdin instead of signing in. |
+
+Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
+
+When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [Access control](/enterprise/access-control/) explains roles, teams and rules.
+
+### Check who you are
+
+```bash
+aerolvm whoami
+```
+
+```text
+alice@acme.com
+role     runner
+team     payments
+via      Acme Okta
+expires  in 54m (15:04 UTC)
+```
+
+`team` reads `all teams` for a credential bound to every team. `via` says how you signed in: a provider's name, `API token "<name>"`, or `server token`.
+
+Add `--explain` to see which rule (binding) gave you this role, and the claims of your own sign-in it was matched against:
+
+```text
+Why:
+  binding 3 matched, in effect: okta group="payments-eng" -> runner/payments
+  binding 5 also matched: okta group="everyone" -> viewer/*
+
+Your sign-in carried (issuer okta):
+  username  alice@acme.com
+  groups    everyone, payments-eng
+  roles     (none)
+```
+
+When a saved API token has less than 7 days left, every command prints one warning line on stderr, such as `aerolvm: warning: the API token "ci-deploy" expires in 6 days (2026-10-23). Ask an admin for a new one before then.` It never goes to stdout or `--json` output.
+
+### Print a token for scripts
+
+```bash
+SB_API_TOKEN=$(aerolvm auth token) python agent.py
+```
+
+`aerolvm auth token` prints the credential the CLI would send: your SSO sign-in (renewed first if it is about to expire), the saved API token, or `SB_PAT_TOKEN`. A sign-in token lasts about an hour, so run it again for long jobs.
+
+### Manage API tokens
+
+```bash
+aerolvm token create --name ci-deploy --role runner --team payments --expires-in 90d
+aerolvm token list
+aerolvm token revoke tok_7Hq2aBcDeFgH
+```
+
+- **`create`** prints the new token on stdout, and only this once. Store it right away. All four flags are required. `--team '*'` means every team, and `auditor` and `admin` need it.
+- **`list`** shows each token's ID, name, role, team, expiry and creator. It never shows a secret.
+- **`revoke`** takes the ID (`tok_…`) or the token itself. It succeeds even when the token is already gone. Every server stops accepting it within seconds.
+- `create` and `revoke` need an admin. `list` needs an auditor or an admin.
+
+The server needs `SB_IDENTITY_ENABLED=true` to accept the tokens it creates. See [Access control](/enterprise/access-control/#give-a-service-its-own-token).
+
+### Search audit records
+
+```bash
+aerolvm audit search --export s3://acme-audit/audit --caller ana@acme.com --since 7d
+```
+
+This finds records in your exported audit log, such as everything one person did this week. It checks each record's place in the hash chain as it reads, so what it prints is tamper-checked. It needs no server and no token.
+
+| Flag | What it does |
+|---|---|
+| `--since <when>` | Where the window starts. Required. A time, a duration such as `720h`, or days such as `30d`. |
+| `--export` or `--export-dir` | Where the exported records are. Give exactly one, as for `audit verify`. |
+| `--caller <id-or-name>` | Records for one caller: an ID (`tok_…`, `operator`, `system:lifecycle`) or a display name such as an email, in any case. |
+| `--kind <kind>` | One kind of record, such as `api`, `secret_open`, `egress` or `auth_denied`. |
+| `--sandbox <id>` | Records about one sandbox. |
+| `--result <result>` | `ok`, `denied` or `error` for API records. |
+| `--until <when>` | Where the window ends. Default: now. |
+| `--limit <n>` | Print at most this many matches. Default `1000`, and `0` prints all. |
+| `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+
+Each match is one line, then each server's verdict. Exit codes are those of `audit verify`.
+
+### Review who has access
+
+```bash
+aerolvm access review --export s3://acme-audit/audit --since 90d --identity-file identity.yaml > access-review.md
+```
+
+This writes the evidence for a quarterly access review. It joins the server's token list with your exported audit records, and flags tokens no record names, expired and expiring tokens, every admin, identity file changes, and refused calls. It needs an auditor or admin credential for the token list, and reads the export like `audit search`.
+
+| Flag | What it does |
+|---|---|
+| `--since <when>` | Where the review window starts. Required. A quarter is `90d`. |
+| `--export` or `--export-dir` | Where the exported records are. Give exactly one. |
+| `--identity-file <path>` | Also list the role rules in your identity file, and which servers run that exact file. It is read on your machine and never sent anywhere. |
+| `--format md\|csv` | Markdown (the default) or CSV. |
+| `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--json` | Print the report as JSON. |
+
+A tampered export fails the review: nothing is printed on stdout, and the command exits `1`. [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) describes every section, flag and CSV column.
 
 ### Shell details
 
@@ -178,7 +293,7 @@ Check the `code` field. It does not change between versions. Common codes are `n
 
 `exec` and `shell` exit with the remote command's own code instead. It is `128+n` when signal `n` killed the command, and `125` when `aerolvm` itself failed. `exec` exits with `124` when `--timeout` fires, and `shell` with `0` when you detach.
 
-`audit verify` exits with `3` when the result is INCOMPLETE. See [Check an audit log against its witness](#check-an-audit-log-against-its-witness).
+`audit verify`, `audit search` and `access review` exit with `3` when the result is INCOMPLETE. See [Check an audit log against its witness](#check-an-audit-log-against-its-witness).
 
 ### Safe to repeat
 
@@ -238,8 +353,92 @@ Keep exported records at least as long as your `--since` window, or the result i
 
 If two programs race to create the same name, both calls succeed. One creates the sandbox. The other gets HTTP 409 (Conflict) and should look the name up again. The CLI does that for you.
 
+## Same thing from the SDK
+
+Every command is an ordinary API call, so the SDKs do the same. This is [Your first sandbox](#your-first-sandbox) in code:
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    const sandbox = await client.create({ image: "python:3.12" });
+    const result = await sandbox.exec("python -V");
+    console.log(result.stdout);
+    await sandbox.destroy();
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    sandbox = client.create(image="python:3.12")
+    result = sandbox.exec("python -V")
+    print(result["stdout"])
+    sandbox.destroy()
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{Image: "python:3.12"})
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sandbox.Destroy(ctx)
+
+    result, err := sandbox.ExecCommand(ctx, "python -V")
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Print(result.Stdout)
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::{Client, CreateOptions};
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12".into(),
+        ..Default::default()
+    })?;
+    let result = sandbox.exec("python -V")?;
+    print!("{}", result.stdout);
+    sandbox.destroy()?;
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    import ai.aerol.microvm.MicroVMClient;
+    import ai.aerol.microvm.Sandbox;
+    import ai.aerol.microvm.model.CreateOptions;
+    import ai.aerol.microvm.model.ExecResult;
+
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN or SB_API_TOKEN
+
+    Sandbox sandbox = client.create(new CreateOptions().setImage("python:3.12"));
+    ExecResult result = sandbox.exec("python -V");
+    System.out.print(result.stdout);
+    sandbox.destroy();
+    ```
+  </TabItem>
+</Tabs>
+
+`aerolvm whoami` and `aerolvm token` are `whoami()` and `tokens` in every SDK. See [Access control](/enterprise/access-control/).
+
 ## Next steps
 
+- [Access control](/enterprise/access-control/): roles, teams, API tokens and SSO.
 - [MCP server](/mcp/): give an AI coding tool its own sandboxes through the same program.
 - [Run commands](/exec-streaming/): what `exec` does, from the SDK side.
 - [Terminal sessions](/sessions/): the shells and background commands behind `shell` and `--background`.

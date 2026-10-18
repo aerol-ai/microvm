@@ -92,7 +92,8 @@ forwards (`aerolvm_auth_failures_total{key="operator",key2="pat_origin"}`).
    `SB_PAT_SCOPE` in `/etc/sandboxd/sandboxd.env` across nodes.
 2. Set the same value everywhere through Terraform or Ansible, re-run
    install.sh with the same `--pat-scope` on the odd node (Caddy's upstream
-   must match), and restart it.
+   must match), and restart it. Read [Re-running install.sh](#re-running-installsh)
+   first: the re-run rewrites the node's settings file.
 
 ## MirrorStale
 
@@ -219,7 +220,8 @@ handshake fails.
 1. Boot logs the flag: `journalctl -u sandboxd | grep 'PROXY protocol v2'`.
 2. Check `/etc/caddy/Caddyfile` has a `servers 127.0.0.1:8443` block with
    `listener_wrappers { proxy_protocol { allow 127.0.0.1/32 } tls }`.
-3. Fix: re-run install.sh with `--l4-proxy-protocol`, or set
+3. Fix: re-run install.sh with `--l4-proxy-protocol` (see
+   [Re-running install.sh](#re-running-installsh)), or set
    `SB_L4_FALLBACK_PROXY_PROTOCOL=false` and restart sandboxd.
 4. To turn it off for good: set the flag false and restart sandboxd
    **before** removing the wrapper. The wrapper accepts connections with or
@@ -238,9 +240,13 @@ Enterprise mode requires it.
    remote SDK scripts, and the Prometheus scrape
    ([RotateScrapeToken](#rotatescrapetoken)).
 3. On every node re-run install.sh with `--pat-scope host` (optionally with
-   `--l4-proxy-protocol`). It sets `SB_PAT_SCOPE=host` and points Caddy at
-   the public socket `/run/sandboxd-public/api.sock`. Any other reverse proxy
-   on the host must use that socket too.
+   `--l4-proxy-protocol`), following [Re-running install.sh](#re-running-installsh):
+   pass every original flag and the current `--pat-token`, put back the
+   settings you added by hand (`SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE`
+   and the rest), then `systemctl restart sandboxd`. The re-run sets
+   `SB_PAT_SCOPE=host` and points Caddy at the public socket
+   `/run/sandboxd-public/api.sock`. Any other reverse proxy on the host must
+   use that socket too.
 4. Check: `stat /run/sandboxd-public /run/sandboxd-public/api.sock` shows
    `root:caddy`, `drwxr-x---` and `srw-rw----`. sandboxd refuses to boot if
    it cannot make them. A PAT through the public domain now gets 401 "the
@@ -249,9 +255,49 @@ Enterprise mode requires it.
 
 Rollback, step by step: set `SB_PAT_SCOPE=any` (refused in enterprise mode)
 and re-run install.sh with `--pat-scope any` so Caddy goes back to
-`127.0.0.1:21212`; then, if needed, `SB_IDENTITY_ENABLED=false` and restart.
+`127.0.0.1:21212` (the same [re-run rules](#re-running-installsh) apply);
+then, if needed, `SB_IDENTITY_ENABLED=false` and restart.
 Undo PROXY protocol as in [ProxyProtocolMismatch](#proxyprotocolmismatch),
 step 4.
+
+## Re-running install.sh
+
+Several steps above re-run `scripts/install.sh` on a node that is already
+installed. On Linux a re-run does three things that are easy to miss:
+
+- **It rewrites `/etc/sandboxd/sandboxd.env` from scratch** (`write_environment`
+  starts with `cat >`). Nothing from the old file is kept: the new file holds
+  only the defaults and what this run's flags produce. Every setting you
+  added by hand is gone, including `SB_IDENTITY_ENABLED`, `SB_IDENTITY_FILE`,
+  `SB_ENTERPRISE_MODE`, `SB_NODE_ID`, the audit export and witness settings,
+  `SB_OPERATOR_VOLUME_SCOPE` and `SB_PAT_TOKEN_PREVIOUS`. With
+  `SB_ENTERPRISE_MODE` gone the node boots outside enterprise mode; with
+  `SB_IDENTITY_ENABLED` gone it refuses every API token and SSO sign-in.
+- **Without `--pat-token` it makes a new random PAT** (`openssl rand -hex 24`),
+  and every client and peer still holding the old one is refused.
+- **It does not restart a running sandboxd.** `systemctl enable --now` only
+  starts a stopped unit. Caddy is restarted (the run replaces its binary), so
+  it picks up the new Caddyfile at once. Under `--pat-scope host` that means
+  Caddy proxies to `/run/sandboxd-public/api.sock` before the old sandboxd
+  process has created it, and public API calls fail until sandboxd restarts.
+
+So, on each node:
+
+1. Save the current settings: `sudo cp /etc/sandboxd/sandboxd.env /root/sandboxd.env.before`.
+2. Re-run install.sh with every flag the node was installed with, the
+   current PAT (`--pat-token "$(sudo grep '^SB_PAT_TOKEN=' /root/sandboxd.env.before | cut -d= -f2-)"`),
+   and the new flag (`--pat-scope host`, `--l4-proxy-protocol`, …).
+3. Put back what the installer did not write: compare the files
+   (`sudo diff /root/sandboxd.env.before /etc/sandboxd/sandboxd.env`) and
+   append each missing line, such as `SB_IDENTITY_ENABLED=true` and
+   `SB_ENTERPRISE_MODE=true`. If a key appears twice, systemd uses the last
+   one.
+4. `sudo systemctl restart sandboxd`, then check `journalctl -u sandboxd` for
+   a clean boot (enterprise mode names any rule that is missing).
+
+Clusters built with the project's Terraform set extra settings through its
+`extra_sandboxd_env` variable (or a node's `sandboxd_env`); keep them there,
+not only in the file on the node.
 
 ## Post-deploy checklist
 

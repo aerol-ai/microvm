@@ -32,7 +32,9 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 Run the installer again with the options you want. This also upgrades AerolVM to the newest release.
 
 <Aside type="caution">
-Each run rewrites the settings file, `/etc/sandboxd/sandboxd.env`. Pass every option again, including `--pat-token`. Without it, the installer makes a new random token, and your apps stop working until you update them. Settings you added to the file by hand are lost too.
+Each run rewrites the settings file, `/etc/sandboxd/sandboxd.env`, from scratch. Pass every option again, including `--pat-token`. Without it, the installer makes a new random token, and your apps stop working until you update them. Settings you added to the file by hand are lost too, such as `SB_IDENTITY_ENABLED`, `SB_ENTERPRISE_MODE` or the audit witness settings. Save a copy of the file first, and add those lines back afterwards.
+
+A run does not restart a server that is already running. Run `sudo systemctl restart sandboxd` afterwards, so the new settings and program take effect.
 </Aside>
 
 ## Add more kinds of sandbox
@@ -149,6 +151,8 @@ Add `SB_ENABLE_WASM=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`
 | `--tls-issuer internal` | Caddy's own certificate authority signs every certificate. No DNS provider needed, but clients must trust Caddy's root certificate. For labs. |
 | `--caddy-storage-s3` and the `--caddy-storage-s3-*` options | Share certificates between several servers through an S3 bucket. |
 | `--ingress-proxy-routing` | Route sandbox links without writing a Caddy route for each sandbox. Off by default. |
+| `--pat-scope <any\|host>` | Where the server's token (`--pat-token`) works. `any`, the default, keeps today's behavior. `host` accepts it only on the server itself (`127.0.0.1:21212`) and from other cluster servers. Everyone else must sign in with SSO or use a named API token. Caddy then talks to the server through a private socket. [Enterprise mode](/enterprise/enterprise-mode/) requires `host`. Turn it on only after every server runs a release that has it, and see the caution above about settings you added by hand. See [Access control](/enterprise/access-control/#step-5-limit-the-server-token-to-the-server). |
+| `--l4-proxy-protocol` | Domain mode only. Passes each caller's real address through Caddy to the server, so audit records and alerts show it instead of `127.0.0.1`. Off by default. |
 | `--build-from-source` | Build `sandboxd` and `toolboxd` from the current checkout instead of downloading them. |
 
 ## Next steps
