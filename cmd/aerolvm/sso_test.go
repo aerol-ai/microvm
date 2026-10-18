@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,13 +117,26 @@ type fakeIssuer struct {
 	devicePending int
 	deviceDeny    bool
 	noDevice      bool
-	scopes        []string
-	codes         map[string]fakeCode
-	refresh       map[string]bool
-	idTokens      map[string]fakeClaims
-	lastAuth      url.Values
-	grants        map[string]int
-	n             int
+	// devicePKCE is the client's PKCE method, as Keycloak enforces it on
+	// the device grant too ("" for a client without one); deviceChallenge
+	// is the challenge the device code was issued with.
+	devicePKCE      string
+	deviceChallenge string
+	// deviceStrict refuses any parameter RFC 8628 doesn't name, on the
+	// device request and on the poll.
+	deviceStrict bool
+	// deviceInvalid is an invalid_request description the device endpoint
+	// answers every request with.
+	deviceInvalid  string
+	deviceRequests []url.Values
+	devicePolls    []url.Values
+	scopes         []string
+	codes          map[string]fakeCode
+	refresh        map[string]bool
+	idTokens       map[string]fakeClaims
+	lastAuth       url.Values
+	grants         map[string]int
+	n              int
 }
 
 type fakeCode struct {
@@ -190,9 +204,23 @@ func (f *fakeIssuer) authorize(w http.ResponseWriter, r *http.Request) {
 }
 
 func oauthError(w http.ResponseWriter, status int, code string) {
+	oauthErrorDesc(w, status, code, "the fake issuer said no")
+}
+
+func oauthErrorDesc(w http.ResponseWriter, status int, code, desc string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": "the fake issuer said no"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": code, "error_description": desc})
+}
+
+// unknownParam is the first form parameter not in allowed, "" when none.
+func unknownParam(form url.Values, allowed ...string) string {
+	for k := range form {
+		if !slices.Contains(allowed, k) {
+			return k
+		}
+	}
+	return ""
 }
 
 func (f *fakeIssuer) token(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +252,19 @@ func (f *fakeIssuer) token(w http.ResponseWriter, r *http.Request) {
 		}
 		delete(f.refresh, rt) // rotation: a refresh token works once
 	case "urn:ietf:params:oauth:grant-type:device_code":
+		f.devicePolls = append(f.devicePolls, r.PostForm)
+		verifier := r.PostForm.Get("code_verifier")
+		sum := sha256.Sum256([]byte(verifier))
 		switch {
+		case f.deviceStrict && unknownParam(r.PostForm, "grant_type", "device_code", "client_id", "client_secret", "scope") != "":
+			oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", "unknown parameter: "+unknownParam(r.PostForm, "grant_type", "device_code", "client_id", "client_secret", "scope"))
+			return
+		case f.deviceChallenge != "" && base64.RawURLEncoding.EncodeToString(sum[:]) != f.deviceChallenge,
+			f.deviceChallenge == "" && verifier != "":
+			// Keycloak checks the verifier against the device code's
+			// challenge, and refuses a verifier with no challenge.
+			oauthErrorDesc(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
+			return
 		case f.deviceDeny:
 			oauthError(w, http.StatusBadRequest, "access_denied")
 			return
@@ -255,10 +295,36 @@ func (f *fakeIssuer) token(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeIssuer) device(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deviceRequests = append(f.deviceRequests, r.PostForm)
 	if r.PostForm.Get("client_id") != f.clientID {
 		oauthError(w, http.StatusUnauthorized, "invalid_client")
 		return
 	}
+	if p := unknownParam(r.PostForm, "client_id", "scope"); f.deviceStrict && p != "" {
+		oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", "unknown parameter: "+p)
+		return
+	}
+	if f.deviceInvalid != "" {
+		oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", f.deviceInvalid)
+		return
+	}
+	// Keycloak's AuthorizationEndpointChecker, which its device endpoint
+	// runs: a client with a PKCE method needs that method and a challenge.
+	method, challenge := r.PostForm.Get("code_challenge_method"), r.PostForm.Get("code_challenge")
+	switch {
+	case f.devicePKCE != "" && method == "":
+		oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", "Missing parameter: code_challenge_method")
+		return
+	case f.devicePKCE != "" && method != f.devicePKCE:
+		oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", "Invalid parameter: code challenge method is not matching the configured one")
+		return
+	case f.devicePKCE != "" && challenge == "":
+		oauthErrorDesc(w, http.StatusBadRequest, "invalid_request", "Missing parameter: code_challenge")
+		return
+	}
+	f.deviceChallenge = challenge
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"device_code": "dc-1", "user_code": "ABCD-EFGH", "verification_uri": f.URL + "/activate",
@@ -663,6 +729,112 @@ func TestSSOLoginDeviceFlowWithTeam(t *testing.T) {
 	}
 }
 
+// TestSSODeviceFlowPKCE is the Keycloak live check's B1: a provider that
+// enforces PKCE on the device grant (Keycloak 26 with a PKCE method on the
+// client) gets an S256 challenge on a second device request and the
+// verifier on every poll; a provider that refuses parameters RFC 8628
+// doesn't name gets none, which is what Okta, Entra ID and Google receive;
+// any other refusal is reported as it was. The DR15 words don't change.
+func TestSSODeviceFlowPKCE(t *testing.T) {
+	t.Run("a provider that requires PKCE on the device grant", func(t *testing.T) {
+		w := newSSOWorld(t)
+		w.issuer.devicePKCE = "S256"
+		w.issuer.devicePending = 1
+		h := w.h
+		if code := h.run("login", w.server.URL, "--device", "--team", "checkout"); code != exitOK {
+			t.Fatalf("login --device = %d %q", code, h.stderr.String())
+		}
+		checkGolden(t, "login-device.golden", w.normalize(h.stderr.String()))
+		w.issuer.set(func(f *fakeIssuer) {
+			if len(f.deviceRequests) != 2 {
+				t.Fatalf("device requests = %d, want the plain one and one with PKCE", len(f.deviceRequests))
+			}
+			first, second := f.deviceRequests[0], f.deviceRequests[1]
+			if first.Has("code_challenge") || first.Has("code_challenge_method") {
+				t.Fatalf("the first device request carried PKCE: %v", first)
+			}
+			if second.Get("code_challenge_method") != "S256" || len(second.Get("code_challenge")) != 43 {
+				t.Fatalf("the retry = %v, want an S256 challenge", second)
+			}
+			if len(f.devicePolls) != 2 {
+				t.Fatalf("polls = %d", len(f.devicePolls))
+			}
+			for _, poll := range f.devicePolls {
+				sum := sha256.Sum256([]byte(poll.Get("code_verifier")))
+				if base64.RawURLEncoding.EncodeToString(sum[:]) != second.Get("code_challenge") {
+					t.Fatalf("a poll without the verifier: %v", poll)
+				}
+			}
+		})
+		if saved := w.saved(t); saved.SSO == nil || saved.SSO.RefreshToken == "" {
+			t.Fatalf("saved = %+v", saved)
+		}
+	})
+
+	t.Run("a provider that refuses unknown parameters gets none", func(t *testing.T) {
+		w := newSSOWorld(t)
+		w.issuer.deviceStrict = true
+		if code := w.h.run("login", w.server.URL, "--device"); code != exitOK {
+			t.Fatalf("login --device = %d %q", code, w.h.stderr.String())
+		}
+		w.issuer.set(func(f *fakeIssuer) {
+			if len(f.deviceRequests) != 1 || len(f.devicePolls) != 1 || f.devicePolls[0].Has("code_verifier") {
+				t.Fatalf("device requests %v, polls %v", f.deviceRequests, f.devicePolls)
+			}
+		})
+	})
+
+	t.Run("another invalid_request is reported, not retried", func(t *testing.T) {
+		w := newSSOWorld(t)
+		w.issuer.deviceInvalid = "Invalid scopes: groups"
+		if code := w.h.run("login", w.server.URL, "--device"); code != exitError ||
+			!strings.Contains(w.h.stderr.String(), "aerolvm: Acme Okta refused the sign-in (invalid_request: Invalid scopes: groups)") {
+			t.Fatalf("login --device = %d %q", code, w.h.stderr.String())
+		}
+		w.issuer.set(func(f *fakeIssuer) {
+			if len(f.deviceRequests) != 1 {
+				t.Fatalf("device requests = %d", len(f.deviceRequests))
+			}
+		})
+	})
+
+	t.Run("PKCE is asked for once", func(t *testing.T) {
+		w := newSSOWorld(t)
+		w.issuer.devicePKCE = "plain" // the CLI sends only S256
+		if code := w.h.run("login", w.server.URL, "--device"); code != exitError ||
+			!strings.Contains(w.h.stderr.String(), "Acme Okta refused the sign-in (invalid_request: Invalid parameter: code challenge method is not matching the configured one)") {
+			t.Fatalf("login --device = %d %q", code, w.h.stderr.String())
+		}
+		w.issuer.set(func(f *fakeIssuer) {
+			if len(f.deviceRequests) != 2 {
+				t.Fatalf("device requests = %d, want 2", len(f.deviceRequests))
+			}
+		})
+		if _, err := os.Stat(w.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("a failed login saved something: %v", err)
+		}
+	})
+}
+
+func TestWantsPKCE(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"Keycloak: no method", &oauth2.RetrieveError{ErrorCode: "invalid_request", ErrorDescription: "Missing parameter: code_challenge_method"}, true},
+		{"Keycloak: no challenge", &oauth2.RetrieveError{ErrorCode: "invalid_request", ErrorDescription: "Missing parameter: code_challenge"}, true},
+		{"another server's wording", &oauth2.RetrieveError{ErrorCode: "invalid_request", ErrorDescription: "PKCE is required for this client"}, true},
+		{"another invalid_request", &oauth2.RetrieveError{ErrorCode: "invalid_request", ErrorDescription: "Invalid scopes: groups"}, false},
+		{"another error code", &oauth2.RetrieveError{ErrorCode: "invalid_client", ErrorDescription: "code_challenge"}, false},
+		{"not a provider answer", errors.New("dial tcp: connection refused"), false},
+	} {
+		if got := wantsPKCE(tc.err); got != tc.want {
+			t.Errorf("%s: wantsPKCE = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // TestSSOLoginRefusals: the DR15 "no binding" line with the ten-group cap,
 // DR8's overage and no-groups wording, a team the sign-in can't act for,
 // the D17 reasons and a 503. Nothing is saved after any of them.
@@ -917,11 +1089,12 @@ func TestSSORenewalEdge(t *testing.T) {
 	}
 }
 
-// TestSSORenewalFailure is DR15's refresh-failure line, before the command
-// sends anything, on stderr and in the --json envelope.
+// TestSSORenewalFailure is DR15's refresh-failure line for an expired ID
+// token, before the command sends anything, on stderr and in the --json
+// envelope.
 func TestSSORenewalFailure(t *testing.T) {
 	w := newSSOWorld(t)
-	w.seedLogin(t, day0.Add(10*time.Second))
+	w.seedLogin(t, day0.Add(-10*time.Second))
 	w.issuer.failRefresh = true
 	before := len(w.server.requests())
 	if code := w.h.run("list"); code != exitError {
@@ -946,6 +1119,71 @@ func TestSSORenewalFailure(t *testing.T) {
 	}
 	if code := w.h.run("whoami"); code != exitError || !strings.Contains(w.h.stderr.String(), "couldn't be renewed") {
 		t.Fatalf("no refresh token = %d %q", code, w.h.stderr.String())
+	}
+}
+
+// TestSSORenewalFailureKeepsValidToken is the Keycloak live check's B2: a
+// renewal that fails in the last minute of the ID token's life (a provider
+// outage, a network blip, a disabled user) keeps sending the current token
+// until its exp, with one warning saying until when. sandboxd decides; the
+// refresh-failure line waits until the token has actually expired.
+func TestSSORenewalFailureKeepsValidToken(t *testing.T) {
+	w := newSSOWorld(t)
+	w.server.upstream.AddSandbox(models.Sandbox{Name: "box"})
+	login := w.seedLogin(t, day0.Add(40*time.Second))
+	w.issuer.failRefresh = true
+
+	if code := w.h.run("list"); code != exitOK {
+		t.Fatalf("list = %d %q", code, w.h.stderr.String())
+	}
+	checkGolden(t, "refresh-failed-still-valid.golden", w.normalize(w.h.stderr.String()))
+	reqs := w.server.requests()
+	if last := reqs[len(reqs)-1]; last.bearer != login.Token {
+		t.Fatalf("the command sent %q, not the still-valid token", last.bearer)
+	}
+	if w.saved(t).Token != login.Token {
+		t.Fatal("a failed renewal changed the saved login")
+	}
+	// The JSON envelope and stdout stay clean; the warning is stderr only.
+	if code := w.h.run("whoami", "--json"); code != exitOK || strings.Count(w.h.stderr.String(), "warning:") != 1 {
+		t.Fatalf("whoami --json = %d %q", code, w.h.stderr.String())
+	}
+	var who models.WhoAmI
+	w.h.jsonOut(&who)
+	if who.Role != "runner" {
+		t.Fatalf("whoami --json = %+v", who)
+	}
+	// auth token prints the token that still works.
+	if code := w.h.run("auth", "token"); code != exitOK || strings.TrimSpace(w.h.stdout.String()) != login.Token {
+		t.Fatalf("auth token = %d %q %q", code, w.h.stdout.String(), w.h.stderr.String())
+	}
+	// At exp it has expired: DR15's line, and nothing is sent.
+	w.clock.Set(day0.Add(40 * time.Second))
+	before := len(w.server.requests())
+	if code := w.h.run("list"); code != exitError {
+		t.Fatalf("list at exp = %d", code)
+	}
+	checkGolden(t, "refresh-failed.golden", w.normalize(w.h.stderr.String()))
+	if len(w.server.requests()) != before {
+		t.Fatal("an expired sign-in that couldn't be renewed still called sandboxd")
+	}
+
+	// A long-running command: after a failed renewal, a 401 for a token
+	// that is still unexpired (a deny entry, say) is not worded as an
+	// expiry.
+	w.clock.Set(day0)
+	conn, err := w.h.app.prepare(context.Background(), nil)
+	if err != nil || conn.token != login.Token || !conn.sso.renewalFailed() {
+		t.Fatalf("prepare = %q, %v", conn.token, err)
+	}
+	e := w.h.app.explainRefusal(&agenttools.Error{Code: agenttools.CodeUnauthorized, HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"})
+	if e.Message != "sandboxd at "+w.server.URL+" refused your sign-in" || e.Hint != "sign in again: aerolvm login --sso "+w.server.URL {
+		t.Fatalf("explainRefusal before exp = %+v", e)
+	}
+	w.clock.Set(day0.Add(time.Minute))
+	e = w.h.app.explainRefusal(&agenttools.Error{Code: agenttools.CodeUnauthorized, HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"})
+	if e.Message != "your sign-in to "+w.server.URL+" expired and couldn't be renewed. Sign in again: aerolvm login --sso "+w.server.URL {
+		t.Fatalf("explainRefusal after exp = %+v", e)
 	}
 }
 
@@ -1415,7 +1653,7 @@ func TestSSOEdges(t *testing.T) {
 
 	// A renewal whose provider answers without an ID token fails, and the
 	// old login stays as it was.
-	before := w.seedLogin(t, day0.Add(5*time.Second))
+	before := w.seedLogin(t, day0.Add(-5*time.Second))
 	w.issuer.set(func(f *fakeIssuer) { f.noIDToken = true })
 	if code := h.run("whoami"); code != exitError || !strings.Contains(h.stderr.String(), "couldn't be renewed") || w.saved(t).Token != before.Token {
 		t.Fatalf("renewal without an ID token = %d %q", code, h.stderr.String())

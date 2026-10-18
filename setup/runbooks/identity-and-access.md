@@ -38,7 +38,7 @@ the node that serves the request.
 
 | Severity | Criteria |
 |---|---|
-| SEV-2 | `SandboxdIdentityMirrorRefusingTokens` on many nodes (CI and services are locked out), or a leaked PAT. |
+| SEV-2 | `SandboxdIdentityMirrorRefusingTokens` on many nodes (CI and services are locked out), a leaked PAT, or a leaked provider signing key ([KeyCompromise](#keycompromise)). |
 | SEV-3 | One node refuses tokens, JWKS failing for one issuer, or a scope or identity-file drift. |
 | SEV-4 | A single break-glass use you can explain, or a rejected identity-file edit. |
 
@@ -125,6 +125,30 @@ server right now".
    pointed the issuer at the right URL.
 3. While it is down, people can use an API token. See
    [ProviderOutage](#provideroutage).
+
+## KeyCompromise
+
+A provider's signing key leaked, or the provider withdrew a key it no longer
+trusts. Each node keeps the keys it fetched, so a key the provider removed
+stays trusted on that node until the node fetches again: at the hourly
+refresh, or when a token with a key id it doesn't know arrives (at most once
+a minute per issuer). A `SIGHUP` or an identity-file reload does **not**
+fetch keys again while the issuer's `url` and `jwks_file` stay the same.
+
+1. Remove the key at the provider first, so it signs nothing new.
+2. **Issuer read from discovery:** restart sandboxd on every node, one at a
+   time (`systemctl restart sandboxd`). Each node fetches the provider's
+   current keys as it starts.
+3. **Issuer with `jwks_file`:** write the new key set to a **new** file, point
+   `jwks_file` at it in the identity file, push the file to every node and
+   wait one poll (or send `SIGHUP`). A changed `jwks_file` path is a new key
+   source, which each node loads at once. Rewriting the old file in place is
+   picked up only at the next hourly refresh.
+4. Check each node: `aerolvm_identity_jwks_fetch_total{key=<issuer>,key2="ok"}`
+   went up, and a token signed with the removed key gets `401` with reason
+   `invalid_signature`.
+5. People whose sign-in was signed with the removed key get `401` and sign
+   in again; the CLI and the dashboard tell them how.
 
 ## IdentityFileDrift
 

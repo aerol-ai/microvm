@@ -147,7 +147,7 @@ Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you 
 - With no address, it asks for one. The default is the local install, `http://127.0.0.1:21212`.
 - `SB_API_URL` and `SB_PAT_TOKEN` (or `SB_API_TOKEN`) still win over the saved login when they are set.
 - The saved login is only ever sent to the address it was saved for.
-- An SSO login renews itself while your company allows it. When it cannot, the CLI says so: sign in again with `aerolvm login --sso <url>`.
+- An SSO login renews itself while your company allows it. If a renewal fails while your sign-in still works, the CLI warns you and keeps using it until it ends. Once it has ended, the CLI says so: sign in again with `aerolvm login --sso <url>`.
 - In CI, pipe a token in: `aerolvm login <url> --token-stdin`.
 - `aerolvm logout` forgets the login on this machine. A token keeps working on the server.
 
@@ -160,7 +160,7 @@ Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you 
 | `--client-secret-stdin` | Read the provider app's client secret from stdin, and save it with the login. Only Google needs this. Your admin gives you the value. |
 | `--token-stdin` | Read an API token from stdin instead of signing in. |
 
-Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
+Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
 
 When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [Access control](/enterprise/access-control/) explains roles, teams and rules.
 

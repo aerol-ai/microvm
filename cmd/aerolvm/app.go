@@ -278,6 +278,14 @@ func (a *app) note(format string, args ...any) {
 // prepare is connection plus what must happen before a command's first
 // call: an SSO login is renewed when under a minute is left (§5.6). It
 // records the connection so a refused token can be named in the error.
+//
+// A failed renewal keeps the current ID token while it is unexpired: a
+// provider outage or a network blip in the last minute of a sign-in is a
+// warning, not "sign in again". The token is used strictly until its exp.
+// sandboxd's 60 s leeway is for clock skew between machines, not extra
+// life, and this machine's clock can't tell how much of it is left, so
+// counting on it would send tokens some nodes already refuse. DR15's
+// refresh-failure line is for a token that has expired.
 func (a *app) prepare(ctx context.Context, c *commonFlags) (connection, error) {
 	conn, err := a.connection()
 	if err != nil {
@@ -291,7 +299,13 @@ func (a *app) prepare(ctx context.Context, c *commonFlags) (connection, error) {
 			if c != nil && c.debug {
 				a.note("aerolvm debug: renewing the sign-in failed: %v", err)
 			}
-			return connection{}, renewalFailedError(conn.apiURL)
+			exp := conn.sso.expiry()
+			left := exp.Sub(a.clock())
+			if left <= 0 {
+				return connection{}, renewalFailedError(conn.apiURL)
+			}
+			a.note("aerolvm: warning: your sign-in to %s couldn't be renewed. It still works until %s (%s left). If this keeps happening, sign in again: aerolvm login --sso %s",
+				conn.apiURL, exp.UTC().Format("15:04:05 UTC"), shortDuration(left), conn.apiURL)
 		}
 		conn.token = token
 	}

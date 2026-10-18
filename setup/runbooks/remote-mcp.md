@@ -215,10 +215,18 @@ access tokens):
 1. Create a client for the connector: standard flow, PKCE, the connector's
    redirect URL.
 2. Add an Audience mapper (to a client scope the connector gets, or to the
-   client) that puts your `mcp_audiences` value into access tokens.
-3. Add a Group Membership mapper with "Add to access token" on, so group
-   bindings match.
-4. The issuer's `url` is `https://<keycloak>/realms/<realm>`.
+   client) that puts your `mcp_audiences` value into access tokens: set
+   "Included Custom Audience" to it, "Add to access token" on and "Add to
+   ID token" off.
+3. Add a Group Membership mapper with the claim name `groups`, "Add to
+   access token" on and "Full group path" off, so group bindings match.
+   Full group path is on by default and sends `/platform-admins`; then no
+   `group: platform-admins` binding matches (or write the binding with the
+   slash, `group: /platform-admins`). The connector's client needs this
+   mapper too, not only the CLI and dashboard clients.
+4. The issuer's `url` is `https://<keycloak>/realms/<realm>`. Set Keycloak's
+   `hostname` option (`KC_HOSTNAME`) to that public address, so the `iss`
+   in its tokens is the same for every node and for the connector.
 
 **Zitadel** (not yet tested against a live tenant; these steps follow
 Zitadel's documentation):

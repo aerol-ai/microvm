@@ -203,10 +203,16 @@ func (s *Server) pinnedTarget(ctx context.Context, needShell bool) (*microvm.San
 		return nil, Notice{}, err
 	}
 	if !s.opts.CreateIfMissing {
+		// --create-if-missing is the local server's flag; the remote /mcp
+		// endpoint takes the same option as a URL query parameter.
+		howToCreate := "restart this server with --create-if-missing"
+		if s.opts.Remote {
+			howToCreate = "add create_if_missing=true to this connector's /mcp URL"
+		}
 		return nil, Notice{}, &agenttools.Error{
 			Code:    agenttools.CodeNotFound,
 			Message: fmt.Sprintf("the pinned sandbox %q does not exist", s.opts.Sandbox),
-			Hint:    "create it (aerolvm create --name " + s.opts.Sandbox + ") or restart this server with --create-if-missing",
+			Hint:    "create it (aerolvm create --name " + s.opts.Sandbox + ") or " + howToCreate,
 		}
 	}
 	res, err := s.tools.GetOrCreate(ctx, agenttools.CreateSpec{

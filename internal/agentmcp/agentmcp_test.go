@@ -470,6 +470,13 @@ func TestPinnedWithoutCreate(t *testing.T) {
 	if !r.isError || !strings.Contains(r.text, `the pinned sandbox "box" does not exist`) || !strings.Contains(r.text, "--create-if-missing") {
 		t.Fatalf("missing pinned = %+v", r)
 	}
+	// The remote /mcp endpoint has no flags: its hint names the URL
+	// parameter a connector user can set.
+	remote := newEnv(t, Options{Sandbox: "box", Remote: true})
+	if r := remote.call("read_file", map[string]any{"path": "/x"}); !r.isError ||
+		!strings.Contains(r.text, "add create_if_missing=true to this connector's /mcp URL") || strings.Contains(r.text, "--create-if-missing") {
+		t.Fatalf("missing pinned, remote = %+v", r)
+	}
 	e.fake.AddSandbox(models.Sandbox{Name: "box"})
 	if r := e.call("write_file", map[string]any{"path": "/a", "content": "x"}); r.isError {
 		t.Fatal(r.text)

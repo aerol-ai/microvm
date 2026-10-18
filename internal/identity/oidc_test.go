@@ -345,6 +345,80 @@ func TestVerifierKeyWithdrawal(t *testing.T) {
 	}
 }
 
+// TestVerifierWithdrawnKeyUntilNextFetch pins what the identity runbook's
+// KeyCompromise entry tells operators (Keycloak live check O1). A key the
+// provider withdrew stays trusted until this node's next fetch: an identity
+// file reload (SIGHUP) keeps the fetched key set when the issuer's source is
+// unchanged, and so does rewriting a jwks_file in place. A restart fetches
+// afresh, and so does pointing jwks_file at a new path.
+func TestVerifierWithdrawnKeyUntilNextFetch(t *testing.T) {
+	t.Run("discovery: a reload keeps the key, a restart drops it", func(t *testing.T) {
+		env := newVerifierEnv(t, "")
+		withdrawn := env.iss.Mint(t, env.claims("00u1", "payments-eng"))
+		if _, _, err := env.auth(withdrawn); err != nil {
+			t.Fatal(err)
+		}
+		env.iss.Publish(env.iss.Rotate(t, jose.RS256)) // the provider withdraws the old key
+		env.load(t, testIdentityFile(env.iss.URL, "deny_subjects: [\"test:someone-else\"]\n"))
+		env.clock.Advance(2 * time.Minute)
+		hits := env.iss.JWKSHits.Load()
+		if _, _, err := env.auth(withdrawn); err != nil {
+			t.Fatalf("after a reload, a withdrawn key is still trusted until the next fetch: %v", err)
+		}
+		if env.iss.JWKSHits.Load() != hits {
+			t.Fatal("a reload refetched the keys")
+		}
+		restarted := NewVerifier(env.cfg.Load, VerifierOptions{HTTPClient: env.iss.Client(), Now: env.clock.Now})
+		if _, _, err := restarted.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
+			t.Fatalf("after a restart: %v", err)
+		}
+	})
+
+	t.Run("jwks_file: rewriting in place waits, a new path applies at once", func(t *testing.T) {
+		iss := identitytest.New(t)
+		dir := t.TempDir()
+		write := func(name string) string {
+			path := filepath.Join(dir, name)
+			if err := os.WriteFile(path, iss.JWKS(), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}
+		var cfg atomic.Pointer[Config]
+		load := func(path, extra string) {
+			c, err := Parse([]byte(fmt.Sprintf("version: 1\nissuers:\n  - {name: eks, url: %q, jwks_file: %q, audiences: [aerolvm]}\nbindings:\n  - {issuer: eks, claim: {sub: ci}, role: runner, team: payments}\n%s", iss.URL, path, extra)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Store(c)
+		}
+		clock := newFakeClock()
+		v := NewVerifier(cfg.Load, VerifierOptions{Now: clock.Now, HTTPClient: &http.Client{Transport: failingTransport{}}})
+		auth := func(token string) error {
+			_, _, err := v.Authenticate(httptest.NewRequest(http.MethodGet, "/v1/sandboxes", nil), token)
+			return err
+		}
+		load(write("jwks-a.json"), "")
+		withdrawn := iss.Mint(t, iss.Claims(clock.Now(), "aerolvm", "ci"))
+		if err := auth(withdrawn); err != nil {
+			t.Fatal(err)
+		}
+		iss.Publish(iss.Rotate(t, jose.RS256))
+		load(write("jwks-a.json"), "deny_subjects: [\"eks:someone-else\"]\n")
+		clock.Advance(2 * time.Minute)
+		if err := auth(withdrawn); err != nil {
+			t.Fatalf("same jwks_file path after a reload: %v", err)
+		}
+		load(write("jwks-b.json"), "")
+		if err := auth(withdrawn); reasonOf(err) != controlplane.RejectInvalidSignature {
+			t.Fatalf("new jwks_file path: %v", err)
+		}
+		if err := auth(iss.Mint(t, iss.Claims(clock.Now(), "aerolvm", "ci"))); err != nil {
+			t.Fatalf("a token signed with the new key: %v", err)
+		}
+	})
+}
+
 // TestVerifierHeadersIgnored is finding 3.5: jku, x5u and an embedded jwk
 // are never used. A token the issuer signed verifies whatever those
 // headers say, and a token an attacker signed is refused even when the

@@ -36,7 +36,7 @@ On a remote server, the safest way in is an SSH tunnel: a secure link from your 
 ssh -L 21212:127.0.0.1:21212 <user>@<server-ip>
 ```
 
-Then open `http://localhost:21212/ui` in your browser.
+Then open `http://localhost:21212/ui` in your browser. Type `localhost`, not `127.0.0.1`: company sign-in sends the address you opened to your provider, and your operator registered the `localhost` one.
 
 The dashboard works on every node: server, worker or ingress (a node that takes public traffic). The node and placement lists come from the whole cluster, whichever node you open.
 
@@ -67,7 +67,7 @@ The header shows who you are: your name and an `admin` badge, or "Server token" 
 
 ### Staying signed in, and signing out
 
-- **A company sign-in lasts as long as your provider allows,** often about an hour. The page renews it on its own about two minutes before it ends. For every provider except Google, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
+- **A company sign-in lasts as long as your provider allows,** often about an hour. The page renews it on its own about two minutes before it ends. For every provider except Google, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails while your sign-in still works, nothing changes on the page: it keeps using your sign-in and tries again when it ends. Once your sign-in has ended, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
 - **Sign out** clears the tab and stops Google from signing you straight back in. It does not sign you out of your company account, the same as other company apps.
 - **Use a different account** asks your provider to let you pick another account.
 
@@ -201,7 +201,7 @@ Each alert links straight to a step-by-step runbook. See [Runbooks](/operational
 This section is for the server operator. Company sign-in on the dashboard needs [access control](/enterprise/access-control/) on, and an identity file with a dashboard app for each provider you want as a button.
 
 1. **Register a dashboard app at your provider.** Make it a single-page app, a public client with no secret, using the authorization code flow with PKCE.
-2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui`.
+2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui` as a redirect URI and `http://localhost:21212` as an allowed origin. Without that origin, the page can't finish the sign-in and says "didn't sign you in (network_error)". Register `localhost`, not `127.0.0.1`, and tell people to open the tunnel at `http://localhost:21212/ui`. A provider refuses a redirect URI it doesn't know, so a tab opened at `127.0.0.1` gets an "invalid redirect_uri" error.
 3. **Ask for the scopes `openid email profile`,** and put the groups claim in the ID token.
 4. **Add the app's client ID** to the issuer's `audiences` and as `clients.dashboard` in the identity file. Set `display_name` to the button label.
 
@@ -211,7 +211,7 @@ Only issuers with `clients.dashboard` get a button, in the order of the identity
 |---|---|
 | Okta | A Single-Page app with Authorization Code and PKCE. Add `https://<api-domain>` as a Trusted Origin for CORS. Add a groups claim to the ID token. |
 | Entra ID | An app registration with the "Single-page application" platform and the `/ui` redirect URI. Above 200 groups, Entra leaves the groups out, so bind on app roles. |
-| Keycloak | A public client with the standard flow and PKCE. Set Web origins to `https://<api-domain>`, and add a Group Membership mapper to the ID token. |
+| Keycloak | A public client with the standard flow and PKCE (`S256`). Set Web origins to `https://<api-domain>`, plus `http://localhost:21212` for an SSH tunnel. Add a Group Membership mapper to the ID token, and turn its **Full group path** off. With it on (the default), the groups arrive as `/platform-admins` and no group rule matches. |
 | Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
 | Authentik | Share one application with the CLI: a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI; Authentik then allows cross-origin calls from that address. The `profile` scope already puts `groups` in the ID token. |
 | Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [Access control](/enterprise/access-control/#zitadel-roles-as-groups) shows how. |

@@ -839,9 +839,28 @@ function issuerFromMeta(m) {
   return { name: m.issuer, display: m.display, kind: m.kind, url: m.url, client: m.client };
 }
 
-// renewDelayMs: how long until an SSO sign-in should renew (exp − 120 s).
-function renewDelayMs(expSec, nowMs) {
-  return Math.max(0, (Number(expSec) - RENEW_BEFORE_S) * 1000 - nowMs);
+// renewDelayMs: how long until an SSO sign-in should renew: exp − 120 s,
+// or, once a renewal failed while the token still worked, exp itself. Each
+// try for a code-flow provider is a full-page redirect, so a failure is
+// tried once more, when the token runs out, not on every tick.
+function renewDelayMs(expSec, nowMs, failed) {
+  const at = Number(expSec) * 1000 - (failed ? 0 : RENEW_BEFORE_S * 1000);
+  return Math.max(0, at - nowMs);
+}
+
+// tokenLive: the ID token's exp is still ahead. Strictly exp: sandboxd's
+// 60 s leeway is for clock skew between machines, not extra life.
+function tokenLive(expSec, nowMs) {
+  return typeof expSec === "number" && expSec * 1000 > nowMs;
+}
+
+// failedRenewalOutcome decides what a failed renewal does (DR6; Keycloak
+// live check B2). While the ID token still works and sandboxd hasn't
+// answered 401 `expired`, the page "keep"s the session: no banner, the
+// header and panels stay, and it renews again when the token expires.
+// Otherwise it "expire"s: the "Your sign-in expired" banner.
+function failedRenewalOutcome(reason, expSec, nowMs) {
+  return reason !== "expired" && tokenLive(expSec, nowMs) ? "keep" : "expire";
 }
 
 // The view a renewal redirect saves and restores (DR6): the placements page,
@@ -906,7 +925,7 @@ function createSingleFlight(fn) {
 // other 401 goes to onRejected.
 //
 // deps: fetch, bearer(), kind(), renewal (createSingleFlight), tracker,
-// isExpired(), onRejected(kind, reason).
+// isExpired(), onRejected(kind, reason), onExpired().
 function createAPI(deps) {
   async function request(path, opts) {
     opts = opts || {};
@@ -941,6 +960,10 @@ function createAPI(deps) {
       if (await deps.renewal.run("expired")) {
         return request(path, Object.assign({}, opts, { retried: true }));
       }
+      // sandboxd says the token expired, whatever this tab's clock says. A
+      // proactive renewal this call shared may have kept the session; this
+      // answer ends it.
+      deps.onExpired();
       throw new SessionExpired();
     }
     deps.onRejected(kind, reason);
@@ -956,14 +979,15 @@ function createAPI(deps) {
 //
 // deps: session(), recentlyRenewed(), googleRenew(meta) → Promise<bool>,
 // idle(), beginRedirect(issuer, mode) → Promise<url>, saveView(),
-// navigate(url), onFailed(), onRenewed().
+// navigate(url), onFailed(reason), onRenewed(). reason is what started the
+// renewal: "proactive", "visible" or "expired".
 function createRenewer(deps) {
-  return async function renew() {
+  return async function renew(reason) {
     const s = deps.session();
-    if (!s || deps.recentlyRenewed()) { deps.onFailed(); return false; }
+    if (!s || deps.recentlyRenewed()) { deps.onFailed(reason); return false; }
     if (s.kind === "google") {
       const ok = await deps.googleRenew(s);
-      if (ok) { deps.onRenewed(); } else { deps.onFailed(); }
+      if (ok) { deps.onRenewed(); } else { deps.onFailed(reason); }
       return ok;
     }
     await deps.idle();
@@ -971,7 +995,7 @@ function createRenewer(deps) {
     try {
       url = await deps.beginRedirect(issuerFromMeta(s), "renew");
     } catch (_) {
-      deps.onFailed();
+      deps.onFailed(reason);
       return false;
     }
     deps.saveView();
@@ -1161,7 +1185,7 @@ function boot() {
     discoveryPhase: "loading", discovery: null,
     signin: {}, noAccessBody: null, focusPending: false, buttonsKey: "",
     pageTokens: [""], pageIndex: 0, nextPageToken: "", timer: null,
-    expired: false, renewTimer: null, renewDue: false, renewedAt: 0, restoreScrollY: 0,
+    expired: false, renewTimer: null, renewDue: false, renewedAt: 0, renewFailed: false, restoreScrollY: 0,
     tracker: createTracker(),
     gis: { loading: null, issuer: null, nonce: "", width: 0, pendingRenew: null, clickAt: 0, credentialAt: 0 },
   };
@@ -1183,6 +1207,7 @@ function boot() {
     renewal: S.renewal,
     tracker: S.tracker,
     isExpired: () => S.expired,
+    onExpired: () => { if (!S.expired) { renewalFailed("expired"); } },
     onRejected: (kind, reason) => {
       clearSession();
       showSignIn({ message: rejectionMessage(kind, reason), error: true, tokenOpen: kind !== "sso" });
@@ -1252,13 +1277,15 @@ function clearSession() {
   S.sso = null;
   S.kind = "";
   S.who = null;
+  S.renewFailed = false;
   clearRenewTimer();
   stopTimer();
 }
 
 // trySignIn checks a credential with whoami and routes on the answer (DR1,
 // DR8, DR9). source is "token" (the paste box), "sso" (a provider just
-// handed it over) or "stored" (a reload).
+// handed it over), "stored" (a reload) or "kept" (a failed renewal came
+// back while the token still works).
 async function trySignIn(bearer, sso, source) {
   const kind = credentialKind(bearer, sso);
   const retry = () => trySignIn(bearer, sso, source);
@@ -1280,6 +1307,13 @@ async function trySignIn(bearer, sso, source) {
       // A reload after the token expired: renew the way the overview would.
       commitSession(bearer, sso);
       if (await S.renewal.run("expired")) { return trySignIn(S.bearer, S.sso, "renewed"); }
+      return undefined;
+    }
+    if (source === "kept" && kind === "sso" && reason === "expired") {
+      // A renewal just failed and sandboxd already counts the token expired
+      // (this tab's clock is behind): the banner, not another redirect.
+      commitSession(bearer, sso);
+      showOverview({ expired: true });
       return undefined;
     }
     if (source !== "token") { clearSession(); }
@@ -1603,12 +1637,19 @@ async function finishRedirect(cb) {
   return trySignIn(ex.idToken, ssoMetaFor(issuer, claims), "sso");
 }
 
-// renewalFailedAfterRedirect: a prompt=none renewal came back refused. The
-// overview comes back with its saved view and the banner (DR6).
+// renewalFailedAfterRedirect: a prompt=none renewal came back refused. While
+// the ID token still works, the page signs back in with it: whoami fills
+// the header, the saved view comes back, and it renews again when the token
+// expires. Once it has expired, the overview comes back with its saved view
+// and the banner (DR6).
 function renewalFailedAfterRedirect() {
   const bearer = store.get(KEYS.bearer) || "";
   const sso = parseJSON(store.get(KEYS.sso));
   if (!bearer || !sso) { return showSignIn({ message: MSG.expired, error: true, focus: true }); }
+  if (failedRenewalOutcome("redirect", sso.exp, Date.now()) === "keep") {
+    S.renewFailed = true;
+    return trySignIn(bearer, sso, "kept");
+  }
   S.bearer = bearer;
   S.sso = sso;
   S.kind = "sso";
@@ -1750,7 +1791,7 @@ async function switchAccount(name) {
 function scheduleRenewal() {
   clearRenewTimer();
   if (S.kind !== "sso" || !S.sso || typeof S.sso.exp !== "number") { return; }
-  const delay = Math.min(renewDelayMs(S.sso.exp, Date.now()), 2147483647);
+  const delay = Math.min(renewDelayMs(S.sso.exp, Date.now(), S.renewFailed), 2147483647);
   S.renewTimer = setTimeout(() => {
     S.renewTimer = null;
     if (document.hidden) {
@@ -1766,7 +1807,13 @@ function clearRenewTimer() {
   S.renewDue = false;
 }
 
-function renewalFailed() {
+function renewalFailed(reason) {
+  if (S.sso && failedRenewalOutcome(reason, S.sso.exp, Date.now()) === "keep") {
+    // The token still works: keep sending it, and try again at its exp.
+    S.renewFailed = true;
+    scheduleRenewal();
+    return;
+  }
   S.expired = true;
   stopTimer();
   clearRenewTimer();
@@ -1781,6 +1828,7 @@ function renewalFailed() {
 
 function renewalSucceeded() {
   S.expired = false;
+  S.renewFailed = false;
   el("expiry-banner").hidden = true;
   scheduleRenewal();
   if (S.view === "overview") {
@@ -2299,7 +2347,7 @@ function wire() {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden || S.view !== "overview") { return; }
     // A background tab renews when it becomes visible (DR6).
-    const due = S.renewDue || (S.kind === "sso" && S.sso && !S.expired && renewDelayMs(S.sso.exp, Date.now()) === 0);
+    const due = S.renewDue || (S.kind === "sso" && S.sso && !S.expired && renewDelayMs(S.sso.exp, Date.now(), S.renewFailed) === 0);
     if (due && !S.expired) {
       S.renewDue = false;
       S.renewal.run("visible");
@@ -2345,7 +2393,7 @@ if (globalThis.__AEROLVM_TEST__) {
     credentialKind, rejectionMessage, safeCode, b64urlEncode, b64urlDecodeText, randomToken,
     pkceChallenge, decodeJWT, checkIDToken, idTokenProblemMessage, promptFor, redirectURI,
     authorizeURL, providerMetadata, exchangeCode, callbackParams, pendingProblem, ssoMetaFor,
-    issuerFromMeta, renewDelayMs, serializeView, parseView, createTracker, createSingleFlight,
+    issuerFromMeta, renewDelayMs, tokenLive, failedRenewalOutcome, serializeView, parseView, createTracker, createSingleFlight,
     createAPI, createRenewer, signOutSession, applyDeferredSignOut, gisPromptGaveUp, aggregateCapacity,
   };
 } else {

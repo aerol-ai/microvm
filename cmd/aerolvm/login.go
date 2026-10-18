@@ -269,8 +269,10 @@ func (a *app) explainRefusal(e *agenttools.Error) *agenttools.Error {
 	}
 	refused := *e
 	switch {
-	case a.conn.sso != nil && a.conn.sso.renewalFailed():
-		// The ID token ran out mid-run and could not be renewed (DR15).
+	case a.conn.sso != nil && a.conn.sso.renewalFailed() && !a.clock().Before(a.conn.sso.expiry()):
+		// The ID token ran out and could not be renewed (DR15). While it is
+		// unexpired, a 401 is something else (a deny entry, say), and the
+		// SSO wording below fits it.
 		failed := renewalFailedError(a.conn.apiURL)
 		failed.HTTPStatus = e.HTTPStatus
 		return failed
