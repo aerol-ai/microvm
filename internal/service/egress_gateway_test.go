@@ -552,11 +552,18 @@ func TestSuperviseReleasesHoldsOnRecovery(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	// The release clears the store row first and recounts the gauge after,
+	// from the store, with the supervisor's context. Stopping the
+	// supervisor in between cancels that recount's read, so the gauge
+	// stays 1: wait for the gauge too before stopping it.
+	for svc.egressStats.held.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("held gauge must return to 0")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	cancel()
 	<-done
-	if svc.egressStats.held.Load() != 0 {
-		t.Fatal("held gauge must return to 0")
-	}
 }
 
 // TestGetShowsEgressStatus (D16): GET carries egress_status for a container
