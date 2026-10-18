@@ -309,7 +309,11 @@ func TestContainerIDAndExitNilEventPush95(t *testing.T) {
 
 func TestStreamEventsCtxDonePush95(t *testing.T) {
 	d := newTestDriver(t)
-	d.SetClient(NewTestClient("aerolvm", newFakeTransport()))
+	// A stream that stays open: the fake transport closes its event channel
+	// from a goroutine, and when that won the race StreamEvents' select had
+	// a closed stream and a done context to pick from, and half the time
+	// returned nil.
+	d.SetClient(NewTestClient("aerolvm", &openSubscribeTransport{}))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	out := make(chan docker.DockerEvent, 1)
@@ -436,4 +440,12 @@ func TestEnsureImagePullSemCancelPush95(t *testing.T) {
 	if _, err := d.ensureImage(ctx, d.client, "alpine:3.20", nil); err == nil {
 		t.Fatal("want ctx cancel while waiting for pull sem")
 	}
+}
+
+// openSubscribeTransport's event stream never ends and never errors, so
+// only the caller's context can stop a reader.
+type openSubscribeTransport struct{ fakeTransport }
+
+func (*openSubscribeTransport) subscribe(context.Context, ...string) (<-chan *events.Envelope, <-chan error) {
+	return make(chan *events.Envelope), make(chan error)
 }
