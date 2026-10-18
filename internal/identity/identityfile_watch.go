@@ -38,6 +38,8 @@ type Watcher struct {
 	// differs from the file before it, including the first. RecordChanges
 	// drains it.
 	changed chan struct{}
+	// onReload runs after every Reload but the boot load (see OnReload).
+	onReload atomic.Pointer[func()]
 }
 
 // NewWatcher loads path once. A file that is missing or invalid leaves
@@ -70,9 +72,33 @@ func (w *Watcher) BootError() error {
 	return w.bootErr
 }
 
+// OnReload registers fn to run after every later Reload, a SIGHUP or an
+// edit the poll noticed, whether or not the file changed and whether or not
+// it was valid. The daemon registers Verifier.RefetchKeys here before it
+// starts the poll and the SIGHUP handler: the keys belong to the file in
+// force, and a SIGHUP with an unchanged file is exactly how an operator
+// asks for them to be fetched again after a key compromise. fn must not
+// block; it runs on the reloading goroutine, after the reload lock is
+// released.
+func (w *Watcher) OnReload(fn func()) {
+	if w == nil || fn == nil {
+		return
+	}
+	w.onReload.Store(&fn)
+}
+
 // Reload re-reads the file now. An unchanged hash swaps nothing and signals
-// no change; an invalid file keeps the last good one.
+// no change; an invalid file keeps the last good one. Either way the
+// OnReload hook runs afterwards.
 func (w *Watcher) Reload() error {
+	err := w.reload()
+	if fn := w.onReload.Load(); fn != nil {
+		(*fn)()
+	}
+	return err
+}
+
+func (w *Watcher) reload() error {
 	w.reloadMu.Lock()
 	defer w.reloadMu.Unlock()
 	st, err := os.Stat(w.path)

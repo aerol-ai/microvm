@@ -207,6 +207,29 @@ func (v *Verifier) Bootstrap(ctx context.Context) {
 	wg.Wait()
 }
 
+// RefetchKeys starts a fetch of every issuer's keys in the identity file in
+// force, whatever the refetch gap, and returns without waiting. The daemon
+// runs it after every identity-file reload (Watcher.OnReload): a SIGHUP,
+// including one that changes nothing in the file, or an edit the poll
+// noticed. That is what lets a SIGHUP drop a key the provider withdrew
+// (the runbook's KeyCompromise entry) instead of trusting it until the
+// hourly refresh. Requests never wait on it: they verify against the keys
+// held until the fetch lands, a failed fetch keeps those keys (logged, and
+// counted in aerolvm_identity_jwks_fetch_total as an error), and a cached
+// token verified with a key the fetch withdrew is checked again (keySet.gen).
+func (v *Verifier) RefetchKeys() {
+	at := v.opts.Now()
+	// current() compiles a changed file first, which starts fetching any new
+	// issuer's keys; refetch joins those fetches rather than doubling them.
+	st, err := v.current()
+	if err != nil {
+		return
+	}
+	for _, iv := range st.issuers {
+		iv.keys.refetch(at)
+	}
+}
+
 // Run keeps keys fresh until ctx ends: every tick it retries an issuer that
 // has none yet and refreshes one whose keys are older than the refresh
 // interval. Both go through the refetch gap.

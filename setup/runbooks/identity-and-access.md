@@ -130,23 +130,29 @@ server right now".
 
 A provider's signing key leaked, or the provider withdrew a key it no longer
 trusts. Each node keeps the keys it fetched, so a key the provider removed
-stays trusted on that node until the node fetches again: at the hourly
-refresh, or when a token with a key id it doesn't know arrives (at most once
-a minute per issuer). A `SIGHUP` or an identity-file reload does **not**
-fetch keys again while the issuer's `url` and `jwks_file` stay the same.
+stays trusted on that node until the node fetches again. A node fetches at
+the hourly refresh, when a token with a key id it doesn't know arrives (at
+most once a minute per issuer), and on every identity-file reload: a
+`SIGHUP`, even with the file unchanged, or an edit the poll notices. A
+reload's fetch ignores the once-a-minute limit.
 
 1. Remove the key at the provider first, so it signs nothing new.
-2. **Issuer read from discovery:** restart sandboxd on every node, one at a
-   time (`systemctl restart sandboxd`). Each node fetches the provider's
-   current keys as it starts.
-3. **Issuer with `jwks_file`:** write the new key set to a **new** file, point
-   `jwks_file` at it in the identity file, push the file to every node and
-   wait one poll (or send `SIGHUP`). A changed `jwks_file` path is a new key
-   source, which each node loads at once. Rewriting the old file in place is
-   picked up only at the next hourly refresh.
-4. Check each node: `aerolvm_identity_jwks_fetch_total{key=<issuer>,key2="ok"}`
-   went up, and a token signed with the removed key gets `401` with reason
-   `invalid_signature`.
+2. **Issuer read from discovery:** send `SIGHUP` to sandboxd on every node
+   (`sudo systemctl kill --kill-who=main --signal=HUP sandboxd`). Each node
+   fetches the provider's current keys in the background; requests keep
+   working while it does.
+3. **Issuer with `jwks_file`:** write the new key set to every node (in place
+   or to a new path named in the identity file), then send `SIGHUP`, or wait
+   one poll if you also changed the identity file. The reload reads the
+   file again.
+4. Check each node: `aerolvm_identity_jwks_last_success_timestamp{key=<issuer>}`
+   moved past the time of the `SIGHUP`, and a token signed with the removed
+   key gets `401` with reason `invalid_signature`. If the fetch failed (the
+   provider or the file was unreachable), the node logs "refetching an
+   issuer's signing keys failed; still verifying with the keys fetched
+   before", counts `aerolvm_identity_jwks_fetch_total{key=<issuer>,key2="error"}`,
+   and keeps the old keys, the removed one included. Fix the cause and send
+   `SIGHUP` again; restarting sandboxd also works.
 5. People whose sign-in was signed with the removed key get `401` and sign
    in again; the CLI and the dashboard tell them how.
 

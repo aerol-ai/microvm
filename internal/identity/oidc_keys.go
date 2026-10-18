@@ -25,10 +25,12 @@ import (
 // An issuer's signing keys (§5.5). Keys come only from the issuer's own
 // discovery document or its jwks_file: the JWT headers jku, x5u and an
 // embedded jwk are never consulted (CEO review finding 3.5). They are
-// fetched at daemon start, refreshed hourly, and refetched on an unknown key
-// id at most once a minute per issuer. A JWKS fetch is never per request: a
-// spray of tokens with made-up key ids costs the provider one request a
-// minute per node.
+// fetched at daemon start, refreshed hourly, refetched on an unknown key
+// id at most once a minute per issuer, and refetched on every identity-file
+// reload (SIGHUP or an edit), so a key the provider withdrew stops
+// verifying without a restart. A JWKS fetch is never per request: a spray
+// of tokens with made-up key ids costs the provider one request a minute
+// per node.
 
 // MaxDocumentBytes caps a discovery or JWKS document (finding 5.5): a
 // misbehaving provider cannot make a node buffer an unbounded body.
@@ -65,8 +67,9 @@ type keySnapshot struct {
 
 // fetchCall is one in-flight fetch; waiters block on done.
 type fetchCall struct {
-	done chan struct{}
-	err  error
+	done    chan struct{}
+	err     error
+	started time.Time
 }
 
 // keySet holds one issuer's keys. The hot path is ready.Load() plus
@@ -95,6 +98,11 @@ type keySet struct {
 	mu          sync.Mutex
 	lastAttempt time.Time
 	inflight    *fetchCall
+	// refetchAfter is set when a reload asked for keys while a fetch that
+	// started before the reload was still running: that fetch may have read
+	// the provider before the change the reload is for, so another one
+	// follows it (see refetch).
+	refetchAfter time.Time
 
 	// jwksURL is the discovered JWKS endpoint, reused until a fetch fails.
 	// Only the single in-flight fetch touches it.
@@ -116,7 +124,8 @@ func newKeySet(iss *Issuer, opts *VerifierOptions) *keySet {
 }
 
 // keySetID keys the registry that keeps fetched keys across identity-file
-// reloads: an issuer whose source is unchanged keeps its keys.
+// reloads: an issuer whose source is unchanged keeps verifying with its
+// keys until the reload's refetch (Verifier.RefetchKeys) replaces them.
 func keySetID(iss *Issuer) string {
 	return iss.Name + "\x00" + iss.URL + "\x00" + iss.JWKSFile
 }
@@ -133,10 +142,7 @@ func (k *keySet) refresh(ctx context.Context, wait time.Duration) error {
 			k.mu.Unlock()
 			return errKeysRateLimited
 		}
-		k.lastAttempt = now
-		call = &fetchCall{done: make(chan struct{})}
-		k.inflight = call
-		go k.run(call)
+		call = k.startLocked(now)
 	}
 	k.mu.Unlock()
 	if wait <= 0 {
@@ -154,12 +160,53 @@ func (k *keySet) refresh(ctx context.Context, wait time.Duration) error {
 	}
 }
 
+// refetch fetches the keys again because the identity file was reloaded (a
+// SIGHUP, or an edit the poll noticed), so a key the provider withdrew
+// stops verifying at once instead of at the hourly refresh (the runbook's
+// KeyCompromise entry). It ignores the refetch gap: the gap bounds what a
+// caller's made-up key ids can trigger, and a reload is the operator's own
+// act. It never waits. Requests keep verifying against the keys already
+// held until the fetch lands, and a failed fetch keeps them, because fetch
+// only ever replaces a snapshot with a good one.
+//
+// A fetch already in flight is joined when it started at or after at. One
+// that started earlier may have read the provider (or the jwks_file) before
+// the change the reload is for, so another fetch follows it.
+func (k *keySet) refetch(at time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if call := k.inflight; call != nil {
+		if call.started.Before(at) && at.After(k.refetchAfter) {
+			k.refetchAfter = at
+		}
+		return
+	}
+	k.startLocked(k.now())
+}
+
+// startLocked starts one fetch. k.mu is held and no fetch is in flight.
+func (k *keySet) startLocked(now time.Time) *fetchCall {
+	k.lastAttempt = now
+	call := &fetchCall{done: make(chan struct{}), started: now}
+	k.inflight = call
+	go k.run(call)
+	return call
+}
+
 func (k *keySet) run(call *fetchCall) {
 	ctx, cancel := context.WithTimeout(context.Background(), k.timeout)
 	defer cancel()
 	call.err = k.fetch(ctx)
 	k.mu.Lock()
 	k.inflight = nil
+	if !k.refetchAfter.IsZero() && call.started.Before(k.refetchAfter) {
+		// A reload asked for keys newer than this fetch. The follow-up
+		// starts after that reload by construction, so it satisfies it;
+		// clearing the mark first means a clock stepped backwards cannot
+		// chain fetches.
+		k.refetchAfter = time.Time{}
+		k.startLocked(k.now())
+	}
 	k.mu.Unlock()
 	close(call.done)
 }
@@ -195,6 +242,13 @@ func (k *keySet) fetch(ctx context.Context) error {
 		}
 		observeJWKSFetch(k.issuer, result, now)
 		k.jwksURL = ""
+		if prev := k.snap.Load(); prev != nil {
+			// A refresh or a reload's refetch: the keys already held stay
+			// in force, so nothing is refused that was accepted before.
+			k.log.Warn("identity: refetching an issuer's signing keys failed; still verifying with the keys fetched before",
+				"issuer", k.issuer, "keys_fetched_at", prev.fetched.UTC().Format(time.RFC3339), "error", clip(err.Error()))
+			return err
+		}
 		k.log.Warn("identity: fetching an issuer's signing keys failed; tokens it signs get 503 until a fetch succeeds",
 			"issuer", k.issuer, "error", clip(err.Error()))
 		return err

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -122,6 +123,56 @@ func TestWatcherRunPicksUpEdits(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	cancel()
+	<-done
+}
+
+// TestWatcherOnReload: the hook runs after every Reload, whether the file
+// changed, is unchanged (a SIGHUP that only asks for the keys again) or is
+// invalid, and after the poll's reloads too, but never for the boot load.
+func TestWatcherOnReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.yaml")
+	writeIdentityFile(t, path, minimalIssuer)
+	w := NewWatcher(path, nil)
+	var calls atomic.Int32
+	w.OnReload(func() { calls.Add(1) })
+	w.OnReload(nil) // ignored: the hook stays
+	var nilWatcher *Watcher
+	nilWatcher.OnReload(func() { t.Fatal("a nil watcher has no reloads") })
+	if calls.Load() != 0 {
+		t.Fatal("the boot load ran before the hook was registered, so it must not count")
+	}
+
+	steps := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{"unchanged (a SIGHUP)", minimalIssuer, false},
+		{"changed", minimalIssuer + "deny_subjects: [\"okta:00u1\"]\n", false},
+		{"invalid", minimalIssuer + "bogus: 1\n", true},
+	}
+	for i, s := range steps {
+		writeIdentityFile(t, path, s.body)
+		if err := w.Reload(); (err != nil) != s.wantErr {
+			t.Fatalf("%s: reload err %v", s.name, err)
+		}
+		if got := calls.Load(); got != int32(i+1) {
+			t.Fatalf("%s: hook ran %d times, want %d", s.name, got, i+1)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { w.Run(ctx, 5*time.Millisecond); close(done) }()
+	// A few ticks over an unchanged mtime first: the poll must not reload,
+	// so the hook must not run.
+	time.Sleep(30 * time.Millisecond)
+	if got := calls.Load(); got != int32(len(steps)) {
+		t.Fatalf("the poll ran the hook %d times over an unchanged file", got-int32(len(steps)))
+	}
+	writeIdentityFile(t, path, minimalIssuer+"deny_subjects: [\"okta:00u2\"]\n")
+	waitFor(t, "the poll's reload to run the hook", func() bool { return calls.Load() == int32(len(steps)+1) })
 	cancel()
 	<-done
 }

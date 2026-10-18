@@ -41,6 +41,10 @@ func wireIdentityFile(ctx context.Context, cfg config.Config, rec identityRecord
 			"path", cfg.IdentityFile, "error", err)
 	}
 	v := identity.NewVerifier(w.Current, identity.VerifierOptions{Logger: logger})
+	// Every reload refetches the issuers' keys, so a SIGHUP is enough to
+	// stop trusting a key the provider withdrew. Registered before the poll
+	// and the SIGHUP handler start, so no reload can miss it.
+	w.OnReload(v.RefetchKeys)
 	go w.Run(ctx, identity.FilePollInterval)
 	go reloadIdentityOnSIGHUP(ctx, w, logger)
 	// Keys at start, through the lazy-bootstrap latch: off the boot path,
@@ -77,7 +81,8 @@ func mcpResource(c *identity.Config) api.MCPResource {
 }
 
 // reloadIdentityOnSIGHUP reloads the identity file on SIGHUP, so an
-// emergency deny_subjects entry applies at once instead of within a poll.
+// emergency deny_subjects entry applies at once instead of within a poll,
+// and the reload hook refetches every issuer's keys.
 // signal.Notify fans SIGHUP out to every channel registered for it, so this
 // and the egress operator file's reload both run.
 func reloadIdentityOnSIGHUP(ctx context.Context, w *identity.Watcher, logger *slog.Logger) {
