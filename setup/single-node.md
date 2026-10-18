@@ -189,7 +189,7 @@ languages.
 | Restart Caddy | `sudo systemctl restart caddy` |
 | Re-read PAT | `grep SB_PAT_TOKEN /etc/sandboxd/sandboxd.env` |
 | Re-read Cloudflare token | `cat /etc/default/caddy` |
-| Update binaries | Re-run the installer with the same flags. State and certs are preserved. |
+| Update binaries | Re-run the installer with the same flags, then `sudo systemctl restart sandboxd`. State and certs are preserved. |
 | List sandboxes | `curl -H "Authorization: Bearer $SB_PAT_TOKEN" https://sandbox.example.com/v1/sandboxes` |
 
 The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
@@ -251,8 +251,11 @@ its inclusion above.
 
 ## Updating
 
-Re-run the installer with the same flags. The daemon restarts in place; the
-state DB and certs are preserved.
+Re-run the installer with the same flags, then restart the daemon with
+`sudo systemctl restart sandboxd`. The state DB and certs are preserved. The
+installer restarts a running daemon on its own only when the run changed
+`/etc/sandboxd/sandboxd.env` or the unit; with the same flags neither
+changes, so the old binary keeps running until you restart it.
 
 ```bash
 curl -fsSL https://aerolvm.aerol.ai \
