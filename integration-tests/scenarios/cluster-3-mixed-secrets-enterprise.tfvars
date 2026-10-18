@@ -48,6 +48,12 @@ default_with_isolate = true
 
 extra_sandboxd_env = {
   SB_ENTERPRISE_MODE = "true"
+  # Enterprise mode requires named credentials (identity on) and a PAT
+  # confined to the host (plans/identity-and-access.md §5.12, T10); pat_scope
+  # below installs the matching Caddy half. SB_IDENTITY_FILE is where the
+  # suite installs the test issuer (capability identity-oidc).
+  SB_IDENTITY_ENABLED = "true"
+  SB_IDENTITY_FILE    = "/etc/sandboxd/itest-identity.yaml"
   # The jail is the enterprise posture; the chroot-populate blocker that used
   # to force it off is closed (pkg/isolate/chroot.go PrepareJailBase).
   SB_ISOLATE_USE_JAIL = "true"
@@ -56,6 +62,14 @@ extra_sandboxd_env = {
   # the one-day lock needs one-day retention (D13).
   SB_SECRET_AUDIT_RETENTION_DAYS = "1"
 }
+
+# install.sh --pat-scope host (T10): Caddy proxies to the public Unix socket and
+# the PAT works only from a loopback peer and mTLS peers. run.sh mints an admin
+# avm_ token on the seed for every remote call (capability pat-scope-host).
+pat_scope = "host"
+# install.sh --l4-proxy-protocol (T10): caddy-l4 hands the client address to
+# the HTTPS site, so auth_denied records name the real caller (UC-288).
+l4_proxy_protocol = true
 
 nodes = {
   node1 = { role = "mixed", seed = true, spot = true }

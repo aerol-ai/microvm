@@ -1029,6 +1029,13 @@ run_one() {
   caps_docker_netns_pool=$(yq -r '.capabilities | contains(["docker-netns-pool"])' "$caps_file")
   caps_docker_engine=$(yq -r '.capabilities | contains(["docker-engine"])' "$caps_file")
   caps_obs=$(yq -r '.capabilities | contains(["observability"])' "$caps_file")
+  # Identity and access (plans/identity-and-access.md T12). pat-scope-host:
+  # the nodes run SB_PAT_SCOPE=host, so the PAT works only from a loopback
+  # peer and every remote call needs a named token (see mint_suite_token).
+  # audit-export-s3: the suite reads the scenario's audit export bucket.
+  local caps_pat_scope_host caps_audit_export_s3
+  caps_pat_scope_host=$(yq -r '.capabilities | contains(["pat-scope-host"])' "$caps_file")
+  caps_audit_export_s3=$(yq -r '.capabilities | contains(["audit-export-s3"])' "$caps_file")
   if [[ "$caps_domain" == "true" ]]; then
     # Refused by hand, not left to errexit. The lease runs inside $(…), where
     # bash clears -e, and errexit in run_one itself is off whenever a caller
@@ -1213,6 +1220,11 @@ run_one() {
   grafana_url=$(echo "$targets" | jq -r '.grafana_url // ""')
   pushgateway_url=$(echo "$targets" | jq -r '.pushgateway_url // ""')
   pat=$(yq -r '.cluster.pat_token' "${REPO_ROOT}/config/secrets.yml")
+  # api_token is what every REMOTE call presents: the PAT, unless the
+  # scenario confines the PAT to the host, in which case it is an admin avm_
+  # token minted on the seed's loopback below. Calls made on a node over SSH
+  # (log collection, membership dumps) keep the PAT, which works there.
+  local api_token="$pat"
 
   local inconclusive=0
   if [[ "$caps_domain" == "true" ]]; then
@@ -1229,7 +1241,14 @@ run_one() {
     # later. Replacement is the COMMON case now, because the local-build
     # pipeline changes user_data on every code change.
     wait_for_tls "$leased" || echo "tls: pre-wait timed out; deferring to the health probe" >&2
-    wait_for_health "$base_url" "$pat" || inconclusive=1
+    if [[ "$caps_pat_scope_host" == "true" ]]; then
+      # Mint before the first health probe: through Caddy the PAT is a 401.
+      api_token=$(mint_suite_token "ubuntu@$(echo "$targets" | jq -r '.seed_ip')" "$pat" "$scenario") || {
+        api_token="$pat"
+        inconclusive=1
+      }
+    fi
+    wait_for_health "$base_url" "$api_token" || inconclusive=1
     # A healthy API is not a finished box. A scenario's extra_user_data runs
     # after install and may restart sandboxd and the egress gateway: the
     # private-cloud one installs dnsmasq and squid and writes the operator
@@ -1244,7 +1263,7 @@ run_one() {
       if (( ci_rc != 0 )); then
         echo "cloud-init: not confirmed done on ${seed_ip} (rc=${ci_rc}); running the suite anyway" >&2
       fi
-      wait_for_health "$base_url" "$pat" || inconclusive=1
+      wait_for_health "$base_url" "$api_token" || inconclusive=1
     fi
   else
     # local-mode: SSH tunnel to the seed, talk to localhost:21212. Unlike the
@@ -1287,7 +1306,7 @@ run_one() {
   if [[ "$inconclusive" != "1" && "$caps_wasm" == "true" ]]; then
     echo "=== staging wasm standard modules on ${scenario} ==="
     if stage_wasm_modules "${HERE}/fixtures/wasm" "${overlay}/cluster.yml" "$caps_domain" "$targets"; then
-      wait_for_health "$base_url" "$pat" || inconclusive=1
+      wait_for_health "$base_url" "$api_token" || inconclusive=1
     else
       echo "scenario ${scenario}: wasm module staging failed" >&2
       inconclusive=1
@@ -1299,7 +1318,7 @@ run_one() {
   local expected_members
   expected_members=$(yq -r '.expected_members // ""' "$caps_file")
   if [[ "$inconclusive" != "1" && "$caps_cluster" == "true" && -n "$expected_members" ]]; then
-    wait_for_members "$base_url" "$pat" "$expected_members" || inconclusive=1
+    wait_for_members "$base_url" "$api_token" "$expected_members" || inconclusive=1
   fi
 
   # Observability stack: wait for Grafana after sandboxd health (obs user_data
@@ -1351,7 +1370,7 @@ run_one() {
   if [[ "$BENCH_ONLY" == "1" ]]; then
     local bench_out="${AEROL_BENCH_OUT:-integration-tests/reports/${scenario}-bench.json}"
     set +e
-    run_bench_tests "$scenario" "$base_url" "$pat" "$caps_file" "$leased" \
+    run_bench_tests "$scenario" "$base_url" "$api_token" "$caps_file" "$leased" \
       "$expected_members" "$wasm_ref" "$bench_out"
     local test_rc=$?
     set -e
@@ -1448,6 +1467,16 @@ run_one() {
     export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-$witness_region}"
   fi
 
+  # The audit export bucket, for the auditor's tools (UC-279). Empty unless
+  # the scenario exports to S3.
+  local audit_export_bucket="" audit_export_prefix=""
+  if [[ "$caps_audit_export_s3" == "true" ]]; then
+    audit_export_bucket=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+      output -raw audit_export_bucket 2>/dev/null) || audit_export_bucket=""
+    audit_export_prefix=$(TF_DATA_DIR="$sdir" terraform -chdir="${REPO_ROOT}/Terraform" \
+      output -raw audit_export_prefix 2>/dev/null) || audit_export_prefix=""
+  fi
+
     # 150m, not 60m: the 8-member hetero suite runs every disruptive case
     # with real rejoin waits, and T18's first scenario was killed by the 60m
     # timeout one file before UC-170 — the case the run existed to prove. A
@@ -1456,11 +1485,13 @@ run_one() {
     # command: a comment line inside a backslash continuation ends it, and
     # every AEROL_* assignment above silently stops applying — which is
     # exactly how this comment first broke the suite.)
-  AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
+  AEROL_BASE_URL="$base_url" AEROL_PAT="$api_token" AEROL_OPERATOR_PAT="$pat" AEROL_SCENARIO="$scenario" \
     AEROL_CAPS="${caps_file}" \
     AEROL_DOMAIN="${leased}" \
     AEROL_EXPECTED_MEMBERS="${expected_members}" \
     AEROL_INTEGRATION_TARGETS="${targets}" \
+    AEROL_AUDIT_EXPORT_BUCKET="${audit_export_bucket}" \
+    AEROL_AUDIT_EXPORT_PREFIX="${audit_export_prefix}" \
     AEROL_AUDIT_WITNESS_BUCKET="${witness_bucket}" \
     AEROL_AUDIT_WITNESS_PREFIX="${witness_prefix}" \
     AEROL_AUDIT_WITNESS_REGION="${witness_region:-us-east-1}" \
@@ -1493,7 +1524,7 @@ run_one() {
       pass=$((pass + 1))
       echo "=== soak pass ${pass} ===" >&2
       set +e
-      AEROL_BASE_URL="$base_url" AEROL_PAT="$pat" AEROL_SCENARIO="$scenario" \
+      AEROL_BASE_URL="$base_url" AEROL_PAT="$api_token" AEROL_OPERATOR_PAT="$pat" AEROL_SCENARIO="$scenario" \
         AEROL_CAPS="${caps_file}" \
         AEROL_DOMAIN="${leased}" \
         AEROL_EXPECTED_MEMBERS="${expected_members}" \

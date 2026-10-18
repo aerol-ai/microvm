@@ -22,7 +22,7 @@ BIN_DIR ?= bin
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
 	integration-routing integration-routing-hetero-lite \
-	integration-bench-cluster
+	integration-bench-cluster integration-identity-gate integration-identity-only
 
 fmt:
 	$(GO) fmt ./...
@@ -209,6 +209,20 @@ integration-secrets-only:
 # Narrow it further ad hoc: make integration-secrets-only SECRETS_TEST_RUN='TestOwnerDeath.*'
 SECRETS_TEST_RUN ?= $(shell cat integration-tests/lib/secrets-tests.regex)
 SCENARIO ?= cluster-3-mixed-secrets
+
+# Identity and access (plans/identity-and-access.md T12, UC-268..UC-294).
+# The base pair carries the token and SSO cases; the enterprise pair adds the
+# host-scoped PAT, PROXY protocol, PAT rotation and the enterprise boot gates;
+# hetero-lite adds the worker-partition chaos (UC-291) and the token spray
+# (UC-272b). Cheapest first, sequential because they share the domain pool.
+integration-identity-gate: integration-single integration-cluster-mixed integration-secrets-enterprise-single integration-secrets-enterprise integration-secrets-hetero-lite
+
+# Re-run only the identity cases against a scenario kept up with `keep`.
+# Partial report, like integration-secrets-only.
+#   make integration-identity-only SCENARIO=cluster-3-mixed
+integration-identity-only:
+	AEROL_TEST_RUN='$(IDENTITY_TEST_RUN)' integration-tests/run.sh $(SCENARIO) $(RUN_FLAGS)
+IDENTITY_TEST_RUN ?= ^TestIdentity
 
 # The latency arm UC-165's band is measured against (D5: baseline is
 # main-built binaries via `make itest-build BUILD_FLAGS="--ref main"`).

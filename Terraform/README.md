@@ -143,7 +143,11 @@ phases:
    --dns-provider cloudflare --dns-api-token <cloudflare.api_token>` so the
    per-node Caddy gets a real wildcard cert via Let's Encrypt DNS-01. Optional
    `--with-gvisor` / `--with-nvidia-gpu` / `--with-amd-gpu` /
-   `--idle-timeout-min` are appended from per-node flags. If `domain_name` is
+   `--idle-timeout-min` are appended from per-node flags, and the
+   cluster-wide `pat_scope = "host"` and `l4_proxy_protocol = true` add
+   `--pat-scope host` (the PAT only from this host and cluster peers, Caddy on
+   the public socket; enterprise mode requires it) and `--l4-proxy-protocol`
+   (the real client address through Caddy). If `domain_name` is
    empty the DNS-01 args are dropped and install.sh falls back to IP/path mode
    with no TLS.
 2. **Seed only - `cluster-init.sh`** with `--role <seed-role>
