@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -200,7 +201,8 @@ func TestWireIdentityFileMCPResource(t *testing.T) {
 // runbook's KeyCompromise entry) while the current key keeps working.
 // Before the hook, the dropped key stayed trusted until the hourly refresh.
 func TestWireIdentityFileSIGHUPRefetchesKeys(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logs := &logRecorder{}
+	logger := slog.New(logs)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	iss := identitytest.New(t)
@@ -253,7 +255,53 @@ func TestWireIdentityFileSIGHUPRefetchesKeys(t *testing.T) {
 		_ = syscall.Kill(os.Getpid(), syscall.SIGHUP)
 		time.Sleep(20 * time.Millisecond)
 	}
-	if code := whoami(iss.Mint(t, iss.Claims(time.Now(), "aerolvm", "ci"))); code != http.StatusOK {
+	current := iss.Mint(t, iss.Claims(time.Now(), "aerolvm", "ci"))
+	if code := whoami(current); code != http.StatusOK {
 		t.Fatalf("a token signed with the current key after the SIGHUP = %d, want 200", code)
 	}
+
+	// A SIGHUP over a broken edit keeps the last good file, logs it, and
+	// still refetches the keys of the file in force: nothing that worked
+	// stops working.
+	if err := os.WriteFile(path, []byte("version: 1\nbogus: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for !logs.saw("identity file reload failed") {
+		if time.Now().After(deadline) {
+			t.Fatal("a SIGHUP over an invalid identity file was never reported")
+		}
+		_ = syscall.Kill(os.Getpid(), syscall.SIGHUP)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if code := whoami(current); code != http.StatusOK {
+		t.Fatalf("after a SIGHUP over an invalid file, a token that worked = %d, want 200", code)
+	}
+}
+
+// logRecorder is a slog handler that remembers every message, so a test can
+// wait for a log line written on another goroutine.
+type logRecorder struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (l *logRecorder) Enabled(context.Context, slog.Level) bool { return true }
+func (l *logRecorder) Handle(_ context.Context, r slog.Record) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.msgs = append(l.msgs, r.Message)
+	return nil
+}
+func (l *logRecorder) WithAttrs([]slog.Attr) slog.Handler { return l }
+func (l *logRecorder) WithGroup(string) slog.Handler      { return l }
+
+func (l *logRecorder) saw(prefix string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, m := range l.msgs {
+		if strings.HasPrefix(m, prefix) {
+			return true
+		}
+	}
+	return false
 }
