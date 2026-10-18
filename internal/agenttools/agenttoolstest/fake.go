@@ -972,8 +972,12 @@ func (s *Server) liveAttach(conn *websocket.Conn, session *Session, replay []byt
 	stdinR, stdinW := io.Pipe()
 	detached := make(chan struct{})
 	go func() {
-		defer close(detached)
+		// Deferred calls run last-first: detached closes before stdin does,
+		// so a command that ends on the stdin EOF already sees the detach
+		// and reports nothing. The other order let it write an exit message
+		// in between.
 		defer stdinW.Close()
+		defer close(detached)
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
