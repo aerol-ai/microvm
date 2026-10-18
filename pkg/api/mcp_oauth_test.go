@@ -367,10 +367,12 @@ func TestMCPToolCallUsesTheHandoff(t *testing.T) {
 		t.Fatalf("exec = %q; the name lookup must succeed as the caller through the hand-off", text)
 	}
 	sink.reset()
-	if _, _ = toolText(t, cs, "expose_port", map[string]any{"port": 8080}); len(sink.records()) != 1 {
-		t.Fatalf("one tool call wrote %d records: %+v", len(sink.records()), sink.records())
+	toolText(t, cs, "expose_port", map[string]any{"port": 8080})
+	recs := sink.waitRecords(t, 1)
+	if len(recs) != 1 {
+		t.Fatalf("one tool call wrote %d records: %+v", len(recs), recs)
 	}
-	ev := sink.records()[0]
+	ev := recs[0]
 	want := &auditlog.Caller{Kind: "oidc", ID: "oidc:okta:ana", Name: "ana@acme.com", Team: "payments"}
 	if ev.Ref != "POST /v1/sandboxes/{id}/ports/{port}" || ev.Request.Surface != auditlog.SurfaceMCP || !reflect.DeepEqual(ev.Caller, want) {
 		t.Fatalf("tool call record = %+v caller %+v request %+v", ev, ev.Caller, ev.Request)
@@ -669,7 +671,7 @@ func TestMCPInnerCallTeamIsTheCallers(t *testing.T) {
 		}
 		sink.reset()
 		toolText(t, cs, "expose_port", map[string]any{"port": 8080})
-		if got := sink.records(); len(got) != 1 || got[0].Caller == nil || got[0].Caller.Team != "billing" {
+		if got := sink.waitRecords(t, 1); len(got) != 1 || got[0].Caller == nil || got[0].Caller.Team != "billing" {
 			t.Fatalf("the inner call's record must name team billing: %+v", got)
 		}
 	})
