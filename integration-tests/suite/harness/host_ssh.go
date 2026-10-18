@@ -232,3 +232,40 @@ func SSHForward(t *testing.T, node IntegrationNode, remote string) string {
 	t.Fatalf("ssh -L %s:%s to %s never came up: %s", local, remote, node.Name, strings.TrimSpace(stderr.String()))
 	return ""
 }
+
+// reverseForwardUpScript reports whether something listens on the node's
+// 127.0.0.1:<port>, which is the reverse forward once sshd has bound it.
+func reverseForwardUpScript(port string) string {
+	return "ss -ltn 2>/dev/null | grep -q '127.0.0.1:" + port + " ' && echo UP || echo DOWN"
+}
+
+// SSHReverseForward makes the node's 127.0.0.1:<port> reach this machine's
+// 127.0.0.1:<port> for the rest of the test. The nodes cannot reach the
+// operator's machine on their own; this is how a process on a node (the
+// aerolvm CLI signing in against the in-harness issuer, UC-282) reaches a
+// server the suite runs, at the same URL the suite uses for it.
+func SSHReverseForward(t *testing.T, node IntegrationNode, port string) {
+	t.Helper()
+	RequireNodeSSH(t, node)
+	target, _ := SSHTarget(node)
+	spec := "127.0.0.1:" + port + ":127.0.0.1:" + port
+	args := append(sshBaseArgs(), "-N", "-o", "ExitOnForwardFailure=yes", "-R", spec, target)
+	cmd := exec.Command("ssh", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("ssh -R to %s: %v", node.Name, err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if out, err := SSHRun(t, target, reverseForwardUpScript(port)); err == nil && strings.Contains(out, "UP") {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("ssh -R %s to %s never came up: %s", spec, node.Name, strings.TrimSpace(stderr.String()))
+}

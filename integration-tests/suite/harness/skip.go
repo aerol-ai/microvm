@@ -6,7 +6,12 @@ package harness
 type Scenario struct {
 	Name    string
 	BaseURL string
-	PAT     string
+	// PAT is the credential every remote call presents: the operator token,
+	// or under SB_PAT_SCOPE=host an admin avm_ token run.sh minted with it.
+	PAT string
+	// OperatorPAT is the operator token itself (AEROL_OPERATOR_PAT, else
+	// PAT), for cases that present it on a node's loopback address.
+	OperatorPAT string
 	// Domain is the leased apex domain for domain-bearing scenarios (empty in
 	// local-mode). Tests that build hostnames under the wildcard zone — e.g.
 	// the custom-domain reachability use case — read it. The wildcard
