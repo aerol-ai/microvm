@@ -326,6 +326,29 @@ func renderBootstrap(t *testing.T, output string) string {
 	return out
 }
 
+// pat_scope and l4_proxy_protocol are install.sh flags (plans/identity-and-
+// access.md §5.11). Off, the render must not mention them, so a default
+// deployment is byte-identical to before; on, both reach install.sh, which
+// writes the Caddy half (the public socket, the PROXY listener wrapper) that
+// the sandboxd half needs.
+func TestBootstrapPassesIdentityInstallFlagsOnlyWhenSet(t *testing.T) {
+	off := renderBootstrap(t, "joiner")
+	for _, flag := range []string{"--pat-scope", "--l4-proxy-protocol"} {
+		if strings.Contains(off, flag) {
+			t.Errorf("the default render passes %s to install.sh", flag)
+		}
+	}
+	on := renderBootstrap(t, "joiner_identity_flags")
+	for _, want := range []string{"INSTALL_ARGS+=(--pat-scope host)", "INSTALL_ARGS+=(--l4-proxy-protocol)"} {
+		if !strings.Contains(on, want) {
+			t.Errorf("the render with the flags set lacks %q", want)
+		}
+	}
+	if flagAt, runAt := strings.Index(on, "--pat-scope host"), strings.Index(on, "sudo /tmp/install.sh"); runAt < 0 || flagAt > runAt {
+		t.Errorf("the flags must be appended before install.sh runs (flag at %d, install at %d)", flagAt, runAt)
+	}
+}
+
 // secret_kms_enabled=false must emit NOTHING. A node that quietly got
 // SB_SECRET_PROVIDER=awskms without a key would fail daemon start outright
 // (config.go rejects awskms with no SB_SECRET_AWS_KMS_KEY_ID), and a

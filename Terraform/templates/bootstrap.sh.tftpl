@@ -7,6 +7,7 @@
 #   pat_token, domain, cloudflare_api_token,
 #   with_firecracker (bool), with_gvisor (bool), with_isolate (bool), ingress_proxy_routing (bool), with_nvidia_gpu (bool), with_amd_gpu (bool),
 #   idle_timeout_min (number; 0 disables),
+#   pat_scope ("any" | "host"), l4_proxy_protocol (bool),
 #   firecracker_binary_url, firecracker_jailer_url, firecracker_kernel_url,
 #   firecracker_kernel_config_url, firecracker_auto_install,
 #   firecracker_version, firecracker_upstream_arch,
@@ -189,6 +190,12 @@ INSTALL_ARGS+=(--with-amd-gpu)
 %{ endif ~}
 %{ if idle_timeout_min > 0 ~}
 INSTALL_ARGS+=(--idle-timeout-min '${idle_timeout_min}')
+%{ endif ~}
+%{ if pat_scope == "host" ~}
+INSTALL_ARGS+=(--pat-scope host)
+%{ endif ~}
+%{ if l4_proxy_protocol ~}
+INSTALL_ARGS+=(--l4-proxy-protocol)
 %{ endif ~}
 %{ if caddy_storage_s3_enabled ~}
 # Shared S3-backed Caddy cert storage. Every node points at the same

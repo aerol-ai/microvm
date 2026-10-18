@@ -36,6 +36,8 @@ locals {
     with_nvidia_gpu = false
     with_amd_gpu = false
     idle_timeout_min = 30
+    pat_scope = "any"
+    l4_proxy_protocol = false
     firecracker_binary_url = "x"
     firecracker_jailer_url = "x"
     firecracker_kernel_url = "x"
@@ -166,6 +168,17 @@ locals {
 }
 output "seed"   { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = true })) }
 output "joiner" { value = templatefile("__TEMPLATE__", merge(local.base, { is_seed = false })) }
+
+# install.sh --pat-scope host and --l4-proxy-protocol (identity-and-access
+# T10/T12): the Caddy halves are written by install.sh, so the template only
+# has to pass the flags, and only when asked.
+output "joiner_identity_flags" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed           = false
+    pat_scope         = "host"
+    l4_proxy_protocol = true
+  }))
+}
 
 # The public CAs: no internal CA configured. The TLS values arrive null, as a
 # key present with no value in cluster.yml (or the itest overlay) decodes,

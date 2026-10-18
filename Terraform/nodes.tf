@@ -83,6 +83,8 @@ resource "aws_instance" "seed" {
     with_nvidia_gpu                          = local.seed_node.with_nvidia_gpu
     with_amd_gpu                             = local.seed_node.with_amd_gpu
     idle_timeout_min                         = local.seed_node.idle_timeout_min
+    pat_scope                                = var.pat_scope
+    l4_proxy_protocol                        = var.l4_proxy_protocol
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
@@ -307,6 +309,8 @@ resource "aws_instance" "joiner" {
     with_nvidia_gpu                          = each.value.with_nvidia_gpu
     with_amd_gpu                             = each.value.with_amd_gpu
     idle_timeout_min                         = each.value.idle_timeout_min
+    pat_scope                                = var.pat_scope
+    l4_proxy_protocol                        = var.l4_proxy_protocol
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
