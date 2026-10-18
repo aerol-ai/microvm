@@ -570,4 +570,22 @@ func TestExecuteAsyncAnswersRunningWhenTheWatcherSawTheFailureFirst(t *testing.T
 	}
 	expectStatus(t, env.do(t, http.MethodGet, "/"+devbox.ID+"/executions/"+session, nil, nil), http.StatusBadGateway)
 	env.toolbox.clearFaults()
+
+	// A session the toolbox says is gone (404) is not an unavailable
+	// toolbox: the watcher records the execution as lost, and execute_async
+	// reports that as it always has (writeToolboxError's 502) instead of a
+	// made-up "running".
+	gone := plainSession(devbox.ID, "w8")
+	env.toolbox.failAlways("GET /process/session/"+gone, http.StatusNotFound)
+	env.h.testAfterSubmit = func(devboxID string, ref execRef) {
+		waitFor(t, "the watcher to see the session gone", func() bool { return !env.h.execs.running(resultKey(devboxID, ref.id())) })
+	}
+	var lost executionView
+	rr := env.do(t, http.MethodPost, "/"+devbox.ID+"/execute_async", `{"command":"echo y"}`, &lost, "X-Request-Id", "w8")
+	env.h.testAfterSubmit = nil
+	if rr.Code == http.StatusOK || lost.Status == "running" {
+		t.Fatalf("execute_async for a lost execution = %d %+v, want the error, not running", rr.Code, lost)
+	}
+	expectStatus(t, rr, http.StatusBadGateway)
+	env.toolbox.clearFaults()
 }
