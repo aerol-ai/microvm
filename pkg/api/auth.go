@@ -6,7 +6,7 @@ package api
 // they read the credential and how they word a refusal.
 //
 //	credential ─► authenticators, in order; the first that matches decides
-//	               pat ─► [apiToken T3] ─► [jwt T6] ─► provider
+//	               pat ─► apiToken (T3) ─► [jwt T6] ─► provider
 //	           ─► post-match steps: forward attribution, surface rule,
 //	               team selection
 //	           ─► refusals: reason mapping (401 / 403 / 400) per surface
@@ -17,6 +17,7 @@ import (
 	"errors"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -26,6 +27,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/api/runloop"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -261,9 +263,6 @@ const HeaderTeam = cluster.HeaderTeam
 // non-canonical key allocates a canonical copy on every request.
 var headerTeamKey = http.CanonicalHeaderKey(HeaderTeam)
 
-// maxTeamNameLen bounds a team name (§5.4: [a-z0-9-]{1,63}).
-const maxTeamNameLen = 63
-
 var errBadTeamHeader = errors.New("invalid " + HeaderTeam + " header: a team name is 1 to 63 characters of a-z, 0-9 and -")
 
 // teamNotBoundError refuses a team the credential has no binding for. The
@@ -299,7 +298,7 @@ func selectTeam(r *http.Request, a controlplane.Access) (controlplane.Access, er
 		return a, nil
 	}
 	team := strings.TrimSpace(header)
-	if !validTeamName(team) {
+	if !identitywire.ValidTeamName(team) {
 		return a, errBadTeamHeader
 	}
 	// A fleet credential's team is "*", which is never a valid team name, so
@@ -308,19 +307,6 @@ func selectTeam(r *http.Request, a controlplane.Access) (controlplane.Access, er
 		return a, &teamNotBoundError{team: team, role: a.Role, bound: bound}
 	}
 	return a, nil
-}
-
-func validTeamName(team string) bool {
-	if team == "" || len(team) > maxTeamNameLen {
-		return false
-	}
-	for i := 0; i < len(team); i++ {
-		c := team[i]
-		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '-' {
-			return false
-		}
-	}
-	return true
 }
 
 // authFailure is a refused request, after reason mapping.
@@ -332,10 +318,16 @@ type authFailure struct {
 	// invalidToken is set only for a D17 refusal of an avm_ token or a JWT:
 	// the 401 then carries it in WWW-Authenticate and the body's `reason`.
 	invalidToken controlplane.RejectReason
-	// message is the 400/403 text. A 401 always uses the surface's own
+	// message is the 400/403/503 text. A 401 always uses the surface's own
 	// fixed text, so PAT and managed 401 bodies stay byte for byte as before.
 	message string
+	// retryAfter is the Retry-After seconds of a 503.
+	retryAfter int
 }
+
+// identityStaleRetryAfter is the Retry-After of a stale-mirror 503: about
+// one mirror poll, after which the node may have synced.
+const identityStaleRetryAfter = 5
 
 // mapAuthFailure is reason mapping (D17 for 401s, D9 for 403s). Only an avm_
 // token or a JWT refusal with a known reason tells the caller why. The PAT,
@@ -353,6 +345,11 @@ func mapAuthFailure(linkKind string, err error) *authFailure {
 	}
 	var notBound *teamNotBoundError
 	switch {
+	case errors.Is(err, controlplane.ErrIdentityStale):
+		// The token mirror on this node cannot vouch for any token right
+		// now (§5.4): the credential may be fine, so 503, not 401.
+		return &authFailure{status: http.StatusServiceUnavailable, kind: linkKind, reason: "stale",
+			message: "identity data is stale on this node; retry shortly", retryAfter: identityStaleRetryAfter}
 	case errors.Is(err, errBadTeamHeader):
 		return &authFailure{status: http.StatusBadRequest, kind: linkKind, reason: "bad_team", message: err.Error()}
 	case errors.As(err, &notBound):
@@ -455,6 +452,9 @@ func withCorrelationID(ctx context.Context, r *http.Request) context.Context {
 }
 
 func writeAuthFailure(w http.ResponseWriter, surface authSurface, f *authFailure) {
+	if f.retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(f.retryAfter))
+	}
 	if f.status != http.StatusUnauthorized {
 		surface.write(w, f.status, f.message, "")
 		return

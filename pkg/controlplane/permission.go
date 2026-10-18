@@ -212,3 +212,22 @@ func teamPhrase(team string) string {
 	}
 	return "team " + team
 }
+
+type routePermissionKey struct{}
+
+// ContextWithRoutePermission records the permission the request's route
+// needs, before authentication runs (apihttp.Router stamps it). Only one
+// authenticator reads it: a token mirror that cannot sync still accepts a
+// request whose route needs nothing but metrics.read (CEO review D16), so
+// it has to know the route's permission at authentication time.
+func ContextWithRoutePermission(ctx context.Context, p Permission) context.Context {
+	return context.WithValue(ctx, routePermissionKey{}, p)
+}
+
+// RoutePermissionFromContext returns the permission the request's route
+// needs. ok is false for a request that did not come through a Router (an
+// unknown route must be treated as needing more than metrics.read).
+func RoutePermissionFromContext(ctx context.Context) (Permission, bool) {
+	p, ok := ctx.Value(routePermissionKey{}).(Permission)
+	return p, ok
+}

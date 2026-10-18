@@ -20,6 +20,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/internal/network/tap"
 	"github.com/aerol-ai/microvm/internal/observability"
 	vmmpool "github.com/aerol-ai/microvm/internal/pool/vmm"
@@ -98,24 +99,6 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	cp = cp.WithDefaults()
 	if err := identityBootGuard(cfg, cp); err != nil {
 		return err
-	}
-
-	// TEST-ONLY: the integration harness needs real scoped (non-PAT) tokens to
-	// exercise owner scoping end to end. SB_ITEST_IDENTITY_FILE maps bearer
-	// tokens to owner refs; when set, it replaces the (reject-all) Noop
-	// validator so those tokens authenticate as owner-scoped identities. This is
-	// deliberately NOT the managed identity feature (plans/identity-and-access.md)
-	// — it is throwaway test scaffolding, never wired in a normal deployment.
-	// config.Load already refused it next to SB_IDENTITY_ENABLED or enterprise
-	// mode (eng review D4); task T3 deletes it.
-	if path := cfg.ITestIdentityFile; path != "" {
-		tokens, lerr := loadITestIdentityFile(path)
-		if lerr != nil {
-			return fmt.Errorf("load SB_ITEST_IDENTITY_FILE: %w", lerr)
-		}
-		cp.Validator = itestStaticValidator{tokens: tokens}
-		logger.Warn("TEST-ONLY static identity validator enabled; not for production use",
-			"file", path, "tokens", len(tokens))
 	}
 
 	// Derive a cancellable child so a fatal failure in a background server
@@ -965,7 +948,16 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if apiBuilder != nil {
 		builder = apiBuilder
 	}
-	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator)
+	// Scoped API tokens (plans/identity-and-access.md §5.4). With identity
+	// off this does nothing and NewServer drops the authenticator, so the
+	// server is byte for byte the PAT-only one (L8). With it on: a single
+	// node loads its tokens into memory, a Raft server reads its FSM, and
+	// any other cluster node starts its token mirror.
+	if err := svc.StartAPITokens(ctx); err != nil {
+		return err
+	}
+	server := api.NewServer(logger, svc, dockerClient, builder, cfg, cfg.PATToken, cp.Validator,
+		api.WithCredentialAuthenticator(controlplane.PrincipalToken, identity.NewTokenAuthenticator(svc.APITokenLookup(), logger)))
 	logger.Info("dashboard available", "url", "http://"+cfg.ListenAddr()+"/ui")
 	// Mount the same API handler onto the cluster-internal mTLS listener so
 	// peers can reverse-proxy owner API calls over the cert-pinned channel

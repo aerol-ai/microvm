@@ -10,19 +10,20 @@ package api
 // The cold JWT path (first sight of a token: one RS256 verify, ~50µs on its
 // own) has no budget; its benchmark is for trend only.
 //
-// The avm_ token and JWT authenticators arrive in T3 and T6. Until then the
-// Token and JWT benchmarks run stub authenticators that do the same work the
-// plan budgets for them (§6): a token is a map lookup plus SHA-256 of a
-// 32-byte secret and a constant-time compare; a cached JWT is SHA-256 of the
-// token and a map hit; a cold JWT verifies an RS256 signature. T3 and T6
-// replace the stubs with the real authenticators and keep the same names.
+// The Token benchmark runs the real avm_ authenticator (T3,
+// internal/identity.TokenAuthenticator) over an in-memory token index, the
+// same map read a worker's mirror does: checksum, lookup, SHA-256 of the
+// secret, a constant-time compare and the expiry check. The OIDC verifier
+// arrives in T6; until then the JWT benchmarks run a stand-in that does the
+// work the plan budgets for it (§6): a cached JWT is SHA-256 of the token
+// and a map hit; a cold JWT verifies an RS256 signature. T6 replaces it and
+// keeps the names.
 
 import (
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/subtle"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,43 +34,26 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/identity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
 const authLatencyBudgetP99 = 50 * time.Microsecond
 
-// benchTokenMirror does what T3's in-memory mirror lookup costs.
-type benchTokenMirror struct {
-	records map[string]benchTokenRecord
-}
-
-type benchTokenRecord struct {
-	hash   [32]byte
-	access controlplane.Access
-}
-
-func newBenchTokenMirror() (*benchTokenMirror, string) {
-	const id, secret = "7Hq2aBcDeFgH", "s3cr3t-0123456789abcdefghijklmnopqrstuvwxyzAB"
-	return &benchTokenMirror{records: map[string]benchTokenRecord{
-		id: {hash: sha256.Sum256([]byte(secret)), access: tokenAccess("payments", controlplane.RoleRunner)},
-	}}, "avm_" + id + "_" + secret
-}
-
-func (m *benchTokenMirror) Authenticate(_ *http.Request, bearer string) (controlplane.Access, bool, error) {
-	rest, ok := strings.CutPrefix(bearer, "avm_")
-	if !ok {
-		return controlplane.Access{}, false, nil
+// newBenchToken mints one live runner token into a real token index and
+// returns the real authenticator over it with the token's plaintext.
+func newBenchToken(tb testing.TB) (*identity.TokenAuthenticator, string) {
+	tb.Helper()
+	tok, err := identitywire.NewAPIToken(nil)
+	if err != nil {
+		tb.Fatal(err)
 	}
-	id, secret, ok := strings.Cut(rest, "_")
-	rec, found := m.records[id]
-	if !ok || !found {
-		return controlplane.Access{}, true, &controlplane.CredentialError{Kind: controlplane.PrincipalToken, Reason: controlplane.RejectUnknownOrRevoked}
-	}
-	sum := sha256.Sum256([]byte(secret))
-	if subtle.ConstantTimeCompare(sum[:], rec.hash[:]) != 1 {
-		return controlplane.Access{}, true, &controlplane.CredentialError{Kind: controlplane.PrincipalToken, Reason: controlplane.RejectUnknownOrRevoked}
-	}
-	return rec.access, true, nil
+	hash := tok.SecretHash()
+	var set identity.TokenSet
+	set.Put(identity.TokenRecord{ID: tok.ID, Name: "ci-deploy", Role: controlplane.RoleRunner,
+		OwnerRef: controlplane.TeamOwnerRef("payments"), ExpiresAt: time.Now().Add(24 * time.Hour), SecretHash: hash[:]})
+	return identity.NewTokenAuthenticator(&set, nil), tok.Plaintext()
 }
 
 // benchJWT is a verifier stand-in. With a warm cache it costs what T6's
@@ -134,14 +118,14 @@ func authBenchCase(tb testing.TB, path string) (http.Handler, *http.Request) {
 	bearer := "pat-token"
 	switch path {
 	case "Token":
-		mirror, token := newBenchTokenMirror()
-		opts = append(opts, WithCredentialAuthenticator(controlplane.PrincipalToken, mirror))
+		tokens, token := newBenchToken(tb)
+		opts = append(opts, WithCredentialAuthenticator(controlplane.PrincipalToken, tokens))
 		bearer = token
 	case "JWTCached", "JWTCold":
 		jwt, token := newBenchJWT(tb, path == "JWTCold")
-		mirror, _ := newBenchTokenMirror()
+		tokens, _ := newBenchToken(tb)
 		opts = append(opts,
-			WithCredentialAuthenticator(controlplane.PrincipalToken, mirror),
+			WithCredentialAuthenticator(controlplane.PrincipalToken, tokens),
 			WithCredentialAuthenticator(controlplane.PrincipalOIDC, jwt))
 		bearer = token
 	}

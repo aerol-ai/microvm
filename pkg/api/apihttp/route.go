@@ -149,9 +149,19 @@ func (rt Router) build(tag string, classify func(*http.Request) controlplane.Per
 	authorized := authorize(classify, deny, rt.Audit, next)
 	serve := authorized
 	if rt.Authenticate != nil {
-		serve = rt.Authenticate(authorized)
+		serve = stampRoutePermission(classify, rt.Authenticate(authorized))
 	}
 	return &RouteHandler{tag: tag, classify: classify, authenticates: rt.Authenticate != nil, serve: serve}
+}
+
+// stampRoutePermission puts the route's permission on the request before
+// authentication, for the one authenticator that needs it: a token mirror
+// that cannot sync accepts metrics.read and nothing else (CEO review D16).
+// It decides nothing itself; authorize still classifies the request.
+func stampRoutePermission(classify func(*http.Request) controlplane.Permission, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(controlplane.ContextWithRoutePermission(r.Context(), classify(r))))
+	})
 }
 
 // authorize is the permission check. It runs inside authenticate, so in

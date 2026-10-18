@@ -130,6 +130,19 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrPublicTrafficDisabled):
 		return Classification{Status: http.StatusConflict, Message: err.Error()}
 
+	// API tokens (plans/identity-and-access.md §5.4, finding 5.6).
+	case errors.Is(err, service.ErrAPITokenInvalid):
+		return Classification{Status: http.StatusBadRequest, Message: err.Error()}
+	case errors.Is(err, service.ErrAPITokenNameTaken):
+		return Classification{Status: http.StatusConflict, Message: service.ErrAPITokenNameTaken.Error()}
+	case errors.Is(err, service.ErrAPITokenClusterVersion):
+		return Classification{Status: http.StatusConflict, Message: service.ErrAPITokenClusterVersion.Error()}
+	case errors.Is(err, service.ErrAPITokensUnavailable):
+		// The write may have committed (a leader change mid-apply): say how
+		// to recover, never the raw cluster error.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Log: true, LogLevel: slog.LevelWarn,
+			Message: "the token store did not confirm the write; after a create the token may exist: list tokens, revoke it by id, then create it again"}
+
 	case errors.Is(err, store.ErrSandboxNameConflict):
 		return Classification{Status: http.StatusConflict, Message: "sandbox name already in use", Kind: ErrKindSandboxNameConflict}
 	case errors.Is(err, models.ErrSandboxExists):

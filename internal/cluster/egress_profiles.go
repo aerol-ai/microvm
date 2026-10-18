@@ -1,14 +1,10 @@
 package cluster
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -98,31 +94,10 @@ func (r EgressProfileWriteResponse) err() error {
 	return fmt.Errorf("%w (%s)", sentinel, r.Message)
 }
 
-// egressProfileWritesAllowed is the rolling-upgrade gate (D19): every server
-// in the Raft configuration, failed ones included, must report an FSM op
-// set that applies profile ops. A failed server counts at its last-known
-// gossip meta because it replays the log when it returns; one with no gossip
-// entry at all counts as an old build.
+// egressProfileWritesAllowed is the rolling-upgrade gate (D19) for
+// profile ops: raftServersSupport at the version that introduced them.
 func (c *Cluster) egressProfileWritesAllowed() error {
-	future := c.raft.raft.GetConfiguration()
-	if err := future.Error(); err != nil {
-		return fmt.Errorf("cluster: read raft configuration: %w", err)
-	}
-	for _, srv := range future.Configuration().Servers {
-		id := string(srv.ID)
-		v := 0
-		if id == c.nodeID {
-			v = fsmOpsVersion
-		} else if c.gossip != nil {
-			if m, ok := c.gossip.lookupMember(id); ok {
-				v = m.FSMOpsVersion
-			}
-		}
-		if v < egressProfileFSMOpsVersion {
-			return fmt.Errorf("%w: server %s reports FSM ops version %d, profiles need %d", ErrClusterVersion, id, v, egressProfileFSMOpsVersion)
-		}
-	}
-	return nil
+	return c.raftServersSupport(egressProfileFSMOpsVersion, "profiles")
 }
 
 // WriteEgressProfile puts or deletes a profile. The leader checks the
@@ -157,47 +132,9 @@ func (c *Cluster) WriteEgressProfile(ctx context.Context, req EgressProfileWrite
 }
 
 func (c *Cluster) forwardEgressProfileWrite(ctx context.Context, req EgressProfileWriteRequest) (EgressProfileWriteResponse, error) {
-	leader := c.Leader()
-	if leader == "" {
-		return EgressProfileWriteResponse{}, ErrNotLeader
-	}
-	if c.currentInternalClient() == nil || c.gossip == nil {
-		return EgressProfileWriteResponse{}, ErrPeerInternalURLRequired
-	}
-	peerInternal := c.gossip.peerInternalURL(leader)
-	if peerInternal == "" {
-		return EgressProfileWriteResponse{}, ErrPeerInternalURLRequired
-	}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return EgressProfileWriteResponse{}, err
-	}
-	reqCtx, cancel := context.WithTimeout(ctx, controlPlaneRequestTimeout)
-	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, strings.TrimRight(peerInternal, "/")+PublicInternalEgressProfileWritePath, bytes.NewReader(body))
-	if err != nil {
-		return EgressProfileWriteResponse{}, fmt.Errorf("cluster: build egress profile write: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	SetPeerNodeIDHeader(httpReq, c.nodeID)
-	if c.patToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+c.patToken)
-	}
-	resp, err := c.ClientForPeer(leader).Do(httpReq)
-	if err != nil {
-		return EgressProfileWriteResponse{}, fmt.Errorf("cluster: egress profile write: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		if resp.StatusCode == http.StatusServiceUnavailable {
-			return EgressProfileWriteResponse{}, ErrNotLeader
-		}
-		return EgressProfileWriteResponse{}, fmt.Errorf("cluster: egress profile write: status %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
-	}
 	var out EgressProfileWriteResponse
-	if err := decodeControlPlaneJSON(resp.Body, &out); err != nil {
-		return EgressProfileWriteResponse{}, fmt.Errorf("cluster: decode egress profile write: %w", err)
+	if err := c.forwardToLeaderJSON(ctx, "egress profile write", PublicInternalEgressProfileWritePath, req, &out); err != nil {
+		return EgressProfileWriteResponse{}, err
 	}
 	return out, out.err()
 }
