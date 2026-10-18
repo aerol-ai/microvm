@@ -507,7 +507,7 @@ test("the SSO session record carries what a renewal needs", () => {
 function renewalHarness(opts) {
   opts = opts || {};
   const tracker = D.createTracker();
-  const log = { beginRedirect: [], navigate: [], saveView: 0, failed: 0, renewed: 0, rejected: [], fetches: [] };
+  const log = { beginRedirect: [], navigate: [], saveView: 0, failed: 0, failedReasons: [], expired: 0, renewed: 0, rejected: [], fetches: [] };
   let bearer = "old-token";
   const session = opts.session || { issuer: "okta", display: "Acme Okta", kind: "oidc", url: "https://acme.okta.com", client: "0oa1dash", exp: 1 };
   const renewal = D.createSingleFlight(D.createRenewer({
@@ -518,7 +518,7 @@ function renewalHarness(opts) {
     beginRedirect: opts.beginRedirect || (async (issuer, mode) => { log.beginRedirect.push([issuer.name, mode]); return "https://acme.okta.com/authorize?prompt=none"; }),
     saveView: () => { log.saveView += 1; },
     navigate: (u) => { log.navigate.push(u); },
-    onFailed: () => { log.failed += 1; },
+    onFailed: (reason) => { log.failed += 1; log.failedReasons.push(reason); },
     onRenewed: () => { log.renewed += 1; },
   }));
   let expired = false;
@@ -529,6 +529,7 @@ function renewalHarness(opts) {
     renewal,
     tracker,
     isExpired: () => expired,
+    onExpired: () => { log.expired += 1; },
     onRejected: (kind, reason) => { log.rejected.push([kind, reason]); },
   });
   return { api, renewal, tracker, log, setBearer: (b) => { bearer = b; }, setExpired: (e) => { expired = e; } };
@@ -619,6 +620,72 @@ test("a failed renewal shows the banner once and keeps the view; later calls sen
   await assert.rejects(unreachable.api("/health"), D.SessionExpired);
   assert.equal(unreachable.log.failed, 1);
   assert.equal(unreachable.log.navigate.length, 0);
+});
+
+// Keycloak live check B2: a failed renewal must not end a sign-in whose ID
+// token still works.
+test("a failed renewal keeps a token that still works; the banner waits for its exp or a 401 expired", () => {
+  const now = 1_800_000_000_000;
+  const exp = now / 1000 + 100; // inside the exp − 120 s window
+  for (const reason of ["proactive", "visible", "redirect"]) {
+    assert.equal(D.failedRenewalOutcome(reason, exp, now), "keep", reason);
+  }
+  assert.equal(D.failedRenewalOutcome("expired", exp, now), "expire", "sandboxd's 401 expired ends it, whatever this clock says");
+  assert.equal(D.failedRenewalOutcome("proactive", now / 1000, now), "expire", "at exp the token has expired: strictly exp, no leeway");
+  assert.equal(D.failedRenewalOutcome("proactive", now / 1000 - 30, now), "expire");
+  assert.equal(D.failedRenewalOutcome("proactive", undefined, now), "expire", "no exp: nothing to keep");
+
+  assert.equal(D.tokenLive(now / 1000 + 1, now), true);
+  assert.equal(D.tokenLive(now / 1000, now), false);
+  assert.equal(D.tokenLive("123", now), false);
+
+  // After a failure the next try is at exp, not again at once: each try
+  // for a code-flow provider is a full-page redirect.
+  assert.equal(D.renewDelayMs(exp, now), 0, "inside the window");
+  assert.equal(D.renewDelayMs(exp, now, true), 100 * 1000, "after a failure: at exp");
+  assert.equal(D.renewDelayMs(now / 1000 - 5, now, true), 0, "already expired: now");
+});
+
+test("the renewer tells the page what started a failed renewal", async () => {
+  const google = { issuer: "google", kind: "google", client: "c", url: "https://accounts.google.com", display: "Google" };
+  const h = renewalHarness({ session: google, googleRenew: async () => false, fetch: () => response(200, {}) });
+  assert.equal(await h.renewal.run("proactive"), false);
+  assert.equal(await h.renewal.run("visible"), false);
+  assert.deepEqual(h.log.failedReasons, ["proactive", "visible"]);
+  assert.equal(h.log.expired, 0, "no 401 arrived: the session isn't ended here");
+
+  const unreachable = renewalHarness({ beginRedirect: async () => { throw new Error("down"); } });
+  assert.equal(await unreachable.renewal.run("proactive"), false);
+  assert.deepEqual(unreachable.log.failedReasons, ["proactive"]);
+  const recent = renewalHarness({ recentlyRenewed: true });
+  assert.equal(await recent.renewal.run("visible"), false);
+  assert.deepEqual(recent.log.failedReasons, ["visible"]);
+});
+
+test("a 401 expired that shares a failing proactive renewal still ends the session", async () => {
+  const sent = deferred();
+  const renewing = deferred();
+  const h = renewalHarness({
+    session: { issuer: "google", kind: "google", client: "c", url: "https://accounts.google.com", display: "Google" },
+    googleRenew: () => renewing.promise,
+    fetch: () => sent.promise,
+  });
+  const call = h.api("/v1/cluster/leader"); // in flight before the timer fires
+  await flush();
+  const proactive = h.renewal.run("proactive");
+  sent.resolve(expired401()); // the 401 joins the proactive renewal
+  await flush();
+  renewing.resolve(false);
+  assert.equal(await proactive, false);
+  await assert.rejects(call, D.SessionExpired);
+  assert.deepEqual(h.log.failedReasons, ["proactive"], "one renewal, started by the timer");
+  assert.equal(h.log.expired, 1, "sandboxd's answer ends the session the proactive failure kept");
+
+  // Its own renewal failing for an expired token: the page ends the
+  // session through onFailed("expired"), and onExpired is a no-op there.
+  const own = renewalHarness({ fetch: () => expired401(), recentlyRenewed: true });
+  await assert.rejects(own.api("/health"), D.SessionExpired);
+  assert.deepEqual(own.log.failedReasons, ["expired"]);
 });
 
 test("any other 401 is a rejection, worded by credential kind", async () => {

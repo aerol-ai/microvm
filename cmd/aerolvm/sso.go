@@ -513,16 +513,19 @@ func (a *app) deviceFlow(ctx context.Context, c *commonFlags, login *ssoLogin, p
 		}
 	}
 	cfg := login.oauthConfig("", p.DeviceAuthorizationEndpoint, "", ssoScopes(login.Kind, p))
-	octx, ocancel := a.oauthContext(ctx, c, ssoRequestTimeout)
-	da, err := cfg.DeviceAuth(octx)
-	ocancel()
+	da, verifier, err := a.deviceAuth(ctx, c, cfg)
 	if err != nil {
 		return nil, tokenEndpointError(login, apiURL, err)
 	}
 	a.note("aerolvm: to sign in, open %s and enter the code %s. Waiting…", printable(da.VerificationURI), printable(da.UserCode))
 	wctx, wcancel := a.oauthContext(ctx, c, ssoWaitTimeout)
 	defer wcancel()
-	tok, err := cfg.DeviceAccessToken(wctx, da)
+	var pollOpts []oauth2.AuthCodeOption
+	if verifier != "" {
+		// The device code is bound to the challenge: every poll proves it.
+		pollOpts = append(pollOpts, oauth2.VerifierOption(verifier))
+	}
+	tok, err := cfg.DeviceAccessToken(wctx, da, pollOpts...)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, &agenttools.Error{Code: agenttools.CodeTimeout, Message: "the sign-in code expired before anyone used it", Hint: "run the login again"}
@@ -530,6 +533,41 @@ func (a *app) deviceFlow(ctx context.Context, c *commonFlags, login *ssoLogin, p
 		return nil, tokenEndpointError(login, apiURL, err)
 	}
 	return tok, nil
+}
+
+// deviceAuth asks the provider for a device code. The first request carries
+// no PKCE: Okta, Entra ID and Google document only client_id and scope on
+// their device endpoints, so what they receive stays exactly as before. A
+// provider that also enforces PKCE on the device grant (Keycloak, when the
+// client has a PKCE method set) refuses that request with invalid_request
+// naming the missing code challenge, and deviceAuth asks once more with an
+// S256 challenge. The refused request created no device code, so asking
+// again is safe. A non-empty verifier must go with every token poll.
+func (a *app) deviceAuth(ctx context.Context, c *commonFlags, cfg *oauth2.Config) (*oauth2.DeviceAuthResponse, string, error) {
+	octx, cancel := a.oauthContext(ctx, c, ssoRequestTimeout)
+	da, err := cfg.DeviceAuth(octx)
+	cancel()
+	if err == nil || !wantsPKCE(err) {
+		return da, "", err
+	}
+	verifier := oauth2.GenerateVerifier()
+	octx, cancel = a.oauthContext(ctx, c, ssoRequestTimeout)
+	defer cancel()
+	da, err = cfg.DeviceAuth(octx, oauth2.S256ChallengeOption(verifier))
+	return da, verifier, err
+}
+
+// wantsPKCE reports a device authorization refused for lacking PKCE:
+// invalid_request whose description names the code challenge (Keycloak:
+// "Missing parameter: code_challenge_method") or PKCE. Any other refusal is
+// reported as it is.
+func wantsPKCE(err error) bool {
+	var re *oauth2.RetrieveError
+	if !errors.As(err, &re) || re.ErrorCode != "invalid_request" {
+		return false
+	}
+	desc := strings.ToLower(re.ErrorDescription)
+	return strings.Contains(desc, "code_challenge") || strings.Contains(desc, "pkce")
 }
 
 // providerDeclined is an `error` the provider redirected back with
@@ -793,8 +831,8 @@ func (s *ssoSession) token(ctx context.Context) (string, error) {
 	return s.login.Token, nil
 }
 
-// renewalFailed reports whether the last renewal failed, so the 401 that
-// follows is worded as DR15's refresh failure.
+// renewalFailed reports whether the last renewal failed, so a 401 once the
+// token has expired is worded as DR15's refresh failure.
 func (s *ssoSession) renewalFailed() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
