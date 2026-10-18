@@ -354,11 +354,11 @@ button.link:hover { border: none; }
   </section>
 
   <section class="card" id="metrics-card">
-    <h2>Metrics (expvar)</h2>
+    <h2>Metrics</h2>
     <div class="body">
       <div class="metrics-grid" id="metrics-grid"><span class="muted">loading…</span></div>
       <details id="metrics-raw-details">
-        <summary>Show raw /debug/vars</summary>
+        <summary>Show raw /v1/metrics</summary>
         <pre class="raw" id="metrics-raw">loading…</pre>
       </details>
     </div>
@@ -1118,6 +1118,29 @@ function usageBar(label, used, total, unit) {
       <div class="bar ${cls}"><div style="width: ${(pct * 100).toFixed(1)}%"></div></div>
     </div>
   `;
+}
+
+// parsePrometheusText reads /v1/metrics, the Prometheus text sandboxd
+// renders from its aerolvm_* expvars, into the unlabeled samples by name
+// and the sample lines without the # HELP and # TYPE comments. The metrics
+// panel reads /v1/metrics rather than /debug/vars because Caddy forwards
+// /v1/* from the API domain and never /debug/vars, so on a domain install
+// the page at https://<api-domain>/ui could not reach /debug/vars at all.
+// Every metric the panel picks is an unlabeled gauge or counter; a labeled
+// sample is kept for the raw view only.
+function parsePrometheusText(text) {
+  const values = {};
+  const lines = [];
+  String(text || "").split("\n").forEach((raw) => {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) { return; }
+    lines.push(line);
+    const m = /^([A-Za-z_:][A-Za-z0-9_:]*)\s+(\S+)$/.exec(line);
+    if (!m) { return; }
+    const v = Number(m[2]);
+    if (Number.isFinite(v)) { values[m[1]] = v; }
+  });
+  return { values, lines };
 }
 
 function aggregateCapacity(members) {
@@ -2194,7 +2217,7 @@ async function loadPlacements() {
   }
 }
 
-// /debug/vars output is a JSON object. We surface a curated subset; the rest is in the raw collapsible.
+// A curated subset of /v1/metrics; the rest is in the raw collapsible.
 const METRIC_PICKS = [
   ["aerolvm_raft_apply_total", "raft applies", fmtNum],
   ["aerolvm_raft_apply_inflight", "raft apply inflight", fmtNum],
@@ -2214,18 +2237,17 @@ const METRIC_PICKS = [
 
 async function loadMetrics() {
   try {
-    const res = await S.api("/debug/vars");
+    const res = await S.api("/v1/metrics");
     if (!res.ok) { throw new Error(res.status + " " + res.statusText); }
-    const data = await res.json();
+    const { values, lines } = parsePrometheusText(await res.text());
     const grid = METRIC_PICKS.map(([key, label, fmt]) => {
-      if (!(key in data)) { return ""; }
-      return `<div class="metric"><span class="k">${escapeHTML(label)}</span><span class="v">${fmt(data[key])}</span></div>`;
+      if (!(key in values)) { return ""; }
+      return `<div class="metric"><span class="k">${escapeHTML(label)}</span><span class="v">${escapeHTML(fmt(values[key]))}</span></div>`;
     }).filter(Boolean).join("");
     el("metrics-grid").innerHTML = grid || `<span class="muted">no aerolvm_* metrics yet</span>`;
-    // Filter raw view to just aerolvm_* keys so the panel is operator-readable.
-    const filtered = {};
-    Object.keys(data).forEach((k) => { if (k.startsWith("aerolvm_")) { filtered[k] = data[k]; } });
-    el("metrics-raw").textContent = JSON.stringify(filtered, null, 2);
+    // /v1/metrics renders only aerolvm_* series, so the raw view needs no
+    // filter beyond dropping the comment lines.
+    el("metrics-raw").textContent = lines.join("\n");
   } catch (err) {
     if (err instanceof SessionExpired) { return; }
     el("metrics-grid").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
@@ -2395,6 +2417,7 @@ if (globalThis.__AEROLVM_TEST__) {
     authorizeURL, providerMetadata, exchangeCode, callbackParams, pendingProblem, ssoMetaFor,
     issuerFromMeta, renewDelayMs, tokenLive, failedRenewalOutcome, serializeView, parseView, createTracker, createSingleFlight,
     createAPI, createRenewer, signOutSession, applyDeferredSignOut, gisPromptGaveUp, aggregateCapacity,
+    parsePrometheusText,
   };
 } else {
   boot();

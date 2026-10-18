@@ -81,7 +81,7 @@ Every part of the page reads from an existing API endpoint. The dashboard adds n
 | **Health** | `GET /health` | Overall status, and whether Docker, Caddy (the built-in web proxy), Firecracker and the SSH gateway are working. Also the server version and the number of live sandboxes. |
 | **Nodes** | `GET /v1/cluster/leader` and `GET /v1/cluster/members` | The current Raft leader (the node that makes cluster changes) and the member count. Then one row per node: name, IP, status, role, sandbox count, and CPU, memory, disk and GPU in use. |
 | **Placements** | `GET /v1/cluster/sandbox-index` (one page at a time) | One row per sandbox in the cluster: ID, owner node, state, runtime status, version, and when it was created and last changed. |
-| **Metrics (expvar)** | `GET /debug/vars` | A chosen set of the server's `aerolvm_*` counters, such as Raft write time, forwarded requests and worker health. Open **Show raw /debug/vars** to see all of them. |
+| **Metrics** | `GET /v1/metrics` | A chosen set of the server's `aerolvm_*` counters, such as Raft write time, forwarded requests and worker health. Open **Show raw /v1/metrics** to see all of them. |
 
 What a node's status means:
 
@@ -125,7 +125,7 @@ There are no buttons to create or resize sandboxes. Do that with the [SDKs](/sdk
 Two different things are involved:
 
 - **The page itself (`GET /ui`) needs no login.** It is plain HTML and JavaScript. It holds no passwords and no server data. The sign-in form asks for your token before the page calls any API. This is how a normal login page works.
-- **Every API call the page makes needs your credential.** That includes `GET /health`, `GET /v1/...`, `GET /debug/vars`, `GET /v1/metrics` and the buttons. The page sends it as `Authorization: Bearer <token>`, and the server checks it like any SDK call, with the same role checks. `/debug/vars` needs the `admin` role, because its counters reveal how the system is running (lease state, queue lengths, secret decrypt failures).
+- **Every API call the page makes needs your credential.** That includes `GET /health`, `GET /v1/...`, `GET /v1/metrics` and the buttons. The page sends it as `Authorization: Bearer <token>`, and the server checks it like any SDK call, with the same role checks. `/v1/metrics` needs a role on every team, because its counters reveal how the whole system is running (lease state, queue lengths, secret decrypt failures). The page never calls `/debug/vars`: Caddy does not forward it from your API domain, and it stays `admin`-only on each node's own port.
 - **Company sign-in happens between your browser and your provider.** The server holds no client secret and keeps no session. The browser keeps only the provider's sign-in token, never a refresh token.
 - **The page sends a strict Content-Security-Policy.** Only the page's own script, Google's sign-in script, and your providers' addresses are allowed. Nothing can frame the page.
 
