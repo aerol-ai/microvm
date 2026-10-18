@@ -242,7 +242,7 @@ func callerFromContext(ctx context.Context, patToken string) volumes.Caller {
 	access, ok := controlplane.AccessFromContext(ctx)
 	return volumes.Caller{
 		OwnerRef:  access.Identity.OwnerRef,
-		Operator:  access.Operator,
+		Operator:  access.Fleet,
 		HasAccess: ok,
 		PATToken:  patToken,
 	}

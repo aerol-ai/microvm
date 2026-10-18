@@ -96,6 +96,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}
 	}
 	cp = cp.WithDefaults()
+	if err := identityBootGuard(cfg, cp); err != nil {
+		return err
+	}
 
 	// TEST-ONLY: the integration harness needs real scoped (non-PAT) tokens to
 	// exercise owner scoping end to end. SB_ITEST_IDENTITY_FILE maps bearer
@@ -103,7 +106,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// validator so those tokens authenticate as owner-scoped identities. This is
 	// deliberately NOT the managed identity feature (plans/identity-and-access.md)
 	// — it is throwaway test scaffolding, never wired in a normal deployment.
-	if path := strings.TrimSpace(os.Getenv("SB_ITEST_IDENTITY_FILE")); path != "" {
+	// config.Load already refused it next to SB_IDENTITY_ENABLED or enterprise
+	// mode (eng review D4); task T3 deletes it.
+	if path := cfg.ITestIdentityFile; path != "" {
 		tokens, lerr := loadITestIdentityFile(path)
 		if lerr != nil {
 			return fmt.Errorf("load SB_ITEST_IDENTITY_FILE: %w", lerr)

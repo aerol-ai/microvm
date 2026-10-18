@@ -61,7 +61,7 @@ func newSecretInternalTestMux(t *testing.T, nodeID string) (*http.ServeMux, *ser
 				tok := r.Header.Get("Authorization")
 				var access controlplane.Access
 				if tok == "Bearer operator" {
-					access = controlplane.Access{Operator: true}
+					access = controlplane.Access{Fleet: true}
 				} else {
 					access = controlplane.Access{Identity: controlplane.Identity{OwnerRef: "tenant-a"}}
 				}

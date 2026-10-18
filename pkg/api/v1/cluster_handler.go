@@ -1106,7 +1106,7 @@ func clusterOperatorAccess(r *http.Request) bool {
 	if !ok {
 		return true
 	}
-	return access.Operator
+	return access.Fleet
 }
 
 func clusterOperatorActor(r *http.Request) string {

@@ -581,7 +581,7 @@ func TestRequireOperator(t *testing.T) {
 		ctx  context.Context
 		want int
 	}{
-		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Operator: true}), http.StatusOK},
+		"operator":   {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Fleet: true}), http.StatusOK},
 		"user token": {controlplane.ContextWithAccess(context.Background(), controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acme"}}), http.StatusForbidden},
 		"no access":  {context.Background(), http.StatusForbidden},
 	} {

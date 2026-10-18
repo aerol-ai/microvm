@@ -8,7 +8,7 @@ import (
 
 // requireOperatorAccess rejects non-operator callers with 403
 // (apihttp.RequireOperator). Must sit *inside* Deps.Auth. Peer fan-out uses
-// the fleet PAT, which stamps Operator.
+// the fleet PAT, which authenticates as a fleet admin (node or operator).
 func requireOperatorAccess(next http.Handler) http.Handler {
 	return apihttp.RequireOperator(next)
 }

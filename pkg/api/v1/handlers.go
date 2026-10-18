@@ -38,7 +38,7 @@ func (h *handlers) reconcile(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) capacity(w http.ResponseWriter, r *http.Request) {
 	snapshot := h.deps.Service.Capacity()
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || !access.Operator {
+	if !ok || !access.Fleet {
 		// Template administration is operator-only. Capacity remains useful to
 		// managed callers, but template identifiers can encode internal workload
 		// names and must not leak through this otherwise tenant-visible endpoint.

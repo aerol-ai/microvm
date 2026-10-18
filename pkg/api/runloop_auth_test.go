@@ -32,10 +32,10 @@ func TestRequireRunloopAuth(t *testing.T) {
 		return rec
 	}
 
-	if rec := serve("pat-token"); rec.Code != http.StatusNoContent || !gotAccess.Operator {
+	if rec := serve("pat-token"); rec.Code != http.StatusNoContent || !gotAccess.Fleet {
 		t.Fatalf("PAT: status %d access %+v", rec.Code, gotAccess)
 	}
-	if rec := serve("user-token"); rec.Code != http.StatusNoContent || gotAccess.Operator || gotAccess.Identity.OwnerRef != "tenant-1" {
+	if rec := serve("user-token"); rec.Code != http.StatusNoContent || gotAccess.Fleet || gotAccess.Identity.OwnerRef != "tenant-1" {
 		t.Fatalf("user token: status %d access %+v", rec.Code, gotAccess)
 	}
 	for _, token := range []string{"", "wrong"} {

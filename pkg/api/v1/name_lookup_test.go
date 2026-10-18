@@ -46,7 +46,7 @@ func seedNamedSandbox(t *testing.T, st *store.Store, id, ownerRef, name string, 
 }
 
 func tenantRequest(r *http.Request, ownerRef string) *http.Request {
-	access := controlplane.Access{Operator: true}
+	access := controlplane.Access{Fleet: true}
 	if ownerRef != "" {
 		access = controlplane.Access{Identity: controlplane.Identity{OwnerRef: ownerRef}}
 	}

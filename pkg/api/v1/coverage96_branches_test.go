@@ -268,7 +268,7 @@ func TestC96bClusterOperatorActorFallsBackToOwnerRef(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
 	r = r.WithContext(controlplane.ContextWithAccess(r.Context(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: " tenant-x "},
-		Operator: true,
+		Fleet:    true,
 	}))
 	if got := clusterOperatorActor(r); got != "tenant-x" {
 		t.Fatalf("actor = %q, want tenant-x", got)

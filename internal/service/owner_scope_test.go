@@ -17,7 +17,7 @@ func userCtx(owner string) context.Context {
 
 func operatorCtx() context.Context {
 	return controlplane.ContextWithAccess(context.Background(),
-		controlplane.Access{Operator: true})
+		controlplane.Access{Fleet: true})
 }
 
 func TestOwnerScope(t *testing.T) {

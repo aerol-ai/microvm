@@ -136,7 +136,7 @@ func clusterListCallerKey(r *http.Request) string {
 		return "operator"
 	}
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return "operator"
 	}
 	owner := strings.TrimSpace(access.Identity.OwnerRef)

@@ -131,7 +131,7 @@ func writeAuditRateLimited(w http.ResponseWriter, retry time.Duration) {
 
 func auditIdentityKey(r *http.Request) string {
 	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok || access.Operator {
+	if !ok || access.Fleet {
 		return auditRateLimitIdentityKey
 	}
 	if ref := access.Identity.OwnerRef; ref != "" {

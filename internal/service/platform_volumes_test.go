@@ -104,7 +104,7 @@ func TestResolvePlatformVolumes_DockerS3(t *testing.T) {
 	// Authenticated user token → per-tenant scope (t- prefix).
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
-		Operator: false,
+		Fleet:    false,
 	})
 	req := models.CreateSandboxRequest{
 		Mounts:          []models.MountSpec{{Type: models.MountTypeS3, Source: "other", Target: "/pre"}},
@@ -144,7 +144,7 @@ func TestResolvePlatformVolumesForReplication(t *testing.T) {
 	s.cfg.EnableCluster = true
 	ctx := controlplane.ContextWithAccess(context.Background(), controlplane.Access{
 		Identity: controlplane.Identity{OwnerRef: "tenant-xyz"},
-		Operator: false,
+		Fleet:    false,
 	})
 	v, err := s.CreatePlatformVolume(ctx, "data")
 	if err != nil {

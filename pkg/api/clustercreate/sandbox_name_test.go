@@ -45,7 +45,7 @@ func TestPrepareReservesOwnerQualifiedName(t *testing.T) {
 		opts     PrepareOptions
 		wantName string
 	}{
-		{name: "operator keeps plain name", access: &controlplane.Access{Operator: true}, wantName: "agent"},
+		{name: "operator keeps plain name", access: &controlplane.Access{Fleet: true}, wantName: "agent"},
 		{name: "internal caller keeps plain name", wantName: "agent"},
 		{name: "tenant via v1", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, opts: PrepareOptions{OwnerRef: "acct-a"}, wantName: cluster.QualifiedSandboxName("acct-a", "agent")},
 		{name: "tenant via facade", access: &controlplane.Access{Identity: controlplane.Identity{OwnerRef: "acct-a"}}, wantName: cluster.QualifiedSandboxName("acct-a", "agent")},

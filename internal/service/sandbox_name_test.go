@@ -84,7 +84,7 @@ func TestResolveSandboxIDByNameIsOwnerScoped(t *testing.T) {
 	}{
 		{name: "tenant a", ctx: tenant("acct-a"), want: "sb-name-a"},
 		{name: "tenant b", ctx: tenant("acct-b"), want: "sb-name-b"},
-		{name: "operator", ctx: controlplane.ContextWithAccess(ctx, controlplane.Access{Operator: true}), want: "sb-name-op"},
+		{name: "operator", ctx: controlplane.ContextWithAccess(ctx, controlplane.Access{Fleet: true}), want: "sb-name-op"},
 		{name: "internal caller", ctx: ctx, want: "sb-name-op"},
 		{name: "tenant without the name", ctx: tenant("acct-c"), wantErr: storepkg.ErrNotFound},
 	}

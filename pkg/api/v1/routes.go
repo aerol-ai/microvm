@@ -33,6 +33,9 @@ type Deps struct {
 func RegisterRoutes(mux *http.ServeMux, d Deps) {
 	h := &handlers{deps: d}
 
+	// Who the caller is (identity-and-access §5.2): needs only a valid
+	// principal, describes only the caller, never forwarded.
+	mux.Handle("GET "+PathPrefix+"/whoami", d.Auth(http.HandlerFunc(h.whoami)))
 	mux.Handle("GET "+PathPrefix+"/capacity", d.Auth(http.HandlerFunc(h.capacity)))
 	mux.Handle("POST "+PathPrefix+"/admin/reconcile", withAuthOperator(d, http.HandlerFunc(h.reconcile)))
 	mux.Handle("POST "+PathPrefix+"/images/build", d.Auth(http.HandlerFunc(h.clusterBuildImageWrap)))
