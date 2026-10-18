@@ -1363,6 +1363,13 @@ type ErrorResponse struct {
 	// error_description. Absent on every other error, including the operator
 	// token's 401, so those bodies are byte for byte unchanged.
 	Reason string `json:"reason,omitempty"`
+	// RequiredPermission and Role are set only on a 403 for an avm_ token or
+	// an OIDC caller (plans/identity-and-access.md §5.3, D9): the permission
+	// the route needs and the role the caller holds; Error carries the hint.
+	// Absent for the operator token and managed callers, so their 403 bodies
+	// are byte for byte unchanged.
+	RequiredPermission string `json:"required_permission,omitempty"`
+	Role               string `json:"role,omitempty"`
 }
 
 // WhoAmI is the body of GET /v1/whoami: the caller's own resolved identity

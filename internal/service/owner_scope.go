@@ -26,6 +26,22 @@ func ownerScope(ctx context.Context) (owner string, scoped bool) {
 	return access.Identity.OwnerRef, true
 }
 
+// hostCapable reports whether the caller may use host-side powers: raw host
+// mounts (validateCreateMounts), file:// bundle refs read off the host
+// (createIsolateSandbox), and the operator's trusted path for custom domains
+// (no DNS proof on create, the owner-less TXT on attach). True for the PAT,
+// a cluster node, an internal call with no Access and the admin role; false
+// for viewer, runner (on a team or on every team), auditor and managed
+// callers (plans/identity-and-access.md §5.1, eng review D3/D7).
+//
+// Scope is not power: ownerScope answers which owners a caller sees, and a
+// runner bound to every team is unscoped there but still not host-capable.
+// A new check that gates a host or trust power must ask this, never
+// !scoped; TestOwnerScopeCallSitesAreReviewed fails on an unreviewed use.
+func hostCapable(ctx context.Context) bool {
+	return controlplane.HostCapable(ctx)
+}
+
 // enforceOwner returns store.ErrNotFound when a user-scoped caller references a
 // sandbox it does not own. A 404 (not 403) is deliberate: it denies the
 // existence of another tenant's sandbox so a user token cannot probe IDs to map

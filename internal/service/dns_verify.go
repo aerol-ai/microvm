@@ -30,15 +30,20 @@ func customDomainOwnerToken(owner string) string {
 	return hex.EncodeToString(sum[:])[:customDomainOwnerTokenLen]
 }
 
-// customDomainOwnerTokenFromContext derives the verification token for the
-// current caller: "" for operator/internal (unscoped) callers, a per-tenant
-// token for a validated user token.
-func customDomainOwnerTokenFromContext(ctx context.Context) string {
-	owner, scoped := ownerScope(ctx)
-	if !scoped {
+// customDomainProofToken is the token the caller's DNS proof must carry to
+// attach a hostname to a sandbox owned by sandboxOwner. A host-capable caller
+// (operator, admin, internal) proves with the owner-less legacy record ""
+// whatever the sandbox, because it is trusted to control DNS. Everyone else
+// proves with the record bound to the sandbox's owner: the value
+// CustomDomainDNS publishes for that sandbox. For a tenant that is its own
+// owner (scopedGet already fenced it there), so nothing changes; a runner
+// bound to every team attaching to team payments' sandbox must show
+// payments' record, never the operator's (eng review D3).
+func customDomainProofToken(ctx context.Context, sandboxOwner string) string {
+	if hostCapable(ctx) {
 		return ""
 	}
-	return customDomainOwnerToken(owner)
+	return customDomainOwnerToken(sandboxOwner)
 }
 
 // DNSResolver is an interface to allow mocking of net.Resolver in tests.

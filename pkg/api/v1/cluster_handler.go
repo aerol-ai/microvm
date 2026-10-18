@@ -1098,15 +1098,11 @@ func (h *handlers) clusterInternalStorageObligations(w http.ResponseWriter, r *h
 	apihttp.WriteJSON(w, http.StatusOK, cluster.StorageObligationsResponse{Obligations: views})
 }
 
-// clusterOperatorAccess gates the storage-retirement endpoints. An open-source
-// build carries no control-plane access record, so the PAT that already
-// guards /v1/cluster/** is the operator credential there.
+// clusterOperatorAccess gates the storage-retirement endpoints: the caller
+// must hold fleet.admin, which the route already required (this is the
+// handler's own second check). No Access is an internal call.
 func clusterOperatorAccess(r *http.Request) bool {
-	access, ok := controlplane.AccessFromContext(r.Context())
-	if !ok {
-		return true
-	}
-	return access.Fleet
+	return apihttp.CallerCan(r.Context(), controlplane.PermFleetAdmin)
 }
 
 func clusterOperatorActor(r *http.Request) string {
