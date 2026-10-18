@@ -37,6 +37,10 @@ type Config struct {
 	// variables every SDK reads.
 	APIURL string
 	Token  string
+	// Team is sent as X-AerolVM-Team on every request and WebSocket
+	// handshake (the Go SDK's MicroVMConfig.Team). Empty falls back to
+	// SB_TEAM, as for every SDK.
+	Team   string
 	Source Source
 	// HTTPClient overrides the transport: the --debug logger, the remote
 	// MCP endpoint's in-process transport, and tests.
@@ -60,6 +64,7 @@ func New(cfg Config) (*Tools, error) {
 	client, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{
 		APIUrl:     cfg.APIURL,
 		PATToken:   cfg.Token,
+		Team:       cfg.Team,
 		HTTPClient: cfg.HTTPClient,
 	})
 	if err != nil {

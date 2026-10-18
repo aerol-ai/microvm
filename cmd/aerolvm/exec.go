@@ -58,7 +58,7 @@ func runExec(ctx context.Context, a *app, args []string) int {
 		return execFailure
 	}
 
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, execFailure)
 	}
@@ -207,7 +207,7 @@ func runLogs(ctx context.Context, a *app, args []string) int {
 	if len(pos) != 2 {
 		return a.usageError(c, "logs", "expected <sandbox> <session-id>")
 	}
-	tools, err := a.tools(c)
+	tools, err := a.tools(ctx, c)
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}

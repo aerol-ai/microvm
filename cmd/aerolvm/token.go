@@ -20,9 +20,9 @@ import (
 )
 
 // aerolvm token create|list|revoke manages scoped API tokens
-// (plans/identity-and-access.md §5.4, §5.6). It calls /v1/tokens directly:
-// the SDKs gain tokens.create/list/revoke in task T9. Admin only for create
-// and revoke, auditor or admin for list; sandboxd decides.
+// (plans/identity-and-access.md §5.4, §5.6). It calls /v1/tokens through
+// callAPI, the same path as whoami. Admin only for create and revoke,
+// auditor or admin for list; sandboxd decides.
 
 // tokenRequestTimeout bounds one token call; a create is one Raft apply.
 const tokenRequestTimeout = 30 * time.Second
@@ -162,15 +162,34 @@ func teamWords(team string) string {
 	return "team " + team
 }
 
-// tokenAPI makes one /v1/tokens call with the CLI's connection. A refusal
-// becomes the same error the SDK would return, so a.fail words it like
-// every other verb's (including the "sign in again" hint on a 401).
+// tokenAPI makes one /v1/tokens call with the CLI's connection.
 func (a *app) tokenAPI(ctx context.Context, c *commonFlags, method, path string, in, out any) error {
-	conn, err := a.connection()
+	conn, err := a.resolve(ctx, c)
 	if err != nil {
 		return err
 	}
-	a.conn = &conn
+	return a.callAPI(ctx, c, conn, method, path, in, out)
+}
+
+// apiRefusal is a non-2xx answer from sandboxd: the error the SDK would
+// return, which agenttools classifies like any other, plus the body's
+// identity fields (a 401's reason; the "no binding" 403's reason, issuer,
+// name and groups).
+type apiRefusal struct {
+	*microvm.APIError
+	body models.ErrorResponse
+}
+
+func (e *apiRefusal) Unwrap() error { return e.APIError }
+
+// callAPI makes one identity call (/v1/whoami, /v1/tokens) directly rather
+// than through the SDK's WhoAmI and Tokens: it keeps the refusal body's
+// identity fields (the "no binding" 403's reason, issuer, name and groups;
+// a 401's reason) and can ask whoami to explain itself, neither of which
+// the SDK's surface carries. A refusal becomes the same error the SDK would
+// return, so a.fail words it like every other verb's (including the "sign
+// in again" hint on a 401).
+func (a *app) callAPI(ctx context.Context, c *commonFlags, conn connection, method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
 		raw, err := json.Marshal(in)
@@ -190,9 +209,9 @@ func (a *app) tokenAPI(ctx context.Context, c *commonFlags, method, path string,
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	client := http.DefaultClient
-	if c != nil && c.debug {
-		client = debugHTTPClient(a.stderr)
+	client := a.apiHTTPClient(c, conn)
+	if client == nil {
+		client = http.DefaultClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -214,7 +233,7 @@ func (a *app) tokenAPI(ctx context.Context, c *commonFlags, method, path string,
 		if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
 			apiErr.RetryAfter = time.Duration(s) * time.Second
 		}
-		return apiErr
+		return &apiRefusal{APIError: apiErr, body: e}
 	}
 	if out == nil || resp.StatusCode == http.StatusNoContent {
 		return nil

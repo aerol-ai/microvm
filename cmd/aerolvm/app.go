@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/agenttools"
 	"github.com/aerol-ai/microvm/internal/version"
@@ -39,6 +40,10 @@ type app struct {
 	// signal that cancelled it.
 	notifySignals func(context.Context) (context.Context, func() os.Signal, func())
 	newTools      func(agenttools.Config) (*agenttools.Tools, error)
+	// now is the clock token expiry is judged by; nil means time.Now.
+	now func() time.Time
+	// openBrowser opens the SSO sign-in page; nil means the system browser.
+	openBrowser func(string) error
 	// conn is the connection the command's tools use, so a refused token
 	// can be named in the error.
 	conn *connection
@@ -55,7 +60,16 @@ func newApp() *app {
 		term:          osTerminal{},
 		notifySignals: notifyInterrupts,
 		newTools:      agenttools.New,
+		now:           time.Now,
+		openBrowser:   openBrowser,
 	}
+}
+
+func (a *app) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 type verb struct {
@@ -97,6 +111,8 @@ func (a *app) verbGroups() []verbGroup {
 		}},
 		{"Access", []verb{
 			{"token", "Create, list and revoke scoped API tokens", tokenHelp, runToken},
+			{"whoami", "Show who sandboxd takes you for: role, team, expiry", whoamiHelp, runWhoAmI},
+			{"auth", "Print a fresh bearer token for scripts and SDKs", authHelp, runAuth},
 		}},
 		{"Setup", []verb{
 			{"login", "Save the sandboxd URL and token for every command", loginHelp, runLogin},
@@ -258,14 +274,46 @@ func (a *app) note(format string, args ...any) {
 	fmt.Fprintf(a.stderr, format+"\n", args...)
 }
 
+// prepare is connection plus what must happen before a command's first
+// call: an SSO login is renewed when under a minute is left (§5.6). It
+// records the connection so a refused token can be named in the error.
+func (a *app) prepare(ctx context.Context, c *commonFlags) (connection, error) {
+	conn, err := a.connection()
+	if err != nil {
+		return connection{}, err
+	}
+	a.conn = &conn
+	if conn.sso != nil {
+		conn.sso.client = a.providerClient(c)
+		token, err := conn.sso.token(ctx)
+		if err != nil {
+			if c != nil && c.debug {
+				a.note("aerolvm debug: renewing the sign-in failed: %v", err)
+			}
+			return connection{}, renewalFailedError(conn.apiURL)
+		}
+		conn.token = token
+	}
+	return conn, nil
+}
+
+// resolve is prepare plus the expiry warning for an API token (D8, D15).
+func (a *app) resolve(ctx context.Context, c *commonFlags) (connection, error) {
+	conn, err := a.prepare(ctx, c)
+	if err != nil {
+		return connection{}, err
+	}
+	a.checkTokenExpiry(ctx, c, conn, false)
+	return conn, nil
+}
+
 // tools builds the agenttools layer for a CLI verb, with the connection
 // from the environment or the saved login.
-func (a *app) tools(c *commonFlags) (*agenttools.Tools, error) {
-	conn, err := a.connection()
+func (a *app) tools(ctx context.Context, c *commonFlags) (*agenttools.Tools, error) {
+	conn, err := a.resolve(ctx, c)
 	if err != nil {
 		return nil, err
 	}
-	a.conn = &conn
 	return a.toolsFor(c, conn)
 }
 
@@ -276,11 +324,13 @@ func (a *app) toolsFor(c *commonFlags, conn connection) (*agenttools.Tools, erro
 	cfg := agenttools.Config{
 		APIURL: conn.apiURL,
 		Token:  conn.token,
-		Source: agenttools.SourceCLI,
-		Warn:   func(s string) { a.note("aerolvm: %s", s) },
-	}
-	if c != nil && c.debug {
-		cfg.HTTPClient = debugHTTPClient(a.stderr)
+		// The SDK sends the team on every request and on the WebSocket
+		// handshakes of streamed exec and shell attach, which no HTTP
+		// client reaches.
+		Team:       conn.team,
+		Source:     agenttools.SourceCLI,
+		HTTPClient: a.apiHTTPClient(c, conn),
+		Warn:       func(s string) { a.note("aerolvm: %s", s) },
 	}
 	return a.newTools(cfg)
 }

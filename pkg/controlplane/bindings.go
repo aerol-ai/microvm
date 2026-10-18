@@ -11,6 +11,27 @@ import (
 type TeamBinding struct {
 	Role Role
 	Team string
+	// Index and Rule name the identity-file binding that granted it, for
+	// `whoami --explain` (CEO review D22): its 1-based position in the
+	// file's bindings list and its canonical line
+	// (`okta group="payments-eng" -> runner/payments`). Rule shares the
+	// loaded file's string, so carrying it costs a pointer, not a copy.
+	// Zero for a binding no identity file granted.
+	Index int
+	Rule  string
+}
+
+// ClaimNames is how one identity-file issuer names the claims its bindings
+// match on (§5.5 `claims:`), so `whoami --explain` can read the caller's
+// own claims back out of the token the caller presented (D22). One value
+// per loaded issuer, shared by every Access it verifies: read it, never
+// write it.
+type ClaimNames struct {
+	// Issuer is the issuer's identity-file name.
+	Issuer   string
+	Username string
+	Groups   string
+	Roles    string
 }
 
 // Apply returns a narrowed to binding b: its role, and its team as the owner
