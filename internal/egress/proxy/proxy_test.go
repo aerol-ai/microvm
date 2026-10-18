@@ -67,6 +67,24 @@ func (r *rig) last() Decision {
 	return r.decisions[len(r.decisions)-1]
 }
 
+// waitDecisions waits until the proxy has recorded at least n decisions.
+func (r *rig) waitDecisions(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		r.mu.Lock()
+		got := len(r.decisions)
+		r.mu.Unlock()
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the proxy recorded %d decisions, want %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func newRig(t *testing.T, port uint16, spec egress.Spec, cfg Config) *rig {
 	t.Helper()
 	return newRigOver(t, port, spec, cfg, nil)
@@ -261,6 +279,10 @@ func TestBlockedAndCaps(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first connection never reached the backend")
 	}
+	// The backend can accept before the proxy's dial returns and records
+	// the first connection's allowed decision. Wait for it, or it can land
+	// after the over-cap one and r.last() below reads the wrong decision.
+	r.waitDecisions(t, 1)
 	// The second is over the per-sandbox cap: alert without a hello read.
 	second, _ := net.Dial("tcp", r.addr)
 	buf := make([]byte, 16)
