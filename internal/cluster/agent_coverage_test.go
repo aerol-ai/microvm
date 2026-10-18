@@ -91,6 +91,11 @@ func TestLift3AgentRemainingClientBranches(t *testing.T) {
 				}
 			}
 			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Query().Get("authoritative") == "true" && len(req.IDs) == 1 && req.IDs[0] == "sb-res-empty" {
+				// CancelReservation's leader read.
+				_ = json.NewEncoder(w).Encode(map[string]Placement{"sb-res-empty": placements["sb-res-empty"]})
+				return
+			}
 			_, _ = io.WriteString(w, "null")
 		case r.Method == http.MethodPost && (r.URL.Path == PublicInternalApplyPath || r.URL.Path == InternalAPIPath):
 			http.Error(w, "apply failed", http.StatusInternalServerError)

@@ -839,15 +839,29 @@ func (a *Agent) ReserveOnTarget(ctx context.Context, sandboxID string, target Pl
 	})
 }
 
+// CancelReservation releases a pending reservation, fenced by its
+// incarnation. The read that decides it goes to the leader. A plain lookup
+// reaches a control-plane member chosen at random, and a follower answers it
+// from its own FSM, which may not have applied a reservation proposed a few
+// milliseconds earlier: a worker whose forwarded create failed fast (400
+// "image is required") then read "no such reservation", cancelled nothing,
+// and the name stayed held for ReservationTTL, so every retry got "409
+// sandbox name already in use cluster-wide". Cluster.CancelReservation fixed
+// the same race for raft members; an agent has no FSM of its own, so every
+// cancel takes the authoritative read. If the leader cannot be asked, the
+// error is returned and the caller's retract path logs it; the expiry sweep
+// remains the safety net.
 func (a *Agent) CancelReservation(ctx context.Context, sandboxID string) error {
-	lookup, ok, err := a.lookupPlacement(ctx, strings.TrimSpace(sandboxID))
+	sandboxID = strings.TrimSpace(sandboxID)
+	got, err := a.AuthoritativePlacementsByIDs(ctx, []string{sandboxID})
 	if err != nil {
-		return err
+		return fmt.Errorf("cluster agent: cancel reservation: %w", err)
 	}
-	if !ok || !lookup.Placement.IsReserved() {
+	placement, ok := got[sandboxID]
+	if !ok || !placement.IsReserved() {
 		return nil
 	}
-	incarnationID := strings.TrimSpace(lookup.Placement.IncarnationID)
+	incarnationID := strings.TrimSpace(placement.IncarnationID)
 	if incarnationID == "" {
 		return fmt.Errorf("%w: cancel reservation requires current incarnation", ErrIncarnationConflict)
 	}

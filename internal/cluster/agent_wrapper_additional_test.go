@@ -210,7 +210,15 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 	agent := newAgentControlPlaneHarness(t, capture.handler(t, func(w http.ResponseWriter, r *http.Request) bool {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == PublicInternalPlacementsByIDsPath:
-			t.Fatalf("placement delete must not POST placements-by-ids (leader path): %s", r.URL.RequestURI())
+			var req placementsByIDsRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			if r.URL.Query().Get("authoritative") != "true" || len(req.IDs) != 1 || req.IDs[0] != "sb-reserve" {
+				t.Fatalf("only CancelReservation may take the leader read here, got %s %v", r.URL.RequestURI(), req.IDs)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]Placement{
+				"sb-reserve": {SandboxID: "sb-reserve", OwnerNodeID: "node-a", State: PlacementStateReserved, IncarnationID: "inc-reserve"},
+			})
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-state":
 			w.Header().Set("Content-Type", "application/json")
@@ -241,13 +249,6 @@ func TestAgentLookupDerivedReadsAndMutationWrappers(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
 				SandboxID: "sb-port",
 				Placement: Placement{SandboxID: "sb-port", OwnerNodeID: "worker-self", IncarnationID: "inc-port"},
-			})
-			return true
-		case r.Method == http.MethodGet && r.URL.Path == PublicInternalPlacementPath+"sb-reserve":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(PlacementLookupResponse{
-				SandboxID: "sb-reserve",
-				Placement: Placement{SandboxID: "sb-reserve", OwnerNodeID: "node-a", State: PlacementStateReserved, IncarnationID: "inc-reserve"},
 			})
 			return true
 		case r.Method == http.MethodGet && r.URL.Path == PublicInternalDrainStatePath+"node-a":

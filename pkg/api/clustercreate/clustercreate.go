@@ -331,8 +331,131 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		return Decision{ReservationID: sandboxID}, true
 	}
 	service.RecordCreateReservationState("reserve_remote")
-	c.ForwardHTTP(cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL}, w, r)
+	forwardReservedCreate(w, r, c, cluster.Endpoint{NodeID: target.NodeID, InternalURL: target.InternalURL, APIURL: target.APIURL},
+		sandboxID, opts.PreferredSandboxID == "", opts.Logger)
 	return Decision{}, false
+}
+
+// forwardReservedCreate forwards a create this router just reserved and, when
+// the target refuses it with a 4xx, releases the reservation before the
+// refusal reaches the client.
+//
+// A 4xx other than 409 means the target never made the sandbox: it refused
+// the request (validation, an auth 401 on a worker whose token mirror is one
+// poll behind, a stale target's 421, a rate limit) or failed the create and
+// retracted it. Keeping the reservation until ReservationTTL then only turns
+// the client's corrected retry into "409 sandbox name already in use
+// cluster-wide" for two minutes. The target already cancels after a failed
+// create leg; this also covers the refusals that never reach its create, and
+// is a no-op when the target cancelled first. The refusal is held until the
+// cancel commits, so a retry sent the moment the client reads the 4xx cannot
+// race it. A 409 is excluded and keeps today's behavior (see
+// rejectionHold.rejected).
+//
+// Only a fresh id is released here. With an Idempotency-Key the id is shared
+// by every replay of the key, a replay routes to the existing reservation
+// (routeExistingPlacement) and may be creating under it right now, and the
+// reservation it keeps is exactly what lets that retry finish.
+//
+// A 5xx, a transport failure or a timeout keeps the reservation, as before:
+// the target may still be creating, and cancelling under a live create would
+// leave an untracked sandbox. The expiry sweep stays the safety net there.
+func forwardReservedCreate(w http.ResponseWriter, r *http.Request, c cluster.Client, target cluster.Endpoint, sandboxID string, freshID bool, logger *slog.Logger) {
+	if !freshID {
+		c.ForwardHTTP(target, w, r)
+		return
+	}
+	hold := &rejectionHold{ResponseWriter: w}
+	defer hold.release()
+	c.ForwardHTTP(target, hold, r)
+	if hold.rejected() {
+		service.RecordCreateReservationState("release_rejected")
+		// WithoutCancel: a client that hangs up on the 4xx must not leave
+		// its name held for two minutes.
+		cancelReservation(context.WithoutCancel(r.Context()), c, logger, sandboxID)
+	}
+}
+
+// maxHeldRejectionBytes bounds the refusal body rejectionHold buffers. A
+// create's 4xx is a short JSON error; a larger one is let through rather than
+// held, and the release then still runs, only not ahead of the client.
+const maxHeldRejectionBytes = 64 << 10
+
+// rejectionHold passes a forwarded response through untouched unless its
+// status is a refusal (rejected), in which case it holds the status and body
+// until release.
+type rejectionHold struct {
+	http.ResponseWriter
+	status int
+	held   bool
+	body   bytes.Buffer
+}
+
+func (h *rejectionHold) WriteHeader(status int) {
+	if status < http.StatusOK {
+		// 1xx informational responses precede the final one.
+		h.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if h.status != 0 {
+		return
+	}
+	h.status = status
+	if h.rejected() {
+		h.held = true
+		return
+	}
+	h.ResponseWriter.WriteHeader(status)
+}
+
+func (h *rejectionHold) Write(p []byte) (int, error) {
+	if h.status == 0 {
+		h.WriteHeader(http.StatusOK)
+	}
+	if !h.held {
+		return h.ResponseWriter.Write(p)
+	}
+	if h.body.Len()+len(p) > maxHeldRejectionBytes {
+		h.release()
+		return h.ResponseWriter.Write(p)
+	}
+	return h.body.Write(p)
+}
+
+// Flush forwards a proxy flush, except while a refusal is held.
+func (h *rejectionHold) Flush() {
+	if h.held {
+		return
+	}
+	if f, ok := h.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer.
+func (h *rejectionHold) Unwrap() http.ResponseWriter { return h.ResponseWriter }
+
+// rejected reports a 4xx other than 409. A target's 409 can follow a create
+// that succeeded: the promote lost a name race (OverlapPhasePromote) and, if
+// retractFailedPromote's destroy then failed, the sandbox is still live under
+// the Reserved row. Cancelling that row is the "local sandbox outlives its
+// reservation" case retractReservedCreate refuses to cause, since ownership
+// replay would resurrect it. A real name conflict is a legitimate 409 anyway,
+// so a 409 keeps today's behavior.
+func (h *rejectionHold) rejected() bool {
+	return h.status >= http.StatusBadRequest && h.status < http.StatusInternalServerError &&
+		h.status != http.StatusConflict
+}
+
+// release sends a held refusal. Safe to call more than once.
+func (h *rejectionHold) release() {
+	if !h.held {
+		return
+	}
+	h.held = false
+	h.ResponseWriter.WriteHeader(h.status)
+	_, _ = h.ResponseWriter.Write(h.body.Bytes())
+	h.body.Reset()
 }
 
 func routeExistingPlacement(w http.ResponseWriter, r *http.Request, c cluster.Client, sandboxID string, writeError ErrorWriter) (handled bool, local bool) {
