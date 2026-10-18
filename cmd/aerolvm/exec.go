@@ -260,10 +260,14 @@ func (a *app) followLogs(ctx context.Context, c *commonFlags, sb *microvm.Sandbo
 	case <-ctx.Done():
 		_ = handle.Close()
 		<-done
-		if sig := received(); sig != nil {
-			a.note("aerolvm: detached; the command keeps running")
-			return exitOK
-		}
+	}
+	// A local SIGINT/SIGTERM cancels ctx, which also ends Wait, so either
+	// branch can see it first (as in runShell). Checking the signal only in
+	// the ctx branch turned a detach into "aerolvm: canceled" whenever Wait
+	// won the select.
+	if sig := received(); sig != nil {
+		a.note("aerolvm: detached; the command keeps running")
+		return exitOK
 	}
 	if waitErr != nil {
 		return a.fail(c, waitErr, exitError)
