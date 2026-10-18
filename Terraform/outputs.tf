@@ -103,6 +103,16 @@ output "audit_witness_auditor_policy_arn" {
   value       = var.audit_witness_enabled && var.audit_witness_auditor_policy_enabled ? aws_iam_policy.audit_witness_auditor[0].arn : ""
 }
 
+output "audit_export_bucket" {
+  description = "S3 bucket the nodes export audit records to. Empty when audit_export_enabled=false. Pass s3://<audit_export_bucket>/<audit_export_prefix> to aerolvm audit search --export."
+  value       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
+}
+
+output "audit_export_prefix" {
+  description = "Key prefix of the audit export (SB_AUDIT_EXPORT_S3_PREFIX). Empty when audit_export_enabled=false."
+  value       = var.audit_export_enabled ? var.cluster_name : ""
+}
+
 output "caddy_certs_bucket" {
   description = "Shared Caddy cert storage bucket name. Empty when shared storage is disabled. In BYO mode this echoes the operator-supplied bucket."
   value       = local.caddy_storage_s3.enabled ? local.caddy_storage_s3.bucket : ""
