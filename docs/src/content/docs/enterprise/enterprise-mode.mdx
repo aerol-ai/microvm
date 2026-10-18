@@ -184,7 +184,7 @@ SB_IDENTITY_ENABLED=true
 SB_PAT_SCOPE=host
 ```
 
-`SB_PAT_SCOPE=host` also needs Caddy to reach the server through its private socket. Re-run the installer with `--pat-scope host` on each server: it writes that setting and the Caddy change together. Before you do, move every remote tool that uses the server token (the dashboard, remote MCP, SDK scripts, a Prometheus scrape) to SSO or a named API token. [Access control](/enterprise/access-control/) shows how, including how to make the first admin token.
+`SB_PAT_SCOPE=host` also needs Caddy to reach the server through its private socket. Re-run the installer with `--pat-scope host` on each server: it writes that setting and the Caddy change together. The installer writes the settings file from scratch, so the lines above that you added by hand are lost. Save a copy, pass every install option again with the current `--pat-token`, add the lines back, then run `sudo systemctl restart sandboxd`, since the installer does not restart a running server. Before you do, move every remote tool that uses the server token (the dashboard, remote MCP, SDK scripts, a Prometheus scrape) to SSO or a named API token. [Access control](/enterprise/access-control/) shows how, including how to make the first admin token.
 
 AWS credentials come from the usual places: the server's instance role, environment variables or a profile. The Terraform setup sets the witness settings for you. Set `SB_ENTERPRISE_MODE` yourself, through `extra_sandboxd_env`.
 

@@ -220,7 +220,7 @@ Send your API token as a bearer token. For example, in Claude Code:
 claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox=my-agent&create_if_missing=true" --header "Authorization: Bearer $SB_PAT_TOKEN"
 ```
 
-With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts about an hour. The server token works only if the operator has not limited it to the server.
+With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts about an hour. If your credential belongs to several teams, add `--header "X-AerolVM-Team: checkout"`: every tool call then acts for that team. The server token works only if the operator has not limited it to the server. Once they have, a server token sent to `/mcp` from outside is refused, and the tool calls it would make count as outside too, on every server they reach.
 
 - **Any server in a cluster can answer.** The endpoint keeps nothing between requests.
 - **Each call runs with your token's permissions,** through the same checks as a direct API call.

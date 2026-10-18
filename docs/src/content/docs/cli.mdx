@@ -243,10 +243,19 @@ Each match is one line, then each server's verdict. Exit codes are those of `aud
 ### Review who has access
 
 ```bash
-aerolvm access review --export s3://acme-audit/audit --since 90d > access-review.md
+aerolvm access review --export s3://acme-audit/audit --since 90d --identity-file identity.yaml > access-review.md
 ```
 
-This writes the evidence for a quarterly access review. It joins the server's token list with your exported audit records, and flags tokens no record names, expired and expiring tokens, every admin, and refused calls. Add `--format csv` for a spreadsheet. It needs an auditor or admin credential for the token list, and reads the export like `audit search`.
+This writes the evidence for a quarterly access review. It joins the server's token list with your exported audit records, and flags tokens no record names, expired and expiring tokens, every admin, identity file changes, and refused calls. It needs an auditor or admin credential for the token list, and reads the export like `audit search`.
+
+| Flag | What it does |
+|---|---|
+| `--since <when>` | Where the review window starts. Required. A quarter is `90d`. |
+| `--export` or `--export-dir` | Where the exported records are. Give exactly one. |
+| `--identity-file <path>` | Also list the role rules in your identity file, and which servers run that exact file. It is read on your machine and never sent anywhere. |
+| `--format md\|csv` | Markdown (the default) or CSV. |
+| `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--json` | Print the report as JSON. |
 
 A tampered export fails the review: nothing is printed on stdout, and the command exits `1`. [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) describes every section, flag and CSV column.
 

@@ -182,28 +182,49 @@ Keep exported records at least as long as the window you verify. If records insi
 `aerolvm access review` turns the token list and your verified export into one report you can file as SOC 2 CC6.2 and CC6.3 evidence:
 
 ```bash
-aerolvm access review --export s3://acme-audit/audit --since 90d > access-review.md
+aerolvm access review --export s3://acme-audit/audit --since 90d --identity-file identity.yaml > access-review.md
 aerolvm access review --export s3://acme-audit/audit --since 90d --format csv > access-review.csv
 ```
 
-It needs an `auditor` or `admin` credential for the token list. It reads the export the way `aerolvm audit verify` does, so every record it counts is checked against its chain. A tampered batch fails the review: nothing goes to stdout, and the command exits `1`. If the export is behind, the report carries an INCOMPLETE warning and the command exits `3`.
+The full form is:
+
+```text
+aerolvm access review --since <when> (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
+                      [--identity-file <path>] [--format md|csv] [--witness s3://<bucket>[/<prefix>]]
+                      [--max-lag D] [--region R] [--endpoint URL] [--path-style] [--json]
+```
+
+- It needs an `auditor` or `admin` credential for the token list.
+- It reads the export the way `aerolvm audit verify` does, so every record it counts is checked against its chain.
+- `--identity-file` adds the identity file you hold: its role rules in order, and which servers' newest `identity_config` record names that exact file (by SHA-256). The file is read on your machine and never sent anywhere.
+- `--json` prints the same report as JSON.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | PASS. The report is on stdout. |
+| `1` | FAIL, or an error. A tampered batch fails the review: nothing goes to stdout, and the verdict goes to stderr. A refused token list is an error too. |
+| `2` | Bad usage, such as a missing `--since`. |
+| `3` | INCOMPLETE: the report is printed with a warning, because the export is behind. Also an export with no batches, with no report. |
 
 ### What the report holds
 
-The Markdown report has these parts, in order:
+The Markdown report opens with a summary: the window, the evidence verdict, what the records can show about reads, the token count, and the report's scope. Then come these sections, in order:
 
-1. **A summary:** the window, the evidence verdict, what the records can show about reads, the token count, and the report's scope.
-2. **Findings:** one row per flag, with the subject, its name and a detail.
-3. **Tokens:** every listed token, with its role, team, creator, dates, last recorded action, calls by kind, and flags.
-4. **Token changes in the window:** every token created or revoked, by whom, and on which server.
-5. **Principals seen in the window:** everyone else the records name, such as people, the server token, cluster servers, parts of the server, and SSH keys.
-6. **Refused credentials:** `401`s by source address, with the reasons.
-7. **Evidence:** each server's verdict, its record count and dates, its read-record setting, and records it lost.
+1. **Findings:** one row per flag, with the subject, its name and a detail.
+2. **Tokens:** every listed token, with its role, team, creator, dates, last recorded action, calls by kind, and flags.
+3. **Token changes in the window:** every token created or revoked, by whom, and on which server.
+4. **Identity-file changes in the window:** one block per `identity_config` record, one line per change.
+5. **Identity-file bindings:** with `--identity-file`, the file's hash, issuers and deny count, which servers enforce it, then every role rule in order. Without it, a line saying the file was not read.
+6. **Principals seen in the window:** everyone else the records name, such as people, the server token, cluster servers, parts of the server, and SSH keys.
+7. **Refused credentials:** `401`s by source address, with the reasons.
+8. **Evidence:** each server's verdict, its record count and dates, its read-record setting, records it lost, and the identity file it last recorded.
 
 | Flag | Meaning |
 |---|---|
-| `admin` | A token with the `admin` role, the server token, or a cluster server acting on its own behalf |
-| `admin_grant` | A token was created with the `admin` role in the window |
+| `admin` | A token with the `admin` role, the server token, a cluster server acting on its own behalf, or a role rule that grants `admin` |
+| `admin_grant` | A token was created, or a role rule was added, with the `admin` role |
+| `every_team` | A role rule grants its role on every team (`*`) |
+| `identity_change` | A server's identity file changed |
 | `expired` | A listed token has expired but is not yet removed |
 | `expiring` | A listed token expires within 30 days |
 | `revoked` | A token was revoked in the window |
@@ -213,6 +234,17 @@ The Markdown report has these parts, in order:
 | `refused` | Credentials refused with `401`, by source address |
 | `rate_limited` | Calls the flood limit summed up: their routes are on record, each call is not |
 
+Each identity-file change is one line of one of these kinds:
+
+| Kind | Line |
+|---|---|
+| `file` | The old and new file hash. Flagged `identity_change`. |
+| `binding_added`, `binding_removed` | One role rule, such as `okta group="platform-admins" -> admin/*`. An added rule can carry `admin`, `admin_grant` (in Findings) and `every_team`. |
+| `bindings_reordered` | The rules kept the same lines in a new order, so a person can get a different default role. |
+| `deny_added`, `deny_removed` | One `deny_subjects` entry. |
+| `issuer_added`, `issuer_removed` | One issuer, with its URL, audiences, kind, claims and lifetime cap. |
+| `lines_omitted` | How many lines the record left out because it was too long. The two hashes still name both files. |
+
 **`no_recorded_action` does not mean unused.** Plain reads leave a record only with `SB_AUDIT_API_RECORDS=all`. The server reports that setting nowhere, so the review infers it from the records, per server:
 
 - **`all`** when a server's records include a plain read: an allowed `GET` on a `/v1/` route that is not the token list, not a command or file route, and not a session.
@@ -221,7 +253,7 @@ The Markdown report has these parts, in order:
 
 Across servers, the summary says `all` only if every server is `all`, `mixed` if some are, then `mutations`, then `none`. A read-only token, such as a viewer or a metrics scrape, shows no recorded action unless the setting is `all`.
 
-**What it cannot know.** It lists the tokens the server holds and every caller the records name. It cannot list people your identity provider would let in who never called the API, and it does not read the identity file's role rules.
+**What it cannot know.** It lists the tokens the server holds and every caller the records name. It cannot list people your identity provider would let in who never called the API. With `--identity-file` it lists the role rules, but the records do not say which rule a person matched.
 
 The CSV has one header row:
 
@@ -229,7 +261,7 @@ The CSV has one header row:
 row,id,name,kind,role,team,created_by,created_at,expires_at,last_seen,last_action,node,calls,denied,rate_limited,flags,detail
 ```
 
-The `row` column is `review`, `node`, `token`, `token_created`, `token_revoked`, `principal` or `refused_source`. Flags in one cell are joined with `;`. A cell that starts with `=`, `+`, `-` or `@` gets a leading `'`, so a spreadsheet does not run it as a formula. `--json` prints the same report as JSON.
+The `row` column is one of `review`, `node`, `token`, `token_created`, `token_revoked`, `identity_change`, `identity_file`, `binding`, `principal` or `refused_source`. An `identity_change` row has the change kind in `kind` and the line in `detail`. A `binding` row has the rule's position in `id`, its issuer in `name` and its match in `kind`. Flags in one cell are joined with `;`. A cell that starts with `=`, `+`, `-` or `@` gets a leading `'`, so a spreadsheet does not run it as a formula.
 
 ### Reproduce it in your SIEM
 
@@ -238,6 +270,7 @@ For a large fleet, a quarter of export can be very large. Run the same join in y
 - **Tokens:** the token list, from `aerolvm token list --json` or `tokens.list()` in an SDK. Join it to `api` records on `caller.id` equal to the token `id`.
 - **Last action and calls:** the newest record and the count of records per caller in the window. A record with `request.count` stands for that many identical calls. A record with `reason: rate_limited` stands for `dropped` calls.
 - **Token changes:** `api` records with `request.method` `POST` and `request.route` `/v1/tokens` (created: `request.target` is the new token, and `request.grant` its role and team), or `DELETE` and `/v1/tokens/{id}` (revoked). Count only `result: ok`. `caller` is who did it.
+- **Identity-file changes:** `identity_config` records. `identity_config.old_hash` and `new_hash` name the files. `bindings_added`, `bindings_removed`, `reordered`, `deny_added`, `deny_removed`, `issuers_added`, `issuers_removed` and `omitted` hold the lines. Flag a binding line ending in `-> admin/*` as admin, and any ending in `/*` as every team.
 - **Denied and refused:** `api` records with `result: denied`, and `auth_denied` records grouped by `request.source`. Each `auth_denied` record stands for `1 + dropped` refusals, with the reason in `reason`.
 - **Lost records:** the `dropped` count of `gap` records.
 
