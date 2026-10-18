@@ -54,8 +54,10 @@ input[type="password"], input[type="text"] {
 header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 24px; border-bottom: 1px solid var(--border); background: var(--panel);
-  position: sticky; top: 0; z-index: 10;
 }
+/* The header and the expiry banner stick together, so the banner stays in
+   view however far the overview is scrolled (DR6). */
+.topbar { position: sticky; top: 0; z-index: 10; }
 header .brand { font-weight: 600; font-size: 14px; display: flex; align-items: baseline; gap: 10px; }
 header .brand .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted2); }
 header .brand .dot.ok { background: var(--ok); }
@@ -133,45 +135,152 @@ details > summary { cursor: pointer; color: var(--muted); padding: 6px 0; font-s
 details[open] > summary { margin-bottom: 6px; }
 .pager { display: flex; gap: 8px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
 
+/* Sign-in, signed-in and no-access boxes (plans/identity-and-access.md §5.7).
+   One 360 px box, scrollable when a long group list makes it taller than
+   the viewport (margin: auto centres it without clipping its top). */
 #login {
   position: fixed; inset: 0; background: rgba(8, 9, 12, 0.96);
-  display: flex; align-items: center; justify-content: center; z-index: 100;
+  display: flex; align-items: flex-start; justify-content: center; z-index: 100;
+  overflow-y: auto; padding: 16px 0;
 }
 #login .box {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
-  padding: 24px; width: 360px; max-width: 92vw;
+  padding: 24px; width: 360px; max-width: 92vw; margin: auto;
 }
-#login h1 { margin: 0 0 4px; font-size: 18px; }
-#login p { margin: 0 0 16px; color: var(--muted); }
-#login .actions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+#login h1 { margin: 0; font-size: 18px; }
+#login h2 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+#login h1:focus, #login h2:focus { outline: none; }
+#login h1:focus-visible, #login h2:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#login p { margin: 0 0 12px; color: var(--muted); }
+#login p.body { color: var(--text); }
+#login .host { margin: 0 0 16px; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+#login .actions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; align-items: center; flex-wrap: wrap; }
+#login .actions.split { justify-content: space-between; }
 #login .error { margin-top: 10px; font-size: 12px; }
+#login .msg { margin: 0 0 12px; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+#login .msg:empty { display: none; }
+#login .msg.error { color: var(--bad); margin-top: 0; }
+#login :focus-visible, .banner :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* SSO buttons match Google's large dark button (design review DR11, DR14):
+   40 px tall, the box's full width, a visible --muted2 edge. */
+.sso-stack { display: flex; flex-direction: column; gap: 8px; }
+#login button.sso-btn { height: 40px; width: 100%; padding: 0 12px; font-size: 14px; border-radius: 4px; border-color: var(--muted2); }
+#login button.sso-btn:hover { border-color: var(--accent); }
+#login button.sso-btn:disabled:hover { border-color: var(--muted2); }
+.gis-slot { height: 40px; display: flex; justify-content: center; overflow: hidden; }
+.gis-slot.leaving { pointer-events: none; opacity: 0.5; }
+button.link { background: none; border: none; padding: 0; color: var(--accent); text-decoration: underline; font-size: 12px; }
+button.link:hover { border: none; }
+#switch-account { margin-top: 10px; }
+.divider { display: flex; align-items: center; gap: 10px; margin: 16px 0 4px; color: var(--muted); font-size: 12px; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border-soft); }
+#login label.field { display: block; margin: 4px 0 2px; font-size: 12px; color: var(--text); }
+#login p.hint { margin: 0 0 6px; font-size: 12px; }
+#login p.warn-line { margin: 8px 0 0; font-size: 12px; color: var(--warn); }
+#login pre.cli { margin: 0; padding: 8px 10px; background: var(--panel2); border-radius: 4px; font-size: 12px; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+#login ul.groups { margin: 0 0 12px; padding-left: 18px; max-height: 240px; overflow: auto; font-family: var(--mono); font-size: 11px; color: var(--text); }
+#login ul.groups li.more { color: var(--muted); list-style: none; margin-left: -18px; }
+
+/* Header identity (design review DR5). */
+.who { display: inline-flex; gap: 6px; align-items: center; min-width: 0; }
+.who-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* "Your sign-in expired" bar under the header, in the .pill.warn palette (DR6). */
+.banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 16px; background: #231e10; border-bottom: 1px solid #5a4a1c; color: var(--warn); }
+
+/* Narrow screens (design review DR12): the new screens fit 320 px. */
+@media (max-width: 719px) {
+  header { flex-wrap: wrap; row-gap: 8px; padding: 10px 16px; }
+  header .brand { flex: 1 1 100%; flex-wrap: wrap; min-width: 0; }
+  header .brand small { overflow-wrap: anywhere; }
+  header .actions { flex: 1 1 100%; flex-wrap: wrap; }
+  .who-name { max-width: 140px; }
+}
+@media (max-width: 479px) {
+  .banner { flex-direction: column; align-items: flex-start; }
+}
+@media (max-width: 399px) {
+  #login .box { padding: 16px; }
+}
 </style>
 </head>
 <body>
 
 <div id="login" hidden>
-  <form class="box" id="login-form" autocomplete="off">
-    <h1>sandboxd</h1>
-    <p>Sign in with <code>SB_PAT_TOKEN</code> to view this node.</p>
-    <input type="password" id="pat-input" placeholder="Personal access token" autofocus />
-    <div class="actions">
-      <button type="submit">Sign in</button>
+  <div class="box" id="login-box">
+    <h1 id="box-title" tabindex="-1">AerolVM</h1>
+    <p class="host" id="box-host"></p>
+
+    <div id="view-signin">
+      <p id="signin-notice" hidden></p>
+      <p id="signin-line" hidden></p>
+      <div class="msg" id="signin-msg" aria-live="polite"></div>
+      <div class="actions" id="retry-row" hidden><button type="button" id="retry-btn">Retry</button></div>
+      <p id="sso-loading" hidden></p>
+      <div class="sso-stack" id="sso-buttons" hidden></div>
+      <button type="button" class="link" id="switch-account" hidden>Use a different account</button>
+      <p id="sso-pointer" hidden></p>
+      <div class="divider" id="or-divider" hidden>or</div>
+      <details id="token-details">
+        <summary id="token-summary">Use an API token instead</summary>
+        <form id="login-form" autocomplete="off">
+          <label class="field" for="pat-input">API token</label>
+          <p class="hint" id="pat-hint">An avm_ token or the server's PAT.</p>
+          <input type="password" id="pat-input" aria-describedby="pat-hint" />
+          <p class="warn-line" id="plain-http-warning" hidden></p>
+          <div class="actions">
+            <button type="submit" id="pat-submit">Sign in</button>
+          </div>
+        </form>
+      </details>
     </div>
-    <div class="error" id="login-error" hidden></div>
-  </form>
+
+    <div id="view-signedin" hidden>
+      <p class="body">Signed in as <strong id="si-name"></strong></p>
+      <p id="si-role"></p>
+      <p class="body" id="si-console"></p>
+      <p>From a terminal:</p>
+      <pre class="cli"><code id="si-cli"></code></pre>
+      <div class="actions"><button type="button" id="si-signout">Sign out</button></div>
+    </div>
+
+    <div id="view-noaccess" hidden>
+      <h2 id="na-heading" tabindex="-1"></h2>
+      <p class="body" id="na-who"></p>
+      <p id="na-guidance"></p>
+      <details id="na-groups" hidden>
+        <summary id="na-groups-summary"></summary>
+        <ul class="groups" id="na-groups-list"></ul>
+      </details>
+      <p id="na-nogroups" hidden></p>
+      <p id="na-overage" hidden></p>
+      <div class="actions split">
+        <button type="button" class="link" id="na-switch">Use a different account</button>
+        <button type="button" id="na-signout">Sign out</button>
+      </div>
+    </div>
+  </div>
 </div>
 
+<div class="topbar">
 <header hidden id="app-header">
   <div class="brand">
     <span class="dot" id="status-dot"></span>
     AerolVM <small id="node-summary">loading…</small>
   </div>
   <div class="actions">
+    <span class="who" id="who" hidden><span class="who-name" id="who-name"></span><span class="pill muted" id="who-pill"></span></span>
     <label><input type="checkbox" id="autorefresh" checked /> auto-refresh</label>
     <button id="refresh-btn" type="button">Refresh</button>
     <button id="signout-btn" type="button" class="ghost">Sign out</button>
   </div>
 </header>
+
+<div class="banner" id="expiry-banner" role="alert" hidden>
+  <span id="banner-text"></span>
+  <button type="button" id="banner-signin">Sign in again</button>
+</div>
+</div>
 
 <main hidden id="app-main">
 
@@ -248,7 +357,7 @@ details[open] > summary { margin-bottom: 6px; }
     <h2>Metrics (expvar)</h2>
     <div class="body">
       <div class="metrics-grid" id="metrics-grid"><span class="muted">loading…</span></div>
-      <details>
+      <details id="metrics-raw-details">
         <summary>Show raw /debug/vars</summary>
         <pre class="raw" id="metrics-raw">loading…</pre>
       </details>
@@ -259,90 +368,653 @@ details[open] > summary { margin-bottom: 6px; }
 <script>
 "use strict";
 
-const PAT_KEY = "aerolvm.pat";
-const REFRESH_MS = 5000;
+// The page's one inline script. The server hashes it at boot into the
+// Content-Security-Policy (plans/identity-and-access.md D19), so it must
+// stay the page's only script element, with no attributes, and the page may
+// not grow inline event handlers.
+//
+// Layout: the sign-in logic first, as small functions that touch no DOM
+// (pkg/api/testdata/dashboard_test.mjs runs them under node from
+// TestDashboardPageLogic); then the overview panels; then the DOM layer that
+// wires them to the page. Every value from the server or a provider is
+// rendered with textContent, or escapeHTML in the panels' templates.
 
-const state = {
-  pat: sessionStorage.getItem(PAT_KEY) || "",
-  pageTokens: [""],
-  pageIndex: 0,
-  timer: null,
+// ---------- sign-in logic (no DOM) ----------
+
+// sessionStorage keys. The bearer keeps today's key, so a tab signed in with
+// the PAT before an upgrade stays signed in.
+const KEYS = {
+  bearer: "aerolvm.pat",
+  sso: "aerolvm.sso",
+  pending: "aerolvm.pending",
+  view: "aerolvm.view",
+  lastIssuer: "aerolvm.last_issuer",
+  gisSignedOut: "aerolvm.gis_signed_out",
 };
 
-const el = (id) => document.getElementById(id);
+const DISCOVERY_PATH = "/.well-known/aerolvm-auth";
+const REFRESH_MS = 5000;
+// Renew an SSO sign-in this long before its ID token expires (DR6).
+const RENEW_BEFORE_S = 120;
+// A renewal that comes back and is still refused within this window fails
+// instead of redirecting again, so a skewed clock can't loop the page.
+const RENEW_LOOP_GUARD_MS = 60000;
+const GOOGLE_RENEW_TIMEOUT_MS = 10000;
+// A code-flow attempt older than this is refused on return (stale state).
+const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
+const MAX_GROUPS_SHOWN = 50;
+const GIS_SRC = "https://accounts.google.com/gsi/client";
+const GIS_MIN_WIDTH = 200;
+const GIS_MAX_WIDTH = 400;
+const OIDC_SCOPE = "openid email profile";
 
-// ---------- auth ----------
+// The words for every sign-in state (design review DR9, DR1, DR7, DR8).
+// Reason codes go in parentheses so support can match them.
+const MSG = {
+  lineCompany: "Sign in with your company account.",
+  lineToken: "Sign in with an API token.",
+  loading: "Loading sign-in options…",
+  discoveryFailed: "Couldn't load sign-in options. You can still use an API token.",
+  signingIn: "Signing you in…",
+  staleAttempt: "That sign-in attempt expired. Please try again.",
+  popupBlocked: "Your browser blocked the Google sign-in window. Allow pop-ups for this site, then try again.",
+  clockSkew: "Your computer's clock is more than a minute off. Fix the clock, then sign in again.",
+  unavailable: "Sign-in is unavailable on this server right now. Try again in a minute, or use an API token.",
+  pointerOpen: "SSO sign-in needs a secure connection. Open ",
+  pointerTunnel: "SSO sign-in needs a secure connection. Reach this page through an SSH tunnel to localhost:21212.",
+  plainHTTP: "This connection isn't encrypted. Your token will cross the network in plain text.",
+  // The PAT's rejection text is unchanged (L8).
+  patRejected: "Invalid or expired token. Sign in again.",
+  tokenExpired: "That token has expired.",
+  tokenInvalid: "That token isn't valid or was revoked.",
+  signedOut: "Signed out.",
+  expired: "Your sign-in expired.",
+  operatorTitle: "Actions are recorded as the server, not a person.",
+  noAccessHeading: "You're signed in, but you don't have access here.",
+  noAccessGuidance: "No access rule on this server matches your account. Ask your AerolVM admin to add one for a group you're in.",
+  noGroups: "Your sign-in carried no groups.",
+  overage: "Your sign-in carried too many groups to list. Ask your admin to bind an Entra app role instead.",
+  consoleNeedsAdmin: "This console shows fleet health and needs the admin role.",
+};
 
-function showLogin(errorMsg) {
-  el("login").hidden = false;
-  el("app-header").hidden = true;
-  el("app-main").hidden = true;
-  if (errorMsg) {
-    el("login-error").hidden = false;
-    el("login-error").textContent = errorMsg;
-  } else {
-    el("login-error").hidden = true;
+function msgOpening(display) { return "Opening " + display + "…"; }
+function msgProviderError(display, code) {
+  return display + " didn't sign you in (" + code + "). Try again, or use a different account.";
+}
+function msgWrongApp(reason) {
+  return "This server doesn't accept sign-ins from that app (" + reason + "). Ask your AerolVM admin to check the dashboard client id.";
+}
+function msgUnverified(reason) {
+  return "That sign-in couldn't be verified (" + reason + "). Try again. If it keeps failing, tell your AerolVM admin.";
+}
+
+// SessionExpired is thrown by api() once a renewal failed: the banner is up
+// and the panels keep what they last showed.
+class SessionExpired extends Error {
+  constructor() { super(MSG.expired); this.name = "SessionExpired"; }
+}
+
+function isLocalHostname(host) {
+  const h = String(host || "").toLowerCase();
+  return h === "localhost" || h.endsWith(".localhost") || h === "127.0.0.1" || h === "[::1]" || h === "::1";
+}
+
+// ssoAllowed: providers only accept sign-in redirects to HTTPS or localhost,
+// and a token must not cross the network in the clear (CEO review D18). An
+// SSH tunnel to localhost counts as secure.
+function ssoAllowed(loc) {
+  return loc.protocol === "https:" || isLocalHostname(loc.hostname);
+}
+
+function httpsURL(raw) {
+  try {
+    const u = new URL(String(raw || ""));
+    return u.protocol === "https:" ? u.toString() : "";
+  } catch (_) {
+    return "";
   }
-  setTimeout(() => el("pat-input").focus(), 0);
 }
 
-function showApp() {
-  el("login").hidden = true;
-  el("app-header").hidden = false;
-  el("app-main").hidden = false;
+function displayNameOf(issuer) {
+  return (issuer && (issuer.display_name || issuer.name)) || "";
 }
 
-el("login-form").addEventListener("submit", (e) => {
-  e.preventDefault();
-  const v = el("pat-input").value.trim();
-  if (!v) { return; }
-  state.pat = v;
-  sessionStorage.setItem(PAT_KEY, v);
-  showApp();
-  refreshAll(true);
-});
+// dashboardIssuers is the sign-in button list (DR3): issuers with a
+// dashboard client id, in identity-file order. A workload issuer has none,
+// because a browser sign-in can't start without one.
+function dashboardIssuers(discovery) {
+  if (!discovery || !discovery.identity_enabled || !Array.isArray(discovery.issuers)) { return []; }
+  return discovery.issuers
+    .filter((i) => i && i.name && httpsURL(i.url) && i.clients && i.clients.dashboard)
+    .map((i) => ({
+      name: i.name,
+      display: displayNameOf(i),
+      kind: i.kind === "google" ? "google" : "oidc",
+      url: i.url,
+      client: i.clients.dashboard,
+      label: "Sign in with " + displayNameOf(i),
+    }));
+}
 
-el("signout-btn").addEventListener("click", () => {
-  sessionStorage.removeItem(PAT_KEY);
-  state.pat = "";
-  el("pat-input").value = "";
-  stopTimer();
-  showLogin(null);
-});
+// switchTarget names the issuer "Use a different account" acts on: the only
+// one, or the one this tab last signed in with. With several issuers and no
+// earlier sign-in there is no account to switch from, so the link is hidden.
+function switchTarget(issuers, lastIssuer) {
+  if (issuers.length === 1) { return issuers[0].name; }
+  if (lastIssuer && issuers.some((i) => i.name === lastIssuer)) { return lastIssuer; }
+  return "";
+}
 
-// ---------- fetch wrapper ----------
+// signInModel decides what the sign-in box shows (DR4, DR9 and the Pass 2
+// state table). phase is "loading", "ready" or "failed" (the discovery
+// fetch).
+function signInModel(input) {
+  const loc = input.location;
+  const m = {
+    host: loc.host, line: "", loading: false, buttons: [], switchIssuer: "", pointer: null,
+    divider: false, tokenOpen: true, plainHTTPWarning: !ssoAllowed(loc), message: "", retry: false,
+  };
+  if (input.phase === "loading") {
+    m.loading = true;
+    m.tokenOpen = false;
+    return m;
+  }
+  if (input.phase === "failed") {
+    m.line = MSG.lineToken;
+    m.message = MSG.discoveryFailed;
+    m.retry = true;
+    return m;
+  }
+  const issuers = dashboardIssuers(input.discovery);
+  if (issuers.length === 0) {
+    m.line = MSG.lineToken;
+    return m;
+  }
+  if (!ssoAllowed(loc)) {
+    m.line = MSG.lineToken;
+    const ui = httpsURL(input.discovery.ui_url);
+    m.pointer = ui ? { text: MSG.pointerOpen, href: ui } : { text: MSG.pointerTunnel, href: "" };
+    return m;
+  }
+  m.line = MSG.lineCompany;
+  m.buttons = issuers;
+  m.divider = true;
+  m.tokenOpen = false;
+  m.switchIssuer = switchTarget(issuers, input.lastIssuer);
+  return m;
+}
 
-async function api(path, opts) {
-  opts = opts || {};
-  const headers = Object.assign({}, opts.headers || {}, {
-    "Authorization": "Bearer " + state.pat,
-    "Accept": "application/json",
+// focusTarget is where keyboard focus starts in the sign-in box (DR13): the
+// first focusable element that isn't Google's iframe, which a script can't
+// reliably focus.
+function focusTarget(m) {
+  const i = m.buttons.findIndex((b) => b.kind !== "google");
+  if (i >= 0) { return "sso:" + m.buttons[i].name; }
+  if (m.switchIssuer) { return "switch"; }
+  return m.tokenOpen ? "token" : "summary";
+}
+
+// gisButtonOptions are Google's renderButton options (DR11), at the box's
+// measured inner width, which GIS allows from 200 to 400 px (DR12).
+function gisWidth(measured) {
+  const w = Math.floor(Number(measured) || 0);
+  return Math.max(GIS_MIN_WIDTH, Math.min(GIS_MAX_WIDTH, w));
+}
+function gisButtonOptions(measured) {
+  return {
+    type: "standard",
+    theme: "filled_black",
+    size: "large",
+    shape: "rectangular",
+    text: "signin_with",
+    logo_alignment: "left",
+    width: gisWidth(measured),
+  };
+}
+
+function isOperatorPrincipal(who) {
+  const kind = who && who.principal && who.principal.kind;
+  return kind === "operator" || kind === "node";
+}
+
+// routeFor: the console is for admins (DR1). The admin role and the operator
+// token get the overview; every other role gets the signed-in screen, so no
+// panel ever asks a fleet.admin route on their behalf.
+function routeFor(who) {
+  return who && (who.role === "admin" || isOperatorPrincipal(who)) ? "overview" : "signedin";
+}
+
+// headerIdentity is the header's name and pill (DR5). The operator pill is
+// a warning only with identity on: on a default install there is no named
+// sign-in to steer toward (L8).
+function headerIdentity(who, identityEnabled) {
+  if (isOperatorPrincipal(who)) {
+    return {
+      name: "Server token", title: "Server token", pill: "operator",
+      pillClass: identityEnabled ? "warn" : "muted",
+      pillTitle: identityEnabled ? MSG.operatorTitle : "",
+    };
+  }
+  const p = (who && who.principal) || {};
+  const name = p.name || p.id || "";
+  return { name, title: name, pill: (who && who.role) || "", pillClass: "muted", pillTitle: "" };
+}
+
+function teamPhrase(team) {
+  if (team === "*") { return "all teams"; }
+  return team ? "team " + team : "";
+}
+
+// signedInModel is the signed-in screen (DR1, DR10). The CLI pointer names
+// this page's own address, so `aerolvm login` reaches the same server.
+function signedInModel(who, origin) {
+  const p = (who && who.principal) || {};
+  const team = teamPhrase(who && who.team);
+  return {
+    name: p.name || p.id || "",
+    roleLine: "Role " + ((who && who.role) || "") + (team ? " · " + team : ""),
+    cli: "aerolvm login " + origin + "\naerolvm list",
+  };
+}
+
+function isNoBinding(status, body) {
+  return status === 403 && !!body && (body.reason === "no_binding" || body.reason === "group_overage");
+}
+
+// noAccessModel is the "no binding" screen (DR8), built from the v1 403's
+// own fields: every value is the caller's own claim.
+function noAccessModel(body, discovery) {
+  const known = (discovery && Array.isArray(discovery.issuers)) ? discovery.issuers : [];
+  const issuer = known.find((i) => i && i.name === body.issuer);
+  const display = issuer ? displayNameOf(issuer) : (body.issuer || "");
+  const overage = body.reason === "group_overage";
+  const groups = (!overage && Array.isArray(body.groups)) ? body.groups.filter((g) => typeof g === "string") : [];
+  const dash = dashboardIssuers(discovery).find((i) => i.name === body.issuer);
+  return {
+    heading: MSG.noAccessHeading,
+    who: [body.name, display].filter(Boolean).join(" · "),
+    guidance: MSG.noAccessGuidance,
+    overage,
+    groupsSummary: groups.length ? "Groups your sign-in carried (" + groups.length + ")" : "",
+    groupsShown: groups.slice(0, MAX_GROUPS_SHOWN),
+    groupsMore: groups.length > MAX_GROUPS_SHOWN ? "and " + (groups.length - MAX_GROUPS_SHOWN) + " more" : "",
+    noGroups: !overage && groups.length === 0,
+    switchIssuer: dash ? dash.name : "",
+  };
+}
+
+function looksLikeJWT(token) {
+  return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(token);
+}
+
+// credentialKind: "sso" (signed in through a provider on this page), "avm"
+// (an API token), "jwt" (a pasted provider token) or "pat" (anything else:
+// the operator token, or a managed provider's token).
+function credentialKind(token, sso) {
+  if (sso && sso.issuer) { return "sso"; }
+  if (String(token).startsWith("avm_")) { return "avm"; }
+  if (looksLikeJWT(String(token))) { return "jwt"; }
+  return "pat";
+}
+
+// rejectionMessage words a 401 (DR9). Only an avm_ token or a JWT 401
+// carries a D17 reason; everything else keeps today's text (L8).
+function rejectionMessage(kind, reason) {
+  if (!reason) { return MSG.patRejected; }
+  if (kind === "avm") { return reason === "expired" ? MSG.tokenExpired : MSG.tokenInvalid; }
+  switch (reason) {
+    case "expired": return kind === "sso" ? MSG.expired : MSG.tokenExpired;
+    case "not_yet_valid": return MSG.clockSkew;
+    case "wrong_audience":
+    case "unknown_issuer":
+    case "too_long_lived": return msgWrongApp(reason);
+    default: return msgUnverified(reason);
+  }
+}
+
+// safeCode keeps a provider's error code printable and short; it is shown
+// in parentheses, never interpreted.
+function safeCode(code) {
+  return /^[A-Za-z0-9_.-]{1,64}$/.test(String(code || "")) ? String(code) : "unknown_error";
+}
+
+function b64urlEncode(bytes) {
+  let bin = "";
+  bytes.forEach((b) => { bin += String.fromCharCode(b); });
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function b64urlDecodeText(s) {
+  let b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4) { b64 += "="; }
+  const bin = atob(b64);
+  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+}
+
+function randomToken(n) {
+  const bytes = new Uint8Array(n);
+  crypto.getRandomValues(bytes);
+  return b64urlEncode(bytes);
+}
+
+// pkceChallenge is the S256 code challenge (RFC 7636).
+async function pkceChallenge(verifier) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return b64urlEncode(new Uint8Array(digest));
+}
+
+// decodeJWT reads an ID token's claims. It checks nothing: the server
+// verifies the signature on every request, offline (L1). The page only
+// checks what ties the token to this sign-in attempt (checkIDToken).
+function decodeJWT(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length !== 3) { return null; }
+    const claims = JSON.parse(b64urlDecodeText(parts[1]));
+    return claims && typeof claims === "object" && !Array.isArray(claims) ? claims : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// checkIDToken ties a received ID token to this attempt: the nonce this page
+// generated, its own client id in aud, and an exp still ahead. It returns ""
+// or a problem code.
+function checkIDToken(claims, want) {
+  if (!claims) { return "malformed"; }
+  if (!want.nonce || claims.nonce !== want.nonce) { return "nonce_mismatch"; }
+  const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!want.clientId || !aud.includes(want.clientId)) { return "wrong_audience"; }
+  if (typeof claims.exp !== "number" || claims.exp <= want.nowSec) { return "expired"; }
+  return "";
+}
+
+// idTokenProblemMessage: a token already expired on arrival means this
+// computer's clock is ahead.
+function idTokenProblemMessage(problem) {
+  switch (problem) {
+    case "nonce_mismatch": return MSG.staleAttempt;
+    case "wrong_audience": return msgWrongApp("wrong_audience");
+    case "expired": return MSG.clockSkew;
+    default: return msgUnverified(problem || "malformed");
+  }
+}
+
+// promptFor picks the OIDC prompt: none for a silent renewal (DR6);
+// select_account to switch accounts where the provider supports it, login
+// otherwise (DR7); none at all for a plain sign-in.
+function promptFor(mode, promptValuesSupported) {
+  if (mode === "renew") { return "none"; }
+  if (mode === "switch") {
+    return Array.isArray(promptValuesSupported) && promptValuesSupported.includes("select_account") ? "select_account" : "login";
+  }
+  return "";
+}
+
+function redirectURI(loc) { return loc.origin + "/ui"; }
+
+// authorizeURL is the authorization-code request with PKCE. The dashboard
+// is a public client: no secret anywhere (§5.7).
+function authorizeURL(endpoint, p) {
+  const u = new URL(endpoint);
+  const q = u.searchParams;
+  q.set("response_type", "code");
+  q.set("client_id", p.clientId);
+  q.set("redirect_uri", p.redirectUri);
+  q.set("scope", OIDC_SCOPE);
+  q.set("state", p.state);
+  q.set("nonce", p.nonce);
+  q.set("code_challenge", p.challenge);
+  q.set("code_challenge_method", "S256");
+  if (p.prompt) { q.set("prompt", p.prompt); }
+  return u.toString();
+}
+
+// providerMetadata reads the provider's own discovery document: where to
+// send the person, where to redeem the code, and which prompt values it
+// supports. connect-src allows the issuer's origin for exactly this fetch.
+async function providerMetadata(fetchFn, issuerURL) {
+  const base = String(issuerURL).replace(/\/+$/, "");
+  const res = await fetchFn(base + "/.well-known/openid-configuration", { headers: { Accept: "application/json" } });
+  if (!res.ok) { throw new Error("provider discovery " + res.status); }
+  const doc = await res.json();
+  const authz = httpsURL(doc && doc.authorization_endpoint);
+  const token = httpsURL(doc && doc.token_endpoint);
+  if (!authz || !token) { throw new Error("provider discovery: missing https endpoints"); }
+  return {
+    authorization_endpoint: authz,
+    token_endpoint: token,
+    prompt_values_supported: Array.isArray(doc.prompt_values_supported) ? doc.prompt_values_supported : [],
+  };
+}
+
+// exchangeCode redeems the code with the PKCE verifier. Only the ID token is
+// kept; an access or refresh token in the response is dropped (DR6: the
+// browser only ever holds the ID token).
+async function exchangeCode(fetchFn, pending, code, redirectUri) {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code", code, redirect_uri: redirectUri,
+    client_id: pending.client, code_verifier: pending.verifier,
   });
   let res;
   try {
-    res = await fetch(path, { method: opts.method || "GET", headers, body: opts.body });
-  } catch (err) {
-    throw new Error("network: " + (err && err.message ? err.message : err));
+    res = await fetchFn(pending.tokenEndpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: body.toString(),
+    });
+  } catch (_) {
+    return { error: "network_error" };
   }
-  if (res.status === 401) {
-    sessionStorage.removeItem(PAT_KEY);
-    state.pat = "";
-    showLogin("Invalid or expired token. Sign in again.");
+  let data = null;
+  try { data = await res.json(); } catch (_) { data = null; }
+  if (!res.ok || !data || typeof data.id_token !== "string") {
+    return { error: safeCode((data && data.error) || "token_error") };
+  }
+  return { idToken: data.id_token };
+}
+
+function callbackParams(search) {
+  const q = new URLSearchParams(search || "");
+  if (!q.has("code") && !q.has("error")) { return null; }
+  return { code: q.get("code") || "", error: q.get("error") || "", state: q.get("state") || "" };
+}
+
+// pendingProblem refuses a return that doesn't match this tab's attempt:
+// no attempt, another state, or one too old.
+function pendingProblem(pending, state, nowMs) {
+  if (!pending || !state || pending.state !== state) { return "stale"; }
+  if (typeof pending.at !== "number" || nowMs - pending.at > PENDING_MAX_AGE_MS || pending.at - nowMs > 60000) { return "stale"; }
+  return "";
+}
+
+function ssoMetaFor(issuer, claims) {
+  return {
+    issuer: issuer.name, display: issuer.display, kind: issuer.kind, url: issuer.url,
+    client: issuer.client, exp: claims.exp, sub: claims.sub || "", route: "",
+  };
+}
+
+function issuerFromMeta(m) {
+  return { name: m.issuer, display: m.display, kind: m.kind, url: m.url, client: m.client };
+}
+
+// renewDelayMs: how long until an SSO sign-in should renew (exp − 120 s).
+function renewDelayMs(expSec, nowMs) {
+  return Math.max(0, (Number(expSec) - RENEW_BEFORE_S) * 1000 - nowMs);
+}
+
+// The view a renewal redirect saves and restores (DR6): the placements page,
+// auto-refresh, the open <details> and the scroll position.
+function serializeView(v) {
+  return JSON.stringify({
+    pageTokens: v.pageTokens, pageIndex: v.pageIndex, autorefresh: v.autorefresh,
+    open: v.open, scrollY: v.scrollY,
+  });
+}
+
+function parseView(raw) {
+  let v;
+  try { v = JSON.parse(raw); } catch (_) { return null; }
+  if (!v || typeof v !== "object") { return null; }
+  const tokens = Array.isArray(v.pageTokens) && v.pageTokens.length > 0 && v.pageTokens.every((t) => typeof t === "string") ? v.pageTokens : [""];
+  const index = Number.isInteger(v.pageIndex) && v.pageIndex >= 0 && v.pageIndex < tokens.length ? v.pageIndex : 0;
+  return {
+    pageTokens: tokens,
+    pageIndex: index,
+    autorefresh: v.autorefresh !== false,
+    open: Array.isArray(v.open) ? v.open.filter((id) => typeof id === "string" && /^[A-Za-z0-9_-]+$/.test(id)) : [],
+    scrollY: Number.isFinite(v.scrollY) && v.scrollY > 0 ? v.scrollY : 0,
+  };
+}
+
+// createTracker counts requests in flight, so a renewal redirect can wait
+// for them (DR6).
+function createTracker() {
+  let n = 0;
+  let waiters = [];
+  return {
+    begin() { n += 1; },
+    end() {
+      n = Math.max(0, n - 1);
+      if (n === 0) { const w = waiters; waiters = []; w.forEach((f) => f()); }
+    },
+    count() { return n; },
+    idle() { return n === 0 ? Promise.resolve() : new Promise((resolve) => waiters.push(resolve)); },
+  };
+}
+
+// createSingleFlight runs at most one fn at a time; callers during a run
+// share its result. Four panels' 401s start one renewal, not four (DR6).
+function createSingleFlight(fn) {
+  let current = null;
+  return {
+    run(arg) {
+      if (!current) {
+        current = Promise.resolve().then(() => fn(arg)).finally(() => { current = null; });
+      }
+      return current;
+    },
+    active() { return current !== null; },
+    wait() { return current ? current.then(() => undefined, () => undefined) : Promise.resolve(); },
+  };
+}
+
+// createAPI is the fetch wrapper every panel and action uses. A request
+// waits while a renewal runs, so nothing is sent with a token about to be
+// replaced. A 401 `expired` on an SSO sign-in renews once and retries; any
+// other 401 goes to onRejected.
+//
+// deps: fetch, bearer(), kind(), renewal (createSingleFlight), tracker,
+// isExpired(), onRejected(kind, reason).
+function createAPI(deps) {
+  async function request(path, opts) {
+    opts = opts || {};
+    if (deps.renewal.active()) { await deps.renewal.wait(); }
+    if (deps.isExpired()) { throw new SessionExpired(); }
+    // Counted before the first await, so a renewal timer firing right
+    // after a confirm() prompt closes still waits for this request.
+    deps.tracker.begin();
+    let res;
+    try {
+      res = await deps.fetch(path, {
+        method: opts.method || "GET",
+        headers: Object.assign({}, opts.headers || {}, {
+          "Authorization": "Bearer " + deps.bearer(),
+          "Accept": "application/json",
+        }),
+        body: opts.body,
+      });
+    } catch (err) {
+      throw new Error("network: " + (err && err.message ? err.message : err));
+    } finally {
+      deps.tracker.end();
+    }
+    if (res.status !== 401) { return res; }
+    let reason = "";
+    try {
+      const body = await res.json();
+      reason = body && typeof body.reason === "string" ? body.reason : "";
+    } catch (_) { reason = ""; }
+    const kind = deps.kind();
+    if (kind === "sso" && reason === "expired" && !opts.retried) {
+      if (await deps.renewal.run("expired")) {
+        return request(path, Object.assign({}, opts, { retried: true }));
+      }
+      throw new SessionExpired();
+    }
+    deps.onRejected(kind, reason);
     throw new Error("unauthorized");
   }
-  return res;
+  return request;
 }
 
-async function apiJSON(path) {
-  const res = await api(path);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(res.status + " " + (text || res.statusText));
+// createRenewer is the renewal itself (DR6). Google renews in place through
+// GIS auto-select. Every other provider waits for in-flight requests, saves
+// the view and leaves for a prompt=none redirect; that promise never
+// settles, because the page is leaving.
+//
+// deps: session(), recentlyRenewed(), googleRenew(meta) → Promise<bool>,
+// idle(), beginRedirect(issuer, mode) → Promise<url>, saveView(),
+// navigate(url), onFailed(), onRenewed().
+function createRenewer(deps) {
+  return async function renew() {
+    const s = deps.session();
+    if (!s || deps.recentlyRenewed()) { deps.onFailed(); return false; }
+    if (s.kind === "google") {
+      const ok = await deps.googleRenew(s);
+      if (ok) { deps.onRenewed(); } else { deps.onFailed(); }
+      return ok;
+    }
+    await deps.idle();
+    let url;
+    try {
+      url = await deps.beginRedirect(issuerFromMeta(s), "renew");
+    } catch (_) {
+      deps.onFailed();
+      return false;
+    }
+    deps.saveView();
+    deps.navigate(url);
+    return new Promise(() => {});
+  };
+}
+
+// signOutSession clears this tab's sign-in and saved view, and stops
+// Google's auto-select from signing the person straight back in (DR7). When
+// GIS hasn't loaded yet, a flag makes the call as soon as it does.
+function signOutSession(storage, g) {
+  [KEYS.bearer, KEYS.sso, KEYS.pending, KEYS.view].forEach((k) => storage.removeItem(k));
+  const id = g && g.accounts && g.accounts.id;
+  if (id && typeof id.disableAutoSelect === "function") {
+    id.disableAutoSelect();
+    storage.removeItem(KEYS.gisSignedOut);
+    return true;
   }
-  return res.json();
+  storage.setItem(KEYS.gisSignedOut, "1");
+  return false;
 }
 
-// ---------- formatters ----------
+function applyDeferredSignOut(storage, g) {
+  if (!storage.getItem(KEYS.gisSignedOut)) { return false; }
+  g.accounts.id.disableAutoSelect();
+  storage.removeItem(KEYS.gisSignedOut);
+  return true;
+}
+
+// gisPromptGaveUp reads a GIS prompt notification: a skipped or dismissed
+// moment (other than one that returned a credential) means silent renewal
+// did not happen. A timeout covers browsers that report nothing.
+function gisPromptGaveUp(n) {
+  if (!n) { return false; }
+  if (typeof n.isSkippedMoment === "function" && n.isSkippedMoment()) { return true; }
+  if (typeof n.isDismissedMoment === "function" && n.isDismissedMoment()) {
+    return !(typeof n.getDismissedReason === "function" && n.getDismissedReason() === "credential_returned");
+  }
+  return false;
+}
+
+// ---------- overview: formatters ----------
 
 function pill(status, kind) {
   const cls = kind === "ok" ? "ok" : kind === "warn" ? "warn" : kind === "muted" ? "muted" : "bad";
@@ -461,7 +1133,768 @@ function aggregateCapacity(members) {
   return agg;
 }
 
+// ---------- DOM layer ----------
+
+// S is the page's state, built in boot().
+let S = null;
+
+function el(id) { return document.getElementById(id); }
+
+// store wraps sessionStorage: a browser that refuses storage still gets a
+// working page for this load, it just forgets on reload.
+const store = {
+  get(k) { try { return window.sessionStorage.getItem(k); } catch (_) { return null; } },
+  set(k, v) { try { window.sessionStorage.setItem(k, v); } catch (_) { /* storage refused */ } },
+  remove(k) { try { window.sessionStorage.removeItem(k); } catch (_) { /* storage refused */ } },
+};
+const storageAPI = { getItem: (k) => store.get(k), setItem: (k, v) => store.set(k, v), removeItem: (k) => store.remove(k) };
+
+function parseJSON(raw) {
+  try { return raw ? JSON.parse(raw) : null; } catch (_) { return null; }
+}
+
+function nowSec() { return Math.floor(Date.now() / 1000); }
+
+function boot() {
+  S = {
+    bearer: "", sso: null, kind: "", who: null, view: "",
+    discoveryPhase: "loading", discovery: null,
+    signin: {}, noAccessBody: null, focusPending: false, buttonsKey: "",
+    pageTokens: [""], pageIndex: 0, nextPageToken: "", timer: null,
+    expired: false, renewTimer: null, renewDue: false, renewedAt: 0, restoreScrollY: 0,
+    tracker: createTracker(),
+    gis: { loading: null, issuer: null, nonce: "", width: 0, pendingRenew: null, clickAt: 0, credentialAt: 0 },
+  };
+  S.renewal = createSingleFlight(createRenewer({
+    session: () => S.sso,
+    recentlyRenewed: () => Date.now() - S.renewedAt < RENEW_LOOP_GUARD_MS,
+    googleRenew,
+    idle: () => S.tracker.idle(),
+    beginRedirect,
+    saveView,
+    navigate: (url) => window.location.assign(url),
+    onFailed: renewalFailed,
+    onRenewed: renewalSucceeded,
+  }));
+  S.api = createAPI({
+    fetch: (u, o) => window.fetch(u, o),
+    bearer: () => S.bearer,
+    kind: () => S.kind,
+    renewal: S.renewal,
+    tracker: S.tracker,
+    isExpired: () => S.expired,
+    onRejected: (kind, reason) => {
+      clearSession();
+      showSignIn({ message: rejectionMessage(kind, reason), error: true, tokenOpen: kind !== "sso" });
+    },
+  });
+  fillStaticText();
+  wire();
+  start();
+}
+
+// fillStaticText writes the fixed sentences from MSG, so the words the
+// tests check are the words the page shows.
+function fillStaticText() {
+  el("sso-loading").textContent = MSG.loading;
+  el("plain-http-warning").textContent = MSG.plainHTTP;
+  el("si-console").textContent = MSG.consoleNeedsAdmin;
+  el("na-heading").textContent = MSG.noAccessHeading;
+  el("na-guidance").textContent = MSG.noAccessGuidance;
+  el("na-nogroups").textContent = MSG.noGroups;
+  el("na-overage").textContent = MSG.overage;
+}
+
+async function start() {
+  el("box-host").textContent = window.location.host;
+  loadDiscovery();
+  const cb = callbackParams(window.location.search);
+  if (cb) {
+    // The code and state never stay in the address bar or history.
+    window.history.replaceState(null, "", window.location.pathname);
+    await finishRedirect(cb);
+    return;
+  }
+  const bearer = store.get(KEYS.bearer) || "";
+  if (!bearer) {
+    showSignIn({ focus: true });
+    return;
+  }
+  const sso = parseJSON(store.get(KEYS.sso));
+  if (sso) {
+    // A renewal may run first (DR6); the operator token's reload stays as
+    // quiet as today.
+    showSignIn({ busy: true, message: MSG.signingIn });
+    if (sso.kind === "google") { ensureGIS().catch(() => {}); }
+  }
+  await trySignIn(bearer, sso, "stored");
+}
+
+// ---------- session ----------
+
+function commitSession(bearer, sso) {
+  S.bearer = bearer;
+  S.sso = sso || null;
+  S.kind = credentialKind(bearer, S.sso);
+  store.set(KEYS.bearer, bearer);
+  if (S.sso) {
+    store.set(KEYS.sso, JSON.stringify(S.sso));
+    store.set(KEYS.lastIssuer, S.sso.issuer);
+  } else {
+    store.remove(KEYS.sso);
+  }
+}
+
+function clearSession() {
+  store.remove(KEYS.bearer);
+  store.remove(KEYS.sso);
+  S.bearer = "";
+  S.sso = null;
+  S.kind = "";
+  S.who = null;
+  clearRenewTimer();
+  stopTimer();
+}
+
+// trySignIn checks a credential with whoami and routes on the answer (DR1,
+// DR8, DR9). source is "token" (the paste box), "sso" (a provider just
+// handed it over) or "stored" (a reload).
+async function trySignIn(bearer, sso, source) {
+  const kind = credentialKind(bearer, sso);
+  const retry = () => trySignIn(bearer, sso, source);
+  let res;
+  try {
+    res = await window.fetch("/v1/whoami", { headers: { "Authorization": "Bearer " + bearer, "Accept": "application/json" }, cache: "no-store" });
+  } catch (_) {
+    return showSignIn({ message: MSG.unavailable, error: true, retry, tokenOpen: true });
+  }
+  let body = null;
+  try { body = await res.json(); } catch (_) { body = null; }
+  if (res.ok && body) {
+    commitSession(bearer, sso);
+    return routeWhoAmI(body);
+  }
+  if (res.status === 401) {
+    const reason = body && typeof body.reason === "string" ? body.reason : "";
+    if (source === "stored" && kind === "sso" && reason === "expired" && sso.route === "overview") {
+      // A reload after the token expired: renew the way the overview would.
+      commitSession(bearer, sso);
+      if (await S.renewal.run("expired")) { return trySignIn(S.bearer, S.sso, "renewed"); }
+      return undefined;
+    }
+    if (source !== "token") { clearSession(); }
+    return showSignIn({ message: rejectionMessage(kind, reason), error: true, tokenOpen: kind !== "sso", focus: source === "token" ? "token" : true });
+  }
+  if (isNoBinding(res.status, body)) {
+    commitSession(bearer, sso);
+    return showNoAccess(body);
+  }
+  if (res.status === 403) {
+    if (source !== "token") { clearSession(); }
+    return showSignIn({ message: (body && body.error) || "403", error: true, tokenOpen: kind !== "sso" });
+  }
+  return showSignIn({ message: MSG.unavailable, error: true, retry, tokenOpen: true });
+}
+
+function routeWhoAmI(who) {
+  S.who = who;
+  if (S.sso) {
+    S.sso.route = routeFor(who);
+    store.set(KEYS.sso, JSON.stringify(S.sso));
+  }
+  if (routeFor(who) === "overview") {
+    showOverview();
+  } else {
+    showSignedIn(who);
+  }
+}
+
+// ---------- discovery ----------
+
+async function loadDiscovery() {
+  S.discoveryPhase = "loading";
+  rerender();
+  try {
+    const res = await window.fetch(DISCOVERY_PATH, { headers: { "Accept": "application/json" }, cache: "no-store" });
+    if (!res.ok) { throw new Error(String(res.status)); }
+    S.discovery = await res.json();
+    S.discoveryPhase = "ready";
+  } catch (_) {
+    S.discovery = null;
+    S.discoveryPhase = "failed";
+  }
+  rerender();
+}
+
+function identityEnabled() {
+  return !!(S.discovery && S.discovery.identity_enabled);
+}
+
+function rerender() {
+  if (S.view === "signin") { renderSignIn(); }
+  if (S.view === "noaccess") { renderNoAccess(); }
+  if (S.view === "overview") { renderWho(); }
+}
+
+// ---------- boxes ----------
+
+function showBox(view) {
+  el("login").hidden = false;
+  el("app-header").hidden = true;
+  el("app-main").hidden = true;
+  el("expiry-banner").hidden = true;
+  el("view-signin").hidden = view !== "signin";
+  el("view-signedin").hidden = view !== "signedin";
+  el("view-noaccess").hidden = view !== "noaccess";
+  if (view === "noaccess") {
+    el("login-box").setAttribute("role", "alert");
+  } else {
+    el("login-box").removeAttribute("role");
+  }
+}
+
+// showSignIn opens the sign-in box. opts: notice ("Signed out."), message
+// and error (the live region), retry, tokenOpen (a token problem opens the
+// token disclosure), busy ("Signing you in…" alone), focus (false; or
+// "token" to put the person back in the token field after a rejection).
+function showSignIn(opts) {
+  opts = opts || {};
+  S.view = "signin";
+  stopTimer();
+  clearRenewTimer();
+  S.signin = {
+    notice: opts.notice || "", message: opts.message || "", error: !!opts.error,
+    retry: opts.retry || null, tokenOpen: !!opts.tokenOpen, busy: !!opts.busy,
+  };
+  S.buttonsKey = "";
+  showBox("signin");
+  el("token-details").open = false;
+  S.focusPending = opts.focus !== false && !opts.busy;
+  S.focusToken = opts.focus === "token";
+  renderSignIn();
+}
+
+function renderSignIn() {
+  const si = S.signin;
+  const m = signInModel({
+    phase: S.discoveryPhase, discovery: S.discovery, location: window.location,
+    lastIssuer: store.get(KEYS.lastIssuer) || "",
+  });
+  const busy = si.busy;
+  el("signin-notice").hidden = busy || !si.notice;
+  el("signin-notice").textContent = si.notice;
+  el("signin-line").hidden = busy || !m.line;
+  el("signin-line").textContent = m.line;
+  el("sso-loading").hidden = busy || !m.loading;
+  renderButtons(busy ? [] : m.buttons);
+  el("switch-account").hidden = busy || !m.switchIssuer;
+  el("switch-account").dataset.issuer = m.switchIssuer;
+  renderPointer(busy ? null : m.pointer);
+  el("or-divider").hidden = busy || !m.divider;
+  el("token-details").hidden = busy;
+  if (m.tokenOpen || si.tokenOpen) { el("token-details").open = true; }
+  el("plain-http-warning").hidden = !m.plainHTTPWarning;
+  const message = si.message || m.message;
+  const msg = el("signin-msg");
+  msg.textContent = message;
+  msg.className = "msg" + ((si.message ? si.error : !!m.message) ? " error" : "");
+  const retry = si.retry || (m.retry ? loadDiscovery : null);
+  el("retry-row").hidden = busy || !retry;
+  S.retry = retry;
+  if (S.focusPending && !m.loading) {
+    S.focusPending = false;
+    applyFocus(S.focusToken ? "token" : focusTarget(Object.assign({}, m, { tokenOpen: m.tokenOpen || si.tokenOpen })));
+  }
+}
+
+function renderButtons(buttons) {
+  const key = buttons.map((b) => b.name).join(",");
+  const stack = el("sso-buttons");
+  stack.hidden = buttons.length === 0;
+  if (key === S.buttonsKey) { return; }
+  S.buttonsKey = key;
+  stack.textContent = "";
+  S.gis.width = 0;
+  let googleDone = false;
+  buttons.forEach((b) => {
+    if (b.kind === "google") {
+      // GIS is one client per page, so only the first Google issuer gets
+      // Google's button.
+      if (googleDone) { return; }
+      googleDone = true;
+      const slot = document.createElement("div");
+      slot.className = "gis-slot";
+      slot.id = "gis-slot";
+      slot.dataset.issuer = b.name;
+      stack.appendChild(slot);
+      renderGISButton(b);
+      return;
+    }
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "sso-btn";
+    btn.dataset.issuer = b.name;
+    btn.dataset.label = b.label;
+    btn.textContent = b.label;
+    stack.appendChild(btn);
+  });
+}
+
+function renderPointer(pointer) {
+  const p = el("sso-pointer");
+  p.textContent = "";
+  p.hidden = !pointer;
+  if (!pointer) { return; }
+  p.appendChild(document.createTextNode(pointer.text));
+  if (pointer.href) {
+    const a = document.createElement("a");
+    a.href = pointer.href;
+    a.textContent = pointer.href;
+    p.appendChild(a);
+  }
+}
+
+function applyFocus(target) {
+  let node = null;
+  if (target.startsWith("sso:")) {
+    const name = target.slice(4);
+    node = Array.from(document.querySelectorAll("#sso-buttons button.sso-btn")).find((b) => b.dataset.issuer === name) || null;
+  } else if (target === "switch") {
+    node = el("switch-account");
+  } else if (target === "token") {
+    node = el("pat-input");
+  } else {
+    node = el("token-summary");
+  }
+  if (node) { setTimeout(() => node.focus(), 0); }
+}
+
+function setSignInMessage(text, isError) {
+  S.signin.message = text;
+  S.signin.error = !!isError;
+  const msg = el("signin-msg");
+  msg.textContent = text;
+  msg.className = "msg" + (isError ? " error" : "");
+}
+
+function issuerByName(name) {
+  return dashboardIssuers(S.discovery).find((i) => i.name === name) || null;
+}
+
+// setLeaving shows "Opening Acme Okta…" on the clicked button and disables
+// every sign-in control until the page leaves (DR9).
+function setLeaving(issuer, on) {
+  document.querySelectorAll("#sso-buttons button.sso-btn").forEach((b) => {
+    b.disabled = on;
+    b.textContent = on && b.dataset.issuer === issuer.name ? msgOpening(issuer.display) : b.dataset.label;
+  });
+  const slot = el("gis-slot");
+  if (slot) { slot.classList.toggle("leaving", on); }
+  el("switch-account").disabled = on;
+  el("na-switch").disabled = on;
+}
+
+function showSignedIn(who) {
+  S.view = "signedin";
+  stopTimer();
+  clearRenewTimer();
+  showBox("signedin");
+  const m = signedInModel(who, window.location.origin);
+  el("si-name").textContent = m.name;
+  el("si-role").textContent = m.roleLine;
+  el("si-cli").textContent = m.cli;
+  setTimeout(() => el("box-title").focus(), 0);
+}
+
+function showNoAccess(body) {
+  S.view = "noaccess";
+  S.noAccessBody = body;
+  stopTimer();
+  clearRenewTimer();
+  showBox("noaccess");
+  renderNoAccess();
+  setTimeout(() => el("na-heading").focus(), 0);
+}
+
+function renderNoAccess() {
+  const m = noAccessModel(S.noAccessBody || {}, S.discovery);
+  el("na-who").textContent = m.who;
+  el("na-groups").hidden = !m.groupsSummary;
+  el("na-groups-summary").textContent = m.groupsSummary;
+  const list = el("na-groups-list");
+  list.textContent = "";
+  m.groupsShown.forEach((g) => {
+    const li = document.createElement("li");
+    li.textContent = g;
+    list.appendChild(li);
+  });
+  if (m.groupsMore) {
+    const li = document.createElement("li");
+    li.className = "more";
+    li.textContent = m.groupsMore;
+    list.appendChild(li);
+  }
+  el("na-nogroups").hidden = !m.noGroups;
+  el("na-overage").hidden = !m.overage;
+  el("na-switch").hidden = !m.switchIssuer;
+  el("na-switch").dataset.issuer = m.switchIssuer;
+}
+
+// ---------- provider sign-in ----------
+
+async function beginRedirect(issuer, mode) {
+  const meta = await providerMetadata((u, o) => window.fetch(u, o), issuer.url);
+  const state = randomToken(32);
+  const nonce = randomToken(32);
+  const verifier = randomToken(32);
+  const challenge = await pkceChallenge(verifier);
+  store.set(KEYS.pending, JSON.stringify({
+    state, nonce, verifier, issuer: issuer.name, display: issuer.display, url: issuer.url,
+    client: issuer.client, tokenEndpoint: meta.token_endpoint, mode, at: Date.now(),
+  }));
+  store.set(KEYS.lastIssuer, issuer.name);
+  return authorizeURL(meta.authorization_endpoint, {
+    clientId: issuer.client, redirectUri: redirectURI(window.location), state, nonce, challenge,
+    prompt: promptFor(mode, meta.prompt_values_supported),
+  });
+}
+
+async function startSignIn(issuer, mode) {
+  setLeaving(issuer, true);
+  setSignInMessage("", false);
+  try {
+    window.location.assign(await beginRedirect(issuer, mode));
+  } catch (_) {
+    setLeaving(issuer, false);
+    const message = msgProviderError(issuer.display, "provider_unreachable");
+    if (S.view === "signin") {
+      setSignInMessage(message, true);
+    } else {
+      showSignIn({ message, error: true });
+    }
+  }
+}
+
+// finishRedirect handles the provider sending the person back to /ui.
+async function finishRedirect(cb) {
+  const pending = parseJSON(store.get(KEYS.pending));
+  store.remove(KEYS.pending);
+  showSignIn({ busy: true, message: MSG.signingIn });
+  if (pendingProblem(pending, cb.state, Date.now())) {
+    return showSignIn({ message: MSG.staleAttempt, error: true, focus: true });
+  }
+  const renewing = pending.mode === "renew";
+  if (cb.error) {
+    if (renewing) { return renewalFailedAfterRedirect(); }
+    return showSignIn({ message: msgProviderError(pending.display, safeCode(cb.error)), error: true, focus: true });
+  }
+  const ex = await exchangeCode((u, o) => window.fetch(u, o), pending, cb.code, redirectURI(window.location));
+  if (ex.error) {
+    if (renewing) { return renewalFailedAfterRedirect(); }
+    return showSignIn({ message: msgProviderError(pending.display, ex.error), error: true, focus: true });
+  }
+  const claims = decodeJWT(ex.idToken);
+  const problem = checkIDToken(claims, { nonce: pending.nonce, clientId: pending.client, nowSec: nowSec() });
+  if (problem) {
+    return showSignIn({ message: idTokenProblemMessage(problem), error: true, focus: true });
+  }
+  if (renewing) { S.renewedAt = Date.now(); }
+  const issuer = { name: pending.issuer, display: pending.display, kind: "oidc", url: pending.url, client: pending.client };
+  return trySignIn(ex.idToken, ssoMetaFor(issuer, claims), "sso");
+}
+
+// renewalFailedAfterRedirect: a prompt=none renewal came back refused. The
+// overview comes back with its saved view and the banner (DR6).
+function renewalFailedAfterRedirect() {
+  const bearer = store.get(KEYS.bearer) || "";
+  const sso = parseJSON(store.get(KEYS.sso));
+  if (!bearer || !sso) { return showSignIn({ message: MSG.expired, error: true, focus: true }); }
+  S.bearer = bearer;
+  S.sso = sso;
+  S.kind = "sso";
+  showOverview({ expired: true });
+  return undefined;
+}
+
+// ---------- Google Identity Services (CEO review D2) ----------
+
+function ensureGIS() {
+  if (S.gis.loading) { return S.gis.loading; }
+  S.gis.loading = new Promise((resolve, reject) => {
+    const ready = () => window.google && window.google.accounts && window.google.accounts.id;
+    if (ready()) { resolve(window.google); return; }
+    const sc = document.createElement("script");
+    sc.src = GIS_SRC;
+    sc.async = true;
+    sc.onload = () => (ready() ? resolve(window.google) : reject(new Error("gis")));
+    sc.onerror = () => reject(new Error("gis"));
+    document.head.appendChild(sc);
+  });
+  S.gis.loading.catch(() => { S.gis.loading = null; });
+  return S.gis.loading;
+}
+
+function gisInit(g, issuer) {
+  S.gis.issuer = issuer;
+  S.gis.nonce = randomToken(16);
+  g.accounts.id.initialize({
+    client_id: issuer.client,
+    nonce: S.gis.nonce,
+    callback: onGoogleCredential,
+    auto_select: true,
+    ux_mode: "popup",
+    cancel_on_tap_outside: true,
+  });
+  applyDeferredSignOut(storageAPI, g);
+}
+
+async function renderGISButton(issuer) {
+  let g;
+  try { g = await ensureGIS(); } catch (_) {
+    setSignInMessage(msgProviderError(issuer.display, "gis_unavailable"), true);
+    return;
+  }
+  const slot = el("gis-slot");
+  if (!slot || S.view !== "signin") { return; }
+  if (!S.gis.issuer || S.gis.issuer.name !== issuer.name || !S.gis.nonce) { gisInit(g, issuer); }
+  const width = gisWidth(el("sso-buttons").clientWidth);
+  if (width === S.gis.width && slot.childElementCount > 0) { return; }
+  S.gis.width = width;
+  slot.textContent = "";
+  g.accounts.id.renderButton(slot, Object.assign(gisButtonOptions(width), { click_listener: onGISClick }));
+}
+
+// onGISClick: the click happened inside Google's frame. If the window still
+// has focus a moment later, no pop-up opened: the browser blocked it (DR9).
+function onGISClick() {
+  const issuer = S.gis.issuer;
+  S.gis.clickAt = Date.now();
+  setLeaving(issuer, true);
+  setSignInMessage(msgOpening(issuer.display), false);
+  setTimeout(() => {
+    if (S.gis.credentialAt >= S.gis.clickAt || S.view !== "signin" || !document.hasFocus()) { return; }
+    S.gis.clickAt = 0;
+    setLeaving(issuer, false);
+    setSignInMessage(MSG.popupBlocked, true);
+  }, 1500);
+}
+
+function onGoogleCredential(resp) {
+  const issuer = S.gis.issuer;
+  const token = (resp && resp.credential) || "";
+  const claims = decodeJWT(token);
+  const problem = checkIDToken(claims, { nonce: S.gis.nonce, clientId: issuer.client, nowSec: nowSec() });
+  S.gis.credentialAt = Date.now();
+  S.gis.nonce = "";
+  const renew = S.gis.pendingRenew;
+  if (renew) {
+    S.gis.pendingRenew = null;
+    // A renewal that comes back as another account is not a renewal.
+    if (problem || !S.sso || claims.sub !== S.sso.sub) { renew(false); return; }
+    const meta = Object.assign({}, S.sso, { exp: claims.exp });
+    commitSession(token, meta);
+    renew(true);
+    return;
+  }
+  if (problem) {
+    if (S.view === "signin") { setLeaving(issuer, false); }
+    showSignIn({ message: idTokenProblemMessage(problem), error: true, focus: true });
+    return;
+  }
+  showSignIn({ busy: true, message: MSG.signingIn });
+  trySignIn(token, ssoMetaFor(issuer, claims), "sso");
+}
+
+// googleRenew re-issues the ID token through GIS auto-select, in Google's
+// allowed frame, with no reload (DR6).
+async function googleRenew(meta) {
+  let g;
+  try { g = await ensureGIS(); } catch (_) { return false; }
+  gisInit(g, issuerFromMeta(meta));
+  return new Promise((resolve) => {
+    let done = false;
+    let timer = null;
+    const finish = (ok) => {
+      if (done) { return; }
+      done = true;
+      clearTimeout(timer);
+      S.gis.pendingRenew = null;
+      resolve(ok);
+    };
+    timer = setTimeout(() => finish(false), GOOGLE_RENEW_TIMEOUT_MS);
+    S.gis.pendingRenew = finish;
+    g.accounts.id.prompt((n) => { if (gisPromptGaveUp(n)) { finish(false); } });
+  });
+}
+
+// switchAccount is "Use a different account" (DR7).
+async function switchAccount(name) {
+  const issuer = issuerByName(name);
+  if (!issuer) { return; }
+  if (issuer.kind !== "google") {
+    startSignIn(issuer, "switch");
+    return;
+  }
+  let g;
+  try { g = await ensureGIS(); } catch (_) {
+    setSignInMessage(msgProviderError(issuer.display, "gis_unavailable"), true);
+    return;
+  }
+  g.accounts.id.disableAutoSelect();
+  gisInit(g, issuer);
+  g.accounts.id.prompt();
+}
+
+// ---------- renewal (DR6) ----------
+
+function scheduleRenewal() {
+  clearRenewTimer();
+  if (S.kind !== "sso" || !S.sso || typeof S.sso.exp !== "number") { return; }
+  const delay = Math.min(renewDelayMs(S.sso.exp, Date.now()), 2147483647);
+  S.renewTimer = setTimeout(() => {
+    S.renewTimer = null;
+    if (document.hidden) {
+      S.renewDue = true;
+      return;
+    }
+    S.renewal.run("proactive");
+  }, delay);
+}
+
+function clearRenewTimer() {
+  if (S.renewTimer) { clearTimeout(S.renewTimer); S.renewTimer = null; }
+  S.renewDue = false;
+}
+
+function renewalFailed() {
+  S.expired = true;
+  stopTimer();
+  clearRenewTimer();
+  if (S.view === "overview") {
+    el("banner-text").textContent = MSG.expired;
+    el("expiry-banner").hidden = false;
+    return;
+  }
+  clearSession();
+  showSignIn({ message: MSG.expired, error: true, focus: true });
+}
+
+function renewalSucceeded() {
+  S.expired = false;
+  el("expiry-banner").hidden = true;
+  scheduleRenewal();
+  if (S.view === "overview") {
+    if (el("autorefresh").checked) { startTimer(); }
+    refreshAll(true);
+  }
+}
+
+// signInAgain is the banner's button: the same restore as a renewal, but
+// interactive.
+async function signInAgain() {
+  const s = S.sso;
+  if (!s) { signOut(); return; }
+  saveView();
+  if (s.kind === "google") {
+    showSignIn({ focus: true });
+    return;
+  }
+  try {
+    window.location.assign(await beginRedirect(issuerFromMeta(s), "interactive"));
+  } catch (_) {
+    // The provider can't be reached: say so in the sign-in box. The saved
+    // view stays, so whichever sign-in follows restores it.
+    showSignIn({ message: msgProviderError(s.display, "provider_unreachable"), error: true, focus: true });
+  }
+}
+
+// ---------- view save / restore ----------
+
+function collectView() {
+  return {
+    pageTokens: S.pageTokens.slice(),
+    pageIndex: S.pageIndex,
+    autorefresh: el("autorefresh").checked,
+    open: Array.from(document.querySelectorAll("#app-main details[id]")).filter((d) => d.open).map((d) => d.id),
+    scrollY: window.scrollY,
+  };
+}
+
+function saveView() {
+  store.set(KEYS.view, serializeView(collectView()));
+}
+
+function applySavedView() {
+  const v = parseView(store.get(KEYS.view));
+  store.remove(KEYS.view);
+  if (!v) { return; }
+  S.pageTokens = v.pageTokens;
+  S.pageIndex = v.pageIndex;
+  el("autorefresh").checked = v.autorefresh;
+  v.open.forEach((id) => { const d = el(id); if (d && d.tagName === "DETAILS") { d.open = true; } });
+  S.restoreScrollY = v.scrollY;
+}
+
+// ---------- overview ----------
+
+function showOverview(opts) {
+  opts = opts || {};
+  S.view = "overview";
+  el("login").hidden = true;
+  el("login-box").removeAttribute("role");
+  el("app-header").hidden = false;
+  el("app-main").hidden = false;
+  applySavedView();
+  renderWho();
+  if (opts.expired) {
+    S.expired = true;
+    el("banner-text").textContent = MSG.expired;
+    el("expiry-banner").hidden = false;
+    return;
+  }
+  S.expired = false;
+  el("expiry-banner").hidden = true;
+  refreshAll(true).then(() => {
+    if (S.restoreScrollY) { window.scrollTo(0, S.restoreScrollY); S.restoreScrollY = 0; }
+  });
+  if (el("autorefresh").checked) { startTimer(); }
+  scheduleRenewal();
+}
+
+function renderWho() {
+  const who = el("who");
+  if (!S.who) { who.hidden = true; return; }
+  const h = headerIdentity(S.who, identityEnabled());
+  who.hidden = false;
+  el("who-name").textContent = h.name;
+  el("who-name").title = h.title;
+  const p = el("who-pill");
+  p.textContent = h.pill;
+  p.className = "pill " + h.pillClass;
+  if (h.pillTitle) { p.title = h.pillTitle; } else { p.removeAttribute("title"); }
+}
+
+function signOut() {
+  signOutSession(storageAPI, window.google);
+  clearSession();
+  S.expired = false;
+  S.pageTokens = [""];
+  S.pageIndex = 0;
+  el("pat-input").value = "";
+  el("who").hidden = true;
+  showSignIn({ notice: MSG.signedOut, focus: true });
+}
+
 // ---------- panels ----------
+
+async function apiJSON(path) {
+  const res = await S.api(path);
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(res.status + " " + (text || res.statusText));
+  }
+  return res.json();
+}
 
 async function loadHealth() {
   try {
@@ -485,6 +1918,7 @@ async function loadHealth() {
     dot.classList.remove("ok", "warn", "bad");
     dot.classList.add(statusKind);
   } catch (err) {
+    if (err instanceof SessionExpired) { return; }
     el("health-row").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
     el("status-dot").className = "dot bad";
   }
@@ -620,6 +2054,7 @@ async function loadCluster() {
       `;
     }).join("");
   } catch (err) {
+    if (err instanceof SessionExpired) { return; }
     el("cluster-meta").textContent = "";
     el("members-tbody").innerHTML = `<tr><td colspan="9" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
@@ -627,7 +2062,7 @@ async function loadCluster() {
 
 async function loadPlacements() {
   try {
-    const token = state.pageTokens[state.pageIndex] || "";
+    const token = S.pageTokens[S.pageIndex] || "";
     const q = token ? "?limit=50&page_token=" + encodeURIComponent(token) : "?limit=50";
     let p;
     try {
@@ -702,10 +2137,11 @@ async function loadPlacements() {
         `;
       }).join("");
     }
-    el("page-info").textContent = "page " + (state.pageIndex + 1);
+    el("page-info").textContent = "page " + (S.pageIndex + 1);
     el("next-page-btn").disabled = !p.next_page_token;
-    state.nextPageToken = p.next_page_token || "";
+    S.nextPageToken = p.next_page_token || "";
   } catch (err) {
+    if (err instanceof SessionExpired) { return; }
     el("placements-tbody").innerHTML = `<tr><td colspan="8" class="error">${escapeHTML(err.message)}</td></tr>`;
   }
 }
@@ -730,7 +2166,7 @@ const METRIC_PICKS = [
 
 async function loadMetrics() {
   try {
-    const res = await api("/debug/vars");
+    const res = await S.api("/debug/vars");
     if (!res.ok) { throw new Error(res.status + " " + res.statusText); }
     const data = await res.json();
     const grid = METRIC_PICKS.map(([key, label, fmt]) => {
@@ -743,6 +2179,7 @@ async function loadMetrics() {
     Object.keys(data).forEach((k) => { if (k.startsWith("aerolvm_")) { filtered[k] = data[k]; } });
     el("metrics-raw").textContent = JSON.stringify(filtered, null, 2);
   } catch (err) {
+    if (err instanceof SessionExpired) { return; }
     el("metrics-grid").innerHTML = `<span class="error">${escapeHTML(err.message)}</span>`;
     el("metrics-raw").textContent = "";
   }
@@ -753,7 +2190,7 @@ async function loadMetrics() {
 async function postAction(method, path, label, id) {
   if (!confirm(`${label} on ${id}?\n\nThis calls: ${method} ${path}`)) { return; }
   try {
-    const res = await api(path, { method });
+    const res = await S.api(path, { method });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
       alert(`${label} failed: ${res.status} ${res.statusText}\n${text}`);
@@ -765,78 +2202,155 @@ async function postAction(method, path, label, id) {
   }
 }
 
-document.addEventListener("click", (e) => {
-  const t = e.target;
-  if (!(t instanceof Element) || !t.matches("button[data-action]")) { return; }
-  const id = t.getAttribute("data-id");
-  const action = t.getAttribute("data-action");
-  if (!id) { return; }
-  if (action === "drain") {
-    postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/drain`, "Drain node", id);
-  } else if (action === "uncordon") {
-    postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/uncordon`, "Uncordon node", id);
-  } else if (action === "reclaim") {
-    postAction("POST", `/v1/cluster/orphans/${encodeURIComponent(id)}/reclaim-local`, "Reclaim orphan locally", id);
-  } else if (action === "delete-orphan") {
-    postAction("DELETE", `/v1/cluster/orphans/${encodeURIComponent(id)}`, "Force-delete orphan placement", id);
-  } else if (action === "start-sandbox") {
-    postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/start`, "Start sandbox", id);
-  } else if (action === "stop-sandbox") {
-    postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/stop`, "Stop sandbox", id);
-  } else if (action === "delete-sandbox") {
-    postAction("DELETE", `/v1/sandboxes/${encodeURIComponent(id)}`, "Delete sandbox", id);
-  }
-});
-
-el("next-page-btn").addEventListener("click", () => {
-  if (!state.nextPageToken) { return; }
-  state.pageTokens.push(state.nextPageToken);
-  state.pageIndex = state.pageTokens.length - 1;
-  loadPlacements();
-});
-
-el("reset-page-btn").addEventListener("click", () => {
-  state.pageTokens = [""];
-  state.pageIndex = 0;
-  loadPlacements();
-});
-
-el("refresh-btn").addEventListener("click", () => refreshAll(true));
-
-el("autorefresh").addEventListener("change", () => {
-  if (el("autorefresh").checked) { startTimer(); } else { stopTimer(); }
-});
-
 // ---------- loop ----------
 
+// refreshAll loads the panels. Only the overview loads them, so a caller
+// without the admin role never sends a fleet.admin request (DR1), and
+// nothing loads while a renewal runs or after it failed (DR6).
 async function refreshAll(force) {
-  if (!state.pat) { return; }
+  if (S.view !== "overview" || !S.bearer || S.expired || S.renewal.active()) { return; }
   if (!force && document.hidden) { return; }
   await Promise.all([loadHealth(), loadCluster(), loadPlacements(), loadMetrics()]);
 }
 
 function startTimer() {
   stopTimer();
-  state.timer = setInterval(() => refreshAll(false), REFRESH_MS);
+  S.timer = setInterval(() => refreshAll(false), REFRESH_MS);
 }
 
 function stopTimer() {
-  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  if (S.timer) { clearInterval(S.timer); S.timer = null; }
 }
 
-// ---------- boot ----------
+// ---------- wiring ----------
 
-if (state.pat) {
-  showApp();
-  refreshAll(true);
-  startTimer();
+function wire() {
+  el("login-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const v = el("pat-input").value.trim();
+    if (!v) { return; }
+    el("pat-submit").disabled = true;
+    try {
+      await trySignIn(v, null, "token");
+    } finally {
+      el("pat-submit").disabled = false;
+    }
+  });
+
+  el("sso-buttons").addEventListener("click", (e) => {
+    const t = e.target;
+    if (!(t instanceof Element)) { return; }
+    const btn = t.closest("button.sso-btn");
+    if (!btn || btn.disabled) { return; }
+    const issuer = issuerByName(btn.dataset.issuer);
+    if (issuer) { startSignIn(issuer, "interactive"); }
+  });
+
+  el("switch-account").addEventListener("click", () => switchAccount(el("switch-account").dataset.issuer));
+  el("na-switch").addEventListener("click", () => switchAccount(el("na-switch").dataset.issuer));
+  el("retry-btn").addEventListener("click", () => { if (S.retry) { S.retry(); } });
+  el("signout-btn").addEventListener("click", signOut);
+  el("si-signout").addEventListener("click", signOut);
+  el("na-signout").addEventListener("click", signOut);
+  el("banner-signin").addEventListener("click", signInAgain);
+
+  document.addEventListener("click", (e) => {
+    const t = e.target;
+    if (!(t instanceof Element) || !t.matches("button[data-action]")) { return; }
+    const id = t.getAttribute("data-id");
+    const action = t.getAttribute("data-action");
+    if (!id) { return; }
+    if (action === "drain") {
+      postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/drain`, "Drain node", id);
+    } else if (action === "uncordon") {
+      postAction("POST", `/v1/cluster/nodes/${encodeURIComponent(id)}/uncordon`, "Uncordon node", id);
+    } else if (action === "reclaim") {
+      postAction("POST", `/v1/cluster/orphans/${encodeURIComponent(id)}/reclaim-local`, "Reclaim orphan locally", id);
+    } else if (action === "delete-orphan") {
+      postAction("DELETE", `/v1/cluster/orphans/${encodeURIComponent(id)}`, "Force-delete orphan placement", id);
+    } else if (action === "start-sandbox") {
+      postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/start`, "Start sandbox", id);
+    } else if (action === "stop-sandbox") {
+      postAction("POST", `/v1/sandboxes/${encodeURIComponent(id)}/stop`, "Stop sandbox", id);
+    } else if (action === "delete-sandbox") {
+      postAction("DELETE", `/v1/sandboxes/${encodeURIComponent(id)}`, "Delete sandbox", id);
+    }
+  });
+
+  el("next-page-btn").addEventListener("click", () => {
+    if (!S.nextPageToken) { return; }
+    S.pageTokens.push(S.nextPageToken);
+    S.pageIndex = S.pageTokens.length - 1;
+    loadPlacements();
+  });
+
+  el("reset-page-btn").addEventListener("click", () => {
+    S.pageTokens = [""];
+    S.pageIndex = 0;
+    loadPlacements();
+  });
+
+  el("refresh-btn").addEventListener("click", () => refreshAll(true));
+
+  el("autorefresh").addEventListener("change", () => {
+    if (el("autorefresh").checked) { startTimer(); } else { stopTimer(); }
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || S.view !== "overview") { return; }
+    // A background tab renews when it becomes visible (DR6).
+    const due = S.renewDue || (S.kind === "sso" && S.sso && !S.expired && renewDelayMs(S.sso.exp, Date.now()) === 0);
+    if (due && !S.expired) {
+      S.renewDue = false;
+      S.renewal.run("visible");
+      return;
+    }
+    if (el("autorefresh").checked) { refreshAll(true); }
+  });
+
+  // The pop-up closed without a credential: give the buttons back.
+  window.addEventListener("focus", () => {
+    if (!S.gis.clickAt || S.view !== "signin") { return; }
+    const clickAt = S.gis.clickAt;
+    setTimeout(() => {
+      if (S.gis.clickAt !== clickAt || S.gis.credentialAt >= clickAt || S.view !== "signin") { return; }
+      S.gis.clickAt = 0;
+      setLeaving(S.gis.issuer, false);
+      setSignInMessage("", false);
+    }, 1000);
+  });
+
+  // Google's button is as wide as the box, re-rendered when that changes
+  // (DR12).
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      const slot = el("gis-slot");
+      const issuer = slot && issuerByName(slot.dataset.issuer);
+      if (issuer && S.view === "signin") { renderGISButton(issuer); }
+    }, 150);
+  });
+}
+
+// The test hook: node runs this script with __AEROLVM_TEST__ set and calls
+// these functions directly (pkg/api/testdata/dashboard_test.mjs). In a
+// browser the flag is never set and the page boots.
+if (globalThis.__AEROLVM_TEST__) {
+  globalThis.__dashboard = {
+    KEYS, MSG, RENEW_BEFORE_S, MAX_GROUPS_SHOWN,
+    msgOpening, msgProviderError, msgWrongApp, msgUnverified, SessionExpired,
+    isLocalHostname, ssoAllowed, httpsURL, dashboardIssuers, switchTarget, signInModel, focusTarget,
+    gisWidth, gisButtonOptions, routeFor, headerIdentity, signedInModel, isNoBinding, noAccessModel,
+    credentialKind, rejectionMessage, safeCode, b64urlEncode, b64urlDecodeText, randomToken,
+    pkceChallenge, decodeJWT, checkIDToken, idTokenProblemMessage, promptFor, redirectURI,
+    authorizeURL, providerMetadata, exchangeCode, callbackParams, pendingProblem, ssoMetaFor,
+    issuerFromMeta, renewDelayMs, serializeView, parseView, createTracker, createSingleFlight,
+    createAPI, createRenewer, signOutSession, applyDeferredSignOut, gisPromptGaveUp, aggregateCapacity,
+  };
 } else {
-  showLogin(null);
+  boot();
 }
-
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && state.pat && el("autorefresh").checked) { refreshAll(true); }
-});
 </script>
 </body>
 </html>
