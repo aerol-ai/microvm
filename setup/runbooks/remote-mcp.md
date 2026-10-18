@@ -121,6 +121,12 @@ the token itself.
 - Google cannot be used: its access tokens are opaque, and checking one
   would need a call to Google per request. The identity file refuses
   `mcp: true` on a `kind: google` issuer.
+- Authentik cannot be used yet. Its access tokens are JWTs, but each names
+  only its own application's client id as `aud`, and each Authentik
+  application is its own issuer. sandboxd tells an MCP-only access token
+  from an ID token by audience alone, so the connector's tokens need an
+  audience that the same issuer's ID tokens never carry, and Authentik has
+  no setting for a custom access-token audience.
 
 ### The identity file
 
@@ -137,7 +143,7 @@ bindings:
   - { issuer: okta, group: payments-eng, role: runner, team: payments }
 mcp:
   resource: https://api.acme.dev/mcp               # https://<SB_DOMAIN>/mcp; the path must be /mcp
-  scopes: [api://aerolvm-mcp/mcp]                  # optional; Entra needs one
+  scopes: [api://aerolvm-mcp/mcp]                  # optional; Entra and Zitadel need one
 ```
 
 - `mcp_audiences` must not overlap `audiences`; the load fails if they do.
@@ -214,6 +220,37 @@ access tokens):
    bindings match.
 4. The issuer's `url` is `https://<keycloak>/realms/<realm>`.
 
+**Zitadel** (not yet tested against a live tenant; these steps follow
+Zitadel's documentation):
+
+1. Create a project for the connector alone, for example `AerolVM MCP`.
+   Do not add the connector to the project of the CLI and dashboard apps.
+   Zitadel puts the client id of every app in a project into the `aud` of
+   every token that project issues, so a connector token from the CLI's
+   project would name the CLI app, and sandboxd would accept it on `/v1`
+   too.
+2. In that project, turn on Assert Roles on Authentication. Create the same
+   role keys as in the CLI's project and grant them to the same people:
+   Zitadel puts only a project's own roles into its tokens.
+3. Add the connector as a Web app in that project: the code flow, the
+   connector's redirect URL, and PKCE or a client secret, whichever the
+   connector uses. Set its Auth Token Type to JWT. The default, Bearer, is
+   an opaque token that sandboxd cannot check.
+4. `mcp_audiences` is that project's id, which is in the `aud` of every
+   token the project issues. The issuer's `url` is the same instance URL
+   the CLI and dashboard use, so it is the same identity-file issuer.
+5. Add the `groupsClaim` Action ("Zitadel roles as groups" in
+   [Access control](../../docs/src/content/docs/enterprise/access-control.mdx))
+   to the Complement Token flow's Pre access token creation trigger too, so
+   access tokens carry `groups`. Actions run from each person's own
+   organization, whichever project the app is in.
+6. Set `mcp.scopes: [openid]`. Zitadel refuses a sign-in request that names
+   no scope, and a connector asks for the scopes the RFC 9728 document
+   lists.
+7. Zitadel's access tokens carry no name or email, so the display name of
+   an MCP call is the person's Zitadel user id. Their principal id
+   (`oidc:<issuer>:<sub>`) is the same as through the CLI.
+
 ### Live connector check
 
 Run it once per provider and connector after setup, after a provider or
@@ -246,16 +283,19 @@ real person's account at the provider, so it is manual.
 | — | Entra ID | ChatGPT | not yet run | |
 | — | Keycloak | claude.ai | not yet run | |
 | — | Keycloak | ChatGPT | not yet run | |
+| — | Zitadel | claude.ai | not yet run | |
+| — | Zitadel | ChatGPT | not yet run | |
 
 ### OAuth troubleshooting
 
 | What the connector or log shows | Likely cause | Next step |
 |---|---|---|
 | No sign-in prompt; the connector says the server needs no auth or can't find one | The 401 has no `resource_metadata`: identity off, no `mcp.resource`, or the file failed to load | Open the metadata URL; check `aerolvm_identity_file_load_errors_total` and the boot log |
-| 401 `wrong_audience` on `/mcp` | The token's `aud` is not in `audiences` or `mcp_audiences` | Okta: the authorization server's Audience. Entra: the API app's client id. Keycloak: the Audience mapper |
+| 401 `wrong_audience` on `/mcp` | The token's `aud` is not in `audiences` or `mcp_audiences` | Okta: the authorization server's Audience. Entra: the API app's client id. Keycloak: the Audience mapper. Zitadel: the connector project's id |
 | 401 `unknown_issuer`, body "Entra issued a v1 access token…" | The API app still issues v1 tokens | Set `accessTokenAcceptedVersion: 2` in its manifest |
 | 401 `unknown_issuer` | The token's `iss` is not an issuer `url`, byte for byte | Copy the issuer from the provider's discovery document |
-| 401 with no reason | The token is not a JWT (opaque): Google, or Okta's org authorization server | Use a custom authorization server; Google is not supported |
+| 401 with no reason | The token is not a JWT (opaque): Google, Okta's org authorization server, or a Zitadel app left on the Bearer token type | Okta: use a custom authorization server. Zitadel: set the connector app's Auth Token Type to JWT. Google is not supported |
+| The provider refuses the sign-in because the scope is missing (Zitadel) | No `mcp.scopes`, so the connector asked for no scope | Set `mcp.scopes: [openid]` |
 | 403 "no role binding … through issuer …" | The access token lacks the claims your bindings match | Add groups (or app roles) to access tokens at the provider |
 | 401 `wrong_audience` on `/v1` | A connector token used outside `/mcp` | Expected; people use the CLI or dashboard sign-in for `/v1` |
 | Tool calls on one node's sandboxes fail with `unauthorized`, others work | That node runs a build without OAuth for remote MCP | Upgrade it (see Before you start) |

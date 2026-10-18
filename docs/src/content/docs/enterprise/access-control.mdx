@@ -18,7 +18,7 @@ Every API call carries one credential. The server checks it on its own, with no 
 | Credential | Who uses it | How you get it |
 |---|---|---|
 | **API token** (`avm_…`) | Services, CI jobs, scripts | An admin creates it. It has a name, a role, a team and an expiry. |
-| **Company sign-in** | People | `aerolvm login` or the dashboard sends you to your company's sign-in page, such as Okta, Entra ID, Google or Keycloak. |
+| **Company sign-in** | People | `aerolvm login` or the dashboard sends you to your company's sign-in page, such as Okta, Entra ID, Google, Keycloak, Authentik or Zitadel. |
 | **Workload token** | CI on GitHub Actions, apps on Kubernetes | The platform issues it. Nothing secret is stored on AerolVM. |
 | **Server token** (PAT) | The operator, setup scripts, cluster servers | Chosen at install. It always acts as an admin on every team. Keep it for emergencies. |
 
@@ -532,6 +532,7 @@ deny_subjects: []                       # "<issuer>:<sub>", blocked at once
 How a rule matches:
 
 - `group` matches the groups claim, and `app_role` matches the roles claim (Entra app roles).
+- The groups and roles claims must hold a string or a list of strings. A claim that holds an object, such as Zitadel's project roles, never matches.
 - `claim` matches every listed claim. A list claim matches when it contains the value.
 - A rule on `email` also needs the provider to say the email is verified.
 - Only the rules for the token's own issuer are tried.
@@ -580,8 +581,70 @@ Notes for each provider:
 - **Entra ID.** The issuer `url` is `https://login.microsoftonline.com/<tenant>/v2.0`. Use the "Mobile and desktop applications" platform for the CLI (turn on public client flows for `--device`), and the "Single-page application" platform for the dashboard. Above 200 groups, Entra leaves the groups out of the token. Bind on app roles instead: `{ issuer: entra, app_role: AerolVM.Runner, role: runner, team: payments }`.
 - **Keycloak.** The issuer `url` is `https://<keycloak>/realms/<realm>`. Make both clients public, with the standard flow and PKCE. Turn on the device authorization grant on the CLI client, for `--device`. Set the dashboard client's Web origins to `https://<api-domain>`. Add a Group Membership mapper to the ID token.
 - **Google.** Use `kind: google`. The CLI app is a "Desktop app". Google still wants that app's client secret, so hand it to people when they start, and they run `aerolvm login --sso <url> --client-secret-stdin` once. It never goes on the server. Google offers the device flow only to a "TVs and Limited Input devices" client, and the CLI uses one client ID for both flows, so pick the type you need. The dashboard app is a "Web application" with `https://<api-domain>` as an authorized JavaScript origin. Google gets its own button.
+- **Authentik.** Each Authentik application has its own issuer URL, so use **one** application for both the CLI and the dashboard:
+  - The issuer `url` is `https://<authentik>/application/o/<slug>/`, with the trailing slash. Keep the provider's issuer mode at its default (one issuer per provider), and don't rename the slug later: both change the issuer.
+  - Make its OAuth2/OpenID provider a **Public** client. Put its client ID in `audiences`, and as both `clients.cli` and `clients.dashboard`.
+  - Add the redirect URIs `https://<api-domain>/ui` as **Strict**, and `http://127\.0\.0\.1:\d+/callback` as **Regex**, so the CLI's random port matches. Authentik allows cross-origin calls from the address of each Strict redirect URI, so the dashboard needs nothing more.
+  - Pick an RSA **Signing Key**, such as the built-in "authentik Self-signed Certificate". With no signing key, Authentik signs with HS256, which the server refuses. Leave **Encryption Key** empty.
+  - Add the `offline_access` scope to the provider, so the CLI login can renew itself. For `--device`, give your brand a device code flow.
+  - The default `profile` scope puts a `groups` list in the ID token, so group rules work as they are. Authentik's default `email` scope says the email is not verified, so a rule on `email` never matches.
+  - Keep **Subject mode** at its default, a hashed user ID. Each person's ID is built from it, and a change gives everyone a new ID.
+- **Zitadel.** The issuer `url` is your instance's domain, such as `https://acme-abc123.zitadel.cloud`, with no trailing slash.
+  - Put the CLI and dashboard apps in a project of their own. Zitadel puts the client ID of every app in a project into every token the project issues, so a sign-in token for any other app in that project would also work here.
+  - For the CLI, create a **Native** app with PKCE, and turn on the Refresh Token and Device Code grant types. Register `http://127.0.0.1/callback`. Zitadel accepts any port on it for a native app.
+  - For the dashboard, create a **User Agent** app with PKCE. Zitadel allows cross-origin calls from the redirect URI's address, so it needs no extra origin. To sign in through an SSH tunnel too, add `http://localhost:21212/ui` and turn on **Development Mode**. Zitadel allows an `http` redirect URI on a non-native app only in that mode.
+  - Zitadel's roles claim is an object, which the server can't match. Add a flat `groups` claim with a Zitadel Action, as [Zitadel roles as groups](#zitadel-roles-as-groups) shows.
+  - The ID token always has `preferred_username` (the person's login name), but the email only when **User Info inside ID Token** is on. Set `username: preferred_username`, or turn that setting on to show or bind on `email`.
+  - Zitadel's ID tokens last 12 hours by default, not one hour. To cut off a removed person sooner, shorten the ID token lifetime in your instance's OIDC settings.
 
 The dashboard works only over HTTPS, or from `localhost` through an SSH tunnel. [Dashboard](/dashboard/#set-up-sign-in-for-the-dashboard) has the details.
+
+Authentik and Zitadel have not been tested against a live tenant yet. These steps follow each provider's own documentation.
+
+For these two, the issuers in the identity file look like this:
+
+```yaml
+issuers:
+  - name: authentik
+    display_name: Acme Authentik
+    url: https://auth.acme.dev/application/o/aerolvm/      # keep the trailing slash
+    audiences: [Kq7wP2mXv9]                                # the provider's client ID
+    clients: { cli: Kq7wP2mXv9, dashboard: Kq7wP2mXv9 }    # one app serves both
+    claims: { username: email, groups: groups }
+  - name: zitadel
+    display_name: Acme Zitadel
+    url: https://acme-abc123.zitadel.cloud                 # no trailing slash
+    audiences: ["290101", "290102"]                        # the CLI and dashboard client IDs
+    clients: { cli: "290101", dashboard: "290102" }
+    claims: { username: preferred_username, groups: groups }   # groups comes from the Action below
+bindings:
+  - { issuer: authentik, group: platform-admins, role: admin }
+  - { issuer: zitadel,   group: payments-eng,    role: runner, team: payments }   # a Zitadel role key
+```
+
+#### Zitadel roles as groups
+
+Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`). A Zitadel Action can copy the role keys into a flat `groups` list, which group rules can match.
+
+1. In the project of your CLI and dashboard apps, turn on **Assert Roles on Authentication**. Without it, the Action sees no roles.
+2. In the organization your people belong to, open **Actions** and create an Action named `groupsClaim`. Zitadel runs the Actions of each person's own organization. Turn on **Allowed To Fail**, so a broken script can't block sign-in. The person then carries no groups, and gets no role. Use this script:
+
+   ```js
+   function groupsClaim(ctx, api) {
+     if (ctx.v1.user.grants === undefined || ctx.v1.user.grants.count == 0) {
+       return;
+     }
+     let groups = [];
+     ctx.v1.user.grants.grants.forEach(grant => {
+       grant.roles.forEach(role => groups.push(role));
+     });
+     api.v1.claims.setClaim('groups', groups);
+   }
+   ```
+
+3. Under **Flows**, pick **Complement Token**, and add the Action to the **Pre Userinfo creation** trigger. That puts `groups` in ID tokens. For [MCP connectors](/mcp/#sign-in-with-oauth), also add it to **Pre access token creation**.
+
+Each role key becomes one group name. A person granted the `payments-eng` role in the project matches `{ issuer: zitadel, group: payments-eng, ... }`. Only roles from the app's own project are included.
 
 ### Step 4: Check it
 
@@ -604,7 +667,7 @@ The scrape token is **read-only, not metrics-only**. It cannot create, run or de
 
 ## Take access away
 
-- **For a person:** remove them at your identity provider. Their login stops renewing, and their last sign-in token dies within its lifetime, about an hour. To block them at once, add `"<issuer>:<sub>"` to `deny_subjects` and ship the file. Each server applies it within 10 seconds, or at once on `SIGHUP`. Their audit records name them as `oidc:<issuer>:<sub>`; the deny entry is that ID without `oidc:`.
+- **For a person:** remove them at your identity provider. Their login stops renewing, and their last sign-in token dies within its lifetime: about an hour for most providers, and 12 hours by default for Zitadel. To block them at once, add `"<issuer>:<sub>"` to `deny_subjects` and ship the file. Each server applies it within 10 seconds, or at once on `SIGHUP`. Their audit records name them as `oidc:<issuer>:<sub>`; the deny entry is that ID without `oidc:`.
 - **For an API token:** revoke it. Every server stops accepting it within seconds.
 - **For the server token:** rotate it. The [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#rotatepat) shows how to do it with no downtime.
 

@@ -220,7 +220,7 @@ Send your API token as a bearer token. For example, in Claude Code:
 claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox=my-agent&create_if_missing=true" --header "Authorization: Bearer $SB_PAT_TOKEN"
 ```
 
-With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts about an hour. If your credential belongs to several teams, add `--header "X-AerolVM-Team: checkout"`: every tool call then acts for that team. The server token works only if the operator has not limited it to the server. Once they have, a server token sent to `/mcp` from outside is refused, and the tool calls it would make count as outside too, on every server they reach.
+With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts only as long as your provider's sign-in, often about an hour. If your credential belongs to several teams, add `--header "X-AerolVM-Team: checkout"`: every tool call then acts for that team. The server token works only if the operator has not limited it to the server. Once they have, a server token sent to `/mcp` from outside is refused, and the tool calls it would make count as outside too, on every server they reach.
 
 - **Any server in a cluster can answer.** The endpoint keeps nothing between requests.
 - **Each call runs with your token's permissions,** through the same checks as a direct API call.
@@ -232,7 +232,7 @@ With [access control](/enterprise/access-control/) on, use an API token of your 
 Hosted AI products, such as claude.ai and ChatGPT, connect to remote MCP servers with OAuth instead of a pasted token. With access control on, the web endpoint supports this. Your company's identity provider signs the person in, and AerolVM checks the token it issues, the same way it checks every other sign-in.
 
 <Aside type="caution" title="Not verified with any connector yet">
-Each provider and connector pair is checked by hand before these docs claim it works. No pair has passed that check yet: not claude.ai or ChatGPT, with Okta, Entra ID or Keycloak. ChatGPT may not accept a client you register yourself. The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#live-connector-check) records each run.
+Each provider and connector pair is checked by hand before these docs claim it works. No pair has passed that check yet: not claude.ai or ChatGPT, with Okta, Entra ID, Keycloak or Zitadel. ChatGPT may not accept a client you register yourself. The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#live-connector-check) records each run.
 </Aside>
 
 How a connector signs in:
@@ -245,6 +245,7 @@ How a connector signs in:
 - **The token works only on `/mcp`.** Sent anywhere else, it gets `401` with reason `wrong_audience`. Tool calls still work, because `/mcp` passes the checked caller to them inside the server.
 - **Each tool call is checked and recorded on its own,** with the person's role, and with `surface: mcp` in its audit record.
 - **Google cannot be used.** Its access tokens cannot be checked without calling Google on every request.
+- **Authentik cannot be used yet.** Its access tokens can be checked, but each one names only its own Authentik application as the audience, and each application has its own issuer. The server tells an MCP token from a sign-in token by its audience alone, and Authentik has no setting to give the connector's tokens an audience of their own.
 - **You register the connector at your provider,** not at AerolVM. AerolVM hosts no sign-in or registration page.
 
 ### For server operators
@@ -270,7 +271,7 @@ issuers:
     mcp_audiences: [api://aerolvm-mcp]          # tokens for /mcp only
 mcp:
   resource: https://api.acme.dev/mcp            # your /mcp address; the path must be /mcp
-  scopes: [api://aerolvm-mcp/mcp]               # optional; Entra ID needs one
+  scopes: [api://aerolvm-mcp/mcp]               # optional; Entra ID and Zitadel need one
 ```
 
 - `mcp_audiences` must not overlap `audiences`. That is how the server tells an MCP token from a sign-in token.
@@ -278,7 +279,7 @@ mcp:
 - In a cluster, upgrade every server before you add `mcp_audiences`. A server without this release refuses the token on calls it owns.
 - Check it by opening `https://<your-domain>/.well-known/oauth-protected-resource/mcp` in a browser. A `404` means no `mcp.resource` is in force.
 
-The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#oauth-connectors-claudeai-chatgpt) has the steps for Okta, Entra ID and Keycloak, the live check, and a troubleshooting table.
+The [remote MCP runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/remote-mcp.md#oauth-connectors-claudeai-chatgpt) has the steps for Okta, Entra ID, Keycloak and Zitadel, the live check, and a troubleshooting table.
 
 
 ## Same thing from the SDK

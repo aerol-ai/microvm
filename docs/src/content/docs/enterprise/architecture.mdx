@@ -19,7 +19,7 @@ This page describes how an AerolVM deployment is put together from a security po
 | Runtime | The server | Containers, gVisor, Firecracker, WebAssembly or V8 isolates. It builds the wall around each sandbox. | Trusted |
 | Sandbox | Inside the runtime | Your code and everything it starts, plus a small agent that runs commands and moves files | **Untrusted** |
 | Other servers | Your network | Cluster members, only in cluster mode | Trusted after they prove who they are |
-| Identity provider | Your company | Okta, Entra ID, Google, Keycloak, GitHub Actions or a Kubernetes cluster, named in the identity file. It signs people in and signs their tokens. | Trusted for what it signs |
+| Identity provider | Your company | Okta, Entra ID, Google, Keycloak, Authentik, Zitadel, GitHub Actions or a Kubernetes cluster, named in the identity file. It signs people in and signs their tokens. | Trusted for what it signs |
 
 ## Trust boundaries
 

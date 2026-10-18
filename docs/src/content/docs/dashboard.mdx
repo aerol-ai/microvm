@@ -67,7 +67,7 @@ The header shows who you are: your name and an `admin` badge, or "Server token" 
 
 ### Staying signed in, and signing out
 
-- **A company sign-in lasts about an hour.** The page renews it on its own about two minutes before it ends. For Okta, Entra ID and Keycloak, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
+- **A company sign-in lasts as long as your provider allows,** often about an hour. The page renews it on its own about two minutes before it ends. For every provider except Google, the page reloads through your provider and comes back to the same view. Google renews it in place. If renewal fails, a banner says "Your sign-in expired" with a **Sign in again** button, and your view stays.
 - **Sign out** clears the tab and stops Google from signing you straight back in. It does not sign you out of your company account, the same as other company apps.
 - **Use a different account** asks your provider to let you pick another account.
 
@@ -213,6 +213,10 @@ Only issuers with `clients.dashboard` get a button, in the order of the identity
 | Entra ID | An app registration with the "Single-page application" platform and the `/ui` redirect URI. Above 200 groups, Entra leaves the groups out, so bind on app roles. |
 | Keycloak | A public client with the standard flow and PKCE. Set Web origins to `https://<api-domain>`, and add a Group Membership mapper to the ID token. |
 | Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
+| Authentik | Share one application with the CLI: a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI; Authentik then allows cross-origin calls from that address. The `profile` scope already puts `groups` in the ID token. |
+| Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [Access control](/enterprise/access-control/#zitadel-roles-as-groups) shows how. |
+
+Authentik and Zitadel have not been tested against a live tenant yet. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
 
 - **The browser talks to your provider directly.** It reads the provider's discovery document and trades the sign-in code for a token. So your provider must allow cross-origin requests from your dashboard's address, and its token endpoint must be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
 - **The discovery document** at `https://<api-domain>/.well-known/aerolvm-auth` lists the buttons and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.
