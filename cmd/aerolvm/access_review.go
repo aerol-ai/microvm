@@ -92,11 +92,20 @@ const (
 	flagDenied           reviewFlag = "denied"
 	flagRefused          reviewFlag = "refused"
 	flagRateLimited      reviewFlag = "rate_limited"
+	// flagEveryTeam marks an identity-file binding that grants its role on
+	// every team (always so for admin and auditor).
+	flagEveryTeam reviewFlag = "every_team"
+	// flagIdentityChange marks an identity_config record: a node's identity
+	// file changed.
+	flagIdentityChange reviewFlag = "identity_change"
 )
 
 // flagOrder is the order findings are listed in: who holds the most power
-// first, then access that should already be gone, then activity.
-var flagOrder = []reviewFlag{flagAdmin, flagAdminGrant, flagExpired, flagExpiring, flagRevoked, flagNotListed, flagNoRecordedAction, flagDenied, flagRefused, flagRateLimited}
+// first, then changes to who may sign in, then access that should already
+// be gone, then activity. Within a flag, findings keep the report's own
+// order (tokens, token changes, identity changes, bindings, principals,
+// refusing sources), each already sorted.
+var flagOrder = []reviewFlag{flagAdmin, flagAdminGrant, flagEveryTeam, flagIdentityChange, flagExpired, flagExpiring, flagRevoked, flagNotListed, flagNoRecordedAction, flagDenied, flagRefused, flagRateLimited}
 
 // Token change kinds.
 const (
@@ -119,7 +128,11 @@ type accessReview struct {
 	Changes     []reviewChange    `json:"token_changes"`
 	Principals  []reviewPrincipal `json:"principals"`
 	Refused     []reviewRefusal   `json:"refused_credentials"`
-	Nodes       []reviewNode      `json:"nodes"`
+	// IdentityChanges are the identity_config records in the window.
+	IdentityChanges []reviewIdentityChange `json:"identity_changes"`
+	// IdentityFile is the file --identity-file named; nil without it.
+	IdentityFile *reviewIdentityFile `json:"identity_file,omitempty"`
+	Nodes        []reviewNode        `json:"nodes"`
 }
 
 // reviewActivity is what the records say one principal did in the window.
@@ -193,6 +206,9 @@ type reviewNode struct {
 	APIRecords  int64  `json:"api_records"`
 	// Lost is how many records the node's writer dropped (gap markers).
 	Lost int64 `json:"records_lost"`
+	// IdentityHash is the file the node's newest identity_config record in
+	// the window names; empty when it wrote none.
+	IdentityHash string `json:"identity_file_hash,omitempty"`
 }
 
 // reviewFinding is one flagged row, in words.
@@ -232,7 +248,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 	fs, c := a.newFlagSet(verbName)
 	var (
 		witnessURL, exportURL, exportDir, sinceRaw string
-		region, endpoint                           string
+		region, endpoint, identityPath             string
 		pathStyle                                  bool
 		maxLag                                     = auditVerifyDefaultMaxLag
 		format                                     = "md"
@@ -242,6 +258,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 	fs.StringVar(&exportDir, "export-dir", "", "")
 	fs.StringVar(&sinceRaw, "since", "", "")
 	fs.StringVar(&format, "format", format, "")
+	fs.StringVar(&identityPath, "identity-file", "", "")
 	fs.DurationVar(&maxLag, "max-lag", maxLag, "")
 	fs.StringVar(&region, "region", "", "")
 	fs.StringVar(&endpoint, "endpoint", "", "")
@@ -282,8 +299,16 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "%v", err)
 	}
 	opts.s3 = auditexport.S3Config{Region: region, Endpoint: endpoint, PathStyle: pathStyle}
+	// The identity file is local: a broken one stops the review before any
+	// call is made.
+	var identityFile *reviewIdentityFile
+	if identityPath != "" {
+		if identityFile, err = readIdentityFile(identityPath); err != nil {
+			return a.fail(c, err, exitError)
+		}
+	}
 
-	// The token list first: a caller who may not read it (token.read is
+	// The token list next: a caller who may not read it (token.read is
 	// auditor or admin) learns that before the export walk, which can take
 	// minutes.
 	var list models.APITokenList
@@ -298,7 +323,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 	if err != nil {
 		return a.fail(c, err, exitError)
 	}
-	review := merge.finish(list.Tokens)
+	review := merge.finish(list.Tokens, identityFile)
 	// A contradiction outranks an empty export: a hidden witness head with
 	// no batches anywhere is a FAIL, not "nothing to review".
 	if review.Result == auditlog.ResultFail {
@@ -353,6 +378,11 @@ type reviewShare struct {
 	apiRecords int64
 	plainReads int64
 	lost       int64
+	// identityChanges are the node's identity_config records; identityHash
+	// is the file the newest of them names, at identityAt.
+	identityChanges []reviewIdentityChange
+	identityHash    string
+	identityAt      time.Time
 }
 
 func newReviewShare(node string) *reviewShare {
@@ -473,6 +503,9 @@ func (s *reviewShare) observe(ev auditlog.Event) {
 			s.plainReads++
 		}
 		s.tokenChange(ev)
+	case auditlog.KindIdentityConfig:
+		// Also counted below against its caller, system:identity-file.
+		s.identityChange(ev)
 	}
 	c := ev.Caller
 	if c == nil {
@@ -687,7 +720,7 @@ func newReviewMerge(since, now time.Time, witnessed bool) *reviewMerge {
 		r: accessReview{
 			Result: auditlog.ResultPass, WindowStart: since.UTC(), GeneratedAt: now, Witnessed: witnessed,
 			Findings: []reviewFinding{}, Tokens: []reviewToken{}, Changes: []reviewChange{},
-			Principals: []reviewPrincipal{}, Refused: []reviewRefusal{}, Nodes: []reviewNode{},
+			Principals: []reviewPrincipal{}, Refused: []reviewRefusal{}, IdentityChanges: []reviewIdentityChange{}, Nodes: []reviewNode{},
 		},
 		principals: map[string]*reviewPrincipal{},
 		refused:    map[string]*reviewRefusal{},
@@ -707,7 +740,8 @@ func (m *reviewMerge) add(s *reviewShare) {
 		reads = readRecordsMutations
 	}
 	m.nodeReads = append(m.nodeReads, reads)
-	r.Nodes = append(r.Nodes, reviewNode{NodeReport: s.report, ReadRecords: reads, APIRecords: s.apiRecords, Lost: s.lost})
+	r.Nodes = append(r.Nodes, reviewNode{NodeReport: s.report, ReadRecords: reads, APIRecords: s.apiRecords, Lost: s.lost, IdentityHash: s.identityHash})
+	r.IdentityChanges = append(r.IdentityChanges, s.identityChanges...)
 	for id, p := range s.principals {
 		if have, ok := m.principals[id]; ok {
 			have.merge(p)
@@ -729,9 +763,10 @@ func (m *reviewMerge) add(s *reviewShare) {
 	}
 }
 
-// finish joins the merged evidence with the token list, flags every row and
-// returns the report. Call it once, after the last add.
-func (m *reviewMerge) finish(tokens []models.APIToken) accessReview {
+// finish joins the merged evidence with the token list and, when given, the
+// identity file, flags every row and returns the report. Call it once,
+// after the last add.
+func (m *reviewMerge) finish(tokens []models.APIToken, file *reviewIdentityFile) accessReview {
 	r := m.r
 	r.ReadRecords = fleetReadRecords(m.nodeReads)
 	sort.SliceStable(r.Changes, func(i, j int) bool {
@@ -749,6 +784,27 @@ func (m *reviewMerge) finish(tokens []models.APIToken) accessReview {
 			f.add(flagRevoked, ch.TokenID, "", "revoked at "+ch.At.Format(time.RFC3339)+" by "+by+" on "+ch.Node)
 		case ch.Role == string(controlplane.RoleAdmin):
 			f.add(flagAdminGrant, ch.TokenID, "", "minted with role admin on "+teamWords(ch.Team)+" by "+by+" at "+ch.At.Format(time.RFC3339)+" on "+ch.Node)
+		}
+	}
+	sort.SliceStable(r.IdentityChanges, func(i, j int) bool {
+		a, b := r.IdentityChanges[i], r.IdentityChanges[j]
+		return cmp.Or(a.At.Compare(b.At), cmp.Compare(a.Node, b.Node)) < 0
+	})
+	for _, ch := range r.IdentityChanges {
+		f.add(flagIdentityChange, ch.Node, "", identityChangeWords(ch))
+		for _, l := range ch.BindingsAdded {
+			if role, team, ok := bindingGrant(l); ok && role == string(controlplane.RoleAdmin) {
+				f.add(flagAdminGrant, ch.Node, "", "binding added granting admin on "+teamWords(team)+" at "+ch.At.Format(time.RFC3339)+": "+l)
+			}
+		}
+	}
+	if file != nil {
+		r.IdentityFile = file
+		for _, b := range file.Bindings {
+			subject := fmt.Sprintf("binding %d", b.Index)
+			for _, fl := range b.Flags {
+				f.add(fl, subject, b.Issuer, b.Line+": grants "+b.Role+" on "+teamWords(b.Team))
+			}
 		}
 	}
 	r.Principals = principalRows(m.principals, revoked, &f)
@@ -772,7 +828,7 @@ func buildAccessReview(tokens []models.APIToken, shares []*reviewShare, since, n
 	for _, s := range shares {
 		m.add(s)
 	}
-	return m.finish(tokens)
+	return m.finish(tokens, nil)
 }
 
 // tokenRows joins each listed token with its activity, taking the token's
@@ -874,7 +930,8 @@ func (f *findings) add(flag reviewFlag, subject, name, detail string) {
 	*f = append(*f, reviewFinding{Flag: flag, Subject: subject, Name: name, Detail: detail})
 }
 
-// sorted orders findings by flagOrder, then subject.
+// sorted orders findings by flagOrder. Within a flag they keep the order
+// they were added in, which follows the report's own sorted sections.
 func (f findings) sorted() []reviewFinding {
 	rank := map[reviewFlag]int{}
 	for i, fl := range flagOrder {
@@ -882,7 +939,7 @@ func (f findings) sorted() []reviewFinding {
 	}
 	out := append([]reviewFinding{}, f...)
 	sort.SliceStable(out, func(i, j int) bool {
-		return cmp.Or(cmp.Compare(rank[out[i].Flag], rank[out[j].Flag]), cmp.Compare(out[i].Subject, out[j].Subject)) < 0
+		return rank[out[i].Flag] < rank[out[j].Flag]
 	})
 	return out
 }

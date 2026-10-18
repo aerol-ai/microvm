@@ -15,7 +15,7 @@ func TestMarkdownEscape(t *testing.T) {
 		{"ana@acme.com", "ana@acme.com"},
 		{"a|b", `a\|b`},
 		{"*bold* _em_ `code` ~strike~", `\*bold\* \_em\_ \` + "`" + `code\` + "`" + ` \~strike\~`},
-		{"<script>alert(1)</script>", `\<script\>alert(1)\</script\>`},
+		{"<script>alert(1)</script>", `\<script>alert(1)\</script>`},
 		{"[x](https://evil.example)", `\[x\](https\://evil.example)`},
 		{"see www.evil.example and WWW.x", `see www\.evil.example and WWW\.x`},
 		{"&lt; $x$ #1 !", `\&lt; \$x\$ \#1 \!`},
@@ -101,7 +101,7 @@ func TestEmptyAccessReviewRenders(t *testing.T) {
 		"PASS on 1 node, 0 records checked; every witnessed head in the window was checked against the chain",
 		"No findings.", "No tokens are listed.", "No token was created or revoked in the window.",
 		"No principal besides the listed tokens is named in the window.", "No credential was refused in the window.",
-		"| node-a | PASS | 0 | - | - | 0 | none | 0 | no records in the window |",
+		"| node-a | PASS | 0 | - | - | 0 | none | 0 | - | no records in the window |", "No node recorded an identity-file change in the window.", "Not read: pass --identity-file",
 	} {
 		if !strings.Contains(md.String(), want) {
 			t.Errorf("empty Markdown review is missing %q:\n%s", want, md.String())

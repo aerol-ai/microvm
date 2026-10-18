@@ -349,7 +349,8 @@ const accessHelp = `Review who holds access and what they did with it: the evide
 quarterly access review (SOC 2 CC6.2/6.3).
 
 Usage: aerolvm access review --since <when> (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
-                             [--format md|csv] [--witness s3://<bucket>[/<prefix>]]
+                             [--identity-file <path>] [--format md|csv]
+                             [--witness s3://<bucket>[/<prefix>]]
 
 access review joins the token list (GET /v1/tokens, which needs an auditor or
 admin) with the audit export into one report:
@@ -357,13 +358,21 @@ admin) with the audit export into one report:
   - every token: name, role, team, creator, expiry, its last recorded action
     and its calls by kind;
   - every token created or revoked in the window, and who did it;
+  - every identity-file change a node recorded in the window (identity_config
+    records): the old and new file hash, bindings added and removed, a
+    reorder, deny subjects and issuers;
+  - with --identity-file, that file's bindings in order, and which nodes'
+    newest identity_config record names that exact file (by SHA-256);
   - every other principal the records name (people, the operator token,
     nodes, daemon subsystems, sandbox SSH keys): last action, calls by kind;
   - refused credentials (401s) by source address;
   - each node's verdict and what its records cover.
 
-Flags on rows: admin, admin_grant (a token minted with the admin role),
-expired (not yet swept), expiring (within 30 days), revoked, not_listed (a
+Flags on rows: admin (an admin token, the operator token, a node, or a
+binding granting admin), admin_grant (a token minted, or a binding added,
+with the admin role), every_team (a binding granting its role on every
+team), identity_change (a node's identity file changed), expired (not yet
+swept), expiring (within 30 days), revoked, not_listed (a
 token that acted but is gone), no_recorded_action (no api record names the
 token in the window), denied (403s), refused (401s) and rate_limited (calls
 the audit flood budget summarized). Plain reads leave a record only with
@@ -383,6 +392,8 @@ Flags:
   --export-dir D    batches saved from a webhook or bus receiver, laid out as
                     D/node=<id>/YYYY/MM/DD/<batch>.jsonl
   --format F        md (default) or csv
+  --identity-file F the identity file (SB_IDENTITY_FILE) to list bindings
+                    from; it is read locally and never sent anywhere
   --witness URL     also check the witnessed heads, as audit verify does;
                     nodes then come from the witness
   --max-lag D       how long a head may wait for its records (default 15m)

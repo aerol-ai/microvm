@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -19,8 +22,10 @@ import (
 // testdata/access-review is the access review's fixture: an export from
 // three nodes and the token list GET /v1/tokens returned at the same time.
 // accessReviewFixture below is its source; `go test -run
-// TestAccessReviewFixtureIsCurrent -update` rewrites the files from it, and
-// without -update the test fails when they drift apart.
+// 'TestAccessReviewFixtureIsCurrent|TestAccessReviewGolden' -update`
+// rewrites the files and the golden reports from it (the -update flag is
+// shared with sso_test.go's golden files, so name the tests), and without
+// -update the test fails when they drift apart.
 //
 // What it holds, by what the report must show:
 //   - tokens: ci-deploy (busy, part of it summarized by the flood budget),
@@ -36,7 +41,12 @@ import (
 //   - refused credentials from two addresses, seen on both nodes;
 //   - node-a runs with SB_AUDIT_API_RECORDS=mutations and lost 7 records to
 //     a queue overflow; node-b records plain reads (all) and its exporter
-//     re-sent a batch; node-c only has records from before the window.
+//     re-sent a batch; node-c only has records from before the window;
+//   - identity_config records: node-a and node-b move to identity.yaml
+//     (an admin binding added, a binding removed, a deny subject and an
+//     issuer added), then node-b reorders its bindings into a third file,
+//     so with --identity-file node-a enforces it, node-b another file and
+//     node-c is unknown.
 const reviewFixture = "testdata/access-review"
 
 const reviewSince = "2026-10-16T00:00:00Z"
@@ -121,6 +131,20 @@ func accessReviewFixture() []fixtureBatch {
 		&auditlog.Request{Method: "SSH", Route: auditlog.RefSSH, Surface: auditlog.SurfaceSSH, Target: "default"})
 	viaEdge := *ana
 	viaEdge.Via = "node-a"
+	// node-a and node-b move from identity file v1 to the fixture's
+	// identity.yaml; node-b later reorders its bindings into a third file.
+	identityChange := func(node string, t time.Time, change *auditlog.IdentityConfig) auditlog.Event {
+		ev := rec(node, t, auditlog.KindIdentityConfig, "success", "", "", &auditlog.Caller{Kind: "system", ID: "system:identity-file"}, nil)
+		ev.Reason, ev.IdentityConfig = "ok", change
+		return ev
+	}
+	identityV2Change := &auditlog.IdentityConfig{
+		OldHash: identityV1Hash, NewHash: reviewIdentityHash(),
+		BindingsAdded:   []string{`okta group="platform-admins" -> admin/*`, `okta group="eng | <b>all</b> [x](https://evil.example)" -> viewer/*`},
+		BindingsRemoved: []string{`okta group="platform-admins" -> runner/payments`},
+		DenyAdded:       []string{"okta:00u9eve"},
+		IssuersAdded:    []string{`github-actions url="https://token.actions.githubusercontent.com" audiences=["aerolvm"] kind=oidc claims=username:sub,groups:groups,roles:roles max_token_lifetime=24h0m0s`},
+	}
 	operator := &auditlog.Caller{Kind: "operator", ID: "operator"}
 	anaRateLimited := rec("node-b", at(d16, "09:58:00"), auditlog.KindAPI, auditlog.APIResultOK, "", "sb-3", &viaEdge, &auditlog.Request{Routes: []string{"POST " + exec}})
 	anaRateLimited.Reason, anaRateLimited.Dropped = auditlog.ReasonRateLimited, 20
@@ -128,6 +152,7 @@ func accessReviewFixture() []fixtureBatch {
 	nodeA := [][]auditlog.Event{
 		{api("node-a", at(d15, "23:50:00"), auditlog.APIResultOK, "sb-0", prom, reviewCall("POST", "/v1/sandboxes", 201))},
 		{
+			identityChange("node-a", at(d16, "08:30:00"), identityV2Change),
 			api("node-a", at(d16, "09:00:00"), auditlog.APIResultOK, "sb-1", ciDeploy, reviewCall("POST", "/v1/sandboxes", 201)),
 			rec("node-a", at(d16, "09:01:00"), "secret_open", "success", "env:sb-1", "sb-1", ciDeploy, nil),
 			api("node-a", at(d16, "09:05:00"), auditlog.APIResultOK, "", ana, grant(reviewCall("POST", "/v1/tokens", 201), "tok_Adm1nQ4xYz00", "admin", "*")),
@@ -146,6 +171,7 @@ func accessReviewFixture() []fixtureBatch {
 	}
 	nodeB := [][]auditlog.Event{
 		{
+			identityChange("node-b", at(d16, "09:03:00"), identityV2Change),
 			floodMode,
 			api("node-b", at(d16, "09:05:00"), auditlog.APIResultOK, "", operator, grant(reviewCall("POST", "/v1/tokens", 201), "tok_CkOut0000000", "runner", "checkout")),
 			ssh,
@@ -161,6 +187,7 @@ func accessReviewFixture() []fixtureBatch {
 			refused("node-b", at(d16, "09:46:00"), "198.51.100.7", "expired", 1),
 			api("node-b", at(d16, "09:50:00"), auditlog.APIResultOK, "sb-4", operator, reviewCall("POST", "/v1/sandboxes", 201)),
 			api("node-b", at(d16, "09:55:00"), auditlog.APIResultOK, "sb-3", swept, withTarget(reviewCall("GET", exec, 200), "files/download")),
+			identityChange("node-b", at(d16, "09:57:00"), &auditlog.IdentityConfig{OldHash: reviewIdentityHash(), NewHash: identityV3Hash, Reordered: true, DenyRemoved: []string{"okta:00u9eve"}}),
 			anaRateLimited,
 		},
 	}
@@ -186,6 +213,44 @@ func accessReviewFixture() []fixtureBatch {
 	// name: verified as already-checked records, never counted twice.
 	out = append(out, fixtureBatch{node: "node-b", day: "2026/10/16", name: "node-b_0-resent.jsonl", evs: nodeB[0][1:]})
 	return out
+}
+
+// reviewIdentityYAML is the fixture's identity.yaml: the file node-a
+// enforces at the end of the window. Bob's group carries Markdown and the
+// ops team starts a spreadsheet formula, both of which sandboxd accepts.
+const reviewIdentityYAML = `version: 1
+issuers:
+  - name: okta
+    display_name: Acme Okta
+    url: https://acme.okta.com/oauth2/default
+    audiences: [0oa1cli]
+    clients: { cli: 0oa1cli }
+    claims: { username: email, groups: groups }
+  - name: github-actions
+    url: https://token.actions.githubusercontent.com
+    audiences: [aerolvm]
+    claims: { username: sub }
+bindings:                              # first match wins, top to bottom
+  - { issuer: okta, group: platform-admins, role: admin }
+  - { issuer: okta, group: secops, role: auditor }
+  - { issuer: okta, group: "eng | <b>all</b> [x](https://evil.example)", role: viewer, team: "*" }
+  - { issuer: okta, group: payments-eng, role: runner, team: payments }
+  - { issuer: okta, group: ops, role: runner, team: -ops }
+  - { issuer: github-actions, claim: { repository: acme/payments, ref: refs/heads/main }, role: runner, team: payments }
+deny_subjects: ["okta:00u9eve"]
+`
+
+// identityV1Hash and identityV3Hash stand for the files before and after
+// identity.yaml; only identity.yaml exists as a file.
+var (
+	identityV1Hash = strings.Repeat("1a", 32)
+	identityV3Hash = strings.Repeat("3c", 32)
+)
+
+// reviewIdentityHash is identity.yaml's SHA-256, as a node records it.
+func reviewIdentityHash() string {
+	sum := sha256.Sum256([]byte(reviewIdentityYAML))
+	return hex.EncodeToString(sum[:])
 }
 
 // reviewFixtureTokens is the token list the fixture's GET /v1/tokens returns.
@@ -223,6 +288,7 @@ func TestAccessReviewFixtureIsCurrent(t *testing.T) {
 		t.Fatal(err)
 	}
 	files[filepath.Join(reviewFixture, "tokens.json")] = append(raw, '\n')
+	files[filepath.Join(reviewFixture, "identity.yaml")] = []byte(reviewIdentityYAML)
 	for path, want := range files {
 		if *updateGolden {
 			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -312,10 +378,19 @@ func checkReviewGolden(t *testing.T, name string, got []byte) {
 // TestAccessReviewGolden is the report itself, in both file formats, over
 // the fixture export and token list.
 func TestAccessReviewGolden(t *testing.T) {
-	for _, tc := range []struct{ format, golden string }{{"md", "review.md"}, {"csv", "review.csv"}} {
-		t.Run(tc.format, func(t *testing.T) {
+	identityFile := []string{"--identity-file", filepath.Join(reviewFixture, "identity.yaml")}
+	for _, tc := range []struct {
+		name, golden string
+		args         []string
+	}{
+		{"md", "review.md", []string{"--format", "md"}},
+		{"csv", "review.csv", []string{"--format", "csv"}},
+		{"md with the identity file", "review-identity.md", append([]string{"--format", "md"}, identityFile...)},
+		{"csv with the identity file", "review-identity.csv", append([]string{"--format", "csv"}, identityFile...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			h := newReviewHarness(t, nil, 0)
-			if code := h.run(reviewArgs("--format", tc.format)...); code != exitOK {
+			if code := h.run(reviewArgs(tc.args...)...); code != exitOK {
 				t.Fatalf("exit %d\nstdout: %s\nstderr: %s", code, h.stdout.String(), h.stderr.String())
 			}
 			if h.stderr.String() != "" {
@@ -382,16 +457,17 @@ func TestAccessReviewJSON(t *testing.T) {
 		principals[p.ID] = p
 	}
 	wantPrincipals := map[string]string{
-		"oidc:okta:00u1ana": "rate_limited",
-		"oidc:okta:00u2bob": "denied",
-		"oidc:okta:00u9eve": "denied",
-		"operator":          "admin",
-		"node:node-b":       "admin",
-		"sb-3":              "",
-		"system:audit":      "",
-		"system:lifecycle":  "",
-		"tok_Gone7Rv0ked0":  "not_listed",
-		"tok_Swept0ld0000":  "not_listed",
+		"oidc:okta:00u1ana":    "rate_limited",
+		"oidc:okta:00u2bob":    "denied",
+		"oidc:okta:00u9eve":    "denied",
+		"operator":             "admin",
+		"node:node-b":          "admin",
+		"sb-3":                 "",
+		"system:audit":         "",
+		"system:identity-file": "",
+		"system:lifecycle":     "",
+		"tok_Gone7Rv0ked0":     "not_listed",
+		"tok_Swept0ld0000":     "not_listed",
 	}
 	if len(principals) != len(wantPrincipals) {
 		t.Fatalf("principals: %+v", rep.Principals)
@@ -416,10 +492,10 @@ func TestAccessReviewJSON(t *testing.T) {
 	for _, n := range rep.Nodes {
 		nodes[n.NodeID] = n
 	}
-	if a := nodes["node-a"]; a.ReadRecords != readRecordsMutations || a.Lost != 7 || a.RecordsChecked != 13 {
+	if a := nodes["node-a"]; a.ReadRecords != readRecordsMutations || a.Lost != 7 || a.RecordsChecked != 14 || a.IdentityHash != reviewIdentityHash() {
 		t.Errorf("node-a: %+v", a)
 	}
-	if b := nodes["node-b"]; b.ReadRecords != readRecordsAll || b.UnreachedBatches != 1 || b.RecordsChecked != 14 {
+	if b := nodes["node-b"]; b.ReadRecords != readRecordsAll || b.UnreachedBatches != 1 || b.RecordsChecked != 16 || b.IdentityHash != identityV3Hash {
 		t.Errorf("node-b: %+v", b)
 	}
 	if c := nodes["node-c"]; c.ReadRecords != readRecordsNone || c.RecordsChecked != 0 || c.Result != auditlog.ResultPass {
@@ -473,34 +549,38 @@ func TestAccessReviewTamperedExportFails(t *testing.T) {
 // TestAccessReviewEscaping: what the golden files show for the hostile
 // names, checked on its own so a regeneration cannot quietly drop it.
 func TestAccessReviewEscaping(t *testing.T) {
+	identityFile := []string{"--identity-file", filepath.Join(reviewFixture, "identity.yaml")}
 	h := newReviewHarness(t, nil, 0)
-	if code := h.run(reviewArgs()...); code != exitOK {
+	if code := h.run(reviewArgs(identityFile...)...); code != exitOK {
 		t.Fatalf("md exit %d: %s", code, h.stderr.String())
 	}
 	md := h.stdout.String()
 	for _, want := range []string{
-		`Bob \| \<b\>\*admin\*\</b\> \[click\](https\://evil.example) www\.evil.example`,
+		`Bob \| \<b>\*admin\*\</b> \[click\](https\://evil.example) www\.evil.example`,
 		`=HYPERLINK("https\://evil.example","report")`, // '=' is not Markdown; the link is broken
 		`| tok\_0ldC10000000 | -legacy-ci |`,
 		`| \* |`,
+		// A group name from the identity file, in the bindings table and in
+		// a binding line from an identity_config record.
+		`| 3 | okta | group="eng \| \<b>all\</b> \[x\](https\://evil.example)" | viewer | \* | every\_team |`,
+		`| binding\_added | okta group="eng \| \<b>all\</b> \[x\](https\://evil.example)" -> viewer/\* | every\_team |`,
 	} {
 		if !strings.Contains(md, want) {
 			t.Errorf("Markdown does not contain %q", want)
 		}
 	}
-	for _, bad := range []string{"<b>", "[click](", "https://evil", "| Bob | <"} {
-		if strings.Contains(md, bad) {
-			t.Errorf("Markdown carries unescaped %q", bad)
-		}
+	if m := regexp.MustCompile(`(^|[^\\])(<|\[click\]\(|https://evil)`).FindString(md); m != "" {
+		t.Errorf("Markdown carries unescaped %q", m)
 	}
 	h = newReviewHarness(t, nil, 0)
-	if code := h.run(reviewArgs("--format", "csv")...); code != exitOK {
+	if code := h.run(reviewArgs(append(identityFile, "--format", "csv")...)...); code != exitOK {
 		t.Fatalf("csv exit %d: %s", code, h.stderr.String())
 	}
 	csvOut := h.stdout.String()
 	for _, want := range []string{
 		`"'=HYPERLINK(""https://evil.example"",""report"")"`,
 		`token,tok_0ldC10000000,'-legacy-ci,`,
+		`binding,5,okta,"group=""ops""",runner,'-ops,`,
 	} {
 		if !strings.Contains(csvOut, want) {
 			t.Errorf("CSV does not contain %q:\n%s", want, csvOut)
@@ -546,6 +626,10 @@ func TestAccessReviewUsageAndErrors(t *testing.T) {
 		{name: "unexpected argument", args: []string{"access", "review", "extra", "--since", "90d", "--export-dir", empty}, code: exitUsage, want: "unexpected argument"},
 		{name: "unknown flag", args: []string{"access", "review", "--nope"}, code: exitUsage, want: "nope"},
 		{name: "a caller who may not read tokens", args: reviewArgs(), status: http.StatusForbidden, code: exitError, want: "token.read needs the auditor or admin role"},
+		// A broken identity file stops the review before any call: the
+		// token server here would refuse, and that is not what is reported.
+		{name: "a missing identity file", args: reviewArgs("--identity-file", filepath.Join(empty, "identity.yaml")), status: http.StatusForbidden, code: exitError, want: "--identity-file: open"},
+		{name: "an identity file sandboxd would refuse", args: reviewArgs("--identity-file", filepath.Join(reviewFixture, "tokens.json")), status: http.StatusForbidden, code: exitError, want: "version 0, want 1"},
 		{name: "an empty export is incomplete", args: []string{"access", "review", "--since", reviewSince, "--export-dir", empty}, code: exitIncomplete, want: "no export batches found"},
 		{name: "nothing exported since the window opened", args: []string{"access", "review", "--since", reviewSince, "--export-dir", oldOnly}, code: exitIncomplete, want: "no export batches found"},
 		{name: "a missing export dir", args: []string{"access", "review", "--since", reviewSince, "--export-dir", filepath.Join(empty, "nope")}, code: exitError, want: "no such file"},

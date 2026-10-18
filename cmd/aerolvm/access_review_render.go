@@ -19,15 +19,17 @@ import (
 
 // mdEscape makes s literal text in a Markdown table cell. It backslash-
 // escapes the characters that start inline markup (emphasis, code, links,
-// raw HTML, entities, GitHub math and strikethrough) and the cell separator,
-// and breaks the two patterns GitHub turns into links without any markup
-// ("https://…" and "www.…"), so a display name cannot become a link to
-// somewhere else.
+// raw HTML and autolinks, entities, GitHub math and strikethrough) and the
+// cell separator, and breaks the two patterns GitHub turns into links
+// without any markup ("https://…" and "www.…"), so a display name cannot
+// become a link to somewhere else. ">" is left alone: it is markup only at
+// the start of a line, no value here starts one, and with "<" escaped no
+// tag can form, so "->" in a binding line stays readable.
 func mdEscape(s string) string {
 	var b strings.Builder
 	for i, r := range s {
 		switch r {
-		case '\\', '`', '*', '_', '[', ']', '<', '>', '|', '~', '&', '$', '#', '!':
+		case '\\', '`', '*', '_', '[', ']', '<', '|', '~', '&', '$', '#', '!':
 			b.WriteByte('\\')
 		case ':':
 			if strings.HasPrefix(s[i:], "://") {
@@ -181,7 +183,13 @@ func writeAccessReviewMarkdown(w io.Writer, r accessReview) {
 	fmt.Fprintf(w, "- **Evidence:** %s\n", mdEscape(evidenceWords(r)))
 	fmt.Fprintf(w, "- **Read records:** %s\n", mdEscape(readRecordsWords(r)))
 	fmt.Fprintf(w, "- **Tokens:** %d listed by GET /v1/tokens\n", len(r.Tokens))
-	fmt.Fprintln(w, "- **Scope:** this report lists the tokens sandboxd holds and every principal the audit records name in the window. It cannot list people an identity provider would let in who never called the API. Roles are shown for tokens and the operator token; a person who signs in through an identity provider gets a role from the identity file's bindings, which this report does not read.")
+	scope := "this report lists the tokens sandboxd holds and every principal the audit records name in the window. It cannot list people an identity provider would let in who never called the API. Roles are shown for tokens and the operator token; a person who signs in through an identity provider gets a role from the identity file's bindings, "
+	if r.IdentityFile == nil {
+		scope += "which this report lists only with --identity-file."
+	} else {
+		scope += "listed below, but the audit records do not say which binding a person matched."
+	}
+	fmt.Fprintf(w, "- **Scope:** %s\n", mdEscape(scope))
 
 	fmt.Fprintln(w, "\n## Findings")
 	fmt.Fprintln(w)
@@ -216,6 +224,8 @@ func writeAccessReviewMarkdown(w io.Writer, r accessReview) {
 		}
 	}
 
+	writeIdentityMarkdown(w, r)
+
 	fmt.Fprintln(w, "\n## Principals seen in the window")
 	fmt.Fprintln(w)
 	if len(r.Principals) == 0 {
@@ -243,11 +253,84 @@ func writeAccessReviewMarkdown(w io.Writer, r accessReview) {
 
 	fmt.Fprintln(w, "\n## Evidence")
 	fmt.Fprintln(w)
-	mdHeader(w, "Node", "Result", "Records", "From", "To", "Batches", "Read records", "Lost", "Notes")
+	mdHeader(w, "Node", "Result", "Records", "From", "To", "Batches", "Read records", "Lost", "Identity file", "Notes")
 	for _, n := range r.Nodes {
 		mdRow(w, n.NodeID, string(n.Result), strconv.FormatInt(n.RecordsChecked, 10), stamp(n.EvidenceFrom), stamp(n.EvidenceTo),
-			strconv.Itoa(n.ExportBatches), n.ReadRecords, strconv.FormatInt(n.Lost, 10), nodeNotes(n, r.Witnessed))
+			strconv.Itoa(n.ExportBatches), n.ReadRecords, strconv.FormatInt(n.Lost, 10), shortHash(n.IdentityHash), nodeNotes(n, r.Witnessed))
 	}
+}
+
+// writeIdentityMarkdown renders the identity-file changes the records hold
+// and, with --identity-file, the file's bindings.
+func writeIdentityMarkdown(w io.Writer, r accessReview) {
+	fmt.Fprintln(w, "\n## Identity-file changes in the window")
+	fmt.Fprintln(w)
+	if len(r.IdentityChanges) == 0 {
+		fmt.Fprintln(w, "No node recorded an identity-file change in the window.")
+	} else {
+		mdHeader(w, "When", "Node", "Change", "Line", "Flags")
+		for _, ch := range r.IdentityChanges {
+			for _, l := range changeLines(ch, shortHash) {
+				mdRow(w, ch.At.Format(time.RFC3339), ch.Node, l.change, l.line, flagsText(l.flags, ", "))
+			}
+		}
+	}
+
+	fmt.Fprintln(w, "\n## Identity-file bindings")
+	fmt.Fprintln(w)
+	file := r.IdentityFile
+	if file == nil {
+		fmt.Fprintln(w, "Not read: pass --identity-file with the file the nodes enforce to list who it lets sign in, and with which role.")
+		return
+	}
+	fmt.Fprintf(w, "- **File:** %s\n", mdEscape(identityFileWords(file)))
+	fmt.Fprintf(w, "- **Enforced by:** %s\n", mdEscape(enforcementWords(file, r.Nodes, shortHash)))
+	fmt.Fprintln(w)
+	if len(file.Bindings) == 0 {
+		fmt.Fprintln(w, "The file holds no bindings: nobody can sign in through its issuers.")
+		return
+	}
+	fmt.Fprintln(w, "Bindings are tried top to bottom; a person's first match is their default role.")
+	fmt.Fprintln(w)
+	mdHeader(w, "#", "Issuer", "Match", "Role", "Team", "Flags")
+	for _, b := range file.Bindings {
+		mdRow(w, strconv.Itoa(b.Index), b.Issuer, b.Match, b.Role, b.Team, flagsText(b.Flags, ", "))
+	}
+}
+
+// identityFileWords sums up the file the reviewer gave.
+func identityFileWords(file *reviewIdentityFile) string {
+	issuers := make([]string, len(file.Issuers))
+	for i, iss := range file.Issuers {
+		issuers[i] = iss.Name
+		if iss.DisplayName != "" && iss.DisplayName != iss.Name {
+			issuers[i] += " (" + iss.DisplayName + ")"
+		}
+	}
+	return fmt.Sprintf("SHA-256 %s; issuers %s; %d %s; %d denied %s", file.Hash, strings.Join(issuers, ", "),
+		len(file.Bindings), plural(int64(len(file.Bindings)), "binding", "bindings"), file.DenySubjects, plural(int64(file.DenySubjects), "subject", "subjects"))
+}
+
+// enforcementWords says which nodes' newest identity_config record in the
+// window names the file: the only evidence in the export of which file a
+// node enforces.
+func enforcementWords(file *reviewIdentityFile, nodes []reviewNode, hash func(string) string) string {
+	same, other, unknown := enforcement(file, nodes)
+	var parts []string
+	if len(same) > 0 {
+		parts = append(parts, "this file, by the newest identity_config record on "+strings.Join(same, ", "))
+	}
+	if len(other) > 0 {
+		named := make([]string, len(other))
+		for i, o := range other {
+			named[i] = o.node + " (" + hash(o.hash) + ")"
+		}
+		parts = append(parts, "another file on "+strings.Join(named, ", "))
+	}
+	if len(unknown) > 0 {
+		parts = append(parts, "unknown on "+strings.Join(unknown, ", ")+", which recorded no identity-file change in the window (compare the aerolvm_identity_file_info metric)")
+	}
+	return strings.Join(parts, "; ")
 }
 
 // accessReviewCSVHeader is the CSV's one header. Every row has a type in
@@ -255,8 +338,9 @@ func writeAccessReviewMarkdown(w io.Writer, r accessReview) {
 var accessReviewCSVHeader = []string{"row", "id", "name", "kind", "role", "team", "created_by", "created_at", "expires_at", "last_seen", "last_action", "node", "calls", "denied", "rate_limited", "flags", "detail"}
 
 // writeAccessReviewCSV renders the report as one CSV table: a review row
-// with the verdict, one row per node, token, token change, other principal
-// and refusing source.
+// with the verdict, one row per node, token, token change, identity-file
+// change line, identity file and binding (with --identity-file), other
+// principal and refusing source.
 func writeAccessReviewCSV(w io.Writer, r accessReview) {
 	cw := csv.NewWriter(w)
 	row := func(cells ...string) {
@@ -281,6 +365,9 @@ func writeAccessReviewCSV(w io.Writer, r accessReview) {
 	for _, n := range r.Nodes {
 		detail := fmt.Sprintf("result=%s; evidence_from=%s; evidence_to=%s; batches=%d; api_read_records=%s; records_lost=%d",
 			n.Result, stamp(n.EvidenceFrom), stamp(n.EvidenceTo), n.ExportBatches, n.ReadRecords, n.Lost)
+		if n.IdentityHash != "" {
+			detail += "; identity_file_hash=" + n.IdentityHash
+		}
 		if notes := nodeNotes(n, r.Witnessed); notes != "" {
 			detail += "; notes=" + notes
 		}
@@ -293,6 +380,23 @@ func writeAccessReviewCSV(w io.Writer, r accessReview) {
 	for _, ch := range r.Changes {
 		row("token_"+ch.Change, ch.TokenID, "", "token", ch.Role, ch.Team, "", "", "", ch.At.Format(time.RFC3339), "", ch.Node, "", "", "", flagsText(ch.Flags, ";"),
 			"by="+who(ch.By, ch.ByName))
+	}
+	full := func(h string) string { return h }
+	for _, ch := range r.IdentityChanges {
+		for _, l := range changeLines(ch, full) {
+			role, team, _ := bindingGrant(l.line)
+			if !strings.HasPrefix(l.change, "binding_") {
+				role, team = "", ""
+			}
+			row("identity_change", ch.NewHash, "", l.change, role, team, "", "", "", ch.At.Format(time.RFC3339), "", ch.Node, "", "", "", flagsText(l.flags, ";"), l.line)
+		}
+	}
+	if file := r.IdentityFile; file != nil {
+		row("identity_file", file.Hash, "", "identity_file", "", "", "", "", "", "", "", "", "", "", "", "",
+			identityFileWords(file)+"; enforced by: "+enforcementWords(file, r.Nodes, full))
+		for _, b := range file.Bindings {
+			row("binding", strconv.Itoa(b.Index), b.Issuer, b.Match, b.Role, b.Team, "", "", "", "", "", "", "", "", "", flagsText(b.Flags, ";"), b.Line)
+		}
 	}
 	for _, p := range r.Principals {
 		row("principal", p.ID, p.Name, p.Kind, "", strings.Join(p.Teams, " "), "", "", "",
