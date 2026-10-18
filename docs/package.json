@@ -28,7 +28,7 @@
   "devDependencies": {
     "prettier": "^3.9.9",
     "prettier-plugin-astro": "^1.1.1",
-    "wrangler": "4.149.0"
+    "wrangler": "4.151.0"
   },
   "optionalDependencies": {
     "@emnapi/core": "1.11.3",
