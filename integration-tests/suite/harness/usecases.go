@@ -173,7 +173,7 @@ const (
 	CapRemoteMCP Capability = "remote-mcp"
 
 	// Identity and access (plans/identity-and-access.md, task T12; the use
-	// cases are UC-268..UC-294, §8 of the plan).
+	// cases are UC-268..UC-296, §8 of the plan).
 	//
 	// CapIdentity means every node runs SB_IDENTITY_ENABLED=true: scoped
 	// avm_ API tokens work, minted at setup with the operator credential
@@ -795,6 +795,8 @@ var Registry = []UseCase{
 	{ID: "UC-292", Title: "Chaos: the Raft leader killed during 50 token creates: no two live tokens share a name, every 201 names a token that exists and works, no 503 ever returned a secret", Requires: []Capability{CapIdentity, CapCluster}, Implemented: true},
 	{ID: "UC-293", Title: "Chaos: the test issuer's key rotated under load: at most one key refetch per minute per node, no 5xx, new-key tokens accepted within one refetch", Requires: []Capability{CapIdentityOIDC, CapCluster}, Implemented: true},
 	{ID: "UC-294", Title: "Two teams register the same WASM bytes with no id: each gets its own row, neither sees or deletes the other's, no conflict; a boot by id resolves the caller's row", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
+	{ID: "UC-295", Title: "A team token cannot register a WASM module from a raw host path (absolute or file://): refused with the same not-found whether the path exists or not (no host-file oracle); the reserved keyword still resolves (#537)", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
+	{ID: "UC-296", Title: "A team token's WASM module delete never removes a shared standard module: after a runner registers and deletes the reserved keyword row, the operator can still register it (the staged file survived) (#537)", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
