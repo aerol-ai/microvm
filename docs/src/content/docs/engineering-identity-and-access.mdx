@@ -18,7 +18,7 @@ Until now, an AerolVM server had one secret key for its API. Everyone who used t
 - AerolVM runs no login service and keeps no sessions. Every server checks the provider's signed token by itself, with no network call per request. That is the same model the Kubernetes API server uses.
 - In a cluster, the call is checked on the server that receives it, and again on the server that owns the sandbox. No server trusts another server's word.
 - Each caller gets one of four roles, on one team or on every team. The rules live in a file you can review in Git.
-- Services and CI get named tokens that expire and can be revoked. A revoke reaches every server in about 5 seconds. CI on GitHub Actions or Kubernetes needs no stored secret at all.
+- Services and CI get named tokens that expire and can be revoked. A revoke reaches every server within about 6 seconds (each worker polls every 5 seconds, with up to a second of random delay). CI on GitHub Actions or Kubernetes needs no stored secret at all.
 - Every API call that changes something writes a hash-chained audit record with the caller's name.
 - It has limits. A person you remove keeps access until their last sign-in token expires, about an hour, unless you block them by hand.
 
@@ -38,7 +38,7 @@ The answer to all three was "no". That made AerolVM hard to approve.
 
 ## The big choice: no login server
 
-The usual way to add sign-in is to build a login service. You sign in once. The service creates a session, and every later call checks that session with the service. That adds a new server to run, to secure and to keep online. In a cluster of 2,000 servers, every one of them would have to call it, or share its session data.
+The usual way to add sign-in is to build a login service. You sign in once. The service creates a session, and every later call checks that session with the service. That adds a new server to run, to secure and to keep online. AerolVM is designed for fleets of up to 2,000 servers; we have run it on 8. With a login service, every one of those servers would have to call it, or share its session data.
 
 We chose a different model. AerolVM is a **resource server**. It holds the resources, but it does not log anyone in. Your company's **identity provider** does that. The identity provider is the service that already holds your company's accounts and checks passwords.
 
@@ -333,28 +333,28 @@ The other side of this is a rollback floor. Once a server has written a caller, 
   - Zitadel puts roles in a shape AerolVM can't match. A small Zitadel Action has to copy them into a flat `groups` list.
   - Google and Authentik can't be used for MCP connectors. Checking Google's access tokens would need a call to Google on every request. Authentik can't give connector tokens an audience of their own.
 - **Hosted MCP connectors are not proven yet.** The OAuth path for claude.ai and ChatGPT is built, and tested with a test provider and with Keycloak. But no hosted connector has passed our live check yet.
-- **Only Keycloak has been tested live.** Keycloak is the only real provider we have tested end to end: first on a laptop, then on the live 8-node AWS cluster these screenshots come from. The steps for Okta, Entra ID, Google, Authentik and Zitadel follow each provider's own documentation. The test suite also runs every case on live clusters with a test provider of its own.
+- **So far, we have tested live only against Keycloak.** Our live tests used Keycloak end to end: first on a laptop, then on the 8-node AWS cluster these screenshots come from. For Okta, Entra ID, Google, Authentik and Zitadel, the setup steps come from each provider's own documentation. We have not run them against a live account yet. The test suite also runs every case on live clusters with a test provider of its own.
 - **It is off by default.** A new server still has only the server token until the operator turns this on.
 - **The server token still exists.** Servers use it to call each other, so it cannot be removed. `SB_PAT_SCOPE=host` limits it to the server itself and other cluster servers. Enterprise mode requires that.
-- **A new token can lag on other nodes.** A token just created may be refused for up to one mirror poll, about 5 seconds, on a node that has not synced yet.
+- **A new token can lag on other nodes.** A token just created may be refused for up to one mirror poll, about 6 seconds at most, on a node that has not synced yet.
 - **A taken-over server or provider is out of scope.** Someone with root on a server holds the server token and can act as anyone. Someone who controls your identity provider can sign in as anyone. The [audit witness](/engineering-audit-witness/) limits what a taken-over server can rewrite afterwards.
 - **No SAML or SCIM.** Every provider on our list speaks OIDC. A company that uses only SAML can bridge through Keycloak or Dex.
 
 ## What it costs
 
-We measured each step on an Apple M1 Max laptop. These numbers come from the benchmarks and tests in the pull requests that built the feature.
+Each step was measured on an Apple M1 Max laptop, by the benchmarks and tests in the pull requests that built the feature. The last column names the source. We did not re-run them for this post.
 
-| Step | Cost |
-|---|---|
-| Checking the server token | 494 ns per request, up from 157 ns, when this part landed. Each request now also builds a caller record and counts it in the metrics. |
-| Checking the role for a route | About 46 ns, with no memory allocated |
-| Checking an API token | About 1.4 µs. The slowest 1 in 100 took 4.5 µs. |
-| Checking a sign-in token seen before | About 2.3 µs, with a 10,000-rule identity file. The slowest 1 in 100 took about 5 µs. |
-| Checking a sign-in token the first time | 174 µs in our benchmark, which includes the signature math and a scan of 10,000 rules. It happens once per token on each server. |
-| Writing one audit record | About 1.5 µs. The slowest 1 in 100 took 3 µs. |
-| 10,000 fake or broken tokens | Zero calls to the server nodes |
-| Keeping the token list fresh | One small request every 5 seconds from each worker and ingress node |
-| Provider keys | One fetch at start and one every hour on each server, plus at most one a minute when a new key appears |
+| Step | Cost | Source |
+|---|---|---|
+| Checking the server token | 494 ns per request, up from 157 ns, when this part landed. Each request now also builds a caller record and counts it in the metrics. | [#739](https://github.com/aerol-ai/microvm/pull/739) |
+| Checking the role for a route | About 46 ns, with no memory allocated | [#741](https://github.com/aerol-ai/microvm/pull/741) |
+| Checking an API token | About 1.4 µs. The slowest 1 in 100 took 4.5 µs. | [#744](https://github.com/aerol-ai/microvm/pull/744) |
+| Checking a sign-in token seen before | About 2.3 µs, with a 10,000-rule identity file. The slowest 1 in 100 took about 5 µs. | [#742](https://github.com/aerol-ai/microvm/pull/742), [#748](https://github.com/aerol-ai/microvm/pull/748) |
+| Checking a sign-in token the first time | 174 µs in our benchmark, which includes the signature math and a scan of 10,000 rules. It happens once per token on each server. | [#742](https://github.com/aerol-ai/microvm/pull/742) |
+| Writing one audit record | About 1.5 µs. The slowest 1 in 100 took 3 µs. | [#743](https://github.com/aerol-ai/microvm/pull/743) |
+| 10,000 fake or broken tokens | Zero calls to the server nodes | [#744](https://github.com/aerol-ai/microvm/pull/744) |
+| Keeping the token list fresh | One small request every 5 seconds, plus up to a second of random delay, from each worker and ingress node | Code default |
+| Provider keys | One fetch at start and one every hour on each server, plus at most one a minute when a new key appears | Code default |
 
 Creating a sandbox gains no network call and no disk wait. It gains one in-memory role check and one audit record, which is written to disk in the background.
 

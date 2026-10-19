@@ -295,7 +295,7 @@ Listing needs an `auditor` or an `admin`. Revoking needs an `admin`.
 </Tabs>
 
 - **The list never shows a secret.** Expired tokens stay on the list for 30 days, marked `expired`. Then the server removes them.
-- **A revoke works everywhere within seconds.** Servers that hold the cluster's shared state stop accepting the token at once. Other servers stop within one sync, about 5 seconds.
+- **A revoke works everywhere within seconds.** Servers that hold the cluster's shared state stop accepting the token at once. Other servers stop within one sync: within about 6 seconds, because each one polls every 5 seconds, with up to a second of random delay.
 - **Revoking twice is safe.** A token that is already gone still returns success.
 
 ## Act for one of several teams
