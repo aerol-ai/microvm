@@ -65,13 +65,16 @@ var reviewedOwnerScopeUses = map[string]scopeUse{
 }
 
 // reviewedHostCapableUses lists every function that asks hostCapable: the
-// four operator-only gates of eng review D3/D7 and nothing else.
+// operator-only host-power gates of eng review D3/D7 plus the WASM module gates
+// of issue #537, and nothing else.
 var reviewedHostCapableUses = map[string]scopeUse{
 	"hostCapable":                          {0, "the predicate"},
 	"Service.validateCreateMounts":         {1, "raw host-side mounts"},
 	"Service.createIsolateSandbox":         {1, "file:// bundle refs read off the host"},
 	"Service.persistCustomDomainsOnCreate": {1, "custom domains on create without a DNS proof"},
 	"customDomainProofToken":               {1, "the owner-less legacy DNS proof on attach"},
+	"wasmResolveContext":                   {1, "#537: raw host-path WASM module refs read off the host"},
+	"Service.DeleteWasmModule":             {1, "#537: reclaiming WASM module bytes on delete"},
 }
 
 // reviewedFleetReads lists every function that reads Access.Fleet directly

@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 func accessCtx(a controlplane.Access) context.Context {
@@ -112,6 +115,34 @@ func TestHostCapableGates(t *testing.T) {
 			}
 			if got := customDomainProofToken(tc.ctx, "team:payments"); got != want {
 				t.Errorf("DNS proof token for team payments' sandbox = %q, want %q", got, want)
+			}
+
+			// Gate 5 (#537): a WASM module ref that is a raw host path resolves
+			// only for a host-capable caller (owner_scope.go wasmResolveContext);
+			// a tenant gets the generic not-found.
+			wsvc, wdir := wasmHostGatingHarness(t)
+			hostPath := filepath.Join(wdir, "python.wasm")
+			_, werr := wsvc.CreateWasmModule(tc.ctx, models.CreateWasmModuleRequest{ID: "g5", ModuleRef: hostPath})
+			if tc.host != (werr == nil) || (!tc.host && !errors.Is(werr, wasmmod.ErrModuleNotFound)) {
+				t.Errorf("wasm host-path module ref: err = %v, host %v", werr, tc.host)
+			}
+
+			// Gate 6 (#537): reclaiming WASM module bytes on delete is
+			// host-capable only (wasm_module_api.go DeleteWasmModule). A tenant
+			// may register the standard keyword but its delete must leave the
+			// shared staged file; a host-capable delete reclaims it.
+			dsvc, ddir := wasmHostGatingHarness(t)
+			staged := filepath.Join(ddir, "python.wasm")
+			mod, err := dsvc.CreateWasmModule(tc.ctx, models.CreateWasmModuleRequest{ModuleRef: "python"})
+			if err != nil {
+				t.Fatalf("register keyword (host %v): %v", tc.host, err)
+			}
+			if err := dsvc.DeleteWasmModule(tc.ctx, mod.ID); err != nil {
+				t.Fatalf("delete keyword row (host %v): %v", tc.host, err)
+			}
+			_, statErr := os.Stat(staged)
+			if gone := os.IsNotExist(statErr); gone != tc.host {
+				t.Errorf("staged module reclaimed = %v, host %v", gone, tc.host)
 			}
 		})
 	}

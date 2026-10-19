@@ -88,6 +88,32 @@ func CatalogueOwner(ctx context.Context) (string, bool) {
 	return owner, ok
 }
 
+type hostPathsDeniedKey struct{}
+
+// WithHostPathsDenied marks ctx as a caller that may NOT resolve a module from
+// a raw host path: an absolute path, a file:// URL, or a bare filename staged
+// under ModulesDir (resolution step 4). Those forms read a file off the host as
+// the daemon user, which is an operator/self-host convenience, not something a
+// scoped tenant may drive — a tenant naming module_ref:"/etc/…" (or a bare
+// operator-staged filename) would otherwise turn create and module registration
+// into an arbitrary host-file read, and the per-ref error would leak which host
+// paths exist. The service sets this for every caller that is not host-capable
+// (plans/identity-and-access.md §5.1); operator, node and internal callers are
+// never marked, so they keep host-path resolution exactly as before.
+//
+// It gates ONLY step 4. Reserved keywords (step 1, e.g. "python"), oci:// refs
+// (step 2) and owner-scoped catalogue ids (step 3) resolve for everyone, so a
+// tenant keeps every legitimate ref and loses only the raw-host-path escape.
+func WithHostPathsDenied(ctx context.Context) context.Context {
+	return context.WithValue(ctx, hostPathsDeniedKey{}, true)
+}
+
+// HostPathsDenied reports whether ctx was marked by WithHostPathsDenied.
+func HostPathsDenied(ctx context.Context) bool {
+	denied, _ := ctx.Value(hostPathsDeniedKey{}).(bool)
+	return denied
+}
+
 // NewModuleResolver builds a chokepoint over modulesDir. cacheDir defaults to
 // modulesDir/cache when empty.
 func NewModuleResolver(modulesDir, cacheDir string) *ModuleResolver {
@@ -147,6 +173,16 @@ func (r *ModuleResolver) ResolveWithAuth(ctx context.Context, ref string, authOv
 	}
 
 	// 4. file:// / absolute / bare filename under ModulesDir.
+	//
+	// A non-host-capable caller (a scoped tenant) stops here: it reached step 4
+	// only because the ref was not a reserved keyword, an oci:// ref or a
+	// catalogue id it owns, which means it is a raw host path or an
+	// operator-staged bare name. Refuse with the same not-found every unknown
+	// ref gets, so the daemon never reads a host file on a tenant's behalf and
+	// the error cannot be used to probe which host paths exist.
+	if HostPathsDenied(ctx) {
+		return nil, fmt.Errorf("%w: %q", ErrModuleNotFound, ref)
+	}
 	resolved, err := r.file.Resolve(ctx, ref)
 	if err != nil {
 		// Normalize a missing-file into the typed not-found so the service can

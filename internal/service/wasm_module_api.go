@@ -148,7 +148,7 @@ func (s *Service) CreateWasmModule(ctx context.Context, req models.CreateWasmMod
 		}
 	}
 
-	resolved, err := s.wasmModuleResolver.Resolve(ctx, moduleRef)
+	resolved, err := s.wasmModuleResolver.Resolve(wasmResolveContext(ctx), moduleRef)
 	if err != nil {
 		if explicitID != "" {
 			now := time.Now().UTC()
@@ -288,7 +288,16 @@ func (s *Service) DeleteWasmModule(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if !shared && s.wasm != nil {
+	// Reclaim the bytes only for a host-capable caller. A tenant catalogue row
+	// only ever REFERENCES module bytes on the host — operator-staged standard
+	// modules (ModulesDir/python.wasm) and reserved keywords are provisioned by
+	// the operator, and oci:// pulls live in a content-addressed cache the
+	// operator reaps — so a tenant row-delete must drop the row alone. Without
+	// this gate RemoveImage re-resolves rec.ModuleRef (e.g. "python") and
+	// removes the shared file, letting one team break every tenant's Python
+	// sandboxes on the node (issue #537). The row-visibility rule already fenced
+	// the caller to its own namespace, so the row delete below is safe for all.
+	if !shared && s.wasm != nil && hostCapable(ctx) {
 		if err := s.wasm.RemoveImage(ctx, rec.ModuleRef); err != nil {
 			return err
 		}
