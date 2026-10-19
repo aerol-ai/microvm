@@ -55,17 +55,19 @@ Any expose / unexpose / reconcile path that touches BOTH caddy and the store can
 
 ## 5. Mount inputs run on the host
 
-Mount fields (`source`, `options.opts` for NFS, `options.extra_args` for S3, mount-tool flags generally) are passed verbatim into commands that execute on the host as the daemon user — outside the microVM isolation boundary. PAT holders are assumed to be host operators; the threat model treats their input as already-trusted.
+Mount fields (`source`, `options.opts` for NFS, `options.extra_args` for S3, mount-tool flags generally) are passed verbatim into commands that execute on the host as the daemon user — outside the microVM isolation boundary. They are **operator-only**: the daemon treats them as trusted because only a host-capable caller may supply them.
 
-If you change who holds a PAT (sub-accounts, hosted offering, external CI), this assumption inverts and these fields become a host attack surface. Before that move:
+Since v0.6.8 (identity and access) the open-source build has non-operator callers — team `avm_` tokens and SSO identities — so the "PAT == operator" assumption no longer covers every caller. Scope is not host power, so these host-side inputs are gated on `controlplane.HostCapable` / `service.hostCapable(ctx)` (true only for the operator PAT, a cluster node, an internal call and the admin role):
 
-- Allowlist `options.opts` / `extra_args` keys instead of pass-through.
-- Isolate mount helpers (dedicated low-priv user, network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM).
-- Re-validate `source` schemes and reject control characters.
+- **Raw mounts** are refused for a non-host-capable caller entirely (`Service.validateCreateMounts` → `models.ErrMountOperatorOnly`); tenants use owner-namespaced platform volumes. This is stricter than allowlisting `options.opts` / `extra_args`.
+- **`file://` and bare-path jsbundle refs** are refused for a scoped tenant (`Service.createIsolateSandbox`); tenants upload via `/v1/js-bundles` and reference a digest or name.
+- **WASM module refs from a raw host path** (absolute, `file://`, or a bare name under `ModulesDir`) are refused at the resolver chokepoint for a non-host-capable caller, and a tenant's module-catalogue delete reclaims no host bytes (`pkg/wasmmod` `WithHostPathsDenied`, `Service.DeleteWasmModule`; issue #537).
 
 `source` and `options` are also **replicated in the clear** inside a cluster (Raft placement spec and recovery store, via `RedactClusterSecrets`); only `credentials` is sealed. `models.MountSpec.Validate` refuses credential-shaped names in `options` keys, `extra_args` flags, NFS `opts` entries, and rclone connection-string parameters in `source`, so a secret cannot ride a replicated field by accident.
 
-**Reviewer asks:** does this PR widen what a PAT holder can pass into a host-side mount command? If yes, is it still safe under the "PAT == operator" assumption, and is the assumption still accurate? Does it add a mount option or source form that can carry a credential? If so, it must go through `credentials`.
+Still open: the mount helpers themselves are not sandboxed (dedicated low-priv user, network namespace scoped to the declared endpoint, seccomp/AppArmor, or a helper VM), and `source` scheme / control-character validation is not hardened. Until that lands, raw mounts stay operator-only rather than allowlisted for tenants.
+
+**Reviewer asks:** does this PR let a non-host-capable caller reach a host-side mount or module input — a new field, a new resolver path, or a gate that asks `!scoped` instead of `hostCapable`? Does it add a mount option or source form that can carry a credential? If so, it must go through `credentials`. A new `hostCapable` call site needs a reviewed row in `reviewedHostCapableUses` (`internal/service/owner_scope_callsites_test.go`).
 
 
 ## 6. TCP host-port pool & L4 bootstrap
