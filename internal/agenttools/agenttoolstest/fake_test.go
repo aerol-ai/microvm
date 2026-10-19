@@ -337,6 +337,35 @@ func TestFakeToolboxFilesAndExec(t *testing.T) {
 	conn.Close()
 }
 
+// TestFakeExecStartErrorHangsUp: a refused start is answered with its error
+// frame and then a normal close, even when a stdin close follows the start
+// frame, so the client reads the reason instead of a reset.
+func TestFakeExecStartErrorHangsUp(t *testing.T) {
+	s := New(t)
+	sb := s.AddSandbox(models.Sandbox{Name: "box"})
+	s.ExecStartError = "no shell"
+	wsURL := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/sandboxes/" + sb.ID + "/toolbox/process/exec/stream"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, http.Header{"Authorization": []string{"Bearer " + Token}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.WriteJSON(map[string]string{"command": "echo hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.WriteJSON(map[string]string{"type": "close"}); err != nil {
+		t.Fatal(err)
+	}
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	var msg map[string]string
+	if err := conn.ReadJSON(&msg); err != nil || msg["type"] != "error" || msg["message"] != "no shell" {
+		t.Fatalf("start refusal = %v, %v", msg, err)
+	}
+	if _, _, err := conn.ReadMessage(); !websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+		t.Fatalf("after the error frame = %v, want a normal close", err)
+	}
+}
+
 func TestFakeSessions(t *testing.T) {
 	s := New(t)
 	sb := s.AddSandbox(models.Sandbox{Name: "box"})
