@@ -26,7 +26,7 @@ require (
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.35
-	github.com/aws/aws-sdk-go-v2/service/kms v1.55.4
+	github.com/aws/aws-sdk-go-v2/service/kms v1.61.4
 	github.com/containerd/containerd/api v1.12.0
 	github.com/containerd/containerd/v2 v2.4.2
 	github.com/containerd/errdefs v1.0.0
