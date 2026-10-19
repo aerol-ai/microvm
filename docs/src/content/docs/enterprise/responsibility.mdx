@@ -83,7 +83,7 @@ Each limit has a workaround you can use today. Where a fix is planned, the last 
 | **Code runs as the image's default user**, which is usually root. Setting a user at create time does not change this yet. | Build your image with a non-root `USER`. | |
 | **Some limits are not enforced on every runtime.** Disk is not limited on containerd and gVisor. The number of processes is not limited in containers. | Use Firecracker for hostile code. It has its own disk and its own kernel. | |
 | **Images are not checked for signatures.** | Check signatures in your build pipeline, then pin the image by digest (`image@sha256:...`). | [Image signature checks](https://github.com/aerol-ai/microvm/discussions/650) |
-| **The server token can do everything,** and by default it is the only credential. | Turn on [access control](/enterprise/access-control/): SSO for people, scoped tokens for services. Then set `SB_PAT_SCOPE=host` so the server token works only on the server. | |
+| **The server token can do everything,** and by default it is the only credential. | Turn on [access control](/enterprise/sso/): SSO for people, scoped tokens for services. Then set `SB_PAT_SCOPE=host` so the server token works only on the server. | |
 | **Roles are fixed.** There are four roles, bound to one team or to every team, and no per-sandbox permissions. | Split work across teams. | |
 | **Removing a person at your identity provider is not instant.** Their last sign-in keeps working until it ends, about an hour. | Add them to `deny_subjects` in the identity file for an instant block. | |
 | **No SCIM or SAML.** | Remove people at your provider, and keep sign-in lifetimes short. Bridge a SAML-only provider through Keycloak or Dex. | |

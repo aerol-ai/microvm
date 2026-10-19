@@ -2,7 +2,7 @@
 
 This is the design of a released AerolVM node: who acts, and what each actor can cause the system to do. The daemon is `sandboxd`. `toolboxd` is the agent inside a sandbox. Caddy terminates TLS and routes HTTP and TCP. A cluster is optional; with cluster mode off, peer actions do not run.
 
-Identity is optional too. With `SB_IDENTITY_ENABLED=false` (the default), the only API credential is the operator token (PAT), and every caller who holds it acts as the operator. With identity on, callers hold named credentials: scoped API tokens (`avm_…`), ID tokens from the company's identity provider, or workload tokens. Each request then runs as a **principal** (who), with a **role** (`viewer`, `runner`, `auditor` or `admin`) on one team or on every team (`*`). A team is an owner (`team:<name>`), so another team's sandbox answers 404. `docs/src/content/docs/enterprise/access-control.mdx` is the user-facing page.
+Identity is optional too. With `SB_IDENTITY_ENABLED=false` (the default), the only API credential is the operator token (PAT), and every caller who holds it acts as the operator. With identity on, callers hold named credentials: scoped API tokens (`avm_…`), ID tokens from the company's identity provider, or workload tokens. Each request then runs as a **principal** (who), with a **role** (`viewer`, `runner`, `auditor` or `admin`) on one team or on every team (`*`). A team is an owner (`team:<name>`), so another team's sandbox answers 404. `docs/src/content/docs/enterprise/sso.mdx` is the user-facing page.
 
 ## Actors
 

@@ -5,7 +5,7 @@ description: Open the built-in web page that shows node health, cluster members,
 
 import { Aside } from '@astrojs/starlight/components';
 
-Every AerolVM server has a built-in dashboard for operators. It is one web page, served by `sandboxd` (the AerolVM server program) itself. You sign in with your `SB_PAT_TOKEN` (the server's access token), an admin API token, or, when [access control](/enterprise/access-control/) is on, your company account. The page then shows server health, the nodes in your cluster, where each sandbox runs, and the server's internal counters.
+Every AerolVM server has a built-in dashboard for operators. It is one web page, served by `sandboxd` (the AerolVM server program) itself. You sign in with your `SB_PAT_TOKEN` (the server's access token), an admin API token, or, when [access control](/enterprise/sso/) is on, your company account. The page then shows server health, the nodes in your cluster, where each sandbox runs, and the server's internal counters.
 
 There is nothing to install. If the server is running, the dashboard is there.
 
@@ -154,7 +154,7 @@ scrape_configs:
           - worker-1.example.com:21212
 ```
 
-With [access control](/enterprise/access-control/) on, use a `viewer` token bound to every team instead of the server token: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. It cannot create, run or delete anything. It is read-only, not metrics-only: it can also read every team's sandbox details and audit records. A server that briefly loses contact with the cluster's token list still accepts it for metrics.
+With [access control](/enterprise/sso/) on, use a `viewer` token bound to every team instead of the server token: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. It cannot create, run or delete anything. It is read-only, not metrics-only: it can also read every team's sandbox details and audit records. A server that briefly loses contact with the cluster's token list still accepts it for metrics.
 
 Good first alerts to set up:
 
@@ -198,7 +198,7 @@ Each alert links straight to a step-by-step runbook. See [Runbooks](/operational
 
 ## Set up sign-in for the dashboard
 
-This section is for the server operator. Company sign-in on the dashboard needs [access control](/enterprise/access-control/) on, and an identity file with a dashboard app for each provider you want as a button.
+This section is for the server operator. Company sign-in on the dashboard needs [access control](/enterprise/sso/) on, and an identity file with a dashboard app for each provider you want as a button.
 
 1. **Register a dashboard app at your provider.** Make it a single-page app, a public client with no secret, using the authorization code flow with PKCE.
 2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui` as a redirect URI and `http://localhost:21212` as an allowed origin. Without that origin, the page can't finish the sign-in and says "didn't sign you in (network_error)". Register `localhost`, not `127.0.0.1`, and tell people to open the tunnel at `http://localhost:21212/ui`. A provider refuses a redirect URI it doesn't know, so a tab opened at `127.0.0.1` gets an "invalid redirect_uri" error.
@@ -214,16 +214,16 @@ Only issuers with `clients.dashboard` get a button, in the order of the identity
 | Keycloak | A public client with the standard flow and PKCE (`S256`). Set Web origins to `https://<api-domain>`, plus `http://localhost:21212` for an SSH tunnel. Add a Group Membership mapper to the ID token, and turn its **Full group path** off. With it on (the default), the groups arrive as `/platform-admins` and no group rule matches. |
 | Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
 | Authentik | Share one application with the CLI: a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI; Authentik then allows cross-origin calls from that address. The `profile` scope already puts `groups` in the ID token. |
-| Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [Access control](/enterprise/access-control/#zitadel-roles-as-groups) shows how. |
+| Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [SSO](/enterprise/sso/#zitadel-roles-as-groups) shows how. |
 
-Authentik and Zitadel have not been tested against a live tenant yet. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
+Authentik and Zitadel have not been tested against a live tenant yet. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
 
 - **The browser talks to your provider directly.** It reads the provider's discovery document and trades the sign-in code for a token. So your provider must allow cross-origin requests from your dashboard's address, and its token endpoint must be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
 - **The discovery document** at `https://<api-domain>/.well-known/aerolvm-auth` lists the buttons and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.
 
 ## Next steps
 
-- [Access control](/enterprise/access-control/): roles, teams, API tokens and SSO.
+- [SSO](/enterprise/sso/): company sign-in, roles, teams and API tokens.
 - [Runbooks](/operational-runbooks/): what to do when an alert fires.
 - [Cluster setup](/cluster-setup/): create a cluster to watch.
 - [Reconcile](/reconcile/): fix sandbox counts that no longer match reality.

@@ -32,6 +32,8 @@ export default defineConfig({
     '/preview': '/public-urls',
     '/port-allowlist': '/public-urls',
     '/comparison': '/aerolvm-vs-daytona-vs-e2b',
+    // enterprise/access-control.mdx was renamed to enterprise/sso.mdx.
+    '/enterprise/access-control': '/enterprise/sso',
   },
   integrations: [
     // Must precede starlight() so it rewrites ```mermaid fenced blocks into

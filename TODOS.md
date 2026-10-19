@@ -486,7 +486,7 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   would need a fifth role or per-route scopes, which the plan rules out for
   v1 (four fixed roles). Reopen only if a buyer needs a scrape credential
   that cannot read audit records.
-- **Docs:** `docs/src/content/docs/enterprise/access-control.mdx`,
+- **Docs:** `docs/src/content/docs/enterprise/sso.mdx`,
   `setup/obs/README.md`, `setup/runbooks/identity-and-access.md`.
 
 ## Native per-runtime metric labels (observability, `internal/service` + `internal/pool`)

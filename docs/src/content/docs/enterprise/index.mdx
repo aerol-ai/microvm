@@ -80,10 +80,10 @@ Each feature is **Default** (on with no setup), **You turn it on**, or **Propose
 | Operations | Clusters with failover and mutual TLS | You turn it on | [Reference architectures](/enterprise/deployment/) |
 | Operations | Metrics, traces, dashboards and alerts with runbooks | You turn it on | [Runbooks](/operational-runbooks/) |
 | Supply chain | Checksums, a bill of materials and a signed build record with every release | Default | [Release verification](https://github.com/aerol-ai/microvm/blob/main/RELEASE-VERIFICATION.md) |
-| Identity | Single sign-on (SSO) with Okta, Entra ID, Google, Keycloak, Authentik, Zitadel or any OIDC provider, in the CLI and the dashboard | You turn it on | [Access control](/enterprise/access-control/) |
-| Identity | Scoped API tokens and four roles, per team | You turn it on | [Access control](/enterprise/access-control/) |
-| Identity | CI sign-in with GitHub Actions or Kubernetes, with no stored secret | You turn it on | [Access control](/enterprise/access-control/#sign-in-from-ci-with-no-stored-secret) |
-| Identity | Named credentials enforced: the server token works only on the server | You turn it on (required by enterprise mode) | [Access control](/enterprise/access-control/#step-5-limit-the-server-token-to-the-server) |
+| Identity | Single sign-on (SSO) with Okta, Entra ID, Google, Keycloak, Authentik, Zitadel or any OIDC provider, in the CLI and the dashboard | You turn it on | [SSO](/enterprise/sso/) |
+| Identity | Scoped API tokens and four roles, per team | You turn it on | [SSO](/enterprise/sso/) |
+| Identity | CI sign-in with GitHub Actions or Kubernetes, with no stored secret | You turn it on | [SSO](/enterprise/sso/#sign-in-from-ci-with-no-stored-secret) |
+| Identity | Named credentials enforced: the server token works only on the server | You turn it on (required by enterprise mode) | [SSO](/enterprise/sso/#step-5-limit-the-server-token-to-the-server) |
 | Audit | The API caller's name in audit records, for every change, command and refused call | Default | [Audit and compliance](/enterprise/audit-evidence/) |
 | Audit | Access review report for SOC 2 | You turn it on | [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) |
 | Operations | Quotas per team | Proposed | [Discuss](https://github.com/aerol-ai/microvm/discussions/648) |
@@ -115,7 +115,7 @@ flowchart LR
 | Who can reach a new sandbox? | No one, until you share a port. | [Network security](/enterprise/security-controls/#network-security) |
 | Where do secrets live? | Sealed on the server. Every time one is opened, a record is written. | [Data protection](/enterprise/security-controls/#data-protection) |
 | Can an AI agent leak an API key? | Not with an inject rule. The sandbox only ever holds a placeholder. | [Data protection](/enterprise/security-controls/#data-protection) |
-| Who can call the API? | Anyone with the server token, by default. With access control on, each person signs in with your company account and each service gets its own token, each with one role on one team. Enterprise mode limits the server token to the server. | [Access control](/enterprise/access-control/) |
+| Who can call the API? | Anyone with the server token, by default. With access control on, each person signs in with your company account and each service gets its own token, each with one role on one team. Enterprise mode limits the server token to the server. | [SSO](/enterprise/sso/) |
 | What gets recorded? | Every change, command and refused call, with the caller's name. Every secret read, and the outbound connections the filter refuses. You can keep a copy off the server. | [Audit and compliance](/enterprise/audit-evidence/) |
 | Can someone who takes over a server rewrite the log? | Not without being caught, once the audit witness is on. It keeps the log's fingerprints in a locked S3 bucket. Only the newest 30 seconds of records stay open to a rewrite. | [Enterprise mode](/enterprise/enterprise-mode/) |
 | Who handles what? | AerolVM enforces the controls. You run the servers and choose the settings. | [Shared responsibility](/enterprise/responsibility/) |

@@ -169,6 +169,7 @@ const getBlogSidebarConfig = (): NavigationGroup[] => [
       link('/engineering-network-defenses', '- Fencing the network'),
       link('/engineering-secret-handling', '- Keeping API keys out'),
       link('/engineering-audit-witness', '- Catching a rewritten audit log'),
+      link('/engineering-identity-and-access', '- SSO with no login server'),
       link('/engineering-snapshot-correctness', '- Correct snapshot clones'),
       link('/engineering-frozen-kernel-problem', '- The frozen-kernel problem'),
       link('/randomness-in-cloned-sandboxes', '- Randomness in FC clones'),
@@ -274,7 +275,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
-      link(`${ent}/access-control`, '- Access control'),
+      link(`${ent}/sso`, '- SSO'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),
       link(`${ent}/responsibility`, '- Shared responsibility'),
     ],

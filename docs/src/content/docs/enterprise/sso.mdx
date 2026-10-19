@@ -1,42 +1,55 @@
 ---
-title: Access control
-description: Give every person and service its own sign-in, with a role and a team, so each call is limited and every action names who did it.
+title: SSO
+description: Let people sign in with their company account and give each service its own token. Each caller gets a role on a team, and every action names who did it.
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Out of the box, an AerolVM server has one secret token, `SB_PAT_TOKEN`. Everyone who holds it can do everything, and the audit log records every one of them as the same operator.
+A new AerolVM server has one secret token, `SB_PAT_TOKEN`. We call it the server token. Anyone who holds it can do everything. The audit log records all of them as the same person: the operator.
 
-Access control fixes that. People sign in with their company account (single sign-on, or SSO). Services and CI jobs get their own tokens. Each caller gets a **role** on one **team**, so a CI job can run sandboxes for the payments team and nothing else. Every call is recorded with the caller's name.
+SSO fixes that. SSO stands for single sign-on. It means people sign in to AerolVM with the company account they already use for email and other work tools. Services and CI jobs get tokens of their own. Each caller gets a **role** on one **team**. For example, a CI job can run sandboxes for the payments team and do nothing else. Every call is recorded with the caller's name.
 
-It is part of the free download. It is off until the server operator turns it on, and a server with it off works exactly as before.
+SSO is part of the free download. It is off until the server operator turns it on. A server with it off works exactly as before.
+
+## Words to know
+
+| Word | What it means |
+|---|---|
+| **Single sign-on (SSO)** | Signing in with your company account instead of a separate AerolVM password. |
+| **Identity provider** | The service that holds your company accounts and checks passwords, such as Okta, Entra ID, Google, Keycloak, Authentik or Zitadel. |
+| **Issuer** | One identity provider, as AerolVM sees it. Each issuer has a web address. |
+| **Token** | A long string of characters that proves who is calling. Code sends it with every API call. |
+| **Role** | What a caller may do, such as only look, or also run commands. |
+| **Team** | A group of sandboxes that belong together, such as `payments`. |
+| **Binding** | A rule that gives a role on a team. For example: "people in the `payments-eng` group are runners on the `payments` team". |
+| **Server token (PAT)** | The one secret token every server is installed with. It always acts as an admin. |
 
 ## How it works
 
-Every API call carries one credential. The server checks it on its own, with no call to a login service:
+Every API call carries one credential. The server checks it by itself. It never calls a login service to do so.
 
 | Credential | Who uses it | How you get it |
 |---|---|---|
-| **API token** (`avm_…`) | Services, CI jobs, scripts | An admin creates it. It has a name, a role, a team and an expiry. |
+| **API token** (`avm_…`) | Services, CI jobs, scripts | An admin creates it. It has a name, a role, a team and an end date. |
 | **Company sign-in** | People | `aerolvm login` or the dashboard sends you to your company's sign-in page, such as Okta, Entra ID, Google, Keycloak, Authentik or Zitadel. |
-| **Workload token** | CI on GitHub Actions, apps on Kubernetes | The platform issues it. Nothing secret is stored on AerolVM. |
+| **Workload token** | CI on GitHub Actions, apps on Kubernetes | The platform gives it to the job. AerolVM stores no secret for it. |
 | **Server token** (PAT) | The operator, setup scripts, cluster servers | Chosen at install. It always acts as an admin on every team. Keep it for emergencies. |
 
-Each credential maps to one of four roles:
+Each credential gets one of four roles:
 
 | Role | Can do | Bound to |
 |---|---|---|
 | `viewer` | See sandboxes and read their audit records. | One team, or every team (`*`) |
-| `runner` | Everything a viewer can, plus create, change, delete and run commands in sandboxes, and read their environment variables. | One team, or every team (`*`) |
-| `auditor` | See every team's sandboxes and audit records, list API tokens, and verify the audit chain. Never change anything. | Every team only |
-| `admin` | Everything, including creating API tokens and running cluster operations. | Every team only |
+| `runner` | Everything a viewer can. It can also create, change and delete sandboxes, run commands in them, and read their environment variables. | One team, or every team (`*`) |
+| `auditor` | See every team's sandboxes and audit records, list API tokens, and check the audit chain. It can never change anything. | Every team only |
+| `admin` | Everything. That includes creating API tokens and running cluster tasks. | Every team only |
 
-A role bound to every team (`*`) can also read the server's metrics at `/v1/metrics`. A `runner` on every team still cannot use host-side features, such as mounting a folder from the server. Those need `admin`.
+A role bound to every team (`*`) can also read the server's metrics at `/v1/metrics`. A `runner` on every team still cannot use features that reach into the server itself, such as mounting a folder from the server. Those need `admin`.
 
-A **team** is a name, such as `payments`. Sandboxes a team creates belong to that team:
+A **team** is a name, such as `payments`. Sandboxes that a team creates belong to that team:
 
-- **Another team's sandbox** answers `404 Not Found`, as if it did not exist.
-- **Your own team's sandbox, with a role that is too small,** answers `403 Forbidden`. The message names the role you would need, such as "role viewer on team payments cannot sandbox.exec; ask an admin for role runner on team payments".
+- **Another team's sandbox** answers `404 Not Found`. It looks as if it does not exist.
+- **Your own team's sandbox, when your role is too small,** answers `403 Forbidden`. The message names the role you would need. For example: "role viewer on team payments cannot sandbox.exec; ask an admin for role runner on team payments".
 
 ```mermaid
 flowchart LR
@@ -47,11 +60,11 @@ flowchart LR
     H --> A[("Audit record<br/>naming the caller")]
 ```
 
-In a cluster, the server that owns the sandbox checks the credential again. No server trusts another server's word about who you are.
+In a cluster, the call may reach one server and then move to the server that owns the sandbox. That second server checks the credential again. No server trusts another server's word about who you are.
 
 ## Check who you are
 
-Every credential can ask the server who it is. This is the first thing to run when a call is refused.
+Any credential can ask the server who it is. Run this first when a call is refused.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -119,16 +132,16 @@ Every credential can ask the server who it is. This is the first thing to run wh
   </TabItem>
 </Tabs>
 
-- `principal.id` is stable: `tok_…` for an API token, `oidc:<issuer>:<sub>` for a person, `operator` for the server token. Audit records use it.
+- `principal.id` never changes. It is `tok_…` for an API token, `oidc:<issuer>:<sub>` for a person, and `operator` for the server token. Audit records use it.
 - `principal.name` is for people to read, such as `ci-deploy` or `alice@acme.com`.
 - `team` is a team name, or `*` for every team.
 - `expiresAt` is when the credential stops working. The server token never expires, so it has none.
 
-From a terminal, `aerolvm whoami` prints the same, and `aerolvm whoami --explain` also shows which rule gave you your role. See the [CLI](/cli/#check-who-you-are).
+From a terminal, `aerolvm whoami` prints the same thing. `aerolvm whoami --explain` also shows which rule gave you your role. See the [CLI](/cli/#check-who-you-are).
 
 ## Give a service its own token
 
-An admin creates API tokens. Each one has a name, a role, a team and an expiry.
+An admin creates API tokens. Each one has a name, a role, a team and an end date.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -208,13 +221,13 @@ The same from a terminal:
 aerolvm token create --name ci-deploy --role runner --team payments --expires-in 90d
 ```
 
-- **The secret is shown once.** The server keeps only a hash of it. If you lose it, revoke the token and create a new one.
-- **Every token expires.** `expiresIn` takes days (`90d`) or hours (`720h`). The server sets the longest allowed: 365 days by default, 90 days in [enterprise mode](/enterprise/enterprise-mode/).
+- **You see the secret once.** The server keeps only a hash of it, a fingerprint that cannot be turned back into the secret. If you lose it, revoke the token and create a new one.
+- **Every token expires.** `expiresIn` takes days (`90d`) or hours (`720h`). The server sets the longest allowed time: 365 days by default, and 90 days in [enterprise mode](/enterprise/enterprise-mode/).
 - **`auditor` and `admin` need `team: "*"`.**
-- **Names are unique within a team.** Creating the same name twice fails with `409 Conflict`. A 409 can also mean an earlier try worked but its answer was lost. That secret cannot be recovered, so revoke the token by its ID and create it again.
+- **Names are unique within a team.** Creating the same name twice fails with `409 Conflict`. A 409 can also mean an earlier try worked, but its answer was lost. That secret cannot be shown again. Revoke the token by its ID and create it again.
 - **Secret scanners can find leaked tokens.** Every token starts with `avm_` and ends with a checksum. The pattern is `avm_[0-9A-Za-z]{12}_[0-9A-Za-z_-]{43}_[0-9A-Za-z]{6}`.
 
-To use the token, set it where your code reads its credential. `SB_API_TOKEN` and `SB_PAT_TOKEN` both work in every SDK and the CLI. If both are set, `SB_PAT_TOKEN` wins.
+To use the token, put it where your code reads its credential. `SB_API_TOKEN` and `SB_PAT_TOKEN` both work in every SDK and in the CLI. If both are set, `SB_PAT_TOKEN` wins.
 
 ```bash
 export SB_API_URL=https://api.acme.dev
@@ -223,7 +236,7 @@ export SB_API_TOKEN=avm_...
 
 ### List and revoke tokens
 
-Listing needs an `auditor` or `admin`. Revoking needs an `admin`.
+Listing needs an `auditor` or an `admin`. Revoking needs an `admin`.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -281,13 +294,13 @@ Listing needs an `auditor` or `admin`. Revoking needs an `admin`.
   </TabItem>
 </Tabs>
 
-- **The list never shows a secret.** Expired tokens stay listed, marked `expired`, for 30 days. Then the server removes them.
-- **A revoke works everywhere within seconds.** Servers that hold the cluster's state stop accepting the token at once. Other servers stop within one sync, about 5 seconds.
+- **The list never shows a secret.** Expired tokens stay on the list for 30 days, marked `expired`. Then the server removes them.
+- **A revoke works everywhere within seconds.** Servers that hold the cluster's shared state stop accepting the token at once. Other servers stop within one sync, about 5 seconds.
 - **Revoking twice is safe.** A token that is already gone still returns success.
 
 ## Act for one of several teams
 
-A person can be in more than one team. Their sign-in then matches several rules, and the first one is used. To act for another of their teams, name it. The SDKs send it as the `X-AerolVM-Team` header on every call.
+A person can be in more than one team. Their sign-in then matches several rules, and the server uses the first one. To act for another of their teams, name that team. The SDKs send it as the `X-AerolVM-Team` header on every call.
 
 <Tabs syncKey="lang">
   <TabItem label="TypeScript">
@@ -329,25 +342,38 @@ A person can be in more than one team. Their sign-in then matches several rules,
   </TabItem>
 </Tabs>
 
-- **It only chooses.** The team must be one your credential already holds. Any other team gets `403 Forbidden`.
-- **It cannot pick "every team".** A team name is 1 to 63 of `a-z`, `0-9` and `-`. To act on every team, send no team, and let the first rule be the fleet one. See [the identity file](#step-2-write-the-identity-file).
+- **It only chooses.** The team must be one your credential already has. Any other team gets `403 Forbidden`.
+- **It cannot pick "every team".** A team name is 1 to 63 characters of `a-z`, `0-9` and `-`. To act on every team, send no team. The first rule then has to be the one for every team. See [the identity file](#step-2-write-the-identity-file).
 - **The server token ignores it.**
 - **In the CLI,** use `aerolvm login --team checkout` or `SB_TEAM`.
-- **TypeScript only:** live command streams (`execStream`, `attachSession`) cannot send the header, so they use your first team.
+- **TypeScript only:** live command streams (`execStream`, `attachSession`) cannot send the header. They use your first team.
 
 ## Sign in with your company account
 
-People sign in through your identity provider. AerolVM never sees their password and keeps no session. The provider signs a short-lived token, about an hour, and every AerolVM server checks that signature with the provider's public keys.
+People sign in through your identity provider. AerolVM never sees their password. It keeps no login session either. Instead, the provider signs a short-lived token, which lasts about an hour. Every AerolVM server checks that signature with the provider's public keys.
 
-- **In a terminal:** `aerolvm login https://api.acme.dev` opens your browser. Over SSH, add `--device` to get a code to type on another device. The login renews itself while your provider allows it. See [Save your login](/cli/#save-your-login).
-- **In a browser:** open the [dashboard](/dashboard/) at `https://api.acme.dev/ui` and pick your provider. The dashboard's console is for admins. Other roles see who they are and how to use the CLI.
+<div style="max-width: 440px; margin: 0 auto 24px;">
+  <img
+    src="/blog/sso/dashboard-sign-in.webp"
+    alt="The AerolVM dashboard sign-in box, with a Sign in with Keycloak button, a Use a different account link, and a closed Use an API token instead section"
+    width="880"
+    height="700"
+    loading="lazy"
+    style="width: 100%; height: auto; display: block; border-radius: 0.75rem; border: 1px solid rgba(148, 163, 184, 0.2);"
+  />
+</div>
+
+*The dashboard shows one button for each provider. The token box stays closed until you need it.*
+
+- **In a terminal:** `aerolvm login https://api.acme.dev` opens your browser. Over SSH, add `--device`. You get a code to type on another device. The login renews itself while your provider allows it. See [Save your login](/cli/#save-your-login).
+- **In a browser:** open the [dashboard](/dashboard/) at `https://api.acme.dev/ui` and pick your provider. The dashboard's console is for admins. People with other roles see who they are and how to use the CLI.
 - **In code:** `aerolvm auth token` prints a fresh token for a script: `SB_API_TOKEN=$(aerolvm auth token) python agent.py`. It lasts about an hour, so get a new one for long jobs.
 
 ### Sign in from CI with no stored secret
 
-GitHub Actions and Kubernetes can each give a job a signed token that says who it is. AerolVM checks it the same way, so there is no AerolVM secret to store or rotate.
+GitHub Actions and Kubernetes can each give a job a signed token that says who the job is. AerolVM checks it the same way it checks a person's sign-in. So there is no AerolVM secret to store or change.
 
-On **GitHub Actions**, ask for a token with the audience `aerolvm`:
+On **GitHub Actions**, ask for a token with the audience `aerolvm`. The audience names who the token is for.
 
 ```yaml
 permissions:
@@ -374,7 +400,7 @@ jobs:
 
 The token lasts a few minutes. For a long job, get a fresh one before each step that calls AerolVM.
 
-On **Kubernetes**, mount a service account token with the audience `aerolvm`. The kubelet renews the file on its own:
+On **Kubernetes**, mount a service account token with the audience `aerolvm`. The kubelet, the agent on each Kubernetes machine, renews the file by itself:
 
 ```yaml
 spec:
@@ -460,7 +486,7 @@ Then read the file each time you build a client:
   </TabItem>
 </Tabs>
 
-The server never calls the Kubernetes API to check the token. It checks the signature with the keys your cluster publishes.
+The server never calls the Kubernetes API to check the token. It checks the signature with the public keys your cluster publishes.
 
 ## Set it up
 
@@ -468,13 +494,13 @@ This section is for the server operator.
 
 ### Step 1: Turn it on
 
-Add this to every server's environment, then restart:
+Add this setting to every server's environment, then restart:
 
 ```bash
 SB_IDENTITY_ENABLED=true
 ```
 
-That is **tokens-only mode**: API tokens work, and nobody signs in with SSO yet. It needs no identity provider, so it works on networks with no internet access. It is a complete setup, and enough for [enterprise mode](/enterprise/enterprise-mode/).
+This is **tokens-only mode**. API tokens work, but nobody signs in with SSO yet. It needs no identity provider, so it works on networks with no internet access. It is a complete setup. It is also enough for [enterprise mode](/enterprise/enterprise-mode/).
 
 Make the first admin token with the server token, on a server:
 
@@ -483,15 +509,15 @@ SB_API_URL=http://127.0.0.1:21212 SB_PAT_TOKEN=<server token> \
   aerolvm token create --name first-admin --role admin --team '*' --expires-in 30d
 ```
 
-Use that admin token from then on, and keep the server token for emergencies.
+Use that admin token from then on. Keep the server token for emergencies.
 
 <Aside type="note">
-With `SB_IDENTITY_ENABLED` off, tokens can still be created and listed, but no server accepts them. This lets you prepare tokens before you turn it on.
+With `SB_IDENTITY_ENABLED` off, you can still create and list tokens, but no server accepts them. This lets you prepare tokens before you turn it on.
 </Aside>
 
 ### Step 2: Write the identity file
 
-The identity file names your identity providers and maps their groups to AerolVM roles. Point `SB_IDENTITY_FILE` at it on every server.
+The identity file lists your identity providers. It also maps their groups to AerolVM roles. Point `SB_IDENTITY_FILE` at it on every server.
 
 ```yaml
 version: 1
@@ -527,44 +553,44 @@ bindings:                               # fleet rules first, then team rules
 deny_subjects: []                       # "<issuer>:<sub>", blocked at once
 ```
 
-**Put rules for every team (`admin`, `auditor`, or `*`) above rules for one team.** A person who matches several rules gets the first one by default. A team header can pick another of their team rules, but nothing can pick a fleet rule that sits lower. So an admin who is also in `payments-eng` would lose admin if the team rule came first. The dashboard sends no team header at all.
+**Put rules for every team above rules for one team.** A rule for every team is an `admin`, an `auditor`, or any rule with `team: '*'`. When a person matches several rules, they get the first one by default. A team header can pick another of their team rules. But nothing can pick a rule for every team that sits lower down. So if a team rule came first, an admin who is also in `payments-eng` would lose admin. The dashboard sends no team header at all.
 
 How a rule matches:
 
-- `group` matches the groups claim, and `app_role` matches the roles claim (Entra app roles).
-- The groups and roles claims must hold a string or a list of strings. A claim that holds an object, such as Zitadel's project roles, never matches.
-- `claim` matches every listed claim. A list claim matches when it contains the value.
+- `group` matches the groups claim. `app_role` matches the roles claim (Entra app roles). A claim is one named fact inside a sign-in token, such as an email address or a list of groups.
+- The groups and roles claims must hold a string or a list of strings. A claim that holds an object never matches, such as Zitadel's project roles.
+- `claim` matches only when every listed claim matches. A list claim matches when it contains the value.
 - A rule on `email` also needs the provider to say the email is verified.
 - Only the rules for the token's own issuer are tried.
 
 How the file loads:
 
-- Unknown keys, a missing `version`, or an empty file fail the load. For tokens-only mode, unset `SB_IDENTITY_FILE` instead of leaving the file empty.
-- Each server re-reads it within 10 seconds of a change, or at once on `SIGHUP`. A bad edit keeps the last good file and counts an error.
-- A bad file at start turns off SSO sign-in (it answers `503`) until you fix it. API tokens and the server token keep working.
-- Every change writes one `identity_config` audit record on each server, with the old and new file hash and the rules added and removed. The file cannot say who edited it. Keep it in Git or your config tool, so that history names the author.
-- Ship the same file to every server, with Terraform or Ansible. The `aerolvm_identity_file_info` metric shows a server whose copy differs.
+- Unknown keys fail the load. So do a missing `version` and an empty file. For tokens-only mode, unset `SB_IDENTITY_FILE` instead of leaving the file empty.
+- Each server reads the file again within 10 seconds of a change, or at once on `SIGHUP`. A bad edit keeps the last good file and counts an error.
+- A bad file at start turns off SSO sign-in until you fix it. SSO sign-ins then get `503`. API tokens and the server token keep working.
+- Every change writes one `identity_config` audit record on each server. It holds the old and new file hash, plus the rules added and removed. The file cannot say who edited it. Keep it in Git or your config tool, so that history names the author.
+- Send the same file to every server, with Terraform or Ansible. The `aerolvm_identity_file_info` metric shows a server whose copy differs.
 
 | Field | What it is |
 |---|---|
 | `version` | Always `1`. |
-| `issuers[].name` | Required. 1 to 63 of `a-z`, `0-9` and `-`. Part of every person's ID (`oidc:<name>:<sub>`), so do not rename it. |
-| `issuers[].display_name` | Optional. The dashboard button and CLI menu label, 1 to 40 characters. Defaults to `name`. Never used in IDs or records. |
-| `issuers[].kind` | `oidc` (default) or `google`. `google` makes the dashboard use Google's own sign-in button. |
-| `issuers[].url` | Required. The provider's issuer URL, over `https`. Must equal the token's `iss` exactly. |
+| `issuers[].name` | Required. 1 to 63 characters of `a-z`, `0-9` and `-`. It is part of every person's ID (`oidc:<name>:<sub>`), so do not rename it. |
+| `issuers[].display_name` | Optional. The dashboard button and CLI menu label, 1 to 40 characters. Defaults to `name`. It is never used in IDs or records. |
+| `issuers[].kind` | `oidc` (the default) or `google`. `google` makes the dashboard use Google's own sign-in button. |
+| `issuers[].url` | Required. The provider's issuer URL, over `https`. It must equal the token's `iss` exactly. |
 | `issuers[].jwks_file` | Optional. A file with the provider's public keys, for a provider your servers cannot reach. |
-| `issuers[].audiences` | Required. The client IDs (or `aerolvm`, for workload tokens) a token may be issued for. |
+| `issuers[].audiences` | Required. The client IDs (or `aerolvm`, for workload tokens) that a token may be made for. |
 | `issuers[].clients.cli`, `.dashboard` | Optional. The client IDs of your CLI and dashboard apps. Each must also be in `audiences`. Only issuers with one appear in the CLI menu or as a dashboard button. |
 | `issuers[].claims.username`, `.groups`, `.roles` | Which claims hold the display name, the groups and the app roles. Defaults: `sub`, `groups`, `roles`. |
 | `issuers[].max_token_lifetime` | Default `24h`. Tokens that last longer are refused. Raise it only for a workload issuer that needs it. |
 | `issuers[].mcp`, `.mcp_audiences` | For MCP connectors such as claude.ai. See [MCP server](/mcp/#sign-in-with-oauth). |
-| `bindings[]` | `issuer`, exactly one of `group`, `app_role` or `claim`, then `role` and `team`. `team` is a team name or `*`. `auditor` and `admin` are always `*`. |
+| `bindings[]` | `issuer`, then exactly one of `group`, `app_role` or `claim`, then `role` and `team`. `team` is a team name or `*`. `auditor` and `admin` are always `*`. |
 | `deny_subjects[]` | `"<issuer>:<sub>"`. Refused on every call after the next reload. |
 | `mcp.resource`, `mcp.scopes` | For MCP connectors. See [MCP server](/mcp/#sign-in-with-oauth). |
 
 ### Step 3: Register the apps at your provider
 
-Register two apps at your identity provider: one for the CLI and one for the dashboard. Put their client IDs in `clients` and `audiences`. Neither needs a client secret on the server.
+Register two apps at your identity provider: one for the CLI and one for the dashboard. Put their client IDs in `clients` and `audiences`. Neither one needs a client secret on the server.
 
 | | CLI app | Dashboard app |
 |---|---|---|
@@ -572,39 +598,53 @@ Register two apps at your identity provider: one for the CLI and one for the das
 | Sign-in flow | Authorization code with PKCE. Also the device flow, for `--device`. | Authorization code with PKCE |
 | Redirect URI | `http://127.0.0.1/callback`. The CLI listens on a random port, so the provider must accept any port on that address. | `https://<api-domain>/ui` |
 | Allowed origin (CORS) | None | `https://<api-domain>` |
-| Scopes | `openid email profile`, and `offline_access` so the login can renew itself | `openid email profile` |
+| Scopes | `openid email profile`, plus `offline_access` so the login can renew itself | `openid email profile` |
 | Groups | Put the groups claim in the ID token | Put the groups claim in the ID token |
+
+PKCE is a standard way for an app with no secret to sign in safely. A redirect URI is the address the provider sends you back to after you sign in.
 
 Notes for each provider:
 
-- **Okta.** Create a Native app for the CLI, with the Refresh Token grant (and Device Authorization, for `--device`). Create a Single-Page app for the dashboard, and add `https://<api-domain>` as a Trusted Origin for CORS. Add a groups claim to the ID token.
-- **Entra ID.** The issuer `url` is `https://login.microsoftonline.com/<tenant>/v2.0`. Use the "Mobile and desktop applications" platform for the CLI (turn on public client flows for `--device`), and the "Single-page application" platform for the dashboard. Above 200 groups, Entra leaves the groups out of the token. Bind on app roles instead: `{ issuer: entra, app_role: AerolVM.Runner, role: runner, team: payments }`.
+- **Okta.**
+  - Create a Native app for the CLI, with the Refresh Token grant. Add Device Authorization too, for `--device`.
+  - Create a Single-Page app for the dashboard. Add `https://<api-domain>` as a Trusted Origin for CORS.
+  - Add a groups claim to the ID token.
+- **Entra ID.**
+  - The issuer `url` is `https://login.microsoftonline.com/<tenant>/v2.0`.
+  - Use the "Mobile and desktop applications" platform for the CLI. Turn on public client flows for `--device`.
+  - Use the "Single-page application" platform for the dashboard.
+  - Above 200 groups, Entra leaves the groups out of the token. Bind on app roles instead: `{ issuer: entra, app_role: AerolVM.Runner, role: runner, team: payments }`.
 - **Keycloak.**
-  - The issuer `url` is `https://<keycloak>/realms/<realm>`. Set Keycloak's `hostname` option (`KC_HOSTNAME`) to that public address. Without it, Keycloak writes whatever host a request used into the token's issuer, so a node that reaches Keycloak by another address sees an issuer that doesn't match, and sign-in fails. Every node must reach that address.
+  - The issuer `url` is `https://<keycloak>/realms/<realm>`. Set Keycloak's `hostname` option (`KC_HOSTNAME`) to that public address. Without it, Keycloak writes whatever host a request used into the token's issuer. Then a server that reaches Keycloak by another address sees an issuer that does not match, and sign-in fails. Every server must reach that address.
   - Make both clients public, with the standard flow. Set **Proof Key for Code Exchange Code Challenge Method** to `S256` on both. Turn on **OAuth 2.0 Device Authorization Grant** on the CLI client, for `--device`. The CLI sends PKCE on the device flow too when Keycloak asks for it.
-  - On `--device`, Keycloak shows a page asking you to grant access, even with **Consent required** off. Approve it to finish signing in.
+  - On `--device`, Keycloak shows a page that asks you to grant access, even with **Consent required** off. Approve it to finish signing in.
   - Set the dashboard client's **Web origins** to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Without it, the dashboard says "Keycloak didn't sign you in (network_error)".
-  - Add a **Group Membership** mapper with the claim name `groups` and **Add to ID token** on. Put it in a client scope both clients get, such as a default client scope. Turn **Full group path** off. It is on by default, which sends `/platform-admins` instead of `platform-admins`, and then no `group: platform-admins` rule matches. If you keep it on, write the rules with the slash: `group: /platform-admins`.
-- **Google.** Use `kind: google`. The CLI app is a "Desktop app". Google still wants that app's client secret, so hand it to people when they start, and they run `aerolvm login --sso <url> --client-secret-stdin` once. It never goes on the server. Google offers the device flow only to a "TVs and Limited Input devices" client, and the CLI uses one client ID for both flows, so pick the type you need. The dashboard app is a "Web application" with `https://<api-domain>` as an authorized JavaScript origin. Google gets its own button.
-- **Authentik.** Each Authentik application has its own issuer URL, so use **one** application for both the CLI and the dashboard:
-  - The issuer `url` is `https://<authentik>/application/o/<slug>/`, with the trailing slash. Keep the provider's issuer mode at its default (one issuer per provider), and don't rename the slug later: both change the issuer.
+  - Add a **Group Membership** mapper with the claim name `groups` and **Add to ID token** on. Put it in a client scope that both clients get, such as a default client scope.
+  - Turn **Full group path** off. It is on by default. Then Keycloak sends `/platform-admins` instead of `platform-admins`, and no `group: platform-admins` rule matches. If you keep it on, write the rules with the slash: `group: /platform-admins`.
+- **Google.**
+  - Use `kind: google`. Google gets its own button.
+  - The CLI app is a "Desktop app". Google still wants that app's client secret. Hand it to people when they start. They run `aerolvm login --sso <url> --client-secret-stdin` once. It never goes on the server.
+  - Google offers the device flow only to a "TVs and Limited Input devices" client. The CLI uses one client ID for both flows, so pick the type you need.
+  - The dashboard app is a "Web application" with `https://<api-domain>` as an authorized JavaScript origin.
+- **Authentik.** Each Authentik application has its own issuer URL. So use **one** application for both the CLI and the dashboard:
+  - The issuer `url` is `https://<authentik>/application/o/<slug>/`, with the slash at the end. Keep the provider's issuer mode at its default, one issuer per provider. Don't rename the slug later. Both changes change the issuer.
   - Make its OAuth2/OpenID provider a **Public** client. Put its client ID in `audiences`, and as both `clients.cli` and `clients.dashboard`.
-  - Add the redirect URIs `https://<api-domain>/ui` as **Strict**, and `http://127\.0\.0\.1:\d+/callback` as **Regex**, so the CLI's random port matches. Authentik allows cross-origin calls from the address of each Strict redirect URI, so the dashboard needs nothing more.
+  - Add the redirect URI `https://<api-domain>/ui` as **Strict**. Add `http://127\.0\.0\.1:\d+/callback` as **Regex**, so the CLI's random port matches. Authentik allows cross-origin calls from the address of each Strict redirect URI, so the dashboard needs nothing more.
   - Pick an RSA **Signing Key**, such as the built-in "authentik Self-signed Certificate". With no signing key, Authentik signs with HS256, which the server refuses. Leave **Encryption Key** empty.
   - Add the `offline_access` scope to the provider, so the CLI login can renew itself. For `--device`, give your brand a device code flow.
   - The default `profile` scope puts a `groups` list in the ID token, so group rules work as they are. Authentik's default `email` scope says the email is not verified, so a rule on `email` never matches.
   - Keep **Subject mode** at its default, a hashed user ID. Each person's ID is built from it, and a change gives everyone a new ID.
-- **Zitadel.** The issuer `url` is your instance's domain, such as `https://acme-abc123.zitadel.cloud`, with no trailing slash.
-  - Put the CLI and dashboard apps in a project of their own. Zitadel puts the client ID of every app in a project into every token the project issues, so a sign-in token for any other app in that project would also work here.
-  - For the CLI, create a **Native** app with PKCE, and turn on the Refresh Token and Device Code grant types. Register `http://127.0.0.1/callback`. Zitadel accepts any port on it for a native app.
+- **Zitadel.** The issuer `url` is your instance's domain, such as `https://acme-abc123.zitadel.cloud`, with no slash at the end.
+  - Put the CLI and dashboard apps in a project of their own. Zitadel puts the client ID of every app in a project into every token that project issues. So a sign-in token for any other app in that project would also work here.
+  - For the CLI, create a **Native** app with PKCE. Turn on the Refresh Token and Device Code grant types. Register `http://127.0.0.1/callback`. Zitadel accepts any port on it for a native app.
   - For the dashboard, create a **User Agent** app with PKCE. Zitadel allows cross-origin calls from the redirect URI's address, so it needs no extra origin. To sign in through an SSH tunnel too, add `http://localhost:21212/ui` and turn on **Development Mode**. Zitadel allows an `http` redirect URI on a non-native app only in that mode.
   - Zitadel's roles claim is an object, which the server can't match. Add a flat `groups` claim with a Zitadel Action, as [Zitadel roles as groups](#zitadel-roles-as-groups) shows.
-  - The ID token always has `preferred_username` (the person's login name), but the email only when **User Info inside ID Token** is on. Set `username: preferred_username`, or turn that setting on to show or bind on `email`.
+  - The ID token always has `preferred_username`, the person's login name. It has the email only when **User Info inside ID Token** is on. Set `username: preferred_username`, or turn that setting on to show or bind on `email`.
   - Zitadel's ID tokens last 12 hours by default, not one hour. To cut off a removed person sooner, shorten the ID token lifetime in your instance's OIDC settings.
 
 The dashboard works only over HTTPS, or from `localhost` through an SSH tunnel. [Dashboard](/dashboard/#set-up-sign-in-for-the-dashboard) has the details.
 
-Authentik and Zitadel have not been tested against a live tenant yet. These steps follow each provider's own documentation.
+Authentik and Zitadel have not been tested against a live account yet. These steps follow each provider's own documentation.
 
 For these two, the issuers in the identity file look like this:
 
@@ -629,10 +669,10 @@ bindings:
 
 #### Zitadel roles as groups
 
-Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`). A Zitadel Action can copy the role keys into a flat `groups` list, which group rules can match.
+Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`). A Zitadel Action is a small script that runs at sign-in. It can copy the role keys into a flat `groups` list, which group rules can match.
 
 1. In the project of your CLI and dashboard apps, turn on **Assert Roles on Authentication**. Without it, the Action sees no roles.
-2. In the organization your people belong to, open **Actions** and create an Action named `groupsClaim`. Zitadel runs the Actions of each person's own organization. Turn on **Allowed To Fail**, so a broken script can't block sign-in. The person then carries no groups, and gets no role. Use this script:
+2. Open **Actions** in the organization your people belong to. Zitadel runs the Actions of each person's own organization. Create an Action named `groupsClaim`. Turn on **Allowed To Fail**, so a broken script can't block sign-in. If it does break, the person carries no groups and gets no role. Use this script:
 
    ```js
    function groupsClaim(ctx, api) {
@@ -647,24 +687,37 @@ Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`)
    }
    ```
 
-3. Under **Flows**, pick **Complement Token**, and add the Action to the **Pre Userinfo creation** trigger. That puts `groups` in ID tokens. For [MCP connectors](/mcp/#sign-in-with-oauth), also add it to **Pre access token creation**.
+3. Under **Flows**, pick **Complement Token**. Add the Action to the **Pre Userinfo creation** trigger. That puts `groups` in ID tokens. For [MCP connectors](/mcp/#sign-in-with-oauth), also add it to **Pre access token creation**.
 
 Each role key becomes one group name. A person granted the `payments-eng` role in the project matches `{ issuer: zitadel, group: payments-eng, ... }`. Only roles from the app's own project are included.
 
 ### Step 4: Check it
 
-1. Open `https://<api-domain>/.well-known/aerolvm-auth` in a browser. It lists every provider with a CLI or dashboard app, and `identity_enabled: true`.
+1. Open `https://<api-domain>/.well-known/aerolvm-auth` in a browser. It lists every provider that has a CLI or dashboard app. It also shows `identity_enabled: true`.
 2. Run `aerolvm login https://<api-domain>`, then `aerolvm whoami --explain`. It shows your role and team, the rule that matched, and the groups your sign-in carried.
 3. If no rule matches, the CLI and the dashboard both say so and list your groups. Add a rule for one of them.
 
+<div style="max-width: 440px; margin: 0 auto 24px;">
+  <img
+    src="/blog/sso/dashboard-no-access.webp"
+    alt="The dashboard's no-access screen for the user demo-nobody signed in with Keycloak. It says no access rule on this server matches the account, and that the sign-in carried no groups."
+    width="880"
+    height="800"
+    loading="lazy"
+    style="width: 100%; height: auto; display: block; border-radius: 0.75rem; border: 1px solid rgba(148, 163, 184, 0.2);"
+  />
+</div>
+
+*A person whose sign-in matches no rule sees this screen. It lists the groups they carried, so they can tell an admin what to add.*
+
 ### Step 5: Limit the server token to the server
 
-With `SB_PAT_SCOPE=host`, the server token works only on the server itself and between cluster servers. Everyone else must use SSO or an API token, so every remote action names a person or a service. [Enterprise mode](/enterprise/enterprise-mode/) requires it.
+With `SB_PAT_SCOPE=host`, the server token works only on the server itself and between cluster servers. Everyone else must use SSO or an API token. So every action from outside names a person or a service. [Enterprise mode](/enterprise/enterprise-mode/) requires it.
 
-1. **Upgrade every server first.** Older servers do not mark the server token when they pass a call to another server, and a server with `host` refuses an unmarked one.
-2. **Move remote tools off the server token:** the dashboard, remote MCP, SDK scripts, and your Prometheus scrape. For the scrape, a `viewer` token on every team works: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. With the project's Terraform, set it as `cluster.metrics_token` in `config/secrets.yml` and apply again.
-3. **Move your own settings out of the installer's file.** The installer writes the settings file (`/etc/sandboxd/sandboxd.env`) from scratch, so every setting you added by hand is gone after it runs, including `SB_IDENTITY_ENABLED`, `SB_IDENTITY_FILE` and `SB_ENTERPRISE_MODE`. Put them in a file the installer never touches, as [Installer options](/getting-started/installer-options/#keep-your-own-settings) shows.
-4. **Re-run the installer on each server with `--pat-scope host`.** Pass every install option again with the current `--pat-token`; without it, the installer makes a new server token. Caddy then reaches the server through a private socket, so its traffic no longer looks like it comes from the server itself. Any other proxy on the server must use that socket too. The installer restarts the server and waits for the socket before it starts Caddy.
+1. **Upgrade every server first.** When older servers pass a call to another server, they do not mark the server token. A server with `host` refuses an unmarked one.
+2. **Move remote tools off the server token.** That means the dashboard, remote MCP, SDK scripts, and your Prometheus scrape. For the scrape, a `viewer` token on every team works: `aerolvm token create --name prometheus --role viewer --team '*' --expires-in 90d`. With the project's Terraform, set it as `cluster.metrics_token` in `config/secrets.yml` and apply again.
+3. **Move your own settings out of the installer's file.** The installer writes the settings file (`/etc/sandboxd/sandboxd.env`) from scratch. So after it runs, every setting you added by hand is gone. That includes `SB_IDENTITY_ENABLED`, `SB_IDENTITY_FILE` and `SB_ENTERPRISE_MODE`. Put them in a file the installer never touches, as [Installer options](/getting-started/installer-options/#keep-your-own-settings) shows.
+4. **Run the installer again on each server with `--pat-scope host`.** Pass every install option again, with the current `--pat-token`. Without it, the installer makes a new server token. Caddy then reaches the server through a private socket, so its traffic no longer looks like it comes from the server itself. Any other proxy on the server must use that socket too. The installer restarts the server and waits for the socket before it starts Caddy.
 
 Setup scripts on the server keep working with `http://127.0.0.1:21212`. A server token sent from anywhere else gets `401`: "the operator token works only on this host; sign in with `aerolvm login --sso` or use a named token".
 
@@ -672,22 +725,22 @@ The scrape token is **read-only, not metrics-only**. It cannot create, run or de
 
 ## Take access away
 
-- **For a person:** remove them at your identity provider. Their login stops renewing, and their last sign-in token dies within its lifetime: about an hour for most providers, and 12 hours by default for Zitadel. To block them at once, add `"<issuer>:<sub>"` to `deny_subjects` and ship the file. Each server applies it within 10 seconds, or at once on `SIGHUP`. Their audit records name them as `oidc:<issuer>:<sub>`; the deny entry is that ID without `oidc:`.
+- **For a person:** remove them at your identity provider. Their login stops renewing. Their last sign-in token stops working when it expires. That is about an hour for most providers, and 12 hours by default for Zitadel. To block them at once, add `"<issuer>:<sub>"` to `deny_subjects` and send out the file. Each server applies it within 10 seconds, or at once on `SIGHUP`. Their audit records name them as `oidc:<issuer>:<sub>`. The deny entry is that ID without `oidc:`.
 - **For an API token:** revoke it. Every server stops accepting it within seconds.
-- **For the server token:** rotate it. The [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#rotatepat) shows how to do it with no downtime.
+- **For the server token:** change it (rotate it). The [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md#rotatepat) shows how to do it with no downtime.
 
 ## What gets recorded
 
-With access control on or off, every call that changes something writes an audit record that names the caller:
+With SSO on or off, every call that changes something writes an audit record. The record names the caller.
 
-- **Every call except plain reads:** create, delete, start, stop, ports, snapshots, tokens, and every command or file call inside a sandbox (file reads too, since files can hold secrets). With `SB_AUDIT_API_RECORDS=all`, plain reads too.
+- **Every call except plain reads.** That covers create, delete, start, stop, ports, snapshots, tokens, and every command or file call inside a sandbox. File reads count too, since files can hold secrets. With `SB_AUDIT_API_RECORDS=all`, plain reads are recorded too.
 - **Refused calls.** A `403` is a record with `result: denied`. A refused credential (`401`) is an `auth_denied` record, at most one per address per minute.
-- **The server's own work,** such as a lifecycle timer deleting a sandbox, names the part of the server that did it, such as `system:lifecycle`.
-- **Commands are not stored by default.** A record holds a fingerprint of the command, which proves what ran without keeping secrets it might hold.
+- **The server's own work.** For example, a lifecycle timer may delete a sandbox. The record names the part of the server that did it, such as `system:lifecycle`.
+- **Commands are not stored by default.** A record holds a fingerprint of the command. The fingerprint proves what ran without keeping any secrets the command held.
 
-Every mutating action is recorded, except calls in the last sync interval (1 second) before an unclean crash, unless the call is durable. Token create, token revoke and sandbox delete are durable when `SB_AUDIT_API_DURABLE` is on, as it always is in enterprise mode.
+Every action that changes something is recorded, with one exception. Calls in the last second before an unclean crash can be lost, because records are saved to disk once a second. Durable calls are never lost. Token create, token revoke and sandbox delete are durable when `SB_AUDIT_API_DURABLE` is on, as it always is in enterprise mode.
 
-[Audit and compliance](/enterprise/audit-evidence/) lists every field, maps the records to SOC 2, and shows how to produce an access review.
+[Audit and compliance](/enterprise/audit-evidence/) lists every field and maps the records to SOC 2. It also shows how to produce an access review.
 
 ## Errors you may see
 
@@ -696,12 +749,12 @@ Every mutating action is recorded, except calls in the last sync interval (1 sec
 | `401` with reason `expired` | The token's time is up. | Sign in again, or ask for a new API token. |
 | `401` with reason `not_yet_valid` | Your computer's clock is more than a minute off. | Fix the clock. |
 | `401` with reason `wrong_audience`, `unknown_issuer` or `too_long_lived` | The token came from an app or provider this server does not trust. | Check `issuers` in the identity file. |
-| `401` with reason `invalid_signature` or `malformed` | The token is damaged or forged. | Sign in again. |
+| `401` with reason `invalid_signature` or `malformed` | The token is damaged or fake. | Sign in again. |
 | `401` with reason `unknown_or_revoked` | The API token was revoked, or the person is on the deny list. | Ask an admin. |
 | `403` "no role binding for …" | You signed in, but no rule matches you. The message lists your groups. | Ask an admin to add a rule for one of them. |
 | `403` "role … cannot …; ask an admin for role …" | Your role is too small for this call. | Ask for the role it names. |
 | `403` "is not one of this credential's teams" | You picked a team you do not belong to. | Unset `SB_TEAM`, or pick one of your teams. |
-| `404` | The sandbox does not exist, or belongs to another team. | Check the team you act for. |
+| `404` | The sandbox does not exist, or it belongs to another team. | Check the team you act for. |
 | `503` "identity data is stale on this node" | This server lost contact with the cluster's token list for over a minute. | Retry. The server token and SSO still work. |
 | `503` "sign-in with an identity provider is unavailable" | The identity file failed to load, or the provider's keys could not be fetched. | Retry, or use an API token. Operators: check the server log. |
 
@@ -711,14 +764,14 @@ Every mutating action is recorded, except calls in the last sync interval (1 sec
 
 | Setting | Default | What it does |
 |---|---|---|
-| `SB_IDENTITY_ENABLED` | `false` | Turns on API tokens and SSO. Required by enterprise mode. |
+| `SB_IDENTITY_ENABLED` | `false` | Turns on API tokens and SSO. Enterprise mode requires it. |
 | `SB_IDENTITY_FILE` | Empty | The identity file. Empty means tokens-only mode. |
 | `SB_TOKEN_MAX_TTL` | `8760h` (365 days) | The longest an API token may last. 90 days at most in enterprise mode. |
-| `SB_IDENTITY_SYNC_INTERVAL` | `5s` | How often servers without the cluster's state fetch token changes. |
+| `SB_IDENTITY_SYNC_INTERVAL` | `5s` | How often servers without the cluster's shared state fetch token changes. |
 | `SB_IDENTITY_MAX_STALE` | `60s` | After this long without a sync, a server refuses API tokens, except to read metrics. |
-| `SB_PAT_SCOPE` | `any` | `host` limits the server token to the server and cluster servers. Required by enterprise mode. |
+| `SB_PAT_SCOPE` | `any` | `host` limits the server token to the server and cluster servers. Enterprise mode requires it. |
 | `SB_PUBLIC_API_SOCKET` | `/run/sandboxd-public/api.sock` | The socket Caddy uses when `SB_PAT_SCOPE=host`. |
-| `SB_PAT_TOKEN_PREVIOUS` | Empty | A second server token, accepted only during a rotation. |
+| `SB_PAT_TOKEN_PREVIOUS` | Empty | A second server token, accepted only while you rotate the main one. |
 | `SB_OPERATOR_VOLUME_SCOPE` | Empty | Pins where the operator's platform volumes live, so a token rotation does not move them. |
 | `SB_L4_FALLBACK_PROXY_PROTOCOL` | `false` | Passes callers' real addresses through Caddy. Set by `install.sh --l4-proxy-protocol`. |
 
@@ -726,7 +779,7 @@ Client settings, read by every SDK and the CLI:
 
 | Setting | What it does |
 |---|---|
-| `SB_API_TOKEN` | The credential to send: an API token, a sign-in token or the server token. The same as `SB_PAT_TOKEN`, which wins if both are set. |
+| `SB_API_TOKEN` | The credential to send: an API token, a sign-in token or the server token. It is the same as `SB_PAT_TOKEN`, which wins if both are set. |
 | `SB_TEAM` | The team to act for, sent as `X-AerolVM-Team`. Empty uses your first rule. |
 
 [Config defaults](https://github.com/aerol-ai/microvm/blob/main/setup/config-defaults.md) explains why each default is what it is.
@@ -734,19 +787,26 @@ Client settings, read by every SDK and the CLI:
 ### Monitoring
 
 - **Metrics:** `aerolvm_auth_requests_total` (by credential kind and origin), `aerolvm_auth_failures_total` (by reason), `aerolvm_identity_mirror_age_seconds`, `aerolvm_identity_jwks_fetch_total`, `aerolvm_identity_file_info`, `aerolvm_identity_file_load_errors_total`, `aerolvm_api_tokens` (by role), `aerolvm_pat_scope_drift` and `aerolvm_auth_client_ip_dropped_total`.
-- **Alerts:** the server token used from outside, servers with different `SB_PAT_SCOPE` settings, a stale token list, failing key fetches, identity files that differ between servers, and identity file load errors. They are in [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml).
+- **Alerts:** they are in [`setup/prometheus/sandboxd-alerts.yml`](https://github.com/aerol-ai/microvm/blob/main/setup/prometheus/sandboxd-alerts.yml). They fire when:
+  - the server token is used from outside;
+  - servers have different `SB_PAT_SCOPE` settings;
+  - the token list goes stale;
+  - key fetches fail;
+  - identity files differ between servers;
+  - an identity file fails to load.
 - **Dashboard:** the "Identity and access" row in `setup/grafana/d9-security-isolation.json`.
-- **Traces:** each request span carries the caller's kind, ID, team and the permission checked. Display names never go into traces.
-- **Runbook:** [`setup/runbooks/identity-and-access.md`](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md) covers every alert, rotating the server token and the scrape token, the first admin token, a provider outage, and turning on `SB_PAT_SCOPE=host`.
+- **Traces:** each request span carries the caller's kind, ID and team, and the permission checked. Display names never go into traces.
+- **Runbook:** [`setup/runbooks/identity-and-access.md`](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/identity-and-access.md) covers every alert. It also covers rotating the server token and the scrape token, the first admin token, a provider outage, and turning on `SB_PAT_SCOPE=host`.
 
 ### Upgrades and rollback
 
 - **A cluster starts writing callers into audit records only when every server runs this release.** During a rolling upgrade, records look as they did before.
-- **Do not roll back below this release once a server has written a caller.** An older server cannot verify those records, so it refuses to start while `SB_SECRET_AUDIT_STRICT_BOOT` is on, which enterprise mode requires. An older `aerolvm audit verify` fails the same way, so upgrade the CLI first.
-- **To turn access control off,** set `SB_IDENTITY_ENABLED=false` and restart. Tokens stay stored, and the server token works as before. Enterprise mode refuses this.
+- **Once a server has written a caller, do not roll back below this release.** An older server cannot check those records. So it refuses to start while `SB_SECRET_AUDIT_STRICT_BOOT` is on, which enterprise mode requires. An older `aerolvm audit verify` fails the same way, so upgrade the CLI first.
+- **To turn SSO and tokens off,** set `SB_IDENTITY_ENABLED=false` and restart. Tokens stay stored, and the server token works as before. Enterprise mode refuses this.
 
 ## Next steps
 
+- [How AerolVM checks who you are](/engineering-identity-and-access/): the design behind this page, with diagrams.
 - [aerolvm CLI](/cli/#save-your-login): sign in, check who you are, and manage tokens from a terminal.
 - [Dashboard](/dashboard/): sign in to the web console.
 - [Audit and compliance](/enterprise/audit-evidence/): the records, the SOC 2 mapping and the access review.
