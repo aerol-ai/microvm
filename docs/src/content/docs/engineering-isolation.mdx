@@ -276,7 +276,7 @@ GPU sandboxes need the Docker engine. NVIDIA GPUs are passed in through Docker. 
 
 - **Every call needs a credential.** The server compares its own token in constant time, so its timing does not reveal the token.
 - **By default the server has one token**, the operator token. Whoever holds it is trusted like the server's operator.
-- **With [access control](/enterprise/access-control/) on,** people sign in with their company account and services get their own scoped tokens. Each has one role on one team, and another team's sandboxes answer `404`.
+- **With [access control](/enterprise/sso/) on,** people sign in with their company account and services get their own scoped tokens. Each has one role on one team, and another team's sandboxes answer `404`.
 
 ## Where this boundary ends
 

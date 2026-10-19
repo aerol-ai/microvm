@@ -160,9 +160,9 @@ Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you 
 | `--client-secret-stdin` | Read the provider app's client secret from stdin, and save it with the login. Only Google needs this. Your admin gives you the value. |
 | `--token-stdin` | Read an API token from stdin instead of signing in. |
 
-Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [Access control](/enterprise/access-control/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
+Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
 
-When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [Access control](/enterprise/access-control/) explains roles, teams and rules.
+When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [SSO](/enterprise/sso/) explains roles, teams and rules.
 
 ### Check who you are
 
@@ -216,7 +216,7 @@ aerolvm token revoke tok_7Hq2aBcDeFgH
 - **`revoke`** takes the ID (`tok_…`) or the token itself. It succeeds even when the token is already gone. Every server stops accepting it within seconds.
 - `create` and `revoke` need an admin. `list` needs an auditor or an admin.
 
-The server needs `SB_IDENTITY_ENABLED=true` to accept the tokens it creates. See [Access control](/enterprise/access-control/#give-a-service-its-own-token).
+The server needs `SB_IDENTITY_ENABLED=true` to accept the tokens it creates. See [SSO](/enterprise/sso/#give-a-service-its-own-token).
 
 ### Search audit records
 
@@ -434,11 +434,11 @@ Every command is an ordinary API call, so the SDKs do the same. This is [Your fi
   </TabItem>
 </Tabs>
 
-`aerolvm whoami` and `aerolvm token` are `whoami()` and `tokens` in every SDK. See [Access control](/enterprise/access-control/).
+`aerolvm whoami` and `aerolvm token` are `whoami()` and `tokens` in every SDK. See [SSO](/enterprise/sso/).
 
 ## Next steps
 
-- [Access control](/enterprise/access-control/): roles, teams, API tokens and SSO.
+- [SSO](/enterprise/sso/): company sign-in, roles, teams and API tokens.
 - [MCP server](/mcp/): give an AI coding tool its own sandboxes through the same program.
 - [Run commands](/exec-streaming/): what `exec` does, from the SDK side.
 - [Terminal sessions](/sessions/): the shells and background commands behind `shell` and `--background`.

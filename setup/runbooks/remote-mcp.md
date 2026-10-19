@@ -248,7 +248,7 @@ Zitadel's documentation):
    token the project issues. The issuer's `url` is the same instance URL
    the CLI and dashboard use, so it is the same identity-file issuer.
 5. Add the `groupsClaim` Action ("Zitadel roles as groups" in
-   [Access control](../../docs/src/content/docs/enterprise/access-control.mdx))
+   [SSO](../../docs/src/content/docs/enterprise/sso.mdx))
    to the Complement Token flow's Pre access token creation trigger too, so
    access tokens carry `groups`. Actions run from each person's own
    organization, whichever project the app is in.

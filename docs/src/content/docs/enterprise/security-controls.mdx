@@ -79,7 +79,7 @@ flowchart TB
 | IM‑2 | Permission on every route | Yes | AerolVM | Each route needs a permission. Cluster changes, templates and the debug counters need the `admin` role or the server token. |
 | IM‑3 | A separate SSH key for each sandbox | Yes, when SSH is on | AerolVM | The private key is returned once and never stored. Set `SB_ENABLE_SSH_GATEWAY=false` if you do not use SSH. |
 | IM‑4 | Cluster server identity | Required in cluster mode | Shared | Keep the cluster authority's key safe, and renew certificates before their 90 days end |
-| IM‑5 | Single sign-on | No | You | `SB_IDENTITY_ENABLED=true` and an identity file naming your provider. See [Access control](/enterprise/access-control/). |
+| IM‑5 | Single sign-on | No | You | `SB_IDENTITY_ENABLED=true` and an identity file naming your provider. See [SSO](/enterprise/sso/). |
 | IM‑6 | Scoped tokens and roles | No | You | `SB_IDENTITY_ENABLED=true`. Tokens expire, and each has one role on one team. Required by enterprise mode. |
 | IM‑7 | Server token limited to the server | No | You | `SB_PAT_SCOPE=host` (`install.sh --pat-scope host`), so remote callers must use named credentials. Required by enterprise mode. |
 

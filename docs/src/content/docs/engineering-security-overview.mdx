@@ -23,7 +23,7 @@ Every claim here was checked against the code. Where a protection stops, the pos
 
 ## In short
 
-- Every API call carries a credential, and every server checks it on its own. By default that is the server's one token, checked in constant time. With [access control](/enterprise/access-control/) on, people sign in with their company account and services get their own tokens, each with one role on one team.
+- Every API call carries a credential, and every server checks it on its own. By default that is the server's one token, checked in constant time. With [access control](/enterprise/sso/) on, people sign in with their company account and services get their own tokens, each with one role on one team.
 - A new sandbox is private. Nobody can reach it until you share a port.
 - Secrets are encrypted with AES-256-GCM before they touch the disk. Environment variables are also bound to their own sandbox, so a copy cannot be opened for another one.
 - Servers in a cluster prove who they are with certificates signed by the cluster's own authority.
@@ -122,7 +122,7 @@ Every API call must carry the token. The server compares it in constant time. A 
 
 The API itself speaks plain HTTP. In domain mode, Caddy (the web server in front of AerolVM) adds HTTPS, so the token travels encrypted. Keep port `21212` private, so HTTPS is the only way in. The [Hardening](/enterprise/hardening/) checklist shows how.
 
-With access control on, people and services stop sharing that token. A person signs in with their company account through `aerolvm login` or the dashboard. The company's identity provider signs a short-lived token, and every AerolVM server checks that signature with the provider's public keys, with no call to a login service. A service gets its own API token, which an admin creates and can revoke. Each credential carries one role on one team, and another team's sandbox looks like it does not exist. The [access control](/enterprise/access-control/) page explains it.
+With access control on, people and services stop sharing that token. A person signs in with their company account through `aerolvm login` or the dashboard. The company's identity provider signs a short-lived token, and every AerolVM server checks that signature with the provider's public keys, with no call to a login service. A service gets its own API token, which an admin creates and can revoke. Each credential carries one role on one team, and another team's sandbox looks like it does not exist. The [access control](/enterprise/sso/) page explains it.
 
 A few calls need the admin role, such as changing the cluster. Two pages are open on purpose: a health check for load balancers, and the dashboard's web page. The dashboard page holds no data itself. You sign in to it, and every data call it makes still needs your credential.
 

@@ -12,7 +12,7 @@ MCP, the [Model Context Protocol](https://modelcontextprotocol.io), is a standar
 ## Before you start
 
 - **Install the aerolvm CLI.** See [Install](/cli/#install).
-- **Have your server's address and token ready.** They are the same ones the SDKs use. After the [Quickstart](/quick-start/), the address is `http://localhost:21212` and the token is the one you picked. If your server uses [access control](/enterprise/access-control/), use your own API token, or sign in once with `aerolvm login` and skip the token (see [Use your saved login](#use-your-saved-login)).
+- **Have your server's address and token ready.** They are the same ones the SDKs use. After the [Quickstart](/quick-start/), the address is `http://localhost:21212` and the token is the one you picked. If your server uses [access control](/enterprise/sso/), use your own API token, or sign in once with `aerolvm login` and skip the token (see [Use your saved login](#use-your-saved-login)).
 
 ## Set up your AI tool
 
@@ -220,7 +220,7 @@ Send your API token as a bearer token. For example, in Claude Code:
 claude mcp add --transport http aerolvm "https://sandbox.example.com/mcp?sandbox=my-agent&create_if_missing=true" --header "Authorization: Bearer $SB_PAT_TOKEN"
 ```
 
-With [access control](/enterprise/access-control/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts only as long as your provider's sign-in, often about an hour. If your credential belongs to several teams, add `--header "X-AerolVM-Team: checkout"`: every tool call then acts for that team. The server token works only if the operator has not limited it to the server. Once they have, a server token sent to `/mcp` from outside is refused, and the tool calls it would make count as outside too, on every server they reach.
+With [access control](/enterprise/sso/) on, use an API token of your own (`avm_…`). A sign-in token from `aerolvm auth token` works too, but it lasts only as long as your provider's sign-in, often about an hour. If your credential belongs to several teams, add `--header "X-AerolVM-Team: checkout"`: every tool call then acts for that team. The server token works only if the operator has not limited it to the server. Once they have, a server token sent to `/mcp` from outside is refused, and the tool calls it would make count as outside too, on every server they reach.
 
 - **Any server in a cluster can answer.** The endpoint keeps nothing between requests.
 - **Each call runs with your token's permissions,** through the same checks as a direct API call.
@@ -259,7 +259,7 @@ How a connector signs in:
 
 The server counts tool calls by tool and result in the `aerolvm_mcp_tool_calls_total` metric. It writes one log line per call, with the tool, sandbox, owner, result and time taken. It never logs arguments or output.
 
-To turn on [OAuth sign-in](#sign-in-with-oauth), set `SB_IDENTITY_ENABLED=true`, an identity file, and `SB_MCP_ENABLED=true` on every server. Then add these to the [identity file](/enterprise/access-control/#step-2-write-the-identity-file):
+To turn on [OAuth sign-in](#sign-in-with-oauth), set `SB_IDENTITY_ENABLED=true`, an identity file, and `SB_MCP_ENABLED=true` on every server. Then add these to the [identity file](/enterprise/sso/#step-2-write-the-identity-file):
 
 ```yaml
 issuers:
@@ -361,7 +361,7 @@ Each tool call is an ordinary API call, made with your credential. This is what 
 ## Next steps
 
 - [aerolvm CLI](/cli/): the same program, used by hand from your terminal.
-- [Access control](/enterprise/access-control/): give each agent its own token, with a role and a team.
+- [SSO](/enterprise/sso/): give each agent its own token, with a role and a team.
 - [Allow only some websites](/network-access/#allow-only-some-websites): limit where an agent's sandbox can connect.
 - [Create and manage sandboxes](/sandboxes/): set idle timers like the ones MCP uses.
 - [Run commands](/exec-streaming/): what `exec` does under the hood.
