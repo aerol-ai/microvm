@@ -700,6 +700,7 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if startError != "" {
 		_ = conn.WriteJSON(map[string]any{"type": "error", "message": startError})
+		hangUp(conn, nil)
 		return
 	}
 
@@ -707,7 +708,9 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 	killed := make(chan struct{})
 	var killOnce sync.Once
 	kill := func() { killOnce.Do(func() { close(killed) }) }
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		defer stdinW.Close()
 		for {
 			msgType, data, err := conn.ReadMessage()
@@ -716,9 +719,9 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if msgType == websocket.BinaryMessage {
-				if _, err := stdinW.Write(data); err != nil {
-					return
-				}
+				// Once the command is done the pipe is closed and input
+				// is dropped, but still read: see hangUp.
+				_, _ = stdinW.Write(data)
 				continue
 			}
 			var ctrl control
@@ -746,6 +749,7 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 		defer writeMu.Unlock()
 		_ = conn.WriteMessage(websocket.BinaryMessage, append([]byte{stream}, b...))
 	}, killed)
+	_ = stdinR.Close() // nobody reads it now; a pending write must not block the reader
 	if signal == DropStream {
 		_ = conn.UnderlyingConn().Close()
 		return
@@ -753,6 +757,35 @@ func (s *Server) execStream(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	_ = conn.WriteJSON(map[string]any{"type": "exit", "code": code, "signal": signal})
 	writeMu.Unlock()
+	hangUp(conn, drained)
+}
+
+// clientHangUpWait bounds how long a finished exec stream waits for its
+// client to hang up before closing anyway.
+const clientHangUpWait = 5 * time.Second
+
+// hangUp ends an exec stream whose last frame is written. Closing the
+// socket while a client frame sits unread in it (a stdin close or resize
+// that landed after the reader's last read) makes the kernel reset the
+// connection, and the reset throws away the output and exit frame not yet
+// delivered: the client reports a dropped stream for a command that
+// finished (TestExecBoundsOutput, CI runs 37225385691 and 38985693849).
+// So it sends a close frame and waits for the client to hang up first; the
+// SDK does once it reads the exit frame, and a raw websocket client
+// answers the close frame. drained is closed once the stream's reader has
+// seen the client go; nil means no reader runs, and hangUp reads itself.
+func hangUp(conn *websocket.Conn, drained <-chan struct{}) {
+	_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(clientHangUpWait))
+	if drained != nil {
+		<-drained
+		return
+	}
+	for {
+		if _, _, err := conn.NextReader(); err != nil {
+			return
+		}
+	}
 }
 
 // control is a JSON control frame a client sends on an exec or attach
