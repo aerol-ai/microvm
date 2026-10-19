@@ -13,12 +13,12 @@ timeline
     June 2026 : 4 releases : v0.5.1 to v0.5.4
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
-    October 2026 : 7 releases : v0.6.1 to v0.6.7
+    October 2026 : 8 releases : v0.6.1 to v0.6.8
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 8 | Sep 28, 2026 to Oct 16, 2026 | [v0.6.7](#v067-enterprise-mode-with-the-free-download) |
+| [0.6](#06-release-line) | 9 | Sep 28, 2026 to Oct 19, 2026 | [v0.6.8](#v068-sso-roles-and-the-caller-in-every-audit-record) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -26,6 +26,29 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.8: SSO, roles, and the caller in every audit record
+
+*October 19, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.8)
+
+Named callers, company SSO, roles, and the caller in every audit record. This closes the three questions a security review asks: can each person sign in with their company account, can access be limited by role, and is every action tied to a named person. It answers Discussions #646, #647 and #649 as one feature.
+
+> **Identity is off by default.** With `SB_IDENTITY_ENABLED` unset, a server behaves exactly as before, except audit records now name `caller: operator` or `caller: system`. The operator token (PAT) is unchanged and stays the break-glass and node-to-node credential. Single-node and local Docker installs need nothing new.
+
+- **Company SSO, with no login server.** People and CI sign in with your identity provider over OIDC; each node verifies the provider's signed token itself, so there is no session store and no new service to run. `aerolvm login --sso`, the dashboard, GitHub Actions and Kubernetes workload tokens all use it. Verified locally against Keycloak, with setup docs for Authentik and Zitadel; Okta, Entra ID and Google follow the same OIDC path.
+- **Four roles, scoped to a team or the fleet.** `viewer`, `runner`, `auditor` and `admin`. Every route declares the permission it needs, and a team token sees only its own sandboxes.
+- **Scoped API tokens for services and CI.** `avm_…` tokens are hashed, expiring and revocable within about 15 seconds across a cluster. Mint them with `aerolvm token create` or `POST /v1/tokens`.
+- **The caller in every audit record.** A hash-chained `caller` field, plus a chain record for every create, delete, exec, file, port, snapshot and token call (kind `api`). A forwarded request is attributed on the owner node, with the edge node recorded as `via`.
+- **Enforced SSO.** `SB_PAT_SCOPE=host` confines the shared operator token to the host and cluster peers, so remote people must use SSO or a scoped token.
+
+**Before you upgrade:**
+
+- **Nothing changes unless you set `SB_IDENTITY_ENABLED=true`.** The PAT is unchanged; audit records simply gain `caller: operator` or `caller: system`.
+- **Rollback floor: do not roll back past v0.6.8 once a node has written a `caller` record.** An older binary fails strict audit-boot verification on that log. Recovery is to stay on v0.6.8 or boot once with `SB_SECRET_AUDIT_BOOT_VERIFY=warn`. Upgrade the `aerolvm` CLI first, because an older `aerolvm audit verify` fails the same way.
+- **Rolling upgrades are safe.** In a cluster the new audit fields and record kinds are written only once every member runs this release (the gossip `fv` gate); until then records are written as before.
+- **Enterprise mode now requires `SB_IDENTITY_ENABLED=true` and `SB_PAT_SCOPE=host`.**
+- **`SB_PAT_SCOPE=host` moves remote PAT users to SSO or a scoped token.** The dashboard, remote `/mcp`, remote SDK scripts and the Prometheus scrape then need a named credential; set an optional `metrics_token` in `config/secrets.yml` for the scrape (leaving it unset keeps the PAT).
+- **Re-run `install.sh`** to pick up the PROXY-protocol wrapper on the L4 fallback. A binary-only upgrade leaves it off, so nothing breaks.
 
 ### v0.6.7: Enterprise mode with the free download
 
