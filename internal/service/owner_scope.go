@@ -7,6 +7,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
 
 // ownerScope reports the account a request is fenced to. scoped=false means the
@@ -40,6 +41,24 @@ func ownerScope(ctx context.Context) (owner string, scoped bool) {
 // !scoped; TestOwnerScopeCallSitesAreReviewed fails on an unreviewed use.
 func hostCapable(ctx context.Context) bool {
 	return controlplane.HostCapable(ctx)
+}
+
+// wasmResolveContext annotates ctx for the WASM module resolver so that a caller
+// which is not host-capable (a scoped tenant) cannot resolve a module from a raw
+// host path (absolute, file://, or a bare operator-staged filename under
+// ModulesDir — resolver step 4). Operator, node and internal callers are
+// host-capable and pass through unmarked, keeping host-path resolution.
+//
+// It is the WASM counterpart of the hostCapable gate the raw-mount and file://
+// jsbundle paths already use (eng review D3/D7): scope is not power, so a runner
+// bound to every team is unscoped but still refused a host path. Reserved
+// keywords and oci:// / owned-catalogue refs resolve for everyone, so a tenant
+// loses only the host-path escape (plans/identity-and-access.md §5.1).
+func wasmResolveContext(ctx context.Context) context.Context {
+	if hostCapable(ctx) {
+		return ctx
+	}
+	return wasmmod.WithHostPathsDenied(ctx)
 }
 
 // enforceOwner returns store.ErrNotFound when a user-scoped caller references a

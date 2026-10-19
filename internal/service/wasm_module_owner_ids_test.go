@@ -135,13 +135,15 @@ func TestWasmModuleCatalogue_PerOwnerIDs(t *testing.T) {
 		}
 	}
 
-	// B deletes its digest row: A's row survives, and the bytes A's row still
-	// pins are left alone.
+	// B deletes its digest row: A's row survives. A tenant (acct-B) is not
+	// host-capable, so its delete reclaims no host bytes at all — the module
+	// file it only ever referenced is left for the operator to reap (issue
+	// #537). RemoveImage therefore never fires on any tenant delete below.
 	if err := svc.DeleteWasmModule(b, modA.ID); err != nil {
 		t.Fatalf("B delete own: %v", err)
 	}
 	if len(rt.removeImages) != 0 {
-		t.Fatalf("RemoveImage = %v while A's row still pins the bytes", rt.removeImages)
+		t.Fatalf("RemoveImage = %v; a tenant delete must not reclaim host bytes (#537)", rt.removeImages)
 	}
 	if _, _, ok := svc.ResolveOwnedWasmModule(a, modA.ID); !ok {
 		t.Fatal("A's module stopped resolving after B's delete")
@@ -149,19 +151,17 @@ func TestWasmModuleCatalogue_PerOwnerIDs(t *testing.T) {
 	if err := svc.DeleteWasmModule(b, modA.ID); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("B delete again = %v, want ErrNotFound (A's row is out of reach)", err)
 	}
-	// B's shadow of the operator id still pins the same bytes, so A's delete
-	// keeps them too; B's last row then takes them.
+	// Both remaining rows belong to tenants, so neither delete reclaims bytes:
+	// the row goes, the shared host file stays. A's delete drops A's row; B's
+	// delete drops B's shadow and the operator ("") row surfaces again.
 	if err := svc.DeleteWasmModule(a, modA.ID); err != nil {
 		t.Fatalf("A delete own: %v", err)
-	}
-	if len(rt.removeImages) != 0 {
-		t.Fatalf("RemoveImage = %v while B's std-mod row still pins the bytes", rt.removeImages)
 	}
 	if err := svc.DeleteWasmModule(b, "std-mod"); err != nil {
 		t.Fatalf("B delete shadow row: %v", err)
 	}
-	if len(rt.removeImages) != 1 || rt.removeImages[0] != refB {
-		t.Fatalf("RemoveImage = %v, want [%s]", rt.removeImages, refB)
+	if len(rt.removeImages) != 0 {
+		t.Fatalf("RemoveImage = %v; tenant deletes must never reclaim host bytes (#537)", rt.removeImages)
 	}
 	if got, err := svc.GetWasmModule(b, "std-mod"); err != nil || got.ModuleRef != "std" {
 		t.Fatalf("B get after deleting its shadow = %+v, %v; want the operator row back", got, err)

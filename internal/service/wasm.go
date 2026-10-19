@@ -165,7 +165,11 @@ func (s *Service) createWasmSandbox(ctx context.Context, req models.CreateSandbo
 	// row will carry, which a failover recreate knows only from its placement
 	// (its context has no caller). Computed once, here, and reused below.
 	ownerRef := s.ownerRefForCreateOrRecreate(ctx, sandboxID)
-	state, err := s.wasm.Create(wasmmod.WithCatalogueOwner(ctx, ownerRef), req, sandboxID, toolboxToken, binds)
+	// wasmResolveContext stops a scoped tenant from booting a sandbox off a raw
+	// host path (module_ref:"/path" or "file://…"); an internal failover/recreate
+	// has no caller and stays host-capable, so a stored operator path still
+	// resolves on replay (issue #537).
+	state, err := s.wasm.Create(wasmmod.WithCatalogueOwner(wasmResolveContext(ctx), ownerRef), req, sandboxID, toolboxToken, binds)
 	if err != nil {
 		cleanupMounts()
 		releaseAdmission()
