@@ -604,50 +604,54 @@ Register two apps at your identity provider: one for the CLI and one for the das
 
 PKCE is a standard way for an app with no secret to sign in safely. A redirect URI is the address the provider sends you back to after you sign in.
 
-Notes for each provider:
-
-- **Okta.**
-  - Create a Native app for the CLI, with the Refresh Token grant. Add Device Authorization too, for `--device`.
-  - Create a Single-Page app for the dashboard. Add `https://<api-domain>` as a Trusted Origin for CORS.
-  - Add a groups claim to the ID token.
-- **Entra ID.**
-  - The issuer `url` is `https://login.microsoftonline.com/<tenant>/v2.0`.
-  - Use the "Mobile and desktop applications" platform for the CLI. Turn on public client flows for `--device`.
-  - Use the "Single-page application" platform for the dashboard.
-  - Above 200 groups, Entra leaves the groups out of the token. Bind on app roles instead: `{ issuer: entra, app_role: AerolVM.Runner, role: runner, team: payments }`.
-- **Keycloak.**
-  - The issuer `url` is `https://<keycloak>/realms/<realm>`. Set Keycloak's `hostname` option (`KC_HOSTNAME`) to that public address. Without it, Keycloak writes whatever host a request used into the token's issuer. Then a server that reaches Keycloak by another address sees an issuer that does not match, and sign-in fails. Every server must reach that address.
-  - Make both clients public, with the standard flow. Set **Proof Key for Code Exchange Code Challenge Method** to `S256` on both. Turn on **OAuth 2.0 Device Authorization Grant** on the CLI client, for `--device`. The CLI sends PKCE on the device flow too when Keycloak asks for it.
-  - On `--device`, Keycloak shows a page that asks you to grant access, even with **Consent required** off. Approve it to finish signing in.
-  - Set the dashboard client's **Web origins** to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Without it, the dashboard says "Keycloak didn't sign you in (network_error)".
-  - Add a **Group Membership** mapper with the claim name `groups` and **Add to ID token** on. Put it in a client scope that both clients get, such as a default client scope.
-  - Turn **Full group path** off. It is on by default. Then Keycloak sends `/platform-admins` instead of `platform-admins`, and no `group: platform-admins` rule matches. If you keep it on, write the rules with the slash: `group: /platform-admins`.
-- **Google.**
-  - Use `kind: google`. Google gets its own button.
-  - The CLI app is a "Desktop app". Google still wants that app's client secret. Hand it to people when they start. They run `aerolvm login --sso <url> --client-secret-stdin` once. It never goes on the server.
-  - Google offers the device flow only to a "TVs and Limited Input devices" client. The CLI uses one client ID for both flows, so pick the type you need.
-  - The dashboard app is a "Web application" with `https://<api-domain>` as an authorized JavaScript origin.
-- **Authentik.** Each Authentik application has its own issuer URL. So use **one** application for both the CLI and the dashboard:
-  - The issuer `url` is `https://<authentik>/application/o/<slug>/`, with the slash at the end. Keep the provider's issuer mode at its default, one issuer per provider. Don't rename the slug later. Both changes change the issuer.
-  - Make its OAuth2/OpenID provider a **Public** client. Put its client ID in `audiences`, and as both `clients.cli` and `clients.dashboard`.
-  - Add the redirect URI `https://<api-domain>/ui` as **Strict**. Add `http://127\.0\.0\.1:\d+/callback` as **Regex**, so the CLI's random port matches. Authentik allows cross-origin calls from the address of each Strict redirect URI, so the dashboard needs nothing more.
-  - Pick an RSA **Signing Key**, such as the built-in "authentik Self-signed Certificate". With no signing key, Authentik signs with HS256, which the server refuses. Leave **Encryption Key** empty.
-  - Add the `offline_access` scope to the provider, so the CLI login can renew itself. For `--device`, give your brand a device code flow.
-  - The default `profile` scope puts a `groups` list in the ID token, so group rules work as they are. Authentik's default `email` scope says the email is not verified, so a rule on `email` never matches.
-  - Keep **Subject mode** at its default, a hashed user ID. Each person's ID is built from it, and a change gives everyone a new ID.
-- **Zitadel.** The issuer `url` is your instance's domain, such as `https://acme-abc123.zitadel.cloud`, with no slash at the end.
-  - Put the CLI and dashboard apps in a project of their own. Zitadel puts the client ID of every app in a project into every token that project issues. So a sign-in token for any other app in that project would also work here.
-  - For the CLI, create a **Native** app with PKCE. Turn on the Refresh Token and Device Code grant types. Register `http://127.0.0.1/callback`. Zitadel accepts any port on it for a native app.
-  - For the dashboard, create a **User Agent** app with PKCE. Zitadel allows cross-origin calls from the redirect URI's address, so it needs no extra origin. To sign in through an SSH tunnel too, add `http://localhost:21212/ui` and turn on **Development Mode**. Zitadel allows an `http` redirect URI on a non-native app only in that mode.
-  - Zitadel's roles claim is an object, which the server can't match. Add a flat `groups` claim with a Zitadel Action, as [Zitadel roles as groups](#zitadel-roles-as-groups) shows.
-  - The ID token always has `preferred_username`, the person's login name. It has the email only when **User Info inside ID Token** is on. Set `username: preferred_username`, or turn that setting on to show or bind on `email`.
-  - Zitadel's ID tokens last 12 hours by default, not one hour. To cut off a removed person sooner, shorten the ID token lifetime in your instance's OIDC settings.
-
 The dashboard works only over HTTPS, or from `localhost` through an SSH tunnel. [Dashboard](/dashboard/#set-up-sign-in-for-the-dashboard) has the details.
 
-Authentik and Zitadel have not been tested against a live account yet. These steps follow each provider's own documentation.
+Each provider has its own notes below.
 
-For these two, the issuers in the identity file look like this:
+#### Okta
+
+- Create a Native app for the CLI, with the Refresh Token grant. Add Device Authorization too, for `--device`.
+- Create a Single-Page app for the dashboard. Add `https://<api-domain>` as a Trusted Origin for CORS.
+- Add a groups claim to the ID token.
+
+#### Entra ID
+
+- The issuer `url` is `https://login.microsoftonline.com/<tenant>/v2.0`.
+- Use the "Mobile and desktop applications" platform for the CLI. Turn on public client flows for `--device`.
+- Use the "Single-page application" platform for the dashboard.
+- Above 200 groups, Entra leaves the groups out of the token. Bind on app roles instead: `{ issuer: entra, app_role: AerolVM.Runner, role: runner, team: payments }`.
+
+#### Keycloak
+
+- The issuer `url` is `https://<keycloak>/realms/<realm>`. Set Keycloak's `hostname` option (`KC_HOSTNAME`) to that public address. Without it, Keycloak writes whatever host a request used into the token's issuer. Then a server that reaches Keycloak by another address sees an issuer that does not match, and sign-in fails. Every server must reach that address.
+- Make both clients public, with the standard flow. Set **Proof Key for Code Exchange Code Challenge Method** to `S256` on both. Turn on **OAuth 2.0 Device Authorization Grant** on the CLI client, for `--device`. The CLI sends PKCE on the device flow too when Keycloak asks for it.
+- On `--device`, Keycloak shows a page that asks you to grant access, even with **Consent required** off. Approve it to finish signing in.
+- Set the dashboard client's **Web origins** to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Without it, the dashboard says "Keycloak didn't sign you in (network_error)".
+- Add a **Group Membership** mapper with the claim name `groups` and **Add to ID token** on. Put it in a client scope that both clients get, such as a default client scope.
+- Turn **Full group path** off. It is on by default. Then Keycloak sends `/platform-admins` instead of `platform-admins`, and no `group: platform-admins` rule matches. If you keep it on, write the rules with the slash: `group: /platform-admins`.
+
+#### Google
+
+- Use `kind: google`. Google gets its own button.
+- The CLI app is a "Desktop app". Google still wants that app's client secret. Hand it to people when they start. They run `aerolvm login --sso <url> --client-secret-stdin` once. It never goes on the server.
+- Google offers the device flow only to a "TVs and Limited Input devices" client. The CLI uses one client ID for both flows, so pick the type you need.
+- The dashboard app is a "Web application" with `https://<api-domain>` as an authorized JavaScript origin.
+
+#### Authentik
+
+Authentik has not been tested against a live account yet. These steps follow Authentik's own documentation.
+
+Each Authentik application has its own issuer URL. So use **one** application for both the CLI and the dashboard:
+
+- The issuer `url` is `https://<authentik>/application/o/<slug>/`, with the slash at the end. Keep the provider's issuer mode at its default, one issuer per provider. Don't rename the slug later. Both changes change the issuer.
+- Make its OAuth2/OpenID provider a **Public** client. Put its client ID in `audiences`, and as both `clients.cli` and `clients.dashboard`.
+- Add the redirect URI `https://<api-domain>/ui` as **Strict**. Add `http://127\.0\.0\.1:\d+/callback` as **Regex**, so the CLI's random port matches. Authentik allows cross-origin calls from the address of each Strict redirect URI, so the dashboard needs nothing more.
+- Pick an RSA **Signing Key**, such as the built-in "authentik Self-signed Certificate". With no signing key, Authentik signs with HS256, which the server refuses. Leave **Encryption Key** empty.
+- Add the `offline_access` scope to the provider, so the CLI login can renew itself. For `--device`, give your brand a device code flow.
+- The default `profile` scope puts a `groups` list in the ID token, so group rules work as they are. Authentik's default `email` scope says the email is not verified, so a rule on `email` never matches.
+- Keep **Subject mode** at its default, a hashed user ID. Each person's ID is built from it, and a change gives everyone a new ID.
+
+Its issuer in the identity file looks like this:
 
 ```yaml
 issuers:
@@ -657,6 +661,27 @@ issuers:
     audiences: [Kq7wP2mXv9]                                # the provider's client ID
     clients: { cli: Kq7wP2mXv9, dashboard: Kq7wP2mXv9 }    # one app serves both
     claims: { username: email, groups: groups }
+bindings:
+  - { issuer: authentik, group: platform-admins, role: admin }
+```
+
+#### Zitadel
+
+Zitadel has not been tested against a live account yet. These steps follow Zitadel's own documentation.
+
+The issuer `url` is your instance's domain, such as `https://acme-abc123.zitadel.cloud`, with no slash at the end.
+
+- Put the CLI and dashboard apps in a project of their own. Zitadel puts the client ID of every app in a project into every token that project issues. So a sign-in token for any other app in that project would also work here.
+- For the CLI, create a **Native** app with PKCE. Turn on the Refresh Token and Device Code grant types. Register `http://127.0.0.1/callback`. Zitadel accepts any port on it for a native app.
+- For the dashboard, create a **User Agent** app with PKCE. Zitadel allows cross-origin calls from the redirect URI's address, so it needs no extra origin. To sign in through an SSH tunnel too, add `http://localhost:21212/ui` and turn on **Development Mode**. Zitadel allows an `http` redirect URI on a non-native app only in that mode.
+- Zitadel's roles claim is an object, which the server can't match. Add a flat `groups` claim with a Zitadel Action, as [Zitadel roles as groups](#zitadel-roles-as-groups) shows.
+- The ID token always has `preferred_username`, the person's login name. It has the email only when **User Info inside ID Token** is on. Set `username: preferred_username`, or turn that setting on to show or bind on `email`.
+- Zitadel's ID tokens last 12 hours by default, not one hour. To cut off a removed person sooner, shorten the ID token lifetime in your instance's OIDC settings.
+
+Its issuer in the identity file looks like this:
+
+```yaml
+issuers:
   - name: zitadel
     display_name: Acme Zitadel
     url: https://acme-abc123.zitadel.cloud                 # no trailing slash
@@ -664,8 +689,7 @@ issuers:
     clients: { cli: "290101", dashboard: "290102" }
     claims: { username: preferred_username, groups: groups }   # groups comes from the Action below
 bindings:
-  - { issuer: authentik, group: platform-admins, role: admin }
-  - { issuer: zitadel,   group: payments-eng,    role: runner, team: payments }   # a Zitadel role key
+  - { issuer: zitadel, group: payments-eng, role: runner, team: payments }   # a Zitadel role key
 ```
 
 #### Zitadel roles as groups
@@ -691,6 +715,55 @@ Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`)
 3. Under **Flows**, pick **Complement Token**. Add the Action to the **Pre Userinfo creation** trigger. That puts `groups` in ID tokens. For [MCP connectors](/mcp/#sign-in-with-oauth), also add it to **Pre access token creation**.
 
 Each role key becomes one group name. A person granted the `payments-eng` role in the project matches `{ issuer: zitadel, group: payments-eng, ... }`. Only roles from the app's own project are included.
+
+#### Dex
+
+Dex has not been tested against a live account yet. These steps follow Dex's own documentation and source code, for Dex v2.46.
+
+Dex signs people in through another system, such as LDAP, GitHub or a SAML provider. Dex calls each of these a connector. So Dex is also how a company that uses only SAML signs in to AerolVM.
+
+- The issuer `url` is the `issuer` in Dex's config file, such as `https://dex.acme.dev`. It must use `https`, and every server must reach it.
+- Add both apps under `staticClients`, each with `public: true`. Give the CLI client **no** `redirectURIs`. Dex then accepts `http://127.0.0.1` on any port, and the device flow for `--device`. Give the dashboard client the redirect URI `https://<api-domain>/ui`. For an SSH tunnel, add `http://localhost:21212/ui` too.
+- Set `web.allowedOrigins` to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Without it, Dex allows no cross-origin calls, and the dashboard says "didn't sign you in (network_error)".
+- Set `oauth2.skipApprovalScreen: true`. Otherwise Dex asks people to grant access every time they sign in.
+- Dex puts `groups` in the ID token only when an app asks for the `groups` scope. The CLI and the dashboard both ask for it, because Dex lists that scope. The groups come from your connector, and not every connector sends them. Check your connector's page in Dex's documentation.
+- Each person's ID is built from their user ID and the connector's `id`. Don't rename a connector's `id` later. That gives everyone a new ID.
+- Dex's ID tokens last 24 hours by default. The server accepts that. To cut off a removed person sooner, set `expiry.idTokens` to `1h`.
+- The dashboard renews a sign-in quietly before its ID token expires. Dex allows that only with its sessions feature, which is new and experimental in v2.46. Set `DEX_SESSIONS_ENABLED=true` and add a `sessions` block to Dex's config. Without it, the dashboard says "Your sign-in expired" when the token runs out, and people sign in again. The CLI renews with a refresh token instead, if your connector supports refresh.
+
+The parts of Dex's config file that matter here look like this:
+
+```yaml
+issuer: https://dex.acme.dev
+web:
+  allowedOrigins: ["https://api.acme.dev"]
+oauth2:
+  skipApprovalScreen: true
+expiry:
+  idTokens: "1h"
+staticClients:
+  - id: aerolvm-cli
+    name: AerolVM CLI
+    public: true                                      # no redirectURIs: any 127.0.0.1 port, plus --device
+  - id: aerolvm-dashboard
+    name: AerolVM dashboard
+    public: true
+    redirectURIs: ["https://api.acme.dev/ui"]
+```
+
+Its issuer in the identity file looks like this:
+
+```yaml
+issuers:
+  - name: dex
+    display_name: Acme Dex
+    url: https://dex.acme.dev                         # Dex's issuer, exactly
+    audiences: [aerolvm-cli, aerolvm-dashboard]       # the CLI and dashboard client IDs
+    clients: { cli: aerolvm-cli, dashboard: aerolvm-dashboard }
+    claims: { username: email, groups: groups }
+bindings:
+  - { issuer: dex, group: platform-admins, role: admin }
+```
 
 ### Step 4: Check it
 

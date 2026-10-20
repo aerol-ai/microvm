@@ -160,7 +160,7 @@ Either way, the login is saved in `~/.config/aerolvm/config.json`, and only you 
 | `--client-secret-stdin` | Read the provider app's client secret from stdin, and save it with the login. Only Google needs this. Your admin gives you the value. |
 | `--token-stdin` | Read an API token from stdin instead of signing in. |
 
-Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik and Zitadel.
+Over SSH, `--device` prints something like `aerolvm: to sign in, open https://acme.okta.com/activate and enter the code ABCD-EFGH. Waiting…`. It works only if your admin turned on the device flow for the CLI app at your provider. Some providers, such as Keycloak, then ask you to grant access on that page. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) lists that setting for Okta, Entra ID, Keycloak, Google, Authentik, Zitadel and Dex.
 
 When you sign in but the server has no rule for you, the CLI lists the groups your sign-in carried. Send that line to your AerolVM admin. [SSO](/enterprise/sso/) explains roles, teams and rules.
 

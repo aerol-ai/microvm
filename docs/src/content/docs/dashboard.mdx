@@ -215,8 +215,9 @@ Only issuers with `clients.dashboard` get a button, in the order of the identity
 | Google | Use `kind: google`. Create a "Web application" client with `https://<api-domain>` as an authorized JavaScript origin. Google uses its own sign-in button and pop-up. |
 | Authentik | Share one application with the CLI: a Public OAuth2/OpenID provider with an RSA signing key. Add `https://<api-domain>/ui` as a Strict redirect URI; Authentik then allows cross-origin calls from that address. The `profile` scope already puts `groups` in the ID token. |
 | Zitadel | A User Agent app with PKCE, in the CLI app's project, with no other apps in it. Zitadel's own roles claim is an object the server can't read, so add a flat `groups` claim with an Action. [SSO](/enterprise/sso/#zitadel-roles-as-groups) shows how. |
+| Dex | A static client with `public: true` and the `/ui` redirect URI. Set `web.allowedOrigins` to `https://<api-domain>`. Quiet renewal needs Dex's experimental sessions (`DEX_SESSIONS_ENABLED=true`); without them, people sign in again when the ID token expires. [SSO](/enterprise/sso/#dex) has the details. |
 
-Authentik and Zitadel have not been tested against a live tenant yet. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
+Authentik, Zitadel and Dex have not been tested against a live tenant yet. [SSO](/enterprise/sso/#step-3-register-the-apps-at-your-provider) has the full steps for every provider.
 
 - **The browser talks to your provider directly.** It reads the provider's discovery document and trades the sign-in code for a token. So your provider must allow cross-origin requests from your dashboard's address, and its token endpoint must be on the same address as its issuer URL. The page's Content-Security-Policy allows only those addresses.
 - **The discovery document** at `https://<api-domain>/.well-known/aerolvm-auth` lists the buttons and the dashboard's HTTPS address (`ui_url`, from `SB_DOMAIN`). The page reads it to draw the sign-in box.

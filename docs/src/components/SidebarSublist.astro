@@ -11,12 +11,16 @@ const isGroupActive = entry =>
 
 const isGroupCurrent = entry =>
   entry.homePageHref ? comparePaths(entry.homePageHref, Astro.url.pathname) : false
+
+const hasChildren = entry => entry.type === 'link' && entry.children?.length > 0
+
+const childListId = entry => `sidebar-children${entry.href.replace(/[^a-z0-9]+/gi, '-')}`
 ---
 
 <ul class:list={{ 'top-level': !nested, nested }}>
   {
     sublist.map(entry => (
-      <li>
+      <li class:list={{ 'has-children': hasChildren(entry) }}>
         {
           entry.type === 'link' ? (
             <a
@@ -54,10 +58,80 @@ const isGroupCurrent = entry =>
             </div>
           ) : null
         }
+        {
+          hasChildren(entry) && (
+            <>
+              <button
+                type="button"
+                class="children-toggle"
+                aria-expanded="false"
+                aria-controls={childListId(entry)}
+                aria-label={`${entry.label.replace(/^-\s*/, '')} sections`}
+              />
+              <ul id={childListId(entry)} class="children" hidden>
+                {entry.children.map(child => (
+                  <li>
+                    <a href={child.href}>
+                      <span>{child.label}</span>
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )
+        }
       </li>
     ))
   }
 </ul>
+
+<script>
+  // A link's children start closed; its toggle opens them. Landing on one of
+  // them opens the list and marks it, so a reader who picked "Okta" from
+  // another page still sees where they are.
+  const listFor = (toggle: HTMLElement) =>
+    document.getElementById(toggle.getAttribute('aria-controls') || '')
+
+  const setOpen = (toggle: HTMLElement, list: HTMLElement, open: boolean) => {
+    toggle.setAttribute('aria-expanded', String(open))
+    list.hidden = !open
+  }
+
+  const pathAndHash = (url: { pathname: string; hash: string }) =>
+    url.pathname.replace(/\/$/, '') + url.hash
+
+  const markCurrent = () => {
+    const here = pathAndHash(location)
+    document.querySelectorAll<HTMLElement>('.children-toggle').forEach(toggle => {
+      const list = listFor(toggle)
+      if (!list) return
+      let current = false
+      list.querySelectorAll<HTMLAnchorElement>('a').forEach(link => {
+        const match = pathAndHash(new URL(link.href)) === here
+        if (match) link.setAttribute('aria-current', 'location')
+        else link.removeAttribute('aria-current')
+        current ||= match
+      })
+      if (current) setOpen(toggle, list, true)
+    })
+  }
+
+  const onReady = () => {
+    document.querySelectorAll<HTMLElement>('.children-toggle').forEach(toggle => {
+      if (toggle.dataset.bound) return
+      toggle.dataset.bound = 'true'
+      toggle.addEventListener('click', () => {
+        const list = listFor(toggle)
+        if (list) setOpen(toggle, list, list.hidden)
+      })
+    })
+    markCurrent()
+  }
+
+  document.addEventListener('DOMContentLoaded', onReady)
+  document.addEventListener('astro:page-load', onReady)
+  window.addEventListener('hashchange', markCurrent)
+</script>
 
 <style>
   ul {
@@ -129,7 +203,65 @@ const isGroupCurrent = entry =>
   }
 
   li > a.active,
-  li > a[aria-current='page'] {
+  li > a[aria-current='page'],
+  li > a[aria-current='location'] {
     color: var(--hover-color);
+  }
+
+  /* The toggle sits right after the label, boxed, so a link that holds more
+     reads as one at a glance; the list wraps onto its own line below. */
+  li.has-children {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 0.5rem;
+  }
+
+  .children-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    padding: 0;
+    border: 1px solid var(--border-extra);
+    border-radius: 0.3rem;
+    background: var(--block-bg-color);
+    color: var(--primary-text-color);
+    font-family: var(--font-condensed);
+    font-size: 0.875rem;
+    font-weight: 600;
+    line-height: 1;
+    cursor: pointer;
+    transition:
+      color 0.2s ease,
+      border-color 0.2s ease;
+  }
+
+  .children-toggle::before {
+    content: '+';
+  }
+
+  .children-toggle[aria-expanded='true']::before {
+    content: '−';
+  }
+
+  .children-toggle:hover,
+  .children-toggle:focus-visible,
+  .children-toggle[aria-expanded='true'] {
+    border-color: var(--hover-color);
+    color: var(--hover-color);
+  }
+
+  ul.children {
+    flex-basis: 100%;
+    margin: 0 0 4px 0.25rem;
+    padding-left: 0.75rem;
+    border-left: 1px solid var(--sl-color-hairline-light);
+  }
+
+  ul.children > li > a {
+    font-size: 0.8125rem;
+    padding: 3px 0;
   }
 </style>
