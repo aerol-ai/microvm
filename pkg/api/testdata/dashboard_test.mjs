@@ -436,6 +436,17 @@ test("the authorization request is a PKCE public-client code flow back to /ui", 
   assert.equal(D.redirectURI(TUNNEL), "http://localhost:21212/ui");
 });
 
+test("groups is asked for only where the provider makes it a scope, as Dex does", () => {
+  const scopeFor = (scopesSupported) => new URL(D.authorizeURL("https://idp/authorize", {
+    clientId: "c", redirectUri: "r", state: "s", nonce: "n", challenge: "c", prompt: "", scopesSupported,
+  })).searchParams.get("scope");
+  assert.equal(scopeFor(["openid", "email", "groups", "profile", "offline_access"]), "openid email profile groups");
+  assert.equal(scopeFor(["openid", "email", "profile", "offline_access"]), "openid email profile",
+    "no groups scope, and never offline_access: the browser keeps only the ID token");
+  assert.equal(scopeFor([]), "openid email profile");
+  assert.equal(scopeFor(undefined), "openid email profile", "a provider that doesn't publish the list");
+});
+
 test("the provider's discovery document gives the endpoints and prompt values", async () => {
   const seen = [];
   const fetchOK = async (u) => {
@@ -444,15 +455,20 @@ test("the provider's discovery document gives the endpoints and prompt values", 
       authorization_endpoint: "https://acme.okta.com/oauth2/default/v1/authorize",
       token_endpoint: "https://acme.okta.com/oauth2/default/v1/token",
       prompt_values_supported: ["none", "login", "select_account"],
+      scopes_supported: ["openid", "email", "profile", "groups"],
     });
   };
   const meta = await D.providerMetadata(fetchOK, "https://acme.okta.com/oauth2/default/");
   assert.deepEqual(seen, ["https://acme.okta.com/oauth2/default/.well-known/openid-configuration"]);
   assert.equal(meta.token_endpoint, "https://acme.okta.com/oauth2/default/v1/token");
   assert.deepEqual([...meta.prompt_values_supported], ["none", "login", "select_account"]);
+  assert.deepEqual([...meta.scopes_supported], ["openid", "email", "profile", "groups"]);
 
   const noPrompts = await D.providerMetadata(async () => response(200, { authorization_endpoint: "https://e/a", token_endpoint: "https://e/t" }), "https://e");
   assert.equal(noPrompts.prompt_values_supported.length, 0);
+  assert.equal(noPrompts.scopes_supported.length, 0);
+  const badScopes = await D.providerMetadata(async () => response(200, { authorization_endpoint: "https://e/a", token_endpoint: "https://e/t", scopes_supported: "groups" }), "https://e");
+  assert.equal(badScopes.scopes_supported.length, 0, "a scopes_supported that isn't a list is ignored");
   await assert.rejects(D.providerMetadata(async () => response(200, { authorization_endpoint: "http://e/a", token_endpoint: "https://e/t" }), "https://e"));
   await assert.rejects(D.providerMetadata(async () => response(404, {}), "https://e"));
 });

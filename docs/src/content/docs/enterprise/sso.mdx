@@ -599,6 +599,7 @@ Register two apps at your identity provider: one for the CLI and one for the das
 | Redirect URI | `http://127.0.0.1/callback`. The CLI listens on a random port, so the provider must accept any port on that address. | `https://<api-domain>/ui` |
 | Allowed origin (CORS) | None | `https://<api-domain>` |
 | Scopes | `openid email profile`, plus `offline_access` so the login can renew itself | `openid email profile` |
+| Scopes it adds on its own | `groups`, when the provider lists that scope | `groups`, when the provider lists that scope |
 | Groups | Put the groups claim in the ID token | Put the groups claim in the ID token |
 
 PKCE is a standard way for an app with no secret to sign in safely. A redirect URI is the address the provider sends you back to after you sign in.

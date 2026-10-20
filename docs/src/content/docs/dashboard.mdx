@@ -202,7 +202,7 @@ This section is for the server operator. Company sign-in on the dashboard needs 
 
 1. **Register a dashboard app at your provider.** Make it a single-page app, a public client with no secret, using the authorization code flow with PKCE.
 2. **Register `https://<api-domain>/ui`** as its redirect URI, and `https://<api-domain>` as an allowed origin. To sign in through an SSH tunnel too, also register `http://localhost:21212/ui` as a redirect URI and `http://localhost:21212` as an allowed origin. Without that origin, the page can't finish the sign-in and says "didn't sign you in (network_error)". Register `localhost`, not `127.0.0.1`, and tell people to open the tunnel at `http://localhost:21212/ui`. A provider refuses a redirect URI it doesn't know, so a tab opened at `127.0.0.1` gets an "invalid redirect_uri" error.
-3. **Ask for the scopes `openid email profile`,** and put the groups claim in the ID token.
+3. **Put the groups claim in the ID token.** The dashboard asks for the scopes `openid email profile`, plus `groups` when your provider lists that scope, as Dex does.
 4. **Add the app's client ID** to the issuer's `audiences` and as `clients.dashboard` in the identity file. Set `display_name` to the button label.
 
 Only issuers with `clients.dashboard` get a button, in the order of the identity file. Workload issuers, such as GitHub Actions, get none. Only the first Google issuer gets a button, because Google allows one sign-in client per page.
