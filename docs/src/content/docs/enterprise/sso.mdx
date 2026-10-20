@@ -716,6 +716,55 @@ Zitadel puts a person's roles in an object (`urn:zitadel:iam:org:project:roles`)
 
 Each role key becomes one group name. A person granted the `payments-eng` role in the project matches `{ issuer: zitadel, group: payments-eng, ... }`. Only roles from the app's own project are included.
 
+#### Dex
+
+Dex has not been tested against a live account yet. These steps follow Dex's own documentation and source code, for Dex v2.46.
+
+Dex signs people in through another system, such as LDAP, GitHub or a SAML provider. Dex calls each of these a connector. So Dex is also how a company that uses only SAML signs in to AerolVM.
+
+- The issuer `url` is the `issuer` in Dex's config file, such as `https://dex.acme.dev`. It must use `https`, and every server must reach it.
+- Add both apps under `staticClients`, each with `public: true`. Give the CLI client **no** `redirectURIs`. Dex then accepts `http://127.0.0.1` on any port, and the device flow for `--device`. Give the dashboard client the redirect URI `https://<api-domain>/ui`. For an SSH tunnel, add `http://localhost:21212/ui` too.
+- Set `web.allowedOrigins` to `https://<api-domain>`. For an SSH tunnel, add `http://localhost:21212` too. Without it, Dex allows no cross-origin calls, and the dashboard says "didn't sign you in (network_error)".
+- Set `oauth2.skipApprovalScreen: true`. Otherwise Dex asks people to grant access every time they sign in.
+- Dex puts `groups` in the ID token only when an app asks for the `groups` scope. The CLI and the dashboard both ask for it, because Dex lists that scope. The groups come from your connector, and not every connector sends them. Check your connector's page in Dex's documentation.
+- Each person's ID is built from their user ID and the connector's `id`. Don't rename a connector's `id` later. That gives everyone a new ID.
+- Dex's ID tokens last 24 hours by default. The server accepts that. To cut off a removed person sooner, set `expiry.idTokens` to `1h`.
+- The dashboard renews a sign-in quietly before its ID token expires. Dex allows that only with its sessions feature, which is new and experimental in v2.46. Set `DEX_SESSIONS_ENABLED=true` and add a `sessions` block to Dex's config. Without it, the dashboard says "Your sign-in expired" when the token runs out, and people sign in again. The CLI renews with a refresh token instead, if your connector supports refresh.
+
+The parts of Dex's config file that matter here look like this:
+
+```yaml
+issuer: https://dex.acme.dev
+web:
+  allowedOrigins: ["https://api.acme.dev"]
+oauth2:
+  skipApprovalScreen: true
+expiry:
+  idTokens: "1h"
+staticClients:
+  - id: aerolvm-cli
+    name: AerolVM CLI
+    public: true                                      # no redirectURIs: any 127.0.0.1 port, plus --device
+  - id: aerolvm-dashboard
+    name: AerolVM dashboard
+    public: true
+    redirectURIs: ["https://api.acme.dev/ui"]
+```
+
+Its issuer in the identity file looks like this:
+
+```yaml
+issuers:
+  - name: dex
+    display_name: Acme Dex
+    url: https://dex.acme.dev                         # Dex's issuer, exactly
+    audiences: [aerolvm-cli, aerolvm-dashboard]       # the CLI and dashboard client IDs
+    clients: { cli: aerolvm-cli, dashboard: aerolvm-dashboard }
+    claims: { username: email, groups: groups }
+bindings:
+  - { issuer: dex, group: platform-admins, role: admin }
+```
+
 ### Step 4: Check it
 
 1. Open `https://<api-domain>/.well-known/aerolvm-auth` in a browser. It lists every provider that has a CLI or dashboard app. It also shows `identity_enabled: true`.

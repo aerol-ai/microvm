@@ -260,6 +260,7 @@ const ssoProviders = [
   ['google', 'Google'],
   ['authentik', 'Authentik'],
   ['zitadel', 'Zitadel'],
+  ['dex', 'Dex'],
 ].map(([id, label]) => link(`${ent}/sso/#${id}`, label))
 
 // The Enterprise tab, grouped the way enterprise docs usually are: start
