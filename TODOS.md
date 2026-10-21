@@ -595,6 +595,51 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
+## GCP Cloud KMS and Azure Key Vault key providers (security, key custody)
+
+- **What:** add `gcpkms` and `azurekv` providers on the `DataKeyWrapper`
+  seam (`pkg/secrets/kms.go:16-19`), next to `awskms`, `vault` and `pkcs11`.
+- **Why:** customers on Google Cloud or Azure keep their keys in those
+  clouds' key services. Deferred at CEO review 2026-10-20
+  (`plans/customer-key-custody.md`, CEO-E5): no GCP or Azure customer has
+  asked, and the live test harness only knows AWS.
+- **Pros:** native key custody on every major cloud; Cloud KMS is what a GKE
+  Marketplace listing would expect.
+- **Cons:** each needs its own cloud account, credentials and harness
+  support before the docs can say "tested".
+- **Start:** copy `pkg/secrets/awskms.go` (narrow client interface plus
+  error mapping) and run `testProviderContract`
+  (`pkg/secrets/provider_contract_test.go:17`) over the new wrapper. Bind the
+  encryption context as AAD (Cloud KMS `additionalAuthenticatedData`).
+- **Trigger:** the GKE phase of `plans/kubernetes-deployment.md` for Cloud
+  KMS; a named Azure customer for Key Vault.
+- **Effort / priority:** M each (L with test accounts), P3.
+- **Depends on:** `plans/customer-key-custody.md` Phase 1 (seam split and
+  provider tags).
+
+---
+
+## HSM signing of audit chain heads (security, audit witness)
+
+- **What:** sign each witnessed audit chain head with a PKCS#11 key the
+  daemon cannot read, and have `aerolvm audit verify` (`cmd/aerolvm/audit.go`)
+  check the signatures, with a dual-read for old unsigned heads.
+- **Why:** a compromised node can still write a new head that matches a
+  rewritten chain; a signature from a key it cannot read stops that. This is
+  the second follow-up in `plans/secrets-hardening.md:1014` and a non-goal of
+  `plans/open-audit-witness.md`. Deferred at CEO review 2026-10-20
+  (`plans/customer-key-custody.md`, CEO-E6) so the key-custody stack does not
+  change a just-shipped evidence format.
+- **Pros:** forged heads fail the verifier even after a full node compromise.
+- **Cons:** a new signed-head format and verifier dual-read; needs its own
+  plan and eng review.
+- **Start:** reuse the PKCS#11 session pool from `plans/customer-key-custody.md`
+  Phase 3; the witness writer is `internal/service/secret_audit_witness.go`.
+- **Effort / priority:** L, P3.
+- **Depends on:** `plans/customer-key-custody.md` Phase 3 merged.
+
+---
+
 ## Done
 
 Kept for the record. Each entry names the fix and where it lives.
