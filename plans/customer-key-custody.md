@@ -1224,6 +1224,38 @@ latency are operator-run (they cost money) and stay open in the gate table.
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
 
+## Phase 6 status (2026-10-31)
+
+Built and checked offline; the live runs are operator-run and not yet run.
+
+- **Tag-gated CI job** `key-custody-integration`: Vault 1.18 and OpenBao 2.1
+  dev servers (images pinned by digest), running `TestVaultLive` and the new
+  `TestVaultProviderContract` (the provider contract against a real key
+  store). Both pass locally against both servers. SoftHSM2 already runs in
+  `go-tests` (`TestSoftHSM`).
+- **Live scenarios** `cluster-3-mixed-secrets-vault`,
+  `cluster-3-mixed-secrets-pkcs11` and `cluster-3-mixed-wrapped-kms`, with
+  UC-297..310 (`make integration-key-custody-{vault,pkcs11,kms}`). The vault
+  and pkcs11 scenarios start from a local cluster and run the migration over
+  SSH (two-step switch, then the wrap), so the switch UC of CEO-M1 is
+  UC-297. Fixture steps were rehearsed locally: the OpenBao TLS dev server,
+  Transit backup, delete and restore, and `bao proxy` with `token_file`
+  auto-auth on a real OpenBao 2.1.1; SoftHSM2 init, AES import and object
+  listing in an Ubuntu 24.04 container. That rehearsal found that
+  `softhsm2-util --import` drops whitespace bytes from a key file, so the
+  fixture uses alphanumeric keys.
+- **Deviations.** The OpenBao server is a dev server (in-memory, TLS) rather
+  than Raft storage: no case restarts it. The eng D22 case (switch a running
+  `local` cluster to `awskms` with a create during the rolling restart) is
+  not built: it needs a scenario that starts local with a KMS key, and the
+  Vault switch (UC-297) covers the same open order; it is listed under
+  Follow-ups.
+- **Found while building it:** #805 added `key_custody` to the bootstrap
+  template but not to the render-test fixture, so `TestBootstrapTemplateRenders`
+  failed wherever terraform is installed; fixed here, with a wrapped render.
+- **Not run:** the three live scenarios and the AWS CloudHSM run (F3), which
+  need operator approval for AWS spend. The Outcome section waits for them.
+
 ## Phase 5 results (2026-10-31)
 
 - **Enterprise rules (§7).** Strict boot is required for every external
@@ -1460,6 +1492,9 @@ founder answers differently, §3 and §7 change.
 - ~~**F-R1:** a rewrap sweep~~ Now in scope as Design §11 (CEO-E4).
 - Live provider switching: a decrypt-only previous provider plus a reseal.
 - ~~Server key (data key) rotation~~ now in scope as Design §13 (eng D26).
+- The eng D22 live case: switch a running `local` cluster to `awskms` with a
+  create during the rolling restart that fails over to a node not yet
+  switched (needs a scenario that boots local with a KMS key).
 - GCP Cloud KMS and Azure Key Vault: TODOS.md entry (CEO-E5); triggers are
   the K8s plan's GKE phase and a named Azure customer. KMIP: on customer
   demand.
