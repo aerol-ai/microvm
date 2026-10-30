@@ -1021,8 +1021,7 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 
 	// With custody=wrapped the cluster check accepts the wrapped file, and a
 	// plaintext key does not stand in for it (plans/customer-key-custody.md
-	// §3). Wrapped custody itself refuses until Phase 4, so a passing cluster
-	// check shows up as that refusal.
+	// §3). `sandboxd key` loads before the file exists: it is what makes it.
 	t.Run("wrapped_custody_cluster_key_check", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
@@ -1035,11 +1034,14 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "needs the wrapped server key at "+wrapped) {
 			t.Fatalf("plaintext key with no wrapped file = %v", err)
 		}
+		if cfg, err := LoadForKeyTool(); err != nil || cfg.CredentialKeyCustody != "wrapped" {
+			t.Fatalf("key tool before the wrapped file exists = %v", err)
+		}
 		if err := os.WriteFile(wrapped, []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "wrapped is not implemented yet") {
-			t.Fatalf("wrapped file present = %v, want only the not-implemented refusal", err)
+		if cfg, err := Load(); err != nil || cfg.CredentialKeyCustody != "wrapped" || cfg.CredentialKeyWrappedPath != wrapped {
+			t.Fatalf("wrapped file present = %v", err)
 		}
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", filepath.Join(wrapped, "nested"))
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "stat ") {

@@ -1847,6 +1847,17 @@ func validateIdentityFile(cfg Config) error {
 }
 
 func Load() (Config, error) {
+	return load(false)
+}
+
+// LoadForKeyTool is Load for `sandboxd key`, minus the cluster-mode check
+// that the shared server key already exists: `sandboxd key wrap --generate`
+// is what creates it on the seed.
+func LoadForKeyTool() (Config, error) {
+	return load(true)
+}
+
+func load(keyTool bool) (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
@@ -2632,7 +2643,7 @@ func Load() (Config, error) {
 		// sealed row must also be fanned out to recipient peers (or a KMS
 		// provider used). Refuse boot without a shared key unless the
 		// operator opts out.
-		if !cfg.ClusterInsecureCredentials {
+		if !cfg.ClusterInsecureCredentials && !keyTool {
 			if err := checkClusterCredentialKey(cfg); err != nil {
 				return Config{}, err
 			}
@@ -2686,7 +2697,6 @@ func Load() (Config, error) {
 		if cfg.SecretProvider == "local" {
 			return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs an external SB_SECRET_PROVIDER (awskms, vault or pkcs11) to wrap the server key")
 		}
-		return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped is not implemented yet; use file")
 	default:
 		return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped (got %q)", cfg.CredentialKeyCustody)
 	}

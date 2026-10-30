@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -27,11 +29,7 @@ func (f *fakePKCS11Helper) Unwrap(context.Context, []byte, map[string]string) ([
 func (f *fakePKCS11Helper) Info() pkcs11.Info { return f.info }
 func (f *fakePKCS11Helper) Close() error      { f.closed = true; return nil }
 
-type helperSink struct{ got secrets.DataKeyWrapper }
-
-func (s *helperSink) SetPKCS11Helper(w secrets.DataKeyWrapper) { s.got = w }
-
-func TestWirePKCS11Helper(t *testing.T) {
+func TestStartKeyStorePKCS11(t *testing.T) {
 	pkcs11Cfg := config.Config{
 		SecretProvider: "pkcs11", SecretPKCS11Module: "/m.so", SecretPKCS11TokenLabel: "tok",
 		SecretPKCS11PINFile: "/pin", SecretPKCS11KeyLabel: "k", SecretPKCS11DecryptLabels: []string{"j"},
@@ -43,15 +41,14 @@ func TestWirePKCS11Helper(t *testing.T) {
 		helper     *fakePKCS11Helper
 		startErr   error
 		wantErr    string
-		wantSet    bool
 		wantClosed bool
 		wantLog    string
 	}{
-		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{HardwareSlot: true}}, wantSet: true},
-		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantSet: true, wantLog: "software token"},
+		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{HardwareSlot: true}}},
+		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantLog: "software token"},
 		{name: "software token in enterprise mode", cfg: func(c config.Config) config.Config { c.EnterpriseMode = true; return c },
 			helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantErr: "not a hardware slot", wantClosed: true},
-		{name: "first start fails, lenient", helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantSet: true, wantLog: "retrying in the background"},
+		{name: "first start fails, lenient", helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantLog: "retrying in the background"},
 		{name: "first start fails, strict", cfg: func(c config.Config) config.Config { c.SecretProviderStrictBoot = true; return c },
 			helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantErr: "STRICT_BOOT", wantClosed: true},
 		{name: "cannot start at all", startErr: errors.New("no socket dir"), wantErr: "no socket dir"},
@@ -73,17 +70,18 @@ func TestWirePKCS11Helper(t *testing.T) {
 			}
 			t.Cleanup(func() { startPKCS11 = orig })
 			var logs bytes.Buffer
-			sink := &helperSink{}
-			stop, err := wirePKCS11Helper(cfg, slog.New(slog.NewTextHandler(&logs, nil)), sink)
+			ks, err := startKeyStore(context.Background(), cfg, slog.New(slog.NewTextHandler(&logs, nil)))
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want %q", err, tc.wantErr)
 				}
-			} else if err != nil {
-				t.Fatal(err)
-			}
-			if (sink.got != nil) != tc.wantSet {
-				t.Fatalf("helper handed to the service = %v, want %v", sink.got != nil, tc.wantSet)
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if ks.helper == nil || ks.wrapper == nil {
+					t.Fatalf("key store = %+v, want the helper and a client built on it", ks)
+				}
 			}
 			if tc.helper != nil && tc.helper.closed != tc.wantClosed {
 				t.Fatalf("closed = %v, want %v", tc.helper.closed, tc.wantClosed)
@@ -94,17 +92,69 @@ func TestWirePKCS11Helper(t *testing.T) {
 			if got.Socket != "/run/x/helper.sock" || got.Token.Sessions != 8+secrets.BackgroundSlots() || got.Token.KeyLabel != "k" || got.Token.DecryptLabels[0] != "j" {
 				t.Fatalf("helper options = %+v", got)
 			}
-			if stop != nil {
-				stop()
-				if tc.helper != nil && !tc.helper.closed {
+			if err == nil {
+				ks.stop()
+				if !tc.helper.closed {
 					t.Fatal("stop did not close the helper")
 				}
 			}
 		})
 	}
-	stop, err := wirePKCS11Helper(config.Config{SecretProvider: "awskms"}, slog.Default(), &helperSink{})
-	if err != nil || stop == nil {
-		t.Fatalf("no pkcs11 settings = %v", err)
+}
+
+func TestStartKeyStoreWithoutPKCS11(t *testing.T) {
+	ks, err := startKeyStore(context.Background(), config.Config{SecretProvider: "local"}, slog.Default())
+	if err != nil || ks.wrapper != nil || ks.helper != nil {
+		t.Fatalf("local = %+v %v", ks, err)
 	}
-	stop()
+	ks.stop()
+	// A provider whose client cannot be built stops the boot.
+	if _, err := startKeyStore(context.Background(), config.Config{SecretProvider: "vault"}, slog.Default()); err == nil {
+		t.Fatal("vault with no settings started")
+	}
+}
+
+// §3 boot: wrapped custody generates on a fresh single node, then reopens
+// the same key; a plaintext key left behind stops the boot (F1).
+func TestOpenServerKey(t *testing.T) {
+	ctx := context.Background()
+	fake, err := secrets.NewFakeKMS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cfg := config.Config{
+		SecretProvider: "awskms", SecretAWSkmsKeyID: "alias/k", CredentialKeyCustody: "wrapped",
+		CredentialEncryptionKeyPath: filepath.Join(dir, "credential_encryption.key"),
+		CredentialKeyWrappedPath:    filepath.Join(dir, "credential_encryption.key.wrapped"),
+		DBPath:                      filepath.Join(dir, "state.db"),
+	}
+	c1, err := openServerKey(ctx, cfg, fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, _ := c1.Encrypt([]byte("x"))
+	f, err := secrets.ReadWrappedKeyFile(cfg.CredentialKeyWrappedPath)
+	if err != nil || f.Provider != "awskms" || f.KeyRef != "alias/k" {
+		t.Fatalf("wrapped file = %+v %v", f, err)
+	}
+	if err := os.WriteFile(cfg.DBPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := openServerKey(ctx, cfg, fake)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := c2.Decrypt(sealed); err != nil || string(got) != "x" {
+		t.Fatalf("reopen = %q %v", got, err)
+	}
+	if err := os.WriteFile(cfg.CredentialEncryptionKeyPath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openServerKey(ctx, cfg, fake); err == nil || !strings.Contains(err.Error(), "plaintext key file exists") {
+		t.Fatalf("plaintext left behind = %v", err)
+	}
+	if bootNodeID(config.Config{NodeID: " n1 "}) != "n1" || bootNodeID(config.Config{}) != "standalone" {
+		t.Fatal("bootNodeID")
+	}
 }

@@ -181,6 +181,10 @@ type Service struct {
 	// pkcs11Helper is the running PKCS#11 helper client, set by pkg/daemon
 	// before ConfigureSecretProvider; nil when no PKCS#11 settings are set.
 	pkcs11Helper secrets.DataKeyWrapper
+	// keyStoreWrapper is the key-store client the daemon built before it
+	// opened the server key (SetKeyStoreWrapper); nil for local, or when a
+	// test builds the service directly.
+	keyStoreWrapper secrets.DataKeyWrapper
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -775,27 +779,34 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		return nil
 	}
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
-	vault := s.cfg.SecretVaultOptions()
-	vault.NodeID = s.keyStoreNodeID()
-	// Boot-time key-store calls carry the "boot" background correlation id.
-	ctx = secrets.ContextWithBackgroundPurpose(ctx, "boot")
-	opts := secrets.ProviderOptions{
-		Name:        name,
-		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
-		Vault:       vault,
-		PKCS11:      s.pkcs11Helper,
-		Cipher:      s.cipher,
-		Store:       newSecretBlobStore(s.store),
-		Wrapper:     s.secretWrapBackend,
-		MaxInFlight: s.cfg.SecretProviderMaxInFlight,
-		Observer:    recordKeyStoreLimiterWait,
+	ctx = bootContext(ctx)
+	wrapper := s.keyStoreWrapper
+	if wrapper == nil && secrets.IsExternalProvider(name) {
+		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
+		opts.Wrapper = s.secretWrapBackend
+		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
 	}
-	p, wrapper, err := secrets.NewProvider(ctx, opts)
+	p, wrapper, err := secrets.NewProvider(ctx, secrets.ProviderOptions{
+		Name: name, Cipher: s.cipher, Store: newSecretBlobStore(s.store), Prebuilt: wrapper,
+	})
 	if err != nil {
 		return err
 	}
 	s.secretProvider = p
 	if !secrets.IsExternalProvider(name) || wrapper == nil {
+		return nil
+	}
+	if s.cfg.CredentialKeyCustody == secrets.CustodyWrapped && s.keyStoreWrapper != nil {
+		// The daemon unwrapped the server key through this same client at
+		// boot: real data already proved the key store (§3 step 5).
+		recordSecretProviderCanary(true)
+		if s.logger != nil {
+			s.logger.Info("secret provider ok: the server key unwrapped through it at boot", "provider", name)
+		}
 		return nil
 	}
 	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {

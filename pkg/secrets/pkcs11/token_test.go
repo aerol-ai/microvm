@@ -562,3 +562,27 @@ func TestTokenOpenRefusals(t *testing.T) {
 		t.Fatalf("missing module = %v", err)
 	}
 }
+
+func TestInProcess(t *testing.T) {
+	tok := openFake(t, newFakeHSM("k"), TokenConfig{KeyLabel: "k"})
+	p := &InProcess{b: tok}
+	ctx := context.Background()
+	encCtx := map[string]string{"aerolvm.purpose": "server-key"}
+	w, err := p.Wrap(ctx, []byte("server-key"), encCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.Unwrap(ctx, w, encCtx); err != nil || string(got) != "server-key" {
+		t.Fatalf("Unwrap = %q %v", got, err)
+	}
+	if _, err := p.Unwrap(ctx, w, nil); !errors.Is(err, secrets.ErrDecryptFailed) {
+		t.Fatalf("context is AAD: %v", err)
+	}
+	if p.Info().KeyLabel != "k" {
+		t.Fatal("Info")
+	}
+	p.Close()
+	if _, err := OpenInProcess(TokenConfig{}); err == nil {
+		t.Fatal("no module accepted")
+	}
+}
