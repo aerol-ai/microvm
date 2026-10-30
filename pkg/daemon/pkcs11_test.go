@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"os"
@@ -129,7 +130,7 @@ func TestOpenServerKey(t *testing.T) {
 		CredentialKeyWrappedPath:    filepath.Join(dir, "credential_encryption.key.wrapped"),
 		DBPath:                      filepath.Join(dir, "state.db"),
 	}
-	c1, err := openServerKey(ctx, cfg, fake)
+	c1, err := openServerKey(ctx, cfg, fake, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +142,7 @@ func TestOpenServerKey(t *testing.T) {
 	if err := os.WriteFile(cfg.DBPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c2, err := openServerKey(ctx, cfg, fake)
+	c2, err := openServerKey(ctx, cfg, fake, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,10 +152,41 @@ func TestOpenServerKey(t *testing.T) {
 	if err := os.WriteFile(cfg.CredentialEncryptionKeyPath, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openServerKey(ctx, cfg, fake); err == nil || !strings.Contains(err.Error(), "plaintext key file exists") {
+	if _, err := openServerKey(ctx, cfg, fake, nil); err == nil || !strings.Contains(err.Error(), "plaintext key file exists") {
 		t.Fatalf("plaintext left behind = %v", err)
 	}
 	if bootNodeID(config.Config{NodeID: " n1 "}) != "n1" || bootNodeID(config.Config{}) != "standalone" {
 		t.Fatal("bootNodeID")
+	}
+}
+
+// §13 boot: custody=file opens its ring file and warns while the retired
+// key 0 still sits in the key file.
+func TestOpenServerKeyRingFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := config.Config{
+		SecretProvider: "local", CredentialKeyCustody: "file",
+		CredentialEncryptionKeyPath: filepath.Join(dir, "credential_encryption.key"),
+		DBPath:                      filepath.Join(dir, "state.db"),
+	}
+	k0, _ := secrets.NewServerKey()
+	if err := os.WriteFile(cfg.CredentialEncryptionKeyPath, []byte(base64.StdEncoding.EncodeToString(k0)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staged, _ := secrets.NewRingEntry(ctx, 1, nil)
+	ring, _ := secrets.StageRingKey([]secrets.RingEntry{secrets.LegacyRingEntry(k0)}, staged)
+	ring, _, _, _ = secrets.PromoteRingKey(ring)
+	ring, _ = secrets.RetireRingKey(ring, 0)
+	if err := secrets.WriteKeyRingFile(cfg.KeyRingPath(), secrets.KeyRingFile{Ring: ring}); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	c, err := openServerKey(ctx, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil || c.CurrentKeyID() != 1 || len(c.KeyIDs()) != 1 {
+		t.Fatalf("ring boot = %v", err)
+	}
+	if !strings.Contains(logs.String(), "key 0 is retired but the plaintext key is still") {
+		t.Fatalf("no leftover-key warning: %s", logs.String())
 	}
 }

@@ -128,9 +128,10 @@ func startPKCS11Helper(cfg config.Config, logger *slog.Logger) (pkcs11Helper, fu
 }
 
 // openServerKey opens the server key per §3's boot decision: today's
-// plaintext key with custody "file", the wrapped file through the key store
-// with custody "wrapped" (generated on a fresh single node).
-func openServerKey(ctx context.Context, cfg config.Config, w secrets.DataKeyWrapper) (*secrets.Cipher, error) {
+// plaintext key (or custody=file's ring, once rotated) with custody "file",
+// the wrapped file's ring through the key store with custody "wrapped"
+// (generated on a fresh single node).
+func openServerKey(ctx context.Context, cfg config.Config, w secrets.DataKeyWrapper, logger *slog.Logger) (*secrets.Cipher, error) {
 	exists := func(path string) bool {
 		if path == "" {
 			return false
@@ -147,7 +148,14 @@ func openServerKey(ctx context.Context, cfg config.Config, w secrets.DataKeyWrap
 		StateDBExists:       exists(cfg.DBPath),
 		PlaintextPath:       cfg.CredentialEncryptionKeyPath,
 		WrappedPath:         cfg.CredentialKeyWrappedPath,
+		RingFileExists:      exists(cfg.KeyRingPath()),
+		RingPath:            cfg.KeyRingPath(),
 	}
-	return secrets.OpenServerKey(secrets.ContextWithBackgroundPurpose(ctx, "boot"), in, cfg.CredentialEncryptionKey, w,
+	c, err := secrets.OpenServerKey(secrets.ContextWithBackgroundPurpose(ctx, "boot"), in, cfg.CredentialEncryptionKey, w,
 		secrets.NormalizeProviderName(cfg.SecretProvider), service.KeyStoreRef(cfg))
+	if err == nil && logger != nil && secrets.RetiredKeyStillPresent(in, cfg.CredentialEncryptionKey) {
+		logger.Warn("server-key ring: key 0 is retired but the plaintext key is still in SB_CREDENTIAL_ENCRYPTION_KEY or the key file; remove it so a copy of it opens nothing current",
+			"key_file", cfg.CredentialEncryptionKeyPath)
+	}
+	return c, err
 }

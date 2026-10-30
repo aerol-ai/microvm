@@ -310,41 +310,53 @@ func (s *Service) RevocableContext(parent context.Context) (context.Context, con
 }
 
 // StartKeyCustody runs the key-custody loop until ctx ends (eng D2: one
-// owner of the server key's lifecycle, two cadences). With wrapped custody
-// it re-checks the server-key file every SB_SECRET_PROVIDER_RECHECK_INTERVAL;
-// with any external provider it runs the rewrap sweep now (the API is
-// already serving) and then every hour after a random start delay of up to
-// an hour, so a fleet restarted together does not sweep in lockstep (eng
-// D19). With a local provider and a plaintext key it does nothing.
+// owner of the server key's lifecycle). Every SB_SECRET_PROVIDER_RECHECK_INTERVAL
+// it re-reads the server-key ring, so a `sandboxd key rotate` step reaches
+// the node without a restart (§13): with wrapped custody as part of the
+// re-check that unwraps the file again, with custody=file by reading the
+// ring file. While a rotation is in progress the same tick reseals rows
+// onto the current key. With any external provider it also runs the
+// rewrap sweep now (the API is already serving) and then every hour after
+// a random start delay of up to an hour, so a fleet restarted together
+// does not sweep in lockstep (eng D19).
 func (s *Service) StartKeyCustody(ctx context.Context) {
-	if s == nil || s.keyStoreWrapper == nil || s.cipher == nil {
+	if s == nil || s.cipher == nil {
 		return
 	}
-	recheck := s.cfg.CredentialKeyCustody == secrets.CustodyWrapped
-	sweep := secrets.IsExternalProvider(s.cfg.SecretProvider)
-	if !recheck && !sweep {
-		return
-	}
+	recheck := s.cfg.CredentialKeyCustody == secrets.CustodyWrapped && s.keyStoreWrapper != nil
+	sweep := s.keyStoreWrapper != nil && secrets.IsExternalProvider(s.cfg.SecretProvider)
 	interval := s.cfg.SecretProviderRecheckInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	if entries, err := s.serverKeyRing(); err == nil {
+		// Boot is a re-read too: a step taken while the daemon was down
+		// is recorded now.
+		s.noteServerKeyRing(entries)
+	}
 	go func() {
-		var recheckC, sweepC <-chan time.Time
+		var sweepC <-chan time.Time
 		// ±10% jitter on the re-check, for the same reason.
 		nextRecheck := func() <-chan time.Time {
 			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
 		}
-		if recheck {
-			recheckC = nextRecheck()
-		}
+		recheckC := nextRecheck()
 		if sweep {
 			s.sweepPass(ctx)
 			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
 		}
+		s.resealTick(ctx)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-recheckC:
-				s.RecheckServerKey(ctx)
+				if recheck {
+					s.RecheckServerKey(ctx)
+				} else {
+					s.reloadKeyRingFile()
+				}
+				s.resealTick(ctx)
 				recheckC = nextRecheck()
 			case <-sweepC:
 				s.sweepPass(ctx)
@@ -361,9 +373,8 @@ func (s *Service) RecheckServerKey(ctx context.Context) string {
 	cctx, cancel := context.WithTimeout(secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "recheck")), keyRecheckTimeout)
 	defer cancel()
 	f, err := secrets.ReadWrappedKeyFile(s.cfg.CredentialKeyWrappedPath)
-	var key []byte
 	if err == nil {
-		key, err = secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
+		_, err = secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
 	}
 	result := recheckResult(err)
 	keyRecheckTotal.Add(result, 1)
@@ -381,10 +392,20 @@ func (s *Service) RecheckServerKey(ctx context.Context) string {
 	switch result {
 	case recheckOK:
 		recordSecretProviderCanary(true)
-		if s.KeyRevoked() {
-			if rerr := s.recoverKey(ctx, key); rerr != nil {
-				s.logger.Error("key custody: the key unwraps again but the node could not take it back", "error", rerr)
-			}
+		if !s.KeyRevoked() {
+			s.applyWrappedRing(cctx, f)
+			break
+		}
+		// Recovery takes the whole ring back, not only the current key
+		// (eng D12, §13).
+		keys, rerr := secrets.UnwrapRing(cctx, s.keyStoreWrapper, f, nil)
+		if rerr == nil {
+			rerr = s.recoverKey(ctx, keys)
+		}
+		if rerr != nil {
+			s.logger.Error("key custody: the key unwraps again but the node could not take it back", "error", rerr)
+		} else {
+			s.noteServerKeyRing(f.Entries())
 		}
 	case recheckRevoked:
 		s.logger.Error("key custody: the key store reports the key revoked", "consecutive", streak, "revoke_after", s.cfg.SecretProviderRevokeAfter, "error", err)
@@ -499,10 +520,10 @@ func restartEgressGatewayUnit(ctx context.Context) error {
 }
 
 // recoverKey brings the node back after the customer restored the key (eng
-// D12): the same key returns to the shared Cipher, the gateway gets its CA
+// D12): the same ring returns to the shared Cipher, the gateway gets its CA
 // and the sandboxes' injection secrets again, and health returns to ok.
-func (s *Service) recoverKey(ctx context.Context, key []byte) error {
-	if err := s.cipher.Restore(key); err != nil {
+func (s *Service) recoverKey(ctx context.Context, keys []secrets.RingKey) error {
+	if err := s.cipher.RestoreRing(keys); err != nil {
 		return err
 	}
 	s.keyCustody.mu.Lock()
@@ -659,8 +680,8 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 }
 
 // rewrapServerKeyFile moves the wrapped server-key file onto the current
-// key, like `sandboxd key rewrap` does with the daemon stopped. It returns 1
-// while the file stays stale.
+// key, every key of its ring (§13), like `sandboxd key rewrap` does with
+// the daemon stopped. It returns 1 while the file stays stale.
 func (s *Service) rewrapServerKeyFile(ctx context.Context, current string) (int, error) {
 	if s.cfg.CredentialKeyCustody != secrets.CustodyWrapped || current == "" {
 		return 0, nil
@@ -670,21 +691,18 @@ func (s *Service) rewrapServerKeyFile(ctx context.Context, current string) (int,
 	if err != nil {
 		return 1, err
 	}
-	if f.KeyVersion() == current {
+	if f.StaleRingKeys(current) == 0 {
 		return 0, nil
 	}
 	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
 	defer cancel()
-	key, err := secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
+	nf, err := secrets.RewrapRing(cctx, s.keyStoreWrapper, f)
 	if err != nil {
 		return 1, err
 	}
-	nf, err := secrets.WrapServerKey(cctx, s.keyStoreWrapper, key, f.Provider, f.KeyRef)
-	if err != nil {
-		return 1, err
-	}
-	nf.MigratedFromPlaintext = f.MigratedFromPlaintext
-	if err := secrets.WriteWrappedKeyFile(path, nf); err != nil {
+	if err := secrets.ReplaceWrappedKeyFile(path, f, nf); err != nil {
+		// ErrKeyFileChanged: `sandboxd key rotate` edited it meanwhile; the
+		// next pass rewraps what it wrote.
 		return 1, err
 	}
 	s.logger.Info("key custody: server-key file rewrapped", "from", f.KeyVersion(), "to", nf.KeyVersion())

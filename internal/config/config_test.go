@@ -1870,3 +1870,31 @@ func TestRunsSSHGateway(t *testing.T) {
 		})
 	}
 }
+
+// The server-key ring path (plans/customer-key-custody.md §13) and the
+// cluster key check, which accepts a ring once key 0 has left the key file.
+func TestKeyRingPathAndClusterCheck(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{CredentialEncryptionKeyPath: filepath.Join(dir, "k")}
+	if cfg.KeyRingPath() != filepath.Join(dir, "k.ring") {
+		t.Fatalf("default = %q", cfg.KeyRingPath())
+	}
+	if err := checkClusterCredentialKey(cfg); err == nil {
+		t.Fatal("no key and no ring passed")
+	}
+	if err := os.WriteFile(cfg.KeyRingPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkClusterCredentialKey(cfg); err != nil {
+		t.Fatalf("ring = %v", err)
+	}
+	cfg.CredentialKeyRingPath = "/elsewhere.ring"
+	if cfg.KeyRingPath() != "/elsewhere.ring" {
+		t.Fatal("override")
+	}
+	t.Setenv("SB_CREDENTIAL_KEY_RING_PATH", " /x/ring ")
+	t.Setenv("SB_PAT_TOKEN", "pat")
+	if got, err := Load(); err != nil || got.KeyRingPath() != "/x/ring" {
+		t.Fatalf("env = %v %v", got.KeyRingPath(), err)
+	}
+}

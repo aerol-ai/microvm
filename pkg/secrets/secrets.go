@@ -208,11 +208,6 @@ func (c *Cipher) RestoreRing(keys []RingKey) error {
 	return nil
 }
 
-// Restore takes back a single legacy key (a ring of one).
-func (c *Cipher) Restore(key []byte) error {
-	return c.RestoreRing([]RingKey{{ID: 0, Key: key, Current: true}})
-}
-
 // Revoked reports whether Revoke dropped the keys.
 func (c *Cipher) Revoked() bool { return c != nil && c.revoked.Load() }
 

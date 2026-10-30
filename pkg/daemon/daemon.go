@@ -160,7 +160,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return err
 	}
 	defer keys.stop()
-	cipher, err := openServerKey(ctx, cfg, keys.wrapper)
+	cipher, err := openServerKey(ctx, cfg, keys.wrapper, logger)
 	if err != nil {
 		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
