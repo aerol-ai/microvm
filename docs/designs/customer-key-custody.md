@@ -46,7 +46,7 @@ verify without gossip feature-version gating).
 - Design §9 + Phase 4/5: `sandboxd key status`, custody gauge, enterprise plaintext alert and runbook.
 - Design §10 + Phase 4/5/6: runtime re-check of the wrapped server key on a separate background budget; new `ErrKeyRevoked`/`ErrKeyVersionRetired` sentinels; per-backend revoke signals (KMS disabled/pending deletion/not found; PKCS#11 key gone or decrypt disabled; Vault key deleted; a Vault 403 or a retired version is never a revoke); on revoke a full stop (CEO-E2R) through a revocable shared `Cipher`, dropped egress CA, degraded health, `key_revoked` audit event, `SandboxdKeyRevoked` alert. Open: CEO-E2a (auto-recover vs restart), CEO-E2b (placement awareness), CEO-E2c (defaults, Vault error text).
 - Design §1 + Phase 2/5: `X-Aerol-Correlation-ID` on Transit calls; docs for Vault audited headers.
-- Design §11 + Phase 4b: in-daemon rewrap sweep (Vault rewrap with AAD or decrypt+encrypt fallback, PKCS#11 old→new label; no AWS sweep) with compare-and-swap under `lockSecretSandboxOps`; `sandboxd_key_rows_stale` gauge; early retirement is stale, not a revoke (`SandboxdKeyVersionRetiredInUse`). `sandboxd key rewrap` covers the server-key file only. Open: CEO-E4a (cadence), CEO-E4b (no cross-node sealed-byte comparison).
+- Design §11 + Phase 4b: in-daemon rewrap sweep (Vault decrypt+encrypt, since Transit rewrap takes no AAD, PKCS#11 old→new label; no AWS sweep) with compare-and-swap under `lockSecretSandboxOps`; `sandboxd_key_rows_stale` gauge; early retirement is stale, not a revoke (`SandboxdKeyVersionRetiredInUse`). `sandboxd key rewrap` covers the server-key file only. Open: CEO-E4a (cadence), CEO-E4b (no cross-node sealed-byte comparison).
 
 ## Deferred to TODOS.md
 - "GCP Cloud KMS and Azure Key Vault key providers (security, key custody)": triggers are the GKE phase of plans/kubernetes-deployment.md and a named Azure customer.
@@ -83,3 +83,22 @@ AWS `KMSInvalidStateException` counts only with `PendingDeletion` from
 
 ## Reviewer Concerns
 - Spec review stopped at the 3-iteration cap with score 6/10 (iteration 3). Its 8 issues were fixed after that review and checked by the author against the amended plan text, not re-reviewed: see the plan's "Spec review" note.
+
+## Eng review changes (2026-10-21 to 2026-10-30)
+
+The eng review answered every eng-owned item and changed some scope. The plan
+(`plans/customer-key-custody.md`, "Eng review") is the source of truth:
+
+- **PKCS#11 helper.** The vendor library runs in a supervised
+  `--pkcs11-helper` process, with per-op deadlines (D5, D25).
+- **Server-key rotation.** Now in scope (Phase 4c, D26); it is no longer a
+  non-goal.
+- **Revoke.** It also closes inspected connections and drops injected
+  secrets in the egress gateway (D21), and an old gateway is restarted (D4).
+  Nodes auto-recover when the key returns (D12).
+- **Provider switches** are two-step with no failover window, for every
+  backend (D8, D22).
+- **HSM label rotation** is staged (D23).
+- **Peer copies** keep the bytes already on disk (D20).
+- **The claim** covers a migrated install only after old copies are
+  destroyed or the server key is rotated (D24).

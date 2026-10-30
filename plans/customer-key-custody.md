@@ -1,9 +1,10 @@
 # Customer key custody: HashiCorp Vault and PKCS#11 (HSM) key providers
 
-Status: **DRAFT 2026-10-20**. CEO review done 2026-10-20 (SELECTIVE EXPANSION;
-decisions in "CEO review" at the end, folded into the sections above). Next
-step: `/plan-eng-review`. Open questions and the phase each one blocks are in
-"Decisions needed". Nothing here is built.
+Status: **DRAFT, reviewed.** CEO review 2026-10-20 (SELECTIVE EXPANSION, D1–D18)
+and eng review 2026-10-21 to 2026-10-30 (eng D2–D26), both folded into the sections above;
+records at the end. Every design decision is answered; what remains are
+Phase 0 measurements, listed in "Decisions needed" with the phase each one
+gates. Nothing here is built.
 
 Source of the ask: the enterprise gap list row
 
@@ -133,6 +134,16 @@ server key wrapped:**
 
 **It does not cover:**
 
+- **Copies made before a migration.** `sandboxd key wrap` wraps the **same**
+  server key. Backups taken before the migration archived `/etc/sandboxd`
+  (`scripts/sandboxd-backup.sh:69`), including the plaintext key in
+  `cluster.env`, and old cred bundles and S3 bundle object versions hold it
+  too. For a migrated install the claim holds only after those copies are
+  destroyed **or** after a server-key rotation (Design §13, eng D26) retires
+  the plaintext-era key; the docs give the checklist, and `sandboxd key status` shows
+  "migrated from plaintext" until `sandboxd key ack-migration` (eng D24,
+  outside voice OV5). A fresh wrapped install has no such copies.
+
 - **Software tokens.** SoftHSM2 keeps its token store and PIN on the same
   disk, so a stolen disk does decrypt. It is a test backend only; enterprise
   mode refuses a PKCS#11 slot that is not a hardware slot (Design §2).
@@ -173,9 +184,8 @@ server key wrapped:**
   audit-ingest token, webhook HMAC key and the upstream (AOCR) wrap key. They
   are credentials, not data-encryption keys. Operators can already source them
   from Vault with Vault Agent templates.
-- **Rotating the server key itself.** The `Cipher` format has no key ID, so
-  rotating the data key means resealing every row. Rotating the **key-store
-  key that wraps it** is in scope and cheap (see "Rotation").
+- ~~**Rotating the server key itself.**~~ Now in scope as Design §13 (eng
+  D26).
 - **Live provider switching between external providers.** `awskms` →
   `vault`/`pkcs11` and external → external stay unsupported in v1. Rows get
   tagged now so a later tool needs no format change. Moving from `local` to
@@ -283,11 +293,29 @@ has no equivalent, and the docs say so.
 `vault:vN:`, new wraps use the latest version, and old rows still decrypt
 until the operator raises `min_decryption_version`. Before raising it, the
 rewrap sweep (Design §11, CEO-E4) must move live rows to the new version.
-Transit's `rewrap` endpoint does this without exposing the DEK to sandboxd,
-if it accepts `associated_data` (Phase 0). If it does not, the sweep
-decrypts and re-encrypts inside sandboxd, as an open does.
+Transit's `rewrap` endpoint cannot be used: it takes no `associated_data`,
+and vault issue #29532 reports it fails for AAD-bound ciphertext (eng review
+finding 2). The sweep decrypts and re-encrypts inside sandboxd, as an open
+does.
 
 ### 2. The `pkcs11` provider (HSMs)
+
+**Process (eng D5).** The vendor library never loads into the daemon. sandboxd
+starts `sandboxd --pkcs11-helper` (the same binary, like `--wasm-worker`,
+`cmd/sandboxd/main.go:39`) and talks to it over a 0600 Unix socket in
+`/run/sandboxd` with four ops: Wrap, Unwrap, Ping and Info (slot flags and
+labels, for the custody report and the hardware-slot rule). The session pool,
+login and `C_Initialize` live in the helper. If the helper exits, sandboxd
+restarts it with backoff and calls in that window return
+`ErrProviderUnavailable`. Every op also carries a 5 s deadline (a constant);
+if one passes it, sandboxd kills and replaces the helper, which frees any
+vendor session stuck in a C call, and the `key_custody` loop runs each step
+under its own deadline so it never stalls behind the helper (eng D25, outside
+voice OV6). A vendor crash therefore costs a helper restart,
+not the daemon, and vendor code never sees sandboxd's memory. The helper is a
+child of sandboxd, so it never runs a different version. The short-lived
+`sandboxd key` CLI loads the same package in its own process; a crash there
+only ends the command.
 
 **Library.** Use `github.com/miekg/pkcs11`. It loads the vendor module with
 `dlopen` at runtime, so nothing vendor-specific is linked at build time. We
@@ -370,7 +398,7 @@ sweep (Design §11). Nothing else.
 | Backend | Grant |
 |---|---|
 | `awskms` | `kms:Encrypt`, `kms:Decrypt` and `kms:DescribeKey` (to tell a pending deletion from an outage, Design §10) on the one key. No `ReEncrypt`: AWS rotates in place, so there is no AWS sweep (Design §11). |
-| `vault` | `update` on `<mount>/encrypt/<key>`, `<mount>/decrypt/<key>` and `<mount>/rewrap/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). |
+| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). |
 | `pkcs11` | user login on the token; the key object with `CKA_ENCRYPT` and `CKA_DECRYPT`; the decrypt-only labels with `CKA_DECRYPT`. |
 
 ### 3. The wrapped server key
@@ -454,7 +482,9 @@ the process environment on top. It never opens the database.
   key-store key and wrap it under the newest one. Rows are not touched; the
   daemon's sweep (Design §11) rewraps them at its next boot or cadence.
 - `sandboxd key verify`: unwrap and check, without starting the daemon.
-- `sandboxd key status`: the custody report (Design §9).
+- `sandboxd key status`: the custody report (Design §9). After a migration
+  it shows "migrated from plaintext: destroy old backups and bundles" until
+  the operator runs `sandboxd key ack-migration` (eng D24).
 - `sandboxd key unwrap --to-file --i-understand-plaintext` (CEO-R1): the
   rollback to `custody=file`. At the next boot the daemon sees the custody
   changed and writes a `key_custody_changed` audit event (Section 3, S7). Unwraps through the key store, writes the key
@@ -486,9 +516,11 @@ file to all nodes, remove the key line from `cluster.env`, delete old cred
 bundles and overwrite or delete the S3 bundle object, restart node by node. The F1 refusal catches a forgotten
 `cluster.env` line.
 
-**Backups.** `scripts/sandboxd-backup.sh` copies only `state.db` and the raft
-directory today. Add the wrapped file to the backup and to
-`scripts/sandboxd-restore.sh`. The restore needs the key store reachable,
+**Backups.** `scripts/sandboxd-backup.sh` copies `state.db`, the raft
+directory **and `/etc/sandboxd`** (`:69`), which holds the plaintext key line in
+`cluster.env`. With `custody=wrapped` the script stops archiving the
+plaintext key line and the key file, and adds the wrapped file; the restore
+script (`scripts/sandboxd-restore.sh`) installs it (eng D24). The restore needs the key store reachable,
 which the runbook states. After a key version is retired (Design §11), an
 older backup's wrapped file no longer opens, so the runbook says to take a
 fresh backup after every retirement.
@@ -498,8 +530,10 @@ fresh backup after every retirement.
 Vault ciphertext already starts with `vault:v`. PKCS#11 output starts with
 `p11:`, as defined above. Untagged bytes are either a `local` row (DEK wrapped
 under the server key) or an `awskms` row (opaque KMS blob). An untagged row is
-opened with the server key first, then with AWS KMS when that is the
-provider (Design §12). `Unwrap` checks the tag before calling out. On a mismatch it returns `ErrProviderUnavailable` with
+opened with the server key first, then with AWS KMS whenever the node has
+AWS KMS settings, whatever its sealing provider (Design §12, eng D22). `Unwrap` checks the tag before calling out, and a
+tagged row opens with whichever configured backend its tag names, even when
+that is not the sealing provider (eng D8). On a mismatch it returns `ErrProviderUnavailable` with
 "row wrapped by X; node configured for Y" instead of a bare decrypt failure.
 This needs no envelope version bump, because the tag lives inside the wrapper's
 own output. Live switching (a decrypt-only previous provider plus a reseal
@@ -513,7 +547,10 @@ sweep) can be added later with no format change.
 - **Limit in one place.** A `limitedWrapper` decorator in `pkg/secrets` caps
   in-flight calls per node (`SB_SECRET_PROVIDER_MAX_INFLIGHT`, default 8, and
   the PKCS#11 pool uses the same number). It retries `ErrProviderThrottled`
-  with jittered backoff inside the caller's context deadline. All three
+  with jittered backoff inside the caller's context deadline, and retries
+  `ErrProviderUnavailable` once, for foreground calls only, after 100-300 ms of
+  jitter when the deadline leaves room (eng D17). Background calls never
+  retry; their next tick does. All three
   providers get it, `awskms` included. This fixes fact 7.
 - **Fleet math** at the review bar (2,000 nodes, 100k sandboxes):
   - A rolling restart opens about 50 secret-bearing sandboxes per node. That is
@@ -523,16 +560,21 @@ sweep) can be added later with no format change.
   - Phase 0 measures what one Vault active node and one CloudHSM partition can
     sustain. The docs publish the sizing rule from that measurement, not from
     vendor claims.
+- **Settings (eng D13).** Only `SB_SECRET_PROVIDER_MAX_INFLIGHT` (default 8)
+  is a setting, so operators can fit it to their HSM's session limit; the
+  reserved create slot, the background budget and the backoff ceiling are
+  commented constants until Phase 0 gives a reason to change them.
 - **Background work never blocks a create.** The re-check (Design §10) and
   the sweep (Design §11) use a separate, smaller budget (2 slots [estimated])
   inside `limitedWrapper`, so a create's `Wrap` never waits behind them. The
   PKCS#11 session pool is sized foreground plus background (8 + 2), so the
   cold-start bound in the fleet math above becomes 2,000 × 10 = 20k calls in flight.
 - **Sweep load after a rotation.** Every copy on every node is rewrapped, and
-  on Vault every call lands on one active node. The sweep starts after a
-  random delay of up to one cadence period and runs only on the 2 background
-  slots, which caps it at 2 × 2,000 = 4k in flight fleet-wide [estimated].
-  CEO-E4a sets the cadence with Phase 0's Vault throughput in hand.
+  on Vault every call lands on one active node. The sweep runs at boot and
+  hourly (eng D19), starts after a random delay of up to an hour, and runs
+  only on the 2 background slots, which caps it at 2 × 2,000 = 4k in flight
+  fleet-wide [estimated]. An idle pass is a local scan plus, on Vault, one key
+  version read (about 0.6 calls/s at 2,000 nodes [estimated]).
 - **No DEK cache** (non-goal above).
 
 ### 6. Boot-path latency (CLAUDE.md rule 2)
@@ -610,7 +652,7 @@ server key's `custody` is not `wrapped`. Its runbook entry goes in
 bound, without restarting nodes.
 
 **Re-check.** With `custody=wrapped`, every
-`SB_SECRET_PROVIDER_RECHECK_INTERVAL` (default 5 minutes [estimated], with
+`SB_SECRET_PROVIDER_RECHECK_INTERVAL` (default 5 minutes, eng D18, with
 jitter), each node **unwraps its stored wrapped server key again** and
 compares the `check` value. This uses real data, not a fresh canary, so it
 also catches a retired version still in use (reported as stale, not as a
@@ -620,7 +662,9 @@ one key-store call per node per interval, about 7 calls per second across
 
 **Only deliberate signals count as a revoke.** Phase 1 adds an
 `ErrKeyRevoked` sentinel (and `ErrKeyVersionRetired` for stale versions) to
-`pkg/secrets/errors.go`. Each re-check result is sorted into ok, unavailable,
+`pkg/secrets/errors.go`, and `openRawEnvelope` passes both through like the
+three existing provider classes (`pkg/secrets/envelope.go:257`; outside voice
+OV7). Each re-check result is sorted into ok, unavailable,
 throttled, denied, retired or **revoked**:
 
 | Backend | Revoked means | Not a revoke (alert only) |
@@ -652,12 +696,18 @@ therefore covers both holders. Recovery (CEO-E2a) swaps a new AEAD in. The
 store.
 
 **On a revoke.** After `SB_SECRET_PROVIDER_REVOKE_AFTER` consecutive revoked
-results (default 3, so about 15 minutes [estimated]), the node:
+results (default 3, so about 15 minutes, eng D18), the node:
 
 - **stops processing the customer's data (full stop, CEO-E2R).** It calls
   `Cipher.Revoke()`, drops its in-memory egress-inspection CA
   (`egress.InspectCA`, loaded at `internal/service/egress_inspect.go:117`),
-  and stops opening cluster-secret copies. The CA key also lives in the
+  and stops opening cluster-secret copies. The egress gateway's
+  `clear_inspect_ca` drops the CA, drops every sandbox's injection secrets
+  (`Spec.Secrets`, read by inject rules at `internal/egress/proxy/inspect.go:251`)
+  and closes established inspected connections, which otherwise keep the
+  inspector they loaded at connect time (`:108-110`); inject rules then deny
+  with `ReasonSecretMissing`, and sandboxd's Syncs carry no secrets while the
+  node is revoked (eng D21, outside voice OV2). The CA key also lives in the
   **egress gateway**, a separate process with its own systemd unit
   (`packaging/aerolvm-egress-gateway.service`), which gets it through
   `set_inspect_ca` (`internal/egress/proto.go:38`,
@@ -667,7 +717,11 @@ results (default 3, so about 15 minutes [estimated]), the node:
   (about 15 minutes; sandboxd sends the bound in the `set_inspect_ca`
   message, so the gateway needs no setting of its own), so a sandboxd that can no longer boot cannot leave the
   key behind, while an ordinary sandboxd restart (seconds) does not break
-  inspected egress; Go cannot promise memory is
+  inspected egress. An **older** gateway still running after an upgrade
+  answers `unknown op` (`internal/egress/server.go:278`); sandboxd then
+  restarts `aerolvm-egress-gateway.service`, the gateway comes back without
+  the CA (it is memory-only), and a revoked sandboxd never resends it. The
+  alert and audit event say the gateway was restarted (eng D4); Go cannot promise memory is
   zeroed, so the docs say "dropped", not "wiped";
 - fails every operation that reads sealed data with `ErrKeyRevoked` ("key
   revoked by the key store"). Because every sandbox's toolbox token is sealed
@@ -699,12 +753,18 @@ visible.
 
 **Pending for eng review** (accepted scope, open implementation choices):
 
-- **CEO-E2a.** After the customer re-enables the key, does the node recover
-  on its own at the next good re-check, or only after a restart?
-- **CEO-E2b.** Should a revoked node tell placement to stop sending it creates
-  that carry secrets, or is failing closed with a clear error enough?
-- **CEO-E2c.** Confirm the defaults (5 minutes × 3) and the exact Vault error
-  text for a retired version (Phase 0).
+- ~~**CEO-E2a.**~~ Answered (eng D12): auto-recover. On the first re-check
+  after a revoke where the stored key unwraps and its check matches, the loop
+  swaps the AEAD back into the shared `Cipher`, re-sends the CA and the
+  sandboxes' injection secrets to the gateway (`set_inspect_ca` and the next
+  Sync), returns health to ok, resets the counter and writes a
+  `key_recovered` audit event (a new `Kind`). A later revoke needs N revoked
+  results again.
+- ~~**CEO-E2b.**~~ Answered (eng D7): no placement change. A revoke is
+  cluster-wide because every node wraps the same server key; failing closed
+  with 503 `key_revoked` is enough, and `internal/cluster` is untouched.
+- ~~**CEO-E2c.**~~ Answered (eng D18): defaults 5 minutes × 3 (about 15
+  minutes), both settings. The exact Vault error text stays a Phase 0 item.
 
 ### 11. Rewrap sweep (CEO-E4)
 
@@ -719,7 +779,7 @@ wrapped key, so the payload, the seal generation and the ref stay the same.
 
 | Backend | How a stale row is found | How it is rewrapped |
 |---|---|---|
-| `vault` | `vault:vN:` prefix with N below the latest version | Transit `rewrap` with `associated_data` (Phase 0); else decrypt and re-encrypt in sandboxd |
+| `vault` | `vault:vN:` prefix with N below the latest version | decrypt and re-encrypt in sandboxd (Transit `rewrap` takes no AAD; eng finding 2) |
 | `pkcs11` | label in the `p11:` header is not `SB_SECRET_PKCS11_KEY_LABEL` | decrypt under the old label, encrypt under the new, inside one session |
 
 AWS KMS has no sweep: it rotates key material in place and never retires it,
@@ -728,7 +788,8 @@ and a changed key id is a provider switch, which v1 does not support.
 **Where it runs.** Inside the daemon, never in a second process: SQLite has
 one writer per process (`MaxOpenConns=1`), and a CLI opening the database
 alongside the daemon would break that. It runs at boot and then on a cadence
-(CEO-E4a), on the background budget of `limitedWrapper` (Design §5), and
+every hour after that (eng D19, a constant), on the background budget of
+`limitedWrapper` (Design §5), and
 also rewraps the node's own server-key file. With the daemon stopped,
 `sandboxd key rewrap` covers the server-key file, and the rows wait for the
 next boot sweep.
@@ -743,6 +804,26 @@ never upserts (Section 4). The paths it can meet: a new `Put` (new generation, a
 current, so skip), a reseal from repair, an incoming peer copy, delete and
 tombstone, and reseal retirement. Each node rewraps only its own copies; no
 fan-out, because every node reaches the same key store.
+
+**Peer copies after a rewrap (eng D3).** A rewrap changes only `WrappedKey`,
+but the peer receive path rejected same-generation, different-bytes copies
+(`internal/store/store.go:5865-5870`), and the put-outbox resends the row's
+current bytes. A `pkg/secrets` helper now compares two envelopes on every
+field except `WrappedKey`. `PutClusterSecret` uses it at `:5865` and `:5888`:
+same generation and same content is idempotent and **keeps the bytes already
+on disk** (no rewrite; tomb and outbox transitions still apply), because each
+node's own sweep owns rewrapping its own copies and a late, older copy must
+never undo it (eng D20, outside voice OV1). A different payload is still a
+conflict.
+
+**PKCS#11 label rotation (eng D23).** Labels are per-node settings, so a
+rotation is staged: (1) add label B to `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS`
+on every node, then confirm every member lists B in
+`aerolvm_key_decryptable{backend,key}`; (2) set `SB_SECRET_PKCS11_KEY_LABEL=B`
+on every node; (3) wait until every member reports stale = 0 **and**
+`aerolvm_key_current{backend,key}` = B; (4) retire A. Both info gauges also
+show in `sandboxd key status`. Vault and AWS KMS need none of this: their
+versions are global.
 
 **Progress and retirement.** A `aerolvm_key_rows_stale` gauge per node
 counts stale rows **plus the node's server-key file**. It is a daemon metric;
@@ -773,8 +854,9 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
 - **Opening an untagged row.** The node first tries the server key with the
   local rules (`KeyAADBound`, the same recipient check as `LocalProvider`).
   GCM authenticates the attempt, so a wrong guess fails cleanly. If that
-  fails and the provider is `awskms`, it tries AWS KMS (an untagged
-  `awskms` row). This replaces "untagged means `awskms`" (§4, E4) with
+  fails and the node has AWS KMS settings (whatever its sealing provider), it
+  tries AWS KMS (an untagged `awskms` row). That keeps the two-step switch
+  (eng D8) window-free for `local → awskms` too (eng D22, outside voice OV3). This replaces "untagged means `awskms`" (§4, E4) with
   "untagged means local, else `awskms`".
 - **Converting.** The sweep (§11) gains a fourth source format: a local row is
   unwrapped with the server key and wrapped under the new provider, under the
@@ -786,11 +868,73 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
   the full stop.
 - **Still unsupported:** `awskms` → `vault`/`pkcs11`, and any external →
   external switch (Non-goals).
-- **Known limit, rolling switch.** A node not yet switched cannot open rows
-  sealed by a switched node. Sandboxes created during the rolling restart can
-  lack a usable failover copy on unswitched nodes until those nodes switch.
-  The runbook keeps the window short (switch config on every node, then a
-  quick rolling restart). Eng review may narrow it (E9).
+- **Two-step switch, no window (eng D8).** A node opens any tagged row whose
+  backend it has settings for, whatever `SB_SECRET_PROVIDER` says; sealing
+  still follows `SB_SECRET_PROVIDER`. The runbook: (1) add the new backend's
+  settings (and key-store access) to every node, which changes nothing;
+  (2) flip `SB_SECRET_PROVIDER` in a rolling restart. Every node can open the
+  new rows before any node seals them, so no sandbox loses its failover copy
+  during the switch.
+
+### 13. Server-key rotation (eng D26)
+
+**Why.** Wrapping keeps the same server key (§3), so copies made before a
+migration still open data (claim, "Copies made before a migration"). Rotating
+the key and resealing every row makes those copies useless for anything
+sealed after the rotation, and answers the "how do you rotate data keys?"
+audit question.
+
+**Format.** `Cipher` output today is `nonce(12) || ciphertext+tag`
+(`pkg/secrets/secrets.go:25-30`) with no key id. New writes are
+`0xA1 || key_id(4 bytes) || nonce(12) || ciphertext+tag`. Reading tries the
+key-id form first (look the id up in the ring) and falls back to the legacy
+form under the ring's legacy key. GCM authenticates both attempts, so a
+legacy blob that happens to start with `0xA1` fails the first try cleanly.
+Legacy blobs read as key id 0.
+
+**Key ring.** The server-key file becomes a ring: a list of keys, each with an
+id, its wrapped (or, with `custody=file`, plain) bytes, its `check`, and a
+state of `current`, `decrypt` or `retired`. Exactly one key is `current`. The
+`key_custody` loop re-reads the file on every re-check, so a ring change
+reaches a running node within about 5 minutes with no restart. Rotation works
+with both custody modes; with `custody=wrapped` every ring key is wrapped by
+the key store.
+
+**Staged rotation** (the same pattern as eng D8 and D23):
+
+1. `sandboxd key rotate --stage` makes key K2 and writes the ring with K1
+   `current` and K2 `decrypt`. It refuses unless every alive member advertises
+   the ring-format gossip feature version (`liveMembersAtLeast`,
+   `internal/cluster/audit_caller_gate.go:46`), so no old binary ever meets a
+   key-id blob. The operator copies the file to every node, as for the
+   initial wrap.
+2. When `aerolvm_server_key_ring{key_id,state}` shows K2 decryptable on every
+   member, `sandboxd key rotate --promote` makes K2 `current`; nodes seal new
+   data with K2 after their next re-read.
+3. The `key_custody` loop reseals every sealed column under K2, paged and
+   under compare-and-swap on the exact bytes it read: toolbox tokens, env,
+   registry auth, mount credentials, the egress CA record, and `local`
+   cluster-secret copies (peer copies follow eng D20: each node reseals its
+   own, an older incoming copy never replaces a newer one).
+   `aerolvm_server_key_rows{key_id}` counts what is left. This is local AES
+   work only: the ring is already in memory, so it makes no key-store calls.
+4. When every member reports zero rows on K1 and K2 `current`,
+   `sandboxd key rotate --retire K1` marks K1 `retired` and drops its bytes
+   from the ring.
+
+After step 4, a copy of K1 (old backup, old cred bundle, old S3 object)
+opens nothing sealed after the rotation, and nothing in the current
+database. It still opens the old backup's own old rows, which no rotation can
+change. The D24 "migrated from plaintext" notice clears on its own when the
+plaintext-era key is retired.
+
+**Revoke and recovery.** `Cipher.Revoke()` drops every ring key; auto-recovery
+(eng D12) restores the ring from the file after a good unwrap and check of
+the current key.
+
+**Audit.** `key_rotation_staged`, `key_rotation_promoted` and
+`key_rotation_retired` are new `Kind` values, written by the node that runs
+the command at its next boot or re-read.
 
 ## Coordination with other plans
 
@@ -802,10 +946,8 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
 - **HSM signing of audit heads** (`plans/secrets-hardening.md:1014`, and
   `plans/open-audit-witness.md` Non-goals) can reuse the PKCS#11 session pool
   from Phase 3. Deferred to its TODOS.md entry (CEO-E6).
-- **Cluster placement.** If eng review answers CEO-E2b "yes" (a revoked node
-  tells placement to stop sending it creates), that change touches
-  `internal/cluster` and falls under CLAUDE.md rule 6: a regression test next
-  to the changed file and a cluster-correctness call-out in the PR.
+- **Cluster placement.** Untouched: eng D7 chose no placement change, so
+  CLAUDE.md rule 6 does not apply to this stack.
 
 ## Testing
 
@@ -825,8 +967,11 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
   `pkg/daemon` (wrapper before `NewCipher` before store open).
 - **Config:** a validation table for every new variable and the enterprise
   rules.
-- **`limitedWrapper`:** concurrency cap, backoff, context deadline, and that
-  background calls never take the foreground slots.
+- **`limitedWrapper`:** concurrency cap, backoff, context deadline, that
+  background calls never take the foreground slots, and one retry of
+  `ErrProviderUnavailable` for foreground calls only (a fake that fails once
+  succeeds; one that fails twice returns 503; a background call never
+  retries) (eng D17).
 - **Error classes:** each backend's table (Design §1, §2, §10) maps to the
   right sentinel, including the `awskms` change for `Disabled` and
   `NotFound`, `KMSInvalidState` counted as a revoke only with
@@ -836,18 +981,42 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
   and no plaintext key (`config.go:2573-2580` rewritten).
 - **API errors (Section 2):** each provider class returns 503 with its stable
   code, `Retry-After` on throttling; no log line contains a request or
-  response body from the key store.
+  response body from the key store. An end-to-end case opens a cluster
+  secret whose key was revoked and checks the handler returns 503
+  `key_revoked`, which needs `openRawEnvelope` (`pkg/secrets/envelope.go:255-260`)
+  to pass `ErrKeyRevoked` and `ErrKeyVersionRetired` through instead of
+  folding them into `ErrDecryptFailed` (outside voice OV7).
 - **Custody report (§9):** a table test over config combinations for
   `sandboxd key status` and the gauge labels, including `software token`.
 - **Revocation (§10):** the classifier per backend; N consecutive revokes
   trip, a non-revoke in between resets the count, a Vault 403 never trips;
   the shared `Cipher` stops working for both the store and the service; the
-  `key_revoked` event kind; and recovery per CEO-E2a.
+  `key_revoked` event kind; and recovery (eng D12): revoke → re-enable → the
+  next good re-check restores the `Cipher`, re-sends the CA, returns health
+  to ok and writes `key_recovered`.
+- **Two-step switch (eng D8, D22):** a node still sealing `local` but holding
+  the Vault settings opens a `vault:` row; a node still sealing `local` but
+  holding AWS KMS settings opens an untagged `awskms` row; a node without the
+  settings returns the "wrapped by X; node configured for Y" error.
+- **Untagged rows (eng D9):** a table over local-only, KMS-only and mixed
+  histories; every row opens.
 - **Adoption (§12):** an untagged local row opens with the server key; an
   untagged `awskms` row falls through to AWS KMS; the sweep converts a local
   row and the payload is unchanged; a revoked `Cipher` opens neither.
 - **Revoke ordering (Section 4):** a `Decrypt` paused after its AEAD load
   completes across a revoke; a fresh one after it returns `ErrKeyRevoked`.
+- **Server-key rotation (eng D26):** a legacy blob and a key-id blob both open;
+  a legacy blob starting with `0xA1` falls back cleanly; `--stage` refuses
+  while any member lacks the feature version; each reseal loses to a racing
+  writer of the same row; revoke drops every ring key and recovery restores
+  them; a live UC runs stage → promote → reseal → retire on a 3-node cluster
+  with a failover between every step, then shows an old backup's key opens no
+  current row.
+- **Peer copies (eng D3, D20):** `PutClusterSecret` with the same generation
+  and only `WrappedKey` changed succeeds and keeps the bytes already on disk;
+  a pre-sweep copy arriving after the receiver's sweep leaves the receiver's
+  newer wrapping in place; a changed payload still returns
+  `ErrClusterSecretPayloadConflict`.
 - **Sweep (§11):** compare-and-swap loses to each of the five racing paths
   (new `Put`, repair reseal, incoming peer copy, delete or tombstone, reseal
   retirement); an already-current row is a no-op; the stale-rows gauge.
@@ -856,20 +1025,44 @@ recipient binding (`pkg/secrets/envelope.go:130`, `:229`). After the switch:
 - **Provider tags (§4):** a row wrapped by another provider returns the
   "wrapped by X; node configured for Y" error, not a bare decrypt failure.
 - **Full stop (§10):** after a revoke, `clear_inspect_ca` reaches the
-  gateway; the gateway drops its CA once sandboxd has been gone past the
+  gateway; a fake old gateway answering `unknown op` gets its unit restarted
+  and no CA is resent (eng D4); an open keep-alive inspected connection is
+  closed, an inject rule denies with `ReasonSecretMissing`, and a Sync during
+  the revoke carries no secrets (eng D21); the gateway drops its CA once sandboxd has been gone past the
   bound it was sent, and keeps it across a short restart; open SSH and
   exec streams close, health reports degraded, and a retired version never
   trips a revoke.
+- **PKCS#11 helper (eng D5, D25):** the helper exits mid-call → the caller gets
+  `ErrProviderUnavailable`, sandboxd restarts it with backoff and the next
+  call succeeds; a fake helper that never answers is killed and replaced
+  after the 5 s deadline, and the restart counter records `deadline`; the socket is 0600; the daemon process never maps the
+  vendor library (checked through `/proc/self/maps` in a tag-gated test).
 - **PKCS#11 (§2):** enterprise mode refuses a non-hardware slot; re-login
   after a reopened session; the label mapping (current missing → revoked,
   decrypt-only missing → retired, unknown → decrypt failure).
 - **Security (Section 3):** `--generate` refuses on a joiner (S5); a custody
   change between boots writes `key_custody_changed` (S7); a Vault key name
   with `/` or `..` is refused (S9).
+- **Migration notice (eng D24):** after `sandboxd key wrap` on an install with
+  a plaintext key, `key status` reports "migrated from plaintext" until
+  `key ack-migration`; the backup script with `custody=wrapped` archives no
+  plaintext key.
 - **`sandboxd key`:** `unwrap --to-file` round-trips to the same key and
   refuses without `--i-understand-plaintext`; `wrap --generate` refuses when any key exists; env-file
   loading order; the daemon never generates in cluster mode or with an
   existing `state.db`; a joiner without the wrapped file refuses to start.
+
+**Regression contract (eng D15).** Existing behavior is protected by new rows
+in the existing table tests, with existing rows unchanged:
+
+| Behavior | Preserve | Intended difference |
+|---|---|---|
+| `awskms` error mapping (`TestMapAWSKMSError`) | Throttled, AccessDenied, other codes | Disabled, NotFound, InvalidState with PendingDeletion → `ErrKeyRevoked` |
+| API error classes (`classify_test.go`) | every non-provider status | five provider classes → 503 with stable codes |
+| `PutClusterSecret` (put-outbox and store tests) | stale generation rejected; tomb rules; payload conflict | same generation, only `WrappedKey` changed → idempotent |
+| Upstream wrap key loader (`wrap_key_loader_test.go`) | 0400 required; looser or writable refused | none |
+| `custody=file`, `local` provider (`secrets_test.go`, `config_test.go`) | `NewCipher` env/file/generate; cluster key check | none |
+| `awskms` create path (provider contract run) | same results | passes through `limitedWrapper` |
 
 **Tag-gated real backends** (a new CI job like `wasm-integration`, not in
 `make test`): run `vault server -dev`, `bao server -dev` and SoftHSM2 on the
@@ -901,16 +1094,21 @@ runner, and run the same contract suite against each.
   - rotate, wait for the stale-rows gauge to reach 0 on every node, retire the
     old version, then fail over a sandbox sealed before the rotation: it
     opens (the CEO 10x promise);
+  - the four-step PKCS#11 label rotation on the SoftHSM2 scenario, with a
+    failover between every step (eng D23);
   - a joiner without the wrapped file refuses to start;
   - a fresh cluster built with `cluster-init.sh` / `cluster-join.sh
     --key-custody wrapped` (through the Terraform `key_custody` variable, since
     the itest reuses the prod module), and a single node with `install.sh
     --key-custody wrapped`: no plaintext key in the key file, `cluster.env`,
     the cred bundle or the S3 bundle object;
-  - backup, then restore onto a fresh node with the key store reachable;
+  - backup, then restore onto a fresh node with the key store reachable; the
+    new backup holds no plaintext key line or key file (eng D24);
   - switch a running 3-node `local` cluster to `vault`: fail over a sandbox
     sealed before the switch, once before the sweep converts it and once after
-    (CEO-M1).
+    (CEO-M1);
+  - the same two-step switch from `local` to `awskms`, with a create during
+    the rolling restart failing over to a not-yet-switched node (eng D22).
 
 ## Docs
 
@@ -933,6 +1131,10 @@ runner, and run the same contract suite against each.
   - `engineering-secret-handling.mdx:180`, `:224`;
   - `setup/config-defaults.md:64-66`, `:96`, `:192`;
   - `setup/runbooks/secrets-and-audit.md:89`, `:768`.
+- **Rotation runbooks:** `key-custody.mdx` and
+  `setup/runbooks/secrets-and-audit.md` cover the server-key rotation (stage,
+  promote, reseal, retire; eng D26), the PKCS#11 label rotation (eng D23)
+  and the migration cleanup checklist (eng D24).
 - **Vault Agent example:** `key-custody.mdx` shows an Agent config for both
   auth modes (token file, API proxy). Config files are allowed; raw HTTP is
   not.
@@ -945,12 +1147,13 @@ One PR per phase, stacked, with nothing merged until the whole stack is green.
 
 | Phase | What | Effort |
 |---|---|---|
-| 0 | **Spike, no product code.** On Vault and OpenBao: decrypt with the wrong AAD is rejected; `rewrap` accepts `associated_data`; the error text for a deleted key and for a retired version; audited request headers record `X-Aerol-Correlation-ID`. On SoftHSM2 and CloudHSM: GCM IV behavior and `CKF_HW_SLOT`. Choose miekg or crypto11. Measure p50, p99 and throughput for AWS KMS, Vault and CloudHSM from one region. Record the results in this file. | S (plus about 2 hours of CloudHSM) |
+| 0 | **Spike, no product code.** On Vault and OpenBao: decrypt with the wrong AAD is rejected; the error text for a deleted key and for a retired version; audited request headers record `X-Aerol-Correlation-ID`. On SoftHSM2 and CloudHSM: GCM IV behavior, `CKF_HW_SLOT`, and whether AES-GCM is available (eng D16 builds the key-wrap fallback only if a target lacks it). Choose miekg or crypto11. Measure p50, p99 and throughput for AWS KMS, Vault and CloudHSM from one region. Record the results in this file. | S (plus about 2 hours of CloudHSM) |
 | 1 | **Seam split.** `secrets.NewWrapper(ctx, opts)` builds the wrapper from config with no store, and `NewProvider` takes it. Add the `limitedWrapper` decorator with its background budget, the provider tags, the `ErrKeyRevoked` and `ErrKeyVersionRetired` sentinels (and the `awskms` mapping change), the boot canary and strict-boot option for every external provider (the enterprise **requirement** lands in Phase 5), the cluster-mode key check at `config.go:2573-2580`, the reserved create slot, the provider-error to HTTP 503 mapping in `apihttp.WriteStoreAwareError` (Section 2), and the config validation. No other behavior change for `local` or `awskms`. | S |
 | 2 | The `vault` wrapper and its tests, including the correlation header (CEO-E3). | M |
-| 3 | The `pkcs11` wrapper, session pool and tests. | M |
-| 4 | Wrapped server key: boot order in `pkg/daemon`, the revocable `Cipher`, `sandboxd key wrap [--generate]/rewrap/verify/status/unwrap` with env-file loading, `--key-custody wrapped` in `cluster-init.sh`, `cluster-join.sh`, `install.sh` and the Terraform bootstrap (`key_custody` variable, `bootstrap.sh.tftpl`) (fact 10), the joiner refusal, the backup and restore scripts, the custody gauge (CEO-E1), the revocation re-check (CEO-E2), and the full-stop pieces: `clear_inspect_ca`, closing proxied sessions, degraded health (CEO-E2R). | L |
-| 4b | Rewrap sweep (CEO-E4): in-daemon sweep with compare-and-swap, the stale-rows gauge, `ErrKeyVersionRetired` handling, and local → external conversion with the untagged-row open order (CEO-M1, Design §12). | L |
+| 3 | The `pkcs11` wrapper, the `--pkcs11-helper` process with its socket protocol and supervisor (eng D5), the session pool, tests, plus a CI run of every `sandboxd` release-matrix target with the new cgo dependency (eng Scope Challenge finding 4). | L |
+| 4 | Wrapped server key: boot order in `pkg/daemon`, the revocable `Cipher`, `sandboxd key wrap [--generate]/rewrap/verify/status/unwrap` with env-file loading, `--key-custody wrapped` in `cluster-init.sh`, `cluster-join.sh`, `install.sh` and the Terraform bootstrap (`key_custody` variable, `bootstrap.sh.tftpl`) (fact 10), the joiner refusal, the backup and restore scripts, the custody gauge (CEO-E1), the revocation re-check with auto-recovery (CEO-E2, eng D12), and the full-stop pieces: `clear_inspect_ca` (drops the CA and injection secrets, closes inspected connections; eng D21) with the restart fallback for an old gateway (eng D4), closing proxied sessions, degraded health (CEO-E2R). | L |
+| 4b | Rewrap sweep (CEO-E4): in-daemon sweep with compare-and-swap, the stale-rows gauge, `ErrKeyVersionRetired` handling, local → external conversion with the untagged-row open order (CEO-M1, Design §12), and the peer-copy comparison without `WrappedKey` (eng D3). | L |
+| 4c | Server-key rotation (eng D26): key-id `Cipher` format with authenticated dual read, the key ring, `sandboxd key rotate --stage/--promote/--retire` gated on gossip feature version, the reseal pass in the `key_custody` loop for every sealed column, the ring gauges and the rotation audit kinds. | XL |
 | 5 | Enterprise rules, the docs page and updates, config-defaults, the runbook, the `SandboxdServerKeyPlaintext`, `SandboxdKeyRevoked`, `SandboxdKeyVersionRetiredInUse` and `SandboxdKeyStoreThrottling` alerts with runbooks and `alerts_test.go` rows (CEO-E1, CEO-E2, CEO-E4, Section 8), the key-custody Grafana row, the revoke procedure per backend, and the Vault Agent example. | S |
 | 6 | The tag-gated CI job, the live itest scenarios, the CloudHSM run, and an Outcome section here. | M (AWS time) |
 | 7 | **One release later (F2):** enterprise mode with an external provider refuses `custody=file`; release notes announce it one release ahead. | S |
@@ -969,25 +1172,25 @@ gates are answered and written back here.
 | ~~F1 plaintext-present refusal~~ answered: refuse (D13) | founder | — |
 | ~~F2 enterprise requires `wrapped`~~ answered: warn, then refuse (D16) | founder | — |
 | ~~F3 first HSM to certify~~ answered: AWS CloudHSM (D14) | founder | — |
-| E1 Vault auth modes | eng | Phase 2 |
-| E2 thin Vault client | eng | Phase 2 |
-| E3 key-wrap-pad fallback | eng | Phase 3 (after Phase 0) |
-| E4 untagged rows: local first, then `awskms` (§12, revised by CEO-M1) | eng | Phase 1 |
-| E9 narrow the rolling-switch window (§12 known limit) | eng | Phase 4b |
-| E5 `limitedWrapper` defaults in config | eng | Phase 1 |
-| CEO-E2a auto-recover after re-enable | eng | Phase 4 |
-| CEO-E2b placement awareness | eng | Phase 4 (rule 6 if yes) |
-| CEO-E2c defaults (5 min × 3) | eng | Phase 4 (after Phase 0) |
-| CEO-E2e an older running egress gateway rejects `clear_inspect_ca` after an upgrade: restart it, or alert that the revoke is incomplete | eng | Phase 4 |
-| E6 PKCS#11 in-process, or in a helper process (a vendor library crash or memory bug cannot take down sandboxd or read its memory) | eng | Phase 3 |
-| E7 PKCS#11 code in its own package (`pkg/secrets/pkcs11`) so cgo and the vendor library stay out of the base package | eng | Phase 3 |
-| E8 one short retry for `ErrProviderUnavailable` inside the caller's deadline (Vault active-node failover returns 503 for seconds) | eng | Phase 1 |
-| CEO-E4a sweep cadence | eng | Phase 4b |
-| CEO-E4b no cross-node sealed-byte comparison | eng | Phase 4b |
+| ~~E1 Vault auth modes~~ answered: Vault Agent only (eng D10) | — | — |
+| ~~E2 thin Vault client~~ answered: thin client (eng D11) | — | — |
+| ~~E3 key-wrap-pad fallback~~ answered: only if Phase 0 finds a target HSM without AES-GCM (eng D16) | — | — |
+| ~~E4 untagged rows~~ answered: local first, then `awskms` (eng D9) | — | — |
+| ~~E9 rolling-switch window~~ answered: two-step switch, no window (eng D8) | — | — |
+| ~~E5 limiter settings~~ answered: only `SB_SECRET_PROVIDER_MAX_INFLIGHT` (eng D13) | — | — |
+| ~~CEO-E2a recovery~~ answered: auto-recover on a good re-check (eng D12) | — | — |
+| ~~CEO-E2b placement awareness~~ answered: none (eng D7) | — | — |
+| ~~CEO-E2c re-check defaults~~ answered: 5 min × 3 (eng D18) | — | — |
+| ~~CEO-E2e older egress gateway after an upgrade~~ answered: restart the gateway unit on `unknown op` (eng D4) | — | — |
+| ~~E6 PKCS#11 in-process or helper~~ answered: helper process (eng D5) | — | — |
+| ~~E7 PKCS#11 package~~ answered: `pkg/secrets/pkcs11` with a `!cgo` stub (eng D6) | — | — |
+| ~~E8 short retry on Unavailable~~ answered: one jittered retry, foreground only (eng D17) | — | — |
+| ~~CEO-E4a sweep cadence~~ answered: boot + hourly (eng D19) | — | — |
+| ~~CEO-E4b no cross-node sealed-byte comparison~~ found one (`store.go:5865`); fixed by comparing without `WrappedKey` (eng D3) | — | — |
 | Phase 0: Vault and OpenBao reject a wrong AAD on decrypt (else the derived-key fallback) | Phase 0 result | Phase 2 |
 | Phase 0: miekg vs crypto11 | Phase 0 result | Phase 3 |
 | Phase 0: CloudHSM sets `CKF_HW_SLOT` (if not, enterprise mode would refuse it; rule changes) | Phase 0 result | Phase 3 |
-| Phase 0: Transit `rewrap` accepts `associated_data` (else decrypt and re-encrypt) | Phase 0 result | Phase 4b |
+| ~~Phase 0: Transit `rewrap` accepts `associated_data`~~ answered: no (vault issue #29532); the sweep decrypts and re-encrypts (eng finding 2) | — | — |
 | Phase 0: Vault and OpenBao audited request headers record `X-Aerol-Correlation-ID` | Phase 0 result | Phase 2 (header), Phase 5 (docs) |
 | Phase 0: Vault error text for a deleted key and for a retired version | Phase 0 result | Phase 2 (error table) |
 | Phase 0: create-path wait under a restart storm, with the reserved slot | Phase 0 result | Phase 1 |
@@ -1009,22 +1212,22 @@ founder answers differently, §3 and §7 change.
 **Eng review:**
 
 - **E1.** Vault auth limited to a token file and the Agent proxy in v1?
-  *Recommend yes.*
-- **E2.** Thin Vault client instead of `hashicorp/vault/api`? *Recommend thin.*
-- **E3.** Ship the PKCS#11 key-wrap-pad fallback? *Recommend:* only if Phase 0
-  finds a target HSM without GCM.
-- **E4.** Untagged rows: try the server key (local) first, then `awskms`
-  (Design §12, after CEO-M1). Check that no other wrapper has produced rows in
-  the field. FakeKMS is test-only.
-- **E5.** Put `limitedWrapper` defaults (8 in flight, backoff ceiling) in
-  config now, or hard-code them until measurements exist?
+  **Answered 2026-10-25 (eng D10): yes.**
+- **E2.** Thin Vault client instead of `hashicorp/vault/api`? **Answered
+  2026-10-25 (eng D11): thin client.**
+- **E3.** Ship the PKCS#11 key-wrap-pad fallback? **Answered 2026-10-25 (eng
+  D16): only if Phase 0 finds a target HSM without AES-GCM.**
+- **E4.** Untagged rows: try the server key (local) first, then `awskms`.
+  **Answered 2026-10-25 (eng D9).**
+- **E5.** Put `limitedWrapper` defaults in config now, or hard-code them?
+  **Answered 2026-10-25 (eng D13): only `SB_SECRET_PROVIDER_MAX_INFLIGHT` is
+  a setting; the rest are commented constants.**
 
 ## Follow-ups (not in this plan)
 
 - ~~**F-R1:** a rewrap sweep~~ Now in scope as Design §11 (CEO-E4).
 - Live provider switching: a decrypt-only previous provider plus a reseal.
-- Server key (data key) rotation: add a key ID to the `Cipher` format, then
-  reseal.
+- ~~Server key (data key) rotation~~ now in scope as Design §13 (eng D26).
 - GCP Cloud KMS and Azure Key Vault: TODOS.md entry (CEO-E5); triggers are
   the K8s plan's GKE phase and a named Azure customer. KMIP: on customer
   demand.
@@ -1150,8 +1353,9 @@ needs an answer before eng review; the Phase 0 results gate their phases
 ```
                          customer key store
       AWS KMS   |   Vault / OpenBao Transit    |   HSM via PKCS#11
-          ^                ^ TLS, or Vault Agent       ^ vendor .so, session pool
-          |                | proxy on loopback         | (cgo, own package)
+          ^                ^ TLS, or Vault Agent       ^ vendor .so + session pool, in the
+          |                | proxy on loopback         | --pkcs11-helper process over a 0600
+          |                |                           | socket (eng D5); pkg/secrets/pkcs11 (D6)
   +-------+----------------+---------------------------+--------------+
   | pkg/secrets  DataKeyWrapper: awskms | vault | pkcs11               |
   |   tag check (§4) -> limitedWrapper: 8 foreground (1 for creates)   |
@@ -1162,8 +1366,9 @@ needs an answer before eng review; the Phase 0 results gate their phases
   KMSProvider (cluster-secret      server-key custody (wrapped file)
   copies) -> BlobStore (SQLite)        |
           ^                            v
-  rewrap sweep (in daemon,       revocable *Cipher (one, shared) ---> store: toolbox
-  CAS under lockSecretSandboxOps)      |                              tokens, env, ...
+  key_custody loop (eng D2):     revocable *Cipher (one, shared) ---> store: toolbox
+  re-check, revoke, recover,           |                              tokens, env, ...
+  sweep (CAS)
                                        +---> service: registry, mounts, egress CA
                                        +---> egress gateway (own unit, 0600 socket):
                                        |     set_inspect_ca / clear_inspect_ca (new)
@@ -1228,7 +1433,7 @@ only, CAS).
 
 | Integration | Realistic failure | Handled? |
 |---|---|---|
-| Vault | active-node failover returns 503 for seconds | creates with secrets fail fast as Unavailable. **Gap**: no short retry for Unavailable (pending E8) |
+| Vault | active-node failover returns 503 for seconds | creates with secrets fail fast as Unavailable. **Gap**: no short retry for Unavailable (answered: one retry, eng D17) |
 | HSM | HA failover drops sessions | yes: reopen + re-login (§2) |
 | AWS KMS | throttling | yes: limiter backoff |
 | Egress gateway | still the old binary after an upgrade | pending CEO-E2e |
@@ -1277,7 +1482,7 @@ API surface (every handler)  | any provider class reaching a handler       | tod
 EXCEPTION CLASS          | RESCUED? | RESCUE ACTION                             | USER SEES
 -------------------------|----------|-------------------------------------------|---------------------------------
 ErrProviderThrottled     | Y        | jittered backoff inside the deadline      | slower call, then 503 + Retry-After
-ErrProviderUnavailable   | partial  | none today (pending E8: one short retry)  | 503 "key store unavailable"
+ErrProviderUnavailable   | Y        | one jittered retry, foreground only (D17) | 503 "key store unavailable"
 ErrProviderDenied        | N        | re-raise with context; alert via canary   | 503 "key store denied this node"
 ErrKeyRevoked            | Y        | full stop (§10)                           | 503 "key revoked by the key store"
 ErrKeyVersionRetired     | N        | stale alert; row unusable on this node    | 503 "key version retired"
@@ -1309,7 +1514,7 @@ the message.
 | S1 | Wrong or hostile `SB_SECRET_VAULT_ADDR`: `Wrap` sends the DEK in plaintext to whoever answers | Low | High | Yes: TLS with `SB_SECRET_VAULT_CACERT`, plain `http://` only on loopback |
 | S2 | Node root steals the Vault token or reaches the Agent proxy | Medium | Medium | Accepted limit, stated in the claim: decrypts only while the key store is reachable, every call is logged, revocable |
 | S3 | PIN file stolen | Medium | Medium | Same as S2; group/other bits refused (`wrap_key_loader.go:72` check) |
-| S4 | Vendor PKCS#11 library runs inside sandboxd: a crash takes the daemon down, a bug can read its memory | Low | High | Pending E6 (helper process) |
+| S4 | Vendor PKCS#11 library runs inside sandboxd: a crash takes the daemon down, a bug can read its memory | Low | High | **Mitigated (eng D5):** the library runs only in the supervised `--pkcs11-helper` process |
 | S5 | `sandboxd key wrap --generate` run on a joiner by mistake mints a second server key and splits the cluster | Medium | High | **Fixed here:** in cluster mode `--generate` also needs `--seed`, an empty raft directory and no `state.db` |
 | S6 | A plaintext key left behind after migration makes the claim false | Medium | High | F1 (asked below) |
 | S7 | Custody downgrade (custody set back to `file`, by `unwrap --to-file` or by hand) goes unnoticed | Medium | Medium | **Fixed here:** the daemon records the last custody it booted with and writes a `key_custody_changed` audit event (a new `Kind`) when it differs; the custody alert (§9) fires too |
@@ -1388,7 +1593,7 @@ nothing written
 | `sandboxd key wrap --generate` | run on a joiner | yes | refused (S5) |
 | Retiring a key version | done before the stale gauge reached 0 everywhere | partly | stale alert; those rows fail on that node. Runbook: lower `min_decryption_version` again, or restore the label if not yet destroyed |
 | Revoke | key disabled, then re-enabled inside 15 minutes | yes | an ok re-check resets the counter, no trip |
-| Revoke | key disabled for 20 minutes, then re-enabled | pending | trips; recovery per CEO-E2a |
+| Revoke | key disabled for 20 minutes, then re-enabled | yes | trips; the next good re-check auto-recovers (eng D12) |
 | Restore | backup restored onto a fresh node | yes | backup includes the wrapped file; key store must be reachable |
 | Upgrade | sandboxd new, egress gateway still old | pending | CEO-E2e |
 
@@ -1396,15 +1601,18 @@ nothing written
 
 - **Where the code goes** (fits existing patterns): `pkg/secrets/vault.go`,
   `limited.go`, `custody.go` (the wrapped-file format and boot decision), the
-  revocable AEAD inside `secrets.go`; PKCS#11 in its own package (E7), like
-  `pkg/wasm` keeps wasmtime behind a tag; the re-check and sweep as
-  `internal/service/key_recheck.go` and `key_rewrap_sweep.go`; the
-  `sandboxd key` subcommand dispatched from `cmd/sandboxd/main.go` like
+  revocable AEAD inside `secrets.go`; PKCS#11 in `pkg/secrets/pkcs11` with a
+  `!cgo` stub (eng D6), like `pkg/wasm` keeps wasmtime behind a tag; the re-check, revoke, recover and sweep as one
+  loop in `internal/service/key_custody.go` with two cadences (eng D2: one
+  owner of the server key's lifecycle); the `sandboxd key` subcommand in
+  `cmd/sandboxd/key.go`, dispatched from `cmd/sandboxd/main.go` like
   `egress-gateway`.
 - **Reuse, not copies.** `encryptionContextAAD` moves out of `fake_kms.go`
   (already planned). The group/other permission check in
-  `wrap_key_loader.go:72` becomes one helper used by the upstream wrap key, the
-  PIN file and the wrapped server-key file, instead of three copies.
+  `wrap_key_loader.go:72` becomes `refuseGroupOtherBits(path)`, used by the
+  upstream wrap key, the PIN file and the wrapped server-key file (eng D14);
+  the upstream key keeps its stricter write-bit check (`:75`) inline, because
+  sandboxd itself rewrites the wrapped file at 0600.
   `CanaryWrapUnwrap` (`kms.go`) stays the one canary.
 - **Branching.** The boot custody decision has many inputs (custody setting,
   plaintext present, wrapped present, cluster mode, `state.db` present,
@@ -1491,7 +1699,11 @@ injectable clock and interval; live UCs shorten the intervals by config.
   `aerolvm_key_store_call_seconds{backend,op}` (histogram),
   `aerolvm_key_store_limiter_wait_seconds{budget}`,
   `aerolvm_key_custody{class,custody,enterprise}`,
-  `aerolvm_key_rows_stale`, `aerolvm_key_revoked`. Names follow the existing
+  `aerolvm_key_rows_stale`, `aerolvm_key_revoked`,
+  `aerolvm_key_decryptable{backend,key}` and `aerolvm_key_current{backend,key}`
+  (eng D23), `aerolvm_pkcs11_helper_restarts_total{reason}` (exit,
+  deadline; eng D25), and `aerolvm_server_key_ring{key_id,state}` and
+  `aerolvm_server_key_rows{key_id}` for server-key rotation (eng D26). Names follow the existing
   `aerolvm_` prefix (the plan's `sandboxd_` names are renamed to match).
 - **Alerts** in `setup/prometheus/sandboxd-alerts.yml`, each with a runbook
   entry and a row in `alerts_test.go`: `SandboxdServerKeyPlaintext`,
@@ -2061,7 +2273,7 @@ Still short of the ideal:
 
 See Section 2. It has about 30 codepath rows. GAP 1 (provider errors reached
 callers as 500) is fixed by CEO-A1. GAP 2 (no short retry for Vault
-active-node failover) is pending E8.
+active-node failover) is answered by eng D17 (one foreground retry).
 
 #### Failure modes registry
 
@@ -2071,19 +2283,19 @@ CODEPATH                 | FAILURE MODE                         | RESCUED? | TES
 boot unwrap              | key store down                       | Y (exit) | Y     | node down, canary alert    | Y
 boot unwrap              | plaintext still present (F1)         | Y        | Y     | refuses, names the file    | Y
 boot unwrap              | wrong key (check mismatch)           | Y        | Y     | refuses                    | Y
-cluster create Wrap      | key store unavailable                | partial  | Y     | 503 key_store_unavailable  | Y   (E8 retry pending)
+cluster create Wrap      | key store unavailable                | Y        | Y     | one retry, then 503 key_store_unavailable | Y   (eng D17)
 cluster create Wrap      | throttled                            | Y        | Y     | slower, or 503 + Retry-After | Y
 failover open            | stale/retired version                | N        | Y     | 503 key_version_retired + alert | Y
 re-check                 | revoke signal x N                    | Y        | Y     | full stop, 503 key_revoked | Y
 re-check                 | Vault 403 (token expired)            | Y        | Y     | canary alert; no revoke    | Y
 revoke                   | egress gateway down                  | Y        | Y     | gateway self-drops after bound | Y
-revoke                   | OLD egress gateway ignores clear op  | N        | N     | SILENT: CA stays in old gateway | N   <- CRITICAL GAP (pending CEO-E2e)
+revoke                   | OLD egress gateway ignores clear op  | Y        | Y     | gateway restarted; alert says so | Y   (was a CRITICAL GAP; closed by eng D4)
 revoke                   | direct {id}.{domain} route           | by design| Y     | route keeps working (named exception, D10) | n/a
 sweep                    | CAS lost                             | Y        | Y     | nothing (correct)          | Y
 sweep                    | key store errors                     | Y        | Y     | stale gauge stays > 0      | Y
-pkcs11                   | vendor library crash                 | N        | N     | daemon restarts            | Y   (pending E6)
+pkcs11                   | vendor library crash                 | Y        | Y     | helper restarts; brief 503 key_store_unavailable | Y   (eng D5)
 pkcs11                   | HSM HA failover                      | Y        | Y     | nothing                    | Y
-local -> external switch | rolling-switch window                | partial  | Y     | failover copy unusable on unswitched node | Y (E9)
+local -> external switch | rolling-switch window                | Y        | Y     | nothing: two-step switch, no window | Y (eng D8)
 ```
 
 One CRITICAL GAP, owned by eng review: CEO-E2e (an old egress gateway after
@@ -2120,7 +2332,8 @@ Seven diagrams in this review:
 ```
 DEPLOYMENT SEQUENCE
  merge whole stack -> release N -> upgrade nodes one by one (custody=file, provider unchanged: no change)
-   -> set provider (local -> vault/pkcs11) on all nodes' config -> quick rolling restart (E9 window)
+   -> step 1: add vault/pkcs11 settings to every node (no behaviour change; every node can now open new rows)
+   -> step 2: flip SB_SECRET_PROVIDER in a rolling restart (no failover window, eng D8)
    -> sweep converts local rows (watch aerolvm_key_rows_stale -> 0 on every member)
    -> sandboxd key wrap on one node -> copy wrapped file -> remove plaintext (F1) -> restart node by node
    -> enterprise: release N warns on custody=file; release N+1 refuses (Phase 7)
@@ -2177,11 +2390,11 @@ architecture ~5x, research ~3x.
   - Files: `pkg/secrets/vault.go` and tests.
   - Verify: httptest suite, plus the tag-gated `vault -dev` and `bao -dev`
     contract run.
-- [ ] **T4 (P1, human: ~1w / CC: ~4h)** — Phase 3 — `pkcs11` wrapper.
+- [ ] **T4 (P1, human: ~2w / CC: ~1d)** — Phase 3 — `pkcs11` wrapper in the `--pkcs11-helper` process (eng D5).
   - Surfaced by: Design §2; Section 3 (S4).
   - Covers: session pool; re-login; label rules; hardware-slot rule. Decide
-    E6 and E7 first.
-  - Files: `pkg/secrets/pkcs11/` (per E7).
+    (process: eng D5; package: eng D6).
+  - Files: `pkg/secrets/pkcs11/`, `cmd/sandboxd/main.go` (helper entry).
   - Verify: fake `p11API` suite, plus SoftHSM2 in CI.
 - [ ] **T5 (P1, human: ~2w / CC: ~1d)** — Phase 4 — wrapped server key and
   revoke.
@@ -2192,7 +2405,7 @@ architecture ~5x, research ~3x.
     degraded health); scripts and Terraform. Decide CEO-E2a, E2b and E2e
     first.
   - Files: `pkg/daemon/daemon.go`, `pkg/secrets/{secrets,custody}.go`,
-    `cmd/sandboxd/main.go`, `internal/service/key_recheck.go`,
+    `cmd/sandboxd/main.go`, `cmd/sandboxd/key.go`, `internal/service/key_custody.go`,
     `internal/egress/proto.go`, `internal/egress/gatewayd/daemon.go`,
     `pkg/sshgateway/gateway.go`, `scripts/cluster-{init,join}.sh`,
     `scripts/install.sh`, `scripts/sandboxd-{backup,restore}.sh`,
@@ -2203,7 +2416,9 @@ architecture ~5x, research ~3x.
   - Surfaced by: Design §11, §12; Section 4.
   - Covers: CAS, never holding the lock across the call, the stale gauge.
     Decide CEO-E4a, E4b and E9 first.
-  - Files: `internal/service/key_rewrap_sweep.go`.
+  - Files: `internal/service/key_custody.go` (adds the sweep cadence to the
+    one loop, eng D2), `internal/store/store.go` and a `pkg/secrets` envelope
+    comparison helper (eng D3).
   - Verify: race tests against the five writers, plus the live switch UC.
 - [ ] **T7 (P1, human: ~3d / CC: ~3h)** — Phase 5 — docs, alerts and
   dashboard.
@@ -2273,32 +2488,1450 @@ in the Completion Summary).
 
 Tasks JSONL: `~/.gstack/projects/aerol-ai-microvm/tasks-ceo-review-20261021-161803.jsonl` (9 tasks).
 
+## Eng review (2026-10-21 to 2026-10-30)
+
+Target: `plans/customer-key-custody.md` (this file), PR #784. Binding input:
+the CEO review decisions D1–D18 above and `docs/designs/customer-key-custody.md`.
+Report file: this file.
+
+### Scope Challenge A: assessment
+
+**Reuse.** Every sub-problem maps to existing code (CEO "What already exists"
+table); nothing is rebuilt.
+
+**Complexity.** About 40 changed files [estimated]. New parts:
+
+- the vault wrapper;
+- the pkcs11 wrapper and its session pool;
+- `limitedWrapper`;
+- the custody file and boot decision;
+- the revocable AEAD;
+- the re-check loop;
+- the sweep;
+- the `sandboxd key` CLI;
+- one gateway op.
+
+That is 8+ files and 2+ new services, so the complexity gate trips. No
+feature cuts are proposed: D1–D18 are binding.
+
+**Search check.**
+
+- [Layer 1] Root-key wrapping by a KMS or HSM is how Vault itself stores its
+  root key, and in-process PKCS#11 is the common Go practice (crypto11 users,
+  Vault's own HSM seal).
+- [Layer 2] Vault issue #29532 reports that Transit `rewrap` fails for
+  ciphertext encrypted with `associated_data`. The rewrap API lists no AAD
+  parameter; decrypt does.
+- [Layer 2] CloudHSM SDK 5 and newer HSM libraries need an explicit re-login
+  after a reconnect, which matches §2's re-login rule.
+
+**TODOS cross-reference.**
+
+- "A partitioned node keeps serving: /health ignores cluster membership"
+  explains why degraded health does not stop ingress routing (§10 already
+  says so).
+- "A resealed secret whose replacement holder is dead never re-seals" is
+  untouched by this plan.
+- Nothing in TODOS.md blocks the plan.
+
+**Distribution.** No new binary. `sandboxd` gains a cgo dependency
+(`miekg/pkcs11`); the release matrix cross-compiles `sandboxd` with `CC` for
+each Linux target (`.github/workflows/release.yml:225-237`). Phase 3 must
+prove every matrix target still builds.
+
+**Findings.**
+
+1. **[P1] (confidence: 9/10) `internal/store/store.go:5865-5870`: a rewrapped
+   row conflicts with peers' copies forever.** The quoted code:
+   `if existingGen.Int64 == rec.SealGeneration { if bytes.Equal(existingPayload,
+   rec.SealedPayload) { … } else { return …ErrClusterSecretPayloadConflict`.
+   The put-outbox resends the row's current bytes from `cluster_secrets`. Once
+   the sweep rewraps the owner's row (same generation, new `WrappedKey`), a
+   retried fan-out to a peer that already holds the old bytes gets a payload
+   conflict and a non-2xx, so the outbox never drains. That turns CEO-E4b into
+   a real defect. Decision: E4b below.
+2. **[P2] (confidence: 8/10) §11 and the permissions table: the Vault sweep
+   cannot use `rewrap`** (Layer 2 above). This is a factual correction and
+   needs no question: §11 uses the plan's own fallback (decrypt, then encrypt
+   inside sandboxd), the Vault grant drops `rewrap`, and the Phase 0 rewrap row
+   is answered "no". The DEK passes through sandboxd memory during a sweep, as
+   it does on every open.
+3. **[P2] (confidence: 9/10) `internal/egress/server.go:278`
+   (`return nil, fmt.Errorf("unknown op %q", req.Op)`): an old gateway is
+   detectable.** This informs CEO-E2e.
+4. **[P3] (confidence: 8/10) distribution:** the Phase 3 PR must run the
+   release build matrix with the new cgo dependency. This is required proof for
+   CEO-1 and needs no question.
+
+**Reality rows (eng).**
+
+| Premise | Claim | Receipt | Verdict |
+|---|---|---|---|
+| Rewrap conflicts with peer copies | same generation + different bytes is rejected | `internal/store/store.go:5865-5870` | verified (static read) |
+| Old gateway detectable | unknown op returns an error | `internal/egress/server.go:278` | verified (static read) |
+| Vault rewrap and AAD | rewrap takes no `associated_data` | Vault Transit API docs; vault issue #29532 | verified (docs + issue) |
+| `pkg/secrets` only in sandboxd | `cmd/aerolvm`, `cmd/toolboxd`, gatewayd do not import it | `go list -deps` (CEO Section 1) | verified (command) |
+| Vault decrypt rejects a wrong AAD | decrypt authenticates `associated_data` | none | unverified (Phase 0) |
+| miekg/pkcs11 uses `dlopen` | runtime load | none | unverified |
+| Vault Agent proxy injects the token | `use_auto_auth_token` | none | unverified |
+
+unverified=3
+
+```
+REALITY: premise-table finding unverified=3; rewrap/peer-copy conflict found plans/customer-key-custody.md:944
+REALITY: already-done pass no commits on origin/main since 2026-10-20 touch pkg/secrets, internal/store/store.go or internal/egress internal/store/store.go:5865
+REALITY: surface-check pass existing commands verified (sandboxd egress-gateway, aerolvm audit verify); sandboxd key and --key-custody are new internal/egress/gatewayd/run.go:21
+REALITY: binding-decisions pass CEO D1-D18 binding; no default reintroduced docs/designs/customer-key-custody.md:22
+REALITY: numbers pass all latency/throughput figures deferred to Phase 0; limiter and fleet numbers tagged [estimated] plans/customer-key-custody.md:518
+REALITY: deferred-asks pass no linked issue plans/customer-key-custody.md:7
+REALITY: pr-count pass 9 stacked PRs (Phases 0,1,2,3,4,4b,5,6 + Phase 7 next release); no ship-policy.json; no partial merges plans/customer-key-custody.md:944
+```
+
+### Scope Challenge B: scope record
+
+feature answers: none proposed (CEO D1–D18 binding); structure: Smaller
+arrangement (D2, 2026-10-21); accepted scope: all CEO-approved features
+unchanged, with one `internal/service/key_custody.go` loop owning re-check,
+revoke, recover and the sweep (two cadences, shared background budget), and
+the `sandboxd key` CLI in `cmd/sandboxd/key.go` (no new package); pending
+remedies: E1, E2, E3, E4, E4b, E5, E6, E7, E8, E9, CEO-E2a, CEO-E2b,
+CEO-E2c, CEO-E2e, CEO-E4a.
+
+Scope Challenge result: scope accepted as-is (a smaller arrangement that keeps
+scope is not a reduction).
+
+### Section 1: Architecture
+
+Findings (most severe first):
+
+1. [P1] (confidence: 9/10) `internal/egress/server.go:278` and
+   `internal/egress/gatewayd/daemon.go:151`: an egress gateway still running the
+   old binary after an upgrade keeps the inspection CA key through a revoke
+   (the CEO critical gap). Decision: CEO-E2e.
+2. [P2] (confidence: 8/10) §2 / Phase 1: one key-store client per process.
+   PKCS#11 `C_Initialize` must run once per process (a second call returns
+   `CKR_CRYPTOKI_ALREADY_INITIALIZED`). The boot unwrap builds the wrapper
+   before `NewCipher` (`pkg/daemon/daemon.go:152-158`), and
+   `ConfigureSecretProvider` runs later (`:314`). Phase 1's seam split already
+   passes one wrapper into `NewProvider`; the plan now says that one instance
+   serves boot, the provider, the loop and the CLI. This is required for
+   CEO-1 and needs no question.
+3. Open eng choices owned here: E6, E7, CEO-E2b, E9, E4, E1, E2, CEO-E2a.
+
+Section 1 dispositions: finding 1 approved A (D4, CEO-E2e); finding 2
+required work, no question (one wrapper instance per process); finding 3:
+E6 approved B (D5), E7 approved A (D6), CEO-E2b approved A (D7), E9 approved A
+(D8), E4 approved A (D9), E1 approved A (D10), E2 approved A (D11), CEO-E2a
+approved A (D12).
+
+### Section 2: Code quality
+
+Findings (most severe first):
+
+1. [P3] (confidence: 8/10) Design §5 / Phase 1: which limiter numbers become
+   settings (E5). The plan names `SB_SECRET_PROVIDER_MAX_INFLIGHT` (default 8),
+   1 reserved create slot and 2 background slots; HSM partitions differ in
+   session limits by vendor. Decision: E5.
+2. [P3] (confidence: 9/10) `pkg/secrets/wrap_key_loader.go:72`
+   (`if mode&0o077 != 0 {`): the CEO review proposed one shared file-mode
+   helper for the upstream wrap key, the PKCS#11 PIN file and the wrapped
+   server-key file. Callers: one existing (`LoadUpstreamWrapKeyRing`), two
+   proposed (PIN file in Phase 3, wrapped file in Phase 4). Decision: E10.
+3. Accuracy of touched diagrams: the CEO Section 1 architecture diagram
+   showed a separate "rewrap sweep" box and no PKCS#11 helper; refreshed here
+   after D2 and D5 (no question: it records approved answers).
+
+Section 2 dispositions: finding 1 approved A (D13, E5); finding 2 approved
+A (D14, E10); finding 3 recorded (diagram refreshed, no question).
+
+### Section 3: Tests
+
+Framework: Go `testing` with table-driven tests (CLAUDE.md "Testing &
+coverage"; `make test` is offline; live checks behind the `integration` tag).
+Existing tests read for this section: `pkg/secrets/awskms_test.go`
+(`TestMapAWSKMSError`), `pkg/secrets/wrap_key_loader_test.go`,
+`pkg/secrets/provider_contract_test.go`, `internal/store/cluster_secret_put_outbox_test.go`,
+`pkg/api/apihttp/classify_test.go`, `internal/config/config_test.go`.
+
+```
+CODE PATHS                                              USER / OPERATOR FLOWS
+[+] pkg/secrets                                         [+] Adopt Vault on an existing cluster
+  ├── vault wrapper (Wrap/Unwrap/keys)                    ├── [GAP] [→E2E] two-step switch, failover before/after
+  │   ├── [GAP] happy, 403+reload, 429, 5xx, bad JSON     │         sweep (cluster-3-mixed-secrets-vault)
+  │   └── [GAP] correlation header, AAD mismatch          └── [GAP] [→E2E] custody wrap on a running cluster
+  ├── pkcs11 client + helper (eng D5)                   [+] Revoke and recover
+  │   ├── [GAP] wrap/unwrap via helper, label rules       ├── [GAP] [→E2E] KMS disable → full stop in bound
+  │   ├── [GAP] helper exits mid-call → Unavailable       ├── [GAP] [→E2E] Vault 403 alone never revokes
+  │   └── [GAP] re-login after reopen, HW-slot rule       └── [GAP] [→E2E] re-enable → auto-recover (eng D12)
+  ├── limitedWrapper                                    [+] Rotate and retire
+  │   └── [GAP] cap, reserved create slot, bg budget,     └── [GAP] [→E2E] rotate → gauge 0 → retire → failover
+  │             deadline, backoff                       [+] Error states the operator sees
+  ├── tags + untagged order (D9)                          ├── [GAP] 503 codes per class (CEO-A1)
+  │   └── [GAP] table: local, KMS, mixed, other-tag       ├── [GAP] boot refusals name the file (F1, S5)
+  ├── custody file + boot decision (pure fn)              └── [GAP] custody report per config (CEO-E1)
+  │   └── [GAP] table over custody × files × cluster ×  [+] Install paths
+  │             state.db × seed                           ├── [GAP] [→E2E] cluster-init/join --key-custody
+  ├── revocable Cipher                                    └── [GAP] [→E2E] Terraform key_custody variable
+  │   └── [GAP] revoke vs in-flight Decrypt, recover
+  ├── envelope comparison helper (D3)                   EXISTING (regression risk, see R-REG)
+  │   └── [GAP] same content / payload differs           ├── [★★★ TESTED] awskms mapping — awskms_test.go:56
+  └── refuseGroupOtherBits (D14)                          ├── [★★★ TESTED] upstream key mode — wrap_key_loader_test.go:82
+      └── [GAP] table over modes                          ├── [★★  TESTED] put-outbox conflict — cluster_secret_put_outbox_test.go
+[+] internal/service/key_custody.go (eng D2)              ├── [★★  TESTED] provider contract — provider_contract_test.go:17
+  ├── [GAP] re-check classifier, N-consecutive, reset     └── [★★  TESTED] error classify — classify_test.go
+  ├── [GAP] revoke actions (CA clear, old gateway
+  │         restart D4, sessions, health, audit event)
+  ├── [GAP] recover (D12)
+  └── [GAP] sweep CAS vs 5 writers, local→external
+[+] internal/store PutClusterSecret (D3)
+  └── [GAP] same gen rewrapped → idempotent
+[+] pkg/api/apihttp classify (CEO-A1)
+  └── [GAP] five 503 codes, Retry-After
+
+COVERAGE (new paths): 0/31 tested today (all proposed) | existing at-risk paths: 5/5 have tests
+QUALITY of existing: ★★★:2 ★★:3 | GAPS: 31 (11 E2E, 0 eval)
+```
+
+Every GAP above already has a matching test in the plan's Testing section,
+added by the CEO review or this review's decisions; this diagram adds no new
+test scope. No LLM or prompt paths, so no eval.
+
+**Value cards (critical paths):**
+- Value: protects=a revoked node serves nothing within the bound; fails_when=a revoke signal is mis-classified or the Cipher keeps its AEAD; why_new=no revoke exists today; seam=injectable clock and fake wrapper; no_claim=real KMS/Vault timing (fakes in unit, shortened interval in the live UC)
+- Value: protects=a Vault 403 never revokes; fails_when=403 maps to ErrKeyRevoked; why_new=new classifier; seam=none; no_claim=Vault Agent token renewal (faked by removing the token file)
+- Value: protects=rewrapped rows do not jam peers; fails_when=PutClusterSecret compares raw bytes again; why_new=put-outbox tests cover payload conflict only; seam=none; no_claim=none beyond protects
+- Value: protects=no plaintext key on a wrapped node; fails_when=any of the five locations keeps the key; why_new=no custody mode exists; seam=none; no_claim=disk forensics (checks files and env, not freed blocks)
+- Value: protects=helper crash does not take down sandboxd; fails_when=the supervisor stops restarting or calls hang; why_new=no helper exists; seam=helper binary flag; no_claim=real vendor library crash modes (killed process stands in)
+
+**Tests made obsolete:** none. `coverage96_gen_test.go` / `coverage97_test.go`
+in `pkg/secrets` and `internal/config` are coverage-named files the CEO review
+flagged as patterns to avoid; this plan adds no such files and retires none
+(out of scope; a `/test-audit` candidate).
+
+**Regression rule.** Five existing behaviors are at risk from approved
+changes. Their coverage contract is decided in R-REG below.
+
+Section 3 dispositions: regression contract approved A (D15, R-REG); E3
+approved A (D16); coverage diagram adds no new test scope beyond approved
+decisions.
+
+### Section 4: Performance
+
+Findings (most severe first):
+
+1. [P2] (confidence: 7/10) CEO Section 1 production-failure table ("Vault:
+   active-node failover returns 503 for seconds ... Gap: no short retry"):
+   creates with secrets fail fast during a Vault leader change. Decision: E8.
+2. [P3] (confidence: 8/10) Design §10 "Re-check ... default 5 minutes", "N
+   default 3": the defaults set the revoke bound in the claim (~15 min) and
+   the fleet's steady key-store load (~7 calls/s at 2,000 nodes
+   [estimated]). Decision: CEO-E2c.
+3. [P3] (confidence: 8/10) Design §11 "It runs at boot and then on a cadence
+   (CEO-E4a)": the cadence decides how long an operator waits for the stale
+   gauge to reach 0 before retiring a version. Decision: CEO-E4a.
+4. [P3] (confidence: 6/10, medium confidence, verify) eng D5 adds an IPC hop
+   per PKCS#11 call (about 0.1 ms [estimated]) against an HSM round trip of
+   milliseconds; no action beyond Phase 0 measuring it with the rest.
+5. Memory, queries and indexes: unchanged from CEO Section 7 (paged sweep, no
+   new index, no cache). No issues found.
+
+Section 4 dispositions: finding 1 approved A (D17, E8); finding 2 approved
+A (D18, CEO-E2c); finding 3 approved A (D19, CEO-E4a); findings 4 and 5
+recorded, no action.
+
+### Outside voice (codex, eng phase)
+
+Codex completed (model gpt-6-astra via the gstack catalog; full output in
+the review conversation). Seven findings; each was checked against the code
+before acting:
+
+| # | Severity | Finding | Verified? | Disposition |
+|---|---|---|---|---|
+| OV1 | High | D3 keeps incoming bytes, so a delayed pre-sweep copy can overwrite a rewrapped row after its gauge read 0 | yes: D3 accepted scope ("the incoming bytes are kept") | decision OV1 (reopens D3) |
+| OV2 | High | clearing the CA leaves established inspected connections running and injection secrets in the gateway | yes: `serveInspect` loads the inspector once per connection (`internal/egress/proxy/inspect.go:108-110`); inject rules read `cur.Spec.Secrets` (`:251`); secrets are memory-only (`internal/egress/snapshot.go:34`) | decision OV2 |
+| OV3 | High | the two-step switch fails for `local → awskms`: AWS rows are untagged and the AWS fallback requires the provider to be `awskms` | yes: §12 "if that fails and the provider is `awskms`" | decision OV3 (reopens D9 wording) |
+| OV4 | High | PKCS#11 label rotation has no cluster rollout order; "0 stale" does not prove every node targets the same label | yes: labels are per-node settings (§2) | decision OV4 |
+| OV5 | High | backups archive `/etc/sandboxd`, including `cluster.env` with the plaintext key, so old backups still decrypt after wrapping | yes: `scripts/sandboxd-backup.sh:69` (`copy_if_exists "$config_dir" ...`) | decision OV5 |
+| OV6 | Medium | the PKCS#11 helper is restarted on exit but not on a hang | yes: §2 (eng D5) covers exits only | decision OV6 |
+| OV7 | Medium | `openRawEnvelope` turns unwrap errors other than three provider classes into `ErrDecryptFailed` with `%v`, so `ErrKeyRevoked` and `ErrKeyVersionRetired` never reach the 503 mapping | yes: `pkg/secrets/envelope.go:255-260` | **applied, no question**: necessary implementation of approved CEO-A1 and CEO-E2; both new sentinels pass through, and a provider-to-handler test checks the 503 code |
+
+Outside voice dispositions: OV1 approved A (D20, reopened D3); OV2 approved
+A (D21); OV3 approved A (D22, reopened D9 wording); OV4 approved A (D23); OV5
+approved A (D24); OV6 approved A (D25); OV7 applied as required work. No
+remaining disagreement with the outside voice.
+
+## Decision ledger (eng review)
+
+### E4b: rewrapped rows vs peer copies
+Finding: Scope Challenge 1, P1, confidence 9/10, `internal/store/store.go:5865-5870`, reviewer: eng review (Claude)
+Plan baseline: CEO-E4b open ("confirm nothing compares sealed bytes across nodes"), gate row blocks Phase 4b
+Runtime evidence: `PutClusterSecret` rejects same `seal_generation` with different `sealed_payload` as `ErrClusterSecretPayloadConflict` (static read); the put-outbox resends the row's current bytes
+Comparison grid:
+
+```text
+Commitment                          | Current                   | A (compare without key)        | B (sweep skips outbox rows)     | C (both)
+same gen, only WrappedKey differs   | conflict, non-2xx forever | idempotent; keep incoming bytes| still conflict (never sent)     | idempotent
+same gen, payload differs           | conflict                  | conflict (unchanged)           | conflict                        | conflict
+rows with a pending outbox          | n/a                       | rewrapped normally             | skipped until outbox drains     | skipped
+retirement after a dead peer        | n/a                       | not blocked                    | blocked until the outbox retires| blocked
+where the fix lives                 | n/a                       | one shared comparison in store | sweep only                      | both
+effort                              | n/a                       | S (human ~1d / CC ~30min)      | S (human ~1d / CC ~30min)       | S+S
+```
+
+Question D3:
+D3 — E4b: After the sweep rewraps a row, how do peers accept the new copy without a "payload conflict"?
+Project: plans/customer-key-custody on PR #784; Scope Challenge finding 1 (P1, confidence 9/10).
+ELI10: When a node re-wraps a secret's key onto the newest key version, the secret itself does not change, only the small wrapped key inside it. But peers check "same version, different bytes" and reject that as a conflict (internal/store/store.go:5865-5870). If the owner later resends that row to a peer, the peer refuses forever and the retry queue never drains.
+Stakes if we pick wrong: the retry queue jams after the first key rotation, and a dead peer could block key retirement indefinitely.
+Recommendation: A because the comparison every caller goes through is the root cause, so fixing it once covers the sweep and any future rewrap (fix it once where they all route through).
+Note: options differ in kind, not coverage — no completeness score.
+Net: fix the shared check once, against keeping rewrapped bytes off the wire at the cost of blocked retirements.
+Header: Rewrap conflict
+Options:
+A) Compare without the key
+The peer-copy check treats same generation and same envelope apart from `WrappedKey` as idempotent and keeps the incoming bytes, so peers converge on the newest wrapping; a different payload is still a conflict. Effort S (human ~1d / CC ~30min), risk low; one shared helper in `pkg/secrets`. ✅ Fixes the root cause in the one comparison every peer write goes through. ✅ Rotation and retirement never wait on a slow or dead peer. ❌ The store now parses the envelope instead of comparing raw bytes.
+B) Sweep skips outbox rows
+The sweep leaves any row with a pending put or delete outbox entry alone, so rewrapped bytes are never resent. Effort S (human ~1d / CC ~30min), risk medium. ✅ No change to the peer receive path. ✅ Very small diff. ❌ A dead peer keeps its outbox row for a long time, so that sandbox's key can never be retired.
+C) Both
+Do A and also skip rows with a pending outbox. Effort S+S, risk low. ✅ Belt and braces against any other byte comparison. ✅ Rewrapped bytes rarely travel at all. ❌ Inherits B's retirement block for rows behind a dead peer.
+
+State: approved
+Actual answer: A) Compare without the key (D3, 2026-10-21)
+Accepted scope: a `pkg/secrets` helper that compares two sealed envelopes on every field except `WrappedKey`; `PutClusterSecret` uses it at `internal/store/store.go:5865` and `:5888`, so same generation and same content is idempotent and the incoming bytes are kept, while a different payload stays a conflict; a store test for both cases; §11, Phase 4b and the gate table updated.
+History: the "incoming bytes are kept" half was reopened by outside voice OV1 and replaced by D20 (keep the bytes already on disk); the comparison itself stands.
+
+### CEO-E2e: old egress gateway after an upgrade
+Finding: Section 1 finding 1, P1, confidence 9/10, `internal/egress/server.go:278`, reviewer: eng review (Claude)
+Plan baseline: open (gate table, blocks Phase 4); CEO failure-modes registry marks it the one CRITICAL GAP
+Runtime evidence: the gateway keeps the CA in memory only and "sandboxd sends it again after every gateway start" (`internal/egress/gatewayd/daemon.go:147-151`); an unknown op returns `unknown op %q` (`internal/egress/server.go:278`); the gateway is designed to outlive sandboxd restarts
+Comparison grid:
+
+```text
+Commitment                         | Current         | A (restart on unknown op)            | B (restart old gateway at upgrade) | C (alert only)
+revoke with an old gateway         | CA stays (silent)| sandboxd restarts the gateway unit; | gateway already new at revoke time | alert; CA stays until an operator
+                                   |                 | it comes up without the CA          |                                    | restarts the gateway
+egress blip                        | none            | only on that rare revoke            | at every upgrade with an old gateway| none
+gateway outlives sandboxd restarts | yes (by design) | kept                                | broken for upgrades                | kept
+critical gap closed                | no              | yes                                 | yes                                | no (visible, not closed)
+effort                             | n/a             | S (human ~1d / CC ~30min)           | S-M (human ~2d / CC ~1h)           | S
+```
+
+Question D4:
+D4 — CEO-E2e: When a key is revoked but the node's egress gateway is still an old version that does not understand "clear the CA", what does sandboxd do?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 1 (P1, the CEO review's one critical gap).
+ELI10: The egress gateway is a separate long-running program that holds the private key it uses to inspect sandboxes' HTTPS traffic. It is designed to keep running across sandboxd upgrades, so right after an upgrade it may be the old version. On a revoke, sandboxd sends it a new "clear the CA" message; an old gateway answers "unknown op" and keeps the key, silently. The gateway only holds the key in memory, so restarting it clears the key for good.
+Stakes if we pick wrong: a revoke that looks complete while one process still holds a customer-derived key.
+Recommendation: A because it closes the gap with a restart only in the rare revoke-plus-old-gateway case, and keeps the gateway's designed ability to outlive normal upgrades.
+Note: options differ in kind, not coverage — no completeness score.
+Net: a targeted restart on a revoke, against restarting gateways at every upgrade or leaving the gap visible but open.
+Header: Old gateway
+Options:
+A) Restart on unknown op
+If the gateway answers `unknown op` to `clear_inspect_ca`, sandboxd restarts the gateway's systemd unit; the gateway comes back without the CA (it is memory-only) and a revoked sandboxd never resends it. The revoke alert says the gateway was restarted. Effort S (human ~1d / CC ~30min), risk low; tested with a fake old gateway. ✅ Closes the critical gap in every version mix. ✅ Normal upgrades still leave the gateway running. ❌ That one revoke briefly interrupts all egress on the node while the gateway restarts.
+B) Restart at upgrade
+At sandboxd startup, check the gateway's supported ops; if it is too old, restart it right away, so an old gateway never meets a revoke. Effort S-M (human ~2d / CC ~1h), risk medium. ✅ Never relies on the revoke moment. ✅ Old gateways disappear quickly after any upgrade. ❌ Every upgrade with an old gateway now blips egress, which the gateway was designed to avoid.
+C) Alert only
+Raise an alert that the revoke is incomplete until the gateway is restarted by hand. Effort S, risk medium. ✅ No automatic restarts at all. ✅ Smallest change. ❌ The CA stays in memory until a human acts, so the gap is visible but still open.
+
+State: approved
+Actual answer: A) Restart on unknown op (D4, 2026-10-21; asked twice at the user's request, same answer both times)
+Accepted scope: on revoke, if the gateway answers `unknown op` to `clear_inspect_ca`, sandboxd restarts `aerolvm-egress-gateway.service`; the gateway comes back without the CA (memory-only) and a revoked sandboxd never resends it; the `SandboxdKeyRevoked` alert and the `key_revoked` audit event note the restart; a test with a fake old gateway; §10, Phase 4 and the failure-modes registry updated (critical gap closed).
+History: none
+
+### E6: PKCS#11 in-process or in a helper process
+Finding: Section 1 finding 3, P2, confidence 8/10, Design §2 ("Library. Use `github.com/miekg/pkcs11`"), reviewer: eng review (Claude)
+Plan baseline: open (gate table, blocks Phase 3); CEO Section 3 S4 (vendor library inside sandboxd: Low likelihood, High impact)
+Runtime evidence: sandboxd already runs code out of process with the same binary (`--wasm-worker`, `--wasm-resident-host`, `cmd/sandboxd/main.go:39`, `:63`); Vault's own HSM seal and crypto11 users load PKCS#11 in-process [Layer 1]
+Comparison grid:
+
+```text
+Commitment                         | Current (plan)       | A (in-process)                   | B (helper process)
+where the vendor library runs      | sandboxd process     | sandboxd process                 | `sandboxd --pkcs11-helper`, UDS 0600
+vendor crash                       | sandboxd dies        | sandboxd dies; systemd restarts  | helper dies; sandboxd restarts it; callers
+                                   |                      |                                  | see Unavailable for a moment
+vendor bug reading memory          | can read everything  | can read everything              | sees only the DEKs it wraps
+latency per call                   | HSM round trip       | HSM round trip                   | + ~0.1 ms IPC [estimated]
+follow-up TODO for a helper        | none                 | asked separately at TODO stage   | n/a
+effort                             | M                    | M (human ~1w / CC ~4h)           | L (human ~2w / CC ~1d)
+```
+
+Question D5:
+D5 — E6: Should the vendor's HSM library run inside sandboxd, or in a small separate helper process?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P2).
+ELI10: Talking to an HSM means loading the vendor's C library into a program. Inside sandboxd, a crash or memory bug in that library takes down the whole daemon and could read everything sandboxd holds in memory. In a small helper process, only the helper crashes and it only ever sees the keys it wraps. sandboxd already runs its WASM workers this way, so the pattern exists. It costs about a week more.
+Stakes if we pick wrong: in-process means a vendor library bug can crash every sandbox's control plane on that node; a helper adds a moving part to build and test.
+Recommendation: A because it is how Vault itself and most Go HSM users load PKCS#11 (boring by default), and a vendor crash only costs a systemd restart.
+Note: options differ in kind, not coverage — no completeness score.
+Net: the proven, simpler in-process path, against isolating vendor code at about a week's extra cost.
+Header: HSM process
+Options:
+A) In-process (recommended)
+Load the vendor library in sandboxd through `miekg/pkcs11`, as the plan says. A vendor crash restarts sandboxd under systemd. Effort M (human ~1w / CC ~4h), risk medium. ✅ The common, proven pattern, with nothing new to supervise. ✅ No IPC hop on every wrap and unwrap. ❌ A vendor library crash or memory bug affects the whole daemon.
+B) Helper process
+Run `sandboxd --pkcs11-helper` (same binary, like the WASM worker) behind a 0600 Unix socket with Wrap, Unwrap and Ping; sandboxd restarts it on exit. Effort L (human ~2w / CC ~1d), risk medium. ✅ A vendor crash costs a helper restart, not the daemon. ✅ Vendor code never sees sandboxd's memory. ❌ A new process, protocol and supervisor to build, test and keep version-matched.
+
+State: approved
+Actual answer: B) Helper process (D5, 2026-10-21; against the in-process recommendation)
+Accepted scope: the vendor library runs only in `sandboxd --pkcs11-helper` (same binary), started and supervised by sandboxd behind a 0600 Unix socket in `/run/sandboxd`, with Wrap, Unwrap, Ping and Info ops; the session pool, login and `C_Initialize` live in the helper; sandboxd restarts it on exit with backoff and callers see `ErrProviderUnavailable` meanwhile; §2, Section 3 S4, Phase 3 (now L), tests and the failure-modes registry updated.
+History: an earlier draft had a third option that bundled a follow-up TODO; removed so the TODO is asked on its own.
+
+### E7: where the PKCS#11 code lives
+Finding: Section 1 finding 3, P3, confidence 8/10, Design §5 code quality ("PKCS#11 in its own package (E7)"), reviewer: eng review (Claude)
+Plan baseline: open (gate table, blocks Phase 3); eng D5 put the vendor library in a helper process
+Runtime evidence: `pkg/secrets` is linked only into sandboxd, which is already cgo (`go list -deps`, CEO Section 1); `pkg/wasm` keeps its optional engine behind a build tag (CLAUDE.md repository map)
+Comparison grid:
+
+```text
+Commitment                    | Current     | A (own package)                                   | B (inside pkg/secrets)
+package                       | undecided   | `pkg/secrets/pkcs11` (cgo), helper main in        | files in `pkg/secrets`, helper main in
+                              |             | `cmd/sandboxd`                                    | `cmd/sandboxd`
+non-cgo build of pkg/secrets  | n/a         | still builds; pkcs11 package has a `!cgo` stub     | needs cgo for the whole package
+                              |             | that returns "pkcs11 needs a cgo build"           |
+test isolation                | n/a         | fake-p11 tests in their own package               | mixed into the 3,800-line package tests
+helper process (eng D5)       | approved    | unchanged                                         | unchanged
+effort                        | n/a         | S (human ~2h / CC ~15min)                         | S (none extra)
+```
+
+Question D6:
+D6 — E7: Should the HSM code live in its own Go package, or inside the existing secrets package?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P3); D5 already put the vendor library in a helper process.
+ELI10: The HSM code needs C bindings (cgo). If it sits inside the main secrets package, every program that imports that package must be built with cgo too. A separate small package keeps the C part fenced off, gives it its own tests, and lets a non-cgo build fail with a clear "needs cgo" message instead of a compile error.
+Stakes if we pick wrong: mixing it in makes the secrets package harder to build and test on its own; splitting it adds one package to wire up.
+Recommendation: A because it keeps cgo and the vendor binding out of the package every other piece of sandboxd depends on, at almost no cost (explicit over clever).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a fenced-off C binding, against one fewer package.
+Header: HSM package
+Options:
+A) Own package (recommended)
+Put the PKCS#11 code in `pkg/secrets/pkcs11` with a `!cgo` stub, wired by `pkg/daemon` and the helper's entry point in `cmd/sandboxd`. Effort S (human ~2h / CC ~15min), risk low. ✅ `pkg/secrets` stays pure Go and builds without cgo. ✅ The vendor binding and its fakes are tested on their own. ❌ One more package and import to wire through the factory.
+B) Inside pkg/secrets
+Add the PKCS#11 files to `pkg/secrets` next to `awskms.go`. Effort S (nothing extra), risk low. ✅ Every wrapper lives side by side in one place. ✅ No extra wiring. ❌ The whole secrets package then needs cgo to build, including for its unit tests.
+
+State: approved
+Actual answer: A) Own package (D6, 2026-10-21)
+Accepted scope: PKCS#11 code in `pkg/secrets/pkcs11` (cgo) with a `!cgo` stub returning "pkcs11 needs a cgo build"; wired by `pkg/daemon` and the helper entry point in `cmd/sandboxd`; §5, the gate table and T4 updated.
+History: none
+
+### CEO-E2b: should a revoked node steer placement away
+Finding: Section 1 finding 3, P3, confidence 8/10, Design §10 "Pending for eng review: CEO-E2b", reviewer: eng review (Claude)
+Plan baseline: open (gate table, blocks Phase 4; CLAUDE.md rule 6 if yes)
+Runtime evidence: every node in a cluster wraps the same server key under the same key-store key (§3 "All cluster nodes share one server key"), so a deliberate revoke trips on every node that can reach the key store within the same bound; a node that cannot reach it never trips (claim text)
+Comparison grid:
+
+```text
+Commitment                        | Current            | A (no placement change)                  | B (placement skips revoked nodes)
+creates routed to a revoked node  | n/a                | fail closed with 503 key_revoked         | routed to a node without the flag
+cluster-wide revoke               | all nodes trip     | every node fails closed (same outcome)   | every node flagged; nothing to route to
+partial revoke (some nodes only)  | n/a                | only when some nodes cannot reach the    | creates go to nodes that never saw the
+                                  |                    | key store; those keep serving anyway     | revoke, which may hold the key longer
+internal/cluster change           | none               | none                                     | a gossip capacity flag + placement filter;
+                                  |                    |                                          | rule 6 regression test and call-out
+effort                            | n/a                | S (nothing extra)                        | M (human ~3d / CC ~3h)
+```
+
+Question D7:
+D7 — CEO-E2b: When a node has been revoked, should the cluster stop sending it new sandboxes?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P3).
+ELI10: A revoked node refuses every request with a clear "key revoked" error. We could also teach the cluster's placement logic to stop picking that node. But every node in a cluster uses the same key, so a real revoke hits all of them within the same window, and there is no healthy node to send work to. The only nodes that would still be picked are ones that cannot reach the key store, which is the opposite of what a revoke wants.
+Stakes if we pick wrong: B touches the fragile cluster placement code for a case where it changes nothing or routes work to the wrong node.
+Recommendation: A because a revoke is cluster-wide by construction, so placement awareness buys nothing and costs a change in the riskiest part of the repo (blast radius, boring by default).
+Note: options differ in kind, not coverage — no completeness score.
+Net: no cluster change, against routing around a revoke that has no healthy nodes to route to.
+Header: Placement
+Options:
+A) No placement change (recommended)
+A revoked node fails closed with 503 `key_revoked` and degraded health; placement is untouched. Effort S (nothing extra), risk low. ✅ No change to `internal/cluster`, the most fragile area in the repo. ✅ Correct for the real case, where every node revokes together. ❌ A create that lands on a revoked node gets an error instead of being re-routed.
+B) Placement skips revoked nodes
+Add a "key revoked" flag to the gossip capacity heartbeat and filter it in placement. Effort M (human ~3d / CC ~3h), risk medium; needs a regression test next to `placement.go` and a cluster-correctness call-out (CLAUDE.md rule 6). ✅ Creates avoid a node that cannot serve them. ✅ Useful if a future design ever revokes one node alone. ❌ In a real revoke it either finds no node, or picks one that has not yet seen the revoke.
+
+State: approved
+Actual answer: A) No placement change (D7, 2026-10-21)
+Accepted scope: no change to `internal/cluster`; a revoked node fails closed with 503 `key_revoked` and degraded health; §10, the coordination note and the gate table updated.
+History: none
+
+### E9: the rolling-switch window
+Finding: Section 1 finding 3, P2, confidence 8/10, Design §12 "Known limit, rolling switch", reviewer: eng review (Claude)
+Plan baseline: CEO-M1 (D15) accepted local → external migration with a documented window; E9 open (blocks Phase 4b)
+Runtime evidence: provider tags (§4) let `Unwrap` dispatch by tag before calling out, so a node can tell a `vault:` or `p11:` row from a local one without being configured to seal with that provider
+Comparison grid:
+
+```text
+Commitment                         | Current (D15)                 | A (two-step switch)                         | B (accept the window)
+unswitched node meets a vault row  | cannot open it                | opens it: it has the vault settings already | cannot open it
+what decides how a node opens      | SB_SECRET_PROVIDER only       | the row's tag + whichever backend settings  | SB_SECRET_PROVIDER only
+                                   |                               | the node has                                |
+what decides how a node seals      | SB_SECRET_PROVIDER            | SB_SECRET_PROVIDER (unchanged)              | SB_SECRET_PROVIDER
+runbook                            | one rolling restart           | 1) add backend settings everywhere (no      | one quick rolling restart
+                                   |                               | behaviour change) 2) flip the provider      |
+failover gap during the switch     | yes, for the restart window   | none                                        | yes, for the restart window
+effort                             | n/a                           | S (human ~1d / CC ~30min)                   | S (docs)
+```
+
+Question D8:
+D8 — E9: During a switch from local to Vault or HSM, how do we avoid sandboxes losing their failover copy for the length of the rolling restart?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P2).
+ELI10: Nodes switch one at a time. A node that has switched seals new secrets with Vault, but a node that has not switched yet cannot open them, so a sandbox created in that window has no usable backup copy on the unswitched nodes. Because every wrapped key now says which backend made it, we can let any node open a Vault-made row as long as it has the Vault settings, even before it starts sealing with Vault. The switch then becomes two harmless steps: hand every node the Vault settings, then flip which backend seals.
+Stakes if we pick wrong: B leaves a real failover hole every time a customer adopts Vault or an HSM; A adds one rule about how rows are opened.
+Recommendation: A because it removes the gap completely with a small rule that the provider tags already make possible (edge cases over speed).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a gap-free two-step switch, against a documented failover hole.
+Header: Switch window
+Options:
+A) Two-step switch (recommended)
+A node opens any tagged row whose backend it has settings for, whatever `SB_SECRET_PROVIDER` says; sealing still follows `SB_SECRET_PROVIDER`. The runbook adds the backend settings to every node first, then flips the provider in a rolling restart. Effort S (human ~1d / CC ~30min), risk low; tested by opening a `vault:` row on a node still sealing local. ✅ No sandbox loses its failover copy at any point in the switch. ✅ Reuses the tags; no new format. ❌ The node now needs key-store access for opening before it seals with it, which the runbook must say.
+B) Accept the window
+Keep §12 as written: switch config everywhere, then do a quick rolling restart, and document the window. Effort S (docs), risk medium. ✅ Nothing new in the open path. ✅ Simple to explain. ❌ Sandboxes created during the restart window can lack a usable failover copy until every node has switched.
+
+State: approved
+Actual answer: A) Two-step switch (D8, 2026-10-25)
+Accepted scope: a node opens any tagged row whose backend it has settings for, regardless of `SB_SECRET_PROVIDER`; sealing still follows `SB_SECRET_PROVIDER`; the runbook adds backend settings to every node, then flips the provider in a rolling restart; a test opening a `vault:` row on a node still sealing local; §4, §12, the deployment sequence and the gate table updated.
+History: none
+
+### E4: how untagged rows are opened
+Finding: Section 1 finding 3, P3, confidence 9/10, Design §4 and §12 ("an untagged row is opened with the server key first, then with AWS KMS"), reviewer: eng review (Claude)
+Plan baseline: CEO-M1 (D15) revised E4 from "untagged = awskms" to "local first, then awskms"; open for eng confirmation (blocks Phase 1)
+Runtime evidence: a local row's DEK is `Cipher.EncryptWithAAD(dek, KeyAADBound(...))` (`pkg/secrets/envelope.go:130`), an `awskms` row's is an opaque KMS blob; both are untagged bytes today; GCM authenticates the local attempt, so a wrong guess fails cleanly
+Comparison grid:
+
+```text
+Commitment                        | Current (D15 text)             | A (trial: local, then awskms)      | B (explicit legacy setting)
+untagged row on a local node      | server key                     | server key                         | per SB_SECRET_LEGACY_ROWS
+untagged row on an awskms node    | server key, then AWS KMS       | server key, then AWS KMS           | per SB_SECRET_LEGACY_ROWS
+mixed history (local then awskms) | both open                      | both open                          | only the configured kind opens
+cost of a wrong first guess       | one local GCM open (µs)        | one local GCM open (µs)            | none
+new setting                       | none                           | none                               | SB_SECRET_LEGACY_ROWS=local|awskms
+effort                            | n/a                            | S (as planned)                     | S
+```
+
+Question D9:
+D9 — E4: For old rows with no provider tag, should a node try the server key first and then AWS KMS, or should an operator setting say which kind they are?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P3).
+ELI10: Rows sealed before this change carry no label saying who wrapped them; they are either "local" (wrapped by the server key) or AWS KMS. Trying the server key first costs microseconds and fails cleanly if wrong, because the encryption checks itself; then AWS KMS gets its turn. A setting would skip the guess but breaks clusters whose history has both kinds, for example a cluster that moved from local to AWS KMS.
+Stakes if we pick wrong: a setting can leave a mixed-history cluster unable to open half its old rows; the trial costs one cheap local check per old row.
+Recommendation: A because it opens every real history correctly with no new setting, and the wrong guess is authenticated and cheap (explicit over clever does not need a knob here).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a cheap authenticated guess that always works, against a setting that skips the guess but can strand mixed histories.
+Header: Untagged rows
+Options:
+A) Trial: local, then AWS KMS (recommended)
+Open an untagged row with the server key and local rules first; if that fails and the provider is `awskms`, try AWS KMS. Effort S (as planned), risk low; table test for each history. ✅ Works for local-only, KMS-only and mixed histories with no configuration. ✅ The failed first try is authenticated and costs microseconds. ❌ An `awskms` node does one wasted local check each time it opens an old untagged row (AWS rows are never swept).
+B) Explicit legacy setting
+Add `SB_SECRET_LEGACY_ROWS=local|awskms` and open untagged rows only that way. Effort S, risk medium. ✅ No guessing at all. ✅ The operator states the history explicitly. ❌ A cluster whose old rows include both kinds cannot open some of them.
+
+State: approved
+Actual answer: A) Trial: local, then AWS KMS (D9, 2026-10-25)
+Accepted scope: unchanged design (§4, §12): untagged rows open with the server key first, then AWS KMS when that is the provider; a table test per history (local-only, KMS-only, mixed); gate table and "Decisions needed" E4 marked answered.
+History: the "when that is the provider" condition was reopened by outside voice OV3 and replaced by D22 (whenever AWS KMS settings are present); the trial order stands.
+
+### E1: how sandboxd authenticates to Vault
+Finding: Section 1 finding 3, P3, confidence 8/10, Design §1 "Auth (v1): no login code in sandboxd", reviewer: eng review (Claude)
+Plan baseline: recommended token file + Agent proxy only; open (blocks Phase 2)
+Runtime evidence: none in the repo (no Vault code exists); Vault Agent auto-auth supports AppRole, Kubernetes, AWS IAM and TLS cert methods [in-distribution knowledge, unverified]
+Comparison grid:
+
+```text
+Commitment                     | Current (plan)                   | A (Agent only)                       | B (Agent + direct login)
+token file from Vault Agent    | yes                              | yes                                  | yes
+Agent API proxy (no token)     | yes                              | yes                                  | yes
+direct AppRole/Kubernetes login| no                               | no                                   | yes: login, token renew, re-login on
+                                |                                  |                                      | expiry inside sandboxd
+secrets held by sandboxd       | token (file) or none (proxy)     | token (file) or none (proxy)         | + role_id/secret_id or SA token path
+node dependency                | Vault Agent                      | Vault Agent                          | Vault Agent optional
+effort                         | n/a                              | S (as planned)                       | M (human ~4d / CC ~3h)
+```
+
+Question D10:
+D10 — E1: Should sandboxd log in to Vault itself, or rely on Vault Agent running next to it?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P3).
+ELI10: To call Vault, sandboxd needs a token. HashiCorp's own tool, Vault Agent, can log in with any method a customer uses (AppRole, Kubernetes, AWS, certificates), keep the token fresh, and either write it to a file or add it to requests for us. Building login into sandboxd means re-implementing token renewal and every login method we choose to support, and holding the login credential ourselves.
+Stakes if we pick wrong: building login now adds secret-handling code that Vault Agent already does well; relying on Agent adds one process customers must run.
+Recommendation: A because Vault Agent is HashiCorp's supported way to do this, it covers every login method, and sandboxd then never holds a login credential (boring by default).
+Note: options differ in kind, not coverage — no completeness score.
+Net: one fewer credential and no renewal code, against one more process customers must run.
+Header: Vault auth
+Options:
+A) Vault Agent only (recommended)
+sandboxd reads a token file written by Vault Agent, or sends requests through Agent's local proxy; it has no login code. Effort S (as planned), risk low. ✅ Every Vault login method works through Agent with no code in sandboxd. ✅ In proxy mode sandboxd holds no Vault credential at all. ❌ Customers must run and supervise Vault Agent on each node.
+B) Agent plus direct login
+Also support AppRole and Kubernetes login inside sandboxd, with token renewal and re-login. Effort M (human ~4d / CC ~3h), risk medium. ✅ Works without Vault Agent for those two methods. ✅ One fewer process on the node. ❌ sandboxd must hold and protect a login credential and own token renewal, which Agent already does.
+
+State: approved
+Actual answer: A) Vault Agent only (D10, 2026-10-25)
+Accepted scope: unchanged design (§1 Auth): token file written by Vault Agent, or the Agent API proxy; no login code in sandboxd; gate table and "Decisions needed" E1 marked answered.
+History: none
+
+### E2: a thin Vault client or HashiCorp's library
+Finding: Section 1 finding 3, P3, confidence 8/10, Design §1 "Client. A thin HTTP client in `pkg/secrets/vault.go`", reviewer: eng review (Claude)
+Plan baseline: recommended thin client; open (blocks Phase 2)
+Runtime evidence: `github.com/hashicorp/vault/api` is not in `go.mod` today (checked); the repo's own thin REST clients are `pkg/caddy/client.go` and `pkg/firecracker/client.go`; the calls needed are two POSTs (encrypt, decrypt) and one GET (`keys/<key>`), after eng D10 removed login
+Comparison grid:
+
+```text
+Commitment                      | Current (plan)          | A (thin client)                         | B (hashicorp/vault/api)
+endpoints used                  | encrypt, decrypt, keys  | encrypt, decrypt, keys                  | same, through the library
+new module dependencies         | none                    | none                                    | vault/api and its transitive tree
+token file reload, headers      | ours                    | ours (~250 lines with tests)            | library + our wrapper
+TLS / CA / namespace            | ours                    | stdlib net/http                         | library config
+error mapping table (§1)        | ours                    | ours, on HTTP status + body             | ours, on library error types
+effort                          | n/a                     | S (human ~2d / CC ~2h)                  | S (human ~1d / CC ~1h) + dependency review
+```
+
+Question D11:
+D11 — E2: Should the Vault client be a small hand-written HTTP client, or HashiCorp's official Go library?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P3); after D10 there is no login code, so the client needs three calls.
+ELI10: sandboxd only needs to call three Vault endpoints: encrypt, decrypt and read the key's version. A small client in the style of the repo's existing Caddy and Firecracker clients is about 250 lines with no new dependencies. HashiCorp's library saves writing those lines but brings its whole dependency tree into the security-sensitive secrets package, which then has to be reviewed and kept patched.
+Stakes if we pick wrong: the library adds dependency and CVE-tracking weight to the most sensitive package; the thin client means we own a little more HTTP code.
+Recommendation: A because three calls do not justify a new dependency tree in the secrets package, and the repo already has this exact client pattern twice (reuse before adding a dependency).
+Note: options differ in kind, not coverage — no completeness score.
+Net: about 250 lines of familiar code, against a new dependency tree in the secrets package.
+Header: Vault client
+Options:
+A) Thin client (recommended)
+Write `pkg/secrets/vault.go` on `net/http`, like `pkg/caddy/client.go`, behind a narrow `vaultAPI` interface for tests. Effort S (human ~2d / CC ~2h), risk low. ✅ No new module dependencies in the secrets package. ✅ Same pattern and test style as the repo's other REST clients. ❌ We own the HTTP details (timeouts, keep-alive limits, error bodies) ourselves.
+B) HashiCorp's library
+Use `github.com/hashicorp/vault/api` for the calls and wrap it in our error mapping. Effort S (human ~1d / CC ~1h) plus a dependency review, risk medium. ✅ HashiCorp maintains the client and its quirks. ✅ Less of our own HTTP code. ❌ A large dependency tree enters the most security-sensitive package and must be tracked for CVEs.
+
+State: approved
+Actual answer: A) Thin client (D11, 2026-10-25)
+Accepted scope: unchanged design (§1 Client): `pkg/secrets/vault.go` on `net/http` behind a narrow `vaultAPI` interface; no new module dependency; gate table and "Decisions needed" E2 marked answered.
+History: none
+
+### CEO-E2a: recovery after the key comes back
+Finding: Section 1 finding 3, P2, confidence 8/10, Design §10 "Pending for eng review: CEO-E2a", reviewer: eng review (Claude)
+Plan baseline: open (blocks Phase 4); the custody state machine (CEO Section 1) allows REVOKED → ACTIVE only on a fresh unwrap plus a matching check, and only if this answer is "auto-recover"
+Runtime evidence: the revocable `Cipher` holds its AEAD behind an atomic pointer, so a swap back is one store (Design §10 "The mechanism"); the gateway takes the CA again through `set_inspect_ca` (`internal/egress/gatewayd/daemon.go:151`)
+Comparison grid:
+
+```text
+Commitment                       | Current         | A (auto-recover)                              | B (restart only)
+when service returns             | undecided       | next re-check after re-enable (<= 5 min)      | when an operator restarts the node
+what proves the key is back      | n/a             | a fresh unwrap of the stored file + matching  | the boot unwrap + check
+                                 |                 | check                                         |
+what is restored                 | n/a             | Cipher AEAD swap, CA re-sent to the gateway,  | everything, by a normal boot
+                                 |                 | health back to ok, counter reset              |
+evidence                         | n/a             | `key_recovered` audit event (new Kind), alert | boot log + `key_custody_changed` if custody
+                                 |                 | resolves                                      | changed
+flapping                         | n/a             | a re-revoke needs N revoked results again     | n/a
+effort                           | n/a             | S (human ~1d / CC ~1h)                        | S (nothing extra)
+```
+
+Question D12:
+D12 — CEO-E2a: After a customer revokes and then re-enables their key, should nodes come back on their own or only after a restart?
+Project: plans/customer-key-custody on PR #784; Section 1 finding 3 (P2).
+ELI10: A revoke makes every node stop processing within about 15 minutes. If the customer then re-enables the key, perhaps because the revoke was a mistake, the nodes can notice on their next 5-minute check that the key works again and switch themselves back on. The alternative is that someone restarts every node by hand. Coming back on its own needs the same proof a boot uses: unwrap the stored key and check it matches.
+Stakes if we pick wrong: restart-only turns an accidental revoke into a fleet-wide manual restart; auto-recover adds a "switch back on" path that must restore everything a revoke turned off.
+Recommendation: A because re-enabling a key is as deliberate as disabling it, the proof is the same one boot uses, and nobody should have to restart a whole fleet by hand (systems over heroes).
+Note: options differ in kind, not coverage — no completeness score.
+Net: hands-free recovery with one more tested path, against a manual restart of every node.
+Header: Recovery
+Options:
+A) Auto-recover (recommended)
+On the first re-check after a revoke where the stored key unwraps and its check matches, swap the AEAD back, re-send the CA to the gateway, return health to ok, reset the counter and write a `key_recovered` audit event. Effort S (human ~1d / CC ~1h), risk low; tested revoke → re-enable → recover. ✅ An accidental revoke heals within about 5 minutes with no one touching the fleet. ✅ Uses the same proof as boot, so it cannot recover with a wrong key. ❌ One more path that must restore everything the revoke turned off, and must be tested as such.
+B) Restart only
+A revoked node stays stopped until an operator restarts it; the boot unwrap then proves the key. Effort S (nothing extra), risk low. ✅ No recovery code: a boot is the only way back. ✅ A human always decides when service returns. ❌ An accidental revoke means restarting every node in the fleet by hand.
+
+State: approved
+Actual answer: A) Auto-recover (D12, 2026-10-25)
+Accepted scope: on the first re-check after a revoke where the stored key unwraps and its check matches, the loop swaps the AEAD back, re-sends the CA to the gateway, returns health to ok, resets the counter and writes a `key_recovered` audit event (new Kind); a re-revoke needs N revoked results again; a revoke → re-enable → recover test (unit + live UC); §10, Phase 4 and the gate table updated.
+History: none
+
+### E5: which limiter numbers are settings
+Finding: Section 2 finding 1, P3, confidence 8/10, Design §5 "Limit in one place" and "Background work never blocks a create", reviewer: eng review (Claude)
+Plan baseline: open (blocks Phase 1); the plan already names `SB_SECRET_PROVIDER_MAX_INFLIGHT` (default 8)
+Runtime evidence: none measured yet (Phase 0); CloudHSM limits sessions per client and vendor partitions differ [in-distribution knowledge]; the repo keeps config-default rationale in `setup/config-defaults.md`
+Comparison grid:
+
+```text
+Commitment                     | Current (plan)                 | A (one setting)                       | B (all settings)                     | C (all hard-coded)
+foreground in-flight cap       | SB_SECRET_PROVIDER_MAX_INFLIGHT| setting, default 8                    | setting, default 8                   | constant 8
+reserved create slot           | 1 [estimated]                  | constant 1                            | setting                              | constant 1
+background budget              | 2 [estimated]                  | constant 2                            | setting                              | constant 2
+backoff ceiling                | unspecified                    | constant (inside caller deadline)     | setting                              | constant
+helper session pool (eng D5)   | foreground + background        | MAX_INFLIGHT + 2                      | sum of settings                      | 10
+config-defaults.md rows        | n/a                            | 1                                     | 4                                    | 0
+effort                         | n/a                            | S (human ~2h / CC ~15min)             | S (human ~4h / CC ~30min)            | S
+```
+
+Question D13:
+D13 — E5: Which of the key-store traffic limits should operators be able to change?
+Project: plans/customer-key-custody on PR #784; Section 2 finding 1 (P3).
+ELI10: sandboxd limits how many key-store calls run at once: 8 for normal work, 1 of those kept free for creates, 2 more for background jobs, plus a retry backoff. HSMs differ a lot in how many sessions they allow, so an operator may need to lower the main number for their HSM. The other three are internal balancing numbers nobody has measured yet; making them settings adds knobs that are hard to explain and easy to break.
+Stakes if we pick wrong: no setting at all can leave a small HSM overloaded; four settings invite misconfiguration nobody can reason about.
+Recommendation: A because the one number that depends on the customer's hardware becomes a setting, and the rest stay constants until Phase 0 measurements give a reason (avoid premature abstraction).
+Note: options differ in kind, not coverage — no completeness score.
+Net: one setting tied to real hardware limits, against four knobs or none.
+Header: Limiter settings
+Options:
+A) One setting (recommended)
+Keep `SB_SECRET_PROVIDER_MAX_INFLIGHT` (default 8) as the only setting; the reserved create slot (1), background budget (2) and backoff ceiling are constants with comments explaining them. Effort S (human ~2h / CC ~15min), risk low. ✅ Operators can fit the cap to their HSM's session limit. ✅ One row in `setup/config-defaults.md`, easy to explain. ❌ Changing the internal balance later needs a code change.
+B) All settings
+Make the reserved slot, background budget and backoff ceiling settings too. Effort S (human ~4h / CC ~30min), risk medium. ✅ Every number can be tuned in the field. ✅ No release needed to rebalance. ❌ Four knobs with no measurements behind them, which operators can set into a state where creates starve.
+C) All hard-coded
+No settings; every number is a constant. Effort S, risk medium. ✅ Nothing to misconfigure. ✅ Simplest code. ❌ An HSM with fewer sessions than 10 cannot be supported without a new build.
+
+State: approved
+Actual answer: A) One setting (D13, 2026-10-25)
+Accepted scope: `SB_SECRET_PROVIDER_MAX_INFLIGHT` (default 8) is the only limiter setting, with a `setup/config-defaults.md` row; the reserved create slot (1), background budget (2) and backoff ceiling are commented constants; the helper session pool is MAX_INFLIGHT + 2; §5, the gate table and "Decisions needed" E5 updated.
+History: none
+
+### E10: one helper for secret-file permissions
+Finding: Section 2 finding 2, P3, confidence 9/10, `pkg/secrets/wrap_key_loader.go:72`, reviewer: eng review (Claude)
+Plan baseline: CEO Section 5 proposed "one helper used by the upstream wrap key, the PIN file and the wrapped server-key file"; not individually approved
+Runtime evidence: `LoadUpstreamWrapKeyRing` refuses group/other bits (`if mode&0o077 != 0`, `:72`) **and** any write bit (`if mode&0o200 != 0`, `:75`), wanting 0400. The wrapped server-key file is written and rewritten by sandboxd itself at 0600 (§3, §11), so it must allow the owner write bit; the PIN file allows 0400 or 0600 (§2 settings)
+Shared-code rubric: callers = 1 existing (`LoadUpstreamWrapKeyRing`, `wrap_key_loader.go:72`), 2 proposed (PIN file loader, Phase 3; wrapped-file loader, Phase 4: plan assumptions). Common contract: "refuse group or other permission bits". Difference: only the upstream key also refuses the owner write bit, so that check stays at its caller. Lines: implementation ~6 removed, ~10 added (helper + error text), saves ~4 net across 3 callers [estimated]; tests: one table test replaces three.
+Comparison grid:
+
+```text
+Commitment                       | Current               | A (small shared helper)                     | B (three inline checks)
+group/other-bit rule             | inline in 1 place      | `refuseGroupOtherBits(path)` in pkg/secrets, | copied into the PIN and wrapped-file loaders
+                                 |                       | used by all 3 callers                       |
+owner write-bit rule (0400 only) | upstream key only      | stays inline at the upstream key            | stays inline at the upstream key
+error text                       | one wording            | one wording for all 3                       | three wordings
+tests                            | 1                      | 1 table test for the helper                 | 3
+net lines                        | n/a                    | about -4 implementation, fewer test lines   | about +12
+effort                           | n/a                    | S (human ~1h / CC ~10min)                   | S (human ~1h / CC ~10min)
+```
+
+Question D14:
+D14 — E10: Should the three "is this secret file locked down?" checks share one small helper?
+Project: plans/customer-key-custody on PR #784; Section 2 finding 2 (P3).
+ELI10: Three files hold sensitive material: the existing upstream wrap key, the new HSM PIN file and the new wrapped server key. Each must refuse to load if anyone besides the owner can read it. Today that check exists once (wrap_key_loader.go:72). One small shared function gives all three the same rule and the same error message, tested once. The existing file's extra "must not be writable" rule stays where it is, because sandboxd itself rewrites the wrapped key file.
+Stakes if we pick wrong: copies can drift so one file quietly accepts looser permissions; a helper adds one tiny function.
+Recommendation: A because the same security rule should live in one tested place, and the helper stays tiny by leaving the caller-specific write rule outside it (shared code only when it improves reliability).
+Note: options differ in kind, not coverage — no completeness score.
+Net: one tested rule for three files, against three copies that can drift.
+Header: File-mode helper
+Options:
+A) Small shared helper (recommended)
+Add `refuseGroupOtherBits(path)` to `pkg/secrets`, used by the upstream wrap key, PIN file and wrapped-file loaders; the upstream key keeps its extra write-bit check inline. Effort S (human ~1h / CC ~10min), risk low; one table test. ✅ One rule, one message, one test for every secret file. ✅ A future secret file gets the right check by calling one function. ❌ The upstream key's loader changes slightly, so its existing tests must still pass unchanged.
+B) Three inline checks
+Copy the group/other check into the two new loaders and leave the existing one alone. Effort S (human ~1h / CC ~10min), risk low. ✅ No change to existing code. ✅ Each loader reads on its own. ❌ Three copies of a security rule that can drift apart over time.
+
+State: approved
+Actual answer: A) Small shared helper (D14, 2026-10-25)
+Accepted scope: `refuseGroupOtherBits(path)` in `pkg/secrets`, used by `LoadUpstreamWrapKeyRing` (its write-bit check stays inline), the PIN file loader and the wrapped-file loader; one table test; existing `wrap_key_loader_test.go` stays green unchanged; §5 updated.
+History: none
+
+### R-REG: regression contract for changed existing behavior
+Finding: Section 3 regression rule, CRITICAL (existing behavior at risk), confidence 9/10, reviewer: eng review (Claude)
+Plan baseline: the changes themselves are approved (CEO-A1 503 mapping, CEO-E2 awskms mapping, eng D3 comparison, eng D14 helper, custody=file default unchanged); no regression contract recorded yet
+Runtime evidence: existing tests: `TestMapAWSKMSError` (`pkg/secrets/awskms_test.go:56`), `TestLoadUpstreamWrapKeyRing_RejectsLooseMode` (`wrap_key_loader_test.go:82`), put-outbox conflict cases (`internal/store/cluster_secret_put_outbox_test.go`), `testProviderContract` (`provider_contract_test.go:17`), `classify_test.go`
+Behaviors to preserve and intended differences:
+
+```text
+Behavior                                  | Preserve                                         | Intended difference
+awskms error mapping                      | Throttled, AccessDenied, other codes unchanged   | Disabled, NotFound, InvalidState+PendingDeletion -> ErrKeyRevoked
+API error classes                         | every non-provider error status unchanged        | five provider classes -> 503 with stable codes
+PutClusterSecret                          | stale gen rejected; tomb rules; payload conflict  | same gen + only WrappedKey changed -> idempotent
+upstream wrap key loader                  | 0400 required; looser or writable refused        | none (helper extraction only)
+custody=file boot, local provider         | NewCipher env/file/generate exactly as today;     | none
+                                          | cluster key check unchanged                      |
+awskms create path under normal load      | same results as today                            | now passes through limitedWrapper
+```
+
+Comparison grid:
+
+```text
+Commitment                     | Current      | A (extend existing tables)                    | B (separate regression files)
+where assertions live          | n/a          | new rows in the existing table tests above,   | new *_regression_test.go per package pinning
+                               |              | existing rows unchanged                       | today's behavior, then existing tests edited
+intended differences           | n/a          | the changed rows say what changed and why     | in the regression files
+"custody=file unchanged"       | n/a          | rows in secrets_test.go and config_test.go    | a regression file per package
+duplicate coverage             | n/a          | none                                          | some overlap with existing tables
+effort                         | n/a          | S (human ~1d / CC ~1h)                        | S-M (human ~2d / CC ~2h)
+```
+
+Question D15:
+D15 — R-REG: How do we prove the existing behavior we are not changing stays the same?
+Project: plans/customer-key-custody on PR #784; Section 3 regression rule (existing behavior at risk).
+ELI10: Several approved changes touch code that already works: how AWS KMS errors are classified, the HTTP status for key-store errors, how a peer accepts a secret copy, the upstream key's permission check, and the default boot path when nothing new is turned on. Each needs tests that fail if anything other than the intended change moves. The question is where those tests live, not whether to write them.
+Stakes if we pick wrong: a quiet change to existing behavior (for example, the default boot path) ships unnoticed to every current install.
+Recommendation: A because the repo's style is table-driven tests and these behaviors already have tables; adding rows keeps one source of truth per behavior (match the existing harness).
+Note: options differ in kind, not coverage — no completeness score.
+Net: new rows in the existing tables, against a parallel set of regression files.
+Header: Regression tests
+Options:
+A) Extend existing tables (recommended)
+Add rows to `TestMapAWSKMSError`, `classify_test.go`, the put-outbox and store tests, `wrap_key_loader_test.go`, `secrets_test.go`, `config_test.go` and the provider contract run; existing rows stay unchanged and each changed row states the intended difference. Effort S (human ~1d / CC ~1h), risk low. ✅ One source of truth per behavior, in the style the repo already uses. ✅ A reviewer sees the intended difference next to the unchanged cases. ❌ The preserve-cases are spread across seven test files instead of one place.
+B) Separate regression files
+Add a `*_regression_test.go` per package that pins today's behavior before any change lands, then edit the existing tests. Effort S-M (human ~2d / CC ~2h), risk low. ✅ The whole "must not change" contract is easy to find. ✅ Written first, it catches a change even if an existing test is edited. ❌ Overlaps the existing tables, so two places must be kept in step.
+
+State: approved
+Actual answer: A) Extend existing tables (D15, 2026-10-25)
+Accepted scope: regression rows added to `TestMapAWSKMSError`, `classify_test.go`, the put-outbox and store tests, `wrap_key_loader_test.go`, `secrets_test.go`, `config_test.go` and the provider contract run; existing rows unchanged; each changed row states its intended difference; the preserve/difference table above becomes the Testing section's regression contract.
+History: none
+
+### E3: the PKCS#11 key-wrap fallback for HSMs without AES-GCM
+Finding: Section 3, P3, confidence 7/10, Design §2 "No-GCM fallback ... Ship it only if Phase 0 finds a target HSM without GCM", reviewer: eng review (Claude)
+Plan baseline: recommended "only if Phase 0 needs it"; open (blocks Phase 3, after Phase 0)
+Runtime evidence: none (no HSM tested yet); F3 (D14 of the CEO review) chose AWS CloudHSM first, whose PKCS#11 library documents AES-GCM with an HSM-generated IV (AWS docs cited in the plan)
+Comparison grid:
+
+```text
+Commitment                         | Current                         | A (decide after Phase 0)                  | B (ship it now)
+CKM_AES_KEY_WRAP_PAD code path      | not built                       | not built unless Phase 0 finds a target   | built and tested in Phase 3
+                                    |                                 | HSM without AES-GCM                       |
+AAD on the wrapped key              | GCM AAD                         | GCM AAD                                   | GCM AAD, or none on the fallback (payload
+                                    |                                 |                                           | AAD still binds identity)
+test matrix                         | GCM                             | GCM                                       | GCM + key-wrap on SoftHSM2
+what Phase 0 must record            | GCM IV behavior                 | + "AES-GCM available" per target HSM      | same
+effort                              | n/a                             | S now (zero implementation work)          | S-M (human ~2d / CC ~2h)
+```
+
+Question D16:
+D16 — E3: Should we build a second HSM wrapping method for HSMs that lack AES-GCM, or wait until we meet one?
+Project: plans/customer-key-custody on PR #784; Section 3 (P3).
+ELI10: The HSM provider wraps keys with AES-GCM, which almost every modern HSM supports, including AWS CloudHSM, the one we certify first. A few older HSMs only offer a different wrapping method that cannot carry the extra "this belongs to sandbox X" tag. The design stays safe without that tag, because the secret itself carries it, but it is a second code path to build and test.
+Stakes if we pick wrong: building it now adds an untested-in-the-field path; waiting means a customer with an old HSM gets "not supported" until we add it.
+Recommendation: A because no target HSM needs it today, CloudHSM supports AES-GCM, and Phase 0 records the fact for each HSM we test (do not build for problems that do not exist yet).
+Note: options differ in kind, not coverage — no completeness score.
+Net: no second path until a real HSM needs it, against support for older HSMs from day one.
+Header: Key-wrap fallback
+Options:
+A) Decide after Phase 0 (recommended)
+Build only AES-GCM now; Phase 0 records "AES-GCM available" for every HSM it tests, and the fallback is built only if one of them lacks it. Effort S now (zero implementation work), risk low. ✅ One wrapping path to build, test and support. ✅ The decision is made on a measured fact, not a guess. ❌ A customer with an HSM lacking AES-GCM waits for a follow-up.
+B) Ship it now
+Build `CKM_AES_KEY_WRAP_PAD` as a configured fallback and test it on SoftHSM2. Effort S-M (human ~2d / CC ~2h), risk medium. ✅ Older HSMs work on day one. ✅ No follow-up needed later. ❌ A second code path that no tested customer HSM needs yet.
+
+State: approved
+Actual answer: A) Decide after Phase 0 (D16, 2026-10-25)
+Accepted scope: build AES-GCM only; Phase 0 records "AES-GCM available" for each HSM it tests; the key-wrap fallback is built only if a tested target lacks AES-GCM (no implementation now); Phase 0 row and the gate table updated.
+History: none
+
+### E8: retry once when the key store is briefly unavailable
+Finding: Section 4 finding 1, P2, confidence 7/10, CEO Section 1 production-failure table (Vault row), reviewer: eng review (Claude)
+Plan baseline: `limitedWrapper` retries only `ErrProviderThrottled` (Design §5); E8 open (blocks Phase 1)
+Runtime evidence: no retry exists for any provider class today (`internal/service/metrics.go:316` only counts); Vault returns 503 while a standby is promoted [in-distribution knowledge, unverified]; AWS KMS and HSM HA clients mostly fail over below the caller
+Comparison grid:
+
+```text
+Commitment                        | Current                 | A (one short retry, foreground)               | B (no retry)
+create during a brief blip        | 503 key_store_unavailable| one retry after 100-300 ms jitter, if the      | 503 key_store_unavailable
+                                  |                         | caller deadline has room; then 503            |
+multi-second Vault handover       | 503                     | 503 (retry lands inside the handover)         | 503
+background calls (re-check, sweep)| n/a                     | no retry; the next tick tries again           | no retry
+counts toward a revoke            | no                      | no (Unavailable is never a revoke)            | no
+added latency on a real outage    | none                    | up to ~300 ms before the 503                  | none
+effort                            | n/a                     | S (human ~2h / CC ~15min)                     | S (nothing extra)
+```
+
+Question D17:
+D17 — E8: When the key store answers "temporarily unavailable", should a create retry once before failing?
+Project: plans/customer-key-custody on PR #784; Section 4 finding 1 (P2).
+ELI10: Short key-store hiccups happen: a dropped connection, a request that lands at the end of a Vault handover, a brief network blip. Today any of them fails the create. One quick retry, about a quarter second later and only if the request still has time left, hides those. It does not hide a handover that lasts several seconds; that still fails with a clear "try again" error. Background jobs do not need it: they try again on their next run.
+Stakes if we pick wrong: no retry means customer-visible failures on every brief blip; a retry adds up to ~300 ms before a real outage's error.
+Recommendation: A because a single bounded retry hides brief blips at almost no cost and never retries past the caller's deadline (thorough handling over speed).
+Note: options differ in kind, not coverage — no completeness score.
+Net: one bounded retry that hides brief blips, against failing fast every time.
+Header: Unavailable retry
+Options:
+A) One short retry (recommended)
+For foreground calls only, retry `ErrProviderUnavailable` once after 100-300 ms of jitter if the caller's deadline leaves room; background calls never retry. Effort S (human ~2h / CC ~15min), risk low; unit test with a fake that fails once. ✅ Brief blips and the tail of a Vault handover never reach the customer. ✅ Bounded: one retry, inside the deadline, never on background work. ❌ A multi-second handover still fails, and a real outage's 503 arrives up to ~300 ms later.
+B) No retry
+Fail fast with 503 `key_store_unavailable` and let the client retry. Effort S (nothing extra), risk low. ✅ Simplest behavior, the error arrives immediately. ✅ Clients with their own retry are not double-retried. ❌ Every brief blip shows up as a failed create.
+
+State: approved
+Actual answer: A) One short retry (D17, 2026-10-25)
+Accepted scope: `limitedWrapper` retries `ErrProviderUnavailable` once, for foreground calls only, after 100-300 ms of jitter if the caller's deadline leaves room; background calls never retry; a unit test with a fake that fails once; §5, the Section 2 rescue table and the gate table updated.
+History: an earlier draft claimed the retry "rides over most handovers"; corrected before asking, since a multi-second handover still fails.
+
+### CEO-E2c: re-check defaults
+Finding: Section 4 finding 2, P3, confidence 8/10, Design §10 "default 5 minutes", "default 3, so about 15 minutes", reviewer: eng review (Claude)
+Plan baseline: 5 min × 3 written into the claim ("about 15 minutes") as [estimated]; CEO-E2c open (blocks Phase 4, after Phase 0); both stay settings (`SB_SECRET_PROVIDER_RECHECK_INTERVAL`, `SB_SECRET_PROVIDER_REVOKE_AFTER`)
+Runtime evidence: none measured; fleet load = nodes ÷ interval (one unwrap per node per interval, Design §10); the gateway self-drop uses the same bound (Design §10)
+Comparison grid:
+
+```text
+Commitment                  | Current (plan)        | A (5 min x 3)           | B (1 min x 3)            | C (15 min x 2)
+revoke bound in the claim   | ~15 min               | ~15 min                 | ~3 min                   | ~30 min
+fleet load at 2,000 nodes   | ~7 calls/s [est.]     | ~7 calls/s              | ~33 calls/s              | ~2 calls/s
+false-trip protection       | 3 deliberate signals  | 3 in a row              | 3 in a row (3 min)       | 2 in a row
+gateway self-drop bound     | ~15 min               | ~15 min                 | ~3 min (a slow sandboxd  | ~30 min
+                            |                       |                         | restart could drop it)   |
+still settings              | yes                   | yes                     | yes                      | yes
+effort                      | n/a                   | S (as planned)          | S                        | S
+```
+
+Question D18:
+D18 — CEO-E2c: What revoke window should the defaults give: about 15 minutes, about 3 minutes, or about 30 minutes?
+Project: plans/customer-key-custody on PR #784; Section 4 finding 2 (P3).
+ELI10: Each node re-checks the key every few minutes and stops after a few "revoked" answers in a row. Checking every 5 minutes, 3 times, means a revoke bites within about 15 minutes and the whole fleet makes about 7 key-store calls a second. Checking every minute cuts the window to about 3 minutes but adds five times the load, and also shrinks the grace the egress gateway gives a restarting sandboxd. Operators can change both numbers; this only picks the default the docs promise.
+Stakes if we pick wrong: too long and the promised cut-off feels slow to a security buyer; too short and key stores carry more load and gateways can drop their CA during a slow restart.
+Recommendation: A because 15 minutes is a credible cut-off for a deliberate revoke, keeps fleet load trivial, and leaves the gateway a safe restart grace; buyers who need faster can set a shorter interval (boring by default).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a 15-minute default with light load, against a faster cut-off at five times the load or a slower one at a third.
+Header: Re-check default
+Options:
+A) 5 min x 3 (recommended)
+Re-check every 5 minutes; trip after 3 revoked results in a row; the claim says "about 15 minutes". Effort S (as planned), risk low. ✅ About 7 key-store calls per second across 2,000 nodes. ✅ The gateway's self-drop grace stays well above a normal sandboxd restart. ❌ A buyer who wants a faster cut-off has to change the setting.
+B) 1 min x 3
+Re-check every minute; trip after 3; the claim says "about 3 minutes". Effort S, risk medium. ✅ The fastest default cut-off. ✅ A strong line in a security review. ❌ Five times the key-store load, and a sandboxd restart slower than ~3 minutes would make the gateway drop its CA.
+C) 15 min x 2
+Re-check every 15 minutes; trip after 2; the claim says "about 30 minutes". Effort S, risk low. ✅ The lightest load, about 2 calls per second. ✅ The fewest background entries in the key store's audit log. ❌ A 30-minute cut-off reads as slow to a security buyer.
+
+State: approved
+Actual answer: A) 5 min x 3 (D18, 2026-10-25)
+Accepted scope: defaults `SB_SECRET_PROVIDER_RECHECK_INTERVAL=5m` and `SB_SECRET_PROVIDER_REVOKE_AFTER=3` (both settings, documented in `setup/config-defaults.md`); the claim keeps "about 15 minutes"; the gateway self-drop bound follows; the Vault error text stays a Phase 0 item; §10 and the gate table updated.
+History: option C's second pro was corrected before asking (key-store outages never count toward a revoke in any option).
+
+### CEO-E4a: sweep cadence
+Finding: Section 4 finding 3, P3, confidence 8/10, Design §11 "It runs at boot and then on a cadence (CEO-E4a)", reviewer: eng review (Claude)
+Plan baseline: boot plus an undecided cadence, on the 2-slot background budget, with a random start delay (Design §5 "Sweep load after a rotation"); CEO-E4a open (blocks Phase 4b)
+Runtime evidence: a pass reads every local row once by primary-key pages and parses only the `WrappedKey` prefix (CEO Section 7); rewrap calls happen only for stale rows; on Vault each pass also reads the key's latest version once (`read` on `<mount>/keys/<key>`), so an idle pass is a local scan plus that one read; operators retire a version only after every member's stale gauge reads 0 (§11)
+Comparison grid:
+
+```text
+Commitment                          | Current      | A (boot + hourly)                    | B (boot + daily)                     | C (boot only)
+wait after a rotation before retire | undecided    | up to ~1 h (+ start jitter)          | up to ~24 h                          | until every node restarts
+local scan cost when nothing stale  | n/a          | 24 paged scans/day/node              | 1 scan/day/node                      | 1 per boot
+key-store calls                     | stale rows   | stale rows, plus 1 version read per  | stale rows, plus 1 version read per  | stale rows, plus 1 read
+                                    |              | pass on Vault (~0.6/s at 2,000 nodes) | pass on Vault                        | per boot
+start spread across the fleet       | random delay | random delay up to 1 h               | random delay up to 24 h              | follows restarts
+new setting                         | none         | none (constant, per eng D13)         | none (constant)                      | none
+effort                              | n/a          | S (human ~1h / CC ~10min)            | S                                    | S
+```
+
+Question D19:
+D19 — CEO-E4a: After a key rotation, how often should each node look for old-version rows to rewrap?
+Project: plans/customer-key-custody on PR #784; Section 4 finding 3 (P3).
+ELI10: After a customer rotates their key, every node re-wraps its stored keys onto the new version in the background, and only when every node's "stale" count is zero can the old version be retired. Looking every hour means the wait after a rotation is about an hour; daily means about a day; boot-only means someone must restart every node. A look with nothing to do is a quick local scan plus, on Vault, one small call to read the key's version, so hourly costs almost nothing.
+Stakes if we pick wrong: daily or boot-only makes key retirement slow or manual; much more often than hourly adds local scanning for no gain.
+Recommendation: A because an hour is a reasonable wait for a deliberate rotation, the idle scan is cheap, and nobody has to restart the fleet to finish a rotation (systems over heroes).
+Note: options differ in kind, not coverage — no completeness score.
+Net: an hour's wait with cheap idle scans, against a day's wait or a manual fleet restart.
+Header: Sweep cadence
+Options:
+A) Boot + hourly (recommended)
+Sweep at boot (after the API is serving) and then every hour, with a random start delay of up to an hour across the fleet. Effort S (human ~1h / CC ~10min), risk low. ✅ A rotation finishes on its own within about an hour. ✅ An idle pass is a paged local scan plus, on Vault, one version read. ❌ 24 local scans a day on every node, even when nothing is stale.
+B) Boot + daily
+Sweep at boot and then once a day, with a random start delay of up to a day. Effort S, risk low. ✅ The least background work. ✅ Spreads any rotation load over a whole day. ❌ Operators wait up to a day before they can retire an old key version.
+C) Boot only
+Sweep only at boot; a rotation completes when every node has restarted. Effort S, risk medium. ✅ No background timer at all. ✅ Simplest to reason about. ❌ Finishing a rotation needs a restart of every node in the fleet.
+
+State: approved
+Actual answer: A) Boot + hourly (D19, 2026-10-25)
+Accepted scope: the `key_custody` loop sweeps at boot (after the API is serving) and then every hour as a constant, with a random start delay of up to an hour; on Vault each pass reads the key's latest version once; §5, §11 and the gate table updated.
+History: the idle-pass cost was corrected before asking (on Vault a pass also reads the key version once).
+
+### OV1: equal-content peer copies keep which wrapping (reopens D3)
+Finding: outside voice OV1, High, confidence 9/10, eng D3 accepted scope, reviewer: codex (verified by eng review)
+Plan baseline: D3 (approved A): same generation and same content is idempotent and **keeps the incoming bytes**
+Runtime evidence: each node's sweep rewraps only its own copies (§11); the put-outbox resends whatever bytes the sender holds; `PutClusterSecret` already skips the row rewrite when bytes are identical (`internal/store/store.go:5888`)
+Reason for reopening: new evidence. A delayed copy sealed before the sender's sweep can arrive after the receiver's own sweep, put the old wrapping back, and make a row that already counted as current stale again after the operator retires the old version.
+Comparison grid:
+
+```text
+Commitment                         | Current (D3)                   | A (apply: keep existing)           | B (keep D3)           | C (investigate)        | D (defer)
+same gen, equal content, new bytes | write incoming bytes           | no rewrite; keep existing bytes;   | write incoming bytes  | D3 stays until a       | D3 stays; OV1 open
+                                   |                                | apply tomb/outbox transitions; ACK |                       | bounded probe          |
+receiver's own swept row           | can be overwritten by an older | never overwritten                  | can be overwritten    | unchanged              | unchanged
+                                   | wrapping                       |                                    |                       |                        |
+who rewraps the receiver's copy    | sender (by resending)          | the receiver's own sweep           | sender                | unchanged              | unchanged
+payload differs, same gen          | conflict                       | conflict                           | conflict              | conflict               | conflict
+effort                             | S                              | S (a smaller change than D3)       | S                     | S (study only)         | S
+```
+
+Question D20:
+D20 — OV1 (reopens D3): When a peer copy arrives with the same secret but a different wrapping, keep the copy already on disk or take the incoming one?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV1 (High), checked against D3.
+ELI10: In D3 we chose to accept a peer's copy that differs only in its wrapped key and to store the incoming bytes. The outside reviewer found the catch: an older copy, sent before the sender re-wrapped it, can arrive after this node has already re-wrapped its own copy, and would put the old wrapping back. If the old key version is then retired, that row breaks. Keeping whatever is already on disk avoids it, because every node re-wraps its own copies anyway.
+Stakes if we pick wrong: keeping D3 can silently undo a rotation on some nodes and break those rows when the old version is retired.
+Recommendation: A because each node already owns rewrapping its own copies, so the safe rule is to never let a peer overwrite them (explicit over clever).
+Note: options differ in kind, not coverage — no completeness score.
+Net: never overwrite a local wrapping, against D3's simpler "take what arrives".
+Header: Peer copy rule
+Options:
+A) Apply: keep existing
+For the same generation and equal content, do not rewrite the row: keep the bytes already on disk, still apply the tomb and outbox transitions, and return success; a different payload is still a conflict. Effort S (smaller than D3), risk low; a test sends a pre-sweep copy after the receiver's sweep and checks the receiver's wrapping survives. ✅ A rotation can never be undone by a late peer copy. ✅ Matches who owns rewrapping: each node's own sweep. ❌ A receiver's copy is only as fresh as its own sweep, not the sender's.
+B) Keep D3
+Store the incoming bytes as D3 says. Effort S, risk high. ✅ No change from the approved answer. ✅ Peers adopt the sender's wrapping immediately. ❌ A late, older copy can undo a rotation and break rows after retirement.
+C) Investigate first
+Keep D3 for now and spend at most half a day probing outbox timing to see how often a late copy can land after a sweep; then ask again. Effort S (study only), risk medium. ✅ Decides on measured timing. ✅ No design change yet. ❌ The race exists whatever the timing shows, so the probe changes little.
+D) Defer
+Leave D3 in place and keep OV1 open as an unresolved decision. Effort S, risk high. ✅ No change now. ✅ Revisit during Phase 4b. ❌ Phase 4b would start with a known way to undo rotations.
+
+State: approved
+Actual answer: A) Apply: keep existing (D20, 2026-10-25)
+Accepted scope: same generation and equal content (ignoring `WrappedKey`) is idempotent and keeps the bytes already on disk: no row rewrite, the tomb and outbox transitions still apply, success is returned; a different payload is still a conflict; a test sends a pre-sweep copy after the receiver's sweep and checks the receiver's wrapping survives; §11 and the test list updated.
+History: D3 (approved A, 2026-10-21) chose "compare without the key" and "keep the incoming bytes"; this row reopens only the "which bytes" half. The comparison itself (ignore `WrappedKey`) stays approved.
+
+### OV2: what the egress gateway drops on a revoke
+Finding: outside voice OV2, High, confidence 9/10, `internal/egress/proxy/inspect.go:108-110` and `:251`, reviewer: codex (verified by eng review)
+Plan baseline: CEO-E2R (D9, full stop) says inspected egress fails closed; §10 sends `clear_inspect_ca`, with a unit restart for an old gateway (eng D4)
+Runtime evidence: `serveInspect` loads the inspector once at connection start (`ins := p.currentInspector()`), so established inspected connections keep using it; inject rules read `cur.Spec.Secrets[key]` and replace a header with the secret (`:251`); the gateway never writes those secrets to its snapshot (`internal/egress/snapshot.go:34`); its comment says a policy change can close inspected connections (`inspect.go:106-107`)
+Comparison grid:
+
+```text
+Commitment                           | Current (D4 + §10)            | A (apply: full clear op)                 | B (keep)                 | C (investigate)       | D (defer)
+new inspected handshakes after revoke| refused                       | refused                                  | refused                  | refused               | refused
+established inspected connections    | keep running with the old CA  | closed by the gateway                    | keep running             | unchanged             | unchanged
+injection secrets in gateway memory  | kept; inject rules still add  | dropped; inject rules deny with           | kept                     | unchanged             | unchanged
+                                     | real credentials              | ReasonSecretMissing                      |                          |                       |
+post-revoke Syncs from sandboxd      | unspecified                   | carry no secrets                         | unspecified              | unspecified           | unspecified
+non-inspected egress                 | keeps working                 | keeps working                            | keeps working            | keeps working         | keeps working
+old gateway (D4)                     | unit restart                  | unit restart (clears all three)          | unit restart             | unit restart          | unit restart
+effort                               | n/a                           | S-M (human ~2d / CC ~2h)                 | S                        | S                     | S
+```
+
+Question D21:
+D21 — OV2: On a revoke, should the egress gateway also cut existing inspected connections and forget the secrets it injects?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV2 (High), checked against inspect.go.
+ELI10: The egress gateway inspects some HTTPS traffic and can add a real credential into outgoing requests for a sandbox (for example an API key header). Our revoke only stops new inspected connections. Connections already open keep using the old certificate, and the gateway keeps the credentials it adds, so a running sandbox can keep calling out with a customer secret after the revoke. The full stop you chose in the CEO review promises that stops.
+Stakes if we pick wrong: a revoke looks complete while running sandboxes keep sending real customer credentials through already-open connections.
+Recommendation: A because the full stop you approved (D9) promises AerolVM stops using customer secrets, and these are exactly such secrets (thorough handling over speed).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a revoke that also ends open inspected sessions and injected credentials, against a revoke that only blocks new ones.
+Header: Gateway on revoke
+Options:
+A) Apply: full clear op
+`clear_inspect_ca` drops the CA, drops every sandbox's injection secrets and closes established inspected connections; inject rules then deny with `ReasonSecretMissing`; sandboxd's later Syncs carry no secrets while revoked; an old gateway is still restarted (D4), which clears all three. Effort S-M (human ~2d / CC ~2h), risk low; tested with an open keep-alive connection and an inject rule across a revoke. ✅ No customer credential leaves through AerolVM after a revoke. ✅ Non-inspected egress keeps working, as the full stop promised. ❌ Open inspected sessions in running sandboxes are cut mid-flight.
+B) Keep the current design
+Only refuse new inspected handshakes. Effort S, risk high. ✅ No new gateway behavior. ✅ No connections are cut. ❌ Running sandboxes keep sending injected customer secrets after a revoke, contradicting D9.
+C) Investigate first
+Spend at most a day measuring how long inspected connections live and how inject rules are used in practice; then ask again. Effort S (study only), risk medium. ✅ Decides on real usage. ✅ No change yet. ❌ The leak exists for any connection that outlives the bound, whatever the numbers say.
+D) Defer
+Keep the current design and leave OV2 open. Effort S, risk high. ✅ No change now. ✅ Revisit in Phase 4. ❌ Phase 4 starts with a known gap in the full stop.
+
+State: approved
+Actual answer: A) Apply: full clear op (D21, 2026-10-25)
+Accepted scope: `clear_inspect_ca` drops the CA, drops every sandbox's injection secrets and closes established inspected connections; inject rules then deny with `ReasonSecretMissing`; sandboxd's Syncs carry no secrets while the node is revoked; an old gateway is still restarted (D4); on auto-recovery (D12) the next Sync and `set_inspect_ca` restore them; a test with an open keep-alive inspected connection and an inject rule across a revoke; §10, tests and Phase 4 updated.
+History: none
+
+### OV3: the two-step switch for AWS KMS (reopens D9 wording)
+Finding: outside voice OV3, High, confidence 9/10, Design §12 "If that fails and the provider is `awskms`, it tries AWS KMS", reviewer: codex (verified by eng review)
+Plan baseline: D9 (approved A): untagged rows try the server key, then AWS KMS **if the provider is `awskms`**; D8 (approved A): a node opens any **tagged** row whose backend it has settings for
+Runtime evidence: AWS KMS rows carry no tag (§4); during a `local → awskms` switch, an unswitched node (provider still `local`, AWS settings already added in step 1) never tries AWS KMS for an untagged row, so D8's no-window promise fails for exactly this path
+Reason for reopening: contradiction between two approved answers, found by the outside voice.
+Comparison grid:
+
+```text
+Commitment                           | Current (D8 + D9)                 | A (apply: settings decide)         | B (keep D9 wording)          | C (investigate) | D (defer)
+untagged row, node has AWS settings  | AWS tried only if provider=awskms | AWS tried whenever AWS settings    | only if provider=awskms      | unchanged       | unchanged
+                                     |                                   | are present                        |                              |                 |
+local -> awskms two-step switch      | has a failover window             | no window                          | window (documented)          | unchanged       | unchanged
+local -> vault / pkcs11 switch       | no window (tags)                  | no window                          | no window                    | no window       | no window
+untagged row on a node without AWS   | server key only                   | server key only                    | server key only              | same            | same
+effort                               | n/a                               | S (human ~2h / CC ~15min)          | S (docs)                     | S               | S
+```
+
+Question D22:
+D22 — OV3 (reopens D9 wording): For old untagged rows, should a node try AWS KMS whenever it has AWS KMS settings, not only when AWS KMS is its sealing provider?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV3 (High), a conflict between D8 and D9.
+ELI10: D8 made switching providers safe by letting every node open the new kind of row as soon as it has that provider's settings, before it starts sealing with it. That works for Vault and HSM rows because they are labelled. AWS KMS rows carry no label, and D9's rule only tries AWS KMS when AWS KMS is the node's sealing provider. So during a switch from local to AWS KMS, a node that has not switched yet cannot open new rows, which is the very gap D8 closed. Trying AWS KMS whenever the node has AWS settings fixes it.
+Stakes if we pick wrong: local-to-AWS-KMS adopters get the failover gap D8 was meant to remove.
+Recommendation: A because it makes D8's promise true for every provider with a one-word change to D9's rule (fix the conflict where the rule lives).
+Note: options differ in kind, not coverage — no completeness score.
+Net: one consistent "settings decide" rule for every provider, against a documented gap for AWS KMS adopters.
+Header: AWS switch
+Options:
+A) Apply: settings decide
+An untagged row opens with the server key first, then with AWS KMS whenever AWS KMS settings are present, whatever the sealing provider; test the `local → awskms` two-step switch separately from Vault. Effort S (human ~2h / CC ~15min), risk low. ✅ The two-step switch has no window for any provider. ✅ One rule for tagged and untagged rows: the node's settings decide what it can open. ❌ A node with AWS settings but no AWS permissions makes one failed AWS call for a stray untagged row.
+B) Keep D9's wording
+Try AWS KMS only when it is the sealing provider; document that `local → awskms` keeps a short failover window. Effort S (docs), risk medium. ✅ No change to an approved rule. ✅ Nothing new to test. ❌ Local-to-AWS-KMS adopters lose failover copies during the switch.
+C) Investigate first
+Spend at most half a day checking whether any customer would switch local to AWS KMS rather than to Vault or HSM; then ask again. Effort S (study only), risk medium. ✅ Decides on real demand. ✅ No change yet. ❌ The rule conflict stays in the plan until then.
+D) Defer
+Keep D9's wording and leave OV3 open. Effort S, risk medium. ✅ No change now. ✅ Revisit in Phase 4b. ❌ The plan carries two approved rules that disagree.
+
+State: approved
+Actual answer: A) Apply: settings decide (D22, 2026-10-25)
+Accepted scope: an untagged row opens with the server key first, then with AWS KMS whenever AWS KMS settings are present, whatever the sealing provider; the `local → awskms` two-step switch gets its own test and live UC, separate from Vault; §4, §12, the D9 record and the test list updated.
+History: D9 (approved A, 2026-10-21) chose the trial order (server key, then AWS KMS when the provider is `awskms`); only the "when" condition is reopened.
+
+### OV4: PKCS#11 key rotation across a cluster
+Finding: outside voice OV4, High, confidence 8/10, Design §2 settings (`SB_SECRET_PKCS11_KEY_LABEL`, `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS`) and §11 "Progress and retirement", reviewer: codex (verified by eng review)
+Plan baseline: §11: rotate, wait for every member's stale gauge = 0, retire; labels are per-node settings
+Runtime evidence: a `p11:` header naming a label the node does not list is `ErrDecryptFailed` (§2 label table), so a node switched to label B produces rows its unswitched peers reject; the stale gauge counts rows not on **that node's** current label, so "0 everywhere" can hold while nodes target different labels; Vault versions are global, so this is PKCS#11-only
+Comparison grid:
+
+```text
+Commitment                       | Current (§11)                    | A (apply: staged rollout)                     | B (keep)                 | C (investigate) | D (defer)
+order of a label rotation        | "rotate", unspecified            | 1) add B to DECRYPT labels on every node;     | unspecified              | unspecified     | unspecified
+                                 |                                  | 2) set KEY_LABEL=B on every node; 3) wait;    |                          |                 |
+                                 |                                  | 4) retire A                                   |                          |                 |
+proof step 1 is done everywhere | none                             | `aerolvm_key_decryptable{backend,key}` info   | none                     | none            | none
+                                 |                                  | gauge: every member lists B before step 2     |                          |                 |
+proof every node targets B       | none                             | `aerolvm_key_current{backend,key}` info gauge  | none                     | none            | none
+                                 |                                  | (both also in `sandboxd key status`)          |                          |                 |
+retirement gate                  | stale = 0 on every member        | stale = 0 AND current key = B on every member | stale = 0                | same            | same
+a node sealing B before peers    | peers reject B rows              | prevented by checking the decryptable gauge   | peers reject B rows      | same            | same
+can open B                       |                                  | on every member before step 2                 |                          |                 |
+Vault, AWS KMS                   | unaffected                       | unaffected (versions are global)              | unaffected               | same            | same
+effort                           | n/a                              | S (human ~1d / CC ~1h)                        | S                        | S               | S
+```
+
+Question D23:
+D23 — OV4: How do we rotate an HSM key across a cluster without nodes rejecting each other's copies?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV4 (High).
+ELI10: With an HSM, each node is told which key label to use. If one node starts using the new label before the others know about it, the others cannot open what it writes. And "no stale rows anywhere" can look true while some nodes are still on the old label. The fix is the same two-step idea as the provider switch: first let every node open the new label and check that all of them report it, then switch every node to write with it, then check that every node reports the new label as current before retiring the old one.
+Stakes if we pick wrong: an HSM rotation can break failover copies mid-rollout, or retire a label some node still writes with.
+Recommendation: A because it reuses the proven two-step pattern and adds the one signal needed to prove retirement is safe (systems over heroes).
+Note: options differ in kind, not coverage — no completeness score.
+Net: a staged, checkable rotation, against an unspecified one that can break copies.
+Header: HSM rotation
+Options:
+A) Apply: staged rollout
+Document and test the four steps; add `aerolvm_key_decryptable{backend,key}` and `aerolvm_key_current{backend,key}` info gauges (both also in `sandboxd key status`); step 2 starts only when every member lists B as decryptable; the retirement gate becomes stale = 0 and current key = B on every member. Effort S (human ~1d / CC ~1h), risk low. ✅ Copies stay openable at every step of the rotation. ✅ Operators can prove every node moved before retiring. ❌ A rotation takes two rolling config changes instead of one.
+B) Keep the current text
+Leave §11's "rotate, wait, retire" as is. Effort S, risk high. ✅ No new gauge or runbook steps. ✅ One config change per rotation. ❌ A rotation can break copies mid-rollout and the retirement gate can be wrong.
+C) Investigate first
+Spend at most half a day checking how CloudHSM and SoftHSM handle two active labels at once; then ask again. Effort S (study only), risk medium. ✅ Confirms the HSM side before writing the runbook. ✅ No change yet. ❌ The ordering problem is in our config model, not the HSM, so the study changes little.
+D) Defer
+Keep the current text and leave OV4 open. Effort S, risk high. ✅ No change now. ✅ Revisit in Phase 4b. ❌ The first HSM rotation in the field could break failover copies.
+
+State: approved
+Actual answer: A) Apply: staged rollout (D23, 2026-10-25)
+Accepted scope: a four-step PKCS#11 label rotation (add B to decrypt labels everywhere; switch `KEY_LABEL` to B everywhere; wait; retire A); `aerolvm_key_decryptable{backend,key}` and `aerolvm_key_current{backend,key}` info gauges, also in `sandboxd key status`; step 2 starts only when every member lists B as decryptable; retirement needs stale = 0 and current = B on every member; a live UC for the rotation; §11, Section 8 metrics and tests updated.
+History: an earlier draft's boot warning was replaced before asking (a node can always decrypt its own current label, so the warning proved nothing).
+
+### OV5: old plaintext copies after migrating to a wrapped key
+Finding: outside voice OV5, High, confidence 9/10, `scripts/sandboxd-backup.sh:69` (`copy_if_exists "$config_dir" "$tmpdir/root/etc/sandboxd"`), reviewer: codex (verified by eng review)
+Plan baseline: §3 "Backups" says the backup copies `state.db` and the raft directory and adds the wrapped file; the claim says "no long-lived key that decrypts AerolVM-held secrets is stored in plaintext outside your key store"
+Runtime evidence: the backup also archives `/etc/sandboxd`, which holds `cluster.env` with `SB_CREDENTIAL_ENCRYPTION_KEY=<plaintext>` (fact 10); `sandboxd key wrap` wraps the **same** key, so every older backup, old cred bundle and old S3 bundle object version still decrypts data sealed after the migration; F1 only checks the node itself
+Comparison grid:
+
+```text
+Commitment                        | Current                      | A (apply: honest claim + cleanup)        | B (rotate the key at migration)        | C (investigate) | D (defer)
+claim for a fresh wrapped install | true                         | true                                     | true                                   | same            | same
+claim for a migrated install      | true (wrong)                 | true only after old copies are destroyed;| true after the reseal                  | unchanged       | unchanged
+                                  |                              | docs and custody report say so           |                                        |                 |
+backup script                     | archives cluster.env key     | stops archiving the plaintext key line   | stops archiving it                     | unchanged       | unchanged
+                                  |                              | and key file; keeps the wrapped file     |                                        |                 |
+custody report                    | n/a                          | "migrated from plaintext: destroy old    | n/a                                    | n/a             | n/a
+                                  |                              | backups/bundles" until acknowledged      |                                        |                 |
+server-key rotation (non-goal)    | non-goal                     | stays a non-goal; TODO asked separately  | built now: new key + reseal of every   | non-goal        | non-goal
+                                  |                              |                                          | row on every node                      |                 |
+effort                            | n/a                          | S (human ~1d / CC ~1h)                   | XL (human ~4w / CC ~3d)                | S               | S
+```
+
+Question D24:
+D24 — OV5: An install that migrates from a plain key file to a wrapped key keeps the same key, so old backups still unlock it. What do we do?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV5 (High), checked against the backup script.
+ELI10: Wrapping protects the key from now on, but it is still the same key. Every backup taken before the migration archived /etc/sandboxd, including the plain key, and so did old copies of the cluster setup bundle. Anyone holding one of those can still decrypt data written after the migration. We can either say so plainly and give a cleanup checklist, or generate a brand-new key at migration and re-encrypt everything, which is a large job we listed as out of scope.
+Stakes if we pick wrong: the docs would promise "no key on disk" to customers whose old backups still hold it.
+Recommendation: A because it makes the claim true and checkable with a small change, while a full key rotation is a separate, much larger feature (asked as its own TODO).
+Note: options differ in kind, not coverage — no completeness score.
+Net: an honest claim with a cleanup checklist, against a full key rotation at migration.
+Header: Old key copies
+Options:
+A) Apply: honest claim + cleanup
+The claim covers a migrated install only after old copies are destroyed; the docs give a checklist (old backups, cred bundles, S3 bundle object versions, `cluster.env` history); the backup script stops archiving the plaintext key line and key file and keeps the wrapped file; `sandboxd key status` shows "migrated from plaintext" until the operator runs `sandboxd key ack-migration`. Effort S (human ~1d / CC ~1h), risk low. ✅ The claim is true for every install it covers. ✅ New backups never contain the plain key again. ❌ Migrated customers must find and destroy old copies by hand.
+B) Rotate the key at migration
+`sandboxd key wrap` makes a new server key and re-encrypts every sealed row (env, toolbox tokens, registry, mounts, egress CA, local cluster copies) on every node. Effort XL (human ~4w / CC ~3d), risk high. ✅ Old copies become useless the moment migration ends. ✅ No cleanup checklist. ❌ A large cross-node re-encryption that the plan lists as a non-goal, with its own failure modes.
+C) Investigate first
+Spend at most a day sizing a server-key rotation design; then ask again. Effort S (study only), risk medium. ✅ Decides with a real estimate for B. ✅ No change yet. ❌ The claim stays wrong in the plan until then.
+D) Defer
+Leave the claim as it is and keep OV5 open. Effort S, risk high. ✅ No change now. ✅ Revisit before Phase 5 docs. ❌ The plan's main promise is false for migrated installs.
+
+State: approved
+Actual answer: A) Apply: honest claim + cleanup (D24, 2026-10-25)
+Accepted scope: the claim covers a migrated install only after old copies are destroyed, with a docs checklist (old backups, cred bundles, S3 bundle object versions, `cluster.env` history); `scripts/sandboxd-backup.sh` stops archiving the plaintext key line and key file and keeps the wrapped file; `sandboxd key status` shows "migrated from plaintext" until `sandboxd key ack-migration`; server-key rotation stays a non-goal (TODO asked separately); the claim, §3, §9 and tests updated.
+History: none
+
+### OV6: a hung PKCS#11 helper
+Finding: outside voice OV6, Medium, confidence 8/10, Design §2 "Process (eng D5) ... If the helper exits, sandboxd restarts it", reviewer: codex (verified by eng review)
+Plan baseline: eng D5 (approved B): sandboxd restarts the helper **on exit** with backoff
+Runtime evidence: a vendor `C_Encrypt`/`C_Decrypt` can block inside the helper while the process stays alive; the caller's context cancels only sandboxd's wait, not the vendor call, so the session stays held; enough hangs exhaust the pool (MAX_INFLIGHT + 2, eng D13) and stall the `key_custody` loop (eng D2)
+Comparison grid:
+
+```text
+Commitment                         | Current (D5)               | A (apply: deadlines + replace)              | B (keep)           | C (investigate) | D (defer)
+per-op deadline in the helper       | none                       | each op carries a deadline (default 5 s,    | none               | none            | none
+                                   |                            | constant)                                   |                    |                 |
+helper with an op past its deadline| keeps running              | sandboxd kills and replaces it; in-flight   | keeps running      | same            | same
+                                   |                            | calls get ErrProviderUnavailable            |                    |                 |
+sessions held by a hung call       | held until it returns      | released by process death                   | held               | same            | same
+key_custody loop under a hang      | can stall                  | each step has its own deadline, so the loop | can stall          | same            | same
+                                   |                            | moves on to the next tick                   |                    |                 |
+metric                             | none                       | aerolvm_pkcs11_helper_restarts_total{reason}| none               | none            | none
+                                   |                            | (exit, deadline)                            |                    |                 |
+effort                             | n/a                        | S (human ~1d / CC ~1h)                      | S                  | S               | S
+```
+
+Question D25:
+D25 — OV6: If the HSM helper hangs instead of crashing, how do we recover?
+Project: plans/customer-key-custody on PR #784; outside voice finding OV6 (Medium).
+ELI10: D5 put the HSM library in a helper process that sandboxd restarts if it crashes. But a vendor library can also just hang: the helper stays alive and never answers, holding HSM sessions. Enough hangs use up every session, and the background key loop stalls too. Giving every request a time limit, and replacing a helper that blows it, turns a hang into the same quick recovery as a crash.
+Stakes if we pick wrong: a hanging vendor library can freeze all key work on a node until someone restarts it by hand.
+Recommendation: A because a hang should recover the same way a crash does, and killing the helper is the only reliable way to free a vendor session stuck in a C call (thorough handling over speed).
+Note: options differ in kind, not coverage — no completeness score.
+Net: hangs recover like crashes, against hangs that need a human.
+Header: Helper hangs
+Options:
+A) Apply: deadlines + replace
+Every helper op carries a deadline (5 s, a constant); if any op passes it, sandboxd kills and replaces the helper and in-flight calls get `ErrProviderUnavailable`; each `key_custody` step runs under its own deadline so the loop reaches its next tick; a restart counter labels the reason (exit or deadline). Effort S (human ~1d / CC ~1h), risk low; tested with a fake helper that never answers. ✅ A hang costs one helper restart, like a crash. ✅ The key loop never stalls behind a vendor call. ❌ A slow but healthy HSM call past 5 s gets cut and retried as unavailable.
+B) Keep D5 as is
+Restart only on exit. Effort S, risk medium. ✅ No new timer logic. ✅ No risk of cutting a slow but valid call. ❌ A hung vendor call can hold sessions and stall key work until a manual restart.
+C) Investigate first
+Spend at most half a day measuring CloudHSM and SoftHSM call latency tails to pick a deadline; then ask again. Effort S (study only), risk medium. ✅ The deadline is set from data. ✅ No change yet. ❌ The hang path stays unhandled in the plan until then (Phase 0 measures latency anyway).
+D) Defer
+Keep D5 as is and leave OV6 open. Effort S, risk medium. ✅ No change now. ✅ Revisit in Phase 3. ❌ Phase 3 starts without a hang story.
+
+State: approved
+Actual answer: A) Apply: deadlines + replace (D25, 2026-10-30)
+Accepted scope: every helper op carries a 5 s deadline (constant); an op past it makes sandboxd kill and replace the helper, and in-flight calls get `ErrProviderUnavailable`; each `key_custody` step runs under its own deadline; `aerolvm_pkcs11_helper_restarts_total{reason}` (exit, deadline); a test with a fake helper that never answers; §2, Section 8 metrics and tests updated.
+History: none
+
+### T-ROT: server-key (data key) rotation TODO
+Finding: TODO proposal from D24 (outside voice OV5), reviewer: eng review (Claude)
+Plan baseline: Non-goals: "Rotating the server key itself. The `Cipher` format has no key ID, so rotating the data key means resealing every row." D24 chose an honest claim plus a cleanup checklist and said this TODO would be asked separately
+Runtime evidence: `Cipher` seals `nonce || ciphertext+tag` with no key id (`pkg/secrets/secrets.go:25-30`); every sealed column (env, toolbox tokens, registry, mounts, egress CA, local cluster copies) uses it
+TODO draft:
+- What: rotate the server key itself: give the `Cipher` format a key id, keep old keys decrypt-only, reseal every row on every node under the new key, then retire the old one.
+- Why: after a migration from a plaintext key (D24), old backups and bundles still hold the key; rotating it makes them useless without a manual cleanup. Also meets data-key cryptoperiod rules.
+- Pros: closes OV5 completely; a standard answer to "how do you rotate data keys?".
+- Cons: a cross-node reseal of every sealed column; a format change with a dual-read period; large (XL).
+- Context: start at `pkg/secrets/secrets.go` (`Cipher`, `loadOrGenerateKey`) and the store's sealed columns (`internal/store/store.go:2191-2213` for toolbox tokens); reuse the sweep's compare-and-swap pattern from Design §11.
+- Effort: human XL / CC L. Priority: P3. Depends on: this plan's Phase 4 (wrapped server key) and Phase 4b (sweep).
+Comparison grid:
+
+```text
+Commitment            | Current            | A (add to TODOS.md)            | B (skip)                     | C (build it now)
+server-key rotation   | non-goal           | tracked TODO, P3               | not tracked                  | in this stack (XL)
+OV5 old copies        | cleanup checklist  | cleanup checklist (D24)        | cleanup checklist (D24)      | old copies made useless
+effort now            | n/a                | S (one TODOS.md entry)         | none                         | XL (human ~4w / CC ~3d)
+```
+
+Question D26:
+D26 — T-ROT: Track rotating the server key itself as a TODO?
+Project: plans/customer-key-custody on PR #784; a TODO that came out of D24.
+ELI10: D24 made the promise honest for installs that migrate from a plain key: old backups still hold the key until someone destroys them. The full fix is to give the server key a version and re-encrypt everything under a new one, so old copies stop working. That is a large job across every node and every kind of stored secret, so the question is only whether to write it down as future work.
+Stakes if we pick wrong: skipping it loses the only full fix for old copies; building it now adds the biggest piece of work in the whole plan.
+Recommendation: A because it is the real fix for D24's limitation and a common audit question, but it is far too large to add to this stack.
+Note: options differ in kind, not coverage — no completeness score.
+Net: a tracked follow-up, against forgetting it or roughly doubling this stack.
+Header: Key rotation TODO
+Options:
+A) Add to TODOS.md (recommended)
+Add a P3 entry "Rotate the server key (data key)" with the What/Why/Pros/Cons/Start fields above, depending on Phases 4 and 4b. Effort S now (one entry). ✅ The full fix for old copies is recorded with where to start. ✅ Answers the "how do you rotate data keys?" audit question with a plan. ❌ One more open TODO in the backlog.
+B) Skip
+Do not record it; D24's checklist is the answer. Effort none. ✅ No backlog growth. ✅ Nothing to maintain. ❌ The only complete fix for old plaintext copies is forgotten.
+C) Build it now
+Add server-key rotation to this stack. Effort XL (human ~4w / CC ~3d), risk high. ✅ Old copies are useless after any migration. ✅ Data-key rotation ships with the feature. ❌ Roughly doubles the stack and adds a cross-node format change.
+
+State: approved
+Actual answer: C) Build it now (D26, 2026-10-30; against the "add to TODOS.md" recommendation)
+Accepted scope: server-key rotation ships in this stack as Design §13 and Phase 4c: a key-id `Cipher` format with authenticated dual read, a key ring in the server-key file, a staged rotation (stage, promote, reseal, retire) gated on every member's gossip feature version and proved by gauges, and a reseal of every sealed column by the `key_custody` loop; the Non-goal is removed; no TODOS.md entry.
+History: none
+
+Required work recorded without its own row, each covered by an approved
+contract: Scope Challenge finding 2 (Vault sweep decrypts and re-encrypts;
+factual correction), finding 4 (release-matrix build in Phase 3; required
+proof for CEO-1), Section 1 finding 2 (one wrapper instance per process;
+required for CEO-1), Section 2 finding 3 (diagram refresh), outside voice OV7
+(sentinels pass through envelope opening; required for CEO-A1 and CEO-E2).
+D1 was the gstack upgrade prompt, an admin choice, not a remedy.
+
+Approval readiness: PASS. Checked rows and answers: structure (D2, Smaller
+arrangement); E4b (D3 → A, "which bytes" half superseded by D20); CEO-E2e
+(D4 → A); E6 (D5 → B); E7 (D6 → A); CEO-E2b (D7 → A); E9 (D8 → A); E4 (D9 →
+A, condition superseded by D22); E1 (D10 → A); E2 (D11 → A); CEO-E2a (D12 →
+A); E5 (D13 → A); E10 (D14 → A); R-REG (D15 → A); E3 (D16 → A); E8 (D17 →
+A); CEO-E2c (D18 → A); CEO-E4a (D19 → A); OV1 (D20 → A); OV2 (D21 → A); OV3
+(D22 → A); OV4 (D23 → A); OV5 (D24 → A); OV6 (D25 → A); T-ROT (D26 → C).
+
+### Eng review outputs
+
+`PLAN_REALITY: phase=eng rows=7/7 missing=none unverified=3 verdict=complete`
+
+#### NOT in scope
+
+- GCP Cloud KMS and Azure Key Vault (CEO-E5, TODOS.md).
+- HSM signing of audit heads (CEO-E6, TODOS.md).
+- External → external provider switching (Non-goals; `local → external` is
+  supported, eng D8/D22).
+- A PKCS#11 key-wrap fallback for HSMs without AES-GCM, unless Phase 0 finds
+  one (eng D16).
+- Direct Vault login methods in sandboxd (eng D10).
+- Placement changes on revoke (eng D7).
+- Configurable limiter internals beyond `SB_SECRET_PROVIDER_MAX_INFLIGHT`
+  (eng D13).
+
+#### What already exists
+
+The CEO "What already exists" table still holds. The eng review adds:
+
+- the gateway's memory-only secrets (`internal/egress/snapshot.go:34`), so a
+  restart clears them (D4, D21);
+- the gossip feature-version gate (`liveMembersAtLeast`,
+  `internal/cluster/audit_caller_gate.go:46`), reused to gate server-key
+  rotation (D26);
+- the `--wasm-worker` helper pattern (`cmd/sandboxd/main.go:39`), reused for
+  `--pkcs11-helper` (D5);
+- the identical-bytes skip in `PutClusterSecret` (`internal/store/store.go:5888`),
+  extended by the envelope comparison (D3, D20);
+- `refuseGroupOtherBits` extracted from `wrap_key_loader.go:72` (D14). Shared
+  helper evidence: one existing caller and two proposed; about 4 lines saved
+  net; one table test instead of three.
+
+#### Diagrams
+
+The eng review adds or refreshes:
+
+- the system architecture (refreshed for D2, D5 and D6);
+- the Section 3 coverage diagram;
+- the Section 4 async schedule (sweep vs writers, CEO review);
+- the server-key ring below.
+
+Name inline diagrams in `internal/service/key_custody.go` (the loop's states)
+and `pkg/secrets/secrets.go` (blob format).
+
+```
+SERVER-KEY RING (eng D26), per key
+  [none] --stage--> DECRYPT --promote--> CURRENT --(next key promoted)--> DECRYPT
+  DECRYPT --retire (rows on it = 0 on every member)--> RETIRED (bytes dropped)
+  invariant: exactly one CURRENT; stage refused unless every member has the ring fv
+  invalid: RETIRED -> anything (a retired key's bytes are gone)
+```
+
+#### Failure modes (new or changed by the eng review)
+
+```
+CODEPATH                   | FAILURE                                   | TEST? | HANDLED? | USER SEES
+peer copy after a rewrap   | late older copy overwrites a newer one     | Y     | Y (D20)  | nothing; rotation holds
+revoke, open inspected conn| keeps the old inspector, injects secrets   | Y     | Y (D21)  | inspected session closed; inject denied
+revoke, old gateway        | unknown op keeps the CA                    | Y     | Y (D4)   | gateway restarted; alert says so
+local -> awskms switch     | unswitched node cannot open AWS rows       | Y     | Y (D22)  | nothing; failover works
+PKCS#11 label rotation     | peers reject rows on a new label           | Y     | Y (D23)  | nothing if the staged steps are followed
+migration from plaintext   | old backups still decrypt                  | Y     | Y (D24/26)| custody report notice; rotation or cleanup
+PKCS#11 helper hang        | sessions held, loop stalls                 | Y     | Y (D25)  | brief 503, helper replaced
+server-key rotation        | old binary meets a key-id blob             | Y     | Y (fv gate)| stage refused until all members upgrade
+cluster-secret open, revoked| sentinel folded into DecryptFailed (500)  | Y     | Y (OV7)  | 503 key_revoked
+```
+
+Critical gaps: 0 (the CEO review's one, CEO-E2e, closed by D4).
+
+#### Worktree parallelization strategy
+
+| Step | Modules touched | Depends on |
+|---|---|---|
+| Phase 1 seam, limiter, errors | `pkg/secrets/`, `pkg/api/apihttp/`, `internal/config/` | — |
+| Phase 2 vault | `pkg/secrets/` (vault.go only) | Phase 1 |
+| Phase 3 pkcs11 + helper | `pkg/secrets/pkcs11/`, `cmd/sandboxd/` | Phase 1 |
+| Phase 4 wrapped key, loop, full stop | `pkg/daemon/`, `pkg/secrets/`, `internal/service/`, `internal/egress/`, `pkg/sshgateway/`, `cmd/sandboxd/`, `scripts/`, `Terraform/` | Phase 1 |
+| Phase 4b sweep, migration, peer copies | `internal/service/`, `internal/store/`, `pkg/secrets/` | Phase 4 |
+| Phase 4c server-key rotation | `pkg/secrets/`, `internal/service/`, `internal/store/`, `internal/cluster/` (fv read only), `cmd/sandboxd/` | Phase 4b |
+| Phase 5 docs, alerts, dashboards | `docs/`, `setup/` | decisions (start now), finalize after 4c |
+| Phase 6 CI and live itests | `.github/workflows/`, `integration-tests/` | Phases 2–4c |
+
+- **Lane A:** Phase 1 → Phase 4 → Phase 4b → Phase 4c (shared `pkg/secrets/` and `internal/service/`).
+- **Lane B:** Phase 2 (after Phase 1).
+- **Lane C:** Phase 3 (after Phase 1).
+- **Lane D:** Phase 5 drafts.
+- **Execution order:** launch A; when Phase 1 lands on its branch, launch B and C alongside A; D runs throughout; Phase 6 waits for all. The stack still merges as a whole.
+- **Conflict flags:** `cmd/sandboxd/main.go` is touched by Phase 3 (helper flag) and Phase 4 (`key` subcommand), so sequence those two edits. `pkg/secrets/factory.go` is touched by Phases 1, 2 and 3; land Phase 1 first.
+
+## Implementation Tasks (eng review)
+
+Synthesized from this review's findings. Each task derives from a specific
+finding above. Ratios assumed: features ~30x, tests ~50x, architecture ~5x.
+
+- [ ] **ET1 (P1, human: ~1d / CC: ~30min)** — store — compare envelopes without `WrappedKey`, keep existing bytes
+  - Surfaced by: Scope Challenge finding 1; outside voice OV1 (D3, D20)
+  - Files: `internal/store/store.go`, `pkg/secrets/envelope.go`
+  - Verify: `go test ./internal/store/... -run ClusterSecret`
+- [ ] **ET2 (P1, human: ~2h / CC: ~10min)** — envelope — pass `ErrKeyRevoked` and `ErrKeyVersionRetired` through
+  - Surfaced by: outside voice OV7
+  - Files: `pkg/secrets/envelope.go`
+  - Verify: the provider-to-handler 503 test
+- [ ] **ET3 (P1, human: ~2d / CC: ~2h)** — egress — full clear op, secret-free Syncs while revoked, old-gateway restart
+  - Surfaced by: Section 1 finding 1; OV2 (D4, D21)
+  - Files: `internal/egress/proto.go`, `internal/egress/server.go`, `internal/egress/gatewayd/daemon.go`, `internal/egress/proxy/inspect.go`, `internal/service/`
+  - Verify: open keep-alive inspected connection across a revoke; fake old gateway
+- [ ] **ET4 (P1, human: ~2w / CC: ~1d)** — pkcs11 — helper process with deadlines and replacement, own package
+  - Surfaced by: Section 1 (D5, D6); OV6 (D25)
+  - Files: `pkg/secrets/pkcs11/`, `cmd/sandboxd/main.go`
+  - Verify: helper-exit and never-answers tests; SoftHSM2 CI job
+- [ ] **ET5 (P1, human: ~1d / CC: ~1h)** — open rules — tagged rows by settings, untagged AWS by settings
+  - Surfaced by: Section 1 (D8); OV3 (D22)
+  - Files: `pkg/secrets/`
+  - Verify: two-step switch tests for `vault` and `awskms`
+- [ ] **ET6 (P1, human: ~1d / CC: ~1h)** — pkcs11 rotation — staged steps and info gauges
+  - Surfaced by: OV4 (D23)
+  - Files: `pkg/secrets/pkcs11/`, `internal/service/metrics.go`
+  - Verify: SoftHSM2 four-step rotation UC
+- [ ] **ET7 (P1, human: ~1d / CC: ~1h)** — backups — no plaintext key in backups; migration notice and ack
+  - Surfaced by: OV5 (D24)
+  - Files: `scripts/sandboxd-backup.sh`, `scripts/sandboxd-restore.sh`, `cmd/sandboxd/key.go`
+  - Verify: backup-contents test; `key status` notice test
+- [ ] **ET8 (P1, human: ~4w / CC: ~3d)** — server-key rotation — format, ring, staged commands, reseal, fv gate
+  - Surfaced by: T-ROT (D26)
+  - Files: `pkg/secrets/secrets.go`, `internal/service/key_custody.go`, `internal/store/store.go`, `cmd/sandboxd/key.go`
+  - Verify: dual-read, fv-gate, reseal-race tests; live rotation UC
+- [ ] **ET9 (P1, human: ~3h / CC: ~20min)** — limiter — one setting; one foreground retry of Unavailable
+  - Surfaced by: Section 2 (D13); Section 4 (D17)
+  - Files: `pkg/secrets/limited.go`, `internal/config/config.go`, `setup/config-defaults.md`
+  - Verify: limiter table test
+- [ ] **ET10 (P1, human: ~3d / CC: ~3h)** — key_custody loop — re-check 5m×3, revoke, auto-recover, hourly sweep
+  - Surfaced by: D2, D12, D18, D19
+  - Files: `internal/service/key_custody.go`
+  - Verify: injectable-clock tests; live revoke-and-recover UC
+- [ ] **ET11 (P2, human: ~1h / CC: ~10min)** — secrets — `refuseGroupOtherBits` helper
+  - Surfaced by: Section 2 finding 2 (D14)
+  - Files: `pkg/secrets/wrap_key_loader.go`, new helper
+  - Verify: `wrap_key_loader_test.go` unchanged and green; helper table test
+- [ ] **ET12 (P1, human: ~1d / CC: ~1h)** — tests — regression rows in existing tables
+  - Surfaced by: Section 3 regression rule (D15)
+  - Files: `pkg/secrets/awskms_test.go`, `pkg/api/apihttp/classify_test.go`, `internal/store/cluster_secret_put_outbox_test.go`, `pkg/secrets/wrap_key_loader_test.go`, `pkg/secrets/secrets_test.go`, `internal/config/config_test.go`
+  - Verify: `make test`
+- [ ] **ET13 (P2, human: ~2h / CC: ~15min)** — CI — build every `sandboxd` release-matrix target with the cgo dependency
+  - Surfaced by: Scope Challenge finding 4
+  - Files: `.github/workflows/`
+  - Verify: the CI job passes on all targets
+
+Tasks JSONL: written to the gstack project directory (see Completion summary).
+
+#### Suppressed findings
+
+None (no finding scored below 5).
+
+#### Unresolved decisions that may bite you later
+
+None in this review. The CEO review's 15 eng-owned items were all answered
+here (D3–D19), and the only open items are Phase 0 measurements, which the
+gate table lists with the phases they gate.
+
+#### Completion summary
+
+- Step 0: Scope Challenge — scope accepted as-is (smaller arrangement, D2)
+- Reality rows: 7/7 applicable rows emitted (`PLAN_REALITY` complete), 3 unverified premises
+- Architecture Review: 10 issues found (2 findings + 8 open choices, all resolved)
+- Code Quality Review: 3 issues found
+- Test Review: diagram produced, 1 gap identified (regression contract, D15)
+- Performance Review: 5 issues found (3 resolved by decisions, 2 recorded)
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 1 item proposed to user (built now instead, D26)
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: codex (gpt-6-astra), completed; 7 findings, 6 resolved by decisions D20–D25, 1 applied as required work
+- Parallelization: 4 lanes, 3 parallel / 1 sequential (Lane A)
+- Lake Score: N/A (no answers were scored for completeness)
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN | 6 proposals, 4 accepted, 2 deferred; plus 4 scope decisions from the review sections (CEO-R1, CEO-M1, CEO-A1, CEO-A2) and 2 reopened refinements (CEO-E2R, CEO-E2D); 1 critical gap pending (CEO-E2e) |
-| Outside Review | codex, from `/plan-ceo-review` | Independent 2nd opinion | 1 | unavailable | codex MODEL_UNUSABLE (CLI cannot decode the models response); native fallback gave no report within five minutes; no completed external review |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | ISSUES OPEN (2026-10-21; older than the 7-day window, see note) | 6 proposals, 4 accepted, 2 deferred |
+| Outside Review | codex, from `/plan-ceo-review` and `/plan-eng-review` | Independent 2nd opinion | 2 | completed (eng phase); unavailable (CEO phase) | 7 findings; 7 resolved; 0 unresolved (eng phase). CEO phase: codex MODEL_UNUSABLE, native fallback timed out, no completed external review |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 19 issues, 0 critical gaps (all dispositioned: D2–D26; 0 unresolved) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — (no UI scope) |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **OUTSIDE COVERAGE:** codex, plan-review phase, unavailable (MODEL_UNUSABLE; fix: upgrade the Codex CLI). The native Claude fallback timed out at five minutes and earns no coverage credit. Three in-host spec reviews ran inside the CEO review (scores 5, 6, 6; cap reached; last 8 fixes verified by the author).
-- **VERDICT:** no review is CLEAR yet. The CEO review is complete with its founder decisions settled (D1–D18); the remaining choices are eng-owned. Eng review required.
+Note: the CEO review's 15 open items were all eng-owned and were answered in
+this eng review (D3–D19); its log row predates them.
 
-**UNRESOLVED DECISIONS:**
-- E1 Vault auth limited to a token file and the Agent proxy (blocks Phase 2)
-- E2 thin Vault client instead of `hashicorp/vault/api` (blocks Phase 2)
-- E3 PKCS#11 key-wrap-pad fallback, only if Phase 0 finds a no-GCM HSM (blocks Phase 3)
-- E4 untagged rows: local first, then `awskms` (revised by CEO-M1; blocks Phase 1)
-- E5 limiter numbers in config or hard-coded (blocks Phase 1)
-- E6 PKCS#11 in-process or in a helper process (blocks Phase 3)
-- E7 PKCS#11 in its own package (blocks Phase 3)
-- E8 one short retry for `ErrProviderUnavailable` (blocks Phase 1)
-- E9 narrowing the rolling-switch window (blocks Phase 4b)
-- CEO-E2a auto-recover after the key is re-enabled, or restart only (blocks Phase 4)
-- CEO-E2b revoked node tells placement to stop sending it creates (blocks Phase 4; CLAUDE.md rule 6 if yes)
-- CEO-E2c re-check defaults, 5 minutes × 3 (blocks Phase 4)
-- CEO-E2e an old egress gateway ignores `clear_inspect_ca` after an upgrade: the one CRITICAL GAP (blocks Phase 4)
-- CEO-E4a sweep cadence and trigger (blocks Phase 4b)
-- CEO-E4b confirm nothing compares sealed bytes across nodes (blocks Phase 4b)
+- **OUTSIDE COVERAGE:** codex (gpt-6-astra), eng plan-review phase, completed, 7 findings (OV1–OV7): six resolved by decisions D20–D25, one applied as required work (OV7). CEO plan-review phase: unavailable (MODEL_UNUSABLE; native fallback gave no report within five minutes).
+- **CROSS-MODEL:** the native eng review (Claude) and codex agree on the core design. Codex found seven problems the native review had missed:
+  - peer-copy overwrite after a rewrap;
+  - inspected connections and injected secrets surviving a revoke;
+  - the AWS KMS two-step switch;
+  - PKCS#11 label rollout order;
+  - plaintext keys in old backups;
+  - helper hangs;
+  - sentinels lost in envelope opening.
+
+  Every one was confirmed against the code before acting. There was no disagreement left after the decisions.
+- **VERDICT:** no review is CLEAR. The eng review ran and resolved every decision with 0 critical gaps, but its status is ISSUES OPEN because it found issues, and only a clean run clears the dashboard. Eng review required (a clean re-run, or the user's call to proceed to implementation).
+
+NO UNRESOLVED DECISIONS
