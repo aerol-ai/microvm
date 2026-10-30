@@ -32,13 +32,13 @@ func TestCipherRevokeRestore(t *testing.T) {
 	if !IsKeyStoreError(fmt.Errorf("open toolbox token: %w", ErrKeyRevoked)) || IsKeyStoreError(ErrDecryptFailed) {
 		t.Fatal("IsKeyStoreError")
 	}
-	if err := c.Restore(bytes.Repeat([]byte{5}, 32)); err == nil {
+	if err := c.RestoreRing([]RingKey{{ID: 0, Key: bytes.Repeat([]byte{5}, 32), Current: true}}); err == nil {
 		t.Fatal("a different key restored")
 	}
 	if !c.Revoked() {
 		t.Fatal("a refused restore cleared the revoke")
 	}
-	if err := c.Restore(key); err != nil {
+	if err := c.RestoreRing([]RingKey{{ID: 0, Key: key, Current: true}}); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := c.Decrypt(sealed); err != nil || string(got) != "toolbox token" || c.Revoked() {
@@ -46,13 +46,13 @@ func TestCipherRevokeRestore(t *testing.T) {
 	}
 	var nilCipher *Cipher
 	nilCipher.Revoke()
-	if nilCipher.Revoked() || nilCipher.Restore(key) == nil {
+	if nilCipher.Revoked() || nilCipher.RestoreRing([]RingKey{{ID: 0, Key: key, Current: true}}) == nil {
 		t.Fatal("nil cipher")
 	}
 	if _, err := (&Cipher{}).Encrypt(nil); err == nil || errors.Is(err, ErrKeyRevoked) {
 		t.Fatalf("zero cipher = %v, want not initialized", err)
 	}
-	if err := (&Cipher{check: serverKeyCheck(key[:7])}).Restore(key[:7]); err == nil {
+	if err := (&Cipher{}).RestoreRing([]RingKey{{ID: 0, Key: key[:7], Current: true}}); err == nil {
 		t.Fatal("a key AES refuses was restored")
 	}
 }
