@@ -1047,6 +1047,36 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("secret_provider_pkcs11", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		pin := filepath.Join(dir, "pin")
+		if err := os.WriteFile(pin, []byte("1234"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SB_SECRET_PROVIDER", "pkcs11")
+		t.Setenv("SB_SECRET_PKCS11_MODULE", "/usr/lib/vendor/libcloudhsm_pkcs11.so")
+		t.Setenv("SB_SECRET_PKCS11_TOKEN_LABEL", "cavium")
+		t.Setenv("SB_SECRET_PKCS11_PIN_FILE", pin)
+		t.Setenv("SB_SECRET_PKCS11_KEY_LABEL", "aerolvm-kek-b")
+		t.Setenv("SB_SECRET_PKCS11_DECRYPT_KEY_LABELS", "aerolvm-kek-a, ,aerolvm-kek-0")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "allow only its owner") {
+			t.Fatalf("PIN file readable by others = %v", err)
+		}
+		if err := os.Chmod(pin, 0o400); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("pkcs11 = %v", err)
+		}
+		if !cfg.PKCS11Configured() || cfg.SecretPKCS11GCMIV != "auto" || cfg.SecretPKCS11RunDir != "/run/sandboxd/pkcs11" ||
+			strings.Join(cfg.SecretPKCS11DecryptLabels, ",") != "aerolvm-kek-a,aerolvm-kek-0" {
+			t.Fatalf("pkcs11 settings = %q %q %v", cfg.SecretPKCS11GCMIV, cfg.SecretPKCS11RunDir, cfg.SecretPKCS11DecryptLabels)
+		}
+	})
+
 	t.Run("secret_provider_awskms_requires_key", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))

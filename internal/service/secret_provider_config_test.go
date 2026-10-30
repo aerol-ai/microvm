@@ -171,3 +171,44 @@ func TestKeyStoreMetrics(t *testing.T) {
 		t.Fatalf("create wait bucket = %d, want %d", got, before+1)
 	}
 }
+
+// pkg/daemon hands in the running PKCS#11 helper; a pkcs11 node seals with it
+// and runs the boot canary through it.
+func TestConfigureSecretProviderPKCS11(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cipher, err := secrets.NewCipher("", filepath.Join(dir, "key"))
+	if err != nil {
+		t.Fatalf("cipher: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	svc := New(config.Config{SecretProvider: "pkcs11", SecretProviderStrictBoot: true}, logger, st, nil, nil, nil, cipher, nil, nil)
+	if err := svc.ConfigureSecretProvider(context.Background()); err == nil || !strings.Contains(err.Error(), "helper is not running") {
+		t.Fatalf("pkcs11 with no helper = %v", err)
+	}
+	helper := p11Stub{}
+	svc.SetPKCS11Helper(helper)
+	if err := svc.ConfigureSecretProvider(context.Background()); err != nil {
+		t.Fatalf("pkcs11 with a helper = %v", err)
+	}
+	if secretProviderCanaryOK.Value() != 1 {
+		t.Fatal("canary did not run through the helper")
+	}
+	(*Service)(nil).SetPKCS11Helper(helper)
+}
+
+// p11Stub tags its output like the PKCS#11 helper, so the router sends rows
+// back to it.
+type p11Stub struct{}
+
+func (p11Stub) Wrap(_ context.Context, dek []byte, _ map[string]string) ([]byte, error) {
+	return append([]byte("p11:1:"), dek...), nil
+}
+
+func (p11Stub) Unwrap(_ context.Context, w []byte, _ map[string]string) ([]byte, error) {
+	return []byte(strings.TrimPrefix(string(w), "p11:1:")), nil
+}

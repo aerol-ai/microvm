@@ -178,6 +178,9 @@ type Service struct {
 	// builds (tests inject a fake KMS so no call leaves the process). It is
 	// still routed and limited.
 	secretWrapBackend secrets.DataKeyWrapper
+	// pkcs11Helper is the running PKCS#11 helper client, set by pkg/daemon
+	// before ConfigureSecretProvider; nil when no PKCS#11 settings are set.
+	pkcs11Helper secrets.DataKeyWrapper
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -780,6 +783,7 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		Name:        name,
 		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
 		Vault:       vault,
+		PKCS11:      s.pkcs11Helper,
 		Cipher:      s.cipher,
 		Store:       newSecretBlobStore(s.store),
 		Wrapper:     s.secretWrapBackend,
@@ -810,6 +814,14 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		s.logger.Info("secret provider boot canary ok", "provider", name)
 	}
 	return nil
+}
+
+// SetPKCS11Helper hands ConfigureSecretProvider the running PKCS#11 helper
+// (pkg/daemon starts it: the vendor library never loads into sandboxd).
+func (s *Service) SetPKCS11Helper(w secrets.DataKeyWrapper) {
+	if s != nil {
+		s.pkcs11Helper = w
+	}
 }
 
 // keyStoreNodeID names this node in the key store's audit log: the cluster

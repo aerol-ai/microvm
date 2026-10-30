@@ -290,3 +290,38 @@ func TestMainEgressGatewayDispatch(t *testing.T) {
 		}
 	}
 }
+
+func TestMainPKCS11Helper(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"sandboxd", "--pkcs11-helper", "--socket", "/run/x/helper.sock"}
+	orig := runPKCS11Helper
+	t.Cleanup(func() { runPKCS11Helper = orig })
+	origExit := osExit
+	exitCode := -1
+	osExit = func(code int) { exitCode = code }
+	t.Cleanup(func() { osExit = origExit })
+
+	var got []string
+	runPKCS11Helper = func(args []string) error { got = args; return nil }
+	main()
+	if strings.Join(got, " ") != "--socket /run/x/helper.sock" || exitCode != -1 {
+		t.Fatalf("helper args %v exit %d", got, exitCode)
+	}
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = origStderr })
+	runPKCS11Helper = func([]string) error { return errors.New("no token") }
+	main()
+	_ = w.Close()
+	var stderr bytes.Buffer
+	_, _ = io.Copy(&stderr, r)
+	if exitCode != 1 || !strings.Contains(stderr.String(), "no token") {
+		t.Fatalf("helper failure: exit %d stderr %q", exitCode, stderr.String())
+	}
+}

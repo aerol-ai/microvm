@@ -1,0 +1,110 @@
+package daemon
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"log/slog"
+	"strings"
+	"testing"
+
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
+)
+
+type fakePKCS11Helper struct {
+	info   pkcs11.Info
+	closed bool
+}
+
+func (f *fakePKCS11Helper) Wrap(context.Context, []byte, map[string]string) ([]byte, error) {
+	return nil, nil
+}
+func (f *fakePKCS11Helper) Unwrap(context.Context, []byte, map[string]string) ([]byte, error) {
+	return nil, nil
+}
+func (f *fakePKCS11Helper) Info() pkcs11.Info { return f.info }
+func (f *fakePKCS11Helper) Close() error      { f.closed = true; return nil }
+
+type helperSink struct{ got secrets.DataKeyWrapper }
+
+func (s *helperSink) SetPKCS11Helper(w secrets.DataKeyWrapper) { s.got = w }
+
+func TestWirePKCS11Helper(t *testing.T) {
+	pkcs11Cfg := config.Config{
+		SecretProvider: "pkcs11", SecretPKCS11Module: "/m.so", SecretPKCS11TokenLabel: "tok",
+		SecretPKCS11PINFile: "/pin", SecretPKCS11KeyLabel: "k", SecretPKCS11DecryptLabels: []string{"j"},
+		SecretPKCS11GCMIV: "auto", SecretPKCS11RunDir: "/run/x", SecretProviderMaxInFlight: 8,
+	}
+	cases := []struct {
+		name       string
+		cfg        func(config.Config) config.Config
+		helper     *fakePKCS11Helper
+		startErr   error
+		wantErr    string
+		wantSet    bool
+		wantClosed bool
+		wantLog    string
+	}{
+		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{HardwareSlot: true}}, wantSet: true},
+		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantSet: true, wantLog: "software token"},
+		{name: "software token in enterprise mode", cfg: func(c config.Config) config.Config { c.EnterpriseMode = true; return c },
+			helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantErr: "not a hardware slot", wantClosed: true},
+		{name: "first start fails, lenient", helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantSet: true, wantLog: "retrying in the background"},
+		{name: "first start fails, strict", cfg: func(c config.Config) config.Config { c.SecretProviderStrictBoot = true; return c },
+			helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantErr: "STRICT_BOOT", wantClosed: true},
+		{name: "cannot start at all", startErr: errors.New("no socket dir"), wantErr: "no socket dir"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := pkcs11Cfg
+			if tc.cfg != nil {
+				cfg = tc.cfg(cfg)
+			}
+			var got pkcs11.HelperOptions
+			orig := startPKCS11
+			startPKCS11 = func(o pkcs11.HelperOptions) (pkcs11Helper, error) {
+				got = o
+				if tc.helper == nil {
+					return nil, tc.startErr
+				}
+				return tc.helper, tc.startErr
+			}
+			t.Cleanup(func() { startPKCS11 = orig })
+			var logs bytes.Buffer
+			sink := &helperSink{}
+			stop, err := wirePKCS11Helper(cfg, slog.New(slog.NewTextHandler(&logs, nil)), sink)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want %q", err, tc.wantErr)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if (sink.got != nil) != tc.wantSet {
+				t.Fatalf("helper handed to the service = %v, want %v", sink.got != nil, tc.wantSet)
+			}
+			if tc.helper != nil && tc.helper.closed != tc.wantClosed {
+				t.Fatalf("closed = %v, want %v", tc.helper.closed, tc.wantClosed)
+			}
+			if tc.wantLog != "" && !strings.Contains(logs.String(), tc.wantLog) {
+				t.Fatalf("log = %q, want %q", logs.String(), tc.wantLog)
+			}
+			if got.Socket != "/run/x/helper.sock" || got.Token.Sessions != 8+secrets.BackgroundSlots() || got.Token.KeyLabel != "k" || got.Token.DecryptLabels[0] != "j" {
+				t.Fatalf("helper options = %+v", got)
+			}
+			if stop != nil {
+				stop()
+				if tc.helper != nil && !tc.helper.closed {
+					t.Fatal("stop did not close the helper")
+				}
+			}
+		})
+	}
+	stop, err := wirePKCS11Helper(config.Config{SecretProvider: "awskms"}, slog.Default(), &helperSink{})
+	if err != nil || stop == nil {
+		t.Fatalf("no pkcs11 settings = %v", err)
+	}
+	stop()
+}

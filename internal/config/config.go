@@ -1182,6 +1182,22 @@ type Config struct {
 	SecretVaultTokenFile string
 	SecretVaultNamespace string
 	SecretVaultCACert    string
+
+	// PKCS#11 (HSM) settings for SecretProvider=pkcs11
+	// (plans/customer-key-custody.md §2). The vendor module loads only in
+	// the `sandboxd --pkcs11-helper` process. Set with another provider, the
+	// node already opens p11 rows. SB_SECRET_PKCS11_MODULE,
+	// SB_SECRET_PKCS11_TOKEN_LABEL, SB_SECRET_PKCS11_PIN_FILE (owner-only
+	// mode), SB_SECRET_PKCS11_KEY_LABEL, SB_SECRET_PKCS11_DECRYPT_KEY_LABELS
+	// (comma-separated, for rotation), SB_SECRET_PKCS11_GCM_IV
+	// (auto|hsm|caller), SB_SECRET_PKCS11_RUN_DIR (the helper's socket).
+	SecretPKCS11Module        string
+	SecretPKCS11TokenLabel    string
+	SecretPKCS11PINFile       string
+	SecretPKCS11KeyLabel      string
+	SecretPKCS11DecryptLabels []string
+	SecretPKCS11GCMIV         string
+	SecretPKCS11RunDir        string
 	// SecretProviderStrictBoot fails daemon start when the boot canary
 	// (wrap/unwrap) of any external provider fails. Default false = fail-open
 	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
@@ -2026,6 +2042,13 @@ func Load() (Config, error) {
 		SecretVaultTokenFile:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_TOKEN_FILE")),
 		SecretVaultNamespace:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_NAMESPACE")),
 		SecretVaultCACert:             strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_CACERT")),
+		SecretPKCS11Module:            strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_MODULE")),
+		SecretPKCS11TokenLabel:        os.Getenv("SB_SECRET_PKCS11_TOKEN_LABEL"),
+		SecretPKCS11PINFile:           strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_PIN_FILE")),
+		SecretPKCS11KeyLabel:          strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_KEY_LABEL")),
+		SecretPKCS11DecryptLabels:     splitEnvList("SB_SECRET_PKCS11_DECRYPT_KEY_LABELS"),
+		SecretPKCS11GCMIV:             strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PKCS11_GCM_IV", "auto"))),
+		SecretPKCS11RunDir:            getEnv("SB_SECRET_PKCS11_RUN_DIR", "/run/sandboxd/pkcs11"),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
@@ -2635,10 +2658,7 @@ func Load() (Config, error) {
 	case "vault":
 		// NewVault below checks the settings.
 	case "pkcs11":
-		// A known value that refuses until its wrapper lands
-		// (plans/customer-key-custody.md Phase 3). Never silently fall back
-		// to local.
-		return Config{}, errors.New("SB_SECRET_PROVIDER=pkcs11 is not implemented yet; use local, awskms or vault")
+		// checkPKCS11Settings below checks the settings.
 	default:
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
 	}
@@ -2646,6 +2666,11 @@ func Load() (Config, error) {
 		// The daemon's own validator: address scheme, key and mount names,
 		// CA bundle. It makes no call to Vault.
 		if _, err := secrets.NewVault(vault); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProvider == "pkcs11" || cfg.PKCS11Configured() {
+		if err := checkPKCS11Settings(cfg); err != nil {
 			return Config{}, err
 		}
 	}
@@ -3347,6 +3372,36 @@ func (c Config) validateAuditWitness() error {
 	}
 	if c.NodeID == "" || c.NodeID == auditwitness.StandaloneNodeID {
 		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
+	}
+	return nil
+}
+
+// PKCS11Configured reports whether any PKCS#11 setting is present, which
+// makes the node start the helper even when it seals with another provider.
+func (c Config) PKCS11Configured() bool {
+	return c.SecretPKCS11Module != "" || c.SecretPKCS11KeyLabel != ""
+}
+
+// checkPKCS11Settings fails boot on settings the helper would refuse anyway,
+// so the error names the setting instead of a helper that will not start.
+func checkPKCS11Settings(c Config) error {
+	for _, s := range []struct{ name, value string }{
+		{"SB_SECRET_PKCS11_MODULE", c.SecretPKCS11Module},
+		{"SB_SECRET_PKCS11_TOKEN_LABEL", c.SecretPKCS11TokenLabel},
+		{"SB_SECRET_PKCS11_PIN_FILE", c.SecretPKCS11PINFile},
+		{"SB_SECRET_PKCS11_KEY_LABEL", c.SecretPKCS11KeyLabel},
+	} {
+		if strings.TrimSpace(s.value) == "" {
+			return fmt.Errorf("%s is required for the pkcs11 provider", s.name)
+		}
+	}
+	switch c.SecretPKCS11GCMIV {
+	case "auto", "hsm", "caller":
+	default:
+		return fmt.Errorf("SB_SECRET_PKCS11_GCM_IV must be auto, hsm or caller (got %q)", c.SecretPKCS11GCMIV)
+	}
+	if err := secrets.RefuseGroupOtherBits(c.SecretPKCS11PINFile); err != nil {
+		return fmt.Errorf("SB_SECRET_PKCS11_PIN_FILE: %w", err)
 	}
 	return nil
 }
