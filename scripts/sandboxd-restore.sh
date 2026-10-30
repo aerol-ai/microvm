@@ -54,4 +54,10 @@ if [[ -f "$wrapped" ]]; then
   chmod 0600 "$wrapped"
   echo "the server key is wrapped: run \`sandboxd key verify\` with the key store reachable before starting sandboxd"
 fi
+ring="$target_root/var/lib/sandboxd/credential_encryption.key.ring"
+if [[ -f "$ring" ]]; then
+  # A rotated plaintext key (custody "file"): the ring holds every live key.
+  chmod 0600 "$ring"
+  echo "the server key was rotated: the ring at $ring holds it; keep it with SB_CREDENTIAL_KEY_RING_PATH unset or pointing there"
+fi
 echo "verify ownership/modes, then start sandboxd"

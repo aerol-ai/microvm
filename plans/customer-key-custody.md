@@ -954,8 +954,10 @@ plaintext-era key is retired.
 the current key.
 
 **Audit.** `key_rotation_staged`, `key_rotation_promoted` and
-`key_rotation_retired` are new `Kind` values, written by the node that runs
-the command at its next boot or re-read.
+`key_rotation_retired` are new `Kind` values. Every node writes them when it
+takes the step, at its next boot or re-read (not only the node that ran the
+command), so each node's log shows when that node started sealing with the
+new key.
 
 ## Coordination with other plans
 
@@ -1221,6 +1223,58 @@ latency are operator-run (they cost money) and stay open in the gate table.
 
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
+
+## Phase 4c results (2026-10-31)
+
+Server-key rotation (§13, eng D26) as designed: the key-id `Cipher` format
+with authenticated dual read, the ring (format 2 of the wrapped file; for
+custody `file` a plaintext ring file at `SB_CREDENTIAL_KEY_RING_PATH`),
+`sandboxd key rotate --stage/--promote/--retire ID`, the ring re-read and the
+reseal pass in the key-custody loop, `aerolvm_server_key_ring{key,key2}`,
+`aerolvm_server_key_rows{key}` and the three rotation audit kinds.
+
+Live on a real `sandboxd` + Vault 1.18 (single node, 10 s re-check), with 8
+values sealed through the real store (toolbox token, registry auth, mounts,
+env on two sandboxes), no restart between steps: the staged key showed on the
+ring gauge 10 s after `--stage`; 10 s after `--promote` all 8 values were on
+key 1 (`aerolvm_server_key_rows{key="1"} 8`); after `--retire 0` the rows
+gauge cleared. Offline, the new ring opened all 8 on key 1, and a copy of key
+0 taken before the rotation opened none of them. The node then rebooted from
+the ring file, and its audit log held one `key_rotation_staged`, one
+`_promoted` and one `_retired` record.
+
+Decisions made while building it:
+
+- **Who writes the rotation records.** Every node, as it takes each step
+  (§13 Audit updated), not only the node that ran the command.
+- **The stage gate.** `fsmOpsVersion` 4, with `ServerKeyRingFSMOpsVersion`
+  naming it. The CLI cannot see gossip, so `GET /v1/cluster/members` now
+  also returns `server_key_ring_ready` (the gossip gate with its boot-window
+  rule); a daemon that predates it, an unreachable daemon, a lagging member
+  or a node that has not rejoined all refuse the stage.
+- **One rotation at a time.** `--stage` refuses while any key is
+  decrypt-only. Retiring a staged key that was never promoted cancels the
+  rotation. Key ids are never reused.
+- **custody `file`.** The ring file, once written, holds every live key; a
+  key in `SB_CREDENTIAL_ENCRYPTION_KEY` or the key file must match ring key 0
+  while key 0 is live, and boot warns when it is still there after key 0 is
+  retired. The cluster shared-key check accepts the ring file. Backups carry
+  it; `cluster-join.sh` installs one found in the cred bundle.
+- **Lost updates.** A whole-row sandbox write carries a registry blob read
+  earlier; during a rotation the store moves it onto the current key before
+  writing, so a write that raced the reseal pass cannot put the old key's
+  bytes back. The daemon's rewrap and `sandboxd key rotate` both edit the
+  server-key file; each writes only if the file is unchanged since its read
+  (`ErrKeyFileChanged`).
+- **Counting.** A value that lost its compare-and-swap is counted under the
+  key it was read on until the next pass looks again, so the rows gauge
+  never reaches 0 early; values no ring key opens are counted as
+  `unopenable`. With one key in the ring the pass reads nothing.
+
+Not done here: the rotation runbook and alerts (Phase 5), the 3-node live UC
+with a failover between every step (Phase 6). Rolling a node back to a build
+before this one is not possible once a key is promoted: its rows name their
+key.
 
 ## Phase 4b results (2026-10-31)
 
