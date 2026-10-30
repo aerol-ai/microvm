@@ -1222,6 +1222,29 @@ latency are operator-run (they cost money) and stay open in the gate table.
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
 
+## Phase 4 results (2026-10-31)
+
+Shipped as two stacked PRs. Both were run live on a real `sandboxd` against a
+Vault 1.18 dev server in a Linux container.
+
+**4.1, the wrapped server key:** a fresh single node wrote only
+`credential_encryption.key.wrapped` (0600, `vault:v1`); a restart reopened the
+same key; a plaintext key file left behind stopped the boot (F1); `sandboxd key
+unwrap --to-file` followed by a `file`-custody boot wrote `key_custody_changed`
+(S7); with the Transit key deleted, boot failed with `key revoked by the key
+store`. The run caught one bug (a spurious first-boot warning), fixed before
+the PR.
+
+**4.2, revocation:** with a 10 s re-check and `REVOKE_AFTER=2`, the node
+stopped 20 s after the Transit key was deleted (health `key_custody: revoked`,
+`key_revoked` audit record) and resumed 10 s after the key was restored from a
+Transit backup (`key_recovered`). The egress gateway path (`clear_inspect_ca`,
+the restart of an older gateway, the self-drop after the bound) is covered by
+unit tests; the container run had no gateway.
+
+One addition to §3: custody `file` with only a wrapped key present refuses to
+boot instead of minting a fresh plaintext key that would orphan every row.
+
 ## Phase 3 results (2026-10-31)
 
 `pkg/secrets/pkcs11` (eng D5, D6): the helper process, its socket protocol and
