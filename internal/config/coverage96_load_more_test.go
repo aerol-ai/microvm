@@ -65,6 +65,13 @@ func TestCov96LoadEnterpriseRejectsHardeningOptOuts(t *testing.T) {
 			"SB_SECRET_AWS_KMS_KEY_ID":       "alias/aerolvm",
 			"SB_SECRET_PROVIDER_STRICT_BOOT": "false",
 		}, want: "SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms"},
+		{name: "lenient vault boot", env: map[string]string{
+			"SB_SECRET_PROVIDER":             "vault",
+			"SB_SECRET_VAULT_ADDR":           "https://vault.example:8200",
+			"SB_SECRET_VAULT_KEY_NAME":       "aerolvm-kek",
+			"SB_SECRET_VAULT_TOKEN_FILE":     "/etc/sandboxd/vault-token",
+			"SB_SECRET_PROVIDER_STRICT_BOOT": "false",
+		}, want: "SB_SECRET_PROVIDER_STRICT_BOOT must be true for vault"},
 		{name: "zero tomb retention", env: map[string]string{"SB_SECRET_TOMB_RETENTION_DAYS": "0"}, want: "retention must be non-zero"},
 		{name: "unbounded egress evidence", env: map[string]string{"SB_AUDIT_EGRESS_SANDBOX_RATE": "0"}, want: "SB_AUDIT_EGRESS_SANDBOX_RATE must be > 0"},
 	}

@@ -190,3 +190,34 @@ func TestOpenServerKeyRingFile(t *testing.T) {
 		t.Fatalf("no leftover-key warning: %s", logs.String())
 	}
 }
+
+// F2, first release (§7): an enterprise node with a key store but a
+// plaintext server key is warned about at boot; wrapped custody, a local
+// provider or a non-enterprise node is not.
+func TestEnterpriseCustodyWarning(t *testing.T) {
+	base := config.Config{EnterpriseMode: true, SecretProvider: "vault", CredentialKeyCustody: "file"}
+	if msg := enterpriseCustodyWarning(base); !strings.Contains(msg, "SB_SECRET_PROVIDER=vault") || !strings.Contains(msg, "next release refuses") {
+		t.Fatalf("warning = %q", msg)
+	}
+	for _, cfg := range []config.Config{
+		{EnterpriseMode: true, SecretProvider: "vault", CredentialKeyCustody: "wrapped"},
+		{EnterpriseMode: true, SecretProvider: "local", CredentialKeyCustody: "file"},
+		{EnterpriseMode: false, SecretProvider: "vault", CredentialKeyCustody: "file"},
+	} {
+		if msg := enterpriseCustodyWarning(cfg); msg != "" {
+			t.Fatalf("%+v warned: %q", cfg, msg)
+		}
+	}
+	dir := t.TempDir()
+	cfg := base
+	cfg.SecretProvider = "awskms"
+	cfg.CredentialEncryptionKeyPath = filepath.Join(dir, "credential_encryption.key")
+	cfg.DBPath = filepath.Join(dir, "state.db")
+	var logs strings.Builder
+	if _, err := openServerKey(context.Background(), cfg, nil, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "the key custody claim does not hold") {
+		t.Fatalf("boot did not warn: %s", logs.String())
+	}
+}

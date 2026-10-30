@@ -2823,8 +2823,10 @@ func load(keyTool bool) (Config, error) {
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
-			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		// A key store this node cannot reach must stop the boot, whichever
+		// one it is (plans/customer-key-custody.md §7).
+		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
+			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
