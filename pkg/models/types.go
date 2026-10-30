@@ -1425,6 +1425,28 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 
+// Key-store error codes, each returned with 503 when the key store that wraps
+// sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
+// classes (plans/customer-key-custody.md, eng review Section 2). The response
+// message is fixed text, never the key store's own response.
+const (
+	// ErrorCodeKeyStoreUnavailable: the key store could not be reached.
+	// Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreUnavailable = "key_store_unavailable"
+	// ErrorCodeKeyStoreThrottled: the key store, or this node's cap on calls
+	// to it, is saturated. Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreThrottled = "key_store_throttled"
+	// ErrorCodeKeyStoreDenied: the key store refused this node's credentials
+	// or policy. An operator has to fix the grant.
+	ErrorCodeKeyStoreDenied = "key_store_denied"
+	// ErrorCodeKeyRevoked: the key was disabled or deleted in the key store,
+	// so secrets stay sealed until the key owner restores it.
+	ErrorCodeKeyRevoked = "key_revoked"
+	// ErrorCodeKeyVersionRetired: the secret was wrapped under a key version
+	// the key store no longer allows.
+	ErrorCodeKeyVersionRetired = "key_version_retired"
+)
+
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming
 // a facade later would require a one-shot UPDATE.
