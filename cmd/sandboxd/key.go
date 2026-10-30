@@ -75,6 +75,9 @@ const keyUsage = `usage: sandboxd key <command> [--env-file PATH]...
   unwrap --to-file --i-understand-plaintext
                         write the server key back to a plaintext file (rollback)
   ack-migration         acknowledge that old plaintext copies are destroyed
+  rotate --stage        add a new server key, decrypt only (cluster: every member upgraded)
+  rotate --promote      make the staged key current; nodes reseal their rows onto it
+  rotate --retire ID    drop a key once no row on any member is left on it
 `
 
 // runKeyCLI runs `sandboxd key` with args after "key".
@@ -96,6 +99,9 @@ func runKeyCLI(args []string, out io.Writer) error {
 	seed := fs.Bool("seed", false, "wrap --generate in cluster mode: this node is the seed")
 	toFile := fs.Bool("to-file", false, "unwrap: write the plaintext key file")
 	understand := fs.Bool("i-understand-plaintext", false, "unwrap: acknowledge the key will sit in plaintext on disk")
+	stage := fs.Bool("stage", false, "rotate: add a new decrypt-only key")
+	promote := fs.Bool("promote", false, "rotate: make the staged key current")
+	retire := fs.Int64("retire", -1, "rotate: retire this key id")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -131,6 +137,22 @@ func runKeyCLI(args []string, out io.Writer) error {
 		return keyUnwrap(ctx, cfg, out)
 	case "ack-migration":
 		return keyAckMigration(cfg, out)
+	case "rotate":
+		steps := 0
+		step := ""
+		for name, on := range map[string]bool{"stage": *stage, "promote": *promote, "retire": *retire >= 0} {
+			if on {
+				steps++
+				step = name
+			}
+		}
+		if steps != 1 {
+			return errors.New("rotate takes exactly one of --stage, --promote or --retire ID")
+		}
+		if *retire > int64(^uint32(0)) {
+			return fmt.Errorf("--retire %d is not a key id", *retire)
+		}
+		return keyRotate(ctx, cfg, step, uint32(max(*retire, 0)), out)
 	default:
 		fmt.Fprint(out, keyUsage)
 		return fmt.Errorf("unknown command %q", cmd)
@@ -197,6 +219,13 @@ func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer
 		fmt.Fprintf(tw, "%s\t%s\t%s\n", row.Class, row.Custody, note)
 	}
 	_ = tw.Flush()
+	if ring := cfg.KeyRingPath(); fileExists(ring) {
+		if rf, err := secrets.ReadKeyRingFile(ring); err == nil {
+			fmt.Fprintf(out, "\nserver-key ring file (plaintext): %s\n  keys: %s\n", ring, ringLines(rf.Ring))
+		} else {
+			fmt.Fprintf(out, "\nserver-key ring file: %v\n", err)
+		}
+	}
 	path := cfg.CredentialKeyWrappedPath
 	if !fileExists(path) {
 		fmt.Fprintf(out, "\nwrapped server-key file: none at %s\n", path)
@@ -213,7 +242,7 @@ func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer
 	if version == "" {
 		version = "(the key store does not say)"
 	}
-	fmt.Fprintf(out, "\nwrapped server-key file: %s\n  provider: %s\n  key: %s\n  wrapped under: %s\n", path, f.Provider, f.KeyRef, version)
+	fmt.Fprintf(out, "\nwrapped server-key file: %s\n  provider: %s\n  key: %s\n  wrapped under: %s\n  server keys: %s\n", path, f.Provider, f.KeyRef, version, ringLines(f.Entries()))
 	if f.MigratedFromPlaintext {
 		fmt.Fprintln(out, "  migrated from plaintext: destroy old backups and bundles, then run `sandboxd key ack-migration`")
 	}
@@ -224,10 +253,10 @@ func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer
 	}
 	if check {
 		return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
-			if _, err := secrets.UnwrapServerKey(ctx, w, f); err != nil {
+			if _, err := secrets.UnwrapRing(ctx, w, f, nil); err != nil {
 				return err
 			}
-			fmt.Fprintln(out, "  check: unwraps and matches")
+			fmt.Fprintln(out, "  check: every server key unwraps and matches")
 			return nil
 		})
 	}
@@ -240,7 +269,7 @@ func keyVerify(ctx context.Context, cfg config.Config, out io.Writer) error {
 		return err
 	}
 	return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
-		if _, err := secrets.UnwrapServerKey(ctx, w, f); err != nil {
+		if _, err := secrets.UnwrapRing(ctx, w, f, nil); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "ok: %s unwraps through %s and matches its check\n", cfg.CredentialKeyWrappedPath, f.Provider)
@@ -261,13 +290,19 @@ func writeVerified(ctx context.Context, w secrets.DataKeyWrapper, path string, f
 	if err != nil {
 		return fmt.Errorf("verify %s: %w", path, err)
 	}
-	if !bytes.Equal(got, key) {
+	if key != nil && !bytes.Equal(got, key) {
 		return fmt.Errorf("verify %s: it unwraps to a different key", path)
+	}
+	if _, err := secrets.UnwrapRing(ctx, w, back, nil); err != nil {
+		return fmt.Errorf("verify %s: %w", path, err)
 	}
 	return nil
 }
 
 func keyWrap(ctx context.Context, cfg config.Config, out io.Writer) error {
+	if ring := cfg.KeyRingPath(); fileExists(ring) {
+		return keyWrapRing(ctx, cfg, ring, out)
+	}
 	key, ok, err := secrets.LoadPlaintextKey(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
 	if err != nil {
 		return err
@@ -308,6 +343,33 @@ next:
   4. destroy old backups, cred bundles and S3 bundle object versions that hold the plaintext key, then run `+"`sandboxd key ack-migration`"+`
   5. restart node by node
 `, path, path, cfg.CredentialEncryptionKeyPath)
+		return nil
+	})
+}
+
+// keyWrapRing migrates a rotated plaintext key: every live ring key is
+// wrapped into a ring wrapped file.
+func keyWrapRing(ctx context.Context, cfg config.Config, ringPath string, out io.Writer) error {
+	ring, err := secrets.ReadKeyRingFile(ringPath)
+	if err != nil {
+		return err
+	}
+	path := cfg.CredentialKeyWrappedPath
+	if fileExists(path) {
+		return fmt.Errorf("refusing to replace the existing wrapped key %s", path)
+	}
+	return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
+		f, err := secrets.WrapRing(ctx, w, ring, secrets.NormalizeProviderName(cfg.SecretProvider), service.KeyStoreRef(cfg))
+		if err != nil {
+			return err
+		}
+		f.MigratedFromPlaintext = true
+		if err := writeVerified(ctx, w, path, f, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, `wrapped: the server-key ring %s into %s
+next: as for a single key (copy the wrapped file, set SB_CREDENTIAL_KEY_CUSTODY=wrapped, remove the env key), and also delete the plaintext ring file %s on every node
+`, ringPath, path, ringPath)
 		return nil
 	})
 }
@@ -362,11 +424,11 @@ func keyRewrap(ctx context.Context, cfg config.Config, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		nf, err := secrets.WrapServerKey(ctx, w, key, secrets.NormalizeProviderName(cfg.SecretProvider), service.KeyStoreRef(cfg))
+		nf, err := secrets.RewrapRing(ctx, w, f)
 		if err != nil {
 			return err
 		}
-		nf.MigratedFromPlaintext = f.MigratedFromPlaintext
+		nf.Provider, nf.KeyRef = secrets.NormalizeProviderName(cfg.SecretProvider), service.KeyStoreRef(cfg)
 		if err := writeVerified(ctx, w, path, nf, key); err != nil {
 			return err
 		}
@@ -392,6 +454,9 @@ func keyUnwrap(ctx context.Context, cfg config.Config, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if f.Format == secrets.WrappedKeyRingFormat {
+		return keyUnwrapRing(ctx, cfg, f, out)
+	}
 	return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
 		key, err := secrets.UnwrapServerKey(ctx, w, f)
 		if err != nil {
@@ -409,6 +474,28 @@ func keyUnwrap(ctx context.Context, cfg config.Config, out io.Writer) error {
 			return fmt.Errorf("write %s: %w", dst, werr)
 		}
 		fmt.Fprintf(out, `wrote the server key in plaintext to %s (mode 0600)
+the key custody claim no longer holds for this node.
+next: set SB_CREDENTIAL_KEY_CUSTODY=file and restart; the daemon records the change (key_custody_changed)
+`, dst)
+		return nil
+	})
+}
+
+// keyUnwrapRing is the rollback of a rotated key: the plaintext ring file.
+func keyUnwrapRing(ctx context.Context, cfg config.Config, f secrets.WrappedKeyFile, out io.Writer) error {
+	dst := cfg.KeyRingPath()
+	if fileExists(dst) {
+		return fmt.Errorf("refusing to overwrite the existing ring file %s", dst)
+	}
+	return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
+		ring, err := secrets.UnwrapRingToFile(ctx, w, f)
+		if err != nil {
+			return err
+		}
+		if err := secrets.WriteKeyRingFile(dst, ring); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, `wrote the server-key ring in plaintext to %s (mode 0600)
 the key custody claim no longer holds for this node.
 next: set SB_CREDENTIAL_KEY_CUSTODY=file and restart; the daemon records the change (key_custody_changed)
 `, dst)

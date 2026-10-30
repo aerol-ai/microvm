@@ -80,7 +80,7 @@ func TestKeyGenerateVerifyStatus(t *testing.T) {
 		t.Fatalf("verify = %q %v", out, err)
 	}
 	out, err = runKey(t, "status", "--check", "--env-file", env)
-	if err != nil || !strings.Contains(out, "server key                customer key store (wrapped)") || !strings.Contains(out, "check: unwraps and matches") ||
+	if err != nil || !strings.Contains(out, "server key                customer key store (wrapped)") || !strings.Contains(out, "check: every server key unwraps and matches") || !strings.Contains(out, "server keys: 0=current") ||
 		!strings.Contains(out, "key: alias/aerolvm") || strings.Contains(out, "migrated from plaintext") {
 		t.Fatalf("status = %q %v", out, err)
 	}
@@ -199,7 +199,7 @@ func TestKeyCLIErrors(t *testing.T) {
 	if out, err := runKey(t, "help"); err != nil || !strings.Contains(out, "usage") {
 		t.Fatalf("help = %v", err)
 	}
-	if _, err := runKey(t, "rotate", "--env-file", env); err == nil || !strings.Contains(err.Error(), "unknown command") {
+	if _, err := runKey(t, "bogus", "--env-file", env); err == nil || !strings.Contains(err.Error(), "unknown command") {
 		t.Fatalf("unknown = %v", err)
 	}
 	if _, err := runKey(t, "status", "--bogus"); err == nil {
