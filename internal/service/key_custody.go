@@ -309,26 +309,46 @@ func (s *Service) RevocableContext(parent context.Context) (context.Context, con
 	return ctx, cancel
 }
 
-// StartKeyCustody runs the re-check loop until ctx ends. It does nothing
-// unless custody is wrapped: with a plaintext key there is no wrapped file
-// to re-check, and the custody report says so.
+// StartKeyCustody runs the key-custody loop until ctx ends (eng D2: one
+// owner of the server key's lifecycle, two cadences). With wrapped custody
+// it re-checks the server-key file every SB_SECRET_PROVIDER_RECHECK_INTERVAL;
+// with any external provider it runs the rewrap sweep now (the API is
+// already serving) and then every hour after a random start delay of up to
+// an hour, so a fleet restarted together does not sweep in lockstep (eng
+// D19). With a local provider and a plaintext key it does nothing.
 func (s *Service) StartKeyCustody(ctx context.Context) {
-	if s == nil || s.cfg.CredentialKeyCustody != secrets.CustodyWrapped || s.keyStoreWrapper == nil || s.cipher == nil {
+	if s == nil || s.keyStoreWrapper == nil || s.cipher == nil {
+		return
+	}
+	recheck := s.cfg.CredentialKeyCustody == secrets.CustodyWrapped
+	sweep := secrets.IsExternalProvider(s.cfg.SecretProvider)
+	if !recheck && !sweep {
 		return
 	}
 	interval := s.cfg.SecretProviderRecheckInterval
 	go func() {
+		var recheckC, sweepC <-chan time.Time
+		// ±10% jitter on the re-check, for the same reason.
+		nextRecheck := func() <-chan time.Time {
+			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
+		}
+		if recheck {
+			recheckC = nextRecheck()
+		}
+		if sweep {
+			s.sweepPass(ctx)
+			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
+		}
 		for {
-			// ±10% jitter, so a fleet restarted together does not re-check
-			// in lockstep.
-			d := interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval))
-			t := time.NewTimer(d)
 			select {
 			case <-ctx.Done():
-				t.Stop()
 				return
-			case <-t.C:
+			case <-recheckC:
 				s.RecheckServerKey(ctx)
+				recheckC = nextRecheck()
+			case <-sweepC:
+				s.sweepPass(ctx)
+				sweepC = time.After(keySweepInterval)
 			}
 		}
 	}()
@@ -523,4 +543,175 @@ func (s *Service) emitKeyCustodyEvent(kind, reason string) {
 		return
 	}
 	sink.Emit(ev)
+}
+
+// The rewrap sweep (§11, §12, CEO-E4).
+
+// keySweepInterval is the sweep cadence after the boot pass (eng D19, a
+// constant); keySweepPage is how many rows one store read pages through.
+const (
+	keySweepInterval = time.Hour
+	keySweepPage     = 200
+)
+
+var (
+	// keyRowsStale counts this node's rows not on the current key, plus its
+	// server-key file. "0 on every member" is when an old version may be
+	// retired (§11) or a local → key store switch is complete (§12).
+	keyRowsStale = expvar.NewInt("aerolvm_key_rows_stale")
+	// keyRowsRetired counts rows on a key version the key store no longer
+	// decrypts: opens of those sandboxes fail on this node
+	// (SandboxdKeyVersionRetiredInUse).
+	keyRowsRetired    = expvar.NewInt("aerolvm_key_rows_retired")
+	keyRowsRewrapped  = expvar.NewInt("aerolvm_key_rows_rewrapped_total")
+	keyCurrentGauge   = expvar.NewMap("aerolvm_key_current")
+	keyDecryptableMap = expvar.NewMap("aerolvm_key_decryptable")
+)
+
+// decryptableKeys is a key store that lists the key versions it still opens
+// (the PKCS#11 helper: its current label and its decrypt-only labels).
+type decryptableKeys interface {
+	DecryptableKeyVersions() []string
+}
+
+func (s *Service) sweepPass(ctx context.Context) {
+	stale, err := s.SweepKeys(ctx)
+	if err != nil {
+		s.logger.Warn("key custody: rewrap sweep stopped early; the next pass retries", "stale", stale, "error", err)
+	}
+}
+
+// SweepKeys moves this node's stale rows and its server-key file onto the
+// sealing provider's current key and returns how many stay stale. Each node
+// sweeps only its own copies, every node reaching the same key store, so
+// there is no fan-out. A row is read without a lock, the key store is
+// called with no lock held, and only the conditional write takes the
+// sandbox's secret lock (compare-and-swap): a reseal, a delete or a newer
+// peer copy that lands in between wins and the row is skipped (Section 4).
+func (s *Service) SweepKeys(ctx context.Context) (int, error) {
+	if s == nil || s.keyStoreWrapper == nil || s.KeyRevoked() || !secrets.IsExternalProvider(s.cfg.SecretProvider) {
+		return 0, nil
+	}
+	bctx := secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "sweep"))
+	step := func() (context.Context, context.CancelFunc) { return context.WithTimeout(bctx, keyRecheckTimeout) }
+	cctx, cancel := step()
+	current, _, err := secrets.CurrentKeyVersion(cctx, s.keyStoreWrapper)
+	cancel()
+	if err != nil {
+		return 0, fmt.Errorf("read the current key version: %w", err)
+	}
+	s.publishKeyVersions(current)
+	provider := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	stale, retired := 0, 0
+	after := ""
+	for {
+		rows, err := s.store.ListClusterSecretsBatch(ctx, after, keySweepPage)
+		if err != nil {
+			return stale, err
+		}
+		for _, row := range rows {
+			state, cerr := secrets.ClassifyRow(row.SealedPayload, s.cipher, provider, current)
+			if cerr != nil || state != secrets.RowStale {
+				continue
+			}
+			stale++
+			cctx, cancel := step()
+			rewrapped, rerr := secrets.RewrapEnvelope(cctx, row.SealedPayload, s.cipher, s.keyStoreWrapper)
+			cancel()
+			switch {
+			case errors.Is(rerr, secrets.ErrKeyVersionRetired):
+				retired++
+				continue
+			case rerr != nil && secrets.IsKeyStoreError(rerr):
+				// The key store is down, throttling or refusing: stop here,
+				// the next pass picks up where this one could not.
+				keyRowsRetired.Set(int64(retired))
+				return stale, rerr
+			case rerr != nil:
+				s.logger.Warn("key custody: row not rewrapped", "ref", row.Ref, "error", rerr)
+				continue
+			}
+			unlock := lockSecretSandboxOps(row.SandboxID)
+			ok, werr := s.store.RewrapClusterSecret(ctx, row.Ref, row.SealGeneration, row.SealedPayload, rewrapped)
+			unlock()
+			if werr != nil {
+				s.logger.Warn("key custody: rewrapped row not stored", "ref", row.Ref, "error", werr)
+				continue
+			}
+			if ok {
+				stale--
+				keyRowsRewrapped.Add(1)
+			}
+		}
+		if len(rows) < keySweepPage {
+			break
+		}
+		after = rows[len(rows)-1].Ref
+	}
+	fileStale, ferr := s.rewrapServerKeyFile(bctx, current)
+	if ferr != nil {
+		s.logger.Warn("key custody: server-key file not rewrapped", "error", ferr)
+	}
+	stale += fileStale
+	keyRowsStale.Set(int64(stale))
+	keyRowsRetired.Set(int64(retired))
+	return stale, nil
+}
+
+// rewrapServerKeyFile moves the wrapped server-key file onto the current
+// key, like `sandboxd key rewrap` does with the daemon stopped. It returns 1
+// while the file stays stale.
+func (s *Service) rewrapServerKeyFile(ctx context.Context, current string) (int, error) {
+	if s.cfg.CredentialKeyCustody != secrets.CustodyWrapped || current == "" {
+		return 0, nil
+	}
+	path := s.cfg.CredentialKeyWrappedPath
+	f, err := secrets.ReadWrappedKeyFile(path)
+	if err != nil {
+		return 1, err
+	}
+	if f.KeyVersion() == current {
+		return 0, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
+	defer cancel()
+	key, err := secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
+	if err != nil {
+		return 1, err
+	}
+	nf, err := secrets.WrapServerKey(cctx, s.keyStoreWrapper, key, f.Provider, f.KeyRef)
+	if err != nil {
+		return 1, err
+	}
+	nf.MigratedFromPlaintext = f.MigratedFromPlaintext
+	if err := secrets.WriteWrappedKeyFile(path, nf); err != nil {
+		return 1, err
+	}
+	s.logger.Info("key custody: server-key file rewrapped", "from", f.KeyVersion(), "to", nf.KeyVersion())
+	return 0, nil
+}
+
+// publishKeyVersions sets the info gauges a PKCS#11 label rotation waits on
+// (eng D23): aerolvm_key_current{key=backend,key2=version} and
+// aerolvm_key_decryptable{key=backend,key2=version}.
+func (s *Service) publishKeyVersions(current string) {
+	backend := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	setInfo := func(m *expvar.Map, versions []string) {
+		inner := new(expvar.Map).Init()
+		for _, v := range versions {
+			one := new(expvar.Int)
+			one.Set(1)
+			inner.Set(v, one)
+		}
+		m.Init()
+		m.Set(backend, inner)
+	}
+	if current != "" {
+		setInfo(keyCurrentGauge, []string{current})
+	}
+	if d, ok := s.pkcs11Helper.(decryptableKeys); ok {
+		setInfo(keyDecryptableMap, d.DecryptableKeyVersions())
+	} else if current != "" {
+		setInfo(keyDecryptableMap, []string{current})
+	}
 }
