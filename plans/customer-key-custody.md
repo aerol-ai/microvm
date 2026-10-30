@@ -412,7 +412,7 @@ sweep (Design §11). Nothing else.
 | Backend | Grant |
 |---|---|
 | `awskms` | `kms:Encrypt`, `kms:Decrypt` and `kms:DescribeKey` (to tell a pending deletion from an outage, Design §10) on the one key. No `ReEncrypt`: AWS rotates in place, so there is no AWS sweep (Design §11). |
-| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). **Never `create`** on the encrypt path: Transit would recreate a deleted key on the next encrypt (Phase 0); sandboxd checks this at boot through `sys/capabilities-self`. |
+| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). **Never `create`** on the encrypt path: Transit would recreate a deleted key on the next encrypt (Phase 0); sandboxd checks this at boot through `sys/capabilities-self`, so the token also needs `update` on `sys/capabilities-self` (part of Vault's `default` policy; a token made with `no_default_policy` must be granted it). |
 | `pkcs11` | user login on the token; the key object with `CKA_ENCRYPT` and `CKA_DECRYPT`; the decrypt-only labels with `CKA_DECRYPT`. |
 
 ### 3. The wrapped server key
@@ -1214,6 +1214,30 @@ latency are operator-run (they cost money) and stay open in the gate table.
 
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
+
+## Phase 2 results (2026-10-31)
+
+`TestVaultLive` (`pkg/secrets/vault_integration_test.go`, `integration` build
+tag) against Vault 1.18 and OpenBao 2.1 dev servers in Docker, each through
+both `agent` and `proxy` with `api_proxy { use_auto_auth_token = "force" }`
+and `token_file` auto-auth. All four runs pass:
+
+| Check | Result |
+|---|---|
+| canary with an `update`-only token from a token file | ok |
+| decrypt with the wrong encryption context | `ErrDecryptFailed` |
+| boot with the root token, or a token with `create` on the encrypt path | refused (`IsVaultPolicyError`) |
+| open through the Agent or Proxy listener, no token in sandboxd | ok: the proxy premise holds |
+| decrypt below `min_decryption_version` | `ErrKeyVersionRetired` |
+| decrypt after the key is deleted | `ErrKeyRevoked` |
+| encrypt after the key is deleted, `update`-only token | `ErrProviderDenied`, and the key is not recreated (404) |
+
+Two findings for the Phase 5 docs. Vault 1.18 and OpenBao 2.1 both log that
+Agent's API proxy is deprecated in favor of the `proxy` subcommand, so the
+docs show `vault proxy` (`bao proxy`) for the no-token mode and Agent only for
+the token-file mode. Agent's `token_file` auto-auth needs `lookup-self` from
+the `default` policy, and the boot check needs `sys/capabilities-self` (also in
+`default`), so the documented policy keeps `default` or grants both.
 
 ## Decisions needed
 

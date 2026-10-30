@@ -61,8 +61,14 @@ feature is still mid-rollout.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault` \| `pkcs11`. Off-state is `local` — never contacts a key store unless explicitly set. `vault` and `pkcs11` refuse to boot until their providers ship (plans/customer-key-custody.md). See `docs/.../cluster-secrets.mdx`. |
-| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
+| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault` \| `pkcs11`. Off-state is `local` — never contacts a key store unless explicitly set. `pkcs11` refuses to boot until its provider ships (plans/customer-key-custody.md). See `docs/.../cluster-secrets.mdx`. |
+| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. Set with another provider, the node still opens AWS KMS rows (step 1 of a provider switch). |
+| `SB_SECRET_VAULT_ADDR` | (empty) | Vault or OpenBao URL. Required when `SB_SECRET_PROVIDER=vault`. `https`, or `http` only to loopback (a local `vault proxy`). Set with another provider, the node already opens vault rows. |
+| `SB_SECRET_VAULT_KEY_NAME` | (empty) | Transit key name. Required with `SB_SECRET_VAULT_ADDR`. |
+| `SB_SECRET_VAULT_TRANSIT_MOUNT` | `transit` | Transit mount path. |
+| `SB_SECRET_VAULT_TOKEN_FILE` | (empty) | Token file written by Vault Agent auto-auth; re-read when it changes and once more after a 403. Empty means `SB_SECRET_VAULT_ADDR` is a local `vault proxy` that adds the token, so sandboxd holds none. `VAULT_TOKEN` is never read. The token may hold only `update` on the encrypt and decrypt paths: a token with `create`, `sudo` or `root` there stops the boot, because Transit would recreate a deleted key and undo a revoke. |
+| `SB_SECRET_VAULT_NAMESPACE` | (empty) | Vault Enterprise namespace (`X-Vault-Namespace`). |
+| `SB_SECRET_VAULT_CACERT` | (empty) | PEM CA bundle for a private PKI. |
 | `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start when the boot canary of any external provider fails. Default fail-open with a warning. |
 | `SB_SECRET_PROVIDER_MAX_INFLIGHT` | `8` | Foreground key-store calls in flight per node (1–256). One slot is kept for creates; background work has 2 more slots of its own. Lower it to fit an HSM partition's session limit or one Vault active node's capacity. Throttled calls back off inside the caller's deadline, then fail 503 `key_store_throttled`. |
 | `SB_CREDENTIAL_KEY_CUSTODY` | `file` | `file` \| `wrapped`. `file` keeps the server key in the env or `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` (today's behavior). `wrapped` keeps only a copy wrapped by the external provider at `SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH` and refuses to boot until that ships (plans/customer-key-custody.md Phase 4). |
