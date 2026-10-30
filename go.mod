@@ -39,6 +39,7 @@ require (
 	github.com/google/nftables v0.3.0
 	github.com/hashicorp/raft-wal v0.4.2
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42
+	github.com/miekg/pkcs11 v1.1.2
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/runtime-spec v1.3.0

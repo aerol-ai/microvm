@@ -28,6 +28,11 @@ type ProviderOptions struct {
 	// Vault is required when Name=vault. Set with another provider, it lets
 	// the node already open vault rows during a switch.
 	Vault VaultOptions
+	// PKCS11 is the running PKCS#11 helper client, required when
+	// Name=pkcs11. pkg/daemon starts it (the vendor library lives in its own
+	// process, eng D5), so this package never imports pkg/secrets/pkcs11.
+	// Set with another provider, it lets the node open p11 rows.
+	PKCS11 DataKeyWrapper
 	// Cipher is required for local.
 	Cipher *Cipher
 	// Store persists sealed blobs for every provider.
@@ -71,16 +76,13 @@ func IsExternalProvider(name string) bool {
 // unwrapped. It returns nil for local. The result seals with the configured
 // provider, opens each row with whichever backend its tag names among those
 // the node has settings for (so a provider switch is two steps, §12), and
-// limits in-flight calls. pkcs11 is a known name that refuses until its
-// wrapper lands, never falling back to local.
+// limits in-flight calls.
 func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, error) {
 	name := NormalizeProviderName(opts.Name)
 	switch name {
 	case ProviderLocal:
 		return nil, nil
-	case ProviderAWSKMS, ProviderVault:
-	case ProviderPKCS11:
-		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local, awskms or vault", name)
+	case ProviderAWSKMS, ProviderVault, ProviderPKCS11:
 	default:
 		return nil, fmt.Errorf("SB_SECRET_PROVIDER must be %q, %q, %q or %q (got %q)", ProviderLocal, ProviderAWSKMS, ProviderVault, ProviderPKCS11, opts.Name)
 	}
@@ -103,9 +105,15 @@ func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, erro
 			openers[ProviderVault] = v
 		}
 	}
+	if opts.PKCS11 != nil {
+		openers[ProviderPKCS11] = opts.PKCS11
+	}
 	seal := opts.Wrapper
 	if seal == nil {
 		seal = openers[name]
+	}
+	if seal == nil {
+		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s: the PKCS#11 helper is not running", name)
 	}
 	if v, ok := seal.(*Vault); ok {
 		// A token that may create keys would undo a revoke, so it stops the

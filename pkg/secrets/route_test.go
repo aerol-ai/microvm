@@ -133,3 +133,32 @@ func TestKMSProviderOpenReportsRevoke(t *testing.T) {
 		t.Fatalf("open after revoke = %v (calls %d)", err, revoked.calls)
 	}
 }
+
+// pkg/daemon hands the running PKCS#11 helper in as opts.PKCS11: it seals
+// for a pkcs11 node and opens p11 rows on any other node that has it.
+func TestNewWrapperPKCS11(t *testing.T) {
+	ctx := context.Background()
+	helper := &tagWrapper{tag: "p11:1:"}
+	if _, err := NewWrapper(ctx, ProviderOptions{Name: "pkcs11"}); err == nil || !strings.Contains(err.Error(), "helper is not running") {
+		t.Fatalf("pkcs11 without a helper = %v", err)
+	}
+	w, err := NewWrapper(ctx, ProviderOptions{Name: "pkcs11", PKCS11: helper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := w.Wrap(ctx, []byte("dek"), nil)
+	if err != nil || WrappedKeyBackend(sealed) != ProviderPKCS11 {
+		t.Fatalf("Wrap = %q %v", sealed, err)
+	}
+	fake, err := NewFakeKMS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	aws, err := NewWrapper(ctx, ProviderOptions{Name: "awskms", Wrapper: fake, PKCS11: helper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := aws.Unwrap(ctx, sealed, nil); err != nil || string(got) != "dek" {
+		t.Fatalf("awskms node opening a p11 row = %q %v", got, err)
+	}
+}
