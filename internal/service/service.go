@@ -772,9 +772,14 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		return nil
 	}
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	vault := s.cfg.SecretVaultOptions()
+	vault.NodeID = s.keyStoreNodeID()
+	// Boot-time key-store calls carry the "boot" background correlation id.
+	ctx = secrets.ContextWithBackgroundPurpose(ctx, "boot")
 	opts := secrets.ProviderOptions{
 		Name:        name,
 		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
+		Vault:       vault,
 		Cipher:      s.cipher,
 		Store:       newSecretBlobStore(s.store),
 		Wrapper:     s.secretWrapBackend,
@@ -805,6 +810,18 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		s.logger.Info("secret provider boot canary ok", "provider", name)
 	}
 	return nil
+}
+
+// keyStoreNodeID names this node in the key store's audit log: the cluster
+// id when there is one, else the configured node id, else "standalone".
+func (s *Service) keyStoreNodeID() string {
+	if id := s.selfNodeID(); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(s.cfg.NodeID); id != "" {
+		return id
+	}
+	return "standalone"
 }
 
 // ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct

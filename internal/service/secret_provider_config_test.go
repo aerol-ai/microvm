@@ -2,12 +2,16 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,7 +41,32 @@ func TestConfigureSecretProviderLocal(t *testing.T) {
 	}
 }
 
-func TestConfigureSecretProviderVaultRejected(t *testing.T) {
+// A vault node boots through Vault Agent's local proxy (no token in
+// sandboxd): the canary runs against Transit and carries the boot
+// correlation id; missing settings refuse.
+func TestConfigureSecretProviderVault(t *testing.T) {
+	var mu sync.Mutex
+	var correlation []string
+	transit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		correlation = append(correlation, r.Header.Get(secrets.CorrelationHeader))
+		mu.Unlock()
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/sys/capabilities-self":
+			_, _ = w.Write([]byte(`{"data":{"transit/encrypt/k":["update"],"transit/decrypt/k":["update"]}}`))
+		case "/v1/transit/encrypt/k":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ciphertext": "vault:v1:" + body["plaintext"].(string)}})
+		case "/v1/transit/decrypt/k":
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"plaintext": strings.TrimPrefix(body["ciphertext"].(string), "vault:v1:")}})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(transit.Close)
+
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "db.sqlite"))
 	if err != nil {
@@ -49,10 +78,28 @@ func TestConfigureSecretProviderVaultRejected(t *testing.T) {
 		t.Fatalf("cipher: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc := New(config.Config{SecretProvider: "vault"}, logger, st, nil, nil, nil, cipher, nil, nil)
-	err = svc.ConfigureSecretProvider(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Fatalf("ConfigureSecretProvider vault = %v, want not implemented", err)
+	cfg := config.Config{SecretProvider: "vault", SecretProviderStrictBoot: true, SecretVaultAddr: transit.URL, SecretVaultKeyName: "k", SecretVaultMount: "transit"}
+	svc := New(cfg, logger, st, nil, nil, nil, cipher, nil, nil)
+	if err := svc.ConfigureSecretProvider(context.Background()); err != nil {
+		t.Fatalf("ConfigureSecretProvider vault = %v", err)
+	}
+	if _, ok := svc.secretProvider.(*secrets.KMSProvider); !ok || secretProviderCanaryOK.Value() != 1 {
+		t.Fatalf("provider %T canary %d", svc.secretProvider, secretProviderCanaryOK.Value())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(correlation) != 3 {
+		t.Fatalf("calls = %d, want capabilities + encrypt + decrypt", len(correlation))
+	}
+	for _, id := range correlation {
+		if id != "aerolvm-background:boot:standalone" {
+			t.Fatalf("correlation ids = %v", correlation)
+		}
+	}
+
+	missing := New(config.Config{SecretProvider: "vault"}, logger, st, nil, nil, nil, cipher, nil, nil)
+	if err := missing.ConfigureSecretProvider(context.Background()); err == nil || !strings.Contains(err.Error(), "SB_SECRET_VAULT_ADDR is required") {
+		t.Fatalf("vault without settings = %v", err)
 	}
 }
 

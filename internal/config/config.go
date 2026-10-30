@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -1164,8 +1165,23 @@ type Config struct {
 	// "pkcs11". The off-state is local, not "no provider". SB_SECRET_PROVIDER.
 	SecretProvider string
 	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
+	// Set with another provider, the node still opens AWS KMS rows (step 1 of
+	// a provider switch, plans/customer-key-custody.md §12).
 	// SB_SECRET_AWS_KMS_KEY_ID.
 	SecretAWSkmsKeyID string
+	// Vault Transit / OpenBao settings for SecretProvider=vault
+	// (plans/customer-key-custody.md §1). Set with another provider, the node
+	// already opens vault rows. No Vault login code: TokenFile is written by
+	// Vault Agent, or Addr points at Agent's local API proxy.
+	// SB_SECRET_VAULT_ADDR, SB_SECRET_VAULT_TRANSIT_MOUNT (default transit),
+	// SB_SECRET_VAULT_KEY_NAME, SB_SECRET_VAULT_TOKEN_FILE,
+	// SB_SECRET_VAULT_NAMESPACE, SB_SECRET_VAULT_CACERT.
+	SecretVaultAddr      string
+	SecretVaultMount     string
+	SecretVaultKeyName   string
+	SecretVaultTokenFile string
+	SecretVaultNamespace string
+	SecretVaultCACert    string
 	// SecretProviderStrictBoot fails daemon start when the boot canary
 	// (wrap/unwrap) of any external provider fails. Default false = fail-open
 	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
@@ -2004,6 +2020,12 @@ func Load() (Config, error) {
 		SecretRecipientBackupCount:    getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
 		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretVaultAddr:               strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_ADDR")),
+		SecretVaultMount:              getEnv("SB_SECRET_VAULT_TRANSIT_MOUNT", "transit"),
+		SecretVaultKeyName:            strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_KEY_NAME")),
+		SecretVaultTokenFile:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_TOKEN_FILE")),
+		SecretVaultNamespace:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_NAMESPACE")),
+		SecretVaultCACert:             strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_CACERT")),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
@@ -2610,13 +2632,22 @@ func Load() (Config, error) {
 		if cfg.SecretAWSkmsKeyID == "" {
 			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
 		}
-	case "vault", "pkcs11":
-		// Known values on the same seam that refuse until their wrappers land
-		// (plans/customer-key-custody.md Phases 2-3). Never silently fall back
+	case "vault":
+		// NewVault below checks the settings.
+	case "pkcs11":
+		// A known value that refuses until its wrapper lands
+		// (plans/customer-key-custody.md Phase 3). Never silently fall back
 		// to local.
-		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local or awskms", cfg.SecretProvider)
+		return Config{}, errors.New("SB_SECRET_PROVIDER=pkcs11 is not implemented yet; use local, awskms or vault")
 	default:
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
+	}
+	if vault := cfg.SecretVaultOptions(); cfg.SecretProvider == "vault" || vault.Configured() {
+		// The daemon's own validator: address scheme, key and mount names,
+		// CA bundle. It makes no call to Vault.
+		if _, err := secrets.NewVault(vault); err != nil {
+			return Config{}, err
+		}
 	}
 	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
@@ -3318,6 +3349,19 @@ func (c Config) validateAuditWitness() error {
 		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
 	}
 	return nil
+}
+
+// SecretVaultOptions projects the Vault settings into the shape pkg/secrets
+// opens. NodeID is filled in by the service, which knows the cluster id.
+func (c Config) SecretVaultOptions() secrets.VaultOptions {
+	return secrets.VaultOptions{
+		Addr:      c.SecretVaultAddr,
+		Mount:     c.SecretVaultMount,
+		KeyName:   c.SecretVaultKeyName,
+		TokenFile: c.SecretVaultTokenFile,
+		Namespace: c.SecretVaultNamespace,
+		CACert:    c.SecretVaultCACert,
+	}
 }
 
 // AuditWitnessConfig projects the witness settings into the shape

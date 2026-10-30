@@ -1059,14 +1059,24 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("secret_provider_vault_not_implemented", func(t *testing.T) {
+	t.Run("secret_provider_vault", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 		t.Setenv("SB_SECRET_PROVIDER", "vault")
-		_, err := Load()
-		if err == nil || !strings.Contains(err.Error(), "not implemented") {
-			t.Fatalf("expected vault not-implemented error, got %v", err)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_SECRET_VAULT_ADDR is required") {
+			t.Fatalf("vault without settings = %v", err)
+		}
+		t.Setenv("SB_SECRET_VAULT_ADDR", "http://127.0.0.1:8100")
+		t.Setenv("SB_SECRET_VAULT_KEY_NAME", "aerolvm-kek")
+		t.Setenv("SB_SECRET_VAULT_NAMESPACE", "team-a")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("vault through a local Agent proxy = %v", err)
+		}
+		v := cfg.SecretVaultOptions()
+		if v.Addr != "http://127.0.0.1:8100" || v.Mount != "transit" || v.KeyName != "aerolvm-kek" || v.Namespace != "team-a" || v.TokenFile != "" {
+			t.Fatalf("SecretVaultOptions = %+v", v)
 		}
 	})
 

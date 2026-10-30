@@ -12,7 +12,10 @@ func TestCov96LoadRejectsSecretProviderAndAuditBounds(t *testing.T) {
 		want string
 	}{
 		{name: "unknown provider", env: map[string]string{"SB_SECRET_PROVIDER": "gcpkms"}, want: "SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11"},
-		{name: "vault provider", env: map[string]string{"SB_SECRET_PROVIDER": "vault"}, want: "vault is not implemented"},
+		{name: "vault without an address", env: map[string]string{"SB_SECRET_PROVIDER": "vault", "SB_SECRET_VAULT_KEY_NAME": "aerolvm"}, want: "SB_SECRET_VAULT_ADDR is required"},
+		{name: "vault without a key", env: map[string]string{"SB_SECRET_PROVIDER": "vault", "SB_SECRET_VAULT_ADDR": "https://vault.example"}, want: "SB_SECRET_VAULT_KEY_NAME"},
+		{name: "vault over plain http", env: map[string]string{"SB_SECRET_PROVIDER": "vault", "SB_SECRET_VAULT_ADDR": "http://vault.example:8200", "SB_SECRET_VAULT_KEY_NAME": "aerolvm"}, want: "non-loopback"},
+		{name: "partial vault settings beside awskms", env: map[string]string{"SB_SECRET_PROVIDER": "awskms", "SB_SECRET_AWS_KMS_KEY_ID": "alias/aerolvm", "SB_SECRET_VAULT_KEY_NAME": "aerolvm"}, want: "SB_SECRET_VAULT_ADDR is required"},
 		{name: "pkcs11 provider", env: map[string]string{"SB_SECRET_PROVIDER": "pkcs11"}, want: "pkcs11 is not implemented"},
 		{name: "zero in-flight cap", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "0"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
 		{name: "in-flight cap over 256", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "257"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
