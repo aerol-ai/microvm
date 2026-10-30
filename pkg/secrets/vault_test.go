@@ -81,7 +81,7 @@ func TestVaultWrapChecksPolicyOnce(t *testing.T) {
 		t.Fatalf("paths = %v, want %v (policy checked once)", api.paths, want)
 	}
 	if api.bodies[1]["plaintext"] != base64.StdEncoding.EncodeToString([]byte("dek")) ||
-		api.bodies[1]["associated_data"] != base64.StdEncoding.EncodeToString(encryptionContextAAD(encCtx)) {
+		api.bodies[1]["associated_data"] != base64.StdEncoding.EncodeToString(EncryptionContextAAD(encCtx)) {
 		t.Fatalf("encrypt body = %v", api.bodies[1])
 	}
 	if _, ok := api.bodies[2]["associated_data"]; ok {

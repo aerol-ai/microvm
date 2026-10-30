@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -147,5 +149,36 @@ func TestLoadUpstreamWrapKeyRing_ReadFileError(t *testing.T) {
 	os.Mkdir(path, 0400)
 	if _, err := LoadUpstreamWrapKeyRing(path); err == nil {
 		t.Fatal("expected error reading directory as key file")
+	}
+}
+
+// One rule for every secret file (eng D14): owner-only modes pass, any group
+// or other bit is refused, and a missing file keeps its os.ErrNotExist.
+func TestRefuseGroupOtherBits(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		mode os.FileMode
+		ok   bool
+	}{
+		{0o400, true}, {0o600, true}, {0o700, true},
+		{0o640, false}, {0o604, false}, {0o620, false}, {0o602, false}, {0o644, false},
+	} {
+		p := filepath.Join(dir, fmt.Sprintf("f-%o", tc.mode))
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(p, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		err := RefuseGroupOtherBits(p)
+		if (err == nil) != tc.ok {
+			t.Fatalf("mode %#o: err = %v, want ok=%v", tc.mode, err, tc.ok)
+		}
+		if err != nil && !strings.Contains(err.Error(), "allow only its owner") {
+			t.Fatalf("mode %#o: message %q", tc.mode, err)
+		}
+	}
+	if err := RefuseGroupOtherBits(filepath.Join(dir, "none")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("missing file = %v", err)
 	}
 }

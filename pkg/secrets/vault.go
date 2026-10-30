@@ -194,7 +194,7 @@ func (v *Vault) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) 
 		return nil, err
 	}
 	body := map[string]any{"plaintext": base64.StdEncoding.EncodeToString(dek)}
-	if aad := encryptionContextAAD(encCtx); len(aad) > 0 {
+	if aad := EncryptionContextAAD(encCtx); len(aad) > 0 {
 		body["associated_data"] = base64.StdEncoding.EncodeToString(aad)
 	}
 	status, resp, err := v.api.call(ctx, v.encPath, body)
@@ -217,7 +217,7 @@ func (v *Vault) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]st
 		return nil, fmt.Errorf("%w: wrapped key is not vault ciphertext", ErrDecryptFailed)
 	}
 	body := map[string]any{"ciphertext": string(wrapped)}
-	if aad := encryptionContextAAD(encCtx); len(aad) > 0 {
+	if aad := EncryptionContextAAD(encCtx); len(aad) > 0 {
 		body["associated_data"] = base64.StdEncoding.EncodeToString(aad)
 	}
 	status, resp, err := v.api.call(ctx, v.decPath, body)

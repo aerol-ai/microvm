@@ -20,11 +20,12 @@ type DataKeyWrapper interface {
 	Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) (dek []byte, err error)
 }
 
-// encryptionContextAAD encodes encCtx as additional authenticated data for
-// backends that take raw AAD (FakeKMS, Vault Transit's associated_data):
+// EncryptionContextAAD encodes encCtx as additional authenticated data for
+// backends that take raw AAD (FakeKMS, Vault Transit's associated_data, the
+// PKCS#11 helper's GCM AAD):
 // sorted keys, each key and value NUL-terminated, so two different contexts
 // never encode the same.
-func encryptionContextAAD(encCtx map[string]string) []byte {
+func EncryptionContextAAD(encCtx map[string]string) []byte {
 	if len(encCtx) == 0 {
 		return nil
 	}
