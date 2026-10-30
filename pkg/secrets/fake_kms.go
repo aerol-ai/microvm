@@ -7,8 +7,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
-	"sort"
-	"strings"
 	"sync"
 )
 
@@ -80,25 +78,6 @@ func (f *FakeKMS) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]
 		return nil, fmt.Errorf("%w: fake kms unwrap: %v", ErrDecryptFailed, err)
 	}
 	return plain, nil
-}
-
-func encryptionContextAAD(encCtx map[string]string) []byte {
-	if len(encCtx) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(encCtx))
-	for k := range encCtx {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	for _, k := range keys {
-		b.WriteString(k)
-		b.WriteByte(0)
-		b.WriteString(encCtx[k])
-		b.WriteByte(0)
-	}
-	return []byte(b.String())
 }
 
 func (f *FakeKMS) injectedLocked() error {

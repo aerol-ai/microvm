@@ -22,8 +22,12 @@ const DefaultMaxInFlight = 8
 type ProviderOptions struct {
 	// Name is local | awskms | vault | pkcs11 (default local).
 	Name string
-	// AWSKMSKeyID is required when Name=awskms.
+	// AWSKMSKeyID is required when Name=awskms. Set with another provider, it
+	// lets the node still open AWS KMS rows during a switch.
 	AWSKMSKeyID string
+	// Vault is required when Name=vault. Set with another provider, it lets
+	// the node already open vault rows during a switch.
+	Vault VaultOptions
 	// Cipher is required for local.
 	Cipher *Cipher
 	// Store persists sealed blobs for every provider.
@@ -64,34 +68,62 @@ func IsExternalProvider(name string) bool {
 
 // NewWrapper builds the key-store client for an external provider from config
 // alone, with no store, so the daemon can build it before the server key is
-// unwrapped. It returns nil for local. The result routes by wrapped-key tag
-// and limits in-flight calls. vault and pkcs11 are known names that refuse
-// until their wrappers land, never falling back to local.
+// unwrapped. It returns nil for local. The result seals with the configured
+// provider, opens each row with whichever backend its tag names among those
+// the node has settings for (so a provider switch is two steps, §12), and
+// limits in-flight calls. pkcs11 is a known name that refuses until its
+// wrapper lands, never falling back to local.
 func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, error) {
 	name := NormalizeProviderName(opts.Name)
-	var seal DataKeyWrapper
 	switch name {
 	case ProviderLocal:
 		return nil, nil
-	case ProviderAWSKMS:
-		seal = opts.Wrapper
-		if seal == nil {
+	case ProviderAWSKMS, ProviderVault:
+	case ProviderPKCS11:
+		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local, awskms or vault", name)
+	default:
+		return nil, fmt.Errorf("SB_SECRET_PROVIDER must be %q, %q, %q or %q (got %q)", ProviderLocal, ProviderAWSKMS, ProviderVault, ProviderPKCS11, opts.Name)
+	}
+	openers := map[string]DataKeyWrapper{}
+	if name == ProviderAWSKMS || strings.TrimSpace(opts.AWSKMSKeyID) != "" {
+		if name != ProviderAWSKMS || opts.Wrapper == nil {
 			w, err := NewAWSKMS(ctx, opts.AWSKMSKeyID)
 			if err != nil {
 				return nil, err
 			}
-			seal = w
+			openers[ProviderAWSKMS] = w
 		}
-	case ProviderVault, ProviderPKCS11:
-		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local or awskms", name)
-	default:
-		return nil, fmt.Errorf("SB_SECRET_PROVIDER must be %q, %q, %q or %q (got %q)", ProviderLocal, ProviderAWSKMS, ProviderVault, ProviderPKCS11, opts.Name)
+	}
+	if name == ProviderVault || opts.Vault.Configured() {
+		if name != ProviderVault || opts.Wrapper == nil {
+			v, err := NewVault(opts.Vault)
+			if err != nil {
+				return nil, err
+			}
+			openers[ProviderVault] = v
+		}
+	}
+	seal := opts.Wrapper
+	if seal == nil {
+		seal = openers[name]
+	}
+	if v, ok := seal.(*Vault); ok {
+		// A token that may create keys would undo a revoke, so it stops the
+		// boot whatever SB_SECRET_PROVIDER_STRICT_BOOT says. A Vault that is
+		// down here is the canary's to report; the check runs again before
+		// the first encrypt.
+		pctx, cancel := context.WithTimeout(ContextWithBackgroundPurpose(ctx, "boot"), vaultPolicyCheckTimeout)
+		err := v.ensurePolicy(pctx)
+		cancel()
+		if IsVaultPolicyError(err) {
+			return nil, err
+		}
 	}
 	maxInFlight := opts.MaxInFlight
 	if maxInFlight <= 0 {
 		maxInFlight = DefaultMaxInFlight
 	}
-	return NewLimitedWrapper(NewRouter(name, seal, nil), maxInFlight, opts.Observer), nil
+	return NewLimitedWrapper(NewRouter(name, seal, openers), maxInFlight, opts.Observer), nil
 }
 
 // NewProvider builds the configured Provider. For an external provider it

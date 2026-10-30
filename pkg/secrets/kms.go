@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"sort"
+	"strings"
 )
 
 // DataKeyWrapper wraps and unwraps per-secret data encryption keys (DEKs).
@@ -16,6 +18,29 @@ import (
 type DataKeyWrapper interface {
 	Wrap(ctx context.Context, dek []byte, encCtx map[string]string) (wrapped []byte, err error)
 	Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]string) (dek []byte, err error)
+}
+
+// encryptionContextAAD encodes encCtx as additional authenticated data for
+// backends that take raw AAD (FakeKMS, Vault Transit's associated_data):
+// sorted keys, each key and value NUL-terminated, so two different contexts
+// never encode the same.
+func encryptionContextAAD(encCtx map[string]string) []byte {
+	if len(encCtx) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(encCtx))
+	for k := range encCtx {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(k)
+		b.WriteByte(0)
+		b.WriteString(encCtx[k])
+		b.WriteByte(0)
+	}
+	return []byte(b.String())
 }
 
 // CanaryWrapUnwrap exercises Wrap+Unwrap with a random 32-byte DEK. Used at
