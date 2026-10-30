@@ -65,6 +65,10 @@ func (p *Proxy) SetInspector(i Inspector) {
 	p.inspector.Store(&inspectorBox{i})
 }
 
+// InspectorForTest is the installed inspector, for tests of the code that
+// installs and removes it.
+func (p *Proxy) InspectorForTest() Inspector { return p.currentInspector() }
+
 func (p *Proxy) currentInspector() Inspector {
 	if b := p.inspector.Load(); b != nil {
 		return b.Inspector
@@ -116,6 +120,7 @@ func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, ds
 	}
 	peer := peerAddr(c)
 	tc := p.src.Track(id, name, 443, c)
+	tc.MarkInspected()
 	defer tc.Close()
 	tlsConn := tls.Server(&replayConn{Conn: c, r: br}, &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return ins.Leaf(name) },

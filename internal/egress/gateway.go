@@ -290,6 +290,18 @@ func compile(spec Spec) (*entry, error) {
 	return e, nil
 }
 
+// DropSecrets forgets every sandbox's injection secrets; inject rules then
+// deny with ReasonSecretMissing until sandboxd sends them again (key
+// revoked, eng D21). Sources handed out earlier keep their old map, which is
+// why CloseInspected closes their connections.
+func (g *Gateway) DropSecrets() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, e := range g.byID {
+		e.spec.Secrets = nil
+	}
+}
+
 func specHash(s Spec) string {
 	s.Blocked = 0 // block state changes must not discard learned elements
 	s.Secrets = nil
