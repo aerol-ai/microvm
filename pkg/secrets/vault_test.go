@@ -35,7 +35,7 @@ type scriptedReply struct {
 	err    error
 }
 
-func (s *scriptedVault) call(_ context.Context, path string, body any) (int, vaultResponse, error) {
+func (s *scriptedVault) call(_ context.Context, _, path string, body any) (int, vaultResponse, error) {
 	s.paths = append(s.paths, path)
 	b, _ := body.(map[string]any)
 	s.bodies = append(s.bodies, b)
@@ -410,12 +410,12 @@ func TestVaultTokenReloadOn403(t *testing.T) {
 	if err := os.Chtimes(tokenPath, fi.ModTime(), fi.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	status, _, err := h.call(context.Background(), "transit/decrypt/k", map[string]any{"ciphertext": "vault:v1:none"})
+	status, _, err := h.call(context.Background(), http.MethodPost, "transit/decrypt/k", map[string]any{"ciphertext": "vault:v1:none"})
 	if err != nil || status != 400 || f.forbidden != 1 {
 		t.Fatalf("after reload status %d err %v forbidden %d", status, err, f.forbidden)
 	}
 	f.tokens = map[string]bool{"other": true}
-	status, _, err = h.call(context.Background(), "transit/decrypt/k", map[string]any{"ciphertext": "x"})
+	status, _, err = h.call(context.Background(), http.MethodPost, "transit/decrypt/k", map[string]any{"ciphertext": "x"})
 	if err != nil || status != 403 || f.forbidden != 2 {
 		t.Fatalf("unchanged token: status %d err %v forbidden %d (want one request)", status, err, f.forbidden)
 	}
@@ -432,7 +432,7 @@ func TestVaultHTTPEdges(t *testing.T) {
 	ctx := ContextWithBackgroundPurpose(context.Background(), "recheck")
 
 	// No token file: Agent's proxy adds the token, sandboxd sends none.
-	if status, _, err := h.call(ctx, "transit/encrypt/k", map[string]any{"plaintext": "AA=="}); err != nil || status != 200 {
+	if status, _, err := h.call(ctx, http.MethodPost, "transit/encrypt/k", map[string]any{"plaintext": "AA=="}); err != nil || status != 200 {
 		t.Fatalf("proxy mode = %d %v", status, err)
 	}
 	last := f.headers[len(f.headers)-1]
@@ -441,25 +441,25 @@ func TestVaultHTTPEdges(t *testing.T) {
 	}
 	// A caller-supplied id that a header must not carry is dropped.
 	bad := auditlog.ContextWithCorrelationID(context.Background(), "a b\tc")
-	if _, _, err := h.call(bad, "transit/encrypt/k", map[string]any{}); err != nil {
+	if _, _, err := h.call(bad, http.MethodPost, "transit/encrypt/k", map[string]any{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.headers[len(f.headers)-1].Get(CorrelationHeader); got != "" {
 		t.Fatalf("unsafe correlation id forwarded: %q", got)
 	}
 	// A non-JSON reply still classifies by status.
-	if status, resp, err := h.call(context.Background(), "nope", map[string]any{}); err != nil || status != 404 || len(resp.Errors) != 0 {
+	if status, resp, err := h.call(context.Background(), http.MethodPost, "nope", map[string]any{}); err != nil || status != 404 || len(resp.Errors) != 0 {
 		t.Fatalf("html 404 = %d %v %v", status, resp, err)
 	}
 	// Redirects are not followed: X-Vault-Token must not travel to them.
 	f.mu.Lock()
 	f.redirect = true
 	f.mu.Unlock()
-	if status, _, err := h.call(context.Background(), "transit/encrypt/k", map[string]any{}); err != nil || status != http.StatusTemporaryRedirect {
+	if status, _, err := h.call(context.Background(), http.MethodPost, "transit/encrypt/k", map[string]any{}); err != nil || status != http.StatusTemporaryRedirect {
 		t.Fatalf("redirect = %d %v", status, err)
 	}
 	// A body that cannot be encoded never reaches the wire.
-	if _, _, err := h.call(context.Background(), "x", map[string]any{"c": make(chan int)}); err == nil {
+	if _, _, err := h.call(context.Background(), http.MethodPost, "x", map[string]any{"c": make(chan int)}); err == nil {
 		t.Fatal("unencodable body accepted")
 	}
 	// Nothing listening.
@@ -493,7 +493,7 @@ func TestVaultTokenFileErrors(t *testing.T) {
 		t.Fatalf("directory as token file = %v", err)
 	}
 	v := &vaultHTTP{token: &tokenFile{path: filepath.Join(dir, "none")}}
-	if _, _, err := v.call(context.Background(), "x", nil); !errors.Is(err, ErrProviderUnavailable) {
+	if _, _, err := v.call(context.Background(), http.MethodPost, "x", nil); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("call without a token file = %v", err)
 	}
 }

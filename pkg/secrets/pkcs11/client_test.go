@@ -454,3 +454,25 @@ type nopListener struct{}
 func (nopListener) Accept() (net.Conn, error) { return nil, errors.New("closed") }
 func (nopListener) Close() error              { return nil }
 func (nopListener) Addr() net.Addr            { return &net.UnixAddr{} }
+
+func TestHelperCurrentKeyVersion(t *testing.T) {
+	fastTimings(t)
+	var starts atomic.Int32
+	h, err := StartHelper(HelperOptions{Socket: shortSocket(t), start: inprocStarter(&fakeBackend{info: Info{KeyLabel: "kek-b", DecryptLabels: []string{"kek-a"}}}, &starts, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if v, err := h.CurrentKeyVersion(context.Background()); err != nil || v != "p11:kek-b" {
+		t.Fatalf("CurrentKeyVersion = %q %v", v, err)
+	}
+	if got := h.DecryptableKeyVersions(); strings.Join(got, ",") != "p11:kek-b,p11:kek-a" {
+		t.Fatalf("DecryptableKeyVersions = %v", got)
+	}
+	if _, err := (&Helper{}).CurrentKeyVersion(context.Background()); !errors.Is(err, secrets.ErrProviderUnavailable) {
+		t.Fatalf("not started = %v", err)
+	}
+	if (&Helper{}).DecryptableKeyVersions() != nil {
+		t.Fatal("a helper that never started lists keys")
+	}
+}

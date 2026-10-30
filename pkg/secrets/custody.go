@@ -11,7 +11,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -53,22 +52,8 @@ type WrappedKeyFile struct {
 }
 
 // KeyVersion names what the file is wrapped under, for the custody report:
-// "vault:v3", a PKCS#11 key label, or "" when the backend does not say.
-func (f WrappedKeyFile) KeyVersion() string {
-	w := string(f.Wrapped)
-	switch {
-	case strings.HasPrefix(w, tagVault):
-		if i := strings.Index(w[len(tagVault):], ":"); i > 0 {
-			return w[:len(tagVault)+i]
-		}
-	case strings.HasPrefix(w, tagPKCS11+"1:") && len(w) > len(tagPKCS11)+3:
-		n := int(w[len(tagPKCS11)+2])
-		if start := len(tagPKCS11) + 3; n > 0 && len(w) >= start+n {
-			return "p11:" + w[start:start+n]
-		}
-	}
-	return ""
-}
+// "vault:v3", "p11:<label>", or "" when the backend does not say.
+func (f WrappedKeyFile) KeyVersion() string { return WrappedKeyVersion(f.Wrapped) }
 
 func serverKeyCheck(key []byte) []byte {
 	m := hmac.New(sha256.New, key)

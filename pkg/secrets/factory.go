@@ -155,5 +155,7 @@ func NewProvider(ctx context.Context, opts ProviderOptions) (Provider, DataKeyWr
 			return nil, nil, err
 		}
 	}
-	return NewKMSProvider(w, opts.Store), w, nil
+	p := NewKMSProvider(w, opts.Store)
+	p.local = opts.Cipher
+	return p, w, nil
 }
