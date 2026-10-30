@@ -100,6 +100,8 @@ CADDY_STORAGE_S3_ENCRYPTION_KEY=""
 #                        written in this one step: the flag without the
 #                        wrapper breaks every HTTPS handshake.
 PAT_SCOPE="any"
+KEY_CUSTODY="file"
+SECRET_PROVIDER_ENV=""
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 
@@ -263,6 +265,15 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --key-custody <file|wrapped> "wrapped" keeps the server key only wrapped by
+                               the customer's key store (AWS KMS, Vault or an
+                               HSM): the first boot generates it and writes no
+                               plaintext copy; a re-run over a plaintext key
+                               wraps it. Needs --secret-provider-env.
+                               (plans/customer-key-custody.md)
+  --secret-provider-env <file> SB_SECRET_* lines naming the key store
+                               (SB_SECRET_PROVIDER=awskms|vault|pkcs11 and its
+                               settings), appended to sandboxd.env.
   --l4-proxy-protocol          Domain mode: send the real client address
                                from caddy-l4 to the HTTPS site (PROXY
                                protocol v2) and on to sandboxd, so audit
@@ -662,6 +673,14 @@ while [[ $# -gt 0 ]]; do
 			L4_PROXY_PROTOCOL="true"
 			shift
 			;;
+		--key-custody)
+			KEY_CUSTODY="$2"
+			shift 2
+			;;
+		--secret-provider-env)
+			SECRET_PROVIDER_ENV="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -678,6 +697,28 @@ if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+case "$KEY_CUSTODY" in
+	file) ;;
+	wrapped)
+		if [[ "$LOCAL_MODE" == "true" ]]; then
+			echo "--key-custody wrapped is not supported with --local" >&2
+			exit 1
+		fi
+		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
+			exit 1
+		fi
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
+			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "--key-custody must be file or wrapped (got $KEY_CUSTODY)" >&2
+		exit 1
+		;;
+esac
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -1260,7 +1301,37 @@ EOF
 #SB_AUDIT_WITNESS_S3_ENDPOINT=
 #SB_AUDIT_WITNESS_S3_PATH_STYLE=false
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		{
+			echo "# Key custody (plans/customer-key-custody.md): the server key exists"
+			echo "# only wrapped by the key store below; see sandboxd key status."
+			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
+			# IMDS fallback turns a missing region into an opaque timeout.
+			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
+}
+
+# prepare_key_custody wraps a plaintext server key left by an earlier
+# install, so the daemon (which refuses wrapped custody while a plaintext
+# key file exists) starts. A fresh install has no key: the first boot
+# generates it and writes only the wrapped file.
+prepare_key_custody() {
+	[[ "$KEY_CUSTODY" == "wrapped" ]] || return 0
+	local plain=/var/lib/sandboxd/credential_encryption.key
+	local wrapped=/var/lib/sandboxd/credential_encryption.key.wrapped
+	if [[ -f "$plain" && ! -f "$wrapped" ]]; then
+		echo "Wrapping the existing server key at $plain"
+		"$INSTALL_PREFIX/sandboxd" key wrap --env-file /etc/sandboxd/sandboxd.env
+		# Not a secure delete; `sandboxd key status` reports the migration
+		# until `sandboxd key ack-migration`.
+		rm -f "$plain"
+	elif [[ -f "$plain" && -f "$wrapped" ]]; then
+		"$INSTALL_PREFIX/sandboxd" key verify --env-file /etc/sandboxd/sandboxd.env
+		rm -f "$plain"
+	fi
 }
 
 write_caddyfile() {
@@ -2424,6 +2495,7 @@ install_custom_caddy "$DNS_PROVIDER"
 install_binaries
 record_sandboxd_state
 write_environment
+prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
 write_route_dns_resolver

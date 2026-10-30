@@ -46,4 +46,12 @@ fi
 mkdir -p "$target_root"
 tar -C "$target_root" -xzf "$input"
 echo "restored $input into $target_root"
+wrapped="$target_root/var/lib/sandboxd/credential_encryption.key.wrapped"
+if [[ -f "$wrapped" ]]; then
+  # Key custody "wrapped": sandboxd unwraps this at boot through the key
+  # store, which must be reachable. A backup taken before a key version was
+  # retired no longer opens once that version is gone.
+  chmod 0600 "$wrapped"
+  echo "the server key is wrapped: run \`sandboxd key verify\` with the key store reachable before starting sandboxd"
+fi
 echo "verify ownership/modes, then start sandboxd"
