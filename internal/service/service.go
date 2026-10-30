@@ -185,6 +185,9 @@ type Service struct {
 	// opened the server key (SetKeyStoreWrapper); nil for local, or when a
 	// test builds the service directly.
 	keyStoreWrapper secrets.DataKeyWrapper
+	// keyCustody is the server key's lifecycle under wrapped custody:
+	// re-check, revoke, recover (plans/customer-key-custody.md §10).
+	keyCustody keyCustodyState
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -2792,7 +2795,7 @@ func (s *Service) UnsealRegistry(ctx context.Context, sandboxID string, sealed [
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt registry auth", decErr)
 	}
 	var out models.RegistryAuth
 	if err := json.Unmarshal(plain, &out); err != nil {
@@ -2896,7 +2899,7 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 		}
 		plain, decErr := s.cipher.DecryptWithAAD(sealed, secrets.EnvAAD(sandboxID, auditIncarnationID))
 		if decErr != nil {
-			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+			return nil, sealedOpenError("decrypt env", decErr)
 		}
 		var out map[string]string
 		if umErr := json.Unmarshal(plain, &out); umErr != nil {
@@ -3027,7 +3030,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt mounts", decErr)
 	}
 	var file models.MountSpecFile
 	if umErr := json.Unmarshal(plain, &file); umErr != nil {
@@ -5323,6 +5326,13 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	if s.cfg.RunsSSHGateway() && sshStatus != "ok" {
 		status = "degraded"
 	}
+	// A revoked key stops the node's work on sealed data (§10). Health still
+	// answers, so the docs do not promise the ingress stops routing here.
+	keyCustody := ""
+	if s.KeyRevoked() {
+		keyCustody = "revoked"
+		status = "degraded"
+	}
 
 	clusterTopology := ""
 	clusterNodes := 0
@@ -5351,8 +5361,19 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
+		KeyCustody:      keyCustody,
 		Version:         version.Version,
 	}, nil
+}
+
+// sealedOpenError reports a failed open of a sealed value. A key-store class
+// (a revoke) stays visible, so the API answers 503 key_revoked instead of a
+// decrypt failure; anything else is ErrDecryptFailed as before.
+func sealedOpenError(what string, err error) error {
+	if secrets.IsKeyStoreError(err) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return fmt.Errorf("%w: %s: %v", secrets.ErrDecryptFailed, what, err)
 }
 
 // Capacity returns the admitter's current snapshot. Returns the zero value

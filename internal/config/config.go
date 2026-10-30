@@ -1208,6 +1208,13 @@ type Config struct {
 	// kept for creates and background work has its own 2 slots on top (eng
 	// D13). Default 8, range 1-256. SB_SECRET_PROVIDER_MAX_INFLIGHT.
 	SecretProviderMaxInFlight int
+	// SecretProviderRecheckInterval is how often a node with wrapped
+	// custody unwraps its server-key file again to notice a revoke, with
+	// jitter; SecretProviderRevokeAfter consecutive revoked results stop the
+	// node (about 15 minutes by default, eng D18).
+	// SB_SECRET_PROVIDER_RECHECK_INTERVAL, SB_SECRET_PROVIDER_REVOKE_AFTER.
+	SecretProviderRecheckInterval time.Duration
+	SecretProviderRevokeAfter     int
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -2062,6 +2069,8 @@ func load(keyTool bool) (Config, error) {
 		SecretPKCS11RunDir:            getEnv("SB_SECRET_PKCS11_RUN_DIR", "/run/sandboxd/pkcs11"),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
+		SecretProviderRecheckInterval: getEnvDuration("SB_SECRET_PROVIDER_RECHECK_INTERVAL", 5*time.Minute),
+		SecretProviderRevokeAfter:     getEnvInt("SB_SECRET_PROVIDER_REVOKE_AFTER", 3),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
@@ -2687,6 +2696,12 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
+	}
+	if cfg.SecretProviderRecheckInterval < 10*time.Second {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_RECHECK_INTERVAL must be at least 10s (got %s)", cfg.SecretProviderRecheckInterval)
+	}
+	if cfg.SecretProviderRevokeAfter < 1 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_REVOKE_AFTER must be at least 1 (got %d)", cfg.SecretProviderRevokeAfter)
 	}
 	switch cfg.CredentialKeyCustody {
 	case "", "file":

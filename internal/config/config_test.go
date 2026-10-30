@@ -1011,6 +1011,9 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load() error = %v", err)
 		}
+		if cfg.SecretProviderRecheckInterval != 5*time.Minute || cfg.SecretProviderRevokeAfter != 3 {
+			t.Fatalf("re-check %v × %d, want 5m × 3", cfg.SecretProviderRecheckInterval, cfg.SecretProviderRevokeAfter)
+		}
 		if cfg.SecretProviderMaxInFlight != 8 || cfg.CredentialKeyCustody != "file" {
 			t.Fatalf("max in-flight %d custody %q, want 8 file", cfg.SecretProviderMaxInFlight, cfg.CredentialKeyCustody)
 		}

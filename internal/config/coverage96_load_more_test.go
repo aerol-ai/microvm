@@ -22,6 +22,8 @@ func TestCov96LoadRejectsSecretProviderAndAuditBounds(t *testing.T) {
 		{name: "pkcs11 settings beside awskms, pin missing", env: map[string]string{"SB_SECRET_PROVIDER": "awskms", "SB_SECRET_AWS_KMS_KEY_ID": "alias/x", "SB_SECRET_PKCS11_MODULE": "/m.so", "SB_SECRET_PKCS11_TOKEN_LABEL": "t", "SB_SECRET_PKCS11_PIN_FILE": "/nonexistent/pin", "SB_SECRET_PKCS11_KEY_LABEL": "k"}, want: "SB_SECRET_PKCS11_PIN_FILE"},
 		{name: "zero in-flight cap", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "0"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
 		{name: "in-flight cap over 256", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "257"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
+		{name: "recheck too often", env: map[string]string{"SB_SECRET_PROVIDER_RECHECK_INTERVAL": "1s"}, want: "SB_SECRET_PROVIDER_RECHECK_INTERVAL must be at least 10s"},
+		{name: "revoke after zero", env: map[string]string{"SB_SECRET_PROVIDER_REVOKE_AFTER": "0"}, want: "SB_SECRET_PROVIDER_REVOKE_AFTER must be at least 1"},
 		{name: "unknown key custody", env: map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "hsm"}, want: "SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped"},
 		{name: "wrapped custody with local provider", env: map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"}, want: "needs an external SB_SECRET_PROVIDER"},
 		{name: "awskms without key", env: map[string]string{"SB_SECRET_PROVIDER": "awskms"}, want: "SB_SECRET_AWS_KMS_KEY_ID"},

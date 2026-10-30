@@ -38,9 +38,12 @@ type fakeGateway struct {
 	learnedErr   error
 	forgotten    []string
 	inspectCA    []egress.InspectCA
-	inspectErr   error
-	retained     []string
-	retains      int
+	// cleared counts ClearInspectCA calls; clearErr is what they return.
+	cleared    int
+	clearErr   error
+	inspectErr error
+	retained   []string
+	retains    int
 }
 
 func newFakeGateway() *fakeGateway {
@@ -131,6 +134,13 @@ func (f *fakeGateway) RetainLearned(_ context.Context, ids []string) error {
 	f.retains++
 	return nil
 }
+func (f *fakeGateway) ClearInspectCA(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleared++
+	return f.clearErr
+}
+
 func (f *fakeGateway) SetInspectCA(_ context.Context, ca egress.InspectCA) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
