@@ -250,6 +250,14 @@ other methods:
   API proxy adds the token itself (`use_auto_auth_token`). sandboxd holds no
   Vault credential at all.
 
+**Least privilege, checked (Phase 0).** With a token that may `create` on
+`<mount>/encrypt/<key>`, Transit silently recreates a deleted key on the next
+encrypt, which would hide a revoke. At boot sandboxd calls
+`sys/capabilities-self` for its encrypt, decrypt and keys paths and refuses to
+start if the encrypt path allows `create`, `sudo` or `root`. With the plan's
+`update`-only policy, an encrypt against a deleted key returns 403 and the key
+stays deleted.
+
 Refuse any `http://` address that is not loopback. Direct login methods wait
 for a customer who cannot run Vault Agent. sandboxd never reads the
 `VAULT_TOKEN` environment variable, so a token cannot reach it through the
@@ -330,9 +338,13 @@ vendor quirks, especially the CloudHSM GCM IV. Phase 0 makes the final choice.
 `Unwrap` is `C_Decrypt`.
 
 - **The IV.** AWS CloudHSM refuses an IV from the caller and writes its own
-  into `CK_GCM_PARAMS.pIv`. SoftHSM2 accepts the caller's IV. Support both with
-  `SB_SECRET_PKCS11_GCM_IV=hsm|caller` (default `hsm`). Phase 0 checks whether
-  probing the HSM can detect this instead.
+  into `CK_GCM_PARAMS.pIv`. SoftHSM2 accepts the caller's IV and, given a
+  zeroed buffer, encrypts with that all-zero IV instead of writing one (Phase
+  0). So `SB_SECRET_PKCS11_GCM_IV=auto|hsm|caller` defaults to `auto`: at helper
+  start, one probe encrypt with a zeroed IV buffer decides the mode (buffer
+  filled → `hsm`; buffer left zero → `caller`, with a fresh `crypto/rand` IV per
+  wrap). In every mode, a wrap whose IV comes back all zero is refused, so a
+  nonce can never repeat.
 - **No-GCM fallback.** `CKM_AES_KEY_WRAP_PAD` (RFC 5649) has no AAD. It would
   still be safe, because the v4 envelope already binds the sandbox identity
   into the payload AAD (`envelope.go:21-24`). A wrapped key moved to another
@@ -356,12 +368,14 @@ example), log in again, treating `CKR_USER_ALREADY_LOGGED_IN` as success;
 | PKCS#11 result | Error |
 |---|---|
 | `CKR_SESSION_COUNT`, `CKR_DEVICE_MEMORY`, pool wait timeout | `ErrProviderThrottled` |
-| `CKR_KEY_FUNCTION_NOT_PERMITTED` (decrypt turned off), or the **current** label (`SB_SECRET_PKCS11_KEY_LABEL`) not found | `ErrKeyRevoked` (new, Design §10) |
+| `CKR_KEY_FUNCTION_NOT_PERMITTED` (decrypt turned off), or the **current** label (`SB_SECRET_PKCS11_KEY_LABEL`) not found **while the session is logged in** (`C_GetSessionInfo` reports a user-functions state; private objects are invisible otherwise, Phase 0) | `ErrKeyRevoked` (new, Design §10) |
+| a label not found while the session is **not** logged in | re-login, then search again; never a revoke on its own |
+| `CKR_OBJECT_HANDLE_INVALID` on a cached key handle | search the label again, then classify |
 | `CKR_PIN_INCORRECT`, `CKR_PIN_EXPIRED`, `CKR_PIN_LOCKED` | `ErrProviderDenied` |
 | a label in `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` not found, while the current label still exists | `ErrKeyVersionRetired` |
 | a decrypt-only label not found **and** the current label not found | `ErrKeyRevoked` (so a revoke during a rotation window still trips) |
 | a `p11:` header naming a label in neither setting | `ErrDecryptFailed` ("wrapped under an unknown key label") |
-| `CKR_ENCRYPTED_DATA_INVALID`, `CKR_ENCRYPTED_DATA_LEN_RANGE`, a bad `p11:` header | `ErrDecryptFailed` |
+| `CKR_ENCRYPTED_DATA_INVALID`, `CKR_ENCRYPTED_DATA_LEN_RANGE`, a bad `p11:` header, or `CKR_GENERAL_ERROR` from `C_Decrypt` after a successful `C_DecryptInit` (SoftHSM2 reports a GCM tag mismatch this way, Phase 0) | `ErrDecryptFailed` |
 | anything else | `ErrProviderUnavailable` |
 
 sandboxd runs helpers with `os/exec`. Go's fork-then-exec never calls PKCS#11
@@ -377,7 +391,7 @@ reviewer does not have to rediscover it.
 | `SB_SECRET_PKCS11_PIN_FILE` | User PIN; group and other permission bits refused, with the same check as `wrap_key_loader.go:72` (0400 and 0600 pass) |
 | `SB_SECRET_PKCS11_KEY_LABEL` | Current key, used for new wraps |
 | `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` | Older keys still allowed for unwrap (rotation) |
-| `SB_SECRET_PKCS11_GCM_IV` | `hsm` (default) or `caller` |
+| `SB_SECRET_PKCS11_GCM_IV` | `auto` (default; probed at helper start), `hsm` or `caller` |
 
 **Software tokens.** At boot, `C_GetSlotInfo` reports whether the slot is
 hardware (`CKF_HW_SLOT`). SoftHSM2 is not. Enterprise mode refuses a
@@ -398,7 +412,7 @@ sweep (Design §11). Nothing else.
 | Backend | Grant |
 |---|---|
 | `awskms` | `kms:Encrypt`, `kms:Decrypt` and `kms:DescribeKey` (to tell a pending deletion from an outage, Design §10) on the one key. No `ReEncrypt`: AWS rotates in place, so there is no AWS sweep (Design §11). |
-| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). |
+| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). **Never `create`** on the encrypt path: Transit would recreate a deleted key on the next encrypt (Phase 0); sandboxd checks this at boot through `sys/capabilities-self`. |
 | `pkcs11` | user login on the token; the key object with `CKA_ENCRYPT` and `CKA_DECRYPT`; the decrypt-only labels with `CKA_DECRYPT`. |
 
 ### 3. The wrapped server key
@@ -1162,6 +1176,45 @@ Phase 1 also rewrites the reject at `internal/config/config.go:2599-2602` and
 the comment at `pkg/secrets/factory.go:38-40`. The `vault` value keeps
 refusing to boot until Phase 2 lands in the same stack.
 
+## Phase 0 results (2026-10-30)
+
+Run locally in Docker against Vault 1.18 and OpenBao 2.1 dev servers and
+SoftHSM2 2.6.1 (Debian bookworm), with `github.com/miekg/pkcs11` v1.1.1. The
+probe programs were throwaway and are not in the repo. CloudHSM and AWS-region
+latency are operator-run (they cost money) and stay open in the gate table.
+
+**Vault and OpenBao (identical results):**
+
+| Check | Result |
+|---|---|
+| encrypt with `associated_data` | 200 |
+| decrypt with the right AAD | 200, plaintext matches |
+| decrypt with a wrong or missing AAD | 400 `cipher: message authentication failed` → `ErrDecryptFailed`; no derived-key fallback needed |
+| `rewrap` with `associated_data` | 400 `cipher: message authentication failed` (confirms eng finding 2) |
+| decrypt after the key is deleted | 400 `encryption key not found`, also with an `update`-only token → `ErrKeyRevoked` |
+| decrypt below `min_decryption_version` | 400 `ciphertext or signature version is disallowed by policy (too old)` → `ErrKeyVersionRetired` |
+| `min_decryption_version` above latest | 400 `cannot set min decryption version of 5, latest key version is 2` |
+| encrypt after the key is deleted | root token: 200 and the key is **silently recreated**; `update`-only token: 403 `permission denied`, key stays deleted → new boot check (§1 "Least privilege, checked") |
+| audited request header | `x-aerol-correlation-id` recorded in the audit log with `hmac=false` |
+| `read` on `keys/<key>` | returns `latest_version` and `min_decryption_version` |
+| encrypt latency, loopback Docker on macOS | Vault p50 2.0 ms / p99 7.6 ms; OpenBao 1.5 / 5.5 ms (not the AWS-region number) |
+
+**SoftHSM2:**
+
+| Check | Result |
+|---|---|
+| `CKF_HW_SLOT` | false → enterprise refuses it, as designed |
+| `CKM_AES_GCM` / `CKM_AES_KEY_WRAP_PAD` | both available → no fallback needed (eng D16) |
+| caller-supplied IV | accepted |
+| zeroed IV buffer | **not filled; encrypts with the all-zero IV** → IV mode is now probed at helper start and an all-zero IV is always refused (§2) |
+| wrong AAD on decrypt | `CKR_GENERAL_ERROR`, not `CKR_ENCRYPTED_DATA_INVALID` → mapped to `ErrDecryptFailed` after a successful `C_DecryptInit` (§2) |
+| second `C_Login` | `CKR_USER_ALREADY_LOGGED_IN` → treat as success |
+| after every session closes | login is lost and private keys are **invisible** (label not found) → "label not found" is a revoke only while logged in (§2) |
+| destroyed key | label search finds nothing; a cached handle returns `CKR_OBJECT_HANDLE_INVALID` |
+
+**Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
+token (tested in Phase 2), and the CloudHSM rows above.
+
 ## Decisions needed
 
 Each open question blocks a named phase. A phase does not start until its
@@ -1187,13 +1240,14 @@ gates are answered and written back here.
 | ~~E8 short retry on Unavailable~~ answered: one jittered retry, foreground only (eng D17) | — | — |
 | ~~CEO-E4a sweep cadence~~ answered: boot + hourly (eng D19) | — | — |
 | ~~CEO-E4b no cross-node sealed-byte comparison~~ found one (`store.go:5865`); fixed by comparing without `WrappedKey` (eng D3) | — | — |
-| Phase 0: Vault and OpenBao reject a wrong AAD on decrypt (else the derived-key fallback) | Phase 0 result | Phase 2 |
-| Phase 0: miekg vs crypto11 | Phase 0 result | Phase 3 |
-| Phase 0: CloudHSM sets `CKF_HW_SLOT` (if not, enterprise mode would refuse it; rule changes) | Phase 0 result | Phase 3 |
+| ~~Phase 0: Vault and OpenBao reject a wrong AAD on decrypt~~ answered: yes, 400 `cipher: message authentication failed` on both (Phase 0) | — | — |
+| ~~Phase 0: miekg vs crypto11~~ answered: `github.com/miekg/pkcs11` v1.1.1 (Phase 0) | — | — |
+| Phase 0: CloudHSM sets `CKF_HW_SLOT`, fills a zeroed IV buffer, and offers AES-GCM (SoftHSM2 answered: no HW flag, no IV fill, GCM yes) | operator-run CloudHSM (costs money) | Phase 6 enterprise claim for CloudHSM |
 | ~~Phase 0: Transit `rewrap` accepts `associated_data`~~ answered: no (vault issue #29532); the sweep decrypts and re-encrypts (eng finding 2) | — | — |
-| Phase 0: Vault and OpenBao audited request headers record `X-Aerol-Correlation-ID` | Phase 0 result | Phase 2 (header), Phase 5 (docs) |
-| Phase 0: Vault error text for a deleted key and for a retired version | Phase 0 result | Phase 2 (error table) |
-| Phase 0: create-path wait under a restart storm, with the reserved slot | Phase 0 result | Phase 1 |
+| ~~Phase 0: audited request headers record `X-Aerol-Correlation-ID`~~ answered: yes on both with `hmac=false` (Phase 0) | — | — |
+| ~~Phase 0: Vault error text~~ answered: deleted key `encryption key not found`; retired version `ciphertext or signature version is disallowed by policy (too old)` (Phase 0) | — | — |
+| Phase 0: create-path wait under a restart storm, with the reserved slot (fake-backend benchmark in Phase 1; AWS numbers in the operator run) | Phase 1 benchmark + operator run | Phase 1 |
+| Phase 0: AWS-region latency and throughput for AWS KMS, Vault and CloudHSM (loopback only so far: Vault p50 2.0 ms / p99 7.6 ms, OpenBao 1.5 / 5.5 ms) | operator-run | Phase 6 sizing docs |
 | Background budget (2 slots) and re-check settings (5 min × 3) | eng, with Phase 0 numbers | Phase 1 (budget), Phase 4 (re-check) |
 
 The design text already assumes the recommended answer to F1 and F2. If the
