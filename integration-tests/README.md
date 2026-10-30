@@ -143,6 +143,39 @@ integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
 [`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
 runbook the automation mirrors (use it to debug a failed gate).
 
+## Key custody scenarios
+
+Customer key custody (`plans/customer-key-custody.md` Phase 6) has three
+scenarios. Each costs what any 3-node scenario costs; none adds an AWS
+service except the KMS key of the last one.
+
+| Scenario | Make target | Key store |
+|---|---|---|
+| `cluster-3-mixed-secrets-vault` | `make integration-key-custody-vault` | OpenBao 2.1.1 dev server (TLS) on the seed, OpenBao Proxy on every node |
+| `cluster-3-mixed-secrets-pkcs11` | `make integration-key-custody-pkcs11` | SoftHSM2 on every node, the same keys imported into each token |
+| `cluster-3-mixed-wrapped-kms` | `make integration-key-custody-kms` | A real AWS KMS key, with Terraform `key_custody = "wrapped"` |
+
+The vault and pkcs11 scenarios boot a plain local cluster. The cases
+(`suite/z_keycustody_*_test.go`, helpers in
+`suite/keycustody_support_test.go`) install the key store over SSH, switch
+to it the two-step way and wrap the server key, which is the migration a
+customer runs. Each step leaves a marker in `/var/lib/itest-keycustody` on
+the node, so a case run alone (`-run`) brings the cluster to the state it
+needs first. Settings go into `/etc/sandboxd/itest-keycustody.env` under a
+drop-in that sorts before the suite's transient override, so a boot-gate
+case can still override them for one restart.
+
+Fixture notes:
+
+- The OpenBao dev store is in memory: it lives as long as the
+  `itest-openbao` unit on the seed. The Transit key is exportable with
+  plaintext backup allowed, only so UC-300 can restore it after deleting it.
+- `softhsm2-util --import` skips whitespace bytes in a key file, so the
+  fixture's AES keys are 32 alphanumeric bytes.
+- SoftHSM2 keeps keys on the node's disk: the pkcs11 scenario proves the
+  code path, not a network HSM. The one AWS CloudHSM run is operator-gated
+  and not a scenario here (CloudHSM bills hourly per HSM).
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
