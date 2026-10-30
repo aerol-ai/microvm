@@ -174,6 +174,10 @@ type Service struct {
 	// Lazily built from cipher+store when tests construct &Service{...}
 	// without New; mount/registry seal paths still use cipher directly.
 	secretProvider secrets.Provider
+	// secretWrapBackend replaces the key-store client ConfigureSecretProvider
+	// builds (tests inject a fake KMS so no call leaves the process). It is
+	// still routed and limited.
+	secretWrapBackend secrets.DataKeyWrapper
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -759,9 +763,10 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 }
 
 // ConfigureSecretProvider selects the secrets.Provider from cfg.SecretProvider.
-// For awskms it builds the AWS client, runs an optional wrap/unwrap canary
-// (E4 lite), and fails open unless cfg.SecretProviderStrictBoot. Safe to call
-// when the provider is already local — it is a no-op refresh for that case.
+// For an external provider it builds the key-store client behind the per-node
+// limiter, runs a wrap/unwrap canary (E4 lite), and fails open unless
+// cfg.SecretProviderStrictBoot. Safe to call when the provider is already
+// local — it is a no-op refresh for that case.
 func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
@@ -772,13 +777,16 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
 		Cipher:      s.cipher,
 		Store:       newSecretBlobStore(s.store),
+		Wrapper:     s.secretWrapBackend,
+		MaxInFlight: s.cfg.SecretProviderMaxInFlight,
+		Observer:    recordKeyStoreLimiterWait,
 	}
 	p, wrapper, err := secrets.NewProvider(ctx, opts)
 	if err != nil {
 		return err
 	}
 	s.secretProvider = p
-	if name != secrets.ProviderAWSKMS || wrapper == nil {
+	if !secrets.IsExternalProvider(name) || wrapper == nil {
 		return nil
 	}
 	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {

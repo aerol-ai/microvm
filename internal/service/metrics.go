@@ -66,8 +66,13 @@ var (
 	secretDeleteOutboxRetiredStandalone = expvar.NewInt("aerolvm_secret_delete_outbox_retired_standalone_total")
 	secretPutOutboxRetiredStandalone    = expvar.NewInt("aerolvm_secret_put_outbox_retired_standalone_total")
 	secretCiphertextRetiredTotal        = expvar.NewInt("aerolvm_secret_ciphertext_retired_total")
-	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
+	// secretProviderCanaryOK is 1 after a successful external provider boot
+	// canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
+	// keyStoreLimiterWait is how long key-store calls waited for a slot, per
+	// limiter budget (foreground, create, background). A rising foreground
+	// tail means SB_SECRET_PROVIDER_MAX_INFLIGHT is below what restarts need.
+	keyStoreLimiterWait = scaleobs.NewNestedDurationBuckets("aerolvm_key_store_limiter_wait_seconds_bucket")
 	// Best-effort local seal failures (ownership replay backfill).
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
@@ -202,6 +207,10 @@ func recordSecretPutOutboxFailure() {
 	secretPutOutboxFailuresTotal.Add(1)
 }
 
+func recordKeyStoreLimiterWait(budget string, wait time.Duration) {
+	keyStoreLimiterWait.Observe(budget, wait)
+}
+
 func recordSecretProviderCanary(ok bool) {
 	if ok {
 		secretProviderCanaryOK.Set(1)
@@ -311,6 +320,10 @@ func classifySecretMetricError(err error) string {
 		return "ref_not_found"
 	case errors.Is(err, secrets.ErrDecryptFailed):
 		return "decrypt_failed"
+	case errors.Is(err, secrets.ErrKeyRevoked):
+		return "key_revoked"
+	case errors.Is(err, secrets.ErrKeyVersionRetired):
+		return "key_version_retired"
 	case errors.Is(err, secrets.ErrProviderUnavailable):
 		return "provider_unavailable"
 	case errors.Is(err, secrets.ErrProviderThrottled):
