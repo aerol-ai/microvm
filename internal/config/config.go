@@ -418,6 +418,15 @@ type Config struct {
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
 	CredentialEncryptionKeyPath string
+	// CredentialKeyCustody is how the server key is kept at rest: "file"
+	// (default; plaintext in the env or the key file, today's behavior) or
+	// "wrapped" (wrapped by SB_SECRET_PROVIDER and unwrapped at boot, so no
+	// plaintext copy lives on disk; plans/customer-key-custody.md §3).
+	// SB_CREDENTIAL_KEY_CUSTODY.
+	CredentialKeyCustody string
+	// CredentialKeyWrappedPath is the wrapped server-key file used when
+	// CredentialKeyCustody=wrapped. SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH.
+	CredentialKeyWrappedPath    string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
@@ -1151,16 +1160,22 @@ type Config struct {
 	SecretRecipientBackupCount int
 
 	// SecretProvider selects the secrets.Provider backend: "local" (default —
-	// node-local AES key, never contacts AWS/Vault), "awskms", or "vault".
-	// The off-state is local, not "no provider". SB_SECRET_PROVIDER.
+	// node-local AES key, never contacts a key store), "awskms", "vault" or
+	// "pkcs11". The off-state is local, not "no provider". SB_SECRET_PROVIDER.
 	SecretProvider string
 	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
 	// SB_SECRET_AWS_KMS_KEY_ID.
 	SecretAWSkmsKeyID string
-	// SecretProviderStrictBoot fails daemon start when the awskms boot canary
-	// (wrap/unwrap) fails. Default false = fail-open with a warning (E4 lite).
-	// SB_SECRET_PROVIDER_STRICT_BOOT.
+	// SecretProviderStrictBoot fails daemon start when the boot canary
+	// (wrap/unwrap) of any external provider fails. Default false = fail-open
+	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
 	SecretProviderStrictBoot bool
+	// SecretProviderMaxInFlight caps foreground key-store calls per node, so
+	// a restart storm cannot exceed what the customer's key store (an HSM
+	// partition's session limit, one Vault active node) can take. One slot is
+	// kept for creates and background work has its own 2 slots on top (eng
+	// D13). Default 8, range 1-256. SB_SECRET_PROVIDER_MAX_INFLIGHT.
+	SecretProviderMaxInFlight int
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -1887,6 +1902,8 @@ func Load() (Config, error) {
 		SSHHostKeyPath:                    getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:           strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
 		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		CredentialKeyCustody:              strings.ToLower(strings.TrimSpace(getEnv("SB_CREDENTIAL_KEY_CUSTODY", "file"))),
+		CredentialKeyWrappedPath:          getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", "/var/lib/sandboxd/credential_encryption.key.wrapped"),
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
@@ -1988,6 +2005,7 @@ func Load() (Config, error) {
 		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
+		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
@@ -2567,15 +2585,11 @@ func Load() (Config, error) {
 		// Sealed registry/mount credentials use this node-local AES key. A
 		// shared key is necessary but not sufficient for HA failover: the
 		// sealed row must also be fanned out to recipient peers (or a KMS
-		// provider used). Accept
-		// either an explicit env var or an already-distributed key file;
-		// refuse boot otherwise unless the operator opts out.
-		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
-			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
-				if os.IsNotExist(err) {
-					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
-				}
-				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+		// provider used). Refuse boot without a shared key unless the
+		// operator opts out.
+		if !cfg.ClusterInsecureCredentials {
+			if err := checkClusterCredentialKey(cfg); err != nil {
+				return Config{}, err
 			}
 		}
 		if cfg.ClusterTLSDir == "" {
@@ -2596,12 +2610,29 @@ func Load() (Config, error) {
 		if cfg.SecretAWSkmsKeyID == "" {
 			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
 		}
-	case "vault":
-		// Honest reject: vault is a reserved value on the same Provider seam
-		// but is not implemented. Never silently fall back to local.
-		return Config{}, errors.New("SB_SECRET_PROVIDER=vault is not implemented yet; use local or awskms")
+	case "vault", "pkcs11":
+		// Known values on the same seam that refuse until their wrappers land
+		// (plans/customer-key-custody.md Phases 2-3). Never silently fall back
+		// to local.
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local or awskms", cfg.SecretProvider)
 	default:
-		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, or vault (got %q)", cfg.SecretProvider)
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
+	}
+	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
+	}
+	switch cfg.CredentialKeyCustody {
+	case "", "file":
+		cfg.CredentialKeyCustody = "file"
+	case "wrapped":
+		// The server key is wrapped by the same key store that wraps row DEKs:
+		// one key store, one set of permissions, one log.
+		if cfg.SecretProvider == "local" {
+			return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs an external SB_SECRET_PROVIDER (awskms, vault or pkcs11) to wrap the server key")
+		}
+		return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped is not implemented yet; use file")
+	default:
+		return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped (got %q)", cfg.CredentialKeyCustody)
 	}
 	if cfg.SecretAuditRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
@@ -3043,6 +3074,33 @@ func getEnv(key, fallback string) string {
 		return ""
 	}
 	return value
+}
+
+// checkClusterCredentialKey refuses cluster mode without a server key every
+// node can share. With custody=file that is the env var or an already
+// distributed key file. With custody=wrapped it is the wrapped file only: a
+// plaintext copy is exactly what wrapped custody removes, so it does not
+// count here.
+func checkClusterCredentialKey(cfg Config) error {
+	if cfg.CredentialKeyCustody == "wrapped" {
+		if _, err := os.Stat(cfg.CredentialKeyWrappedPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs the wrapped server key at %s when SB_ENABLE_CLUSTER=true (wrap it on the first node and copy the wrapped file to every node; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out)", cfg.CredentialKeyWrappedPath)
+			}
+			return fmt.Errorf("stat %s: %w", cfg.CredentialKeyWrappedPath, err)
+		}
+		return nil
+	}
+	if cfg.CredentialEncryptionKey != "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
+		}
+		return fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+	}
+	return nil
 }
 
 func getEnvInt(key string, fallback int) int {

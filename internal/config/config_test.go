@@ -1002,6 +1002,51 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("secret_provider_limits_and_custody_defaults", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("SB_SECRET_PROVIDER", "")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if cfg.SecretProviderMaxInFlight != 8 || cfg.CredentialKeyCustody != "file" {
+			t.Fatalf("max in-flight %d custody %q, want 8 file", cfg.SecretProviderMaxInFlight, cfg.CredentialKeyCustody)
+		}
+		if cfg.CredentialKeyWrappedPath != "/var/lib/sandboxd/credential_encryption.key.wrapped" {
+			t.Fatalf("CredentialKeyWrappedPath = %q", cfg.CredentialKeyWrappedPath)
+		}
+	})
+
+	// With custody=wrapped the cluster check accepts the wrapped file, and a
+	// plaintext key does not stand in for it (plans/customer-key-custody.md
+	// §3). Wrapped custody itself refuses until Phase 4, so a passing cluster
+	// check shows up as that refusal.
+	t.Run("wrapped_custody_cluster_key_check", func(t *testing.T) {
+		dir := t.TempDir()
+		setClusterDefaults(t, filepath.Join(dir, "cred.key"))
+		wrapped := filepath.Join(dir, "cred.key.wrapped")
+		t.Setenv("SB_CREDENTIAL_KEY_CUSTODY", "wrapped")
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", wrapped)
+		t.Setenv("SB_SECRET_PROVIDER", "awskms")
+		t.Setenv("SB_SECRET_AWS_KMS_KEY_ID", "alias/aerolvm")
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "needs the wrapped server key at "+wrapped) {
+			t.Fatalf("plaintext key with no wrapped file = %v", err)
+		}
+		if err := os.WriteFile(wrapped, []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "wrapped is not implemented yet") {
+			t.Fatalf("wrapped file present = %v, want only the not-implemented refusal", err)
+		}
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", filepath.Join(wrapped, "nested"))
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "stat ") {
+			t.Fatalf("unreadable wrapped path = %v", err)
+		}
+	})
+
 	t.Run("secret_provider_awskms_requires_key", func(t *testing.T) {
 		dir := t.TempDir()
 		setClusterDefaults(t, filepath.Join(dir, "cred.key"))

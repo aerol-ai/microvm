@@ -11,8 +11,18 @@ func TestCov96LoadRejectsSecretProviderAndAuditBounds(t *testing.T) {
 		env  map[string]string
 		want string
 	}{
-		{name: "unknown provider", env: map[string]string{"SB_SECRET_PROVIDER": "gcpkms"}, want: "SB_SECRET_PROVIDER must be local, awskms, or vault"},
+		{name: "unknown provider", env: map[string]string{"SB_SECRET_PROVIDER": "gcpkms"}, want: "SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11"},
 		{name: "vault provider", env: map[string]string{"SB_SECRET_PROVIDER": "vault"}, want: "vault is not implemented"},
+		{name: "pkcs11 provider", env: map[string]string{"SB_SECRET_PROVIDER": "pkcs11"}, want: "pkcs11 is not implemented"},
+		{name: "zero in-flight cap", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "0"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
+		{name: "in-flight cap over 256", env: map[string]string{"SB_SECRET_PROVIDER_MAX_INFLIGHT": "257"}, want: "SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256"},
+		{name: "unknown key custody", env: map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "hsm"}, want: "SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped"},
+		{name: "wrapped custody with local provider", env: map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"}, want: "needs an external SB_SECRET_PROVIDER"},
+		{name: "wrapped custody not implemented", env: map[string]string{
+			"SB_CREDENTIAL_KEY_CUSTODY": "Wrapped",
+			"SB_SECRET_PROVIDER":        "awskms",
+			"SB_SECRET_AWS_KMS_KEY_ID":  "alias/aerolvm",
+		}, want: "SB_CREDENTIAL_KEY_CUSTODY=wrapped is not implemented yet"},
 		{name: "awskms without key", env: map[string]string{"SB_SECRET_PROVIDER": "awskms"}, want: "SB_SECRET_AWS_KMS_KEY_ID"},
 		{name: "negative audit retention", env: map[string]string{"SB_SECRET_AUDIT_RETENTION_DAYS": "-1"}, want: "SB_SECRET_AUDIT_RETENTION_DAYS"},
 		{name: "deleted grace over a day", env: map[string]string{"SB_AUDIT_DELETED_GRACE": "25h"}, want: "SB_AUDIT_DELETED_GRACE must be <= 24h"},
