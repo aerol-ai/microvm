@@ -5863,8 +5863,8 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("%w: existing seal_generation %d > %d for ref %q", ErrClusterSecretStaleGeneration, existingGen.Int64, rec.SealGeneration, rec.Ref)
 	}
 	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration {
-		if bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
-			// Same generation + same ciphertext: idempotent noop (still apply
+		if sameSealedSecret(existingPayload, rec.SealedPayload) {
+			// Same generation + same content: idempotent noop (still apply
 			// tomb and outbox transitions below so an originator retry recovers).
 		} else {
 			return 0, fmt.Errorf("%w: seal_generation %d payload conflict for ref %q", ErrClusterSecretPayloadConflict, rec.SealGeneration, rec.Ref)
@@ -5885,9 +5885,11 @@ func (s *Store) PutClusterSecret(ctx context.Context, rec ClusterSecretRecord) (
 		return 0, fmt.Errorf("%w: sandbox %q secret was deleted (tombstone gen=%d)", ErrClusterSecretTombBlocksPut, rec.SandboxID, tombGen.Int64)
 	}
 
-	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && bytes.Equal(nullableBlob(existingPayload), nullableBlob(rec.SealedPayload)) {
-		// Equal-generation identical payload: skip the row rewrite but still
-		// apply the generation's tomb and outbox transitions.
+	if existingGen.Valid && existingGen.Int64 == rec.SealGeneration && sameSealedSecret(existingPayload, rec.SealedPayload) {
+		// Equal-generation identical content: skip the row rewrite (the bytes
+		// on disk stay, so a late peer copy never undoes this node's own
+		// rewrap, eng D20) but still apply the generation's tomb and outbox
+		// transitions.
 		if _, err := tx.ExecContext(ctx, `
 			DELETE FROM cluster_secret_tombs WHERE sandbox_id = ? AND incarnation_id = ?
 		`, rec.SandboxID, parsedRef.IncarnationID); err != nil {
@@ -7634,6 +7636,37 @@ func (s *Store) ClusterSecretTombGenerationForIncarnation(ctx context.Context, s
 		return 0, fmt.Errorf("get cluster secret lifecycle tomb generation: %w", err)
 	}
 	return gen, nil
+}
+
+// sameSealedSecret reports whether two sealed rows of one generation hold
+// the same secret. After a key-store rewrap only the envelope's WrappedKey
+// differs between holders (plans/customer-key-custody.md §11, eng D3), and
+// that is the same secret.
+func sameSealedSecret(a, b []byte) bool {
+	return bytes.Equal(nullableBlob(a), nullableBlob(b)) || secrets.SameEnvelopeContent(a, b)
+}
+
+// RewrapClusterSecret replaces a row's sealed bytes with a rewrap of them,
+// only if the row still has the generation and the bytes the caller read
+// (compare-and-swap): a reseal, a delete or a newer peer copy that landed in
+// between wins, and the caller skips the row. A rewrap must keep the
+// content; anything else is refused.
+func (s *Store) RewrapClusterSecret(ctx context.Context, ref string, generation int64, old, rewrapped []byte) (bool, error) {
+	if !secrets.SameEnvelopeContent(old, rewrapped) {
+		return false, fmt.Errorf("%w: rewrap of %q changes more than the wrapped key", ErrClusterSecretPayloadConflict, ref)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE cluster_secrets SET sealed_payload = ?, updated_at = ?
+		WHERE ref = ? AND seal_generation = ? AND sealed_payload = ?
+	`, rewrapped, time.Now().UTC(), ref, generation, old)
+	if err != nil {
+		return false, fmt.Errorf("rewrap cluster secret %q: %w", ref, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("rewrap cluster secret %q: %w", ref, err)
+	}
+	return n == 1, nil
 }
 
 // ListClusterSecretsBatch returns the next ref-ordered page after afterRef.
