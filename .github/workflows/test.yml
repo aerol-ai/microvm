@@ -268,6 +268,53 @@ jobs:
           AEROL_WASM_IT_TOKEN: ${{ secrets.AEROL_WASM_IT_TOKEN }}
         run: go test -count=1 -tags integration -run TestIntegrationModulePushPullRoundTrip ./pkg/wasmmod/...
 
+  key-custody-integration:
+    # Real key stores for customer key custody (plans/customer-key-custody.md
+    # Phase 6): the provider contract and the live Vault checks (canary, AAD,
+    # the create-capability refusal, retired versions, revoke by deletion)
+    # against Vault and OpenBao dev servers. Behind the `integration` build
+    # tag, so `make test` stays offline. SoftHSM2 runs in go-tests already
+    # (TestSoftHSM). Images pinned by digest.
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start Vault and OpenBao dev servers
+        run: |
+          docker run -d --name vault --cap-add IPC_LOCK -p 18200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root \
+            hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166 \
+            server -dev -dev-listen-address=0.0.0.0:8200
+          docker run -d --name openbao -p 18300:8200 -e BAO_DEV_ROOT_TOKEN_ID=root -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            openbao/openbao:2.1@sha256:af40ca17625ec44aa1ffe3698f85162d71d9cc97adc9e97821ef393ac94b6e42 \
+            server -dev
+          for port in 18200 18300; do
+            for _ in $(seq 1 30); do
+              curl -sf "http://127.0.0.1:$port/v1/sys/health" >/dev/null && break
+              sleep 1
+            done
+          done
+
+      - name: Key store contract and live checks (Vault 1.18)
+        env:
+          SB_TEST_VAULT_ADDR: http://127.0.0.1:18200
+          SB_TEST_VAULT_ROOT_TOKEN: root
+        run: go test -count=1 -tags integration -run 'TestVaultLive|TestVaultProviderContract' -v ./pkg/secrets/
+
+      - name: Key store contract and live checks (OpenBao 2.1)
+        env:
+          SB_TEST_VAULT_ADDR: http://127.0.0.1:18300
+          SB_TEST_VAULT_ROOT_TOKEN: root
+        run: go test -count=1 -tags integration -run 'TestVaultLive|TestVaultProviderContract' -v ./pkg/secrets/
+
   go-sdk-tests:
     needs: paths
     if: needs.paths.outputs.go_sdk == 'true'

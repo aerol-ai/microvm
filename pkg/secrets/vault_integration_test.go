@@ -169,3 +169,36 @@ func (a vaultAdmin) newToken(policy string) string {
 	}
 	return out.Auth.ClientToken
 }
+
+// TestVaultProviderContract runs the provider contract every backend must
+// meet (provider_contract_test.go) against a real Vault or OpenBao: the
+// Phase 6 tag-gated CI job runs it against both dev servers. Same skip rule
+// as TestVaultLive.
+func TestVaultProviderContract(t *testing.T) {
+	addr, root := os.Getenv("SB_TEST_VAULT_ADDR"), os.Getenv("SB_TEST_VAULT_ROOT_TOKEN")
+	if addr == "" || root == "" {
+		t.Skip("SB_TEST_VAULT_ADDR / SB_TEST_VAULT_ROOT_TOKEN not set; skipping live Vault")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	admin := vaultAdmin{t: t, addr: addr, token: root}
+	suffix := make([]byte, 4)
+	_, _ = rand.Read(suffix)
+	key := "aerolvm-contract-" + hex.EncodeToString(suffix)
+	admin.do("POST", "sys/mounts/transit", map[string]any{"type": "transit"}, true)
+	admin.do("POST", "transit/keys/"+key, map[string]any{"type": "aes256-gcm96"}, false)
+	admin.do("PUT", "sys/policies/acl/"+key, map[string]any{"policy": fmt.Sprintf(
+		`path "transit/encrypt/%[1]s" { capabilities = ["update"] }
+path "transit/decrypt/%[1]s" { capabilities = ["update"] }
+path "transit/keys/%[1]s" { capabilities = ["read"] }
+path "sys/capabilities-self" { capabilities = ["update"] }`, key)}, false)
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte(admin.newToken(key)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w, err := NewWrapper(ctx, ProviderOptions{Name: ProviderVault, Vault: VaultOptions{Addr: addr, KeyName: key, TokenFile: tokenPath, NodeID: "contract"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testProviderContract(t, NewKMSProvider(w, newMemBlobStore()), providerContractOpts{anyNodeCanOpen: true})
+}
