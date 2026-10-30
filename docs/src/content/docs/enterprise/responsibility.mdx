@@ -33,7 +33,7 @@ Blue is yours. Purple is shared. Green is handled by AerolVM.
 | Sandbox images | | Choose where images come from, check them and pin them |
 | Sandbox settings | Enforces the runtime wall, the network policy and the limits you set | Choose the runtime, the policy, the mounts and the limits |
 | API tokens and access | Checks every credential on every server with no call to a login service. Enforces roles and teams on every route, and records every call with its caller. | Run your identity provider and remove leavers there. Write the role rules in the identity file. Give out and revoke API tokens. Keep the server token secret and, in production, limit it to the server. Review access every quarter. |
-| Secrets and keys | Seals secrets with AES-256-GCM and keeps inject values out of sandboxes | Protect and back up the server key. Set up AWS KMS if you use it. |
+| Secrets and keys | Seals secrets with AES-256-GCM, keeps inject values out of sandboxes, and stops within minutes when your key store revokes the key | Run your key store (AWS KMS, Vault, OpenBao or an HSM) and its access, or protect and back up the server key file. |
 | Audit records | Records every change, command, refused call, secret read and refused connection, with the caller, and checks the chain | Ship the records off the server and keep them as long as you need |
 | Software and fixes | Ships signed releases, and fixes security issues on the newest release line | Verify downloads and upgrade |
 | Isolation and checks | Builds the walls, seals the data and runs the checks | |

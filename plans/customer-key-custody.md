@@ -1224,6 +1224,41 @@ latency are operator-run (they cost money) and stay open in the gate table.
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
 
+## Phase 5 results (2026-10-31)
+
+- **Enterprise rules (§7).** Strict boot is required for every external
+  provider, not only `awskms`. An enterprise node with an external provider
+  and custody `file` logs a warning at boot and fires
+  `SandboxdServerKeyPlaintext` (F2, first release; Phase 7 refuses it). The
+  hardware-slot rule shipped in Phase 3.
+- **Metrics (Section 8).** Added the two key-store call metrics Phase 1 left
+  out: `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` and
+  `aerolvm_key_store_call_seconds_bucket{key="<backend>_<op>"}`, reported by
+  the router for every backend call, plus one OTEL span per call
+  (`key_store.wrap` / `key_store.unwrap`, backend and class attributes,
+  never key bytes).
+- **Alerts.** A `sandboxd.key-custody` group with
+  `SandboxdServerKeyPlaintext`, `SandboxdKeyRevoked` (critical),
+  `SandboxdKeyVersionRetiredInUse` and `SandboxdKeyStoreThrottling` (over 5%
+  of one backend's calls throttled for 15 minutes); `promtool check rules`
+  passes; `TestKeyCustodyAlertRules` checks severities, registered metrics,
+  positional labels and runbook anchors.
+- **Runbook.** `setup/runbooks/secrets-and-audit.md` gains a Key custody
+  section: one entry per alert, the revoke procedure per backend, both
+  rotations (key-store key incl. the four-step PKCS#11 label rotation, and
+  the server key) and the migration cleanup checklist.
+- **Dashboard.** A Key custody row in `d9-security-isolation.json`, checked by
+  `TestKeyCustodyRowMetricsAreRegistered`.
+- **Docs.** New page `enterprise/key-custody.mdx` ("Use your own key store"),
+  registered in the Enterprise tab's Security group rather than the Docs
+  sidebar, whose cluster-operations group is commented out; it sits next to
+  SSO. It ends with the five-language SDK section. The pages the Docs list
+  names, plus `cluster-glossary`, `engineering-security-overview`,
+  `engineering-trust-boundary` and `enterprise-mode`, no longer say "AWS KMS
+  only" or "Vault not built yet". Vendor naming follows the rule: Vault 1.18
+  and OpenBao 2.1 (tested live), HSMs as "any PKCS#11 v2.40 AES-GCM HSM; not
+  yet tested on hardware".
+
 ## Phase 4c results (2026-10-31)
 
 Server-key rotation (§13, eng D26) as designed: the key-id `Cipher` format
