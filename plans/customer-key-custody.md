@@ -325,7 +325,9 @@ child of sandboxd, so it never runs a different version. The short-lived
 `sandboxd key` CLI loads the same package in its own process; a crash there
 only ends the command.
 
-**Library.** Use `github.com/miekg/pkcs11`. It loads the vendor module with
+**Library.** Use `github.com/miekg/pkcs11` (v1.1.2: the module graph already
+pins it through containerd, and requiring Phase 0's v1.1.1 would downgrade
+containerd). It loads the vendor module with
 `dlopen` at runtime, so nothing vendor-specific is linked at build time. We
 need one mechanism and a session pool, about 300 lines. The `crypto11` family
 (ThalesGroup, now forked as `eclipse-keypont/crypto11`) is the reference for
@@ -343,8 +345,13 @@ vendor quirks, especially the CloudHSM GCM IV. Phase 0 makes the final choice.
   0). So `SB_SECRET_PKCS11_GCM_IV=auto|hsm|caller` defaults to `auto`: at helper
   start, one probe encrypt with a zeroed IV buffer decides the mode (buffer
   filled → `hsm`; buffer left zero → `caller`, with a fresh `crypto/rand` IV per
-  wrap). In every mode, a wrap whose IV comes back all zero is refused, so a
-  nonce can never repeat.
+  wrap). The probe runs on a throwaway session key (`CKA_TOKEN=false`), never
+  the real one (Phase 3): on a token that leaves the buffer zero it does
+  encrypt with the all-zero IV, and doing that with the real key at every
+  helper start would repeat a (key, IV) pair. A token that refuses session
+  keys makes `auto` fail with a message to set `hsm` or `caller`. In every
+  mode, a wrap whose IV comes back all zero is refused, so a nonce can never
+  repeat, and an unwrap of a row with an all-zero IV is refused too.
 - **No-GCM fallback.** `CKM_AES_KEY_WRAP_PAD` (RFC 5649) has no AAD. It would
   still be safe, because the v4 envelope already binds the sandbox identity
   into the payload AAD (`envelope.go:21-24`). A wrapped key moved to another
@@ -1214,6 +1221,22 @@ latency are operator-run (they cost money) and stay open in the gate table.
 
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
+
+## Phase 3 results (2026-10-31)
+
+`pkg/secrets/pkcs11` (eng D5, D6): the helper process, its socket protocol and
+supervisor, the session pool and the §2 error table, with a `!cgo` stub.
+
+| Check | Result |
+|---|---|
+| `TestSoftHSM` (SoftHSM2 2.6.1, Debian bookworm container) | wrap and unwrap, fresh non-zero IVs, `auto` → `caller`, `CKF_HW_SLOT` false, wrong AAD → `ErrDecryptFailed`, decrypt-only key destroyed → `ErrKeyVersionRetired`, current key destroyed → `ErrKeyRevoked` |
+| `TestVendorLibraryStaysInHelper` | `libsofthsm2.so` is in the helper's `/proc/<pid>/maps` and not in the parent's |
+| `sandboxd` boot with `SB_SECRET_PROVIDER=pkcs11` on SoftHSM2 | helper started, software-token warning, `secret provider boot canary ok provider=pkcs11` |
+| `go build ./cmd/sandboxd` with cgo | linux amd64, 386, arm64, armv7, armv6 (cross gcc in Docker) and darwin arm64 all build; CI runs the same matrix (`sandboxd-cgo-matrix`) |
+
+One design change from §2 as reviewed: the IV probe uses a throwaway session
+key (see "The IV" above). Sessions are opened read-write because the probe
+creates and destroys that key.
 
 ## Phase 2 results (2026-10-31)
 
