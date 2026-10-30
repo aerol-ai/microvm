@@ -1222,6 +1222,25 @@ latency are operator-run (they cost money) and stay open in the gate table.
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
 
+## Phase 4b results (2026-10-31)
+
+The rewrap sweep runs in the key-custody loop: at boot (after the API is up)
+and hourly after a random start delay. It moves this node's rows, and its
+server-key file, onto the sealing provider's current key under
+compare-and-swap, converts local rows after a `local → external` switch, and
+counts what is left in `aerolvm_key_rows_stale` and rows on a retired version
+in `aerolvm_key_rows_retired`. `PutClusterSecret` treats a same-generation
+copy that differs only in `WrappedKey` as the same secret and keeps the bytes
+on disk (eng D3, D20). An untagged row opens with the server key first, then
+AWS KMS (§12, eng D22).
+
+Live on a real `sandboxd` + Vault 1.18 (single node, so no cluster rows):
+after a Transit rotation the boot sweep rewrapped the server-key file
+(`vault:v1 → vault:v2`), and with v1 then retired the node still booted.
+Cluster rows are covered by unit tests over a Transit-like versioned store
+(paging past one page, conversion, rotation, retirement, key-store failure
+mid-pass); the cluster run is Phase 6.
+
 ## Phase 4 results (2026-10-31)
 
 Shipped as two stacked PRs. Both were run live on a real `sandboxd` against a
