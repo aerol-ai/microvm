@@ -37,6 +37,7 @@ func KeyStoreOptions(cfg config.Config, nodeID string, pkcs11 secrets.DataKeyWra
 		PKCS11:      pkcs11,
 		MaxInFlight: cfg.SecretProviderMaxInFlight,
 		Observer:    recordKeyStoreLimiterWait,
+		Calls:       recordKeyStoreCall,
 	}
 }
 

@@ -49,6 +49,9 @@ type ProviderOptions struct {
 	MaxInFlight int
 	// Observer is told how long calls waited for a key-store slot; may be nil.
 	Observer LimiterObserver
+	// Calls is told about every key-store call (backend, op, class,
+	// latency); may be nil.
+	Calls CallObserver
 }
 
 // NormalizeProviderName lowercases and defaults empty to local.
@@ -131,7 +134,9 @@ func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, erro
 	if maxInFlight <= 0 {
 		maxInFlight = DefaultMaxInFlight
 	}
-	return NewLimitedWrapper(NewRouter(name, seal, openers), maxInFlight, opts.Observer), nil
+	r := NewRouter(name, seal, openers)
+	r.observe = opts.Calls
+	return NewLimitedWrapper(r, maxInFlight, opts.Observer), nil
 }
 
 // NewProvider builds the configured Provider. For an external provider it

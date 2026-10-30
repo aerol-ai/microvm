@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/scaleobs"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -169,6 +171,28 @@ func TestKeyStoreMetrics(t *testing.T) {
 	recordKeyStoreLimiterWait(secrets.BudgetCreate, 3*time.Millisecond)
 	if got := keyStoreLimiterWait.Value(secrets.BudgetCreate, "le_5ms"); got != before+1 {
 		t.Fatalf("create wait bucket = %d, want %d", got, before+1)
+	}
+	// Key-store calls: {backend,op,class} counts and a latency histogram.
+	calls := func() int64 {
+		byOp, _ := keyStoreCalls.Get("vault").(*expvar.Map)
+		if byOp == nil {
+			return 0
+		}
+		byClass, _ := byOp.Get("unwrap").(*expvar.Map)
+		if byClass == nil {
+			return 0
+		}
+		return scaleobs.IntValue(byClass.Get("throttled"))
+	}
+	n := calls()
+	lat := keyStoreCallSeconds.Value("vault_unwrap", "le_5ms")
+	recordKeyStoreCall("vault", "unwrap", "throttled", 3*time.Millisecond)
+	recordKeyStoreCall("vault", "unwrap", "throttled", 3*time.Millisecond)
+	if calls() != n+2 || keyStoreCallSeconds.Value("vault_unwrap", "le_5ms") != lat+2 {
+		t.Fatalf("key-store calls = %d (was %d)", calls(), n)
+	}
+	if KeyStoreOptions(config.Config{}, "n", nil).Calls == nil {
+		t.Fatal("KeyStoreOptions does not report calls")
 	}
 }
 
