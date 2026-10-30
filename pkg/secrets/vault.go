@@ -63,7 +63,9 @@ const (
 )
 
 var (
-	vaultNameRE        = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	// A key name is one path segment with no dots (S9): ".." would address a
+	// different Vault path with the node's token.
+	vaultNameRE        = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 	vaultMountRE       = regexp.MustCompile(`^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$`)
 	safeCorrelationIDs = regexp.MustCompile(`^[A-Za-z0-9._:@+=/-]{1,128}$`)
 	// errVaultPolicy marks a token that may do more than the provider needs.
@@ -105,7 +107,7 @@ func NewVault(opts VaultOptions) (*Vault, error) {
 	}
 	key := strings.TrimSpace(opts.KeyName)
 	if !vaultNameRE.MatchString(key) {
-		return nil, fmt.Errorf("SB_SECRET_VAULT_KEY_NAME must be a Transit key name of letters, digits, '.', '_' or '-' (got %q)", opts.KeyName)
+		return nil, fmt.Errorf("SB_SECRET_VAULT_KEY_NAME must be a Transit key name of letters, digits, '_' or '-' (got %q)", opts.KeyName)
 	}
 	mount := strings.Trim(strings.TrimSpace(opts.Mount), "/")
 	if mount == "" {

@@ -223,6 +223,8 @@ func TestNewVaultValidation(t *testing.T) {
 		{"credentials in url", VaultOptions{Addr: "https://u:p@vault.example", KeyName: "k"}, "no credentials"},
 		{"no host", VaultOptions{Addr: "https://", KeyName: "k"}, "with a host"},
 		{"bad key name", VaultOptions{Addr: "https://vault.example", KeyName: "a/b"}, "SB_SECRET_VAULT_KEY_NAME"},
+		{"dot-dot key name", VaultOptions{Addr: "https://vault.example", KeyName: ".."}, "SB_SECRET_VAULT_KEY_NAME"},
+		{"dotted key name", VaultOptions{Addr: "https://vault.example", KeyName: "kek.v2"}, "SB_SECRET_VAULT_KEY_NAME"},
 		{"dot-dot mount", VaultOptions{Addr: "https://vault.example", KeyName: "k", Mount: "../sys"}, "SB_SECRET_VAULT_TRANSIT_MOUNT"},
 		{"empty segment mount", VaultOptions{Addr: "https://vault.example", KeyName: "k", Mount: "a//b"}, "SB_SECRET_VAULT_TRANSIT_MOUNT"},
 		{"missing ca file", VaultOptions{Addr: "https://vault.example", KeyName: "k", CACert: filepath.Join(dir, "none.pem")}, "read SB_SECRET_VAULT_CACERT"},
