@@ -128,9 +128,12 @@ jobs:
           cache: true
 
       - name: Install build dependencies
+        # softhsm2 lets pkg/secrets/pkcs11 test its real PKCS#11 adapter
+        # (TestSoftHSM, TestVendorLibraryStaysInHelper); a local library, so
+        # the suite stays offline.
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential softhsm2
 
       - name: Run unit tests with coverage
         run: |
@@ -170,10 +173,54 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential softhsm2
 
       - name: Race test all daemon packages
         run: go test -race -count=1 -timeout 25m ./cmd/... ./internal/... ./pkg/...
+
+  # Every sandboxd release target builds with cgo (go-sqlite3, and the
+  # PKCS#11 helper's miekg/pkcs11 since plans/customer-key-custody.md Phase
+  # 3). Same toolchains as release.yml's build matrix, so a cgo dependency
+  # that breaks a cross-compile fails here instead of at release time.
+  sandboxd-cgo-matrix:
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
+    name: sandboxd cgo build - ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64, goarm: "", suffix: linux_amd64, cc: gcc, apt_pkgs: build-essential }
+          - { runner: ubuntu-latest, goos: linux, goarch: "386", goarm: "", suffix: linux_386, cc: gcc, apt_pkgs: "build-essential gcc-multilib" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm64, goarm: "", suffix: linux_arm64, cc: aarch64-linux-gnu-gcc, apt_pkgs: "build-essential gcc-aarch64-linux-gnu" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "7", suffix: linux_armv7, cc: arm-linux-gnueabihf-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabihf" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "6", suffix: linux_armv6, cc: arm-linux-gnueabi-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabi" }
+          - { runner: macos-14, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "", apt_pkgs: "" }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_pkgs }}
+
+      - name: Build sandboxd
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CC: ${{ matrix.cc }}
+        run: go build -trimpath -o /tmp/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
 
   go-security:
     needs: paths
