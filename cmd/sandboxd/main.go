@@ -46,6 +46,16 @@ func main() {
 		return
 	}
 
+	// Server-key custody tool (plans/customer-key-custody.md §3). Runs
+	// outside systemd and never opens the database.
+	if len(os.Args) >= 2 && os.Args[1] == keySubcommand {
+		if err := runKeyCLI(os.Args[2:], os.Stdout); err != nil {
+			os.Stderr.WriteString("sandboxd key: " + err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
 	// PKCS#11 helper: the only process that loads the HSM vendor library
 	// (plans/customer-key-custody.md §2, eng D5). Started and supervised by
 	// sandboxd over a 0600 Unix socket, so a vendor crash or hang costs a
