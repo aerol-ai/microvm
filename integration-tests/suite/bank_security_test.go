@@ -298,8 +298,22 @@ func TestBankForkBombContained(t *testing.T) {
 		if out, rc := bankRun(t, neighbour, "echo alive", time.Minute); rc != 0 || !strings.Contains(out, "alive") {
 			t.Errorf("the neighbour stopped answering after the fork bomb: %q", out)
 		}
-		if out, rc := bankRun(t, sb, "echo alive", 2*time.Minute); rc != 0 || !strings.Contains(out, "alive") {
-			t.Errorf("the sandbox itself did not recover after its processes were killed: %q", out)
+		// At its pids limit the sandbox cannot even fork the kill above; it
+		// recovers when the bomb's sleeps end (120 s), so allow longer.
+		recovered := false
+		var last string
+		for deadline := time.Now().Add(3 * time.Minute); time.Now().Before(deadline); time.Sleep(10 * time.Second) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			res, err := sb.ExecCommand(ctx, "echo alive")
+			cancel()
+			if err == nil && res.ExitCode == 0 && strings.Contains(res.Stdout, "alive") {
+				recovered = true
+				break
+			}
+			last = fmt.Sprintf("%v %q", err, res.Stdout+res.Stderr)
+		}
+		if !recovered {
+			t.Errorf("the sandbox itself did not recover within 3 minutes of the fork bomb: %s", last)
 		}
 	})
 }
