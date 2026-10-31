@@ -86,6 +86,7 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	if !ok {
 		t.Skip("no SSH-reachable non-seed node runs the isolate runtime")
 	}
+	requireNonSeedVictim(t, victim)
 	target, _ := harness.SSHTarget(victim)
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", victim.Name, err, out)
