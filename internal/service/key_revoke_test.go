@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +76,20 @@ func revokeHarness(t *testing.T) (*Service, *switchableKMS, *fakeGateway, []byte
 	closed := new(int)
 	svc.OnKeyRevoked(func() int { *closed++; return 2 })
 	return svc, kms, gw, key, closed
+}
+
+// startKeyCustody starts svc's custody loops for one test and, when the
+// test ends, stops them and waits: the loops publish process-wide gauges
+// that later tests read, and a loop left running resets them under those
+// tests (the reseal gauge flaked under -race that way).
+func startKeyCustody(t *testing.T, svc *Service, ctx context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		cancel()
+		svc.keyCustody.loops.Wait()
+	})
+	svc.StartKeyCustody(ctx)
 }
 
 func custodyRecords(svc *Service, kind string) []SecretAuditEvent {
@@ -430,6 +448,40 @@ func TestOwedGatewayClearIsRetried(t *testing.T) {
 	}
 }
 
+// TestVaultReplyTextNeverReachesLogs: a key-store reply can echo request
+// content (a plugin, a proxy in front of Vault), and the re-check logs its
+// error, so nothing of the reply's text may reach the log.
+func TestVaultReplyTextNeverReachesLogs(t *testing.T) {
+	const marker = "SENSITIVE_PROVIDER_BODY_MARKER"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `{"errors":[%q]}`, marker)
+	}))
+	t.Cleanup(srv.Close)
+	v, err := secrets.NewVault(secrets.VaultOptions{Addr: srv.URL, KeyName: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, _, _, _, _ := revokeHarness(t)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.SetKeyStoreWrapper(v)
+	f, err := secrets.ReadWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Wrapped = []byte("vault:v1:fixture")
+	if err := secrets.WriteWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath, f); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.RecheckServerKey(context.Background()); got != recheckDenied {
+		t.Fatalf("re-check = %s, want %s", got, recheckDenied)
+	}
+	if strings.Contains(logs.String(), marker) || !strings.Contains(logs.String(), "403") {
+		t.Fatalf("log = %s, want the status and none of the reply", logs.String())
+	}
+}
+
 // The file swapped for another key: it unwraps and matches its own check,
 // but the node only takes back the key it was built with.
 func TestRecoveryRefusesADifferentKey(t *testing.T) {
@@ -468,7 +520,7 @@ func TestStartKeyCustody(t *testing.T) {
 	}
 	before := count()
 	ctx, cancel := context.WithCancel(context.Background())
-	svc.StartKeyCustody(ctx)
+	startKeyCustody(t, svc, ctx)
 	deadline := time.Now().Add(2 * time.Second)
 	for count() == before {
 		if time.Now().After(deadline) {
@@ -479,7 +531,7 @@ func TestStartKeyCustody(t *testing.T) {
 	cancel()
 	// File custody: no loop at all.
 	svc.cfg.CredentialKeyCustody = secrets.CustodyFile
-	svc.StartKeyCustody(context.Background())
+	startKeyCustody(t, svc, context.Background())
 	(*Service)(nil).StartKeyCustody(context.Background())
 	if (*Service)(nil).KeyRevoked() {
 		t.Fatal("nil service revoked")

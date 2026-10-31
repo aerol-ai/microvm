@@ -275,6 +275,15 @@ type keyCustodyState struct {
 	closers []func() int
 	// restartGateway replaces the systemctl restart in tests.
 	restartGateway func(context.Context) error
+	// sweptVersion is the key-store version the last finished sweep
+	// counted against, and resealedRing the server-key ring the last
+	// finished reseal pass counted (ringView): a count is only good for
+	// the target it was made for. Both under mu.
+	sweptVersion string
+	resealedRing string
+	// loops are StartKeyCustody's goroutines, so a shutdown (or a test)
+	// can wait for them to stop touching the gauges.
+	loops sync.WaitGroup
 }
 
 // KeyRevoked reports whether the customer's key store revoked the server
@@ -360,7 +369,9 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 		s.noteServerKeyRing(entries)
 	}
 	reseal := make(chan struct{}, 1)
+	s.keyCustody.loops.Add(2)
 	go func() {
+		defer s.keyCustody.loops.Done()
 		// ±10% jitter on the re-check, for the same reason.
 		nextRecheck := func() <-chan time.Time {
 			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
@@ -385,10 +396,14 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 		}
 	}()
 	go func() {
+		defer s.keyCustody.loops.Done()
 		var sweepC <-chan time.Time
 		if sweep {
 			s.sweepPass(ctx)
 			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		s.resealTick(ctx)
 		for {
@@ -645,8 +660,11 @@ const (
 var (
 	// keyRowsStale counts this node's rows not on the current key, plus its
 	// server-key file. "0 on every member" is when an old version may be
-	// retired (§11) or a local → key store switch is complete (§12).
-	keyRowsStale = expvar.NewInt("aerolvm_key_rows_stale")
+	// retired (§11) or a local → key store switch is complete (§12), so it
+	// is -1, unknown, until a sweep against the current version finishes:
+	// at boot, on a node that does not sweep, and while a pass against a
+	// new version runs.
+	keyRowsStale = unknownGauge("aerolvm_key_rows_stale")
 	// keyRowsRetired counts rows on a key version the key store no longer
 	// decrypts: opens of those sandboxes fail on this node
 	// (SandboxdKeyVersionRetiredInUse).
@@ -655,6 +673,13 @@ var (
 	keyCurrentGauge   = expvar.NewMap("aerolvm_key_current")
 	keyDecryptableMap = expvar.NewMap("aerolvm_key_decryptable")
 )
+
+// unknownGauge is an expvar gauge that starts at -1: nothing counted yet.
+func unknownGauge(name string) *expvar.Int {
+	v := expvar.NewInt(name)
+	v.Set(-1)
+	return v
+}
 
 // decryptableKeys is a key store that lists the key versions it still opens
 // (the PKCS#11 helper: its current label and its decrypt-only labels).
@@ -701,6 +726,17 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	cancel()
 	if err != nil {
 		return 0, fmt.Errorf("read the current key version: %w", err)
+	}
+	// The last pass counted against the version it saw. Until a pass
+	// against this one finishes, that count says nothing about it: current
+	// = v2 beside the v1 pass's stale = 0 would read as safe to retire v1
+	// while its rows are still being moved. So the count goes before the
+	// new version is published.
+	s.keyCustody.mu.Lock()
+	sameTarget := s.keyCustody.sweptVersion == current
+	s.keyCustody.mu.Unlock()
+	if !sameTarget {
+		keyRowsStale.Set(-1)
 	}
 	s.publishKeyVersions(current)
 	provider := secrets.NormalizeProviderName(s.cfg.SecretProvider)
@@ -756,6 +792,9 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	finished = true
 	keyRowsStale.Set(int64(stale))
 	keyRowsRetired.Set(int64(retired))
+	s.keyCustody.mu.Lock()
+	s.keyCustody.sweptVersion = current
+	s.keyCustody.mu.Unlock()
 	return stale, nil
 }
 
