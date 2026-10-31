@@ -1309,6 +1309,7 @@ four fresh clusters, all torn down afterwards:
 | UC-314 a backup restored onto the wiped node boots through the key store and rejoins; its next backup holds no plaintext key | vault | pass (146 s) after a test fix |
 | UC-315 one node installed with `install.sh --key-custody wrapped` | new `single-node-wrapped-kms` | pass |
 | UC-304 now also checks that a pre-rotation copy of the wrapped file holds only the retired key | vault | pass |
+| UC-305 restart with the plan's 50 secret-bearing sandboxes (0.25 CPU, 256 MB each): all open, no throttled call | vault | pass |
 | UC-301 key store down at boot | vault | **failed, then fixed**: see below; pass (165 s) |
 
 UC-301 found a third product gap: the unit `install.sh` writes stops
@@ -1322,8 +1323,21 @@ Deviations: "restore onto a fresh node" restores onto the same machine
 after wiping everything the backup covers (the suite cannot add a node);
 "a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
 SSH-session half of the full stop and the alert itself stay unit-tested
-(the alert's condition, `aerolvm_key_revoked == 1`, is asserted live); the
-restart test keeps 20 sandboxes, not 50, for the test nodes' capacity.
+(the alert's condition, `aerolvm_key_revoked == 1`, is asserted live).
+
+A full local `go test ./...` on the stack (CI runs no Go job on a PR that
+targets another stack branch) found `pkg/caddy`'s install.sh render test
+failing since the wrapped-key phase: its prelude lacked `KEY_CUSTODY`.
+Fixed on this branch.
+
+Follow-up (not a key-custody regression): on a joiner, install.sh starts
+sandboxd standalone before cluster-join.sh, and with `--key-custody
+wrapped` that first boot takes the "fresh single node, generate" path; the
+join restarts it within seconds (one live run caught it cancelled mid-wrap)
+and installs the seed's wrapped file over anything it wrote. Nothing is
+sealed in that window, and the plaintext install has the same
+standalone-first boot, but install.sh could skip starting sandboxd when a
+join follows.
 
 ## Phase 5 results (2026-10-31)
 
