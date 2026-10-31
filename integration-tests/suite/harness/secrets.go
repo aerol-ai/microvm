@@ -716,7 +716,7 @@ func awaitUnitActive(t *testing.T, target, unit string, timeout time.Duration) b
 		// reporting a healthy node as failed to start.
 		switch lastNonEmptyLine(out) {
 		case "active":
-			return true
+			return unitStaysActive(t, target, unit, unitStableWindow)
 		case "failed":
 			// Terminal: systemd has given up. Polling on would just burn the
 			// remaining timeout for an answer that cannot change.
@@ -728,6 +728,33 @@ func awaitUnitActive(t *testing.T, target, unit string, timeout time.Duration) b
 		time.Sleep(2 * time.Second)
 	}
 	return false
+}
+
+// unitStableWindow is how long a unit must stay up to count as started.
+// A variable so the harness's own tests need not wait it out.
+var unitStableWindow = 20 * time.Second
+
+// unitStaysActive reports whether unit stays active, with no new restarts,
+// for window. sandboxd is Type=simple with Restart=always: a daemon its boot
+// gate refuses is "active" for the moment between each restart and its exit,
+// and reading that one moment as a start made a held gate look like it
+// failed OPEN (UC-265 on single-node-secrets-enterprise, where the journal
+// showed "sandboxd exited with error: secret audit witness mismatch" on
+// every restart).
+func unitStaysActive(t *testing.T, target, unit string, window time.Duration) bool {
+	t.Helper()
+	restarts := func() string {
+		out, _ := SSHRun(t, target, "systemctl show -p NRestarts --value "+unit+" || true")
+		return lastNonEmptyLine(out)
+	}
+	before := restarts()
+	for deadline := time.Now().Add(window); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
+		out, _ := SSHRun(t, target, "sudo systemctl is-active "+unit+" || true")
+		if lastNonEmptyLine(out) != "active" {
+			return false
+		}
+	}
+	return restarts() == before
 }
 
 func sortedKeys(m map[string]string) []string {
