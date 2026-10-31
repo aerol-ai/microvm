@@ -66,11 +66,18 @@ func (s *Service) nodeControlEndpoints() []netip.AddrPort {
 var hostServicePorts = []uint16{22, 111}
 
 // controlPorts are this node's control listeners (API, SSH gateway, Raft,
-// gossip and the cluster mTLS listener) and its host services.
+// gossip, the cluster mTLS listener and, with ingress proxy routing, the
+// host-port redirect listener) and its host services.
 func (s *Service) controlPorts() []uint16 {
 	out := append([]uint16(nil), hostServicePorts...)
 	if s.cfg.APIPort > 0 && s.cfg.APIPort < 65536 {
 		out = append(out, uint16(s.cfg.APIPort))
+	}
+	// The redirect listener takes raw-TCP host-port traffic the firewall
+	// steered to it; a sandbox has no business dialing it directly (found
+	// reachable on cluster-3-mixed-routing, UC-319).
+	if s.cfg.IngressProxyRouting && s.cfg.HostPortRedirectPort > 0 && s.cfg.HostPortRedirectPort < 65536 {
+		out = append(out, uint16(s.cfg.HostPortRedirectPort))
 	}
 	for _, addr := range []string{s.cfg.SSHListenAddr, s.cfg.RaftBindAddr, s.cfg.GossipBindAddr, s.cfg.ClusterInternalListenAddr} {
 		if _, p, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {

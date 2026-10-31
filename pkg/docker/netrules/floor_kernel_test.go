@@ -81,7 +81,7 @@ func TestKernelFloor(t *testing.T) {
 	floor := []netip.Prefix{netip.MustParsePrefix("10.211.0.0/24")}
 	for _, backend := range []string{BackendNetlink, BackendExec} {
 		t.Run(backend, func(t *testing.T) {
-			_ = exec.Command("iptables", "-F", ChainAerolvmFloor).Run()
+			_ = exec.Command("iptables", "-F", FloorChainFor(subnet)).Run()
 			mgr, err := NewWithOptions(true, backend, ChainAerolvmUser)
 			if err != nil {
 				t.Fatal(err)
@@ -99,12 +99,13 @@ func TestKernelFloor(t *testing.T) {
 				t.Fatal("the floor must drop forwarded traffic from the sandbox subnet")
 			}
 			// Replacing is whole-chain: a second set with the same entry
-			// leaves one rule, not two.
+			// leaves the same two rules (the entry, and the subnet to itself
+			// while sandboxes are isolated from each other), not four.
 			if err := mgr.SetFloor(subnet, floor); err != nil {
 				t.Fatal(err)
 			}
-			out, _ := exec.Command("iptables", "-S", ChainAerolvmFloor).CombinedOutput()
-			if n := strings.Count(string(out), "-j DROP"); n != 1 {
+			out, _ := exec.Command("iptables", "-S", FloorChainFor(subnet)).CombinedOutput()
+			if n := strings.Count(string(out), "-j DROP"); n != 2 {
 				t.Fatalf("floor rules after a repeat = %d:\n%s", n, out)
 			}
 			if err := mgr.SetFloor(subnet, nil); err != nil {
