@@ -343,13 +343,17 @@ func mcpForward(r *http.Request) bool {
 // requestSurface is the surface an api or denied record names: the one the
 // in-process transport put on the context (an edge's MCP inner call), or
 // mcp for a peer's MCP forward, so the owner that runs a forwarded inner
-// call records it as the MCP call it is (§5.9).
+// call records it as the MCP call it is (§5.9), or ssh for a call the SSH
+// gateway bridged (sshGatewayCall).
 func requestSurface(r *http.Request) string {
 	if surface := auditlog.SurfaceFromContext(r.Context()); surface != "" {
 		return surface
 	}
 	if mcpForward(r) {
 		return auditlog.SurfaceMCP
+	}
+	if _, ok := auditlog.SSHGatewayCallFromContext(r.Context()); ok {
+		return auditlog.SurfaceSSH
 	}
 	return ""
 }
@@ -627,6 +631,9 @@ func (s *Server) withAuth(surface authSurface, next http.Handler) http.Handler {
 			return
 		}
 		ctx := controlplane.ContextWithAccess(r.Context(), access)
+		if call, ok := sshGatewayCall(r, access); ok {
+			ctx = auditlog.ContextWithSSHGatewayCall(ctx, call)
+		}
 		switch access.Principal.Kind {
 		case controlplane.PrincipalOperator, controlplane.PrincipalNode:
 			// Where this node accepted the PAT, for the
