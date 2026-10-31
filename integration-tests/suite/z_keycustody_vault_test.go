@@ -426,10 +426,11 @@ func TestKeyCustodyRestartWithManySecrets(t *testing.T) {
 	kcVaultWrapped(t, targets)
 	nodes := kcNodes(targets)
 	c := client(t)
-	const n = 20
+	// The plan's 50, kept small so three t3.medium nodes hold them all.
+	const n = 50
 	ids := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, Env: map[string]string{"UC305": strconv.Itoa(i)}})
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, CPU: 0.25, MemoryMB: 256, DiskGB: 1, Env: map[string]string{"UC305": strconv.Itoa(i)}})
 		ids = append(ids, sb.ID)
 	}
 	throttled := map[string]float64{}
