@@ -31,6 +31,9 @@ INTERNAL_ADVERTISE_URL=""
 TLS_BUNDLE_OUT=""
 CRED_KEY_PATH=""
 CRED_BUNDLE_OUT=""
+KEY_CUSTODY="file"
+WRAPPED_KEY_PATH=""
+SANDBOXD_BIN="${SANDBOXD_BIN:-/usr/local/bin/sandboxd}"
 FORCE="false"
 MAX_AUTO_VOTERS="5"
 NODE_ROLE=""
@@ -84,6 +87,16 @@ Options:
                                 /var/lib/sandboxd/credential_encryption.key.
                                 If the file is missing, a fresh 32-byte key is
                                 generated and written here.
+  --key-custody <file|wrapped>  How the server key is kept. "wrapped" keeps
+                                it only wrapped by SB_SECRET_PROVIDER (awskms,
+                                vault or pkcs11, set in sandboxd.env): no
+                                plaintext key in cluster.env, on disk or in
+                                the cred bundle (plans/customer-key-custody.md).
+                                Default: file.
+  --wrapped-key-path <path>     Wrapped server-key file. Default:
+                                SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH from
+                                sandboxd.env, else
+                                /var/lib/sandboxd/credential_encryption.key.wrapped.
   --cred-bundle-out <path>      Standalone credential bundle (tarball with
                                 credential_encryption.key). Kept separate from
                                 the TLS trust bundle so ca.crt distribution
@@ -142,6 +155,8 @@ while [[ $# -gt 0 ]]; do
 		--tls-bundle-out)     TLS_BUNDLE_OUT="$2"; shift 2 ;;
 		--credential-key-path) CRED_KEY_PATH="$2"; shift 2 ;;
 		--cred-bundle-out)    CRED_BUNDLE_OUT="$2"; shift 2 ;;
+		--key-custody)        KEY_CUSTODY="$2"; shift 2 ;;
+		--wrapped-key-path)   WRAPPED_KEY_PATH="$2"; shift 2 ;;
 		--max-auto-voters)    MAX_AUTO_VOTERS="$2"; shift 2 ;;
 		--role)               NODE_ROLE="$2"; shift 2 ;;
 		--ingress-advertise-host) INGRESS_ADVERTISE_HOST="$2"; shift 2 ;;
@@ -321,22 +336,57 @@ if [[ -z "$CRED_KEY_PATH" ]]; then
 	CRED_KEY_PATH="${CRED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key}"
 fi
 
-if [[ ! -f "$CRED_KEY_PATH" ]]; then
-	mkdir -p "$(dirname "$CRED_KEY_PATH")"
-	if ! command -v openssl >/dev/null 2>&1; then
-		echo "openssl not found — required to generate the credential encryption key." >&2
-		echo "Install openssl, or pre-create $CRED_KEY_PATH (base64-encoded 32 bytes)." >&2
-		exit 1
-	fi
-	openssl rand -base64 32 > "$CRED_KEY_PATH"
-	chmod 0600 "$CRED_KEY_PATH"
+case "$KEY_CUSTODY" in
+	file|wrapped) ;;
+	*) echo "--key-custody must be file or wrapped (got $KEY_CUSTODY)" >&2; exit 1 ;;
+esac
+if [[ -z "$WRAPPED_KEY_PATH" ]]; then
+	WRAPPED_KEY_PATH="$(read_sandboxd_env_value SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH)"
+	WRAPPED_KEY_PATH="${WRAPPED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key.wrapped}"
 fi
 
-CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_PATH")"
-CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
-if [[ "$CRED_DECODED_LEN" != "32" ]]; then
-	echo "Invalid credential key at $CRED_KEY_PATH: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
-	exit 1
+if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+	# The key exists only wrapped by the customer's key store; sandboxd key
+	# reaches it with the settings in sandboxd.env and never writes a
+	# plaintext copy (plans/customer-key-custody.md §3).
+	key_tool() {
+		SB_CREDENTIAL_ENCRYPTION_KEY_PATH="$CRED_KEY_PATH" \
+		SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH="$WRAPPED_KEY_PATH" \
+			"$SANDBOXD_BIN" key "$@" --env-file /etc/sandboxd/sandboxd.env
+	}
+	if [[ -f "$WRAPPED_KEY_PATH" ]]; then
+		echo "[cluster-init] reusing the wrapped server key at $WRAPPED_KEY_PATH"
+		key_tool verify
+	elif [[ -f "$CRED_KEY_PATH" ]]; then
+		# install.sh's first boot made a plaintext key: wrap it, then remove
+		# it, because the daemon refuses to start under wrapped custody while
+		# it exists. This is not a secure delete; `sandboxd key status` keeps
+		# reporting the migration until `sandboxd key ack-migration`.
+		echo "[cluster-init] wrapping the existing server key at $CRED_KEY_PATH"
+		key_tool wrap
+		rm -f "$CRED_KEY_PATH"
+	else
+		key_tool wrap --generate --seed
+	fi
+	chmod 0600 "$WRAPPED_KEY_PATH"
+else
+	if [[ ! -f "$CRED_KEY_PATH" ]]; then
+		mkdir -p "$(dirname "$CRED_KEY_PATH")"
+		if ! command -v openssl >/dev/null 2>&1; then
+			echo "openssl not found — required to generate the credential encryption key." >&2
+			echo "Install openssl, or pre-create $CRED_KEY_PATH (base64-encoded 32 bytes)." >&2
+			exit 1
+		fi
+		openssl rand -base64 32 > "$CRED_KEY_PATH"
+		chmod 0600 "$CRED_KEY_PATH"
+	fi
+
+	CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_PATH")"
+	CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+	if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+		echo "Invalid credential key at $CRED_KEY_PATH: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
+		exit 1
+	fi
 fi
 
 # --- Cluster TLS material (self-signed CA + per-node cert) -----------------
@@ -415,8 +465,14 @@ if [[ -z "$CRED_BUNDLE_OUT" ]]; then
 	CRED_BUNDLE_OUT="$(pwd)/aerolvm-cred-bundle.tar.gz"
 fi
 CRED_STAGE_DIR="$(mktemp -d)"
-install -m 0600 "$CRED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key"
-tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
+if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+	# Ciphertext only: the bundle (and any S3 copy of it) never holds the key.
+	install -m 0600 "$WRAPPED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key.wrapped"
+	tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key.wrapped
+else
+	install -m 0600 "$CRED_KEY_PATH" "$CRED_STAGE_DIR/credential_encryption.key"
+	tar -C "$CRED_STAGE_DIR" -czf "$CRED_BUNDLE_OUT" credential_encryption.key
+fi
 chmod 0600 "$CRED_BUNDLE_OUT"
 rm -rf "$CRED_STAGE_DIR"
 CRED_BUNDLE_GENERATED="true"
@@ -443,10 +499,16 @@ SB_RAFT_DATA_DIR=$RAFT_DATA_DIR
 SB_GOSSIP_BIND_ADDR=$GOSSIP_BIND_ADDR
 SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
-SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
-SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH=$WRAPPED_KEY_PATH"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH"
+	else
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH"
+	fi
 	if [[ -n "$NODE_ROLE" ]]; then
 		echo "SB_NODE_ROLE=$NODE_ROLE"
 	fi

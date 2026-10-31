@@ -595,6 +595,23 @@ variable "secret_kms_enabled" {
 # SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
 # from failing at daemon start with a config error. A scenario can still turn
 # it off through extra_sandboxd_env, which is rendered after this block.
+# Server-key custody (plans/customer-key-custody.md §3). "wrapped" keeps the
+# server key that seals env, registry, mount and toolbox secrets only wrapped
+# by the KMS key above: install.sh and cluster-init.sh never write it in
+# plaintext, and the S3 cred bundle object then holds only the wrapped file.
+# Needs secret_kms_enabled (this module provisions only AWS KMS; Vault and
+# HSM key stores are the customer's own).
+variable "key_custody" {
+  description = "Server-key custody: \"file\" (default, plaintext key) or \"wrapped\" (wrapped by the secret_kms_enabled key; needs a release whose scripts have --key-custody)."
+  type        = string
+  default     = "file"
+
+  validation {
+    condition     = contains(["file", "wrapped"], var.key_custody)
+    error_message = "key_custody must be \"file\" or \"wrapped\"."
+  }
+}
+
 variable "secret_kms_strict_boot" {
   description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
   type        = bool

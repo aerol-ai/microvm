@@ -250,6 +250,14 @@ other methods:
   API proxy adds the token itself (`use_auto_auth_token`). sandboxd holds no
   Vault credential at all.
 
+**Least privilege, checked (Phase 0).** With a token that may `create` on
+`<mount>/encrypt/<key>`, Transit silently recreates a deleted key on the next
+encrypt, which would hide a revoke. At boot sandboxd calls
+`sys/capabilities-self` for its encrypt, decrypt and keys paths and refuses to
+start if the encrypt path allows `create`, `sudo` or `root`. With the plan's
+`update`-only policy, an encrypt against a deleted key returns 403 and the key
+stays deleted.
+
 Refuse any `http://` address that is not loopback. Direct login methods wait
 for a customer who cannot run Vault Agent. sandboxd never reads the
 `VAULT_TOKEN` environment variable, so a token cannot reach it through the
@@ -317,7 +325,9 @@ child of sandboxd, so it never runs a different version. The short-lived
 `sandboxd key` CLI loads the same package in its own process; a crash there
 only ends the command.
 
-**Library.** Use `github.com/miekg/pkcs11`. It loads the vendor module with
+**Library.** Use `github.com/miekg/pkcs11` (v1.1.2: the module graph already
+pins it through containerd, and requiring Phase 0's v1.1.1 would downgrade
+containerd). It loads the vendor module with
 `dlopen` at runtime, so nothing vendor-specific is linked at build time. We
 need one mechanism and a session pool, about 300 lines. The `crypto11` family
 (ThalesGroup, now forked as `eclipse-keypont/crypto11`) is the reference for
@@ -330,9 +340,18 @@ vendor quirks, especially the CloudHSM GCM IV. Phase 0 makes the final choice.
 `Unwrap` is `C_Decrypt`.
 
 - **The IV.** AWS CloudHSM refuses an IV from the caller and writes its own
-  into `CK_GCM_PARAMS.pIv`. SoftHSM2 accepts the caller's IV. Support both with
-  `SB_SECRET_PKCS11_GCM_IV=hsm|caller` (default `hsm`). Phase 0 checks whether
-  probing the HSM can detect this instead.
+  into `CK_GCM_PARAMS.pIv`. SoftHSM2 accepts the caller's IV and, given a
+  zeroed buffer, encrypts with that all-zero IV instead of writing one (Phase
+  0). So `SB_SECRET_PKCS11_GCM_IV=auto|hsm|caller` defaults to `auto`: at helper
+  start, one probe encrypt with a zeroed IV buffer decides the mode (buffer
+  filled → `hsm`; buffer left zero → `caller`, with a fresh `crypto/rand` IV per
+  wrap). The probe runs on a throwaway session key (`CKA_TOKEN=false`), never
+  the real one (Phase 3): on a token that leaves the buffer zero it does
+  encrypt with the all-zero IV, and doing that with the real key at every
+  helper start would repeat a (key, IV) pair. A token that refuses session
+  keys makes `auto` fail with a message to set `hsm` or `caller`. In every
+  mode, a wrap whose IV comes back all zero is refused, so a nonce can never
+  repeat, and an unwrap of a row with an all-zero IV is refused too.
 - **No-GCM fallback.** `CKM_AES_KEY_WRAP_PAD` (RFC 5649) has no AAD. It would
   still be safe, because the v4 envelope already binds the sandbox identity
   into the payload AAD (`envelope.go:21-24`). A wrapped key moved to another
@@ -356,12 +375,14 @@ example), log in again, treating `CKR_USER_ALREADY_LOGGED_IN` as success;
 | PKCS#11 result | Error |
 |---|---|
 | `CKR_SESSION_COUNT`, `CKR_DEVICE_MEMORY`, pool wait timeout | `ErrProviderThrottled` |
-| `CKR_KEY_FUNCTION_NOT_PERMITTED` (decrypt turned off), or the **current** label (`SB_SECRET_PKCS11_KEY_LABEL`) not found | `ErrKeyRevoked` (new, Design §10) |
+| `CKR_KEY_FUNCTION_NOT_PERMITTED` (decrypt turned off), or the **current** label (`SB_SECRET_PKCS11_KEY_LABEL`) not found **while the session is logged in** (`C_GetSessionInfo` reports a user-functions state; private objects are invisible otherwise, Phase 0) | `ErrKeyRevoked` (new, Design §10) |
+| a label not found while the session is **not** logged in | re-login, then search again; never a revoke on its own |
+| `CKR_OBJECT_HANDLE_INVALID` on a cached key handle | search the label again, then classify |
 | `CKR_PIN_INCORRECT`, `CKR_PIN_EXPIRED`, `CKR_PIN_LOCKED` | `ErrProviderDenied` |
 | a label in `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` not found, while the current label still exists | `ErrKeyVersionRetired` |
 | a decrypt-only label not found **and** the current label not found | `ErrKeyRevoked` (so a revoke during a rotation window still trips) |
 | a `p11:` header naming a label in neither setting | `ErrDecryptFailed` ("wrapped under an unknown key label") |
-| `CKR_ENCRYPTED_DATA_INVALID`, `CKR_ENCRYPTED_DATA_LEN_RANGE`, a bad `p11:` header | `ErrDecryptFailed` |
+| `CKR_ENCRYPTED_DATA_INVALID`, `CKR_ENCRYPTED_DATA_LEN_RANGE`, a bad `p11:` header, or `CKR_GENERAL_ERROR` from `C_Decrypt` after a successful `C_DecryptInit` (SoftHSM2 reports a GCM tag mismatch this way, Phase 0) | `ErrDecryptFailed` |
 | anything else | `ErrProviderUnavailable` |
 
 sandboxd runs helpers with `os/exec`. Go's fork-then-exec never calls PKCS#11
@@ -377,7 +398,7 @@ reviewer does not have to rediscover it.
 | `SB_SECRET_PKCS11_PIN_FILE` | User PIN; group and other permission bits refused, with the same check as `wrap_key_loader.go:72` (0400 and 0600 pass) |
 | `SB_SECRET_PKCS11_KEY_LABEL` | Current key, used for new wraps |
 | `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` | Older keys still allowed for unwrap (rotation) |
-| `SB_SECRET_PKCS11_GCM_IV` | `hsm` (default) or `caller` |
+| `SB_SECRET_PKCS11_GCM_IV` | `auto` (default; probed at helper start), `hsm` or `caller` |
 
 **Software tokens.** At boot, `C_GetSlotInfo` reports whether the slot is
 hardware (`CKF_HW_SLOT`). SoftHSM2 is not. Enterprise mode refuses a
@@ -398,7 +419,7 @@ sweep (Design §11). Nothing else.
 | Backend | Grant |
 |---|---|
 | `awskms` | `kms:Encrypt`, `kms:Decrypt` and `kms:DescribeKey` (to tell a pending deletion from an outage, Design §10) on the one key. No `ReEncrypt`: AWS rotates in place, so there is no AWS sweep (Design §11). |
-| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). |
+| `vault` | `update` on `<mount>/encrypt/<key>` and `<mount>/decrypt/<key>`; `read` on `<mount>/keys/<key>` (latest version for the sweep). No `rewrap` (eng finding 2). **Never `create`** on the encrypt path: Transit would recreate a deleted key on the next encrypt (Phase 0); sandboxd checks this at boot through `sys/capabilities-self`, so the token also needs `update` on `sys/capabilities-self` (part of Vault's `default` policy; a token made with `no_default_policy` must be granted it). |
 | `pkcs11` | user login on the token; the key object with `CKA_ENCRYPT` and `CKA_DECRYPT`; the decrypt-only labels with `CKA_DECRYPT`. |
 
 ### 3. The wrapped server key
@@ -461,6 +482,13 @@ Running nodes are unaffected, since the key is in memory. Make one attempt with
 a 10-second timeout. `sandboxd.service` already has `Restart=always`
 (`packaging/sandboxd.service:16`), so do not add a retry loop. The runbook
 names this dependency.
+
+*Correction (2026-10-31, live UC-301):* the unit `install.sh` writes also
+sets `StartLimitBurst=10` in 5 minutes, so systemd stops restarting after
+about 50 s of failed boots and the node stayed down after the key store came
+back. `sandboxd-healthcheck.timer` now resets and starts a **failed** unit
+every 30 s (an operator's `systemctl stop` leaves it inactive, not failed,
+and it stays stopped). Still no retry loop in the daemon.
 
 **Migration and operations.** Add a `sandboxd key` subcommand, next to the
 existing `egress-gateway` subcommand (`cmd/sandboxd/main.go:79`). It runs
@@ -722,7 +750,14 @@ results (default 3, so about 15 minutes, eng D18), the node:
   restarts `aerolvm-egress-gateway.service`, the gateway comes back without
   the CA (it is memory-only), and a revoked sandboxd never resends it. The
   alert and audit event say the gateway was restarted (eng D4); Go cannot promise memory is
-  zeroed, so the docs say "dropped", not "wiped";
+  zeroed, so the docs say "dropped", not "wiped". A CA push in flight when
+  the key is revoked reaches the gateway before the clear, never after it
+  (pushes and the clear share a lock, and a push re-checks the revoke under
+  it). A clear that does not reach the gateway is sent again on every
+  re-check and every gateway reconnect until it lands, since a revoked
+  sandboxd that keeps talking to the gateway is never silent long enough
+  for the self-drop. The re-check runs on a loop of its own, so a sweep or
+  reseal pass stuck in a key-store call never delays a revoke;
 - fails every operation that reads sealed data with `ErrKeyRevoked` ("key
   revoked by the key store"). Because every sandbox's toolbox token is sealed
   with the server key (fact 3), that is almost everything: create (with or
@@ -933,8 +968,10 @@ plaintext-era key is retired.
 the current key.
 
 **Audit.** `key_rotation_staged`, `key_rotation_promoted` and
-`key_rotation_retired` are new `Kind` values, written by the node that runs
-the command at its next boot or re-read.
+`key_rotation_retired` are new `Kind` values. Every node writes them when it
+takes the step, at its next boot or re-read (not only the node that ran the
+command), so each node's log shows when that node started sealing with the
+new key.
 
 ## Coordination with other plans
 
@@ -1151,7 +1188,7 @@ One PR per phase, stacked, with nothing merged until the whole stack is green.
 | 1 | **Seam split.** `secrets.NewWrapper(ctx, opts)` builds the wrapper from config with no store, and `NewProvider` takes it. Add the `limitedWrapper` decorator with its background budget, the provider tags, the `ErrKeyRevoked` and `ErrKeyVersionRetired` sentinels (and the `awskms` mapping change), the boot canary and strict-boot option for every external provider (the enterprise **requirement** lands in Phase 5), the cluster-mode key check at `config.go:2573-2580`, the reserved create slot, the provider-error to HTTP 503 mapping in `apihttp.WriteStoreAwareError` (Section 2), and the config validation. No other behavior change for `local` or `awskms`. | S |
 | 2 | The `vault` wrapper and its tests, including the correlation header (CEO-E3). | M |
 | 3 | The `pkcs11` wrapper, the `--pkcs11-helper` process with its socket protocol and supervisor (eng D5), the session pool, tests, plus a CI run of every `sandboxd` release-matrix target with the new cgo dependency (eng Scope Challenge finding 4). | L |
-| 4 | Wrapped server key: boot order in `pkg/daemon`, the revocable `Cipher`, `sandboxd key wrap [--generate]/rewrap/verify/status/unwrap` with env-file loading, `--key-custody wrapped` in `cluster-init.sh`, `cluster-join.sh`, `install.sh` and the Terraform bootstrap (`key_custody` variable, `bootstrap.sh.tftpl`) (fact 10), the joiner refusal, the backup and restore scripts, the custody gauge (CEO-E1), the revocation re-check with auto-recovery (CEO-E2, eng D12), and the full-stop pieces: `clear_inspect_ca` (drops the CA and injection secrets, closes inspected connections; eng D21) with the restart fallback for an old gateway (eng D4), closing proxied sessions, degraded health (CEO-E2R). | L |
+| 4 | (Shipped as two stacked PRs, 4.1 the wrapped key and 4.2 revocation, to keep each reviewable.) Wrapped server key: boot order in `pkg/daemon`, the revocable `Cipher`, `sandboxd key wrap [--generate]/rewrap/verify/status/unwrap` with env-file loading, `--key-custody wrapped` in `cluster-init.sh`, `cluster-join.sh`, `install.sh` and the Terraform bootstrap (`key_custody` variable, `bootstrap.sh.tftpl`) (fact 10), the joiner refusal, the backup and restore scripts, the custody gauge (CEO-E1), the revocation re-check with auto-recovery (CEO-E2, eng D12), and the full-stop pieces: `clear_inspect_ca` (drops the CA and injection secrets, closes inspected connections; eng D21) with the restart fallback for an old gateway (eng D4), closing proxied sessions, degraded health (CEO-E2R). | L |
 | 4b | Rewrap sweep (CEO-E4): in-daemon sweep with compare-and-swap, the stale-rows gauge, `ErrKeyVersionRetired` handling, local → external conversion with the untagged-row open order (CEO-M1, Design §12), and the peer-copy comparison without `WrappedKey` (eng D3). | L |
 | 4c | Server-key rotation (eng D26): key-id `Cipher` format with authenticated dual read, the key ring, `sandboxd key rotate --stage/--promote/--retire` gated on gossip feature version, the reseal pass in the `key_custody` loop for every sealed column, the ring gauges and the rotation audit kinds. | XL |
 | 5 | Enterprise rules, the docs page and updates, config-defaults, the runbook, the `SandboxdServerKeyPlaintext`, `SandboxdKeyRevoked`, `SandboxdKeyVersionRetiredInUse` and `SandboxdKeyStoreThrottling` alerts with runbooks and `alerts_test.go` rows (CEO-E1, CEO-E2, CEO-E4, Section 8), the key-custody Grafana row, the revoke procedure per backend, and the Vault Agent example. | S |
@@ -1161,6 +1198,341 @@ One PR per phase, stacked, with nothing merged until the whole stack is green.
 Phase 1 also rewrites the reject at `internal/config/config.go:2599-2602` and
 the comment at `pkg/secrets/factory.go:38-40`. The `vault` value keeps
 refusing to boot until Phase 2 lands in the same stack.
+
+## Phase 0 results (2026-10-30)
+
+Run locally in Docker against Vault 1.18 and OpenBao 2.1 dev servers and
+SoftHSM2 2.6.1 (Debian bookworm), with `github.com/miekg/pkcs11` v1.1.1. The
+probe programs were throwaway and are not in the repo. CloudHSM and AWS-region
+latency are operator-run (they cost money) and stay open in the gate table.
+
+**Vault and OpenBao (identical results):**
+
+| Check | Result |
+|---|---|
+| encrypt with `associated_data` | 200 |
+| decrypt with the right AAD | 200, plaintext matches |
+| decrypt with a wrong or missing AAD | 400 `cipher: message authentication failed` → `ErrDecryptFailed`; no derived-key fallback needed |
+| `rewrap` with `associated_data` | 400 `cipher: message authentication failed` (confirms eng finding 2) |
+| decrypt after the key is deleted | 400 `encryption key not found`, also with an `update`-only token → `ErrKeyRevoked` |
+| decrypt below `min_decryption_version` | 400 `ciphertext or signature version is disallowed by policy (too old)` → `ErrKeyVersionRetired` |
+| `min_decryption_version` above latest | 400 `cannot set min decryption version of 5, latest key version is 2` |
+| encrypt after the key is deleted | root token: 200 and the key is **silently recreated**; `update`-only token: 403 `permission denied`, key stays deleted → new boot check (§1 "Least privilege, checked") |
+| audited request header | `x-aerol-correlation-id` recorded in the audit log with `hmac=false` |
+| `read` on `keys/<key>` | returns `latest_version` and `min_decryption_version` |
+| encrypt latency, loopback Docker on macOS | Vault p50 2.0 ms / p99 7.6 ms; OpenBao 1.5 / 5.5 ms (not the AWS-region number) |
+
+**SoftHSM2:**
+
+| Check | Result |
+|---|---|
+| `CKF_HW_SLOT` | false → enterprise refuses it, as designed |
+| `CKM_AES_GCM` / `CKM_AES_KEY_WRAP_PAD` | both available → no fallback needed (eng D16) |
+| caller-supplied IV | accepted |
+| zeroed IV buffer | **not filled; encrypts with the all-zero IV** → IV mode is now probed at helper start and an all-zero IV is always refused (§2) |
+| wrong AAD on decrypt | `CKR_GENERAL_ERROR`, not `CKR_ENCRYPTED_DATA_INVALID` → mapped to `ErrDecryptFailed` after a successful `C_DecryptInit` (§2) |
+| second `C_Login` | `CKR_USER_ALREADY_LOGGED_IN` → treat as success |
+| after every session closes | login is lost and private keys are **invisible** (label not found) → "label not found" is a revoke only while logged in (§2) |
+| destroyed key | label search finds nothing; a cached handle returns `CKR_OBJECT_HANDLE_INVALID` |
+
+**Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
+token (tested in Phase 2), and the CloudHSM rows above.
+
+## Phase 6 results (2026-10-31)
+
+All three live scenarios passed from fresh clusters in one run each, and the
+AWS CloudHSM run passed. Every AWS resource was torn down afterwards.
+
+| Run | Result |
+|---|---|
+| `cluster-3-mixed-secrets-vault` (UC-297..306) | 10/10 pass, about 33 min of suite on a new 3-node cluster |
+| `cluster-3-mixed-secrets-pkcs11` (UC-307..309) | 3/3 pass, about 17 min |
+| `cluster-3-mixed-wrapped-kms` (UC-310) | pass, with a real failover |
+| AWS CloudHSM, `hsm2m.medium`, FIPS mode, one HSM | `TestPKCS11Live` pass: hardware slot, IV mode `hsm` (the HSM writes the GCM IV), AAD, missing label = revoke, label rotation, 64 concurrent round trips through the helper in 182 ms with the library mapped only there. A real `sandboxd` generated a wrapped key, booted through CloudHSM, and took a server-key stage, promote and retire live. |
+
+- **Tag-gated CI job** `key-custody-integration`: Vault 1.18 and OpenBao 2.1
+  dev servers (images pinned by digest) running `TestVaultLive` and
+  `TestVaultProviderContract`, and SoftHSM2 running `TestPKCS11Live`.
+- **What the live runs found:** no product bug. Seven fixture bugs, all
+  fixed: a glob in a root-only directory (it would have passed UC-298 and
+  UC-310 falsely), a marker check that could not see its own markers (and so
+  restarted the in-memory OpenBao and wiped its key), port 8200 closed
+  between nodes, keep-alive connections pinned to the stopped node, failovers
+  skipped when the sandbox sat on the seed, a proxy token gone stale after
+  an OpenBao restart, and `softhsm2-util --import` dropping whitespace bytes
+  from a key file. Also #805's `key_custody` missing from the Terraform
+  render fixture.
+- **CloudHSM notes for the docs:** module
+  `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so`, token label `hsm1`, PIN file
+  `<crypto user>:<password>`; a one-HSM cluster refuses key operations
+  unless the client disables the key availability check. AWS had no
+  `hsm2m.medium` capacity in us-east-1a; us-east-1b worked.
+- **Deviations.** The OpenBao server is a dev server with TLS (in memory) and
+  OpenBao Proxy, not Raft storage and Agent: no case restarts it, and Agent's
+  token-file mode was covered in Phase 2. The eng D22 case is a follow-up.
+
+**Coverage gaps (2026-10-31).** A review of the test list above against the
+tests found 12 items covered and 20 partly covered. Every unit-level gap is
+now closed (branch `feat/key-custody-6b-test-gaps`, stacked on Phase 6):
+
+- the sweep loses to each of the five racing writers (new `Put`, repair
+  reseal, peer copy of a newer and of the same generation, delete with and
+  without a tombstone, reseal retirement), and does not hold the sandbox lock
+  across the key-store call; a `Decrypt` in flight across a revoke;
+- the full stop: a gateway Sync while revoked carries no secrets and no CA,
+  an old gateway's restart gets no CA, an inject rule refuses with
+  `secret_missing` after `DropSecrets`, recovery re-sends the CA and the
+  secrets and health returns to ok; a real v1 handler answers 503
+  `key_revoked` with nothing sealed in the response or the log; a Vault
+  error never carries a request or response body;
+- the PKCS#11 helper killed mid-call (exit, not deadline) and a successful
+  call after the restart and after a deadline replacement;
+- the D9 history table, sweep correlation ids on every call, the AWS KMS
+  contract through the limiter, the remaining config rows, and the boot
+  order (the database is not opened when the key store refuses).
+
+The gap review found two product gaps, both fixed on the same branch:
+
+- **eng D8 step 1 did not work from `local`.** A node with
+  `SB_SECRET_PROVIDER=local` ignored the key-store settings: it built no
+  client and `LocalProvider.Open` used the server key only, so a failover
+  onto a node not yet flipped could not open a row a switched peer sealed.
+  Such a node now gets an open-only client (`secrets.NewOpenWrapper`) and
+  opens through the same path a switched node uses; without the settings it
+  names the key store it lacks. The live UC-297 never hit this because its
+  failovers run after every node has flipped.
+- **`software token` was only a log line (§2).** The custody report takes
+  the running token's slot kind: `aerolvm_key_custody` reads
+  `pkcs11 (software token)`, and `sandboxd key status --check` prints it.
+
+**Live gaps (2026-10-31, branch `feat/key-custody-6c-live-gaps`).** Run on
+four fresh clusters, all torn down afterwards:
+
+| UC | Scenario | Result |
+|---|---|---|
+| UC-311 AWS KMS key disabled → full stop (gauge, health, audit, an open exec stream closes, 503 `key_revoked`) → re-enabled → recovery and a failover | `cluster-3-mixed-wrapped-kms` | pass |
+| UC-312 the two-step switch from local to AWS KMS (eng D22), with a failover from a switched node to one still sealing locally | new `cluster-3-mixed-kms-switch` | pass (373 s): the step-1 fix, live |
+| UC-313 env, registry and mount secrets come back after a failover (TLS + htpasswd registry and an SSHFS share on the seed) | `cluster-3-mixed-secrets-vault` | pass |
+| UC-314 a backup restored onto the wiped node boots through the key store and rejoins; its next backup holds no plaintext key | vault | pass (146 s) after a test fix |
+| UC-315 one node installed with `install.sh --key-custody wrapped` | new `single-node-wrapped-kms` | pass |
+| UC-304 now also checks that a pre-rotation copy of the wrapped file holds only the retired key | vault | pass |
+| UC-305 restart with the plan's 50 secret-bearing sandboxes (0.25 CPU, 256 MB each): all open, no throttled call | vault | pass |
+| UC-301 key store down at boot | vault | **failed, then fixed**: see below; pass (165 s) |
+
+UC-301 found a third product gap: the unit `install.sh` writes stops
+restarting after 10 failed starts in 5 minutes, and the healthcheck skipped a
+unit that was not active, so a node whose key store was down for more than
+about 50 s at boot never came back. The healthcheck now starts a failed unit
+again every 30 s (see the correction under "Failure rule"), and UC-301 takes
+that path on purpose.
+
+Restore onto a fresh machine (UC-316, `fix/restore-fresh-machine`): the
+single node's root volume is replaced from its launch image, so cloud-init
+installs AerolVM afresh with a key of its own; a backup taken before is
+restored and the node boots through AWS KMS with the backup's key, on the
+backup's database (its boot reaps the sandbox whose container went with the
+old disk, as the runbook expects), with no decrypt error; pass. Writing it
+found that `sandboxd-restore.sh` extracted over a fresh install's
+`state.db-wal` and Raft log; it now moves them aside first. UC-314 keeps the
+same-machine wipe on the cluster.
+
+Deviations: "a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
+SSH-session half of the full stop and the alert itself stay unit-tested
+(the alert's condition, `aerolvm_key_revoked == 1`, is asserted live).
+
+A full local `go test ./...` on the stack (CI runs no Go job on a PR that
+targets another stack branch) found `pkg/caddy`'s install.sh render test
+failing since the wrapped-key phase: its prelude lacked `KEY_CUSTODY`.
+Fixed on this branch.
+
+Joiner first boot (found live, fixed on `feat/install-joiner-no-start`): on
+a joiner, install.sh started sandboxd standalone before cluster-join.sh, and
+with `--key-custody wrapped` that first boot took the "fresh single node,
+generate" path; the join restarted it within seconds (one live run caught it
+cancelled mid-wrap) and installed the seed's wrapped file over anything it
+wrote. install.sh now takes `--no-start`, the Terraform bootstrap passes it
+on joiners only (the seed's first boot is the one that makes the key), and
+UC-310 checks that a joiner's first start comes after its join and that it
+never wrapped a key.
+
+## Phase 5 results (2026-10-31)
+
+- **Enterprise rules (§7).** Strict boot is required for every external
+  provider, not only `awskms`. An enterprise node with an external provider
+  and custody `file` logs a warning at boot and fires
+  `SandboxdServerKeyPlaintext` (F2, first release; Phase 7 refuses it). The
+  hardware-slot rule shipped in Phase 3.
+- **Metrics (Section 8).** Added the two key-store call metrics Phase 1 left
+  out: `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` and
+  `aerolvm_key_store_call_seconds_bucket{key="<backend>_<op>"}`, reported by
+  the router for every backend call, plus one OTEL span per call
+  (`key_store.wrap` / `key_store.unwrap`, backend and class attributes,
+  never key bytes).
+- **Alerts.** A `sandboxd.key-custody` group with
+  `SandboxdServerKeyPlaintext`, `SandboxdKeyRevoked` (critical),
+  `SandboxdKeyVersionRetiredInUse` and `SandboxdKeyStoreThrottling` (over 5%
+  of one backend's calls throttled for 15 minutes); `promtool check rules`
+  passes; `TestKeyCustodyAlertRules` checks severities, registered metrics,
+  positional labels and runbook anchors.
+- **Runbook.** `setup/runbooks/secrets-and-audit.md` gains a Key custody
+  section: one entry per alert, the revoke procedure per backend, both
+  rotations (key-store key incl. the four-step PKCS#11 label rotation, and
+  the server key) and the migration cleanup checklist.
+- **Dashboard.** A Key custody row in `d9-security-isolation.json`, checked by
+  `TestKeyCustodyRowMetricsAreRegistered`.
+- **Docs.** New page `enterprise/key-custody.mdx` ("Use your own key store"),
+  registered in the Enterprise tab's Security group rather than the Docs
+  sidebar, whose cluster-operations group is commented out; it sits next to
+  SSO. It ends with the five-language SDK section. The pages the Docs list
+  names, plus `cluster-glossary`, `engineering-security-overview`,
+  `engineering-trust-boundary` and `enterprise-mode`, no longer say "AWS KMS
+  only" or "Vault not built yet". Vendor naming follows the rule: Vault 1.18
+  and OpenBao 2.1 (tested live), HSMs as "any PKCS#11 v2.40 AES-GCM HSM; not
+  yet tested on hardware".
+
+## Phase 4c results (2026-10-31)
+
+Server-key rotation (§13, eng D26) as designed: the key-id `Cipher` format
+with authenticated dual read, the ring (format 2 of the wrapped file; for
+custody `file` a plaintext ring file at `SB_CREDENTIAL_KEY_RING_PATH`),
+`sandboxd key rotate --stage/--promote/--retire ID`, the ring re-read and the
+reseal pass in the key-custody loop, `aerolvm_server_key_ring{key,key2}`,
+`aerolvm_server_key_rows{key}` and the three rotation audit kinds.
+
+Live on a real `sandboxd` + Vault 1.18 (single node, 10 s re-check), with 8
+values sealed through the real store (toolbox token, registry auth, mounts,
+env on two sandboxes), no restart between steps: the staged key showed on the
+ring gauge 10 s after `--stage`; 10 s after `--promote` all 8 values were on
+key 1 (`aerolvm_server_key_rows{key="1"} 8`); after `--retire 0` the rows
+gauge cleared. Offline, the new ring opened all 8 on key 1, and a copy of key
+0 taken before the rotation opened none of them. The node then rebooted from
+the ring file, and its audit log held one `key_rotation_staged`, one
+`_promoted` and one `_retired` record.
+
+Decisions made while building it:
+
+- **Who writes the rotation records.** Every node, as it takes each step
+  (§13 Audit updated), not only the node that ran the command.
+- **The stage gate.** `fsmOpsVersion` 4, with `ServerKeyRingFSMOpsVersion`
+  naming it. The CLI cannot see gossip, so `GET /v1/cluster/members` now
+  also returns `server_key_ring_ready` (the gossip gate with its boot-window
+  rule); a daemon that predates it, an unreachable daemon, a lagging member
+  or a node that has not rejoined all refuse the stage.
+- **One rotation at a time.** `--stage` refuses while any key is
+  decrypt-only. Retiring a staged key that was never promoted cancels the
+  rotation. Key ids are never reused.
+- **custody `file`.** The ring file, once written, holds every live key; a
+  key in `SB_CREDENTIAL_ENCRYPTION_KEY` or the key file must match ring key 0
+  while key 0 is live, and boot warns when it is still there after key 0 is
+  retired. The cluster shared-key check accepts the ring file. Backups carry
+  it; `cluster-join.sh` installs one found in the cred bundle.
+- **Lost updates.** A whole-row sandbox write (reconcile, a status change)
+  is a snapshot read earlier, and its sealed values may predate the reseal
+  pass and a retirement since. So it keeps the sealed values the row has:
+  only Create, the reseal pass and a write with a new plaintext toolbox
+  token change one, and a raced write cannot put back bytes nothing opens.
+  The daemon's rewrap and `sandboxd key` both edit the server-key and ring
+  files; each holds a lock on the file across its read, compare and write,
+  and writes only if the file is unchanged since its read
+  (`ErrKeyFileChanged`).
+- **Counting.** A value that lost its compare-and-swap is counted under the
+  key it was read on until the next pass looks again, so the rows gauge
+  never reaches 0 early; values no ring key opens are counted as
+  `unopenable`. With one key in the ring the pass reads nothing. A count
+  is only good for the target it was made for: every old key is -1,
+  unknown, from the moment the node takes a ring the last finished pass
+  did not count until a pass under it finishes, and after a pass that
+  stopped early (never a partial count or an absent key). The key-store
+  sweep's `aerolvm_key_rows_stale` is the same per key-store version: -1 at
+  boot, before a new current version is published, and after a stopped
+  pass; it never lowers `aerolvm_key_rows_retired`.
+
+Not done here: the rotation runbook and alerts (Phase 5), the 3-node live UC
+with a failover between every step (Phase 6). Rolling a node back to a build
+before this one is not possible once a key is promoted: its rows name their
+key.
+
+## Phase 4b results (2026-10-31)
+
+The rewrap sweep runs in the key-custody loop: at boot (after the API is up)
+and hourly after a random start delay. It moves this node's rows, and its
+server-key file, onto the sealing provider's current key under
+compare-and-swap, converts local rows after a `local → external` switch, and
+counts what is left in `aerolvm_key_rows_stale` and rows on a retired version
+in `aerolvm_key_rows_retired`. `PutClusterSecret` treats a same-generation
+copy that differs only in `WrappedKey` as the same secret and keeps the bytes
+on disk (eng D3, D20). An untagged row opens with the server key first, then
+AWS KMS (§12, eng D22).
+
+Live on a real `sandboxd` + Vault 1.18 (single node, so no cluster rows):
+after a Transit rotation the boot sweep rewrapped the server-key file
+(`vault:v1 → vault:v2`), and with v1 then retired the node still booted.
+Cluster rows are covered by unit tests over a Transit-like versioned store
+(paging past one page, conversion, rotation, retirement, key-store failure
+mid-pass); the cluster run is Phase 6.
+
+## Phase 4 results (2026-10-31)
+
+Shipped as two stacked PRs. Both were run live on a real `sandboxd` against a
+Vault 1.18 dev server in a Linux container.
+
+**4.1, the wrapped server key:** a fresh single node wrote only
+`credential_encryption.key.wrapped` (0600, `vault:v1`); a restart reopened the
+same key; a plaintext key file left behind stopped the boot (F1); `sandboxd key
+unwrap --to-file` followed by a `file`-custody boot wrote `key_custody_changed`
+(S7); with the Transit key deleted, boot failed with `key revoked by the key
+store`. The run caught one bug (a spurious first-boot warning), fixed before
+the PR.
+
+**4.2, revocation:** with a 10 s re-check and `REVOKE_AFTER=2`, the node
+stopped 20 s after the Transit key was deleted (health `key_custody: revoked`,
+`key_revoked` audit record) and resumed 10 s after the key was restored from a
+Transit backup (`key_recovered`). The egress gateway path (`clear_inspect_ca`,
+the restart of an older gateway, the self-drop after the bound) is covered by
+unit tests; the container run had no gateway.
+
+One addition to §3: custody `file` with only a wrapped key present refuses to
+boot instead of minting a fresh plaintext key that would orphan every row.
+
+## Phase 3 results (2026-10-31)
+
+`pkg/secrets/pkcs11` (eng D5, D6): the helper process, its socket protocol and
+supervisor, the session pool and the §2 error table, with a `!cgo` stub.
+
+| Check | Result |
+|---|---|
+| `TestSoftHSM` (SoftHSM2 2.6.1, Debian bookworm container) | wrap and unwrap, fresh non-zero IVs, `auto` → `caller`, `CKF_HW_SLOT` false, wrong AAD → `ErrDecryptFailed`, decrypt-only key destroyed → `ErrKeyVersionRetired`, current key destroyed → `ErrKeyRevoked` |
+| `TestVendorLibraryStaysInHelper` | `libsofthsm2.so` is in the helper's `/proc/<pid>/maps` and not in the parent's |
+| `sandboxd` boot with `SB_SECRET_PROVIDER=pkcs11` on SoftHSM2 | helper started, software-token warning, `secret provider boot canary ok provider=pkcs11` |
+| `go build ./cmd/sandboxd` with cgo | linux amd64, 386, arm64, armv7, armv6 (cross gcc in Docker) and darwin arm64 all build; CI runs the same matrix (`sandboxd-cgo-matrix`) |
+
+One design change from §2 as reviewed: the IV probe uses a throwaway session
+key (see "The IV" above). Sessions are opened read-write because the probe
+creates and destroys that key.
+
+## Phase 2 results (2026-10-31)
+
+`TestVaultLive` (`pkg/secrets/vault_integration_test.go`, `integration` build
+tag) against Vault 1.18 and OpenBao 2.1 dev servers in Docker, each through
+both `agent` and `proxy` with `api_proxy { use_auto_auth_token = "force" }`
+and `token_file` auto-auth. All four runs pass:
+
+| Check | Result |
+|---|---|
+| canary with an `update`-only token from a token file | ok |
+| decrypt with the wrong encryption context | `ErrDecryptFailed` |
+| boot with the root token, or a token with `create` on the encrypt path | refused (`IsVaultPolicyError`) |
+| open through the Agent or Proxy listener, no token in sandboxd | ok: the proxy premise holds |
+| decrypt below `min_decryption_version` | `ErrKeyVersionRetired` |
+| decrypt after the key is deleted | `ErrKeyRevoked` |
+| encrypt after the key is deleted, `update`-only token | `ErrProviderDenied`, and the key is not recreated (404) |
+
+Two findings for the Phase 5 docs. Vault 1.18 and OpenBao 2.1 both log that
+Agent's API proxy is deprecated in favor of the `proxy` subcommand, so the
+docs show `vault proxy` (`bao proxy`) for the no-token mode and Agent only for
+the token-file mode. Agent's `token_file` auto-auth needs `lookup-self` from
+the `default` policy, and the boot check needs `sys/capabilities-self` (also in
+`default`), so the documented policy keeps `default` or grants both.
 
 ## Decisions needed
 
@@ -1187,13 +1559,14 @@ gates are answered and written back here.
 | ~~E8 short retry on Unavailable~~ answered: one jittered retry, foreground only (eng D17) | — | — |
 | ~~CEO-E4a sweep cadence~~ answered: boot + hourly (eng D19) | — | — |
 | ~~CEO-E4b no cross-node sealed-byte comparison~~ found one (`store.go:5865`); fixed by comparing without `WrappedKey` (eng D3) | — | — |
-| Phase 0: Vault and OpenBao reject a wrong AAD on decrypt (else the derived-key fallback) | Phase 0 result | Phase 2 |
-| Phase 0: miekg vs crypto11 | Phase 0 result | Phase 3 |
-| Phase 0: CloudHSM sets `CKF_HW_SLOT` (if not, enterprise mode would refuse it; rule changes) | Phase 0 result | Phase 3 |
+| ~~Phase 0: Vault and OpenBao reject a wrong AAD on decrypt~~ answered: yes, 400 `cipher: message authentication failed` on both (Phase 0) | — | — |
+| ~~Phase 0: miekg vs crypto11~~ answered: `github.com/miekg/pkcs11` v1.1.1 (Phase 0) | — | — |
+| Phase 0: CloudHSM sets `CKF_HW_SLOT`, fills a zeroed IV buffer, and offers AES-GCM (SoftHSM2 answered: no HW flag, no IV fill, GCM yes) | operator-run CloudHSM (costs money) | Phase 6 enterprise claim for CloudHSM |
 | ~~Phase 0: Transit `rewrap` accepts `associated_data`~~ answered: no (vault issue #29532); the sweep decrypts and re-encrypts (eng finding 2) | — | — |
-| Phase 0: Vault and OpenBao audited request headers record `X-Aerol-Correlation-ID` | Phase 0 result | Phase 2 (header), Phase 5 (docs) |
-| Phase 0: Vault error text for a deleted key and for a retired version | Phase 0 result | Phase 2 (error table) |
-| Phase 0: create-path wait under a restart storm, with the reserved slot | Phase 0 result | Phase 1 |
+| ~~Phase 0: audited request headers record `X-Aerol-Correlation-ID`~~ answered: yes on both with `hmac=false` (Phase 0) | — | — |
+| ~~Phase 0: Vault error text~~ answered: deleted key `encryption key not found`; retired version `ciphertext or signature version is disallowed by policy (too old)` (Phase 0) | — | — |
+| Phase 0: create-path wait under a restart storm, with the reserved slot (fake-backend benchmark in Phase 1; AWS numbers in the operator run) | Phase 1 benchmark + operator run | Phase 1 |
+| Phase 0: AWS-region latency and throughput for AWS KMS, Vault and CloudHSM (loopback only so far: Vault p50 2.0 ms / p99 7.6 ms, OpenBao 1.5 / 5.5 ms) | operator-run | Phase 6 sizing docs |
 | Background budget (2 slots) and re-check settings (5 min × 3) | eng, with Phase 0 numbers | Phase 1 (budget), Phase 4 (re-check) |
 
 The design text already assumes the recommended answer to F1 and F2. If the
@@ -1228,6 +1601,15 @@ founder answers differently, §3 and §7 change.
 - ~~**F-R1:** a rewrap sweep~~ Now in scope as Design §11 (CEO-E4).
 - Live provider switching: a decrypt-only previous provider plus a reseal.
 - ~~Server key (data key) rotation~~ now in scope as Design §13 (eng D26).
+- The eng D22 live case: switch a running `local` cluster to `awskms` with a
+  create during the rolling restart that fails over to a node not yet
+  switched (needs a scenario that boots local with a KMS key).
+- Not in the test list, found in review: split reachability (some nodes
+  reach the key store, others do not); Firecracker, WASM, isolate and gVisor
+  sandboxes under wrapped custody and revoke; enterprise mode with wrapped
+  custody end to end; a mixed-version rolling upgrade through the fv 4 gate,
+  live; the create-latency cost of each key store; the reseal pass over
+  100k rows; Vault token expiry and renewal, and Vault HA standby failover.
 - GCP Cloud KMS and Azure Key Vault: TODOS.md entry (CEO-E5); triggers are
   the K8s plan's GKE phase and a named Azure customer. KMIP: on customer
   demand.
@@ -1471,7 +1853,7 @@ server-key boot unwrap       | file missing / bad mode / bad JSON / format | ref
                              | check mismatch                              | refuse: "wrong key-store key?"
                              | key store unavailable / denied / revoked    | exit with the class; systemd restarts
 re-check loop                | any error                                   | classified (§10); panic recovered
-revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; gateway self-drops after bound
+revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; resent each re-check and reconnect; gateway self-drops after bound
 sweep                        | CAS lost                                    | skip (counter)
                              | key-store or SQLite error                   | stop this pass, retry next cadence
 sandboxd key CLI             | env file missing                            | warn, use process env

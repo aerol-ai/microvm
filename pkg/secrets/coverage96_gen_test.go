@@ -110,7 +110,7 @@ func cover96_funcs() {
 		SealEnvelopeBound(zero96[*Cipher](), zero96[Secrets](), zero96[[]string](), zero96[SealBinding]())
 	}) // envelope.go:85
 	// skip SealRawEnvelopeWrappedBound (envelope.go:137)
-	cover96Call(func() { encryptionContextAAD(zero96[map[string]string]()) }) // fake_kms.go:85
+	cover96Call(func() { EncryptionContextAAD(zero96[map[string]string]()) }) // fake_kms.go:85
 	cover96Call(func() { mapAWSKMSError(zero96[error]()) })                   // awskms.go:92
 	// skip openRawEnvelope (envelope.go:214)
 	cover96Call(func() { validateCurrentHandle(zero96[string](), zero96[Handle]()) }) // provider.go:116
