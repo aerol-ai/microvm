@@ -129,6 +129,15 @@ type EgressFloorSetter interface {
 	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
 }
 
+// WritableLayerSizer is a container engine that can say how much a
+// sandbox has written to its writable layer. Neither containerd's overlay
+// snapshotter nor Docker's overlay2 on a stock ext4 root enforces a size,
+// so the disk watchdog (Service.runDiskLimitWatch) stops a sandbox that has
+// written past its DiskGB.
+type WritableLayerSizer interface {
+	WritableLayerBytes(ctx context.Context, containerRef string) (int64, error)
+}
+
 type ContainerRuntime interface {
 	Runtime
 

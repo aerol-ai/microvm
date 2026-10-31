@@ -249,12 +249,14 @@ Each sandbox gets 1 CPU, 1 GB of memory and 10 GB of disk, unless you ask for mo
 
 | Runtime | CPU | Memory | Disk | Number of processes |
 |---|---|---|---|---|
-| Docker | Enforced | Enforced, with no extra swap | Enforced when the server's storage supports it | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
-| containerd | Enforced | Enforced | Not enforced | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
-| gVisor | Enforced | Enforced | Not enforced | Inside gVisor's own kernel |
+| Docker | Enforced | Enforced, with no extra swap | Enforced when the server's storage supports it; otherwise stopped past its size | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
+| containerd | Enforced | Enforced | Stopped past its size | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
+| gVisor | Enforced | Enforced | Stopped past its size | Inside gVisor's own kernel |
 | Firecracker | The virtual machine's CPUs | The virtual machine's memory | The size of its disk | Inside its own kernel |
 | WebAssembly | Each call stops after 5 minutes | Up to 256 MB | Not enforced | No processes |
 | V8 isolate | The jail's cgroup | The jail's cgroup | No file system | Up to 512 |
+
+**A container sandbox that writes past its disk size is stopped.** containerd, gVisor and Docker on a standard root filesystem do not cap a sandbox's writable layer, so the server checks each one every 15 seconds (`SB_DISK_LIMIT_CHECK_INTERVAL`) and stops a sandbox that has written more than its disk size. Its data stays, its last error says why, and traffic does not restart it. A fast writer can go a few GB past its size between checks, so leave headroom on the server's disk, or use Firecracker, whose disk is a fixed-size image.
 
 This picture shows how the sizes become limits on the three Linux runtimes.
 

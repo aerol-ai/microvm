@@ -1909,3 +1909,19 @@ func sandboxIDFromContainerName(name string) string {
 	name = strings.TrimPrefix(name, "/")
 	return name
 }
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the container's
+// SizeRw (bytes written to its writable layer), which dockerd computes on a
+// size=true inspect.
+func (c *Client) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	var out struct {
+		SizeRw *int64 `json:"SizeRw"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerRef)+"/json", url.Values{"size": {"true"}}, nil, nil, &out); err != nil {
+		return 0, fmt.Errorf("inspect container size: %w", err)
+	}
+	if out.SizeRw == nil {
+		return 0, nil
+	}
+	return *out.SizeRw, nil
+}

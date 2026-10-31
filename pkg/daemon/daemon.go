@@ -831,6 +831,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartReconcileLoop(ctx)
 		}
 		svc.StartLifecycleSweep(ctx)
+		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
 		// Opt-in live CPU/memory sampler. No-op unless a usage reporter is wired

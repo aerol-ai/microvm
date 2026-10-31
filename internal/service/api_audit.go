@@ -246,6 +246,7 @@ func (s *Service) SSHSessionsRecordedByOwner() bool {
 // caller system:<subsystem> (§5.9, "System actions").
 const (
 	systemActionAutoStop    = "lifecycle.auto_stop"
+	systemActionDiskStop    = "lifecycle.disk_limit_stop"
 	systemActionAutoDelete  = "lifecycle.auto_delete"
 	systemActionReap        = "reconcile.reap"
 	systemActionOrphanReap  = "reconcile.orphan_delete"
