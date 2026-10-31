@@ -289,6 +289,41 @@ func (c *Client) ClearNetworkBlockEgress(containerIP string) error {
 	return c.networkRules.ClearBlockAllEgress(containerIP)
 }
 
+// hasCreateNetRules reports whether a create asks for host firewall rules.
+func hasCreateNetRules(req models.CreateSandboxRequest) bool {
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+}
+
+// applyCreateNetRules installs a create's rules on ip before its workload
+// starts: block-all (a hostname-filtered create arrives as one), or the
+// CIDR lists.
+func (c *Client) applyCreateNetRules(ip string, req models.CreateSandboxRequest) error {
+	if req.NetworkBlockAll {
+		if err := c.networkRules.BlockAllEgress(ip); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		if err := c.networkRules.ApplyEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+			return fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// clearCreateNetRules removes what applyCreateNetRules may have installed
+// on ip, a partial install included.
+func (c *Client) clearCreateNetRules(ip string, req models.CreateSandboxRequest) {
+	if !hasCreateNetRules(req) {
+		return
+	}
+	_ = c.networkRules.ClearBlockAllEgress(ip)
+	_ = c.networkRules.ClearBlockAllIngress(ip)
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		_ = c.networkRules.ClearEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut)
+	}
+}
+
 // ApplyEgressPolicy installs the selective-egress CIDR policy. Idempotent —
 // called on Create (initial install), StartSandbox (after a Stop+Start cycle
 // drops the rules on the stop event), and reconcile (to heal host-side state
@@ -533,6 +568,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// joining a foreign netns is not a supported shape there.
 	var adoptedNetns netnsSlot
 	var netnsAdopted, keepNetnsPause bool
+	// earlyRules: the request's rules may be on the pause slot's address,
+	// put there before the workload started; addressReported: the create
+	// was told that address (runtime.AddressObserver).
+	var earlyRules, addressReported bool
 	if c.netnsPool != nil && effectiveRuntime == models.RuntimeDocker {
 		netnsStart := time.Now()
 		adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID)
@@ -547,6 +586,16 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		// failure below it must be removed, not returned to the pool — a
 		// rename back would race a concurrent duplicate create.
 		if netnsAdopted && !keepNetnsPause {
+			// Every failure below has removed the workload container by
+			// now, so nothing sends from the address: the create lets go of
+			// what it keyed by it, then its rules go while the pause
+			// container still holds it, and the address goes last.
+			if addressReported {
+				sbruntime.NotifyReleasingAddress(ctx, adoptedNetns.ip)
+			}
+			if earlyRules {
+				c.clearCreateNetRules(adoptedNetns.ip, req)
+			}
 			c.netnsPool.ReleaseAdopted(context.WithoutCancel(ctx), adoptedNetns)
 		}
 	}()
@@ -661,6 +710,25 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// The pause slot fixed the address before the workload exists, and a
+	// duplicate create stopped at the name conflict above: put the
+	// request's rules on the address before the workload starts, so it
+	// never runs without them (a hostname-filtered create's block-all
+	// included), and report it, so the create's egress gateway attach
+	// overlaps the start and the readiness wait.
+	if ip := strings.TrimSpace(adoptedNetns.ip); netnsAdopted && ip != "" {
+		earlyRules = true
+		netrulesStart := time.Now()
+		if err := c.applyCreateNetRules(ip, req); err != nil {
+			_ = c.removeContainer(ctx, created.ID, true)
+			return nil, err
+		}
+		if hasCreateNetRules(req) {
+			CreateTimingFrom(ctx).RecordStage("docker_netrules", time.Since(netrulesStart))
+		}
+		addressReported = true
+		sbruntime.NotifyAddressKnown(ctx, ip)
+	}
 
 	startStart := time.Now()
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
@@ -708,8 +776,14 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		Status:      models.SandboxStatusStarted,
 	}
 
+	if earlyRules && runtime.ContainerIP != strings.TrimSpace(adoptedNetns.ip) {
+		// The rules, and any attach the create started, are on the pause
+		// slot's address: a workload at another one would run without them.
+		_ = c.removeContainer(ctx, created.ID, true)
+		return nil, fmt.Errorf("docker: sandbox came up at %q, not at its pause slot's address %q", runtime.ContainerIP, adoptedNetns.ip)
+	}
 	netrulesStart := time.Now()
-	if req.NetworkBlockAll {
+	if req.NetworkBlockAll && !earlyRules {
 		if err := c.networkRules.BlockAllEgress(runtime.ContainerIP); err != nil {
 			// Fail closed: the user opted into network isolation, so a sandbox
 			// that came up without the DROP rule must not be left running.
@@ -721,7 +795,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+	if (len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0) && !earlyRules {
 		if err := c.networkRules.ApplyEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
 			// Fail closed, same rationale as NetworkBlockAll: the user opted
 			// into a restricted egress policy, so a sandbox that came up with
@@ -732,7 +806,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			return nil, fmt.Errorf("apply egress policy: %w", err)
 		}
 	}
-	if req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+	if hasCreateNetRules(req) && !earlyRules {
 		CreateTimingFrom(ctx).RecordStage("docker_netrules", time.Since(netrulesStart))
 	}
 
@@ -829,6 +903,11 @@ func (c *Client) Stop(ctx context.Context, containerRef string) error {
 }
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
+	if sandbox != nil && c.netnsPool != nil {
+		if onPause, err := c.hasNetnsPause(ctx, sandbox.ID); err == nil && onPause {
+			return c.destroyOnPause(ctx, sandbox)
+		}
+	}
 	if sandbox != nil {
 		// Clear both directions: a stale ingress DROP would re-attach to whoever
 		// next gets this IP from Docker's IPAM pool.
@@ -851,6 +930,43 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return errors.New("sandbox container ID is not available")
 	}
 	return c.removeContainer(ctx, containerRef, true)
+}
+
+// hasNetnsPause reports whether the sandbox runs on an adopted pause
+// container (the pause-netns pool).
+func (c *Client) hasNetnsPause(ctx context.Context, sandboxID string) (bool, error) {
+	if _, err := c.inspectContainer(ctx, netnsAdoptedName(sandboxID)); err != nil {
+		if isContainerNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// destroyOnPause removes a sandbox whose address its pause container holds.
+// That address outlives the workload container, so the order can keep the
+// sandbox shut and its address clean: the workload goes first; then the
+// destroy's runtime.AddressObserver (the egress gateway detach) is told;
+// then the address's rules go while the pause container still holds it;
+// and the pause container, with the address, goes last. A workload that
+// couldn't be removed keeps everything for the retry. (A plain container's
+// address is Docker's and goes with the container, so Destroy keeps its
+// rules-first order there.)
+func (c *Client) destroyOnPause(ctx context.Context, sandbox *models.Sandbox) error {
+	RemoveReadySocketsForSandbox(c.readyDir, sandbox.ID)
+	ref := strings.TrimSpace(sandbox.ContainerID)
+	if ref == "" {
+		return errors.New("sandbox container ID is not available")
+	}
+	if err := c.removeContainer(ctx, ref, true); err != nil {
+		return err
+	}
+	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
+	_ = c.ClearNetworkRules(sandbox.ContainerIP)
+	_ = c.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+	c.removeNetnsPauseForSandbox(ctx, sandbox.ID)
+	return nil
 }
 
 // SweepOrphanReadySockets removes ready sockets not referenced by existing
