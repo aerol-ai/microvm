@@ -26,6 +26,7 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 | `--version <tag>` | The release to install, such as `v0.6.4`. | `latest` |
 | `--idle-timeout-min <minutes>` | Stops running sandboxes after this many idle minutes. It skips sandboxes that set their own lifecycle. | `0` (off) |
 | `--node-name <name>` | A friendly name for this server, shown in the cluster table of the [dashboard](/dashboard/). | Empty |
+| `--no-start` | Installs and enables everything but leaves the server stopped. Use it on a server that will join a cluster: `cluster-join.sh` starts it once it has the cluster's settings and key. Not with `--local`. | Off: the server starts |
 
 ## Change or upgrade an install
 

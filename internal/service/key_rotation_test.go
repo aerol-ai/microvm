@@ -361,6 +361,41 @@ func TestNoteServerKeyRingRetriesUnrecordedStep(t *testing.T) {
 	}
 }
 
+// TestResealRowsAreForTheirRing: a retire waits for the old key to be gone
+// from aerolvm_server_key_rows, so a count is only good for the ring it was
+// made under. A promote between two passes shows the old key as unknown at
+// once, and only a finished pass under the new ring drops it.
+func TestResealRowsAreForTheirRing(t *testing.T) {
+	svc, _, _, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	seedSealedRows(t, svc, "sb-1")
+	// One key: nothing older to count.
+	if counts, err := svc.ResealServerKeyRows(ctx); err != nil || counts != nil || len(ringGauge(t, serverKeyRowsGauge)) != 0 {
+		t.Fatalf("one key = %v %v", counts, err)
+	}
+	k1, _ := secrets.NewServerKey()
+	if err := svc.cipher.SetRing([]secrets.RingKey{{ID: 0}, {ID: 1, Key: k1, Current: true}}); err != nil {
+		t.Fatal(err)
+	}
+	svc.noteServerKeyRing(nil)
+	if g := ringGauge(t, serverKeyRowsGauge); len(g) != 1 || g["0"] != float64(-1) {
+		t.Fatalf("right after the promote = %v, want key 0 unknown", g)
+	}
+	counts, err := svc.ResealServerKeyRows(ctx)
+	if err != nil || counts["0"] != 0 || counts["1"] == 0 {
+		t.Fatalf("pass = %v %v", counts, err)
+	}
+	if g := ringGauge(t, serverKeyRowsGauge); g["0"] != nil || g["1"] == nil {
+		t.Fatalf("after the pass = %v, want key 0 gone", g)
+	}
+	// The same ring taken again keeps the finished count.
+	svc.noteServerKeyRing(nil)
+	if g := ringGauge(t, serverKeyRowsGauge); g["0"] != nil || g["1"] == nil {
+		t.Fatalf("the same ring re-read = %v", g)
+	}
+}
+
 // TestResealPassEdges: an unopenable value is counted, a corrupt CA record
 // stops the pass, and the loop picks a ring change up on its own.
 func TestResealPassEdges(t *testing.T) {
@@ -389,6 +424,11 @@ func TestResealPassEdges(t *testing.T) {
 	if _, err := svc.ResealServerKeyRows(ctx); err == nil {
 		t.Fatal("a corrupt CA record did not stop the pass")
 	}
+	// A pass that stopped early publishes the old key as unknown, never
+	// as gone (what a retire waits for) or as a partial count.
+	if g := ringGauge(t, serverKeyRowsGauge); len(g) != 1 || g["0"] != float64(-1) {
+		t.Fatalf("rows gauge after a stopped pass = %v", g)
+	}
 	svc.resealTick(ctx)
 	raw, _ := json.Marshal(egressCARecord{CertPEM: "x", SealedKey: []byte("junk")})
 	if err := os.WriteFile(ca, raw, 0o600); err != nil {
@@ -412,7 +452,7 @@ func TestResealPassEdges(t *testing.T) {
 	}
 	lctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	svc2.StartKeyCustody(lctx)
+	startKeyCustody(t, svc2, lctx)
 	deadline := time.Now().Add(5 * time.Second)
 	for len(svc2.cipher.KeyIDs()) != 2 {
 		if time.Now().After(deadline) {
@@ -479,6 +519,6 @@ func TestRotationRingAndPagingEdges(t *testing.T) {
 		t.Fatal("read a missing wrapped file")
 	}
 	lctx, cancel := context.WithCancel(ctx)
-	svc2.StartKeyCustody(lctx) // the loop still starts without a readable ring
+	startKeyCustody(t, svc2, lctx) // the loop still starts without a readable ring
 	cancel()
 }

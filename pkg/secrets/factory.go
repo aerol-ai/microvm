@@ -190,10 +190,19 @@ func NewProvider(ctx context.Context, opts ProviderOptions) (Provider, DataKeyWr
 			return nil, nil, fmt.Errorf("cluster secrets cipher is not configured")
 		}
 		p := NewLocalProvider(opts.Cipher, opts.Store)
-		if opts.Prebuilt != nil {
+		w := opts.Prebuilt
+		if w == nil {
+			// Built here when the caller did not: settings alone must be
+			// enough to open the rows a switched peer seals.
+			var err error
+			if w, err = NewOpenWrapper(ctx, opts); err != nil {
+				return nil, nil, err
+			}
+		}
+		if w != nil {
 			// The node holds a key store's settings (NewOpenWrapper): it
 			// opens rows the way a switched node does, local rows included.
-			p.keyStore = &KMSProvider{wrapper: opts.Prebuilt, store: opts.Store, local: opts.Cipher}
+			p.keyStore = &KMSProvider{wrapper: w, store: opts.Store, local: opts.Cipher}
 		}
 		return p, nil, nil
 	}
