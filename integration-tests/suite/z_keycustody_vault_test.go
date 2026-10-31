@@ -200,7 +200,11 @@ func TestKeyCustodyRevokeAndRecover(t *testing.T) {
 }
 
 // UC-301 — with the key store unreachable a restarted node refuses to
-// start, and starts by itself once the key store answers again.
+// start, and starts by itself once the key store answers again, even after
+// systemd has stopped restarting it (StartLimitBurst): the healthcheck
+// timer starts a failed unit again. The first fresh-cluster run of this
+// case found nothing did, so a key store down for over a minute left the
+// node down for good.
 func TestKeyCustodyKeyStoreDownAtBoot(t *testing.T) {
 	harness.Require(t, sc, "UC-301")
 	targets := kcTargets(t)
@@ -215,17 +219,25 @@ func TestKeyCustodyKeyStoreDownAtBoot(t *testing.T) {
 	})
 	kcSSH(t, node, "sudo systemctl stop itest-bao-proxy; sudo systemctl reset-failed itest-bao-proxy 2>/dev/null || true")
 	kcSSH(t, node, "sudo systemctl restart sandboxd || true")
-	// A few failed starts (Restart=always, 5s apart), well inside the unit's
-	// start limit of 10 in 5 minutes.
-	time.Sleep(20 * time.Second)
-	if state := strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")); state == "active" {
-		t.Fatalf("%s started with its key store unreachable", node.Name)
+	// Failed starts 5 s apart until systemd's start limit (10 in 5 minutes)
+	// leaves the unit failed: the state an outage of over a minute reaches.
+	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(5 * time.Second) {
+		if state := strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")); state == "active" {
+			t.Fatalf("%s started with its key store unreachable", node.Name)
+		}
+		if strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-failed sandboxd || true")) == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reached systemd's start limit with its key store unreachable", node.Name)
+		}
 	}
-	if j := kcSSH(t, node, "sudo journalctl -u sandboxd --no-pager -n 120 || true"); !strings.Contains(j, "unwrap server key") {
+	if j := kcSSH(t, node, "sudo journalctl -u sandboxd --no-pager -n 200 || true"); !strings.Contains(j, "unwrap server key") {
 		t.Fatalf("%s did not say why it refused to start:\n%s", node.Name, j)
 	}
 	kcEnsureProxy(t, seed, node)
-	deadline := time.Now().Add(2 * time.Minute)
+	// The healthcheck timer runs every 30 s and starts the failed unit again.
+	deadline := time.Now().Add(3 * time.Minute)
 	for strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")) != "active" {
 		if time.Now().After(deadline) {
 			t.Fatalf("%s did not start by itself after its key store came back", node.Name)
@@ -604,8 +616,10 @@ sudo test -s `+kcWrapped+` && echo WRAPPED`); strings.Contains(out, "KEYFILE") |
 		t.Fatalf("%s: `sandboxd key status --check` after the restore:\n%s", node.Name, s)
 	}
 	kcAwaitMetric(t, []harness.IntegrationNode{node}, "aerolvm_key_custody", map[string]string{"key": "server key", "key2": "customer key store (wrapped)"}, time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
+	// The backup script reports what it wrote; only the search below is
+	// judged.
+	kcSSH(t, node, "sudo bash /usr/local/lib/itest-sandboxd-backup.sh --output /var/tmp/itest-dr2.tgz")
 	listing := kcSSH(t, node, `set -e
-sudo bash /usr/local/lib/itest-sandboxd-backup.sh --output /var/tmp/itest-dr2.tgz
 sudo rm -rf /var/tmp/itest-dr2 && sudo mkdir -p /var/tmp/itest-dr2 && sudo tar -xzf /var/tmp/itest-dr2.tgz -C /var/tmp/itest-dr2
 sudo find /var/tmp/itest-dr2 -name credential_encryption.key
 sudo grep -rl '^SB_CREDENTIAL_ENCRYPTION_KEY=' /var/tmp/itest-dr2 2>/dev/null || true`)
