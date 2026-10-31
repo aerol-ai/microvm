@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -427,6 +431,40 @@ func TestOwedGatewayClearIsRetried(t *testing.T) {
 	svc.RecheckServerKey(ctx)
 	if err := svc.ResyncEgressGateway(ctx); err != nil || clears() != 3 {
 		t.Fatalf("a clear that landed was sent again: %v, clears %d", err, clears())
+	}
+}
+
+// TestVaultReplyTextNeverReachesLogs: a key-store reply can echo request
+// content (a plugin, a proxy in front of Vault), and the re-check logs its
+// error, so nothing of the reply's text may reach the log.
+func TestVaultReplyTextNeverReachesLogs(t *testing.T) {
+	const marker = "SENSITIVE_PROVIDER_BODY_MARKER"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, `{"errors":[%q]}`, marker)
+	}))
+	t.Cleanup(srv.Close)
+	v, err := secrets.NewVault(secrets.VaultOptions{Addr: srv.URL, KeyName: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc, _, _, _, _ := revokeHarness(t)
+	var logs bytes.Buffer
+	svc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	svc.SetKeyStoreWrapper(v)
+	f, err := secrets.ReadWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Wrapped = []byte("vault:v1:fixture")
+	if err := secrets.WriteWrappedKeyFile(svc.cfg.CredentialKeyWrappedPath, f); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.RecheckServerKey(context.Background()); got != recheckDenied {
+		t.Fatalf("re-check = %s, want %s", got, recheckDenied)
+	}
+	if strings.Contains(logs.String(), marker) || !strings.Contains(logs.String(), "403") {
+		t.Fatalf("log = %s, want the status and none of the reply", logs.String())
 	}
 }
 
