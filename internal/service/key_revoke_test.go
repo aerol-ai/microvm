@@ -320,6 +320,116 @@ func TestRevokeRestartsAnOldGateway(t *testing.T) {
 	}
 }
 
+// heldCAGateway holds SetInspectCA until released and tracks whether the
+// gateway ends up holding the CA, in the order set and clear arrive.
+type heldCAGateway struct {
+	*fakeGateway
+	entered, release chan struct{}
+	once             sync.Once
+	holds            bool
+}
+
+func (g *heldCAGateway) SetInspectCA(context.Context, egress.InspectCA) error {
+	g.once.Do(func() { close(g.entered) })
+	<-g.release
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.holds = true
+	return nil
+}
+
+func (g *heldCAGateway) ClearInspectCA(context.Context) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.holds = false
+	g.cleared++
+	return nil
+}
+
+// TestInFlightCAPushLandsBeforeTheRevokeClear: a CA push in flight when
+// the key is revoked must not reach the gateway after the revoke's clear,
+// and no push starts once the key is revoked (eng D4).
+func TestInFlightCAPushLandsBeforeTheRevokeClear(t *testing.T) {
+	svc, _, gw, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	ca, err := svc.ensureEgressCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &heldCAGateway{fakeGateway: gw, entered: make(chan struct{}), release: make(chan struct{})}
+	svc.SetEgressGateway(g, nil)
+	pushed := make(chan error, 1)
+	go func() { pushed <- svc.pushEgressCA(ctx, ca) }()
+	<-g.entered
+	revoked := make(chan struct{})
+	go func() { svc.revokeKey(ctx, secrets.ErrKeyRevoked); close(revoked) }()
+	select {
+	case <-revoked:
+		t.Fatal("the revoke's clear did not wait for the push in flight")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(g.release)
+	<-revoked
+	if err := <-pushed; err != nil {
+		t.Fatal(err)
+	}
+	g.mu.Lock()
+	holds := g.holds
+	g.mu.Unlock()
+	if holds {
+		t.Fatal("the gateway holds the CA after the revoke")
+	}
+	if err := svc.pushEgressCA(ctx, ca); !errors.Is(err, secrets.ErrKeyRevoked) {
+		t.Fatalf("a push after the revoke = %v", err)
+	}
+	if err := svc.resyncEgressCA(ctx); err != nil || svc.egressCA.Load() != nil {
+		t.Fatalf("a resync after the revoke = %v, CA in memory %v", err, svc.egressCA.Load() != nil)
+	}
+}
+
+// TestOwedGatewayClearIsRetried: a revoke whose clear never reached the
+// gateway sends it again on each re-check and on a gateway reconnect,
+// until it lands. A revoked node that keeps talking to the gateway is never
+// silent long enough for the gateway's own bound to drop the CA.
+func TestOwedGatewayClearIsRetried(t *testing.T) {
+	svc, kms, gw, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	if _, err := svc.ensureEgressCA(); err != nil {
+		t.Fatal(err)
+	}
+	clears := func() int {
+		gw.mu.Lock()
+		defer gw.mu.Unlock()
+		return gw.cleared
+	}
+	gw.mu.Lock()
+	gw.clearErr = errors.New("connection refused")
+	gw.mu.Unlock()
+	kms.set(secrets.ErrKeyRevoked)
+	for i := 0; i < 3; i++ {
+		svc.RecheckServerKey(ctx)
+	}
+	if !svc.KeyRevoked() || clears() != 1 {
+		t.Fatalf("revoked %v, clears %d", svc.KeyRevoked(), clears())
+	}
+	svc.RecheckServerKey(ctx)
+	if clears() != 2 {
+		t.Fatalf("the next re-check did not send the clear again: %d", clears())
+	}
+	gw.mu.Lock()
+	gw.clearErr = nil
+	gw.mu.Unlock()
+	if err := svc.ResyncEgressGateway(ctx); err != nil || clears() != 3 {
+		t.Fatalf("a reconnect = %v, clears %d", err, clears())
+	}
+	svc.RecheckServerKey(ctx)
+	if err := svc.ResyncEgressGateway(ctx); err != nil || clears() != 3 {
+		t.Fatalf("a clear that landed was sent again: %v, clears %d", err, clears())
+	}
+}
+
 // The file swapped for another key: it unwraps and matches its own check,
 // but the node only takes back the key it was built with.
 func TestRecoveryRefusesADifferentKey(t *testing.T) {

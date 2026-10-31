@@ -292,6 +292,44 @@ func TestFailedSweepPublishesStaleUnknown(t *testing.T) {
 	}
 }
 
+// hungVersion is a key store whose version read hangs until its context
+// ends (the sweep's first call), and which says the key is revoked.
+type hungVersion struct {
+	*transitLike
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (w *hungVersion) Unwrap(context.Context, []byte, map[string]string) ([]byte, error) {
+	return nil, secrets.ErrKeyRevoked
+}
+
+func (w *hungVersion) CurrentKeyVersion(ctx context.Context) (string, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// TestSweepDoesNotHoldBackRevocation: a sweep stuck in a key-store call
+// (up to keyRecheckTimeout, 30s, per call) must not delay the re-check
+// that revokes the node.
+func TestSweepDoesNotHoldBackRevocation(t *testing.T) {
+	svc, tl, _ := sweepHarness(t, 0)
+	svc.cfg.SecretProviderRecheckInterval = 10 * time.Millisecond
+	svc.cfg.SecretProviderRevokeAfter = 1
+	w := &hungVersion{transitLike: tl, entered: make(chan struct{})}
+	svc.SetKeyStoreWrapper(w)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc.StartKeyCustody(ctx)
+	<-w.entered
+	for deadline := time.Now().Add(5 * time.Second); !svc.KeyRevoked(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the re-check waited on a hung sweep: not revoked after 5s")
+		}
+	}
+}
+
 type failingAfterVersion struct{ *transitLike }
 
 func (f *failingAfterVersion) Unwrap(context.Context, []byte, map[string]string) ([]byte, error) {

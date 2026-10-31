@@ -750,7 +750,14 @@ results (default 3, so about 15 minutes, eng D18), the node:
   restarts `aerolvm-egress-gateway.service`, the gateway comes back without
   the CA (it is memory-only), and a revoked sandboxd never resends it. The
   alert and audit event say the gateway was restarted (eng D4); Go cannot promise memory is
-  zeroed, so the docs say "dropped", not "wiped";
+  zeroed, so the docs say "dropped", not "wiped". A CA push in flight when
+  the key is revoked reaches the gateway before the clear, never after it
+  (pushes and the clear share a lock, and a push re-checks the revoke under
+  it). A clear that does not reach the gateway is sent again on every
+  re-check and every gateway reconnect until it lands, since a revoked
+  sandboxd that keeps talking to the gateway is never silent long enough
+  for the self-drop. The re-check runs on a loop of its own, so a sweep or
+  reseal pass stuck in a key-store call never delays a revoke;
 - fails every operation that reads sealed data with `ErrKeyRevoked` ("key
   revoked by the key store"). Because every sandbox's toolbox token is sealed
   with the server key (fact 3), that is almost everything: create (with or
@@ -1843,7 +1850,7 @@ server-key boot unwrap       | file missing / bad mode / bad JSON / format | ref
                              | check mismatch                              | refuse: "wrong key-store key?"
                              | key store unavailable / denied / revoked    | exit with the class; systemd restarts
 re-check loop                | any error                                   | classified (§10); panic recovered
-revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; gateway self-drops after bound
+revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; resent each re-check and reconnect; gateway self-drops after bound
 sweep                        | CAS lost                                    | skip (counter)
                              | key-store or SQLite error                   | stop this pass, retry next cadence
 sandboxd key CLI             | env file missing                            | warn, use process env

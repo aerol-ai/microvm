@@ -339,6 +339,11 @@ func (s *Service) RevocableContext(parent context.Context) (context.Context, con
 // rewrap sweep now (the API is already serving) and then every hour after
 // a random start delay of up to an hour, so a fleet restarted together
 // does not sweep in lockstep (eng D19).
+//
+// The re-check has a loop of its own: a sweep or reseal pass can take
+// minutes (a key-store call per stale row, a hung call up to its timeout),
+// and a revoke must not wait for one. The passes share a second loop, one
+// at a time; each re-check asks it for a reseal pass.
 func (s *Service) StartKeyCustody(ctx context.Context) {
 	if s == nil || s.cipher == nil {
 		return
@@ -354,18 +359,13 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 		// is recorded now.
 		s.noteServerKeyRing(entries)
 	}
+	reseal := make(chan struct{}, 1)
 	go func() {
-		var sweepC <-chan time.Time
 		// ±10% jitter on the re-check, for the same reason.
 		nextRecheck := func() <-chan time.Time {
 			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
 		}
 		recheckC := nextRecheck()
-		if sweep {
-			s.sweepPass(ctx)
-			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
-		}
-		s.resealTick(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -376,8 +376,27 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 				} else {
 					s.reloadKeyRingFile()
 				}
-				s.resealTick(ctx)
+				select {
+				case reseal <- struct{}{}:
+				default: // a pass is already asked for
+				}
 				recheckC = nextRecheck()
+			}
+		}
+	}()
+	go func() {
+		var sweepC <-chan time.Time
+		if sweep {
+			s.sweepPass(ctx)
+			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
+		}
+		s.resealTick(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reseal:
+				s.resealTick(ctx)
 			case <-sweepC:
 				s.sweepPass(ctx)
 				sweepC = time.After(keySweepInterval)
@@ -390,6 +409,7 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 // returns. Only a deliberate signal from the key store counts toward a
 // revoke: a 403, an outage or a retired version never does (§10).
 func (s *Service) RecheckServerKey(ctx context.Context) string {
+	s.retryEgressCAClear(ctx)
 	cctx, cancel := context.WithTimeout(secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "recheck")), keyRecheckTimeout)
 	defer cancel()
 	f, err := secrets.ReadWrappedKeyFile(s.cfg.CredentialKeyWrappedPath)
@@ -502,10 +522,21 @@ func (s *Service) revokeKey(ctx context.Context, cause error) {
 // predates clear_inspect_ca is restarted instead; it comes back without the
 // CA (memory only) and a revoked node never resends it (eng D4). It says
 // what happened, for the audit record.
+//
+// A clear that does not reach the gateway is owed: every re-check of the
+// revoked node and every gateway reconnect sends it again, since a revoked
+// node that keeps talking to the gateway is never silent long enough for
+// the gateway's own bound to drop the CA.
 func (s *Service) clearEgressInspection(ctx context.Context, restart func(context.Context) error) string {
+	s.egressCAMu.Lock()
 	s.egressCA.Store(nil)
+	s.egressCAMu.Unlock()
+	// After any push in flight; none starts once the key is revoked.
+	s.egressCAPushMu.Lock()
+	defer s.egressCAPushMu.Unlock()
 	s.egressCAPushed.Store(false)
 	if !s.egressEnabled() {
+		s.egressCAClearOwed.Store(false)
 		return "not used"
 	}
 	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
@@ -513,21 +544,36 @@ func (s *Service) clearEgressInspection(ctx context.Context, restart func(contex
 	err := s.egressGateway().ClearInspectCA(cctx)
 	switch {
 	case err == nil:
+		s.egressCAClearOwed.Store(false)
 		return "cleared"
 	case egress.IsUnknownOp(err):
 		if restart == nil {
 			restart = restartEgressGatewayUnit
 		}
 		if rerr := restart(cctx); rerr != nil {
-			s.logger.Error("key custody: could not restart the egress gateway to drop its CA", "error", rerr)
+			s.egressCAClearOwed.Store(true)
+			s.logger.Error("key custody: could not restart the egress gateway to drop its CA; retried on the next re-check", "error", rerr)
 			return "restart failed"
 		}
+		s.egressCAClearOwed.Store(false)
 		return "restarted (predates clear_inspect_ca)"
 	default:
-		// An unreachable gateway either holds no CA (it restarted) or drops
-		// it once this node is silent past the bound it sent.
-		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA", "error", err)
+		s.egressCAClearOwed.Store(true)
+		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA; retried on the next re-check", "error", err)
 		return "unreachable"
+	}
+}
+
+// retryEgressCAClear sends a revoke's clear again while it is owed.
+func (s *Service) retryEgressCAClear(ctx context.Context) {
+	if !s.KeyRevoked() || !s.egressCAClearOwed.Load() {
+		return
+	}
+	s.keyCustody.mu.Lock()
+	restart := s.keyCustody.restartGateway
+	s.keyCustody.mu.Unlock()
+	if got := s.clearEgressInspection(ctx, restart); !s.egressCAClearOwed.Load() {
+		s.logger.Warn("key custody: egress gateway dropped its CA on a retry", "gateway", got)
 	}
 }
 
@@ -550,6 +596,7 @@ func (s *Service) recoverKey(ctx context.Context, keys []secrets.RingKey) error 
 	s.keyCustody.revoked.Store(false)
 	s.keyCustody.stop = make(chan struct{})
 	s.keyCustody.mu.Unlock()
+	s.egressCAClearOwed.Store(false)
 	keyRevokedGauge.Set(0)
 	if s.egressEnabled() {
 		s.egressMu.Lock()
