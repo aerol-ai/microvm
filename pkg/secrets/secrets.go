@@ -278,11 +278,11 @@ func (c *Cipher) Reseal(sealed, aad []byte) (out []byte, from uint32, changed bo
 	return out, from, true, nil
 }
 
-// SealedKeyID names the key a blob says it was sealed with, without opening
+// sealedKeyID names the key a blob says it was sealed with, without opening
 // it: the id after the marker, or 0 (legacy) for a blob without one. A
 // legacy blob that happens to start with the marker reads as another id;
 // open it to be sure.
-func SealedKeyID(sealed []byte) uint32 {
+func sealedKeyID(sealed []byte) uint32 {
 	if len(sealed) > keyIDHeaderLen && sealed[0] == keyIDMarker {
 		return binary.BigEndian.Uint32(sealed[1:keyIDHeaderLen])
 	}

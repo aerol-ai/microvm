@@ -750,7 +750,14 @@ results (default 3, so about 15 minutes, eng D18), the node:
   restarts `aerolvm-egress-gateway.service`, the gateway comes back without
   the CA (it is memory-only), and a revoked sandboxd never resends it. The
   alert and audit event say the gateway was restarted (eng D4); Go cannot promise memory is
-  zeroed, so the docs say "dropped", not "wiped";
+  zeroed, so the docs say "dropped", not "wiped". A CA push in flight when
+  the key is revoked reaches the gateway before the clear, never after it
+  (pushes and the clear share a lock, and a push re-checks the revoke under
+  it). A clear that does not reach the gateway is sent again on every
+  re-check and every gateway reconnect until it lands, since a revoked
+  sandboxd that keeps talking to the gateway is never silent long enough
+  for the self-drop. The re-check runs on a loop of its own, so a sweep or
+  reseal pass stuck in a key-store call never delays a revoke;
 - fails every operation that reads sealed data with `ErrKeyRevoked` ("key
   revoked by the key store"). Because every sandbox's toolbox token is sealed
   with the server key (fact 3), that is almost everything: create (with or
@@ -1419,16 +1426,26 @@ Decisions made while building it:
   while key 0 is live, and boot warns when it is still there after key 0 is
   retired. The cluster shared-key check accepts the ring file. Backups carry
   it; `cluster-join.sh` installs one found in the cred bundle.
-- **Lost updates.** A whole-row sandbox write carries a registry blob read
-  earlier; during a rotation the store moves it onto the current key before
-  writing, so a write that raced the reseal pass cannot put the old key's
-  bytes back. The daemon's rewrap and `sandboxd key rotate` both edit the
-  server-key file; each writes only if the file is unchanged since its read
+- **Lost updates.** A whole-row sandbox write (reconcile, a status change)
+  is a snapshot read earlier, and its sealed values may predate the reseal
+  pass and a retirement since. So it keeps the sealed values the row has:
+  only Create, the reseal pass and a write with a new plaintext toolbox
+  token change one, and a raced write cannot put back bytes nothing opens.
+  The daemon's rewrap and `sandboxd key` both edit the server-key and ring
+  files; each holds a lock on the file across its read, compare and write,
+  and writes only if the file is unchanged since its read
   (`ErrKeyFileChanged`).
 - **Counting.** A value that lost its compare-and-swap is counted under the
   key it was read on until the next pass looks again, so the rows gauge
   never reaches 0 early; values no ring key opens are counted as
-  `unopenable`. With one key in the ring the pass reads nothing.
+  `unopenable`. With one key in the ring the pass reads nothing. A count
+  is only good for the target it was made for: every old key is -1,
+  unknown, from the moment the node takes a ring the last finished pass
+  did not count until a pass under it finishes, and after a pass that
+  stopped early (never a partial count or an absent key). The key-store
+  sweep's `aerolvm_key_rows_stale` is the same per key-store version: -1 at
+  boot, before a new current version is published, and after a stopped
+  pass; it never lowers `aerolvm_key_rows_retired`.
 
 Not done here: the rotation runbook and alerts (Phase 5), the 3-node live UC
 with a failover between every step (Phase 6). Rolling a node back to a build
@@ -1836,7 +1853,7 @@ server-key boot unwrap       | file missing / bad mode / bad JSON / format | ref
                              | check mismatch                              | refuse: "wrong key-store key?"
                              | key store unavailable / denied / revoked    | exit with the class; systemd restarts
 re-check loop                | any error                                   | classified (§10); panic recovered
-revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; gateway self-drops after bound
+revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; resent each re-check and reconnect; gateway self-drops after bound
 sweep                        | CAS lost                                    | skip (counter)
                              | key-store or SQLite error                   | stop this pass, retry next cadence
 sandboxd key CLI             | env file missing                            | warn, use process env

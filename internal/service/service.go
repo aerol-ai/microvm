@@ -448,12 +448,16 @@ type Service struct {
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
-	// that the connected gateway has it.
-	egressCA       atomic.Pointer[egress.InspectCA]
-	egressCAMu     sync.Mutex
-	egressCAPushed atomic.Bool
-	egressSubOnce  sync.Once
-	egressStats    egressCounters
+	// that the connected gateway has it. egressCAPushMu orders the CA's
+	// pushes against a revoke's clear at the gateway, and
+	// egressCAClearOwed is set while that clear has not reached it.
+	egressCA          atomic.Pointer[egress.InspectCA]
+	egressCAMu        sync.Mutex
+	egressCAPushed    atomic.Bool
+	egressCAPushMu    sync.Mutex
+	egressCAClearOwed atomic.Bool
+	egressSubOnce     sync.Once
+	egressStats       egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
 	// for the same reason as egressWired: readiness reads it.
 	egressSelfTest atomic.Pointer[egressSelfTest]
