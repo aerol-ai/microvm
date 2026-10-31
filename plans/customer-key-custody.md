@@ -1330,14 +1330,15 @@ targets another stack branch) found `pkg/caddy`'s install.sh render test
 failing since the wrapped-key phase: its prelude lacked `KEY_CUSTODY`.
 Fixed on this branch.
 
-Follow-up (not a key-custody regression): on a joiner, install.sh starts
-sandboxd standalone before cluster-join.sh, and with `--key-custody
-wrapped` that first boot takes the "fresh single node, generate" path; the
-join restarts it within seconds (one live run caught it cancelled mid-wrap)
-and installs the seed's wrapped file over anything it wrote. Nothing is
-sealed in that window, and the plaintext install has the same
-standalone-first boot, but install.sh could skip starting sandboxd when a
-join follows.
+Joiner first boot (found live, fixed on `feat/install-joiner-no-start`): on
+a joiner, install.sh started sandboxd standalone before cluster-join.sh, and
+with `--key-custody wrapped` that first boot took the "fresh single node,
+generate" path; the join restarted it within seconds (one live run caught it
+cancelled mid-wrap) and installed the seed's wrapped file over anything it
+wrote. install.sh now takes `--no-start`, the Terraform bootstrap passes it
+on joiners only (the seed's first boot is the one that makes the key), and
+UC-310 checks that a joiner's first start comes after its join and that it
+never wrapped a key.
 
 ## Phase 5 results (2026-10-31)
 

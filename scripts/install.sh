@@ -102,6 +102,7 @@ CADDY_STORAGE_S3_ENCRYPTION_KEY=""
 PAT_SCOPE="any"
 KEY_CUSTODY="file"
 SECRET_PROVIDER_ENV=""
+NO_START="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 
@@ -265,6 +266,11 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --no-start                   Install and enable everything but leave sandboxd
+                               stopped, for a node cluster-join.sh will start
+                               once it has the cluster's config and server key.
+                               Booting it before that, as a lone node, would
+                               make a server key of its own. Not with --local.
   --key-custody <file|wrapped> "wrapped" keeps the server key only wrapped by
                                the customer's key store (AWS KMS, Vault or an
                                HSM): the first boot generates it and writes no
@@ -677,6 +683,10 @@ while [[ $# -gt 0 ]]; do
 			KEY_CUSTODY="$2"
 			shift 2
 			;;
+		--no-start)
+			NO_START="true"
+			shift
+			;;
 		--secret-provider-env)
 			SECRET_PROVIDER_ENV="$2"
 			shift 2
@@ -696,6 +706,11 @@ done
 if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
+fi
+
+if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
+	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
+	exit 1
 fi
 
 case "$KEY_CUSTODY" in
@@ -2520,13 +2535,23 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
-# Before Caddy: a re-run that changed sandboxd's settings restarts it and
-# waits for it, so Caddy starts in front of a sandboxd (and, under
-# --pat-scope host, a public socket) that is already there.
-restart_sandboxd_if_reconfigured
-systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+if [[ "$NO_START" == "true" ]]; then
+	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
+	# cluster's server key are in place (see --no-start).
+	systemctl enable caddy sandboxd sandboxd-healthcheck.timer
+	systemctl start caddy sandboxd-healthcheck.timer
+else
+	# Before Caddy: a re-run that changed sandboxd's settings restarts it and
+	# waits for it, so Caddy starts in front of a sandboxd (and, under
+	# --pat-scope host, a public socket) that is already there.
+	restart_sandboxd_if_reconfigured
+	systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+fi
 
 echo "AerolVM installed"
+if [[ "$NO_START" == "true" ]]; then
+	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
+fi
 echo "PAT token: $PAT_TOKEN"
 echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then
