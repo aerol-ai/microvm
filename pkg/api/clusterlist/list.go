@@ -191,6 +191,13 @@ func SelectPeersForPage(c cluster.Client, ownerRef, pageToken string, limit int)
 		}
 		return out, nil, "", true, nil
 	}
+	if pageToken != "" && len(page.Placements) == 0 {
+		// A cursor continues a walk of the placement index, and there is no
+		// index to walk (a server still catching up after a restart, or an
+		// agent whose control plane did not answer). Answering it would end
+		// the list here, silently dropping every later page.
+		return nil, nil, "", false, nil
+	}
 
 	return peersFromPlacements(page, selfID, lookup)
 }
