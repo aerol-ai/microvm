@@ -243,7 +243,56 @@ func TestBankAPIThroughput(t *testing.T) {
 			t.Errorf("GET %s under load: %d server errors, %d transport errors", path, srvErr.Load(), netErr.Load())
 		}
 	}
+	bankInRegionAPILoad(t, workers, dur)
 }
+
+// bankInRegionAPILoad repeats the list load from a node in the same region,
+// through the public endpoint (ingress, TLS and all), so the latencies are
+// the platform's and not the runner's distance to it.
+func bankInRegionAPILoad(t *testing.T, workers int, dur time.Duration) {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil || len(targets.Nodes) == 0 || !strings.HasPrefix(sc.BaseURL, "https://") {
+		return
+	}
+	node := targets.Nodes[len(targets.Nodes)-1]
+	target, ok := harness.SSHTarget(node)
+	if !ok || !harness.NodeSSHReachable(t, node) {
+		return
+	}
+	// The token goes over stdin, never onto a command line.
+	script := fmt.Sprintf(`read -r pat; end=$(( $(date +%%s) + %d ))
+run() { while [ $(date +%%s) -lt $end ]; do curl -sk -o /dev/null -w '%%{http_code} %%{time_total}
+' -H "Authorization: Bearer $pat" %s/v1/sandboxes; done; }
+for i in $(seq 1 %d); do run & done; wait`, int(dur.Seconds()), strings.TrimRight(sc.BaseURL, "/"), workers)
+	out, err := harness.SSHRunStdin(t, target, "bash -c "+shellQuote(script), sc.PAT+"\n")
+	if err != nil {
+		t.Logf("in-region load from %s: %v", node.Name, err)
+		return
+	}
+	var lat []time.Duration
+	codes := map[string]int{}
+	for _, l := range strings.Split(out, "\n") {
+		f := strings.Fields(l)
+		if len(f) != 2 {
+			continue
+		}
+		codes[f[0]]++
+		if s, err := strconv.ParseFloat(f[1], 64); err == nil && f[0] == "200" {
+			lat = append(lat, time.Duration(s*float64(time.Second)))
+		}
+	}
+	sum := bankSummarize(lat)
+	bankRecord(t, "api_throughput_in_region_v1_sandboxes", map[string]any{"from": node.Name, "concurrency": workers, "seconds": dur.Seconds(), "codes": codes, "rps": float64(len(lat)) / dur.Seconds(), "latency": sum})
+	t.Logf("in-region GET /v1/sandboxes x%d from %s for %v: %.0f req/s, codes %v, %+v", workers, node.Name, dur, float64(len(lat))/dur.Seconds(), codes, sum)
+	for code, n := range codes {
+		if strings.HasPrefix(code, "5") && code != "503" {
+			t.Errorf("in-region load: %d responses %s", n, code)
+		}
+	}
+}
+
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'" }
 
 // UC-335 — exec latency and concurrency per runtime: sequential execs give
 // the latency a caller sees; concurrent execs into one sandbox must all
