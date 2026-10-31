@@ -424,3 +424,39 @@ func TestNetlinkBlockClearCost(t *testing.T) {
 		}
 	}
 }
+
+// TestNetlinkBatchConnAndListingEdges: a connection that fails after the
+// listing fails the batch with nothing applied, and two refs in one chain
+// share one listing.
+func TestNetlinkBatchConnAndListingEdges(t *testing.T) {
+	f := newChainNFT()
+	f.add(ChainAerolvmUser, dropSpec("10.0.0.2")...)
+	f.add(ChainAerolvmUser, dropSpec("10.0.0.3")...)
+	calls := 0
+	boom := errors.New("conn boom")
+	failSecond := &netlinkBackend{newConn: func() (nftAPI, error) {
+		calls++
+		if calls > 1 {
+			return nil, boom
+		}
+		return f, nil
+	}}
+	ref := RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.2")}
+	if err := failSecond.DeleteAll(ref); !errors.Is(err, boom) {
+		t.Fatalf("delete: %v", err)
+	}
+	calls = 0
+	if _, err := failSecond.EnsureAll(RuleInsert{RuleRef: RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.9")}, Pos: 1}); !errors.Is(err, boom) {
+		t.Fatalf("ensure: %v", err)
+	}
+	if f.count(ChainAerolvmUser, dropSpec("10.0.0.2")...) != 1 || f.flushes != 0 {
+		t.Fatal("a failed batch must apply nothing")
+	}
+	f.gets = map[string]int{}
+	if err := chainBackend(f).DeleteAll(ref, RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.3")}); err != nil {
+		t.Fatal(err)
+	}
+	if f.gets[ChainAerolvmUser] != 1 || f.count(ChainAerolvmUser, dropSpec("10.0.0.2")...) != 0 || f.count(ChainAerolvmUser, dropSpec("10.0.0.3")...) != 0 {
+		t.Fatalf("listings %v; both rules must go from one listing", f.gets)
+	}
+}

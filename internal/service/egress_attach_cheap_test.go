@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -141,5 +142,57 @@ func TestAttachErrorsKeepTheirClass(t *testing.T) {
 	}
 	if svc.egressReady.Load() {
 		t.Fatal("an unavailable gateway must drop the ready latch")
+	}
+}
+
+// unblockFailRuntime refuses the lift of the driver block.
+type unblockFailRuntime struct {
+	*holdRuntime
+	err error
+}
+
+func (u *unblockFailRuntime) ClearNetworkBlockEgress(string) error { return u.err }
+
+// TestAttachEdgeBranches: a sandbox that isn't in gateway mode attaches
+// nothing and keeps its block; a firewall that refuses the lift, and a hold
+// release that can't read the store, fail the attach without lifting.
+func TestAttachEdgeBranches(t *testing.T) {
+	svc, gw, rt := newEgressHarness(t)
+	ctx := context.Background()
+	bad := &models.Sandbox{ID: "sb-bad", ContainerIP: "not-an-ip", Runtime: models.RuntimeDocker, NetworkAllowOut: []string{"pypi.org"}}
+	if err := svc.attachSandboxEgress(ctx, bad, rt); err != nil || gw.isAttached("sb-bad") || slices.Contains(rt.clearNetworkBlockEgresses, "not-an-ip") {
+		t.Fatalf("not gateway mode: err %v attached %v", err, gw.isAttached("sb-bad"))
+	}
+
+	sb := &models.Sandbox{ID: "sb-lift", ContainerIP: "10.0.0.43", Runtime: models.RuntimeDocker, NetworkAllowOut: []string{"pypi.org"}}
+	// A gateway that can't be bootstrapped fails the attach before the RPC.
+	gw.readyErr = egress.ErrUnavailable
+	svc.egressReady.Store(false)
+	if err := svc.attachSandboxEgress(ctx, sb, rt); !errors.Is(err, egress.ErrUnavailable) || gw.isAttached("sb-lift") {
+		t.Fatalf("down gateway: %v", err)
+	}
+	gw.readyErr = nil
+	err := svc.attachSandboxEgress(ctx, sb, &unblockFailRuntime{holdRuntime: rt, err: errors.New("iptables gone")})
+	if err == nil || !strings.Contains(err.Error(), "lift driver block") {
+		t.Fatalf("refused lift: %v", err)
+	}
+
+	now := time.Now().UTC()
+	held := &models.Sandbox{ID: "sb-held", Image: "alpine", Status: models.SandboxStatusStarted, ContainerID: "ctr-held", ContainerIP: "10.0.0.44",
+		Runtime: models.RuntimeDocker, NetworkAllowOut: []string{"pypi.org"}, CreatedAt: now, UpdatedAt: now, LastActiveAt: now}
+	if err := svc.store.Create(ctx, held); err != nil {
+		t.Fatal(err)
+	}
+	svc.holdSandboxEgress(ctx, held, rt, egressHoldAttachFailed)
+	svc.testAttachStage = func(stage string, _ time.Duration) {
+		if stage == attachStageRPC {
+			_ = svc.store.Close()
+		}
+	}
+	if err := svc.attachSandboxEgress(ctx, held, rt); err == nil {
+		t.Fatal("a hold release that can't read the store must fail the attach")
+	}
+	if slices.Contains(rt.clearNetworkBlockEgresses, "10.0.0.44") {
+		t.Fatal("the block must stay when the release failed")
 	}
 }

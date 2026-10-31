@@ -28,7 +28,8 @@ var errBatchStale = errors.New("netrules: chain changed under the batch")
 // cost of a batch on a busy node (every other sandbox's rules are in it),
 // and two of them side by side cost one.
 type chainListing struct {
-	rules map[string][]*nftables.Rule
+	rules  map[string][]*nftables.Rule
+	chains map[string]*nftables.Chain
 }
 
 func chainKey(table, chain string) string { return table + "|" + chain }
@@ -72,12 +73,12 @@ func (b *netlinkBackend) listChains(refs []RuleRef) (*chainListing, error) {
 		}()
 	}
 	wg.Wait()
-	l := &chainListing{rules: make(map[string][]*nftables.Rule, len(jobs))}
+	l := &chainListing{rules: make(map[string][]*nftables.Rule, len(jobs)), chains: make(map[string]*nftables.Chain, len(jobs))}
 	for _, j := range jobs {
 		if j.err != nil {
 			return nil, j.err
 		}
-		l.rules[j.key] = j.rules
+		l.rules[j.key], l.chains[j.key] = j.rules, j.ch
 	}
 	return l, nil
 }
@@ -177,17 +178,14 @@ func (b *netlinkBackend) ensureAllOnce(ins []RuleInsert) ([]bool, error) {
 		if err != nil {
 			return nil, err
 		}
-		tbl, ch, err := lookupTableChain(in.Table, in.Chain)
-		if err != nil {
-			return nil, err
-		}
-		rules := l.rules[chainKey(in.Table, in.Chain)]
+		k := chainKey(in.Table, in.Chain)
+		ch, rules := l.chains[k], l.rules[k]
 		if slices.ContainsFunc(rules, func(r *nftables.Rule) bool { return exprsEqualIgnoringCounters(exprs, r.Exprs) }) {
 			continue
 		}
 		// The Insert contract: position 1 is the top; a later position
 		// goes before the rule now at that index; past the end appends.
-		rule := &nftables.Rule{Table: tbl, Chain: ch, Exprs: exprs}
+		rule := &nftables.Rule{Table: ch.Table, Chain: ch, Exprs: exprs}
 		switch idx := in.Pos - 1; {
 		case in.Pos <= 1:
 			conn.InsertRule(rule)
