@@ -215,6 +215,9 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		managedLabelKey:  "true",
 		poolParkLabelKey: poolParkLabelValue,
 	}
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		labels[containerIPLabelKey] = ip
+	}
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
 		return nil, err
