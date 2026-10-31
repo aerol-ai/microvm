@@ -250,6 +250,19 @@ const getUseCasesSidebarConfig = (): NavigationGroup[] => [
 
 const ent = '/enterprise'
 
+// Every provider the SSO page has setup notes for, linked to its heading there.
+// They sit under SSO, closed until opened, so the sidebar shows which providers
+// work without a page per provider.
+const ssoProviders = [
+  ['okta', 'Okta'],
+  ['entra-id', 'Entra ID'],
+  ['keycloak', 'Keycloak'],
+  ['google', 'Google'],
+  ['authentik', 'Authentik'],
+  ['zitadel', 'Zitadel'],
+  ['dex', 'Dex'],
+].map(([id, label]) => link(`${ent}/sso/#${id}`, label))
+
 // The Enterprise tab, grouped the way enterprise docs usually are: start
 // here, architecture, security, compliance, then support.
 const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
@@ -275,7 +288,7 @@ const getEnterpriseSidebarConfig = (): NavigationGroup[] => [
     entries: [
       link(`${ent}/security-controls`, '- Security baseline'),
       link(`${ent}/hardening`, '- Hardening guide'),
-      link(`${ent}/sso`, '- SSO'),
+      { ...link(`${ent}/sso`, '- SSO'), children: ssoProviders },
       link(`${ent}/key-custody`, '- Use your own key store'),
       link(`${ent}/enterprise-mode`, '- Enterprise mode'),
       link(`${ent}/responsibility`, '- Shared responsibility'),
