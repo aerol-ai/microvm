@@ -106,10 +106,52 @@ func (s *Service) applyWrappedRing(ctx context.Context, f secrets.WrappedKeyFile
 	s.noteServerKeyRing(f.Entries())
 }
 
+// ringView names the ring a reseal count is for: its keys and the current
+// one.
+func ringView(c *secrets.Cipher) string {
+	return fmt.Sprint(c.KeyIDs(), "/", c.CurrentKeyID())
+}
+
+func (s *Service) setResealedRing(view string) {
+	s.keyCustody.mu.Lock()
+	s.keyCustody.resealedRing = view
+	s.keyCustody.mu.Unlock()
+}
+
+// invalidateResealRows publishes every key of the cipher's ring but the
+// current one as -1, unknown, unless the last finished pass counted this
+// very ring (view; "" always invalidates).
+func (s *Service) invalidateResealRows(view string) {
+	s.keyCustody.mu.Lock()
+	same := view != "" && s.keyCustody.resealedRing == view
+	if !same {
+		s.keyCustody.resealedRing = ""
+	}
+	s.keyCustody.mu.Unlock()
+	if same {
+		return
+	}
+	serverKeyRowsGauge.Init()
+	cur := s.cipher.CurrentKeyID()
+	for _, id := range s.cipher.KeyIDs() {
+		if id != cur {
+			v := new(expvar.Int)
+			v.Set(-1)
+			serverKeyRowsGauge.Set(strconv.FormatUint(uint64(id), 10), v)
+		}
+	}
+}
+
 // noteServerKeyRing publishes the ring gauge and records each rotation step
 // since the last ring this node took. The state is written only once every
 // record is durable, so a failed record is retried on the next re-read.
+// A ring the last reseal pass did not count shows its old keys as unknown
+// at once, not after the next pass starts (a promote between two passes
+// would otherwise show the old key as gone).
 func (s *Service) noteServerKeyRing(entries []secrets.RingEntry) {
+	if s.cipher != nil && s.cipher.Rotating() {
+		s.invalidateResealRows(ringView(s.cipher))
+	}
 	inner := map[string]*expvar.Map{}
 	for _, e := range entries {
 		id := strconv.FormatUint(uint64(e.ID), 10)
@@ -208,10 +250,20 @@ func (s *Service) emitDurableKeyEvent(kind, reason string) bool {
 // read on until the next pass looks again: the count never reaches 0 early.
 // With one key in the ring there is nothing to move and nothing is read.
 func (s *Service) ResealServerKeyRows(ctx context.Context) (map[string]int, error) {
-	if s == nil || s.cipher == nil || s.KeyRevoked() || !s.cipher.Rotating() {
+	if s == nil || s.cipher == nil || s.KeyRevoked() {
 		serverKeyRowsGauge.Init()
 		return nil, nil
 	}
+	view := ringView(s.cipher)
+	if !s.cipher.Rotating() {
+		// One key: nothing older to count.
+		serverKeyRowsGauge.Init()
+		s.setResealedRing(view)
+		return nil, nil
+	}
+	// Counts are for the ring they were made under: until a pass under
+	// this one finishes, the old keys are unknown, never absent.
+	s.invalidateResealRows(view)
 	current := strconv.FormatUint(uint64(s.cipher.CurrentKeyID()), 10)
 	counts := map[string]int{}
 	resealed := 0
@@ -224,25 +276,21 @@ func (s *Service) ResealServerKeyRows(ctx context.Context) (map[string]int, erro
 		counts[strconv.FormatUint(uint64(from), 10)]++
 	}
 	err := s.resealPass(ctx, count, func() { counts[rowsUnopenable]++ })
-	serverKeyRowsGauge.Init()
-	publish := func(id string, n int64) {
-		v := new(expvar.Int)
-		v.Set(n)
-		serverKeyRowsGauge.Set(id, v)
-	}
-	if err != nil {
-		// A pass that stopped early counted only some values, and a key it
-		// did not reach would be absent: what a retire waits for. So every
-		// key but the current one is published as unknown (-1).
-		for _, id := range s.cipher.KeyIDs() {
-			if k := strconv.FormatUint(uint64(id), 10); k != current {
-				publish(k, -1)
-			}
-		}
-	} else {
+	switch {
+	case err != nil, ringView(s.cipher) != view:
+		// A pass that stopped early counted only some values, and one that
+		// a ring change overtook counted for a ring that is gone: a key it
+		// did not reach would be absent, what a retire waits for. Every
+		// key but the current one stays unknown (-1).
+		s.invalidateResealRows("")
+	default:
+		serverKeyRowsGauge.Init()
 		for id, n := range counts {
-			publish(id, int64(n))
+			v := new(expvar.Int)
+			v.Set(int64(n))
+			serverKeyRowsGauge.Set(id, v)
 		}
+		s.setResealedRing(view)
 	}
 	keyRowsResealed.Add(int64(resealed))
 	if resealed > 0 {

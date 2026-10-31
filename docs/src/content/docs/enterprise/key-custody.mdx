@@ -248,7 +248,7 @@ A **deleted** key makes everything sealed with it unreadable for good. That is h
 
 ### The key in your key store
 
-- **Vault or OpenBao:** rotate the Transit key. Each server moves its stored keys onto the new version in the background, once an hour. When `aerolvm_key_rows_stale` is 0 on every server, you can raise `min_decryption_version` to retire the old version. A value of -1 means the last pass did not finish, so keep waiting. Retiring too early fires `SandboxdKeyVersionRetiredInUse`.
+- **Vault or OpenBao:** rotate the Transit key. Each server moves its stored keys onto the new version in the background, once an hour. When `aerolvm_key_rows_stale` is 0 on every server, you can raise `min_decryption_version` to retire the old version. A value of -1 means no pass against the new version has finished yet, so keep waiting. Retiring too early fires `SandboxdKeyVersionRetiredInUse`.
 - **AWS KMS:** rotates in place. Nothing to do.
 - **HSM:** labels are settings on each server, so rotation takes four steps: add the new label to `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` everywhere; switch `SB_SECRET_PKCS11_KEY_LABEL` to it once every server lists it as decryptable; wait for `aerolvm_key_rows_stale` to reach 0; then remove the old label and destroy the old key. The [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#rotate-the-key-store-key) has the details.
 
@@ -257,7 +257,7 @@ A **deleted** key makes everything sealed with it unreadable for good. That is h
 A new server key makes old copies of the server key useless for anything in the current database. It works with wrapped custody and with a plain key file.
 
 1. `sandboxd key rotate --stage` on one server. Copy the file it names to every server. Wait until `aerolvm_server_key_ring{key="1",key2="decrypt"}` shows on every server.
-2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server. A value of -1 means the last pass did not finish, so keep waiting.
+2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server. A value of -1 means no pass under the new key has finished yet, so keep waiting.
 3. `sandboxd key rotate --retire 0`, and copy the file again.
 
 Every server must run a release that supports rotation before step 1; `--stage` checks this and refuses otherwise. Each server records `key_rotation_staged`, `key_rotation_promoted` and `key_rotation_retired` in its audit log. After step 2 a server cannot go back to an older release.
