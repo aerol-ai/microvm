@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/cmd/toolboxd/loginshell"
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sandboxenv"
 	"github.com/aerol-ai/microvm/cmd/toolboxd/sessions"
 	"github.com/aerol-ai/microvm/internal/version"
 	"github.com/aerol-ai/microvm/pkg/clonegen"
@@ -31,6 +32,20 @@ import (
 )
 
 var userCommandPID atomic.Int64
+
+// sandboxEnv is the sandbox env a Firecracker host pushes over vsock
+// (set_env). Empty on a container runtime, whose sandbox env is already in
+// os.Environ(). Every child toolboxd starts for the user takes its
+// environment from childEnviron, so the pushed env reaches exec, sessions,
+// terminals, SSH, envd and Daytona processes alike.
+var sandboxEnv = &sandboxenv.Store{}
+
+// childEnviron is the environment a user-facing child starts from: toolboxd's
+// own (the image env, minus the toolbox token) with the sandbox env laid on
+// top. Callers append a request's own env after it, so per-request env wins.
+func childEnviron() []string {
+	return sandboxEnv.Environ(os.Environ())
+}
 
 var (
 	hostnameFn = os.Hostname
@@ -195,6 +210,7 @@ func main() {
 		RecordingRetention: envDuration("SB_RECORDING_RETENTION", 7*24*time.Hour),
 		BufferBytes:        envInt("SB_SESSION_BUFFER_BYTES", 1<<20),
 		StartProcess:       startSessionProcess,
+		BaseEnv:            childEnviron,
 	})
 	if err != nil {
 		logger.Warn("session manager init failed; sessions disabled", "error", err)
@@ -221,6 +237,7 @@ func main() {
 	// so the handler's pre_snapshot can fsync session recordings; nil
 	// is treated as "no sessions to flush" by the handler.
 	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions), srv.cloneGen)
+	vsockHandler.env = sandboxEnv
 	if vs, err := newVsockServerFn(defaultVsockPort, vsockHandler, logger); err != nil {
 		logger.Warn("vsock listener disabled", "error", err)
 	} else {
@@ -273,7 +290,7 @@ func startUserCommand(logger *slog.Logger, args []string) {
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = os.Environ()
+	cmd.Env = childEnviron()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		logger.Error("failed to start user command", "args", args, "error", err)
@@ -606,7 +623,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	// A login shell, so profile setup applies; the image's PATH, which
 	// /etc/profile resets, goes back in front before the command runs.
 	cmd := exec.CommandContext(ctx, shell, "-lc", loginshell.Prefix(req.Command))
-	cmd.Env = append(append(os.Environ(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
+	cmd.Env = append(append(childEnviron(), envMapToSlice(req.Env)...), loginshell.EnvFor(req.Env)...)
 	if req.WorkDir != "" {
 		cmd.Dir = req.WorkDir
 	}
