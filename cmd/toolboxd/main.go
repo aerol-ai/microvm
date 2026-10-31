@@ -652,7 +652,7 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 	result.ExitCode, _ = interpretWaitResult(waitErr)
 	if waitErr != nil {
 		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !errors.Is(waitErr, syscall.ECHILD) {
+		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
 			result.Stderr = strings.TrimSpace(result.Stderr + "\n" + waitErr.Error())
 		}
 	}
