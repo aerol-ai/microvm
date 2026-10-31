@@ -103,10 +103,10 @@ func cover96_ptr_Driver(recv *Driver) {
 	}) // driver.go:1124
 	cover96Call(func() { recv.requireKernelVMGenID() }) // driver.go:1694
 	// skip sendVsockOp (snapshot.go:392)
-	cover96Call(func() { recv.startFromSandboxSnapshot(cover96Ctx(), zero96[string]()) }) // sandbox_snapshot.go:296
-	cover96Call(func() { recv.stopToSandboxSnapshot(cover96Ctx(), zero96[string]()) })    // sandbox_snapshot.go:98
+	cover96Call(func() { recv.startFromSandboxSnapshot(cover96Ctx(), zero96[string](), zero96[string]()) }) // sandbox_snapshot.go:296
+	cover96Call(func() { recv.stopToSandboxSnapshot(cover96Ctx(), zero96[string]()) })                      // sandbox_snapshot.go:98
 	cover96Call(func() {
-		recv.tryAcquireWarm(cover96Ctx(), zero96[models.CreateSandboxRequest](), zero96[string](), zero96[*TemplateResolution](), zero96[*TapSlot](), zero96[string]())
+		recv.tryAcquireWarm(cover96Ctx(), zero96[models.CreateSandboxRequest](), zero96[string](), zero96[string](), zero96[*TemplateResolution](), zero96[*TapSlot](), zero96[string]())
 	}) // warmacquire.go:94
 	cover96Call(func() {
 		recv.writeSandboxSnapshot(cover96Ctx(), zero96[string](), zero96[VMMHandle](), zero96[VMMClient](), zero96[uint32]())

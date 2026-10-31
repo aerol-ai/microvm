@@ -2028,6 +2028,9 @@ type templateBuilderAdapter struct {
 
 func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
 	var inject []oci.InjectFile
+	// No token, on purpose: the template's disk and snapshot are shared by
+	// every sandbox booted from it, so its agent boots token-less, serves
+	// nothing, and is adopted per sandbox over vsock (the driver's adopt op).
 	for _, f := range fcruntime.ColdBootInjectFiles(a.toolboxBinaryPath, "", nil) {
 		inject = append(inject, oci.InjectFile{
 			HostPath:  f.HostPath,

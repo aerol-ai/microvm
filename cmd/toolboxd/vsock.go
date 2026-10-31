@@ -20,10 +20,10 @@ package main
 // lifetime (no snapshots in flight), so the snapshot-tear problem
 // doesn't apply. Vsock is reserved for host control-plane messages: the
 // snapshot-lifecycle signals and, once per boot, the sandbox env
-// (set_env). The env rides vsock rather than the TCP API because only the
-// host can open this channel (Firecracker's Unix socket in the VMM's run
-// directory), and because a template snapshot has no other way to receive
-// a per-sandbox value.
+// (set_env) and the sandbox's identity (adopt). Both ride vsock rather than
+// the TCP API because only the host can open this channel (Firecracker's
+// Unix socket in the VMM's run directory), and because a template snapshot
+// has no other way to receive a per-sandbox value.
 
 import (
 	"bufio"
@@ -75,6 +75,14 @@ const (
 	// because a sandbox silently missing its secrets is the bug this op
 	// exists to close. See cmd/toolboxd/sandboxenv.
 	OpSetEnv VsockOp = "set_env"
+	// OpAdopt gives a token-less agent its sandbox identity. Data is
+	// {"sandbox_id":"...","token":"..."}. A guest booted from a template,
+	// a template snapshot or the warm pool has no toolbox token (the
+	// template's disk and memory must not carry one, or every clone would
+	// share it) and serves nothing but /health until this op lands. Like
+	// set_env it is mandatory: the host fails the create when it is not
+	// acked. The first token sticks; see server.adoptOverVsock.
+	OpAdopt VsockOp = "adopt"
 )
 
 // VsockMessage is the request shape. Newline-delimited JSON, one
@@ -112,6 +120,17 @@ type VsockHandler interface {
 // fails the create rather than booting a sandbox without its env.
 type vsockEnvHandler interface {
 	OnSetEnv(ctx context.Context, raw json.RawMessage) error
+}
+
+// vsockAdoptHandler is the optional adopt capability, separate for the same
+// reason as vsockEnvHandler: a handler without it answers "unknown op".
+type vsockAdoptHandler interface {
+	OnAdopt(ctx context.Context, raw json.RawMessage) error
+}
+
+// identityAdopter is the part of the server the adopt op drives.
+type identityAdopter interface {
+	adoptOverVsock(sandboxID, token string) (changed bool, err error)
 }
 
 // vsockReadDeadline is the per-message read budget enforced by
@@ -185,6 +204,11 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 			return h.OnSetEnv(ctx, msg.Data)
 		}
 		return fmt.Errorf("unknown op %q", msg.Op)
+	case OpAdopt:
+		if h, ok := handler.(vsockAdoptHandler); ok {
+			return h.OnAdopt(ctx, msg.Data)
+		}
+		return fmt.Errorf("unknown op %q", msg.Op)
 	case "":
 		return errors.New("missing op")
 	default:
@@ -240,6 +264,8 @@ type quiesceHandler struct {
 	cloneGen *clonegen.Generation
 	// env receives set_env pushes; nil answers set_env with an error.
 	env *sandboxenv.Store
+	// identity receives adopt; nil answers adopt with an error.
+	identity identityAdopter
 }
 
 func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *clonegen.Generation) *quiesceHandler {
@@ -349,5 +375,28 @@ func (h *quiesceHandler) OnSetEnv(_ context.Context, raw json.RawMessage) error 
 		return fmt.Errorf("set_env: %w", err)
 	}
 	h.logger.Info("vsock: set_env applied", "keys", len(data.Env), "changed", changed)
+	return nil
+}
+
+// OnAdopt hands the server the sandbox identity the host pushed. The token
+// is the sandbox's credential, so it is never logged or echoed: a malformed
+// payload is reported without the decoder's error, which can quote input.
+func (h *quiesceHandler) OnAdopt(_ context.Context, raw json.RawMessage) error {
+	if h.identity == nil {
+		return errors.New("adopt: this agent cannot take an identity")
+	}
+	var data struct {
+		SandboxID string `json:"sandbox_id"`
+		Token     string `json:"token"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return errors.New("adopt: malformed payload; want {\"sandbox_id\":\"...\",\"token\":\"...\"}")
+	}
+	changed, err := h.identity.adoptOverVsock(data.SandboxID, data.Token)
+	if err != nil {
+		h.logger.Warn("vsock: adopt refused", "sandbox_id", data.SandboxID, "error", err)
+		return err
+	}
+	h.logger.Info("vsock: adopt applied", "sandbox_id", data.SandboxID, "changed", changed)
 	return nil
 }

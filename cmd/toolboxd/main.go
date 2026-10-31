@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,9 +94,19 @@ type server struct {
 	execLiveness execStreamLiveness
 }
 
+// servingRequests reports whether the agent may answer anything beyond
+// /health. It needs a per-sandbox token: an agent without one (a Firecracker
+// guest booted from a template, a template snapshot or the warm pool, before
+// the host adopts it over vsock) fails closed instead of serving exec, files
+// and sessions to whoever reaches its port. A parked container also waits
+// for its adoption, because the token it booted with is its slot's bootstrap
+// token, not a sandbox's.
 func (s *server) servingRequests() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.authToken == "" {
+		return false
+	}
 	return !s.parkedMode || s.adopted
 }
 
@@ -105,6 +116,51 @@ func (s *server) adoptIdentity(sandboxID, token string) {
 	s.authToken = strings.TrimSpace(token)
 	s.adopted = true
 	s.mu.Unlock()
+}
+
+// errAdoptedElsewhere refuses a token other than the one the agent holds. A
+// template clone or warm slot is adopted by exactly one sandbox; a second
+// sandbox's identity must never replace the first's.
+var errAdoptedElsewhere = errors.New("adopt: this agent already holds another sandbox's identity")
+
+// adoptOverVsock gives the agent its sandbox identity from the host's vsock
+// adopt op (Firecracker). The first token sticks: re-delivering it converges
+// (a retry after a lost ack), any other token is refused. A token baked in at
+// boot (a cold-booted guest's SB_TOOLBOX_TOKEN) counts as the first. Nothing
+// here returns or logs the token.
+func (s *server) adoptOverVsock(sandboxID, token string) (changed bool, err error) {
+	sandboxID = strings.TrimSpace(sandboxID)
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false, errors.New("adopt: a token is required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.parkedMode {
+		// A parked container is adopted over its slot's ready socket, which
+		// also starts its held-back command; vsock is the VM path only.
+		return false, errors.New("adopt: a parked agent is adopted over its ready socket")
+	}
+	switch {
+	case s.authToken == "":
+		s.authToken = token
+		changed = true
+	case subtle.ConstantTimeCompare([]byte(s.authToken), []byte(token)) != 1:
+		return false, errAdoptedElsewhere
+	}
+	if sandboxID != "" && sandboxID != s.sandboxID {
+		s.sandboxID = sandboxID
+		changed = true
+	}
+	return changed, nil
+}
+
+// identity returns the sandbox ID and token under the lock: adoption can
+// land while requests are being served.
+func (s *server) identity() (sandboxID, token string) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sandboxID, s.authToken
 }
 
 func (s *server) setAllowedPorts(ports []int) {
@@ -238,6 +294,7 @@ func main() {
 	// is treated as "no sessions to flush" by the handler.
 	vsockHandler := newQuiesceHandler(logger, newSessionFlusher(srv.sessions), srv.cloneGen)
 	vsockHandler.env = sandboxEnv
+	vsockHandler.identity = srv
 	if vs, err := newVsockServerFn(defaultVsockPort, vsockHandler, logger); err != nil {
 		logger.Warn("vsock listener disabled", "error", err)
 	} else {
@@ -249,7 +306,8 @@ func main() {
 		defer vs.Close()
 	}
 
-	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", srv.sandboxID, "version", version.Version)
+	listeningID, _ := srv.identity()
+	logger.Info("toolboxd listening", "addr", addr, "sandbox_id", listeningID, "version", version.Version)
 	if err := serveHTTPFn(httpServer, ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("toolboxd failed", "error", err)
 		os.Exit(1)
@@ -362,6 +420,10 @@ func (s *server) routes() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = s.stripSandboxPrefix(r)
 
+		// Before adoption only /health answers: the host's readiness poll
+		// for a container, and nothing that runs a command or reads a file.
+		// Everything else, including the routes that are open after
+		// adoption (/, /version, /clone-generation, /proxy/), waits.
 		if !s.servingRequests() && r.URL.Path != "/health" {
 			writeError(w, http.StatusServiceUnavailable, "sandbox not adopted")
 			return
@@ -369,8 +431,9 @@ func (s *server) routes() http.Handler {
 
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/":
+			sandboxID, _ := s.identity()
 			writeJSON(w, http.StatusOK, map[string]any{
-				"sandbox_id": s.sandboxID,
+				"sandbox_id": sandboxID,
 				"version":    version.Version,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/health":
@@ -486,7 +549,8 @@ func (s *server) routes() http.Handler {
 }
 
 func (s *server) stripSandboxPrefix(r *http.Request) *http.Request {
-	r.URL.Path = normalizeSandboxPath(r.URL.Path, s.sandboxID)
+	sandboxID, _ := s.identity()
+	r.URL.Path = normalizeSandboxPath(r.URL.Path, sandboxID)
 	return r
 }
 
@@ -581,13 +645,16 @@ func isKnownToolboxPath(path string) bool {
 	}
 }
 
+// requireAuth admits a request that carries this sandbox's token. An agent
+// with no token admits nothing: the routes() gate already answers 503 before
+// adoption, and this check fails closed on its own so no route can reach a
+// handler unauthenticated however it is wired.
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.authToken == "" {
-		return true
-	}
+	_, token := s.identity()
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authorization, prefix) || strings.TrimPrefix(authorization, prefix) != s.authToken {
+	if token == "" || !strings.HasPrefix(authorization, prefix) ||
+		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(authorization, prefix)), []byte(token)) != 1 {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return false
 	}

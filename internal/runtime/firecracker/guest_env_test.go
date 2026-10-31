@@ -223,7 +223,7 @@ func TestCreateDeliversEnvOnEveryBootPath(t *testing.T) {
 		{
 			name:    "cold boot from an OCI image",
 			stage:   func(*testing.T, *driverFixture) (string, uint32) { return "", 3 },
-			wantOps: []string{"ping", "post_resume", guestEnvOp},
+			wantOps: []string{"ping", "post_resume", guestEnvOp, guestAdoptOp},
 		},
 		{
 			name: "cold boot from a template rootfs",
@@ -231,14 +231,14 @@ func TestCreateDeliversEnvOnEveryBootPath(t *testing.T) {
 				stageSnapshotTemplate(t, f, false)
 				return "tpl-rootfs", 3
 			},
-			wantOps: []string{"ping", "post_resume", guestEnvOp},
+			wantOps: []string{"ping", "post_resume", guestEnvOp, guestAdoptOp},
 		},
 		{
 			name: "snapshot load from a template",
 			stage: func(t *testing.T, f *driverFixture) (string, uint32) {
 				return "tpl-snap", stageSnapshotTemplate(t, f, true)
 			},
-			wantOps: []string{"ping", "post_resume", guestEnvOp},
+			wantOps: []string{"ping", "post_resume", guestEnvOp, guestAdoptOp},
 		},
 		{
 			name: "warm-pool acquire",
@@ -247,7 +247,7 @@ func TestCreateDeliversEnvOnEveryBootPath(t *testing.T) {
 				stageWarmTemplate(t, f, false)
 				return "tpl-warm", 200
 			},
-			wantOps: []string{"ping", "post_resume", guestEnvOp},
+			wantOps: []string{"ping", "post_resume", guestEnvOp, guestAdoptOp},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -295,8 +295,8 @@ func TestCreateWithoutEnvSendsNoSetEnv(t *testing.T) {
 	if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", MemoryMB: 128}, "sb-noenv", "tok", nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if got := vsock.opList(); !slices.Equal(got, []string{"ping", "post_resume"}) {
-		t.Fatalf("vsock ops = %v, want [ping post_resume]", got)
+	if got := vsock.opList(); !slices.Equal(got, []string{"ping", "post_resume", guestAdoptOp}) {
+		t.Fatalf("vsock ops = %v, want [ping post_resume adopt]", got)
 	}
 	if slices.ContainsFunc(timing.Stages(), func(s createtiming.Stage) bool { return s.Name == "fc_env" }) {
 		t.Fatal("an env-less create recorded fc_env")
