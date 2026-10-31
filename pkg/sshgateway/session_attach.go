@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
@@ -241,7 +242,7 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, ep s
 // findOrCreateSession looks up the named session via toolboxd's HTTP API and
 // returns its ID, creating it if absent. Synchronous; uses small timeouts.
 func (g *Gateway) findOrCreateSession(ctx context.Context, ep sessionEndpoint, name string, state *sessionState) (string, error) {
-	httpClient := &http.Client{Timeout: 5 * time.Second}
+	httpClient := toolboxhttp.Client(5 * time.Second)
 
 	create := models.CreateSessionRequest{
 		Name: name,
