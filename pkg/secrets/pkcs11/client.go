@@ -265,6 +265,32 @@ func (h *Helper) Info() Info {
 	return h.info
 }
 
+// CurrentKeyVersion implements secrets.KeyVersioner: the label new wraps
+// use, in the form secrets.WrappedKeyVersion reports, so the rewrap sweep
+// moves rows on older labels to it (§11, eng D23).
+func (h *Helper) CurrentKeyVersion(context.Context) (string, error) {
+	label := h.Info().KeyLabel
+	if label == "" {
+		return "", fmt.Errorf("%w: the pkcs11 helper has not started", secrets.ErrProviderUnavailable)
+	}
+	return "p11:" + label, nil
+}
+
+// DecryptableKeyVersions lists the labels this node still opens, current
+// first, for aerolvm_key_decryptable (eng D23: a rotation waits until every
+// member can open the new label before switching to it).
+func (h *Helper) DecryptableKeyVersions() []string {
+	info := h.Info()
+	if info.KeyLabel == "" {
+		return nil
+	}
+	out := []string{"p11:" + info.KeyLabel}
+	for _, l := range info.DecryptLabels {
+		out = append(out, "p11:"+l)
+	}
+	return out
+}
+
 // Wrap implements secrets.DataKeyWrapper.
 func (h *Helper) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) ([]byte, error) {
 	return h.call(ctx, request{Op: opWrap, Data: dek, AAD: secrets.EncryptionContextAAD(encCtx)})

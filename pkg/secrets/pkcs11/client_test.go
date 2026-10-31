@@ -26,7 +26,11 @@ func TestMain(m *testing.M) {
 			if cfg.KeyLabel == "refuse" {
 				return nil, errors.New("token refused")
 			}
-			return &fakeBackend{info: Info{KeyLabel: cfg.KeyLabel, TokenLabel: cfg.TokenLabel, DecryptLabels: cfg.DecryptLabels, IVMode: cfg.IVMode}}, nil
+			b := &fakeBackend{info: Info{KeyLabel: cfg.KeyLabel, TokenLabel: cfg.TokenLabel, DecryptLabels: cfg.DecryptLabels, IVMode: cfg.IVMode}}
+			if cfg.KeyLabel == "hang-once" {
+				b.hangOnce = cfg.TokenLabel
+			}
+			return b, nil
 		}
 		if os.Getenv("PKCS11_HELPER_REAL") == "1" {
 			open = openBackend
@@ -48,6 +52,10 @@ type fakeBackend struct {
 	hang    chan struct{} // Wrap blocks until closed, ignoring ctx, like a stuck C call
 	closed  bool
 	lastAAD []byte
+	// hangOnce is a marker file: the first Wrap any helper process sees
+	// creates it and hangs for good, like a stuck C call; once it exists,
+	// Wrap serves (TestHelperExitMidCall).
+	hangOnce string
 }
 
 func (f *fakeBackend) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {
@@ -57,6 +65,12 @@ func (f *fakeBackend) Wrap(_ context.Context, dek, aad []byte) ([]byte, error) {
 	f.mu.Unlock()
 	if hang != nil {
 		<-hang
+	}
+	if f.hangOnce != "" {
+		if _, serr := os.Stat(f.hangOnce); errors.Is(serr, os.ErrNotExist) {
+			_ = os.WriteFile(f.hangOnce, nil, 0o600)
+			select {}
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -243,6 +257,61 @@ func TestHelperDeadlineKillsStuckHelper(t *testing.T) {
 	waitUntil(t, "replacement", func() bool { return starts.Load() == 2 })
 	if counter(RestartDeadline) != before+1 {
 		t.Fatalf("deadline restarts = %d, want %d", counter(RestartDeadline), before+1)
+	}
+	// The replacement serves once the token answers again.
+	b.set(func(f *fakeBackend) { f.hang = nil })
+	waitUntil(t, "the replacement ready", h.isReady)
+	if _, err := h.Wrap(context.Background(), []byte("d"), nil); err != nil {
+		t.Fatalf("after the replacement: %v", err)
+	}
+	if OpDeadline != 5*time.Second {
+		t.Fatalf("OpDeadline = %v, the plan's bound is 5s (eng D25)", OpDeadline)
+	}
+}
+
+// eng D5: the helper process exits in the middle of a call. That caller
+// gets ErrProviderUnavailable when the process dies, not after the op
+// deadline; the restart counts as an exit; the next call succeeds through
+// the new process.
+func TestHelperExitMidCall(t *testing.T) {
+	fastTimings(t)
+	opDeadlineOverride.Store(int64(30 * time.Second))
+	startTimeoutOverride.Store(int64(10 * time.Second))
+	marker := filepath.Join(t.TempDir(), "in-call")
+	h, err := StartHelper(HelperOptions{Socket: shortSocket(t), Token: TokenConfig{KeyLabel: "hang-once", TokenLabel: marker}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	exits, deadlines := counter(RestartExit), counter(RestartDeadline)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := h.Wrap(context.Background(), []byte("dek"), nil)
+		errc <- err
+	}()
+	waitUntil(t, "the call to reach the helper", func() bool { _, err := os.Stat(marker); return err == nil })
+	h.mu.Lock()
+	p := h.proc
+	h.mu.Unlock()
+	_ = p.Kill()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, secrets.ErrProviderUnavailable) {
+			t.Fatalf("the call in flight = %v, want ErrProviderUnavailable", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the call outlived the helper process")
+	}
+	waitUntil(t, "the restart", func() bool { return counter(RestartExit) == exits+1 && h.isReady() })
+	if counter(RestartDeadline) != deadlines {
+		t.Fatal("an exit was counted as a deadline")
+	}
+	w, err := h.Wrap(context.Background(), []byte("dek"), nil)
+	if err != nil {
+		t.Fatalf("after the restart: %v", err)
+	}
+	if got, err := h.Unwrap(context.Background(), w, nil); err != nil || string(got) != "dek" {
+		t.Fatalf("Unwrap after the restart = %q %v", got, err)
 	}
 }
 
@@ -454,3 +523,25 @@ type nopListener struct{}
 func (nopListener) Accept() (net.Conn, error) { return nil, errors.New("closed") }
 func (nopListener) Close() error              { return nil }
 func (nopListener) Addr() net.Addr            { return &net.UnixAddr{} }
+
+func TestHelperCurrentKeyVersion(t *testing.T) {
+	fastTimings(t)
+	var starts atomic.Int32
+	h, err := StartHelper(HelperOptions{Socket: shortSocket(t), start: inprocStarter(&fakeBackend{info: Info{KeyLabel: "kek-b", DecryptLabels: []string{"kek-a"}}}, &starts, nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	if v, err := h.CurrentKeyVersion(context.Background()); err != nil || v != "p11:kek-b" {
+		t.Fatalf("CurrentKeyVersion = %q %v", v, err)
+	}
+	if got := h.DecryptableKeyVersions(); strings.Join(got, ",") != "p11:kek-b,p11:kek-a" {
+		t.Fatalf("DecryptableKeyVersions = %v", got)
+	}
+	if _, err := (&Helper{}).CurrentKeyVersion(context.Background()); !errors.Is(err, secrets.ErrProviderUnavailable) {
+		t.Fatalf("not started = %v", err)
+	}
+	if (&Helper{}).DecryptableKeyVersions() != nil {
+		t.Fatal("a helper that never started lists keys")
+	}
+}

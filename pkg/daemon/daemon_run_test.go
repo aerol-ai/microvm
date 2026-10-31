@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -616,4 +617,39 @@ func TestStartTemplateRotationReconciler_IntervalWithoutMaxAge(t *testing.T) {
 		FirecrackerTemplateRotationInterval: 5 * time.Millisecond,
 		FirecrackerTemplateMaxAge:           0,
 	}, st, svc)
+}
+
+// plans/customer-key-custody.md §3: with wrapped custody the key-store
+// client starts first, the server key is opened through it, and only then
+// is the store opened. A key store that refuses stops the boot at the
+// cipher, before the database file exists.
+func TestRun_WrappedCustodyOpensTheKeyBeforeTheStore(t *testing.T) {
+	paths := setBaseRunEnv(t)
+	var calls atomic.Int32
+	vault := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
+	}))
+	t.Cleanup(vault.Close)
+	t.Setenv("SB_CREDENTIAL_KEY_CUSTODY", "wrapped")
+	t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", filepath.Join(paths.rootDir, "credential_encryption.key.wrapped"))
+	t.Setenv("SB_SECRET_PROVIDER", "vault")
+	t.Setenv("SB_SECRET_VAULT_ADDR", vault.URL)
+	t.Setenv("SB_SECRET_VAULT_KEY_NAME", "aerolvm-kek")
+
+	err := Run(context.Background(), testLogger(), nil)
+	if err == nil || !strings.Contains(err.Error(), "initialize credential cipher") {
+		t.Fatalf("Run = %v, want the boot to stop at the server key", err)
+	}
+	if calls.Load() == 0 {
+		t.Fatal("the server key was not opened through the key store")
+	}
+	if _, err := os.Stat(paths.dbPath); !os.IsNotExist(err) {
+		t.Fatalf("the store was opened before the server key: %v", err)
+	}
+	if _, err := os.Stat(paths.keyPath); !os.IsNotExist(err) {
+		t.Fatalf("a plaintext server key was written: %v", err)
+	}
 }

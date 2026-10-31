@@ -37,6 +37,7 @@ func KeyStoreOptions(cfg config.Config, nodeID string, pkcs11 secrets.DataKeyWra
 		PKCS11:      pkcs11,
 		MaxInFlight: cfg.SecretProviderMaxInFlight,
 		Observer:    recordKeyStoreLimiterWait,
+		Calls:       recordKeyStoreCall,
 	}
 }
 
@@ -72,6 +73,13 @@ const (
 	CustodyNotConfigured   = "not configured"
 )
 
+// The answers for a PKCS#11 slot that is not hardware (SoftHSM2): the key
+// sits in a file on this host, so the report does not claim an HSM (§2).
+const (
+	CustodyWrappedSoftwareToken = "customer key store (wrapped, software token)"
+	CustodyPKCS11SoftwareToken  = "pkcs11 (software token)"
+)
+
 // CustodyRow is one key class and where it lives.
 type CustodyRow struct {
 	Class   string
@@ -81,9 +89,15 @@ type CustodyRow struct {
 	InScope bool
 }
 
-// CustodyReport is where each key class lives on this node, from config
-// alone: no key-store call, no database (§9).
-func CustodyReport(cfg config.Config) []CustodyRow {
+// CustodyFacts are what config cannot say: only the running PKCS#11 token
+// knows whether its slot is hardware.
+type CustodyFacts struct {
+	SoftwareToken bool
+}
+
+// CustodyReport is where each key class lives on this node, from config and
+// facts: no key-store call, no database (§9).
+func CustodyReport(cfg config.Config, facts CustodyFacts) []CustodyRow {
 	server := CustodyPlaintextFile
 	switch {
 	case cfg.CredentialKeyCustody == secrets.CustodyWrapped:
@@ -94,6 +108,12 @@ func CustodyReport(cfg config.Config) []CustodyRow {
 	deks := secrets.NormalizeProviderName(cfg.SecretProvider)
 	if deks == secrets.ProviderLocal {
 		deks = CustodyLocalServerKey
+	}
+	if facts.SoftwareToken && deks == secrets.ProviderPKCS11 {
+		deks = CustodyPKCS11SoftwareToken
+		if server == CustodyWrappedKeyStore {
+			server = CustodyWrappedSoftwareToken
+		}
 	}
 	plainOrNone := func(set bool, how string) string {
 		if set {
@@ -119,10 +139,10 @@ func CustodyReport(cfg config.Config) []CustodyRow {
 var keyCustodyGauge = expvar.NewMap("aerolvm_key_custody")
 
 // PublishKeyCustody publishes the custody report as the gauge.
-func PublishKeyCustody(cfg config.Config) {
+func PublishKeyCustody(cfg config.Config, facts CustodyFacts) {
 	keyCustodyGauge.Init()
 	enterprise := strconv.FormatBool(cfg.EnterpriseMode)
-	for _, row := range CustodyReport(cfg) {
+	for _, row := range CustodyReport(cfg, facts) {
 		byCustody := new(expvar.Map).Init()
 		byEnterprise := new(expvar.Map).Init()
 		one := new(expvar.Int)
@@ -255,6 +275,15 @@ type keyCustodyState struct {
 	closers []func() int
 	// restartGateway replaces the systemctl restart in tests.
 	restartGateway func(context.Context) error
+	// sweptVersion is the key-store version the last finished sweep
+	// counted against, and resealedRing the server-key ring the last
+	// finished reseal pass counted (ringView): a count is only good for
+	// the target it was made for. Both under mu.
+	sweptVersion string
+	resealedRing string
+	// loops are StartKeyCustody's goroutines, so a shutdown (or a test)
+	// can wait for them to stop touching the gauges.
+	loops sync.WaitGroup
 }
 
 // KeyRevoked reports whether the customer's key store revoked the server
@@ -309,26 +338,83 @@ func (s *Service) RevocableContext(parent context.Context) (context.Context, con
 	return ctx, cancel
 }
 
-// StartKeyCustody runs the re-check loop until ctx ends. It does nothing
-// unless custody is wrapped: with a plaintext key there is no wrapped file
-// to re-check, and the custody report says so.
+// StartKeyCustody runs the key-custody loop until ctx ends (eng D2: one
+// owner of the server key's lifecycle). Every SB_SECRET_PROVIDER_RECHECK_INTERVAL
+// it re-reads the server-key ring, so a `sandboxd key rotate` step reaches
+// the node without a restart (§13): with wrapped custody as part of the
+// re-check that unwraps the file again, with custody=file by reading the
+// ring file. While a rotation is in progress the same tick reseals rows
+// onto the current key. With any external provider it also runs the
+// rewrap sweep now (the API is already serving) and then every hour after
+// a random start delay of up to an hour, so a fleet restarted together
+// does not sweep in lockstep (eng D19).
+//
+// The re-check has a loop of its own: a sweep or reseal pass can take
+// minutes (a key-store call per stale row, a hung call up to its timeout),
+// and a revoke must not wait for one. The passes share a second loop, one
+// at a time; each re-check asks it for a reseal pass.
 func (s *Service) StartKeyCustody(ctx context.Context) {
-	if s == nil || s.cfg.CredentialKeyCustody != secrets.CustodyWrapped || s.keyStoreWrapper == nil || s.cipher == nil {
+	if s == nil || s.cipher == nil {
 		return
 	}
+	recheck := s.cfg.CredentialKeyCustody == secrets.CustodyWrapped && s.keyStoreWrapper != nil
+	sweep := s.keyStoreWrapper != nil && secrets.IsExternalProvider(s.cfg.SecretProvider)
 	interval := s.cfg.SecretProviderRecheckInterval
+	if interval <= 0 {
+		interval = 5 * time.Minute
+	}
+	if entries, err := s.serverKeyRing(); err == nil {
+		// Boot is a re-read too: a step taken while the daemon was down
+		// is recorded now.
+		s.noteServerKeyRing(entries)
+	}
+	reseal := make(chan struct{}, 1)
+	s.keyCustody.loops.Add(2)
 	go func() {
+		defer s.keyCustody.loops.Done()
+		// ±10% jitter on the re-check, for the same reason.
+		nextRecheck := func() <-chan time.Time {
+			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
+		}
+		recheckC := nextRecheck()
 		for {
-			// ±10% jitter, so a fleet restarted together does not re-check
-			// in lockstep.
-			d := interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval))
-			t := time.NewTimer(d)
 			select {
 			case <-ctx.Done():
-				t.Stop()
 				return
-			case <-t.C:
-				s.RecheckServerKey(ctx)
+			case <-recheckC:
+				if recheck {
+					s.RecheckServerKey(ctx)
+				} else {
+					s.reloadKeyRingFile()
+				}
+				select {
+				case reseal <- struct{}{}:
+				default: // a pass is already asked for
+				}
+				recheckC = nextRecheck()
+			}
+		}
+	}()
+	go func() {
+		defer s.keyCustody.loops.Done()
+		var sweepC <-chan time.Time
+		if sweep {
+			s.sweepPass(ctx)
+			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.resealTick(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reseal:
+				s.resealTick(ctx)
+			case <-sweepC:
+				s.sweepPass(ctx)
+				sweepC = time.After(keySweepInterval)
 			}
 		}
 	}()
@@ -338,12 +424,12 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 // returns. Only a deliberate signal from the key store counts toward a
 // revoke: a 403, an outage or a retired version never does (§10).
 func (s *Service) RecheckServerKey(ctx context.Context) string {
+	s.retryEgressCAClear(ctx)
 	cctx, cancel := context.WithTimeout(secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "recheck")), keyRecheckTimeout)
 	defer cancel()
 	f, err := secrets.ReadWrappedKeyFile(s.cfg.CredentialKeyWrappedPath)
-	var key []byte
 	if err == nil {
-		key, err = secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
+		_, err = secrets.UnwrapServerKey(cctx, s.keyStoreWrapper, f)
 	}
 	result := recheckResult(err)
 	keyRecheckTotal.Add(result, 1)
@@ -361,10 +447,20 @@ func (s *Service) RecheckServerKey(ctx context.Context) string {
 	switch result {
 	case recheckOK:
 		recordSecretProviderCanary(true)
-		if s.KeyRevoked() {
-			if rerr := s.recoverKey(ctx, key); rerr != nil {
-				s.logger.Error("key custody: the key unwraps again but the node could not take it back", "error", rerr)
-			}
+		if !s.KeyRevoked() {
+			s.applyWrappedRing(cctx, f)
+			break
+		}
+		// Recovery takes the whole ring back, not only the current key
+		// (eng D12, §13).
+		keys, rerr := secrets.UnwrapRing(cctx, s.keyStoreWrapper, f, nil)
+		if rerr == nil {
+			rerr = s.recoverKey(ctx, keys)
+		}
+		if rerr != nil {
+			s.logger.Error("key custody: the key unwraps again but the node could not take it back", "error", rerr)
+		} else {
+			s.noteServerKeyRing(f.Entries())
 		}
 	case recheckRevoked:
 		s.logger.Error("key custody: the key store reports the key revoked", "consecutive", streak, "revoke_after", s.cfg.SecretProviderRevokeAfter, "error", err)
@@ -441,10 +537,21 @@ func (s *Service) revokeKey(ctx context.Context, cause error) {
 // predates clear_inspect_ca is restarted instead; it comes back without the
 // CA (memory only) and a revoked node never resends it (eng D4). It says
 // what happened, for the audit record.
+//
+// A clear that does not reach the gateway is owed: every re-check of the
+// revoked node and every gateway reconnect sends it again, since a revoked
+// node that keeps talking to the gateway is never silent long enough for
+// the gateway's own bound to drop the CA.
 func (s *Service) clearEgressInspection(ctx context.Context, restart func(context.Context) error) string {
+	s.egressCAMu.Lock()
 	s.egressCA.Store(nil)
+	s.egressCAMu.Unlock()
+	// After any push in flight; none starts once the key is revoked.
+	s.egressCAPushMu.Lock()
+	defer s.egressCAPushMu.Unlock()
 	s.egressCAPushed.Store(false)
 	if !s.egressEnabled() {
+		s.egressCAClearOwed.Store(false)
 		return "not used"
 	}
 	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
@@ -452,21 +559,36 @@ func (s *Service) clearEgressInspection(ctx context.Context, restart func(contex
 	err := s.egressGateway().ClearInspectCA(cctx)
 	switch {
 	case err == nil:
+		s.egressCAClearOwed.Store(false)
 		return "cleared"
 	case egress.IsUnknownOp(err):
 		if restart == nil {
 			restart = restartEgressGatewayUnit
 		}
 		if rerr := restart(cctx); rerr != nil {
-			s.logger.Error("key custody: could not restart the egress gateway to drop its CA", "error", rerr)
+			s.egressCAClearOwed.Store(true)
+			s.logger.Error("key custody: could not restart the egress gateway to drop its CA; retried on the next re-check", "error", rerr)
 			return "restart failed"
 		}
+		s.egressCAClearOwed.Store(false)
 		return "restarted (predates clear_inspect_ca)"
 	default:
-		// An unreachable gateway either holds no CA (it restarted) or drops
-		// it once this node is silent past the bound it sent.
-		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA", "error", err)
+		s.egressCAClearOwed.Store(true)
+		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA; retried on the next re-check", "error", err)
 		return "unreachable"
+	}
+}
+
+// retryEgressCAClear sends a revoke's clear again while it is owed.
+func (s *Service) retryEgressCAClear(ctx context.Context) {
+	if !s.KeyRevoked() || !s.egressCAClearOwed.Load() {
+		return
+	}
+	s.keyCustody.mu.Lock()
+	restart := s.keyCustody.restartGateway
+	s.keyCustody.mu.Unlock()
+	if got := s.clearEgressInspection(ctx, restart); !s.egressCAClearOwed.Load() {
+		s.logger.Warn("key custody: egress gateway dropped its CA on a retry", "gateway", got)
 	}
 }
 
@@ -479,16 +601,17 @@ func restartEgressGatewayUnit(ctx context.Context) error {
 }
 
 // recoverKey brings the node back after the customer restored the key (eng
-// D12): the same key returns to the shared Cipher, the gateway gets its CA
+// D12): the same ring returns to the shared Cipher, the gateway gets its CA
 // and the sandboxes' injection secrets again, and health returns to ok.
-func (s *Service) recoverKey(ctx context.Context, key []byte) error {
-	if err := s.cipher.Restore(key); err != nil {
+func (s *Service) recoverKey(ctx context.Context, keys []secrets.RingKey) error {
+	if err := s.cipher.RestoreRing(keys); err != nil {
 		return err
 	}
 	s.keyCustody.mu.Lock()
 	s.keyCustody.revoked.Store(false)
 	s.keyCustody.stop = make(chan struct{})
 	s.keyCustody.mu.Unlock()
+	s.egressCAClearOwed.Store(false)
 	keyRevokedGauge.Set(0)
 	if s.egressEnabled() {
 		s.egressMu.Lock()
@@ -523,4 +646,209 @@ func (s *Service) emitKeyCustodyEvent(kind, reason string) {
 		return
 	}
 	sink.Emit(ev)
+}
+
+// The rewrap sweep (§11, §12, CEO-E4).
+
+// keySweepInterval is the sweep cadence after the boot pass (eng D19, a
+// constant); keySweepPage is how many rows one store read pages through.
+const (
+	keySweepInterval = time.Hour
+	keySweepPage     = 200
+)
+
+var (
+	// keyRowsStale counts this node's rows not on the current key, plus its
+	// server-key file. "0 on every member" is when an old version may be
+	// retired (§11) or a local → key store switch is complete (§12), so it
+	// is -1, unknown, until a sweep against the current version finishes:
+	// at boot, on a node that does not sweep, and while a pass against a
+	// new version runs.
+	keyRowsStale = unknownGauge("aerolvm_key_rows_stale")
+	// keyRowsRetired counts rows on a key version the key store no longer
+	// decrypts: opens of those sandboxes fail on this node
+	// (SandboxdKeyVersionRetiredInUse).
+	keyRowsRetired    = expvar.NewInt("aerolvm_key_rows_retired")
+	keyRowsRewrapped  = expvar.NewInt("aerolvm_key_rows_rewrapped_total")
+	keyCurrentGauge   = expvar.NewMap("aerolvm_key_current")
+	keyDecryptableMap = expvar.NewMap("aerolvm_key_decryptable")
+)
+
+// unknownGauge is an expvar gauge that starts at -1: nothing counted yet.
+func unknownGauge(name string) *expvar.Int {
+	v := expvar.NewInt(name)
+	v.Set(-1)
+	return v
+}
+
+// decryptableKeys is a key store that lists the key versions it still opens
+// (the PKCS#11 helper: its current label and its decrypt-only labels).
+type decryptableKeys interface {
+	DecryptableKeyVersions() []string
+}
+
+func (s *Service) sweepPass(ctx context.Context) {
+	stale, err := s.SweepKeys(ctx)
+	if err != nil {
+		s.logger.Warn("key custody: rewrap sweep stopped early; the next pass retries", "stale", stale, "error", err)
+	}
+}
+
+// SweepKeys moves this node's stale rows and its server-key file onto the
+// sealing provider's current key and returns how many stay stale. Each node
+// sweeps only its own copies, every node reaching the same key store, so
+// there is no fan-out. A row is read without a lock, the key store is
+// called with no lock held, and only the conditional write takes the
+// sandbox's secret lock (compare-and-swap): a reseal, a delete or a newer
+// peer copy that lands in between wins and the row is skipped (Section 4).
+func (s *Service) SweepKeys(ctx context.Context) (int, error) {
+	if s == nil || s.keyStoreWrapper == nil || s.KeyRevoked() || !secrets.IsExternalProvider(s.cfg.SecretProvider) {
+		return 0, nil
+	}
+	bctx := secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "sweep"))
+	step := func() (context.Context, context.CancelFunc) { return context.WithTimeout(bctx, keyRecheckTimeout) }
+	stale, retired := 0, 0
+	// An operator retires the old version once stale reads 0 on every
+	// member, so only a finished pass publishes a count. One that stops
+	// early publishes stale as unknown (-1), never its count so far or the
+	// last pass's 0, and never lowers the retired count it alerts on.
+	finished := false
+	defer func() {
+		if !finished {
+			keyRowsStale.Set(-1)
+			if int64(retired) > keyRowsRetired.Value() {
+				keyRowsRetired.Set(int64(retired))
+			}
+		}
+	}()
+	cctx, cancel := step()
+	current, _, err := secrets.CurrentKeyVersion(cctx, s.keyStoreWrapper)
+	cancel()
+	if err != nil {
+		return 0, fmt.Errorf("read the current key version: %w", err)
+	}
+	// The last pass counted against the version it saw. Until a pass
+	// against this one finishes, that count says nothing about it: current
+	// = v2 beside the v1 pass's stale = 0 would read as safe to retire v1
+	// while its rows are still being moved. So the count goes before the
+	// new version is published.
+	s.keyCustody.mu.Lock()
+	sameTarget := s.keyCustody.sweptVersion == current
+	s.keyCustody.mu.Unlock()
+	if !sameTarget {
+		keyRowsStale.Set(-1)
+	}
+	s.publishKeyVersions(current)
+	provider := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	after := ""
+	for {
+		rows, err := s.store.ListClusterSecretsBatch(ctx, after, keySweepPage)
+		if err != nil {
+			return stale, err
+		}
+		for _, row := range rows {
+			state, cerr := secrets.ClassifyRow(row.SealedPayload, s.cipher, provider, current)
+			if cerr != nil || state != secrets.RowStale {
+				continue
+			}
+			stale++
+			cctx, cancel := step()
+			rewrapped, rerr := secrets.RewrapEnvelope(cctx, row.SealedPayload, s.cipher, s.keyStoreWrapper)
+			cancel()
+			switch {
+			case errors.Is(rerr, secrets.ErrKeyVersionRetired):
+				retired++
+				continue
+			case rerr != nil && secrets.IsKeyStoreError(rerr):
+				// The key store is down, throttling or refusing: stop here,
+				// the next pass picks up where this one could not.
+				return stale, rerr
+			case rerr != nil:
+				s.logger.Warn("key custody: row not rewrapped", "ref", row.Ref, "error", rerr)
+				continue
+			}
+			unlock := lockSecretSandboxOps(row.SandboxID)
+			ok, werr := s.store.RewrapClusterSecret(ctx, row.Ref, row.SealGeneration, row.SealedPayload, rewrapped)
+			unlock()
+			if werr != nil {
+				s.logger.Warn("key custody: rewrapped row not stored", "ref", row.Ref, "error", werr)
+				continue
+			}
+			if ok {
+				stale--
+				keyRowsRewrapped.Add(1)
+			}
+		}
+		if len(rows) < keySweepPage {
+			break
+		}
+		after = rows[len(rows)-1].Ref
+	}
+	fileStale, ferr := s.rewrapServerKeyFile(bctx, current)
+	if ferr != nil {
+		s.logger.Warn("key custody: server-key file not rewrapped", "error", ferr)
+	}
+	stale += fileStale
+	finished = true
+	keyRowsStale.Set(int64(stale))
+	keyRowsRetired.Set(int64(retired))
+	s.keyCustody.mu.Lock()
+	s.keyCustody.sweptVersion = current
+	s.keyCustody.mu.Unlock()
+	return stale, nil
+}
+
+// rewrapServerKeyFile moves the wrapped server-key file onto the current
+// key, every key of its ring (§13), like `sandboxd key rewrap` does with
+// the daemon stopped. It returns 1 while the file stays stale.
+func (s *Service) rewrapServerKeyFile(ctx context.Context, current string) (int, error) {
+	if s.cfg.CredentialKeyCustody != secrets.CustodyWrapped || current == "" {
+		return 0, nil
+	}
+	path := s.cfg.CredentialKeyWrappedPath
+	f, err := secrets.ReadWrappedKeyFile(path)
+	if err != nil {
+		return 1, err
+	}
+	if f.StaleRingKeys(current) == 0 {
+		return 0, nil
+	}
+	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
+	defer cancel()
+	nf, err := secrets.RewrapRing(cctx, s.keyStoreWrapper, f)
+	if err != nil {
+		return 1, err
+	}
+	if err := secrets.ReplaceWrappedKeyFile(path, f, nf); err != nil {
+		// ErrKeyFileChanged: `sandboxd key rotate` edited it meanwhile; the
+		// next pass rewraps what it wrote.
+		return 1, err
+	}
+	s.logger.Info("key custody: server-key file rewrapped", "from", f.KeyVersion(), "to", nf.KeyVersion())
+	return 0, nil
+}
+
+// publishKeyVersions sets the info gauges a PKCS#11 label rotation waits on
+// (eng D23): aerolvm_key_current{key=backend,key2=version} and
+// aerolvm_key_decryptable{key=backend,key2=version}.
+func (s *Service) publishKeyVersions(current string) {
+	backend := secrets.NormalizeProviderName(s.cfg.SecretProvider)
+	setInfo := func(m *expvar.Map, versions []string) {
+		inner := new(expvar.Map).Init()
+		for _, v := range versions {
+			one := new(expvar.Int)
+			one.Set(1)
+			inner.Set(v, one)
+		}
+		m.Init()
+		m.Set(backend, inner)
+	}
+	if current != "" {
+		setInfo(keyCurrentGauge, []string{current})
+	}
+	if d, ok := s.pkcs11Helper.(decryptableKeys); ok {
+		setInfo(keyDecryptableMap, d.DecryptableKeyVersions())
+	} else if current != "" {
+		setInfo(keyDecryptableMap, []string{current})
+	}
 }

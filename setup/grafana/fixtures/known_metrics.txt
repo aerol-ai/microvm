@@ -132,3 +132,13 @@ aerolvm_identity_jwks_fetch_total
 aerolvm_identity_jwks_last_success_timestamp
 aerolvm_identity_mirror_age_seconds
 aerolvm_pat_scope_drift
+# Key custody (plans/customer-key-custody.md Section 8). Each is also
+# checked against the Go tree by TestKeyCustodyRowMetricsAreRegistered.
+aerolvm_key_custody
+aerolvm_key_revoked
+aerolvm_key_rows_stale
+aerolvm_key_rows_retired
+aerolvm_key_store_calls_total
+aerolvm_key_store_call_seconds_bucket
+aerolvm_key_store_limiter_wait_seconds_bucket
+aerolvm_server_key_rows

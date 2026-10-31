@@ -417,6 +417,14 @@ else
 
 	mkdir -p "$(dirname "$CRED_KEY_PATH")"
 	install -m 0600 "$CRED_KEY_SOURCE" "$CRED_KEY_PATH"
+	if tar -tzf "$CRED_BUNDLE" | grep -qx 'credential_encryption.key.ring'; then
+		# The cluster rotated its server key (plans/customer-key-custody.md
+		# §13) and the bundle was refreshed with the ring: rows sealed under
+		# the newer keys open only with it.
+		tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key.ring
+		install -m 0600 "$CRED_STAGE_DIR/credential_encryption.key.ring" "${CRED_KEY_PATH}.ring"
+		echo "[cluster-join] installed the server-key ring at ${CRED_KEY_PATH}.ring"
+	fi
 	rm -rf "$CRED_STAGE_DIR"
 fi
 

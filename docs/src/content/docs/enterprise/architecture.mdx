@@ -37,7 +37,7 @@ flowchart TB
         end
     end
     Peers["Other cluster servers<br/>trusted after mutual TLS"]
-    Systems["Your audit store,<br/>monitoring and KMS"]
+    Systems["Your audit store,<br/>monitoring and key store"]
     Visitors -- "B1: shared links only" --> Edge
     Apps -- "B2: HTTPS and a named credential" --> Edge
     IdP -. "B7: public keys only" .-> Core
@@ -135,7 +135,7 @@ With `SB_PAT_SCOPE=host`, Caddy reaches the API through a private Unix socket in
 |---|---|
 | Environment variables | AES-256-GCM, bound to the sandbox's ID and its current life |
 | Registry passwords, storage credentials and the agent's token | AES-256-GCM with the server's key |
-| Failover copies of secrets | A fresh key for each copy, wrapped by the server's key or by AWS KMS |
+| Failover copies of secrets | A fresh key for each copy, wrapped by the server's key or by your key store (AWS KMS, Vault, OpenBao or an HSM) |
 | Database files | Readable only by the server's own user |
 | Audit log | Readable only by the server's own user, and hash-chained |
 | Files inside sandboxes | Not encrypted by AerolVM. Use encrypted disks on the server. |
@@ -168,14 +168,15 @@ With access control off, the default, the server token is the only API credentia
 
 ```mermaid
 flowchart TB
-    K["Server key<br/>32 bytes, from a setting or a file"] --> L["Seals secrets in<br/>the local database"]
+    K["Server key<br/>32 bytes, from a setting, a file,<br/>or unwrapped by your key store"] --> L["Seals secrets in<br/>the local database"]
     K --> C["Wraps the key of each<br/>failover copy, by default"]
-    KMS["AWS KMS, optional"] --> C2["Wraps the key of each<br/>failover copy instead"]
+    KMS["Your key store, optional<br/>AWS KMS, Vault, OpenBao, HSM"] --> C2["Wraps the key of each<br/>failover copy instead"]
+    KMS -. "wrapped custody" .-> K
     G["Network filter memory"] --> I["Holds inject values,<br/>never written to its disk"]
 ```
 
-- **The server key** seals every secret in the local database. It comes from `SB_CREDENTIAL_ENCRYPTION_KEY`, or from a file the server makes on first start. Back it up whenever you back up the database, and store the two copies apart.
-- **AWS KMS** is optional. It wraps the keys of the copies a cluster sends to backup servers, so AWS permissions and logs apply to them. Secrets in each server's own database still use that server's key.
+- **The server key** seals every secret in the local database. By default it comes from `SB_CREDENTIAL_ENCRYPTION_KEY`, or from a file the server makes on first start. Back it up whenever you back up the database, and store the two copies apart. With wrapped custody only a copy wrapped by your key store sits on disk, and disabling the key stops every server within minutes. See [Use your own key store](/enterprise/key-custody/).
+- **Your key store** is optional: AWS KMS, Vault, OpenBao or an HSM. It wraps the keys of the copies a cluster sends to backup servers, so its permissions and logs apply to them. Secrets in each server's own database use the server key, which your key store can hold too.
 - **Inject values** live in the network filter's memory only. The server resends them after the filter restarts.
 
 ## Connect your apps securely

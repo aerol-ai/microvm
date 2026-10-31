@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"os"
@@ -43,9 +44,11 @@ func TestStartKeyStorePKCS11(t *testing.T) {
 		wantErr    string
 		wantClosed bool
 		wantLog    string
+		// wantSoft: the custody report names a software token (§2).
+		wantSoft bool
 	}{
-		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{HardwareSlot: true}}},
-		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantLog: "software token"},
+		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "hsm1", HardwareSlot: true}}},
+		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantLog: "software token", wantSoft: true},
 		{name: "software token in enterprise mode", cfg: func(c config.Config) config.Config { c.EnterpriseMode = true; return c },
 			helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantErr: "not a hardware slot", wantClosed: true},
 		{name: "first start fails, lenient", helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantLog: "retrying in the background"},
@@ -81,6 +84,9 @@ func TestStartKeyStorePKCS11(t *testing.T) {
 				}
 				if ks.helper == nil || ks.wrapper == nil {
 					t.Fatalf("key store = %+v, want the helper and a client built on it", ks)
+				}
+				if got := ks.custodyFacts().SoftwareToken; got != tc.wantSoft {
+					t.Fatalf("custody facts: software token %v, want %v", got, tc.wantSoft)
 				}
 			}
 			if tc.helper != nil && tc.helper.closed != tc.wantClosed {
@@ -129,7 +135,7 @@ func TestOpenServerKey(t *testing.T) {
 		CredentialKeyWrappedPath:    filepath.Join(dir, "credential_encryption.key.wrapped"),
 		DBPath:                      filepath.Join(dir, "state.db"),
 	}
-	c1, err := openServerKey(ctx, cfg, fake)
+	c1, err := openServerKey(ctx, cfg, fake, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +147,7 @@ func TestOpenServerKey(t *testing.T) {
 	if err := os.WriteFile(cfg.DBPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	c2, err := openServerKey(ctx, cfg, fake)
+	c2, err := openServerKey(ctx, cfg, fake, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,10 +157,72 @@ func TestOpenServerKey(t *testing.T) {
 	if err := os.WriteFile(cfg.CredentialEncryptionKeyPath, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := openServerKey(ctx, cfg, fake); err == nil || !strings.Contains(err.Error(), "plaintext key file exists") {
+	if _, err := openServerKey(ctx, cfg, fake, nil); err == nil || !strings.Contains(err.Error(), "plaintext key file exists") {
 		t.Fatalf("plaintext left behind = %v", err)
 	}
 	if bootNodeID(config.Config{NodeID: " n1 "}) != "n1" || bootNodeID(config.Config{}) != "standalone" {
 		t.Fatal("bootNodeID")
+	}
+}
+
+// §13 boot: custody=file opens its ring file and warns while the retired
+// key 0 still sits in the key file.
+func TestOpenServerKeyRingFile(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := config.Config{
+		SecretProvider: "local", CredentialKeyCustody: "file",
+		CredentialEncryptionKeyPath: filepath.Join(dir, "credential_encryption.key"),
+		DBPath:                      filepath.Join(dir, "state.db"),
+	}
+	k0, _ := secrets.NewServerKey()
+	if err := os.WriteFile(cfg.CredentialEncryptionKeyPath, []byte(base64.StdEncoding.EncodeToString(k0)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	staged, _ := secrets.NewRingEntry(ctx, 1, nil)
+	ring, _ := secrets.StageRingKey([]secrets.RingEntry{secrets.LegacyRingEntry(k0)}, staged)
+	ring, _, _, _ = secrets.PromoteRingKey(ring)
+	ring, _ = secrets.RetireRingKey(ring, 0)
+	if err := secrets.WriteKeyRingFile(cfg.KeyRingPath(), secrets.KeyRingFile{Ring: ring}); err != nil {
+		t.Fatal(err)
+	}
+	var logs strings.Builder
+	c, err := openServerKey(ctx, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	if err != nil || c.CurrentKeyID() != 1 || len(c.KeyIDs()) != 1 {
+		t.Fatalf("ring boot = %v", err)
+	}
+	if !strings.Contains(logs.String(), "key 0 is retired but the plaintext key is still") {
+		t.Fatalf("no leftover-key warning: %s", logs.String())
+	}
+}
+
+// F2, first release (§7): an enterprise node with a key store but a
+// plaintext server key is warned about at boot; wrapped custody, a local
+// provider or a non-enterprise node is not.
+func TestEnterpriseCustodyWarning(t *testing.T) {
+	base := config.Config{EnterpriseMode: true, SecretProvider: "vault", CredentialKeyCustody: "file"}
+	if msg := enterpriseCustodyWarning(base); !strings.Contains(msg, "SB_SECRET_PROVIDER=vault") || !strings.Contains(msg, "next release refuses") {
+		t.Fatalf("warning = %q", msg)
+	}
+	for _, cfg := range []config.Config{
+		{EnterpriseMode: true, SecretProvider: "vault", CredentialKeyCustody: "wrapped"},
+		{EnterpriseMode: true, SecretProvider: "local", CredentialKeyCustody: "file"},
+		{EnterpriseMode: false, SecretProvider: "vault", CredentialKeyCustody: "file"},
+	} {
+		if msg := enterpriseCustodyWarning(cfg); msg != "" {
+			t.Fatalf("%+v warned: %q", cfg, msg)
+		}
+	}
+	dir := t.TempDir()
+	cfg := base
+	cfg.SecretProvider = "awskms"
+	cfg.CredentialEncryptionKeyPath = filepath.Join(dir, "credential_encryption.key")
+	cfg.DBPath = filepath.Join(dir, "state.db")
+	var logs strings.Builder
+	if _, err := openServerKey(context.Background(), cfg, nil, slog.New(slog.NewTextHandler(&logs, nil))); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "the key custody claim does not hold") {
+		t.Fatalf("boot did not warn: %s", logs.String())
 	}
 }

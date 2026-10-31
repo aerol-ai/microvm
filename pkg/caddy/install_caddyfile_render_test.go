@@ -51,6 +51,9 @@ func renderInstall(t *testing.T, installSh string, vars map[string]string) (env,
 		"ROUTE_DNS_ADDR": "127.0.0.1:53053", "WITH_GVISOR": "false", "WITH_ISOLATE": "false", "WITH_CONTAINERD_ENGINE": "false",
 		"PAT_SCOPE": "any", "PUBLIC_API_SOCKET": "/run/sandboxd-public/api.sock", "L4_PROXY_PROTOCOL": "false",
 		"ACME_CA": "", "ACME_CA_ROOT": "", "ACME_EMAIL": "", "CADDY_STORAGE_S3_ACCESS_KEY": "",
+		// install.sh's default; write_environment adds the key-store lines
+		// only for "wrapped" (plans/customer-key-custody.md §3).
+		"KEY_CUSTODY": "file",
 	}
 	for k, v := range vars {
 		defaults[k] = v

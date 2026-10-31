@@ -427,7 +427,11 @@ type Config struct {
 	CredentialKeyCustody string
 	// CredentialKeyWrappedPath is the wrapped server-key file used when
 	// CredentialKeyCustody=wrapped. SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH.
-	CredentialKeyWrappedPath    string
+	CredentialKeyWrappedPath string
+	// CredentialKeyRingPath is custody=file's server-key ring, written by
+	// `sandboxd key rotate` (plans/customer-key-custody.md §13).
+	// SB_CREDENTIAL_KEY_RING_PATH; empty means KeyRingPath's default.
+	CredentialKeyRingPath       string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
@@ -1954,6 +1958,7 @@ func load(keyTool bool) (Config, error) {
 		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
 		CredentialKeyCustody:              strings.ToLower(strings.TrimSpace(getEnv("SB_CREDENTIAL_KEY_CUSTODY", "file"))),
 		CredentialKeyWrappedPath:          getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", "/var/lib/sandboxd/credential_encryption.key.wrapped"),
+		CredentialKeyRingPath:             strings.TrimSpace(os.Getenv("SB_CREDENTIAL_KEY_RING_PATH")),
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
@@ -2818,8 +2823,10 @@ func load(keyTool bool) (Config, error) {
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
-			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		// A key store this node cannot reach must stop the boot, whichever
+		// one it is (plans/customer-key-custody.md §7).
+		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
+			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
@@ -2975,6 +2982,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
+// else the key file's path plus ".ring".
+func (c Config) KeyRingPath() string {
+	if c.CredentialKeyRingPath != "" {
+		return c.CredentialKeyRingPath
+	}
+	return c.CredentialEncryptionKeyPath + ".ring"
 }
 
 func (c Config) ListenAddr() string {
@@ -3173,6 +3189,10 @@ func checkClusterCredentialKey(cfg Config) error {
 		return nil
 	}
 	if cfg.CredentialEncryptionKey != "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.KeyRingPath()); err == nil {
+		// A rotated key: the ring holds every live key (§13).
 		return nil
 	}
 	if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {

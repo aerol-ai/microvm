@@ -1,6 +1,9 @@
 package config
 
 import (
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1046,6 +1049,20 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 		if cfg, err := Load(); err != nil || cfg.CredentialKeyCustody != "wrapped" || cfg.CredentialKeyWrappedPath != wrapped {
 			t.Fatalf("wrapped file present = %v", err)
 		}
+		// The point of wrapped custody: a cluster node with the wrapped file
+		// and no plaintext key anywhere, which custody=file refuses.
+		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY", "")
+		if _, err := os.Stat(filepath.Join(dir, "cred.key")); !os.IsNotExist(err) {
+			t.Fatalf("a plaintext key file exists: %v", err)
+		}
+		if cfg, err := Load(); err != nil || cfg.CredentialEncryptionKey != "" {
+			t.Fatalf("wrapped custody with no plaintext key = %v", err)
+		}
+		t.Setenv("SB_CREDENTIAL_KEY_CUSTODY", "file")
+		if _, err := Load(); err == nil {
+			t.Fatal("custody=file in cluster mode loaded with no server key")
+		}
+		t.Setenv("SB_CREDENTIAL_KEY_CUSTODY", "wrapped")
 		t.Setenv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", filepath.Join(wrapped, "nested"))
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "stat ") {
 			t.Fatalf("unreadable wrapped path = %v", err)
@@ -1110,8 +1127,30 @@ func TestClusterCredentialKeyValidation(t *testing.T) {
 			t.Fatalf("vault through a local Agent proxy = %v", err)
 		}
 		v := cfg.SecretVaultOptions()
-		if v.Addr != "http://127.0.0.1:8100" || v.Mount != "transit" || v.KeyName != "aerolvm-kek" || v.Namespace != "team-a" || v.TokenFile != "" {
+		if v.Addr != "http://127.0.0.1:8100" || v.Mount != "transit" || v.KeyName != "aerolvm-kek" || v.Namespace != "team-a" || v.TokenFile != "" || v.CACert != "" {
 			t.Fatalf("SecretVaultOptions = %+v", v)
+		}
+		// A mount other than transit, and a private CA for Vault's TLS: the
+		// file must hold a PEM certificate.
+		t.Setenv("SB_SECRET_VAULT_TRANSIT_MOUNT", "aerolvm-transit")
+		ca := filepath.Join(dir, "vault-ca.pem")
+		t.Setenv("SB_SECRET_VAULT_CACERT", " "+ca+" ")
+		if err := os.WriteFile(ca, []byte("not a certificate"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "holds no PEM certificate") {
+			t.Fatalf("a CA file with no certificate = %v", err)
+		}
+		srv := httptest.NewTLSServer(http.NotFoundHandler())
+		srv.Close()
+		if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if cfg, err = Load(); err != nil {
+			t.Fatal(err)
+		}
+		if v := cfg.SecretVaultOptions(); v.Mount != "aerolvm-transit" || v.CACert != ca {
+			t.Fatalf("SecretVaultOptions with a mount and a CA = %+v", v)
 		}
 	})
 
@@ -1868,5 +1907,33 @@ func TestRunsSSHGateway(t *testing.T) {
 				t.Fatalf("RunsSSHGateway(enabled=%v, role=%q) = %v, want %v", tc.enabled, tc.role, got, tc.want)
 			}
 		})
+	}
+}
+
+// The server-key ring path (plans/customer-key-custody.md §13) and the
+// cluster key check, which accepts a ring once key 0 has left the key file.
+func TestKeyRingPathAndClusterCheck(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{CredentialEncryptionKeyPath: filepath.Join(dir, "k")}
+	if cfg.KeyRingPath() != filepath.Join(dir, "k.ring") {
+		t.Fatalf("default = %q", cfg.KeyRingPath())
+	}
+	if err := checkClusterCredentialKey(cfg); err == nil {
+		t.Fatal("no key and no ring passed")
+	}
+	if err := os.WriteFile(cfg.KeyRingPath(), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkClusterCredentialKey(cfg); err != nil {
+		t.Fatalf("ring = %v", err)
+	}
+	cfg.CredentialKeyRingPath = "/elsewhere.ring"
+	if cfg.KeyRingPath() != "/elsewhere.ring" {
+		t.Fatal("override")
+	}
+	t.Setenv("SB_CREDENTIAL_KEY_RING_PATH", " /x/ring ")
+	t.Setenv("SB_PAT_TOKEN", "pat")
+	if got, err := Load(); err != nil || got.KeyRingPath() != "/x/ring" {
+		t.Fatalf("env = %v %v", got.KeyRingPath(), err)
 	}
 }
