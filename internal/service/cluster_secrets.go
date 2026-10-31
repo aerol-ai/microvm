@@ -1608,6 +1608,14 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	// would otherwise never repair this generation split.
 	unlock := lockSecretSandboxOps(sandboxID)
 	defer unlock()
+	// staged is a generation ahead of Raft that finalizing can never publish:
+	// it names no remote recipient while Raft still does. Builds before the
+	// no-replacement check moved ahead of Put wrote these whenever every
+	// backup was drained or dead at once. Each tick then refused to finalize
+	// it and returned before re-evaluating anything, so its deletes to the
+	// old holders stayed staged forever and the sandbox never resealed again.
+	// It is superseded below from the owner's copy instead.
+	var staged *store.ClusterSecretRecord
 	if s.store != nil && placement.SecretSealGeneration > 0 {
 		local, err := s.store.GetClusterSecretForSandboxIncarnation(ctx, sandboxID, placement.IncarnationID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
@@ -1617,7 +1625,10 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 			parsed, parseErr := secrets.ParseRef(local.Ref)
 			if parseErr == nil && parsed.IncarnationID == placement.IncarnationID &&
 				(placement.SecretRef == "" || local.Ref == placement.SecretRef) {
-				return s.finalizeResealedSecret(ctx, c, placement, local)
+				if !resealStageLacksRemoteBackup(local.Recipients, placement.SecretRecipients, selfID) {
+					return s.finalizeResealedSecret(ctx, c, placement, local)
+				}
+				staged = local
 			}
 		}
 	}
@@ -1643,7 +1654,10 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 			gen = placement.SecretSealGeneration
 		}
 	}
-	if !s.anySecretTargetDead(frozen, alive, selfID) {
+	// An unpromotable stage is resealed even when Raft's set is healthy or
+	// unchanged: the owner's row has already left Raft's generation, so
+	// leaving it alone is what keeps the split.
+	if staged == nil && !s.anySecretTargetDead(frozen, alive, selfID) {
 		return nil
 	}
 
@@ -1654,8 +1668,17 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	sort.Strings(replacements)
 	sortedFrozen := append([]string(nil), frozen...)
 	sort.Strings(sortedFrozen)
-	if sameStringSlice(sortedFrozen, replacements) {
+	if staged == nil && sameStringSlice(sortedFrozen, replacements) {
 		return nil
+	}
+	// The durability floor: a holder is retired only after a remote
+	// replacement ACKs the new generation, so with none available the current
+	// generation and its holders (drained ones included) stay authoritative.
+	// This must be decided BEFORE Put. Put overwrites the owner's row and
+	// stages deletes to the retired holders, and an owner-only generation
+	// that no remote holds can never be promoted (see staged above).
+	if len(nonSelfRecipients(replacements, selfID)) == 0 {
+		return errors.New("no live replacement backup is available for reseal")
 	}
 
 	p := s.provider()
@@ -1677,6 +1700,12 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 		secretsHandle.Ref = rec.Ref
 		secretsHandle.Version = rec.Version
 		secretsHandle.SealGeneration = rec.SealGeneration
+	}
+	if staged != nil {
+		// Open the generation the owner's row actually holds. The Raft handle
+		// still names the one the stage overwrote; the CAS below stays fenced
+		// on Raft's generation.
+		secretsHandle.Ref, secretsHandle.Version, secretsHandle.SealGeneration = staged.Ref, staged.Version, staged.SealGeneration
 	}
 	if gen <= 0 {
 		gen = placement.SecretSealGeneration
@@ -1723,7 +1752,19 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	}
 	retired := retiredSecretRecipients(previousRecipients, replacements, selfID)
 	if len(retired) > 0 {
+		// Put merges this with a superseded stage's delete row and drops the
+		// holders the new generation keeps, in the same transaction.
 		putCtx = secrets.ContextWithRetiredRecipients(putCtx, retired)
+	} else if staged != nil {
+		// Nothing to merge into, so the superseded stage's delete row would
+		// outlive it. Once Raft passes its generation the reconciler would
+		// promote it and DELETE holders this generation keeps, stripping any
+		// that the new generation has not reached yet. Dropping it first is
+		// crash-safe: Raft still names those holders, so a retry recomputes
+		// every real retirement from Raft.
+		if err := s.store.DeleteSecretDeleteOutbox(ctx, sandboxID, incarnationID, staged.SealGeneration); err != nil {
+			return fmt.Errorf("drop superseded reseal retirement: %w", err)
+		}
 	}
 	handle, err := p.Put(putCtx, sandboxID, bag, replacements)
 	if err != nil {
@@ -1766,9 +1807,6 @@ func (s *Service) expandAndResealDeadSecretTargetsForPlacement(ctx context.Conte
 	}
 	pusher := s.secretPeerPusher()
 	remoteTargets := nonSelfRecipients(replacements, selfID)
-	if len(remoteTargets) == 0 {
-		return errors.New("no live replacement backup is available for reseal")
-	}
 	if pusher == nil && len(remoteTargets) > 0 {
 		return fmt.Errorf("secret peer transport unavailable; reseal remains staged locally")
 	}
@@ -1841,7 +1879,7 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 	selfID := s.selfNodeID()
 	recipients := secrets.NormalizeRecipients(local.Recipients)
 	remoteTargets := nonSelfRecipients(recipients, selfID)
-	if len(nonSelfRecipients(placement.SecretRecipients, selfID)) > 0 && len(remoteTargets) == 0 {
+	if resealStageLacksRemoteBackup(recipients, placement.SecretRecipients, selfID) {
 		return errors.New("interrupted reseal has no remote replacement backup")
 	}
 	pusher := s.secretPeerPusher()
@@ -1887,6 +1925,13 @@ func (s *Service) finalizeResealedSecret(ctx context.Context, c cluster.Client, 
 	resetSecretHoldersForGeneration(local.SandboxID, placement.IncarnationID, local.SealGeneration, selfID)
 	setSecretHolderTargets(local.SandboxID, placement.IncarnationID, local.SealGeneration, recipients)
 	return nil
+}
+
+// resealStageLacksRemoteBackup reports a staged generation that would shrink
+// a replicated set to this node alone. Promoting it would leave the secret on
+// one disk, so finalizeResealedSecret refuses it and the reseal supersedes it.
+func resealStageLacksRemoteBackup(staged, authoritative []string, selfID string) bool {
+	return len(nonSelfRecipients(staged, selfID)) == 0 && len(nonSelfRecipients(authoritative, selfID)) > 0
 }
 
 func retiredSecretRecipients(previous, current []string, selfID string) []string {
