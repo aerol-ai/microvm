@@ -1257,14 +1257,46 @@ AWS CloudHSM run passed. Every AWS resource was torn down afterwards.
   OpenBao Proxy, not Raft storage and Agent: no case restarts it, and Agent's
   token-file mode was covered in Phase 2. The eng D22 case is a follow-up.
 
-**Coverage gaps found by a review of the test list above** (being closed
-next): unit level, the sweep's five racing paths, a decrypt in flight across
-a revoke, the two-step switch from a `local` sealer, the remaining full-stop
-assertions (no CA resent to an old gateway, Sync during a revoke, inject deny
-after DropSecrets), the no-key-store-body-in-logs check and an offline 503
-`key_revoked` handler test, the helper killed mid-call; live, AWS KMS revoke,
-registry and mount secrets, the live full-stop checks, a fresh joiner,
-restore onto a new node, and a single-node wrapped install.
+**Coverage gaps (2026-10-31).** A review of the test list above against the
+tests found 12 items covered and 20 partly covered. Every unit-level gap is
+now closed (branch `feat/key-custody-6b-test-gaps`, stacked on Phase 6):
+
+- the sweep loses to each of the five racing writers (new `Put`, repair
+  reseal, peer copy of a newer and of the same generation, delete with and
+  without a tombstone, reseal retirement), and does not hold the sandbox lock
+  across the key-store call; a `Decrypt` in flight across a revoke;
+- the full stop: a gateway Sync while revoked carries no secrets and no CA,
+  an old gateway's restart gets no CA, an inject rule refuses with
+  `secret_missing` after `DropSecrets`, recovery re-sends the CA and the
+  secrets and health returns to ok; a real v1 handler answers 503
+  `key_revoked` with nothing sealed in the response or the log; a Vault
+  error never carries a request or response body;
+- the PKCS#11 helper killed mid-call (exit, not deadline) and a successful
+  call after the restart and after a deadline replacement;
+- the D9 history table, sweep correlation ids on every call, the AWS KMS
+  contract through the limiter, the remaining config rows, and the boot
+  order (the database is not opened when the key store refuses).
+
+The gap review found two product gaps, both fixed on the same branch:
+
+- **eng D8 step 1 did not work from `local`.** A node with
+  `SB_SECRET_PROVIDER=local` ignored the key-store settings: it built no
+  client and `LocalProvider.Open` used the server key only, so a failover
+  onto a node not yet flipped could not open a row a switched peer sealed.
+  Such a node now gets an open-only client (`secrets.NewOpenWrapper`) and
+  opens through the same path a switched node uses; without the settings it
+  names the key store it lacks. The live UC-297 never hit this because its
+  failovers run after every node has flipped.
+- **`software token` was only a log line (§2).** The custody report takes
+  the running token's slot kind: `aerolvm_key_custody` reads
+  `pkcs11 (software token)`, and `sandboxd key status --check` prints it.
+
+Still open, all live (they need AWS spend): AWS KMS revoke, registry and
+mount secrets, the live full-stop checks (SSH and exec streams, CA, alert),
+a fresh joiner, restore onto a new node, a single-node
+`install.sh --key-custody wrapped`, the eng D22 switch with a failover onto
+a node still in step 1, and "an old backup key opens no current row" in
+UC-304.
 
 ## Phase 5 results (2026-10-31)
 
