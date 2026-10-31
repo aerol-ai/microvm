@@ -45,6 +45,9 @@ type Cipher struct {
 	// ring change may add keys or drop retired ones, never swap a key under
 	// an id it already knows (that would make every row on it unreadable).
 	checks map[uint32][]byte
+	// afterLoad, set only by tests, runs once a call has loaded the ring:
+	// it holds a Decrypt there while a Revoke lands (§4, async ordering 1).
+	afterLoad func()
 }
 
 // keyRing is the server keys a Cipher holds (plans/customer-key-custody.md
@@ -298,6 +301,9 @@ func (c *Cipher) activeRing() (*keyRing, error) {
 		return nil, errors.New("cipher not initialized")
 	}
 	if r := c.ring.Load(); r != nil {
+		if c.afterLoad != nil {
+			c.afterLoad()
+		}
 		return r, nil
 	}
 	if c.revoked.Load() {
