@@ -216,7 +216,8 @@ flowchart TB
 The server runs commands and moves files through `toolboxd`, a small helper inside each sandbox.
 
 - **Containers:** the server talks to `toolboxd` over HTTP on port 2280, at the sandbox's own address. Each sandbox gets its own random token. `toolboxd` removes the token from its environment before it starts your programs.
-- **Firecracker:** the server reaches `toolboxd` over the virtual machine's private network link. A vsock channel (a direct host-to-guest socket) carries only start-up and snapshot signals.
+- **Firecracker:** the server reaches `toolboxd` over the virtual machine's private network link, with the sandbox's own token, as for a container. A vsock channel (a direct host-to-guest socket) carries start-up and snapshot signals, and hands `toolboxd` its token: a virtual machine started from a template or the warm pool has none until then.
+- **No token, no service.** A `toolboxd` that holds no token answers nothing but its health check. It never runs a command or reads a file for a caller it cannot check.
 - **WebAssembly and V8 isolates:** there is no helper inside. The server handles commands and files itself.
 
 This is how a call reaches `toolboxd` in a container or a Firecracker sandbox.
@@ -225,8 +226,8 @@ This is how a call reaches `toolboxd` in a container or a Firecracker sandbox.
 flowchart TB
     SDK["Your SDK call"] -- "your API token" --> S["AerolVM server"]
     S -- "HTTP on port 2280,<br/>with the sandbox's own token" --> TC["toolboxd<br/>in a container"]
-    S -- "HTTP over the virtual machine's<br/>private network link" --> TF["toolboxd<br/>in a Firecracker sandbox"]
-    S -. "vsock, start-up and<br/>snapshot signals only" .-> TF
+    S -- "HTTP over the virtual machine's<br/>private network link,<br/>with the sandbox's own token" --> TF["toolboxd<br/>in a Firecracker sandbox"]
+    S -. "vsock: start-up, the token,<br/>snapshot signals" .-> TF
 ```
 
 What `toolboxd` can do is what the API offers: run commands and code, open terminal sessions, read and write files, and run Git.
