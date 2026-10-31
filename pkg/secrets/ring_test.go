@@ -736,6 +736,25 @@ func TestReplaceWrappedKeyFileSerializesWriters(t *testing.T) {
 	}
 }
 
+// TestKeyFileLockErrors: a writer that cannot take the lock writes nothing.
+func TestKeyFileLockErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens the lock file in a read-only directory")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	ring := KeyRingFile{Ring: []RingEntry{LegacyRingEntry(ringKey(t))}}
+	if err := WriteKeyRingFile(filepath.Join(dir, "k.ring"), ring); err == nil || !strings.Contains(err.Error(), "lock") {
+		t.Fatalf("write without the lock = %v", err)
+	}
+	if err := ReplaceKeyRingFile(filepath.Join(dir, "k.ring"), nil, ring); err == nil || !strings.Contains(err.Error(), "lock") {
+		t.Fatalf("replace without the lock = %v", err)
+	}
+}
+
 // TestReplaceKeyRingFile: custody "file" rotation's ring save is the same
 // compare-and-swap, including against a ring file that appeared after the
 // rotation started from the legacy plaintext key.
