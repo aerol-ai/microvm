@@ -455,6 +455,10 @@ func methodNotImplemented(method string) error {
 // 6 HTTP-over-UDS calls, and 1 Firecracker vsock proxy dial. The OCI pipeline
 // is the only stage with multi-second worst-case latency; per the plan, Phase
 // 2 caches the rootfs and skips this stage when a template hit lands.
+// A request with an env adds one more vsock round trip (set_env, recorded
+// as the fc_env stage) on every path; an env-less request adds nothing.
+// Every create adds one vsock round trip, adopt (the fc_adopt stage), which
+// hands the guest its sandbox ID and toolbox token; see guest_identity.go.
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	// All seams are required for a real Create. Distinct error messages
 	// per missing seam so the operator can localize the wiring bug from
@@ -521,6 +525,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if req.OverlaySizeGB > 0 && !d.cfg.OverlayEnabled {
 		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
 	}
+	// The env is delivered to the guest after boot (deliverGuestEnv); an
+	// env the guest agent would refuse fails here, before a VM exists.
+	if err := validateGuestEnv(req.Env); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: %w", err)
+	}
+	// The guest is adopted with this token after boot (adoptGuest); without
+	// one it would serve nothing, so refuse before a VM exists.
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: %w", errGuestTokenMissing)
+	}
 
 	// Step 1: Phase 4 warm-VMM pool fast path. Resolve the template
 	// early (before cold-spawn) so a pool hit avoids spending the
@@ -544,7 +558,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 	warmStart := time.Now()
-	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, nil, ""); err != nil {
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
 		return nil, err
 	} else if hit {
 		// UC-98's warm-hit marker: fc_warm carries both the acquire
@@ -890,6 +904,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			"guest_ip", slot.GuestIP,
 			"gateway_ip", slot.HostIP,
 			"tap", slot.TapName)
+	}
+	// Step 8c: the sandbox env. Neither the rootfs nor a template snapshot
+	// carries it, so the agent gets it now, before Create returns and any
+	// exec can reach the guest. Mandatory when the request has an env: a
+	// failure unwinds the VM through the deferred cleanups above.
+	if err := d.deliverGuestEnv(ctx, vsockPath, handshakeCID, allocID, req.Env); err != nil {
+		return nil, err
+	}
+	// Step 8d: the sandbox's identity, last, so the agent starts serving
+	// only once everything it needs is in place. A template rootfs or
+	// snapshot carries no token and its agent serves nothing until now; a
+	// cold-booted agent already holds this token and the op converges.
+	if err := d.adoptGuest(ctx, vsockPath, handshakeCID, allocID, toolboxToken, adoptRemedyCreate); err != nil {
+		return nil, err
 	}
 	d.scheduleToolboxTCPProbe("create", allocID, slot, snapshotLoadPath)
 
@@ -1381,8 +1409,26 @@ func ociImageRefFor(ref string) string {
 // The VMM process itself does not survive Stop; the stable contract is
 // snapshot-on-stop, destroy host resources, then LoadSnapshot+PATCH+Resume
 // on Start.
+//
+// Start has no toolbox token, so it only reports a VMM that is already
+// running; a restore needs StartWithIdentity, which the service always uses
+// (runtime.IdentityStarter).
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
-	return d.startFromSandboxSnapshot(ctx, sandboxID)
+	return d.startFromSandboxSnapshot(ctx, sandboxID, "")
+}
+
+// StartWithIdentity implements runtime.IdentityStarter: Start, then adopt the
+// restored guest with the sandbox's token. An agent restored from a snapshot
+// taken after its create already holds that token and the adopt converges;
+// one restored without it (a guest stopped while it ran a toolboxd from before
+// identity delivery, or one built by an older daemon) gets it now or, if it
+// cannot take it, is not started. For Firecracker containerRef is the
+// sandbox ID (Service.runtimeRef).
+func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+	if containerRef != sandboxID {
+		return nil, fmt.Errorf("firecracker runtime: start %q: runtime reference does not name sandbox %q", containerRef, sandboxID)
+	}
+	return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
 }
 
 // Stop captures a full per-sandbox snapshot, persists the root/overlay disk

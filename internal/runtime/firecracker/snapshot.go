@@ -390,31 +390,12 @@ func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotReque
 // ignored. Passing data=nil omits the data field via json's "omitempty" on a
 // *json.RawMessage built from the marshal.
 func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) error {
-	payload := struct {
-		Op   string          `json:"op"`
-		Data json.RawMessage `json:"data,omitempty"`
-	}{Op: op}
-	if data != nil {
-		raw, err := json.Marshal(data)
-		if err != nil {
-			return fmt.Errorf("marshal data: %w", err)
-		}
-		payload.Data = raw
-	}
-	line, err := json.Marshal(payload)
+	conn, cancel, err := d.openVsockOp(ctx, socketPath, guestCID, op, data)
 	if err != nil {
-		return fmt.Errorf("marshal op: %w", err)
+		return err
 	}
-	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
-	if err != nil {
-		return fmt.Errorf("dial cid=%d: %w", guestCID, err)
-	}
 	defer conn.Close()
-	if _, err := conn.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("write: %w", err)
-	}
 	// Read the single newline-delimited JSON ack the guest writes, and STOP at
 	// the newline. The guest (cmd/toolboxd handleVsockConn) keeps the
 	// connection open to serve further ops, so it never sends EOF after the
@@ -429,6 +410,40 @@ func (d *Driver) sendVsockOp(ctx context.Context, socketPath string, guestCID ui
 	// We only care that the ack arrived; its content is discarded.
 	_, _ = bufio.NewReader(conn).ReadString('\n')
 	return nil
+}
+
+// openVsockOp marshals {"op":<op>,"data":<data>}, dials the guest agent
+// through Firecracker's host-side vsock proxy and writes the line. The
+// caller reads the ack, then closes the conn and calls cancel (which ends
+// the dial context whose deadline the conn carries).
+func (d *Driver) openVsockOp(ctx context.Context, socketPath string, guestCID uint32, op string, data any) (io.ReadWriteCloser, context.CancelFunc, error) {
+	payload := struct {
+		Op   string          `json:"op"`
+		Data json.RawMessage `json:"data,omitempty"`
+	}{Op: op}
+	if data != nil {
+		raw, err := json.Marshal(data)
+		if err != nil {
+			return nil, nil, fmt.Errorf("marshal data: %w", err)
+		}
+		payload.Data = raw
+	}
+	line, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal op: %w", err)
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	conn, err := d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("dial cid=%d: %w", guestCID, err)
+	}
+	if _, err := conn.Write(append(line, '\n')); err != nil {
+		_ = conn.Close()
+		cancel()
+		return nil, nil, fmt.Errorf("write: %w", err)
+	}
+	return conn, cancel, nil
 }
 
 func (d *Driver) createSnapshotArtifacts(ctx context.Context, client VMMClient, runDir, outMemPath, outStatePath string) error {

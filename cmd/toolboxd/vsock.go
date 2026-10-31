@@ -18,8 +18,12 @@ package main
 // What this channel does NOT carry: the regular HTTP toolbox API. That
 // stays on TCP/eth0 — it's only used during the sandbox's running
 // lifetime (no snapshots in flight), so the snapshot-tear problem
-// doesn't apply. Vsock is reserved for control-plane signals tied to the
-// snapshot lifecycle.
+// doesn't apply. Vsock is reserved for host control-plane messages: the
+// snapshot-lifecycle signals and, once per boot, the sandbox env
+// (set_env) and the sandbox's identity (adopt). Both ride vsock rather than
+// the TCP API because only the host can open this channel (Firecracker's
+// Unix socket in the VMM's run directory), and because a template snapshot
+// has no other way to receive a per-sandbox value.
 
 import (
 	"bufio"
@@ -31,6 +35,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/aerol-ai/microvm/cmd/toolboxd/sandboxenv"
 	"github.com/aerol-ai/microvm/pkg/clonegen"
 )
 
@@ -61,6 +66,23 @@ const (
 	// "resumed at <ts>" marker (useful for triaging snapshot-related
 	// bugs in production) and re-arms any wall-clock-sensitive watchers.
 	OpPostResume VsockOp = "post_resume"
+	// OpSetEnv delivers the sandbox's create-time env to a guest that
+	// could not inherit it (Firecracker: the rootfs or template snapshot
+	// never saw the create request). Data is {"env":{"KEY":"value"}}; the
+	// agent replaces its sandbox env with exactly that map, so a retried or
+	// repeated push converges instead of appending. Unlike post_resume it
+	// is not best-effort: the host fails the create when it is not acked,
+	// because a sandbox silently missing its secrets is the bug this op
+	// exists to close. See cmd/toolboxd/sandboxenv.
+	OpSetEnv VsockOp = "set_env"
+	// OpAdopt gives a token-less agent its sandbox identity. Data is
+	// {"sandbox_id":"...","token":"..."}. A guest booted from a template,
+	// a template snapshot or the warm pool has no toolbox token (the
+	// template's disk and memory must not carry one, or every clone would
+	// share it) and serves nothing but /health until this op lands. Like
+	// set_env it is mandatory: the host fails the create when it is not
+	// acked. The first token sticks; see server.adoptOverVsock.
+	OpAdopt VsockOp = "adopt"
 )
 
 // VsockMessage is the request shape. Newline-delimited JSON, one
@@ -90,6 +112,25 @@ type VsockHandler interface {
 	OnPing(ctx context.Context) error
 	OnPreSnapshot(ctx context.Context, raw json.RawMessage) error
 	OnPostResume(ctx context.Context, raw json.RawMessage) error
+}
+
+// vsockEnvHandler is the optional set_env capability. Separate from
+// VsockHandler so a handler without an env store answers set_env with
+// "unknown op", the same answer a pre-set_env agent gives, and the host
+// fails the create rather than booting a sandbox without its env.
+type vsockEnvHandler interface {
+	OnSetEnv(ctx context.Context, raw json.RawMessage) error
+}
+
+// vsockAdoptHandler is the optional adopt capability, separate for the same
+// reason as vsockEnvHandler: a handler without it answers "unknown op".
+type vsockAdoptHandler interface {
+	OnAdopt(ctx context.Context, raw json.RawMessage) error
+}
+
+// identityAdopter is the part of the server the adopt op drives.
+type identityAdopter interface {
+	adoptOverVsock(sandboxID, token string) (changed bool, err error)
 }
 
 // vsockReadDeadline is the per-message read budget enforced by
@@ -158,6 +199,16 @@ func dispatchVsock(ctx context.Context, msg VsockMessage, handler VsockHandler) 
 		return handler.OnPreSnapshot(ctx, msg.Data)
 	case OpPostResume:
 		return handler.OnPostResume(ctx, msg.Data)
+	case OpSetEnv:
+		if h, ok := handler.(vsockEnvHandler); ok {
+			return h.OnSetEnv(ctx, msg.Data)
+		}
+		return fmt.Errorf("unknown op %q", msg.Op)
+	case OpAdopt:
+		if h, ok := handler.(vsockAdoptHandler); ok {
+			return h.OnAdopt(ctx, msg.Data)
+		}
+		return fmt.Errorf("unknown op %q", msg.Op)
 	case "":
 		return errors.New("missing op")
 	default:
@@ -211,6 +262,10 @@ type quiesceHandler struct {
 	sessions sessionFlusher
 	quiesce  quiesceOps
 	cloneGen *clonegen.Generation
+	// env receives set_env pushes; nil answers set_env with an error.
+	env *sandboxenv.Store
+	// identity receives adopt; nil answers adopt with an error.
+	identity identityAdopter
 }
 
 func newQuiesceHandler(logger *slog.Logger, sessions sessionFlusher, cloneGen *clonegen.Generation) *quiesceHandler {
@@ -298,5 +353,50 @@ func (h *quiesceHandler) OnPostResume(ctx context.Context, raw json.RawMessage) 
 			"prefix_len", data.Network.PrefixLen)
 	}
 	h.logger.Info("vsock: post_resume complete", logFields...)
+	return nil
+}
+
+// OnSetEnv replaces the sandbox env with the pushed map. The env carries
+// secrets, so nothing here logs or returns a key or a value: the log line
+// has the key count only, and a malformed payload is reported without the
+// decoder's error (which can quote the offending input).
+func (h *quiesceHandler) OnSetEnv(_ context.Context, raw json.RawMessage) error {
+	if h.env == nil {
+		return errors.New("set_env: this agent has no sandbox env store")
+	}
+	var data struct {
+		Env map[string]string `json:"env"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return errors.New("set_env: malformed payload; want {\"env\":{\"KEY\":\"value\"}}")
+	}
+	changed, err := h.env.Replace(data.Env)
+	if err != nil {
+		return fmt.Errorf("set_env: %w", err)
+	}
+	h.logger.Info("vsock: set_env applied", "keys", len(data.Env), "changed", changed)
+	return nil
+}
+
+// OnAdopt hands the server the sandbox identity the host pushed. The token
+// is the sandbox's credential, so it is never logged or echoed: a malformed
+// payload is reported without the decoder's error, which can quote input.
+func (h *quiesceHandler) OnAdopt(_ context.Context, raw json.RawMessage) error {
+	if h.identity == nil {
+		return errors.New("adopt: this agent cannot take an identity")
+	}
+	var data struct {
+		SandboxID string `json:"sandbox_id"`
+		Token     string `json:"token"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &data) != nil {
+		return errors.New("adopt: malformed payload; want {\"sandbox_id\":\"...\",\"token\":\"...\"}")
+	}
+	changed, err := h.identity.adoptOverVsock(data.SandboxID, data.Token)
+	if err != nil {
+		h.logger.Warn("vsock: adopt refused", "sandbox_id", data.SandboxID, "error", err)
+		return err
+	}
+	h.logger.Info("vsock: adopt applied", "sandbox_id", data.SandboxID, "changed", changed)
 	return nil
 }

@@ -177,6 +177,7 @@ For an entry with another port, such as `github.com:22`, the proxy cannot read a
 
 - **Sandboxes on the same server cannot reach each other.** Traffic from one sandbox to another on the same server is dropped, policy or not. An operator who needs the old open behavior sets `SB_SANDBOX_INTERCONNECT=true` (refused in enterprise mode).
 - **Sandboxes cannot reach the server's own services.** AerolVM's API, Raft, gossip, cluster and SSH-gateway ports and the server's SSH and rpcbind are closed to every sandbox, with or without an operator file. Only `node_control_port_guard: false` in the file turns this off.
+- **Firecracker sandboxes are always fenced off.** No packet of any kind, ping included, goes from one Firecracker sandbox to another. Nothing in a container or gVisor sandbox can open a connection into one. Replies to a Firecracker sandbox's own connections still come in, and the server reaches it directly, not through this fence.
 - **Addresses cannot be faked.** Containers cannot forge packets, and the server checks that each packet from a Firecracker sandbox comes from its own address.
 - **Each sandbox's rules follow its address,** so one sandbox's policy never changes another's.
 

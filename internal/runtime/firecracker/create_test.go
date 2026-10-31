@@ -609,9 +609,10 @@ func TestCreate_HappyPath(t *testing.T) {
 	if !f.vmm.started || !f.vmm.waited || f.vmm.shutdown {
 		t.Errorf("vmm started=%v waited=%v shutdown=%v; want true/true/false", f.vmm.started, f.vmm.waited, f.vmm.shutdown)
 	}
-	// Vsock handshake plus best-effort post-boot network reconfigure.
-	if f.vsock.dials != 2 {
-		t.Errorf("vsock dials = %d, want 2", f.vsock.dials)
+	// Vsock handshake, best-effort post-boot network reconfigure, and the
+	// mandatory adopt (guest_identity.go).
+	if f.vsock.dials != 3 {
+		t.Errorf("vsock dials = %d, want 3", f.vsock.dials)
 	}
 	// REST: machine config, boot source, drive, nic, vsock, action all set.
 	if f.client.mc == nil || f.client.mc.VcpuCount != 2 || f.client.mc.MemSizeMib != 256 {

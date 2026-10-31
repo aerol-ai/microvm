@@ -237,7 +237,9 @@ func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
 // sandbox identity again. A Docker container adopted from the warm pool keeps
 // the pool's parked env for life (Docker can't change a container's env), so
 // after every stop its toolboxd boots parked and serves nothing until it is
-// adopted again with the sandbox's ID and toolbox token.
+// adopted again with the sandbox's ID and toolbox token. A Firecracker guest
+// restored from its stopped snapshot is adopted again over vsock: its
+// toolboxd serves nothing without the token.
 type IdentityStarter interface {
 	StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error)
 }

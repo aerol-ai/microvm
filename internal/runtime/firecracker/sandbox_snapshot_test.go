@@ -54,7 +54,7 @@ func TestStopStartSnapshotLifecycle(t *testing.T) {
 		t.Fatalf("manifest = %+v, want cid=3 overlay=true checksum", manifest)
 	}
 
-	started, err := f.driver.Start(ctx, "sb-snap-life")
+	started, err := f.driver.StartWithIdentity(ctx, "sb-snap-life", "sb-snap-life", "tok")
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}

@@ -105,7 +105,7 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	args = append(args, scriptPath)
 	args = append(args, req.Argv...)
 	cmd := exec.CommandContext(ctx, interp, args...)
-	cmd.Env = append(os.Environ(), envMapToSlice(req.Envs)...)
+	cmd.Env = append(childEnviron(), envMapToSlice(req.Envs)...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

@@ -2558,6 +2558,10 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
 	}
+	// The driver delivers the env into the guest, so a key the egress
+	// gateway injects (or ever injected) stays a placeholder there, as on
+	// the container path (P3-2). The row keeps the real value, sealed.
+	driverReq.Env = withholdEnv(driverReq.Env, withheldKeys(&req))
 
 	toolboxToken, err := generateToolboxToken()
 	if err != nil {
