@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 )
@@ -48,6 +49,31 @@ var ErrFloorUnsupported = errors.New("netrules: backend cannot manage the egress
 
 var floorMu sync.Mutex
 
+// floorEntry is one runtime's floor: the manager whose user chain jumps to
+// it, its sandbox subnet and the operator's floor addresses.
+type floorEntry struct {
+	m      *Manager
+	fb     floorBackend
+	subnet netip.Prefix
+	cidrs  []netip.Prefix
+}
+
+// floors are every runtime's floor on this node, by chain. Each runtime knows
+// only its own subnet, but with sandbox interconnect off a floor must drop
+// traffic from its subnet to every sandbox subnet on the node: a per-subnet
+// self-drop alone let a Firecracker guest open a connection to a container
+// sandbox on the same node (bank-readiness UC-339 on cluster-bank-flagship).
+// Guarded by floorMu.
+var floors = map[string]*floorEntry{}
+
+// ResetFloorsForTest forgets every registered floor. Test-only seam: the
+// registry is process-wide, as a node's runtimes share one process.
+func ResetFloorsForTest() {
+	floorMu.Lock()
+	defer floorMu.Unlock()
+	floors = map[string]*floorEntry{}
+}
+
 // allowInterconnect lets sandboxes on one node reach each other
 // (SB_SANDBOX_INTERCONNECT). Off by default: the floor also drops traffic
 // from the sandbox subnet to the sandbox subnet, so one tenant's sandbox
@@ -60,9 +86,11 @@ var allowInterconnect atomic.Bool
 func SetSandboxInterconnect(allow bool) { allowInterconnect.Store(allow) }
 
 // SetFloor replaces the node-wide deny floor for sandboxes on subnet. An
-// empty cidrs list clears it. The flush and refill are separate steps, so
-// the floor is briefly empty while it is replaced; the egress gateway's own
-// copy of the floor (its deny_floor set) stays in place throughout.
+// empty cidrs list clears the operator's part. The flush and refill are
+// separate steps, so the floor is briefly empty while it is replaced; the
+// egress gateway's own copy of the floor (its deny_floor set) stays in
+// place throughout. A subnet seen for the first time also re-renders every
+// other runtime's floor, so each drops traffic to it.
 func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	if !m.Enabled() || !subnet.IsValid() {
 		return nil
@@ -74,6 +102,35 @@ func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	floorMu.Lock()
 	defer floorMu.Unlock()
 	chain := FloorChainFor(subnet)
+	_, known := floors[chain]
+	floors[chain] = &floorEntry{m: m, fb: fb, subnet: subnet.Masked(), cidrs: append([]netip.Prefix(nil), cidrs...)}
+	if err := renderFloor(chain, floors[chain]); err != nil {
+		return err
+	}
+	if known {
+		return nil
+	}
+	others := make([]string, 0, len(floors))
+	for other := range floors {
+		if other != chain {
+			others = append(others, other)
+		}
+	}
+	sort.Strings(others)
+	for _, other := range others {
+		if err := renderFloor(other, floors[other]); err != nil {
+			return fmt.Errorf("egress floor for %s after %s joined: %w", floors[other].subnet, subnet.Masked(), err)
+		}
+	}
+	return nil
+}
+
+// renderFloor writes one floor chain: its manager's user chain jumps to it
+// first, then DROPs from its subnet to each operator floor address and,
+// with interconnect off, to every sandbox subnet registered on the node
+// (its own included). Caller holds floorMu.
+func renderFloor(chain string, e *floorEntry) error {
+	m, fb := e.m, e.fb
 	// Before the jump goes in: a rule inserted from here on lands below it.
 	m.floorChain.Store(chain)
 	m.floorFirst.Store(true)
@@ -89,15 +146,27 @@ func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	if !m.legacyFloorEmptied.Swap(true) {
 		_ = fb.FlushChain(ChainAerolvmFloor)
 	}
-	src := subnet.Masked().String()
+	dsts := append([]netip.Prefix(nil), e.cidrs...)
 	if !allowInterconnect.Load() {
-		cidrs = append(append([]netip.Prefix(nil), cidrs...), subnet.Masked())
+		subnets := make([]netip.Prefix, 0, len(floors))
+		for _, other := range floors {
+			subnets = append(subnets, other.subnet)
+		}
+		sort.Slice(subnets, func(i, j int) bool { return subnets[i].String() < subnets[j].String() })
+		dsts = append(dsts, subnets...)
 	}
-	for _, c := range cidrs {
+	src := e.subnet.String()
+	seen := map[string]bool{}
+	for _, c := range dsts {
 		if !c.Addr().Is4() {
 			continue
 		}
-		if err := m.ipt.Insert("filter", chain, 1, "-s", src, "-d", c.Masked().String(), "-j", "DROP"); err != nil {
+		dst := c.Masked().String()
+		if seen[dst] {
+			continue
+		}
+		seen[dst] = true
+		if err := m.ipt.Insert("filter", chain, 1, "-s", src, "-d", dst, "-j", "DROP"); err != nil {
 			return fmt.Errorf("egress floor rule %s: %w", c, err)
 		}
 	}
