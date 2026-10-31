@@ -275,6 +275,15 @@ type keyCustodyState struct {
 	closers []func() int
 	// restartGateway replaces the systemctl restart in tests.
 	restartGateway func(context.Context) error
+	// sweptVersion is the key-store version the last finished sweep
+	// counted against, and resealedRing the server-key ring the last
+	// finished reseal pass counted (ringView): a count is only good for
+	// the target it was made for. Both under mu.
+	sweptVersion string
+	resealedRing string
+	// loops are StartKeyCustody's goroutines, so a shutdown (or a test)
+	// can wait for them to stop touching the gauges.
+	loops sync.WaitGroup
 }
 
 // KeyRevoked reports whether the customer's key store revoked the server
@@ -339,6 +348,11 @@ func (s *Service) RevocableContext(parent context.Context) (context.Context, con
 // rewrap sweep now (the API is already serving) and then every hour after
 // a random start delay of up to an hour, so a fleet restarted together
 // does not sweep in lockstep (eng D19).
+//
+// The re-check has a loop of its own: a sweep or reseal pass can take
+// minutes (a key-store call per stale row, a hung call up to its timeout),
+// and a revoke must not wait for one. The passes share a second loop, one
+// at a time; each re-check asks it for a reseal pass.
 func (s *Service) StartKeyCustody(ctx context.Context) {
 	if s == nil || s.cipher == nil {
 		return
@@ -354,18 +368,15 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 		// is recorded now.
 		s.noteServerKeyRing(entries)
 	}
+	reseal := make(chan struct{}, 1)
+	s.keyCustody.loops.Add(2)
 	go func() {
-		var sweepC <-chan time.Time
+		defer s.keyCustody.loops.Done()
 		// ±10% jitter on the re-check, for the same reason.
 		nextRecheck := func() <-chan time.Time {
 			return time.After(interval + time.Duration((rand.Float64()*0.2-0.1)*float64(interval)))
 		}
 		recheckC := nextRecheck()
-		if sweep {
-			s.sweepPass(ctx)
-			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
-		}
-		s.resealTick(ctx)
 		for {
 			select {
 			case <-ctx.Done():
@@ -376,8 +387,31 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 				} else {
 					s.reloadKeyRingFile()
 				}
-				s.resealTick(ctx)
+				select {
+				case reseal <- struct{}{}:
+				default: // a pass is already asked for
+				}
 				recheckC = nextRecheck()
+			}
+		}
+	}()
+	go func() {
+		defer s.keyCustody.loops.Done()
+		var sweepC <-chan time.Time
+		if sweep {
+			s.sweepPass(ctx)
+			sweepC = time.After(time.Duration(rand.Int64N(int64(keySweepInterval))))
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.resealTick(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-reseal:
+				s.resealTick(ctx)
 			case <-sweepC:
 				s.sweepPass(ctx)
 				sweepC = time.After(keySweepInterval)
@@ -390,6 +424,7 @@ func (s *Service) StartKeyCustody(ctx context.Context) {
 // returns. Only a deliberate signal from the key store counts toward a
 // revoke: a 403, an outage or a retired version never does (§10).
 func (s *Service) RecheckServerKey(ctx context.Context) string {
+	s.retryEgressCAClear(ctx)
 	cctx, cancel := context.WithTimeout(secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "recheck")), keyRecheckTimeout)
 	defer cancel()
 	f, err := secrets.ReadWrappedKeyFile(s.cfg.CredentialKeyWrappedPath)
@@ -502,10 +537,21 @@ func (s *Service) revokeKey(ctx context.Context, cause error) {
 // predates clear_inspect_ca is restarted instead; it comes back without the
 // CA (memory only) and a revoked node never resends it (eng D4). It says
 // what happened, for the audit record.
+//
+// A clear that does not reach the gateway is owed: every re-check of the
+// revoked node and every gateway reconnect sends it again, since a revoked
+// node that keeps talking to the gateway is never silent long enough for
+// the gateway's own bound to drop the CA.
 func (s *Service) clearEgressInspection(ctx context.Context, restart func(context.Context) error) string {
+	s.egressCAMu.Lock()
 	s.egressCA.Store(nil)
+	s.egressCAMu.Unlock()
+	// After any push in flight; none starts once the key is revoked.
+	s.egressCAPushMu.Lock()
+	defer s.egressCAPushMu.Unlock()
 	s.egressCAPushed.Store(false)
 	if !s.egressEnabled() {
+		s.egressCAClearOwed.Store(false)
 		return "not used"
 	}
 	cctx, cancel := context.WithTimeout(ctx, keyRecheckTimeout)
@@ -513,21 +559,36 @@ func (s *Service) clearEgressInspection(ctx context.Context, restart func(contex
 	err := s.egressGateway().ClearInspectCA(cctx)
 	switch {
 	case err == nil:
+		s.egressCAClearOwed.Store(false)
 		return "cleared"
 	case egress.IsUnknownOp(err):
 		if restart == nil {
 			restart = restartEgressGatewayUnit
 		}
 		if rerr := restart(cctx); rerr != nil {
-			s.logger.Error("key custody: could not restart the egress gateway to drop its CA", "error", rerr)
+			s.egressCAClearOwed.Store(true)
+			s.logger.Error("key custody: could not restart the egress gateway to drop its CA; retried on the next re-check", "error", rerr)
 			return "restart failed"
 		}
+		s.egressCAClearOwed.Store(false)
 		return "restarted (predates clear_inspect_ca)"
 	default:
-		// An unreachable gateway either holds no CA (it restarted) or drops
-		// it once this node is silent past the bound it sent.
-		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA", "error", err)
+		s.egressCAClearOwed.Store(true)
+		s.logger.Warn("key custody: egress gateway unreachable while dropping its CA; retried on the next re-check", "error", err)
 		return "unreachable"
+	}
+}
+
+// retryEgressCAClear sends a revoke's clear again while it is owed.
+func (s *Service) retryEgressCAClear(ctx context.Context) {
+	if !s.KeyRevoked() || !s.egressCAClearOwed.Load() {
+		return
+	}
+	s.keyCustody.mu.Lock()
+	restart := s.keyCustody.restartGateway
+	s.keyCustody.mu.Unlock()
+	if got := s.clearEgressInspection(ctx, restart); !s.egressCAClearOwed.Load() {
+		s.logger.Warn("key custody: egress gateway dropped its CA on a retry", "gateway", got)
 	}
 }
 
@@ -550,6 +611,7 @@ func (s *Service) recoverKey(ctx context.Context, keys []secrets.RingKey) error 
 	s.keyCustody.revoked.Store(false)
 	s.keyCustody.stop = make(chan struct{})
 	s.keyCustody.mu.Unlock()
+	s.egressCAClearOwed.Store(false)
 	keyRevokedGauge.Set(0)
 	if s.egressEnabled() {
 		s.egressMu.Lock()
@@ -598,8 +660,11 @@ const (
 var (
 	// keyRowsStale counts this node's rows not on the current key, plus its
 	// server-key file. "0 on every member" is when an old version may be
-	// retired (§11) or a local → key store switch is complete (§12).
-	keyRowsStale = expvar.NewInt("aerolvm_key_rows_stale")
+	// retired (§11) or a local → key store switch is complete (§12), so it
+	// is -1, unknown, until a sweep against the current version finishes:
+	// at boot, on a node that does not sweep, and while a pass against a
+	// new version runs.
+	keyRowsStale = unknownGauge("aerolvm_key_rows_stale")
 	// keyRowsRetired counts rows on a key version the key store no longer
 	// decrypts: opens of those sandboxes fail on this node
 	// (SandboxdKeyVersionRetiredInUse).
@@ -608,6 +673,13 @@ var (
 	keyCurrentGauge   = expvar.NewMap("aerolvm_key_current")
 	keyDecryptableMap = expvar.NewMap("aerolvm_key_decryptable")
 )
+
+// unknownGauge is an expvar gauge that starts at -1: nothing counted yet.
+func unknownGauge(name string) *expvar.Int {
+	v := expvar.NewInt(name)
+	v.Set(-1)
+	return v
+}
 
 // decryptableKeys is a key store that lists the key versions it still opens
 // (the PKCS#11 helper: its current label and its decrypt-only labels).
@@ -654,6 +726,17 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	cancel()
 	if err != nil {
 		return 0, fmt.Errorf("read the current key version: %w", err)
+	}
+	// The last pass counted against the version it saw. Until a pass
+	// against this one finishes, that count says nothing about it: current
+	// = v2 beside the v1 pass's stale = 0 would read as safe to retire v1
+	// while its rows are still being moved. So the count goes before the
+	// new version is published.
+	s.keyCustody.mu.Lock()
+	sameTarget := s.keyCustody.sweptVersion == current
+	s.keyCustody.mu.Unlock()
+	if !sameTarget {
+		keyRowsStale.Set(-1)
 	}
 	s.publishKeyVersions(current)
 	provider := secrets.NormalizeProviderName(s.cfg.SecretProvider)
@@ -709,6 +792,9 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	finished = true
 	keyRowsStale.Set(int64(stale))
 	keyRowsRetired.Set(int64(retired))
+	s.keyCustody.mu.Lock()
+	s.keyCustody.sweptVersion = current
+	s.keyCustody.mu.Unlock()
 	return stale, nil
 }
 
