@@ -371,15 +371,15 @@ func TestAuthDeniedLimiterBounds(t *testing.T) {
 	now := time.Date(2026, 10, 17, 9, 0, 0, 0, time.UTC)
 	l.now = func() time.Time { return now }
 	for i := 0; i < authDeniedMaxSources; i++ {
-		if ok, _ := l.admit("10.0.0." + strings.Repeat("x", i%7) + string(rune(i))); !ok {
+		if ok, _ := l.admit("10.0.0."+strings.Repeat("x", i%7)+string(rune(i)), authDeniedRequest{}); !ok {
 			t.Fatalf("source %d refused below the cap", i)
 		}
 	}
-	if ok, _ := l.admit("192.0.2.1"); ok {
+	if ok, _ := l.admit("192.0.2.1", authDeniedRequest{}); ok {
 		t.Fatal("a new source past the cap was recorded")
 	}
 	now = now.Add(time.Minute)
-	if ok, n := l.admit("192.0.2.1"); !ok || n != 1 {
+	if ok, n := l.admit("192.0.2.1", authDeniedRequest{}); !ok || n != 1 {
 		t.Fatalf("after the sweep: %v %d", ok, n)
 	}
 	if got := tcpPeerAddress(&http.Request{RemoteAddr: "pipe"}); got != "pipe" {

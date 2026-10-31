@@ -35,6 +35,7 @@ A SIEM (security information and event management system) is where many companie
 - **Every secret open is recorded:** when a sandbox starts, when it is rebuilt, and when someone asks for its variables.
 - **Every API call that changes something is recorded, with its caller:** create, delete, start, stop, ports, snapshots, tokens, and every command or file call inside a sandbox. Refused calls are recorded too. Only the server that ran the call records it, so a call forwarded across a cluster is recorded once.
 - **Every mutating action is recorded, except calls in the last sync interval before an unclean crash, unless the call is durable.** The sync interval is 1 second. Token create, token revoke and sandbox delete are durable when `SB_AUDIT_API_DURABLE` is on, which enterprise mode requires.
+- **Every refused credential is counted.** A burst of bad tokens from one address writes one record at once. When that minute ends, one more record counts the rest, even if the address has gone quiet. A graceful shutdown writes the counts it still holds. An unclean crash loses the counts of each address's last minute, but the first refusal of that minute is already recorded.
 - **Records are chained.** Each record holds a fingerprint (hash) of the one before, so a changed or deleted record breaks the chain. Someone with root on a server could rebuild that server's chain. The copy you export and the witness are what catch that.
 - **The witness keeps fingerprints off the server.** With [enterprise mode](/enterprise/enterprise-mode/), each server stores its newest fingerprint in an S3 bucket with Object Lock. No server can change or delete what is stored there, so a rebuilt chain no longer matches.
 - **Shipping never drops a batch.** If your receiver is down, the server keeps the records, retries, and raises an alert when it falls behind.
@@ -47,7 +48,7 @@ A SIEM (security information and event management system) is where many companie
 | `secret_open` | A sandbox's variables, registry password or storage credentials are opened |
 | `egress` | The network filter refuses an outbound connection. It can also record the ones it allows. |
 | `api` | An API call: every call that changes something, every command and file call, token listing, audit checks, and every `403`. With `SB_AUDIT_API_RECORDS=all`, plain reads too. Also an SSH session opening, and the server's own deletes and stops. |
-| `auth_denied` | A refused credential (`401`), at most one per source address per minute. `dropped` counts the others it stands for. |
+| `auth_denied` | A refused credential (`401`), at most one per source address per minute. The first refusal is written at once. The rest of that minute are written as one record when the minute ends, describing the last of them. `dropped` counts the others it stands for. |
 | `identity_config` | The identity file changed on this server: the old and new file hash, and the role rules and deny entries added and removed |
 | `api_flood_mode` | The server switched how it limits a flood of `api` records |
 | `gap` | Records had to be skipped. The marker carries the count. |
@@ -271,7 +272,7 @@ For a large fleet, a quarter of export can be very large. Run the same join in y
 - **Last action and calls:** the newest record and the count of records per caller in the window. A record with `request.count` stands for that many identical calls. A record with `reason: rate_limited` stands for `dropped` calls.
 - **Token changes:** `api` records with `request.method` `POST` and `request.route` `/v1/tokens` (created: `request.target` is the new token, and `request.grant` its role and team), or `DELETE` and `/v1/tokens/{id}` (revoked). Count only `result: ok`. `caller` is who did it.
 - **Identity-file changes:** `identity_config` records. `identity_config.old_hash` and `new_hash` name the files. `bindings_added`, `bindings_removed`, `reordered`, `deny_added`, `deny_removed`, `issuers_added`, `issuers_removed` and `omitted` hold the lines. Flag a binding line ending in `-> admin/*` as admin, and any ending in `/*` as every team.
-- **Denied and refused:** `api` records with `result: denied`, and `auth_denied` records grouped by `request.source`. Each `auth_denied` record stands for `1 + dropped` refusals, with the reason in `reason`.
+- **Denied and refused:** `api` records with `result: denied`, and `auth_denied` records grouped by `request.source`. Each `auth_denied` record stands for `1 + dropped` refusals from that address. Its `request.method`, `request.route` and `reason` are those of the last one.
 - **Lost records:** the `dropped` count of `gap` records.
 
 ## Read a sandbox's audit history
