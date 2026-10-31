@@ -877,6 +877,11 @@ var Registry = []UseCase{
 	{ID: "UC-338", Title: "Scale: density per runtime: small sandboxes created 8 at a time until a clean capacity refusal or the cap; every created sandbox runs and the API still answers", Requires: []Capability{CapBenchmark, CapDocker}, Implemented: true},
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// Early gateway attach (perf/egress-attach-early): the attach overlaps the
+	// runtime create, and must never open a sandbox or leave state behind.
+	{ID: "UC-340", Title: "Egress: a hostname-allowlisted sandbox has no unfiltered egress from its workload's first instruction (probes started at workload start never reach an outside address directly, during or after the create), and after the create only its allowlist is reachable", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-341", Title: "Egress: a hostname-filtered create that fails after the runtime built the sandbox leaves no gateway set element and no firewall rule per address on any node, and the next sandboxes get only their own policy", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-342", Title: "Egress: churn of hostname-rule sandboxes (create, fetch the allowed name, destroy; AEROL_EGRESS_CHURN times) leaves the gateway's sets and the host firewall's per-address rules flat on every node", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
