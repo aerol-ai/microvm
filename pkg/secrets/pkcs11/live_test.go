@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -105,11 +106,38 @@ func TestPKCS11Live(t *testing.T) {
 		pb.Close()
 	}
 
-	// The helper process with the session pool full: many concurrent calls,
-	// every one answered, and the vendor library mapped only in the helper.
-	if err := os.Setenv("PKCS11_HELPER_REAL", "1"); err != nil {
-		t.Fatal(err)
+	// The helper half runs in a fresh process: this one opened the module
+	// in-process above, and a vendor library (AWS CloudHSM's) can stay
+	// mapped after close, which would make the isolation check meaningless.
+	cmd := exec.Command(os.Args[0], "-test.run=^TestPKCS11LiveHelper$", "-test.count=1", "-test.v")
+	cmd.Env = append(os.Environ(), "PKCS11_LIVE_CHILD=1", "PKCS11_HELPER_REAL=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "--- PASS: TestPKCS11LiveHelper") {
+		t.Fatalf("helper child: %v\n%s", err, out)
 	}
+	t.Logf("helper child:\n%s", out)
+}
+
+// TestPKCS11LiveHelper is TestPKCS11Live's helper half, run by it in a
+// fresh process: many concurrent calls through the helper with the session
+// pool full, every one answered, and the vendor library mapped only in the
+// helper.
+func TestPKCS11LiveHelper(t *testing.T) {
+	if os.Getenv("PKCS11_LIVE_CHILD") != "1" {
+		t.Skip("run by TestPKCS11Live in a fresh process")
+	}
+	module := os.Getenv("SB_TEST_PKCS11_MODULE")
+	cfg := TokenConfig{
+		Module:     module,
+		TokenLabel: os.Getenv("SB_TEST_PKCS11_TOKEN_LABEL"),
+		PINFile:    os.Getenv("SB_TEST_PKCS11_PIN_FILE"),
+		KeyLabel:   os.Getenv("SB_TEST_PKCS11_KEY_LABEL"),
+		IVMode:     IVAuto,
+		Sessions:   4,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	dek := []byte("0123456789abcdef0123456789abcdef")
 	dir, err := os.MkdirTemp("/tmp", "p11live")
 	if err != nil {
 		t.Fatal(err)
