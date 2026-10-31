@@ -3127,6 +3127,19 @@ func (s *Service) GetSandbox(ctx context.Context, id string) (*models.Sandbox, e
 	return s.GetSandboxWithOptions(ctx, id, GetSandboxOptions{})
 }
 
+// HasLocalSandbox reports whether this node's store holds a row for id,
+// unscoped (the handler that serves the row applies owner scoping). Only a
+// definite miss is false: any other store error is true, so the caller serves
+// locally and the handler surfaces that error instead of a guessed absence.
+// The cluster router asks it only while the placement view is catching up.
+func (s *Service) HasLocalSandbox(ctx context.Context, id string) bool {
+	if s == nil || s.store == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	_, err := s.store.Get(ctx, id)
+	return !errors.Is(err, store.ErrNotFound)
+}
+
 // GetSandboxWithOptions returns a sandbox. Env is omitted unless IncludeEnv
 // is set; that opt-in path loads via loadEnv and is audited.
 func (s *Service) GetSandboxWithOptions(ctx context.Context, id string, opts GetSandboxOptions) (*models.Sandbox, error) {

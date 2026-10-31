@@ -253,6 +253,11 @@ func Classify(err error) Classification {
 	// leader's internal address.
 	case cluster.IsLeaderUnavailable(err):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "cluster leader unavailable (an election is in progress); retry shortly", LogLevel: slog.LevelInfo, Log: true}
+	// A restarted node whose placement view has not caught up cannot prove a
+	// sandbox is gone: retry, never 404 (a client that trusts a 404 leaks
+	// the sandbox, its secrets and its capacity).
+	case errors.Is(err, cluster.ErrNotCaughtUp):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.CatchUpRetryAfterSeconds, Message: "this node is catching up with the cluster after a restart; retry shortly"}
 
 	default:
 		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error()), Kind: ErrKindUnclassified, LogLevel: slog.LevelWarn, Log: true}
