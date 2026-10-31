@@ -26,6 +26,8 @@ const egressOperatorPoll = 10 * time.Second
 // reload keeps the last good file.
 func wireEgressOperator(ctx context.Context, cfg config.Config, svc *service.Service, logger *slog.Logger) {
 	if cfg.EgressOperatorFile == "" {
+		// No file: the floor still holds the cloud metadata endpoints.
+		svc.ApplyEgressFloor(ctx)
 		return
 	}
 	// Isolate egress leaves from sandboxd's own process, so its guard follows

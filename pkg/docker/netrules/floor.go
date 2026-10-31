@@ -18,7 +18,8 @@ const ChainAerolvmFloor = "AEROLVM-FLOOR"
 // floorBackend is the optional chain management the floor needs.
 type floorBackend interface {
 	// EnsureJumpChain creates child if absent and makes the first rule of
-	// parent a jump to it.
+	// parent a jump to it: a jump already there but lower down (a chain an
+	// older daemon filled) moves to the top, with no moment without one.
 	EnsureJumpChain(parent, child string) error
 	// FlushChain removes every rule in chain.
 	FlushChain(chain string) error
@@ -43,6 +44,8 @@ func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	}
 	floorMu.Lock()
 	defer floorMu.Unlock()
+	// Before the jump goes in: a rule inserted from here on lands below it.
+	m.floorFirst.Store(true)
 	if err := fb.EnsureJumpChain(m.filterChain(), ChainAerolvmFloor); err != nil {
 		return fmt.Errorf("egress floor chain: %w", err)
 	}

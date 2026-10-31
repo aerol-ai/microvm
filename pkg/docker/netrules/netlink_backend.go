@@ -370,17 +370,34 @@ func (b *netlinkBackend) EnsureJumpChain(parent, child string) error {
 	if err != nil {
 		return fmt.Errorf("nft get %s rules: %w", parent, err)
 	}
-	for _, r := range rules {
+	isJump := func(r *nftables.Rule) bool {
 		for _, e := range r.Exprs {
 			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictJump && v.Chain == child {
-				return nil
+				return true
 			}
 		}
+		return false
 	}
+	var lower []*nftables.Rule
+	for i, r := range rules {
+		if isJump(r) {
+			if i == 0 {
+				return nil
+			}
+			lower = append(lower, r)
+		}
+	}
+	// One batch: the new top jump goes in and any lower one comes out by its
+	// handle (stable, unlike a position), so there is no moment without it.
 	conn.InsertRule(&nftables.Rule{Table: tbl, Chain: pch, Exprs: []expr.Any{
 		&expr.Counter{},
 		&expr.Verdict{Kind: expr.VerdictJump, Chain: child},
 	}})
+	for _, r := range lower {
+		if err := conn.DelRule(r); err != nil {
+			return fmt.Errorf("nft delete lower %s jump to %s: %w", parent, child, err)
+		}
+	}
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("nft insert %s jump to %s: %w", parent, child, err)
 	}

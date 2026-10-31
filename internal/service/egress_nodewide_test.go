@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // floorRuntime is a container runtime that records the deny floor.
@@ -32,18 +34,25 @@ func TestOperatorFloorReachesTheHostFirewall(t *testing.T) {
 	fc := &floorRuntime{holdRuntime: &holdRuntime{recordingRuntime: &recordingRuntime{}}}
 	svc.SetFirecrackerRuntime(fc)
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ndeny_cidrs: [10.20.0.0/16]\n"))
-	if len(rt.floor) != 1 || len(rt.floor[0]) != 1 || rt.floor[0][0] != netip.MustParsePrefix("10.20.0.0/16") {
-		t.Fatalf("floor = %v", rt.floor)
+	want := egresspolicy.WithMetadataFloor([]netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")})
+	if len(rt.floor) != 1 || !slices.Equal(rt.floor[0], want) {
+		t.Fatalf("floor = %v, want the file's deny_cidrs and the metadata endpoints", rt.floor)
 	}
-	if len(fc.floor) != 1 || len(fc.floor[0]) != 1 {
+	if len(fc.floor) != 1 || !slices.Equal(fc.floor[0], want) {
 		t.Fatalf("the Firecracker guests get the floor too: %v", fc.floor)
 	}
 	rt.err = errors.New("iptables gone")
 	svc.OnEgressOperatorChange(operatorWatcher(t, "version: 1\n").Current())
-	if len(rt.floor) != 2 || len(rt.floor[1]) != 0 {
-		t.Fatalf("a changed file replaces the floor: %v", rt.floor)
+	if len(rt.floor) != 2 || !slices.Equal(rt.floor[1], egresspolicy.MetadataPrefixes) {
+		t.Fatalf("a changed file replaces the floor, keeping the metadata endpoints: %v", rt.floor)
 	}
-	svc.applyEgressFloor(context.Background(), nil) // no file: nothing to do
+	// No file at all: the floor is the metadata endpoints alone, installed
+	// at boot (ApplyEgressFloor), so no node runs without it.
+	rt.err = nil
+	svc.ApplyEgressFloor(context.Background())
+	if last := rt.floor[len(rt.floor)-1]; !slices.Equal(last, egresspolicy.MetadataPrefixes) {
+		t.Fatalf("the floor with no operator file = %v", last)
+	}
 }
 
 type membersClient struct {

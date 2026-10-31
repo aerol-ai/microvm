@@ -93,13 +93,23 @@ func (s *Service) OnEgressOperatorChange(op *operator.Operator) {
 	s.kickEgressProfileReapply()
 }
 
-// applyEgressFloor installs the operator's deny_cidrs as a node-wide DROP on
-// each container engine's bridge and the Firecracker TAP subnet (§5.10
-// PC-2). It is the floor's copy that works without the egress gateway;
-// failures are logged, not fatal, because the gateway's own floor and the
-// WASM/isolate dial guards still hold it.
+// ApplyEgressFloor installs the deny floor with no operator file: the cloud
+// metadata endpoints alone. The daemon calls it at boot when
+// SB_EGRESS_OPERATOR_FILE is unset, so the node's instance credentials are
+// out of every sandbox's reach on every node, not only where an operator
+// file is configured.
+func (s *Service) ApplyEgressFloor(ctx context.Context) {
+	s.applyEgressFloor(ctx, nil)
+}
+
+// applyEgressFloor installs the deny floor (the operator's deny_cidrs and
+// the cloud metadata endpoints; op may be nil) as a node-wide DROP on each
+// container engine's bridge and the Firecracker TAP subnet (§5.10 PC-2). It
+// is the floor's copy that works without the egress gateway; failures are
+// logged, not fatal, because the gateway's own floor and the WASM/isolate
+// dial guards still hold it.
 func (s *Service) applyEgressFloor(ctx context.Context, op *operator.Operator) {
-	if s == nil || op == nil {
+	if s == nil {
 		return
 	}
 	for _, rt := range []runtime.Runtime{s.docker, s.containerd, s.firecracker} {
