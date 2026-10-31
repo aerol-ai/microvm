@@ -355,7 +355,11 @@ curl -sfk https://127.0.0.1:8200/v1/sys/health >/dev/null`)
 // adding it to every request, so sandboxd itself holds no Vault token.
 func kcEnsureProxy(t *testing.T, seed, node harness.IntegrationNode) {
 	t.Helper()
-	if kcMarked(t, node, "bao-proxy") && strings.Contains(kcSSH(t, node, "systemctl is-active itest-bao-proxy || true"), "active") {
+	// Reuse a proxy only if an authenticated call through it works: health
+	// answers without a token, so a proxy holding a token from an OpenBao
+	// that has since restarted (its store is in memory) looks healthy while
+	// every real call gets 403.
+	if kcMarked(t, node, "bao-proxy") && strings.TrimSpace(kcSSH(t, node, `curl -sf -o /dev/null -X POST `+kcProxyAddr+`/v1/sys/capabilities-self -d '{"paths":["transit/encrypt/`+kcTransitKey+`"]}' && echo ok || echo stale`)) == "ok" {
 		return
 	}
 	token := strings.TrimSpace(kcBao(t, seed, "token create -policy=aerolvm -period=72h -field=token"))
