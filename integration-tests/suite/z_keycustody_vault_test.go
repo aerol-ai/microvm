@@ -74,7 +74,7 @@ func TestKeyCustodyWrapServerKey(t *testing.T) {
 			}
 		}
 		clean := kcSSH(t, n, `if sudo test -e `+kcKeyFile+`; then echo KEYFILE; fi
-if sudo grep -l '^SB_CREDENTIAL_ENCRYPTION_KEY=' /etc/sandboxd/*.env 2>/dev/null; then echo ENVKEY; fi
+if sudo sh -c "grep -l '^SB_CREDENTIAL_ENCRYPTION_KEY=' /etc/sandboxd/*.env"; then echo ENVKEY; fi
 sudo test -s `+kcWrapped+` && echo WRAPPED`)
 		if strings.Contains(clean, "KEYFILE") || strings.Contains(clean, "ENVKEY") || !strings.Contains(clean, "WRAPPED") {
 			t.Fatalf("%s still holds a plaintext server key, or has no wrapped file:\n%s", n.Name, clean)

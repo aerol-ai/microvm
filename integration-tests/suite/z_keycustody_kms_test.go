@@ -24,8 +24,8 @@ func TestKeyCustodyKMSWrappedFromTheStart(t *testing.T) {
 	sawBundle := false
 	for _, n := range nodes {
 		out := kcSSH(t, n, `if sudo test -e `+kcKeyFile+`; then echo KEYFILE; fi
-if sudo grep -l '^SB_CREDENTIAL_ENCRYPTION_KEY=' /etc/sandboxd/*.env 2>/dev/null; then echo ENVKEY; fi
-sudo grep -h '^SB_CREDENTIAL_KEY_CUSTODY=' /etc/sandboxd/*.env 2>/dev/null || true
+if sudo sh -c "grep -l '^SB_CREDENTIAL_ENCRYPTION_KEY=' /etc/sandboxd/*.env"; then echo ENVKEY; fi
+sudo sh -c "grep -h '^SB_CREDENTIAL_KEY_CUSTODY=' /etc/sandboxd/*.env" || true
 sudo test -s `+kcWrapped+` && echo WRAPPED
 # The seed's own bundle, and on a joiner the copy cluster-join.sh downloaded
 # from the S3 bundle object.

@@ -503,7 +503,7 @@ sudo install -d -m 0700 `+kcStateDir+`
 echo "$KA" | base64 -d | sudo tee `+kcStateDir+`/kek-a.bin >/dev/null
 echo "$KB" | base64 -d | sudo tee `+kcStateDir+`/kek-b.bin >/dev/null
 printf '%s' "$PIN" | sudo tee `+kcSoftHSMPIN+` >/dev/null
-sudo chmod 0600 `+kcSoftHSMPIN+` `+kcStateDir+`/*.bin
+sudo chmod 0600 `+kcSoftHSMPIN+` `+kcStateDir+`/kek-a.bin `+kcStateDir+`/kek-b.bin
 # A half-finished earlier attempt is started over: one object per label.
 sudo softhsm2-util --delete-token --token `+kcSoftHSMToken+` >/dev/null 2>&1 || true
 sudo softhsm2-util --init-token --free --label `+kcSoftHSMToken+` --so-pin "$PIN" --pin "$PIN" >/dev/null
