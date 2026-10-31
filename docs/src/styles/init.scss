@@ -1,8 +1,15 @@
 @use './mixins.scss' as *;
 
 html {
-  scroll-behavior: smooth;
   scroll-padding-top: 84px;
+}
+
+// Smooth only once the page has loaded (Head.astro sets the attribute). On the
+// scroll that lands a new page at its #anchor, smooth animates toward where
+// the heading sat before the web fonts swapped in, and stops ~48px past it,
+// under the header.
+html[data-smooth-scroll] {
+  scroll-behavior: smooth;
 }
 
 body {
