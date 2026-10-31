@@ -35,7 +35,7 @@ type scriptedReply struct {
 	err    error
 }
 
-func (s *scriptedVault) call(_ context.Context, path string, body any) (int, vaultResponse, error) {
+func (s *scriptedVault) call(_ context.Context, _, path string, body any) (int, vaultResponse, error) {
 	s.paths = append(s.paths, path)
 	b, _ := body.(map[string]any)
 	s.bodies = append(s.bodies, b)
@@ -156,9 +156,14 @@ func TestClassifyVault(t *testing.T) {
 			t.Fatalf("%s %d %v = %v, want %v", tc.op, tc.status, tc.errs, err, tc.want)
 		}
 	}
-	long := classifyVault("decrypt", 500, []string{strings.Repeat("x", 500)})
-	if len(long.Error()) > vaultErrorTextMax+80 {
-		t.Fatalf("error text not bounded: %d bytes", len(long.Error()))
+	// Vault's text picks the class but is never carried: it can echo
+	// request content, and these errors are logged.
+	for _, tc := range cases {
+		for _, e := range tc.errs {
+			if err := classifyVault(tc.op, tc.status, []string{e + " ECHOED-REQUEST"}); strings.Contains(err.Error(), "ECHOED-REQUEST") {
+				t.Fatalf("%s %d carries Vault's text: %v", tc.op, tc.status, err)
+			}
+		}
 	}
 }
 
@@ -410,12 +415,12 @@ func TestVaultTokenReloadOn403(t *testing.T) {
 	if err := os.Chtimes(tokenPath, fi.ModTime(), fi.ModTime()); err != nil {
 		t.Fatal(err)
 	}
-	status, _, err := h.call(context.Background(), "transit/decrypt/k", map[string]any{"ciphertext": "vault:v1:none"})
+	status, _, err := h.call(context.Background(), http.MethodPost, "transit/decrypt/k", map[string]any{"ciphertext": "vault:v1:none"})
 	if err != nil || status != 400 || f.forbidden != 1 {
 		t.Fatalf("after reload status %d err %v forbidden %d", status, err, f.forbidden)
 	}
 	f.tokens = map[string]bool{"other": true}
-	status, _, err = h.call(context.Background(), "transit/decrypt/k", map[string]any{"ciphertext": "x"})
+	status, _, err = h.call(context.Background(), http.MethodPost, "transit/decrypt/k", map[string]any{"ciphertext": "x"})
 	if err != nil || status != 403 || f.forbidden != 2 {
 		t.Fatalf("unchanged token: status %d err %v forbidden %d (want one request)", status, err, f.forbidden)
 	}
@@ -432,7 +437,7 @@ func TestVaultHTTPEdges(t *testing.T) {
 	ctx := ContextWithBackgroundPurpose(context.Background(), "recheck")
 
 	// No token file: Agent's proxy adds the token, sandboxd sends none.
-	if status, _, err := h.call(ctx, "transit/encrypt/k", map[string]any{"plaintext": "AA=="}); err != nil || status != 200 {
+	if status, _, err := h.call(ctx, http.MethodPost, "transit/encrypt/k", map[string]any{"plaintext": "AA=="}); err != nil || status != 200 {
 		t.Fatalf("proxy mode = %d %v", status, err)
 	}
 	last := f.headers[len(f.headers)-1]
@@ -441,25 +446,25 @@ func TestVaultHTTPEdges(t *testing.T) {
 	}
 	// A caller-supplied id that a header must not carry is dropped.
 	bad := auditlog.ContextWithCorrelationID(context.Background(), "a b\tc")
-	if _, _, err := h.call(bad, "transit/encrypt/k", map[string]any{}); err != nil {
+	if _, _, err := h.call(bad, http.MethodPost, "transit/encrypt/k", map[string]any{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := f.headers[len(f.headers)-1].Get(CorrelationHeader); got != "" {
 		t.Fatalf("unsafe correlation id forwarded: %q", got)
 	}
 	// A non-JSON reply still classifies by status.
-	if status, resp, err := h.call(context.Background(), "nope", map[string]any{}); err != nil || status != 404 || len(resp.Errors) != 0 {
+	if status, resp, err := h.call(context.Background(), http.MethodPost, "nope", map[string]any{}); err != nil || status != 404 || len(resp.Errors) != 0 {
 		t.Fatalf("html 404 = %d %v %v", status, resp, err)
 	}
 	// Redirects are not followed: X-Vault-Token must not travel to them.
 	f.mu.Lock()
 	f.redirect = true
 	f.mu.Unlock()
-	if status, _, err := h.call(context.Background(), "transit/encrypt/k", map[string]any{}); err != nil || status != http.StatusTemporaryRedirect {
+	if status, _, err := h.call(context.Background(), http.MethodPost, "transit/encrypt/k", map[string]any{}); err != nil || status != http.StatusTemporaryRedirect {
 		t.Fatalf("redirect = %d %v", status, err)
 	}
 	// A body that cannot be encoded never reaches the wire.
-	if _, _, err := h.call(context.Background(), "x", map[string]any{"c": make(chan int)}); err == nil {
+	if _, _, err := h.call(context.Background(), http.MethodPost, "x", map[string]any{"c": make(chan int)}); err == nil {
 		t.Fatal("unencodable body accepted")
 	}
 	// Nothing listening.
@@ -493,7 +498,7 @@ func TestVaultTokenFileErrors(t *testing.T) {
 		t.Fatalf("directory as token file = %v", err)
 	}
 	v := &vaultHTTP{token: &tokenFile{path: filepath.Join(dir, "none")}}
-	if _, _, err := v.call(context.Background(), "x", nil); !errors.Is(err, ErrProviderUnavailable) {
+	if _, _, err := v.call(context.Background(), http.MethodPost, "x", nil); !errors.Is(err, ErrProviderUnavailable) {
 		t.Fatalf("call without a token file = %v", err)
 	}
 }
@@ -564,5 +569,51 @@ func TestNewWrapperOpensOtherBackend(t *testing.T) {
 	}
 	if _, err := NewWrapper(ctx, ProviderOptions{Name: "awskms", Wrapper: fake, Vault: VaultOptions{KeyName: "k"}}); err == nil {
 		t.Fatal("partial vault settings must fail")
+	}
+}
+
+// API errors (plans/customer-key-custody.md Section 2): no key-store error,
+// and so no log line built from one, carries a request or response body. A
+// proxy that echoes the request (the data key) as its error page, or a
+// Transit reply with more in it than its errors, leaves only the class and
+// Vault's own error text.
+func TestVaultErrorsCarryNoBody(t *testing.T) {
+	const plainMarker = "UkVTUE9OU0UtUExBSU5URVhU"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := make([]byte, 4096)
+		n, _ := r.Body.Read(raw)
+		switch r.URL.Path {
+		case "/v1/sys/capabilities-self":
+			_, _ = w.Write([]byte(`{"data":{"transit/encrypt/k":["update"],"transit/decrypt/k":["update"]}}`))
+		case "/v1/transit/encrypt/k":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>upstream said: " + string(raw[:n]) + "</html>"))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"internal error"}, "data": map[string]any{"plaintext": plainMarker}, "request": string(raw[:n])})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	v, err := NewVault(VaultOptions{Addr: srv.URL, KeyName: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek := []byte("0123456789abcdef0123456789abcdef")
+	_, werr := v.Wrap(context.Background(), dek, map[string]string{"aerolvm.ref": "r"})
+	_, uerr := v.Unwrap(context.Background(), []byte("vault:v1:Q0lQSEVSVEVYVC1NQVJLRVI="), map[string]string{"aerolvm.ref": "r"})
+	for _, err := range []error{werr, uerr} {
+		if !errors.Is(err, ErrProviderUnavailable) {
+			t.Fatalf("err = %v, want ErrProviderUnavailable", err)
+		}
+		for _, leak := range []string{base64.StdEncoding.EncodeToString(dek), string(dek), plainMarker, "Q0lQSEVSVEVYVC1NQVJLRVI", "upstream said"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("error text carries the key store's body (%q): %v", leak, err)
+			}
+		}
+	}
+	// Not even Vault's own error list: only the status.
+	if strings.Contains(uerr.Error(), "internal error") || !strings.Contains(uerr.Error(), "500") {
+		t.Fatalf("unwrap error = %v, want the status and no reply text", uerr)
 	}
 }

@@ -100,6 +100,9 @@ CADDY_STORAGE_S3_ENCRYPTION_KEY=""
 #                        written in this one step: the flag without the
 #                        wrapper breaks every HTTPS handshake.
 PAT_SCOPE="any"
+KEY_CUSTODY="file"
+SECRET_PROVIDER_ENV=""
+NO_START="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
 
@@ -263,6 +266,20 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --no-start                   Install and enable everything but leave sandboxd
+                               stopped, for a node cluster-join.sh will start
+                               once it has the cluster's config and server key.
+                               Booting it before that, as a lone node, would
+                               make a server key of its own. Not with --local.
+  --key-custody <file|wrapped> "wrapped" keeps the server key only wrapped by
+                               the customer's key store (AWS KMS, Vault or an
+                               HSM): the first boot generates it and writes no
+                               plaintext copy; a re-run over a plaintext key
+                               wraps it. Needs --secret-provider-env.
+                               (plans/customer-key-custody.md)
+  --secret-provider-env <file> SB_SECRET_* lines naming the key store
+                               (SB_SECRET_PROVIDER=awskms|vault|pkcs11 and its
+                               settings), appended to sandboxd.env.
   --l4-proxy-protocol          Domain mode: send the real client address
                                from caddy-l4 to the HTTPS site (PROXY
                                protocol v2) and on to sandboxd, so audit
@@ -662,6 +679,18 @@ while [[ $# -gt 0 ]]; do
 			L4_PROXY_PROTOCOL="true"
 			shift
 			;;
+		--key-custody)
+			KEY_CUSTODY="$2"
+			shift 2
+			;;
+		--no-start)
+			NO_START="true"
+			shift
+			;;
+		--secret-provider-env)
+			SECRET_PROVIDER_ENV="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -678,6 +707,33 @@ if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
+	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
+	exit 1
+fi
+
+case "$KEY_CUSTODY" in
+	file) ;;
+	wrapped)
+		if [[ "$LOCAL_MODE" == "true" ]]; then
+			echo "--key-custody wrapped is not supported with --local" >&2
+			exit 1
+		fi
+		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
+			exit 1
+		fi
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
+			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "--key-custody must be file or wrapped (got $KEY_CUSTODY)" >&2
+		exit 1
+		;;
+esac
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -1260,7 +1316,37 @@ EOF
 #SB_AUDIT_WITNESS_S3_ENDPOINT=
 #SB_AUDIT_WITNESS_S3_PATH_STYLE=false
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		{
+			echo "# Key custody (plans/customer-key-custody.md): the server key exists"
+			echo "# only wrapped by the key store below; see sandboxd key status."
+			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
+			# IMDS fallback turns a missing region into an opaque timeout.
+			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
+}
+
+# prepare_key_custody wraps a plaintext server key left by an earlier
+# install, so the daemon (which refuses wrapped custody while a plaintext
+# key file exists) starts. A fresh install has no key: the first boot
+# generates it and writes only the wrapped file.
+prepare_key_custody() {
+	[[ "$KEY_CUSTODY" == "wrapped" ]] || return 0
+	local plain=/var/lib/sandboxd/credential_encryption.key
+	local wrapped=/var/lib/sandboxd/credential_encryption.key.wrapped
+	if [[ -f "$plain" && ! -f "$wrapped" ]]; then
+		echo "Wrapping the existing server key at $plain"
+		"$INSTALL_PREFIX/sandboxd" key wrap --env-file /etc/sandboxd/sandboxd.env
+		# Not a secure delete; `sandboxd key status` reports the migration
+		# until `sandboxd key ack-migration`.
+		rm -f "$plain"
+	elif [[ -f "$plain" && -f "$wrapped" ]]; then
+		"$INSTALL_PREFIX/sandboxd" key verify --env-file /etc/sandboxd/sandboxd.env
+		rm -f "$plain"
+	fi
 }
 
 write_caddyfile() {
@@ -1625,6 +1711,19 @@ ENV_FILE="/etc/sandboxd/sandboxd.env"
 if [[ -f "$ENV_FILE" ]]; then
 	# shellcheck disable=SC1091
 	source "$ENV_FILE"
+fi
+
+# systemd stops restarting a unit that failed StartLimitBurst times within
+# StartLimitIntervalSec. A node whose key store was unreachable at boot
+# (wrapped server-key custody) fails that way and would stay down after the
+# key store came back, so a failed unit is reset and started again here,
+# every run of this timer. A unit an operator stopped is inactive, not
+# failed, and is left alone.
+if systemctl is-failed --quiet sandboxd.service; then
+	logger -t sandboxd-healthcheck "sandboxd.service is failed; resetting it and starting it again"
+	systemctl reset-failed sandboxd.service
+	systemctl start sandboxd.service || true
+	exit 0
 fi
 
 if ! systemctl is-active --quiet sandboxd.service; then
@@ -2424,6 +2523,7 @@ install_custom_caddy "$DNS_PROVIDER"
 install_binaries
 record_sandboxd_state
 write_environment
+prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
 write_route_dns_resolver
@@ -2435,13 +2535,23 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
-# Before Caddy: a re-run that changed sandboxd's settings restarts it and
-# waits for it, so Caddy starts in front of a sandboxd (and, under
-# --pat-scope host, a public socket) that is already there.
-restart_sandboxd_if_reconfigured
-systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+if [[ "$NO_START" == "true" ]]; then
+	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
+	# cluster's server key are in place (see --no-start).
+	systemctl enable caddy sandboxd sandboxd-healthcheck.timer
+	systemctl start caddy sandboxd-healthcheck.timer
+else
+	# Before Caddy: a re-run that changed sandboxd's settings restarts it and
+	# waits for it, so Caddy starts in front of a sandboxd (and, under
+	# --pat-scope host, a public socket) that is already there.
+	restart_sandboxd_if_reconfigured
+	systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+fi
 
 echo "AerolVM installed"
+if [[ "$NO_START" == "true" ]]; then
+	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
+fi
 echo "PAT token: $PAT_TOKEN"
 echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then
