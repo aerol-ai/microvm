@@ -22,6 +22,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -1015,6 +1016,12 @@ func (c *Client) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken
 func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
 	inspect, err := c.inspectContainer(ctx, containerRef)
 	if err != nil {
+		// Only Docker's 404 says the container is gone; a timeout or a 500
+		// says nothing about it, and reconcile deletes the row only on the
+		// former (sbruntime.InstanceGone).
+		if isContainerNotFoundError(err) {
+			return nil, fmt.Errorf("inspect container: %w: %w", sbruntime.ErrInstanceNotFound, err)
+		}
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
 	return &SandboxRuntime{
@@ -1841,6 +1848,12 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 		return nil
 	}
 	return err
+}
+
+// isContainerNotFoundError matches the status doRequest reports when Docker
+// answers 404 ("No such container") for a container path.
+func isContainerNotFoundError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed with status 404")
 }
 
 // isContainerRemoveBenignError matches the substring doRequest emits for HTTP
