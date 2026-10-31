@@ -101,6 +101,40 @@ type Gateway struct {
 
 	// containerEngine gates the containerd one-shot-exec-via-toolbox path.
 	containerEngine string
+
+	// conns are the open client connections, so CloseAll can end every
+	// session when the customer revokes the key: each holds a toolbox token
+	// opened before the revoke (plans/customer-key-custody.md §10).
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
+}
+
+// CloseAll closes every open SSH connection and returns how many it closed.
+func (g *Gateway) CloseAll() int {
+	g.connMu.Lock()
+	open := make([]net.Conn, 0, len(g.conns))
+	for c := range g.conns {
+		open = append(open, c)
+	}
+	g.connMu.Unlock()
+	for _, c := range open {
+		_ = c.Close()
+	}
+	return len(open)
+}
+
+func (g *Gateway) trackConn(c net.Conn) func() {
+	g.connMu.Lock()
+	if g.conns == nil {
+		g.conns = map[net.Conn]struct{}{}
+	}
+	g.conns[c] = struct{}{}
+	g.connMu.Unlock()
+	return func() {
+		g.connMu.Lock()
+		delete(g.conns, c)
+		g.connMu.Unlock()
+	}
 }
 
 // New constructs a Gateway. It loads or generates the host key. Returns an
@@ -159,6 +193,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 
 func (g *Gateway) handleConn(ctx context.Context, nConn net.Conn) {
 	remote := nConn.RemoteAddr().String()
+	defer g.trackConn(nConn)()
 	defer func() {
 		_ = nConn.Close()
 	}()

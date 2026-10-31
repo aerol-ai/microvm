@@ -3,7 +3,12 @@ package secrets
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/aerol-ai/microvm/internal/observability"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Wrapped-key tags. Vault and OpenBao ciphertext starts with "vault:v<N>:" on
@@ -41,6 +46,47 @@ type Router struct {
 	sealName string
 	seal     DataKeyWrapper
 	openers  map[string]DataKeyWrapper
+	observe  CallObserver
+}
+
+// CallObserver is told about every call the router makes to a key-store
+// backend: the backend, "wrap" or "unwrap", the outcome class (CallClass)
+// and how long it took. Retries above the router count as separate calls.
+type CallObserver func(backend, op, class string, took time.Duration)
+
+// CallClass is the outcome class of one key-store call, for metrics.
+func CallClass(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrKeyRevoked):
+		return "revoked"
+	case errors.Is(err, ErrKeyVersionRetired):
+		return "retired"
+	case errors.Is(err, ErrProviderThrottled):
+		return "throttled"
+	case errors.Is(err, ErrProviderDenied):
+		return "denied"
+	case errors.Is(err, ErrProviderUnavailable):
+		return "unavailable"
+	default:
+		return "error"
+	}
+}
+
+// do runs one backend call inside a span (Section 8: one span per
+// key-store call, never the key bytes) and reports it to the observer.
+func (r *Router) do(ctx context.Context, backend, op string, call func(context.Context) ([]byte, error)) ([]byte, error) {
+	ctx, span := observability.StartSpan(ctx, "key_store."+op, attribute.String("key_store.backend", backend))
+	start := time.Now()
+	out, err := call(ctx)
+	class := CallClass(err)
+	span.SetAttributes(attribute.String("key_store.class", class))
+	observability.EndSpan(span, err)
+	if r.observe != nil {
+		r.observe(backend, op, class, time.Since(start))
+	}
+	return out, err
 }
 
 // NewRouter seals with seal (named sealName) and opens with openers, keyed by
@@ -63,7 +109,7 @@ func (r *Router) Wrap(ctx context.Context, dek []byte, encCtx map[string]string)
 	if r == nil || r.seal == nil {
 		return nil, fmt.Errorf("%w: secret provider wrap backend is not configured", ErrProviderUnavailable)
 	}
-	return r.seal.Wrap(ctx, dek, encCtx)
+	return r.do(ctx, r.sealName, "wrap", func(ctx context.Context) ([]byte, error) { return r.seal.Wrap(ctx, dek, encCtx) })
 }
 
 // Unwrap implements DataKeyWrapper with the backend the wrapped key's tag
@@ -80,5 +126,5 @@ func (r *Router) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]s
 	if w == nil {
 		return nil, fmt.Errorf("%w: row wrapped by %s; node configured for %s and has no %s settings", ErrProviderUnavailable, backend, r.sealName, backend)
 	}
-	return w.Unwrap(ctx, wrapped, encCtx)
+	return r.do(ctx, backend, "unwrap", func(ctx context.Context) ([]byte, error) { return w.Unwrap(ctx, wrapped, encCtx) })
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -426,7 +427,11 @@ type Config struct {
 	CredentialKeyCustody string
 	// CredentialKeyWrappedPath is the wrapped server-key file used when
 	// CredentialKeyCustody=wrapped. SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH.
-	CredentialKeyWrappedPath    string
+	CredentialKeyWrappedPath string
+	// CredentialKeyRingPath is custody=file's server-key ring, written by
+	// `sandboxd key rotate` (plans/customer-key-custody.md §13).
+	// SB_CREDENTIAL_KEY_RING_PATH; empty means KeyRingPath's default.
+	CredentialKeyRingPath       string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
@@ -1164,8 +1169,39 @@ type Config struct {
 	// "pkcs11". The off-state is local, not "no provider". SB_SECRET_PROVIDER.
 	SecretProvider string
 	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
+	// Set with another provider, the node still opens AWS KMS rows (step 1 of
+	// a provider switch, plans/customer-key-custody.md §12).
 	// SB_SECRET_AWS_KMS_KEY_ID.
 	SecretAWSkmsKeyID string
+	// Vault Transit / OpenBao settings for SecretProvider=vault
+	// (plans/customer-key-custody.md §1). Set with another provider, the node
+	// already opens vault rows. No Vault login code: TokenFile is written by
+	// Vault Agent, or Addr points at Agent's local API proxy.
+	// SB_SECRET_VAULT_ADDR, SB_SECRET_VAULT_TRANSIT_MOUNT (default transit),
+	// SB_SECRET_VAULT_KEY_NAME, SB_SECRET_VAULT_TOKEN_FILE,
+	// SB_SECRET_VAULT_NAMESPACE, SB_SECRET_VAULT_CACERT.
+	SecretVaultAddr      string
+	SecretVaultMount     string
+	SecretVaultKeyName   string
+	SecretVaultTokenFile string
+	SecretVaultNamespace string
+	SecretVaultCACert    string
+
+	// PKCS#11 (HSM) settings for SecretProvider=pkcs11
+	// (plans/customer-key-custody.md §2). The vendor module loads only in
+	// the `sandboxd --pkcs11-helper` process. Set with another provider, the
+	// node already opens p11 rows. SB_SECRET_PKCS11_MODULE,
+	// SB_SECRET_PKCS11_TOKEN_LABEL, SB_SECRET_PKCS11_PIN_FILE (owner-only
+	// mode), SB_SECRET_PKCS11_KEY_LABEL, SB_SECRET_PKCS11_DECRYPT_KEY_LABELS
+	// (comma-separated, for rotation), SB_SECRET_PKCS11_GCM_IV
+	// (auto|hsm|caller), SB_SECRET_PKCS11_RUN_DIR (the helper's socket).
+	SecretPKCS11Module        string
+	SecretPKCS11TokenLabel    string
+	SecretPKCS11PINFile       string
+	SecretPKCS11KeyLabel      string
+	SecretPKCS11DecryptLabels []string
+	SecretPKCS11GCMIV         string
+	SecretPKCS11RunDir        string
 	// SecretProviderStrictBoot fails daemon start when the boot canary
 	// (wrap/unwrap) of any external provider fails. Default false = fail-open
 	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
@@ -1176,6 +1212,13 @@ type Config struct {
 	// kept for creates and background work has its own 2 slots on top (eng
 	// D13). Default 8, range 1-256. SB_SECRET_PROVIDER_MAX_INFLIGHT.
 	SecretProviderMaxInFlight int
+	// SecretProviderRecheckInterval is how often a node with wrapped
+	// custody unwraps its server-key file again to notice a revoke, with
+	// jitter; SecretProviderRevokeAfter consecutive revoked results stop the
+	// node (about 15 minutes by default, eng D18).
+	// SB_SECRET_PROVIDER_RECHECK_INTERVAL, SB_SECRET_PROVIDER_REVOKE_AFTER.
+	SecretProviderRecheckInterval time.Duration
+	SecretProviderRevokeAfter     int
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -1815,6 +1858,17 @@ func validateIdentityFile(cfg Config) error {
 }
 
 func Load() (Config, error) {
+	return load(false)
+}
+
+// LoadForKeyTool is Load for `sandboxd key`, minus the cluster-mode check
+// that the shared server key already exists: `sandboxd key wrap --generate`
+// is what creates it on the seed.
+func LoadForKeyTool() (Config, error) {
+	return load(true)
+}
+
+func load(keyTool bool) (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
@@ -1904,6 +1958,7 @@ func Load() (Config, error) {
 		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
 		CredentialKeyCustody:              strings.ToLower(strings.TrimSpace(getEnv("SB_CREDENTIAL_KEY_CUSTODY", "file"))),
 		CredentialKeyWrappedPath:          getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", "/var/lib/sandboxd/credential_encryption.key.wrapped"),
+		CredentialKeyRingPath:             strings.TrimSpace(os.Getenv("SB_CREDENTIAL_KEY_RING_PATH")),
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
@@ -2004,8 +2059,23 @@ func Load() (Config, error) {
 		SecretRecipientBackupCount:    getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
 		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretVaultAddr:               strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_ADDR")),
+		SecretVaultMount:              getEnv("SB_SECRET_VAULT_TRANSIT_MOUNT", "transit"),
+		SecretVaultKeyName:            strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_KEY_NAME")),
+		SecretVaultTokenFile:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_TOKEN_FILE")),
+		SecretVaultNamespace:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_NAMESPACE")),
+		SecretVaultCACert:             strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_CACERT")),
+		SecretPKCS11Module:            strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_MODULE")),
+		SecretPKCS11TokenLabel:        os.Getenv("SB_SECRET_PKCS11_TOKEN_LABEL"),
+		SecretPKCS11PINFile:           strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_PIN_FILE")),
+		SecretPKCS11KeyLabel:          strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_KEY_LABEL")),
+		SecretPKCS11DecryptLabels:     splitEnvList("SB_SECRET_PKCS11_DECRYPT_KEY_LABELS"),
+		SecretPKCS11GCMIV:             strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PKCS11_GCM_IV", "auto"))),
+		SecretPKCS11RunDir:            getEnv("SB_SECRET_PKCS11_RUN_DIR", "/run/sandboxd/pkcs11"),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
 		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
+		SecretProviderRecheckInterval: getEnvDuration("SB_SECRET_PROVIDER_RECHECK_INTERVAL", 5*time.Minute),
+		SecretProviderRevokeAfter:     getEnvInt("SB_SECRET_PROVIDER_REVOKE_AFTER", 3),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
@@ -2587,7 +2657,7 @@ func Load() (Config, error) {
 		// sealed row must also be fanned out to recipient peers (or a KMS
 		// provider used). Refuse boot without a shared key unless the
 		// operator opts out.
-		if !cfg.ClusterInsecureCredentials {
+		if !cfg.ClusterInsecureCredentials && !keyTool {
 			if err := checkClusterCredentialKey(cfg); err != nil {
 				return Config{}, err
 			}
@@ -2610,16 +2680,33 @@ func Load() (Config, error) {
 		if cfg.SecretAWSkmsKeyID == "" {
 			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
 		}
-	case "vault", "pkcs11":
-		// Known values on the same seam that refuse until their wrappers land
-		// (plans/customer-key-custody.md Phases 2-3). Never silently fall back
-		// to local.
-		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER=%s is not implemented yet; use local or awskms", cfg.SecretProvider)
+	case "vault":
+		// NewVault below checks the settings.
+	case "pkcs11":
+		// checkPKCS11Settings below checks the settings.
 	default:
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
 	}
+	if vault := cfg.SecretVaultOptions(); cfg.SecretProvider == "vault" || vault.Configured() {
+		// The daemon's own validator: address scheme, key and mount names,
+		// CA bundle. It makes no call to Vault.
+		if _, err := secrets.NewVault(vault); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProvider == "pkcs11" || cfg.PKCS11Configured() {
+		if err := checkPKCS11Settings(cfg); err != nil {
+			return Config{}, err
+		}
+	}
 	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
 		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
+	}
+	if cfg.SecretProviderRecheckInterval < 10*time.Second {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_RECHECK_INTERVAL must be at least 10s (got %s)", cfg.SecretProviderRecheckInterval)
+	}
+	if cfg.SecretProviderRevokeAfter < 1 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_REVOKE_AFTER must be at least 1 (got %d)", cfg.SecretProviderRevokeAfter)
 	}
 	switch cfg.CredentialKeyCustody {
 	case "", "file":
@@ -2630,7 +2717,6 @@ func Load() (Config, error) {
 		if cfg.SecretProvider == "local" {
 			return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs an external SB_SECRET_PROVIDER (awskms, vault or pkcs11) to wrap the server key")
 		}
-		return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped is not implemented yet; use file")
 	default:
 		return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped (got %q)", cfg.CredentialKeyCustody)
 	}
@@ -2737,8 +2823,10 @@ func Load() (Config, error) {
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
-			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		// A key store this node cannot reach must stop the boot, whichever
+		// one it is (plans/customer-key-custody.md §7).
+		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
+			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
@@ -2894,6 +2982,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
+// else the key file's path plus ".ring".
+func (c Config) KeyRingPath() string {
+	if c.CredentialKeyRingPath != "" {
+		return c.CredentialKeyRingPath
+	}
+	return c.CredentialEncryptionKeyPath + ".ring"
 }
 
 func (c Config) ListenAddr() string {
@@ -3092,6 +3189,10 @@ func checkClusterCredentialKey(cfg Config) error {
 		return nil
 	}
 	if cfg.CredentialEncryptionKey != "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.KeyRingPath()); err == nil {
+		// A rotated key: the ring holds every live key (§13).
 		return nil
 	}
 	if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
@@ -3318,6 +3419,49 @@ func (c Config) validateAuditWitness() error {
 		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
 	}
 	return nil
+}
+
+// PKCS11Configured reports whether any PKCS#11 setting is present, which
+// makes the node start the helper even when it seals with another provider.
+func (c Config) PKCS11Configured() bool {
+	return c.SecretPKCS11Module != "" || c.SecretPKCS11KeyLabel != ""
+}
+
+// checkPKCS11Settings fails boot on settings the helper would refuse anyway,
+// so the error names the setting instead of a helper that will not start.
+func checkPKCS11Settings(c Config) error {
+	for _, s := range []struct{ name, value string }{
+		{"SB_SECRET_PKCS11_MODULE", c.SecretPKCS11Module},
+		{"SB_SECRET_PKCS11_TOKEN_LABEL", c.SecretPKCS11TokenLabel},
+		{"SB_SECRET_PKCS11_PIN_FILE", c.SecretPKCS11PINFile},
+		{"SB_SECRET_PKCS11_KEY_LABEL", c.SecretPKCS11KeyLabel},
+	} {
+		if strings.TrimSpace(s.value) == "" {
+			return fmt.Errorf("%s is required for the pkcs11 provider", s.name)
+		}
+	}
+	switch c.SecretPKCS11GCMIV {
+	case "auto", "hsm", "caller":
+	default:
+		return fmt.Errorf("SB_SECRET_PKCS11_GCM_IV must be auto, hsm or caller (got %q)", c.SecretPKCS11GCMIV)
+	}
+	if err := secrets.RefuseGroupOtherBits(c.SecretPKCS11PINFile); err != nil {
+		return fmt.Errorf("SB_SECRET_PKCS11_PIN_FILE: %w", err)
+	}
+	return nil
+}
+
+// SecretVaultOptions projects the Vault settings into the shape pkg/secrets
+// opens. NodeID is filled in by the service, which knows the cluster id.
+func (c Config) SecretVaultOptions() secrets.VaultOptions {
+	return secrets.VaultOptions{
+		Addr:      c.SecretVaultAddr,
+		Mount:     c.SecretVaultMount,
+		KeyName:   c.SecretVaultKeyName,
+		TokenFile: c.SecretVaultTokenFile,
+		Namespace: c.SecretVaultNamespace,
+		CACert:    c.SecretVaultCACert,
+	}
 }
 
 // AuditWitnessConfig projects the witness settings into the shape

@@ -79,7 +79,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 
 	for _, branch := range []string{
 		"seed", "joiner", "joiner_kms", "joiner_audit_s3", "joiner_audit_file",
-		"seed_receiver", "joiner_receiver", "seed_public_ca",
+		"seed_receiver", "joiner_receiver", "seed_public_ca", "seed_wrapped",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -520,5 +520,44 @@ func TestBootstrapOmitsAuditReceiverWhenDisabled(t *testing.T) {
 		if strings.Contains(out, forbidden) {
 			t.Errorf("receiver disabled but the render contains %q", forbidden)
 		}
+	}
+}
+
+// TestBootstrapWrappedCustodyFlags: with key_custody = "wrapped" the seed
+// passes --key-custody to install.sh (with the key-store env) and to
+// cluster-init.sh; with the default it passes neither, so an older
+// cluster-init.sh never sees the flag.
+func TestBootstrapWrappedCustodyFlags(t *testing.T) {
+	wrapped := renderBootstrap(t, "seed_wrapped")
+	for _, want := range []string{"INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-provider.env)", "INIT_ARGS+=(--key-custody wrapped)", "SB_SECRET_PROVIDER=awskms"} {
+		if !strings.Contains(wrapped, want) {
+			t.Errorf("seed_wrapped is missing %q", want)
+		}
+	}
+	if plain := renderBootstrap(t, "seed"); strings.Contains(plain, "--key-custody") {
+		t.Error("the default custody passes --key-custody")
+	}
+}
+
+// A joiner's install.sh leaves sandboxd stopped (--no-start) until
+// cluster-join.sh starts it with the cluster's config and server key; a
+// first boot as a lone node would begin making a server key of its own. The
+// seed boots at install: its first boot is the one that makes the key.
+func TestBootstrapJoinerInstallsWithoutStarting(t *testing.T) {
+	const flag = "INSTALL_ARGS+=(--no-start)"
+	for _, out := range []string{"joiner", "joiner_kms"} {
+		if !strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s does not pass --no-start to install.sh", out)
+		}
+	}
+	for _, out := range []string{"seed", "seed_wrapped"} {
+		if strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s passes --no-start, but the seed must boot at install", out)
+		}
+	}
+	// install.sh runs before cluster-join.sh, and the flag is set before it.
+	joiner := renderBootstrap(t, "joiner")
+	if i, j := strings.Index(joiner, flag), strings.Index(joiner, `sudo /tmp/install.sh "${INSTALL_ARGS[@]}"`); i < 0 || j < 0 || i > j {
+		t.Errorf("--no-start is not added before install.sh runs (flag at %d, install at %d)", i, j)
 	}
 }

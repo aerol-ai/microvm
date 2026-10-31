@@ -148,6 +148,7 @@ resource "aws_instance" "seed" {
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
     secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    key_custody                              = var.key_custody
     audit_export_backend                     = var.audit_export_backend
     audit_export_file_path                   = var.audit_export_file_path
     audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
@@ -236,6 +237,13 @@ resource "aws_instance" "seed" {
     # shard-aware router with shard_aware_ingress. Failing here is cheaper
     # than provisioning 100 nodes the daemon rejects. Mirrored in
     # Terraform/validate/ingress.go.
+    # Wrapped custody needs a key store to wrap with; the only one this
+    # module provisions is the AWS KMS key behind secret_kms_enabled.
+    precondition {
+      condition     = var.key_custody == "file" || var.secret_kms_enabled
+      error_message = "key_custody = \"wrapped\" needs secret_kms_enabled = true: the server key is wrapped by that KMS key."
+    }
+
     precondition {
       condition     = length(local.ingress_node_names) <= 10 || var.shard_aware_ingress
       error_message = "More than 10 ingress-capable nodes (ingress, a hybrid containing it, or mixed) need a shard-aware router in front of the tier (GET /v1/cluster/ingress-route/{id}); set shard_aware_ingress = true only once that router is in place. See setup/runbooks/cluster-ingress-topology.md."
@@ -375,6 +383,7 @@ resource "aws_instance" "joiner" {
     joiner_role_unique_id        = aws_iam_role.joiner.unique_id
     secret_kms_key_arn           = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot       = var.secret_kms_strict_boot
+    key_custody                  = var.key_custody
     audit_export_backend         = var.audit_export_backend
     audit_export_file_path       = var.audit_export_file_path
     audit_export_s3_bucket       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""

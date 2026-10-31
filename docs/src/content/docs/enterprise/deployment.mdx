@@ -76,7 +76,7 @@ flowchart TB
     N1 <-- "2. mutual TLS" --> N2
     N2 <-- "mutual TLS" --> N3
     N1 -. "3. sealed secret copies" .-> N3
-    N2 -- "4" --> Ext["Your audit store,<br/>monitoring and AWS KMS"]
+    N2 -- "4" --> Ext["Your audit store,<br/>monitoring and key store"]
 ```
 
 **Workflow**
@@ -84,7 +84,7 @@ flowchart TB
 1. Your app sends every request to one address. Any server can take a call and pass it to the server that runs the sandbox.
 2. Servers vote on every change, such as where a new sandbox runs, over mutual TLS.
 3. A sandbox with failover sends sealed copies of its secrets to backup servers. If its server dies, a healthy one rebuilds it with the same ID, ports and link.
-4. Each server ships its audit log and metrics to your systems. AWS KMS can hold the keys for sealed copies.
+4. Each server ships its audit log and metrics to your systems. Your key store (AWS KMS, Vault, OpenBao or an HSM) can hold the keys for sealed copies and the server key.
 
 **Components**
 
@@ -93,7 +93,7 @@ flowchart TB
 | 2 to 10 alike servers | Each one does every job. Use 3 or more to survive a dead server. |
 | Load balancer or DNS | One address in front of all servers |
 | Private network | Carries the cluster ports `7000` to `7002` |
-| AWS KMS (optional) | Wraps the keys of sealed secret copies |
+| Your key store (optional) | Wraps the keys of sealed secret copies and, with wrapped custody, the server key. See [Use your own key store](/enterprise/key-custody/). |
 
 **Considerations**
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -131,5 +132,90 @@ func TestKMSProviderOpenReportsRevoke(t *testing.T) {
 	_, err = p.Open(ctx, "sb", h, "n")
 	if !errors.Is(err, ErrKeyRevoked) || errors.Is(err, ErrDecryptFailed) || revoked.calls != 1 {
 		t.Fatalf("open after revoke = %v (calls %d)", err, revoked.calls)
+	}
+}
+
+// pkg/daemon hands the running PKCS#11 helper in as opts.PKCS11: it seals
+// for a pkcs11 node and opens p11 rows on any other node that has it.
+func TestNewWrapperPKCS11(t *testing.T) {
+	ctx := context.Background()
+	helper := &tagWrapper{tag: "p11:1:"}
+	if _, err := NewWrapper(ctx, ProviderOptions{Name: "pkcs11"}); err == nil || !strings.Contains(err.Error(), "helper is not running") {
+		t.Fatalf("pkcs11 without a helper = %v", err)
+	}
+	w, err := NewWrapper(ctx, ProviderOptions{Name: "pkcs11", PKCS11: helper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := w.Wrap(ctx, []byte("dek"), nil)
+	if err != nil || WrappedKeyBackend(sealed) != ProviderPKCS11 {
+		t.Fatalf("Wrap = %q %v", sealed, err)
+	}
+	fake, err := NewFakeKMS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	aws, err := NewWrapper(ctx, ProviderOptions{Name: "awskms", Wrapper: fake, PKCS11: helper})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := aws.Unwrap(ctx, sealed, nil); err != nil || string(got) != "dek" {
+		t.Fatalf("awskms node opening a p11 row = %q %v", got, err)
+	}
+}
+
+type failingWrapper struct{ err error }
+
+func (f failingWrapper) Wrap(context.Context, []byte, map[string]string) ([]byte, error) {
+	return nil, f.err
+}
+func (f failingWrapper) Unwrap(context.Context, []byte, map[string]string) ([]byte, error) {
+	return nil, f.err
+}
+
+// Every backend call is reported once with its backend, op and class
+// (Section 8), and a call that never reaches a backend is not.
+func TestRouterReportsCalls(t *testing.T) {
+	type call struct{ backend, op, class string }
+	var got []call
+	r := NewRouter(ProviderVault, &tagWrapper{tag: "vault:v1:"}, map[string]DataKeyWrapper{
+		ProviderAWSKMS: failingWrapper{err: ErrProviderThrottled},
+	})
+	r.observe = func(backend, op, class string, took time.Duration) {
+		if took < 0 {
+			t.Fatal("negative latency")
+		}
+		got = append(got, call{backend, op, class})
+	}
+	ctx := context.Background()
+	_, _ = r.Wrap(ctx, []byte("dek"), nil)
+	_, _ = r.Unwrap(ctx, []byte("vault:v1:dek"), nil)
+	_, _ = r.Unwrap(ctx, []byte("untagged"), nil)
+	_, _ = r.Unwrap(ctx, []byte("p11:1:x"), nil) // no pkcs11 settings: no call
+	want := []call{{"vault", "wrap", "ok"}, {"vault", "unwrap", "ok"}, {"awskms", "unwrap", "throttled"}}
+	if len(got) != len(want) {
+		t.Fatalf("calls = %v", got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("call %d = %v, want %v", i, got[i], want[i])
+		}
+	}
+	for err, class := range map[error]string{
+		nil: "ok", ErrKeyRevoked: "revoked", ErrKeyVersionRetired: "retired", ErrProviderThrottled: "throttled",
+		ErrProviderDenied: "denied", ErrProviderUnavailable: "unavailable", errors.New("x"): "error",
+	} {
+		if got := CallClass(err); got != class {
+			t.Fatalf("CallClass(%v) = %q, want %q", err, got, class)
+		}
+	}
+	// The factory wires the observer.
+	var n int
+	w, err := NewWrapper(ctx, ProviderOptions{Name: ProviderPKCS11, PKCS11: &tagWrapper{tag: "p11:"}, Calls: func(string, string, string, time.Duration) { n++ }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Wrap(ctx, []byte("dek"), nil); err != nil || n != 1 {
+		t.Fatalf("the factory did not wire the call observer: %v %d", err, n)
 	}
 }

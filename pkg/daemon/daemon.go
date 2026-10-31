@@ -152,7 +152,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Initialize the cipher before opening the database. Store startup may need
 	// it to transactionally seal plaintext env/toolbox values left by a
 	// pre-hardening release before any service begins reading the database.
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	// With wrapped custody the server key comes from the customer's key
+	// store, so its client (and the PKCS#11 helper) start first
+	// (plans/customer-key-custody.md §3).
+	keys, err := startKeyStore(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer keys.stop()
+	cipher, err := openServerKey(ctx, cfg, keys.wrapper, logger)
 	if err != nil {
 		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
@@ -311,9 +319,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
 		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
 	}
+	keys.handTo(svc)
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
+	svc.RecordKeyCustody()
+	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -926,6 +937,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err != nil {
 			return fmt.Errorf("create ssh gateway: %w", err)
 		}
+		// A key revoke ends every SSH session: each holds a toolbox token
+		// opened before it (plans/customer-key-custody.md §10).
+		svc.OnKeyRevoked(gw.CloseAll)
 		go func() {
 			if err := gw.Start(ctx); err != nil {
 				logger.Warn("ssh gateway stopped", "error", err)
@@ -1005,6 +1019,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			cancel()
 		}
 	}()
+	// The revoke re-check (wrapped custody only) starts once the API is up;
+	// it runs on the key store's background budget, never a create's.
+	svc.StartKeyCustody(ctx)
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {
