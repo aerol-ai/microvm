@@ -235,6 +235,12 @@ AWS_REGION=${aws_region}
 EOF
 INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-provider.env)
 %{ endif ~}
+%{ if !is_seed ~}
+# A joiner: cluster-join.sh starts sandboxd once it has the cluster's config
+# and server key. Booted before that, as a lone node, it would begin making a
+# server key of its own (with wrapped custody, a wrap through the key store).
+INSTALL_ARGS+=(--no-start)
+%{ endif ~}
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 
 %{ if is_seed ~}

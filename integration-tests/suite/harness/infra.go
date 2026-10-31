@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // IntegrationNode is one row from Terraform's integration_targets.nodes output.
@@ -112,6 +113,61 @@ func EC2InstanceState(t *testing.T, instanceID string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// SetKMSKeyEnabled disables or re-enables a customer-managed KMS key via the
+// AWS CLI: what a customer does to revoke AerolVM's access to its key store
+// (plans/customer-key-custody.md §10). Only the scenario's own key, which
+// teardown schedules for deletion, may be passed here.
+func SetKMSKeyEnabled(t *testing.T, keyID string, enabled bool) {
+	t.Helper()
+	if keyID == "" {
+		t.Fatalf("empty KMS key id")
+	}
+	verb := "disable-key"
+	if enabled {
+		verb = "enable-key"
+	}
+	args := append([]string{"kms", verb, "--key-id", keyID}, awsRegionArgs()...)
+	out, err := exec.Command("aws", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("aws kms %s %s: %v (%s)", verb, keyID, err, strings.TrimSpace(string(out)))
+	}
+}
+
+// ReplaceRootVolume gives an instance a new root volume from its launch
+// state (the AMI) via the AWS CLI and waits for the swap: the same machine,
+// address and instance id with a fresh OS disk, so cloud-init runs the
+// node's bootstrap again as on first boot. Everything on the old disk is
+// deleted with it.
+func ReplaceRootVolume(t *testing.T, instanceID string, timeout time.Duration) {
+	t.Helper()
+	if instanceID == "" {
+		t.Fatalf("empty instance id")
+	}
+	args := append([]string{"ec2", "create-replace-root-volume-task", "--instance-id", instanceID,
+		"--delete-replaced-root-volume", "--query", "ReplaceRootVolumeTask.ReplaceRootVolumeTaskId", "--output", "text"}, awsRegionArgs()...)
+	out, err := exec.Command("aws", args...).CombinedOutput()
+	task := strings.TrimSpace(string(out))
+	if err != nil || task == "" {
+		t.Fatalf("aws ec2 create-replace-root-volume-task %s: %v (%s)", instanceID, err, task)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		args := append([]string{"ec2", "describe-replace-root-volume-tasks", "--replace-root-volume-task-ids", task,
+			"--query", "ReplaceRootVolumeTasks[0].TaskState", "--output", "text"}, awsRegionArgs()...)
+		out, err := exec.Command("aws", args...).CombinedOutput()
+		state := strings.TrimSpace(string(out))
+		switch {
+		case err == nil && state == "succeeded":
+			return
+		case err == nil && strings.HasPrefix(state, "fail"):
+			t.Fatalf("replace root volume task %s on %s: %s", task, instanceID, state)
+		case time.Now().After(deadline):
+			t.Fatalf("replace root volume task %s on %s not done within %s (last %q, %v)", task, instanceID, timeout, state, err)
+		}
+		time.Sleep(10 * time.Second)
+	}
 }
 
 // SetEC2InstanceRunning stops or starts an EC2 instance via the AWS CLI.

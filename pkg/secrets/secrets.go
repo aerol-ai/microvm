@@ -45,6 +45,9 @@ type Cipher struct {
 	// ring change may add keys or drop retired ones, never swap a key under
 	// an id it already knows (that would make every row on it unreadable).
 	checks map[uint32][]byte
+	// afterLoad, set only by tests, runs once a call has loaded the ring:
+	// it holds a Decrypt there while a Revoke lands (§4, async ordering 1).
+	afterLoad func()
 }
 
 // keyRing is the server keys a Cipher holds (plans/customer-key-custody.md
@@ -275,11 +278,11 @@ func (c *Cipher) Reseal(sealed, aad []byte) (out []byte, from uint32, changed bo
 	return out, from, true, nil
 }
 
-// SealedKeyID names the key a blob says it was sealed with, without opening
+// sealedKeyID names the key a blob says it was sealed with, without opening
 // it: the id after the marker, or 0 (legacy) for a blob without one. A
 // legacy blob that happens to start with the marker reads as another id;
 // open it to be sure.
-func SealedKeyID(sealed []byte) uint32 {
+func sealedKeyID(sealed []byte) uint32 {
 	if len(sealed) > keyIDHeaderLen && sealed[0] == keyIDMarker {
 		return binary.BigEndian.Uint32(sealed[1:keyIDHeaderLen])
 	}
@@ -298,6 +301,9 @@ func (c *Cipher) activeRing() (*keyRing, error) {
 		return nil, errors.New("cipher not initialized")
 	}
 	if r := c.ring.Load(); r != nil {
+		if c.afterLoad != nil {
+			c.afterLoad()
+		}
 		return r, nil
 	}
 	if c.revoked.Load() {
