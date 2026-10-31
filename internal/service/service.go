@@ -3764,7 +3764,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, nil
 }
 
@@ -3840,7 +3840,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, true, nil
 }
 
@@ -4082,13 +4082,14 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 
 // registerSnapshotHome records, best-effort, that this node holds the snapshot's
 // image, so a snapshot-by-id GET/DELETE that lands on another node can be routed
-// here (B6). A snapshot lives in per-node SQLite with no node column, so the
-// replicated name → node index is the only cluster-wide home lookup. A failure
-// costs only routing — the snapshot is still usable locally and a re-register
-// would fix it — so it never fails the create. It is a no-op single-node (the
-// Noop client). The write detaches from the request context so a client that
-// disconnected right after the commit still gets the snapshot registered.
-func (s *Service) registerSnapshotHome(ctx context.Context, ownerRef, name string) {
+// here (B6), and so can a create that names the snapshot's committed tag. A
+// snapshot lives in per-node SQLite with no node column, so the replicated
+// index is the only cluster-wide home lookup. A failure costs only routing —
+// the snapshot is still usable locally and a re-register would fix it — so it
+// never fails the create. It is a no-op single-node (the Noop client). The
+// write detaches from the request context so a client that disconnected right
+// after the commit still gets the snapshot registered.
+func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -4097,25 +4098,42 @@ func (s *Service) registerSnapshotHome(ctx context.Context, ownerRef, name strin
 	if self == "" {
 		return
 	}
-	// Key the home entry by (owner, name) so a tenant cannot overwrite another
-	// tenant's same-named entry and hijack its routing (#11).
-	key := cluster.SnapshotHomeKey(ownerRef, name)
-	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node register failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
 }
 
-// forgetSnapshotHome drops the snapshot's home entry after it is deleted.
+// forgetSnapshotHome drops the snapshot's home entries after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
-func (s *Service) forgetSnapshotHome(ctx context.Context, ownerRef, name string) {
+func (s *Service) forgetSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	key := cluster.SnapshotHomeKey(ownerRef, name)
-	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node forget failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
+}
+
+// snapshotHomeKeys lists the index keys a snapshot's home is recorded under.
+// The (owner, name) key stops a tenant overwriting another tenant's same-named
+// entry and hijacking its routing (#11). A snapshot that owns its committed tag
+// is also keyed by that tag, so a create naming the tag (the SDK hands a
+// caller snap.Image) reaches this node from any other; the tag is the one
+// NormalizeCreateImageDistribution resolves through this row (snapshotCommittedAs),
+// so a registered alias that merely points at someone's tag adds no tag key.
+func snapshotHomeKeys(snapshot *models.SandboxSnapshot) []string {
+	keys := []string{cluster.SnapshotHomeKey(snapshot.OwnerRef, snapshot.Name)}
+	if snapshotImageIsOwnedTag(snapshot) {
+		if key := cluster.SnapshotImageHomeKey(snapshot.Image); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
@@ -4152,7 +4170,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err := s.store.DeleteSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); err != nil {
 		return err
 	}
-	s.forgetSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.forgetSnapshotHome(ctx, snapshot)
 	return nil
 }
 
