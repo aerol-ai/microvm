@@ -78,6 +78,20 @@ func revokeHarness(t *testing.T) (*Service, *switchableKMS, *fakeGateway, []byte
 	return svc, kms, gw, key, closed
 }
 
+// startKeyCustody starts svc's custody loops for one test and, when the
+// test ends, stops them and waits: the loops publish process-wide gauges
+// that later tests read, and a loop left running resets them under those
+// tests (the reseal gauge flaked under -race that way).
+func startKeyCustody(t *testing.T, svc *Service, ctx context.Context) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(func() {
+		cancel()
+		svc.keyCustody.loops.Wait()
+	})
+	svc.StartKeyCustody(ctx)
+}
+
 func custodyRecords(svc *Service, kind string) []SecretAuditEvent {
 	sink, ok := svc.secretAuditSink().(*memSecretAuditSink)
 	if !ok {
@@ -506,7 +520,7 @@ func TestStartKeyCustody(t *testing.T) {
 	}
 	before := count()
 	ctx, cancel := context.WithCancel(context.Background())
-	svc.StartKeyCustody(ctx)
+	startKeyCustody(t, svc, ctx)
 	deadline := time.Now().Add(2 * time.Second)
 	for count() == before {
 		if time.Now().After(deadline) {
@@ -517,7 +531,7 @@ func TestStartKeyCustody(t *testing.T) {
 	cancel()
 	// File custody: no loop at all.
 	svc.cfg.CredentialKeyCustody = secrets.CustodyFile
-	svc.StartKeyCustody(context.Background())
+	startKeyCustody(t, svc, context.Background())
 	(*Service)(nil).StartKeyCustody(context.Background())
 	if (*Service)(nil).KeyRevoked() {
 		t.Fatal("nil service revoked")

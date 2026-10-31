@@ -292,6 +292,63 @@ func TestFailedSweepPublishesStaleUnknown(t *testing.T) {
 	}
 }
 
+// heldUnwrap holds the sweep in its first unwrap until released, then
+// answers as the key store it wraps.
+type heldUnwrap struct {
+	*transitLike
+	entered, release chan struct{}
+	once             sync.Once
+}
+
+func (w *heldUnwrap) Unwrap(ctx context.Context, b []byte, c map[string]string) ([]byte, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return w.transitLike.Unwrap(ctx, b, c)
+}
+
+// TestSweepReadinessIsForItsVersion: stale = 0 is what an operator retires
+// the old version on, so a count is only published for the version it was
+// made against. While the first pass against a new version runs, the last
+// pass's 0 must not stand beside the new current version.
+func TestSweepReadinessIsForItsVersion(t *testing.T) {
+	svc, tl, _ := sweepHarness(t, 2)
+	ctx := context.Background()
+	if _, err := svc.SweepKeys(ctx); err != nil || keyRowsStale.Value() != 0 {
+		t.Fatalf("first sweep = %v, stale %d", err, keyRowsStale.Value())
+	}
+	held := func(want int64, what string) {
+		t.Helper()
+		w := &heldUnwrap{transitLike: tl, entered: make(chan struct{}), release: make(chan struct{})}
+		svc.SetKeyStoreWrapper(w)
+		done := make(chan error, 1)
+		go func() { _, err := svc.SweepKeys(ctx); done <- err }()
+		select {
+		case <-w.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the sweep never unwrapped", what)
+		}
+		got, version := keyRowsStale.Value(), keyCurrentGauge.String()
+		close(w.release)
+		if err := <-done; err != nil {
+			t.Fatalf("%s: sweep = %v", what, err)
+		}
+		if got != want {
+			t.Fatalf("%s: stale %d beside current %s mid-pass, want %d", what, got, version, want)
+		}
+	}
+	tl.rotate(t)
+	held(-1, "the first pass against v2")
+	if keyRowsStale.Value() != 0 {
+		t.Fatalf("after the v2 pass: stale %d", keyRowsStale.Value())
+	}
+}
+
+func TestUnknownGaugeStartsUnknown(t *testing.T) {
+	if v := unknownGauge("aerolvm_test_unknown_gauge").Value(); v != -1 {
+		t.Fatalf("a fresh readiness gauge = %d, want -1", v)
+	}
+}
+
 // hungVersion is a key store whose version read hangs until its context
 // ends (the sweep's first call), and which says the key is revoked.
 type hungVersion struct {
@@ -321,7 +378,7 @@ func TestSweepDoesNotHoldBackRevocation(t *testing.T) {
 	svc.SetKeyStoreWrapper(w)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.StartKeyCustody(ctx)
+	startKeyCustody(t, svc, ctx)
 	<-w.entered
 	for deadline := time.Now().Add(5 * time.Second); !svc.KeyRevoked(); time.Sleep(5 * time.Millisecond) {
 		if time.Now().After(deadline) {
@@ -371,7 +428,7 @@ func TestStartKeyCustodySweepsAtBoot(t *testing.T) {
 	svc.cfg.CredentialKeyCustody = secrets.CustodyFile
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	svc.StartKeyCustody(ctx)
+	startKeyCustody(t, svc, ctx)
 	deadline := time.Now().Add(2 * time.Second)
 	for rowVersion(t, svc, refs[0]) != "vault:v2" {
 		if time.Now().After(deadline) {

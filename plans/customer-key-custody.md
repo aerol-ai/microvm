@@ -1438,11 +1438,14 @@ Decisions made while building it:
 - **Counting.** A value that lost its compare-and-swap is counted under the
   key it was read on until the next pass looks again, so the rows gauge
   never reaches 0 early; values no ring key opens are counted as
-  `unopenable`. With one key in the ring the pass reads nothing. A pass
-  that stops early (a store or key-store error) publishes every old key as
-  -1, unknown, never a partial count or an absent key; the key-store
-  sweep's `aerolvm_key_rows_stale` does the same, and never lowers
-  `aerolvm_key_rows_retired`.
+  `unopenable`. With one key in the ring the pass reads nothing. A count
+  is only good for the target it was made for: every old key is -1,
+  unknown, from the moment the node takes a ring the last finished pass
+  did not count until a pass under it finishes, and after a pass that
+  stopped early (never a partial count or an absent key). The key-store
+  sweep's `aerolvm_key_rows_stale` is the same per key-store version: -1 at
+  boot, before a new current version is published, and after a stopped
+  pass; it never lowers `aerolvm_key_rows_retired`.
 
 Not done here: the rotation runbook and alerts (Phase 5), the 3-node live UC
 with a failover between every step (Phase 6). Rolling a node back to a build
