@@ -341,6 +341,17 @@ func TestKeyCustodyServerKeyRotation(t *testing.T) {
 		kcCopyWrappedFile(t, targets, seed)
 		return out
 	}
+	// The key being replaced: 0 on a cluster that never rotated, the last
+	// promoted key on one that did.
+	old := ""
+	for _, f := range strings.Fields(kcSSH(t, seed, "sudo /usr/local/bin/sandboxd key status "+kcKeyCLIEnv+" | grep 'server keys:'")) {
+		if id, ok := strings.CutSuffix(f, "=current"); ok {
+			old = id
+		}
+	}
+	if old == "" {
+		t.Fatal("`sandboxd key status` names no current server key")
+	}
 	out := step("--stage")
 	if !strings.Contains(out, "staged: key ") {
 		t.Fatalf("stage: %s", out)
@@ -351,14 +362,30 @@ func TestKeyCustodyServerKeyRotation(t *testing.T) {
 
 	step("--promote")
 	kcAwaitMetric(t, nodes, "aerolvm_server_key_ring", map[string]string{"key": staged, "key2": "current"}, 2*time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
-	kcAwaitMetric(t, nodes, "aerolvm_server_key_rows", map[string]string{"key": staged}, 3*time.Minute, func(v float64, ok bool) bool { return ok && v > 0 })
-	for _, old := range []string{"0", "unopenable"} {
-		kcAwaitMetric(t, nodes, "aerolvm_server_key_rows", map[string]string{"key": old}, 3*time.Minute, func(v float64, ok bool) bool { return !ok || v == 0 })
+	// Values on the new key somewhere in the cluster. Not on every node: a
+	// node that holds no sealed value (after a failover moved its sandbox
+	// away) publishes no row count at all.
+	deadline := time.Now().Add(3 * time.Minute)
+	for total := 0.0; ; {
+		total = 0
+		for _, n := range nodes {
+			total += harness.MetricValueOrZero(kcMetricsOf(t, n), "aerolvm_server_key_rows", map[string]string{"key": staged})
+		}
+		if total > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no node reports a value sealed under key %s after the promote", staged)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	for _, gone := range []string{old, "unopenable"} {
+		kcAwaitMetric(t, nodes, "aerolvm_server_key_rows", map[string]string{"key": gone}, 3*time.Minute, func(v float64, ok bool) bool { return !ok || v == 0 })
 	}
 	kcHAFailover(t, targets, sb.ID, "UC304_TOKEN", secret)
 
-	step("--retire 0")
-	kcAwaitMetric(t, nodes, "aerolvm_server_key_ring", map[string]string{"key": "0", "key2": "retired"}, 2*time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
+	step("--retire " + old)
+	kcAwaitMetric(t, nodes, "aerolvm_server_key_ring", map[string]string{"key": old, "key2": "retired"}, 2*time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
 	kcHAFailover(t, targets, sb.ID, "UC304_TOKEN", secret)
 	kcHAFailover(t, targets, "", "UC304_AFTER", secretValue(t, "304b"))
 	for _, n := range nodes {
