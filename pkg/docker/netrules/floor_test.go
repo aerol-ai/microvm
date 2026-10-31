@@ -53,12 +53,19 @@ func TestSetFloor(t *testing.T) {
 	if be.jumps[0] != ChainDockerUser+"->"+ChainAerolvmFloor || be.flushes != 1 {
 		t.Fatalf("jumps=%v flushes=%d", be.jumps, be.flushes)
 	}
-	if be.countMatching(ChainAerolvmFloor) != 2 || be.countMatching("192.168.7.0/24") != 1 {
+	// The listed IPv4 ranges, and the subnet to itself: sandboxes are
+	// isolated from each other by default.
+	if be.countMatching(ChainAerolvmFloor) != 3 || be.countMatching("192.168.7.0/24") != 1 || be.countMatching("-d|172.17.0.0/16") != 1 {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
-	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(ChainAerolvmFloor) != 0 {
-		t.Fatalf("clearing the floor: %v %v", err, be.rules)
+	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(ChainAerolvmFloor) != 1 {
+		t.Fatalf("clearing the operator's floor keeps the isolation rule: %v %v", err, be.rules)
 	}
+	SetSandboxInterconnect(true)
+	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(ChainAerolvmFloor) != 0 {
+		t.Fatalf("SB_SANDBOX_INTERCONNECT=true drops the isolation rule: %v %v", err, be.rules)
+	}
+	SetSandboxInterconnect(false)
 	be.jumpErr = errors.New("boom")
 	if err := m.SetFloor(subnet, floor); err == nil {
 		t.Fatal("chain errors surface")

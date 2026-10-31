@@ -186,7 +186,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req)...)
+		specOpts = append(specOpts, resourceSpecOpts(req, d.cfg.PidsLimit)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
@@ -948,8 +948,12 @@ func (d *Driver) removeHostFiles(sandboxID string) error {
 	return os.RemoveAll(dir)
 }
 
-func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
+func resourceSpecOpts(req models.CreateSandboxRequest, pidsLimit int64) []oci.SpecOpts {
 	var out []oci.SpecOpts
+	if pidsLimit > 0 {
+		// A fork bomb stops here instead of exhausting the node.
+		out = append(out, oci.WithPidsLimit(pidsLimit))
+	}
 	if req.MemoryMB > 0 {
 		out = append(out, oci.WithMemoryLimit(uint64(req.MemoryMB)*1024*1024))
 	}

@@ -123,15 +123,18 @@ func TestSyncNodeControl(t *testing.T) {
 	if err := svc.EnsureEgressGatewayReady(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// No operator file: the guard is on, over the API and the node's own
+	// SSH and rpcbind.
+	want := []netip.AddrPort{netip.MustParseAddrPort("172.17.0.1:22"), netip.MustParseAddrPort("172.17.0.1:111"), netip.MustParseAddrPort("172.17.0.1:21212")}
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 0 {
-		t.Fatal("no operator file: the guard is never pushed")
+	if gw.controlCalls != 1 || !slices.Equal(gw.control, want) {
+		t.Fatalf("no operator file: push = %d calls %v, want %v", gw.controlCalls, gw.control, want)
 	}
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\n"))
 	svc.syncNodeControl(ctx)
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 1 || len(gw.control) != 1 || gw.control[0] != netip.MustParseAddrPort("172.17.0.1:21212") {
-		t.Fatalf("push = %d calls %v", gw.controlCalls, gw.control)
+	if gw.controlCalls != 1 || !slices.Equal(gw.control, want) {
+		t.Fatalf("an unchanged list is not pushed again: %d calls %v", gw.controlCalls, gw.control)
 	}
 	if err := svc.ResyncEgressGateway(ctx); err != nil {
 		t.Fatal(err)
