@@ -530,8 +530,10 @@ func keyAckMigration(cfg config.Config, out io.Writer) error {
 		fmt.Fprintln(out, "nothing to acknowledge: this key was never plaintext")
 		return nil
 	}
-	f.MigratedFromPlaintext = false
-	if err := secrets.WriteWrappedKeyFile(path, f); err != nil {
+	nf := f
+	nf.MigratedFromPlaintext = false
+	// A compare-and-swap: never undo a rewrap or rotation written meanwhile.
+	if err := secrets.ReplaceWrappedKeyFile(path, f, nf); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "acknowledged: %s no longer reports a plaintext migration; copy it to every node\n", path)

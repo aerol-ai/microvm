@@ -146,12 +146,15 @@ func openKeyRing(ctx context.Context, cfg config.Config, fn func(context.Context
 	}
 	path := cfg.KeyRingPath()
 	var entries []secrets.RingEntry
+	// The ring as read: the save is a compare-and-swap against it (nil: the
+	// ring file must still not exist).
+	var read *secrets.KeyRingFile
 	if fileExists(path) {
 		f, err := secrets.ReadKeyRingFile(path)
 		if err != nil {
 			return err
 		}
-		entries = f.Ring
+		entries, read = f.Ring, &f
 	} else {
 		key, ok, err := secrets.LoadPlaintextKey(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
 		if err != nil {
@@ -171,7 +174,7 @@ func openKeyRing(ctx context.Context, cfg config.Config, fn func(context.Context
 			return secrets.NewRingEntry(ctx, id, nil)
 		},
 		save: func(_ context.Context, entries []secrets.RingEntry) error {
-			if err := secrets.WriteKeyRingFile(path, secrets.KeyRingFile{Ring: entries}); err != nil {
+			if err := secrets.ReplaceKeyRingFile(path, read, secrets.KeyRingFile{Ring: entries}); err != nil {
 				return err
 			}
 			_, err := secrets.ReadKeyRingFile(path)
