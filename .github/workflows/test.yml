@@ -315,6 +315,33 @@ jobs:
           SB_TEST_VAULT_ROOT_TOKEN: root
         run: go test -count=1 -tags integration -run 'TestVaultLive|TestVaultProviderContract' -v ./pkg/secrets/
 
+      # The same live PKCS#11 checks the operator runs against AWS CloudHSM:
+      # IV probe, AAD, missing label = revoke, label rotation, and 64
+      # concurrent calls through the helper. softhsm2-util --import skips
+      # whitespace bytes in a key file, so the keys are alphanumeric.
+      - name: PKCS#11 live checks (SoftHSM2)
+        env:
+          SB_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+          SB_TEST_PKCS11_TOKEN_LABEL: aerolvm
+          SB_TEST_PKCS11_PIN_FILE: /tmp/itest-hsm-pin
+          SB_TEST_PKCS11_KEY_LABEL: kek-a
+          SB_TEST_PKCS11_KEY_LABEL_B: kek-b
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq softhsm2
+          PIN=$(head -c 64 /dev/urandom | tr -dc 0-9 | head -c 8)
+          printf %s "$PIN" > /tmp/itest-hsm-pin && chmod 0600 /tmp/itest-hsm-pin
+          export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm2.conf"
+          mkdir -p "$RUNNER_TEMP/softhsm-tokens"
+          printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$RUNNER_TEMP/softhsm-tokens" > "$SOFTHSM2_CONF"
+          softhsm2-util --init-token --free --label aerolvm --so-pin "$PIN" --pin "$PIN" >/dev/null
+          for L in kek-a kek-b; do
+            head -c 512 /dev/urandom | tr -dc A-Za-z0-9 | head -c 32 > "$RUNNER_TEMP/$L.bin"
+            softhsm2-util --import "$RUNNER_TEMP/$L.bin" --aes --token aerolvm --label "$L" \
+              --id "$(printf %s "$L" | od -An -tx1 | tr -d ' \n')" --pin "$PIN" >/dev/null
+          done
+          CGO_ENABLED=1 go test -count=1 -tags integration -run TestPKCS11Live -v ./pkg/secrets/pkcs11/
+
   go-sdk-tests:
     needs: paths
     if: needs.paths.outputs.go_sdk == 'true'
