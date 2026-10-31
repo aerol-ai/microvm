@@ -17,6 +17,10 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# The OpenBao fixture on the seed listens on 8200; every node's OpenBao
+# Proxy reaches it there, inside the VPC only.
+cluster_internal_tcp_ports = [7000, 7001, 7002, 8200]
+
 nodes = {
   node1 = { role = "mixed", seed = true, spot = true }
   node2 = { role = "mixed", spot = true }

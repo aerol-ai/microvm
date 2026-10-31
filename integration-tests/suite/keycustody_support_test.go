@@ -120,7 +120,10 @@ func kcSSHStdin(t *testing.T, node harness.IntegrationNode, script, stdin string
 
 func kcMarked(t *testing.T, node harness.IntegrationNode, step string) bool {
 	t.Helper()
-	return strings.TrimSpace(kcSSH(t, node, "test -f "+kcStateDir+"/"+step+" && echo yes || echo no")) == "yes"
+	// sudo: the state directory is 0700 root, so the ubuntu user cannot see
+	// inside it and a plain test -f always says no (the first live run redid
+	// every fixture step in every case because of it).
+	return strings.TrimSpace(kcSSH(t, node, "sudo test -f "+kcStateDir+"/"+step+" && echo yes || echo no")) == "yes"
 }
 
 func kcMark(t *testing.T, node harness.IntegrationNode, step string) {
