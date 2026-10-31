@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/auditlog"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
@@ -100,6 +102,48 @@ func (g *Gateway) fetchRemoteSandbox(ctx context.Context, sandboxID, forwardID s
 	return &sandbox, nil
 }
 
+// bridgedSession is one remote session channel's attribution. Every call
+// the gateway bridges for it is attested as this gateway acting for the
+// holder of sandboxID's key, so the owner records the call as theirs and
+// not as the operator whose token the loopback hop carries. When the owner
+// also writes the session's ssh record, the first call carries the open
+// marker that asks it to: that call always reaches the owner before
+// anything runs in the sandbox (the session list, or the create that starts
+// a one-shot command), and it is sent once whatever happens after.
+type bridgedSession struct {
+	sandboxID string
+	// session is the ssh record's target, as recordSession names it.
+	session      string
+	ownerRecords bool
+	opened       atomic.Bool
+}
+
+func (b *bridgedSession) attest(h http.Header) {
+	call := auditlog.SSHGatewayCall{SandboxID: b.sandboxID}
+	if b.ownerRecords && b.opened.CompareAndSwap(false, true) {
+		call.Open, call.Session = true, b.session
+	}
+	AttestBridgedCall(h, call)
+}
+
+// bridgeSession decides where a remote-owned session's ssh record is
+// written. The owner writes it when every member runs a build that honours
+// the open marker: it then lands in the sandbox's own audit, which is all
+// the audit read asks (its fan-out reaches the nodes that owned the
+// sandbox, never an ingress gateway). Until then, during a rolling upgrade,
+// the gateway records here as it always did, rather than hand the record
+// to an owner that would drop the marker. Either way the session gets
+// exactly one record, and the call to decide is an in-process gate read.
+func (g *Gateway) bridgeSession(ctx context.Context, sandboxID, mode, sessionName string) *bridgedSession {
+	b := &bridgedSession{sandboxID: sandboxID, session: sessionRecordTarget(mode, sessionName)}
+	if o, ok := g.svc.(OwnerSessionRecorder); ok && o.SSHSessionsRecordedByOwner() {
+		b.ownerRecords = true
+		return b
+	}
+	g.recordSession(ctx, sandboxID, mode, sessionName)
+	return b
+}
+
 // handleRemoteSession services an SSH session channel for a sandbox owned by
 // another node. It mirrors handleSession's request handling but always bridges
 // to the owner's toolbox session API via this node's v1 surface — there is no
@@ -109,11 +153,11 @@ func (g *Gateway) fetchRemoteSandbox(ctx context.Context, sandboxID, forwardID s
 //
 // The attach runs concurrently with the request loop so mid-session
 // window-change events can be forwarded as PTY resizes (UC-9).
-func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionName string, channel ssh.Channel, requests <-chan *ssh.Request) {
+func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionName string, bridge *bridgedSession, channel ssh.Channel, requests <-chan *ssh.Request) {
 	defer channel.Close()
 
 	forwardID := newForwardID()
-	ep := g.remoteSessionEndpoint(sandboxID, forwardID)
+	ep := g.remoteSessionEndpoint(sandboxID, forwardID, bridge)
 	state := &sessionState{envVars: make([]string, 0, 4)}
 
 	resize := make(chan [2]uint32, 4)
@@ -236,14 +280,20 @@ func (g *Gateway) handleRemoteSession(ctx context.Context, sandboxID, sessionNam
 
 // remoteSessionEndpoint targets this node's own v1 sessions surface for the
 // sandbox; clusterForwardWrap forwards it to the owner. The loopback hop uses
-// the PAT; the owner injects the real toolbox token on its side.
-func (g *Gateway) remoteSessionEndpoint(sandboxID, forwardID string) sessionEndpoint {
+// the PAT; the owner injects the real toolbox token on its side. Every call
+// is attested for the sandbox's key; a nil bridge attests without ever
+// asking the owner to record the session.
+func (g *Gateway) remoteSessionEndpoint(sandboxID, forwardID string, bridge *bridgedSession) sessionEndpoint {
 	httpRoot := g.remoteBaseURL + "/v1/sandboxes/" + url.PathEscape(sandboxID) + "/sessions"
+	if bridge == nil {
+		bridge = &bridgedSession{sandboxID: sandboxID}
+	}
 	return sessionEndpoint{
 		baseURL:   httpRoot,
 		wsURL:     httpToWS(httpRoot),
 		auth:      bearer(g.remotePAT),
 		forwardID: forwardID,
+		bridge:    bridge,
 	}
 }
 
