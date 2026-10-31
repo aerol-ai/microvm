@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // TLS inspection's node CA (plans/egress-domain-filtering.md §5.9, P3-1).
@@ -176,9 +177,28 @@ func writeFileAtomic(path string, b []byte, mode os.FileMode) error {
 // pushEgressCA hands the gateway the CA once per gateway connection; the
 // gateway keeps it in memory only. Callers hold egressMu or run before any
 // attach that needs it.
+//
+// A push and a revoke's clear never overlap, and a push re-checks the
+// revoke under the same lock: one already in flight when the key is
+// revoked reaches the gateway before the clear does, never after it, and
+// none starts once the key is revoked (eng D4).
 func (s *Service) pushEgressCA(ctx context.Context, ca egress.InspectCA) error {
 	if s.egressCAPushed.Load() {
 		return nil
+	}
+	s.egressCAPushMu.Lock()
+	defer s.egressCAPushMu.Unlock()
+	if s.KeyRevoked() {
+		return fmt.Errorf("%w: %w", ErrEgressGatewayUnavailable, secrets.ErrKeyRevoked)
+	}
+	if s.egressCAPushed.Load() {
+		return nil
+	}
+	if s.cfg.CredentialKeyCustody == secrets.CustodyWrapped {
+		// The revoke bound: a sandboxd whose key was revoked cannot boot to
+		// send clear_inspect_ca, so the gateway drops the CA once this node
+		// has been silent that long (plans/customer-key-custody.md §10).
+		ca.DropAfterSeconds = int64((s.cfg.SecretProviderRecheckInterval * time.Duration(s.cfg.SecretProviderRevokeAfter)).Seconds())
 	}
 	if err := s.egressGateway().SetInspectCA(ctx, ca); err != nil {
 		return fmt.Errorf("%w: hand the gateway its inspection CA: %v", ErrEgressGatewayUnavailable, err)
@@ -192,12 +212,28 @@ func (s *Service) pushEgressCA(ctx context.Context, ca egress.InspectCA) error {
 // without one. A node that never inspected has nothing to send.
 func (s *Service) resyncEgressCA(ctx context.Context) error {
 	s.egressCAPushed.Store(false)
+	// A revoked node never resends the CA, even to a gateway that just
+	// restarted without it (eng D4); one that came back without having
+	// restarted still holds it if the revoke's clear never reached it.
+	if s.KeyRevoked() {
+		s.retryEgressCAClear(ctx)
+		return nil
+	}
+	// Under egressCAMu, as the revoke's drop is: a load that raced the
+	// revoke is dropped after it, never kept.
+	s.egressCAMu.Lock()
 	ca, ok, err := s.loadEgressCA()
+	if err == nil && ok {
+		s.egressCA.Store(&ca)
+	}
+	s.egressCAMu.Unlock()
 	if err != nil || !ok {
 		return err
 	}
-	s.egressCA.Store(&ca)
-	return s.pushEgressCA(ctx, ca)
+	if err := s.pushEgressCA(ctx, ca); err != nil && !errors.Is(err, secrets.ErrKeyRevoked) {
+		return err
+	}
+	return nil
 }
 
 // prepareInspect readies a container create with inspect rules: the CA
@@ -362,6 +398,10 @@ func (s *Service) EgressProcidAuthorize(ctx context.Context, sandboxID string) (
 // value it can't read is left out, so its requests are refused at the
 // gateway rather than sent with the placeholder.
 func (s *Service) egressSecrets(ctx context.Context, sb *models.Sandbox) map[string]string {
+	// A revoked node sends the gateway no secrets (eng D21).
+	if s.KeyRevoked() {
+		return nil
+	}
 	keys := injectKeys(sb.NetworkEgressRules)
 	if len(keys) == 0 {
 		return nil

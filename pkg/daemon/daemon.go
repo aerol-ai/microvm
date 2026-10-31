@@ -160,7 +160,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return err
 	}
 	defer keys.stop()
-	cipher, err := openServerKey(ctx, cfg, keys.wrapper)
+	cipher, err := openServerKey(ctx, cfg, keys.wrapper, logger)
 	if err != nil {
 		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
@@ -324,7 +324,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
 	svc.RecordKeyCustody()
-	service.PublishKeyCustody(cfg)
+	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -937,6 +937,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err != nil {
 			return fmt.Errorf("create ssh gateway: %w", err)
 		}
+		// A key revoke ends every SSH session: each holds a toolbox token
+		// opened before it (plans/customer-key-custody.md §10).
+		svc.OnKeyRevoked(gw.CloseAll)
 		go func() {
 			if err := gw.Start(ctx); err != nil {
 				logger.Warn("ssh gateway stopped", "error", err)
@@ -1016,6 +1019,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			cancel()
 		}
 	}()
+	// The revoke re-check (wrapped custody only) starts once the API is up;
+	// it runs on the key store's background budget, never a create's.
+	svc.StartKeyCustody(ctx)
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {

@@ -185,6 +185,9 @@ type Service struct {
 	// opened the server key (SetKeyStoreWrapper); nil for local, or when a
 	// test builds the service directly.
 	keyStoreWrapper secrets.DataKeyWrapper
+	// keyCustody is the server key's lifecycle under wrapped custody:
+	// re-check, revoke, recover (plans/customer-key-custody.md §10).
+	keyCustody keyCustodyState
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -445,12 +448,16 @@ type Service struct {
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
-	// that the connected gateway has it.
-	egressCA       atomic.Pointer[egress.InspectCA]
-	egressCAMu     sync.Mutex
-	egressCAPushed atomic.Bool
-	egressSubOnce  sync.Once
-	egressStats    egressCounters
+	// that the connected gateway has it. egressCAPushMu orders the CA's
+	// pushes against a revoke's clear at the gateway, and
+	// egressCAClearOwed is set while that clear has not reached it.
+	egressCA          atomic.Pointer[egress.InspectCA]
+	egressCAMu        sync.Mutex
+	egressCAPushed    atomic.Bool
+	egressCAPushMu    sync.Mutex
+	egressCAClearOwed atomic.Bool
+	egressSubOnce     sync.Once
+	egressStats       egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
 	// for the same reason as egressWired: readiness reads it.
 	egressSelfTest atomic.Pointer[egressSelfTest]
@@ -781,10 +788,20 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
 	ctx = bootContext(ctx)
 	wrapper := s.keyStoreWrapper
-	if wrapper == nil && secrets.IsExternalProvider(name) {
+	switch {
+	case wrapper != nil:
+	case secrets.IsExternalProvider(name):
 		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
 		opts.Wrapper = s.secretWrapBackend
 		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
+	default:
+		// Still sealing local, maybe with a key store's settings already
+		// added: step 1 of the two-step switch (§12, eng D8).
+		w, err := secrets.NewOpenWrapper(ctx, KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper))
 		if err != nil {
 			return err
 		}
@@ -2792,7 +2809,7 @@ func (s *Service) UnsealRegistry(ctx context.Context, sandboxID string, sealed [
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt registry auth", decErr)
 	}
 	var out models.RegistryAuth
 	if err := json.Unmarshal(plain, &out); err != nil {
@@ -2896,7 +2913,7 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 		}
 		plain, decErr := s.cipher.DecryptWithAAD(sealed, secrets.EnvAAD(sandboxID, auditIncarnationID))
 		if decErr != nil {
-			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+			return nil, sealedOpenError("decrypt env", decErr)
 		}
 		var out map[string]string
 		if umErr := json.Unmarshal(plain, &out); umErr != nil {
@@ -3027,7 +3044,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt mounts", decErr)
 	}
 	var file models.MountSpecFile
 	if umErr := json.Unmarshal(plain, &file); umErr != nil {
@@ -5323,6 +5340,13 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	if s.cfg.RunsSSHGateway() && sshStatus != "ok" {
 		status = "degraded"
 	}
+	// A revoked key stops the node's work on sealed data (§10). Health still
+	// answers, so the docs do not promise the ingress stops routing here.
+	keyCustody := ""
+	if s.KeyRevoked() {
+		keyCustody = "revoked"
+		status = "degraded"
+	}
 
 	clusterTopology := ""
 	clusterNodes := 0
@@ -5351,8 +5375,19 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
+		KeyCustody:      keyCustody,
 		Version:         version.Version,
 	}, nil
+}
+
+// sealedOpenError reports a failed open of a sealed value. A key-store class
+// (a revoke) stays visible, so the API answers 503 key_revoked instead of a
+// decrypt failure; anything else is ErrDecryptFailed as before.
+func sealedOpenError(what string, err error) error {
+	if secrets.IsKeyStoreError(err) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return fmt.Errorf("%w: %s: %v", secrets.ErrDecryptFailed, what, err)
 }
 
 // Capacity returns the admitter's current snapshot. Returns the zero value

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"expvar"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
@@ -73,6 +74,13 @@ var (
 	// limiter budget (foreground, create, background). A rising foreground
 	// tail means SB_SECRET_PROVIDER_MAX_INFLIGHT is below what restarts need.
 	keyStoreLimiterWait = scaleobs.NewNestedDurationBuckets("aerolvm_key_store_limiter_wait_seconds_bucket")
+	// keyStoreCalls counts key-store calls by backend, op and outcome class
+	// (aerolvm_key_store_calls_total{key=backend,key2=op,key3=class});
+	// SandboxdKeyStoreThrottling watches the throttled class.
+	keyStoreCalls = expvar.NewMap("aerolvm_key_store_calls_total")
+	// keyStoreCallSeconds is each call's latency, keyed "<backend>_<op>".
+	keyStoreCallSeconds = scaleobs.NewNestedDurationBuckets("aerolvm_key_store_call_seconds_bucket")
+	keyStoreCallsMu     sync.Mutex
 	// Best-effort local seal failures (ownership replay backfill).
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
@@ -209,6 +217,24 @@ func recordSecretPutOutboxFailure() {
 
 func recordKeyStoreLimiterWait(budget string, wait time.Duration) {
 	keyStoreLimiterWait.Observe(budget, wait)
+}
+
+// recordKeyStoreCall is the router's CallObserver.
+func recordKeyStoreCall(backend, op, class string, took time.Duration) {
+	keyStoreCallsMu.Lock()
+	byOp, _ := keyStoreCalls.Get(backend).(*expvar.Map)
+	if byOp == nil {
+		byOp = new(expvar.Map).Init()
+		keyStoreCalls.Set(backend, byOp)
+	}
+	byClass, _ := byOp.Get(op).(*expvar.Map)
+	if byClass == nil {
+		byClass = new(expvar.Map).Init()
+		byOp.Set(op, byClass)
+	}
+	keyStoreCallsMu.Unlock()
+	byClass.Add(class, 1)
+	keyStoreCallSeconds.Observe(backend+"_"+op, took)
 }
 
 func recordSecretProviderCanary(ok bool) {

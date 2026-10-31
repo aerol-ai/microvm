@@ -1334,7 +1334,11 @@ type HealthStatus struct {
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
-	Version         string `json:"version"`
+	// KeyCustody is "revoked" while the customer's key store has revoked
+	// the server key and the node has stopped processing their data;
+	// otherwise empty (plans/customer-key-custody.md §10).
+	KeyCustody string `json:"key_custody,omitempty"`
+	Version    string `json:"version"`
 }
 
 type ExecRequest struct {

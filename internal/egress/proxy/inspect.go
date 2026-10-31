@@ -65,6 +65,10 @@ func (p *Proxy) SetInspector(i Inspector) {
 	p.inspector.Store(&inspectorBox{i})
 }
 
+// InspectorForTest is the installed inspector, for tests of the code that
+// installs and removes it.
+func (p *Proxy) InspectorForTest() Inspector { return p.currentInspector() }
+
 func (p *Proxy) currentInspector() Inspector {
 	if b := p.inspector.Load(); b != nil {
 		return b.Inspector
@@ -107,16 +111,29 @@ func (l *oneConnListener) Addr() net.Addr { return l.conn.LocalAddr() }
 // closes it.
 func (p *Proxy) serveInspect(c net.Conn, br *bufio.Reader, src egress.Source, dst netip.AddrPort, name string, nameAllowed bool, is func(string) bool) {
 	id := src.Spec.ID
-	ins := p.currentInspector()
-	if ins == nil {
+	box := p.inspector.Load()
+	if box == nil {
 		p.observe(Decision{SandboxID: id, Host: name, Port: 443, Reason: ReasonInspectUnavailable, Mode: src.Mode})
 		writeTLSAlert(c)
 		_ = c.Close()
 		return
 	}
+	ins := box.Inspector
 	peer := peerAddr(c)
 	tc := p.src.Track(id, name, 443, c)
+	tc.MarkInspected()
 	defer tc.Close()
+	// A revoke's clear removes the inspector, then closes every connection
+	// marked inspected (both under the gateway's connection lock). One
+	// admitted across the clear is either marked in time for that close or
+	// finds the inspector it loaded gone here, so none goes on to complete
+	// TLS with the dropped CA (eng D21). A replaced CA also lands here: the
+	// client reconnects to the new one.
+	if p.inspector.Load() != box {
+		p.observe(Decision{SandboxID: id, Host: name, Port: 443, Reason: ReasonInspectUnavailable, Mode: src.Mode})
+		writeTLSAlert(c)
+		return
+	}
 	tlsConn := tls.Server(&replayConn{Conn: c, r: br}, &tls.Config{
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return ins.Leaf(name) },
 		NextProtos:     []string{"h2", "http/1.1"},

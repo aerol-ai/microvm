@@ -110,8 +110,9 @@ Raft keeps its records on disk, so they survive restarts.
 | `SB_CLUSTER_INTERNAL_ADVERTISE` | The HTTPS address other nodes use for that listener, for example `https://10.0.0.5:7002`. | Worked out from the node's main IP |
 | `SB_CREDENTIAL_ENCRYPTION_KEY` | The shared key for the local secrets provider. Required in cluster mode, unless the key file exists. It is not enough for failover on its own. See [Secrets providers](/cluster-secrets/). | Empty |
 | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` | A file to read that key from. | `/var/lib/sandboxd/credential_encryption.key` |
+| `SB_CREDENTIAL_KEY_CUSTODY` | `file` keeps the server key in a file or `SB_CREDENTIAL_ENCRYPTION_KEY`. `wrapped` keeps only a copy wrapped by your key store, so no plain key sits on disk. See [Use your own key store](/enterprise/key-custody/). | `file` |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Skip the key requirement. Only for short-lived tests that use no sealed passwords. Not allowed in enterprise mode. | `false` |
-| `SB_SECRET_PROVIDER` | `local`, `awskms` or `vault` (not built yet). See [Secrets providers](/cluster-secrets/). | `local` |
+| `SB_SECRET_PROVIDER` | `local`, `awskms`, `vault` or `pkcs11`. See [Secrets providers](/cluster-secrets/). | `local` |
 | `SB_SECRET_AWS_KMS_KEY_ID` | The AWS KMS key used to wrap each secret's key. Required with `awskms`. | Empty |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | How many nodes besides the owner can open each sealed secret for `failover.policy=recreate`. At least 1 in a cluster, at least 2 in enterprise mode. | `2` |
 | `SB_SECRET_FANOUT_MIN_ACK_WAIT` | How long a create waits for the first backup to confirm its copy. Must be above zero in a cluster. | `2s` |
