@@ -143,9 +143,17 @@ func TestSyncNodeControl(t *testing.T) {
 	if gw.controlCalls != 2 {
 		t.Fatal("a full sync must re-push the list to a restarted gateway")
 	}
+	// With ingress proxy routing on, the host-port redirect listener is a
+	// control port too: sandboxes reached it on cluster-3-mixed-routing.
+	svc.cfg.IngressProxyRouting, svc.cfg.HostPortRedirectPort = true, 21215
+	svc.syncNodeControl(ctx)
+	if !slices.Contains(gw.control, netip.MustParseAddrPort("172.17.0.1:21215")) {
+		t.Fatalf("redirect listener not guarded: %v", gw.control)
+	}
+	svc.cfg.IngressProxyRouting = false
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\nnode_control_port_guard: false\n"))
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 3 || len(gw.control) != 0 {
+	if gw.controlCalls != 4 || len(gw.control) != 0 {
 		t.Fatalf("turning the guard off must clear it: %v", gw.control)
 	}
 }
