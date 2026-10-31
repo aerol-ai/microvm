@@ -282,8 +282,11 @@ func TestConcurrentResealTriggersConverge(t *testing.T) {
 
 	// Converged means: no outstanding outbox work AND two consecutive reads
 	// agree. One read can catch a moment between two competing reseals.
+	// "|| len(Holders) >= 1" used to stand here, true from the start, so the
+	// first read came back on the old generation and the one reseal the
+	// drains caused then read as a second, racing generation.
 	settled := harness.AwaitSecretHolders(t, c, sb.ID, resealTimeout, func(v harness.SecretHoldersView) bool {
-		return v.SealGeneration > before.SealGeneration || len(v.Holders) >= 1
+		return v.SealGeneration > before.SealGeneration && v.Converged() && len(v.Holders) >= 1
 	})
 	time.Sleep(20 * time.Second)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
