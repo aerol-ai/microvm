@@ -212,6 +212,14 @@ type Config struct {
 	AutoReconcile                bool
 	EnableCaddy                  bool
 	EnableNetworkRules           bool
+	// AllowUnenforcedNetworkPolicy lets a container sandbox keep a network
+	// policy (block-all, address lists, hostname rules, byte caps) on a node
+	// whose host firewall is off (SB_ENABLE_NETWORK_RULES=false, or not a
+	// Linux host), where nothing enforces it. Off, those creates and updates
+	// are refused (501): a control the API accepts but does not enforce is
+	// worse than one it refuses. For local development only; enterprise mode
+	// refuses it. SB_ALLOW_UNENFORCED_NETWORK_POLICY.
+	AllowUnenforcedNetworkPolicy bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
@@ -1912,6 +1920,7 @@ func load(keyTool bool) (Config, error) {
 		AutoReconcile:                     getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		AllowUnenforcedNetworkPolicy:      getEnvBool("SB_ALLOW_UNENFORCED_NETWORK_POLICY", false),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
 		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
 		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
@@ -2819,6 +2828,9 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.AllowUnenforcedNetworkPolicy {
+			return Config{}, errors.New("SB_ALLOW_UNENFORCED_NETWORK_POLICY must be false when SB_ENTERPRISE_MODE=true (it accepts network policy the node does not enforce)")
 		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")

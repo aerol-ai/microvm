@@ -138,3 +138,22 @@ func TestSetEgressFloorUsesTheSandboxSubnet(t *testing.T) {
 		t.Fatal("bridge discovery errors surface")
 	}
 }
+
+// NetRulesEnabled is what the service asks before it accepts network policy
+// for a docker sandbox: false for a disabled manager (network rules off, or
+// not Linux) and for none at all.
+func TestClientNetRulesEnabled(t *testing.T) {
+	cases := map[string]struct {
+		c    *Client
+		want bool
+	}{
+		"rules on":       {&Client{networkRules: netrules.NewWithBackend(&memRuleBackend{})}, true},
+		"rules disabled": {&Client{networkRules: disabledRules(t)}, false},
+		"no manager":     {&Client{}, false},
+	}
+	for name, tc := range cases {
+		if got := tc.c.NetRulesEnabled(); got != tc.want {
+			t.Errorf("%s: NetRulesEnabled = %v, want %v", name, got, tc.want)
+		}
+	}
+}
