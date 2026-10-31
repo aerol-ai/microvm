@@ -2,7 +2,8 @@
 
 package suite
 
-// Security boundary cases for running untrusted code (UC-317..UC-332): what
+// Security boundary cases for running untrusted code (UC-317..UC-332 and
+// UC-339): what
 // a regulated buyer asks of a platform that executes code it did not write.
 // Every case attacks the boundary from inside a sandbox, or from the
 // internet, and asserts it holds on each shell runtime the scenario has:
@@ -198,7 +199,9 @@ func TestBankCloudMetadataUnreachable(t *testing.T) {
 
 // UC-318 — one tenant's sandbox cannot connect to another's: a listener in
 // sandbox B is unreachable from sandbox A, on the same node and the same
-// bridge, with both on default (open) egress.
+// bridge, with both on default (open) egress. ICMP too: with sandbox
+// interconnect off (SB_SANDBOX_INTERCONNECT, off by default) no packet of any
+// protocol may pass, and an echo reply is proof that one did.
 func TestBankNoLateralMovement(t *testing.T) {
 	harness.Require(t, sc, "UC-318")
 	if sc.Has(harness.CapNoHostFirewall) {
@@ -215,7 +218,7 @@ func TestBankNoLateralMovement(t *testing.T) {
 			t.Errorf("sandbox %s reached sandbox %s's listener at %s:8080", a.ID, b.ID, bIP)
 		}
 		if out, _ := bankRun(t, a, fmt.Sprintf("ping -c 2 -W 2 %s >/dev/null 2>&1; echo rc=$?", bIP), time.Minute); strings.Contains(out, "rc=0") {
-			t.Logf("FINDING: sandbox %s gets ICMP echo replies from sandbox %s", a.ID, b.ID)
+			t.Errorf("sandbox %s gets ICMP echo replies from sandbox %s at %s (interconnect is off by default: no protocol may pass)", a.ID, b.ID, bIP)
 		}
 	})
 }
@@ -990,4 +993,117 @@ func TestBankBlockAllNoExfiltration(t *testing.T) {
 			}
 		}
 	})
+}
+
+// bankToolboxPort is the port toolboxd, the agent that runs commands and
+// moves files for the API, listens on inside every container and VM.
+const bankToolboxPort = 2280
+
+// bankUnauthExec sends an exec with no Authorization header to
+// host:2280 from inside sb and returns the HTTP status line, or "" when
+// nothing answered.
+func bankUnauthExec(t *testing.T, sb *microvm.Sandbox, host string) string {
+	t.Helper()
+	const body = `{"command":"id"}`
+	req := fmt.Sprintf(`POST /process/execute HTTP/1.0\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s`, host, len(body), body)
+	out, _ := bankRun(t, sb, fmt.Sprintf("printf '%s' | nc -w 3 %s %d | head -1", req, host, bankToolboxPort), time.Minute)
+	return strings.TrimSpace(out)
+}
+
+// UC-339 — no sandbox reaches another sandbox's toolbox agent, on any pair of
+// runtimes the scenario has (container, gVisor, Firecracker, in both
+// directions), and a Firecracker guest's agent refuses a call that does not
+// carry its sandbox's token, even from the node itself. Before the toolbox
+// auth fix a Firecracker guest booted from a template, a template snapshot or
+// the warm pool ran its agent with no token and served exec and files to any
+// caller that reached port 2280, so the node check runs on a template clone
+// as well as a cold boot.
+func TestBankToolboxAgentUnreachable(t *testing.T) {
+	harness.Require(t, sc, "UC-339")
+	c := client(t)
+	type peer struct {
+		rt bankRuntime
+		sb *microvm.Sandbox
+		ip string
+	}
+	var victims, attackers []peer
+	for _, rt := range bankShellRuntimes(t) {
+		v := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
+		victims = append(victims, peer{rt: rt, sb: v, ip: containerIP(t, c, v)})
+		attackers = append(attackers, peer{rt: rt, sb: bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})})
+	}
+	for _, a := range attackers {
+		for _, v := range victims {
+			a, v := a, v
+			t.Run(a.rt.name+"-to-"+v.rt.name, func(t *testing.T) {
+				if !bankTCPOpen(t, a.sb, v.ip, bankToolboxPort) {
+					return
+				}
+				t.Errorf("sandbox %s (%s) opens a connection to sandbox %s's (%s) toolbox agent at %s:%d",
+					a.sb.ID, a.rt.name, v.sb.ID, v.rt.name, v.ip, bankToolboxPort)
+				// What the connection is worth: an exec without the token.
+				status := bankUnauthExec(t, a.sb, v.ip)
+				t.Logf("an unauthenticated exec from %s to %s answered %q", a.sb.ID, v.sb.ID, status)
+				if f := strings.Fields(status); len(f) >= 2 && strings.HasPrefix(f[1], "2") {
+					t.Errorf("CRITICAL: sandbox %s ran a command in sandbox %s without its token (%s)", a.sb.ID, v.sb.ID, status)
+				}
+			})
+		}
+	}
+
+	if !sc.Has(harness.CapFirecracker) {
+		return
+	}
+	targets := bankTargets(t)
+	fc := []peer{}
+	for _, v := range victims {
+		if v.rt.vm {
+			fc = append(fc, v)
+		}
+	}
+	// A template clone: the boot path whose agent had no token at all.
+	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
+	defer cancel()
+	tmpl, err := c.SDK().CreateTemplate(ctx, sdktypes.CreateTemplateOptions{Image: "docker://" + bankImage(bankRuntime{vm: true})})
+	if err != nil {
+		t.Fatalf("create template: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), time.Minute)
+		defer ccancel()
+		_ = c.SDK().DeleteTemplate(cctx, tmpl.ID)
+	})
+	waitTemplateReady(t, c, tmpl.ID)
+	clone := bankSandbox(t, bankRuntime{name: "firecracker-template", runtime: "firecracker", vm: true}, sdktypes.CreateSandboxOptions{TemplateID: tmpl.ID})
+	fc = append(fc, peer{rt: bankRuntime{name: "firecracker-template", vm: true}, sb: clone, ip: containerIP(t, c, clone)})
+
+	for _, v := range fc {
+		v := v
+		t.Run("node-to-"+v.rt.name, func(t *testing.T) {
+			node := bankSandboxNode(t, targets, v.sb)
+			base := fmt.Sprintf("http://%s:%d", v.ip, bankToolboxPort)
+			const code = `-s -o /dev/null -m 5 -w '%{http_code}\n'`
+			script := strings.Join([]string{
+				fmt.Sprintf(`curl %s -X POST -H 'Content-Type: application/json' -d '{"command":"id"}' %s/process/execute`, code, base),
+				fmt.Sprintf(`curl %s -X POST -H 'Authorization: Bearer not-the-token' -H 'Content-Type: application/json' -d '{"command":"id"}' %s/process/execute`, code, base),
+				fmt.Sprintf(`curl %s '%s/files/download?path=/etc/hostname'`, code, base),
+				fmt.Sprintf(`curl %s %s/sessions`, code, base),
+				fmt.Sprintf(`curl %s %s/health`, code, base),
+			}, "; ")
+			got := strings.Fields(nodeSSH(t, node, script))
+			if len(got) != 5 {
+				t.Fatalf("node %s: unexpected curl output %v", node.Name, got)
+			}
+			// /health answers whether or not the agent is adopted: it proves
+			// the calls above reached the agent and were refused by it.
+			if got[4] != "200" {
+				t.Fatalf("node %s could not reach %s's agent at %s (health %s); the refusals prove nothing", node.Name, v.sb.ID, base, got[4])
+			}
+			for i, what := range []string{"an exec without a token", "an exec with a wrong token", "a file read without a token", "the sessions API without a token"} {
+				if got[i] != "401" && got[i] != "503" {
+					t.Errorf("%s (%s): %s from node %s answered %s, want 401 or 503", v.sb.ID, v.rt.name, what, node.Name, got[i])
+				}
+			}
+		})
+	}
 }

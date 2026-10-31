@@ -875,6 +875,8 @@ var Registry = []UseCase{
 	{ID: "UC-336", Title: "Stability: churn soak (create, exec, destroy on every runtime) under 0.5% failures; daemon memory and descriptors level off; no leaked veth, TAP, firewall rule or sandbox", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-337", Title: "Stability: the daemon on a worker restarted under load serves again within two minutes; nothing leaks", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
 	{ID: "UC-338", Title: "Scale: density per runtime: small sandboxes created 8 at a time until a clean capacity refusal or the cap; every created sandbox runs and the API still answers", Requires: []Capability{CapBenchmark, CapDocker}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go).
+	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
