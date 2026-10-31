@@ -103,6 +103,12 @@ func (c *Cluster) recreateOwnedSandboxes(ctx context.Context) {
 	if r == nil {
 		return
 	}
+	// A view still catching up after a restart can list a self-owned
+	// placement the cluster has since deleted (its local row is gone too, so
+	// it looks exactly like a failover to recreate). Wait for the read index.
+	if !c.PlacementViewCaughtUp() {
+		return
+	}
 	placements := c.fsm.fullPlacementsForOwner(c.nodeID)
 	for id, p := range placements {
 		recreateOwnedPlacement(ctx, ownerRecreateDeps{
