@@ -59,7 +59,7 @@ flowchart LR
 | `SB_SECRET_PROVIDER` | Key store | Tested with |
 |---|---|---|
 | `vault` | HashiCorp Vault or OpenBao, Transit engine | Vault 1.18, OpenBao 2.1 |
-| `pkcs11` | Any HSM with a PKCS#11 v2.40 library and AES-GCM | SoftHSM2 (a software token, for tests only). Not yet tested on hardware. |
+| `pkcs11` | Any HSM with a PKCS#11 v2.40 library and AES-GCM | AWS CloudHSM (`hsm2m.medium`, FIPS mode). Other HSMs: not yet tested. SoftHSM2 for tests only. |
 | `awskms` | AWS KMS | AWS KMS |
 
 The HSM's library runs in a small helper process, never inside the server, so a crash in vendor code does not take the server down.
@@ -156,6 +156,14 @@ SB_SECRET_PROVIDER_STRICT_BOOT=true
 ```
 
 `SB_SECRET_PKCS11_GCM_IV` is `auto` by default: AerolVM checks at start whether the HSM picks the encryption nonce itself. In enterprise mode a token that is not real hardware is refused.
+
+**AWS CloudHSM.** Install the CloudHSM client (Client SDK 5) PKCS#11 library and point it at your cluster with `configure-pkcs11`. Then:
+
+- `SB_SECRET_PKCS11_MODULE` is `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so` and `SB_SECRET_PKCS11_TOKEN_LABEL` is `hsm1`.
+- The PIN file holds `<crypto user>:<password>`.
+- Create the key as that crypto user, for example with `cloudhsm-cli key generate-symmetric aes --label aerolvm-kek --key-length-bytes 32 --attributes encrypt=true decrypt=true`.
+- CloudHSM in FIPS mode writes its own encryption nonce; `auto` detects that.
+- A cluster with one HSM refuses key operations unless the client runs with `--disable-key-availability-check`. Use two HSMs in production.
 
 ## Set up AWS KMS
 
