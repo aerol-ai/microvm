@@ -1,0 +1,24 @@
+# Bank-readiness flagship (cluster-bank-flagship.tfvars): every runtime on a
+# production-shaped cluster, two bare-metal Firecracker hosts, HA ingress and
+# observability. Carries the bank security suite (UC-317..332) on runc,
+# gVisor and Firecracker, the scale and stability suite (UC-333..338) at full
+# size (AEROL_BANK_*), the create benchmark, density, soak and the node-kill
+# cases. expected_members excludes the obs node.
+name: cluster-bank-flagship
+capabilities:
+  - docker
+  - containerd-engine
+  - firecracker
+  - gvisor
+  - wasm
+  - isolate
+  - platform-volumes
+  - domain
+  - cluster
+  - egress-fqdn
+  - benchmark
+  - observability
+
+expected_members: 10
+
+disruptive: true
