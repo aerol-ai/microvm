@@ -1224,37 +1224,47 @@ latency are operator-run (they cost money) and stay open in the gate table.
 **Unverified premises after Phase 0:** Vault Agent's API proxy injecting the
 token (tested in Phase 2), and the CloudHSM rows above.
 
-## Phase 6 status (2026-10-31)
+## Phase 6 results (2026-10-31)
 
-Built and checked offline; the live runs are operator-run and not yet run.
+All three live scenarios passed from fresh clusters in one run each, and the
+AWS CloudHSM run passed. Every AWS resource was torn down afterwards.
+
+| Run | Result |
+|---|---|
+| `cluster-3-mixed-secrets-vault` (UC-297..306) | 10/10 pass, about 33 min of suite on a new 3-node cluster |
+| `cluster-3-mixed-secrets-pkcs11` (UC-307..309) | 3/3 pass, about 17 min |
+| `cluster-3-mixed-wrapped-kms` (UC-310) | pass, with a real failover |
+| AWS CloudHSM, `hsm2m.medium`, FIPS mode, one HSM | `TestPKCS11Live` pass: hardware slot, IV mode `hsm` (the HSM writes the GCM IV), AAD, missing label = revoke, label rotation, 64 concurrent round trips through the helper in 182 ms with the library mapped only there. A real `sandboxd` generated a wrapped key, booted through CloudHSM, and took a server-key stage, promote and retire live. |
 
 - **Tag-gated CI job** `key-custody-integration`: Vault 1.18 and OpenBao 2.1
-  dev servers (images pinned by digest), running `TestVaultLive` and the new
-  `TestVaultProviderContract` (the provider contract against a real key
-  store). Both pass locally against both servers. SoftHSM2 already runs in
-  `go-tests` (`TestSoftHSM`).
-- **Live scenarios** `cluster-3-mixed-secrets-vault`,
-  `cluster-3-mixed-secrets-pkcs11` and `cluster-3-mixed-wrapped-kms`, with
-  UC-297..310 (`make integration-key-custody-{vault,pkcs11,kms}`). The vault
-  and pkcs11 scenarios start from a local cluster and run the migration over
-  SSH (two-step switch, then the wrap), so the switch UC of CEO-M1 is
-  UC-297. Fixture steps were rehearsed locally: the OpenBao TLS dev server,
-  Transit backup, delete and restore, and `bao proxy` with `token_file`
-  auto-auth on a real OpenBao 2.1.1; SoftHSM2 init, AES import and object
-  listing in an Ubuntu 24.04 container. That rehearsal found that
-  `softhsm2-util --import` drops whitespace bytes from a key file, so the
-  fixture uses alphanumeric keys.
-- **Deviations.** The OpenBao server is a dev server (in-memory, TLS) rather
-  than Raft storage: no case restarts it. The eng D22 case (switch a running
-  `local` cluster to `awskms` with a create during the rolling restart) is
-  not built: it needs a scenario that starts local with a KMS key, and the
-  Vault switch (UC-297) covers the same open order; it is listed under
-  Follow-ups.
-- **Found while building it:** #805 added `key_custody` to the bootstrap
-  template but not to the render-test fixture, so `TestBootstrapTemplateRenders`
-  failed wherever terraform is installed; fixed here, with a wrapped render.
-- **Not run:** the three live scenarios and the AWS CloudHSM run (F3), which
-  need operator approval for AWS spend. The Outcome section waits for them.
+  dev servers (images pinned by digest) running `TestVaultLive` and
+  `TestVaultProviderContract`, and SoftHSM2 running `TestPKCS11Live`.
+- **What the live runs found:** no product bug. Seven fixture bugs, all
+  fixed: a glob in a root-only directory (it would have passed UC-298 and
+  UC-310 falsely), a marker check that could not see its own markers (and so
+  restarted the in-memory OpenBao and wiped its key), port 8200 closed
+  between nodes, keep-alive connections pinned to the stopped node, failovers
+  skipped when the sandbox sat on the seed, a proxy token gone stale after
+  an OpenBao restart, and `softhsm2-util --import` dropping whitespace bytes
+  from a key file. Also #805's `key_custody` missing from the Terraform
+  render fixture.
+- **CloudHSM notes for the docs:** module
+  `/opt/cloudhsm/lib/libcloudhsm_pkcs11.so`, token label `hsm1`, PIN file
+  `<crypto user>:<password>`; a one-HSM cluster refuses key operations
+  unless the client disables the key availability check. AWS had no
+  `hsm2m.medium` capacity in us-east-1a; us-east-1b worked.
+- **Deviations.** The OpenBao server is a dev server with TLS (in memory) and
+  OpenBao Proxy, not Raft storage and Agent: no case restarts it, and Agent's
+  token-file mode was covered in Phase 2. The eng D22 case is a follow-up.
+
+**Coverage gaps found by a review of the test list above** (being closed
+next): unit level, the sweep's five racing paths, a decrypt in flight across
+a revoke, the two-step switch from a `local` sealer, the remaining full-stop
+assertions (no CA resent to an old gateway, Sync during a revoke, inject deny
+after DropSecrets), the no-key-store-body-in-logs check and an offline 503
+`key_revoked` handler test, the helper killed mid-call; live, AWS KMS revoke,
+registry and mount secrets, the live full-stop checks, a fresh joiner,
+restore onto a new node, and a single-node wrapped install.
 
 ## Phase 5 results (2026-10-31)
 
@@ -1495,6 +1505,12 @@ founder answers differently, §3 and §7 change.
 - The eng D22 live case: switch a running `local` cluster to `awskms` with a
   create during the rolling restart that fails over to a node not yet
   switched (needs a scenario that boots local with a KMS key).
+- Not in the test list, found in review: split reachability (some nodes
+  reach the key store, others do not); Firecracker, WASM, isolate and gVisor
+  sandboxes under wrapped custody and revoke; enterprise mode with wrapped
+  custody end to end; a mixed-version rolling upgrade through the fv 4 gate,
+  live; the create-latency cost of each key store; the reseal pass over
+  100k rows; Vault token expiry and renewal, and Vault HA standby failover.
 - GCP Cloud KMS and Azure Key Vault: TODOS.md entry (CEO-E5); triggers are
   the K8s plan's GKE phase and a named Azure customer. KMIP: on customer
   demand.
