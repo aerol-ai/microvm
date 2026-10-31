@@ -123,7 +123,7 @@ func TestBankConcurrentCreateBurst(t *testing.T) {
 					defer cancel()
 					t0 := time.Now()
 					sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
-						Image: harness.DefaultImage, Name: fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i), Runtime: rt.runtime,
+						Image: bankImage(rt), Name: fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i), Runtime: rt.runtime,
 						CPU: 0.25, MemoryMB: 128,
 					})
 					d := time.Since(t0)
@@ -263,6 +263,8 @@ func TestBankExecThroughput(t *testing.T) {
 			lat = append(lat, time.Since(t0))
 		}
 		var failed atomic.Int64
+		var errMu sync.Mutex
+		var errs []string
 		var wg sync.WaitGroup
 		t0 := time.Now()
 		for w := 0; w < par; w++ {
@@ -275,6 +277,9 @@ func TestBankExecThroughput(t *testing.T) {
 					cancel()
 					if err != nil || res.ExitCode != 0 {
 						failed.Add(1)
+						errMu.Lock()
+						errs = append(errs, fmt.Sprintf("%v (rc %d)", err, res.ExitCode))
+						errMu.Unlock()
 					}
 				}
 			}()
@@ -285,7 +290,7 @@ func TestBankExecThroughput(t *testing.T) {
 		bankRecord(t, "exec/"+rt.name, map[string]any{"sequential": sum, "concurrent_workers": par, "concurrent_execs": par * 10, "concurrent_failed": failed.Load(), "concurrent_wall_ms": parWall.Milliseconds()})
 		t.Logf("%s exec: sequential %+v; %d concurrent execs in %v, %d failed", rt.name, sum, par*10, parWall, failed.Load())
 		if failed.Load() > 0 {
-			t.Errorf("%d of %d concurrent execs failed", failed.Load(), par*10)
+			t.Errorf("%d of %d concurrent execs failed: %v", failed.Load(), par*10, bankFirstN(errs, 3))
 		}
 	})
 }
@@ -379,7 +384,7 @@ func bankChurn(t *testing.T, c *harness.Client, rts []bankRuntime, workers int, 
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 				t0 := time.Now()
 				sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
-					Image: harness.DefaultImage, Name: fmt.Sprintf("%s-w%d-%d", prefix, w, i), Runtime: rt.runtime, CPU: 0.25, MemoryMB: 128,
+					Image: bankImage(rt), Name: fmt.Sprintf("%s-w%d-%d", prefix, w, i), Runtime: rt.runtime, CPU: 0.25, MemoryMB: 256,
 				})
 				dc := time.Since(t0)
 				if err != nil {
@@ -554,6 +559,10 @@ func TestBankRecoveryUnderLoad(t *testing.T) {
 	time.Sleep(45 * time.Second)
 	restartAt := time.Now()
 	nodeSSH(t, victim, "sudo systemctl restart sandboxd")
+	t.Cleanup(func() {
+		target, _ := harness.SSHTarget(victim)
+		restoreNodeDaemon(t, victim, target)
+	})
 	var back time.Duration
 	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(3 * time.Second) {
 		if strings.Contains(nodeSSH(t, victim, "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:21212/health || true"), "200") {
@@ -563,6 +572,9 @@ func TestBankRecoveryUnderLoad(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("sandboxd on %s did not come back within 3 minutes", victim.Name)
 		}
+	}
+	if err := waitNodeRejoined(t, victim); err != nil {
+		t.Errorf("%s did not rejoin after the restart: %v", victim.Name, err)
 	}
 	time.Sleep(60 * time.Second)
 	close(stop)
@@ -629,7 +641,7 @@ func TestBankDensity(t *testing.T) {
 						defer cancel()
 						t0 := time.Now()
 						sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
-							Image: harness.DefaultImage, Name: fmt.Sprintf("%s-%d-%d", harness.UniqueName(sc, t), len(created), i), Runtime: rt.runtime, CPU: 0.25, MemoryMB: 128,
+							Image: bankImage(rt), Name: fmt.Sprintf("%s-%d-%d", harness.UniqueName(sc, t), len(created), i), Runtime: rt.runtime, CPU: 0.25, MemoryMB: 128,
 						})
 						mu.Lock()
 						defer mu.Unlock()
