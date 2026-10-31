@@ -86,7 +86,8 @@ func TestEarlyAttachOrder(t *testing.T) {
 // removes elsewhere).
 func TestPlainDockerKeepsLateAttach(t *testing.T) {
 	h := newEarlyHarness(t, shapeDockerPlain)
-	h.gw.attachDelay = 40 * time.Millisecond
+	// Long enough that no row persist on a slow disk hides it.
+	h.gw.attachDelay = 300 * time.Millisecond
 	ctx, timing := createtiming.With(context.Background())
 	resp, err := h.svc.CreateSandbox(ctx, h.request())
 	if err != nil {
