@@ -195,6 +195,8 @@ tf_varfile_args() {
   printf -- '-var-file=%s -var-file=%s' "$PROD_TFVARS" "${HERE}/scenarios/${scenario}.tfvars"
   local cert_tfvars="${HERE}/.tf/${scenario}/cert-storage.tfvars"
   [[ -f "$cert_tfvars" ]] && printf -- ' -var-file=%s' "$cert_tfvars"
+  local admin_tfvars="${HERE}/.tf/${scenario}/admin-cidrs.tfvars"
+  [[ -f "$admin_tfvars" ]] && printf -- ' -var-file=%s' "$admin_tfvars"
   # Locally-built artifact URLs (§4.4), chained LAST so they override any
   # sandboxd_url/install_script_url a scenario file happens to pin. Written by
   # prepare_artifacts before apply and deliberately LEFT ON DISK afterwards, so
@@ -249,6 +251,37 @@ acknowledge_hetero_obs_t7() {
   fi
   echo "WARNING: ${scenario} costs ~\$21/hr (5×c5.metal). Set AEROL_HETERO_OBS_T7_OK=1 to acknowledge (Makefile target does)." >&2
   exit 2
+}
+
+# prod_sets_admin_cidrs: the operator's own tfvars name who may reach SSH and
+# the API, and the harness leaves that alone.
+prod_sets_admin_cidrs() {
+  grep -qE '^[[:space:]]*admin_allowed_cidrs[[:space:]]*=' "$PROD_TFVARS" 2>/dev/null
+}
+
+# emit_admin_cidrs_tfvars gives Terraform's required admin_allowed_cidrs this
+# runner's public address when the operator's tfvars leave it unset, so a
+# scenario's SSH and API answer this machine and not the whole internet. It is
+# re-learned every run, so a kept stack follows a runner that changed networks;
+# the last file stands when the address can't be learned.
+emit_admin_cidrs_tfvars() {
+  local sdir="$1" ip
+  local out="${sdir}/admin-cidrs.tfvars"
+  if prod_sets_admin_cidrs; then
+    rm -f "$out"
+    return 0
+  fi
+  ip=$(curl -fsS --max-time 10 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]') || ip=""
+  if [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if [[ -f "$out" ]]; then
+      echo "admin CIDRs: cannot learn this runner's public address; keeping $(tr -d '\n' < "$out")" >&2
+      return 0
+    fi
+    echo "admin CIDRs: cannot learn this runner's public address; set admin_allowed_cidrs in $PROD_TFVARS" >&2
+    return 1
+  fi
+  printf 'admin_allowed_cidrs = ["%s/32"]\n' "$ip" > "$out"
+  echo "admin CIDRs: SSH and the API open to this runner only (${ip}/32)"
 }
 
 # emit_cert_storage_tfvars writes the persistent BYO cert-store override for a
@@ -370,10 +403,16 @@ EOF
 # scenario applied with.
 destroy_scenario() {
   local scenario="$1"
+  # A stack applied before the harness wrote admin-cidrs.tfvars has none on
+  # disk; the destroy needs the required variable set, not a real address.
+  local admin=()
+  if ! prod_sets_admin_cidrs && [[ ! -f "${REPO_ROOT}/integration-tests/.tf/${scenario}/admin-cidrs.tfvars" ]]; then
+    admin=(-var='admin_allowed_cidrs=["127.0.0.1/32"]')
+  fi
   # shellcheck disable=SC2046
   TF_DATA_DIR="${REPO_ROOT}/integration-tests/.tf/${scenario}" \
     terraform -chdir="${REPO_ROOT}/Terraform" destroy -auto-approve -input=false \
-    $(tf_varfile_args "$scenario") \
+    $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
     -var="force_on_demand=$(on_demand_tfvar)" \
     -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
@@ -1100,6 +1139,10 @@ run_one() {
   if [[ "$caps_domain" == "true" ]]; then
     verify_leased_zone "$leased"
   fi
+
+  # Who may reach SSH and the API: this runner, unless the operator's tfvars
+  # say. After the gate, which runs before anything leaves this machine.
+  emit_admin_cidrs_tfvars "$sdir"
 
   # Resolve the SSH identity BEFORE anything is provisioned. wait_for_cloud_init
   # is an SSH call, and without a key it burns its whole timeout, the harness

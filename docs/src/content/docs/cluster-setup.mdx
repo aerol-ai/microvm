@@ -350,7 +350,7 @@ This deletes every EC2 instance, VPC and S3 bucket in the cluster, and every run
 
 ## Good to know
 
-- **Lock down SSH and the API.** By default, `admin_allowed_cidrs` lets any address reach SSH (port 22) and the API (port 21212). Set it to your own IP ranges in `config/terraform.tfvars`.
+- **Lock down SSH and the API.** `admin_allowed_cidrs` is required: set it to your own IP ranges in `config/terraform.tfvars`. It decides who outside the VPC can reach SSH (port 22) and the API (port 21212). A world-open range (`0.0.0.0/0`) is refused unless you also set `allow_admin_from_anywhere = true`.
 - **Keep `config/secrets.yml` private.** It holds your cluster token and your Cloudflare token.
 - **Node names are limited.** Each name in `nodes` must start with a letter or number. It may use only letters, numbers, dots, underscores and hyphens, up to 128 characters.
 

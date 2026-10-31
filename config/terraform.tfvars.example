@@ -141,8 +141,11 @@ nodes = {
 
 # --- Optional hardening / extras --------------------------------------------
 
-# Restrict admin access (SSH 22 and operator API 21212) to specific CIDRs.
-# admin_allowed_cidrs = ["203.0.113.42/32"]
+# Required: who may reach SSH (22) and the operator API (21212) from outside
+# the VPC. Your office or VPN ranges; 0.0.0.0/0 is refused unless
+# allow_admin_from_anywhere = true. The integration harness fills in the
+# runner's own address when this is unset.
+admin_allowed_cidrs = ["203.0.113.42/32"]
 
 # Override the public TCP ports opened on ingress-bearing nodes.
 # public_http_ports = [80, 443]
