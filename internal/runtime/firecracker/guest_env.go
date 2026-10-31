@@ -45,10 +45,12 @@ const (
 	// is an in-memory map swap in the guest; the budget is for a host
 	// under load, not for the guest's work.
 	guestEnvTimeout = 5 * time.Second
-	// guestEnvAttempts caps how many times a push is sent when the vsock
-	// connection fails before an ack. Re-sending is safe because the
-	// agent replaces rather than merges: a push the guest applied but
-	// whose ack was lost converges to the same env on the next attempt.
+	// guestEnvAttempts caps how many times a push (set_env, and adopt in
+	// guest_identity.go) is sent when the vsock connection fails before an
+	// ack. Re-sending is safe because the agent applies both idempotently:
+	// it replaces the env rather than merging, and keeps the first token,
+	// so a push it applied but whose ack was lost converges on the next
+	// attempt.
 	guestEnvAttempts = 3
 	// guestEnvRetryDelay spaces those attempts.
 	guestEnvRetryDelay = 25 * time.Millisecond
@@ -94,24 +96,11 @@ func (d *Driver) deliverGuestEnv(ctx context.Context, socketPath string, guestCI
 	ctx, cancel := context.WithTimeout(ctx, guestEnvTimeout)
 	defer cancel()
 	payload := map[string]any{"env": env}
-	var err error
-	attempt := 0
-	for attempt < guestEnvAttempts {
-		attempt++
-		err = d.sendVsockOpAck(ctx, socketPath, guestCID, guestEnvOp, payload)
-		if err == nil {
-			d.logger.Info("firecracker: sandbox env delivered to guest",
-				"sandbox_id", sandboxID, "keys", len(env), "attempts", attempt)
-			return nil
-		}
-		var rejected *guestRejectedError
-		if errors.As(err, &rejected) || ctx.Err() != nil {
-			break
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(guestEnvRetryDelay):
-		}
+	attempt, err := d.sendVsockOpAckRetry(ctx, socketPath, guestCID, guestEnvOp, payload)
+	if err == nil {
+		d.logger.Info("firecracker: sandbox env delivered to guest",
+			"sandbox_id", sandboxID, "keys", len(env), "attempts", attempt)
+		return nil
 	}
 	var rejected *guestRejectedError
 	if errors.As(err, &rejected) && strings.Contains(rejected.msg, "unknown op") {
