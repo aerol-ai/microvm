@@ -148,7 +148,9 @@ func TestSetEgressFloorUsesTheCNISubnet(t *testing.T) {
 	if err := d.SetEgressFloor(context.Background(), []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
 		t.Fatal(err)
 	}
-	if len(be.rules) != 1 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") {
+	// The operator's range, and the CNI subnet to itself (sandboxes are
+	// isolated from each other by default).
+	if len(be.rules) != 2 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") || !strings.Contains(be.rules[1], "10.88.0.0/16|-d|10.88.0.0/16") {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
 	if err := New(Config{}, nil, nil).SetEgressFloor(context.Background(), nil); err != nil {

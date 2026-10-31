@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -147,7 +146,7 @@ func (s *server) handleDaytonaCodeRun(w http.ResponseWriter, r *http.Request) {
 	stderrStr := string(stderrBytes)
 	if waitErr != nil {
 		var exitErr *exec.ExitError
-		if !errors.As(waitErr, &exitErr) && !errors.Is(waitErr, syscall.ECHILD) {
+		if !errors.As(waitErr, &exitErr) && !reapedElsewhere(waitErr) {
 			stderrStr = strings.TrimSpace(stderrStr + "\n" + waitErr.Error())
 		}
 	}

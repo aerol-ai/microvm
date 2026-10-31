@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -55,7 +57,8 @@ func (f *fakeCapacityRuntime) Inspect(_ context.Context, ref string) (*models.Sa
 	if state, ok := f.inspect[ref]; ok {
 		return state, nil
 	}
-	return &models.SandboxRuntimeState{}, nil
+	// What a real driver answers for a container it has never heard of.
+	return nil, fmt.Errorf("container %s: %w", ref, runtime.ErrInstanceNotFound)
 }
 
 func (f *fakeCapacityRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {

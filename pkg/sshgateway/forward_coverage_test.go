@@ -23,7 +23,7 @@ func TestHandleRemoteSessionRequestBranches(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 
 	// Window-change before start updates the launch PTY snapshot.
@@ -61,7 +61,7 @@ func TestHandleRemoteSessionWindowChangeAndDrain(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "shell"}
 		time.Sleep(30 * time.Millisecond)
@@ -82,7 +82,7 @@ func TestHandleRemoteSessionWindowChangeAndDrain(t *testing.T) {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
-			g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+			g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 		}()
 		requests <- &ssh.Request{Type: "shell"}
 		time.Sleep(30 * time.Millisecond)
@@ -114,7 +114,7 @@ func TestHandleRemoteSessionEnvRequest(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "env", Payload: append(encodeString("LANG"), encodeString("C.UTF-8")...)}
 	requests <- &ssh.Request{Type: "shell"}
@@ -141,7 +141,7 @@ func TestHandleRemoteSessionDuplicateStart(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "shell"}
 	requests <- &ssh.Request{Type: "shell"}

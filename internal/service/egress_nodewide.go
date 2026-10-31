@@ -60,12 +60,24 @@ func (s *Service) nodeControlEndpoints() []netip.AddrPort {
 	return egress.SortedControl(out)
 }
 
-// controlPorts are this node's control listeners: API, SSH gateway, Raft,
-// gossip and the cluster mTLS listener.
+// hostServicePorts are services every node runs that no sandbox has any
+// business reaching: the operator's SSH and rpcbind (on by default on the
+// stock Ubuntu image).
+var hostServicePorts = []uint16{22, 111}
+
+// controlPorts are this node's control listeners (API, SSH gateway, Raft,
+// gossip, the cluster mTLS listener and, with ingress proxy routing, the
+// host-port redirect listener) and its host services.
 func (s *Service) controlPorts() []uint16 {
-	var out []uint16
+	out := append([]uint16(nil), hostServicePorts...)
 	if s.cfg.APIPort > 0 && s.cfg.APIPort < 65536 {
 		out = append(out, uint16(s.cfg.APIPort))
+	}
+	// The redirect listener takes raw-TCP host-port traffic the firewall
+	// steered to it; a sandbox has no business dialing it directly (found
+	// reachable on cluster-3-mixed-routing, UC-319).
+	if s.cfg.IngressProxyRouting && s.cfg.HostPortRedirectPort > 0 && s.cfg.HostPortRedirectPort < 65536 {
+		out = append(out, uint16(s.cfg.HostPortRedirectPort))
 	}
 	for _, addr := range []string{s.cfg.SSHListenAddr, s.cfg.RaftBindAddr, s.cfg.GossipBindAddr, s.cfg.ClusterInternalListenAddr} {
 		if _, p, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {
@@ -119,25 +131,19 @@ var localIPv4s = func() []netip.Addr {
 
 // syncNodeControl pushes the control endpoints when they changed (cluster
 // membership moves, or a gateway restart cleared the record). The guard is
-// part of the operator file (§5.10): without one, or with
-// node_control_port_guard: false, the list is empty, which clears anything
-// pushed earlier.
+// on without an operator file; only node_control_port_guard: false in one
+// turns it off, which clears anything pushed earlier.
 func (s *Service) syncNodeControl(ctx context.Context) {
 	if !s.egressEnabled() || !s.egressReady.Load() {
 		return
 	}
 	op := s.egressOperator()
 	var eps []netip.AddrPort
-	if op != nil && op.NodeControlPortGuard() {
+	if op.NodeControlPortGuard() {
 		eps = s.nodeControlEndpoints()
 	}
 	key := controlKey(eps)
 	if prev := s.egressControlPushed.Load(); prev != nil && *prev == key {
-		return
-	}
-	if op == nil && s.egressControlPushed.Load() == nil {
-		// Never pushed and no operator file: leave the gateway's set as the
-		// kernel has it (empty on a fresh table).
 		return
 	}
 	if err := s.egressGateway().SetNodeControl(ctx, eps); err != nil {

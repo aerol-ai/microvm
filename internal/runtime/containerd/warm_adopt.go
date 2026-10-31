@@ -158,6 +158,9 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 
 	delete(labels, poolParkLabelKey)
 	labels[sandboxIDLabelKey] = sandboxID
+	if ip := strings.TrimSpace(slot.ContainerIP); ip != "" {
+		labels[containerIPLabelKey] = ip
+	}
 	if _, err := container.SetLabels(ctx, labels); err != nil {
 		return nil, err
 	}

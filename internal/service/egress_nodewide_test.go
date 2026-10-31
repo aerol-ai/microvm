@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"net/netip"
+	"slices"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 )
 
 // floorRuntime is a container runtime that records the deny floor.
@@ -32,18 +34,25 @@ func TestOperatorFloorReachesTheHostFirewall(t *testing.T) {
 	fc := &floorRuntime{holdRuntime: &holdRuntime{recordingRuntime: &recordingRuntime{}}}
 	svc.SetFirecrackerRuntime(fc)
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\ndeny_cidrs: [10.20.0.0/16]\n"))
-	if len(rt.floor) != 1 || len(rt.floor[0]) != 1 || rt.floor[0][0] != netip.MustParsePrefix("10.20.0.0/16") {
-		t.Fatalf("floor = %v", rt.floor)
+	want := egresspolicy.WithMetadataFloor([]netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")})
+	if len(rt.floor) != 1 || !slices.Equal(rt.floor[0], want) {
+		t.Fatalf("floor = %v, want the file's deny_cidrs and the metadata endpoints", rt.floor)
 	}
-	if len(fc.floor) != 1 || len(fc.floor[0]) != 1 {
+	if len(fc.floor) != 1 || !slices.Equal(fc.floor[0], want) {
 		t.Fatalf("the Firecracker guests get the floor too: %v", fc.floor)
 	}
 	rt.err = errors.New("iptables gone")
 	svc.OnEgressOperatorChange(operatorWatcher(t, "version: 1\n").Current())
-	if len(rt.floor) != 2 || len(rt.floor[1]) != 0 {
-		t.Fatalf("a changed file replaces the floor: %v", rt.floor)
+	if len(rt.floor) != 2 || !slices.Equal(rt.floor[1], egresspolicy.MetadataPrefixes) {
+		t.Fatalf("a changed file replaces the floor, keeping the metadata endpoints: %v", rt.floor)
 	}
-	svc.applyEgressFloor(context.Background(), nil) // no file: nothing to do
+	// No file at all: the floor is the metadata endpoints alone, installed
+	// at boot (ApplyEgressFloor), so no node runs without it.
+	rt.err = nil
+	svc.ApplyEgressFloor(context.Background())
+	if last := rt.floor[len(rt.floor)-1]; !slices.Equal(last, egresspolicy.MetadataPrefixes) {
+		t.Fatalf("the floor with no operator file = %v", last)
+	}
 }
 
 type membersClient struct {
@@ -114,15 +123,18 @@ func TestSyncNodeControl(t *testing.T) {
 	if err := svc.EnsureEgressGatewayReady(ctx); err != nil {
 		t.Fatal(err)
 	}
+	// No operator file: the guard is on, over the API and the node's own
+	// SSH and rpcbind.
+	want := []netip.AddrPort{netip.MustParseAddrPort("172.17.0.1:22"), netip.MustParseAddrPort("172.17.0.1:111"), netip.MustParseAddrPort("172.17.0.1:21212")}
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 0 {
-		t.Fatal("no operator file: the guard is never pushed")
+	if gw.controlCalls != 1 || !slices.Equal(gw.control, want) {
+		t.Fatalf("no operator file: push = %d calls %v, want %v", gw.controlCalls, gw.control, want)
 	}
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\n"))
 	svc.syncNodeControl(ctx)
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 1 || len(gw.control) != 1 || gw.control[0] != netip.MustParseAddrPort("172.17.0.1:21212") {
-		t.Fatalf("push = %d calls %v", gw.controlCalls, gw.control)
+	if gw.controlCalls != 1 || !slices.Equal(gw.control, want) {
+		t.Fatalf("an unchanged list is not pushed again: %d calls %v", gw.controlCalls, gw.control)
 	}
 	if err := svc.ResyncEgressGateway(ctx); err != nil {
 		t.Fatal(err)
@@ -131,9 +143,17 @@ func TestSyncNodeControl(t *testing.T) {
 	if gw.controlCalls != 2 {
 		t.Fatal("a full sync must re-push the list to a restarted gateway")
 	}
+	// With ingress proxy routing on, the host-port redirect listener is a
+	// control port too: sandboxes reached it on cluster-3-mixed-routing.
+	svc.cfg.IngressProxyRouting, svc.cfg.HostPortRedirectPort = true, 21215
+	svc.syncNodeControl(ctx)
+	if !slices.Contains(gw.control, netip.MustParseAddrPort("172.17.0.1:21215")) {
+		t.Fatalf("redirect listener not guarded: %v", gw.control)
+	}
+	svc.cfg.IngressProxyRouting = false
 	svc.SetEgressOperator(operatorWatcher(t, "version: 1\nnode_control_port_guard: false\n"))
 	svc.syncNodeControl(ctx)
-	if gw.controlCalls != 3 || len(gw.control) != 0 {
+	if gw.controlCalls != 4 || len(gw.control) != 0 {
 		t.Fatalf("turning the guard off must clear it: %v", gw.control)
 	}
 }

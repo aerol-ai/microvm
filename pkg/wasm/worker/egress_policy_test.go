@@ -253,7 +253,9 @@ func TestInstallOperatorGuard(t *testing.T) {
 	}
 	t.Setenv("SB_EGRESS_OPERATOR_FILE", path)
 	installOperatorGuard(m)
-	if g := m.dialGuard(); g.Zone == nil || len(g.DenyFloor) != 1 || g.Strict {
+	// The file's deny_cidrs, plus the cloud metadata endpoints every floor
+	// carries.
+	if g := m.dialGuard(); g.Zone == nil || len(g.DenyFloor) != 1+len(egresspolicy.MetadataPrefixes) || g.DenyFloor[0].String() != "10.66.0.0/16" || g.Strict {
 		t.Fatalf("operator guard = %+v", g)
 	}
 	missing := filepath.Join(t.TempDir(), "missing.yaml")
@@ -265,7 +267,7 @@ func TestInstallOperatorGuard(t *testing.T) {
 	writeOperatorFile(t, missing, "version: 1\ndeny_cidrs: [10.66.0.0/16]\n")
 	waitFor(t, "the poll to install the file that appeared", func() bool {
 		g := m.dialGuard()
-		return !g.Strict && len(g.DenyFloor) == 1
+		return !g.Strict && len(g.DenyFloor) == 1+len(egresspolicy.MetadataPrefixes)
 	})
 	found := false
 	for _, kv := range workerEnvironment() {
@@ -873,7 +875,7 @@ func TestOperatorReloadReachesRunningWorker(t *testing.T) {
 	floorIs := func(cidr string) func() bool {
 		return func() bool {
 			g := m.dialGuard()
-			return len(g.DenyFloor) == 1 && g.DenyFloor[0].String() == cidr
+			return len(g.DenyFloor) == 1+len(egresspolicy.MetadataPrefixes) && g.DenyFloor[0].String() == cidr
 		}
 	}
 	writeOperatorFile(t, path, "version: 1\ndeny_cidrs: [127.0.0.0/8]\n")

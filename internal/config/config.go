@@ -145,6 +145,14 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the processes and threads of each container
+	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
+	// it one sandbox's fork bomb exhausts the node for every tenant.
+	SandboxPidsLimit int
+	// SandboxInterconnect lets sandboxes on one node connect to each other
+	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
+	// tenant's sandbox cannot reach another's listeners.
+	SandboxInterconnect bool
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -1890,6 +1898,8 @@ func load(keyTool bool) (Config, error) {
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
+		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -2568,6 +2578,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
+	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
@@ -2819,6 +2832,12 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxPidsLimit == 0 {
+			return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be above 0 when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxInterconnect {
+			return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
 		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")

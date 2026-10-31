@@ -67,7 +67,7 @@ func (m *Manager) ensureBridgeForwardAccept() error {
 		if exists {
 			continue
 		}
-		if err := m.ipt.Insert("filter", chain, 1, spec...); err != nil {
+		if err := m.ipt.Insert("filter", chain, m.topPos(), spec...); err != nil {
 			return fmt.Errorf("insert bridge forward accept: %w", err)
 		}
 	}
@@ -93,7 +93,16 @@ func (m *Manager) ReassertChain() error {
 	if err := boot.EnsureForwardJump(chain); err != nil {
 		return err
 	}
-	return m.ensureBridgeForwardAccept()
+	if err := m.ensureBridgeForwardAccept(); err != nil {
+		return err
+	}
+	// A flushed or reordered chain gets the floor's jump back on top.
+	if fb, ok := m.ipt.(floorBackend); ok && m.floorFirst.Load() {
+		if floor, _ := m.floorChain.Load().(string); floor != "" {
+			return fb.EnsureJumpChain(chain, floor)
+		}
+	}
+	return nil
 }
 
 // ResetChainLatch clears the bootstrap latch. Test-only seam.

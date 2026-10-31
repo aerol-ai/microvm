@@ -50,29 +50,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
   PR #522 design.
 
-## Reconcile still reaps a healthy sandbox on a transient Inspect error (UC-20 residual, unconfirmed)
-
-- **What:** decide whether `reconcileGoneContainerConfirmed`
-  (`internal/service/service.go:4800`) should reap only on a definite
-  not-found, rather than on any `Inspect` error.
-- **Why:** UC-20 (reconcile deleted a freshly created owned sandbox ~200ms
-  after create; a cross-node snapshot then 404'd) was fixed in PR #360
-  (`dd06a979`). Reconcile now re-Inspects a container missing from the bulk
-  `ListManaged` snapshot before reaping it. But the root cause in that commit
-  is containerd's `ListManaged` skipping a container whose `Inspect` errors
-  mid-adopt or mid-start. The re-check treats **any** `Inspect` error as
-  "gone" (`:4808-4811`), so the same transient error on the targeted call
-  still deletes the row and the cluster placement of a healthy sandbox.
-- **Caveat (why it is a TODO, not a bug):** unreproduced. Whether the
-  targeted `Inspect` can fail transiently in the same window is unknown.
-  Narrowing to not-found also has a cost: a container whose `Inspect` keeps
-  erroring would never be reaped. Get a reproduction first.
-- **Start:** `reconcileGoneContainerConfirmed`;
-  `TestReconcileReInspectsBeforeReap`
-  (`internal/service/reconcile_destroy_test.go:692`); the containerd
-  driver's `ListManaged` skip. UC-20 itself is implemented and not skipped
-  (`integration-tests/suite/lifecycle_more_test.go:176`).
-
 ## Destroy events WARN about an already-deleted placement (cluster)
 
 - **What:** stop `handle docker event failed … cluster: unknown sandbox

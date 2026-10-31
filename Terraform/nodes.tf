@@ -30,10 +30,14 @@ resource "aws_instance" "seed" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
@@ -271,10 +275,14 @@ resource "aws_instance" "joiner" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # See the seed resource for the rationale: zero blocks when spot=false keeps

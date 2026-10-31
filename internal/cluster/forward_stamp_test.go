@@ -286,3 +286,81 @@ func TestForwardHTTPStampsMCPSurface(t *testing.T) {
 		}
 	}
 }
+
+// TestStampForwardSSHGateway: a call the API edge found to be the SSH
+// gateway acting for a sandbox key holder (its context carries the
+// auditlog.SSHGatewayCall) is forwarded with X-Cluster-Ssh-Gateway, so the
+// owner records it as the key's and, on the session's first call, writes
+// the ssh record. Every other forward carries no marker, even one that
+// arrived with a stale or forged header: the marker follows the context the
+// edge built, never a header that came in with the request.
+func TestStampForwardSSHGateway(t *testing.T) {
+	cases := []struct {
+		name  string
+		call  *auditlog.SSHGatewayCall
+		stale string
+		want  string
+	}{
+		{name: "the session's first call", call: &auditlog.SSHGatewayCall{SandboxID: "sb-1", Open: true, Session: "default"}, want: "open=default&sandbox=sb-1"},
+		{name: "a one-shot exec opens with no session", call: &auditlog.SSHGatewayCall{SandboxID: "sb-1", Open: true}, want: "open=&sandbox=sb-1"},
+		{name: "a later call of the session", call: &auditlog.SSHGatewayCall{SandboxID: "sb-1"}, want: "sandbox=sb-1"},
+		{name: "a bridged call replaces a stale marker", call: &auditlog.SSHGatewayCall{SandboxID: "sb-1"}, stale: "sandbox=sb-9&open=x", want: "sandbox=sb-1"},
+		{name: "an ordinary call", want: ""},
+		{name: "an ordinary call drops a forged marker", stale: "sandbox=sb-1&open=default", want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			if tc.call != nil {
+				ctx = auditlog.ContextWithSSHGatewayCall(ctx, *tc.call)
+			}
+			out, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://peer/v1/sandboxes/sb-1/sessions", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.stale != "" {
+				out.Header.Set(HeaderSSHGateway, tc.stale)
+			}
+			StampForward(out, controlplane.OperatorAccess())
+			if got := out.Header.Values(HeaderSSHGateway); (tc.want == "" && len(got) != 0) || (tc.want != "" && (len(got) != 1 || got[0] != tc.want)) {
+				t.Fatalf("%s = %v, want %q", HeaderSSHGateway, got, tc.want)
+			}
+			if out.Header.Get(HeaderForwarded) != "1" {
+				t.Fatal("the marker never travels without the forwarded marker")
+			}
+		})
+	}
+}
+
+// TestForwardHTTPStampsSSHGateway drives the reverse-proxy Director over a
+// real node-bound mTLS hop with a bridged SSH call's context: the owner sees
+// the operator token, the forwarded marker and the session-open marker.
+func TestForwardHTTPStampsSSHGateway(t *testing.T) {
+	seen := make(chan http.Header, 1)
+	srv, client := newNodeBoundForwardServer(t, "edge-1", "owner-1", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	c := newForwardingCluster(t, client.Transport)
+	c.nodeID = "edge-1"
+
+	in := httptest.NewRequest(http.MethodPost, "/v1/sandboxes/sb-1/sessions", nil)
+	in.Header.Set("Authorization", "Bearer pat-token")
+	ctx := controlplane.ContextWithAccess(in.Context(), controlplane.OperatorAccess())
+	in = in.WithContext(auditlog.ContextWithSSHGatewayCall(ctx, auditlog.SSHGatewayCall{SandboxID: "sb-1", Open: true, Session: "default"}))
+
+	rr := httptest.NewRecorder()
+	c.ForwardHTTP(Endpoint{NodeID: "owner-1", InternalURL: srv.URL}, rr, in)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("forward status = %d body %s", rr.Code, rr.Body.String())
+	}
+	h := <-seen
+	for name, value := range map[string]string{"Authorization": "Bearer pat-token", HeaderForwarded: "1", HeaderSSHGateway: "open=default&sandbox=sb-1"} {
+		if got := h.Get(name); got != value {
+			t.Errorf("owner saw %s = %q, want %q", name, got, value)
+		}
+	}
+	if call, ok := auditlog.ParseSSHGatewayCall(h.Get(HeaderSSHGateway)); !ok || call != (auditlog.SSHGatewayCall{SandboxID: "sb-1", Open: true, Session: "default"}) {
+		t.Fatalf("owner parsed %+v ok=%v", call, ok)
+	}
+}

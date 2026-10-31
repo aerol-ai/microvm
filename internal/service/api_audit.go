@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/auditlog"
-	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // API action records (plans/identity-and-access.md §5.9). The API edge
@@ -213,14 +213,32 @@ func (s *Service) RecordAuthDenied(ctx context.Context, method, route, reason, s
 // not to a person, so the caller is the sandbox key; whoever created the
 // sandbox is found through its create record. session is the toolbox
 // session name it attached to ("" for a one-shot exec).
+//
+// The gateway calls it for a session on its own node. For a session it
+// bridged to another node the owner calls it, under the request that opened
+// the session there (pkg/api), and the caller names the gateway's node as
+// Via, the way a forwarded call's does.
 func (s *Service) RecordSSHSession(ctx context.Context, sandboxID, session string) {
 	if s == nil || s.apiRecordsMode() == config.AuditAPIRecordsOff || !s.auditCallerWritesAllowed() {
 		return
 	}
 	ev := s.apiEvent(ctx, APICall{Method: "SSH", Route: auditlog.RefSSH, SandboxID: sandboxID, Surface: auditlog.SurfaceSSH, Target: session})
 	ev.Ref = auditlog.RefSSH
-	ev.Caller = &auditlog.Caller{Kind: string(controlplane.PrincipalSandboxKey), ID: strings.TrimSpace(sandboxID)}
+	ev.Caller = sandboxKeyCaller(ctx, sandboxID)
 	s.emitAPIEvent(ev, false)
+}
+
+// SSHSessionsRecordedByOwner reports whether the SSH gateway may leave the
+// record of a session it bridges to another node to that node, the owner
+// (cluster.SSHSessionRecordGate). False on a single node, which bridges
+// nothing, and in cluster mode until every live member runs a build that
+// writes it; the gateway then records the session itself, as before.
+func (s *Service) SSHSessionsRecordedByOwner() bool {
+	if s == nil || !s.cfg.EnableCluster {
+		return false
+	}
+	gate, ok := s.Cluster().(cluster.SSHSessionRecordGate)
+	return ok && gate.SSHSessionOwnerRecordAllowed()
 }
 
 // System actions: destructive work the daemon does on its own. They used to
@@ -231,6 +249,7 @@ const (
 	systemActionAutoDelete  = "lifecycle.auto_delete"
 	systemActionReap        = "reconcile.reap"
 	systemActionOrphanReap  = "reconcile.orphan_delete"
+	systemActionMarkError   = "reconcile.mark_error"
 	systemActionMethod      = "SYSTEM"
 	auditSubsystemAuditMode = "audit"
 )

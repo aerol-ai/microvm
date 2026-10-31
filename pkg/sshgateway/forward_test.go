@@ -244,7 +244,7 @@ func TestHandleRemoteSession_Shell(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 
 	requests <- &ssh.Request{Type: "pty-req", Payload: bytes.Join([][]byte{
@@ -299,7 +299,7 @@ func TestHandleRemoteSession_Exec(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 	requests <- &ssh.Request{Type: "exec", Payload: encodeString("echo hi")}
 	close(requests)
@@ -348,7 +348,7 @@ func TestHandleRemoteSession_ClientClosesBeforeStart(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		g.handleRemoteSession(context.Background(), "sb-remote", "default", channel, requests)
+		g.handleRemoteSession(context.Background(), "sb-remote", "default", nil, channel, requests)
 	}()
 	close(requests)
 	select {
@@ -362,7 +362,7 @@ func TestHandleRemoteSession_ClientClosesBeforeStart(t *testing.T) {
 // own v1 sessions surface, carries the PAT, and converts http→ws.
 func TestRemoteSessionEndpoint(t *testing.T) {
 	g := &Gateway{remoteBaseURL: "http://127.0.0.1:8080", remotePAT: "pat"}
-	ep := g.remoteSessionEndpoint("sb-1", "fwd-123")
+	ep := g.remoteSessionEndpoint("sb-1", "fwd-123", nil)
 	if ep.baseURL != "http://127.0.0.1:8080/v1/sandboxes/sb-1/sessions" {
 		t.Fatalf("baseURL = %q", ep.baseURL)
 	}
