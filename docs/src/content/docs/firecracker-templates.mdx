@@ -315,7 +315,9 @@ The template must be `ready`, `ready_no_snapshot` or `unhealthy`. The last two s
 A rebuild makes a new snapshot from the disk the template already has. Rebuild when:
 
 - the snapshot is damaged and you want it fixed before the next create;
-- the server's kernel or toolbox (the helper program inside each sandbox) was upgraded. A rebuild picks up the change.
+- the server's kernel was upgraded. A rebuild picks up the change.
+
+A rebuild does not pick up a new toolbox (the helper program inside each sandbox). The toolbox is copied onto the template's disk when the template is created, and a rebuild reuses that disk. After a toolbox upgrade, delete the template and create it again.
 
 It is safe to call many times at once. Parallel calls for the same `ready` template start only one rebuild. The call returns the template with status `unhealthy`. Wait for it to become `ready` again.
 

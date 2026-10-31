@@ -144,6 +144,10 @@ sequenceDiagram
     end
     C->>G: vsock handshake (cid, :1024)
     C->>G: post_resume (clock, network, reseed)
+    opt the request has env
+        C->>G: set_env (the sandbox's variables)
+        G-->>C: ok, or the create fails and is undone
+    end
     G-->>C: ready
     C->>C: register handle, commit slot to sandbox
 ```
@@ -155,6 +159,7 @@ Details that bite if you skip them:
   The snapshot-load path sends no `machine-config` (`configureVMMForLoad` in `driver.go`). It sends `LoadSnapshot` with a network override that points the guest's network card at this sandbox's TAP. Then it sends `PatchDrive` for the rootfs and the overlay. Every other device comes back from the snapshot's state file.
 - **The overlay is sparse.** A requested overlay disk is created as a sparse file. So a 64 GiB overlay uses less than 1 MiB on disk until the guest writes to it.
 - **Snapshot clones resume with stale randomness and a stale clock.** Two clones of one snapshot would otherwise draw identical `getrandom` bytes, and see a time that jumped backwards. After the handshake, the driver sends a best-effort `post_resume` signal (if it fails, the create goes on). The agent sets the clock from the host (`wallclock_unix_ns`) and applies the `network` settings. It then forces a reseed with `RNDADDENTROPY` and `RNDRESEEDCRNG` (`OnPostResume` in `cmd/toolboxd/vsock.go`). Cold boots get the same message; there it mainly re-applies the static network address once the agent is running.
+- **The sandbox's variables arrive after the handshake.** Neither the root disk nor a template snapshot carries them, so the driver sends a `set_env` message over vsock on every create path that has `env` (`deliverGuestEnv` in `internal/runtime/firecracker/guest_env.go`). The agent replaces its in-memory copy with exactly that map, so a resend after a lost reply changes nothing (`cmd/toolboxd/sandboxenv`). Unlike `post_resume` it is not best-effort: if the agent never confirms, or is too old to know the message, the create fails and is undone. A create without `env` sends nothing.
 - **The vsock CID depends on the path.** On the snapshot and warm paths, the guest listens on the template's CID, which was baked into the snapshot at build time. It does not listen on the sandbox's slot CID, so the host dials the template CID for the handshake. AerolVM uses vsock because it survives snapshots; a TCP control channel over the TAP would break on resume.
 - **Snapshot and warm clones share guest memory copy-on-write.** `LoadSnapshot` maps the template's memory image with `MAP_PRIVATE`. On the first write to any page, the kernel's CoW handler gives that VM a private anonymous page and leaves the file untouched. The full memory model is in [How clones share memory](/firecracker-hydration/#how-clones-share-memory-copy-on-write).
 - **`track_dirty_pages` is a separate feature.** It *finds* changed pages for diff snapshots, and does not redirect writes. Turning it on costs a VM exit (a trip from the guest back to the host) on each first write to a page.
@@ -168,7 +173,8 @@ flowchart TB
     S3 --> S4["Bring up the host TAP<br/>and its firewall rules"]
     S4 --> S5["Start the VM process,<br/>then boot or resume the guest"]
     S5 --> S6["vsock handshake with the agent"]
-    S6 --> CHK{"Did every step work?"}
+    S6 --> S7["Send the sandbox's variables<br/>(only when it has env)"]
+    S7 --> CHK{"Did every step work?"}
     CHK -- "yes" --> OK["Done, the sandbox now owns<br/>the slot, the TAP and the VM"]
     CHK -- "no" --> U1["Remove the firewall rules<br/>and the host TAP"]
     U1 --> U2["Stop the VM process and delete<br/>its run folder and the files in it"]
@@ -176,7 +182,7 @@ flowchart TB
 ```
 
 - Undo runs in the reverse of the order things were taken, and only for steps that already happened.
-- A failed `post_resume` is not on this list. It only logs a warning, so it never triggers the undo.
+- A failed `post_resume` is not on this list. It only logs a warning, so it never triggers the undo. A failed `set_env` is on it: a sandbox that silently lacks its variables would look healthy but be wrong.
 
 ## Boot-time budget
 
