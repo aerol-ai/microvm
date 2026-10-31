@@ -219,8 +219,10 @@ func TestBankNoLateralMovement(t *testing.T) {
 
 // UC-319 — host services are unreachable from a default sandbox: every TCP
 // port the node listens on is probed from inside the sandbox on its
-// gateway, the node's private address and its public address. Only the
-// public web ports (80, 443: the same as from the internet) may answer.
+// gateway and the node's private address. Only the public web ports (80,
+// 443) and DNS may answer. The node's public address is left out: a
+// sandbox reaches it through NAT, as any internet client does, so what
+// answers there is the public attack surface (UC-328), not a sandbox hole.
 func TestBankHostServicesUnreachable(t *testing.T) {
 	harness.Require(t, sc, "UC-319")
 	targets := bankTargets(t)
@@ -242,7 +244,7 @@ func TestBankHostServicesUnreachable(t *testing.T) {
 		}
 		gw := bankGateway(t, sb)
 		addrs := []string{gw}
-		for _, a := range []string{node.PrivateIP, node.PublicIP} {
+		for _, a := range []string{node.PrivateIP} {
 			if a != "" && a != gw {
 				addrs = append(addrs, a)
 			}
@@ -277,7 +279,7 @@ func TestBankForkBombContained(t *testing.T) {
 		limit, _ := bankRun(t, sb, "cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo none", time.Minute)
 		const tries = 20000
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		res, err := sb.ExecCommand(ctx, fmt.Sprintf(`i=0; while [ $i -lt %d ]; do sleep 120 & [ $? -eq 0 ] || break; i=$((i+1)); done 2>/dev/null; echo spawned=$i`, tries))
+		res, err := sb.ExecCommand(ctx, fmt.Sprintf(`i=0; while [ $i -lt %d ]; do sleep 120 >/dev/null 2>&1 & [ $? -eq 0 ] || break; i=$((i+1)); done 2>/dev/null; echo spawned=$i`, tries))
 		cancel()
 		spawned := -1
 		if m := regexp.MustCompile(`spawned=(\d+)`).FindStringSubmatch(res.Stdout); m != nil {
@@ -460,8 +462,10 @@ func TestBankPrivilegeBoundary(t *testing.T) {
 			{"echo 1 > /proc/sys/kernel/sysrq", "write a kernel sysctl"},
 			{"echo h > /proc/sysrq-trigger", "trigger sysrq"},
 			{"touch /sys/kernel/aerol-probe", "write to /sys"},
-			{"head -c 16 /proc/kcore >/dev/null", "read kernel memory (/proc/kcore)"},
-			{"head -c 16 /dev/mem >/dev/null", "read physical memory (/dev/mem)"},
+			// runc masks these with /dev/null: a read that returns no
+			// bytes is the mask, not access.
+			{"[ $(head -c 16 /proc/kcore 2>/dev/null | wc -c) -gt 0 ]", "read kernel memory (/proc/kcore)"},
+			{"[ $(head -c 16 /dev/mem 2>/dev/null | wc -c) -gt 0 ]", "read physical memory (/dev/mem)"},
 			{"dmesg >/dev/null", "read the kernel log"},
 			{"modprobe dummy", "load kernel modules"},
 		} {
@@ -537,7 +541,7 @@ func TestBankProcessIsolation(t *testing.T) {
 	harness.Require(t, sc, "UC-327")
 	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
 		other := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
-		bankRun(t, other, "(sleep 600 &) ; echo started", time.Minute)
+		bankRun(t, other, "(sleep 600 >/dev/null 2>&1 &) ; echo started", time.Minute)
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		out, _ := bankRun(t, sb, "ps -o comm 2>/dev/null || ps", time.Minute)
 		for _, daemon := range []string{"sandboxd", "containerd", "dockerd", "caddy", "sshd", "egress-gateway", "systemd-journal", "firecracker"} {
