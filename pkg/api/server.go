@@ -15,6 +15,7 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -73,6 +74,12 @@ type Server struct {
 	// authDenied rate-limits auth_denied records to one per source address
 	// per minute (auth_denied.go).
 	authDenied *authDeniedLimiter
+	// The background work StartBackground runs and StopBackground ends
+	// (auth_denied.go): bgStop and bgDone are nil until it starts.
+	bgMu      sync.Mutex
+	bgStop    chan struct{}
+	bgDone    chan struct{}
+	bgStopped bool
 
 	// Facade config, read once from config.Config (not per request in the
 	// facades). Each facade parses its own format.
