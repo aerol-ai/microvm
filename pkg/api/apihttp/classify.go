@@ -136,6 +136,9 @@ func Classify(err error) Classification {
 	// Egress sentinels (plans/egress-domain-filtering.md).
 	case errors.Is(err, service.ErrEgressOperatorConfigInvalid):
 		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeEgressOperatorConfigInvalid, Message: err.Error()}
+	case errors.Is(err, service.ErrNodeGuardNotReady):
+		// The cause (an iptables error) is for the node's log, not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeNodeGuardNotReady, Message: service.ErrNodeGuardNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressGatewayUnavailable, Message: err.Error()}
 	case errors.Is(err, service.ErrEgressSpecCommitFailed):

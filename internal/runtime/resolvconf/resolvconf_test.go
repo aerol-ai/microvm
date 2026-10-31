@@ -88,3 +88,18 @@ func TestIsLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestNameservers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	body := "# c\nnameserver 127.0.0.53\nnameserver 10.0.1.5\nnameserver ::ffff:10.0.0.2\nnameserver bogus\nnameserver\nsearch x\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := Nameservers(path)
+	if len(got) != 2 || got[0].String() != "10.0.1.5" || got[1].String() != "10.0.0.2" {
+		t.Fatalf("Nameservers = %v", got)
+	}
+	if Nameservers(filepath.Join(t.TempDir(), "missing")) != nil {
+		t.Fatal("a missing file lists none")
+	}
+}
