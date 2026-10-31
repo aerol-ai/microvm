@@ -1319,9 +1319,17 @@ about 50 s at boot never came back. The healthcheck now starts a failed unit
 again every 30 s (see the correction under "Failure rule"), and UC-301 takes
 that path on purpose.
 
-Deviations: "restore onto a fresh node" restores onto the same machine
-after wiping everything the backup covers (the suite cannot add a node);
-"a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
+Restore onto a fresh machine (UC-316, `fix/restore-fresh-machine`): the
+single node's root volume is replaced from its launch image, so cloud-init
+installs AerolVM afresh with a key of its own; a backup taken before is
+restored and the node boots through AWS KMS with the backup's key, on the
+backup's database (its boot reaps the sandbox whose container went with the
+old disk, as the runbook expects), with no decrypt error; pass. Writing it
+found that `sandboxd-restore.sh` extracted over a fresh install's
+`state.db-wal` and Raft log; it now moves them aside first. UC-314 keeps the
+same-machine wipe on the cluster.
+
+Deviations: "a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
 SSH-session half of the full stop and the alert itself stay unit-tested
 (the alert's condition, `aerolvm_key_revoked == 1`, is asserted live).
 
