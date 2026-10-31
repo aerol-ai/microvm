@@ -485,20 +485,33 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 	stages := s.newAttachStages(ctx, span)
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
+	attached, held, err := s.attachGateway(ctx, sb, stages)
+	if err != nil || !attached {
+		return err
+	}
+	return s.liftDriverBlock(ctx, sb, cr, held, stages)
+}
+
+// attachGateway is the gateway half of an attach: the spec, the bootstrap
+// latch and the Attach itself. attached is false (with no error) for a
+// sandbox that isn't in gateway mode; held reports the hold the spec was
+// built with. Nothing here touches the host firewall, so the sandbox stays
+// behind the driver's block-all whatever happens.
+func (s *Service) attachGateway(ctx context.Context, sb *models.Sandbox, stages *attachStages) (attached, held bool, err error) {
 	// A held sandbox attaches shut, whatever the hold's class: only the
 	// release that resolves it lifts the gateway's block. An unreadable
 	// record counts as held.
-	held, _ := s.egressHeld(ctx, sb)
+	held, _ = s.egressHeld(ctx, sb)
 	spec, ok := s.egressSpecFor(sb, held)
 	if !ok {
-		return nil
+		return false, held, nil
 	}
 	spec.Secrets = s.egressSecrets(ctx, sb)
 	spec.Pid = s.egressPid(ctx, sb)
 	stages.mark(attachStageLookup)
 	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
 		s.egressStats.recordAttachFailed()
-		return err
+		return false, held, err
 	}
 	s.kickEgressSelfTest()
 	stages.mark(attachStageReady)
@@ -515,8 +528,15 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
 			s.egressReady.Store(false)
 		}
-		return err
+		return false, held, err
 	}
+	return true, held, nil
+}
+
+// liftDriverBlock is the host-firewall half of an attach, run once the
+// gateway enforces for sb's address: the gateway-hold release and the lift
+// of the driver's block-all.
+func (s *Service) liftDriverBlock(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, held bool, stages *attachStages) error {
 	// Only a hold seen above can need lifting. One recorded since is left
 	// in place, which is fail-closed and is what its own retry lifts
 	// (retryEgressHolds re-attaches held sandboxes); a create therefore

@@ -395,6 +395,11 @@ type Service struct {
 	// show yet into it (review finding 1).
 	egressSyncMu   sync.RWMutex
 	egressInflight egressInflight
+	// egressCreateHolds counts the creates holding an early gateway attach
+	// per sandbox, and egressCreateLocks orders an undo's check-and-detach
+	// against a duplicate create's attach (egress_early.go).
+	egressCreateHolds egressCreateHolds
+	egressCreateLocks egressPolicyLocks
 	// egressHoldLocks serializes each sandbox's hold record with the
 	// enforcement derived from it (egress_blocks.go).
 	egressHoldLocks egressPolicyLocks
@@ -1436,7 +1441,9 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 		return err
 	}
 	if !runtimeAlreadyGone {
-		if err := rt.Destroy(ctx, sandbox); err != nil {
+		// The gateway lets go once the workload is gone and before the
+		// runtime frees the address (gatewayReleaser).
+		if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 			// With the row gone, the ordinary orphan-runtime sweep owns retries and
 			// cannot mistake this for a lifecycle-wide delete.
 			return err
@@ -2239,6 +2246,21 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	// early is the gateway attach this create starts as soon as the runtime
+	// reports the sandbox's address, so it overlaps the runtime create
+	// (egress_early.go). Per-binary rules keep the late attach: the gateway
+	// traces them from the container's init pid, which only the started
+	// container has.
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(ociRt); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, models.Sandbox{ID: sandboxID, Runtime: chosenRuntime, Engine: chosenEngine,
+				NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
+				NetworkEgressRules: req.NetworkEgressRules, Env: req.Env})
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
 	rollbackDestroy := func(partial *models.Sandbox) {
 		if partial == nil {
 			return
@@ -2247,9 +2269,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		partial.Runtime = chosenRuntime
 		partial.Engine = chosenEngine
 		// Destroy first: a container that outlives a failed rollback stays
-		// filtered (attached, or still behind the driver's block-all).
-		destroyErr := ociRt.Destroy(rollback.Context(), partial)
-		if gatewayMode && destroyErr == nil {
+		// filtered (attached, or still behind the driver's block-all). The
+		// runtime tells the observer once the workload is gone and before
+		// its address is free, so the gateway lets go first: an early attach
+		// undoes itself (unless a duplicate create holds it), any other
+		// attach detaches.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), partial, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		destroyErr := ociRt.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && destroyErr != nil:
+			// It may still run: it keeps the attach, and the orphan sweep's
+			// removal detaches it.
+			early.commit()
+		case reported:
+			early.undo()
+		case destroyErr == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, partial.ContainerIP)
 		}
 	}
@@ -2259,9 +2298,17 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes: once the row is stored with the attach joined it owns the
+	// attach; any other exit undoes it (a no-op once a rollback has).
+	egressCommitted := false
+	defer func() { early.end(egressCommitted) }()
 	clearGen := s.egressClears.now()
-	state, err := ociRt.Create(ctx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
+	state, err := ociRt.Create(createCtx, driverReq, sandboxID, toolboxToken, append(binds, inspectBinds...))
 	if err != nil {
+		// A driver that reported the address and failed let it go through
+		// ReleasingAddress; this covers one that didn't.
+		early.undo()
 		cleanupMounts()
 		if resp, dupErr := s.handleDuplicateCreateAfterRuntime(ctx, sandboxID, err); dupErr == nil {
 			return resp, nil
@@ -2279,17 +2326,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode,
 			NetworkEgressRules: req.NetworkEgressRules, Env: req.Env}
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			var err error
-			if !ok {
-				err = ErrEgressGatewayRequired
-			} else {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, attachSB, cr, ok, egressDone)
 	}
 
 	// Seal the registry creds (if any) BEFORE building the row so a marshal
@@ -2484,6 +2521,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		}
 	}
 	platformVolumesCommitted = true
+	egressCommitted = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 	stored, err := s.store.Get(ctx, sandbox.ID)
@@ -2622,12 +2660,31 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// TAP slot allocation, host TAP creation, rootfs build, VMM spawn,
 	// REST orchestration, and the vsock handshake. On error, the
 	// driver releases everything it acquired before returning.
+	//
+	// The gateway attach starts as soon as the driver has the guest's TAP
+	// slot shut and reports its address, so it overlaps the boot
+	// (egress_early.go); a warm-pool hit reports nothing and attaches late.
+	gwSB := models.Sandbox{ID: sandboxID, Runtime: req.Runtime,
+		NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+	var early *earlyEgressAttach
+	createCtx := ctx
+	if gatewayMode && !hasBinariesRule(req.NetworkEgressRules) {
+		if cr, ok := runtime.AsContainerRuntime(s.firecracker); ok {
+			early = s.newEarlyEgressAttach(ctx, cr, gwSB)
+			createCtx = runtime.WithAddressObserver(ctx, early)
+		}
+	}
+	committed := false
 	// The runtime instance exists before the row: reconcile's orphan sweep
 	// must not take it for a leak until this create has returned.
 	defer s.createsInFlight.begin(sandboxID)()
+	// Settles the early attach on every exit, before the in-flight mark
+	// goes (see the container path).
+	defer func() { early.end(committed) }()
 	clearGen := s.egressClears.now()
-	state, err := s.firecracker.Create(ctx, driverReq, sandboxID, toolboxToken, nil)
+	state, err := s.firecracker.Create(createCtx, driverReq, sandboxID, toolboxToken, nil)
 	if err != nil {
+		early.undo()
 		// Phase 6 PR-A: cold-load corruption intercept. The driver's
 		// configureVMMForLoad path verifies the snapshot checksum and
 		// returns ErrSnapshotCorrupt-wrapping errors on mismatch; surface
@@ -2648,32 +2705,40 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		if egressDone == nil {
 			return nil
 		}
+		joinStart := time.Now()
 		err := <-egressDone
 		egressDone = nil
+		createtiming.From(ctx).RecordStage("svc_egress_join", time.Since(joinStart))
 		return err
 	}
+	gwSB.ContainerIP = state.ContainerIP
 	destroyVM := func(partial *models.Sandbox) {
 		_ = waitEgress()
 		// As on the docker path: a VM that outlives a failed rollback stays
-		// filtered.
-		if err := s.firecracker.Destroy(rollback.Context(), partial); err == nil && gatewayMode {
+		// filtered, and the gateway lets go once the VM is down and before
+		// the TAP slot is free.
+		_, reported := early.reported()
+		destroyCtx := s.gatewayReleaserCtx(rollback.Context(), &gwSB, false)
+		if reported {
+			destroyCtx = runtime.WithAddressObserver(rollback.Context(), early)
+		}
+		err := s.firecracker.Destroy(destroyCtx, partial)
+		switch {
+		case !gatewayMode:
+		case reported && err != nil:
+			early.commit()
+		case reported:
+			early.undo()
+		case err == nil:
 			s.detachSandboxEgress(rollback.Context(), partial, state.ContainerIP)
 		}
 	}
 	if gatewayMode {
 		cr, ok := runtime.AsContainerRuntime(s.firecracker)
-		attachSB := &models.Sandbox{ID: state.SandboxID, ContainerIP: state.ContainerIP, Runtime: req.Runtime,
-			NetworkAllowOut: req.NetworkAllowOut, NetworkDenyOut: req.NetworkDenyOut, NetworkEgressMode: req.NetworkEgressMode}
+		attachSB := gwSB
+		attachSB.ID = state.SandboxID
 		egressDone = make(chan error, 1)
-		go func() {
-			attachStart := time.Now()
-			err := ErrEgressGatewayRequired
-			if ok {
-				err = s.attachSandboxEgress(ctx, attachSB, cr)
-			}
-			createtiming.From(ctx).RecordStage("svc_egress_attach", time.Since(attachStart))
-			egressDone <- err
-		}()
+		s.startCreateAttach(ctx, early, &attachSB, cr, ok, egressDone)
 	}
 
 	sealedRegistry, err := s.sealRegistry(req.Registry)
@@ -2783,6 +2848,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 			return nil, fmt.Errorf("%w: %v", ErrEgressGatewayUnavailable, err)
 		}
 	}
+	committed = true
 	s.settleEgressAttach(sandbox.ID)
 	s.settleEnforcedEgress(ctx, sandbox, clearGen)
 
@@ -3489,12 +3555,16 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	// Leave the egress gateway only once the runtime is gone: a destroy that
-	// fails leaves the sandbox running, and still filtered, for the retry
-	// (review finding 3). The gateway's IP ownership check makes the late
-	// detach harmless if the IP was reused meanwhile (D5), and a new owner's
-	// Attach purges the old entry itself.
-	if err := rt.Destroy(ctx, sandbox); err != nil {
+	// Leave the egress gateway only once the workload is gone: a destroy
+	// that fails leaves the sandbox running, and still filtered, for the
+	// retry (review finding 3). And leave it before the address is free:
+	// the runtime calls the releaser between the two (containerd, a pause
+	// netns, Firecracker), so no other sandbox ever meets this one's
+	// gateway state. A runtime whose address goes with the container
+	// (Docker's IPAM) can't, and the teardown below detaches right after;
+	// there the gateway's IP ownership check (D5) and a new gateway-mode
+	// owner's own Attach purge cover the reuse.
+	if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 		return err
 	}
 	// Everything the installed record names goes: a transition that didn't
@@ -5842,7 +5912,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				if err := rt.Destroy(ctx, sandbox); err != nil {
+				if err := rt.Destroy(s.gatewayReleaserCtx(ctx, sandbox, false), sandbox); err != nil {
 					return err
 				}
 			}
@@ -6115,7 +6185,11 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				Runtime:     runtimeName,
 				Engine:      engine,
 			}
-			err := rt.Destroy(ctx, stub)
+			// An orphan may be a create that died after an early gateway
+			// attach (egress_early.go); its stub carries no policy, so the
+			// releaser detaches whatever the gateway holds for it before the
+			// runtime frees the address (a no-op when it holds nothing).
+			err := rt.Destroy(s.gatewayReleaserCtx(ctx, stub, true), stub)
 			orphanDone(err)
 			if err != nil {
 				s.logger.Warn("orphan runtime removal failed",
