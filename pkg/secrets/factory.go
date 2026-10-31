@@ -89,6 +89,43 @@ func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, erro
 	default:
 		return nil, fmt.Errorf("SB_SECRET_PROVIDER must be %q, %q, %q or %q (got %q)", ProviderLocal, ProviderAWSKMS, ProviderVault, ProviderPKCS11, opts.Name)
 	}
+	openers, err := keyStoreOpeners(ctx, opts, name)
+	if err != nil {
+		return nil, err
+	}
+	seal := opts.Wrapper
+	if seal == nil {
+		seal = openers[name]
+	}
+	if seal == nil {
+		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s: the PKCS#11 helper is not running", name)
+	}
+	if err := checkVaultPolicy(ctx, seal); err != nil {
+		return nil, err
+	}
+	return routedWrapper(opts, name, seal, openers), nil
+}
+
+// NewOpenWrapper builds the key-store client of a node that still seals with
+// the server key but already holds a key store's settings: step 1 of the
+// two-step switch (§12, eng D8). It opens the rows that switched nodes seal
+// and never seals; it is nil when the node holds no key-store settings.
+func NewOpenWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, error) {
+	openers, err := keyStoreOpeners(ctx, opts, ProviderLocal)
+	if err != nil || len(openers) == 0 {
+		return nil, err
+	}
+	// The token that opens now seals after step 2: refuse a bad one now.
+	if err := checkVaultPolicy(ctx, openers[ProviderVault]); err != nil {
+		return nil, err
+	}
+	return routedWrapper(opts, ProviderLocal, nil, openers), nil
+}
+
+// keyStoreOpeners builds a client for every key store the node has settings
+// for. The sealing provider's own client is left out when opts.Wrapper
+// replaces it.
+func keyStoreOpeners(ctx context.Context, opts ProviderOptions, name string) (map[string]DataKeyWrapper, error) {
 	openers := map[string]DataKeyWrapper{}
 	if name == ProviderAWSKMS || strings.TrimSpace(opts.AWSKMSKeyID) != "" {
 		if name != ProviderAWSKMS || opts.Wrapper == nil {
@@ -111,32 +148,34 @@ func NewWrapper(ctx context.Context, opts ProviderOptions) (DataKeyWrapper, erro
 	if opts.PKCS11 != nil {
 		openers[ProviderPKCS11] = opts.PKCS11
 	}
-	seal := opts.Wrapper
-	if seal == nil {
-		seal = openers[name]
+	return openers, nil
+}
+
+// checkVaultPolicy refuses a Vault token that may create keys: it would
+// undo a revoke, so it stops the boot whatever SB_SECRET_PROVIDER_STRICT_BOOT
+// says. A Vault that is down here is the canary's to report; the check runs
+// again before the first encrypt.
+func checkVaultPolicy(ctx context.Context, w DataKeyWrapper) error {
+	v, ok := w.(*Vault)
+	if !ok {
+		return nil
 	}
-	if seal == nil {
-		return nil, fmt.Errorf("SB_SECRET_PROVIDER=%s: the PKCS#11 helper is not running", name)
+	pctx, cancel := context.WithTimeout(ContextWithBackgroundPurpose(ctx, "boot"), vaultPolicyCheckTimeout)
+	defer cancel()
+	if err := v.ensurePolicy(pctx); IsVaultPolicyError(err) {
+		return err
 	}
-	if v, ok := seal.(*Vault); ok {
-		// A token that may create keys would undo a revoke, so it stops the
-		// boot whatever SB_SECRET_PROVIDER_STRICT_BOOT says. A Vault that is
-		// down here is the canary's to report; the check runs again before
-		// the first encrypt.
-		pctx, cancel := context.WithTimeout(ContextWithBackgroundPurpose(ctx, "boot"), vaultPolicyCheckTimeout)
-		err := v.ensurePolicy(pctx)
-		cancel()
-		if IsVaultPolicyError(err) {
-			return nil, err
-		}
-	}
+	return nil
+}
+
+func routedWrapper(opts ProviderOptions, name string, seal DataKeyWrapper, openers map[string]DataKeyWrapper) DataKeyWrapper {
 	maxInFlight := opts.MaxInFlight
 	if maxInFlight <= 0 {
 		maxInFlight = DefaultMaxInFlight
 	}
 	r := NewRouter(name, seal, openers)
 	r.observe = opts.Calls
-	return NewLimitedWrapper(r, maxInFlight, opts.Observer), nil
+	return NewLimitedWrapper(r, maxInFlight, opts.Observer)
 }
 
 // NewProvider builds the configured Provider. For an external provider it
@@ -150,7 +189,13 @@ func NewProvider(ctx context.Context, opts ProviderOptions) (Provider, DataKeyWr
 		if opts.Cipher == nil {
 			return nil, nil, fmt.Errorf("cluster secrets cipher is not configured")
 		}
-		return NewLocalProvider(opts.Cipher, opts.Store), nil, nil
+		p := NewLocalProvider(opts.Cipher, opts.Store)
+		if opts.Prebuilt != nil {
+			// The node holds a key store's settings (NewOpenWrapper): it
+			// opens rows the way a switched node does, local rows included.
+			p.keyStore = &KMSProvider{wrapper: opts.Prebuilt, store: opts.Store, local: opts.Cipher}
+		}
+		return p, nil, nil
 	}
 	w := opts.Prebuilt
 	if w == nil {

@@ -784,10 +784,20 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
 	ctx = bootContext(ctx)
 	wrapper := s.keyStoreWrapper
-	if wrapper == nil && secrets.IsExternalProvider(name) {
+	switch {
+	case wrapper != nil:
+	case secrets.IsExternalProvider(name):
 		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
 		opts.Wrapper = s.secretWrapBackend
 		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
+	default:
+		// Still sealing local, maybe with a key store's settings already
+		// added: step 1 of the two-step switch (§12, eng D8).
+		w, err := secrets.NewOpenWrapper(ctx, KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper))
 		if err != nil {
 			return err
 		}
