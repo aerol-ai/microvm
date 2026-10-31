@@ -68,6 +68,8 @@ A SIEM (security information and event management system) is where many companie
 
 No record holds a secret's value or the content of traffic. Commands are recorded only as a fingerprint (`digest`), because commands can carry secrets. An operator who sets `SB_AUDIT_EXEC_COMMAND=full` also records each command's arguments, never its environment.
 
+An SSH session is recorded on the server that runs the sandbox, so it shows up in the sandbox's audit whichever server took the connection. Its caller is the sandbox's key (`sandbox_key`). On a cluster, `via` names the server whose SSH port took the connection. The calls that server makes to carry the session are recorded with the same caller and surface `ssh`, never as the operator's. During a rolling upgrade, until every server runs the new release, the session record stays on the server that took the connection.
+
 The hash covers `caller` and `request`, so changing who did something breaks the chain too. Records from before the release that added callers have neither field, and still verify.
 
 Each record is linked to the one before it by its fingerprint:
