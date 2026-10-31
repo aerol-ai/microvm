@@ -285,6 +285,12 @@ func (d *Driver) tryAcquireWarm(
 			"tap", tapSlot.TapName)
 	}
 	cancel()
+	// The sandbox env, as on the cold path: the warm slot was loaded from a
+	// template snapshot before this sandbox existed. A failure releases the
+	// slot and shuts the VMM down through the deferred rollback above.
+	if err := d.deliverGuestEnv(ctx, vsockPath, slot.VsockCID, sandboxID, req.Env); err != nil {
+		return nil, false, err
+	}
 	d.scheduleToolboxTCPProbe("warm_acquire", sandboxID, tapSlot, true)
 
 	// Register the warm handle + client into the driver's map so

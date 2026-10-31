@@ -455,6 +455,8 @@ func methodNotImplemented(method string) error {
 // 6 HTTP-over-UDS calls, and 1 Firecracker vsock proxy dial. The OCI pipeline
 // is the only stage with multi-second worst-case latency; per the plan, Phase
 // 2 caches the rootfs and skips this stage when a template hit lands.
+// A request with an env adds one more vsock round trip (set_env, recorded
+// as the fc_env stage) on every path; an env-less request adds nothing.
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	// All seams are required for a real Create. Distinct error messages
 	// per missing seam so the operator can localize the wiring bug from
@@ -520,6 +522,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if req.OverlaySizeGB > 0 && !d.cfg.OverlayEnabled {
 		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
+	}
+	// The env is delivered to the guest after boot (deliverGuestEnv); an
+	// env the guest agent would refuse fails here, before a VM exists.
+	if err := validateGuestEnv(req.Env); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: %w", err)
 	}
 
 	// Step 1: Phase 4 warm-VMM pool fast path. Resolve the template
@@ -890,6 +897,13 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			"guest_ip", slot.GuestIP,
 			"gateway_ip", slot.HostIP,
 			"tap", slot.TapName)
+	}
+	// Step 8c: the sandbox env. Neither the rootfs nor a template snapshot
+	// carries it, so the agent gets it now, before Create returns and any
+	// exec can reach the guest. Mandatory when the request has an env: a
+	// failure unwinds the VM through the deferred cleanups above.
+	if err := d.deliverGuestEnv(ctx, vsockPath, handshakeCID, allocID, req.Env); err != nil {
+		return nil, err
 	}
 	d.scheduleToolboxTCPProbe("create", allocID, slot, snapshotLoadPath)
 
