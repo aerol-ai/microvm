@@ -64,6 +64,9 @@ func newEgressSandbox(t *testing.T, c *harness.Client, allow, deny []string) *mi
 // else is dropped.
 func TestEgressAllowCIDR(t *testing.T) {
 	harness.Require(t, sc, "UC-179")
+	if refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{"1.1.1.0/24"}}) {
+		return
+	}
 	c := client(t)
 	sb := newEgressSandbox(t, c, []string{"1.1.1.0/24"}, nil)
 	if !tcpProbe(t, sb, "1.1.1.1", 443) {

@@ -83,6 +83,11 @@ const (
 	// scenario configured S3 or NFS. Where the feature is off, the UCs skip
 	// (not-applicable) rather than fail against a 412.
 	CapPlatformVolumes Capability = "platform-volumes"
+	// CapNoHostFirewall marks a deployment with no host firewall (local
+	// mode: SB_ENABLE_NETWORK_RULES=false). A container sandbox there is
+	// refused network policy (501 network_policy_unenforced) rather than
+	// given policy it cannot enforce, so the egress cases assert that refusal.
+	CapNoHostFirewall Capability = "no-host-firewall"
 	// CapBenchmark gates the create-benchmark UCs (UC-94/UC-95). It is
 	// deliberately separate from the runtime capabilities: the benchmark is
 	// slow and provisions many sandboxes (the density probe runs until the
@@ -279,7 +284,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapDocker: true, CapFirecracker: true, CapGvisor: true, CapWasm: true,
 	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true, CapIngressProxyRouting: true,
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
-	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true,
+	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,

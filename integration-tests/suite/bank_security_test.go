@@ -201,6 +201,9 @@ func TestBankCloudMetadataUnreachable(t *testing.T) {
 // bridge, with both on default (open) egress.
 func TestBankNoLateralMovement(t *testing.T) {
 	harness.Require(t, sc, "UC-318")
+	if sc.Has(harness.CapNoHostFirewall) {
+		t.Skip("no host firewall on this deployment (local mode): sandboxes on it are not isolated from each other; local mode is for development, not for tenants")
+	}
 	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
 		b := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		if out, rc := bankRun(t, b, "nohup sh -c 'while true; do echo victim | nc -l -p 8080; done' >/dev/null 2>&1 & sleep 1; nc -z -w 2 127.0.0.1 8080; echo rc=$?", time.Minute); rc != 0 || !strings.Contains(out, "rc=0") {
@@ -968,6 +971,9 @@ echo journal=$j procs=$p varlog=$l'`, since)
 func TestBankBlockAllNoExfiltration(t *testing.T) {
 	harness.Require(t, sc, "UC-332")
 	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		if !rt.vm && refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkBlockAll: true, Runtime: rt.runtime, Image: bankImage(rt)}) {
+			return
+		}
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{NetworkBlockAll: true})
 		label := "exfil-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 		for _, probe := range []struct{ cmd, what string }{
