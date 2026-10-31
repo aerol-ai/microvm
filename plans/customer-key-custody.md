@@ -1419,11 +1419,14 @@ Decisions made while building it:
   while key 0 is live, and boot warns when it is still there after key 0 is
   retired. The cluster shared-key check accepts the ring file. Backups carry
   it; `cluster-join.sh` installs one found in the cred bundle.
-- **Lost updates.** A whole-row sandbox write carries a registry blob read
-  earlier; during a rotation the store moves it onto the current key before
-  writing, so a write that raced the reseal pass cannot put the old key's
-  bytes back. The daemon's rewrap and `sandboxd key rotate` both edit the
-  server-key file; each writes only if the file is unchanged since its read
+- **Lost updates.** A whole-row sandbox write (reconcile, a status change)
+  is a snapshot read earlier, and its sealed values may predate the reseal
+  pass and a retirement since. So it keeps the sealed values the row has:
+  only Create, the reseal pass and a write with a new plaintext toolbox
+  token change one, and a raced write cannot put back bytes nothing opens.
+  The daemon's rewrap and `sandboxd key` both edit the server-key and ring
+  files; each holds a lock on the file across its read, compare and write,
+  and writes only if the file is unchanged since its read
   (`ErrKeyFileChanged`).
 - **Counting.** A value that lost its compare-and-swap is counted under the
   key it was read on until the next pass looks again, so the rows gauge

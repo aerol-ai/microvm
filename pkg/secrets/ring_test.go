@@ -59,8 +59,8 @@ func TestCipherRingDualRead(t *testing.T) {
 	randReader = &fixedNonceReader{b: []byte{keyIDMarker, 0, 0, 0, 1, 9, 9, 9, 9, 9, 9, 9}}
 	tricky, err := c.EncryptWithAAD([]byte("tricky"), nil)
 	randReader = old
-	if err != nil || SealedKeyID(tricky) != 1 {
-		t.Fatalf("tricky = %v id %d", err, SealedKeyID(tricky))
+	if err != nil || sealedKeyID(tricky) != 1 {
+		t.Fatalf("tricky = %v id %d", err, sealedKeyID(tricky))
 	}
 
 	if err := c.SetRing([]RingKey{{ID: 0, Key: nil}, {ID: 1, Key: k1, Current: true}}); err != nil {
@@ -70,7 +70,7 @@ func TestCipherRingDualRead(t *testing.T) {
 		t.Fatalf("ring = current %d ids %v", c.CurrentKeyID(), c.KeyIDs())
 	}
 	fresh, err := c.EncryptWithAAD([]byte("fresh"), []byte("aad"))
-	if err != nil || fresh[0] != keyIDMarker || binary.BigEndian.Uint32(fresh[1:5]) != 1 || SealedKeyID(fresh) != 1 {
+	if err != nil || fresh[0] != keyIDMarker || binary.BigEndian.Uint32(fresh[1:5]) != 1 || sealedKeyID(fresh) != 1 {
 		t.Fatalf("fresh = %x %v", fresh[:5], err)
 	}
 	for _, tc := range []struct {
@@ -139,8 +139,8 @@ func TestCipherSetRingRules(t *testing.T) {
 	if _, err := NewCipherRing([]RingKey{{ID: 0, Key: k0}}); err == nil {
 		t.Fatal("a ring with no current key built a Cipher")
 	}
-	if SealedKeyID([]byte{keyIDMarker, 0}) != 0 || SealedKeyID([]byte{1, 0, 0, 0, 1, 2}) != 0 {
-		t.Fatal("SealedKeyID of a short or legacy blob")
+	if sealedKeyID([]byte{keyIDMarker, 0}) != 0 || sealedKeyID([]byte{1, 0, 0, 0, 1, 2}) != 0 {
+		t.Fatal("sealedKeyID of a short or legacy blob")
 	}
 	if !c.HoldsKey(0, serverKeyCheck(k0)) || c.HoldsKey(0, serverKeyCheck(other)) || c.HoldsKey(9, nil) {
 		t.Fatal("HoldsKey")
@@ -203,7 +203,7 @@ func TestCipherReseal(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, from, changed, err := c.Reseal(old, []byte("a"))
-	if err != nil || !changed || from != 0 || SealedKeyID(out) != 1 {
+	if err != nil || !changed || from != 0 || sealedKeyID(out) != 1 {
 		t.Fatalf("reseal = %v %v %d", err, changed, from)
 	}
 	if got, id, err := c.OpenWithKeyID(out, []byte("a")); err != nil || string(got) != "v" || id != 1 {
