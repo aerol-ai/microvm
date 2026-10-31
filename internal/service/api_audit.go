@@ -249,6 +249,7 @@ const (
 	systemActionAutoDelete  = "lifecycle.auto_delete"
 	systemActionReap        = "reconcile.reap"
 	systemActionOrphanReap  = "reconcile.orphan_delete"
+	systemActionMarkError   = "reconcile.mark_error"
 	systemActionMethod      = "SYSTEM"
 	auditSubsystemAuditMode = "audit"
 )

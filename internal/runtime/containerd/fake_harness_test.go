@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -46,6 +47,7 @@ type fakeTransport struct {
 	newContainerFn  func(context.Context, string, ...cntr.NewContainerOpts) (cntr.Container, error)
 	emitEvents      bool
 	provider        content.Provider
+	listErr         error
 }
 
 func newFakeTransport() *fakeTransport {
@@ -110,14 +112,37 @@ func (f *fakeTransport) pullImage(ctx context.Context, ref string, opts ...cntr.
 	return f.image, nil
 }
 
-func (f *fakeTransport) listContainers(context.Context, ...string) ([]cntr.Container, error) {
+func (f *fakeTransport) listContainers(ctx context.Context, filters ...string) ([]cntr.Container, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	out := make([]cntr.Container, 0, len(f.containers))
 	for _, c := range f.containers {
+		if !fakeLabelFiltersMatch(ctx, c, filters) {
+			continue
+		}
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+// fakeLabelFiltersMatch applies containerd's `labels.<key>==<value>` filters,
+// the only kind the driver uses to look a container up by sandbox id. Other
+// filters (`labels.<key>`, existence) match every container, as before.
+func fakeLabelFiltersMatch(ctx context.Context, c *fakeContainer, filters []string) bool {
+	for _, f := range filters {
+		key, want, ok := strings.Cut(strings.TrimPrefix(f, "labels."), "==")
+		if !ok || !strings.HasPrefix(f, "labels.") {
+			continue
+		}
+		labels, err := c.Labels(ctx)
+		if err != nil || labels[key] != want {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *fakeTransport) subscribe(ctx context.Context, _ ...string) (<-chan *events.Envelope, <-chan error) {
@@ -241,7 +266,8 @@ func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
 		return nil, c.taskErr
 	}
 	if c.task == nil {
-		return nil, errors.New("no task")
+		// containerd's loadTask wraps the task service's NotFound this way.
+		return nil, fmt.Errorf("no running task found: %w", errdefs.ErrNotFound)
 	}
 	return c.task, nil
 }
