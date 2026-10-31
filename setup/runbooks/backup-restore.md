@@ -28,6 +28,10 @@ The helper includes:
 - `/var/lib/sandboxd/state.db`
 - `/var/lib/sandboxd/raft/`
 - `/etc/sandboxd/`
+- the server key the database is sealed with: `credential_encryption.key.wrapped`
+  with wrapped custody; otherwise `credential_encryption.key` and, after a
+  server-key rotation, `credential_encryption.key.ring` (both plaintext, so
+  store the archive as a secret, or use wrapped custody)
 - a manifest with host, source path, and creation time
 
 The archive does **not** contain Docker image layers, running containers, or
@@ -77,6 +81,18 @@ pullable images and valid credentials.
      --target-root / \
      --force
    ```
+
+   A replacement node that already ran a fresh install has a database and a
+   Raft log of its own. The script moves `state.db` (with its `-wal` and
+   `-shm` files) and `raft/` aside as `*.pre-restore-<time>` before it
+   extracts, so the restored ones are never mixed with them. The server key
+   goes with the database: the node comes back with the archive's key files
+   and none of its own. A fresh install's `credential_encryption.key`,
+   `.ring` or `.wrapped` that the archive replaces, or that does not fit the
+   archive's custody, is moved aside the same way. With wrapped custody the
+   key store must be reachable when sandboxd starts. An archive made before
+   backups carried the key file keeps the node's own key file, with a
+   warning: that only works for a restore in place.
 
 4. Verify expected files:
 
