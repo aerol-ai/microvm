@@ -23,7 +23,7 @@ feature is still mid-rollout.
 |---|---|
 | `SB_AUTO_RECONCILE` | true |
 | `SB_ENABLE_CADDY` | true |
-| `SB_ENABLE_NETWORK_RULES` | true |
+| `SB_ENABLE_NETWORK_RULES` | true. Off (and on any non-Linux host) the docker, containerd and Firecracker runtimes have no firewall, so creates, starts and updates that ask for network policy are refused with `501 network_policy_unenforced`; WASM and isolate filter egress themselves and are unaffected. |
 | `SB_NETRULES_BACKEND` | `netlink` (in-process nftables; `exec` = go-iptables fallback) |
 | `SB_ENABLE_EVENT_MONITOR` | true |
 | `SB_ENABLE_SSH_GATEWAY` | true |
@@ -56,6 +56,7 @@ feature is still mid-rollout.
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
+| `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
 
 ## Secret provider (SB_SECRET_PROVIDER)
 

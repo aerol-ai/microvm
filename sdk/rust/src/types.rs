@@ -565,7 +565,8 @@ pub struct Sandbox {
     #[serde(rename = "network_block_all")]
     pub network_block_all: bool,
     /// Hostname-egress state on get (container runtimes): "active", "held"
-    /// or "unavailable". `None` otherwise, and on list results.
+    /// or "unavailable"; "unenforced" when the server's firewall is off and
+    /// nothing filters the sandbox. `None` otherwise, and on list results.
     #[serde(default, rename = "egress_status", skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
     /// Egress profiles this sandbox references.
@@ -881,7 +882,8 @@ pub struct NetworkPolicy {
     /// Hostname entries in force: inline plus every profile's (at most 1024).
     #[serde(default)]
     pub effective_hostname_count: usize,
-    /// "active", "held" or "unavailable" for hostname rules on a container.
+    /// "active", "held" or "unavailable" for hostname rules on a container;
+    /// "unenforced" when the server's firewall is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
 }

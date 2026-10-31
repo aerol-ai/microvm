@@ -157,7 +157,14 @@ docker ps -a --filter 'label=aerolvm.managed=true' -q | xargs -r docker rm -f
 
 - **No public URLs.** Sandboxes are reachable from the host only.
 - **No TLS.** Traffic is plaintext on loopback.
-- **No multi-tenant isolation hardening.** `SB_ENABLE_NETWORK_RULES=false`.
+- **No multi-tenant isolation hardening.** `SB_ENABLE_NETWORK_RULES=false`, so
+  there is no per-sandbox firewall. A create or update that asks for network
+  policy (`network_block_all`, `network_allow_out`/`network_deny_out`,
+  hostname rules, byte caps) is refused with `501 network_policy_unenforced`
+  instead of being accepted and not enforced. To try policy code paths
+  anyway, set `SB_ALLOW_UNENFORCED_NETWORK_POLICY=true`: the policy is stored
+  but nothing filters the traffic. To have it enforced, run on Linux with
+  `SB_ENABLE_NETWORK_RULES=true`.
 - **No automatic restarts on host reboot if you uninstall Docker.** The
   daemon depends on Docker running first.
 

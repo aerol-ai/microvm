@@ -2162,6 +2162,11 @@ SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
 SB_TOOLBOX_PORT=2280
 SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=false
+# No per-sandbox firewall in local mode: a create or update that asks for
+# network policy (block-all, address lists, hostname rules, byte caps) is
+# refused with 501 network_policy_unenforced instead of being accepted and not
+# enforced. SB_ALLOW_UNENFORCED_NETWORK_POLICY=true accepts it unenforced
+# (development only); SB_ENABLE_NETWORK_RULES=true enforces it.
 SB_ENABLE_NETWORK_RULES=false
 SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
 SB_MOUNTS_CRED_DIR=/run/sandboxd
