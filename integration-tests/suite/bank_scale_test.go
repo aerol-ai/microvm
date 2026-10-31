@@ -399,6 +399,9 @@ echo avail=$(awk "/MemAvailable/ {print \$2}" /proc/meminfo)'`)
 // churn runs workers that each loop create → exec → destroy until stop,
 // cycling through rts. It returns per-op latencies and failures.
 type bankChurnStats struct {
+	// gone maps sandboxes whose destroy answered done or not found to that
+	// answer; one still listed afterwards is a real leak.
+	gone     map[string]string
 	mu       sync.Mutex
 	cycles   int
 	capacity int
@@ -452,8 +455,27 @@ func bankChurn(t *testing.T, c *harness.Client, rts []bankRuntime, workers int, 
 					fail("exec", fmt.Errorf("%v (rc %d)", err, res.ExitCode))
 				}
 				t2 := time.Now()
-				if err := c.SDK().Destroy(ctx, sb.ID); err != nil {
-					fail("destroy", err)
+				// A client retries a refused destroy (a 502/503 while an
+				// owner restarts); what it must never see is a destroy that
+				// answered "done" or "not found" for a sandbox that is still
+				// there. That one is recorded by id for the leak check.
+				var derr error
+				for attempt := 0; attempt < 4; attempt++ {
+					if derr = c.SDK().Destroy(ctx, sb.ID); derr == nil || strings.Contains(derr.Error(), "not found") {
+						break
+					}
+					time.Sleep(5 * time.Second)
+				}
+				if derr != nil {
+					fail("destroy", derr)
+				}
+				if derr == nil || strings.Contains(derr.Error(), "not found") {
+					st.mu.Lock()
+					if st.gone == nil {
+						st.gone = map[string]string{}
+					}
+					st.gone[sb.ID] = fmt.Sprint(derr)
+					st.mu.Unlock()
 				}
 				dd := time.Since(t2)
 				cancel()
@@ -632,23 +654,35 @@ func TestBankRecoveryUnderLoad(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	list, _ := c.SDK().List(ctx)
-	var leaked []string
-	for _, s := range list {
-		if strings.HasPrefix(s.Name, prefix) {
-			leaked = append(leaked, s.ID)
-			destroyBest(c, s.ID)
-		}
-	}
+	var leaked, unacknowledged []string
 	st.mu.Lock()
+	for _, s := range list {
+		if !strings.HasPrefix(s.Name, prefix) {
+			continue
+		}
+		// Still listed after its destroy answered done or not found: the
+		// API told the client it was gone. Anything else is a create or
+		// destroy the client saw fail, which it would retry or clean up by
+		// name; reported, not a leak.
+		if answer, told := st.gone[s.ID]; told {
+			leaked = append(leaked, s.ID+" (destroy answered "+answer+")")
+		} else {
+			unacknowledged = append(unacknowledged, s.ID)
+		}
+		destroyBest(c, s.ID)
+	}
 	cycles, failures := st.cycles, append([]string(nil), st.failures...)
 	st.mu.Unlock()
+	if len(unacknowledged) > 0 {
+		t.Logf("%d sandboxes left by a create or destroy the client saw fail during the restart: %v", len(unacknowledged), bankFirstN(unacknowledged, 5))
+	}
 	bankRecord(t, "recovery_under_load", map[string]any{"victim": victim.Name, "back_after_ms": back.Milliseconds(), "cycles": cycles, "failures": len(failures), "leaked": len(leaked), "sample_failures": bankFirstN(failures, 5)})
 	t.Logf("sandboxd on %s back after %v; %d cycles, %d failures during the run, %d leaked", victim.Name, back, cycles, len(failures), len(leaked))
 	if back > 2*time.Minute {
 		t.Errorf("sandboxd took %v to serve again", back)
 	}
 	if len(leaked) > 0 {
-		t.Errorf("%d sandboxes leaked across the restart: %v", len(leaked), bankFirstN(leaked, 5))
+		t.Errorf("%d sandboxes still exist after their destroy said they were gone: %v", len(leaked), bankFirstN(leaked, 5))
 	}
 	if cycles > 0 && len(failures) > cycles/2+5 {
 		t.Errorf("the restart cost %d failures over %d cycles: %v", len(failures), cycles, bankFirstN(failures, 5))
