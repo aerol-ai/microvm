@@ -15,9 +15,11 @@ Untrusted code that can reach your private network can attack it. This post expl
 
 | Runtime | Outbound, with no policy | Inbound |
 |---|---|---|
-| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses, the cloud metadata service and other sandboxes | Nothing, until you share a port |
+| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses and other sandboxes. Never the cloud metadata service. | Nothing, until you share a port |
 | WebAssembly | No filter until you set a policy | Nothing, until you share a port |
 | V8 isolate | The internet over HTTPS only. Private, loopback, link-local and metadata addresses are always blocked. | Nothing, until you share a port |
+
+**The cloud metadata service is never reachable.** On every server, with or without a policy or an operator file, every sandbox's traffic to the metadata and credential addresses of AWS, Google Cloud, Azure, Alibaba, Oracle and OpenStack is dropped: `169.254.169.254`, `169.254.170.2`, `169.254.170.23`, `168.63.129.16`, `100.100.100.200` and their IPv6 forms. No allow list can open them. Those addresses hand out the server's own cloud credentials.
 
 So for code you do not trust, always set a policy, or have your operator set one for every sandbox on the server. See [For server operators](#for-server-operators).
 
@@ -207,7 +209,7 @@ You can cap how many bytes a sandbox sends or receives in its lifetime. The serv
 Set these in the private-network policy file (`SB_EGRESS_OPERATOR_FILE`). They apply to every sandbox on the server, whatever its own policy says. See [Private networks](/advanced-network-rules/#private-networks).
 
 - **`default_policy`:** the policy a create gets when it sets none. Use `block_all` or `allowlist` so no sandbox starts open.
-- **`deny_cidrs`:** address ranges that are always dropped. Add `169.254.169.254/32` for the cloud metadata service, and your company's private ranges. Do not add the ranges the server gives its own sandboxes.
+- **`deny_cidrs`:** address ranges that are always dropped. Add your company's private ranges. The cloud metadata addresses are always dropped already. Do not add the ranges the server gives its own sandboxes.
 - **`node_control_port_guard: true`:** sandboxes cannot reach AerolVM's own ports on any server.
 
 <Aside type="caution" title="Privileged sandboxes turn off name filtering">
