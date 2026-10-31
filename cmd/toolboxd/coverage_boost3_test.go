@@ -239,7 +239,7 @@ func TestDaytonaAndSessionRouteErrorBranches(t *testing.T) {
 		t.Fatalf("missing session input status = %d", rr.Code)
 	}
 
-	h := (&server{logger: logger, sessions: nil}).routes()
+	h := authedRoutes(&server{logger: logger, sessions: nil})
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/sessions/abc", nil)
 	h.ServeHTTP(rr, req)
@@ -250,7 +250,7 @@ func TestDaytonaAndSessionRouteErrorBranches(t *testing.T) {
 
 func TestEnvdProcessRouteBranches(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	startBody, _ := json.Marshal(map[string]any{
 		"process": map[string]any{"cmd": "/bin/sh", "args": []string{"-c", "cat"}},
@@ -501,7 +501,7 @@ func TestDrainAndDaytonaLogStreaming(t *testing.T) {
 func TestProxyAdminAndSandboxHelpers(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	s := &server{logger: logger, sandboxID: "sb-proxy", allowedPorts: map[int]struct{}{65535: {}}}
-	h := s.routes()
+	h := authedRoutes(s)
 
 	rr := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/proxy/not-a-port", nil)
