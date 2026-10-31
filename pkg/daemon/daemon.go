@@ -108,6 +108,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
+	configureHostMediatedNodeGuard(cfg, logger)
 
 	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
 		Enabled:     cfg.OTELTracesEnabled,
@@ -693,6 +694,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
 	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	// After the gateway is wired: whether its ports are open depends on it.
+	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call

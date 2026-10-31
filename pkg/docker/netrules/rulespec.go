@@ -3,6 +3,7 @@ package netrules
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -15,17 +16,44 @@ const (
 	verdictDrop
 	verdictAccept
 	verdictReturn
+	verdictJump
 )
 
 // parsedRule is the Manager's iptables-shaped argv decoded into the fields
 // the netlink backend needs. Only the shapes Manager emits are supported:
-// -s/-d address-or-CIDR, optional -m comment --comment, and -j
-// DROP|ACCEPT|RETURN (RETURN is used by the AEROLVM-INPUT allowlist rules).
+// -s/-d address-or-CIDR, optional -p tcp|udp with --dport, optional -m
+// comment --comment, and -j DROP|ACCEPT|RETURN or a jump to one of our own
+// chains (RETURN is used by the AEROLVM-INPUT allowlist rules; the node
+// guard's ports and jumps by AEROLVM-NODE).
 type parsedRule struct {
 	src     *net.IPNet
 	dst     *net.IPNet
+	proto   string // "tcp" or "udp"; "" matches every protocol
+	dport   uint16 // 0 matches every port; needs proto
 	comment string
 	verdict verdictKind
+	jump    string // the chain a verdictJump goes to
+}
+
+// ownChainPrefix is what every chain a rule may jump to starts with: a jump
+// to anything else (a target such as LOG, or another tool's chain) is
+// refused rather than translated into something it is not.
+const ownChainPrefix = "AEROLVM-"
+
+// validJumpChain reports whether name is one of our chains, spelled within
+// iptables' limits (28 characters, no spaces or quotes).
+func validJumpChain(name string) bool {
+	if !strings.HasPrefix(name, ownChainPrefix) || len(name) > 28 {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parseRulespec translates iptables argv into a structured rule. Unknown
@@ -63,6 +91,29 @@ func parseRulespec(rulespec ...string) (parsedRule, error) {
 				return parsedRule{}, fmt.Errorf("netrules: -d %q: %w", v, err)
 			}
 			out.dst = n
+		case "-p":
+			v, err := need("-p")
+			if err != nil {
+				return parsedRule{}, err
+			}
+			if v != "tcp" && v != "udp" {
+				return parsedRule{}, fmt.Errorf("netrules: unsupported protocol %q", v)
+			}
+			out.proto = v
+		case "--dport":
+			v, err := need("--dport")
+			if err != nil {
+				return parsedRule{}, err
+			}
+			if out.proto == "" {
+				// iptables refuses a port without -p before it; so do we.
+				return parsedRule{}, fmt.Errorf("netrules: --dport needs -p tcp|udp before it")
+			}
+			n, err := strconv.ParseUint(v, 10, 16)
+			if err != nil || n == 0 {
+				return parsedRule{}, fmt.Errorf("netrules: --dport %q: want 1-65535", v)
+			}
+			out.dport = uint16(n)
 		case "-m":
 			mod, err := need("-m")
 			if err != nil {
@@ -93,7 +144,10 @@ func parseRulespec(rulespec ...string) (parsedRule, error) {
 			case "RETURN":
 				out.verdict = verdictReturn
 			default:
-				return parsedRule{}, fmt.Errorf("netrules: unsupported verdict %q", v)
+				if !validJumpChain(v) {
+					return parsedRule{}, fmt.Errorf("netrules: unsupported verdict %q", v)
+				}
+				out.verdict, out.jump = verdictJump, v
 			}
 		default:
 			return parsedRule{}, fmt.Errorf("netrules: unsupported rulespec token %q", tok)

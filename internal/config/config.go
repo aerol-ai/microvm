@@ -153,6 +153,11 @@ type Config struct {
 	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
 	// tenant's sandbox cannot reach another's listeners.
 	SandboxInterconnect bool
+	// SandboxNodePortsAllow are node ports every sandbox on this node may
+	// reach on top of the node guard's own allowlist
+	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
+	// mode). Sandboxes are default-denied from the node they run on.
+	SandboxNodePortsAllow []SandboxNodePort
 	// DiskLimitCheckInterval is how often the disk watchdog checks each
 	// container sandbox's writable layer against its DiskGB
 	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
@@ -259,8 +264,15 @@ type Config struct {
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
 	EgressProfileApplyQPS int
-	EnableEventMonitor    bool
-	EnableSSHGateway      bool
+	// EgressDNSPort and EgressProxyPort are the egress gateway's listener
+	// ports (SB_EGRESS_DNS_PORT, SB_EGRESS_PROXY_PORT, the same names and
+	// defaults the gateway reads from egress-gateway.env). The node guard
+	// opens them to sandboxes when the gateway runs here, until the gateway
+	// reports the ports it really listens on.
+	EgressDNSPort      int
+	EgressProxyPort    int
+	EnableEventMonitor bool
+	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
 	// of the box; flip to false on a per-host basis to opt that host out of
@@ -1945,6 +1957,8 @@ func load(keyTool bool) (Config, error) {
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
+		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
+		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
@@ -2596,6 +2610,17 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.SandboxPidsLimit < 0 {
 		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
+	}
+	nodePorts, perr := ParseSandboxNodePorts(os.Getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
+	if perr != nil {
+		return Config{}, perr
+	}
+	cfg.SandboxNodePortsAllow = nodePorts
+	if err := validEgressGatewayPorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
 	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",

@@ -128,6 +128,11 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	case ip.IsMulticast() || ip == broadcast:
 		return refuse(DialReasonMulticast, "")
 	}
+	// The node itself, whatever a policy CIDR or the internal zone opens:
+	// one of its addresses can sit inside an allowed private range.
+	if err := CheckNode(t.Addr); err != nil {
+		return err
+	}
 	if err := g.CheckFloor(t.Addr); err != nil {
 		return err
 	}

@@ -470,6 +470,9 @@ type Service struct {
 	// egressControlPushed is the control-port guard list last pushed to the
 	// gateway; nil after a full sync, so a restarted gateway gets it again.
 	egressControlPushed atomic.Pointer[string]
+	// nodeGuard is the node guard's state: what each runtime got, and the
+	// per-runtime result the create gate reads (node_guard.go).
+	nodeGuard nodeGuardState
 	// egressPolicyLocks serializes live policy updates per sandbox (§5.8).
 	egressPolicyLocks egressPolicyLocks
 	// egressProfileKick wakes SuperviseEgressProfiles after a profile change
@@ -1943,6 +1946,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	// generic Docker failure 30s later.
 	if chosenRuntime == models.RuntimeKata {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
+	}
+	// Fail closed: no sandbox on a runtime whose node guard failed to
+	// install, since it could reach every service on the node. One atomic
+	// map read (node_guard.go).
+	if err := s.requireNodeGuard(chosenRuntime); err != nil {
+		return nil, err
 	}
 	if hasBinariesRule(req.NetworkEgressRules) && chosenRuntime == models.RuntimeGvisor {
 		return nil, unsupportedBinaries(chosenRuntime)

@@ -508,6 +508,22 @@ func TestWriteStoreAwareError_EgressOperatorConfigInvalid(t *testing.T) {
 	}
 }
 
+// TestWriteStoreAwareError_NodeGuardNotReady: a create refused because the
+// node guard is not installed is a 503 with a retry and its own code, and
+// the iptables detail stays in the node's log.
+func TestWriteStoreAwareError_NodeGuardNotReady(t *testing.T) {
+	rr := httptest.NewRecorder()
+	WriteStoreAwareError(discardLogger(), rr, fmt.Errorf("%w (runtime docker: iptables: secret detail)", service.ErrNodeGuardNotReady))
+	var body models.ErrorResponse
+	_ = json.Unmarshal(rr.Body.Bytes(), &body)
+	if rr.Code != http.StatusServiceUnavailable || body.Code != models.ErrorCodeNodeGuardNotReady || rr.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d code=%q retry=%q", rr.Code, body.Code, rr.Header().Get("Retry-After"))
+	}
+	if strings.Contains(rr.Body.String(), "secret detail") {
+		t.Fatalf("the cause leaked to the caller: %s", rr.Body.String())
+	}
+}
+
 // TestWriteStoreAwareError_EgressPolicyUpdate: the live-update failures are
 // told apart by status and code (plans/egress-domain-filtering.md §5.8), and
 // every one carries a Retry-After since the PUT is idempotent.
