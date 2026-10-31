@@ -430,6 +430,9 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// reconcileUnknown tracks sandboxes whose runtime could not say whether
+	// they exist, pass after pass (reconcile_unknown.go).
+	reconcileUnknown reconcileUnknownTracker
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -5606,33 +5609,6 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
-// reconcileGoneContainerConfirmed reports whether a sandbox absent from the
-// bulk ListManaged snapshot is DURABLY gone and safe to reap (which deletes the
-// store row and, in cluster mode, the FSM placement). ListManaged is one racy
-// read per tick whose per-container Inspect silently skips a container it can't
-// read at that instant (mid-adopt/mid-start — see the `if err != nil` continue
-// in the containerd driver's ListManaged). Reaping on that single miss drops a
-// healthy sandbox's row and its cluster placement, which surfaced as an
-// intermittent cross-node snapshot 404 (UC-20). So re-verify with a direct,
-// targeted Inspect before destroying: a container the driver can still resolve
-// (non-empty runtime identity, no error) is NOT gone — the bulk snapshot was
-// stale — so spare it and let the next steady-state pass adopt it. A missing
-// driver, an Inspect error, or an empty identity all fall through to the reap,
-// so a genuinely-dead container is still cleaned up on this pass.
-func (s *Service) reconcileGoneContainerConfirmed(ctx context.Context, sandbox *models.Sandbox) bool {
-	if sandbox == nil {
-		return true
-	}
-	rt, err := s.runtimeForSandbox(sandbox)
-	if err != nil {
-		return true
-	}
-	if st, err := rt.Inspect(ctx, s.runtimeRef(sandbox)); err == nil && st != nil && st.ContainerID != "" {
-		return false
-	}
-	return true
-}
-
 func (s *Service) Reconcile(ctx context.Context) error {
 	// The admin reconcile route keeps its caller: a request's Access wins
 	// over the subsystem tag.
@@ -5705,6 +5681,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		knownIDs[sandbox.ID] = struct{}{}
 	}
+	s.reconcileUnknown.retain(knownIDs)
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
@@ -5778,7 +5755,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// (deleteSelfOwnedClusterPlacement): reaping a container that is
 			// actually still there turns a transient miss into permanent loss and
 			// an intermittent cross-node snapshot 404 on a healthy sandbox
-			// (UC-20). Confirmed-gone (error / no such container) still reaps.
+			// (UC-20). Only a definitive not-found reaps; an Inspect that
+			// cannot answer keeps the row (reconcile_unknown.go, UC-320).
 			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
@@ -5896,18 +5874,34 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// The runtime listed it, so any unknown streak is over, and an
+		// error this reconcile recorded for it no longer holds.
+		s.reconcileUnknown.forget(sandbox.ID)
+		if strings.HasPrefix(sandbox.LastError, reconcileUnknownErrorPrefix) {
+			sandbox.LastError = ""
+		}
+		// A started instance listed without an address or id has not moved;
+		// the runtime just did not say this pass (containerd's netns probe
+		// failed, firecracker's list never carries them). Keep the row's, so
+		// its routes, egress rules and toolbox target stay where they are.
+		observedIP := state.ContainerIP
+		if observedIP == "" && state.Status == models.SandboxStatusStarted {
+			observedIP = sandbox.ContainerIP
+		}
 		// A row that says started but whose container stopped or moved
 		// missed the stop (sandboxd was down, the event stream gapped): what
 		// it left at the old address is recorded and cleared now, before
 		// the row forgets the address (review 6 finding 4).
 		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" &&
-			(state.Status != models.SandboxStatusStarted || state.ContainerIP != sandbox.ContainerIP) {
+			(state.Status != models.SandboxStatusStarted || observedIP != sandbox.ContainerIP) {
 			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
 				s.logger.Warn("reconcile: egress rules at a moved sandbox's old address not recorded", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
 			}
 		}
-		sandbox.ContainerID = state.ContainerID
-		sandbox.ContainerIP = state.ContainerIP
+		if state.ContainerID != "" {
+			sandbox.ContainerID = state.ContainerID
+		}
+		sandbox.ContainerIP = observedIP
 		sandbox.Status = state.Status
 		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()
