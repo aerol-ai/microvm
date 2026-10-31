@@ -229,17 +229,30 @@ func kcNodeHealth(t *testing.T, node harness.IntegrationNode) string {
 	return string(resp.Body)
 }
 
-// kcHAFailover creates an HA sandbox carrying a secret (unless sb is
-// given), kills its owner and checks the secret inside the recreated
-// sandbox. It returns the sandbox id. The killed node is restored at test
-// cleanup.
+// kcHAFailover creates an HA sandbox carrying a secret (unless id is
+// given), stops its owner's sandboxd and checks the secret inside the
+// recreated sandbox. It returns the sandbox id. The stopped node is restored
+// before it returns, and at test cleanup if the case fails first.
+//
+// A fresh sandbox that lands on the seed is replaced, since a joiner is the
+// cheaper member to lose. A sandbox the case already owns may sit on the
+// seed after an earlier failover; then the seed is stopped: a failover
+// that is skipped proves nothing, and a restarted seed rejoins (UC-170).
 func kcHAFailover(t *testing.T, targets *harness.IntegrationTargets, id, key, secret string) string {
 	t.Helper()
 	c := client(t)
 	if id == "" {
-		sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: map[string]string{key: secret}})
-		waitRunning(t, sb)
-		id = sb.ID
+		for attempt := 1; ; attempt++ {
+			sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{Env: map[string]string{key: secret}})
+			waitRunning(t, sb)
+			if n, ok := nodeForClusterID(t, c, targets, resolvePlacementOwner(t, c, sb.ID)); !ok || !n.Seed || attempt == 4 {
+				id = sb.ID
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			_ = sb.Destroy(ctx)
+			cancel()
+		}
 	}
 	harness.AwaitFailoverReady(t, c, id, 3*time.Minute)
 	owner := resolvePlacementOwner(t, c, id)
@@ -247,19 +260,28 @@ func kcHAFailover(t *testing.T, targets *harness.IntegrationTargets, id, key, se
 	if !ok {
 		t.Fatalf("owner %s of %s is not a node this suite can reach", owner, id)
 	}
-	if victim.Seed {
-		// Killing the seed costs the whole cluster, not one member; move the
-		// case's fault to a joiner instead of skipping it.
-		t.Logf("owner of %s is the seed; failing it over by restarting a joiner is not possible, checking the open on the seed instead", id)
-		if got := execEnvValue(t, c, id, key, 4*time.Minute); got != secret {
-			t.Fatalf("sandbox %s on the seed reads %q, want its sealed value", id, got)
+	// Read and exec through a node that stays up, on its own loopback API.
+	// The suite's clients share http.DefaultTransport, whose keep-alive pool
+	// can stay pinned to the victim's ingress: every call then gets a 502
+	// from its Caddy for as long as the victim is down, though the cluster
+	// failed over in seconds (the first wrapped-kms run lost UC-310 to that).
+	var via harness.IntegrationNode
+	for _, n := range kcNodes(targets) {
+		if n.Name != victim.Name {
+			via = n
+			break
 		}
-		return id
 	}
+	viaSC := *sc
+	viaSC.BaseURL = nodeBase(t, via)
+	viaSC.PAT = sc.OperatorPAT
+	viaClient := harness.NewClient(t, &viaSC)
+
+	t.Logf("failing %s over: stopping its owner %s", id, victim.Name)
 	restore := harness.KillNodeDaemon(t, victim)
 	t.Cleanup(restore)
-	newOwner := awaitNewOwner(t, c, id, owner, failoverOpenTimeout)
-	if got := execEnvValue(t, c, id, key, 4*time.Minute); got != secret {
+	newOwner := awaitNewOwner(t, viaClient, id, owner, failoverOpenTimeout)
+	if got := execEnvValue(t, viaClient, id, key, 4*time.Minute); got != secret {
 		t.Fatalf("after failover from %s to %s, sandbox %s reads %q, want its sealed value", owner, newOwner, id, got)
 	}
 	restore()
