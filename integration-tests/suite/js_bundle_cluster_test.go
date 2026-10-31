@@ -78,10 +78,13 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 		return
 	}
 
-	// Now stop a peer and assert the response SAYS so.
-	victim, ok := pickNonSeedNode(targets)
+	// Now stop a peer and assert the response SAYS so. The peer must run
+	// isolate: the aggregate asks only isolate workers, so stopping any other
+	// node (the containerd worker on cluster-bank-flagship) correctly leaves
+	// the list complete.
+	victim, ok := isolatePeerToStop(t, c, targets)
 	if !ok {
-		t.Skip("no SSH-reachable non-seed node to stop")
+		t.Skip("no SSH-reachable non-seed node runs the isolate runtime")
 	}
 	target, _ := harness.SSHTarget(victim)
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
@@ -100,4 +103,28 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	}
 	t.Fatalf("with %s stopped, the js-bundle list never set %s: the response is silently short, so an operator would conclude a bundle was deleted",
 		victim.Name, missingPeersHeader)
+}
+
+// isolatePeerToStop picks a non-seed, SSH-reachable node whose capacity
+// advertises the isolate runtime.
+func isolatePeerToStop(t *testing.T, c *harness.Client, targets *harness.IntegrationTargets) (harness.IntegrationNode, bool) {
+	t.Helper()
+	members, err := benchClusterMembers(c)
+	if err != nil {
+		t.Fatalf("read cluster members: %v", err)
+	}
+	for _, n := range targets.Nodes {
+		if n.Seed {
+			continue
+		}
+		if _, ok := harness.SSHTarget(n); !ok {
+			continue
+		}
+		for _, m := range members.Members {
+			if (m.NodeName == n.Name || strings.HasSuffix(m.NodeName, "-"+n.Name)) && nodeAdvertisesRuntime(members, m.NodeID, models.RuntimeIsolate) {
+				return n, true
+			}
+		}
+	}
+	return harness.IntegrationNode{}, false
 }
