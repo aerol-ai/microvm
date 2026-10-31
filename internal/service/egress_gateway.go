@@ -482,6 +482,7 @@ func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, boo
 func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) (err error) {
 	ctx, span := observability.StartSpan(ctx, "egress.attach", attribute.String("sandbox_id", sb.ID))
 	defer func() { observability.EndSpan(span, err) }()
+	stages := s.newAttachStages(ctx, span)
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
 	// A held sandbox attaches shut, whatever the hold's class: only the
@@ -494,11 +495,13 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 	}
 	spec.Secrets = s.egressSecrets(ctx, sb)
 	spec.Pid = s.egressPid(ctx, sb)
+	stages.mark(attachStageLookup)
 	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
 		s.egressStats.recordAttachFailed()
 		return err
 	}
 	s.kickEgressSelfTest()
+	stages.mark(attachStageReady)
 	s.egressSyncMu.RLock()
 	err = s.egressGateway().Attach(ctx, spec)
 	if err == nil {
@@ -506,6 +509,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		s.noteAttached(sb.ID)
 	}
 	s.egressSyncMu.RUnlock()
+	stages.mark(attachStageRPC)
 	if err != nil {
 		s.egressStats.recordAttachFailed()
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
@@ -513,9 +517,17 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		}
 		return err
 	}
-	if err := s.releaseEgressHold(ctx, sb, cr, gatewayHolds...); err != nil {
-		return err
+	// Only a hold seen above can need lifting. One recorded since is left
+	// in place, which is fail-closed and is what its own retry lifts
+	// (retryEgressHolds re-attaches held sandboxes); a create therefore
+	// skips this second read of the store, which on the single SQLite
+	// connection queues behind the create's own row persist.
+	if held {
+		if err := s.releaseEgressHold(ctx, sb, cr, gatewayHolds...); err != nil {
+			return err
+		}
 	}
+	stages.mark(attachStageRelease)
 	// The driver's block-all DROP has done its job; quota and real block-all
 	// keep their own DROPs (applyNetworkQuotaState, NetworkBlockAll).
 	if !sb.NetworkBlockAll && !sb.NetworkQuotaExceeded {
@@ -523,6 +535,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 			return fmt.Errorf("lift driver block after egress attach: %w", err)
 		}
 	}
+	stages.mark(attachStageUnblock)
 	return nil
 }
 

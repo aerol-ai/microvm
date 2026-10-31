@@ -667,6 +667,10 @@ type Service struct {
 	// create paths. Tests close the DB here so PutMounts / custom-domain
 	// persist failure arms run without a store wrapper. Nil in production.
 	testAfterStoreCreate func()
+	// testAttachStage, when set, sees each gateway-attach sub-stage's
+	// duration (egress_attach_stages.go); the attach benchmark reads the
+	// split from it. Nil in production.
+	testAttachStage func(stage string, d time.Duration)
 	// testAfterCustomDomainsOnCreate runs after persistCustomDomainsOnCreate
 	// succeeds on the wasm create path so the subsequent Get/sync failure
 	// rollbacks can be forced. Nil in production.
