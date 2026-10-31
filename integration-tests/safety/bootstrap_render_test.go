@@ -538,3 +538,26 @@ func TestBootstrapWrappedCustodyFlags(t *testing.T) {
 		t.Error("the default custody passes --key-custody")
 	}
 }
+
+// A joiner's install.sh leaves sandboxd stopped (--no-start) until
+// cluster-join.sh starts it with the cluster's config and server key; a
+// first boot as a lone node would begin making a server key of its own. The
+// seed boots at install: its first boot is the one that makes the key.
+func TestBootstrapJoinerInstallsWithoutStarting(t *testing.T) {
+	const flag = "INSTALL_ARGS+=(--no-start)"
+	for _, out := range []string{"joiner", "joiner_kms"} {
+		if !strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s does not pass --no-start to install.sh", out)
+		}
+	}
+	for _, out := range []string{"seed", "seed_wrapped"} {
+		if strings.Contains(renderBootstrap(t, out), flag) {
+			t.Errorf("%s passes --no-start, but the seed must boot at install", out)
+		}
+	}
+	// install.sh runs before cluster-join.sh, and the flag is set before it.
+	joiner := renderBootstrap(t, "joiner")
+	if i, j := strings.Index(joiner, flag), strings.Index(joiner, `sudo /tmp/install.sh "${INSTALL_ARGS[@]}"`); i < 0 || j < 0 || i > j {
+		t.Errorf("--no-start is not added before install.sh runs (flag at %d, install at %d)", i, j)
+	}
+}

@@ -791,6 +791,12 @@ only as `credential_encryption.key.wrapped`, wrapped by the customer's key
 store (`SB_SECRET_PROVIDER`: `awskms`, `vault` or `pkcs11`), and the node
 unwraps it into memory at boot. Design: `plans/customer-key-custody.md`.
 
+A node that cannot reach its key store at boot refuses to start (the log
+says `unwrap server key`). systemd retries every 5 s and gives up after 10
+failures; `sandboxd-healthcheck.timer` then starts the failed unit again
+every 30 s, so the node comes up by itself within about 30 s of the key
+store answering. Nothing needs restarting by hand.
+
 Useful gauges, all per node:
 
 | Metric | Meaning |
@@ -798,9 +804,9 @@ Useful gauges, all per node:
 | `aerolvm_key_custody{key=class,key2=custody,key3=enterprise}` | Where each key class lives (published at boot) |
 | `aerolvm_key_revoked` | 1 while this node is stopped by a revoke |
 | `aerolvm_key_recheck_total{key=result}` | Re-check results: `ok`, `revoked`, `retired`, `denied`, `throttled`, `unavailable`, `mismatch` |
-| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts |
+| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts. Stale is -1, unknown, until a sweep against the current version finishes (at boot, while the first pass against a new version runs, after a pass that stopped early, and on a node that does not sweep): not yet 0 |
 | `aerolvm_key_current`, `aerolvm_key_decryptable` | The key store's current and still-decryptable versions or labels |
-| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens |
+| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens; -1 for every old key until a reseal pass under the current ring finishes |
 | `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` | Key-store calls by outcome |
 
 ### Server key in plaintext

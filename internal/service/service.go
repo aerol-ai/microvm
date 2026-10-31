@@ -448,12 +448,16 @@ type Service struct {
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
-	// that the connected gateway has it.
-	egressCA       atomic.Pointer[egress.InspectCA]
-	egressCAMu     sync.Mutex
-	egressCAPushed atomic.Bool
-	egressSubOnce  sync.Once
-	egressStats    egressCounters
+	// that the connected gateway has it. egressCAPushMu orders the CA's
+	// pushes against a revoke's clear at the gateway, and
+	// egressCAClearOwed is set while that clear has not reached it.
+	egressCA          atomic.Pointer[egress.InspectCA]
+	egressCAMu        sync.Mutex
+	egressCAPushed    atomic.Bool
+	egressCAPushMu    sync.Mutex
+	egressCAClearOwed atomic.Bool
+	egressSubOnce     sync.Once
+	egressStats       egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
 	// for the same reason as egressWired: readiness reads it.
 	egressSelfTest atomic.Pointer[egressSelfTest]
@@ -784,10 +788,20 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
 	ctx = bootContext(ctx)
 	wrapper := s.keyStoreWrapper
-	if wrapper == nil && secrets.IsExternalProvider(name) {
+	switch {
+	case wrapper != nil:
+	case secrets.IsExternalProvider(name):
 		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
 		opts.Wrapper = s.secretWrapBackend
 		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
+	default:
+		// Still sealing local, maybe with a key store's settings already
+		// added: step 1 of the two-step switch (§12, eng D8).
+		w, err := secrets.NewOpenWrapper(ctx, KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper))
 		if err != nil {
 			return err
 		}

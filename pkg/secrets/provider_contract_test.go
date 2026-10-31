@@ -161,6 +161,16 @@ func TestFakeKMSProviderContract(t *testing.T) {
 	}
 	p := NewKMSProvider(fake, newMemBlobStore())
 	testProviderContract(t, p, providerContractOpts{anyNodeCanOpen: true})
+	// The path a node runs, through the router and the limiter, as the
+	// Vault contract does.
+	routed, w, err := NewProvider(context.Background(), ProviderOptions{Name: ProviderAWSKMS, Wrapper: fake, MaxInFlight: 2, Store: newMemBlobStore()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := w.(*limitedWrapper); !ok {
+		t.Fatalf("the node's client is %T, want the limited router", w)
+	}
+	testProviderContract(t, routed, providerContractOpts{anyNodeCanOpen: true})
 }
 
 func TestFakeKMSInjectedErrors(t *testing.T) {

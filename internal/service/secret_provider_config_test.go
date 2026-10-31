@@ -47,6 +47,47 @@ func TestConfigureSecretProviderLocal(t *testing.T) {
 // sandboxd): the canary runs against Transit and carries the boot
 // correlation id; missing settings refuse.
 func TestConfigureSecretProviderVault(t *testing.T) {
+	addr, calls := stubTransit(t)
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cipher, err := secrets.NewCipher("", filepath.Join(dir, "key"))
+	if err != nil {
+		t.Fatalf("cipher: %v", err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := config.Config{SecretProvider: "vault", SecretProviderStrictBoot: true, SecretVaultAddr: addr, SecretVaultKeyName: "k", SecretVaultMount: "transit"}
+	svc := New(cfg, logger, st, nil, nil, nil, cipher, nil, nil)
+	if err := svc.ConfigureSecretProvider(context.Background()); err != nil {
+		t.Fatalf("ConfigureSecretProvider vault = %v", err)
+	}
+	if _, ok := svc.secretProvider.(*secrets.KMSProvider); !ok || secretProviderCanaryOK.Value() != 1 {
+		t.Fatalf("provider %T canary %d", svc.secretProvider, secretProviderCanaryOK.Value())
+	}
+	correlation := calls()
+	if len(correlation) != 3 {
+		t.Fatalf("calls = %d, want capabilities + encrypt + decrypt", len(correlation))
+	}
+	for _, id := range correlation {
+		if id != "aerolvm-background:boot:standalone" {
+			t.Fatalf("correlation ids = %v", correlation)
+		}
+	}
+
+	missing := New(config.Config{SecretProvider: "vault"}, logger, st, nil, nil, nil, cipher, nil, nil)
+	if err := missing.ConfigureSecretProvider(context.Background()); err == nil || !strings.Contains(err.Error(), "SB_SECRET_VAULT_ADDR is required") {
+		t.Fatalf("vault without settings = %v", err)
+	}
+}
+
+// stubTransit is a Vault Transit whose ciphertext is the plaintext behind a
+// "vault:v1:" tag; calls returns each request's correlation id.
+func stubTransit(t *testing.T) (addr string, calls func() []string) {
+	t.Helper()
 	var mu sync.Mutex
 	var correlation []string
 	transit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -63,12 +104,26 @@ func TestConfigureSecretProviderVault(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ciphertext": "vault:v1:" + body["plaintext"].(string)}})
 		case "/v1/transit/decrypt/k":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"plaintext": strings.TrimPrefix(body["ciphertext"].(string), "vault:v1:")}})
+		case "/v1/transit/keys/k":
+			_, _ = w.Write([]byte(`{"data":{"latest_version":1,"min_decryption_version":1}}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	t.Cleanup(transit.Close)
+	return transit.URL, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), correlation...)
+	}
+}
 
+// eng D8: step 1 of a switch from local. A node that still seals with the
+// server key but holds the Vault settings, or runs the PKCS#11 helper its
+// settings started, opens what a switched peer sealed and keeps sealing
+// locally; a node without the settings names the key store it lacks.
+func TestConfigureSecretProviderLocalStepOne(t *testing.T) {
+	addr, _ := stubTransit(t)
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "db.sqlite"))
 	if err != nil {
@@ -80,28 +135,70 @@ func TestConfigureSecretProviderVault(t *testing.T) {
 		t.Fatalf("cipher: %v", err)
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	cfg := config.Config{SecretProvider: "vault", SecretProviderStrictBoot: true, SecretVaultAddr: transit.URL, SecretVaultKeyName: "k", SecretVaultMount: "transit"}
-	svc := New(cfg, logger, st, nil, nil, nil, cipher, nil, nil)
-	if err := svc.ConfigureSecretProvider(context.Background()); err != nil {
-		t.Fatalf("ConfigureSecretProvider vault = %v", err)
-	}
-	if _, ok := svc.secretProvider.(*secrets.KMSProvider); !ok || secretProviderCanaryOK.Value() != 1 {
-		t.Fatalf("provider %T canary %d", svc.secretProvider, secretProviderCanaryOK.Value())
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(correlation) != 3 {
-		t.Fatalf("calls = %d, want capabilities + encrypt + decrypt", len(correlation))
-	}
-	for _, id := range correlation {
-		if id != "aerolvm-background:boot:standalone" {
-			t.Fatalf("correlation ids = %v", correlation)
+	node := func(provider string, vault bool, helper secrets.DataKeyWrapper) *Service {
+		t.Helper()
+		cfg := config.Config{SecretProvider: provider}
+		if vault {
+			cfg.SecretVaultAddr, cfg.SecretVaultKeyName, cfg.SecretVaultMount = addr, "k", "transit"
 		}
+		svc := New(cfg, logger, st, nil, nil, nil, cipher, nil, nil)
+		if helper != nil {
+			svc.SetPKCS11Helper(helper)
+		}
+		if err := svc.ConfigureSecretProvider(context.Background()); err != nil {
+			t.Fatalf("ConfigureSecretProvider %s: %v", provider, err)
+		}
+		return svc
 	}
+	ctx := secrets.ContextWithIncarnationID(context.Background(), "inc")
+	bag := secrets.Secrets{Env: map[string]string{"K": "v"}}
+	put := func(svc *Service, sandboxID string) secrets.Handle {
+		t.Helper()
+		h, err := svc.secretProvider.Put(ctx, sandboxID, bag, []string{"node-a"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	vaultRow := put(node("vault", true, nil), "sb-vault")
+	p11Row := put(node("pkcs11", false, p11Stub{}), "sb-p11")
 
-	missing := New(config.Config{SecretProvider: "vault"}, logger, st, nil, nil, nil, cipher, nil, nil)
-	if err := missing.ConfigureSecretProvider(context.Background()); err == nil || !strings.Contains(err.Error(), "SB_SECRET_VAULT_ADDR is required") {
-		t.Fatalf("vault without settings = %v", err)
+	for _, tc := range []struct {
+		name   string
+		node   *Service
+		ref    string
+		h      secrets.Handle
+		lacked string
+	}{
+		{name: "vault settings", node: node("local", true, nil), ref: "sb-vault", h: vaultRow},
+		{name: "pkcs11 helper", node: node("local", false, p11Stub{}), ref: "sb-p11", h: p11Row},
+		{name: "no settings, vault row", node: node("local", false, nil), ref: "sb-vault", h: vaultRow, lacked: "vault"},
+		{name: "no settings, p11 row", node: node("local", false, nil), ref: "sb-p11", h: p11Row, lacked: "pkcs11"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, ok := tc.node.secretProvider.(*secrets.LocalProvider); !ok {
+				t.Fatalf("a local node built %T", tc.node.secretProvider)
+			}
+			got, err := tc.node.secretProvider.Open(ctx, tc.ref, tc.h, "node-a")
+			if tc.lacked != "" {
+				if !errors.Is(err, secrets.ErrProviderUnavailable) || !strings.Contains(err.Error(), "row wrapped by "+tc.lacked+"; node configured for local") {
+					t.Fatalf("open = %v, want the missing %s settings named", err, tc.lacked)
+				}
+				return
+			}
+			if err != nil || got.Env["K"] != "v" {
+				t.Fatalf("open = %v %v", got.Env, err)
+			}
+			// Sealing still follows SB_SECRET_PROVIDER.
+			h := put(tc.node, "sb-local-"+strings.ReplaceAll(tc.name, " ", "-"))
+			rec, err := st.GetClusterSecret(context.Background(), h.Ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if b := secrets.WrappedKeyBackend(envelopeWrappedKey(t, rec.SealedPayload)); b != "" {
+				t.Fatalf("step 1 sealed with %s", b)
+			}
+		})
 	}
 }
 

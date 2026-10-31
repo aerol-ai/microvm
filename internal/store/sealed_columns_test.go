@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
@@ -144,52 +145,86 @@ func TestResealSealedColumns(t *testing.T) {
 	}
 }
 
-// TestUpsertResealsStaleRegistryAuth: a sandbox read before the reseal pass
-// and written after it carries the old key's registry blob; while a
-// rotation is in progress the write moves it onto the current key, so the
-// pass's work is never undone.
-func TestUpsertResealsStaleRegistryAuth(t *testing.T) {
+// TestUpsertKeepsSealedColumns: a sandbox read before a rotation's reseal
+// pass and written back after the old key was retired (reconcile, a status
+// change) must not put the old key's bytes back. The whole-row write keeps
+// the sealed values the row has; only a new plaintext toolbox token, Create
+// and the reseal pass change one.
+func TestUpsertKeepsSealedColumns(t *testing.T) {
 	ctx := context.Background()
 	st, c := rotationStore(t)
 	sb := testSandbox("sb-r", nil)
+	sb.ToolboxToken = "secret-token"
 	reg, _ := c.Encrypt([]byte(`{"server":"r"}`))
 	sb.RegistryAuthSealed = reg
 	if err := st.Create(ctx, sb); err != nil {
 		t.Fatal(err)
 	}
-	// No rotation: the blob is stored as given.
-	if err := st.Upsert(ctx, sb); err != nil {
+	listed, err := st.List(ctx)
+	if err != nil {
 		t.Fatal(err)
+	}
+	stale := listed[0]
+	if stale.ToolboxToken != "" || len(stale.ToolboxTokenSealed) == 0 || !bytes.Equal(stale.RegistryAuthSealed, reg) {
+		t.Fatal("List snapshot: want the sealed token and registry blob, no plaintext")
+	}
+
+	// Rotate: every value moves to key 1, then key 0 is retired.
+	stageAndPromote(t, c)
+	for _, col := range []SealedColumn{SealedToolboxToken, SealedRegistryAuth} {
+		rows, err := st.ListSealedRows(ctx, col, "", 10)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("%s rows = %v %v", col, rows, err)
+		}
+		fresh, _, _, err := c.Reseal(rows[0].Sealed, rows[0].AAD)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w, err := st.ResealSealedRows(ctx, col, []ResealedRow{{SandboxID: sb.ID, Old: rows[0].Sealed, New: fresh}}); err != nil || !w[0] {
+			t.Fatalf("reseal %s = %v %v", col, w, err)
+		}
+	}
+	if err := c.SetRing([]secrets.RingKey{{ID: 1, Current: true}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The snapshot from before the pass is written back.
+	stale.Status = models.SandboxStatusStopped
+	if err := st.Upsert(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("the old key's toolbox token was written back: %v", err)
+	}
+	if got.ToolboxToken != "secret-token" || got.Status != models.SandboxStatusStopped {
+		t.Fatalf("after the write: token %q status %q", got.ToolboxToken, got.Status)
 	}
 	rows, _ := st.ListSealedRows(ctx, SealedRegistryAuth, "", 10)
-	if !bytes.Equal(rows[0].Sealed, reg) {
-		t.Fatal("a write outside a rotation changed the blob")
+	if plain, id, err := c.OpenWithKeyID(rows[0].Sealed, nil); err != nil || id != 1 || string(plain) != `{"server":"r"}` {
+		t.Fatalf("the old key's registry blob was written back: key %d %v", id, err)
 	}
-	stageAndPromote(t, c)
-	sb.Status = "stopped"
-	if err := st.Upsert(ctx, sb); err != nil {
+
+	// A write with a new plaintext token replaces it, under the current key.
+	got.ToolboxToken = "rotated-token"
+	if err := st.Upsert(ctx, got); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ = st.ListSealedRows(ctx, SealedRegistryAuth, "", 10)
-	if _, id, err := c.OpenWithKeyID(rows[0].Sealed, nil); err != nil || id != 1 {
-		t.Fatalf("stale registry blob written back on key %d: %v", id, err)
+	if again, err := st.Get(ctx, sb.ID); err != nil || again.ToolboxToken != "rotated-token" {
+		t.Fatalf("new plaintext token = %v", err)
 	}
-	// A blob already on the current key is stored as is.
-	current := rows[0].Sealed
-	sb.RegistryAuthSealed = current
-	if err := st.Upsert(ctx, sb); err != nil {
+
+	// A row with no sealed value yet takes the write's.
+	bare := testSandbox("sb-bare", nil)
+	if err := st.Create(ctx, bare); err != nil {
 		t.Fatal(err)
 	}
-	if rows, _ = st.ListSealedRows(ctx, SealedRegistryAuth, "", 10); !bytes.Equal(rows[0].Sealed, current) {
-		t.Fatal("a current blob was resealed")
-	}
-	// A blob nothing opens is stored as given, as before.
-	sb.RegistryAuthSealed = []byte("garbage-not-sealed")
-	if err := st.Upsert(ctx, sb); err != nil {
+	bare.RegistryAuthSealed = rows[0].Sealed
+	if err := st.Upsert(ctx, bare); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ = st.ListSealedRows(ctx, SealedRegistryAuth, "", 10)
-	if string(rows[0].Sealed) != "garbage-not-sealed" {
-		t.Fatal("an unopenable blob was changed")
+	all, _ := st.ListSealedRows(ctx, SealedRegistryAuth, "", 10)
+	if len(all) != 2 {
+		t.Fatalf("registry rows = %d, want the bare row's write kept too", len(all))
 	}
 }

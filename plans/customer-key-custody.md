@@ -483,6 +483,13 @@ a 10-second timeout. `sandboxd.service` already has `Restart=always`
 (`packaging/sandboxd.service:16`), so do not add a retry loop. The runbook
 names this dependency.
 
+*Correction (2026-10-31, live UC-301):* the unit `install.sh` writes also
+sets `StartLimitBurst=10` in 5 minutes, so systemd stops restarting after
+about 50 s of failed boots and the node stayed down after the key store came
+back. `sandboxd-healthcheck.timer` now resets and starts a **failed** unit
+every 30 s (an operator's `systemctl stop` leaves it inactive, not failed,
+and it stays stopped). Still no retry loop in the daemon.
+
 **Migration and operations.** Add a `sandboxd key` subcommand, next to the
 existing `egress-gateway` subcommand (`cmd/sandboxd/main.go:79`). It runs
 outside systemd, so it loads the same env files the unit gives the daemon
@@ -743,7 +750,14 @@ results (default 3, so about 15 minutes, eng D18), the node:
   restarts `aerolvm-egress-gateway.service`, the gateway comes back without
   the CA (it is memory-only), and a revoked sandboxd never resends it. The
   alert and audit event say the gateway was restarted (eng D4); Go cannot promise memory is
-  zeroed, so the docs say "dropped", not "wiped";
+  zeroed, so the docs say "dropped", not "wiped". A CA push in flight when
+  the key is revoked reaches the gateway before the clear, never after it
+  (pushes and the clear share a lock, and a push re-checks the revoke under
+  it). A clear that does not reach the gateway is sent again on every
+  re-check and every gateway reconnect until it lands, since a revoked
+  sandboxd that keeps talking to the gateway is never silent long enough
+  for the self-drop. The re-check runs on a loop of its own, so a sweep or
+  reseal pass stuck in a key-store call never delays a revoke;
 - fails every operation that reads sealed data with `ErrKeyRevoked` ("key
   revoked by the key store"). Because every sandbox's toolbox token is sealed
   with the server key (fact 3), that is almost everything: create (with or
@@ -1257,14 +1271,89 @@ AWS CloudHSM run passed. Every AWS resource was torn down afterwards.
   OpenBao Proxy, not Raft storage and Agent: no case restarts it, and Agent's
   token-file mode was covered in Phase 2. The eng D22 case is a follow-up.
 
-**Coverage gaps found by a review of the test list above** (being closed
-next): unit level, the sweep's five racing paths, a decrypt in flight across
-a revoke, the two-step switch from a `local` sealer, the remaining full-stop
-assertions (no CA resent to an old gateway, Sync during a revoke, inject deny
-after DropSecrets), the no-key-store-body-in-logs check and an offline 503
-`key_revoked` handler test, the helper killed mid-call; live, AWS KMS revoke,
-registry and mount secrets, the live full-stop checks, a fresh joiner,
-restore onto a new node, and a single-node wrapped install.
+**Coverage gaps (2026-10-31).** A review of the test list above against the
+tests found 12 items covered and 20 partly covered. Every unit-level gap is
+now closed (branch `feat/key-custody-6b-test-gaps`, stacked on Phase 6):
+
+- the sweep loses to each of the five racing writers (new `Put`, repair
+  reseal, peer copy of a newer and of the same generation, delete with and
+  without a tombstone, reseal retirement), and does not hold the sandbox lock
+  across the key-store call; a `Decrypt` in flight across a revoke;
+- the full stop: a gateway Sync while revoked carries no secrets and no CA,
+  an old gateway's restart gets no CA, an inject rule refuses with
+  `secret_missing` after `DropSecrets`, recovery re-sends the CA and the
+  secrets and health returns to ok; a real v1 handler answers 503
+  `key_revoked` with nothing sealed in the response or the log; a Vault
+  error never carries a request or response body;
+- the PKCS#11 helper killed mid-call (exit, not deadline) and a successful
+  call after the restart and after a deadline replacement;
+- the D9 history table, sweep correlation ids on every call, the AWS KMS
+  contract through the limiter, the remaining config rows, and the boot
+  order (the database is not opened when the key store refuses).
+
+The gap review found two product gaps, both fixed on the same branch:
+
+- **eng D8 step 1 did not work from `local`.** A node with
+  `SB_SECRET_PROVIDER=local` ignored the key-store settings: it built no
+  client and `LocalProvider.Open` used the server key only, so a failover
+  onto a node not yet flipped could not open a row a switched peer sealed.
+  Such a node now gets an open-only client (`secrets.NewOpenWrapper`) and
+  opens through the same path a switched node uses; without the settings it
+  names the key store it lacks. The live UC-297 never hit this because its
+  failovers run after every node has flipped.
+- **`software token` was only a log line (§2).** The custody report takes
+  the running token's slot kind: `aerolvm_key_custody` reads
+  `pkcs11 (software token)`, and `sandboxd key status --check` prints it.
+
+**Live gaps (2026-10-31, branch `feat/key-custody-6c-live-gaps`).** Run on
+four fresh clusters, all torn down afterwards:
+
+| UC | Scenario | Result |
+|---|---|---|
+| UC-311 AWS KMS key disabled → full stop (gauge, health, audit, an open exec stream closes, 503 `key_revoked`) → re-enabled → recovery and a failover | `cluster-3-mixed-wrapped-kms` | pass |
+| UC-312 the two-step switch from local to AWS KMS (eng D22), with a failover from a switched node to one still sealing locally | new `cluster-3-mixed-kms-switch` | pass (373 s): the step-1 fix, live |
+| UC-313 env, registry and mount secrets come back after a failover (TLS + htpasswd registry and an SSHFS share on the seed) | `cluster-3-mixed-secrets-vault` | pass |
+| UC-314 a backup restored onto the wiped node boots through the key store and rejoins; its next backup holds no plaintext key | vault | pass (146 s) after a test fix |
+| UC-315 one node installed with `install.sh --key-custody wrapped` | new `single-node-wrapped-kms` | pass |
+| UC-304 now also checks that a pre-rotation copy of the wrapped file holds only the retired key | vault | pass |
+| UC-305 restart with the plan's 50 secret-bearing sandboxes (0.25 CPU, 256 MB each): all open, no throttled call | vault | pass |
+| UC-301 key store down at boot | vault | **failed, then fixed**: see below; pass (165 s) |
+
+UC-301 found a third product gap: the unit `install.sh` writes stops
+restarting after 10 failed starts in 5 minutes, and the healthcheck skipped a
+unit that was not active, so a node whose key store was down for more than
+about 50 s at boot never came back. The healthcheck now starts a failed unit
+again every 30 s (see the correction under "Failure rule"), and UC-301 takes
+that path on purpose.
+
+Restore onto a fresh machine (UC-316, `fix/restore-fresh-machine`): the
+single node's root volume is replaced from its launch image, so cloud-init
+installs AerolVM afresh with a key of its own; a backup taken before is
+restored and the node boots through AWS KMS with the backup's key, on the
+backup's database (its boot reaps the sandbox whose container went with the
+old disk, as the runbook expects), with no decrypt error; pass. Writing it
+found that `sandboxd-restore.sh` extracted over a fresh install's
+`state.db-wal` and Raft log; it now moves them aside first. UC-314 keeps the
+same-machine wipe on the cluster.
+
+Deviations: "a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
+SSH-session half of the full stop and the alert itself stay unit-tested
+(the alert's condition, `aerolvm_key_revoked == 1`, is asserted live).
+
+A full local `go test ./...` on the stack (CI runs no Go job on a PR that
+targets another stack branch) found `pkg/caddy`'s install.sh render test
+failing since the wrapped-key phase: its prelude lacked `KEY_CUSTODY`.
+Fixed on this branch.
+
+Joiner first boot (found live, fixed on `feat/install-joiner-no-start`): on
+a joiner, install.sh started sandboxd standalone before cluster-join.sh, and
+with `--key-custody wrapped` that first boot took the "fresh single node,
+generate" path; the join restarted it within seconds (one live run caught it
+cancelled mid-wrap) and installed the seed's wrapped file over anything it
+wrote. install.sh now takes `--no-start`, the Terraform bootstrap passes it
+on joiners only (the seed's first boot is the one that makes the key), and
+UC-310 checks that a joiner's first start comes after its join and that it
+never wrapped a key.
 
 ## Phase 5 results (2026-10-31)
 
@@ -1337,16 +1426,26 @@ Decisions made while building it:
   while key 0 is live, and boot warns when it is still there after key 0 is
   retired. The cluster shared-key check accepts the ring file. Backups carry
   it; `cluster-join.sh` installs one found in the cred bundle.
-- **Lost updates.** A whole-row sandbox write carries a registry blob read
-  earlier; during a rotation the store moves it onto the current key before
-  writing, so a write that raced the reseal pass cannot put the old key's
-  bytes back. The daemon's rewrap and `sandboxd key rotate` both edit the
-  server-key file; each writes only if the file is unchanged since its read
+- **Lost updates.** A whole-row sandbox write (reconcile, a status change)
+  is a snapshot read earlier, and its sealed values may predate the reseal
+  pass and a retirement since. So it keeps the sealed values the row has:
+  only Create, the reseal pass and a write with a new plaintext toolbox
+  token change one, and a raced write cannot put back bytes nothing opens.
+  The daemon's rewrap and `sandboxd key` both edit the server-key and ring
+  files; each holds a lock on the file across its read, compare and write,
+  and writes only if the file is unchanged since its read
   (`ErrKeyFileChanged`).
 - **Counting.** A value that lost its compare-and-swap is counted under the
   key it was read on until the next pass looks again, so the rows gauge
   never reaches 0 early; values no ring key opens are counted as
-  `unopenable`. With one key in the ring the pass reads nothing.
+  `unopenable`. With one key in the ring the pass reads nothing. A count
+  is only good for the target it was made for: every old key is -1,
+  unknown, from the moment the node takes a ring the last finished pass
+  did not count until a pass under it finishes, and after a pass that
+  stopped early (never a partial count or an absent key). The key-store
+  sweep's `aerolvm_key_rows_stale` is the same per key-store version: -1 at
+  boot, before a new current version is published, and after a stopped
+  pass; it never lowers `aerolvm_key_rows_retired`.
 
 Not done here: the rotation runbook and alerts (Phase 5), the 3-node live UC
 with a failover between every step (Phase 6). Rolling a node back to a build
@@ -1754,7 +1853,7 @@ server-key boot unwrap       | file missing / bad mode / bad JSON / format | ref
                              | check mismatch                              | refuse: "wrong key-store key?"
                              | key store unavailable / denied / revoked    | exit with the class; systemd restarts
 re-check loop                | any error                                   | classified (§10); panic recovered
-revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; gateway self-drops after bound
+revoke actions               | clear_inspect_ca fails (gateway down)       | log + alert; resent each re-check and reconnect; gateway self-drops after bound
 sweep                        | CAS lost                                    | skip (counter)
                              | key-store or SQLite error                   | stop this pass, retry next cadence
 sandboxd key CLI             | env file missing                            | warn, use process env

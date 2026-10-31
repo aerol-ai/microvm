@@ -3,7 +3,7 @@
 package suite
 
 // Customer key custody on Vault (plans/customer-key-custody.md Phase 6),
-// UC-297..306, on cluster-3-mixed-secrets-vault. Disruptive: the cases
+// UC-297..306, UC-313 and UC-314, on cluster-3-mixed-secrets-vault. Disruptive: the cases
 // restart, revoke and fail over nodes, so the z_ prefix keeps them after the
 // rest of the suite. They run in order: UC-297 switches the local cluster
 // to Vault and UC-298 wraps the server key; every later case brings the
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -199,7 +200,11 @@ func TestKeyCustodyRevokeAndRecover(t *testing.T) {
 }
 
 // UC-301 — with the key store unreachable a restarted node refuses to
-// start, and starts by itself once the key store answers again.
+// start, and starts by itself once the key store answers again, even after
+// systemd has stopped restarting it (StartLimitBurst): the healthcheck
+// timer starts a failed unit again. The first fresh-cluster run of this
+// case found nothing did, so a key store down for over a minute left the
+// node down for good.
 func TestKeyCustodyKeyStoreDownAtBoot(t *testing.T) {
 	harness.Require(t, sc, "UC-301")
 	targets := kcTargets(t)
@@ -214,27 +219,33 @@ func TestKeyCustodyKeyStoreDownAtBoot(t *testing.T) {
 	})
 	kcSSH(t, node, "sudo systemctl stop itest-bao-proxy; sudo systemctl reset-failed itest-bao-proxy 2>/dev/null || true")
 	kcSSH(t, node, "sudo systemctl restart sandboxd || true")
-	// A few failed starts (Restart=always, 5s apart), well inside the unit's
-	// start limit of 10 in 5 minutes.
-	time.Sleep(20 * time.Second)
-	if state := strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")); state == "active" {
-		t.Fatalf("%s started with its key store unreachable", node.Name)
+	// Failed starts 5 s apart until systemd's start limit (10 in 5 minutes)
+	// leaves the unit failed: the state an outage of over a minute reaches.
+	for deadline := time.Now().Add(3 * time.Minute); ; time.Sleep(5 * time.Second) {
+		if state := strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")); state == "active" {
+			t.Fatalf("%s started with its key store unreachable", node.Name)
+		}
+		if strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-failed sandboxd || true")) == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never reached systemd's start limit with its key store unreachable", node.Name)
+		}
 	}
-	if j := kcSSH(t, node, "sudo journalctl -u sandboxd --no-pager -n 120 || true"); !strings.Contains(j, "unwrap server key") {
+	if j := kcSSH(t, node, "sudo journalctl -u sandboxd --no-pager -n 200 || true"); !strings.Contains(j, "unwrap server key") {
 		t.Fatalf("%s did not say why it refused to start:\n%s", node.Name, j)
 	}
 	kcEnsureProxy(t, seed, node)
-	deadline := time.Now().Add(2 * time.Minute)
+	// The healthcheck timer runs every 30 s and starts the failed unit again.
+	deadline := time.Now().Add(3 * time.Minute)
 	for strings.TrimSpace(kcSSH(t, node, "sudo systemctl is-active sandboxd || true")) != "active" {
 		if time.Now().After(deadline) {
 			t.Fatalf("%s did not start by itself after its key store came back", node.Name)
 		}
 		time.Sleep(5 * time.Second)
 	}
-	if harness.NodeRejoinCheck != nil {
-		if err := harness.NodeRejoinCheck(t, node); err != nil {
-			t.Fatalf("%s started but did not rejoin: %v", node.Name, err)
-		}
+	if err := waitNodeRejoined(t, node); err != nil {
+		t.Fatalf("%s started but did not rejoin: %v", node.Name, err)
 	}
 }
 
@@ -352,6 +363,10 @@ func TestKeyCustodyServerKeyRotation(t *testing.T) {
 	if old == "" {
 		t.Fatal("`sandboxd key status` names no current server key")
 	}
+	// A backup taken now holds only the old key (eng D24).
+	const preRotation = "/var/tmp/itest-prerotation.wrapped"
+	kcSSH(t, seed, "sudo cp "+kcWrapped+" "+preRotation)
+	t.Cleanup(func() { kcSSH(t, seed, "sudo rm -f "+preRotation) })
 	out := step("--stage")
 	if !strings.Contains(out, "staged: key ") {
 		t.Fatalf("stage: %s", out)
@@ -386,6 +401,12 @@ func TestKeyCustodyServerKeyRotation(t *testing.T) {
 
 	step("--retire " + old)
 	kcAwaitMetric(t, nodes, "aerolvm_server_key_ring", map[string]string{"key": old, "key2": "retired"}, 2*time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
+	// The pre-rotation backup holds key `old` only, and no node has a value
+	// left on it (checked before the retire): that backup opens nothing the
+	// cluster holds now.
+	if keys := kcSSH(t, seed, "sudo env SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH="+preRotation+" /usr/local/bin/sandboxd key status "+kcKeyCLIEnv+" | grep 'server keys:'"); !strings.Contains(keys, old+"=current") || strings.Contains(keys, staged+"=") {
+		t.Fatalf("the pre-rotation backup's keys: %s", keys)
+	}
 	kcHAFailover(t, targets, sb.ID, "UC304_TOKEN", secret)
 	kcHAFailover(t, targets, "", "UC304_AFTER", secretValue(t, "304b"))
 	for _, n := range nodes {
@@ -405,10 +426,11 @@ func TestKeyCustodyRestartWithManySecrets(t *testing.T) {
 	kcVaultWrapped(t, targets)
 	nodes := kcNodes(targets)
 	c := client(t)
-	const n = 20
+	// The plan's 50, kept small so three t3.medium nodes hold them all.
+	const n = 50
 	ids := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, Env: map[string]string{"UC305": strconv.Itoa(i)}})
+		sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, CPU: 0.25, MemoryMB: 256, DiskGB: 1, Env: map[string]string{"UC305": strconv.Itoa(i)}})
 		ids = append(ids, sb.ID)
 	}
 	throttled := map[string]float64{}
@@ -474,4 +496,136 @@ sudo grep -h '^key_custody=' /tmp/itest-backup-x/MANIFEST.txt`)
 	if !strings.Contains(out, "ok:") {
 		t.Fatalf("the restored wrapped file does not verify:\n%s", out)
 	}
+}
+
+// UC-313 — the three kinds of secret a sandbox carries (env, registry
+// credentials, mount credentials) are all sealed through the key store and
+// all come back on the node a failover recreates the sandbox on: it pulls
+// the private image with the opened registry credentials and remounts the
+// SSHFS share with the opened key.
+func TestKeyCustodySecretKindsSurviveFailover(t *testing.T) {
+	harness.Require(t, sc, "UC-313")
+	targets := kcTargets(t)
+	kcVaultWrapped(t, targets)
+	reg := kcEnsureRegistry(t, targets)
+	share := kcEnsureShare(t, targets)
+	c := client(t)
+
+	// The image really is private: without credentials it never starts,
+	// whether the create fails at once or the sandbox fails afterwards.
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	anon, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), Image: reg.image})
+	cancel()
+	if err == nil {
+		t.Cleanup(func() {
+			dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
+			_ = c.SDK().Destroy(dctx, anon.ID)
+			dcancel()
+		})
+		for deadline := time.Now().Add(2 * time.Minute); time.Now().Before(deadline) && string(anon.Status) != "error"; time.Sleep(5 * time.Second) {
+			if string(anon.Status) == "started" {
+				t.Fatalf("%s started without registry credentials; the registry is not private", reg.image)
+			}
+			rctx, rcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_ = anon.Refresh(rctx)
+			rcancel()
+		}
+		if string(anon.Status) != "error" {
+			t.Fatalf("a create of %s without registry credentials is %q after 2 minutes, want a failure", reg.image, anon.Status)
+		}
+	}
+
+	secret := secretValue(t, "313")
+	sb := harness.CreateHASandbox(t, c, harness.HASandboxSpec{
+		Image:    reg.image,
+		Registry: &sdktypes.RegistryAuth{Server: reg.host, Username: reg.user, Password: reg.pass},
+		Env:      map[string]string{"UC313_TOKEN": secret},
+		Mounts: []models.MountSpec{{
+			Type: models.MountTypeSSHFS, Target: "/mnt/itest-share", Source: share.source,
+			Credentials: map[string]string{"private_key_pem": share.key}, ReadOnly: true,
+		}},
+	})
+	waitRunning(t, sb)
+	if got := kcExecOut(t, c, sb.ID, "cat /mnt/itest-share/token", 3*time.Minute); got != share.token {
+		t.Fatalf("the share reads %q before the failover", got)
+	}
+	// The env secret is checked inside kcHAFailover; the new owner never
+	// pulled the image before, so starting it there used the opened
+	// registry credentials.
+	kcHAFailover(t, targets, sb.ID, "UC313_TOKEN", secret)
+	if got := kcExecOut(t, c, sb.ID, "cat /mnt/itest-share/token", 4*time.Minute); got != share.token {
+		t.Fatalf("after the failover the share reads %q: the mount key was not opened", got)
+	}
+}
+
+// UC-314 — disaster recovery onto a wiped node (eng D24): a backup of a
+// wrapped node, restored after everything it covers is gone from the node,
+// boots through the key store and rejoins, and the restored node's next
+// backup holds no plaintext key either. The same machine stands in for a
+// new one: the suite cannot add a node.
+func TestKeyCustodyRestoreOntoAWipedNode(t *testing.T) {
+	harness.Require(t, sc, "UC-314")
+	targets := kcTargets(t)
+	kcVaultWrapped(t, targets)
+	node, ok := harness.PickRestartableNode(targets)
+	if !ok {
+		t.Skip("no node to restore")
+	}
+	target, _ := harness.SSHTarget(node)
+	for path, rel := range map[string]string{
+		"/usr/local/lib/itest-sandboxd-backup.sh":  "scripts/sandboxd-backup.sh",
+		"/usr/local/lib/itest-sandboxd-restore.sh": "scripts/sandboxd-restore.sh",
+	} {
+		if err := harness.InstallNodeFile(t, node, path, kcRepoFile(t, rel)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A safety copy that cleanup puts back if the restore does not bring
+	// the node back, so a failure here does not leave the fleet short.
+	kcSSH(t, node, `set -e
+sudo systemctl stop sandboxd
+sudo rm -rf /var/tmp/itest-safety && sudo mkdir -p /var/tmp/itest-safety
+sudo cp -a /var/lib/sandboxd /var/tmp/itest-safety/lib
+sudo cp -a /etc/sandboxd /var/tmp/itest-safety/etc`)
+	back := false
+	t.Cleanup(func() {
+		if !back {
+			kcSSH(t, node, `set -e
+sudo systemctl stop sandboxd || true
+sudo rm -rf /var/lib/sandboxd /etc/sandboxd
+sudo cp -a /var/tmp/itest-safety/lib /var/lib/sandboxd
+sudo cp -a /var/tmp/itest-safety/etc /etc/sandboxd`)
+			restoreNodeDaemon(t, node, target)
+		}
+		kcSSH(t, node, "sudo rm -rf /var/tmp/itest-safety /var/tmp/itest-dr.tgz /var/tmp/itest-dr2.tgz /var/tmp/itest-dr2")
+	})
+	kcSSH(t, node, "sudo bash /usr/local/lib/itest-sandboxd-backup.sh --output /var/tmp/itest-dr.tgz")
+	kcSSH(t, node, `set -e
+sudo rm -rf /var/lib/sandboxd/state.db /var/lib/sandboxd/state.db-wal /var/lib/sandboxd/state.db-shm /var/lib/sandboxd/raft `+kcWrapped+` /etc/sandboxd
+sudo bash /usr/local/lib/itest-sandboxd-restore.sh --input /var/tmp/itest-dr.tgz --target-root / --force`)
+	if out := kcSSH(t, node, `if sudo test -e `+kcKeyFile+`; then echo KEYFILE; fi
+if sudo sh -c "grep -l '^SB_CREDENTIAL_ENCRYPTION_KEY=' /etc/sandboxd/*.env"; then echo ENVKEY; fi
+sudo test -s `+kcWrapped+` && echo WRAPPED`); strings.Contains(out, "KEYFILE") || strings.Contains(out, "ENVKEY") || !strings.Contains(out, "WRAPPED") {
+		t.Fatalf("%s after the restore: a plaintext key, or no wrapped file:\n%s", node.Name, out)
+	}
+	restoreNodeDaemon(t, node, target)
+	if t.Failed() {
+		return
+	}
+	back = true
+	if s := kcSSH(t, node, "sudo /usr/local/bin/sandboxd key status --check "+kcKeyCLIEnv); !strings.Contains(s, "check: every server key unwraps and matches") {
+		t.Fatalf("%s: `sandboxd key status --check` after the restore:\n%s", node.Name, s)
+	}
+	kcAwaitMetric(t, []harness.IntegrationNode{node}, "aerolvm_key_custody", map[string]string{"key": "server key", "key2": "customer key store (wrapped)"}, time.Minute, func(v float64, ok bool) bool { return ok && v == 1 })
+	// The backup script reports what it wrote; only the search below is
+	// judged.
+	kcSSH(t, node, "sudo bash /usr/local/lib/itest-sandboxd-backup.sh --output /var/tmp/itest-dr2.tgz")
+	listing := kcSSH(t, node, `set -e
+sudo rm -rf /var/tmp/itest-dr2 && sudo mkdir -p /var/tmp/itest-dr2 && sudo tar -xzf /var/tmp/itest-dr2.tgz -C /var/tmp/itest-dr2
+sudo find /var/tmp/itest-dr2 -name credential_encryption.key
+sudo grep -rl '^SB_CREDENTIAL_ENCRYPTION_KEY=' /var/tmp/itest-dr2 2>/dev/null || true`)
+	if strings.TrimSpace(listing) != "" {
+		t.Fatalf("the restored node's backup holds a plaintext key:\n%s", listing)
+	}
+	kcHAFailover(t, targets, "", "UC314_TOKEN", secretValue(t, "314"))
 }

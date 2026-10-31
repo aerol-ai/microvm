@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
 )
 
 // keyEnv points the tool at a temp node with AWS KMS settings and a fake
@@ -52,8 +53,8 @@ func keyEnv(t *testing.T, extra map[string]string) (dir string, envFile string, 
 		t.Fatal(err)
 	}
 	orig := openKeyStore
-	openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, func(), error) {
-		return fake, func() {}, nil
+	openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
+		return fake, nil, func() {}, nil
 	}
 	t.Cleanup(func() { openKeyStore = orig })
 	return dir, envFile, fake
@@ -67,7 +68,7 @@ func runKey(t *testing.T, args ...string) (string, error) {
 }
 
 func TestKeyGenerateVerifyStatus(t *testing.T) {
-	dir, env, _ := keyEnv(t, map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"})
+	dir, env, fake := keyEnv(t, map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"})
 	wrapped := filepath.Join(dir, "credential_encryption.key.wrapped")
 	out, err := runKey(t, "wrap", "--generate", "--env-file", env)
 	if err != nil || !strings.Contains(out, "no plaintext copy was written") {
@@ -84,6 +85,23 @@ func TestKeyGenerateVerifyStatus(t *testing.T) {
 		!strings.Contains(out, "key: alias/aerolvm") || strings.Contains(out, "migrated from plaintext") {
 		t.Fatalf("status = %q %v", out, err)
 	}
+	// A PKCS#11 token says what its slot is (§2); only --check opens it.
+	plain := openKeyStore
+	for _, tc := range []struct {
+		hardware bool
+		want     string
+	}{{false, "token: tok (SoftHSM project SoftHSM v2), a software token: the key sits in a file on this host"}, {true, "token: tok (SoftHSM project SoftHSM v2), a hardware slot"}} {
+		openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
+			return fake, &pkcs11.Info{TokenLabel: "tok", Manufacturer: "SoftHSM project", Model: "SoftHSM v2", HardwareSlot: tc.hardware}, func() {}, nil
+		}
+		if out, err := runKey(t, "status", "--check", "--env-file", env); err != nil || !strings.Contains(out, tc.want) {
+			t.Fatalf("status --check, hardware %v = %q %v", tc.hardware, out, err)
+		}
+		if out, _ := runKey(t, "status", "--env-file", env); strings.Contains(out, "token:") {
+			t.Fatalf("status without --check opened the token: %q", out)
+		}
+	}
+	openKeyStore = plain
 	if _, err := runKey(t, "wrap", "--generate", "--env-file", env); err == nil || !strings.Contains(err.Error(), "a wrapped key exists") {
 		t.Fatalf("second generate = %v", err)
 	}
@@ -240,37 +258,44 @@ func TestKeyCLIErrors(t *testing.T) {
 	}
 }
 
-func TestLoadEnvFile(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "env")
-	_ = os.WriteFile(p, []byte("A_KC_TEST='quoted value'\nB_KC_TEST=\"x\"\nC_KC_TEST=keep\n=nokey\n"), 0o600)
+func TestLoadEnvFiles(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sandboxd.env")
+	_ = os.WriteFile(p, []byte("A_KC_TEST='quoted value'\nB_KC_TEST=\"x\"\nC_KC_TEST=keep\n=nokey\nD_KC_TEST=awskms\n"), 0o600)
+	// The cluster drop-in's file comes after the unit's: it wins, as in
+	// systemd, while the process environment wins over both.
+	cluster := filepath.Join(dir, "cluster.env")
+	_ = os.WriteFile(cluster, []byte("D_KC_TEST=vault\nC_KC_TEST=cluster\n"), 0o600)
 	t.Setenv("C_KC_TEST", "from-process")
-	t.Setenv("A_KC_TEST", "")
-	_ = os.Unsetenv("A_KC_TEST")
-	t.Setenv("B_KC_TEST", "")
-	_ = os.Unsetenv("B_KC_TEST")
-	if err := loadEnvFile(p); err != nil {
-		t.Fatal(err)
+	for _, k := range []string{"A_KC_TEST", "B_KC_TEST", "D_KC_TEST"} {
+		t.Setenv(k, "")
+		_ = os.Unsetenv(k)
 	}
-	if os.Getenv("A_KC_TEST") != "quoted value" || os.Getenv("B_KC_TEST") != "x" || os.Getenv("C_KC_TEST") != "from-process" {
-		t.Fatalf("env = %q %q %q", os.Getenv("A_KC_TEST"), os.Getenv("B_KC_TEST"), os.Getenv("C_KC_TEST"))
+	var warned []error
+	loadEnvFiles([]string{p, filepath.Join(dir, "missing.env"), cluster}, func(err error) { warned = append(warned, err) })
+	if os.Getenv("A_KC_TEST") != "quoted value" || os.Getenv("B_KC_TEST") != "x" || os.Getenv("C_KC_TEST") != "from-process" || os.Getenv("D_KC_TEST") != "vault" {
+		t.Fatalf("env = %q %q %q %q", os.Getenv("A_KC_TEST"), os.Getenv("B_KC_TEST"), os.Getenv("C_KC_TEST"), os.Getenv("D_KC_TEST"))
+	}
+	if len(warned) != 1 || !strings.Contains(warned[0].Error(), "missing.env") {
+		t.Fatalf("warnings = %v", warned)
 	}
 }
 
 // The default opener, on the paths that need no key store.
 func TestDefaultOpenKeyStore(t *testing.T) {
 	ctx := context.Background()
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "local"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "local"}); err == nil {
 		t.Fatal("local opened a key store")
 	}
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "pkcs11", SecretPKCS11Module: "/nonexistent.so", SecretPKCS11KeyLabel: "k"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "pkcs11", SecretPKCS11Module: "/nonexistent.so", SecretPKCS11KeyLabel: "k"}); err == nil {
 		t.Fatal("pkcs11 with a missing module opened")
 	}
-	w, closeFn, err := openKeyStore(ctx, config.Config{SecretProvider: "vault", SecretVaultAddr: "http://127.0.0.1:1", SecretVaultKeyName: "k", SecretProviderMaxInFlight: 2})
-	if err != nil || w == nil {
+	w, token, closeFn, err := openKeyStore(ctx, config.Config{SecretProvider: "vault", SecretVaultAddr: "http://127.0.0.1:1", SecretVaultKeyName: "k", SecretProviderMaxInFlight: 2})
+	if err != nil || w == nil || token != nil {
 		t.Fatalf("vault (unreachable, policy checked later) = %v", err)
 	}
 	closeFn()
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "vault"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "vault"}); err == nil {
 		t.Fatal("vault without settings opened")
 	}
 }

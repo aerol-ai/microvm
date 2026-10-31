@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -32,14 +33,15 @@ var defaultEnvFiles = []string{"/etc/sandboxd/sandboxd.env", "/etc/sandboxd/clus
 // keyCallTimeout bounds each key-store call the tool makes.
 const keyCallTimeout = 30 * time.Second
 
-// openKeyStore builds the key-store client for cfg; tests replace it. For
-// pkcs11 the token opens in this process: a vendor crash only ends the
-// command.
-var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKeyWrapper, func(), error) {
+// openKeyStore builds the key-store client for cfg, and returns the PKCS#11
+// token it opened (nil for none); tests replace it. For pkcs11 the token
+// opens in this process: a vendor crash only ends the command.
+var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
 	if !secrets.IsExternalProvider(cfg.SecretProvider) {
-		return nil, nil, errors.New("SB_SECRET_PROVIDER is local: wrapped custody needs awskms, vault or pkcs11")
+		return nil, nil, nil, errors.New("SB_SECRET_PROVIDER is local: wrapped custody needs awskms, vault or pkcs11")
 	}
 	var helper secrets.DataKeyWrapper
+	var token *pkcs11.Info
 	closeFn := func() {}
 	if cfg.SecretProvider == secrets.ProviderPKCS11 || cfg.PKCS11Configured() {
 		tok, err := pkcs11.OpenInProcess(pkcs11.TokenConfig{
@@ -47,16 +49,17 @@ var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKey
 			KeyLabel: cfg.SecretPKCS11KeyLabel, DecryptLabels: cfg.SecretPKCS11DecryptLabels, IVMode: cfg.SecretPKCS11GCMIV, Sessions: 1,
 		})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		helper, closeFn = tok, tok.Close
+		info := tok.Info()
+		helper, token, closeFn = tok, &info, tok.Close
 	}
 	w, err := secrets.NewWrapper(secrets.ContextWithBackgroundPurpose(ctx, "key-cli"), service.KeyStoreOptions(cfg, "key-cli", helper))
 	if err != nil {
 		closeFn()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return w, closeFn, nil
+	return w, token, closeFn, nil
 }
 
 type stringList []string
@@ -108,11 +111,9 @@ func runKeyCLI(args []string, out io.Writer) error {
 	if len(envFiles) == 0 {
 		envFiles = defaultEnvFiles
 	}
-	for _, f := range envFiles {
-		if err := loadEnvFile(f); err != nil {
-			fmt.Fprintf(out, "warning: %v; using the process environment\n", err)
-		}
-	}
+	loadEnvFiles(envFiles, func(err error) {
+		fmt.Fprintf(out, "warning: %v; using the process environment\n", err)
+	})
 	cfg, err := config.LoadForKeyTool()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -159,14 +160,36 @@ func runKeyCLI(args []string, out io.Writer) error {
 	}
 }
 
-// loadEnvFile applies a systemd EnvironmentFile: KEY=VALUE lines, # and ;
-// comments, optional quotes. A variable already in the process environment
-// wins, as in the unit (the process env is on top).
-func loadEnvFile(path string) error {
+// loadEnvFiles applies the unit's EnvironmentFile entries in order. As in
+// systemd a later file overrides an earlier one (cluster.env, the cluster
+// drop-in's, over sandboxd.env), and a variable already in the process
+// environment overrides both. A file it cannot read is reported to warn
+// and skipped.
+func loadEnvFiles(paths []string, warn func(error)) {
+	merged := map[string]string{}
+	for _, p := range paths {
+		vals, err := readEnvFile(p)
+		if err != nil {
+			warn(err)
+			continue
+		}
+		maps.Copy(merged, vals)
+	}
+	for k, v := range merged {
+		if _, set := os.LookupEnv(k); !set {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
+// readEnvFile parses a systemd EnvironmentFile: KEY=VALUE lines, # and ;
+// comments, optional quotes; a later line overrides an earlier one.
+func readEnvFile(path string) (map[string]string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("env file %s: %w", path, err)
+		return nil, fmt.Errorf("env file %s: %w", path, err)
 	}
+	vals := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(raw))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -182,22 +205,26 @@ func loadEnvFile(path string) error {
 		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
 			v = v[1 : len(v)-1]
 		}
-		if _, set := os.LookupEnv(k); !set {
-			_ = os.Setenv(k, v)
-		}
+		vals[k] = v
 	}
-	return sc.Err()
+	return vals, sc.Err()
 }
 
 func withKeyStore(ctx context.Context, cfg config.Config, fn func(context.Context, secrets.DataKeyWrapper) error) error {
-	w, closeFn, err := openKeyStore(ctx, cfg)
+	return withKeyStoreToken(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper, _ *pkcs11.Info) error { return fn(ctx, w) })
+}
+
+// withKeyStoreToken is withKeyStore that also hands fn the PKCS#11 token
+// the client opened, if any.
+func withKeyStoreToken(ctx context.Context, cfg config.Config, fn func(context.Context, secrets.DataKeyWrapper, *pkcs11.Info) error) error {
+	w, token, closeFn, err := openKeyStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer closeFn()
 	ctx, cancel := context.WithTimeout(ctx, keyCallTimeout)
 	defer cancel()
-	return fn(ctx, w)
+	return fn(ctx, w, token)
 }
 
 func fileExists(path string) bool {
@@ -211,7 +238,9 @@ func fileExists(path string) bool {
 func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "KEY\tWHERE IT LIVES\t")
-	for _, row := range service.CustodyReport(cfg) {
+	// Only the token knows whether its slot is hardware: --check, which
+	// opens it, prints that below; the table stays config-only (§9).
+	for _, row := range service.CustodyReport(cfg, service.CustodyFacts{}) {
 		note := ""
 		if !row.InScope {
 			note = "(out of scope for key custody)"
@@ -252,11 +281,18 @@ func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer
 		}
 	}
 	if check {
-		return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
+		return withKeyStoreToken(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper, token *pkcs11.Info) error {
 			if _, err := secrets.UnwrapRing(ctx, w, f, nil); err != nil {
 				return err
 			}
 			fmt.Fprintln(out, "  check: every server key unwraps and matches")
+			if token != nil {
+				if token.HardwareSlot {
+					fmt.Fprintf(out, "  token: %s (%s %s), a hardware slot\n", token.TokenLabel, token.Manufacturer, token.Model)
+				} else {
+					fmt.Fprintf(out, "  token: %s (%s %s), a software token: the key sits in a file on this host, not in an HSM\n", token.TokenLabel, token.Manufacturer, token.Model)
+				}
+			}
 			return nil
 		})
 	}
@@ -513,8 +549,10 @@ func keyAckMigration(cfg config.Config, out io.Writer) error {
 		fmt.Fprintln(out, "nothing to acknowledge: this key was never plaintext")
 		return nil
 	}
-	f.MigratedFromPlaintext = false
-	if err := secrets.WriteWrappedKeyFile(path, f); err != nil {
+	nf := f
+	nf.MigratedFromPlaintext = false
+	// A compare-and-swap: never undo a rewrap or rotation written meanwhile.
+	if err := secrets.ReplaceWrappedKeyFile(path, f, nf); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "acknowledged: %s no longer reports a plaintext migration; copy it to every node\n", path)

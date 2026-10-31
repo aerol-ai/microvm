@@ -239,7 +239,7 @@ Within about 15 minutes (`SB_SECRET_PROVIDER_RECHECK_INTERVAL` × `SB_SECRET_PRO
 Running sandboxes are not killed, but nobody can manage them through AerolVM. When you restore the key, each server resumes on its own within one check, with no restart, and writes `key_recovered`.
 
 <Aside type="note" title="What a revoke does not reach">
-A running sandbox's own public address (`{id}.your-domain`) goes straight to the agent inside it. Whoever already holds that sandbox's token, such as an E2B SDK client, can keep using it until the sandbox stops. Nothing on that path uses your key. A server that cannot reach your key store at all keeps its key until it restarts, and then cannot start.
+A running sandbox's own public address (`{id}.your-domain`) goes straight to the agent inside it. Whoever already holds that sandbox's token, such as an E2B SDK client, can keep using it until the sandbox stops. Nothing on that path uses your key. A server that cannot reach your key store at all keeps its key until it restarts, and then cannot start. It keeps trying, and comes up by itself within about 30 seconds of your key store answering again.
 </Aside>
 
 A **deleted** key makes everything sealed with it unreadable for good. That is how you shut AerolVM out permanently. A **disabled** key makes it unreadable only until you enable it again.
@@ -248,7 +248,7 @@ A **deleted** key makes everything sealed with it unreadable for good. That is h
 
 ### The key in your key store
 
-- **Vault or OpenBao:** rotate the Transit key. Each server moves its stored keys onto the new version in the background, once an hour. When `aerolvm_key_rows_stale` is 0 on every server, you can raise `min_decryption_version` to retire the old version. Retiring too early fires `SandboxdKeyVersionRetiredInUse`.
+- **Vault or OpenBao:** rotate the Transit key. Each server moves its stored keys onto the new version in the background, once an hour. When `aerolvm_key_rows_stale` is 0 on every server, you can raise `min_decryption_version` to retire the old version. A value of -1 means no pass against the new version has finished yet, so keep waiting. Retiring too early fires `SandboxdKeyVersionRetiredInUse`.
 - **AWS KMS:** rotates in place. Nothing to do.
 - **HSM:** labels are settings on each server, so rotation takes four steps: add the new label to `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` everywhere; switch `SB_SECRET_PKCS11_KEY_LABEL` to it once every server lists it as decryptable; wait for `aerolvm_key_rows_stale` to reach 0; then remove the old label and destroy the old key. The [runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#rotate-the-key-store-key) has the details.
 
@@ -257,7 +257,7 @@ A **deleted** key makes everything sealed with it unreadable for good. That is h
 A new server key makes old copies of the server key useless for anything in the current database. It works with wrapped custody and with a plain key file.
 
 1. `sandboxd key rotate --stage` on one server. Copy the file it names to every server. Wait until `aerolvm_server_key_ring{key="1",key2="decrypt"}` shows on every server.
-2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server.
+2. `sandboxd key rotate --promote`, and copy the file again. Each server starts sealing with the new key and moves its stored secrets onto it. Wait until `aerolvm_server_key_rows{key="0"}` is gone on every server. A value of -1 means no pass under the new key has finished yet, so keep waiting.
 3. `sandboxd key rotate --retire 0`, and copy the file again.
 
 Every server must run a release that supports rotation before step 1; `--stage` checks this and refuses otherwise. Each server records `key_rotation_staged`, `key_rotation_promoted` and `key_rotation_retired` in its audit log. After step 2 a server cannot go back to an older release.
@@ -274,7 +274,7 @@ With `SB_ENTERPRISE_MODE=true`:
 
 - **A running server holds the key in memory.** Someone with root on a running server can read it. This is true of every scheme like this one, AWS KMS included.
 - **The server still holds a way in.** It has a Vault token, reaches a local Vault Proxy, or has an HSM PIN file. Someone who steals that can unlock keys only while they can reach your key store, and every call shows in its log.
-- **Software tokens are for tests.** SoftHSM2 keeps its keys and PIN on the same disk, so a stolen disk does unlock them.
+- **Software tokens are for tests.** SoftHSM2 keeps its keys and PIN on the same disk, so a stolen disk does unlock them. Enterprise mode refuses one. Elsewhere the server logs a warning, `sandboxd key status --check` says `software token`, and the `aerolvm_key_custody` metric reads `pkcs11 (software token)`.
 - **Secrets inside a sandbox** are the sandbox's once they are injected. Revoking does not take them back.
 - **Where the evidence is.** Your key store's own log (Vault audit devices, CloudTrail, the HSM's audit log) records every call. AerolVM's audit log records custody changes, revokes, recoveries and rotations.
 
