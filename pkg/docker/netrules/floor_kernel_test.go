@@ -40,6 +40,8 @@ func floorNS(t *testing.T, ns, hostIf, nsIf, hostIP, nsIP, gw string) {
 }
 
 func TestKernelFloor(t *testing.T) {
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
 	if os.Geteuid() != 0 {
 		t.Skip("needs root in a privileged container")
 	}

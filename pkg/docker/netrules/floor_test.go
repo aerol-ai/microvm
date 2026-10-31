@@ -43,6 +43,8 @@ func (f *floorMemBackend) FlushChain(chain string) error {
 // from the top of the user chain; an empty list clears it; IPv6 entries
 // are skipped; a backend without chain management says so.
 func TestSetFloor(t *testing.T) {
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
 	be := &floorMemBackend{}
 	m := NewWithBackend(be)
 	subnet := netip.MustParsePrefix("172.17.0.0/16")
@@ -163,6 +165,8 @@ func (o *orderedBackend) first(chain string) string {
 // not one created after, not across a chain an older daemon filled with
 // the jump lower down, and not after the chain was flushed and re-asserted.
 func TestFloorJumpStaysFirst(t *testing.T) {
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
 	be := &orderedBackend{chains: map[string][]string{}}
 	m := NewWithBackend(be)
 	m.SetBridgeSubnet("10.88.0.0/16")
@@ -223,6 +227,8 @@ func TestFloorJumpStaysFirst(t *testing.T) {
 // floor: on a node running containers and Firecracker guests, the other
 // runtime's sandboxes lost the metadata, deny_cidrs and isolation drops.
 func TestFloorsOfTwoRuntimesCoexist(t *testing.T) {
+	ResetFloorsForTest()
+	t.Cleanup(ResetFloorsForTest)
 	be := &floorMemBackend{}
 	containers := NewWithBackend(be)
 	guests := NewWithBackend(be)
@@ -255,4 +261,70 @@ func TestFloorsOfTwoRuntimesCoexist(t *testing.T) {
 	if !slices.Contains(be.jumps, ChainAerolvmFC+"->"+FloorChainFor(taps)) || !slices.Contains(be.jumps, ChainDockerUser+"->"+FloorChainFor(bridge)) {
 		t.Fatalf("each runtime's chain jumps to its own floor: %v", be.jumps)
 	}
+}
+
+// TestFloorsDropAcrossRuntimes: with interconnect off, a Firecracker guest
+// cannot open a connection to a container sandbox on the same node, nor a
+// container to a guest. Each floor drops its subnet to every sandbox subnet
+// on the node, whichever runtime set its floor first. Found live: a guest on
+// cluster-bank-flagship reached a container's toolbox agent (UC-339).
+func TestFloorsDropAcrossRuntimes(t *testing.T) {
+	bridge := netip.MustParsePrefix("10.88.0.0/16")
+	taps := netip.MustParsePrefix("172.16.0.0/16")
+	drop := func(from, to netip.Prefix) string {
+		return "filter|" + FloorChainFor(from) + "|-s|" + from.String() + "|-d|" + to.String() + "|-j|DROP"
+	}
+	for _, order := range []string{"containers first", "guests first"} {
+		t.Run(order, func(t *testing.T) {
+			ResetFloorsForTest()
+			t.Cleanup(ResetFloorsForTest)
+			be := &floorMemBackend{}
+			containers := NewWithBackend(be)
+			containers.userChain = ChainAerolvmUser
+			guests := NewWithBackend(be)
+			guests.userChain = ChainAerolvmFC
+			first, firstNet, second, secondNet := containers, bridge, guests, taps
+			if order == "guests first" {
+				first, firstNet, second, secondNet = guests, taps, containers, bridge
+			}
+			if err := first.SetFloor(firstNet, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := second.SetFloor(secondNet, nil); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{drop(bridge, taps), drop(bridge, bridge), drop(taps, bridge), drop(taps, taps)} {
+				if !slices.Contains(be.rules, want) {
+					t.Errorf("missing %s in %v", want, be.rules)
+				}
+			}
+			// An operator-file change re-renders one floor; the other keeps
+			// its drop to the first's subnet.
+			if err := containers.SetFloor(bridge, []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Contains(be.rules, drop(taps, bridge)) || !slices.Contains(be.rules, drop(bridge, taps)) {
+				t.Fatalf("a re-render dropped the cross-runtime rules: %v", be.rules)
+			}
+		})
+	}
+	t.Run("interconnect on", func(t *testing.T) {
+		ResetFloorsForTest()
+		t.Cleanup(ResetFloorsForTest)
+		SetSandboxInterconnect(true)
+		t.Cleanup(func() { SetSandboxInterconnect(false) })
+		be := &floorMemBackend{}
+		containers := NewWithBackend(be)
+		guests := NewWithBackend(be)
+		guests.userChain = ChainAerolvmFC
+		if err := containers.SetFloor(bridge, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := guests.SetFloor(taps, nil); err != nil {
+			t.Fatal(err)
+		}
+		if len(be.rules) != 0 {
+			t.Fatalf("SB_SANDBOX_INTERCONNECT=true keeps no subnet drops, got %v", be.rules)
+		}
+	})
 }
