@@ -2,6 +2,7 @@ package gatewayd
 
 import (
 	"context"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -426,7 +427,9 @@ func TestSocketListenerAndGuard(t *testing.T) {
 	}
 	op := filepath.Join(dir, "op.yaml")
 	_ = os.WriteFile(op, []byte("version: 1\ndeny_cidrs: [10.99.0.0/16]\n"), 0o600)
-	if g, _, err := fromOperatorFile(op); err != nil || len(g.DenyFloor) != 1 {
+	// The file's deny_cidrs, then the cloud metadata endpoints every floor
+	// carries.
+	if g, _, err := fromOperatorFile(op); err != nil || len(g.DenyFloor) != 1+len(egresspolicy.MetadataPrefixes) || g.DenyFloor[0].String() != "10.99.0.0/16" {
 		t.Fatalf("operator guard = %+v, %v", g, err)
 	}
 	if safeName("a/b.c") != "a_b_c" {

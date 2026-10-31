@@ -81,6 +81,27 @@ type Manager struct {
 	// bridge + NAT but not FORWARD ACCEPTs (libnetwork did that for docker0),
 	// so it is ours (plan §4 item #5).
 	bridgeSubnet string
+	// floorFirst is set once SetFloor runs: the user chain's first rule is
+	// then the jump to the deny floor, and every other rule goes below it
+	// (topPos). A per-sandbox ACCEPT above the jump would let that sandbox
+	// past the floor (the cloud metadata endpoints, the operator's
+	// deny_cidrs) by naming a floor address, or 0.0.0.0/0, in its allowlist.
+	floorFirst atomic.Bool
+	// floorChain is this manager's floor chain (FloorChainFor its subnet),
+	// set with floorFirst; ReassertChain puts its jump back on top.
+	floorChain atomic.Value // string
+	// legacyFloorEmptied: the shared AEROLVM-FLOOR chain of an older daemon
+	// has been emptied (once per manager).
+	legacyFloorEmptied atomic.Bool
+}
+
+// topPos is the position of a rule that belongs at the top of the user
+// chain: 1, or 2 below the floor's jump once there is one.
+func (m *Manager) topPos() int {
+	if m.floorFirst.Load() {
+		return 2
+	}
+	return 1
 }
 
 // SetBridgeSubnet records the sandbox bridge subnet whose forwarded traffic
@@ -227,7 +248,7 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 
 	inserted := false
 	if !exists {
-		if err := m.ipt.Insert("filter", m.filterChain(), 1, "-s", containerIP, "-j", "DROP"); err != nil {
+		if err := m.ipt.Insert("filter", m.filterChain(), m.topPos(), "-s", containerIP, "-j", "DROP"); err != nil {
 			return false, fmt.Errorf("insert egress rule: %w", err)
 		}
 		inserted = true
@@ -277,7 +298,7 @@ func (m *Manager) BlockAllIngress(containerIP string) error {
 		return nil
 	}
 
-	if err := m.ipt.Insert("filter", m.filterChain(), 1, "-d", containerIP, "-j", "DROP"); err != nil {
+	if err := m.ipt.Insert("filter", m.filterChain(), m.topPos(), "-d", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("insert ingress rule: %w", err)
 	}
 
@@ -546,7 +567,7 @@ func (m *Manager) ensurePolicyRule(spec ...string) error {
 	if exists {
 		return nil
 	}
-	if err := m.ipt.Insert("filter", m.filterChain(), 1, spec...); err != nil {
+	if err := m.ipt.Insert("filter", m.filterChain(), m.topPos(), spec...); err != nil {
 		return fmt.Errorf("insert egress policy rule: %w", err)
 	}
 	return nil

@@ -58,6 +58,7 @@ type Client struct {
 	toolboxLoopback    bool
 	privileged         bool
 	resourceLimitsOff  bool
+	pidsLimit          int64
 	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
@@ -133,6 +134,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxLoopback:    cfg.DockerToolboxLoopback,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		pidsLimit:          int64(cfg.SandboxPidsLimit),
 		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
@@ -582,6 +584,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if req.MemoryMB > 0 {
 			resources["Memory"] = int64(req.MemoryMB) * 1024 * 1024
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
+		}
+		if c.pidsLimit > 0 {
+			// A fork bomb stops here instead of exhausting the node.
+			resources["PidsLimit"] = c.pidsLimit
 		}
 		if req.DiskGB > 0 {
 			// gVisor does not honor StorageOpt size — silently applying it
