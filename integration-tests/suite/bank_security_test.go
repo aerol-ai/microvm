@@ -131,6 +131,31 @@ func bankTCPOpen(t *testing.T, sb *microvm.Sandbox, host string, port int) bool 
 	return strings.Contains(out, "rc=0")
 }
 
+// bankNeighbour returns a sandbox of runtime rt on the same node as of, at a
+// different address. A lateral probe between sandboxes on two nodes says
+// nothing: every node numbers its sandboxes from the same ranges (the first
+// Firecracker guest on each is 172.16.0.2), so it reaches a sandbox on the
+// prober's own node, often the prober itself. The cluster-bank-flagship run
+// reported Firecracker guests answering each other for exactly that reason.
+func bankNeighbour(t *testing.T, rt bankRuntime, of *microvm.Sandbox) (*microvm.Sandbox, bool) {
+	t.Helper()
+	c := client(t)
+	targets := harness.LoadIntegrationTargets()
+	ofIP := containerIP(t, c, of)
+	ofNode := ""
+	if targets != nil && len(targets.Nodes) > 1 {
+		ofNode = bankSandboxNode(t, targets, of).Name
+	}
+	for i := 0; i < 8; i++ {
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
+		if (ofNode == "" || bankSandboxNode(t, targets, sb).Name == ofNode) && containerIP(t, c, sb) != ofIP {
+			return sb, true
+		}
+		destroyBest(c, sb.ID)
+	}
+	return nil, false
+}
+
 // bankTargets is the provisioned nodes with SSH, or a skip.
 func bankTargets(t *testing.T) *harness.IntegrationTargets {
 	t.Helper()
@@ -213,7 +238,10 @@ func TestBankNoLateralMovement(t *testing.T) {
 			t.Fatalf("the victim's listener did not start: %s", out)
 		}
 		bIP := bankIP(t, b)
-		a := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
+		a, ok := bankNeighbour(t, rt, b)
+		if !ok {
+			t.Skipf("no second %s sandbox landed on %s's node; a probe across nodes reaches the prober's own node", rt.name, b.ID)
+		}
 		if bankTCPOpen(t, a, bIP, 8080) {
 			t.Errorf("sandbox %s reached sandbox %s's listener at %s:8080", a.ID, b.ID, bIP)
 		}
@@ -1026,16 +1054,20 @@ func TestBankToolboxAgentUnreachable(t *testing.T) {
 		sb *microvm.Sandbox
 		ip string
 	}
-	var victims, attackers []peer
+	var victims []peer
 	for _, rt := range bankShellRuntimes(t) {
 		v := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		victims = append(victims, peer{rt: rt, sb: v, ip: containerIP(t, c, v)})
-		attackers = append(attackers, peer{rt: rt, sb: bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})})
 	}
-	for _, a := range attackers {
-		for _, v := range victims {
-			a, v := a, v
-			t.Run(a.rt.name+"-to-"+v.rt.name, func(t *testing.T) {
+	for _, v := range victims {
+		for _, rt := range bankShellRuntimes(t) {
+			v, rt := v, rt
+			t.Run(rt.name+"-to-"+v.rt.name, func(t *testing.T) {
+				sb, ok := bankNeighbour(t, rt, v.sb)
+				if !ok {
+					t.Skipf("no %s sandbox landed on %s's node; a probe across nodes reaches the prober's own node", rt.name, v.sb.ID)
+				}
+				a := peer{rt: rt, sb: sb}
 				if !bankTCPOpen(t, a.sb, v.ip, bankToolboxPort) {
 					return
 				}
