@@ -104,6 +104,8 @@ func stubTransit(t *testing.T) (addr string, calls func() []string) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"ciphertext": "vault:v1:" + body["plaintext"].(string)}})
 		case "/v1/transit/decrypt/k":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"plaintext": strings.TrimPrefix(body["ciphertext"].(string), "vault:v1:")}})
+		case "/v1/transit/keys/k":
+			_, _ = w.Write([]byte(`{"data":{"latest_version":1,"min_decryption_version":1}}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

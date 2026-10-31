@@ -305,3 +305,41 @@ func TestStartKeyCustodySweepsAtBoot(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// §5: every key-store call the sweep makes carries the sweep's background
+// correlation id, so the key store's own log ties each call to it.
+func TestSweepCallsCarryTheSweepID(t *testing.T) {
+	addr, calls := stubTransit(t)
+	svc, _, _, _, _ := revokeHarness(t)
+	svc.cfg.CredentialKeyCustody = secrets.CustodyFile
+	svc.cfg.SecretProvider = "vault"
+	svc.cfg.SecretVaultAddr, svc.cfg.SecretVaultKeyName, svc.cfg.SecretVaultMount = addr, "k", "transit"
+	ctx := context.Background()
+	w, err := secrets.NewWrapper(ctx, KeyStoreOptions(svc.cfg, svc.keyStoreNodeID(), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.SetKeyStoreWrapper(w)
+	inc := secrets.ContextWithIncarnationID(ctx, "inc")
+	local := secrets.NewLocalProvider(svc.cipher, newSecretBlobStore(svc.store))
+	for _, id := range []string{"sb-1", "sb-2"} {
+		if _, err := local.Put(inc, id, secrets.Secrets{Env: map[string]string{"K": id}}, []string{"node-a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := len(calls())
+	if stale, err := svc.SweepKeys(ctx); err != nil || stale != 0 {
+		t.Fatalf("sweep = %d %v", stale, err)
+	}
+	got := calls()[before:]
+	// The key read, then one wrap per converted row.
+	if len(got) != 3 {
+		t.Fatalf("sweep made %d key-store calls, want 3", len(got))
+	}
+	want := "aerolvm-background:sweep:" + svc.keyStoreNodeID()
+	for i, id := range got {
+		if id != want {
+			t.Fatalf("call %d carried %q, want %q", i, id, want)
+		}
+	}
+}
