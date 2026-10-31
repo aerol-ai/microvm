@@ -483,6 +483,13 @@ a 10-second timeout. `sandboxd.service` already has `Restart=always`
 (`packaging/sandboxd.service:16`), so do not add a retry loop. The runbook
 names this dependency.
 
+*Correction (2026-10-31, live UC-301):* the unit `install.sh` writes also
+sets `StartLimitBurst=10` in 5 minutes, so systemd stops restarting after
+about 50 s of failed boots and the node stayed down after the key store came
+back. `sandboxd-healthcheck.timer` now resets and starts a **failed** unit
+every 30 s (an operator's `systemctl stop` leaves it inactive, not failed,
+and it stays stopped). Still no retry loop in the daemon.
+
 **Migration and operations.** Add a `sandboxd key` subcommand, next to the
 existing `egress-gateway` subcommand (`cmd/sandboxd/main.go:79`). It runs
 outside systemd, so it loads the same env files the unit gives the daemon
@@ -1291,12 +1298,32 @@ The gap review found two product gaps, both fixed on the same branch:
   the running token's slot kind: `aerolvm_key_custody` reads
   `pkcs11 (software token)`, and `sandboxd key status --check` prints it.
 
-Still open, all live (they need AWS spend): AWS KMS revoke, registry and
-mount secrets, the live full-stop checks (SSH and exec streams, CA, alert),
-a fresh joiner, restore onto a new node, a single-node
-`install.sh --key-custody wrapped`, the eng D22 switch with a failover onto
-a node still in step 1, and "an old backup key opens no current row" in
-UC-304.
+**Live gaps (2026-10-31, branch `feat/key-custody-6c-live-gaps`).** Run on
+four fresh clusters, all torn down afterwards:
+
+| UC | Scenario | Result |
+|---|---|---|
+| UC-311 AWS KMS key disabled → full stop (gauge, health, audit, an open exec stream closes, 503 `key_revoked`) → re-enabled → recovery and a failover | `cluster-3-mixed-wrapped-kms` | pass |
+| UC-312 the two-step switch from local to AWS KMS (eng D22), with a failover from a switched node to one still sealing locally | new `cluster-3-mixed-kms-switch` | pass (373 s): the step-1 fix, live |
+| UC-313 env, registry and mount secrets come back after a failover (TLS + htpasswd registry and an SSHFS share on the seed) | `cluster-3-mixed-secrets-vault` | pass |
+| UC-314 a backup restored onto the wiped node boots through the key store and rejoins; its next backup holds no plaintext key | vault | pass (146 s) after a test fix |
+| UC-315 one node installed with `install.sh --key-custody wrapped` | new `single-node-wrapped-kms` | pass |
+| UC-304 now also checks that a pre-rotation copy of the wrapped file holds only the retired key | vault | pass |
+| UC-301 key store down at boot | vault | **failed, then fixed**: see below; pass (165 s) |
+
+UC-301 found a third product gap: the unit `install.sh` writes stops
+restarting after 10 failed starts in 5 minutes, and the healthcheck skipped a
+unit that was not active, so a node whose key store was down for more than
+about 50 s at boot never came back. The healthcheck now starts a failed unit
+again every 30 s (see the correction under "Failure rule"), and UC-301 takes
+that path on purpose.
+
+Deviations: "restore onto a fresh node" restores onto the same machine
+after wiping everything the backup covers (the suite cannot add a node);
+"a fresh joiner" is covered by UC-310, whose joiners are built wrapped; the
+SSH-session half of the full stop and the alert itself stay unit-tested
+(the alert's condition, `aerolvm_key_revoked == 1`, is asserted live); the
+restart test keeps 20 sandboxes, not 50, for the test nodes' capacity.
 
 ## Phase 5 results (2026-10-31)
 
