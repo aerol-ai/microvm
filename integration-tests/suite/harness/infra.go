@@ -114,6 +114,26 @@ func EC2InstanceState(t *testing.T, instanceID string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// SetKMSKeyEnabled disables or re-enables a customer-managed KMS key via the
+// AWS CLI: what a customer does to revoke AerolVM's access to its key store
+// (plans/customer-key-custody.md §10). Only the scenario's own key, which
+// teardown schedules for deletion, may be passed here.
+func SetKMSKeyEnabled(t *testing.T, keyID string, enabled bool) {
+	t.Helper()
+	if keyID == "" {
+		t.Fatalf("empty KMS key id")
+	}
+	verb := "disable-key"
+	if enabled {
+		verb = "enable-key"
+	}
+	args := append([]string{"kms", verb, "--key-id", keyID}, awsRegionArgs()...)
+	out, err := exec.Command("aws", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("aws kms %s %s: %v (%s)", verb, keyID, err, strings.TrimSpace(string(out)))
+	}
+}
+
 // SetEC2InstanceRunning stops or starts an EC2 instance via the AWS CLI.
 // Region/profile follow the ambient AWS_* env (run.sh exports both for the
 // suite); awsRegionArgs makes the region explicit so the node-kill failover

@@ -22,6 +22,7 @@ BIN_DIR ?= bin
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
 	integration-key-custody-vault integration-key-custody-pkcs11 integration-key-custody-kms \
+	integration-key-custody-kms-switch integration-key-custody-single \
 	integration-routing integration-routing-hetero-lite \
 	integration-bench-cluster integration-identity-gate integration-identity-only
 
@@ -144,7 +145,9 @@ integration-secrets-kms:
 
 # Customer key custody (plans/customer-key-custody.md Phase 6). Real AWS,
 # costs money like every scenario here. vault and pkcs11 install their key
-# store over SSH; kms is built with Terraform key_custody = "wrapped".
+# store over SSH; kms is built with Terraform key_custody = "wrapped";
+# kms-switch runs the two-step switch from local to AWS KMS; single is one
+# node installed with install.sh --key-custody wrapped.
 integration-key-custody-vault:
 	integration-tests/run.sh cluster-3-mixed-secrets-vault $(RUN_FLAGS)
 
@@ -153,6 +156,12 @@ integration-key-custody-pkcs11:
 
 integration-key-custody-kms:
 	integration-tests/run.sh cluster-3-mixed-wrapped-kms $(RUN_FLAGS)
+
+integration-key-custody-kms-switch:
+	integration-tests/run.sh cluster-3-mixed-kms-switch $(RUN_FLAGS)
+
+integration-key-custody-single:
+	integration-tests/run.sh single-node-wrapped-kms $(RUN_FLAGS)
 
 integration-secrets-enterprise:
 	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)

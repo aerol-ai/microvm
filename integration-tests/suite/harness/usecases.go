@@ -232,6 +232,13 @@ const (
 	// key_custody = "wrapped" on a real AWS KMS key, so no plaintext server
 	// key is ever written.
 	CapKeyCustodyKMSWrapped Capability = "key-custody-kms-wrapped"
+	// CapKeyCustodyKMSSwitch: a fresh cluster installed on a real AWS KMS
+	// key with custody file, so a case can step it back to local sealing and
+	// run the two-step switch to AWS KMS (eng D22).
+	CapKeyCustodyKMSSwitch Capability = "key-custody-kms-switch"
+	// CapKeyCustodySingleWrapped: one node installed with
+	// install.sh --key-custody wrapped on a real AWS KMS key.
+	CapKeyCustodySingleWrapped Capability = "key-custody-single-wrapped"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -282,6 +289,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapAuditExportS3: true, CapRollingUpgrade: true, CapPATScopeHost: true,
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
+	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -829,6 +837,11 @@ var Registry = []UseCase{
 	{ID: "UC-308", Title: "Key custody, PKCS#11: the four-step label rotation (decrypt label everywhere, switch the key label, sweep to 0, retire the old label) with a failover between every step", Requires: []Capability{CapKeyCustodyPKCS11, CapCluster, CapSecrets}, Implemented: true},
 	{ID: "UC-309", Title: "Key custody, PKCS#11: destroying the key on one node's token stops that node (key_revoked) and only that node; re-importing the same key brings it back", Requires: []Capability{CapKeyCustodyPKCS11, CapCluster}, Implemented: true},
 	{ID: "UC-310", Title: "Key custody, AWS KMS: a cluster built with key_custody = wrapped never writes a plaintext server key (key file, env files, the seed's cred bundle, the S3 bundle object), and an HA sandbox fails over and opens", Requires: []Capability{CapKeyCustodyKMSWrapped, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-311", Title: "Key custody, AWS KMS: the customer disables the key; every node stops within the bound (key_revoked gauge, health, key_revoked audit record, an exec stream open across it closes, 503 key_revoked on a create); enabling it brings every node back (key_recovered) and a sandbox sealed before fails over and opens", Requires: []Capability{CapKeyCustodyKMSWrapped, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-312", Title: "Key custody, AWS KMS: the two-step switch from local (eng D22) with a failover in the middle of step 2: a sandbox sealed by a switched node fails over to a node that still seals locally and opens; after the switch nothing is stale and sandboxes from before and during it fail over and open", Requires: []Capability{CapKeyCustodyKMSSwitch, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-313", Title: "Key custody: env, registry and mount secrets all come back after a failover: the new owner pulls a private image with the opened registry credentials and remounts an SSHFS share with the opened key", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-314", Title: "Key custody: a backup of a wrapped node restored onto the wiped node boots through the key store and rejoins; the restored node's next backup holds no plaintext key", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-315", Title: "Key custody, AWS KMS: a single node installed with install.sh --key-custody wrapped holds no plaintext server key, and after a restart reopens its sealed values through the key store", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

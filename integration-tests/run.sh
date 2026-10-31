@@ -29,7 +29,8 @@
 #            cluster-hetero-lite-secrets | cluster-hetero-lite-kms |
 #            cluster-3-mixed-bench
 # Key custody (plans/customer-key-custody.md): cluster-3-mixed-secrets-vault |
-#            cluster-3-mixed-secrets-pkcs11 | cluster-3-mixed-wrapped-kms
+#            cluster-3-mixed-secrets-pkcs11 | cluster-3-mixed-wrapped-kms |
+#            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
