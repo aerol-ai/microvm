@@ -13,7 +13,15 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
+)
+
+// Key-store Retry-After hints. A throttle clears in about a second once the
+// limiter's own backoff has run out; an unreachable key store needs longer.
+const (
+	keyStoreThrottledRetryAfterSeconds   = 1
+	keyStoreUnavailableRetryAfterSeconds = 5
 )
 
 // ErrKind names the few service errors a facade words differently for its own
@@ -79,6 +87,21 @@ func Classify(err error) Classification {
 	// wiring state, not client fault. 503+Retry-After so SDKs back off.
 	case errors.Is(err, models.ErrContainerEngineNotRegistered):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: admissionRetryAfterSeconds, Message: "container engine for this sandbox is not available on this node; retry shortly"}
+
+	// Key-store classes (plans/customer-key-custody.md, eng review Section
+	// 2): 503 with a stable code, so a caller can tell "the customer's key
+	// store said no" from our bug. The message is fixed text: the key store's
+	// own response never reaches a client.
+	case errors.Is(err, secrets.ErrKeyRevoked):
+		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeKeyRevoked, Message: "key revoked by the key store", Log: true, LogLevel: slog.LevelWarn}
+	case errors.Is(err, secrets.ErrKeyVersionRetired):
+		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeKeyVersionRetired, Message: "key version retired by the key store", Log: true, LogLevel: slog.LevelWarn}
+	case errors.Is(err, secrets.ErrProviderDenied):
+		return Classification{Status: http.StatusServiceUnavailable, Code: models.ErrorCodeKeyStoreDenied, Message: "key store denied this node", Log: true, LogLevel: slog.LevelWarn}
+	case errors.Is(err, secrets.ErrProviderThrottled):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: keyStoreThrottledRetryAfterSeconds, Code: models.ErrorCodeKeyStoreThrottled, Message: "key store throttled; retry shortly"}
+	case errors.Is(err, secrets.ErrProviderUnavailable):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: keyStoreUnavailableRetryAfterSeconds, Code: models.ErrorCodeKeyStoreUnavailable, Message: "key store unavailable; retry shortly"}
 
 	// Lifecycle-precondition conflicts (pause/resume). Each facade words them
 	// for its own SDK via the Kind.

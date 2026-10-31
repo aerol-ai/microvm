@@ -293,14 +293,14 @@ Two precise points about this envelope:
 - The `Scope` is part of the JSON that gets encrypted. It is not bound as AAD, because `upstream_wrap.go` passes no AAD on purpose, to match the JavaScript code that unwraps it. So the scope check is AOCR's behavior, not a cryptographic binding.
 - Cluster secrets are different. They are sealed with AAD tied to their recipient nodes and their sandbox (`KeyAADBound` and `PayloadAADBound` in `pkg/secrets/envelope.go`). Mount credentials stored on one node have no such binding.
 
-These envelopes use their own key ring file (`LoadUpstreamWrapKeyRing`), separate from the main encryption key. A cluster can also have AWS KMS (Amazon's key management service) wrap each cluster secret's data key, instead of the local key. See [Secrets providers](/cluster-secrets/).
+These envelopes use their own key ring file (`LoadUpstreamWrapKeyRing`), separate from the main encryption key. A cluster can also have its key store (AWS KMS, Vault, OpenBao or an HSM) wrap each cluster secret's data key, instead of the local key. See [Secrets providers](/cluster-secrets/).
 
 ## Where the limits are
 
 These are the places where the boundary is weaker than it might look:
 
-- **Sealing protects data at rest only.** A compromised `sandboxd` holds the key, so it can read decrypted secrets: the boundary stops at the host, not the daemon. For cluster secrets, AWS KMS can hold the key that wraps the data keys. But the local key that seals mounts, environments and toolbox tokens is still a file on the host.
-- **Sealed values are only as safe as the key file.** The database and the key file sit on the same host. Anyone who can read both, such as root, can open every toolbox token and environment. Operators on shared hosts should run `sandboxd` as a dedicated user; the default install runs it as root.
+- **Sealing protects data at rest only.** A compromised `sandboxd` holds the key, so it can read decrypted secrets: the boundary stops at the host, not the daemon. For cluster secrets, your key store can hold the key that wraps the data keys. The local key that seals mounts, environments and toolbox tokens is a file on the host by default; with wrapped custody only a copy wrapped by your key store is on disk and the key itself lives in `sandboxd`'s memory, which root on a running host can still read. See [Use your own key store](/enterprise/key-custody/).
+- **Sealed values are only as safe as the key file.** By default the database and the key file sit on the same host (wrapped custody removes the plain key file). Anyone who can read both, such as root, can open every toolbox token and environment. Operators on shared hosts should run `sandboxd` as a dedicated user; the default install runs it as root.
 - **runc is the default runtime.** It is a resource-isolation boundary, not a security boundary against an attacker who can exploit the kernel. For untrusted tenants sharing a host, set the sandbox's runtime to `gvisor` or `firecracker`. See [gVisor](/gvisor-sandbox/) and [Firecracker architecture](/firecracker-architecture/).
 - **Mount namespaces are the kernel's mechanism, not `sandboxd`'s.** A kernel CVE that allows an escape from a mount namespace is the kernel's bug, but the trust boundary weakens with it.
 - **Network rules and quotas must be set to do anything.** A sandbox with no `network_block_all` and no egress rules can reach everywhere the host can. Property 4 is a mechanism, not a policy.
@@ -440,5 +440,5 @@ Every example below does the same thing. The credentials in the `mounts` array a
 - [Attach cloud storage](/external-storage/): the mount API and the storage backends it supports.
 - [Block or allow the internet](/network-access/): set network rules for a sandbox.
 - [Usage and limits](/network-usage/): byte quotas built on `pkg/docker/netstats`.
-- [Secrets providers](/cluster-secrets/): seal cluster secrets with a local key or AWS KMS.
+- [Secrets providers](/cluster-secrets/): seal cluster secrets with a local key or your key store.
 - [Safe retries (idempotency)](/engineering-idempotency/): why the sealed columns live in a single-writer SQLite store.

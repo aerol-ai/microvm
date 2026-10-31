@@ -1,9 +1,12 @@
 package apihttp
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -11,6 +14,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 // Classify is the single table every surface shares. These are the cases the
@@ -51,6 +55,11 @@ func TestClassify(t *testing.T) {
 		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
 		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},
 		{"token store unavailable", service.ErrAPITokensUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		{"key revoked", secrets.ErrKeyRevoked, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyRevoked, ErrKindOther},
+		{"key version retired", secrets.ErrKeyVersionRetired, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyVersionRetired, ErrKindOther},
+		{"key store denied", secrets.ErrProviderDenied, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyStoreDenied, ErrKindOther},
+		{"key store throttled", secrets.ErrProviderThrottled, http.StatusServiceUnavailable, keyStoreThrottledRetryAfterSeconds, models.ErrorCodeKeyStoreThrottled, ErrKindOther},
+		{"key store unavailable", secrets.ErrProviderUnavailable, http.StatusServiceUnavailable, keyStoreUnavailableRetryAfterSeconds, models.ErrorCodeKeyStoreUnavailable, ErrKindOther},
 		{"unclassified", errors.New("boom"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 	}
 	for _, tc := range cases {
@@ -62,5 +71,29 @@ func TestClassify(t *testing.T) {
 					c.Status, c.RetryAfter, c.Code, c.Kind, tc.status, tc.retryAfter, tc.code, tc.kind)
 			}
 		})
+	}
+}
+
+// A key-store error reaches the client as fixed text with its code: the key
+// store's own error text (here a stand-in for a provider message) stays in
+// the server log.
+func TestWriteStoreAwareErrorKeyStoreClasses(t *testing.T) {
+	for _, class := range []error{secrets.ErrKeyRevoked, secrets.ErrKeyVersionRetired, secrets.ErrProviderDenied, secrets.ErrProviderThrottled, secrets.ErrProviderUnavailable} {
+		rec := httptest.NewRecorder()
+		WriteStoreAwareError(nil, rec, fmt.Errorf("open: %w: provider said key arn:aws:kms:secret-detail", class))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%v: status %d", class, rec.Code)
+		}
+		var body models.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Code == "" || strings.Contains(rec.Body.String(), "secret-detail") {
+			t.Fatalf("%v: body %s", class, rec.Body.String())
+		}
+		wantRetry := errors.Is(class, secrets.ErrProviderThrottled) || errors.Is(class, secrets.ErrProviderUnavailable)
+		if got := rec.Header().Get("Retry-After") != ""; got != wantRetry {
+			t.Fatalf("%v: Retry-After %q", class, rec.Header().Get("Retry-After"))
+		}
 	}
 }

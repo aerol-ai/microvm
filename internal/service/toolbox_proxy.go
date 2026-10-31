@@ -20,6 +20,11 @@ import (
 // ServeToolboxReverseProxy forwards a toolbox request to the sandbox toolbox.
 // WASM sandboxes are served in-process via the driver's ToolboxHost.
 func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string, w http.ResponseWriter, r *http.Request, path string) error {
+	// A key revoke ends the stream: it holds a toolbox token opened before
+	// the revoke (plans/customer-key-custody.md §10).
+	ctx, cancel := s.RevocableContext(ctx)
+	defer cancel()
+	r = r.WithContext(ctx)
 	// Cross-node SSH sessions stamp a correlation ID on the forwarded call
 	// (see pkg/sshgateway/forward.go). Logging it on the owner side lets an
 	// operator join the edge and owner halves of one forwarded SSH session.

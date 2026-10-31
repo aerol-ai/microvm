@@ -128,9 +128,12 @@ jobs:
           cache: true
 
       - name: Install build dependencies
+        # softhsm2 lets pkg/secrets/pkcs11 test its real PKCS#11 adapter
+        # (TestSoftHSM, TestVendorLibraryStaysInHelper); a local library, so
+        # the suite stays offline.
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential softhsm2
 
       - name: Run unit tests with coverage
         run: |
@@ -170,10 +173,54 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential softhsm2
 
       - name: Race test all daemon packages
         run: go test -race -count=1 -timeout 25m ./cmd/... ./internal/... ./pkg/...
+
+  # Every sandboxd release target builds with cgo (go-sqlite3, and the
+  # PKCS#11 helper's miekg/pkcs11 since plans/customer-key-custody.md Phase
+  # 3). Same toolchains as release.yml's build matrix, so a cgo dependency
+  # that breaks a cross-compile fails here instead of at release time.
+  sandboxd-cgo-matrix:
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
+    name: sandboxd cgo build - ${{ matrix.suffix }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, goos: linux, goarch: amd64, goarm: "", suffix: linux_amd64, cc: gcc, apt_pkgs: build-essential }
+          - { runner: ubuntu-latest, goos: linux, goarch: "386", goarm: "", suffix: linux_386, cc: gcc, apt_pkgs: "build-essential gcc-multilib" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm64, goarm: "", suffix: linux_arm64, cc: aarch64-linux-gnu-gcc, apt_pkgs: "build-essential gcc-aarch64-linux-gnu" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "7", suffix: linux_armv7, cc: arm-linux-gnueabihf-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabihf" }
+          - { runner: ubuntu-latest, goos: linux, goarch: arm, goarm: "6", suffix: linux_armv6, cc: arm-linux-gnueabi-gcc, apt_pkgs: "build-essential gcc-arm-linux-gnueabi" }
+          - { runner: macos-14, goos: darwin, goarch: arm64, goarm: "", suffix: darwin_arm64, cc: "", apt_pkgs: "" }
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_pkgs }}
+
+      - name: Build sandboxd
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CC: ${{ matrix.cc }}
+        run: go build -trimpath -o /tmp/sandboxd_${{ matrix.suffix }} ./cmd/sandboxd
 
   go-security:
     needs: paths
@@ -220,6 +267,82 @@ jobs:
           AEROL_WASM_IT_USERNAME: ${{ secrets.AEROL_WASM_IT_USERNAME }}
           AEROL_WASM_IT_TOKEN: ${{ secrets.AEROL_WASM_IT_TOKEN }}
         run: go test -count=1 -tags integration -run TestIntegrationModulePushPullRoundTrip ./pkg/wasmmod/...
+
+  key-custody-integration:
+    # Real key stores for customer key custody (plans/customer-key-custody.md
+    # Phase 6): the provider contract and the live Vault checks (canary, AAD,
+    # the create-capability refusal, retired versions, revoke by deletion)
+    # against Vault and OpenBao dev servers. Behind the `integration` build
+    # tag, so `make test` stays offline. SoftHSM2 runs in go-tests already
+    # (TestSoftHSM). Images pinned by digest.
+    needs: paths
+    if: needs.paths.outputs.go_main == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start Vault and OpenBao dev servers
+        run: |
+          docker run -d --name vault --cap-add IPC_LOCK -p 18200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=root \
+            hashicorp/vault:1.18@sha256:750bb37c1638fa194ab37053a81618c61bb0491ddec6fccac87c07a8e6cd8166 \
+            server -dev -dev-listen-address=0.0.0.0:8200
+          docker run -d --name openbao -p 18300:8200 -e BAO_DEV_ROOT_TOKEN_ID=root -e BAO_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            openbao/openbao:2.1@sha256:af40ca17625ec44aa1ffe3698f85162d71d9cc97adc9e97821ef393ac94b6e42 \
+            server -dev
+          for port in 18200 18300; do
+            for _ in $(seq 1 30); do
+              curl -sf "http://127.0.0.1:$port/v1/sys/health" >/dev/null && break
+              sleep 1
+            done
+          done
+
+      - name: Key store contract and live checks (Vault 1.18)
+        env:
+          SB_TEST_VAULT_ADDR: http://127.0.0.1:18200
+          SB_TEST_VAULT_ROOT_TOKEN: root
+        run: go test -count=1 -tags integration -run 'TestVaultLive|TestVaultProviderContract' -v ./pkg/secrets/
+
+      - name: Key store contract and live checks (OpenBao 2.1)
+        env:
+          SB_TEST_VAULT_ADDR: http://127.0.0.1:18300
+          SB_TEST_VAULT_ROOT_TOKEN: root
+        run: go test -count=1 -tags integration -run 'TestVaultLive|TestVaultProviderContract' -v ./pkg/secrets/
+
+      # The same live PKCS#11 checks the operator runs against AWS CloudHSM:
+      # IV probe, AAD, missing label = revoke, label rotation, and 64
+      # concurrent calls through the helper. softhsm2-util --import skips
+      # whitespace bytes in a key file, so the keys are alphanumeric.
+      - name: PKCS#11 live checks (SoftHSM2)
+        env:
+          SB_TEST_PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+          SB_TEST_PKCS11_TOKEN_LABEL: aerolvm
+          SB_TEST_PKCS11_PIN_FILE: /tmp/itest-hsm-pin
+          SB_TEST_PKCS11_KEY_LABEL: kek-a
+          SB_TEST_PKCS11_KEY_LABEL_B: kek-b
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq softhsm2
+          # Always 8 digits: filtering random bytes down to digits keeps
+          # about 1 in 25, so 64 bytes often gave softhsm2 too short a PIN.
+          PIN=$(printf '%08d' "$(( $(od -An -N4 -tu4 /dev/urandom) % 100000000 ))")
+          printf %s "$PIN" > /tmp/itest-hsm-pin && chmod 0600 /tmp/itest-hsm-pin
+          export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm2.conf"
+          mkdir -p "$RUNNER_TEMP/softhsm-tokens"
+          printf 'directories.tokendir = %s\nobjectstore.backend = file\n' "$RUNNER_TEMP/softhsm-tokens" > "$SOFTHSM2_CONF"
+          softhsm2-util --init-token --free --label aerolvm --so-pin "$PIN" --pin "$PIN" >/dev/null
+          for L in kek-a kek-b; do
+            head -c 512 /dev/urandom | tr -dc A-Za-z0-9 | head -c 32 > "$RUNNER_TEMP/$L.bin"
+            softhsm2-util --import "$RUNNER_TEMP/$L.bin" --aes --token aerolvm --label "$L" \
+              --id "$(printf %s "$L" | od -An -tx1 | tr -d ' \n')" --pin "$PIN" >/dev/null
+          done
+          CGO_ENABLED=1 go test -count=1 -tags integration -run TestPKCS11Live -v ./pkg/secrets/pkcs11/
 
   go-sdk-tests:
     needs: paths

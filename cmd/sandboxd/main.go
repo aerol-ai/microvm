@@ -10,6 +10,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/egress/gatewayd"
 	"github.com/aerol-ai/microvm/pkg/daemon"
 	"github.com/aerol-ai/microvm/pkg/isolate"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -19,6 +20,7 @@ var (
 	runWasmResidentHostCLI = worker.RunCLIResident
 	runIsolateJailShim     = isolate.RunJailShim
 	runEgressGatewayCLI    = gatewayd.RunCLI
+	runPKCS11Helper        = pkcs11.RunHelper
 	osExit                 = os.Exit
 )
 
@@ -38,6 +40,28 @@ func run(ctx context.Context, logger *slog.Logger) error {
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--wasm-worker" {
 		if err := runWasmWorkerCLI(os.Args[2:]); err != nil {
+			os.Stderr.WriteString(err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
+	// Server-key custody tool (plans/customer-key-custody.md §3). Runs
+	// outside systemd and never opens the database.
+	if len(os.Args) >= 2 && os.Args[1] == keySubcommand {
+		if err := runKeyCLI(os.Args[2:], os.Stdout); err != nil {
+			os.Stderr.WriteString("sandboxd key: " + err.Error() + "\n")
+			osExit(1)
+		}
+		return
+	}
+
+	// PKCS#11 helper: the only process that loads the HSM vendor library
+	// (plans/customer-key-custody.md §2, eng D5). Started and supervised by
+	// sandboxd over a 0600 Unix socket, so a vendor crash or hang costs a
+	// helper restart, never the daemon.
+	if len(os.Args) >= 2 && os.Args[1] == pkcs11.HelperFlag {
+		if err := runPKCS11Helper(os.Args[2:]); err != nil {
 			os.Stderr.WriteString(err.Error() + "\n")
 			osExit(1)
 		}

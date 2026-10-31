@@ -62,7 +62,9 @@ Optional:
                                 signs via cluster-sign-node.sh (ca.key never
                                 leaves the seed). Required.
   --cred-bundle <path>          Credential encryption key bundle (tarball
-                                with credential_encryption.key). Required
+                                with credential_encryption.key, or with
+                                credential_encryption.key.wrapped when the
+                                seed ran --key-custody wrapped). Required
                                 always. Kept separate from
                                 the CA trust bundle on purpose.
   --signed-cert <path>          Pre-signed node.crt from cluster-sign-node.sh.
@@ -377,25 +379,54 @@ if [[ -z "$CRED_KEY_PATH" ]]; then
 fi
 
 CRED_STAGE_DIR="$(mktemp -d)"
-tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key
-if [[ ! -f "$CRED_STAGE_DIR/credential_encryption.key" ]]; then
+KEY_CUSTODY="file"
+if tar -tzf "$CRED_BUNDLE" | grep -qx 'credential_encryption.key.wrapped'; then
+	# The seed ran --key-custody wrapped: the bundle carries only the
+	# wrapped server key (ciphertext); this node unwraps it at boot through
+	# the key store named in sandboxd.env (plans/customer-key-custody.md §3).
+	KEY_CUSTODY="wrapped"
+	WRAPPED_KEY_PATH="$(read_sandboxd_env_value SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH)"
+	WRAPPED_KEY_PATH="${WRAPPED_KEY_PATH:-/var/lib/sandboxd/credential_encryption.key.wrapped}"
+	tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key.wrapped
+	mkdir -p "$(dirname "$WRAPPED_KEY_PATH")"
+	install -m 0600 "$CRED_STAGE_DIR/credential_encryption.key.wrapped" "$WRAPPED_KEY_PATH"
 	rm -rf "$CRED_STAGE_DIR"
-	echo "Credential bundle did not contain credential_encryption.key" >&2
-	exit 1
-fi
-CRED_KEY_SOURCE="$CRED_STAGE_DIR/credential_encryption.key"
+	if [[ -f "$CRED_KEY_PATH" ]]; then
+		# This node's own key from install.sh's first boot. It sealed nothing
+		# the cluster needs (joining replaces it today), and the daemon
+		# refuses wrapped custody while a plaintext key file exists.
+		echo "[cluster-join] removing this node's own plaintext key $CRED_KEY_PATH (the cluster's wrapped key replaces it)"
+		rm -f "$CRED_KEY_PATH"
+	fi
+else
+	tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key
+	if [[ ! -f "$CRED_STAGE_DIR/credential_encryption.key" ]]; then
+		rm -rf "$CRED_STAGE_DIR"
+		echo "Credential bundle did not contain credential_encryption.key" >&2
+		exit 1
+	fi
+	CRED_KEY_SOURCE="$CRED_STAGE_DIR/credential_encryption.key"
 
-CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_SOURCE")"
-CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
-if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+	CRED_KEY_VALUE="$(tr -d '\n' < "$CRED_KEY_SOURCE")"
+	CRED_DECODED_LEN="$(printf '%s' "$CRED_KEY_VALUE" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+	if [[ "$CRED_DECODED_LEN" != "32" ]]; then
+		rm -rf "$CRED_STAGE_DIR"
+		echo "Invalid credential key in bundle: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
+		exit 1
+	fi
+
+	mkdir -p "$(dirname "$CRED_KEY_PATH")"
+	install -m 0600 "$CRED_KEY_SOURCE" "$CRED_KEY_PATH"
+	if tar -tzf "$CRED_BUNDLE" | grep -qx 'credential_encryption.key.ring'; then
+		# The cluster rotated its server key (plans/customer-key-custody.md
+		# §13) and the bundle was refreshed with the ring: rows sealed under
+		# the newer keys open only with it.
+		tar -C "$CRED_STAGE_DIR" -xzf "$CRED_BUNDLE" credential_encryption.key.ring
+		install -m 0600 "$CRED_STAGE_DIR/credential_encryption.key.ring" "${CRED_KEY_PATH}.ring"
+		echo "[cluster-join] installed the server-key ring at ${CRED_KEY_PATH}.ring"
+	fi
 	rm -rf "$CRED_STAGE_DIR"
-	echo "Invalid credential key in bundle: base64 must decode to 32 bytes (got $CRED_DECODED_LEN)" >&2
-	exit 1
 fi
-
-mkdir -p "$(dirname "$CRED_KEY_PATH")"
-install -m 0600 "$CRED_KEY_SOURCE" "$CRED_KEY_PATH"
-rm -rf "$CRED_STAGE_DIR"
 
 mkdir -p /etc/sandboxd
 {
@@ -414,10 +445,16 @@ SB_GOSSIP_BIND_ADDR=$GOSSIP_BIND_ADDR
 SB_GOSSIP_ADVERTISE_ADDR=$GOSSIP_ADVERTISE_ADDR
 SB_GOSSIP_SECRET_KEY=$GOSSIP_SECRET_KEY
 SB_BOOTSTRAP_PEERS=$PEERS
-SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE
-SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH
 SB_CLUSTER_MAX_AUTO_VOTERS=$MAX_AUTO_VOTERS
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH=$WRAPPED_KEY_PATH"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH"
+	else
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY=$CRED_KEY_VALUE"
+		echo "SB_CREDENTIAL_ENCRYPTION_KEY_PATH=$CRED_KEY_PATH"
+	fi
 	if [[ -n "$NODE_ROLE" ]]; then
 		echo "SB_NODE_ROLE=$NODE_ROLE"
 	fi

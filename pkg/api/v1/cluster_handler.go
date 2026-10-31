@@ -613,7 +613,13 @@ func (h *handlers) clusterMembers(w http.ResponseWriter, r *http.Request) {
 	for _, m := range members {
 		view = append(view, memberView{Member: m, Drained: c.IsNodeDrained(m.NodeID)})
 	}
-	apihttp.WriteJSON(w, http.StatusOK, map[string]any{"members": view})
+	resp := map[string]any{"members": view}
+	// `sandboxd key rotate --stage` reads this (plans/customer-key-custody.md
+	// §13): the gossip gate with its boot-window rule, not just the list.
+	if gate, ok := c.(cluster.ServerKeyRingGate); ok {
+		resp["server_key_ring_ready"] = gate.ServerKeyRingAllowed()
+	}
+	apihttp.WriteJSON(w, http.StatusOK, resp)
 }
 
 // clusterRemoveMember explicitly removes a node from the raft configuration.

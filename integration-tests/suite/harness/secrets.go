@@ -152,6 +152,9 @@ type HASandboxSpec struct {
 	// Mounts is for the scenarios that can satisfy a real external backend;
 	// MountSpec.Credentials is sealed alongside Env.
 	Mounts []models.MountSpec
+	// Registry is the pull credential for a private Image; sealed alongside
+	// Env, and opened again by the node a failover recreates the sandbox on.
+	Registry *sdktypes.RegistryAuth
 	// Image defaults to DefaultImage.
 	Image string
 }
@@ -175,6 +178,7 @@ func CreateHASandbox(t *testing.T, c *Client, spec HASandboxSpec) *microvm.Sandb
 		AllowPublicTraffic: &public,
 		Env:                spec.Env,
 		Mounts:             spec.Mounts,
+		Registry:           spec.Registry,
 		Failover:           &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
 	}
 
