@@ -38,12 +38,15 @@ const (
 // baseURL is the http(s) /sessions root (no trailing slash); wsURL is the
 // matching ws(s) root; auth is the full Authorization header value or "".
 // forwardID, when set, is echoed as a correlation header on every call so a
-// cross-node SSH session can be traced from the edge to the owner.
+// cross-node SSH session can be traced from the edge to the owner. bridge,
+// set only on the remote path, attests every call as this gateway acting
+// for the sandbox's key (attest.go).
 type sessionEndpoint struct {
 	baseURL   string
 	wsURL     string
 	auth      string
 	forwardID string
+	bridge    *bridgedSession
 }
 
 // forwardIDHeader is the correlation header carried on cross-node SSH calls.
@@ -57,6 +60,9 @@ func (ep sessionEndpoint) applyHeaders(h http.Header) {
 	}
 	if ep.forwardID != "" {
 		h.Set(forwardIDHeader, ep.forwardID)
+	}
+	if ep.bridge != nil {
+		ep.bridge.attest(h)
 	}
 }
 
