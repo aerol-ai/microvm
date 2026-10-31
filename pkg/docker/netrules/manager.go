@@ -240,6 +240,9 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	if b, ok := m.ipt.(batchBackend); ok {
+		return m.blockAllEgressBatch(b, containerIP)
+	}
 
 	exists, err := m.ipt.Exists("filter", m.filterChain(), "-s", containerIP, "-j", "DROP")
 	if err != nil {
@@ -269,6 +272,9 @@ func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	if b, ok := m.ipt.(batchBackend); ok {
+		return m.clearBlockAllEgressBatch(b, containerIP)
+	}
 
 	if err := m.deleteUntilGone("filter", m.filterChain(), "-s", containerIP, "-j", "DROP"); err != nil {
 		return fmt.Errorf("delete egress rule: %w", err)
