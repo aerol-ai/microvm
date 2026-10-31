@@ -36,7 +36,7 @@ func TestOwnerFailover(t *testing.T) {
 // recreate-policy sandbox, kills whichever node owns it, and expects it to
 // reappear under the same id on a live peer.
 //
-// The kill is a daemon stop over SSH (harness.KillNodeDaemon), not an EC2
+// The kill is a daemon stop over SSH (the harness's daemon kill), not an EC2
 // stop-instances: a graceful instance shutdown lets the node flap in gossip and
 // delays SWIM dead-detection past the window, which is why the earlier
 // EC2-stop version never recreated in time. The daemon stop is also the fault
@@ -75,6 +75,7 @@ func TestRecreateViaFailover(t *testing.T) {
 	if !ok {
 		t.Skipf("owner %s is not a node this suite can reach", owner)
 	}
+	requireNonSeedVictim(t, victim)
 
 	t.Logf("killing owner %s (%s); expect recreate on a peer", owner, victim.Name)
 	t.Cleanup(harness.KillNodeDaemon(t, victim))
@@ -149,6 +150,7 @@ func TestSnapshotBackedFailover(t *testing.T) {
 	if !ok {
 		t.Skipf("owner %s is not a node this suite can reach", owner)
 	}
+	requireNonSeedVictim(t, victim)
 
 	// Kill the owner's daemon (SWIM dead-detection; box stays up for restore).
 	t.Logf("killing owner %s (%s) of snapshot-backed sandbox %s", owner, victim.Name, sb.ID)

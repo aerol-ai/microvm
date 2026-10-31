@@ -83,6 +83,11 @@ const (
 	// scenario configured S3 or NFS. Where the feature is off, the UCs skip
 	// (not-applicable) rather than fail against a 412.
 	CapPlatformVolumes Capability = "platform-volumes"
+	// CapNoHostFirewall marks a deployment with no host firewall (local
+	// mode: SB_ENABLE_NETWORK_RULES=false). A container sandbox there is
+	// refused network policy (501 network_policy_unenforced) rather than
+	// given policy it cannot enforce, so the egress cases assert that refusal.
+	CapNoHostFirewall Capability = "no-host-firewall"
 	// CapBenchmark gates the create-benchmark UCs (UC-94/UC-95). It is
 	// deliberately separate from the runtime capabilities: the benchmark is
 	// slow and provisions many sandboxes (the density probe runs until the
@@ -279,7 +284,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapDocker: true, CapFirecracker: true, CapGvisor: true, CapWasm: true,
 	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true, CapIngressProxyRouting: true,
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
-	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true,
+	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
@@ -843,6 +848,35 @@ var Registry = []UseCase{
 	{ID: "UC-314", Title: "Key custody: a backup of a wrapped node restored onto the wiped node boots through the key store and rejoins; the restored node's next backup holds no plaintext key", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
 	{ID: "UC-315", Title: "Key custody, AWS KMS: a single node installed with install.sh --key-custody wrapped holds no plaintext server key, and after a restart reopens its sealed values through the key store", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
 	{ID: "UC-316", Title: "Key custody, AWS KMS: restore onto a fresh machine: the node's root disk is replaced from its launch image (a fresh install with a key of its own), a backup taken before is restored, and the node boots through the key store with the backup's key and opens values sealed before the swap", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
+	// Bank-readiness security boundary (bank_security_test.go): each case
+	// runs on every shell runtime the scenario has (runc, gVisor, Firecracker).
+	{ID: "UC-317", Title: "Security: cloud instance metadata (169.254.169.254, ECS/EKS credential endpoints) is unreachable from every sandbox, even when its own allowlist names it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-318", Title: "Security: one sandbox cannot connect to another sandbox's listener on the same node (no lateral movement on open egress)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-319", Title: "Security: every TCP port the node listens on is unreachable from a default sandbox on the gateway, private and public addresses (web ports and DNS excepted)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-320", Title: "Security: a fork bomb stops at the sandbox's process limit; the sandbox, a neighbour and the node stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-321", Title: "Security: a memory bomb is killed inside the sandbox at its requested limit; the sandbox and a neighbour stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-322", Title: "Security: a disk fill stops at the sandbox's disk size; the node keeps its free space", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-323", Title: "Security: a CPU hog is held to its CPU limit; a neighbour's exec latency stays within bounds", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-324", Title: "Security: container privilege boundary: no dangerous capability, seccomp on, no mounts, sysctls, sysrq, /sys writes, kernel memory, kernel log, modules or host devices", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-325", Title: "Security: kernel boundary per runtime: gVisor and Firecracker sandboxes run on a kernel other than the node's (runc shares it; reported)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-326", Title: "Security: filesystem isolation: no node config, state, engine socket or another sandbox's files are visible in a sandbox", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-327", Title: "Security: process isolation: a sandbox sees neither the node's daemons nor another sandbox's processes", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-328", Title: "Security: public attack surface: a full TCP scan of every node finds only web, the SSH gateway, the L4 pool and admin-scoped ports; the security group opens no admin port to the internet", Requires: []Capability{CapDomain}, Implemented: true},
+	{ID: "UC-329", Title: "Security: TLS posture: TLS 1.0/1.1 and non-forward-secret or CBC suites refused, TLS 1.3 offered, plain HTTP redirected", Requires: []Capability{CapDomain}, Implemented: true},
+	{ID: "UC-330", Title: "Security: unauthenticated surface: every /v1 route, the facades and debug paths refuse without (or with a wrong) token, with no 5xx and no stack trace or source path in any body", Implemented: true},
+	{ID: "UC-331", Title: "Security: a sandbox's secret appears in no journal, process command line or /var/log on any node", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-332", Title: "Security: a block-all sandbox has no way out: TCP, UDP DNS to public resolvers, ICMP, HTTP by name and DNS through its own resolver all fail", Requires: []Capability{CapDocker}, Implemented: true},
+	// Bank-readiness scale and stability (bank_scale_test.go): sizes come
+	// from AEROL_BANK_* so they run small everywhere and large on the
+	// flagship; numbers land in <reports>/<scenario>-bank.json.
+	{ID: "UC-333", Title: "Scale: a burst of concurrent creates per runtime: each starts or is refused for capacity, none fails otherwise, all are destroyed", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-334", Title: "Scale: API read throughput: concurrent clients list sandboxes and read health with no 5xx and no transport error", Implemented: true},
+	{ID: "UC-335", Title: "Scale: exec latency (sequential) and concurrent execs into one sandbox per runtime all succeed", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-336", Title: "Stability: churn soak (create, exec, destroy on every runtime) under 0.5% failures; daemon memory and descriptors level off; no leaked veth, TAP, firewall rule or sandbox", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-337", Title: "Stability: the daemon on a worker restarted under load serves again within two minutes; nothing leaks", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	{ID: "UC-338", Title: "Scale: density per runtime: small sandboxes created 8 at a time until a clean capacity refusal or the cap; every created sandbox runs and the API still answers", Requires: []Capability{CapBenchmark, CapDocker}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go).
+	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
