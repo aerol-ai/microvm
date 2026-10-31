@@ -191,7 +191,8 @@ The full form is:
 ```text
 aerolvm access review --since <when> (--export s3://<bucket>[/<prefix>] | --export-dir <dir>)
                       [--identity-file <path>] [--format md|csv] [--witness s3://<bucket>[/<prefix>]]
-                      [--max-lag D] [--region R] [--endpoint URL] [--path-style] [--json]
+                      [--max-lag D] [--fetch-concurrency N] [--region R] [--endpoint URL]
+                      [--path-style] [--json]
 ```
 
 - It needs an `auditor` or `admin` credential for the token list.

@@ -237,6 +237,7 @@ This finds records in your exported audit log, such as everything one person did
 | `--until <when>` | Where the window ends. Default: now. |
 | `--limit <n>` | Print at most this many matches. Default `1000`, and `0` prints all. |
 | `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once, as for `audit verify`. Default `32`. |
 
 Each match is one line, then each server's verdict. Exit codes are those of `audit verify`.
 
@@ -255,6 +256,7 @@ This writes the evidence for a quarterly access review. It joins the server's to
 | `--identity-file <path>` | Also list the role rules in your identity file, and which servers run that exact file. It is read on your machine and never sent anywhere. |
 | `--format md\|csv` | Markdown (the default) or CSV. |
 | `--witness <s3://…>` | Also check the witnessed fingerprints, as `audit verify` does. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once for each server, as for `audit verify`. Default `32`. Up to four servers are read at once. |
 | `--json` | Print the report as JSON. |
 
 A tampered export fails the review: nothing is printed on stdout, and the command exits `1`. [Audit and compliance](/enterprise/audit-evidence/#access-review-evidence) describes every section, flag and CSV column.
@@ -335,6 +337,7 @@ This is for servers in [enterprise mode](/enterprise/enterprise-mode/). Each ser
 | `--local <id>=<path>` | A copy of one server's `secrets.jsonl`, for records not exported yet. Repeat it for more servers. A bare path works with exactly one `--node`. |
 | `--node <id>` | Check only this server. Repeat it for more. By default, every server in the bucket. |
 | `--max-lag <duration>` | How long a fingerprint may wait for its records. Default `15m`. |
+| `--fetch-concurrency <n>` | How many S3 batches to download at once. Default `32`, from `1` to `256`. Every batch is still read and checked. This only sets how many downloads overlap. |
 | `--region`, `--endpoint`, `--path-style` | S3 client settings, used for both buckets. |
 | `--json` | Print the full report as JSON. |
 
@@ -343,6 +346,8 @@ This is for servers in [enterprise mode](/enterprise/enterprise-mode/). Each ser
 | PASS | `0` | Every fingerprint in the window links to the records. |
 | FAIL | `1` | A fingerprint does not link: a rewritten history, a rollback, or missing records. Also used when the check cannot run. |
 | INCOMPLETE | `3` | Nothing contradicts the witness, but some fingerprints have waited longer than `--max-lag` for their records. The export is behind. Never read this as PASS. |
+
+Each server writes up to one export batch a second, so a busy day can hold tens of thousands of them. The check reads every batch of every day it covers, starting the day before `--since`, so a short window still reads one or two full days. Downloads overlap (`--fetch-concurrency`), wait in a temporary folder, and the folder is removed when the check ends, also when you press Ctrl-C. Ctrl-C exits with `130`.
 
 Keep exported records at least as long as your `--since` window, or the result is FAIL. [Check the whole history](/enterprise/enterprise-mode/#check-the-whole-history) explains how to pick the window.
 
