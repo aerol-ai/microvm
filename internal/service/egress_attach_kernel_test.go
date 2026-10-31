@@ -74,10 +74,19 @@ func BenchmarkKernelEgressAttach(b *testing.B) {
 	}
 }
 
+// BenchmarkKernelEgressCreate: whole creates next to 200 restricted
+// neighbours and 50 attached gateway-mode ones, for a runtime that reports
+// the address on return (late) and one that reports it before a 20 ms
+// build (early: containerd's task start and readiness take longer).
 func BenchmarkKernelEgressCreate(b *testing.B) {
-	rules := kernelRules(b)
-	kernelPrefillRules(b, rules, 200)
-	a := newAttachBench(b, egress.NewNFTBackend(), rules)
-	a.prefill(b, 50)
-	benchCreates(b, a)
+	for _, early := range []bool{false, true} {
+		b.Run(map[bool]string{false: "late", true: "early"}[early], func(b *testing.B) {
+			rules := kernelRules(b)
+			kernelPrefillRules(b, rules, 200)
+			a := newAttachBench(b, egress.NewNFTBackend(), rules)
+			a.prefill(b, 50)
+			a.rt.early, a.rt.build = early, 20*time.Millisecond
+			benchCreates(b, a)
+		})
+	}
 }
