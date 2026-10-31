@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -275,5 +276,60 @@ func TestCurrentKeyVersionChain(t *testing.T) {
 	}
 	if _, _, err := CurrentKeyVersion(bg, full); !errors.Is(err, ErrProviderThrottled) {
 		t.Fatalf("no background slot = %v", err)
+	}
+}
+
+// eng D9, §12: untagged rows are local or AWS KMS. A node that switched
+// from local to awskms opens every row of each history its store can hold,
+// and a revoked server key opens neither kind (the full stop).
+func TestUntaggedRowHistories(t *testing.T) {
+	cases := []struct {
+		name       string
+		local, kms int
+	}{
+		{"local only", 3, 0},
+		{"aws kms only", 0, 3},
+		{"mixed", 2, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := ContextWithIncarnationID(context.Background(), "inc")
+			cipher, _ := NewCipherFromKey(bytes.Repeat([]byte{3}, 32))
+			fake, _ := NewFakeKMS()
+			blobs := newMemBlobStore()
+			type row struct {
+				id string
+				h  Handle
+			}
+			var rows []row
+			put := func(p Provider, id string) {
+				h, err := p.Put(ctx, id, Secrets{Env: map[string]string{"ID": id}}, []string{"n1"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				rows = append(rows, row{id, h})
+			}
+			for i := 0; i < tc.local; i++ {
+				put(NewLocalProvider(cipher, blobs), fmt.Sprintf("sb-local-%d", i))
+			}
+			for i := 0; i < tc.kms; i++ {
+				put(NewKMSProvider(fake, blobs), fmt.Sprintf("sb-kms-%d", i))
+			}
+			p, _, err := NewProvider(ctx, ProviderOptions{Name: ProviderAWSKMS, Cipher: cipher, Store: blobs, Prebuilt: fake})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range rows {
+				if bag, err := p.Open(ctx, r.id, r.h, "n1"); err != nil || bag.Env["ID"] != r.id {
+					t.Fatalf("%s = %v %v", r.id, bag.Env, err)
+				}
+			}
+			cipher.Revoke()
+			for _, r := range rows {
+				if _, err := p.Open(ctx, r.id, r.h, "n1"); !errors.Is(err, ErrKeyRevoked) {
+					t.Fatalf("%s with the server key dropped = %v, want ErrKeyRevoked", r.id, err)
+				}
+			}
+		})
 	}
 }

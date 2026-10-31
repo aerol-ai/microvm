@@ -59,8 +59,8 @@ func TestCipherRingDualRead(t *testing.T) {
 	randReader = &fixedNonceReader{b: []byte{keyIDMarker, 0, 0, 0, 1, 9, 9, 9, 9, 9, 9, 9}}
 	tricky, err := c.EncryptWithAAD([]byte("tricky"), nil)
 	randReader = old
-	if err != nil || SealedKeyID(tricky) != 1 {
-		t.Fatalf("tricky = %v id %d", err, SealedKeyID(tricky))
+	if err != nil || sealedKeyID(tricky) != 1 {
+		t.Fatalf("tricky = %v id %d", err, sealedKeyID(tricky))
 	}
 
 	if err := c.SetRing([]RingKey{{ID: 0, Key: nil}, {ID: 1, Key: k1, Current: true}}); err != nil {
@@ -70,7 +70,7 @@ func TestCipherRingDualRead(t *testing.T) {
 		t.Fatalf("ring = current %d ids %v", c.CurrentKeyID(), c.KeyIDs())
 	}
 	fresh, err := c.EncryptWithAAD([]byte("fresh"), []byte("aad"))
-	if err != nil || fresh[0] != keyIDMarker || binary.BigEndian.Uint32(fresh[1:5]) != 1 || SealedKeyID(fresh) != 1 {
+	if err != nil || fresh[0] != keyIDMarker || binary.BigEndian.Uint32(fresh[1:5]) != 1 || sealedKeyID(fresh) != 1 {
 		t.Fatalf("fresh = %x %v", fresh[:5], err)
 	}
 	for _, tc := range []struct {
@@ -139,8 +139,8 @@ func TestCipherSetRingRules(t *testing.T) {
 	if _, err := NewCipherRing([]RingKey{{ID: 0, Key: k0}}); err == nil {
 		t.Fatal("a ring with no current key built a Cipher")
 	}
-	if SealedKeyID([]byte{keyIDMarker, 0}) != 0 || SealedKeyID([]byte{1, 0, 0, 0, 1, 2}) != 0 {
-		t.Fatal("SealedKeyID of a short or legacy blob")
+	if sealedKeyID([]byte{keyIDMarker, 0}) != 0 || sealedKeyID([]byte{1, 0, 0, 0, 1, 2}) != 0 {
+		t.Fatal("sealedKeyID of a short or legacy blob")
 	}
 	if !c.HoldsKey(0, serverKeyCheck(k0)) || c.HoldsKey(0, serverKeyCheck(other)) || c.HoldsKey(9, nil) {
 		t.Fatal("HoldsKey")
@@ -203,7 +203,7 @@ func TestCipherReseal(t *testing.T) {
 		t.Fatal(err)
 	}
 	out, from, changed, err := c.Reseal(old, []byte("a"))
-	if err != nil || !changed || from != 0 || SealedKeyID(out) != 1 {
+	if err != nil || !changed || from != 0 || sealedKeyID(out) != 1 {
 		t.Fatalf("reseal = %v %v %d", err, changed, from)
 	}
 	if got, id, err := c.OpenWithKeyID(out, []byte("a")); err != nil || string(got) != "v" || id != 1 {
@@ -694,5 +694,122 @@ func TestReplaceWrappedKeyFile(t *testing.T) {
 	}
 	if err := ReplaceWrappedKeyFile(filepath.Join(t.TempDir(), "none"), f, next); err == nil {
 		t.Fatal("replaced a missing file")
+	}
+}
+
+// TestReplaceWrappedKeyFileSerializesWriters: two writers that read the
+// same file race their compare-and-swaps; exactly one wins, every time.
+// Without the lock across read, compare and rename both pass the compare
+// and the second rename silently drops the first one's change.
+func TestReplaceWrappedKeyFileSerializesWriters(t *testing.T) {
+	ctx := context.Background()
+	fake, _ := NewFakeKMS()
+	prev, _ := WrapServerKey(ctx, fake, ringKey(t), ProviderAWSKMS, "")
+	staged, _ := NewRingEntry(ctx, 1, fake)
+	ring, _ := StageRingKey(prev.Entries(), staged)
+	next := prev
+	if err := next.SetEntries(ring); err != nil {
+		t.Fatal(err)
+	}
+	rewrapped, err := RewrapRing(ctx, fake, prev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "k.wrapped")
+	for i := 0; i < 100; i++ {
+		if err := WriteWrappedKeyFile(path, prev); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		result := make(chan error, 2)
+		for _, n := range []WrappedKeyFile{next, rewrapped} {
+			go func() { <-start; result <- ReplaceWrappedKeyFile(path, prev, n) }()
+		}
+		close(start)
+		a, b := <-result, <-result
+		if (a == nil) == (b == nil) {
+			t.Fatalf("attempt %d: want one winner and one ErrKeyFileChanged, got %v and %v", i, a, b)
+		}
+		if a != nil && !errors.Is(a, ErrKeyFileChanged) || b != nil && !errors.Is(b, ErrKeyFileChanged) {
+			t.Fatalf("attempt %d: loser = %v / %v", i, a, b)
+		}
+	}
+}
+
+// TestKeyFileLockErrors: a writer that cannot take the lock writes nothing.
+func TestKeyFileLockErrors(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens the lock file in a read-only directory")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	ring := KeyRingFile{Ring: []RingEntry{LegacyRingEntry(ringKey(t))}}
+	if err := WriteKeyRingFile(filepath.Join(dir, "k.ring"), ring); err == nil || !strings.Contains(err.Error(), "lock") {
+		t.Fatalf("write without the lock = %v", err)
+	}
+	if err := ReplaceKeyRingFile(filepath.Join(dir, "k.ring"), nil, ring); err == nil || !strings.Contains(err.Error(), "lock") {
+		t.Fatalf("replace without the lock = %v", err)
+	}
+}
+
+// TestReplaceKeyRingFile: custody "file" rotation's ring save is the same
+// compare-and-swap, including against a ring file that appeared after the
+// rotation started from the legacy plaintext key.
+func TestReplaceKeyRingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "k.ring")
+	legacy := LegacyRingEntry(ringKey(t))
+	one := KeyRingFile{Ring: []RingEntry{legacy}}
+	if err := ReplaceKeyRingFile(path, nil, one); err != nil {
+		t.Fatalf("first write = %v", err)
+	}
+	// A second rotation that also started from the legacy key loses.
+	if err := ReplaceKeyRingFile(path, nil, one); !errors.Is(err, ErrKeyFileChanged) {
+		t.Fatalf("stale legacy writer = %v", err)
+	}
+	read, err := ReadKeyRingFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staged, _ := NewRingEntry(context.Background(), 1, nil)
+	entries, _ := StageRingKey(read.Ring, staged)
+	two := KeyRingFile{Ring: entries}
+	if err := ReplaceKeyRingFile(path, &read, two); err != nil {
+		t.Fatalf("stage = %v", err)
+	}
+	if err := ReplaceKeyRingFile(path, &read, one); !errors.Is(err, ErrKeyFileChanged) {
+		t.Fatalf("stale writer = %v", err)
+	}
+	if back, _ := ReadKeyRingFile(path); len(back.Ring) != 2 {
+		t.Fatal("the stale writer undid the stage")
+	}
+	if err := ReplaceKeyRingFile(path, &read, KeyRingFile{}); err == nil {
+		t.Fatal("an empty ring written")
+	}
+	bad := filepath.Join(t.TempDir(), "bad.ring")
+	_ = os.WriteFile(bad, []byte("{"), 0o600)
+	if err := ReplaceKeyRingFile(bad, &read, two); err == nil || errors.Is(err, ErrKeyFileChanged) {
+		t.Fatalf("unreadable ring = %v", err)
+	}
+	if err := ReplaceKeyRingFile("/dev/null/x/y", nil, one); err == nil {
+		t.Fatal("unwritable path accepted")
+	}
+
+	// Concurrent writers from the same read: one wins.
+	for i := 0; i < 50; i++ {
+		if err := WriteKeyRingFile(path, read); err != nil {
+			t.Fatal(err)
+		}
+		start := make(chan struct{})
+		result := make(chan error, 2)
+		for range 2 {
+			go func() { <-start; result <- ReplaceKeyRingFile(path, &read, two) }()
+		}
+		close(start)
+		if a, b := <-result, <-result; (a == nil) == (b == nil) {
+			t.Fatalf("attempt %d: want one winner, got %v and %v", i, a, b)
+		}
 	}
 }

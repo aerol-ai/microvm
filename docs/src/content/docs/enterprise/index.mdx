@@ -51,7 +51,7 @@ flowchart LR
     IdP["Your identity provider"] -. "public keys" .-> D
     Caddy --> D["sandboxd<br/>the AerolVM server"]
     D --> S["Sandboxes behind<br/>runtime walls"]
-    D --> Vault[("Sealed secrets")]
+    D --> Sealed[("Sealed secrets")]
     D --> Log[("Hash-chained<br/>audit log")]
     D -- "audit copies" --> Yours["Your audit store<br/>and monitoring"]
     D <-- "mutual TLS" --> Peers["Other servers<br/>in a cluster"]
@@ -72,7 +72,7 @@ Each feature is **Default** (on with no setup), **You turn it on**, or **Propose
 | Network | Outbound policy: block everything, or allow named sites | You turn it on | [Network access](/network-access/) |
 | Data | Secrets sealed with AES-256-GCM | Default | [Security baseline](/enterprise/security-controls/#data-protection) |
 | Data | API keys kept out of sandboxes with inject rules | You turn it on | [Advanced network rules](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox) |
-| Data | AWS KMS for the secret copies a cluster keeps | You turn it on | [Secrets providers](/cluster-secrets/) |
+| Data | Keys in your own key store: AWS KMS, Vault, OpenBao or an HSM, with revoke and rotation | You turn it on | [Use your own key store](/enterprise/key-custody/) |
 | Audit | A hash-chained audit log | Default | [Audit and compliance](/enterprise/audit-evidence/) |
 | Audit | Audit export to a webhook or S3 | You turn it on | [Audit and compliance](/enterprise/audit-evidence/) |
 | Audit | Off-server audit witness (S3 Object Lock) | You turn it on | [Enterprise mode](/enterprise/enterprise-mode/) |

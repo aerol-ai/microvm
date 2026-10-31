@@ -51,7 +51,7 @@ feature is still mid-rollout.
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
 |---|---|
-| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. |
+| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. With an external `SB_SECRET_PROVIDER` it also requires `SB_SECRET_PROVIDER_STRICT_BOOT=true` and a hardware PKCS#11 slot, and warns at boot (and fires `SandboxdServerKeyPlaintext`) while `SB_CREDENTIAL_KEY_CUSTODY=file`; the next release refuses that (plans/customer-key-custody.md §7, F2). |
 | `SB_CONTAINER_PRIVILEGED` | Privileged containers = sandbox escape. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
@@ -61,7 +61,7 @@ feature is still mid-rollout.
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault` \| `pkcs11`. Off-state is `local` — never contacts a key store unless explicitly set. See `docs/.../cluster-secrets.mdx`. |
+| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault` \| `pkcs11`. Off-state is `local` — never contacts a key store unless explicitly set. See `docs/.../cluster-secrets.mdx` and `docs/.../enterprise/key-custody.mdx`. |
 | `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. Set with another provider, the node still opens AWS KMS rows (step 1 of a provider switch). |
 | `SB_SECRET_VAULT_ADDR` | (empty) | Vault or OpenBao URL. Required when `SB_SECRET_PROVIDER=vault`. `https`, or `http` only to loopback (a local `vault proxy`). Set with another provider, the node already opens vault rows. |
 | `SB_SECRET_VAULT_KEY_NAME` | (empty) | Transit key name. Required with `SB_SECRET_VAULT_ADDR`. |
@@ -76,7 +76,7 @@ feature is still mid-rollout.
 | `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` | (empty) | Comma-separated older labels still allowed for unwrap during a rotation. |
 | `SB_SECRET_PKCS11_GCM_IV` | `auto` | Who picks the AES-GCM IV: `auto` probes at helper start on a throwaway session key, `hsm` (the token writes it, e.g. AWS CloudHSM) or `caller` (sandboxd picks a random IV, e.g. SoftHSM2). An all-zero IV is always refused. |
 | `SB_SECRET_PKCS11_RUN_DIR` | `/run/sandboxd/pkcs11` | Directory (made 0700) for the helper's 0600 Unix socket. |
-| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start when the boot canary of any external provider fails. Default fail-open with a warning. |
+| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start when the boot canary of any external provider fails. Default fail-open with a warning. Required for every external provider in enterprise mode. |
 | `SB_SECRET_PROVIDER_MAX_INFLIGHT` | `8` | Foreground key-store calls in flight per node (1–256). One slot is kept for creates; background work has 2 more slots of its own. Lower it to fit an HSM partition's session limit or one Vault active node's capacity. Throttled calls back off inside the caller's deadline, then fail 503 `key_store_throttled`. |
 | `SB_CREDENTIAL_KEY_CUSTODY` | `file` | `file` \| `wrapped`. `file` keeps the server key in the env or `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` (today's behavior). `wrapped` keeps only a copy wrapped by the external provider at `SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH`, unwrapped at boot (one try, 10 s; systemd restarts on failure). Boot refuses if a plaintext key is set or its file exists; a fresh single node generates the key, cluster nodes never do (copy the seed's wrapped file). Manage it with `sandboxd key` (status, verify, wrap, rewrap, unwrap, ack-migration, rotate); `install.sh` and `cluster-init.sh` take `--key-custody wrapped`. Default stays `file`: wrapped custody needs a customer key store. |
 | `SB_SECRET_PROVIDER_RECHECK_INTERVAL` | `5m` | With wrapped custody, how often each node unwraps its server-key file again (±10% jitter) to notice a revoke. Minimum 10s. One key-store call per node per interval, on the background budget. The same tick re-reads the server-key ring with either custody, so a `sandboxd key rotate` step reaches a node without a restart, and while a rotation is in progress it reseals rows onto the current key (local AES work, no key-store call). |
@@ -208,7 +208,8 @@ Terraform creates one with `audit_witness_enabled = true` (lock mode
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |
 |---|---|
-| `SB_SECRET_PROVIDER=awskms` | Needs `SB_SECRET_AWS_KMS_KEY_ID` + AWS credentials / IAM. Default remains `local`. |
+| `SB_SECRET_PROVIDER=awskms` \| `vault` \| `pkcs11` | Needs a customer key store: an AWS KMS key + IAM, a Vault/OpenBao Transit key + Vault Agent or Proxy, or an HSM + its PKCS#11 library. Default remains `local`. |
+| `SB_CREDENTIAL_KEY_CUSTODY=wrapped` | Needs an external `SB_SECRET_PROVIDER` to wrap the server key; cluster nodes need the seed's wrapped file. Default remains `file`. |
 | `SB_ENABLE_FIRECRACKER` | Needs KVM/metal host; rejects create otherwise. |
 | `SB_ENABLE_WASM` | Needs a provisioned wasm modules dir. |
 | `SB_CONTAINER_ENGINE` | Code fallback is `docker` (empty/unknown → docker, so a bare host or the local `install.sh` stays dockerd). **Server deployments now default to `containerd`**: the shipped `config/cluster.yml`, Terraform, and Ansible all set `containerd` — set `container_engine: docker` there to keep a legacy dockerd host. This is the docker→containerd migration target; per-sandbox rows record their owning engine so a flip never strands existing sandboxes. containerd is live-validated on the t3 cluster topology (`cluster-3-mixed-containerd`); metal/arm64 provisioning is not yet live-proven (`plans/containerd-engine.md`). |
