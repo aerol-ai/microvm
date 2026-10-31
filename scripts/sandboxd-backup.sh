@@ -13,6 +13,8 @@ Options:
                          Default: /var/lib/sandboxd/credential_encryption.key.wrapped
   --key-ring PATH        Server-key ring after a rotation (key custody "file").
                          Default: /var/lib/sandboxd/credential_encryption.key.ring
+  --key-file PATH        Plaintext server key (key custody "file").
+                         Default: /var/lib/sandboxd/credential_encryption.key
   --output PATH          Destination .tar.gz archive. Required.
   -h, --help             Show this help.
 USAGE
@@ -23,6 +25,7 @@ raft_dir="/var/lib/sandboxd/raft"
 config_dir="/etc/sandboxd"
 wrapped_key="/var/lib/sandboxd/credential_encryption.key.wrapped"
 key_ring="/var/lib/sandboxd/credential_encryption.key.ring"
+key_file="/var/lib/sandboxd/credential_encryption.key"
 output=""
 
 while [[ $# -gt 0 ]]; do
@@ -32,6 +35,7 @@ while [[ $# -gt 0 ]]; do
     --config-dir) config_dir="${2:?missing --config-dir value}"; shift 2 ;;
     --wrapped-key) wrapped_key="${2:?missing --wrapped-key value}"; shift 2 ;;
     --key-ring) key_ring="${2:?missing --key-ring value}"; shift 2 ;;
+    --key-file) key_file="${2:?missing --key-file value}"; shift 2 ;;
     --output) output="${2:?missing --output value}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -119,11 +123,14 @@ if [[ "$custody" == "wrapped" ]]; then
     sed -i.bak '/^[[:space:]]*SB_CREDENTIAL_ENCRYPTION_KEY[[:space:]]*=/d' "$f" && rm -f "$f.bak"
   done
   copy_if_exists "$wrapped_key" "$tmpdir/root/var/lib/sandboxd/credential_encryption.key.wrapped"
-elif [[ -e "$key_ring" ]]; then
-  # Custody "file" after a server-key rotation (§13): rows sealed under the
-  # newer keys open only with the ring, so it rides along. It holds the keys
-  # in plaintext, like the env key, so the archive is a secret either way.
-  copy_if_exists "$key_ring" "$tmpdir/root/var/lib/sandboxd/credential_encryption.key.ring"
+else
+  # Custody "file": the database's sealed values open only with this node's
+  # key, so a restore onto a fresh machine needs it. Without SB_CREDENTIAL_
+  # ENCRYPTION_KEY in the env files sandboxd keeps it in the key file, and
+  # after a server-key rotation (§13) the ring holds every live key. Both
+  # are plaintext, like the env key, so the archive is a secret either way.
+  [[ -e "$key_file" ]] && copy_if_exists "$key_file" "$tmpdir/root/var/lib/sandboxd/credential_encryption.key"
+  [[ -e "$key_ring" ]] && copy_if_exists "$key_ring" "$tmpdir/root/var/lib/sandboxd/credential_encryption.key.ring"
 fi
 
 mkdir -p "$(dirname "$output")"

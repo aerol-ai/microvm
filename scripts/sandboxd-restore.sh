@@ -66,8 +66,40 @@ fi
 if grep -qE '^\./var/lib/sandboxd/raft/?$' <<<"$listing"; then
   set_aside var/lib/sandboxd/raft
 fi
+# The server key goes with the database it seals: the node must come back
+# with the archive's key files and none of the replaced node's. sandboxd
+# refuses wrapped custody beside a plaintext key or ring, and a fresh
+# install's own key, ring or wrapped file would otherwise sit beside the
+# restored ones. The archive's own copies replace the node's (kept aside
+# for rollback); a node file the archive's custody has no use for is moved
+# aside after extracting.
+key_dir=var/lib/sandboxd
+in_archive() { grep -qx "\./$key_dir/$1" <<<"$listing"; }
+for k in credential_encryption.key credential_encryption.key.ring credential_encryption.key.wrapped; do
+  in_archive "$k" && set_aside "$key_dir/$k"
+done
 tar -C "$target_root" -xzf "$input"
 echo "restored $input into $target_root"
+if in_archive credential_encryption.key.wrapped; then
+  set_aside "$key_dir/credential_encryption.key"
+  set_aside "$key_dir/credential_encryption.key.ring"
+else
+  set_aside "$key_dir/credential_encryption.key.wrapped"
+  in_archive credential_encryption.key.ring || set_aside "$key_dir/credential_encryption.key.ring"
+  if ! in_archive credential_encryption.key && [[ -e "$target_root/$key_dir/credential_encryption.key" ]]; then
+    if in_archive credential_encryption.key.ring ||
+      grep -qsE '^[[:space:]]*SB_CREDENTIAL_ENCRYPTION_KEY[[:space:]]*=[[:space:]]*[^[:space:]]' \
+        "$target_root/etc/sandboxd/sandboxd.env" "$target_root/etc/sandboxd/cluster.env"; then
+      # The archive's ring or env key is the server key; this one is not.
+      set_aside "$key_dir/credential_encryption.key"
+    else
+      # An archive made before backups carried the key file: the node's
+      # own key stays, and opens the restored data only if it is the
+      # backed-up node's key (a restore in place).
+      echo "WARNING: the archive carries no server key; sandboxd will use $target_root/$key_dir/credential_encryption.key, which must be the backed-up node's own key" >&2
+    fi
+  fi
+fi
 wrapped="$target_root/var/lib/sandboxd/credential_encryption.key.wrapped"
 if [[ -f "$wrapped" ]]; then
   # Key custody "wrapped": sandboxd unwraps this at boot through the key
