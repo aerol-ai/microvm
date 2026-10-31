@@ -15,7 +15,7 @@ Untrusted code that can reach your private network can attack it. This post expl
 
 | Runtime | Outbound, with no policy | Inbound |
 |---|---|---|
-| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses and other sandboxes. Never the cloud metadata service. | Nothing, until you share a port |
+| Containers, gVisor and Firecracker | The internet, plus anything the server can reach: private addresses. Never the cloud metadata service, another sandbox on the same server, or the server's own services. | Nothing, until you share a port |
 | WebAssembly | No filter until you set a policy | Nothing, until you share a port |
 | V8 isolate | The internet over HTTPS only. Private, loopback, link-local and metadata addresses are always blocked. | Nothing, until you share a port |
 
@@ -175,7 +175,8 @@ For an entry with another port, such as `github.com:22`, the proxy cannot read a
 
 ## Between sandboxes
 
-- **Without a policy, sandboxes on the same server can reach each other.** A policy fences that off.
+- **Sandboxes on the same server cannot reach each other.** Traffic from one sandbox to another on the same server is dropped, policy or not. An operator who needs the old open behavior sets `SB_SANDBOX_INTERCONNECT=true` (refused in enterprise mode).
+- **Sandboxes cannot reach the server's own services.** AerolVM's API, Raft, gossip, cluster and SSH-gateway ports and the server's SSH and rpcbind are closed to every sandbox, with or without an operator file. Only `node_control_port_guard: false` in the file turns this off.
 - **Addresses cannot be faked.** Containers cannot forge packets, and the server checks that each packet from a Firecracker sandbox comes from its own address.
 - **Each sandbox's rules follow its address,** so one sandbox's policy never changes another's.
 
@@ -210,7 +211,7 @@ Set these in the private-network policy file (`SB_EGRESS_OPERATOR_FILE`). They a
 
 - **`default_policy`:** the policy a create gets when it sets none. Use `block_all` or `allowlist` so no sandbox starts open.
 - **`deny_cidrs`:** address ranges that are always dropped. Add your company's private ranges. The cloud metadata addresses are always dropped already. Do not add the ranges the server gives its own sandboxes.
-- **`node_control_port_guard: true`:** sandboxes cannot reach AerolVM's own ports on any server.
+- **`node_control_port_guard`:** on by default, file or no file. Sandboxes cannot reach AerolVM's own ports on any server, or the server's SSH and rpcbind. Set `false` only if a sandbox must reach them.
 
 <Aside type="caution" title="Privileged sandboxes turn off name filtering">
 If the server allows privileged containers, name allow lists are turned off. Keep `SB_CONTAINER_PRIVILEGED` off.

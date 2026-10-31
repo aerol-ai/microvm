@@ -98,7 +98,9 @@ func (m *Manager) ReassertChain() error {
 	}
 	// A flushed or reordered chain gets the floor's jump back on top.
 	if fb, ok := m.ipt.(floorBackend); ok && m.floorFirst.Load() {
-		return fb.EnsureJumpChain(chain, ChainAerolvmFloor)
+		if floor, _ := m.floorChain.Load().(string); floor != "" {
+			return fb.EnsureJumpChain(chain, floor)
+		}
 	}
 	return nil
 }

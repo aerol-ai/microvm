@@ -202,7 +202,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest())...)
+		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest(), d.cfg.PidsLimit)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))

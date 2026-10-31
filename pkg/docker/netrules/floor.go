@@ -1,19 +1,37 @@
 package netrules
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 )
 
-// ChainAerolvmFloor holds the operator's node-wide deny floor
-// (plans/egress-domain-filtering.md §5.10 PC-2): DROPs from the sandbox
-// bridge subnet to each deny_cidrs entry, jumped from the top of the user
-// chain so they sit above every per-sandbox ACCEPT. A chain of its own
-// because the floor is replaced as a whole when the operator file changes,
-// and the rule backends cannot list rules to find the old ones.
+// ChainAerolvmFloor names the deny floor (plans/egress-domain-filtering.md
+// §5.10 PC-2): DROPs from a sandbox subnet to each floor address, jumped
+// from the top of the user chain so they sit above every per-sandbox ACCEPT.
+// A chain of its own because the floor is replaced as a whole when the
+// operator file changes, and the rule backends cannot list rules to find
+// the old ones.
+//
+// Each sandbox subnet gets its own chain, FloorChainFor(subnet). Docker,
+// containerd and Firecracker each floor their own subnet from their own
+// user chain; when they shared this one chain, every SetFloor flushed it,
+// and on a node running more than one of them only the last subnet kept a
+// floor. This name is now only the legacy chain an older daemon filled,
+// emptied at the first floor so its leftover jump is a no-op.
 const ChainAerolvmFloor = "AEROLVM-FLOOR"
+
+// FloorChainFor is the floor chain for one sandbox subnet: the prefix plus
+// eight hex digits of the subnet's hash, 22 characters, inside iptables'
+// 28-character chain-name limit.
+func FloorChainFor(subnet netip.Prefix) string {
+	sum := sha256.Sum256([]byte(subnet.Masked().String()))
+	return ChainAerolvmFloor + "-" + hex.EncodeToString(sum[:4])
+}
 
 // floorBackend is the optional chain management the floor needs.
 type floorBackend interface {
@@ -30,6 +48,17 @@ var ErrFloorUnsupported = errors.New("netrules: backend cannot manage the egress
 
 var floorMu sync.Mutex
 
+// allowInterconnect lets sandboxes on one node reach each other
+// (SB_SANDBOX_INTERCONNECT). Off by default: the floor also drops traffic
+// from the sandbox subnet to the sandbox subnet, so one tenant's sandbox
+// cannot connect to another's listeners. Traffic to the host's bridge
+// address is input, not forward, so the toolbox and DNS are unaffected.
+var allowInterconnect atomic.Bool
+
+// SetSandboxInterconnect sets whether sandboxes on one node may connect to
+// each other; the daemon sets it from config before the first floor.
+func SetSandboxInterconnect(allow bool) { allowInterconnect.Store(allow) }
+
 // SetFloor replaces the node-wide deny floor for sandboxes on subnet. An
 // empty cidrs list clears it. The flush and refill are separate steps, so
 // the floor is briefly empty while it is replaced; the egress gateway's own
@@ -44,20 +73,31 @@ func (m *Manager) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	}
 	floorMu.Lock()
 	defer floorMu.Unlock()
+	chain := FloorChainFor(subnet)
 	// Before the jump goes in: a rule inserted from here on lands below it.
+	m.floorChain.Store(chain)
 	m.floorFirst.Store(true)
-	if err := fb.EnsureJumpChain(m.filterChain(), ChainAerolvmFloor); err != nil {
+	if err := fb.EnsureJumpChain(m.filterChain(), chain); err != nil {
 		return fmt.Errorf("egress floor chain: %w", err)
 	}
-	if err := fb.FlushChain(ChainAerolvmFloor); err != nil {
+	if err := fb.FlushChain(chain); err != nil {
 		return fmt.Errorf("flush egress floor: %w", err)
 	}
+	// The shared chain an older daemon filled: nothing writes it any more,
+	// so emptying it cannot remove a floor this daemon installed. Absent on
+	// a node that never ran one, which is not an error.
+	if !m.legacyFloorEmptied.Swap(true) {
+		_ = fb.FlushChain(ChainAerolvmFloor)
+	}
 	src := subnet.Masked().String()
+	if !allowInterconnect.Load() {
+		cidrs = append(append([]netip.Prefix(nil), cidrs...), subnet.Masked())
+	}
 	for _, c := range cidrs {
 		if !c.Addr().Is4() {
 			continue
 		}
-		if err := m.ipt.Insert("filter", ChainAerolvmFloor, 1, "-s", src, "-d", c.Masked().String(), "-j", "DROP"); err != nil {
+		if err := m.ipt.Insert("filter", chain, 1, "-s", src, "-d", c.Masked().String(), "-j", "DROP"); err != nil {
 			return fmt.Errorf("egress floor rule %s: %w", c, err)
 		}
 	}

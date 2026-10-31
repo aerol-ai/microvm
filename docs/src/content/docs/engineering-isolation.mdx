@@ -241,7 +241,7 @@ Root inside a sandbox does not get the server's full root powers. The runtime's 
 
 - **Files and processes are separate.** Each sandbox has its own writable layer, its own processes and its own address.
 - **Addresses cannot be faked.** Sandboxes cannot forge packets, and the server checks that each packet comes from the address it should.
-- **The network is open between them by default.** Without a policy, sandboxes on the same server can connect to each other. A policy fences that off. See [Network defenses](/engineering-network-defenses/).
+- **The network is closed between them.** Sandboxes on the same server cannot connect to each other, and none can reach the server's own services. `SB_SANDBOX_INTERCONNECT=true` reopens sandbox-to-sandbox traffic for an operator who needs it. See [Network defenses](/engineering-network-defenses/).
 
 ## Resource limits
 
@@ -249,9 +249,9 @@ Each sandbox gets 1 CPU, 1 GB of memory and 10 GB of disk, unless you ask for mo
 
 | Runtime | CPU | Memory | Disk | Number of processes |
 |---|---|---|---|---|
-| Docker | Enforced | Enforced, with no extra swap | Enforced when the server's storage supports it | Not limited |
-| containerd | Enforced | Enforced | Not enforced | Not limited |
-| gVisor | Enforced | Enforced | Not enforced | Not limited |
+| Docker | Enforced | Enforced, with no extra swap | Enforced when the server's storage supports it | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
+| containerd | Enforced | Enforced | Not enforced | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
+| gVisor | Enforced | Enforced | Not enforced | Inside gVisor's own kernel |
 | Firecracker | The virtual machine's CPUs | The virtual machine's memory | The size of its disk | Inside its own kernel |
 | WebAssembly | Each call stops after 5 minutes | Up to 256 MB | Not enforced | No processes |
 | V8 isolate | The jail's cgroup | The jail's cgroup | No file system | Up to 512 |
