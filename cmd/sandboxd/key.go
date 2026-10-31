@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -110,11 +111,9 @@ func runKeyCLI(args []string, out io.Writer) error {
 	if len(envFiles) == 0 {
 		envFiles = defaultEnvFiles
 	}
-	for _, f := range envFiles {
-		if err := loadEnvFile(f); err != nil {
-			fmt.Fprintf(out, "warning: %v; using the process environment\n", err)
-		}
-	}
+	loadEnvFiles(envFiles, func(err error) {
+		fmt.Fprintf(out, "warning: %v; using the process environment\n", err)
+	})
 	cfg, err := config.LoadForKeyTool()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -161,14 +160,36 @@ func runKeyCLI(args []string, out io.Writer) error {
 	}
 }
 
-// loadEnvFile applies a systemd EnvironmentFile: KEY=VALUE lines, # and ;
-// comments, optional quotes. A variable already in the process environment
-// wins, as in the unit (the process env is on top).
-func loadEnvFile(path string) error {
+// loadEnvFiles applies the unit's EnvironmentFile entries in order. As in
+// systemd a later file overrides an earlier one (cluster.env, the cluster
+// drop-in's, over sandboxd.env), and a variable already in the process
+// environment overrides both. A file it cannot read is reported to warn
+// and skipped.
+func loadEnvFiles(paths []string, warn func(error)) {
+	merged := map[string]string{}
+	for _, p := range paths {
+		vals, err := readEnvFile(p)
+		if err != nil {
+			warn(err)
+			continue
+		}
+		maps.Copy(merged, vals)
+	}
+	for k, v := range merged {
+		if _, set := os.LookupEnv(k); !set {
+			_ = os.Setenv(k, v)
+		}
+	}
+}
+
+// readEnvFile parses a systemd EnvironmentFile: KEY=VALUE lines, # and ;
+// comments, optional quotes; a later line overrides an earlier one.
+func readEnvFile(path string) (map[string]string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("env file %s: %w", path, err)
+		return nil, fmt.Errorf("env file %s: %w", path, err)
 	}
+	vals := map[string]string{}
 	sc := bufio.NewScanner(bytes.NewReader(raw))
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -184,11 +205,9 @@ func loadEnvFile(path string) error {
 		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
 			v = v[1 : len(v)-1]
 		}
-		if _, set := os.LookupEnv(k); !set {
-			_ = os.Setenv(k, v)
-		}
+		vals[k] = v
 	}
-	return sc.Err()
+	return vals, sc.Err()
 }
 
 func withKeyStore(ctx context.Context, cfg config.Config, fn func(context.Context, secrets.DataKeyWrapper) error) error {
