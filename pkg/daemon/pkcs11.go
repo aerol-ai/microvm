@@ -47,6 +47,16 @@ func (ks keyStore) handTo(svc *service.Service) {
 	svc.SetKeyStoreWrapper(ks.wrapper)
 }
 
+// custodyFacts is what the custody report needs from the running token. A
+// helper that never started reports no token, not a software one.
+func (ks keyStore) custodyFacts() service.CustodyFacts {
+	if ks.helper == nil {
+		return service.CustodyFacts{}
+	}
+	info := ks.helper.Info()
+	return service.CustodyFacts{SoftwareToken: info.TokenLabel != "" && !info.HardwareSlot}
+}
+
 // bootNodeID names this node in boot-time key-store calls; the cluster id
 // is not known yet.
 func bootNodeID(cfg config.Config) string {

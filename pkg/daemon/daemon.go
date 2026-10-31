@@ -324,7 +324,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
 	svc.RecordKeyCustody()
-	service.PublishKeyCustody(cfg)
+	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {

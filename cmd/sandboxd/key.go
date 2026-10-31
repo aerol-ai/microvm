@@ -32,14 +32,15 @@ var defaultEnvFiles = []string{"/etc/sandboxd/sandboxd.env", "/etc/sandboxd/clus
 // keyCallTimeout bounds each key-store call the tool makes.
 const keyCallTimeout = 30 * time.Second
 
-// openKeyStore builds the key-store client for cfg; tests replace it. For
-// pkcs11 the token opens in this process: a vendor crash only ends the
-// command.
-var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKeyWrapper, func(), error) {
+// openKeyStore builds the key-store client for cfg, and returns the PKCS#11
+// token it opened (nil for none); tests replace it. For pkcs11 the token
+// opens in this process: a vendor crash only ends the command.
+var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
 	if !secrets.IsExternalProvider(cfg.SecretProvider) {
-		return nil, nil, errors.New("SB_SECRET_PROVIDER is local: wrapped custody needs awskms, vault or pkcs11")
+		return nil, nil, nil, errors.New("SB_SECRET_PROVIDER is local: wrapped custody needs awskms, vault or pkcs11")
 	}
 	var helper secrets.DataKeyWrapper
+	var token *pkcs11.Info
 	closeFn := func() {}
 	if cfg.SecretProvider == secrets.ProviderPKCS11 || cfg.PKCS11Configured() {
 		tok, err := pkcs11.OpenInProcess(pkcs11.TokenConfig{
@@ -47,16 +48,17 @@ var openKeyStore = func(ctx context.Context, cfg config.Config) (secrets.DataKey
 			KeyLabel: cfg.SecretPKCS11KeyLabel, DecryptLabels: cfg.SecretPKCS11DecryptLabels, IVMode: cfg.SecretPKCS11GCMIV, Sessions: 1,
 		})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		helper, closeFn = tok, tok.Close
+		info := tok.Info()
+		helper, token, closeFn = tok, &info, tok.Close
 	}
 	w, err := secrets.NewWrapper(secrets.ContextWithBackgroundPurpose(ctx, "key-cli"), service.KeyStoreOptions(cfg, "key-cli", helper))
 	if err != nil {
 		closeFn()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return w, closeFn, nil
+	return w, token, closeFn, nil
 }
 
 type stringList []string
@@ -190,14 +192,20 @@ func loadEnvFile(path string) error {
 }
 
 func withKeyStore(ctx context.Context, cfg config.Config, fn func(context.Context, secrets.DataKeyWrapper) error) error {
-	w, closeFn, err := openKeyStore(ctx, cfg)
+	return withKeyStoreToken(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper, _ *pkcs11.Info) error { return fn(ctx, w) })
+}
+
+// withKeyStoreToken is withKeyStore that also hands fn the PKCS#11 token
+// the client opened, if any.
+func withKeyStoreToken(ctx context.Context, cfg config.Config, fn func(context.Context, secrets.DataKeyWrapper, *pkcs11.Info) error) error {
+	w, token, closeFn, err := openKeyStore(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer closeFn()
 	ctx, cancel := context.WithTimeout(ctx, keyCallTimeout)
 	defer cancel()
-	return fn(ctx, w)
+	return fn(ctx, w, token)
 }
 
 func fileExists(path string) bool {
@@ -211,7 +219,9 @@ func fileExists(path string) bool {
 func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer) error {
 	tw := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "KEY\tWHERE IT LIVES\t")
-	for _, row := range service.CustodyReport(cfg) {
+	// Only the token knows whether its slot is hardware: --check, which
+	// opens it, prints that below; the table stays config-only (§9).
+	for _, row := range service.CustodyReport(cfg, service.CustodyFacts{}) {
 		note := ""
 		if !row.InScope {
 			note = "(out of scope for key custody)"
@@ -252,11 +262,18 @@ func keyStatus(ctx context.Context, cfg config.Config, check bool, out io.Writer
 		}
 	}
 	if check {
-		return withKeyStore(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper) error {
+		return withKeyStoreToken(ctx, cfg, func(ctx context.Context, w secrets.DataKeyWrapper, token *pkcs11.Info) error {
 			if _, err := secrets.UnwrapRing(ctx, w, f, nil); err != nil {
 				return err
 			}
 			fmt.Fprintln(out, "  check: every server key unwraps and matches")
+			if token != nil {
+				if token.HardwareSlot {
+					fmt.Fprintf(out, "  token: %s (%s %s), a hardware slot\n", token.TokenLabel, token.Manufacturer, token.Model)
+				} else {
+					fmt.Fprintf(out, "  token: %s (%s %s), a software token: the key sits in a file on this host, not in an HSM\n", token.TokenLabel, token.Manufacturer, token.Model)
+				}
+			}
 			return nil
 		})
 	}

@@ -11,6 +11,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/secrets/pkcs11"
 )
 
 // keyEnv points the tool at a temp node with AWS KMS settings and a fake
@@ -52,8 +53,8 @@ func keyEnv(t *testing.T, extra map[string]string) (dir string, envFile string, 
 		t.Fatal(err)
 	}
 	orig := openKeyStore
-	openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, func(), error) {
-		return fake, func() {}, nil
+	openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
+		return fake, nil, func() {}, nil
 	}
 	t.Cleanup(func() { openKeyStore = orig })
 	return dir, envFile, fake
@@ -67,7 +68,7 @@ func runKey(t *testing.T, args ...string) (string, error) {
 }
 
 func TestKeyGenerateVerifyStatus(t *testing.T) {
-	dir, env, _ := keyEnv(t, map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"})
+	dir, env, fake := keyEnv(t, map[string]string{"SB_CREDENTIAL_KEY_CUSTODY": "wrapped"})
 	wrapped := filepath.Join(dir, "credential_encryption.key.wrapped")
 	out, err := runKey(t, "wrap", "--generate", "--env-file", env)
 	if err != nil || !strings.Contains(out, "no plaintext copy was written") {
@@ -84,6 +85,23 @@ func TestKeyGenerateVerifyStatus(t *testing.T) {
 		!strings.Contains(out, "key: alias/aerolvm") || strings.Contains(out, "migrated from plaintext") {
 		t.Fatalf("status = %q %v", out, err)
 	}
+	// A PKCS#11 token says what its slot is (§2); only --check opens it.
+	plain := openKeyStore
+	for _, tc := range []struct {
+		hardware bool
+		want     string
+	}{{false, "token: tok (SoftHSM project SoftHSM v2), a software token: the key sits in a file on this host"}, {true, "token: tok (SoftHSM project SoftHSM v2), a hardware slot"}} {
+		openKeyStore = func(context.Context, config.Config) (secrets.DataKeyWrapper, *pkcs11.Info, func(), error) {
+			return fake, &pkcs11.Info{TokenLabel: "tok", Manufacturer: "SoftHSM project", Model: "SoftHSM v2", HardwareSlot: tc.hardware}, func() {}, nil
+		}
+		if out, err := runKey(t, "status", "--check", "--env-file", env); err != nil || !strings.Contains(out, tc.want) {
+			t.Fatalf("status --check, hardware %v = %q %v", tc.hardware, out, err)
+		}
+		if out, _ := runKey(t, "status", "--env-file", env); strings.Contains(out, "token:") {
+			t.Fatalf("status without --check opened the token: %q", out)
+		}
+	}
+	openKeyStore = plain
 	if _, err := runKey(t, "wrap", "--generate", "--env-file", env); err == nil || !strings.Contains(err.Error(), "a wrapped key exists") {
 		t.Fatalf("second generate = %v", err)
 	}
@@ -259,18 +277,18 @@ func TestLoadEnvFile(t *testing.T) {
 // The default opener, on the paths that need no key store.
 func TestDefaultOpenKeyStore(t *testing.T) {
 	ctx := context.Background()
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "local"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "local"}); err == nil {
 		t.Fatal("local opened a key store")
 	}
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "pkcs11", SecretPKCS11Module: "/nonexistent.so", SecretPKCS11KeyLabel: "k"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "pkcs11", SecretPKCS11Module: "/nonexistent.so", SecretPKCS11KeyLabel: "k"}); err == nil {
 		t.Fatal("pkcs11 with a missing module opened")
 	}
-	w, closeFn, err := openKeyStore(ctx, config.Config{SecretProvider: "vault", SecretVaultAddr: "http://127.0.0.1:1", SecretVaultKeyName: "k", SecretProviderMaxInFlight: 2})
-	if err != nil || w == nil {
+	w, token, closeFn, err := openKeyStore(ctx, config.Config{SecretProvider: "vault", SecretVaultAddr: "http://127.0.0.1:1", SecretVaultKeyName: "k", SecretProviderMaxInFlight: 2})
+	if err != nil || w == nil || token != nil {
 		t.Fatalf("vault (unreachable, policy checked later) = %v", err)
 	}
 	closeFn()
-	if _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "vault"}); err == nil {
+	if _, _, _, err := openKeyStore(ctx, config.Config{SecretProvider: "vault"}); err == nil {
 		t.Fatal("vault without settings opened")
 	}
 }

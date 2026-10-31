@@ -73,6 +73,13 @@ const (
 	CustodyNotConfigured   = "not configured"
 )
 
+// The answers for a PKCS#11 slot that is not hardware (SoftHSM2): the key
+// sits in a file on this host, so the report does not claim an HSM (§2).
+const (
+	CustodyWrappedSoftwareToken = "customer key store (wrapped, software token)"
+	CustodyPKCS11SoftwareToken  = "pkcs11 (software token)"
+)
+
 // CustodyRow is one key class and where it lives.
 type CustodyRow struct {
 	Class   string
@@ -82,9 +89,15 @@ type CustodyRow struct {
 	InScope bool
 }
 
-// CustodyReport is where each key class lives on this node, from config
-// alone: no key-store call, no database (§9).
-func CustodyReport(cfg config.Config) []CustodyRow {
+// CustodyFacts are what config cannot say: only the running PKCS#11 token
+// knows whether its slot is hardware.
+type CustodyFacts struct {
+	SoftwareToken bool
+}
+
+// CustodyReport is where each key class lives on this node, from config and
+// facts: no key-store call, no database (§9).
+func CustodyReport(cfg config.Config, facts CustodyFacts) []CustodyRow {
 	server := CustodyPlaintextFile
 	switch {
 	case cfg.CredentialKeyCustody == secrets.CustodyWrapped:
@@ -95,6 +108,12 @@ func CustodyReport(cfg config.Config) []CustodyRow {
 	deks := secrets.NormalizeProviderName(cfg.SecretProvider)
 	if deks == secrets.ProviderLocal {
 		deks = CustodyLocalServerKey
+	}
+	if facts.SoftwareToken && deks == secrets.ProviderPKCS11 {
+		deks = CustodyPKCS11SoftwareToken
+		if server == CustodyWrappedKeyStore {
+			server = CustodyWrappedSoftwareToken
+		}
 	}
 	plainOrNone := func(set bool, how string) string {
 		if set {
@@ -120,10 +139,10 @@ func CustodyReport(cfg config.Config) []CustodyRow {
 var keyCustodyGauge = expvar.NewMap("aerolvm_key_custody")
 
 // PublishKeyCustody publishes the custody report as the gauge.
-func PublishKeyCustody(cfg config.Config) {
+func PublishKeyCustody(cfg config.Config, facts CustodyFacts) {
 	keyCustodyGauge.Init()
 	enterprise := strconv.FormatBool(cfg.EnterpriseMode)
-	for _, row := range CustodyReport(cfg) {
+	for _, row := range CustodyReport(cfg, facts) {
 		byCustody := new(expvar.Map).Init()
 		byEnterprise := new(expvar.Map).Init()
 		one := new(expvar.Int)

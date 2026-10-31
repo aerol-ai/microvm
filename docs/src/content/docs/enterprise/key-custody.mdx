@@ -274,7 +274,7 @@ With `SB_ENTERPRISE_MODE=true`:
 
 - **A running server holds the key in memory.** Someone with root on a running server can read it. This is true of every scheme like this one, AWS KMS included.
 - **The server still holds a way in.** It has a Vault token, reaches a local Vault Proxy, or has an HSM PIN file. Someone who steals that can unlock keys only while they can reach your key store, and every call shows in its log.
-- **Software tokens are for tests.** SoftHSM2 keeps its keys and PIN on the same disk, so a stolen disk does unlock them.
+- **Software tokens are for tests.** SoftHSM2 keeps its keys and PIN on the same disk, so a stolen disk does unlock them. Enterprise mode refuses one. Elsewhere the server logs a warning, `sandboxd key status --check` says `software token`, and the `aerolvm_key_custody` metric reads `pkcs11 (software token)`.
 - **Secrets inside a sandbox** are the sandbox's once they are injected. Revoking does not take them back.
 - **Where the evidence is.** Your key store's own log (Vault audit devices, CloudTrail, the HSM's audit log) records every call. AerolVM's audit log records custody changes, revokes, recoveries and rotations.
 

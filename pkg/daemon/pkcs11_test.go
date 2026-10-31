@@ -44,9 +44,11 @@ func TestStartKeyStorePKCS11(t *testing.T) {
 		wantErr    string
 		wantClosed bool
 		wantLog    string
+		// wantSoft: the custody report names a software token (§2).
+		wantSoft bool
 	}{
-		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{HardwareSlot: true}}},
-		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantLog: "software token"},
+		{name: "hardware token", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "hsm1", HardwareSlot: true}}},
+		{name: "software token warns", helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantLog: "software token", wantSoft: true},
 		{name: "software token in enterprise mode", cfg: func(c config.Config) config.Config { c.EnterpriseMode = true; return c },
 			helper: &fakePKCS11Helper{info: pkcs11.Info{TokenLabel: "soft"}}, wantErr: "not a hardware slot", wantClosed: true},
 		{name: "first start fails, lenient", helper: &fakePKCS11Helper{}, startErr: secrets.ErrProviderUnavailable, wantLog: "retrying in the background"},
@@ -82,6 +84,9 @@ func TestStartKeyStorePKCS11(t *testing.T) {
 				}
 				if ks.helper == nil || ks.wrapper == nil {
 					t.Fatalf("key store = %+v, want the helper and a client built on it", ks)
+				}
+				if got := ks.custodyFacts().SoftwareToken; got != tc.wantSoft {
+					t.Fatalf("custody facts: software token %v, want %v", got, tc.wantSoft)
 				}
 			}
 			if tc.helper != nil && tc.helper.closed != tc.wantClosed {

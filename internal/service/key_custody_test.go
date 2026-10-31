@@ -44,7 +44,7 @@ func TestCustodyReport(t *testing.T) {
 		t.Fatalf("no %q row", class)
 		return CustodyRow{}
 	}
-	wrapped := CustodyReport(config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "pkcs11", PATToken: "p", ClusterTLSDir: "/tls"})
+	wrapped := CustodyReport(config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "pkcs11", PATToken: "p", ClusterTLSDir: "/tls"}, CustodyFacts{})
 	if r := find(wrapped, "server key"); r.Custody != CustodyWrappedKeyStore || !r.InScope {
 		t.Fatalf("server key = %+v", r)
 	}
@@ -57,20 +57,20 @@ func TestCustodyReport(t *testing.T) {
 	if find(wrapped, "node TLS key").Custody != CustodyPlaintextFile || find(wrapped, "gossip key").Custody != CustodyNotConfigured {
 		t.Fatal("TLS or gossip key")
 	}
-	env := CustodyReport(config.Config{CredentialEncryptionKey: "k", AuditIngestToken: "t", UpstreamWrapKeyPath: "/u", ClusterGossipSecretKey: "g"})
+	env := CustodyReport(config.Config{CredentialEncryptionKey: "k", AuditIngestToken: "t", UpstreamWrapKeyPath: "/u", ClusterGossipSecretKey: "g"}, CustodyFacts{})
 	if find(env, "server key").Custody != CustodyEnvVar || find(env, "cluster-secret DEKs").Custody != CustodyLocalServerKey {
 		t.Fatal("env key or local DEKs")
 	}
 	if find(env, "upstream wrap key").Custody != CustodyPlaintextFile || find(env, "audit-ingest token").Custody != CustodyEnvVar {
 		t.Fatal("upstream or audit-ingest")
 	}
-	if find(CustodyReport(config.Config{}), "server key").Custody != CustodyPlaintextFile {
+	if find(CustodyReport(config.Config{}, CustodyFacts{}), "server key").Custody != CustodyPlaintextFile {
 		t.Fatal("default server key")
 	}
 }
 
 func TestPublishKeyCustody(t *testing.T) {
-	PublishKeyCustody(config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "awskms", EnterpriseMode: true})
+	PublishKeyCustody(config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "awskms", EnterpriseMode: true}, CustodyFacts{})
 	byCustody, ok := keyCustodyGauge.Get("server key").(*expvar.Map)
 	if !ok {
 		t.Fatal("no server key entry")
@@ -83,10 +83,44 @@ func TestPublishKeyCustody(t *testing.T) {
 		t.Fatalf("enterprise label = %s", byEnterprise.String())
 	}
 	// Republishing replaces, never accumulates, rows.
-	PublishKeyCustody(config.Config{})
+	PublishKeyCustody(config.Config{}, CustodyFacts{})
 	byCustody = keyCustodyGauge.Get("server key").(*expvar.Map)
 	if byCustody.Get(CustodyWrappedKeyStore) != nil || byCustody.Get(CustodyPlaintextFile) == nil {
 		t.Fatalf("after republish = %s", byCustody.String())
+	}
+	// A software token is named in the gauge too (§2).
+	PublishKeyCustody(config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "pkcs11"}, CustodyFacts{SoftwareToken: true})
+	if keyCustodyGauge.Get("server key").(*expvar.Map).Get(CustodyWrappedSoftwareToken) == nil ||
+		keyCustodyGauge.Get("cluster-secret DEKs").(*expvar.Map).Get(CustodyPKCS11SoftwareToken) == nil {
+		t.Fatalf("software token gauge = %s", keyCustodyGauge.String())
+	}
+}
+
+// §2: a PKCS#11 slot that is not hardware is reported as a software token,
+// never as an HSM; the fact changes nothing for the other providers.
+func TestCustodyReportSoftwareToken(t *testing.T) {
+	cases := []struct {
+		name        string
+		cfg         config.Config
+		facts       CustodyFacts
+		server, dek string
+	}{
+		{"pkcs11 wrapped, hardware", config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "pkcs11"}, CustodyFacts{}, CustodyWrappedKeyStore, "pkcs11"},
+		{"pkcs11 wrapped, software", config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "pkcs11"}, CustodyFacts{SoftwareToken: true}, CustodyWrappedSoftwareToken, CustodyPKCS11SoftwareToken},
+		{"pkcs11 file custody, software", config.Config{SecretProvider: "pkcs11"}, CustodyFacts{SoftwareToken: true}, CustodyPlaintextFile, CustodyPKCS11SoftwareToken},
+		{"vault wrapped, a stray fact", config.Config{CredentialKeyCustody: "wrapped", SecretProvider: "vault"}, CustodyFacts{SoftwareToken: true}, CustodyWrappedKeyStore, "vault"},
+		{"local with pkcs11 settings", config.Config{SecretProvider: "local"}, CustodyFacts{SoftwareToken: true}, CustodyPlaintextFile, CustodyLocalServerKey},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := map[string]string{}
+			for _, r := range CustodyReport(tc.cfg, tc.facts) {
+				got[r.Class] = r.Custody
+			}
+			if got["server key"] != tc.server || got["cluster-secret DEKs"] != tc.dek || got["egress-inspection CA key"] != tc.server {
+				t.Fatalf("report = %v", got)
+			}
+		})
 	}
 }
 
