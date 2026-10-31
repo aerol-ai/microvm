@@ -123,6 +123,12 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrClusterFinalizationUnavailable):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Message: service.ErrClusterFinalizationUnavailable.Error()}
 
+	// A network policy this node's host firewall would leave unenforced. It
+	// also matches ErrRuntimeNotImplemented, so it must come first to keep
+	// its code.
+	case errors.Is(err, service.ErrNetworkPolicyUnenforced):
+		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeNetworkPolicyUnenforced, Message: err.Error()}
+
 	// An option this runtime/build can't honor is 501, not 400.
 	case errors.Is(err, models.ErrRuntimeNotImplemented):
 		return Classification{Status: http.StatusNotImplemented, Message: err.Error()}

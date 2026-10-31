@@ -71,6 +71,11 @@ const (
 	EgressStatusActive      = "active"
 	EgressStatusHeld        = "held"
 	EgressStatusUnavailable = "unavailable"
+	// EgressStatusUnenforced: the sandbox's runtime enforces its policy with
+	// the host firewall, which is off on this node, so nothing filters its
+	// traffic. Only a sandbox accepted under SB_ALLOW_UNENFORCED_NETWORK_POLICY,
+	// or created before the firewall was turned off, shows it.
+	EgressStatusUnenforced = "unenforced"
 )
 
 // egressAttachTimeout bounds one UDS round trip on the create path.
@@ -920,10 +925,15 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 // EgressStatus reports a sandbox's egress status for GET: "" for a sandbox
 // outside gateway mode and not held, otherwise active, held or unavailable.
 // A hold shows on every runtime: a policy that failed to apply, or profiles
-// that can't be resolved, hold WASM, isolate and CIDR sandboxes too.
+// that can't be resolved, hold WASM, isolate and CIDR sandboxes too. A policy
+// on a runtime whose host firewall is off is unenforced, ahead of all of
+// those: neither an attach nor a hold filters anything there.
 func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
 	if sb == nil || !hasEgressConfig(sb) {
 		return ""
+	}
+	if s.sandboxNetRulesOff(sb) {
+		return EgressStatusUnenforced
 	}
 	gw := models.RuntimeUsesEgressGateway(sb.Runtime) && isGatewayMode(sb)
 	if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil && st.HoldReason != "" {

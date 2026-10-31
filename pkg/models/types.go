@@ -871,9 +871,11 @@ type Sandbox struct {
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
-	// "unavailable" (the gateway is down or lost its table). Empty for every
-	// other sandbox, and on list responses (plans/egress-domain-filtering.md
-	// D16). Response-only: never stored.
+	// "unavailable" (the gateway is down or lost its table). "unenforced" is
+	// any egress policy on a runtime whose host firewall is off on this node
+	// (SB_ENABLE_NETWORK_RULES=false): nothing filters the sandbox's traffic.
+	// Empty for every other sandbox, and on list responses
+	// (plans/egress-domain-filtering.md D16). Response-only: never stored.
 	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic is whether the sandbox currently has a public route:
 	// only true is public. It starts as the create-time flag and the first
@@ -1006,7 +1008,8 @@ type NetworkPolicyRequest struct {
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
 // means it is stored, replicated in a cluster, and live on a running
 // sandbox. EgressStatus is set for a container sandbox in gateway mode, as
-// on GET.
+// on GET; "unenforced" there means the node's host firewall is off and the
+// policy was accepted only under SB_ALLOW_UNENFORCED_NETWORK_POLICY.
 type NetworkPolicy struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
@@ -1428,6 +1431,15 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // deployment's default egress policy is unknown, so creates fail closed
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
+// ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
+// policy update or byte-cap update that needs the host firewall on a node
+// where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the
+// docker, containerd and Firecracker runtimes enforce block-all, address
+// lists, hostname rules and byte caps with it. Retrying won't help; the
+// operator turns the firewall on, or the caller drops the policy or picks a
+// runtime that filters egress itself (wasm, isolate).
+const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
 
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error

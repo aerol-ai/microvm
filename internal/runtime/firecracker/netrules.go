@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -38,6 +39,8 @@ func (d *Driver) SetNetRules(r NetRules) { d.netRules = r }
 // SetTapSubnet records the TAP pool's base CIDR, which the node-wide deny
 // floor is scoped to.
 func (d *Driver) SetTapSubnet(p netip.Prefix) { d.tapSubnet = p }
+
+var _ sbruntime.NetRulesReporter = (*Driver)(nil)
 
 // NetRulesEnabled reports whether the driver can enforce egress policies.
 func (d *Driver) NetRulesEnabled() bool { return d.netRules != nil }

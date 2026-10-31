@@ -23,7 +23,7 @@ feature is still mid-rollout.
 |---|---|
 | `SB_AUTO_RECONCILE` | true |
 | `SB_ENABLE_CADDY` | true |
-| `SB_ENABLE_NETWORK_RULES` | true |
+| `SB_ENABLE_NETWORK_RULES` | true. Off (and on any non-Linux host) the docker, containerd and Firecracker runtimes have no firewall, so creates, starts and updates that ask for network policy are refused with `501 network_policy_unenforced`; WASM and isolate filter egress themselves and are unaffected. |
 | `SB_NETRULES_BACKEND` | `netlink` (in-process nftables; `exec` = go-iptables fallback) |
 | `SB_ENABLE_EVENT_MONITOR` | true |
 | `SB_ENABLE_SSH_GATEWAY` | true |
@@ -59,6 +59,7 @@ feature is still mid-rollout.
 | `SB_SANDBOX_PIDS_LIMIT` | Processes and threads per container sandbox; default `4096`, `0` = unlimited (refused in enterprise mode). |
 | `SB_SANDBOX_INTERCONNECT` | `true` lets sandboxes on one server reach each other; default `false` (isolated, refused in enterprise mode). |
 | `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |
+| `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
 
 ## Secret provider (SB_SECRET_PROVIDER)
 

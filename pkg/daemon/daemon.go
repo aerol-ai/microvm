@@ -184,6 +184,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if rules.Enabled() {
 		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
 	}
+	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled())
 
 	dockerClient, err := docker.New(logger, cfg, rules)
 	if err != nil {

@@ -40,6 +40,8 @@ func TestClassify(t *testing.T) {
 		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		// The service's refusal matches both sentinels; it keeps its code.
+		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
 		{"build timeout", service.ErrBuildTimeout, http.StatusGatewayTimeout, 0, "", ErrKindOther},
 		{"build failed", service.ErrBuildFailed, http.StatusBadGateway, 0, "", ErrKindOther},
 		{"builder unavailable", service.ErrBuilderUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
@@ -111,5 +113,27 @@ func TestClassifyLeaderChangeHidesTheInternalAddress(t *testing.T) {
 	}
 	if strings.Contains(c.Message, "10.42.1.198") || strings.Contains(c.Message, "7002") {
 		t.Fatalf("message leaks the internal address: %q", c.Message)
+	}
+}
+
+// A network policy the node's firewall can't enforce reaches the client as
+// 501 with its stable code and the service's message, which names the
+// refused field and the flag that fixes the node.
+func TestWriteStoreAwareErrorNetworkPolicyUnenforced(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteStoreAwareError(nil, rec, fmt.Errorf("network_block_all refused, see SB_ENABLE_NETWORK_RULES: %w",
+		errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented)))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", rec.Code)
+	}
+	var body models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != models.ErrorCodeNetworkPolicyUnenforced || !strings.Contains(body.Error, "SB_ENABLE_NETWORK_RULES") {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("retrying cannot help: no Retry-After")
 	}
 }

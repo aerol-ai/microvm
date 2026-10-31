@@ -157,3 +157,21 @@ func TestSetEgressFloorUsesTheCNISubnet(t *testing.T) {
 		t.Fatal("no rules manager is a no-op")
 	}
 }
+
+// NetRulesEnabled is what the service asks before it accepts network policy
+// for a containerd sandbox: true only over a live manager.
+func TestDriverNetRulesEnabled(t *testing.T) {
+	disabled, err := netrules.NewWithOptions(false, netrules.BackendExec, netrules.ChainAerolvmUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if New(Config{}, nil, nil).NetRulesEnabled() {
+		t.Fatal("nil manager reported enabled")
+	}
+	if New(Config{}, disabled, nil).NetRulesEnabled() {
+		t.Fatal("disabled manager reported enabled")
+	}
+	if !New(Config{}, netrules.NewWithBackend(&netrulesFailInsertBackend{}), nil).NetRulesEnabled() {
+		t.Fatal("live manager reported disabled")
+	}
+}

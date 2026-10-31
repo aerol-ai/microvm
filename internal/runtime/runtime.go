@@ -121,6 +121,17 @@ type EgressHolder interface {
 	ClearEgressHold(containerIP string) error
 }
 
+// NetRulesReporter is implemented by drivers that enforce a sandbox's network
+// policy (block-all, CIDR allow/deny lists, byte-cap blocks, the egress
+// gateway's fail-closed hold) with host firewall rules: docker, containerd and
+// Firecracker. NetRulesEnabled is false when that firewall is off
+// (SB_ENABLE_NETWORK_RULES=false, or a non-Linux host such as macOS local
+// mode). Every rule call is then a silent no-op, so the service refuses those
+// policies instead of storing one nothing enforces.
+type NetRulesReporter interface {
+	NetRulesEnabled() bool
+}
+
 // EgressFloorSetter is implemented by container runtimes that can install
 // the operator's node-wide deny floor for every sandbox on their bridge
 // (plans/egress-domain-filtering.md §5.10 PC-2). It works without the

@@ -72,7 +72,15 @@ func (d *Driver) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []s
 	return d.networkRules.ClearEgressPolicy(containerIP, allowCIDRs, denyCIDRs)
 }
 
-var _ sbruntime.EgressHolder = (*Driver)(nil)
+var (
+	_ sbruntime.EgressHolder     = (*Driver)(nil)
+	_ sbruntime.NetRulesReporter = (*Driver)(nil)
+)
+
+// NetRulesEnabled reports whether the AEROLVM-USER rules are live. A nil or
+// disabled manager (network rules off, or not Linux) makes every rule method
+// here a no-op.
+func (d *Driver) NetRulesEnabled() bool { return d.networkRules.Enabled() }
 
 // ApplyEgressHold installs the fail-closed hold DROP (CEO D16).
 func (d *Driver) ApplyEgressHold(containerIP string) error {

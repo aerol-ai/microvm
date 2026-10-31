@@ -55,7 +55,15 @@ func ipOwnerFromContainerName(name string) string {
 	return name
 }
 
-var _ runtime.EgressHolder = (*Client)(nil)
+var (
+	_ runtime.EgressHolder     = (*Client)(nil)
+	_ runtime.NetRulesReporter = (*Client)(nil)
+)
+
+// NetRulesEnabled reports whether this client's firewall rules are live. With
+// network rules off, or on a non-Linux host, the manager is disabled and every
+// rule method below returns nil without installing anything.
+func (c *Client) NetRulesEnabled() bool { return c.networkRules.Enabled() }
 
 // SetEgressFloor installs the operator's node-wide deny floor for the
 // sandbox network's subnet (§5.10 PC-2).
