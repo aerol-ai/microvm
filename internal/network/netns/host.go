@@ -13,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/network/cni"
 	"github.com/aerol-ai/microvm/internal/network/hostnet"
+	"github.com/aerol-ai/microvm/internal/store"
 )
 
 // HostManager realizes reserved slots: create netns, CNI ADD, and inverse on
@@ -50,12 +51,15 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 	if err := h.ensureDir(root); err != nil {
 		return "", "", err
 	}
+	// One name for the netns AND the CNI container id; Remove derives the same
+	// name back from the recorded path (Slot.netnsName).
+	name := slot.netnsName()
 	// Create a REAL network namespace, not just a directory: the CNI plugin and
 	// the containerd shim both open this path as a netns. `ip netns add` bind-
 	// mounts a fresh netns at /run/netns/<name>; a plain mkdir'd directory makes
 	// CNI ADD fail with a bare "exit status 1" (the plugin cannot enter a dir).
-	if err := h.createNetns(ctx, slot.SandboxID); err != nil {
-		return "", "", fmt.Errorf("netns host: create netns %s: %w", slot.SandboxID, err)
+	if err := h.createNetns(ctx, name); err != nil {
+		return "", "", fmt.Errorf("netns host: create netns %s: %w", name, err)
 	}
 	// A fresh netns has loopback DOWN, and the CNI runner invokes only the bridge
 	// plugin (cni.resolve reduces the conflist to plugins[0]), so nothing brings
@@ -64,14 +68,14 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 	// (postgres, redis, dev servers, multi-process apps). Do it before CNI ADD so
 	// the namespace is fully usable the instant the container attaches; roll back
 	// the netns on failure, mirroring the CNI ADD path below.
-	if err := h.bringLoopbackUp(ctx, slot.SandboxID); err != nil {
-		_ = h.deleteNetns(ctx, slot.SandboxID)
-		return "", "", fmt.Errorf("netns host: loopback up %s: %w", slot.SandboxID, err)
+	if err := h.bringLoopbackUp(ctx, name); err != nil {
+		_ = h.deleteNetns(ctx, name)
+		return "", "", fmt.Errorf("netns host: loopback up %s: %w", name, err)
 	}
-	path := filepath.Join(root, slot.SandboxID)
-	res, err := h.Runner.Add(ctx, path, slot.SandboxID)
+	path := filepath.Join(root, name)
+	res, err := h.Runner.Add(ctx, path, name)
 	if err != nil {
-		_ = h.deleteNetns(ctx, slot.SandboxID)
+		_ = h.deleteNetns(ctx, name)
 		return "", "", fmt.Errorf("netns host: cni add: %w", err)
 	}
 	return path, res.IP4, nil
@@ -120,28 +124,40 @@ func (h *Host) deleteNetns(ctx context.Context, name string) error {
 	return nil
 }
 
+// Remove deletes everything Realize created for slot: the CNI attachment
+// (veth, host-local lease, masquerade chain), conntrack entries and the named
+// netns. It uses the same identity Realize used (Slot.netnsName), whoever owns
+// the slot now. Errors are joined, never swallowed: the pool keeps a slot out
+// of circulation until Remove succeeds.
 func (h *Host) Remove(ctx context.Context, slot Slot) error {
 	if h == nil || h.Runner == nil {
 		return nil
 	}
-	name := strings.TrimSpace(slot.SandboxID)
-	path := strings.TrimSpace(slot.NetnsPath)
-	if name == "" && path != "" {
-		name = filepath.Base(path)
-	}
+	name := slot.netnsName()
 	if name == "" {
 		return nil
 	}
+	path := strings.TrimSpace(slot.NetnsPath)
 	if path == "" {
 		path = filepath.Join(h.netnsRoot(), name)
 	}
-	// Surface the CNI DEL error rather than swallowing it: a dropped DEL leaks
-	// the veth pair and the host-local IPAM lease with no process death to free
-	// them. Conntrack flush and netns teardown are still attempted regardless.
 	delErr := h.Runner.Del(ctx, path, name)
+	// The bridge plugin's DEL removes the masquerade chain only for addresses
+	// it still finds on the container interface. gVisor (runsc, network=sandbox)
+	// moves the address into its own netstack and deletes it from that
+	// interface at start, so for every gVisor sandbox DEL finds nothing and the
+	// chain plus its POSTROUTING jump stay behind. Tear them down by identity.
+	var masqErr error
+	if t, ok := h.Runner.(cni.IPMasqTeardown); ok {
+		masqErr = t.TeardownIPMasq(ctx, name, slot.ContainerIP)
+	}
 	_ = hostnet.FlushConntrackForIP(slot.ContainerIP)
 	rmErr := h.deleteNetns(ctx, name)
-	return errors.Join(delErr, rmErr)
+	return errors.Join(delErr, masqErr, rmErr)
+}
+
+func (h *Host) netnsPathFor(name string) string {
+	return filepath.Join(h.netnsRoot(), name)
 }
 
 func (h *Host) netnsRoot() string {
@@ -179,6 +195,28 @@ func (b *Builder) Build(ctx context.Context, sandboxID string) (*Slot, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Keep the id: slot is reassigned from MarkRealized/Adopt below, which
+	// return nil on error, and the deferred teardown must still name the slot
+	// (it used to dereference that nil and panic on exactly this path).
+	slotID := slot.SlotID
+	unlock := b.pool.lockSlot(slotID)
+	defer unlock()
+	// Reserve is idempotent per sandbox, so a concurrent duplicate create gets
+	// the same row and waits on the lock above. Re-read: if the first Build
+	// already adopted it, hand that back instead of realizing a second time —
+	// the second `ip netns add` would reuse the live netns, its CNI ADD would
+	// fail as a duplicate, and the rollback would delete the live netns and
+	// free the slot under the running sandbox.
+	cur, err := b.pool.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if cur == nil || cur.SlotID != slotID {
+		return nil, fmt.Errorf("netns builder: reservation of %s for %s was released concurrently", slotID, sandboxID)
+	}
+	if cur.State == store.NetnsSlotStateAdopted {
+		return cur, nil
+	}
 	var (
 		netnsPath string
 		ip        string
@@ -189,16 +227,18 @@ func (b *Builder) Build(ctx context.Context, sandboxID string) (*Slot, error) {
 		if adopted {
 			return
 		}
+		release := func() error { return b.pool.Release(ctx, sandboxID, b.now()) }
+		if !realized {
+			_ = release()
+			return
+		}
 		teardown := Slot{
-			SlotID:      slot.SlotID,
+			SlotID:      slotID,
 			SandboxID:   sandboxID,
 			NetnsPath:   netnsPath,
 			ContainerIP: ip,
 		}
-		if realized {
-			_ = b.host.Remove(ctx, teardown)
-		}
-		_ = b.pool.Release(ctx, sandboxID, b.now())
+		_ = b.pool.teardown(ctx, b.host, teardown, sandboxID, release, b.now())
 	}()
 
 	netnsPath, ip, err = b.host.Realize(ctx, *slot)
@@ -218,10 +258,12 @@ func (b *Builder) Build(ctx context.Context, sandboxID string) (*Slot, error) {
 	return slot, nil
 }
 
-// FakeHost records realize/remove calls for tests.
+// FakeHost records realize/remove calls for tests. Like Host, it keys host
+// state by Slot.netnsName, so a test that releases under the wrong identity
+// leaves the realized entry behind exactly as a real node would.
 type FakeHost struct {
 	mu         sync.Mutex
-	realized   map[string]string // sandboxID -> ip
+	realized   map[string]string // netns name -> ip
 	removed    []string
 	realizeErr error
 	removeErr  error
@@ -231,8 +273,17 @@ func NewFakeHost() *FakeHost {
 	return &FakeHost{realized: make(map[string]string)}
 }
 
-func (f *FakeHost) SetRealizeError(err error) { f.realizeErr = err }
-func (f *FakeHost) SetRemoveError(err error)  { f.removeErr = err }
+func (f *FakeHost) SetRealizeError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.realizeErr = err
+}
+
+func (f *FakeHost) SetRemoveError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removeErr = err
+}
 
 func (f *FakeHost) Realize(ctx context.Context, slot Slot) (string, string, error) {
 	_ = ctx
@@ -241,10 +292,10 @@ func (f *FakeHost) Realize(ctx context.Context, slot Slot) (string, string, erro
 	if f.realizeErr != nil {
 		return "", "", f.realizeErr
 	}
+	name := slot.netnsName()
 	ip := fmt.Sprintf("10.88.0.%d", len(f.realized)+2)
-	path := "/run/netns/" + slot.SandboxID
-	f.realized[slot.SandboxID] = ip
-	return path, ip, nil
+	f.realized[name] = ip
+	return f.netnsPathFor(name), ip, nil
 }
 
 func (f *FakeHost) Remove(ctx context.Context, slot Slot) error {
@@ -254,10 +305,13 @@ func (f *FakeHost) Remove(ctx context.Context, slot Slot) error {
 	if f.removeErr != nil {
 		return f.removeErr
 	}
-	f.removed = append(f.removed, slot.SandboxID)
-	delete(f.realized, slot.SandboxID)
+	name := slot.netnsName()
+	f.removed = append(f.removed, name)
+	delete(f.realized, name)
 	return nil
 }
+
+func (f *FakeHost) netnsPathFor(name string) string { return "/run/netns/" + name }
 
 func (f *FakeHost) RealizedCount() int {
 	f.mu.Lock()
@@ -269,6 +323,13 @@ func (f *FakeHost) RemovedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.removed)
+}
+
+// Removed returns the netns names Remove was called with, in order.
+func (f *FakeHost) Removed() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.removed...)
 }
 
 // timeNow is overridden in tests.

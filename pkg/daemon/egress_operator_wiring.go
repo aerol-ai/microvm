@@ -11,6 +11,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress/operator"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
 
@@ -25,7 +26,10 @@ const egressOperatorPoll = 10 * time.Second
 // creates until it is fixed (the watcher picks up the fix); an invalid
 // reload keeps the last good file.
 func wireEgressOperator(ctx context.Context, cfg config.Config, svc *service.Service, logger *slog.Logger) {
+	netrules.SetSandboxInterconnect(cfg.SandboxInterconnect)
 	if cfg.EgressOperatorFile == "" {
+		// No file: the floor still holds the cloud metadata endpoints.
+		svc.ApplyEgressFloor(ctx)
 		return
 	}
 	// Isolate egress leaves from sandboxd's own process, so its guard follows

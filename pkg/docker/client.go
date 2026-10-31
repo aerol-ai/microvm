@@ -22,6 +22,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -58,6 +59,7 @@ type Client struct {
 	toolboxLoopback    bool
 	privileged         bool
 	resourceLimitsOff  bool
+	pidsLimit          int64
 	defaultRuntime     string
 	httpClient         *http.Client
 	streamClient       *http.Client
@@ -133,6 +135,7 @@ func New(logger *slog.Logger, cfg config.Config, rules *netrules.Manager) (*Clie
 		toolboxLoopback:    cfg.DockerToolboxLoopback,
 		privileged:         cfg.ContainerPrivileged,
 		resourceLimitsOff:  cfg.ResourceLimitsOff,
+		pidsLimit:          int64(cfg.SandboxPidsLimit),
 		defaultRuntime:     cfg.Runtime,
 		httpClient:         &http.Client{Timeout: cfg.HTTPClientTimeout, Transport: transport},
 		streamClient:       &http.Client{Transport: transport},
@@ -583,6 +586,10 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			resources["Memory"] = int64(req.MemoryMB) * 1024 * 1024
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 		}
+		if c.pidsLimit > 0 {
+			// A fork bomb stops here instead of exhausting the node.
+			resources["PidsLimit"] = c.pidsLimit
+		}
 		if req.DiskGB > 0 {
 			// gVisor does not honor StorageOpt size — silently applying it
 			// would mislead operators into thinking quota is enforced. Drop
@@ -1015,6 +1022,12 @@ func (c *Client) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken
 func (c *Client) Inspect(ctx context.Context, containerRef string) (*SandboxRuntime, error) {
 	inspect, err := c.inspectContainer(ctx, containerRef)
 	if err != nil {
+		// Only Docker's 404 says the container is gone; a timeout or a 500
+		// says nothing about it, and reconcile deletes the row only on the
+		// former (sbruntime.InstanceGone).
+		if isContainerNotFoundError(err) {
+			return nil, fmt.Errorf("inspect container: %w: %w", sbruntime.ErrInstanceNotFound, err)
+		}
 		return nil, fmt.Errorf("inspect container: %w", err)
 	}
 	return &SandboxRuntime{
@@ -1843,6 +1856,12 @@ func (c *Client) removeContainer(ctx context.Context, containerRef string, force
 	return err
 }
 
+// isContainerNotFoundError matches the status doRequest reports when Docker
+// answers 404 ("No such container") for a container path.
+func isContainerNotFoundError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "failed with status 404")
+}
+
 // isContainerRemoveBenignError matches the substring doRequest emits for HTTP
 // 404 from the Docker daemon when deleting a container. The post-condition of
 // removeContainer is "container is gone"; 404 means it already is.
@@ -1889,4 +1908,20 @@ func sandboxIDFromContainerName(name string) string {
 	name = strings.TrimSpace(name)
 	name = strings.TrimPrefix(name, "/")
 	return name
+}
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the container's
+// SizeRw (bytes written to its writable layer), which dockerd computes on a
+// size=true inspect.
+func (c *Client) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	var out struct {
+		SizeRw *int64 `json:"SizeRw"`
+	}
+	if err := c.doJSON(ctx, http.MethodGet, "/containers/"+url.PathEscape(containerRef)+"/json", url.Values{"size": {"true"}}, nil, nil, &out); err != nil {
+		return 0, fmt.Errorf("inspect container size: %w", err)
+	}
+	if out.SizeRw == nil {
+		return 0, nil
+	}
+	return *out.SizeRw, nil
 }

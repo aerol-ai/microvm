@@ -313,7 +313,7 @@ AerolVM already kept a hash-chained audit log. Each record holds a fingerprint o
 The `id` comes from the provider's stable user ID, not the email. So a person who changes their email keeps one history.
 
 - **One record per API call.** Every call that changes something is recorded. So is every command and file call inside a sandbox, because files can hold secrets. Plain reads are recorded only if you ask for them.
-- **Refused calls are recorded too.** A `403` is a record with `result: denied`. A bad credential (`401`) is an `auth_denied` record, at most one per address per minute.
+- **Refused calls are recorded too.** A `403` is a record with `result: denied`. A bad credential (`401`) is an `auth_denied` record, at most one per address per minute. Together, those records count every refused call.
 - **Commands are stored as a fingerprint.** The fingerprint proves which command ran, without keeping secrets the command may hold.
 - **Floods are capped.** By default, each sandbox and caller pair can write 20 records a second, after a burst of 100. Extra calls are counted in one summary record that names the caller. A server that hosts more than one team always applies this cap, so one team cannot push another team's records out.
 - **A forwarded call is recorded once,** on the server that ran it. `via` says which server passed it on.

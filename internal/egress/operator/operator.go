@@ -256,28 +256,31 @@ func (o *Operator) UpstreamDialer() (*egresspolicy.Upstream, error) {
 func (o *Operator) Hash() string { return o.hash }
 
 // Guard is the container-gateway dial guard: internal zone and deny floor.
+// The floor always carries the cloud metadata endpoints, file or no file.
 func (o *Operator) Guard() egresspolicy.DialGuard {
 	if o == nil {
-		return egresspolicy.DialGuard{}
+		return egresspolicy.DialGuard{DenyFloor: o.DenyFloor()}
 	}
-	return egresspolicy.DialGuard{Zone: o.zone, DenyFloor: o.floor}
+	return egresspolicy.DialGuard{Zone: o.zone, DenyFloor: o.DenyFloor()}
 }
 
 // IsolateGuard is isolate's strict guard; the zone applies only with the
 // explicit internal_zone.isolate opt-in (D15 unchanged by default).
 func (o *Operator) IsolateGuard() egresspolicy.DialGuard {
 	if o == nil {
-		return egresspolicy.DialGuard{Strict: true}
+		return egresspolicy.DialGuard{Strict: true, DenyFloor: o.DenyFloor()}
 	}
-	return egresspolicy.DialGuard{Strict: true, Zone: o.zone, ZoneInStrict: o.file.InternalZone.Isolate, DenyFloor: o.floor}
+	return egresspolicy.DialGuard{Strict: true, Zone: o.zone, ZoneInStrict: o.file.InternalZone.Isolate, DenyFloor: o.DenyFloor()}
 }
 
-// DenyFloor returns the operator's always-dropped CIDRs.
+// DenyFloor returns the always-dropped CIDRs: the operator's deny_cidrs and
+// the cloud metadata endpoints, which no sandbox may reach on any node
+// (with no operator file, the metadata endpoints alone).
 func (o *Operator) DenyFloor() []netip.Prefix {
 	if o == nil {
-		return nil
+		return egresspolicy.WithMetadataFloor(nil)
 	}
-	return append([]netip.Prefix(nil), o.floor...)
+	return egresspolicy.WithMetadataFloor(o.floor)
 }
 
 // Ceiling returns the ceiling, or nil (no ceiling).

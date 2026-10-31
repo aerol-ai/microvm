@@ -2,6 +2,7 @@ package gatewayd
 
 import (
 	"context"
+	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -60,7 +61,7 @@ func TestReloadOnHUP(t *testing.T) {
 		}
 		select {
 		case op := <-changed:
-			if g := op.Guard(); len(g.DenyFloor) != 1 || g.DenyFloor[0].String() != "10.98.0.0/16" {
+			if g := op.Guard(); len(g.DenyFloor) != 1+len(egresspolicy.MetadataPrefixes) || g.DenyFloor[0].String() != "10.98.0.0/16" {
 				t.Fatalf("reloaded floor = %v", g.DenyFloor)
 			}
 			reloaded = true

@@ -56,6 +56,9 @@ feature is still mid-rollout.
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
+| `SB_SANDBOX_PIDS_LIMIT` | Processes and threads per container sandbox; default `4096`, `0` = unlimited (refused in enterprise mode). |
+| `SB_SANDBOX_INTERCONNECT` | `true` lets sandboxes on one server reach each other; default `false` (isolated, refused in enterprise mode). |
+| `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |
 | `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
 
 ## Secret provider (SB_SECRET_PROVIDER)
@@ -159,8 +162,11 @@ exec body's SHA-256, and the object a non-sandbox route acts on. Only the node
 that runs the handler records; a forwarded call is recorded by its owner with
 the edge as `caller.via`. Refused calls are records too: a 403 is an `api`
 record with `result: denied`; a refused credential (401) is an `auth_denied`
-record, at most one per source address per minute, its `dropped` counting the
-401s folded into it. SSH session opens and the daemon's own destructive work
+record, at most one per source address per minute: the first 401 is written at
+once, and the 401s folded after it are written as one record when the minute
+closes (within about 70 s of the first, even if the address goes quiet), its
+`dropped` counting them. A graceful shutdown writes the counts still owed; a
+crash loses the folded 401s of each address's open minute. SSH session opens and the daemon's own destructive work
 (lifecycle auto-stop and auto-delete, the reconcile reap, the orphan delete)
 write `api` records with `caller: sandbox_key` and `caller: system:<subsystem>`.
 Records are buffered (no fsync on the request path) and, like every new

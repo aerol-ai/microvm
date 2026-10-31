@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -28,8 +30,20 @@ type fakeReconcileRuntime struct {
 	managed map[string]*models.SandboxRuntimeState
 	// inspect backs the reconcile guard's targeted re-Inspect (a container the
 	// bulk ListManaged snapshot missed). Keyed by runtime ref; a ref absent
-	// here returns a not-found error, i.e. "container is durably gone".
-	inspect               map[string]*models.SandboxRuntimeState
+	// here returns runtime.ErrInstanceNotFound, i.e. "container is durably
+	// gone", unless inspectErr is set: then every Inspect fails with it, the
+	// runtime-could-not-answer case.
+	inspect     map[string]*models.SandboxRuntimeState
+	inspectErr  error
+	inspectRefs []string
+	// registryMiss makes an absent ref answer (nil, nil), the way the
+	// firecracker, wasm and isolate drivers report an instance their
+	// in-memory registry does not hold.
+	registryMiss bool
+	// allowDestroy records Destroy instead of panicking, for the runtimes
+	// whose reap still calls Destroy (firecracker, wasm).
+	allowDestroy          bool
+	destroyIDs            []string
 	removeImageHits       atomic.Int32
 	networkBlockAllCalls  []string
 	allowPushAllowedPorts bool
@@ -65,17 +79,28 @@ func (f *fakeReconcileRuntime) Start(context.Context, string) (*models.SandboxRu
 func (f *fakeReconcileRuntime) Stop(context.Context, string) error {
 	panic("unexpected Stop on reconcile destroyed path")
 }
-func (f *fakeReconcileRuntime) Destroy(context.Context, *models.Sandbox) error {
-	panic("unexpected Destroy on reconcile destroyed path: container is already gone")
+func (f *fakeReconcileRuntime) Destroy(_ context.Context, sb *models.Sandbox) error {
+	if !f.allowDestroy {
+		panic("unexpected Destroy on reconcile destroyed path: container is already gone")
+	}
+	f.destroyIDs = append(f.destroyIDs, sb.ID)
+	return nil
 }
 func (f *fakeReconcileRuntime) Resize(context.Context, string, models.ResizeSandboxRequest) error {
 	panic("unexpected Resize on reconcile destroyed path")
 }
 func (f *fakeReconcileRuntime) Inspect(_ context.Context, ref string) (*models.SandboxRuntimeState, error) {
+	f.inspectRefs = append(f.inspectRefs, ref)
+	if f.inspectErr != nil {
+		return nil, f.inspectErr
+	}
 	if st, ok := f.inspect[ref]; ok {
 		return st, nil
 	}
-	return nil, errors.New("container not found")
+	if f.registryMiss {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("container %s: %w", ref, runtime.ErrInstanceNotFound)
 }
 func (f *fakeReconcileRuntime) Ping(context.Context) error {
 	panic("unexpected Ping on reconcile destroyed path")
@@ -774,12 +799,12 @@ func TestReconcileReInspectsBeforeReap(t *testing.T) {
 	})
 }
 
-// TestReconcileGoneContainerConfirmedFallsThrough covers the guard's
-// fall-through-to-reap paths that the Reconcile-level test can't reach: a nil
-// row, and a sandbox whose runtime driver isn't registered (Inspect can't be
-// attempted). Both must report "confirmed gone" so a row is never pinned
-// forever by a nil entry or a missing driver.
-func TestReconcileGoneContainerConfirmedFallsThrough(t *testing.T) {
+// TestReconcileGoneContainerConfirmedEdges covers the guard's edges the
+// Reconcile-level tests can't reach. A nil row is reported gone (there is
+// nothing to keep). A sandbox whose runtime driver isn't registered on this
+// node can't be inspected at all, so nothing says it is gone: it is kept.
+// It used to be reported gone, and reaped.
+func TestReconcileGoneContainerConfirmedEdges(t *testing.T) {
 	svc := &Service{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	ctx := context.Background()
 
@@ -787,11 +812,15 @@ func TestReconcileGoneContainerConfirmedFallsThrough(t *testing.T) {
 		t.Fatal("nil sandbox must be treated as confirmed gone")
 	}
 
-	// Engine=containerd with no containerd driver registered → runtimeForSandbox
-	// returns ErrContainerEngineNotRegistered, so there is no runtime to
-	// re-Inspect with; the guard must fall through to the reap.
-	orphan := &models.Sandbox{ID: "sb-nodriver", Runtime: models.RuntimeDocker, Engine: models.ContainerEngineContainerd}
-	if !svc.reconcileGoneContainerConfirmed(ctx, orphan) {
-		t.Fatal("sandbox with an unregistered runtime driver must be treated as confirmed gone")
+	for _, sb := range []*models.Sandbox{
+		// Engine=containerd with no containerd driver registered.
+		{ID: "sb-nodriver", Runtime: models.RuntimeDocker, Engine: models.ContainerEngineContainerd},
+		{ID: "sb-nofc", Runtime: models.RuntimeFirecracker},
+		{ID: "sb-nowasm", Runtime: models.RuntimeWasm},
+		{ID: "sb-noiso", Runtime: models.RuntimeIsolate},
+	} {
+		if svc.reconcileGoneContainerConfirmed(ctx, sb) {
+			t.Fatalf("%s (runtime %q, engine %q) has no driver to ask, so it must not be reaped", sb.ID, sb.Runtime, sb.Engine)
+		}
 	}
 }

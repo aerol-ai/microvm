@@ -276,10 +276,13 @@ reads it for the internal zone, its copy of the floor and the proxy.
 - **Built-in profiles (`builtin_profiles`, on by default).** `false` refuses
   new `builtin:` references with 400; sandboxes already using one keep it.
 - **Deny floor (`deny_cidrs`).** Dropped for every sandbox in every mode, in
-  three places: the host firewall chain `AEROLVM-FLOOR` (jumped from the top
-  of `DOCKER-USER` or `AEROLVM-USER`, rewritten by sandboxd when the file
+  three places: the host firewall, one chain per sandbox subnet named
+  `AEROLVM-FLOOR-<8 hex>` (jumped from the top of `DOCKER-USER`,
+  `AEROLVM-USER` or `AEROLVM-FC`, rewritten by sandboxd when the file
   changes), the gateway's `deny_floor` set, and the WASM and isolate dial
-  guards. Check the host copy with `sudo iptables -S AEROLVM-FLOOR`.
+  guards. Check the host copies with `sudo iptables -S | grep AEROLVM-FLOOR-`:
+  a node running containers and Firecracker guests has one chain for each.
+  A plain `AEROLVM-FLOOR` chain is an older daemon's, emptied at boot.
 - **Control-port guard (`node_control_port_guard`, on by default when a file
   is present).** Sandboxes cannot open TCP connections to any cluster
   member's API, SSH gateway, Raft, gossip or cluster mTLS port, including

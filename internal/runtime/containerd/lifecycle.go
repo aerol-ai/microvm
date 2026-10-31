@@ -19,6 +19,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -186,7 +187,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req)...)
+		specOpts = append(specOpts, resourceSpecOpts(req, d.cfg.PidsLimit)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
@@ -211,6 +212,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	containerLabels := map[string]string{
 		managedLabelKey:   "true",
 		sandboxIDLabelKey: sandboxID,
+	}
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		containerLabels[containerIPLabelKey] = ip
 	}
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {
@@ -437,25 +441,112 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return container.Delete(ctx, cntr.WithSnapshotCleanup)
 }
 
+// Inspect reports what containerd knows about one container. An error
+// wrapping sbruntime.ErrInstanceNotFound means containerd answered NotFound
+// for the container; reconcile deletes the sandbox's row on that and only
+// that. Any other error means containerd could not answer, and says nothing
+// about the sandbox.
+//
+// A container that exists always yields a state. Stopped when it has no task
+// or its task has exited — a task that died and is still there (runsc crashed
+// under a fork bomb: exit status unavailable) is a stopped sandbox, not a
+// missing one. Started when its task runs, with the address sandboxAddress
+// finds: the netns probe, else the address recorded at create. A running
+// gVisor sandbox always needs the record (its probe can't succeed), and one
+// created before the record existed, or whose netns is gone, has neither:
+// it is still Started, with ContainerIP empty. An unreadable address used to
+// fail Inspect, ListManaged then skipped the container, and reconcile deleted
+// the live sandbox's row and cluster placement. Callers that need the
+// address check for an empty one: Create and Start keep requiring it
+// (runtimeStateAfterStart), the start event and runningAt treat empty as
+// "no change", and reconcile keeps the row's address.
 func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
 	client, err := d.ensureClient()
 	if err != nil {
 		return nil, err
 	}
-	container, err := client.LoadContainer(ctx, containerRef)
+	// By id, then by sandbox-id label: a warm-adopted sandbox keeps its park
+	// container's id, so a sandbox id alone misses it. Gone means neither.
+	container, err := d.loadContainerForRef(ctx, client, containerRef)
 	if err != nil {
-		return nil, err
+		if errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("load container %q: %w: %w", containerRef, sbruntime.ErrInstanceNotFound, err)
+		}
+		return nil, fmt.Errorf("load container %q: %w", containerRef, err)
+	}
+	sandboxID := d.sandboxIDFromContainer(ctx, container)
+	stopped := &models.SandboxRuntimeState{
+		SandboxID:   sandboxID,
+		ContainerID: container.ID(),
+		Status:      models.SandboxStatusStopped,
 	}
 	task, err := container.Task(ctx, nil)
 	if err != nil {
-		return &models.SandboxRuntimeState{
-			SandboxID:   d.sandboxIDFromContainer(ctx, container),
-			ContainerID: containerRef,
-			Status:      models.SandboxStatusStopped,
-		}, nil
+		if errdefs.IsNotFound(err) {
+			return stopped, nil
+		}
+		return nil, fmt.Errorf("load task of %q: %w", containerRef, err)
 	}
-	sandboxID := d.sandboxIDFromContainer(ctx, container)
-	return d.runtimeStateAfterStart(ctx, container, task, sandboxID, "")
+	status, err := task.Status(ctx)
+	if err != nil {
+		if errdefs.IsNotFound(err) {
+			return stopped, nil
+		}
+		return nil, fmt.Errorf("task status of %q: %w", containerRef, err)
+	}
+	switch status.Status {
+	case cntr.Running, cntr.Paused, cntr.Pausing:
+		// Paused is a snapshot commit in progress: the sandbox still owns
+		// its address and must not be reported stopped.
+	case cntr.Stopped, cntr.Created:
+		// Created is a task that never started (an interrupted create or
+		// start); Start deletes and recreates it, as it does a stopped one.
+		return stopped, nil
+	default:
+		return nil, fmt.Errorf("task of %q is in state %q", containerRef, status.Status)
+	}
+	state := &models.SandboxRuntimeState{
+		SandboxID:   sandboxID,
+		ContainerID: container.ID(),
+		Status:      models.SandboxStatusStarted,
+	}
+	ip, err := d.sandboxAddress(ctx, container, task, "")
+	if err != nil {
+		inspectIPUnavailableTotal.Add(1)
+		if d.logger != nil {
+			d.logger.Warn("containerd inspect: running task's address unreadable; reporting it started without one",
+				"sandbox_id", sandboxID, "container_id", container.ID(), "error", err)
+		}
+		return state, nil
+	}
+	state.ContainerIP = ip
+	return state, nil
+}
+
+// sandboxAddress resolves a running task's IPv4. The netns probe answers for
+// runc. It cannot answer for a running gVisor sandbox: runsc takes eth0's
+// address out of the pinned netns when the sentry starts, and the task's pid
+// sits in the host netns, which the probe refuses to report. So when the
+// probe fails, the address the netns slot was given stands in: hint (the
+// create path's prepaid address), then the container's containerIPLabelKey
+// label. The slot keeps that address for the sandbox's life. The label is
+// read only after a failed probe, so a runc sandbox pays nothing extra.
+func (d *Driver) sandboxAddress(ctx context.Context, container cntr.Container, task cntr.Task, hint string) (string, error) {
+	ip, err := containerIPv4FromTaskFn(ctx, task)
+	if err == nil {
+		return ip, nil
+	}
+	if h := strings.TrimSpace(hint); h != "" {
+		return h, nil
+	}
+	if container != nil {
+		if labels, lerr := container.Labels(ctx); lerr == nil {
+			if recorded := strings.TrimSpace(labels[containerIPLabelKey]); recorded != "" {
+				return recorded, nil
+			}
+		}
+	}
+	return "", err
 }
 
 func (d *Driver) sandboxIDFromContainer(ctx context.Context, container cntr.Container) string {
@@ -855,11 +946,7 @@ func (d *Driver) lifoTeardown(ctx context.Context, client *Client, container cnt
 }
 
 func (d *Driver) runtimeStateAfterStart(ctx context.Context, container cntr.Container, task cntr.Task, sandboxID, ipHint string) (*models.SandboxRuntimeState, error) {
-	ip, err := containerIPv4FromTaskFn(ctx, task)
-	if err != nil && strings.TrimSpace(ipHint) != "" {
-		ip = ipHint
-		err = nil
-	}
+	ip, err := d.sandboxAddress(ctx, container, task, ipHint)
 	if err != nil {
 		return nil, err
 	}
@@ -948,8 +1035,12 @@ func (d *Driver) removeHostFiles(sandboxID string) error {
 	return os.RemoveAll(dir)
 }
 
-func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
+func resourceSpecOpts(req models.CreateSandboxRequest, pidsLimit int64) []oci.SpecOpts {
 	var out []oci.SpecOpts
+	if pidsLimit > 0 {
+		// A fork bomb stops here instead of exhausting the node.
+		out = append(out, oci.WithPidsLimit(pidsLimit))
+	}
 	if req.MemoryMB > 0 {
 		out = append(out, oci.WithMemoryLimit(uint64(req.MemoryMB)*1024*1024))
 	}
@@ -966,4 +1057,30 @@ func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
 		out = append(out, oci.WithCPUCFS(quota, cpuPeriod))
 	}
 	return out
+}
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the size of the
+// container's active snapshot (its writable layer) as the snapshotter
+// reports it.
+func (d *Driver) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	if d.client == nil || d.client.Raw() == nil {
+		return 0, errors.New("containerd: client not connected")
+	}
+	container, err := d.client.LoadContainer(ctx, containerRef)
+	if err != nil {
+		return 0, err
+	}
+	ctx = d.client.withNS(ctx)
+	info, err := container.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if info.SnapshotKey == "" {
+		return 0, nil
+	}
+	usage, err := d.client.Raw().SnapshotService(info.Snapshotter).Usage(ctx, info.SnapshotKey)
+	if err != nil {
+		return 0, err
+	}
+	return usage.Size, nil
 }

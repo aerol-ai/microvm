@@ -344,6 +344,9 @@ func parkDefaultResources(c *Client) map[string]any {
 		resources["Memory"] = int64(mem) * 1024 * 1024
 		resources["MemorySwap"] = int64(mem) * 1024 * 1024
 	}
+	if c.pidsLimit > 0 {
+		resources["PidsLimit"] = c.pidsLimit
+	}
 	return resources
 }
 

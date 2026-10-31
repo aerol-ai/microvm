@@ -111,19 +111,28 @@ func (e *execBackend) EnsureInputChain(chain string) error {
 	return nil
 }
 
-// EnsureJumpChain implements floorBackend.
+// EnsureJumpChain implements floorBackend. A jump that is not the first rule
+// gets a new one on top; the lower one stays (a second jump to the same
+// chain is a no-op), because deleting it by position could race a
+// concurrent insert into a stale position and remove a sandbox's rule.
 func (e *execBackend) EnsureJumpChain(parent, child string) error {
 	if err := e.EnsureUserChain(child); err != nil {
 		return err
 	}
-	jump := []string{"-j", child}
-	exists, err := e.ipt.Exists("filter", parent, jump...)
+	rules, err := e.ipt.List("filter", parent)
 	if err != nil {
-		return fmt.Errorf("check %s jump to %s: %w", parent, child, err)
+		return fmt.Errorf("list %s: %w", parent, err)
 	}
-	if exists {
-		return nil
+	for _, r := range rules {
+		if !strings.HasPrefix(r, "-A ") {
+			continue
+		}
+		if strings.TrimSpace(r) == "-A "+parent+" -j "+child {
+			return nil
+		}
+		break // the first rule is something else
 	}
+	jump := []string{"-j", child}
 	if err := e.ipt.Insert("filter", parent, 1, jump...); err != nil {
 		return fmt.Errorf("insert %s jump to %s: %w", parent, child, err)
 	}

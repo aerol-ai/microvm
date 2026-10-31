@@ -15,6 +15,7 @@ import (
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 )
 
 // ServeToolboxReverseProxy forwards a toolbox request to the sandbox toolbox.
@@ -76,6 +77,7 @@ func (s *Service) ServeToolboxReverseProxy(ctx context.Context, sandboxID string
 		return fmt.Errorf("invalid toolbox target: %w", err)
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = toolboxhttp.Transport
 	originalDirector := proxy.Director
 	toolboxToken := endpoint.Token
 	proxy.Director = func(req *http.Request) {
@@ -196,7 +198,7 @@ func (s *Service) RoundTripToolbox(ctx context.Context, sandboxID, method, path 
 	if err != nil {
 		return nil, err
 	}
-	return http.DefaultClient.Do(req)
+	return toolboxhttp.Client(0).Do(req)
 }
 
 // toolboxHostServer is the in-process toolbox both the WASM and isolate

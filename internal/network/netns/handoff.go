@@ -48,6 +48,12 @@ func (h *RuntimeHandoff) Provision(ctx context.Context, sandboxID string) (netns
 	return slot.NetnsPath, slot.ContainerIP, nil
 }
 
+// Release tears down sandboxID's netns and returns the slot to the pool.
+// Idempotent. The host teardown uses the identity CNI ADD used (which is NOT
+// sandboxID for a claimed prewarmed slot or an adopted warm-park slot). If it
+// fails, the slot is parked as releasing and retried by the refiller rather
+// than freed with its lease and NAT chain still on the node; Release still
+// returns nil then, because the failure is owned by the retry from here on.
 func (h *RuntimeHandoff) Release(ctx context.Context, sandboxID string) error {
 	if h == nil || h.pool == nil {
 		return nil
@@ -59,11 +65,34 @@ func (h *RuntimeHandoff) Release(ctx context.Context, sandboxID string) error {
 	if slot == nil {
 		return nil
 	}
-	if h.host != nil {
-		_ = h.host.Remove(ctx, *slot)
+	locked := slot.SlotID
+	if releaseAfterGet != nil {
+		releaseAfterGet(locked)
 	}
-	return h.pool.Release(ctx, sandboxID, h.now())
+	unlock := h.pool.lockSlot(locked)
+	defer unlock()
+	// Re-read under the lock: a concurrent Release for the same sandbox may
+	// have freed the slot while we waited, and the refiller may already have
+	// re-realized it for someone else. Only the current owner may tear down,
+	// and only the slot this lock covers.
+	slot, err = h.pool.Get(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	if slot == nil || slot.SlotID != locked {
+		return nil
+	}
+	free := func() error { return h.pool.Release(ctx, sandboxID, h.now()) }
+	if h.host == nil {
+		return free()
+	}
+	_ = h.pool.teardown(ctx, h.host, *slot, sandboxID, free, h.now())
+	return nil
 }
+
+// releaseAfterGet is set only by tests, to change the slot's ownership in the
+// window between Release's first read and its lock.
+var releaseAfterGet func(slotID string)
 
 // ReassignOwner transfers netns slot ownership from a park slot id to the
 // adopted sandbox id (rename-free warm adopt).
