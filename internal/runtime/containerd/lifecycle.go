@@ -967,3 +967,29 @@ func resourceSpecOpts(req models.CreateSandboxRequest) []oci.SpecOpts {
 	}
 	return out
 }
+
+// WritableLayerBytes implements runtime.WritableLayerSizer: the size of the
+// container's active snapshot (its writable layer) as the snapshotter
+// reports it.
+func (d *Driver) WritableLayerBytes(ctx context.Context, containerRef string) (int64, error) {
+	if d.client == nil || d.client.Raw() == nil {
+		return 0, errors.New("containerd: client not connected")
+	}
+	container, err := d.client.LoadContainer(ctx, containerRef)
+	if err != nil {
+		return 0, err
+	}
+	ctx = d.client.withNS(ctx)
+	info, err := container.Info(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if info.SnapshotKey == "" {
+		return 0, nil
+	}
+	usage, err := d.client.Raw().SnapshotService(info.Snapshotter).Usage(ctx, info.SnapshotKey)
+	if err != nil {
+		return 0, err
+	}
+	return usage.Size, nil
+}
