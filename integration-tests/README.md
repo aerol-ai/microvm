@@ -155,7 +155,7 @@ service except the KMS key of the last three.
 | `cluster-3-mixed-secrets-pkcs11` | `make integration-key-custody-pkcs11` | SoftHSM2 on every node, the same keys imported into each token |
 | `cluster-3-mixed-wrapped-kms` | `make integration-key-custody-kms` | A real AWS KMS key, with Terraform `key_custody = "wrapped"`; UC-311 disables and re-enables it |
 | `cluster-3-mixed-kms-switch` | `make integration-key-custody-kms-switch` | A real AWS KMS key with custody `file`; UC-312 runs the two-step switch from local to it |
-| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped` |
+| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped`; UC-316 replaces its root disk and restores a backup onto the fresh install |
 
 The vault and pkcs11 scenarios boot a plain local cluster. The cases
 (`suite/z_keycustody_*_test.go`, helpers in
