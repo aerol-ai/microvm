@@ -93,16 +93,30 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	t.Cleanup(func() { restoreNodeDaemon(t, victim, target) })
 
 	deadline := time.Now().Add(3 * time.Minute)
+	// Two correct answers with the holder down: the list still names the
+	// bundle (the server tier's replicated catalogue answers for a node that
+	// published its inventory, so nothing is missing), or it is short and
+	// says so in the header. Short and silent is the failure.
+	var stopped string
 	for time.Now().Before(deadline) {
-		_, headers, err := getWithHeaders(ctx, c, "/v1/js-bundles")
+		body, headers, err := getWithHeaders(ctx, c, "/v1/js-bundles")
 		if err == nil && strings.TrimSpace(headers.Get(missingPeersHeader)) != "" {
 			t.Logf("UC-168 PASS: the aggregate declared %q unreachable", headers.Get(missingPeersHeader))
 			return
 		}
+		if err == nil && strings.Contains(body, created.Digest) {
+			stopped = body
+		} else if err == nil {
+			stopped = ""
+		}
 		time.Sleep(10 * time.Second)
 	}
-	t.Fatalf("with %s stopped, the js-bundle list never set %s: the response is silently short, so an operator would conclude a bundle was deleted",
-		victim.Name, missingPeersHeader)
+	if stopped != "" {
+		t.Logf("UC-168 PASS: with %s stopped the list still names its bundle %s (served from the replicated catalogue), so nothing is short", victim.Name, created.Digest)
+		return
+	}
+	t.Fatalf("with %s stopped, the js-bundle list dropped bundle %s and never set %s: the response is silently short, so an operator would conclude a bundle was deleted",
+		victim.Name, created.Digest, missingPeersHeader)
 }
 
 // isolatePeerToStop picks a non-seed, SSH-reachable node whose capacity
