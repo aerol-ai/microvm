@@ -86,7 +86,11 @@ only `ca.crt`, `node.crt`, and `node.key`.
 | `SandboxdAuditWitnessShipFailing` | Heads have not reached the witness for 15 minutes (`aerolvm_secret_audit_witness_healthy` is 0 and failures keep rising) | Fix the path to S3, the node role's witness grants or the bucket policy (the log names the error). Do not restart the node until the witness answers: boot validation needs it |
 | `SandboxdAuditWitnessForeignHead` | This node's witness key holds a head this node did not ship (`aerolvm_secret_audit_witness_foreign_head_total` rose) | Check for a duplicate `SB_NODE_ID`, then treat it as a security incident: [foreign head](#foreign-head-sandboxdauditwitnessforeignhead) |
 | `SandboxdClusterCertExpiring` | Node (<14 days) or CA (<30 days) certificate approaches expiry | Sign a fresh node pair and atomically replace `node.crt`/`node.key`; prefer ≤90-day leaf certs |
-| `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down | For `awskms`, check IAM/KMS; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
+| `SandboxdSecretProviderCanaryFailing` | Provider boot/runtime canary is down; with wrapped custody the node also cannot see a revoke | Check the key store's reachability and this node's grants; consider `SB_SECRET_PROVIDER_STRICT_BOOT` |
+| `SandboxdServerKeyPlaintext` | An enterprise node keeps its server key in plaintext | [Wrap it](#server-key-in-plaintext) |
+| `SandboxdKeyRevoked` | The customer's key store revoked the key; the node stopped | [Key revoked](#key-revoked) |
+| `SandboxdKeyVersionRetiredInUse` | Rows are on a key version the key store no longer decrypts | [Re-enable the version](#retired-key-version-in-use) |
+| `SandboxdKeyStoreThrottling` | The key store throttles over 5% of calls | [Raise its limit](#key-store-throttling) |
 
 ## Audit export connectors
 
@@ -766,9 +770,166 @@ nothing to retire.
 
 1. Read `aerolvm_secret_provider_canary_ok` (1 = ok, 0 = failing).
 2. For `SB_SECRET_PROVIDER=awskms`: verify `SB_SECRET_AWS_KMS_KEY_ID`, IAM
-   `Encrypt`/`Decrypt`, and network path to KMS.
-3. Default boot is fail-open unless `SB_SECRET_PROVIDER_STRICT_BOOT=true`.
+   `Encrypt`/`Decrypt`/`DescribeKey`, and network path to KMS. For `vault`:
+   the token file is readable and its policy allows `update` on
+   `transit/encrypt/<key>` and `transit/decrypt/<key>`. For `pkcs11`: the
+   helper is running (`aerolvm_pkcs11_helper_restarts_total`) and the PIN file
+   and labels are right.
+3. Default boot is fail-open unless `SB_SECRET_PROVIDER_STRICT_BOOT=true`
+   (required in enterprise mode for every external provider).
    Fail-open keeps the daemon up but new wraps/opens may fail — page on-call.
+   With wrapped custody a failing canary also means the node cannot tell a
+   revoke from an outage until the key store answers again.
+
+## Key custody
+
+The server key seals every sandbox's toolbox token, registry and mount
+credentials, environment and the egress inspection CA. `sandboxd key status`
+shows where each key lives on a node (add `--check` to unwrap the server-key
+file once). With `SB_CREDENTIAL_KEY_CUSTODY=wrapped` the server key is on disk
+only as `credential_encryption.key.wrapped`, wrapped by the customer's key
+store (`SB_SECRET_PROVIDER`: `awskms`, `vault` or `pkcs11`), and the node
+unwraps it into memory at boot. Design: `plans/customer-key-custody.md`.
+
+A node that cannot reach its key store at boot refuses to start (the log
+says `unwrap server key`). systemd retries every 5 s and gives up after 10
+failures; `sandboxd-healthcheck.timer` then starts the failed unit again
+every 30 s, so the node comes up by itself within about 30 s of the key
+store answering. Nothing needs restarting by hand.
+
+Useful gauges, all per node:
+
+| Metric | Meaning |
+|---|---|
+| `aerolvm_key_custody{key=class,key2=custody,key3=enterprise}` | Where each key class lives (published at boot) |
+| `aerolvm_key_revoked` | 1 while this node is stopped by a revoke |
+| `aerolvm_key_recheck_total{key=result}` | Re-check results: `ok`, `revoked`, `retired`, `denied`, `throttled`, `unavailable`, `mismatch` |
+| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts. Stale is -1, unknown, until a sweep against the current version finishes (at boot, while the first pass against a new version runs, after a pass that stopped early, and on a node that does not sweep): not yet 0 |
+| `aerolvm_key_current`, `aerolvm_key_decryptable` | The key store's current and still-decryptable versions or labels |
+| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens; -1 for every old key until a reseal pass under the current ring finishes |
+| `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` | Key-store calls by outcome |
+
+### Server key in plaintext
+
+`SandboxdServerKeyPlaintext`: an enterprise node keeps its server key in a
+file or the environment, so "the customer holds the keys" is not true on it.
+
+1. On one node, with the key store reachable: `sandboxd key wrap`. It writes
+   `credential_encryption.key.wrapped` and reads it back through the key store.
+2. Copy that file to every node (it is ciphertext).
+3. On every node set `SB_CREDENTIAL_KEY_CUSTODY=wrapped` and remove
+   `SB_CREDENTIAL_ENCRYPTION_KEY` from `/etc/sandboxd/*.env`.
+4. Run `sandboxd key verify`, then delete the plaintext key file. sandboxd
+   refuses to boot with wrapped custody while a plaintext key is still set.
+5. Restart node by node, then work through the
+   [migration cleanup](#migration-cleanup).
+
+### Key revoked
+
+`SandboxdKeyRevoked`: the key store said the key is gone on
+`SB_SECRET_PROVIDER_REVOKE_AFTER` re-checks in a row (default 3, every 5
+minutes). The node dropped the server key from memory, cleared the egress
+inspection CA and the injected secrets in the gateway, closed SSH sessions and
+proxied toolbox streams, reports `"key_custody": "revoked"` on `/health` and
+wrote a `key_revoked` audit record. Sealed operations return
+`503 key_revoked`. Running sandboxes keep running and their public routes stay
+up.
+
+- **On purpose:** check the alert fired on every node that uses the key.
+- **Not on purpose:** read the key store's own log (Vault audit device,
+  CloudTrail, the HSM audit log) for who deleted or disabled the key, then
+  restore it: Vault/OpenBao from your Transit backup or snapshot, AWS KMS with
+  `aws kms cancel-key-deletion` and `aws kms enable-key`, PKCS#11 from the
+  HSM's backup under the same label.
+
+The node resumes on its own within one re-check of the key coming back
+(`key_recovered` record); no restart. A `403`, an outage or a retired version
+never counts toward a revoke.
+
+### Revoke on purpose
+
+| Backend | Revoke | Undo |
+|---|---|---|
+| Vault / OpenBao | `vault write transit/keys/<key>/config deletion_allowed=true`, then `vault delete transit/keys/<key>` | restore the key from a Transit backup |
+| AWS KMS | `aws kms disable-key --key-id <key>` (or schedule deletion) | `aws kms enable-key` (and `cancel-key-deletion`) |
+| PKCS#11 | delete the key object named by `SB_SECRET_PKCS11_KEY_LABEL` with the HSM's tool | restore the object from the HSM's backup |
+
+Every node stops within `SB_SECRET_PROVIDER_RECHECK_INTERVAL ×
+SB_SECRET_PROVIDER_REVOKE_AFTER` (15 minutes by default). sandboxd refuses a
+Vault token that may create keys, because Transit would silently recreate a
+deleted key on the next encrypt.
+
+### Retired key version in use
+
+`SandboxdKeyVersionRetiredInUse`: rows on this node are wrapped under a key
+version or label the key store no longer decrypts, so those sandboxes cannot
+start or fail over here.
+
+1. Make the old version decryptable again: Vault lower
+   `min_decryption_version`; PKCS#11 put the old label back in
+   `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS`.
+2. Wait for the hourly sweep: `aerolvm_key_rows_stale` 0 on every member.
+3. Retire the old version again.
+
+### Key store throttling
+
+`SandboxdKeyStoreThrottling`: over 5% of one backend's calls were throttled
+for 15 minutes. Creates wait longer (`aerolvm_key_store_limiter_wait_seconds_bucket`
+with `key="foreground"`). Raise the key store's limit (Vault rate-limit
+quotas, an AWS KMS quota increase, more HSM sessions), or lower
+`SB_SECRET_PROVIDER_MAX_INFLIGHT` on every node. The re-check and the sweep
+use their own two slots and never take a create's.
+
+### Rotate the key-store key
+
+- **Vault / OpenBao:** `vault write -f transit/keys/<key>/rotate`. The hourly
+  sweep rewraps rows and the server-key file. When `aerolvm_key_rows_stale`
+  is 0 on every member, raise `min_decryption_version`.
+- **AWS KMS:** rotates in place; nothing to do.
+- **PKCS#11:** labels are per-node settings, so it takes four steps:
+  1. Create label B. Add B to `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` on every
+     node and restart node by node.
+  2. When `aerolvm_key_decryptable{key="pkcs11",key2="p11:B"}` shows on every
+     member, set `SB_SECRET_PKCS11_KEY_LABEL=B` and move A into the decrypt
+     labels, node by node.
+  3. Wait until `aerolvm_key_rows_stale` is 0 and
+     `aerolvm_key_current{key="pkcs11",key2="p11:B"}` shows on every member.
+  4. Remove A from the decrypt labels, then destroy A.
+
+### Rotate the server key
+
+A new server key makes copies of the old one (old backups, cred bundles, a
+pre-wrap plaintext file) useless for anything in the current database. Every
+node must run a release that reads a key ring first; `--stage` checks that.
+
+1. `sandboxd key rotate --stage` on one node. Copy the file it names to every
+   node, and into the cred bundle future joiners use. Wait until
+   `aerolvm_server_key_ring{key="1",key2="decrypt"}` shows on every member
+   (one re-check interval).
+2. `sandboxd key rotate --promote`, copy the file again. Each node seals new
+   data with the new key and reseals its stored values. Wait until
+   `aerolvm_server_key_rows{key="0"}` is gone and
+   `aerolvm_server_key_ring{key="1",key2="current"}` shows on every member.
+3. `sandboxd key rotate --retire 0`, copy the file again. With
+   `SB_CREDENTIAL_KEY_CUSTODY=file`, also remove the old key from the env files
+   and the key file.
+
+Each node writes `key_rotation_staged`, `key_rotation_promoted` and
+`key_rotation_retired` audit records as it takes each step. After a promote a
+node cannot go back to a release before rotation; restore from a backup taken
+before the promote instead. A member that was down during the rotation needs
+the current file (and this release) before it rejoins.
+
+### Migration cleanup
+
+Wrapping an existing key does not destroy the plaintext copies made before.
+`sandboxd key status` says "migrated from plaintext" until you either:
+
+- destroy every old copy (the key file on every node, the env files, cred
+  bundles and their S3 object versions, backups taken before the wrap), then
+  run `sandboxd key ack-migration`; or
+- rotate the server key and retire key 0, which clears the notice on its own:
+  the old copies then open nothing current.
 
 ## Query audit history
 

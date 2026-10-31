@@ -290,3 +290,38 @@ func TestRetainLearnedCollectsOrphans(t *testing.T) {
 		t.Fatal("an empty inventory keeps no recording")
 	}
 }
+
+// A key revoke (plans/customer-key-custody.md §10): clear_inspect_ca removes
+// the inspector; and a gateway whose sandboxd has been silent past the bound
+// it sent drops the CA on its own, while a short silence keeps it.
+func TestDaemonClearsInspectCA(t *testing.T) {
+	r := startDaemon(t, t.TempDir(), egress.NewMemBackend())
+	ctx := context.Background()
+	certPEM, keyPEM, err := inspect.GenerateCA("node", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.SetInspectCA(ctx, egress.InspectCA{CertPEM: certPEM, KeyPEM: keyPEM, DropAfterSeconds: 900}); err != nil {
+		t.Fatal(err)
+	}
+	if r.d.caDropAfter.Load() != int64(15*time.Minute) || r.d.lastContact.Load() == 0 {
+		t.Fatalf("drop bound %v, last contact %d", time.Duration(r.d.caDropAfter.Load()), r.d.lastContact.Load())
+	}
+	last := time.Unix(0, r.d.lastContact.Load())
+	r.d.caDropCheck(last.Add(5 * time.Minute))
+	if r.d.px.InspectorForTest() == nil {
+		t.Fatal("a short silence dropped the CA")
+	}
+	r.d.caDropCheck(last.Add(16 * time.Minute))
+	if r.d.px.InspectorForTest() != nil || r.d.caDropAfter.Load() != 0 {
+		t.Fatal("a silence past the bound kept the CA")
+	}
+	if err := r.client.SetInspectCA(ctx, egress.InspectCA{CertPEM: certPEM, KeyPEM: keyPEM}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.ClearInspectCA(ctx); err != nil || r.d.px.InspectorForTest() != nil {
+		t.Fatalf("clear = %v", err)
+	}
+	// No bound set: the gateway never drops on its own.
+	r.d.caDropCheck(time.Now().Add(24 * time.Hour))
+}

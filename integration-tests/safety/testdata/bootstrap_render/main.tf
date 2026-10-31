@@ -112,6 +112,7 @@ locals {
     sandboxd_env           = { SB_ENTERPRISE_MODE = "true", SB_AUDIT_EXPORT_MODE = "file" }
     secret_kms_key_arn     = ""
     secret_kms_strict_boot = true
+    key_custody            = "file"
     audit_export_backend   = ""
     audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
     audit_export_s3_bucket = ""
@@ -242,6 +243,17 @@ output "joiner_receiver" {
     audit_receiver_host_ip  = "10.42.1.5"
     # A joiner never serves the receiver, so it must not hold the private key.
     audit_receiver_key_pem = ""
+  }))
+}
+
+# Wrapped server-key custody (plans/customer-key-custody.md §3): install.sh
+# gets the key-store env and --key-custody, and the seed's cluster-init.sh
+# gets --key-custody too.
+output "seed_wrapped" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed            = true
+    key_custody        = "wrapped"
+    secret_kms_key_arn = "arn:aws:kms:us-east-1:111122223333:key/abcd-1234"
   }))
 }
 

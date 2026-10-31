@@ -55,7 +55,6 @@ const (
 	// that is down delays boot by at most this before the canary reports it.
 	vaultPolicyCheckTimeout = 5 * time.Second
 	vaultMaxResponseBytes   = 1 << 20
-	vaultErrorTextMax       = 200
 	// CorrelationHeader carries the sandboxd secret-audit correlation id to
 	// the key store, so a Vault audit entry joins to the exact sandboxd event
 	// (CEO-E3). Vault records it once listed under audited request headers.
@@ -84,7 +83,7 @@ type vaultResponse struct {
 // every status and error text without a server (the way kmsAPI narrows the
 // AWS client).
 type vaultAPI interface {
-	call(ctx context.Context, path string, body any) (status int, resp vaultResponse, err error)
+	call(ctx context.Context, method, path string, body any) (status int, resp vaultResponse, err error)
 }
 
 // Vault wraps DEKs with Vault Transit or OpenBao encrypt/decrypt. Its
@@ -94,6 +93,7 @@ type Vault struct {
 	api      vaultAPI
 	encPath  string
 	decPath  string
+	keyPath  string
 	policyOK atomic.Bool
 	policyMu sync.Mutex
 }
@@ -128,7 +128,7 @@ func NewVault(opts VaultOptions) (*Vault, error) {
 }
 
 func newVaultWithAPI(api vaultAPI, mount, key string) *Vault {
-	return &Vault{api: api, encPath: mount + "/encrypt/" + key, decPath: mount + "/decrypt/" + key}
+	return &Vault{api: api, encPath: mount + "/encrypt/" + key, decPath: mount + "/decrypt/" + key, keyPath: mount + "/keys/" + key}
 }
 
 // vaultBaseURL accepts https, or http only to a loopback address (Vault
@@ -196,10 +196,10 @@ func (v *Vault) Wrap(ctx context.Context, dek []byte, encCtx map[string]string) 
 		return nil, err
 	}
 	body := map[string]any{"plaintext": base64.StdEncoding.EncodeToString(dek)}
-	if aad := encryptionContextAAD(encCtx); len(aad) > 0 {
+	if aad := EncryptionContextAAD(encCtx); len(aad) > 0 {
 		body["associated_data"] = base64.StdEncoding.EncodeToString(aad)
 	}
-	status, resp, err := v.api.call(ctx, v.encPath, body)
+	status, resp, err := v.api.call(ctx, http.MethodPost, v.encPath, body)
 	if err != nil {
 		return nil, err
 	}
@@ -219,10 +219,10 @@ func (v *Vault) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]st
 		return nil, fmt.Errorf("%w: wrapped key is not vault ciphertext", ErrDecryptFailed)
 	}
 	body := map[string]any{"ciphertext": string(wrapped)}
-	if aad := encryptionContextAAD(encCtx); len(aad) > 0 {
+	if aad := EncryptionContextAAD(encCtx); len(aad) > 0 {
 		body["associated_data"] = base64.StdEncoding.EncodeToString(aad)
 	}
-	status, resp, err := v.api.call(ctx, v.decPath, body)
+	status, resp, err := v.api.call(ctx, http.MethodPost, v.decPath, body)
 	if err != nil {
 		return nil, err
 	}
@@ -241,28 +241,29 @@ func (v *Vault) Unwrap(ctx context.Context, wrapped []byte, encCtx map[string]st
 // texts are the ones Phase 0 recorded on Vault 1.18 and OpenBao 2.1. Only a
 // deleted key is a revoke: a 403 looks the same for a revoked policy and an
 // expired Agent token, and a retired version marks a stale row (§10).
+//
+// Vault's own text picks the class but never rides along in the error: a
+// plugin, a proxy in front of Vault or a misbehaving server can echo
+// request content into it, and these errors are logged. Each class says
+// the status and a fixed phrase instead.
 func classifyVault(op string, status int, errs []string) error {
-	text := strings.Join(errs, "; ")
-	if len(text) > vaultErrorTextMax {
-		text = text[:vaultErrorTextMax]
-	}
-	lower := strings.ToLower(text)
+	lower := strings.ToLower(strings.Join(errs, "; "))
 	switch {
 	case status == http.StatusTooManyRequests:
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderThrottled, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d too many requests", ErrProviderThrottled, op, status)
 	case status == http.StatusForbidden:
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderDenied, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d permission denied", ErrProviderDenied, op, status)
 	case status == http.StatusBadRequest && strings.Contains(lower, "encryption key not found"):
-		return fmt.Errorf("%w: vault %s: %s", ErrKeyRevoked, op, text)
+		return fmt.Errorf("%w: vault %s: encryption key not found", ErrKeyRevoked, op)
 	case status == http.StatusBadRequest && strings.Contains(lower, "disallowed by policy"):
-		return fmt.Errorf("%w: vault %s: %s", ErrKeyVersionRetired, op, text)
+		return fmt.Errorf("%w: vault %s: key version disallowed by policy", ErrKeyVersionRetired, op)
 	case status == http.StatusBadRequest && op == "decrypt":
 		// Wrong associated data, a tampered ciphertext or a malformed one.
-		return fmt.Errorf("%w: vault decrypt: %s", ErrDecryptFailed, text)
+		return fmt.Errorf("%w: vault decrypt: %d", ErrDecryptFailed, status)
 	default:
 		// 5xx (sealed, standby), 404 (mount gone), a redirect, or an encrypt
 		// 400 nobody expects: the key store cannot do the work right now.
-		return fmt.Errorf("%w: vault %s: %d %s", ErrProviderUnavailable, op, status, text)
+		return fmt.Errorf("%w: vault %s: %d", ErrProviderUnavailable, op, status)
 	}
 }
 
@@ -288,7 +289,7 @@ func (v *Vault) ensurePolicy(ctx context.Context) error {
 }
 
 func (v *Vault) checkPolicy(ctx context.Context) error {
-	status, resp, err := v.api.call(ctx, "sys/capabilities-self", map[string]any{"paths": []string{v.encPath, v.decPath}})
+	status, resp, err := v.api.call(ctx, http.MethodPost, "sys/capabilities-self", map[string]any{"paths": []string{v.encPath, v.decPath}})
 	if err != nil {
 		return err
 	}
@@ -306,6 +307,24 @@ func (v *Vault) checkPolicy(ctx context.Context) error {
 		return fmt.Errorf("%w: the token needs \"update\" on %s and %s", errVaultPolicy, v.encPath, v.decPath)
 	}
 	return nil
+}
+
+// CurrentKeyVersion implements KeyVersioner: the Transit key's latest
+// version, which new wraps use and the rewrap sweep moves rows to (§11).
+// Needs read on <mount>/keys/<key>.
+func (v *Vault) CurrentKeyVersion(ctx context.Context) (string, error) {
+	status, resp, err := v.api.call(ctx, http.MethodGet, v.keyPath, nil)
+	if err != nil {
+		return "", err
+	}
+	if status != http.StatusOK {
+		return "", classifyVault("read key", status, resp.Errors)
+	}
+	latest, ok := resp.Data["latest_version"].(float64)
+	if !ok || latest < 1 {
+		return "", fmt.Errorf("%w: vault read key: no latest_version", ErrProviderUnavailable)
+	}
+	return fmt.Sprintf("%sv%d", tagVault, int(latest)), nil
 }
 
 func capabilitySet(raw any) map[string]bool {
@@ -359,17 +378,17 @@ type vaultHTTP struct {
 	token     *tokenFile // nil: Vault Agent's proxy adds the token
 }
 
-func (h *vaultHTTP) call(ctx context.Context, path string, body any) (int, vaultResponse, error) {
+func (h *vaultHTTP) call(ctx context.Context, method, path string, body any) (int, vaultResponse, error) {
 	token, err := h.currentToken(false)
 	if err != nil {
 		return 0, vaultResponse{}, err
 	}
-	status, resp, err := h.once(ctx, path, body, token)
+	status, resp, err := h.once(ctx, method, path, body, token)
 	if err == nil && status == http.StatusForbidden && h.token != nil {
 		// Agent may have renewed the token since the last read: read the file
 		// once more before reporting denied.
 		if fresh, terr := h.currentToken(true); terr == nil && fresh != token {
-			return h.once(ctx, path, body, fresh)
+			return h.once(ctx, method, path, body, fresh)
 		}
 	}
 	return status, resp, err
@@ -382,17 +401,20 @@ func (h *vaultHTTP) currentToken(force bool) (string, error) {
 	return h.token.get(force)
 }
 
-func (h *vaultHTTP) once(ctx context.Context, path string, body any, token string) (int, vaultResponse, error) {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return 0, vaultResponse{}, fmt.Errorf("encode vault request: %w", err)
+func (h *vaultHTTP) once(ctx context.Context, method, path string, body any, token string) (int, vaultResponse, error) {
+	var payload []byte
+	if body != nil {
+		var err error
+		if payload, err = json.Marshal(body); err != nil {
+			return 0, vaultResponse{}, fmt.Errorf("encode vault request: %w", err)
+		}
 	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, vaultCallTimeout)
 		defer cancel()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.base+"/v1/"+path, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, method, h.base+"/v1/"+path, bytes.NewReader(payload))
 	if err != nil {
 		return 0, vaultResponse{}, fmt.Errorf("%w: build vault request: %v", ErrProviderUnavailable, err)
 	}

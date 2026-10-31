@@ -155,7 +155,7 @@ This mapping is a starting point for your assessor, not a certification. Most of
 | RA‑5 Vulnerability Monitoring and Scanning | gosec, govulncheck and dependency review in the project's CI | PV‑2 |
 | SC‑7 Boundary Protection | Private by default, shared ports only, and a firewall layout | NS‑1, NS‑6 |
 | SC‑8 Transmission Confidentiality and Integrity | HTTPS, and mutual TLS between servers | NS‑6, NS‑7 |
-| SC‑12 Cryptographic Key Establishment and Management | The server key, and optional AWS KMS | DP‑5 |
+| SC‑12 Cryptographic Key Establishment and Management | The server key, optionally wrapped by your key store; your key store's own log (Vault audit device, CloudTrail, HSM audit log) of every unwrap; `key_custody_changed`, `key_revoked` and `key_rotation_*` audit records | DP‑5 |
 | SC‑13 Cryptographic Protection | AES-256-GCM, and TLS 1.2 or newer | DP‑1, NS‑7 |
 | SC‑28 Protection of Information at Rest | Secrets sealed in the database | DP‑1 |
 | SC‑39 Process Isolation | Runtime walls around each sandbox | WI‑1 |

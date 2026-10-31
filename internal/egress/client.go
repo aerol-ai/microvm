@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,10 @@ type API interface {
 	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
 	// SetInspectCA hands the gateway the node's inspection CA (P3-1).
 	SetInspectCA(ctx context.Context, ca InspectCA) error
+	// ClearInspectCA drops the CA, the injection secrets and the inspected
+	// connections. A gateway from before the op answers with an error that
+	// IsUnknownOp reports.
+	ClearInspectCA(ctx context.Context) error
 }
 
 // Noop is the API when there is no gateway. Anything that would put a sandbox
@@ -97,6 +102,9 @@ func (Noop) RetainLearned(context.Context, []string) error { return nil }
 func (Noop) SetInspectCA(context.Context, InspectCA) error {
 	return fmt.Errorf("%w: gateway disabled", ErrUnavailable)
 }
+
+// ClearInspectCA has nothing to drop without a gateway.
+func (Noop) ClearInspectCA(context.Context) error { return nil }
 
 // clientConn is one handshaken UDS connection.
 type clientConn struct {
@@ -309,6 +317,16 @@ func (c *Client) RetainLearned(ctx context.Context, ids []string) error {
 
 func (c *Client) SetInspectCA(ctx context.Context, ca InspectCA) error {
 	return c.call(ctx, opInspectCA, ca, nil)
+}
+
+func (c *Client) ClearInspectCA(ctx context.Context) error {
+	return c.call(ctx, opClearCA, nil, nil)
+}
+
+// IsUnknownOp reports a gateway that does not know the op it was sent: an
+// older gateway still running after sandboxd was upgraded.
+func IsUnknownOp(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "unknown op")
 }
 
 // Subscribe opens a dedicated event-stream connection. Events arrive on the

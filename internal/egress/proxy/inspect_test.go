@@ -234,4 +234,20 @@ func TestInspectInject(t *testing.T) {
 	if code != 403 || !strings.Contains(body, "env:GITHUB_TOKEN") || r.last().Reason != ReasonSecretMissing {
 		t.Fatalf("missing secret: %d %q", code, body)
 	}
+
+	// A key revoke drops every sandbox's secrets at the gateway
+	// (plans/customer-key-custody.md §10, eng D21): the next request, even on
+	// a session kept alive across it, is refused the same way.
+	spec.Secrets = map[string]string{"GITHUB_TOKEN": "Bearer ghp_real"}
+	if err := r.gw.Update(spec); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := do(t, c, http.MethodGet, "https://api.example.com/repos/acme/x", "", ""); code != 200 {
+		t.Fatalf("secret sent again: %d", code)
+	}
+	r.gw.DropSecrets()
+	code, body, _ = do(t, c, http.MethodGet, "https://api.example.com/repos/acme/x", "", "")
+	if code != 403 || strings.Contains(body, "ghp_real") || r.last().Reason != ReasonSecretMissing {
+		t.Fatalf("after DropSecrets: %d %q", code, body)
+	}
 }

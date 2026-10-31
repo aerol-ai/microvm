@@ -34,6 +34,12 @@ type ServerHooks struct {
 	NodeControl func([]netip.AddrPort) error
 	// InspectCA installs the inspection CA (P3-1), memory only.
 	InspectCA func(InspectCA) error
+	// ClearInspectCA drops the CA, the injection secrets and the inspected
+	// connections (key revoked, eng D21).
+	ClearInspectCA func() error
+	// Contact is called on every request from sandboxd, so the gateway knows
+	// how long it has been silent.
+	Contact func()
 	// LossGen and Synced acknowledge a lost table (CEO D17): LossGen is read
 	// as sandboxd's Sync starts and Synced is called with it once the Sync
 	// succeeded, so only a loss that Sync covered is cleared.
@@ -137,6 +143,9 @@ func (s *Server) handle(c net.Conn) {
 		if req.Op == opSubscribe {
 			s.stream(c, req.ID)
 			return
+		}
+		if s.hooks.Contact != nil {
+			s.hooks.Contact()
 		}
 		span := startServerSpan(req.Trace, req.Op)
 		payload, err := s.dispatch(req)
@@ -269,6 +278,11 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 			return nil, fmt.Errorf("%w: inspection not supported", ErrUnavailable)
 		}
 		err = s.hooks.InspectCA(ca)
+	case opClearCA:
+		if s.hooks.ClearInspectCA == nil {
+			return nil, fmt.Errorf("%w: inspection not supported", ErrUnavailable)
+		}
+		err = s.hooks.ClearInspectCA()
 	default:
 		return nil, fmt.Errorf("unknown op %q", req.Op)
 	}

@@ -24,6 +24,36 @@ type TrackedConn struct {
 	once sync.Once
 	g    *Gateway
 	id   string
+	// inspected marks a connection terminated with the node's inspection CA,
+	// which a key revoke must close (eng D21).
+	inspected bool
+}
+
+// MarkInspected marks c as a TLS-inspected connection.
+func (c *TrackedConn) MarkInspected() {
+	c.g.connMu.Lock()
+	c.inspected = true
+	c.g.connMu.Unlock()
+}
+
+// CloseInspected closes every inspected connection of every sandbox. An
+// established one keeps the inspector and secrets it loaded at connect
+// time, so dropping the CA alone would leave it injecting (eng D21).
+func (g *Gateway) CloseInspected() int {
+	g.connMu.Lock()
+	var victims []*TrackedConn
+	for _, set := range g.conns {
+		for c := range set {
+			if c.inspected {
+				victims = append(victims, c)
+			}
+		}
+	}
+	g.connMu.Unlock()
+	for _, c := range victims {
+		_ = c.Close()
+	}
+	return len(victims)
 }
 
 // maxTrackedDsts bounds the addresses one connection remembers: a
