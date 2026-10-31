@@ -146,12 +146,21 @@ func bankNeighbour(t *testing.T, rt bankRuntime, of *microvm.Sandbox) (*microvm.
 	if targets != nil && len(targets.Nodes) > 1 {
 		ofNode = bankSandboxNode(t, targets, of).Name
 	}
+	// Misses stay up until there is a hit: placement spreads new sandboxes
+	// onto the least-loaded node, so destroying each miss at once sends every
+	// retry to the same other node and never lands next to of.
+	var misses []string
+	defer func() {
+		for _, id := range misses {
+			destroyBest(c, id)
+		}
+	}()
 	for i := 0; i < 8; i++ {
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		if (ofNode == "" || bankSandboxNode(t, targets, sb).Name == ofNode) && containerIP(t, c, sb) != ofIP {
 			return sb, true
 		}
-		destroyBest(c, sb.ID)
+		misses = append(misses, sb.ID)
 	}
 	return nil, false
 }
