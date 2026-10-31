@@ -1549,6 +1549,15 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// The node this one took for the leader did not answer: it stopped,
+		// or lost the leadership along with its listener. That is a leader
+		// change in progress, which callers retry (IsLeaderUnavailable). It
+		// used to surface as an unclassified error, a 400 on the public API,
+		// so an SDK gave up on a write a retry seconds later would have
+		// committed. The caller's own cancellation stays what it is.
+		if ctx.Err() == nil {
+			return fmt.Errorf("%w: leader-forward apply: %v", ErrNotLeader, err)
+		}
 		return fmt.Errorf("cluster: leader-forward apply: %w", err)
 	}
 	defer resp.Body.Close()
