@@ -2023,6 +2023,26 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	}
 	req.Runtime = chosenRuntime
 
+	// Block-all, the address lists, hostname rules and byte caps are host
+	// firewall rules on a container: on a node whose firewall is off, refuse
+	// them before any work rather than create a sandbox whose GET claims a
+	// policy nothing enforces. Checked on the effective request, so an
+	// operator default and a failover replay are held to it too.
+	if ociRt, rerr := s.ociEngineForNewCreate(); rerr == nil {
+		fields := firewallPolicyFields(&req)
+		unenforced, ferr := s.requireNetRules(ociRt, chosenRuntime, fields)
+		if ferr != nil {
+			return nil, ferr
+		}
+		if unenforced {
+			defer func() {
+				if err == nil && resp != nil {
+					s.warnUnenforced(resp.ID, chosenRuntime, "create", fields)
+				}
+			}()
+		}
+	}
+
 	if err := s.validateCreateMounts(ctx, req.Mounts, idOverride); err != nil {
 		return nil, err
 	}
@@ -3257,6 +3277,13 @@ func (s *Service) StartSandbox(ctx context.Context, id string) (*models.Sandbox,
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// A sandbox created with a firewall policy, on a node whose firewall has
+	// since been turned off, stays stopped: starting it would run it open
+	// while GET still shows the policy. Nothing has been touched yet.
+	if err := s.checkSandboxNetRules(sandbox, "start", sandboxFirewallFields(sandbox)); err != nil {
+		return nil, err
 	}
 
 	// Re-Admit against the host budget before touching Docker. StopSandbox

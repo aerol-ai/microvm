@@ -161,6 +161,14 @@ func (s *Service) updateNetworkPolicy(ctx context.Context, id string, req models
 	next.NetworkEgressMode = effective.NetworkEgressMode
 	next.NetworkEgressRules = effective.NetworkEgressRules
 	containerRT := !s.isWasmSandbox(old) && !s.isIsolateSandbox(old)
+	// The new policy only: clearing a policy needs no firewall, so a sandbox
+	// on a node without one can always be loosened. Firecracker was held to
+	// its own check above.
+	if !s.isFirecrackerSandbox(old) {
+		if err := s.checkSandboxNetRules(old, "update_network_policy", firewallPolicyFields(&effective)); err != nil {
+			return nil, err
+		}
+	}
 	if len(next.NetworkEgressRules) > 0 && s.isWasmSandbox(old) {
 		return nil, unsupportedWasmEgressRules()
 	}
