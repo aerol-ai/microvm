@@ -329,7 +329,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq softhsm2
-          PIN=$(head -c 64 /dev/urandom | tr -dc 0-9 | head -c 8)
+          # Always 8 digits: filtering random bytes down to digits keeps
+          # about 1 in 25, so 64 bytes often gave softhsm2 too short a PIN.
+          PIN=$(printf '%08d' "$(( $(od -An -N4 -tu4 /dev/urandom) % 100000000 ))")
           printf %s "$PIN" > /tmp/itest-hsm-pin && chmod 0600 /tmp/itest-hsm-pin
           export SOFTHSM2_CONF="$RUNNER_TEMP/softhsm2.conf"
           mkdir -p "$RUNNER_TEMP/softhsm-tokens"
