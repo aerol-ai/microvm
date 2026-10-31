@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/egress"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
@@ -215,6 +216,75 @@ func TestRevokeFullStopAndRecovery(t *testing.T) {
 	_ = key
 }
 
+// A gateway Sync while revoked (the one a gateway restart triggers) carries
+// the sandbox but not its injection secrets, and sends no CA (eng D4, D21);
+// the recovery re-check sends both again and health returns to ok (eng D12).
+func TestRevokedGatewaySyncAndRecovery(t *testing.T) {
+	svc, kms, gw, _, _ := revokeHarness(t)
+	tempDataDir(t, svc)
+	ctx := context.Background()
+	resp, err := svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", Env: map[string]string{"TOKEN": "s3cret"}, NetworkAllowOut: []string{"api.example.org"},
+		NetworkEgressRules: []models.EgressRule{{Host: "api.example.org", Inspect: true, Inject: &models.EgressInject{Header: "Authorization", SecretRef: "env:TOKEN"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	synced := func() (egress.Spec, int) {
+		t.Helper()
+		if err := svc.ResyncEgressGateway(ctx); err != nil {
+			t.Fatalf("resync: %v", err)
+		}
+		gw.mu.Lock()
+		defer gw.mu.Unlock()
+		for _, spec := range gw.synced[len(gw.synced)-1] {
+			if spec.ID == resp.ID {
+				return spec, len(gw.inspectCA)
+			}
+		}
+		t.Fatalf("the sync left out %s", resp.ID)
+		return egress.Spec{}, 0
+	}
+	if spec, cas := synced(); spec.Secrets["TOKEN"] != "s3cret" || cas == 0 {
+		t.Fatalf("before the revoke: secrets %v, CA pushes %d", spec.Secrets, cas)
+	}
+
+	kms.set(secrets.ErrKeyRevoked)
+	for i := 0; i < 3; i++ {
+		svc.RecheckServerKey(ctx)
+	}
+	if !svc.KeyRevoked() {
+		t.Fatal("not revoked")
+	}
+	_, before := synced()
+	spec, after := synced()
+	if spec.Secrets != nil {
+		t.Fatalf("a sync while revoked sent secrets %v", spec.Secrets)
+	}
+	if after != before {
+		t.Fatalf("a sync while revoked sent the CA (%d -> %d pushes)", before, after)
+	}
+
+	kms.set(nil)
+	if got := svc.RecheckServerKey(ctx); got != recheckOK {
+		t.Fatalf("recovery re-check = %s", got)
+	}
+	gw.mu.Lock()
+	recovered, cas := gw.synced[len(gw.synced)-1], len(gw.inspectCA)
+	gw.mu.Unlock()
+	if cas <= after {
+		t.Fatal("recovery did not send the CA again")
+	}
+	sent := false
+	for _, s := range recovered {
+		sent = sent || (s.ID == resp.ID && s.Secrets["TOKEN"] == "s3cret")
+	}
+	if !sent {
+		t.Fatal("recovery did not send the injection secret again")
+	}
+	if h, err := svc.Health(ctx); err != nil || h.Status != "ok" || h.KeyCustody != "" {
+		t.Fatalf("health after recovery = %+v %v", h, err)
+	}
+}
+
 // An older gateway answers clear_inspect_ca with "unknown op": sandboxd
 // restarts it instead, and it comes back without the CA (eng D4).
 func TestRevokeRestartsAnOldGateway(t *testing.T) {
@@ -222,12 +292,20 @@ func TestRevokeRestartsAnOldGateway(t *testing.T) {
 	gw.clearErr = errors.New(`unknown op "clear_inspect_ca"`)
 	restarts := 0
 	svc.SetEgressGatewayRestarter(func(context.Context) error { restarts++; return nil })
+	tempDataDir(t, svc)
+	if _, err := svc.ensureEgressCA(); err != nil {
+		t.Fatal(err)
+	}
 	kms.set(secrets.ErrKeyRevoked)
 	for i := 0; i < 3; i++ {
 		svc.RecheckServerKey(context.Background())
 	}
 	if restarts != 1 {
 		t.Fatalf("restarts = %d", restarts)
+	}
+	// The restarted gateway reconnects: sandboxd sends it no CA.
+	if err := svc.ResyncEgressGateway(context.Background()); err != nil || len(gw.inspectCA) != 0 {
+		t.Fatalf("resync after the restart = %v, CA pushes %d", err, len(gw.inspectCA))
 	}
 	if got := svc.clearEgressInspection(context.Background(), func(context.Context) error { return errors.New("no systemd") }); got != "restart failed" {
 		t.Fatalf("failed restart = %q", got)
