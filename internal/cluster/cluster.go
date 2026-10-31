@@ -210,6 +210,10 @@ const (
 	// (promoting servers or adding workers). A long back-off keeps clients
 	// from busy-retrying while the human change is in flight.
 	InvalidTopologyRetryAfterSeconds = 300
+	// LeaderChangeRetryAfterSeconds is the hint for a write that found no
+	// reachable leader (IsLeaderUnavailable). An election settles within a
+	// few heartbeats, so a short back-off.
+	LeaderChangeRetryAfterSeconds = 2
 )
 
 // PlacementState distinguishes a reservation (capacity held, no docker yet)

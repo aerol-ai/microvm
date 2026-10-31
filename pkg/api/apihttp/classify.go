@@ -242,6 +242,11 @@ func Classify(err error) Classification {
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.InvalidTopologyRetryAfterSeconds, Message: err.Error()}
 	case errors.Is(err, cluster.ErrNoPlacementTarget):
 		return Classification{Status: http.StatusServiceUnavailable, Message: err.Error()}
+	// A write that found no reachable leader: an election is in flight.
+	// Retryable, and worded without the error itself, which names the old
+	// leader's internal address.
+	case cluster.IsLeaderUnavailable(err):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: cluster.LeaderChangeRetryAfterSeconds, Message: "cluster leader unavailable (an election is in progress); retry shortly", LogLevel: slog.LevelInfo, Log: true}
 
 	default:
 		return Classification{Status: http.StatusBadRequest, Message: truncate(err.Error()), Kind: ErrKindUnclassified, LogLevel: slog.LevelWarn, Log: true}
