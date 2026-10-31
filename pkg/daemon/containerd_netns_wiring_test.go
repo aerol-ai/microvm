@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/network/netns"
@@ -157,4 +159,72 @@ func openDaemonTestStore(t *testing.T) *store.Store {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	return st
+}
+
+type fakeNetnsOwnerProber struct {
+	exists map[string]bool
+	err    error
+}
+
+func (f *fakeNetnsOwnerProber) SandboxContainerExists(_ context.Context, id string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.exists[id], nil
+}
+
+// The boot reconcile reaps a netns slot (CNI DEL inside its netns, then
+// delete it) when this callback says the owner is dead. It used to say dead
+// whenever Inspect failed or the task was not running, which reaped the
+// network of every gVisor sandbox (Inspect cannot read its IP from the netns)
+// and of every stopped sandbox at each daemon restart. Only a confirmed
+// missing container may count as dead now.
+func TestNetnsSlotOwnerLiveOnlyConfirmedGoneIsDead(t *testing.T) {
+	ctx := context.Background()
+	live := netnsSlotOwnerLive(&fakeNetnsOwnerProber{exists: map[string]bool{"sb-running-or-stopped": true}}, testLogger())
+	if !live(ctx, "sb-running-or-stopped") {
+		t.Fatal("a sandbox whose container exists must keep its slot")
+	}
+	if live(ctx, "sb-gone") {
+		t.Fatal("a sandbox whose container is gone must lose its slot")
+	}
+	unsure := netnsSlotOwnerLive(&fakeNetnsOwnerProber{err: errors.New("containerd: connection refused")}, testLogger())
+	if !unsure(ctx, "sb-unknown") {
+		t.Fatal("an owner check that errored must keep the slot, not reap a possibly live sandbox")
+	}
+	if netnsSlotOwnerLive(nil, nil)(ctx, "sb-x") {
+		t.Fatal("no prober means no owner can be confirmed")
+	}
+	if !netnsSlotOwnerLive(&fakeNetnsOwnerProber{err: errors.New("boom")}, nil)(ctx, "sb-x") {
+		t.Fatal("nil logger must not change the answer")
+	}
+}
+
+// End to end through Reconcile: a live owner's slot survives, a gone owner's
+// slot is reaped.
+func TestNetnsReconcileKeepsSlotOfExistingContainer(t *testing.T) {
+	st := openDaemonTestStore(t)
+	ctx := context.Background()
+	pool := netns.New(st)
+	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: 2}, time.Unix(1, 0)); err != nil {
+		t.Fatal(err)
+	}
+	host := netns.NewFakeHost()
+	h := netns.NewRuntimeHandoff(pool, host)
+	for _, id := range []string{"sb-gvisor-live", "sb-gone"} {
+		if _, _, err := h.Provision(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := netnsSlotOwnerLive(&fakeNetnsOwnerProber{exists: map[string]bool{"sb-gvisor-live": true}}, testLogger())
+	reaped, err := pool.Reconcile(ctx, host, live, nil, time.Unix(2, 0))
+	if err != nil || reaped != 1 {
+		t.Fatalf("reaped=%d err=%v, want only the gone sandbox reaped", reaped, err)
+	}
+	if slot, _ := pool.Get(ctx, "sb-gvisor-live"); slot == nil {
+		t.Fatal("the live sandbox lost its netns slot")
+	}
+	if got := host.Removed(); len(got) != 1 || got[0] != "sb-gone" {
+		t.Fatalf("host teardown ran for %v, want only sb-gone", got)
+	}
 }

@@ -430,6 +430,9 @@ type Service struct {
 	// createsInFlight is the sandbox IDs whose create is running, which the
 	// reconcile orphan sweep skips (create_inflight.go).
 	createsInFlight createsInFlight
+	// reconcileUnknown tracks sandboxes whose runtime could not say whether
+	// they exist, pass after pass (reconcile_unknown.go).
+	reconcileUnknown reconcileUnknownTracker
 	// egressApplyIdle is true once a pass found no apply_failed hold left;
 	// recording one clears it. Zero (false) at start, so the first pass
 	// after a restart reads the store (review 3 finding 8).
@@ -3764,7 +3767,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, snapshot *models.Sandbox
 		return nil, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, nil
 }
 
@@ -3840,7 +3843,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 		return nil, false, err
 	}
 	s.kickSnapshotPushReconciler(snapshot)
-	s.registerSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.registerSnapshotHome(ctx, snapshot)
 	return snapshot, true, nil
 }
 
@@ -4082,13 +4085,14 @@ func (s *Service) CountSnapshots(ctx context.Context, sourceSandboxID string) (i
 
 // registerSnapshotHome records, best-effort, that this node holds the snapshot's
 // image, so a snapshot-by-id GET/DELETE that lands on another node can be routed
-// here (B6). A snapshot lives in per-node SQLite with no node column, so the
-// replicated name → node index is the only cluster-wide home lookup. A failure
-// costs only routing — the snapshot is still usable locally and a re-register
-// would fix it — so it never fails the create. It is a no-op single-node (the
-// Noop client). The write detaches from the request context so a client that
-// disconnected right after the commit still gets the snapshot registered.
-func (s *Service) registerSnapshotHome(ctx context.Context, ownerRef, name string) {
+// here (B6), and so can a create that names the snapshot's committed tag. A
+// snapshot lives in per-node SQLite with no node column, so the replicated
+// index is the only cluster-wide home lookup. A failure costs only routing —
+// the snapshot is still usable locally and a re-register would fix it — so it
+// never fails the create. It is a no-op single-node (the Noop client). The
+// write detaches from the request context so a client that disconnected right
+// after the commit still gets the snapshot registered.
+func (s *Service) registerSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
@@ -4097,25 +4101,42 @@ func (s *Service) registerSnapshotHome(ctx context.Context, ownerRef, name strin
 	if self == "" {
 		return
 	}
-	// Key the home entry by (owner, name) so a tenant cannot overwrite another
-	// tenant's same-named entry and hijack its routing (#11).
-	key := cluster.SnapshotHomeKey(ownerRef, name)
-	if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node register failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.RegisterSnapshotNode(context.WithoutCancel(ctx), key, self); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node register failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
 }
 
-// forgetSnapshotHome drops the snapshot's home entry after it is deleted.
+// forgetSnapshotHome drops the snapshot's home entries after it is deleted.
 // Best-effort: a stale entry is also swept when its node leaves the cluster.
-func (s *Service) forgetSnapshotHome(ctx context.Context, ownerRef, name string) {
+func (s *Service) forgetSnapshotHome(ctx context.Context, snapshot *models.SandboxSnapshot) {
 	c := s.Cluster()
 	if c == nil {
 		return
 	}
-	key := cluster.SnapshotHomeKey(ownerRef, name)
-	if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
-		s.logger.Warn("snapshot home-node forget failed", "snapshot", name, "error", err)
+	for _, key := range snapshotHomeKeys(snapshot) {
+		if err := c.ForgetSnapshotNode(context.WithoutCancel(ctx), key); err != nil && s.logger != nil {
+			s.logger.Warn("snapshot home-node forget failed", "snapshot", snapshot.Name, "error", err)
+		}
 	}
+}
+
+// snapshotHomeKeys lists the index keys a snapshot's home is recorded under.
+// The (owner, name) key stops a tenant overwriting another tenant's same-named
+// entry and hijacking its routing (#11). A snapshot that owns its committed tag
+// is also keyed by that tag, so a create naming the tag (the SDK hands a
+// caller snap.Image) reaches this node from any other; the tag is the one
+// NormalizeCreateImageDistribution resolves through this row (snapshotCommittedAs),
+// so a registered alias that merely points at someone's tag adds no tag key.
+func snapshotHomeKeys(snapshot *models.SandboxSnapshot) []string {
+	keys := []string{cluster.SnapshotHomeKey(snapshot.OwnerRef, snapshot.Name)}
+	if snapshotImageIsOwnedTag(snapshot) {
+		if key := cluster.SnapshotImageHomeKey(snapshot.Image); key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
@@ -4152,7 +4173,7 @@ func (s *Service) DeleteSnapshot(ctx context.Context, idOrName string) error {
 	if err := s.store.DeleteSnapshot(ctx, snapshot.OwnerRef, snapshot.Name); err != nil {
 		return err
 	}
-	s.forgetSnapshotHome(ctx, snapshot.OwnerRef, snapshot.Name)
+	s.forgetSnapshotHome(ctx, snapshot)
 	return nil
 }
 
@@ -5606,33 +5627,6 @@ func (s *Service) ReplayReservations(ctx context.Context) {
 	s.logger.Info("capacity reservations replayed", "count", replayed)
 }
 
-// reconcileGoneContainerConfirmed reports whether a sandbox absent from the
-// bulk ListManaged snapshot is DURABLY gone and safe to reap (which deletes the
-// store row and, in cluster mode, the FSM placement). ListManaged is one racy
-// read per tick whose per-container Inspect silently skips a container it can't
-// read at that instant (mid-adopt/mid-start — see the `if err != nil` continue
-// in the containerd driver's ListManaged). Reaping on that single miss drops a
-// healthy sandbox's row and its cluster placement, which surfaced as an
-// intermittent cross-node snapshot 404 (UC-20). So re-verify with a direct,
-// targeted Inspect before destroying: a container the driver can still resolve
-// (non-empty runtime identity, no error) is NOT gone — the bulk snapshot was
-// stale — so spare it and let the next steady-state pass adopt it. A missing
-// driver, an Inspect error, or an empty identity all fall through to the reap,
-// so a genuinely-dead container is still cleaned up on this pass.
-func (s *Service) reconcileGoneContainerConfirmed(ctx context.Context, sandbox *models.Sandbox) bool {
-	if sandbox == nil {
-		return true
-	}
-	rt, err := s.runtimeForSandbox(sandbox)
-	if err != nil {
-		return true
-	}
-	if st, err := rt.Inspect(ctx, s.runtimeRef(sandbox)); err == nil && st != nil && st.ContainerID != "" {
-		return false
-	}
-	return true
-}
-
 func (s *Service) Reconcile(ctx context.Context) error {
 	// The admin reconcile route keeps its caller: a request's Access wins
 	// over the subsystem tag.
@@ -5705,6 +5699,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 	for _, sandbox := range known {
 		knownIDs[sandbox.ID] = struct{}{}
 	}
+	s.reconcileUnknown.retain(knownIDs)
 	s.reconcileMissingSelfOwnedPlacements(ctx, knownIDs)
 
 	for _, sandbox := range known {
@@ -5778,7 +5773,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			// (deleteSelfOwnedClusterPlacement): reaping a container that is
 			// actually still there turns a transient miss into permanent loss and
 			// an intermittent cross-node snapshot 404 on a healthy sandbox
-			// (UC-20). Confirmed-gone (error / no such container) still reaps.
+			// (UC-20). Only a definitive not-found reaps; an Inspect that
+			// cannot answer keeps the row (reconcile_unknown.go, UC-320).
 			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
@@ -5896,18 +5892,34 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			continue
 		}
 
+		// The runtime listed it, so any unknown streak is over, and an
+		// error this reconcile recorded for it no longer holds.
+		s.reconcileUnknown.forget(sandbox.ID)
+		if strings.HasPrefix(sandbox.LastError, reconcileUnknownErrorPrefix) {
+			sandbox.LastError = ""
+		}
+		// A started instance listed without an address or id has not moved;
+		// the runtime just did not say this pass (containerd's netns probe
+		// failed, firecracker's list never carries them). Keep the row's, so
+		// its routes, egress rules and toolbox target stay where they are.
+		observedIP := state.ContainerIP
+		if observedIP == "" && state.Status == models.SandboxStatusStarted {
+			observedIP = sandbox.ContainerIP
+		}
 		// A row that says started but whose container stopped or moved
 		// missed the stop (sandboxd was down, the event stream gapped): what
 		// it left at the old address is recorded and cleared now, before
 		// the row forgets the address (review 6 finding 4).
 		if sandbox.Status == models.SandboxStatusStarted && sandbox.ContainerIP != "" &&
-			(state.Status != models.SandboxStatusStarted || state.ContainerIP != sandbox.ContainerIP) {
+			(state.Status != models.SandboxStatusStarted || observedIP != sandbox.ContainerIP) {
 			if err := s.teardownSandboxEgress(ctx, sandbox, sandbox.ContainerIP); err != nil {
 				s.logger.Warn("reconcile: egress rules at a moved sandbox's old address not recorded", "sandbox_id", sandbox.ID, "ip", sandbox.ContainerIP, "error", err)
 			}
 		}
-		sandbox.ContainerID = state.ContainerID
-		sandbox.ContainerIP = state.ContainerIP
+		if state.ContainerID != "" {
+			sandbox.ContainerID = state.ContainerID
+		}
+		sandbox.ContainerIP = observedIP
 		sandbox.Status = state.Status
 		sandbox.PublicURL = s.sandboxPublicURL(sandbox.ID, sandbox.AllowPublicTraffic)
 		sandbox.UpdatedAt = time.Now().UTC()

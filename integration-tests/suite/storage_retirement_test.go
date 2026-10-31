@@ -155,10 +155,13 @@ func TestDrainRaisesAStorageRetirementObligation(t *testing.T) {
 			attested = true
 			break
 		}
-		if !strings.Contains(lastErr.Error(), "409") {
+		// 409: still alive in gossip, and the refusal is correct. 503: the
+		// stopped node was the leader and an election is settling. Anything
+		// else (a 400 for a leader change, as before) is a failure.
+		if !strings.Contains(lastErr.Error(), "409") && !strings.Contains(lastErr.Error(), "503") {
 			t.Fatalf("attest storage retirement for stopped %s: %v", victim, lastErr)
 		}
-		time.Sleep(10 * time.Second) // still alive in gossip; the refusal is correct
+		time.Sleep(10 * time.Second)
 	}
 	if !attested {
 		t.Fatalf("attestation for %s was still refused 3 minutes after its daemon stopped: %v", victim, lastErr)

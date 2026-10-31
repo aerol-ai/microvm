@@ -49,6 +49,9 @@ func TestClassify(t *testing.T) {
 		{"egress inspect recreate", service.ErrEgressInspectRecreate, http.StatusConflict, 0, "", ErrKindOther},
 		{"capacity", cluster.ErrCapacityExceeded, http.StatusServiceUnavailable, cluster.CapacityRetryAfterSeconds, "", ErrKindOther},
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
+		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		{"leader gone mid-forward", fmt.Errorf("%w: leader-forward apply: dial tcp 10.42.1.198:7002: connect: connection refused", cluster.ErrNotLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, 0, "", ErrKindSnapshotNameConflict},
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, 0, "", ErrKindSandboxExists},
 		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
@@ -95,5 +98,18 @@ func TestWriteStoreAwareErrorKeyStoreClasses(t *testing.T) {
 		if got := rec.Header().Get("Retry-After") != ""; got != wantRetry {
 			t.Fatalf("%v: Retry-After %q", class, rec.Header().Get("Retry-After"))
 		}
+	}
+}
+
+// A leader change is answered in fixed words: the forward's error names the
+// old leader's internal address, which is not the caller's business.
+func TestClassifyLeaderChangeHidesTheInternalAddress(t *testing.T) {
+	err := fmt.Errorf("%w: leader-forward apply: Post \"https://10.42.1.198:7002/internal/apply\": dial tcp 10.42.1.198:7002: connect: connection refused", cluster.ErrNotLeader)
+	c := Classify(err)
+	if c.Status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", c.Status)
+	}
+	if strings.Contains(c.Message, "10.42.1.198") || strings.Contains(c.Message, "7002") {
+		t.Fatalf("message leaks the internal address: %q", c.Message)
 	}
 }

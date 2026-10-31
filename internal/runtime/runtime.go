@@ -13,11 +13,28 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
+
+// ErrInstanceNotFound is a runtime's definitive "no such instance": Docker
+// answered 404, containerd answered NotFound. Drivers wrap it so callers can
+// tell it from a runtime that could not answer at all.
+var ErrInstanceNotFound = errors.New("runtime: instance not found")
+
+// InstanceGone reports whether an Inspect result proves the instance does not
+// exist. Only that may justify deleting a sandbox's row: an unknown answer (a
+// timeout, an unreadable netns, a shim that did not reply) once did, and
+// reconcile deleted live sandboxes on it.
+func InstanceGone(state *models.SandboxRuntimeState, err error) bool {
+	if err != nil {
+		return errors.Is(err, ErrInstanceNotFound)
+	}
+	return state == nil
+}
 
 // Runtime is the core contract the service layer requires of any sandbox
 // runtime driver. Implementations must be safe for concurrent use; the
@@ -57,6 +74,16 @@ type Runtime interface {
 	Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error
 
 	// Inspect returns the current runtime state for a single container.
+	//
+	// A result says one of three things, and callers that delete anything
+	// must tell them apart (see InstanceGone):
+	//   - a state: the instance exists. An instance whose address could not
+	//     be read this time is still a state (Started, empty ContainerIP);
+	//   - gone: an error wrapping ErrInstanceNotFound, or (nil, nil) from a
+	//     driver whose registry is in-process memory (firecracker, wasm,
+	//     isolate), where a registry miss is the definitive answer;
+	//   - unknown: any other error. The runtime could not answer; the
+	//     instance may well be running.
 	Inspect(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error)
 
 	// ListManaged returns the runtime state of every container managed by

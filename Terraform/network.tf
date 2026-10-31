@@ -88,7 +88,9 @@ resource "aws_key_pair" "this" {
 
 ###############################################################################
 # Security group. One SG keeps wiring simple; rules below gate by source:
-#   - admin (SSH 22, operator API 21212) → var.admin_allowed_cidrs
+#   - admin (SSH 22, operator API 21212) → var.admin_allowed_cidrs (required;
+#                                          0.0.0.0/0 needs allow_admin_from_anywhere)
+#   - operator API 21212 inside the VPC  → vpc_cidr
 #   - cluster-internal (7000/7001/7002)  → vpc_cidr
 #   - public ingress (80/443 by default) → 0.0.0.0/0, only attached to nodes
 #                                          whose role set contains "ingress"
@@ -120,6 +122,13 @@ resource "aws_security_group_rule" "admin_ssh" {
   to_port           = 22
   cidr_blocks       = var.admin_allowed_cidrs
   description       = "SSH from admin CIDRs"
+
+  lifecycle {
+    precondition {
+      condition     = var.allow_admin_from_anywhere || alltrue([for c in var.admin_allowed_cidrs : tonumber(split("/", c)[1]) > 0])
+      error_message = "admin_allowed_cidrs has a /0 range (0.0.0.0/0), which opens SSH and the daemon API to the whole internet. Set your own ranges, or allow_admin_from_anywhere = true to accept that."
+    }
+  }
 }
 
 resource "aws_security_group_rule" "admin_api" {
@@ -130,6 +139,19 @@ resource "aws_security_group_rule" "admin_api" {
   to_port           = 21212
   cidr_blocks       = var.admin_allowed_cidrs
   description       = "Operator + SDK API from admin CIDRs"
+}
+
+# The API from inside the VPC: the observability node scrapes every node's
+# :21212, and peers reach each other's API. These used to work only because
+# admin_allowed_cidrs defaulted to the whole internet.
+resource "aws_security_group_rule" "vpc_api" {
+  type              = "ingress"
+  security_group_id = aws_security_group.node.id
+  protocol          = "tcp"
+  from_port         = 21212
+  to_port           = 21212
+  cidr_blocks       = [var.vpc_cidr]
+  description       = "Operator API from inside the VPC (monitoring, peers)"
 }
 
 resource "aws_security_group_rule" "cluster_internal_tcp" {

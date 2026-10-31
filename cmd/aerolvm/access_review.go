@@ -251,6 +251,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 		region, endpoint, identityPath             string
 		pathStyle                                  bool
 		maxLag                                     = auditVerifyDefaultMaxLag
+		fetch                                      = auditFetchDefaultConcurrency
 		format                                     = "md"
 	)
 	fs.StringVar(&witnessURL, "witness", "", "")
@@ -260,6 +261,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 	fs.StringVar(&format, "format", format, "")
 	fs.StringVar(&identityPath, "identity-file", "", "")
 	fs.DurationVar(&maxLag, "max-lag", maxLag, "")
+	fs.IntVar(&fetch, "fetch-concurrency", fetch, "")
 	fs.StringVar(&region, "region", "", "")
 	fs.StringVar(&endpoint, "endpoint", "", "")
 	fs.BoolVar(&pathStyle, "path-style", false, "")
@@ -271,7 +273,7 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "unexpected argument %q", pos[0])
 	}
 	now := a.clock().UTC()
-	opts := accessReviewOptions{auditVerifyOptions: auditVerifyOptions{maxLag: maxLag, exportDir: exportDir}, format: format}
+	opts := accessReviewOptions{auditVerifyOptions: auditVerifyOptions{maxLag: maxLag, exportDir: exportDir, fetchConcurrency: fetch}, format: format}
 	switch {
 	case sinceRaw == "":
 		return a.usageError(c, verbName, "--since is required: the review window is yours to choose (a quarter is 90d)")
@@ -281,6 +283,8 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 		return a.usageError(c, verbName, "--format must be md or csv, got %q", format)
 	case maxLag < 0:
 		return a.usageError(c, verbName, "--max-lag must not be negative")
+	case badFetchConcurrency(fetch):
+		return a.usageError(c, verbName, "%s", fetchConcurrencyUsage)
 	}
 	if witnessURL != "" {
 		if opts.witness, err = parseS3URL("witness", witnessURL); err != nil {
@@ -316,12 +320,14 @@ func runAccessReview(ctx context.Context, a *app, args []string) int {
 		return a.fail(c, err, exitError)
 	}
 	merge := newReviewMerge(opts.since, now, opts.hasWitness)
-	err = walkReviewEvidence(ctx, opts, now, merge.add)
+	walkCtx, received, stop := a.notifySignals(ctx)
+	defer stop()
+	err = walkReviewEvidence(walkCtx, opts, now, merge.add)
 	if errors.Is(err, errNoExportBatches) {
 		return a.fail(c, err, exitIncomplete)
 	}
 	if err != nil {
-		return a.fail(c, err, exitError)
+		return a.fail(c, err, auditErrorExit(received))
 	}
 	review := merge.finish(list.Tokens, identityFile)
 	// A contradiction outranks an empty export: a hidden witness head with

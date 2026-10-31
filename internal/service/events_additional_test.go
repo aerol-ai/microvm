@@ -485,9 +485,11 @@ func TestHandleDockerEventAdditionalBranches(t *testing.T) {
 
 	t.Run("start empty IP returns nil", func(t *testing.T) {
 		svc, _, st := newCapacityHarness(t, nil, map[string]*models.SandboxRuntimeState{
-			"ctr-start-empty": {
+			// seedSandbox records ContainerID "ctr-<id>"; the start event
+			// inspects that.
+			"ctr-sb-start-empty": {
 				SandboxID:   "sb-start-empty",
-				ContainerID: "ctr-start-empty",
+				ContainerID: "ctr-sb-start-empty",
 				ContainerIP: "",
 				Status:      models.SandboxStatusStarted,
 			},

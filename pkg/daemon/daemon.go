@@ -1014,6 +1014,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		Protocols:   apiListenerProtocols(),
 	}
 
+	// The API server's own background work (the auth_denied flush) runs
+	// from here to StopBackground at shutdown; nothing when api records
+	// are off.
+	server.StartBackground(ctx)
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("sandboxd stopped unexpectedly", "error", err)
@@ -1163,6 +1167,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			logger.Warn("ingress proxy graceful shutdown failed", "error", err)
 		}
 	}
+	// The API listeners are drained: write the auth_denied records still
+	// owed for folded 401s (those of the drain included) before the audit
+	// writer closes.
+	server.StopBackground()
 	// Drain any pending Caddy admin writes before the process exits so
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.

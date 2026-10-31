@@ -202,7 +202,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest())...)
+		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest(), d.cfg.PidsLimit)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
@@ -214,6 +214,9 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	labels := map[string]string{
 		managedLabelKey:  "true",
 		poolParkLabelKey: poolParkLabelValue,
+	}
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		labels[containerIPLabelKey] = ip
 	}
 	leaseID, err = d.pinImageLease(ctx, client, image)
 	if err != nil {

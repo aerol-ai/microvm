@@ -16,6 +16,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -418,6 +419,15 @@ func clusterListSweep[T any](r *http.Request, c cluster.Client, runtimeName, for
 		Warn(string, ...any)
 	}, what string, index clusterArtifactLocationIndex, catalog clusterArtifactCatalog[T],
 ) (clusterListAggregate[T], error) {
+	// The node aggregating may not run this runtime at all: a server or an
+	// ingress on a cluster whose isolate or Firecracker work lives on
+	// dedicated workers. That is "no rows here", not a failed peer. Counting
+	// it as one marked every such list partial (X-Aerol-Partial) on a
+	// healthy cluster, and with no rows yet answered 501 for a runtime the
+	// cluster does run.
+	if errors.Is(localErr, models.ErrRuntimeNotImplemented) {
+		local, localErr = nil, nil
+	}
 	if localErr != nil && logger != nil {
 		logger.Warn("cluster "+what+": local list failed", "err", localErr)
 	}

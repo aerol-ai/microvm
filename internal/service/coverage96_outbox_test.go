@@ -187,7 +187,9 @@ func TestCov96OutboxRefreshExpandReadFailureSkipsReseal(t *testing.T) {
 // carries on to the probe pass.
 func TestCov96OutboxRefreshLogsResealFailure(t *testing.T) {
 	const id, inc = "cov96ob-resealerr", "inc-resealerr"
-	cl := newCov96OutboxCluster("node-a", "node-a")
+	// node-b is the live replacement; without one the reseal stops at the
+	// durability floor before it ever looks for a provider.
+	cl := newCov96OutboxCluster("node-a", "node-a", "node-b")
 	cl.placements[id] = cluster.Placement{
 		SandboxID: id, OwnerNodeID: "node-a", IncarnationID: inc,
 		SecretSealGeneration: 1, SecretRecipients: []string{"node-a", "node-dead"},

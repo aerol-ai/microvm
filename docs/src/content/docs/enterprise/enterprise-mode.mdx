@@ -93,7 +93,7 @@ The server checks these rules when it starts. If one is missing, it refuses to s
 | Named credentials | `SB_IDENTITY_ENABLED=true` and `SB_PAT_SCOPE=host`. People and services sign in with SSO or a scoped API token. The shared server token works only on the server itself and between cluster servers. SSO is not required: tokens-only mode, with no identity file, works on air-gapped networks. See [SSO](/enterprise/sso/). |
 | Tokens that expire | API tokens last at most 90 days (`SB_TOKEN_MAX_TTL`). |
 | Every change recorded | API action records stay on (`SB_AUDIT_API_RECORDS` is not `off`). Token create, token revoke and sandbox delete wait until their record is on disk (`SB_AUDIT_API_DURABLE`). |
-| Locked-down sandboxes | Privileged mode off (`SB_CONTAINER_PRIVILEGED`). Resource limits on, so `SB_RESOURCE_LIMITS_DISABLED` stays unset. |
+| Locked-down sandboxes | Privileged mode off (`SB_CONTAINER_PRIVILEGED`). Resource limits on, so `SB_RESOURCE_LIMITS_DISABLED` stays unset. A process limit above zero (`SB_SANDBOX_PIDS_LIMIT`), and sandboxes isolated from each other (`SB_SANDBOX_INTERCONNECT` not `true`). |
 | A healthy audit log | The log must open at start (`SB_SECRET_AUDIT_STRICT_BOOT=true`). Audit and delete-record retention must be above zero. So must the per-sandbox audit rate, `SB_AUDIT_EGRESS_SANDBOX_RATE`. |
 | Records copied off the server | `SB_AUDIT_EXPORT_BACKEND` set to `webhook`, `s3` or `bus`. A webhook needs `https` plus a bearer token, an HMAC key or a client certificate. An S3 endpoint needs `https`. |
 | An audit witness | `SB_AUDIT_WITNESS_BACKEND=s3`, a locked bucket and a unique `SB_NODE_ID`. The rest of this page sets it up. |

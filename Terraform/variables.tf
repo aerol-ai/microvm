@@ -75,9 +75,19 @@ variable "availability_zone" {
 }
 
 variable "admin_allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212)."
+  description = "IPv4 CIDRs allowed to reach SSH (22), the operator/SDK API (21212) and the observability node from outside the VPC. Required: set your office or VPN ranges, e.g. [\"203.0.113.0/24\"]. A world-open range (any /0, such as 0.0.0.0/0) is refused unless allow_admin_from_anywhere = true. Inside the VPC the API is always reachable (monitoring, peers)."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.admin_allowed_cidrs) > 0 && alltrue([for c in var.admin_allowed_cidrs : try(cidrsubnet(c, 0, 0) == c && cidrnetmask(c) != "", false)])
+    error_message = "admin_allowed_cidrs must list at least one IPv4 CIDR written as its network address (your office or VPN range, e.g. \"203.0.113.0/24\")."
+  }
+}
+
+variable "allow_admin_from_anywhere" {
+  description = "Accept a world-open admin_allowed_cidrs (0.0.0.0/0), opening SSH and the daemon API to the whole internet. Off by default."
+  type        = bool
+  default     = false
 }
 
 variable "public_http_ports" {
