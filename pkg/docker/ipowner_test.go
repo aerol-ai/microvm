@@ -130,7 +130,8 @@ func TestSetEgressFloorUsesTheSandboxSubnet(t *testing.T) {
 	}
 	// The operator's range, and the subnet to itself (sandboxes isolated
 	// from each other).
-	if be.flushed != 1 || len(be.rules) != 2 || !strings.Contains(be.rules[0], "-s 172.17.0.0/16 -d 10.20.0.0/16 -j DROP") || !strings.Contains(be.rules[1], "-s 172.17.0.0/16 -d 172.17.0.0/16 -j DROP") {
+	// Its own floor chain flushed, and the legacy shared one emptied once.
+	if be.flushed != 2 || len(be.rules) != 2 || !strings.HasPrefix(be.rules[0], netrules.FloorChainFor(netip.MustParsePrefix("172.17.0.0/16"))+" ") || !strings.Contains(be.rules[0], "-s 172.17.0.0/16 -d 10.20.0.0/16 -j DROP") || !strings.Contains(be.rules[1], "-s 172.17.0.0/16 -d 172.17.0.0/16 -j DROP") {
 		t.Fatalf("floor = %v", be.rules)
 	}
 	failing := &Client{networkRules: netrules.NewWithBackend(be), httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {

@@ -50,19 +50,21 @@ func TestSetFloor(t *testing.T) {
 	if err := m.SetFloor(subnet, floor); err != nil {
 		t.Fatal(err)
 	}
-	if be.jumps[0] != ChainDockerUser+"->"+ChainAerolvmFloor || be.flushes != 1 {
+	own := FloorChainFor(subnet)
+	// Its own chain, plus the legacy shared one emptied once.
+	if be.jumps[0] != ChainDockerUser+"->"+own || be.flushes != 2 {
 		t.Fatalf("jumps=%v flushes=%d", be.jumps, be.flushes)
 	}
 	// The listed IPv4 ranges, and the subnet to itself: sandboxes are
 	// isolated from each other by default.
-	if be.countMatching(ChainAerolvmFloor) != 3 || be.countMatching("192.168.7.0/24") != 1 || be.countMatching("-d|172.17.0.0/16") != 1 {
+	if be.countMatching(own) != 3 || be.countMatching("192.168.7.0/24") != 1 || be.countMatching("-d|172.17.0.0/16") != 1 {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
-	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(ChainAerolvmFloor) != 1 {
+	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(own) != 1 || be.flushes != 3 {
 		t.Fatalf("clearing the operator's floor keeps the isolation rule: %v %v", err, be.rules)
 	}
 	SetSandboxInterconnect(true)
-	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(ChainAerolvmFloor) != 0 {
+	if err := m.SetFloor(subnet, nil); err != nil || be.countMatching(own) != 0 {
 		t.Fatalf("SB_SANDBOX_INTERCONNECT=true drops the isolation rule: %v %v", err, be.rules)
 	}
 	SetSandboxInterconnect(false)
@@ -165,8 +167,8 @@ func TestFloorJumpStaysFirst(t *testing.T) {
 	m := NewWithBackend(be)
 	m.SetBridgeSubnet("10.88.0.0/16")
 	chain := m.filterChain()
-	jump := "-j " + ChainAerolvmFloor
 	subnet := netip.MustParsePrefix("10.88.0.0/16")
+	jump := "-j " + FloorChainFor(subnet)
 	floor := []netip.Prefix{netip.MustParsePrefix("169.254.169.254/32")}
 
 	// Before the floor: a wide-open allowlist and a bridge accept.
@@ -212,5 +214,45 @@ func TestFloorJumpStaysFirst(t *testing.T) {
 	plain := NewWithBackend(&orderedBackend{chains: map[string][]string{}})
 	if plain.topPos() != 1 {
 		t.Fatal("no floor: rules go on top")
+	}
+}
+
+// TestFloorsOfTwoRuntimesCoexist: docker, containerd and Firecracker each
+// floor their own subnet from their own user chain. When they shared one
+// floor chain, each SetFloor flushed it and only the last subnet kept a
+// floor: on a node running containers and Firecracker guests, the other
+// runtime's sandboxes lost the metadata, deny_cidrs and isolation drops.
+func TestFloorsOfTwoRuntimesCoexist(t *testing.T) {
+	be := &floorMemBackend{}
+	containers := NewWithBackend(be)
+	guests := NewWithBackend(be)
+	guests.userChain = ChainAerolvmFC
+	bridge := netip.MustParsePrefix("10.88.0.0/16")
+	taps := netip.MustParsePrefix("172.16.0.0/16")
+	imds := []netip.Prefix{netip.MustParsePrefix("169.254.169.254/32")}
+	if FloorChainFor(bridge) == FloorChainFor(taps) || len(FloorChainFor(bridge)) > 28 {
+		t.Fatalf("floor chains %q and %q must differ and fit iptables' 28 characters", FloorChainFor(bridge), FloorChainFor(taps))
+	}
+	if err := containers.SetFloor(bridge, imds); err != nil {
+		t.Fatal(err)
+	}
+	if err := guests.SetFloor(taps, imds); err != nil {
+		t.Fatal(err)
+	}
+	// Replacing one (an operator file change, a re-assert) leaves the other.
+	if err := containers.SetFloor(bridge, imds); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"filter|" + FloorChainFor(bridge) + "|-s|10.88.0.0/16|-d|169.254.169.254/32|-j|DROP",
+		"filter|" + FloorChainFor(taps) + "|-s|172.16.0.0/16|-d|169.254.169.254/32|-j|DROP",
+		"filter|" + FloorChainFor(taps) + "|-s|172.16.0.0/16|-d|172.16.0.0/16|-j|DROP",
+	} {
+		if !slices.Contains(be.rules, want) {
+			t.Errorf("missing %s in %v", want, be.rules)
+		}
+	}
+	if !slices.Contains(be.jumps, ChainAerolvmFC+"->"+FloorChainFor(taps)) || !slices.Contains(be.jumps, ChainDockerUser+"->"+FloorChainFor(bridge)) {
+		t.Fatalf("each runtime's chain jumps to its own floor: %v", be.jumps)
 	}
 }

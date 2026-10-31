@@ -87,6 +87,12 @@ type Manager struct {
 	// past the floor (the cloud metadata endpoints, the operator's
 	// deny_cidrs) by naming a floor address, or 0.0.0.0/0, in its allowlist.
 	floorFirst atomic.Bool
+	// floorChain is this manager's floor chain (FloorChainFor its subnet),
+	// set with floorFirst; ReassertChain puts its jump back on top.
+	floorChain atomic.Value // string
+	// legacyFloorEmptied: the shared AEROLVM-FLOOR chain of an older daemon
+	// has been emptied (once per manager).
+	legacyFloorEmptied atomic.Bool
 }
 
 // topPos is the position of a rule that belongs at the top of the user
