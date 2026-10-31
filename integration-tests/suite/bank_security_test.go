@@ -371,17 +371,52 @@ func TestBankDiskFillContained(t *testing.T) {
 		if budget < diskGB*1024+256 {
 			t.Skipf("node %s has %d MiB free: too little to tell a quota from a full disk", node.Name, before)
 		}
-		out, _ := bankRun(t, sb, fmt.Sprintf("dd if=/dev/zero of=/var/tmp/fill bs=1M count=%d 2>&1 | tail -2; ls -l /var/tmp/fill | awk '{print \"size=\"$5}'", budget), 15*time.Minute)
-		m := regexp.MustCompile(`size=(\d+)`).FindStringSubmatch(out)
+		// Two ways to be contained: the engine enforces the size (the
+		// write fails), or the disk watchdog stops the sandbox once its
+		// writable layer is past it — which also cuts this exec short.
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+		res, execErr := sb.ExecCommand(ctx, fmt.Sprintf("dd if=/dev/zero of=/var/tmp/fill bs=1M count=%d 2>&1 | tail -2; ls -l /var/tmp/fill | awk '{print \"size=\"$5}'", budget))
+		cancel()
 		written := int64(-1)
-		if m != nil {
-			written, _ = strconv.ParseInt(m[1], 10, 64)
+		if execErr == nil {
+			if m := regexp.MustCompile(`size=(\d+)`).FindStringSubmatch(res.Stdout + res.Stderr); m != nil {
+				written, _ = strconv.ParseInt(m[1], 10, 64)
+			}
 		}
 		during := freeMB()
-		_, _ = bankRun(t, sb, "rm -f /var/tmp/fill; sync", 5*time.Minute)
-		t.Logf("%s: wrote %d MiB into a %d GiB sandbox; node %s free %d -> %d MiB", rt.name, written>>20, diskGB, node.Name, before, during)
-		if written > int64(diskGB*1024+512)<<20 {
-			t.Errorf("no disk quota: the sandbox wrote %d MiB with %d GiB asked for (node %s free space %d -> %d MiB)", written>>20, diskGB, node.Name, before, during)
+		var view struct {
+			Status    string `json:"status"`
+			LastError string `json:"last_error"`
+		}
+		stopped := false
+		for deadline := time.Now().Add(time.Minute); ; {
+			gctx, gcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			gerr := client(t).GetJSON(gctx, "/v1/sandboxes/"+sb.ID, &view)
+			gcancel()
+			if gerr == nil && view.Status == "stopped" && strings.Contains(view.LastError, "over its") {
+				stopped = true
+				break
+			}
+			// A write the engine capped leaves a running sandbox; only an
+			// over-size or cut-short write waits for the watchdog's verdict.
+			overSize := written > int64(diskGB*1024+512)<<20
+			if (execErr == nil && !overSize) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(5 * time.Second)
+		}
+		if !stopped {
+			_, _ = bankRun(t, sb, "rm -f /var/tmp/fill; sync", 5*time.Minute)
+		}
+		t.Logf("%s: wrote %d MiB into a %d GiB sandbox; node %s free %d -> %d MiB; status %q %q (exec error %v)", rt.name, written>>20, diskGB, node.Name, before, during, view.Status, view.LastError, execErr)
+		switch {
+		case stopped:
+			// Contained by the watchdog. How far past the size it got is the
+			// write speed times the check interval; reported, not asserted.
+		case execErr != nil:
+			t.Errorf("the disk fill broke the sandbox's exec path and nothing stopped it for its size: %v (status %q)", execErr, view.Status)
+		case written > int64(diskGB*1024+512)<<20:
+			t.Errorf("no disk limit: the sandbox wrote %d MiB with %d GiB asked for and is still %q (node %s free space %d -> %d MiB)", written>>20, diskGB, view.Status, node.Name, before, during)
 		}
 	})
 }
