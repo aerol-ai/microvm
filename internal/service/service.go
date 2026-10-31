@@ -174,6 +174,20 @@ type Service struct {
 	// Lazily built from cipher+store when tests construct &Service{...}
 	// without New; mount/registry seal paths still use cipher directly.
 	secretProvider secrets.Provider
+	// secretWrapBackend replaces the key-store client ConfigureSecretProvider
+	// builds (tests inject a fake KMS so no call leaves the process). It is
+	// still routed and limited.
+	secretWrapBackend secrets.DataKeyWrapper
+	// pkcs11Helper is the running PKCS#11 helper client, set by pkg/daemon
+	// before ConfigureSecretProvider; nil when no PKCS#11 settings are set.
+	pkcs11Helper secrets.DataKeyWrapper
+	// keyStoreWrapper is the key-store client the daemon built before it
+	// opened the server key (SetKeyStoreWrapper); nil for local, or when a
+	// test builds the service directly.
+	keyStoreWrapper secrets.DataKeyWrapper
+	// keyCustody is the server key's lifecycle under wrapped custody:
+	// re-check, revoke, recover (plans/customer-key-custody.md §10).
+	keyCustody keyCustodyState
 	// secretAudit records every secret decrypt/open (cluster provider,
 	// UnsealRegistry, loadMounts). Lazily wired to {Dir(DBPath)}/audit/secrets.jsonl
 	// unless tests inject a sink. Writes are async/buffered — never on the
@@ -434,12 +448,16 @@ type Service struct {
 	egressGaugeDirty atomic.Bool
 	// egressCA is the node's TLS inspection CA once loaded or made (P3-1);
 	// egressCAMu single-flights its creation, and egressCAPushed records
-	// that the connected gateway has it.
-	egressCA       atomic.Pointer[egress.InspectCA]
-	egressCAMu     sync.Mutex
-	egressCAPushed atomic.Bool
-	egressSubOnce  sync.Once
-	egressStats    egressCounters
+	// that the connected gateway has it. egressCAPushMu orders the CA's
+	// pushes against a revoke's clear at the gateway, and
+	// egressCAClearOwed is set while that clear has not reached it.
+	egressCA          atomic.Pointer[egress.InspectCA]
+	egressCAMu        sync.Mutex
+	egressCAPushed    atomic.Bool
+	egressCAPushMu    sync.Mutex
+	egressCAClearOwed atomic.Bool
+	egressSubOnce     sync.Once
+	egressStats       egressCounters
 	// egressSelfTest is the per-bridge self-test (T41); nil skips it. Atomic
 	// for the same reason as egressWired: readiness reads it.
 	egressSelfTest atomic.Pointer[egressSelfTest]
@@ -759,26 +777,53 @@ func New(cfg config.Config, logger *slog.Logger, db *store.Store, runtimeDriver 
 }
 
 // ConfigureSecretProvider selects the secrets.Provider from cfg.SecretProvider.
-// For awskms it builds the AWS client, runs an optional wrap/unwrap canary
-// (E4 lite), and fails open unless cfg.SecretProviderStrictBoot. Safe to call
-// when the provider is already local — it is a no-op refresh for that case.
+// For an external provider it builds the key-store client behind the per-node
+// limiter, runs a wrap/unwrap canary (E4 lite), and fails open unless
+// cfg.SecretProviderStrictBoot. Safe to call when the provider is already
+// local — it is a no-op refresh for that case.
 func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 	if s == nil || s.store == nil {
 		return nil
 	}
 	name := secrets.NormalizeProviderName(s.cfg.SecretProvider)
-	opts := secrets.ProviderOptions{
-		Name:        name,
-		AWSKMSKeyID: s.cfg.SecretAWSkmsKeyID,
-		Cipher:      s.cipher,
-		Store:       newSecretBlobStore(s.store),
+	ctx = bootContext(ctx)
+	wrapper := s.keyStoreWrapper
+	switch {
+	case wrapper != nil:
+	case secrets.IsExternalProvider(name):
+		opts := KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper)
+		opts.Wrapper = s.secretWrapBackend
+		w, err := secrets.NewWrapper(ctx, opts)
+		if err != nil {
+			return err
+		}
+		wrapper = w
+	default:
+		// Still sealing local, maybe with a key store's settings already
+		// added: step 1 of the two-step switch (§12, eng D8).
+		w, err := secrets.NewOpenWrapper(ctx, KeyStoreOptions(s.cfg, s.keyStoreNodeID(), s.pkcs11Helper))
+		if err != nil {
+			return err
+		}
+		wrapper = w
 	}
-	p, wrapper, err := secrets.NewProvider(ctx, opts)
+	p, wrapper, err := secrets.NewProvider(ctx, secrets.ProviderOptions{
+		Name: name, Cipher: s.cipher, Store: newSecretBlobStore(s.store), Prebuilt: wrapper,
+	})
 	if err != nil {
 		return err
 	}
 	s.secretProvider = p
-	if name != secrets.ProviderAWSKMS || wrapper == nil {
+	if !secrets.IsExternalProvider(name) || wrapper == nil {
+		return nil
+	}
+	if s.cfg.CredentialKeyCustody == secrets.CustodyWrapped && s.keyStoreWrapper != nil {
+		// The daemon unwrapped the server key through this same client at
+		// boot: real data already proved the key store (§3 step 5).
+		recordSecretProviderCanary(true)
+		if s.logger != nil {
+			s.logger.Info("secret provider ok: the server key unwrapped through it at boot", "provider", name)
+		}
 		return nil
 	}
 	if err := secrets.CanaryWrapUnwrap(ctx, wrapper); err != nil {
@@ -797,6 +842,26 @@ func (s *Service) ConfigureSecretProvider(ctx context.Context) error {
 		s.logger.Info("secret provider boot canary ok", "provider", name)
 	}
 	return nil
+}
+
+// SetPKCS11Helper hands ConfigureSecretProvider the running PKCS#11 helper
+// (pkg/daemon starts it: the vendor library never loads into sandboxd).
+func (s *Service) SetPKCS11Helper(w secrets.DataKeyWrapper) {
+	if s != nil {
+		s.pkcs11Helper = w
+	}
+}
+
+// keyStoreNodeID names this node in the key store's audit log: the cluster
+// id when there is one, else the configured node id, else "standalone".
+func (s *Service) keyStoreNodeID() string {
+	if id := s.selfNodeID(); id != "" {
+		return id
+	}
+	if id := strings.TrimSpace(s.cfg.NodeID); id != "" {
+		return id
+	}
+	return "standalone"
 }
 
 // ensureTouchCoalescer is the lazy init path TouchSandbox uses. Direct
@@ -2744,7 +2809,7 @@ func (s *Service) UnsealRegistry(ctx context.Context, sandboxID string, sealed [
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt registry auth: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt registry auth", decErr)
 	}
 	var out models.RegistryAuth
 	if err := json.Unmarshal(plain, &out); err != nil {
@@ -2848,7 +2913,7 @@ func (s *Service) loadEnv(ctx context.Context, sandboxID, incarnationID string) 
 		}
 		plain, decErr := s.cipher.DecryptWithAAD(sealed, secrets.EnvAAD(sandboxID, auditIncarnationID))
 		if decErr != nil {
-			return nil, fmt.Errorf("%w: decrypt env: %v", secrets.ErrDecryptFailed, decErr)
+			return nil, sealedOpenError("decrypt env", decErr)
 		}
 		var out map[string]string
 		if umErr := json.Unmarshal(plain, &out); umErr != nil {
@@ -2979,7 +3044,7 @@ func (s *Service) loadMounts(ctx context.Context, sandboxID string) (specs []mod
 	}
 	plain, decErr := s.cipher.Decrypt(sealed)
 	if decErr != nil {
-		return nil, fmt.Errorf("%w: decrypt mounts: %v", secrets.ErrDecryptFailed, decErr)
+		return nil, sealedOpenError("decrypt mounts", decErr)
 	}
 	var file models.MountSpecFile
 	if umErr := json.Unmarshal(plain, &file); umErr != nil {
@@ -5275,6 +5340,13 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 	if s.cfg.RunsSSHGateway() && sshStatus != "ok" {
 		status = "degraded"
 	}
+	// A revoked key stops the node's work on sealed data (§10). Health still
+	// answers, so the docs do not promise the ingress stops routing here.
+	keyCustody := ""
+	if s.KeyRevoked() {
+		keyCustody = "revoked"
+		status = "degraded"
+	}
 
 	clusterTopology := ""
 	clusterNodes := 0
@@ -5303,8 +5375,19 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		SSHGateway:      sshStatus,
 		ClusterTopology: clusterTopology,
 		ClusterNodes:    clusterNodes,
+		KeyCustody:      keyCustody,
 		Version:         version.Version,
 	}, nil
+}
+
+// sealedOpenError reports a failed open of a sealed value. A key-store class
+// (a revoke) stays visible, so the API answers 503 key_revoked instead of a
+// decrypt failure; anything else is ErrDecryptFailed as before.
+func sealedOpenError(what string, err error) error {
+	if secrets.IsKeyStoreError(err) {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return fmt.Errorf("%w: %s: %v", secrets.ErrDecryptFailed, what, err)
 }
 
 // Capacity returns the admitter's current snapshot. Returns the zero value

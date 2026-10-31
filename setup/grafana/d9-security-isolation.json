@@ -446,6 +446,231 @@
       ],
       "title": "Audit flood mode per node",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 53
+      },
+      "id": 14,
+      "panels": [],
+      "title": "Key custody",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Where each node keeps its server key (plans/customer-key-custody.md \u00a79). On an enterprise node (enterprise=true) anything but \"customer key store (wrapped)\" fires SandboxdServerKeyPlaintext.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "id": 15,
+      "targets": [
+        {
+          "expr": "max by (instance, key2, key3) (aerolvm_key_custody{key=\"server key\"})",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Server-key custody per node",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Nodes stopped because the customer's key store revoked the key (SandboxdKeyRevoked). They resume on their own within one re-check of the key coming back.",
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 54
+      },
+      "id": 16,
+      "targets": [
+        {
+          "expr": "sum(aerolvm_key_revoked) or vector(0)",
+          "legendFormat": "revoked",
+          "refId": "A"
+        }
+      ],
+      "title": "Revoked nodes",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Stale rows the hourly sweep will rewrap, and rows on a version the key store no longer decrypts (SandboxdKeyVersionRetiredInUse). Retire an old version only when stale is 0 on every node.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 54
+      },
+      "id": 17,
+      "targets": [
+        {
+          "expr": "max by (instance) (aerolvm_key_rows_stale)",
+          "legendFormat": "stale {{instance}}",
+          "refId": "A"
+        },
+        {
+          "expr": "max by (instance) (aerolvm_key_rows_retired)",
+          "legendFormat": "retired {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Rows not on the current key",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Calls per second to each key store (key=backend) by outcome class (key3). A sustained throttled share fires SandboxdKeyStoreThrottling.",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "id": 18,
+      "targets": [
+        {
+          "expr": "sum by (key, key3) (rate(aerolvm_key_store_calls_total[5m]))",
+          "legendFormat": "{{key}} {{key3}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Key-store calls by backend and outcome",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Calls per second by latency bucket, per backend and op (key=\"<backend>_<op>\", key2=bucket).",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "id": 19,
+      "targets": [
+        {
+          "expr": "sum by (key, key2) (rate(aerolvm_key_store_call_seconds_bucket[5m]))",
+          "legendFormat": "{{key}} {{key2}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Key-store call latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "How long key-store calls waited for a slot, per budget (foreground, create, background). A growing foreground tail means SB_SECRET_PROVIDER_MAX_INFLIGHT is too low for restarts.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "id": 20,
+      "targets": [
+        {
+          "expr": "sum by (key, key2) (rate(aerolvm_key_store_limiter_wait_seconds_bucket[5m]))",
+          "legendFormat": "{{key}} {{key2}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Limiter wait by budget",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Sealed values each server key opens, across nodes, while a rotation is in progress (empty otherwise). Retire the old key when its line is gone on every node.",
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "id": 21,
+      "targets": [
+        {
+          "expr": "sum by (key) (aerolvm_server_key_rows)",
+          "legendFormat": "key {{key}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Server-key rotation: values per key",
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",

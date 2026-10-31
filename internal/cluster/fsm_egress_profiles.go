@@ -31,13 +31,18 @@ const (
 // it once per release that adds such a feature, and give the feature its
 // own constant naming the version that introduced it.
 const (
-	fsmOpsVersion              = 3
+	fsmOpsVersion              = 4
 	egressProfileFSMOpsVersion = 1 // opPutEgressProfile, opDeleteEgressProfile
 	// auditCallerFSMOpsVersion: audit records carry a hash-covered caller
 	// field (AuditCallerWritesAllowed).
 	auditCallerFSMOpsVersion = 2
 	// apiTokenFSMOpsVersion: opPutAPIToken, opDeleteAPIToken (fsm_tokens.go).
 	apiTokenFSMOpsVersion = 3
+	// ServerKeyRingFSMOpsVersion: the server key is a ring and sealed blobs
+	// may name their key (ServerKeyRingAllowed). No FSM op: the version
+	// gates `sandboxd key rotate --stage`, which writes a ring file older
+	// builds refuse to boot from.
+	ServerKeyRingFSMOpsVersion = 4
 )
 
 var (

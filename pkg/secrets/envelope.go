@@ -254,7 +254,7 @@ func openRawEnvelope(
 	}
 	dek, err := unwrap(envelope.WrappedKey, recipients, binding)
 	if err != nil {
-		if errors.Is(err, ErrProviderUnavailable) || errors.Is(err, ErrProviderThrottled) || errors.Is(err, ErrProviderDenied) {
+		if isProviderClass(err) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("%w: unwrap cluster secret data key: %v", ErrDecryptFailed, err)
@@ -438,4 +438,14 @@ func EncryptionContextForBinding(b SealBinding) map[string]string {
 		"aerolvm.generation":     fmt.Sprintf("%d", b.Generation),
 	}
 	return out
+}
+
+// IsKeyStoreError reports whether err carries one of the five key-store
+// classes, which callers must pass on unchanged: folding a revoke into
+// ErrDecryptFailed would hide it from the API's 503 key_revoked answer.
+func IsKeyStoreError(err error) bool { return isProviderClass(err) }
+
+func isProviderClass(err error) bool {
+	return errors.Is(err, ErrProviderUnavailable) || errors.Is(err, ErrProviderThrottled) ||
+		errors.Is(err, ErrProviderDenied) || errors.Is(err, ErrKeyRevoked) || errors.Is(err, ErrKeyVersionRetired)
 }
