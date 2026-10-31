@@ -842,6 +842,7 @@ var Registry = []UseCase{
 	{ID: "UC-313", Title: "Key custody: env, registry and mount secrets all come back after a failover: the new owner pulls a private image with the opened registry credentials and remounts an SSHFS share with the opened key", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
 	{ID: "UC-314", Title: "Key custody: a backup of a wrapped node restored onto the wiped node boots through the key store and rejoins; the restored node's next backup holds no plaintext key", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
 	{ID: "UC-315", Title: "Key custody, AWS KMS: a single node installed with install.sh --key-custody wrapped holds no plaintext server key, and after a restart reopens its sealed values through the key store", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
+	{ID: "UC-316", Title: "Key custody, AWS KMS: restore onto a fresh machine: the node's root disk is replaced from its launch image (a fresh install with a key of its own), a backup taken before is restored, and the node boots through the key store with the backup's key and opens values sealed before the swap", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
