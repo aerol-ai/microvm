@@ -118,7 +118,7 @@ IP mode has no HTTPS. Your token and data cross the network unencrypted. Use it 
 - Keeps state in `/var/lib/sandboxd`.
 - Installs a custom Caddy build with TCP routing (`caddy-l4`) and the Cloudflare DNS plugin. Caddy is the web server that gets the certificates and sends each link to the right sandbox. Its config is `/etc/caddy/Caddyfile`. The Cloudflare token goes in `/etc/default/caddy`.
 - Registers the systemd services `sandboxd`, `caddy` and `aerolvm-egress-gateway`, which handles sandboxes' outbound traffic. If `sandboxd` crashes, systemd restarts it after 5 seconds, up to 10 times in 5 minutes.
-- Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds.
+- Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds. It restarts a server that is unhealthy, and starts again a server that systemd gave up on after 10 failed starts. A server you stopped yourself is left alone.
 - Starts an SSH gateway, so you can [log in to sandboxes over SSH](/ssh-access/).
 - Installs the tools for [cloud storage](/external-storage/): `fuse3`, `sshfs`, `nfs-common`, `rclone` and `mount-s3`.
 

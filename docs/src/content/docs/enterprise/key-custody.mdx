@@ -239,7 +239,7 @@ Within about 15 minutes (`SB_SECRET_PROVIDER_RECHECK_INTERVAL` × `SB_SECRET_PRO
 Running sandboxes are not killed, but nobody can manage them through AerolVM. When you restore the key, each server resumes on its own within one check, with no restart, and writes `key_recovered`.
 
 <Aside type="note" title="What a revoke does not reach">
-A running sandbox's own public address (`{id}.your-domain`) goes straight to the agent inside it. Whoever already holds that sandbox's token, such as an E2B SDK client, can keep using it until the sandbox stops. Nothing on that path uses your key. A server that cannot reach your key store at all keeps its key until it restarts, and then cannot start.
+A running sandbox's own public address (`{id}.your-domain`) goes straight to the agent inside it. Whoever already holds that sandbox's token, such as an E2B SDK client, can keep using it until the sandbox stops. Nothing on that path uses your key. A server that cannot reach your key store at all keeps its key until it restarts, and then cannot start. It keeps trying, and comes up by itself within about 30 seconds of your key store answering again.
 </Aside>
 
 A **deleted** key makes everything sealed with it unreadable for good. That is how you shut AerolVM out permanently. A **disabled** key makes it unreadable only until you enable it again.

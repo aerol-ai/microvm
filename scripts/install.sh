@@ -1698,6 +1698,19 @@ if [[ -f "$ENV_FILE" ]]; then
 	source "$ENV_FILE"
 fi
 
+# systemd stops restarting a unit that failed StartLimitBurst times within
+# StartLimitIntervalSec. A node whose key store was unreachable at boot
+# (wrapped server-key custody) fails that way and would stay down after the
+# key store came back, so a failed unit is reset and started again here,
+# every run of this timer. A unit an operator stopped is inactive, not
+# failed, and is left alone.
+if systemctl is-failed --quiet sandboxd.service; then
+	logger -t sandboxd-healthcheck "sandboxd.service is failed; resetting it and starting it again"
+	systemctl reset-failed sandboxd.service
+	systemctl start sandboxd.service || true
+	exit 0
+fi
+
 if ! systemctl is-active --quiet sandboxd.service; then
 	exit 0
 fi

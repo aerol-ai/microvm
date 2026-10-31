@@ -791,6 +791,12 @@ only as `credential_encryption.key.wrapped`, wrapped by the customer's key
 store (`SB_SECRET_PROVIDER`: `awskms`, `vault` or `pkcs11`), and the node
 unwraps it into memory at boot. Design: `plans/customer-key-custody.md`.
 
+A node that cannot reach its key store at boot refuses to start (the log
+says `unwrap server key`). systemd retries every 5 s and gives up after 10
+failures; `sandboxd-healthcheck.timer` then starts the failed unit again
+every 30 s, so the node comes up by itself within about 30 s of the key
+store answering. Nothing needs restarting by hand.
+
 Useful gauges, all per node:
 
 | Metric | Meaning |
