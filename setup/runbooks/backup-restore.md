@@ -78,6 +78,14 @@ pullable images and valid credentials.
      --force
    ```
 
+   A replacement node that already ran a fresh install has a database and a
+   Raft log of its own. The script moves `state.db` (with its `-wal` and
+   `-shm` files) and `raft/` aside as `*.pre-restore-<time>` before it
+   extracts, so the restored ones are never mixed with them. With wrapped
+   server-key custody the restored `credential_encryption.key.wrapped`
+   replaces the fresh install's, and the key store must be reachable when
+   sandboxd starts.
+
 4. Verify expected files:
 
    ```bash

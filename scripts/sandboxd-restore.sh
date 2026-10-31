@@ -44,6 +44,28 @@ if [[ ! -f "$input" ]]; then
 fi
 
 mkdir -p "$target_root"
+# A restore replaces the node's database and Raft log, never merges into
+# them: SQLite would replay a leftover state.db-wal from the database being
+# replaced onto the restored one, and two Raft logs in one directory are not
+# one log. A replacement node that already ran a fresh install has both.
+# What the archive brings is moved aside first, kept rather than deleted.
+listing="$(tar -tzf "$input")"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+set_aside() {
+  local path="$target_root/$1"
+  if [[ -e "$path" ]]; then
+    mv "$path" "$path.pre-restore-$stamp"
+    echo "moved aside: $path -> $path.pre-restore-$stamp"
+  fi
+}
+if grep -qx '\./var/lib/sandboxd/state\.db' <<<"$listing"; then
+  set_aside var/lib/sandboxd/state.db
+  set_aside var/lib/sandboxd/state.db-wal
+  set_aside var/lib/sandboxd/state.db-shm
+fi
+if grep -qE '^\./var/lib/sandboxd/raft/?$' <<<"$listing"; then
+  set_aside var/lib/sandboxd/raft
+fi
 tar -C "$target_root" -xzf "$input"
 echo "restored $input into $target_root"
 wrapped="$target_root/var/lib/sandboxd/credential_encryption.key.wrapped"
