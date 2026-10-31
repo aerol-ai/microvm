@@ -634,8 +634,70 @@ groups:
           component: secrets-audit
         annotations:
           summary: "sandboxd secret provider canary is failing"
-          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail; for awskms check IAM/KMS reachability."
+          description: "aerolvm_secret_provider_canary_ok has been 0 for 10 minutes. New wraps/opens may fail, and with wrapped custody this node can no longer see a revoke. Check the key store's reachability and the node's grants (IAM/KMS, the Vault token, the PKCS#11 helper)."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md"
+
+  # Customer key custody (plans/customer-key-custody.md §9-§11, Section 8).
+  # The custody gauge is published once at boot; the others move with the
+  # key-custody loop (re-check every SB_SECRET_PROVIDER_RECHECK_INTERVAL,
+  # sweep hourly). Labels are positional (key/key2/key3) like every expvar map.
+  - name: sandboxd.key-custody
+    interval: 30s
+    rules:
+      # An enterprise node whose server key is not wrapped by the customer's
+      # key store: the key custody claim is false on this node (F2).
+      - alert: SandboxdServerKeyPlaintext
+        expr: aerolvm_key_custody{key="server key",key2!="customer key store (wrapped)",key3="true"} == 1
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd enterprise node keeps its server key in plaintext"
+          description: "{{ $labels.instance }} runs SB_ENTERPRISE_MODE=true with the server key as {{ $labels.key2 }}. Wrap it with `sandboxd key wrap` and set SB_CREDENTIAL_KEY_CUSTODY=wrapped; the next release refuses this."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#server-key-in-plaintext"
+
+      # The customer's key store revoked the key and this node stopped
+      # processing their data (full stop, CEO-E2R). Paged: either someone
+      # revoked on purpose and should know every node obeyed, or not.
+      - alert: SandboxdKeyRevoked
+        expr: aerolvm_key_revoked == 1
+        for: 1m
+        labels:
+          severity: critical
+          component: key-custody
+        annotations:
+          summary: "sandboxd stopped: the customer's key store revoked the server key"
+          description: "{{ $labels.instance }} saw the key revoked on SB_SECRET_PROVIDER_REVOKE_AFTER consecutive re-checks. Sealed creates, starts, exec and SSH fail with 503 key_revoked; running sandboxes keep running. It resumes on its own within one re-check of the key being restored."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#key-revoked"
+
+      # Rows wrapped under a key version or label the key store no longer
+      # decrypts: those sandboxes cannot start or fail over on this node.
+      - alert: SandboxdKeyVersionRetiredInUse
+        expr: aerolvm_key_rows_retired > 0
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd holds secrets on a retired key version"
+          description: "{{ $labels.instance }} has {{ $value }} sealed rows on a key version the key store no longer decrypts. Re-enable the old version until aerolvm_key_rows_stale is 0 on every member, then retire it again."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#retired-key-version-in-use"
+
+      # The key store keeps throttling this node: creates slow down and the
+      # limiter's foreground wait grows.
+      - alert: SandboxdKeyStoreThrottling
+        expr: |
+          sum by (instance, key) (rate(aerolvm_key_store_calls_total{key3="throttled"}[5m]))
+            / sum by (instance, key) (rate(aerolvm_key_store_calls_total[5m])) > 0.05
+        for: 15m
+        labels:
+          severity: warning
+          component: key-custody
+        annotations:
+          summary: "sandboxd's key store is throttling it"
+          description: "More than 5% of {{ $labels.key }} calls from {{ $labels.instance }} were throttled for 15 minutes. Raise the key store's rate limit or lower SB_SECRET_PROVIDER_MAX_INFLIGHT across the fleet."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#key-store-throttling"
 
   - name: sandboxd.cluster-topology
     interval: 30s

@@ -112,7 +112,7 @@ Each step to the right puts more between the code and the server's kernel. WebAs
 | DP‑2 | Secrets left out of normal reads | Yes | AerolVM | Reads that ask for variables are recorded |
 | DP‑3 | API keys kept out of sandboxes (on containers, gVisor and V8 isolates) | No | You | Inject rules with `inspect: true`. See [Keep an API key out of the sandbox](/advanced-network-rules/#keep-an-api-key-out-of-the-sandbox). |
 | DP‑4 | Storage credentials kept on the server | Yes | AerolVM | Nothing to set. Mounts run on the server. |
-| DP‑5 | Key management | A server key | Shared | Set `SB_CREDENTIAL_ENCRYPTION_KEY` from your secret manager. In a cluster, consider `SB_SECRET_PROVIDER=awskms`. |
+| DP‑5 | Key management | A server key, which your key store can hold (wrapped custody) | Shared | Keep the server key in your key store (AWS KMS, Vault, OpenBao or an HSM), or set `SB_CREDENTIAL_ENCRYPTION_KEY` from your secret manager. See [Use your own key store](/enterprise/key-custody/). |
 | DP‑6 | Read-only mounts | No | You | `readOnly: true` on each mount that only reads |
 | DP‑7 | Sandbox files encrypted at rest | Not supported yet | You | Use encrypted disks on the server |
 

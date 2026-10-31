@@ -177,7 +177,20 @@ func writeFileAtomic(path string, b []byte, mode os.FileMode) error {
 // pushEgressCA hands the gateway the CA once per gateway connection; the
 // gateway keeps it in memory only. Callers hold egressMu or run before any
 // attach that needs it.
+//
+// A push and a revoke's clear never overlap, and a push re-checks the
+// revoke under the same lock: one already in flight when the key is
+// revoked reaches the gateway before the clear does, never after it, and
+// none starts once the key is revoked (eng D4).
 func (s *Service) pushEgressCA(ctx context.Context, ca egress.InspectCA) error {
+	if s.egressCAPushed.Load() {
+		return nil
+	}
+	s.egressCAPushMu.Lock()
+	defer s.egressCAPushMu.Unlock()
+	if s.KeyRevoked() {
+		return fmt.Errorf("%w: %w", ErrEgressGatewayUnavailable, secrets.ErrKeyRevoked)
+	}
 	if s.egressCAPushed.Load() {
 		return nil
 	}
@@ -200,16 +213,27 @@ func (s *Service) pushEgressCA(ctx context.Context, ca egress.InspectCA) error {
 func (s *Service) resyncEgressCA(ctx context.Context) error {
 	s.egressCAPushed.Store(false)
 	// A revoked node never resends the CA, even to a gateway that just
-	// restarted without it (eng D4).
+	// restarted without it (eng D4); one that came back without having
+	// restarted still holds it if the revoke's clear never reached it.
 	if s.KeyRevoked() {
+		s.retryEgressCAClear(ctx)
 		return nil
 	}
+	// Under egressCAMu, as the revoke's drop is: a load that raced the
+	// revoke is dropped after it, never kept.
+	s.egressCAMu.Lock()
 	ca, ok, err := s.loadEgressCA()
+	if err == nil && ok {
+		s.egressCA.Store(&ca)
+	}
+	s.egressCAMu.Unlock()
 	if err != nil || !ok {
 		return err
 	}
-	s.egressCA.Store(&ca)
-	return s.pushEgressCA(ctx, ca)
+	if err := s.pushEgressCA(ctx, ca); err != nil && !errors.Is(err, secrets.ErrKeyRevoked) {
+		return err
+	}
+	return nil
 }
 
 // prepareInspect readies a container create with inspect rules: the CA

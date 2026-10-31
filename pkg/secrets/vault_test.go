@@ -156,9 +156,14 @@ func TestClassifyVault(t *testing.T) {
 			t.Fatalf("%s %d %v = %v, want %v", tc.op, tc.status, tc.errs, err, tc.want)
 		}
 	}
-	long := classifyVault("decrypt", 500, []string{strings.Repeat("x", 500)})
-	if len(long.Error()) > vaultErrorTextMax+80 {
-		t.Fatalf("error text not bounded: %d bytes", len(long.Error()))
+	// Vault's text picks the class but is never carried: it can echo
+	// request content, and these errors are logged.
+	for _, tc := range cases {
+		for _, e := range tc.errs {
+			if err := classifyVault(tc.op, tc.status, []string{e + " ECHOED-REQUEST"}); strings.Contains(err.Error(), "ECHOED-REQUEST") {
+				t.Fatalf("%s %d carries Vault's text: %v", tc.op, tc.status, err)
+			}
+		}
 	}
 }
 
@@ -564,5 +569,51 @@ func TestNewWrapperOpensOtherBackend(t *testing.T) {
 	}
 	if _, err := NewWrapper(ctx, ProviderOptions{Name: "awskms", Wrapper: fake, Vault: VaultOptions{KeyName: "k"}}); err == nil {
 		t.Fatal("partial vault settings must fail")
+	}
+}
+
+// API errors (plans/customer-key-custody.md Section 2): no key-store error,
+// and so no log line built from one, carries a request or response body. A
+// proxy that echoes the request (the data key) as its error page, or a
+// Transit reply with more in it than its errors, leaves only the class and
+// Vault's own error text.
+func TestVaultErrorsCarryNoBody(t *testing.T) {
+	const plainMarker = "UkVTUE9OU0UtUExBSU5URVhU"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := make([]byte, 4096)
+		n, _ := r.Body.Read(raw)
+		switch r.URL.Path {
+		case "/v1/sys/capabilities-self":
+			_, _ = w.Write([]byte(`{"data":{"transit/encrypt/k":["update"],"transit/decrypt/k":["update"]}}`))
+		case "/v1/transit/encrypt/k":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("<html>upstream said: " + string(raw[:n]) + "</html>"))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []string{"internal error"}, "data": map[string]any{"plaintext": plainMarker}, "request": string(raw[:n])})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	v, err := NewVault(VaultOptions{Addr: srv.URL, KeyName: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek := []byte("0123456789abcdef0123456789abcdef")
+	_, werr := v.Wrap(context.Background(), dek, map[string]string{"aerolvm.ref": "r"})
+	_, uerr := v.Unwrap(context.Background(), []byte("vault:v1:Q0lQSEVSVEVYVC1NQVJLRVI="), map[string]string{"aerolvm.ref": "r"})
+	for _, err := range []error{werr, uerr} {
+		if !errors.Is(err, ErrProviderUnavailable) {
+			t.Fatalf("err = %v, want ErrProviderUnavailable", err)
+		}
+		for _, leak := range []string{base64.StdEncoding.EncodeToString(dek), string(dek), plainMarker, "Q0lQSEVSVEVYVC1NQVJLRVI", "upstream said"} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("error text carries the key store's body (%q): %v", leak, err)
+			}
+		}
+	}
+	// Not even Vault's own error list: only the status.
+	if strings.Contains(uerr.Error(), "internal error") || !strings.Contains(uerr.Error(), "500") {
+		t.Fatalf("unwrap error = %v, want the status and no reply text", uerr)
 	}
 }

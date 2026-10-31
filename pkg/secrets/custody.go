@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -10,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -49,6 +49,9 @@ type WrappedKeyFile struct {
 	// `sandboxd key status` says so until `sandboxd key ack-migration`
 	// (eng D24).
 	MigratedFromPlaintext bool `json:"migrated_from_plaintext,omitempty"`
+	// Ring is the server-key ring of a format 2 file (§13); Wrapped and
+	// Check above are then the current key's.
+	Ring []RingEntry `json:"ring,omitempty"`
 }
 
 // KeyVersion names what the file is wrapped under, for the custody report:
@@ -119,54 +122,33 @@ func ReadWrappedKeyFile(path string) (WrappedKeyFile, error) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s is not valid JSON: %w", path, err)
 	}
-	if f.Format != WrappedKeyFormat {
-		return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s has format %d; this sandboxd reads format %d", path, f.Format, WrappedKeyFormat)
+	if f.Format != WrappedKeyFormat && f.Format != WrappedKeyRingFormat {
+		return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s has format %d; this sandboxd reads formats %d and %d", path, f.Format, WrappedKeyFormat, WrappedKeyRingFormat)
 	}
 	if len(f.Wrapped) == 0 || len(f.Check) != 16 {
 		return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s is missing its wrapped key or check", path)
 	}
+	if f.Format == WrappedKeyRingFormat {
+		if err := validateRing(f.Ring, true); err != nil {
+			return WrappedKeyFile{}, fmt.Errorf("%s: %w", path, err)
+		}
+		if cur := currentEntry(f.Ring); !bytes.Equal(cur.Wrapped, f.Wrapped) || !bytes.Equal(cur.Check, f.Check) {
+			return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s: the top-level key is not the ring's current key (edited by hand?)", path)
+		}
+	} else if len(f.Ring) != 0 {
+		return WrappedKeyFile{}, fmt.Errorf("wrapped server key %s: format %d has no ring", path, WrappedKeyFormat)
+	}
 	return f, nil
 }
 
-// WriteWrappedKeyFile writes f to path atomically at mode 0600: a temp file
-// in the same directory, fsync, rename, fsync of the directory.
+// WriteWrappedKeyFile writes f to path atomically at mode 0600.
 func WriteWrappedKeyFile(path string, f WrappedKeyFile) error {
-	raw, err := json.MarshalIndent(f, "", "  ")
+	unlock, err := lockKeyFile(path)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create wrapped key directory: %w", err)
-	}
-	tmp, err := os.CreateTemp(dir, ".wrapped-key-*")
-	if err != nil {
-		return fmt.Errorf("create wrapped key temp file: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(append(raw, '\n')); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("install wrapped server key: %w", err)
-	}
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
-	return nil
+	defer unlock()
+	return writeSecretJSON(path, f, ".wrapped-key-*")
 }
 
 // LoadPlaintextKey reads the plaintext server key from the env value or the
@@ -201,6 +183,9 @@ type CustodyInputs struct {
 	StateDBExists       bool
 	PlaintextPath       string
 	WrappedPath         string
+	// RingFileExists: custody=file's ring file exists at RingPath (§13).
+	RingFileExists bool
+	RingPath       string
 }
 
 // CustodyAction is what boot does to get the server key.
@@ -222,7 +207,7 @@ const (
 // DecideCustody is the boot decision of §3 as a pure function.
 func DecideCustody(in CustodyInputs) (CustodyAction, string) {
 	if in.Custody != CustodyWrapped {
-		if !in.PlaintextEnvSet && !in.PlaintextFileExists && in.WrappedFileExists {
+		if !in.PlaintextEnvSet && !in.PlaintextFileExists && !in.RingFileExists && in.WrappedFileExists {
 			// Generating a fresh plaintext key here would split this node
 			// from every row sealed under the wrapped one.
 			return ActionRefuse, fmt.Sprintf("SB_CREDENTIAL_KEY_CUSTODY=file, but the only server key is the wrapped one at %s; set SB_CREDENTIAL_KEY_CUSTODY=wrapped, or run `sandboxd key unwrap --to-file --i-understand-plaintext` to go back to a plaintext key", in.WrappedPath)
@@ -235,6 +220,9 @@ func DecideCustody(in CustodyInputs) (CustodyAction, string) {
 	}
 	if in.PlaintextFileExists {
 		return ActionRefuse, fmt.Sprintf("SB_CREDENTIAL_KEY_CUSTODY=wrapped, but a plaintext key file exists at %s; once `sandboxd key verify` succeeds, delete it", in.PlaintextPath)
+	}
+	if in.RingFileExists {
+		return ActionRefuse, fmt.Sprintf("SB_CREDENTIAL_KEY_CUSTODY=wrapped, but a plaintext server-key ring exists at %s; once `sandboxd key verify` succeeds, delete it", in.RingPath)
 	}
 	if in.WrappedFileExists {
 		return ActionUnwrap, ""
@@ -261,41 +249,76 @@ func OpenServerKey(ctx context.Context, in CustodyInputs, plaintextB64 string, w
 	case ActionRefuse:
 		return nil, errors.New(reason)
 	case ActionPlaintext:
+		if in.RingFileExists {
+			return openKeyRingFile(in, plaintextB64)
+		}
 		return NewCipher(plaintextB64, in.PlaintextPath)
 	}
 	ctx, cancel := context.WithTimeout(ctx, unwrapTimeout)
 	defer cancel()
-	var key []byte
 	if action == ActionUnwrap {
 		f, err := ReadWrappedKeyFile(in.WrappedPath)
 		if err != nil {
 			return nil, err
 		}
-		if key, err = UnwrapServerKey(ctx, w, f); err != nil {
-			return nil, err
-		}
-	} else {
-		var err error
-		if key, err = NewServerKey(); err != nil {
-			return nil, err
-		}
-		f, err := WrapServerKey(ctx, w, key, provider, keyRef)
+		keys, err := UnwrapRing(ctx, w, f, nil)
 		if err != nil {
 			return nil, err
 		}
-		if err := WriteWrappedKeyFile(in.WrappedPath, f); err != nil {
-			return nil, err
-		}
-		// Read it back through the key store before trusting it.
-		back, err := ReadWrappedKeyFile(in.WrappedPath)
-		if err != nil {
-			return nil, err
-		}
-		if _, err := UnwrapServerKey(ctx, w, back); err != nil {
-			return nil, fmt.Errorf("verify new wrapped server key: %w", err)
-		}
+		return NewCipherRing(keys)
+	}
+	key, err := NewServerKey()
+	if err != nil {
+		return nil, err
+	}
+	f, err := WrapServerKey(ctx, w, key, provider, keyRef)
+	if err != nil {
+		return nil, err
+	}
+	if err := WriteWrappedKeyFile(in.WrappedPath, f); err != nil {
+		return nil, err
+	}
+	// Read it back through the key store before trusting it.
+	back, err := ReadWrappedKeyFile(in.WrappedPath)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := UnwrapServerKey(ctx, w, back); err != nil {
+		return nil, fmt.Errorf("verify new wrapped server key: %w", err)
 	}
 	return NewCipherFromKey(key)
+}
+
+// openKeyRingFile opens custody=file's ring. A legacy key still in the
+// environment or the key file must be the ring's key 0 while that key is
+// live: a different key there means the ring belongs to another node.
+func openKeyRingFile(in CustodyInputs, plaintextB64 string) (*Cipher, error) {
+	f, err := ReadKeyRingFile(in.RingPath)
+	if err != nil {
+		return nil, err
+	}
+	legacy, ok, err := LoadPlaintextKey(plaintextB64, in.PlaintextPath)
+	if err != nil {
+		return nil, err
+	}
+	if e, live := f.Entry(0); ok && live && e.State != RingStateRetired && !hmac.Equal(serverKeyCheck(legacy), e.Check) {
+		return nil, fmt.Errorf("the legacy server key (SB_CREDENTIAL_ENCRYPTION_KEY or %s) is not key 0 of the ring at %s", in.PlaintextPath, in.RingPath)
+	}
+	return NewCipherRing(f.RingKeys())
+}
+
+// RetiredKeyStillPresent reports a plaintext legacy key left behind after
+// ring key 0 was retired: the rotation's claim needs it destroyed.
+func RetiredKeyStillPresent(in CustodyInputs, plaintextB64 string) bool {
+	if !in.RingFileExists {
+		return false
+	}
+	f, err := ReadKeyRingFile(in.RingPath)
+	if err != nil {
+		return false
+	}
+	e, ok := f.Entry(0)
+	return ok && e.State == RingStateRetired && (plaintextB64 != "" || in.PlaintextFileExists)
 }
 
 // unwrapTimeout bounds the boot unwrap (§3: one attempt, 10 s).

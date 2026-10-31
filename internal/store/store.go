@@ -2279,6 +2279,11 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 	}
 
+	// A whole-row write is a snapshot read earlier, so the update keeps a
+	// sealed column the row already has: one read before a rotation's reseal
+	// pass and written after the old key was retired would otherwise put
+	// back bytes nothing opens. Only Create, the reseal pass and a write
+	// with a new plaintext toolbox token (the last argument) change one.
 	_, err = exec.ExecContext(ctx, `
 		INSERT INTO sandboxes (
 			id, image, status, public_url, container_id, container_ip, cpu, memory_mb, disk_gb,
@@ -2317,7 +2322,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			allow_public_traffic = excluded.allow_public_traffic,
 			mask_request_host = excluded.mask_request_host,
 			toolbox_enabled = excluded.toolbox_enabled,
-			toolbox_token_sealed = excluded.toolbox_token_sealed,
+			toolbox_token_sealed = CASE
+				WHEN ? = 1 OR COALESCE(length(sandboxes.toolbox_token_sealed), 0) = 0 THEN excluded.toolbox_token_sealed
+				ELSE sandboxes.toolbox_token_sealed
+			END,
 			ssh_public_key = excluded.ssh_public_key,
 			last_error = excluded.last_error,
 			container_command_json = excluded.container_command_json,
@@ -2335,7 +2343,10 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 			gpus_json = excluded.gpus_json,
 			net_bytes_in_limit = excluded.net_bytes_in_limit,
 			net_bytes_out_limit = excluded.net_bytes_out_limit,
-			registry_auth_sealed = excluded.registry_auth_sealed,
+			registry_auth_sealed = CASE
+				WHEN COALESCE(length(sandboxes.registry_auth_sealed), 0) = 0 THEN excluded.registry_auth_sealed
+				ELSE sandboxes.registry_auth_sealed
+			END,
 			auto_import_pending = excluded.auto_import_pending,
 			serverless = excluded.serverless,
 			wake_armed = excluded.wake_armed,
@@ -2412,6 +2423,7 @@ func (s *Store) Upsert(ctx context.Context, sandbox *models.Sandbox) error {
 		boolToInt(sandbox.FleetSuspended),
 		strings.TrimSpace(sandbox.TenantID),
 		incarnationID,
+		boolToInt(sandbox.ToolboxToken != ""),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {

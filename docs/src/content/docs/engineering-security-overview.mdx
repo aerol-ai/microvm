@@ -55,7 +55,7 @@ flowchart TB
         Peers["Other servers<br/>in a cluster"]
         Store["Your audit store"]
         Watch["Your monitoring"]
-        KMS["AWS KMS<br/>optional"]
+        KMS["Your key store<br/>optional"]
     end
     In --> Server
     Server --> Out
@@ -226,6 +226,8 @@ The key is 32 random bytes. It comes from `SB_CREDENTIAL_ENCRYPTION_KEY`, or fro
 
 A copied database alone does not reveal secrets, because the key lives outside it. Back up the key whenever you back up the database, and store the two copies apart. It opens everything.
 
+You can also keep the key in your own key store (AWS KMS, Vault, OpenBao or an HSM). Then only a wrapped copy is on disk, every unwrap is a call your key store logs, and disabling the key stops every server within minutes. See [Use your own key store](/enterprise/key-custody/).
+
 ### What else is sealed
 
 | Secret | Sealed? | Notes |
@@ -314,7 +316,7 @@ The servers keep a shared record of which server runs which sandbox. They agree 
 - **Secrets are stripped from the shared record.** Variables, registry passwords and storage credentials are removed before it is written. The record has no field that could hold sealed bytes.
 - **Sealed copies go only where needed.** A sandbox with failover sends a sealed copy of its secrets to two backup servers. The create waits up to 2 seconds for at least one backup to confirm. With no confirmation, the create is called off.
 - **Each copy gets its own key**, bound to that sandbox, that life of it and its list of servers.
-- **With the default key, every server shares one key,** so the list of servers is checked in software, not by the encryption. With AWS KMS, AWS wraps each copy's key and logs every use.
+- **With the default key, every server shares one key,** so the list of servers is checked in software, not by the encryption. With your key store (AWS KMS, Vault, OpenBao or an HSM), it wraps each copy's key and logs every use.
 
 ## The logbook: audit
 
@@ -435,7 +437,7 @@ flowchart LR
 - **Metrics need a credential.** The Prometheus page accepts a `viewer` token bound to every team, or the server token. The raw counters page needs the admin role.
 - **Traces are off by default.** When you turn them on, they follow each request from your app into AerolVM, so you can see where time went.
 - **No secrets in the cameras.** Metrics are counts and timings. Traces and request logs carry the method, the path without its query, the status and the time taken, plus IDs. They never include request bodies or headers, so the commands and variables you send stay out of them.
-- **Ready-made alarms.** Alerts cover a broken audit chain, skipped records, audit shipping that falls behind, cluster badges about to expire and a failing KMS check. Each alert links to a step-by-step [runbook](/operational-runbooks/).
+- **Ready-made alarms.** Alerts cover a broken audit chain, skipped records, audit shipping that falls behind, cluster badges about to expire, a failing key-store check, and a key your key store revoked. Each alert links to a step-by-step [runbook](/operational-runbooks/).
 
 ## Trusting the software itself
 
