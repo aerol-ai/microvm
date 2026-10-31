@@ -804,9 +804,9 @@ Useful gauges, all per node:
 | `aerolvm_key_custody{key=class,key2=custody,key3=enterprise}` | Where each key class lives (published at boot) |
 | `aerolvm_key_revoked` | 1 while this node is stopped by a revoke |
 | `aerolvm_key_recheck_total{key=result}` | Re-check results: `ok`, `revoked`, `retired`, `denied`, `throttled`, `unavailable`, `mismatch` |
-| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts |
+| `aerolvm_key_rows_stale`, `aerolvm_key_rows_retired` | Rows not on the key store's current version; rows on a version it no longer decrypts. Stale is -1 while the last sweep did not finish: not yet 0 |
 | `aerolvm_key_current`, `aerolvm_key_decryptable` | The key store's current and still-decryptable versions or labels |
-| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens |
+| `aerolvm_server_key_ring{key=id,key2=state}`, `aerolvm_server_key_rows{key=id}` | Server-key rotation: the ring this node holds, and how many sealed values each key opens; -1 for every old key while the last reseal pass did not finish |
 | `aerolvm_key_store_calls_total{key=backend,key2=op,key3=class}` | Key-store calls by outcome |
 
 ### Server key in plaintext

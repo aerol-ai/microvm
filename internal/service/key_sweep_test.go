@@ -255,6 +255,43 @@ func TestSweepStopsWhenTheKeyStoreFails(t *testing.T) {
 	}
 }
 
+// TestFailedSweepPublishesStaleUnknown: an operator retires the old key
+// version once aerolvm_key_rows_stale reads 0, so a sweep that stops early,
+// after the current version moved on, must not leave the last pass's 0 (or
+// its own partial count) there, nor lower the retired count.
+func TestFailedSweepPublishesStaleUnknown(t *testing.T) {
+	svc, tl, _ := sweepHarness(t, 3)
+	ctx := context.Background()
+	if _, err := svc.SweepKeys(ctx); err != nil || keyRowsStale.Value() != 0 {
+		t.Fatalf("first sweep = %v, stale %d", err, keyRowsStale.Value())
+	}
+	tl.rotate(t)
+	keyRowsRetired.Set(2)
+	svc.SetKeyStoreWrapper(&failingAfterVersion{transitLike: tl})
+	if _, err := svc.SweepKeys(ctx); err == nil {
+		t.Fatal("the sweep did not fail")
+	}
+	if keyRowsStale.Value() != -1 || keyRowsRetired.Value() != 2 {
+		t.Fatalf("after a stopped sweep: stale %d retired %d, want -1 and 2", keyRowsStale.Value(), keyRowsRetired.Value())
+	}
+	// The version read fails: nothing is known either.
+	keyRowsStale.Set(0)
+	tl.mu.Lock()
+	tl.down = true
+	tl.mu.Unlock()
+	svc.SetKeyStoreWrapper(tl)
+	if _, err := svc.SweepKeys(ctx); err == nil || keyRowsStale.Value() != -1 {
+		t.Fatalf("version read failed = %v, stale %d", err, keyRowsStale.Value())
+	}
+	// A finished pass publishes the real counts again.
+	tl.mu.Lock()
+	tl.down = false
+	tl.mu.Unlock()
+	if _, err := svc.SweepKeys(ctx); err != nil || keyRowsStale.Value() != 0 || keyRowsRetired.Value() != 0 {
+		t.Fatalf("finished sweep = %v, stale %d retired %d", err, keyRowsStale.Value(), keyRowsRetired.Value())
+	}
+}
+
 type failingAfterVersion struct{ *transitLike }
 
 func (f *failingAfterVersion) Unwrap(context.Context, []byte, map[string]string) ([]byte, error) {

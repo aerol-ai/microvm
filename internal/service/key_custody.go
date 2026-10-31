@@ -635,6 +635,20 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	}
 	bctx := secrets.ContextForBackground(secrets.ContextWithBackgroundPurpose(ctx, "sweep"))
 	step := func() (context.Context, context.CancelFunc) { return context.WithTimeout(bctx, keyRecheckTimeout) }
+	stale, retired := 0, 0
+	// An operator retires the old version once stale reads 0 on every
+	// member, so only a finished pass publishes a count. One that stops
+	// early publishes stale as unknown (-1), never its count so far or the
+	// last pass's 0, and never lowers the retired count it alerts on.
+	finished := false
+	defer func() {
+		if !finished {
+			keyRowsStale.Set(-1)
+			if int64(retired) > keyRowsRetired.Value() {
+				keyRowsRetired.Set(int64(retired))
+			}
+		}
+	}()
 	cctx, cancel := step()
 	current, _, err := secrets.CurrentKeyVersion(cctx, s.keyStoreWrapper)
 	cancel()
@@ -643,7 +657,6 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 	}
 	s.publishKeyVersions(current)
 	provider := secrets.NormalizeProviderName(s.cfg.SecretProvider)
-	stale, retired := 0, 0
 	after := ""
 	for {
 		rows, err := s.store.ListClusterSecretsBatch(ctx, after, keySweepPage)
@@ -666,7 +679,6 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 			case rerr != nil && secrets.IsKeyStoreError(rerr):
 				// The key store is down, throttling or refusing: stop here,
 				// the next pass picks up where this one could not.
-				keyRowsRetired.Set(int64(retired))
 				return stale, rerr
 			case rerr != nil:
 				s.logger.Warn("key custody: row not rewrapped", "ref", row.Ref, "error", rerr)
@@ -694,6 +706,7 @@ func (s *Service) SweepKeys(ctx context.Context) (int, error) {
 		s.logger.Warn("key custody: server-key file not rewrapped", "error", ferr)
 	}
 	stale += fileStale
+	finished = true
 	keyRowsStale.Set(int64(stale))
 	keyRowsRetired.Set(int64(retired))
 	return stale, nil

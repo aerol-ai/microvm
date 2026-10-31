@@ -389,6 +389,11 @@ func TestResealPassEdges(t *testing.T) {
 	if _, err := svc.ResealServerKeyRows(ctx); err == nil {
 		t.Fatal("a corrupt CA record did not stop the pass")
 	}
+	// A pass that stopped early publishes the old key as unknown, never
+	// as gone (what a retire waits for) or as a partial count.
+	if g := ringGauge(t, serverKeyRowsGauge); len(g) != 1 || g["0"] != float64(-1) {
+		t.Fatalf("rows gauge after a stopped pass = %v", g)
+	}
 	svc.resealTick(ctx)
 	raw, _ := json.Marshal(egressCARecord{CertPEM: "x", SealedKey: []byte("junk")})
 	if err := os.WriteFile(ca, raw, 0o600); err != nil {

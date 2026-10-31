@@ -225,10 +225,24 @@ func (s *Service) ResealServerKeyRows(ctx context.Context) (map[string]int, erro
 	}
 	err := s.resealPass(ctx, count, func() { counts[rowsUnopenable]++ })
 	serverKeyRowsGauge.Init()
-	for id, n := range counts {
+	publish := func(id string, n int64) {
 		v := new(expvar.Int)
-		v.Set(int64(n))
+		v.Set(n)
 		serverKeyRowsGauge.Set(id, v)
+	}
+	if err != nil {
+		// A pass that stopped early counted only some values, and a key it
+		// did not reach would be absent: what a retire waits for. So every
+		// key but the current one is published as unknown (-1).
+		for _, id := range s.cipher.KeyIDs() {
+			if k := strconv.FormatUint(uint64(id), 10); k != current {
+				publish(k, -1)
+			}
+		}
+	} else {
+		for id, n := range counts {
+			publish(id, int64(n))
+		}
 	}
 	keyRowsResealed.Add(int64(resealed))
 	if resealed > 0 {
