@@ -101,3 +101,54 @@ func TestCov96LoadEnterpriseRejectsHardeningOptOuts(t *testing.T) {
 		})
 	}
 }
+
+// F2, Phase 7 (plans/customer-key-custody.md §7): enterprise mode with a
+// customer key store refuses a plaintext server key. Wrapped custody, the
+// local provider, and the key tool that does the wrapping still load.
+func TestEnterpriseRequiresWrappedCustodyWithAKeyStore(t *testing.T) {
+	enterprise := map[string]string{
+		"SB_PAT_TOKEN":                        strings.Repeat("x", minEnterpriseCredentialBytes),
+		"SB_ENTERPRISE_MODE":                  "true",
+		"SB_ENABLE_CLUSTER":                   "false",
+		"SB_SECRET_AUDIT_EXPORT_URL":          "https://audit.example/export",
+		"SB_SECRET_AUDIT_EXPORT_BEARER_TOKEN": strings.Repeat("e", minEnterpriseCredentialBytes),
+	}
+	kms := mergeEnv(enterprise, map[string]string{
+		"SB_SECRET_PROVIDER":             "awskms",
+		"SB_SECRET_AWS_KMS_KEY_ID":       "alias/aerolvm",
+		"SB_SECRET_PROVIDER_STRICT_BOOT": "true",
+	})
+	set := func(t *testing.T, env map[string]string) {
+		t.Helper()
+		for k, v := range env {
+			t.Setenv(k, v)
+		}
+	}
+	t.Run("a plaintext key next to a key store is refused", func(t *testing.T) {
+		set(t, kms)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SB_CREDENTIAL_KEY_CUSTODY must be wrapped for awskms") {
+			t.Fatalf("err = %v, want the wrapped-custody refusal", err)
+		}
+	})
+	t.Run("the key tool still loads, to wrap it", func(t *testing.T) {
+		set(t, kms)
+		if _, err := LoadForKeyTool(); err != nil {
+			t.Fatalf("LoadForKeyTool = %v", err)
+		}
+	})
+	t.Run("wrapped custody loads", func(t *testing.T) {
+		set(t, mergeEnv(kms, map[string]string{
+			"SB_CREDENTIAL_KEY_CUSTODY":                 "wrapped",
+			"SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH": filepath.Join(t.TempDir(), "credential_encryption.key.wrapped"),
+		}))
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load = %v", err)
+		}
+	})
+	t.Run("the local provider is not a key store", func(t *testing.T) {
+		set(t, enterprise)
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load = %v", err)
+		}
+	})
+}

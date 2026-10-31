@@ -1186,7 +1186,7 @@ One PR per phase, stacked, with nothing merged until the whole stack is green.
 | 4c | Server-key rotation (eng D26): key-id `Cipher` format with authenticated dual read, the key ring, `sandboxd key rotate --stage/--promote/--retire` gated on gossip feature version, the reseal pass in the `key_custody` loop for every sealed column, the ring gauges and the rotation audit kinds. | XL |
 | 5 | Enterprise rules, the docs page and updates, config-defaults, the runbook, the `SandboxdServerKeyPlaintext`, `SandboxdKeyRevoked`, `SandboxdKeyVersionRetiredInUse` and `SandboxdKeyStoreThrottling` alerts with runbooks and `alerts_test.go` rows (CEO-E1, CEO-E2, CEO-E4, Section 8), the key-custody Grafana row, the revoke procedure per backend, and the Vault Agent example. | S |
 | 6 | The tag-gated CI job, the live itest scenarios, the CloudHSM run, and an Outcome section here. | M (AWS time) |
-| 7 | **One release later (F2):** enterprise mode with an external provider refuses `custody=file`; release notes announce it one release ahead. | S |
+| 7 | **One release later (F2):** enterprise mode with an external provider refuses `custody=file`; release notes announce it one release ahead. *(Built, held for the release after the stack: see "Phase 7 status".)* | S |
 
 Phase 1 also rewrites the reject at `internal/config/config.go:2599-2602` and
 the comment at `pkg/secrets/factory.go:38-40`. The `vault` value keeps
@@ -1338,6 +1338,34 @@ and installs the seed's wrapped file over anything it wrote. Nothing is
 sealed in that window, and the plaintext install has the same
 standalone-first boot, but install.sh could skip starting sandboxd when a
 join follows.
+
+## Phase 7 status (2026-10-31)
+
+Built on `feat/key-custody-7-enterprise-refuses-file`, stacked on Phase 6's
+live-gap branch, and **held**: by decision F2 it merges one release after
+the rest of the stack ships, whose release notes announce it.
+
+- **Config.** With `SB_ENTERPRISE_MODE=true` and an external
+  `SB_SECRET_PROVIDER`, `SB_CREDENTIAL_KEY_CUSTODY` must be `wrapped`; the
+  error names `sandboxd key wrap`. `sandboxd key` still loads such a config,
+  since it is how a node gets to `wrapped`. The local provider is not
+  refused (it has no key store to wrap with); `SandboxdServerKeyPlaintext`
+  still covers it.
+- **Removed** the first-release boot warning (`enterpriseCustodyWarning`):
+  a node it would warn about no longer starts.
+- **Scenarios.** `cluster-3-mixed-secrets-enterprise`,
+  `cluster-hetero-lite-kms` and `cluster-hetero-secrets-kms` run enterprise
+  mode on AWS KMS, so they are built with `key_custody = "wrapped"`.
+- **Docs.** The key-custody page, the runbook, the alert text and
+  `setup/config-defaults.md` say "refused" instead of "the next release
+  refuses".
+- **Test.** `TestEnterpriseRequiresWrappedCustodyWithAKeyStore`: refused
+  with a key store and a plaintext key; the key tool, wrapped custody and the
+  local provider still load.
+- **Live (2026-10-31).** `cluster-3-mixed-secrets-enterprise` built wrapped
+  on this build: UC-310 passes (no plaintext key anywhere, failover). A node
+  overridden to custody `file` with a plaintext key set refused at config
+  load with the message above, and came back once the override was removed.
 
 ## Phase 5 results (2026-10-31)
 
@@ -2790,8 +2818,9 @@ architecture ~5x, research ~3x.
   - Surfaced by: Testing; Section 6.
   - Files: `.github/workflows/test.yml`, `integration-tests/suite/`.
   - Verify: `make integration-*` scenarios green, teardown clean.
-- [ ] **T9 (P2, human: ~1h / CC: ~10min)** — Phase 7 — the enterprise flip
-  one release later (F2).
+- [x] **T9 (P2, human: ~1h / CC: ~10min)** — Phase 7 — the enterprise flip
+  one release later (F2). Built 2026-10-31 on `feat/key-custody-7-enterprise-refuses-file`,
+  the top of the stack, and held: it merges one release after the rest ships.
   - Files: `internal/config/config.go`.
   - Verify: config table test.
 
