@@ -168,14 +168,18 @@ var (
 var gatewaySets = []string{"fqdn_src", "src_deny_default", "src_accept", "learn_src", "blocked_src"}
 
 // snapshotEgressNode reads every per-address entry a node holds: each
-// gateway set's elements ("set fqdn_src 10.88.0.5"), each per-IP rule of
-// the sandbox chains ("rule AEROLVM-USER -s 10.88.0.5/32 -j DROP") and each
-// sandbox's pause container ("pause aerolvm-netns-sb-<id>").
+// gateway set's elements ("set fqdn_src 10.88.0.5"), each block set's
+// ("block blocked 10.88.0.5", "block released 10.88.0.5"), each per-IP
+// rule of the sandbox chains ("rule AEROLVM-USER -s 10.88.0.5/32 -j DROP")
+// and each sandbox's pause container ("pause aerolvm-netns-sb-<id>").
 func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeState {
 	t.Helper()
 	var script strings.Builder
 	for _, s := range gatewaySets {
 		fmt.Fprintf(&script, "echo '## set %s'; sudo nft list set inet aerolvm_egress %s 2>/dev/null | sed -n '/elements/,$p'; ", s, s)
+	}
+	for _, s := range []string{"blocked", "released"} {
+		fmt.Fprintf(&script, "echo '## block %s'; sudo nft list set ip aerolvm_block %s 2>/dev/null | sed -n '/elements/,$p'; ", s, s)
 	}
 	for _, ch := range []string{"AEROLVM-USER", "AEROLVM-INPUT", "DOCKER-USER", "AEROLVM-FC"} {
 		fmt.Fprintf(&script, "echo '## chain %s'; sudo iptables -w -S %s 2>/dev/null; ", ch, ch)
@@ -196,7 +200,7 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 			continue
 		}
 		switch {
-		case strings.HasPrefix(section, "set "):
+		case strings.HasPrefix(section, "set "), strings.HasPrefix(section, "block "):
 			for _, m := range setElemRe.FindAllStringSubmatch(line, -1) {
 				st[section+" "+m[1]] = true
 			}
@@ -457,6 +461,10 @@ const heldPrefix = "held-by-park "
 // address a parked warm-pool container holds: the park's own rules, which
 // go when the park does.
 func parkBlock(st egressNodeState, k string) bool {
+	// On the block sets the park block is the address in @blocked.
+	if ip, ok := strings.CutPrefix(k, "block blocked "); ok {
+		return st[heldPrefix+ip]
+	}
 	rule, ok := strings.CutPrefix(k, "rule ")
 	if !ok {
 		return false
@@ -467,4 +475,194 @@ func parkBlock(st egressNodeState, k string) bool {
 	}
 	return strings.HasSuffix(rule, "-s "+m[1]+"/32 -j DROP") ||
 		strings.HasSuffix(rule, "-s "+m[1]+"/32 -m comment --comment sbx-input-block -j DROP")
+}
+
+// blockSetsOn reads a node's two block sets (pkg/docker/netrules
+// blockset.go).
+func blockSetsOn(t *testing.T, node harness.IntegrationNode) (blocked, released map[string]bool) {
+	t.Helper()
+	st := snapshotEgressNode(t, node)
+	blocked, released = map[string]bool{}, map[string]bool{}
+	for k := range st {
+		if ip, ok := strings.CutPrefix(k, "block blocked "); ok {
+			blocked[ip] = true
+		}
+		if ip, ok := strings.CutPrefix(k, "block released "); ok {
+			released[ip] = true
+		}
+	}
+	return blocked, released
+}
+
+// crashWatchScript polls a node's block sets every few milliseconds and,
+// at the first address that joins @blocked without being in @released,
+// kills sandboxd with SIGKILL (systemd starts it again) and prints it.
+const crashWatchScript = `snap() { sudo nft list set ip aerolvm_block "$1" 2>/dev/null | sed -n '/elements/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u; }
+before=$(snap blocked)
+end=$(( $(date +%%s) + %d ))
+while [ "$(date +%%s)" -lt "$end" ]; do
+  rel=$(snap released)
+  for ip in $(snap blocked); do
+    if ! printf '%%s\n' "$before" | grep -qx "$ip" && ! printf '%%s\n' "$rel" | grep -qx "$ip"; then
+      sudo kill -9 $(pidof sandboxd) && echo "KILLED $ip"; exit 0
+    fi
+  done
+  sleep 0.003
+done
+echo NONE`
+
+// UC-358 — a sandboxd killed (SIGKILL) between a hostname-filtered create's
+// block and its lift leaves the address blocked: in @blocked and never in
+// @released, right after the kill and after systemd starts sandboxd again,
+// until the orphan's removal lets the address go (or a retried create of
+// the sandbox legitimately owns it again).
+func TestEgressSandboxdKilledBetweenBlockAndLift(t *testing.T) {
+	harness.Require(t, sc, "UC-358")
+	if !harness.DisruptiveAllowed() {
+		t.Skip("kills sandboxd on a node; set AEROL_ALLOW_DISRUPTIVE=1")
+	}
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil {
+		t.Skip("AEROL_INTEGRATION_TARGETS not set (run via integration-tests/run.sh)")
+	}
+	c := client(t)
+	runtime := ""
+	if sc.Has(harness.CapFirecracker) {
+		runtime = "firecracker" // the longest window between block and lift
+	}
+	type hit struct {
+		node harness.IntegrationNode
+		out  string
+	}
+	hits := make(chan hit, len(targets.Nodes))
+	watchers := 0
+	for _, n := range targets.Nodes {
+		if _, ok := harness.SSHTarget(n); !ok || n.Role == "ingress" {
+			continue
+		}
+		watchers++
+		go func() { hits <- hit{n, nodeSSH(t, n, fmt.Sprintf(crashWatchScript, 90))} }()
+	}
+	if watchers == 0 {
+		t.Skip("no SSH-reachable sandbox node")
+	}
+	time.Sleep(2 * time.Second) // the watchers take their snapshot
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	sb, createErr := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
+		Image: harness.DefaultImage, Name: harness.UniqueName(sc, t), Runtime: runtime,
+		NetworkAllowOut: []string{"pypi.org"},
+	})
+	cancel()
+	if createErr == nil {
+		defer destroyBest(c, sb.ID)
+	}
+	var victim harness.IntegrationNode
+	var ip string
+	for range watchers {
+		h := <-hits
+		if f := strings.Fields(strings.TrimSpace(h.out)); len(f) == 2 && f[0] == "KILLED" {
+			victim, ip = h.node, f[1]
+		}
+	}
+	if ip == "" {
+		t.Skip("no watcher caught a create between its block and its lift (the window was too short on this run)")
+	}
+	t.Logf("killed sandboxd on %s with %s blocked and not released (create err: %v)", victim.Name, ip, createErr)
+	blocked, released := blockSetsOn(t, victim)
+	if !blocked[ip] || released[ip] {
+		t.Fatalf("right after the kill: blocked=%v released=%v, want blocked only", blocked[ip], released[ip])
+	}
+	// sandboxd comes back (systemd); the address must stay shut until the
+	// orphan is removed, unless a sandbox legitimately holds it again.
+	if !eventually(2*time.Minute, func() bool {
+		out := nodeSSH(t, victim, "systemctl is-active sandboxd 2>/dev/null; true")
+		return strings.TrimSpace(out) == "active"
+	}) {
+		t.Fatal("sandboxd did not come back")
+	}
+	owned := func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		list, err := c.SDK().List(ctx)
+		if err != nil {
+			return false
+		}
+		for _, s := range list {
+			if s.ContainerIP == ip && s.Status == "started" {
+				return true
+			}
+		}
+		return false
+	}
+	wait := time.Duration(benchEnvInt("AEROL_UC358_RECONCILE_WAIT_S", 420)) * time.Second
+	deadline := time.Now().Add(wait)
+	for time.Now().Before(deadline) {
+		blocked, released = blockSetsOn(t, victim)
+		if released[ip] && !owned() {
+			t.Fatalf("%s was released with no sandbox holding it after the restart", ip)
+		}
+		if !blocked[ip] && !released[ip] {
+			t.Logf("%s let go after the restart (orphan removed)", ip)
+			return
+		}
+		if owned() {
+			t.Logf("%s is owned again by a started sandbox (the create was retried)", ip)
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+	t.Fatalf("%s still blocked %v after the restart: the orphan was never removed", ip, wait)
+}
+
+// UC-359 — destroying a hostname-filtered sandbox lets its address go in
+// both block sets (no release left behind), and a block-all sandbox that
+// gets the address next is shut from its first instruction.
+func TestEgressReusedAddressInheritsNoRelease(t *testing.T) {
+	harness.Require(t, sc, "UC-359")
+	c := client(t)
+	first := newEgressSandbox(t, c, []string{"pypi.org"}, nil)
+	node := sandboxNode(t, c, first)
+	ip := containerIP(t, c, first)
+	blocked, released := blockSetsOn(t, node)
+	if !blocked[ip] || !released[ip] {
+		t.Fatalf("a running hostname sandbox at %s: blocked=%v released=%v, want both (blocked, then lifted)", ip, blocked[ip], released[ip])
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	err := c.SDK().Destroy(ctx, first.ID)
+	cancel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eventually(30*time.Second, func() bool {
+		blocked, released = blockSetsOn(t, node)
+		return !blocked[ip] && !released[ip]
+	}) {
+		t.Fatalf("destroy left %s in the sets: blocked=%v released=%v", ip, blocked[ip], released[ip])
+	}
+	// The next sandbox: block-all, probing from its first instruction.
+	for i := 0; i < 4; i++ {
+		next := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
+			Image: harness.DefaultImage, Name: fmt.Sprintf("%s-%d", harness.UniqueName(sc, t), i),
+			NetworkBlockAll: true, ContainerCommand: []string{"sh", "-c", earlyProbeScript},
+		})
+		if containerIP(t, c, next) != ip || sandboxNode(t, c, next).Name != node.Name {
+			continue
+		}
+		var log string
+		if !eventually(30*time.Second, func() bool {
+			log = egressExec(t, next, "cat /tmp/early-probe.log 2>/dev/null")
+			return strings.Contains(log, "done")
+		}) {
+			t.Fatalf("probes did not finish:\n%s", lastLines(log, 20))
+		}
+		if strings.Contains(log, "fl=") || strings.Contains(log, "visit_scheme=") {
+			t.Fatalf("the address's next owner (block-all) reached 1.1.1.1:\n%s", lastLines(log, 5))
+		}
+		blocked, released = blockSetsOn(t, node)
+		if !blocked[ip] || released[ip] {
+			t.Fatalf("next owner at %s: blocked=%v released=%v, want blocked only", ip, blocked[ip], released[ip])
+		}
+		return
+	}
+	t.Log("no later create got the address on the same node: the reuse half was not exercised on this run")
 }
