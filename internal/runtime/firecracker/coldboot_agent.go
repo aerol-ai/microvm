@@ -92,22 +92,27 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
-// guestNoIPv6Arg turns IPv6 off in the guest kernel for its whole life. A
-// guest is IPv4-only (the ip= clause below, the TAP /30), and every host
-// rule between a guest and its node is IPv4, so an IPv6 stack in the guest
-// only adds a way around them. ipv6.disable=1, not the disable_ipv6
-// sysctl: root in the guest owns its kernel and could switch a sysctl back
-// on, but not a boot parameter. Ignored by a kernel built without IPv6 (or
-// with it as a module: the guest boots with nomodules). Templates take it
-// at snapshot time; a template snapshotted before it keeps IPv6, and the
-// host end then holds the line: the TAP has IPv6 off and the node's IPv6
-// fence drops what the guest sends.
-const guestNoIPv6Arg = "ipv6.disable=1"
+// guestNoIPv6Arg starts every guest interface with IPv6 off: no address,
+// not even a link-local one or ::1. A guest is IPv4-only (the ip= clause
+// below, the TAP /30), and every host rule between a guest and its node is
+// IPv4. This is defence in depth; the boundary is the node: the TAP's host
+// end has IPv6 off and the node's IPv6 fence drops whatever a guest sends,
+// so root in a guest switching the sysctl back on gains nothing. That is
+// also why it is ipv6.disable_ipv6=1 (the ipv6 module's default for every
+// interface, honoured on the command line with IPv6 built in, as in the
+// Firecracker CI guest kernels) and not ipv6.disable=1: that one removes the
+// IPv6 stack, so socket(AF_INET6) fails with EAFNOSUPPORT and a workload
+// that listens on [::] (nginx's stock listen [::]:80, python3 -m
+// http.server) fails in a VM while it works on every other runtime. With
+// disable_ipv6, [::] still binds dual-stack and takes IPv4, as in a
+// container. Templates take it at snapshot time; one snapshotted before it
+// keeps IPv6 in its guests, held back by the node the same way.
+const guestNoIPv6Arg = "ipv6.disable_ipv6=1"
 
 // coldBootArgs builds the kernel command line for a cold-boot guest that
 // runs the injected agent. It extends the base args with:
 //
-//   - ipv6.disable=1 — always (guestNoIPv6Arg).
+//   - ipv6.disable_ipv6=1 — always (guestNoIPv6Arg).
 //   - ip=<guest>::<gw>:<mask>::eth0:off — kernel IP autoconfig (CONFIG_IP_PNP)
 //     so eth0 is up before userspace; the agent's HTTP server is then
 //     reachable at GuestIP:2280 over the TAP without an in-guest DHCP client.

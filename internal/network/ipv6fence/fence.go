@@ -7,7 +7,7 @@
 // fe80::…%eth0 while the IPv4 address timed out (cluster-3-mixed-routing,
 // containerd, pooled netns). The runtimes now start every sandbox with IPv6
 // off (hostnet.SandboxIPv6Sysctls, netns.Host.Realize, the Firecracker
-// ipv6.disable=1 boot argument, the TAP's host end). This package is the
+// ipv6.disable_ipv6=1 boot argument, the TAP's host end). This package is the
 // second layer, which holds whatever a sandbox does to its own stack: a
 // gVisor sentry or a VM guest has a network stack of its own, and root in a
 // guest owns its kernel.
