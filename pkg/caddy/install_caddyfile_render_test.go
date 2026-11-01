@@ -11,6 +11,23 @@ import (
 	"testing"
 )
 
+// installShFunc returns one top-level function of install.sh, source and
+// all. A function runs to the next top-level function definition: its
+// heredocs hold Caddyfile lines that are a lone "}".
+func installShFunc(t *testing.T, src, name string) string {
+	t.Helper()
+	nextFunc := regexp.MustCompile(`\n[a-z_]+\(\) \{\n`)
+	start := strings.Index(src, "\n"+name+"() {\n")
+	if start < 0 {
+		t.Fatalf("install.sh has no %s()", name)
+	}
+	body := src[start+1:]
+	if loc := nextFunc.FindStringIndex(body[len(name)+5:]); loc != nil {
+		body = body[:len(name)+5+loc[0]+1]
+	}
+	return body
+}
+
 // renderInstall runs install.sh's write_environment and write_caddyfile
 // for a domain-mode install with vars applied, with /etc and /run paths
 // moved under a temp dir, and returns the env file and the Caddyfile.
@@ -24,21 +41,7 @@ func renderInstall(t *testing.T, installSh string, vars map[string]string) (env,
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A function runs to the next top-level function definition: its
-	// heredocs hold Caddyfile lines that are a lone "}".
-	nextFunc := regexp.MustCompile(`\n[a-z_]+\(\) \{\n`)
-	fn := func(name string) string {
-		src := string(raw)
-		start := strings.Index(src, "\n"+name+"() {\n")
-		if start < 0 {
-			t.Fatalf("install.sh has no %s()", name)
-		}
-		body := src[start+1:]
-		if loc := nextFunc.FindStringIndex(body[len(name)+5:]); loc != nil {
-			body = body[:len(name)+5+loc[0]+1]
-		}
-		return body
-	}
+	fn := func(name string) string { return installShFunc(t, string(raw), name) }
 	out := t.TempDir()
 	script := fn("write_environment") + fn("write_caddyfile")
 	// Replacements are tried in argument order: the public socket's path
@@ -50,7 +53,7 @@ func renderInstall(t *testing.T, installSh string, vars map[string]string) (env,
 		"DOMAIN": "sandbox.example.com", "DNS_PROVIDER": "cloudflare", "TLS_ISSUER": "acme", "CADDY_STORAGE_S3": "false",
 		"PAT_TOKEN": "pat", "NODE_NAME": "n1", "PUBLIC_HOST": "203.0.113.1", "INSTALL_PREFIX": "/usr/local/bin",
 		"IDLE_TIMEOUT_MIN": "0", "L4_TLS_LISTEN_DEFAULT": ":443", "INGRESS_PROXY_ROUTING": "false",
-		"ROUTE_DNS_ADDR": "127.0.0.1:53053", "WITH_GVISOR": "false", "WITH_ISOLATE": "false", "WITH_CONTAINERD_ENGINE": "false",
+		"ROUTE_DNS_ADDR": "127.0.0.1:53053", "ROUTE_DNS_LINK_ADDR": "169.254.53.53:53053", "WITH_GVISOR": "false", "WITH_ISOLATE": "false", "WITH_CONTAINERD_ENGINE": "false",
 		"PAT_SCOPE": "any", "PUBLIC_API_SOCKET": "/run/sandboxd-public/api.sock", "L4_PROXY_PROTOCOL": "false",
 		"ACME_CA": "", "ACME_CA_ROOT": "", "ACME_EMAIL": "", "CADDY_STORAGE_S3_ACCESS_KEY": "",
 		// --lb-health-port: empty writes no health listener.
