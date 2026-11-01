@@ -44,6 +44,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
@@ -109,6 +110,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
 	configureHostMediatedNodeGuard(cfg, logger)
+	// Before anything dials a toolbox: every toolbox connection is
+	// dialed with this bound.
+	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)
 
 	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
 		Enabled:     cfg.OTELTracesEnabled,
