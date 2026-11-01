@@ -368,6 +368,19 @@ func TestDockerRestrictedCreateRunsInItsPause(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 			sb, err := c.SDK().Create(ctx, opts)
 			cancel()
+			// With no host firewall (local mode) there is no pause to run in:
+			// the node refuses the policy it cannot enforce (#846), which is
+			// the fail-closed answer this case exists to protect.
+			if sc.Has(harness.CapNoHostFirewall) {
+				if err == nil {
+					destroyBest(c, sb.ID)
+					t.Fatalf("a %s create was accepted on a node with no host firewall; it must be refused as unenforced", k.name)
+				}
+				if !harness.IsUnenforcedPolicyRefusal(err) {
+					t.Fatalf("a %s create on a node with no host firewall failed, but not as the unenforced-policy refusal: %s", k.name, harness.DescribeAPIError(err))
+				}
+				return
+			}
 			if err != nil {
 				t.Fatal(err)
 			}
