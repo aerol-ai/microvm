@@ -24,6 +24,15 @@ caddy_shared_cert_storage = {
   enabled = true
 }
 
+# install.sh --ingress-proxy-routing on every node: static Caddy routes plus
+# the sandboxd route responder, so a sandbox create or destroy writes nothing
+# to Caddy. With per-sandbox routes every create/destroy anywhere reloaded
+# both ingress nodes' Caddy (330 reloads/hour on one), and each reload
+# dropped new connections: UC-230 and UC-266 exec-stream dials failed with
+# "unexpected EOF" (2026-11-01). plans/ingress-proxy-routing.md; this is the
+# metal flagship run TODOS.md asks for before the default flips.
+default_ingress_proxy_routing = true
+
 nodes = {
   server-1  = { role = "server", seed = true, spot = false, instance_type = "m6i.large", volume_size_gb = 30 }
   server-2  = { role = "server", spot = false, instance_type = "m6i.large", volume_size_gb = 30 }
