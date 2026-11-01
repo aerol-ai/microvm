@@ -49,7 +49,7 @@ func TestMountAllRejectsTraversalSandboxID(t *testing.T) {
 // A well-formed id still mounts, proving the guard doesn't break the happy path.
 func TestMountAllAcceptsGeneratedID(t *testing.T) {
 	oldProbe := waitForMountProbe
-	waitForMountProbe = func(string, time.Duration) error { return nil }
+	waitForMountProbe = func(string, time.Duration, <-chan struct{}) error { return nil }
 	t.Cleanup(func() { waitForMountProbe = oldProbe })
 
 	m := newTestManager(t, map[models.MountType]adapters.Adapter{

@@ -22,7 +22,7 @@ func TestCapturedOutputTailTruncation(t *testing.T) {
 }
 
 func TestSpawnMountProcessWithEnv(t *testing.T) {
-	cmd, out, err := spawnMountProcess(adapters.Plan{
+	cmd, out, exit, err := spawnMountProcess(adapters.Plan{
 		Argv: []string{"true"},
 		Env:  []string{"MOUNT_SPAWN_ENV=1"},
 	})
@@ -30,7 +30,7 @@ func TestSpawnMountProcessWithEnv(t *testing.T) {
 		t.Fatalf("spawnMountProcess: %v", err)
 	}
 	t.Cleanup(func() { _ = killMount(cmd) })
-	if out == nil {
-		t.Fatal("expected captured output")
+	if out == nil || exit == nil {
+		t.Fatal("expected captured output and an exit watcher")
 	}
 }

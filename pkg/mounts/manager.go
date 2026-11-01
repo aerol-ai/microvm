@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -55,6 +56,7 @@ type mountState struct {
 	plan       adapters.Plan
 	cmd        *exec.Cmd
 	output     *capturedOutput // captured stdout+stderr of the FUSE mount tool
+	exit       *procExit       // cmd's exit; superviseExit waits on it
 	startedAt  time.Time
 	restarts   int
 	lastCrash  time.Time
@@ -393,18 +395,20 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	// User-space FUSE: spawn and supervise. stdout+stderr are captured so a
 	// mount that never becomes ready surfaces the tool's own error instead of a
 	// bare "timed out waiting for mount" (cluster-hetero UC-81..84).
-	cmd, out, err := spawnMountProcess(plan)
+	cmd, out, exit, err := spawnMountProcess(plan)
 	if err != nil {
 		m.cleanupCred(plan)
 		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", err)
 	}
 	state.cmd = cmd
 	state.output = out
+	state.exit = exit
 
-	if err := waitForMountProbe(hostPath, m.waitTimeout); err != nil {
+	if err := waitForMountProbe(hostPath, m.waitTimeout, exit.done); err != nil {
+		err = mountWaitError(err, exit, out) // before killMount, so the exit status is the tool's own
 		_ = killMount(cmd)
 		m.cleanupCred(plan)
-		return nil, ContainerBind{}, mountWaitError(err, out)
+		return nil, ContainerBind{}, err
 	}
 
 	if plan.UnlinkCred && plan.CredFile != "" {
@@ -421,10 +425,11 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 // superviseExit waits for the mount process to exit and either restarts it
 // once or marks the mount disabled if it crashes a second time within 30s.
 func (m *Manager) superviseExit(state *mountState) {
-	if state.cmd == nil {
-		return
+	if state.exit == nil {
+		return // no process to supervise
 	}
-	err := state.cmd.Wait()
+	<-state.exit.done
+	err := state.exit.err
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -471,7 +476,7 @@ func (m *Manager) superviseExit(state *mountState) {
 	if state.plan.CredFile != "" {
 		_ = writeCredFile(state.plan.CredFile, state.plan.CredBody)
 	}
-	cmd, out, err := spawnMountProcess(state.plan)
+	cmd, out, exit, err := spawnMountProcess(state.plan)
 	if err != nil {
 		state.disabled = true
 		m.logger.Warn("mount restart spawn failed", "sandbox_id", state.sandboxID, "index", state.index, "error", err)
@@ -479,6 +484,7 @@ func (m *Manager) superviseExit(state *mountState) {
 	}
 	state.cmd = cmd
 	state.output = out
+	state.exit = exit
 
 	go m.superviseExit(state)
 }
@@ -530,28 +536,51 @@ func writeCredFile(path string, data []byte) error {
 // replace it to avoid requiring a real FUSE/kernel mount in unit tests.
 var waitForMountProbe = waitForMount
 
+// errMountToolExited and errMountPathRemoved end the readiness wait early.
+// Every FUSE tool here runs in the foreground (mount-s3 --foreground,
+// sshfs -f, rclone mount), so a tool that has exited is not mounting anything,
+// and a mount path that is gone cannot become a mount. Waiting out the timeout
+// on either only hides the cause behind "timed out" (UC-84 waited 30s for a
+// tool the sweep had already killed).
+var (
+	errMountToolExited  = errors.New("mount tool exited before the mount was ready")
+	errMountPathRemoved = errors.New("mount path was removed while waiting for the mount")
+)
+
 // waitForMount polls until the host path appears mounted (its underlying
-// device differs from the parent dir's). Falls back to a sentinel-file probe
-// if the parent is itself a mount point. Returns ErrTimeout after waitTimeout.
-func waitForMount(hostPath string, timeout time.Duration) error {
+// device differs from the parent dir's). It fails fast once exited is closed
+// (the mount tool is gone) or the path no longer exists, and times out after
+// timeout for a tool that is alive but slow. A nil exited never fires.
+func waitForMount(hostPath string, timeout time.Duration, exited <-chan struct{}) error {
 	parent := filepath.Dir(hostPath)
 	parentStat, err := os.Stat(parent)
 	if err != nil {
 		return fmt.Errorf("stat parent: %w", err)
 	}
 	parentSys, _ := parentStat.Sys().(*syscall.Stat_t)
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	poll := time.NewTicker(200 * time.Millisecond)
+	defer poll.Stop()
+	for {
 		st, err := os.Stat(hostPath)
-		if err == nil {
+		switch {
+		case err == nil:
 			sys, _ := st.Sys().(*syscall.Stat_t)
 			if parentSys != nil && sys != nil && sys.Dev != parentSys.Dev {
 				return nil
 			}
+		case errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("%w: %s", errMountPathRemoved, hostPath)
 		}
-		time.Sleep(200 * time.Millisecond)
+		select {
+		case <-exited:
+			return fmt.Errorf("%w at %s", errMountToolExited, hostPath)
+		case <-deadline.C:
+			return fmt.Errorf("timed out waiting for mount at %s", hostPath)
+		case <-poll.C:
+		}
 	}
-	return fmt.Errorf("timed out waiting for mount at %s", hostPath)
 }
 
 // killMount sends SIGTERM to the process group, waits briefly, then SIGKILL.

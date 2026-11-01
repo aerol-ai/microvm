@@ -73,11 +73,11 @@ func mountAsync(m *Manager, id string) <-chan mountResult {
 // sweep took the half-built directory for an orphan, killed the tool and
 // removed the directory, and the create waited out the full 30s mount timeout.
 func TestSweepSkipsMountInProgress(t *testing.T) {
-	entered := make(chan struct{})
+	entered := make(chan (<-chan struct{}))
 	release := make(chan struct{})
 	oldProbe := waitForMountProbe
-	waitForMountProbe = func(string, time.Duration) error {
-		close(entered)
+	waitForMountProbe = func(_ string, _ time.Duration, exited <-chan struct{}) error {
+		entered <- exited
 		<-release
 		return nil
 	}
@@ -92,7 +92,7 @@ func TestSweepSkipsMountInProgress(t *testing.T) {
 
 	done := mountAsync(m, id)
 	t.Cleanup(func() { _ = m.UnmountAll(id) })
-	<-entered
+	exited := <-entered
 
 	m.Sweep(map[string]struct{}{}) // the reconcile tick: nothing is running yet
 
@@ -100,6 +100,15 @@ func TestSweepSkipsMountInProgress(t *testing.T) {
 		close(release)
 		<-done
 		t.Fatalf("sweep removed the in-progress mount directory: %v", err)
+	}
+	// On Linux the old sweep SIGKILLed the tool through /proc; the reaper
+	// would see that within milliseconds.
+	select {
+	case <-exited:
+		close(release)
+		<-done
+		t.Fatal("sweep killed the in-progress mount tool")
+	case <-time.After(200 * time.Millisecond):
 	}
 	if got := logs.String(); !strings.Contains(got, "mounts sweep: skipping, mount in progress") ||
 		strings.Contains(got, "removing orphan") {
