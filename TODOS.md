@@ -176,11 +176,31 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   `Terraform/variables.tf:379-383`, `scripts/install.sh:29`. Only the two
   t3.medium `-routing` scenarios turn it on. The 2026-10-04 cluster-hetero
   run behind #595 ran with it off.
-- **Remaining before the default flips on:** a run on the metal flagship
-  with the flag on (no metal routing scenario or make target exists yet;
-  `Makefile:179-183` has only `integration-routing` and
-  `integration-routing-hetero-lite`), and a latency/throughput A/B
-  (`plans/ingress-proxy-routing.md:300-301`, `:494-496`).
+- **Remaining before the default flips on:** a green run of
+  `cluster-bank-flagship` (the metal flagship), which now runs with the flag
+  on and carries the routing gate plus UC-357, and a latency/throughput A/B
+  against the flag-off flagship runs (`plans/ingress-proxy-routing.md:300-301`,
+  `:494-496`). Then the flip is `default_ingress_proxy_routing = true` in
+  `Terraform/variables.tf` plus the `setup/config-defaults.md` row.
+- **Why it matters (cluster-bank-flagship, 2026-11-01, flag off):** UC-230
+  and UC-266 exec-stream dials failed with `unexpected EOF`, 1 run in 20.
+  Every create or destroy anywhere in the cluster made both dedicated
+  ingress nodes write a `-ingress-sni` route, and each write reloaded Caddy:
+  330 reloads in one hour on ingress-2.
+- **Mechanism, confirmed against the release build** (Caddy v2.11.7 +
+  caddy-l4 v0.1.2, `make test-ingress-reload-e2e`, Linux): a reload restarts
+  every Caddy app, and new connections die two ways. (1) Go's `http.Server`,
+  once `Shutdown` has begun, reads the next request on a connection it
+  already accepted and returns without answering (`net/http`
+  `conn.serve`), so the client sees TLS succeed, then zero bytes:
+  `unexpected EOF` on a WebSocket upgrade. (2) Caddy binds a fresh
+  `SO_REUSEPORT` socket per config and closes the old one, and Linux resets
+  what was still queued on it: `connection reset by peer` or EOF in the TLS
+  handshake. caddy-l4 itself does not cut connections it already accepted.
+  At ~18 reloads/s: 2,053 of 33,241 exec-stream dials failed (1,765
+  `unexpected EOF`); with a 20 ms RTT the resets dominate. The static routes:
+  0 of 20,410. Neither mechanism has a Caddy knob, so the only fix is not
+  reloading.
 - **Background (why the flag exists):** seen in T19 S6 (UC-09). A TLS dial
   to the apex was reset 0.5s in, after another test's route DELETE made
   Caddy reload, and every route change reloads the whole config, including
