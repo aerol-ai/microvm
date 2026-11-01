@@ -53,6 +53,7 @@ image-pull storm if the signals point there.
 | `SandboxdOwnerForwardErrors` | Check owner node health and advertise URLs. | many sandboxes fail cross-node operations. |
 | `SandboxdSecretDecryptErrors` | Check credential encryption key consistency. | failover/recreate workloads cannot start. |
 | `SandboxdAPIListShedding` | Find who polls lists; check owner list latency. | the shed rate keeps rising, or other routes slow down too. |
+| `SandboxdAPIListTenantRateLimited` | Name the tenant in `/debug/vars` `api_list_gate`; ask it to slow down. | other tenants see `503` too (then it is `SandboxdAPIListShedding`). |
 
 ## Control Plane Checks
 
@@ -136,6 +137,25 @@ either: `journalctl -t sandboxd-healthcheck` shows a restart only after 3
 failed liveness probes in a row over 90 s. Spread the clients across more
 ingress nodes, slow the pollers down, or raise the limit on nodes with more
 CPU.
+
+The slots are shared fairly: a tenant (the team or account a credential acts
+for; every unscoped caller is `operator`) holds at most
+`SB_API_LIST_MAX_INFLIGHT_PER_TENANT` of them (a quarter by default), and
+past that its lists get `429` with code `rate_limited`
+(`aerolvm_api_list_rate_limited_total`, alert
+`SandboxdAPIListTenantRateLimited`) while other tenants keep their share. So
+a `503` means several tenants are busy at once or owners are slow, and a `429`
+names one noisy tenant. To find it:
+
+```bash
+curl -s -H "Authorization: Bearer $SB_PAT_TOKEN" http://127.0.0.1:21212/debug/vars | jq .api_list_gate
+```
+
+`busiest` lists the tenants holding or waiting for a slot, most refused first
+(`refused` counts since the tenant last went idle). Ask that tenant to poll
+less often and honour `Retry-After`. Raise its share only for a legitimate
+bursty client; `SB_API_LIST_MAX_INFLIGHT_PER_TENANT=0` turns the per-tenant
+share off (one tenant may then take every slot again).
 
 ## Secret Failure Checks
 
