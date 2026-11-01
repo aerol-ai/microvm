@@ -191,3 +191,45 @@ func median(v []time.Duration) time.Duration {
 	}
 	return s[len(s)/2]
 }
+
+// TestKernelClearAddress: on real nftables, clearing an address removes
+// every rule keyed by it (block-all pair, ingress block, hold, a CIDR
+// policy and its input rules) and nothing else: not another sandbox's
+// allowlist naming it, not another address's rules.
+func TestKernelClearAddress(t *testing.T) {
+	freshFilter(t)
+	m := kernelManager(t, true)
+	const ip, other = "10.97.0.2", "10.97.0.3"
+	for _, a := range []string{ip, other} {
+		if err := m.BlockAllEgress(a); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.BlockAllIngress(a); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.HoldEgress(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.ApplyEgressPolicy(ip, []string{"1.1.1.0/24"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ApplyEgressPolicy(other, []string{ip + "/32"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := iptablesS(t, ChainAerolvmUser, ChainAerolvmInput)
+	if err := m.ClearAddress(ip); err != nil {
+		t.Fatal(err)
+	}
+	after := iptablesS(t, ChainAerolvmUser, ChainAerolvmInput)
+	for _, line := range strings.Split(after, "\n") {
+		if strings.Contains(line, "-s "+ip+"/32") || (strings.Contains(line, "-d "+ip+"/32") && !strings.Contains(line, "-s ")) {
+			t.Fatalf("a rule keyed by %s is left:\n%s", ip, after)
+		}
+	}
+	for _, line := range strings.Split(before, "\n") {
+		if strings.Contains(line, "-s "+other+"/32") && !strings.Contains(after, line) {
+			t.Fatalf("%s's rule %q went with %s:\n%s", other, line, ip, after)
+		}
+	}
+}

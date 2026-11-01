@@ -514,3 +514,96 @@ func TestGatewayReleaserScope(t *testing.T) {
 		t.Fatal("no releaser without the feature")
 	}
 }
+
+// TestSandboxdDeadBetweenBlockAndReleaseStaysShut: a create whose gateway
+// attach never comes (a sandboxd killed between the driver's block and the
+// lift looks the same from the address) leaves the workload running behind
+// the block, with no release in the set, until the create is undone.
+func TestSandboxdDeadBetweenBlockAndReleaseStaysShut(t *testing.T) {
+	for _, shape := range earlyShapes {
+		t.Run(shape, func(t *testing.T) {
+			h := newEarlyHarness(t, shape)
+			stuck := make(chan struct{})
+			h.gw.beforeAttach = func(egress.Spec) error { <-stuck; return fmt.Errorf("%w: gone", egress.ErrUnavailable) }
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				_, err := h.svc.CreateSandbox(ctx, h.request())
+				done <- err
+			}()
+			var ip string
+			if !waitFor(5*time.Second, func() bool {
+				h.m.mu.Lock()
+				defer h.m.mu.Unlock()
+				for a := range h.m.running {
+					ip = a
+					return true
+				}
+				return false
+			}) {
+				t.Fatalf("the workload never started: %v", h.m.events)
+			}
+			// The gateway may enforce already (a full Sync carries the
+			// in-flight spec); the host firewall must hold it shut anyway,
+			// as nothing has lifted it.
+			h.m.mu.Lock()
+			shut := h.m.blocked[ip] && !h.m.released[ip]
+			h.m.mu.Unlock()
+			if !shut {
+				t.Fatalf("workload at %s runs without its block, or with a release, before any lift: %v", ip, h.m.events)
+			}
+			close(stuck)
+			if err := <-done; err == nil {
+				t.Fatal("create succeeded without the gateway")
+			}
+			h.m.assertClean(t)
+			h.m.assertNothingLeft(t)
+		})
+	}
+}
+
+// TestReusedAddressWithAStaleReleaseStaysShut: an address whose last owner
+// left a release in the set (a sandboxd killed after the lift, before the
+// address was let go) goes to a new restricted create: the new block takes
+// the release out, so the new workload starts shut.
+func TestReusedAddressWithAStaleReleaseStaysShut(t *testing.T) {
+	for _, shape := range earlyShapes {
+		t.Run(shape, func(t *testing.T) {
+			h := newEarlyHarness(t, shape)
+			ctx := context.Background()
+			first, err := h.svc.CreateSandbox(ctx, h.request())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.svc.DestroySandbox(ctx, first.ID); err != nil {
+				t.Fatal(err)
+			}
+			h.m.staleRelease(first.ContainerIP)
+			h.rt.waitAttach = h.gw.attachedCh
+			second, err := h.svc.CreateSandbox(ctx, h.request())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.ContainerIP != first.ContainerIP {
+				t.Fatalf("the address was not reused (%s, then %s)", first.ContainerIP, second.ContainerIP)
+			}
+			h.m.assertClean(t)
+			ip := second.ContainerIP
+			if b, s := h.m.index("block "+ip), h.m.index("start "+ip); b < 0 || s < 0 || b > s {
+				t.Fatalf("block %d start %d: %v", b, s, h.m.events)
+			}
+		})
+	}
+}
+
+func waitFor(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return cond()
+}

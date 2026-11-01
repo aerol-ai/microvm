@@ -145,12 +145,20 @@ func (s *Service) gatewayBridges(ctx context.Context) (bridges []egress.Bridge, 
 	if w := s.egressWired.Load(); w != nil && w.bridges != nil {
 		bridges, ok = w.bridges(ctx), true
 	}
-	if fc, isFC := s.firecracker.(interface{ EgressTapSubnet() (netip.Prefix, bool) }); isFC {
-		if subnet, on := fc.EgressTapSubnet(); on {
-			bridges, ok = append(bridges, egress.TapPoolBridge(subnet)), true
-		}
+	if subnet, on := s.tapPool(); on {
+		bridges, ok = append(bridges, egress.TapPoolBridge(subnet)), true
 	}
 	return bridges, ok
+}
+
+// tapPool is the Firecracker TAP subnet when the guests have a firewall:
+// the gateway's TAP pool bridge, and the block of host addresses (one per
+// guest TAP) the control-port guard covers whole.
+func (s *Service) tapPool() (netip.Prefix, bool) {
+	if fc, isFC := s.firecracker.(interface{ EgressTapSubnet() (netip.Prefix, bool) }); isFC {
+		return fc.EgressTapSubnet()
+	}
+	return netip.Prefix{}, false
 }
 
 // egressClient is the wired gateway client, nil until SetEgressGateway.

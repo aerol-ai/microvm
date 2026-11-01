@@ -365,8 +365,12 @@ func encodeElems(set string, list []Elem) ([]nftables.SetElement, error) {
 			el.Key = append(ip4(e.Src), ip4(e.Dst)...)
 			el.KeyEnd = append(ip4(srcEnd(e)), ip4(end)...)
 		case SetNodeControl:
+			end := e.DstEnd
+			if !end.IsValid() {
+				end = e.Dst
+			}
 			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
-			el.KeyEnd = append(append(ip4(srcEnd(e)), ip4(e.Dst)...), port4(e.Port)...)
+			el.KeyEnd = append(append(ip4(srcEnd(e)), ip4(end)...), port4(e.Port)...)
 		case SetAllowLearned, SetBinLearned, SetLearnFlows, SetRejectedFlows:
 			el.Key = append(append(ip4(e.Src), ip4(e.Dst)...), port4(e.Port)...)
 			el.Timeout = e.Timeout
@@ -415,6 +419,9 @@ func decodeElems(set string, raw []nftables.SetElement) []Elem {
 			}
 			if end := addrAt(r.KeyEnd, 0); end != e.Src {
 				e.SrcEnd = end
+			}
+			if end := addrAt(r.KeyEnd, 4); end.IsValid() && end != e.Dst {
+				e.DstEnd = end
 			}
 		case SetAllowLearned, SetBinLearned, SetLearnFlows, SetRejectedFlows:
 			e.Dst = addrAt(r.Key, 4)

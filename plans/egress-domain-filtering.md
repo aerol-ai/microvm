@@ -1278,6 +1278,13 @@ upstream_proxy:
     (`7002`) and Raft ports.
   - It is filled from gossip membership (debounced; up to 2000 members × 4
     ports) and dropped in forward for every sandbox.
+  - The Firecracker TAP subnet is a control pool: one entry per control
+    port with the whole subnet as the destination, not one per guest TAP
+    address. Per-address listing rewrote the whole set at every guest start
+    and stop, a 25 ms hold of the node's commit mutex on a 48-vCPU host
+    that a create's lift waited behind (UC-185 Firecracker p99 20 ms on the
+    bank flagship). An older gateway answers the pools op "unknown op" and
+    gets the per-address list.
   - It extends P0-5, which only protects the local host, to every node.
     Ingress `80`/`443` stays reachable, so agents keep using the API's
     load-balanced URL.
@@ -1797,6 +1804,22 @@ Phase 3 starts.
        one create left whose block-all goes on after the workload starts
        (runsc doesn't join a pause's namespace; on the containerd engine it
        uses the netns pool and is covered).
+     - **Amendment 2026-11-01 (perf/egress-lift-is-an-add).** Measured on
+       the bank flagship (kernel 6.8), the lift still cost about one RCU
+       grace period (every nf_tables commit that deletes waits one, 5.7 ms)
+       plus the chain listings (6 ms at 300 neighbours): 12 ms p50. The
+       block-all is now membership in two sets of the table
+       `ip aerolvm_block` (forward and input base chains drop
+       `ip saddr @blocked ip saddr != @released`): a block is an add to
+       @blocked (and deletes a release left at the address), the lift an
+       add to @released, and only letting an address go deletes (release
+       first), off the create path. Sets are read back at sandboxd start,
+       so a create killed between block and lift stays shut until reconcile
+       removes the orphan, and a stale release never opens a new owner.
+       In the kernel container: svc_egress_attach_unblock p50 72-74 us and
+       svc_egress_join p50 0 (p99 61-196 us) at 300 and 1000 neighbours
+       with churn, against 5.4 ms and 5.3 ms (and failed creates at 1000)
+       on the per-address rules.
    - **Measured, not estimated.**
      - `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` (the
        time the create actually waited) are recorded through
