@@ -38,6 +38,9 @@ func TestClassify(t *testing.T) {
 		{"wake circuit open", service.ErrWakeCircuitOpen, http.StatusServiceUnavailable, 60, "", ErrKindOther},
 		{"manually stopped", service.ErrSandboxManuallyStopped, http.StatusConflict, 0, "", ErrKindOther},
 		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
+		// A toolbox request whose sandbox stopped under it: 409, never a
+		// retryable 5xx (an SDK must not resend an exec that may have run).
+		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
 		// The service's refusal matches both sentinels; it keeps its code.
