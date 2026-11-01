@@ -1214,6 +1214,10 @@ func bankUnauthExec(t *testing.T, sb *microvm.Sandbox, host string) string {
 // the warm pool ran its agent with no token and served exec and files to any
 // caller that reached port 2280, so the node check runs on a template clone
 // as well as a cold boot.
+//
+// With no host firewall (local mode) sandboxes on one node can reach each
+// other by design, so there a container-to-container pair asserts the
+// agent's refusal (401 without the token) instead of unreachability.
 func TestBankToolboxAgentUnreachable(t *testing.T) {
 	harness.Require(t, sc, "UC-339")
 	c := client(t)
@@ -1237,6 +1241,24 @@ func TestBankToolboxAgentUnreachable(t *testing.T) {
 				}
 				a := peer{rt: rt, sb: sb}
 				if !bankTCPOpen(t, a.sb, v.ip, bankToolboxPort) {
+					return
+				}
+				if sc.Has(harness.CapNoHostFirewall) {
+					// No host firewall (local mode): nothing on the network
+					// separates sandboxes on one node, so the port being
+					// reachable is the documented state of this mode (UC-318
+					// skips for the same reason). The agent's own token check
+					// is then the only wall, and it must hold.
+					status := bankUnauthExec(t, a.sb, v.ip)
+					if f := strings.Fields(status); len(f) < 2 || f[1] != "401" {
+						t.Errorf("no host firewall: sandbox %s (%s) reaches sandbox %s's (%s) toolbox agent at %s:%d, and an exec without its token answered %q, want 401",
+							a.sb.ID, a.rt.name, v.sb.ID, v.rt.name, v.ip, bankToolboxPort, status)
+						if len(f) >= 2 && strings.HasPrefix(f[1], "2") {
+							t.Errorf("CRITICAL: sandbox %s ran a command in sandbox %s without its token (%s)", a.sb.ID, v.sb.ID, status)
+						}
+						return
+					}
+					t.Logf("no host firewall: %s reaches %s's toolbox agent, which refuses an exec without its token (%s)", a.sb.ID, v.sb.ID, status)
 					return
 				}
 				t.Errorf("sandbox %s (%s) opens a connection to sandbox %s's (%s) toolbox agent at %s:%d",
