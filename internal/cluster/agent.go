@@ -170,6 +170,9 @@ type Agent struct {
 	recreator        SandboxRecreator
 	recreateFailures *recreateFailureTracker
 	ownerWatcherStop context.CancelFunc
+	// pageReads coalesces concurrent identical placement-page reads
+	// (PlacementPage).
+	pageReads freshFlight[PlacementPageResponse]
 	// ownedRecoveryCursor resumes the owner-index walk on the next tick. Only
 	// the owner-watcher goroutine touches it. It exists so a page budget can
 	// bound one tick's work without the walk losing its place — the reason
@@ -1243,8 +1246,28 @@ func (a *Agent) shardCacheEntryCount() int {
 	return len(a.shardCache)
 }
 
+// PlacementPage reads one page of the placement index from the control
+// plane. Concurrent identical reads share one control-plane request
+// (freshFlight): every GET /v1/sandboxes on an ingress or worker makes one,
+// and on the bank flagship 512 concurrent lists on one ingress made 512
+// concurrent mTLS requests to the servers, whose handshakes starved the
+// node. A shared answer still comes from a read that began after the
+// caller's own request, so coalescing adds no staleness. Each caller gets
+// its own copy of the rows slice (some redact fields in place); the rows'
+// own slices are shared and must not be modified.
 func (a *Agent) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	req = req.Normalize()
+	// A struct of strings, ints and a slice of ints: Marshal cannot fail.
+	key, _ := json.Marshal(req)
+	page, _, _ := a.pageReads.do(string(key), func() (PlacementPageResponse, error) {
+		return a.fetchPlacementPage(req), nil
+	})
+	page.Placements = slices.Clone(page.Placements)
+	page.SkippedSandboxIDs = slices.Clone(page.SkippedSandboxIDs)
+	return page
+}
+
+func (a *Agent) fetchPlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	ctx, cancel := context.WithTimeout(context.Background(), controlPlanePlacementRequestTimeout)
 	defer cancel()
 	var out PlacementPageResponse
