@@ -852,7 +852,7 @@ var Registry = []UseCase{
 	// runs on every shell runtime the scenario has (runc, gVisor, Firecracker).
 	{ID: "UC-317", Title: "Security: cloud instance metadata (169.254.169.254, ECS/EKS credential endpoints) is unreachable from every sandbox, even when its own allowlist names it", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-318", Title: "Security: one sandbox cannot connect to another sandbox's listener on the same node (no lateral movement on open egress)", Requires: []Capability{CapDocker}, Implemented: true},
-	{ID: "UC-319", Title: "Security: every TCP port the node listens on is unreachable from a default sandbox on the gateway, private and public addresses (web ports and DNS excepted)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-319", Title: "Security: a sandbox is default-denied from its own node: every TCP port the node listens on, and DNS over UDP, is unreachable on the gateway and private addresses except the node guard's documented allowlist (ingress 80/443, the egress gateway's DNS/proxy for gateway-mode sandboxes)", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-320", Title: "Security: a fork bomb stops at the sandbox's process limit; the sandbox, a neighbour and the node stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-321", Title: "Security: a memory bomb is killed inside the sandbox at its requested limit; the sandbox and a neighbour stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-322", Title: "Security: a disk fill stops at the sandbox's disk size; the node keeps its free space", Requires: []Capability{CapDocker}, Implemented: true},

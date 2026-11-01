@@ -290,6 +290,19 @@ reads it for the internal zone, its copy of the floor and the proxy.
   list to the gateway (`node_control` set) and refreshes it as membership
   changes. A tool inside a sandbox that called a node's `:21212` directly
   now times out; point it at the ingress URL, or set the guard to `false`.
+  Setting it to `false` never opens the sandbox's own node: the node guard
+  below holds that.
+- **Node guard (always on, no file needed).** Sandboxes are default-denied
+  from the node they run on: every new connection from a sandbox subnet to
+  any node address is dropped by `AEROLVM-NODE` (the first rule of `INPUT`,
+  one `AEROLVM-NODE-<8 hex>-A|B` chain per sandbox subnet), except the
+  gateway's DNS and proxy ports, DNS on a node address the sandboxes'
+  resolver names, 80/443 on an ingress node, and `SB_SANDBOX_NODE_PORTS_ALLOW`.
+  WASM and isolate get the same rule in their dial guard. Check it with
+  `sudo iptables -S AEROLVM-NODE` and the chain it jumps to; the
+  `aerolvm_node_guard_ready` expvar is 1 per runtime that has it. sandboxd
+  re-asserts it every 30 s; a runtime where it cannot be installed refuses
+  creates with 503 `node_guard_not_ready` and logs why.
 
 ## Inspection
 

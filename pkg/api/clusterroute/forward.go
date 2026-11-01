@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 )
 
 // ErrorWriter renders one error in the calling facade's envelope.
@@ -74,17 +75,35 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 				return
 			}
 		}
+		// serveLocal hands the request to the local handler, whose answer
+		// for an id with no local row is 404. While this node's placement
+		// view is catching up after a restart that 404 is a guess: the
+		// placement (or the move away from this node) may simply not have
+		// been applied here yet. Serve a row this node holds; for one it
+		// does not, answer 503 + Retry-After instead of a false "gone".
+		serveLocal := func(localID string) {
+			if !cluster.CaughtUp(c) && !svc.HasLocalSandbox(r.Context(), localID) {
+				WriteNotCaughtUp(w, write)
+				return
+			}
+			local.ServeHTTP(w, r)
+		}
+		localID := id
 		owner, err := c.OwnerOf(id)
 		if errors.Is(err, cluster.ErrUnknownSandbox) && opts.ResolveName {
 			// Per-owner name, resolved in the caller's namespace — the same
 			// one the owner node's resolver uses.
-			_, owner, err = c.OwnerOfName(service.OwnerRefForCreate(r.Context()), id)
+			var resolved string
+			resolved, owner, err = c.OwnerOfName(service.OwnerRefForCreate(r.Context()), id)
+			if err == nil && strings.TrimSpace(resolved) != "" {
+				localID = resolved
+			}
 		}
 		switch {
 		case errors.Is(err, cluster.ErrUnknownSandbox):
 			// Not a cluster-known sandbox: let the local handler answer
 			// (it decides 404, or serves a local-only row).
-			local.ServeHTTP(w, r)
+			serveLocal(localID)
 			return
 		case errors.Is(err, cluster.ErrOrphaned):
 			// The owner died and was evicted; the placement points nowhere.
@@ -97,7 +116,7 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			return
 		}
 		if owner.IsSelf {
-			local.ServeHTTP(w, r)
+			serveLocal(localID)
 			return
 		}
 		if owner.APIURL == "" && owner.InternalURL == "" {
@@ -116,4 +135,15 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		}
 		c.ForwardHTTP(cluster.Endpoint{NodeID: owner.NodeID, InternalURL: owner.InternalURL, APIURL: owner.APIURL}, w, r)
 	})
+}
+
+// WriteNotCaughtUp answers a request whose truthful answer this node cannot
+// give yet: its placement view is catching up after a restart, so "not
+// found" would be a guess (cluster.ErrNotCaughtUp). 503 + Retry-After from
+// the shared classification, in the caller's error envelope.
+func WriteNotCaughtUp(w http.ResponseWriter, write ErrorWriter) {
+	cluster.RecordNotCaughtUpReject()
+	cls := apihttp.Classify(cluster.ErrNotCaughtUp)
+	cls.SetRetryAfter(w)
+	write(w, cls.Status, cls.Message)
 }
