@@ -27,6 +27,9 @@ caddy_shared_cert_storage = {
 
 secret_kms_enabled     = true
 secret_kms_strict_boot = true
+# Enterprise mode refuses a plaintext server key next to a key store
+# (plans/customer-key-custody.md §7, Phase 7): built wrapped from the start.
+key_custody = "wrapped"
 
 # Constraints 2+3: the receiver is the off-node, https sink.
 audit_receiver_enabled = true

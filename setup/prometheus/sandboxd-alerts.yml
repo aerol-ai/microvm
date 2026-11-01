@@ -669,7 +669,7 @@ groups:
           component: key-custody
         annotations:
           summary: "sandboxd enterprise node keeps its server key in plaintext"
-          description: "{{ $labels.instance }} runs SB_ENTERPRISE_MODE=true with the server key as {{ $labels.key2 }}. Wrap it with `sandboxd key wrap` and set SB_CREDENTIAL_KEY_CUSTODY=wrapped; the next release refuses this."
+          description: "{{ $labels.instance }} runs SB_ENTERPRISE_MODE=true with the server key as {{ $labels.key2 }}. Move it to a customer key store (SB_SECRET_PROVIDER), then wrap it with `sandboxd key wrap` and set SB_CREDENTIAL_KEY_CUSTODY=wrapped."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#server-key-in-plaintext"
 
       # The customer's key store revoked the key and this node stopped
