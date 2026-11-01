@@ -6,6 +6,7 @@ import (
 	"net/netip"
 
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -132,6 +133,25 @@ func (d *Driver) ClearEgressHold(containerIP string) error {
 		return nil
 	}
 	return d.networkRules.ClearHoldEgress(containerIP)
+}
+
+var _ sbruntime.NodeGuardSetter = (*Driver)(nil)
+
+// SetNodeGuard default-denies the CNI bridge subnet from the node itself,
+// except allow (netrules ChainAerolvmNode).
+func (d *Driver) SetNodeGuard(_ context.Context, allow []netrules.NodePort) error {
+	if d.networkRules == nil || !d.networkRules.Enabled() {
+		return sbruntime.ErrNodeGuardUnavailable
+	}
+	return d.networkRules.SetNodeGuard(d.networkRules.BridgeSubnet(), allow)
+}
+
+// ReassertNodeGuard puts the guard back if something removed it.
+func (d *Driver) ReassertNodeGuard(context.Context) (bool, error) {
+	if d.networkRules == nil {
+		return false, nil
+	}
+	return d.networkRules.ReassertNodeGuard()
 }
 
 // SetEgressFloor installs the operator's node-wide deny floor for the CNI

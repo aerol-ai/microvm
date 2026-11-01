@@ -1283,6 +1283,23 @@ upstream_proxy:
     load-balanced URL.
   - **Behavior change** for no-policy sandboxes that call a node's `:21212`
     directly. The PR calls it out, and an operator can set `false`.
+- **Node guard** (always on, no file setting; bank-readiness UC-319).
+  - The control-port guard enumerates ports, so every other service on a
+    node (EDR, log shipper, node exporter, SIEM forwarder) stayed open to
+    every default sandbox on the bridge gateway and node addresses.
+  - Sandboxes are now default-denied from their own node: `AEROLVM-NODE`,
+    jumped from the top of `INPUT`, returns established traffic, then jumps
+    each sandbox subnet to its own chain (`AEROLVM-NODE-<hash>-A|B`, swapped
+    on change so it is never open) with an allowlist and a final drop.
+  - Allowlist: the gateway's DNS/proxy ports (when it runs; the ports it
+    reports listening on), DNS on a node address the sandboxes' resolver
+    names, 80/443 on an ingress node, and `SB_SANDBOX_NODE_PORTS_ALLOW`
+    (refused in enterprise mode, never a control port).
+  - WASM and isolate get it in the shared dial guard (`CheckNode`); the
+    gateway's own dials allow no node port (D7).
+  - Re-asserted every 30 s; a runtime without it refuses creates (503
+    `node_guard_not_ready`). `node_control_port_guard` keeps covering the
+    other members' control ports in forward.
 
 **PC-3 Org profiles and the built-in switch (Phase 2, P2-10).**
 - **Org profiles.**

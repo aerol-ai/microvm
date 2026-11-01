@@ -1441,6 +1441,12 @@ const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 // runtime that filters egress itself (wasm, isolate).
 const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
 
+// ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's guard that keeps
+// sandboxes off the node's own services is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
 // classes (plans/customer-key-custody.md, eng review Section 2). The response

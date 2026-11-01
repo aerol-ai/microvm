@@ -146,12 +146,21 @@ func bankNeighbour(t *testing.T, rt bankRuntime, of *microvm.Sandbox) (*microvm.
 	if targets != nil && len(targets.Nodes) > 1 {
 		ofNode = bankSandboxNode(t, targets, of).Name
 	}
+	// Misses stay up until there is a hit: placement spreads new sandboxes
+	// onto the least-loaded node, so destroying each miss at once sends every
+	// retry to the same other node and never lands next to of.
+	var misses []string
+	defer func() {
+		for _, id := range misses {
+			destroyBest(c, id)
+		}
+	}()
 	for i := 0; i < 8; i++ {
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		if (ofNode == "" || bankSandboxNode(t, targets, sb).Name == ofNode) && containerIP(t, c, sb) != ofIP {
 			return sb, true
 		}
-		destroyBest(c, sb.ID)
+		misses = append(misses, sb.ID)
 	}
 	return nil, false
 }
@@ -251,56 +260,214 @@ func TestBankNoLateralMovement(t *testing.T) {
 	})
 }
 
-// UC-319 — host services are unreachable from a default sandbox: every TCP
-// port the node listens on is probed from inside the sandbox on its
-// gateway and the node's private address. Only the public web ports (80,
-// 443) and DNS may answer. The node's public address is left out: a
-// sandbox reaches it through NAT, as any internet client does, so what
-// answers there is the public attack surface (UC-328), not a sandbox hole.
+// UC-319 — a sandbox is default-denied from the node it runs on (the node
+// guard, docs: engineering-network-defenses "The server itself"). Every TCP
+// port the node listens on is probed from inside the sandbox on its gateway
+// and on the node's private address, and only the documented allowlist may
+// answer:
+//   - a default sandbox: 80/443 on a node that serves ingress, DNS on a node
+//     address the sandbox's resolver names, and SB_SANDBOX_NODE_PORTS_ALLOW.
+//     The egress gateway's DNS and proxy ports are open to the subnet in the
+//     host firewall but closed by the gateway itself to a sandbox that does
+//     not use it, so they must not answer here;
+//   - a sandbox with a name allow list (it uses the gateway): only what the
+//     gateway redirects (53, 80, 443) and its own DNS and proxy ports.
+//
+// DNS is probed over UDP too: a default sandbox gets no answer from the node
+// on 53 or the gateway's DNS port, and a gateway-mode sandbox resolves an
+// allowed name through the gateway (the allowlisted path the guard must keep
+// open). The node's public address is left out: a sandbox reaches it through
+// NAT, as any internet client does, so what answers there is the public
+// attack surface (UC-328), not a sandbox hole.
 func TestBankHostServicesUnreachable(t *testing.T) {
 	harness.Require(t, sc, "UC-319")
 	targets := bankTargets(t)
 	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		node := bankSandboxNode(t, targets, sb)
-		out := nodeSSH(t, node, `sudo ss -H -ltn | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | tr '\n' ' '`)
-		// 80/443 answer the internet anyway; 53 is the sandbox's resolver
-		// when the node serves DNS to its sandboxes.
-		allowed := map[int]bool{53: true, 80: true, 443: true}
-		var ports []int
-		for _, f := range strings.Fields(out) {
-			if p, err := strconv.Atoi(f); err == nil && !allowed[p] {
-				ports = append(ports, p)
-			}
-		}
-		if len(ports) == 0 {
-			t.Fatalf("no listening ports read from %s: %q", node.Name, out)
-		}
+		guard := bankNodeGuardAllow(t, node)
+		ports := bankListeningTCP(t, node)
 		gw := bankGateway(t, sb)
 		addrs := []string{gw}
-		for _, a := range []string{node.PrivateIP} {
-			if a != "" && a != gw {
-				addrs = append(addrs, a)
+		if a := node.PrivateIP; a != "" && a != gw {
+			addrs = append(addrs, a)
+		}
+		t.Logf("node %s listens on %v (probed on %v); allowlist: %s", node.Name, ports, addrs, guard)
+
+		open := bankOpenPorts(t, sb, addrs, ports)
+		for _, ap := range open {
+			if !guard.defaultMayReach(ap) {
+				t.Errorf("a default sandbox reaches %s on node %s, which the node guard does not allow", ap, node.Name)
 			}
 		}
-		var script strings.Builder
+		t.Logf("a default sandbox reaches (allowlisted): %v", open)
 		for _, a := range addrs {
-			for _, p := range ports {
-				fmt.Fprintf(&script, "nc -z -w 2 %s %d && echo OPEN %s:%d; ", a, p, a, p)
+			for _, p := range []int{53, guard.gatewayDNS} {
+				if bankUDPDNSAnswers(t, sb, a, p) && !(p == 53 && guard.dns[a]) {
+					t.Errorf("a default sandbox gets a DNS answer from node %s at %s:%d over UDP", node.Name, a, p)
+				}
 			}
 		}
-		got, _ := bankRun(t, sb, script.String()+"true", 10*time.Minute)
-		var open []string
-		for _, line := range strings.Split(got, "\n") {
-			if strings.HasPrefix(line, "OPEN ") {
-				open = append(open, strings.TrimPrefix(line, "OPEN "))
+
+		if !sc.Has(harness.CapEgressFQDN) {
+			return
+		}
+		// A sandbox that uses the gateway: its DNS and proxy pass the guard,
+		// nothing else on the node does.
+		gwsb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{"example.com"}})
+		if out, rc := bankRun(t, gwsb, "nslookup example.com", time.Minute); rc != 0 {
+			t.Errorf("a gateway-mode sandbox could not resolve an allowed name through the gateway (the guard must keep its DNS port open): %s", out)
+		}
+		if _, rc := bankRun(t, gwsb, "nslookup not-allowed-"+strconv.FormatInt(time.Now().UnixNano(), 36)+".example.org >/dev/null 2>&1", time.Minute); rc == 0 {
+			t.Errorf("a gateway-mode sandbox resolved a name outside its allow list")
+		}
+		gwOpen := bankOpenPorts(t, gwsb, []string{bankGateway(t, gwsb)}, ports)
+		for _, ap := range gwOpen {
+			if !guard.gatewayModeMayReach(ap) {
+				t.Errorf("a gateway-mode sandbox reaches %s on node %s, which neither the gateway nor the node guard allows", ap, node.Name)
 			}
 		}
-		t.Logf("node %s listens on %v (probed on %v)", node.Name, ports, addrs)
-		if len(open) > 0 {
-			t.Errorf("a default sandbox reaches host services on %s: %v", node.Name, open)
-		}
+		t.Logf("a gateway-mode sandbox reaches: %v", gwOpen)
 	})
+}
+
+// bankNodeGuard is a node's node-guard allowlist, read from its settings
+// the way sandboxd computes it (internal/service/node_guard.go).
+type bankNodeGuard struct {
+	ingress      bool            // 80 and 443: the node serves public URLs
+	dns          map[string]bool // node addresses the sandbox resolver names (53)
+	hatch        map[int]bool    // SB_SANDBOX_NODE_PORTS_ALLOW (tcp)
+	gatewayDNS   int
+	gatewayProxy int
+}
+
+func (g bankNodeGuard) String() string {
+	return fmt.Sprintf("ingress=%v dns=%v hatch=%v gateway=%d/%d", g.ingress, g.dns, g.hatch, g.gatewayDNS, g.gatewayProxy)
+}
+
+// defaultMayReach: what a sandbox with no policy may open on its node.
+func (g bankNodeGuard) defaultMayReach(addrPort string) bool {
+	host, p, _ := net.SplitHostPort(addrPort)
+	port, _ := strconv.Atoi(p)
+	return (g.ingress && (port == 80 || port == 443)) || (port == 53 && g.dns[host]) || g.hatch[port]
+}
+
+// gatewayModeMayReach: a gateway-mode sandbox's 53, 80 and 443 are
+// redirected to the gateway's listeners, which it may also dial directly.
+func (g bankNodeGuard) gatewayModeMayReach(addrPort string) bool {
+	_, p, _ := net.SplitHostPort(addrPort)
+	port, _ := strconv.Atoi(p)
+	return port == 53 || port == 80 || port == 443 || port == g.gatewayDNS || port == g.gatewayProxy
+}
+
+func bankNodeGuardAllow(t *testing.T, node harness.IntegrationNode) bankNodeGuard {
+	t.Helper()
+	out := nodeSSH(t, node, `env=$(sudo sh -c 'cat /etc/sandboxd/*.env 2>/dev/null')
+val() { printf '%s\n' "$env" | sed -n "s/^$1=//p" | tail -1 | tr -d '"'; }
+echo "role=$(val SB_NODE_ROLE)"
+echo "caddy=$(val SB_ENABLE_CADDY)"
+echo "hatch=$(val SB_SANDBOX_NODE_PORTS_ALLOW)"
+echo "gwdns=$(sudo sed -n 's/^SB_EGRESS_DNS_PORT=//p' /etc/sandboxd/egress-gateway.env 2>/dev/null | tail -1)"
+echo "gwproxy=$(sudo sed -n 's/^SB_EGRESS_PROXY_PORT=//p' /etc/sandboxd/egress-gateway.env 2>/dev/null | tail -1)"
+echo "addrs=$(ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ')"
+echo "ns=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf /run/systemd/resolve/resolv.conf 2>/dev/null | tr '\n' ' ')"`)
+	kv := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), "="); ok {
+			kv[k] = strings.TrimSpace(v)
+		}
+	}
+	role := strings.ToLower(kv["role"])
+	g := bankNodeGuard{
+		ingress:      (role == "" || strings.Contains(role, "mixed") || strings.Contains(role, "ingress")) && kv["caddy"] != "false",
+		dns:          map[string]bool{},
+		hatch:        map[int]bool{},
+		gatewayDNS:   53054,
+		gatewayProxy: 15080,
+	}
+	if n, err := strconv.Atoi(kv["gwdns"]); err == nil {
+		g.gatewayDNS = n
+	}
+	if n, err := strconv.Atoi(kv["gwproxy"]); err == nil {
+		g.gatewayProxy = n
+	}
+	for _, f := range strings.Split(kv["hatch"], ",") {
+		port, proto, _ := strings.Cut(strings.TrimSpace(f), "/")
+		if n, err := strconv.Atoi(port); err == nil && (proto == "" || proto == "tcp") {
+			g.hatch[n] = true
+		}
+	}
+	local := map[string]bool{}
+	for _, a := range strings.Fields(kv["addrs"]) {
+		local[a] = true
+	}
+	for _, ns := range strings.Fields(kv["ns"]) {
+		if local[ns] && !strings.HasPrefix(ns, "127.") {
+			g.dns[ns] = true
+		}
+	}
+	return g
+}
+
+// bankListeningTCP is every TCP port the node listens on, on any address.
+func bankListeningTCP(t *testing.T, node harness.IntegrationNode) []int {
+	t.Helper()
+	out := nodeSSH(t, node, `sudo ss -H -ltn | awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un | tr '\n' ' '`)
+	var ports []int
+	for _, f := range strings.Fields(out) {
+		if p, err := strconv.Atoi(f); err == nil {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) == 0 {
+		t.Fatalf("no listening ports read from %s: %q", node.Name, out)
+	}
+	return ports
+}
+
+// bankOpenPorts returns the addr:port pairs sb can open a TCP connection to.
+func bankOpenPorts(t *testing.T, sb *microvm.Sandbox, addrs []string, ports []int) []string {
+	t.Helper()
+	var script strings.Builder
+	for _, a := range addrs {
+		for _, p := range ports {
+			fmt.Fprintf(&script, "nc -z -w 2 %s %d && echo OPEN %s; ", a, p, net.JoinHostPort(a, strconv.Itoa(p)))
+		}
+	}
+	got, _ := bankRun(t, sb, script.String()+"true", 15*time.Minute)
+	var open []string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "OPEN ") {
+			open = append(open, strings.TrimSpace(strings.TrimPrefix(line, "OPEN ")))
+		}
+	}
+	sort.Strings(open)
+	return open
+}
+
+// bankDNSQuery is a DNS query for example.com/A, as printf octal escapes
+// (busybox printf has no \x).
+func bankDNSQuery() string {
+	q := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
+	for _, label := range []string{"example", "com"} {
+		q = append(q, byte(len(label)))
+		q = append(q, label...)
+	}
+	q = append(q, 0, 0, 1, 0, 1)
+	var b strings.Builder
+	for _, c := range q {
+		fmt.Fprintf(&b, "\\%03o", c)
+	}
+	return b.String()
+}
+
+// bankUDPDNSAnswers reports whether a DNS query over UDP from sb to
+// addr:port gets any answer.
+func bankUDPDNSAnswers(t *testing.T, sb *microvm.Sandbox, addr string, port int) bool {
+	t.Helper()
+	out, _ := bankRun(t, sb, fmt.Sprintf("printf '%s' | nc -u -w 2 %s %d | wc -c", bankDNSQuery(), addr, port), time.Minute)
+	n, _ := strconv.Atoi(strings.TrimSpace(out))
+	return n > 0
 }
 
 // UC-320 — a fork bomb is contained: the sandbox has a process limit, its

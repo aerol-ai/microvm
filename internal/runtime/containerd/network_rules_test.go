@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 )
 
@@ -174,4 +175,53 @@ func TestDriverNetRulesEnabled(t *testing.T) {
 	if !New(Config{}, netrules.NewWithBackend(&netrulesFailInsertBackend{}), nil).NetRulesEnabled() {
 		t.Fatal("live manager reported disabled")
 	}
+}
+
+// TestDriverNodeGuardUsesTheCNISubnet: the node guard covers the CNI
+// bridge's subnet; a driver without a firewall reports the guard as
+// unavailable rather than pretending it is in place.
+func TestDriverNodeGuardUsesTheCNISubnet(t *testing.T) {
+	ctx := context.Background()
+	if err := New(Config{}, nil, nil).SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("no rules manager: %v", err)
+	}
+	off, err := netrules.New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(Config{}, off, nil).SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("rules disabled: %v", err)
+	}
+	if repaired, err := New(Config{}, nil, nil).ReassertNodeGuard(ctx); repaired || err != nil {
+		t.Fatal("no rules manager: nothing to re-assert")
+	}
+	be := &nodeMemBackend{}
+	mgr := netrules.NewWithBackend(be)
+	mgr.SetBridgeSubnet("10.88.0.0/16")
+	d := New(Config{}, mgr, nil)
+	if err := d.SetNodeGuard(ctx, []netrules.NodePort{{Proto: "udp", Port: 53054}}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(be.rules, "\n")
+	if !strings.Contains(joined, "-s|10.88.0.0/16|-p|udp|--dport|53054") || !strings.Contains(joined, "-s|10.88.0.0/16|-m|comment|--comment|sbx-node-guard|-j|DROP") {
+		t.Fatalf("node guard rules = %v", be.rules)
+	}
+	if _, err := d.ReassertNodeGuard(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// nodeMemBackend flushes one chain at a time, as the kernel does.
+type nodeMemBackend struct{ netrulesMemBackend }
+
+func (n *nodeMemBackend) EnsureJumpChain(string, string) error { return nil }
+func (n *nodeMemBackend) FlushChain(chain string) error {
+	kept := n.rules[:0]
+	for _, r := range n.rules {
+		if !strings.HasPrefix(r, "filter|"+chain+"|") {
+			kept = append(kept, r)
+		}
+	}
+	n.rules = kept
+	return nil
 }

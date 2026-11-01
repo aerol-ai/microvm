@@ -16,6 +16,7 @@ import (
 	"errors"
 	"net/netip"
 
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -139,6 +140,23 @@ type NetRulesReporter interface {
 type EgressFloorSetter interface {
 	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
 }
+
+// NodeGuardSetter is implemented by runtimes whose sandboxes reach the node
+// over a host bridge or TAP subnet (containers, gVisor, Firecracker): it
+// default-denies every sandbox on that subnet from the node itself, except
+// allow (pkg/docker/netrules ChainAerolvmNode). WASM and isolate sandboxes
+// dial from host processes and are held off the node by the dial guard
+// instead (egresspolicy.CheckNode).
+type NodeGuardSetter interface {
+	SetNodeGuard(ctx context.Context, allow []netrules.NodePort) error
+	// ReassertNodeGuard puts back a guard something removed; repaired
+	// reports that it had to.
+	ReassertNodeGuard(ctx context.Context) (repaired bool, err error)
+}
+
+// ErrNodeGuardUnavailable means the runtime has no host firewall (network
+// rules are off), so nothing keeps its sandboxes off the node's services.
+var ErrNodeGuardUnavailable = errors.New("runtime: the host firewall is off; sandboxes can reach every service on this node")
 
 // WritableLayerSizer is a container engine that can say how much a
 // sandbox has written to its writable layer. Neither containerd's overlay

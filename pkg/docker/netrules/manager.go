@@ -93,6 +93,9 @@ type Manager struct {
 	// legacyFloorEmptied: the shared AEROLVM-FLOOR chain of an older daemon
 	// has been emptied (once per manager).
 	legacyFloorEmptied atomic.Bool
+	// nodeGuard is the subnet and allowlist SetNodeGuard last installed,
+	// which ReassertNodeGuard restores.
+	nodeGuard atomic.Pointer[nodeGuardState]
 }
 
 // topPos is the position of a rule that belongs at the top of the user

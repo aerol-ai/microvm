@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -44,6 +46,16 @@ func (f *fakeNetRules) ClearEgressPolicy(ip string, a, d []string) error {
 }
 func (f *fakeNetRules) SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error {
 	return f.rec("floor", subnet.String())
+}
+func (f *fakeNetRules) SetNodeGuard(subnet netip.Prefix, allow []netrules.NodePort) error {
+	var ports []string
+	for _, p := range allow {
+		ports = append(ports, p.String())
+	}
+	return f.rec("node-guard", subnet.String(), ports)
+}
+func (f *fakeNetRules) ReassertNodeGuard() (bool, error) {
+	return true, f.rec("node-guard-reassert", "")
 }
 
 func (f *fakeNetRules) has(prefix string) bool {
@@ -182,5 +194,35 @@ func TestGatewayGuestRules(t *testing.T) {
 	}
 	if firewallLists([]string{"bad entry"}, nil) {
 		t.Fatal("an invalid list is never handed to the firewall")
+	}
+}
+
+// TestFirecrackerNodeGuard: the TAP subnet gets the node guard through the
+// driver's firewall; without a firewall the service hears that the guard
+// is unavailable, not that it is in place.
+func TestFirecrackerNodeGuard(t *testing.T) {
+	ctx := context.Background()
+	d := New(Config{}, nil)
+	if err := d.SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("no firewall: %v", err)
+	}
+	if repaired, err := d.ReassertNodeGuard(ctx); repaired || err != nil {
+		t.Fatalf("no firewall, nothing to re-assert: %v %v", repaired, err)
+	}
+	rules := &fakeNetRules{}
+	d.SetNetRules(rules)
+	if err := d.SetNodeGuard(ctx, nil); err == nil {
+		t.Fatal("a firewall without a TAP subnet cannot place the guard")
+	}
+	d.SetTapSubnet(netip.MustParsePrefix("172.16.0.0/16"))
+	allow := []netrules.NodePort{{Proto: "tcp", Port: 15080}, {Proto: "udp", Port: 53054}}
+	if err := d.SetNodeGuard(ctx, allow); err != nil {
+		t.Fatal(err)
+	}
+	if !rules.has("node-guard 172.16.0.0/16 tcp/15080,udp/53054") {
+		t.Fatalf("calls = %v", rules.calls)
+	}
+	if repaired, err := d.ReassertNodeGuard(ctx); !repaired || err != nil || !rules.has("node-guard-reassert") {
+		t.Fatalf("re-assert goes to the firewall: %v %v %v", repaired, err, rules.calls)
 	}
 }

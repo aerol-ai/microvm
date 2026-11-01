@@ -11,6 +11,7 @@ package netrules
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
@@ -76,18 +77,47 @@ func neighbours(tb testing.TB, m *Manager, n int) {
 	}
 }
 
+// nodeGuarded installs the node guard (AEROLVM-NODE) for the bridge subnet
+// the way the service does at boot, through a manager of its own on the
+// real backend, and returns that manager and the guard's chains.
+func nodeGuarded(tb testing.TB) (*Manager, []string) {
+	tb.Helper()
+	g, err := NewWithOptions(true, BackendNetlink, ChainAerolvmUser)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	subnet := netip.MustParsePrefix("10.99.0.0/16")
+	if err := g.SetNodeGuard(subnet, []NodePort{{Proto: "udp", Port: 53}, {Proto: "tcp", Port: 15080}}); err != nil {
+		tb.Fatal(err)
+	}
+	pair := NodeChainsFor(subnet)
+	return g, []string{ChainAerolvmNode, pair[0], pair[1]}
+}
+
 // TestKernelBatchMatchesPerRule runs the same sequence on both paths and
 // compares the chains after each step, including a duplicate rule a past
-// race left (which the clear must sweep) and a re-block (idempotent).
+// race left (which the clear must sweep) and a re-block (idempotent). The
+// node guard is in place first, as on a node since #851: neither path may
+// change a rule of it, and INPUT must end up the same on both.
 func TestKernelBatchMatchesPerRule(t *testing.T) {
 	run := func(batch bool) []string {
 		freshFilter(t)
+		guard, guardChains := nodeGuarded(t)
+		guardBefore := iptablesS(t, guardChains...)
 		m := kernelManager(t, batch)
 		neighbours(t, m, 20)
 		var trace []string
 		snap := func(step string, ins bool, err error) {
-			trace = append(trace, fmt.Sprintf("== %s inserted=%v err=%v\n%s", step, ins, err, iptablesS(t, ChainAerolvmUser, ChainAerolvmInput)))
+			if got := iptablesS(t, guardChains...); got != guardBefore {
+				t.Fatalf("batch=%v %s changed the node guard:\n--- before\n%s\n--- after\n%s", batch, step, guardBefore, got)
+			}
+			trace = append(trace, fmt.Sprintf("== %s inserted=%v err=%v\n%s", step, ins, err, iptablesS(t, "INPUT", ChainAerolvmUser, ChainAerolvmInput)))
 		}
+		defer func() {
+			if repaired, err := guard.ReassertNodeGuard(); err != nil || repaired {
+				t.Fatalf("batch=%v: node guard not intact after the sequence: repaired=%v err=%v", batch, repaired, err)
+			}
+		}()
 		ins, err := m.BlockAllEgressReport("10.97.0.2")
 		snap("block", ins, err)
 		ins, err = m.BlockAllEgressReport("10.97.0.2")

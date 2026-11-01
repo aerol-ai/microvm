@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 )
 
 var _ runtime.IPOwnerResolver = (*Client)(nil)
@@ -76,6 +77,29 @@ func (c *Client) SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
 		return err
 	}
 	return c.networkRules.SetFloor(sn.Subnet, cidrs)
+}
+
+var _ runtime.NodeGuardSetter = (*Client)(nil)
+
+// SetNodeGuard default-denies the sandbox network's subnet from the node
+// itself, except allow (netrules ChainAerolvmNode).
+func (c *Client) SetNodeGuard(ctx context.Context, allow []netrules.NodePort) error {
+	if c.networkRules == nil || !c.networkRules.Enabled() {
+		return runtime.ErrNodeGuardUnavailable
+	}
+	sn, err := c.SandboxBridge(ctx)
+	if err != nil {
+		return err
+	}
+	return c.networkRules.SetNodeGuard(sn.Subnet, allow)
+}
+
+// ReassertNodeGuard puts the guard back if something removed it.
+func (c *Client) ReassertNodeGuard(context.Context) (bool, error) {
+	if c.networkRules == nil {
+		return false, nil
+	}
+	return c.networkRules.ReassertNodeGuard()
 }
 
 // ApplyEgressHold installs the fail-closed hold DROP (CEO D16).

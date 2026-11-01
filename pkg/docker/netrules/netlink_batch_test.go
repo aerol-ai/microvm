@@ -169,7 +169,7 @@ func (f *chainNFT) ListChains() ([]*nftables.Chain, error)     { return nil, nil
 func (f *chainNFT) AddChain(c *nftables.Chain) *nftables.Chain { return c }
 func (f *chainNFT) FlushChain(*nftables.Chain)                 {}
 
-func chainBackend(f *chainNFT) *netlinkBackend {
+func netlinkChainBackend(f *chainNFT) *netlinkBackend {
 	return &netlinkBackend{newConn: func() (nftAPI, error) { return f, nil }}
 }
 
@@ -186,7 +186,7 @@ func TestNetlinkDeleteAllOneListingOneCommit(t *testing.T) {
 	f.add(ChainAerolvmInput, inputBlockSpec("10.0.0.2")...)
 	f.add(ChainAerolvmInput, inputBlockSpec("10.0.0.9")...)
 	f.add(ChainAerolvmInput, inputPolicyDropSpec("10.0.0.2")...) // the allowlist's, not the block's
-	b := chainBackend(f)
+	b := netlinkChainBackend(f)
 	err := b.DeleteAll(
 		RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.2")},
 		RuleRef{Table: "filter", Chain: ChainAerolvmInput, Spec: inputBlockSpec("10.0.0.2")},
@@ -228,7 +228,7 @@ func TestNetlinkDeleteAllRetriesStaleBatch(t *testing.T) {
 	f := newChainNFT()
 	f.add(ChainAerolvmUser, dropSpec("10.0.0.2")...)
 	f.staleFlushes = 1
-	b := chainBackend(f)
+	b := netlinkChainBackend(f)
 	ref := RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.2")}
 	if err := b.DeleteAll(ref); err != nil {
 		t.Fatal(err)
@@ -288,7 +288,7 @@ func TestNetlinkBatchErrors(t *testing.T) {
 			if tc.prep != nil {
 				tc.prep(f)
 			}
-			if err := tc.run(chainBackend(f)); err == nil {
+			if err := tc.run(netlinkChainBackend(f)); err == nil {
 				t.Fatal("want an error")
 			}
 		})
@@ -303,7 +303,7 @@ func TestNetlinkEnsureAllPositions(t *testing.T) {
 	f.add(ChainAerolvmUser, dropSpec("10.0.0.9")...)
 	f.add(ChainAerolvmInput, "-s", "10.0.0.8", "-j", "RETURN") // stands in for the established-return
 	f.add(ChainAerolvmInput, inputBlockSpec("10.0.0.9")...)
-	b := chainBackend(f)
+	b := netlinkChainBackend(f)
 	got, err := b.EnsureAll(
 		RuleInsert{RuleRef: RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.2")}, Pos: 1},
 		RuleInsert{RuleRef: RuleRef{Table: "filter", Chain: ChainAerolvmInput, Spec: inputBlockSpec("10.0.0.2")}, Pos: 2},
@@ -342,7 +342,7 @@ func TestNetlinkEnsureAllRetriesStalePosition(t *testing.T) {
 	f.add(ChainAerolvmInput, "-s", "10.0.0.8", "-j", "RETURN")
 	f.add(ChainAerolvmInput, inputBlockSpec("10.0.0.9")...)
 	f.staleFlushes = 1
-	b := chainBackend(f)
+	b := netlinkChainBackend(f)
 	got, err := b.EnsureAll(RuleInsert{RuleRef: RuleRef{Table: "filter", Chain: ChainAerolvmInput, Spec: inputBlockSpec("10.0.0.2")}, Pos: 2})
 	if err != nil || !got[0] || f.gets[ChainAerolvmInput] != 2 || f.count(ChainAerolvmInput, inputBlockSpec("10.0.0.2")...) != 1 {
 		t.Fatalf("got %v err %v listings %v", got, err, f.gets)
@@ -374,7 +374,7 @@ func TestNetlinkManagerBatchMatchesPerRule(t *testing.T) {
 		f := newChainNFT()
 		f.add(ChainAerolvmInput, "-s", "10.0.0.8", "-j", "RETURN")
 		f.add(ChainAerolvmUser, dropSpec("10.0.0.2")...) // a leftover the clear must sweep with the new one
-		var be RuleBackend = chainBackend(f)
+		var be RuleBackend = netlinkChainBackend(f)
 		if !batch {
 			be = struct{ RuleBackend }{be} // hides DeleteAll/EnsureAll
 		}
@@ -406,7 +406,7 @@ func TestNetlinkBlockClearCost(t *testing.T) {
 		f.add(ChainAerolvmUser, dropSpec(fmt.Sprintf("10.0.1.%d", i+2))...)
 		f.add(ChainAerolvmInput, inputBlockSpec(fmt.Sprintf("10.0.1.%d", i+2))...)
 	}
-	m := &Manager{enabled: true, ipt: chainBackend(f), userChain: ChainAerolvmUser}
+	m := &Manager{enabled: true, ipt: netlinkChainBackend(f), userChain: ChainAerolvmUser}
 	m.inputReady.Store(true)
 	for _, step := range []struct {
 		name string
@@ -453,7 +453,7 @@ func TestNetlinkBatchConnAndListingEdges(t *testing.T) {
 		t.Fatal("a failed batch must apply nothing")
 	}
 	f.gets = map[string]int{}
-	if err := chainBackend(f).DeleteAll(ref, RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.3")}); err != nil {
+	if err := netlinkChainBackend(f).DeleteAll(ref, RuleRef{Table: "filter", Chain: ChainAerolvmUser, Spec: dropSpec("10.0.0.3")}); err != nil {
 		t.Fatal(err)
 	}
 	if f.gets[ChainAerolvmUser] != 1 || f.count(ChainAerolvmUser, dropSpec("10.0.0.2")...) != 0 || f.count(ChainAerolvmUser, dropSpec("10.0.0.3")...) != 0 {

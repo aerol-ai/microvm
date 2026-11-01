@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -60,33 +59,11 @@ func (s *Service) nodeControlEndpoints() []netip.AddrPort {
 	return egress.SortedControl(out)
 }
 
-// hostServicePorts are services every node runs that no sandbox has any
-// business reaching: the operator's SSH and rpcbind (on by default on the
-// stock Ubuntu image).
-var hostServicePorts = []uint16{22, 111}
-
-// controlPorts are this node's control listeners (API, SSH gateway, Raft,
-// gossip, the cluster mTLS listener and, with ingress proxy routing, the
-// host-port redirect listener) and its host services.
+// controlPorts are this node's control listeners and host services
+// (config.NodeControlPorts, which SB_SANDBOX_NODE_PORTS_ALLOW may never
+// open, so the two guards agree).
 func (s *Service) controlPorts() []uint16 {
-	out := append([]uint16(nil), hostServicePorts...)
-	if s.cfg.APIPort > 0 && s.cfg.APIPort < 65536 {
-		out = append(out, uint16(s.cfg.APIPort))
-	}
-	// The redirect listener takes raw-TCP host-port traffic the firewall
-	// steered to it; a sandbox has no business dialing it directly (found
-	// reachable on cluster-3-mixed-routing, UC-319).
-	if s.cfg.IngressProxyRouting && s.cfg.HostPortRedirectPort > 0 && s.cfg.HostPortRedirectPort < 65536 {
-		out = append(out, uint16(s.cfg.HostPortRedirectPort))
-	}
-	for _, addr := range []string{s.cfg.SSHListenAddr, s.cfg.RaftBindAddr, s.cfg.GossipBindAddr, s.cfg.ClusterInternalListenAddr} {
-		if _, p, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {
-			if n, err := strconv.ParseUint(p, 10, 16); err == nil && n > 0 {
-				out = append(out, uint16(n))
-			}
-		}
-	}
-	return out
+	return s.cfg.NodeControlPorts()
 }
 
 // endpointOf parses host:port or a URL with an explicit IPv4 host and port.
