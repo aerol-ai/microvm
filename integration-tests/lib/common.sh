@@ -152,6 +152,12 @@ dump_service_logs() {
           | grep -iE 'cluster|gossip|memberlist|serf|raft|swim|join|leav|voter|leader|peer|bootstrap|secret|encrypt|decrypt|mtls|handshake|advertise|bind' \
           | grep -ivE 'request complete|drain-state lookup|placements lookup' \
           || echo '(no cluster/gossip/raft lines in boot journal)'
+        echo '--- mount sweep / orphan reaping (FULL boot journal, grepped) ---'
+        # The reconcile sweep runs every 5 minutes, so the line that explains a
+        # killed mount (UC-84) is usually long gone from the tail below.
+        sudo journalctl -u ${svc} -b --no-pager 2>/dev/null \
+          | grep -iE 'mounts sweep|orphan|mount process exited|mount external storage' \
+          || echo '(no mount sweep / orphan lines in boot journal)'
       fi
       echo '--- journal (last ${lines} lines) ---'
       sudo journalctl -u ${svc} --no-pager -n ${lines}

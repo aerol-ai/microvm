@@ -218,6 +218,7 @@ func main() {
 	// for the user command and /exec endpoints don't inherit it via os.Environ().
 	os.Unsetenv("SB_TOOLBOX_TOKEN")
 	scrubReadyEnv()
+	applyGvisorPidsLimit(logger)
 	prepareLoginShells(logger, loginshell.ProfileDir)
 
 	startReaperFn(logger)

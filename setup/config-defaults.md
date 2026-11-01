@@ -58,7 +58,7 @@ feature is still mid-rollout.
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
-| `SB_SANDBOX_PIDS_LIMIT` | Processes and threads per container sandbox; default `4096`, `0` = unlimited (refused in enterprise mode). |
+| `SB_SANDBOX_PIDS_LIMIT` | Processes and threads per container sandbox; default `4096`, `0` = unlimited (refused in enterprise mode). A gVisor sandbox gets the cap inside gVisor, lowered to one per MiB of its memory (1024 for the default 1 GB), and a host cgroup limit of twice that plus 1024 for gVisor's own threads. |
 | `SB_SANDBOX_INTERCONNECT` | `true` lets sandboxes on one server reach each other; default `false` (isolated, refused in enterprise mode). |
 | `SB_SANDBOX_NODE_PORTS_ALLOW` | Extra ports of the server itself every sandbox on it may reach, such as `8080,5353/udp` (tcp when bare). Default empty: sandboxes are default-denied from their own server (the node guard, `AEROLVM-NODE` in INPUT), except the egress gateway's DNS and proxy ports (when the gateway runs), DNS on a server address the sandboxes' resolver names, and 80/443 on a server that serves ingress. No ranges. A control or host-service port (API, SSH gateway, Raft, gossip, cluster mTLS, host-port redirect, 22, 111) or the gateway's own port refuses the boot; any entry refuses it in enterprise mode. Logged at every boot. |
 | `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |

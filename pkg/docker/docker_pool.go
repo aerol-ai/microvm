@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -248,6 +249,12 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 		"SB_TOOLBOX_TOKEN=" + bootstrapToken,
 	}
 	envValues = append(envValues, pl.EnvVars()...)
+	// A parked toolboxd caps a gVisor sentry at park time, sized for the
+	// park's default memory: the adopt handshake does not restart it.
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, c.pidsLimit, models.DefaultMemoryMB)
+	if !c.resourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
+	}
 
 	labels := map[string]string{
 		managedLabelKey:  "true",
@@ -279,7 +286,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	if !c.resourceLimitsOff {
 		// Inline, not nested under "Resources": HostConfig embeds the
 		// Resources fields in the Docker API JSON (see the cold path).
-		maps.Copy(hostConfig, parkDefaultResources(c))
+		maps.Copy(hostConfig, parkDefaultResources(hostPids))
 	}
 	if c.parkDiskGB > 0 && effectiveRuntime != models.RuntimeGvisor {
 		hostConfig["StorageOpt"] = map[string]string{"size": fmt.Sprintf("%dG", c.parkDiskGB)}
@@ -333,7 +340,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	}, nil
 }
 
-func parkDefaultResources(c *Client) map[string]any {
+func parkDefaultResources(pidsLimit int64) map[string]any {
 	cpu := models.DefaultCPU
 	mem := models.DefaultMemoryMB
 	resources := map[string]any{}
@@ -345,8 +352,8 @@ func parkDefaultResources(c *Client) map[string]any {
 		resources["Memory"] = int64(mem) * 1024 * 1024
 		resources["MemorySwap"] = int64(mem) * 1024 * 1024
 	}
-	if c.pidsLimit > 0 {
-		resources["PidsLimit"] = c.pidsLimit
+	if pidsLimit > 0 {
+		resources["PidsLimit"] = pidsLimit
 	}
 	return resources
 }

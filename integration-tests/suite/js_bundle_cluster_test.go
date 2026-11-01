@@ -91,6 +91,12 @@ func TestJSBundleListDeclaresUnreachablePeers(t *testing.T) {
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", victim.Name, err, out)
 	}
+	// Out of the client's rotation, as a health-checked load balancer would
+	// take it out. The missing-peers header is written by the node that
+	// serves the list, which still has to ask the victim and fail, so this
+	// hides nothing; a client pinned to the victim's Caddy would read 502
+	// for the whole poll instead. restoreNodeDaemon puts it back.
+	harness.MarkNodeDown(victim.PublicIP)
 	t.Cleanup(func() { restoreNodeDaemon(t, victim, target) })
 
 	deadline := time.Now().Add(3 * time.Minute)

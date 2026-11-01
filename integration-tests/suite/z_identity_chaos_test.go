@@ -479,7 +479,7 @@ func TestIdentityIssuerKeyRotationUnderLoad(t *testing.T) {
 	oldTok := fx.issuer.Token(t, "uc293-old", harness.GroupPaymentsEng)
 	var newTok atomic.Value // string, set after the rotation lands
 	var oldOK, newOK, new401, fivexx, otherFail atomic.Int64
-	hc := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{MaxIdleConnsPerHost: 256}}
+	hc := &http.Client{Timeout: 15 * time.Second, Transport: harness.NewTransport(func(tr *http.Transport) { tr.MaxIdleConnsPerHost = 256 })}
 	jobs := make(chan bool, 4096) // true: use the new-key token
 	var wg sync.WaitGroup
 	for w := 0; w < 128; w++ {
@@ -578,7 +578,7 @@ func TestIdentityPATRotation(t *testing.T) {
 	// PAT works under host scope too).
 	vol := "uc277-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	sdkAt := func(base, pat string) *microvm.Client {
-		c, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: base, PATToken: pat})
+		c, err := microvm.NewClientWithConfig(&sdktypes.MicroVMConfig{APIUrl: base, PATToken: pat, HTTPClient: harness.HTTPClient(0)})
 		if err != nil {
 			t.Fatal(err)
 		}

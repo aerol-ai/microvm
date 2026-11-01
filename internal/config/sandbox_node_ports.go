@@ -45,9 +45,10 @@ func ParseSandboxNodePorts(raw string) ([]SandboxNodePort, error) {
 	return out, nil
 }
 
-// hostServicePorts are services every node runs that no sandbox has any
-// business reaching: the operator's SSH and rpcbind (on by default on the
-// stock Ubuntu image).
+// hostServicePorts are services a node may run that no sandbox has any
+// business reaching: the operator's SSH and rpcbind (port 111). install.sh
+// disables the rpcbind nfs-common brings in, but an NFSv3 mount that locks
+// starts it again, and nodes set up by an older installer still run it.
 var hostServicePorts = []uint16{22, 111}
 
 // NodeControlPorts are this node's control listeners (API, SSH gateway,

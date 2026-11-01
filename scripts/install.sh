@@ -1004,35 +1004,96 @@ install_caddy_package() {
 	rm -rf "$tmp_dir"
 }
 
+# APT_UPDATED is "true" once this run has refreshed the apt package index,
+# so install_mount_tools refreshes it only on the --local path, where
+# install_packages (and its apt-get update) does not run.
+APT_UPDATED="false"
+
+# rpcbind_on_host is true when the rpcbind package is installed, or a unit
+# of an rpcbind installed some other way is enabled.
+rpcbind_on_host() {
+	if [[ "$(dpkg-query -W -f='${Status}' rpcbind 2>/dev/null || true)" == "install ok installed" ]]; then
+		return 0
+	fi
+	command -v systemctl >/dev/null 2>&1 || return 1
+	systemctl is-enabled --quiet rpcbind.socket 2>/dev/null || systemctl is-enabled --quiet rpcbind.service 2>/dev/null
+}
+
+# install_mount_tools installs the programs that mount external storage and
+# platform volumes. The mount runs on the host, not in the sandbox, so
+# sandboxd needs them on its own PATH. Both Linux install paths call it:
+# --local skips install_packages, and a local server used to fail every
+# volume create with `exec: "mount-s3": executable file not found`. A tool
+# that will not install costs only its own mount type, so nothing here fails
+# the install.
+install_mount_tools() {
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "Skipping the mount tools (fuse3, sshfs, nfs-common, rclone, mount-s3): Linux only" >&2
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		echo "Warning: only apt-based distributions get the mount tools from this installer; install fuse3, sshfs, nfs-common, rclone and mount-s3 by hand for external storage and platform volumes" >&2
+		return 0
+	fi
+	if [[ "${APT_UPDATED:-false}" != "true" ]]; then
+		if apt-get update; then
+			APT_UPDATED="true"
+		else
+			echo "Warning: apt-get update failed; installing the mount tools from the existing package index" >&2
+		fi
+	fi
+	# nfs-common depends on rpcbind (the RPC portmapper), whose package
+	# enables and starts it on port 111 on every address: a finding in any
+	# port scan. The NFS client needs it only for an NFSv3 mount that locks,
+	# and then mount.nfs starts rpc-statd.service, which Requires=
+	# rpcbind.socket and so starts it on demand. So it is disabled, not
+	# masked: a mask fails that start, and with it every such mount. A host
+	# that had rpcbind before this run keeps it as it was; it may be in use.
+	local rpcbind_before="false"
+	if rpcbind_on_host; then
+		rpcbind_before="true"
+	fi
+	# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
+	# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
+	# we attempt an apt install first and fall back to the AWS download.
+	apt-get install -y fuse3 sshfs nfs-common rclone || true
+	if [[ "$rpcbind_before" == "true" ]]; then
+		echo "rpcbind was on this host before this run; leaving it as it is" >&2
+	elif ! command -v systemctl >/dev/null 2>&1; then
+		echo "Skipping the rpcbind disable: no systemctl on this host" >&2
+	elif rpcbind_on_host; then
+		systemctl disable --now rpcbind.socket rpcbind.service || \
+			echo "Warning: could not disable rpcbind, so it may listen on port 111; run: systemctl disable --now rpcbind.socket rpcbind.service" >&2
+	fi
+	if ! command -v mount-s3 >/dev/null 2>&1; then
+		local arch_suffix
+		case "$(uname -m)" in
+			x86_64|amd64) arch_suffix="x86_64" ;;
+			aarch64|arm64) arch_suffix="arm64" ;;
+			*) arch_suffix="" ;;
+		esac
+		if [[ -n "$arch_suffix" ]]; then
+			local tmp_deb
+			tmp_deb="$(mktemp --suffix=.deb)"
+			if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
+				apt-get install -y "$tmp_deb" || \
+					echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
+			else
+				echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
+			fi
+			rm -f "$tmp_deb"
+		fi
+	fi
+}
+
 install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
 		drop_caddy_apt_source
 		apt-get update
+		APT_UPDATED="true"
 		apt-get install -y build-essential ca-certificates curl gnupg lsb-release software-properties-common
 		# Mount tooling for the host-managed external storage feature.
-		# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
-		# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
-		# we attempt an apt install first and fall back to the AWS download.
-		apt-get install -y fuse3 sshfs nfs-common rclone || true
-		if ! command -v mount-s3 >/dev/null 2>&1; then
-			local arch_suffix
-			case "$(uname -m)" in
-				x86_64|amd64) arch_suffix="x86_64" ;;
-				aarch64|arm64) arch_suffix="arm64" ;;
-				*) arch_suffix="" ;;
-			esac
-			if [[ -n "$arch_suffix" ]]; then
-				local tmp_deb
-				tmp_deb="$(mktemp --suffix=.deb)"
-				if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
-					apt-get install -y "$tmp_deb" || \
-						echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
-				else
-					echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
-				fi
-				rm -f "$tmp_deb"
-			fi
-		fi
+		install_mount_tools
 		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
 			install_caddy_package
@@ -2551,6 +2612,10 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	install_binaries
 	record_sandboxd_state
 	write_local_environment
+	# This branch skips install_packages, so it installs the two parts of it
+	# a local server still needs, in the same order: the mount tools (platform
+	# volumes and external storage are mounted on the host), then Docker.
+	install_mount_tools
 	# The local unit hard-Requires docker.service; on Linux we must install
 	# the engine here since this branch skips install_packages.
 	ensure_docker

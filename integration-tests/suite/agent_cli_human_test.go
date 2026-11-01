@@ -688,7 +688,7 @@ func TestAerolvmTokenScopeHealthVersion(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, sc.BaseURL+"/health", nil)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		t.Fatalf("GET /health: %v", err)
 	}

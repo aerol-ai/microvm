@@ -479,6 +479,15 @@ func TestBankForkBombContained(t *testing.T) {
 		neighbour := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		limit, _ := bankRun(t, sb, "cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo none", time.Minute)
+		if rt.gvisor {
+			// runsc puts the spec's pids limit on the host cgroup only, where
+			// a bomb panics the sentry; the sandbox's own cap is the one
+			// toolboxd sets inside it (pkg/gvisorpids). "max" or "none" here
+			// means it was not set and the bomb below ends the sandbox.
+			if n, err := strconv.Atoi(strings.TrimSpace(limit)); err != nil || n <= 0 {
+				t.Errorf("gvisor sandbox has no task cap inside the sandbox: pids.max=%q", strings.TrimSpace(limit))
+			}
+		}
 		const tries = 20000
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		res, err := sb.ExecCommand(ctx, fmt.Sprintf(`i=0; while [ $i -lt %d ]; do sleep 120 >/dev/null 2>&1 & [ $? -eq 0 ] || break; i=$((i+1)); done 2>/dev/null; echo spawned=$i`, tries))
@@ -1028,13 +1037,14 @@ func TestBankTLSPosture(t *testing.T) {
 	} else {
 		t.Logf("TLS 1.3: %s", tls.CipherSuiteName(st.CipherSuite))
 	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}).Get("https://" + host + "/health")
+	insecure := harness.NewTransport(func(tr *http.Transport) { tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} })
+	resp, err := (&http.Client{Timeout: 15 * time.Second, Transport: insecure}).Get("https://" + host + "/health")
 	if err == nil {
 		resp.Body.Close()
 		t.Logf("security headers on /health: Strict-Transport-Security=%q X-Content-Type-Options=%q Server=%q",
 			resp.Header.Get("Strict-Transport-Security"), resp.Header.Get("X-Content-Type-Options"), resp.Header.Get("Server"))
 	}
-	plain, err := (&http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get("http://" + strings.Split(host, ":")[0] + "/v1/sandboxes")
+	plain, err := (&http.Client{Timeout: 15 * time.Second, Transport: harness.SharedTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get("http://" + strings.Split(host, ":")[0] + "/v1/sandboxes")
 	if err == nil {
 		plain.Body.Close()
 		if plain.StatusCode < 300 || plain.StatusCode >= 400 {

@@ -148,7 +148,10 @@ type Config struct {
 	ResourceLimitsOff           bool
 	// SandboxPidsLimit caps the processes and threads of each container
 	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
-	// it one sandbox's fork bomb exhausts the node for every tenant.
+	// it one sandbox's fork bomb exhausts the node for every tenant. A gVisor
+	// sandbox is capped inside its own kernel instead, at this or one task
+	// per MiB of its memory if lower, and its host cgroup gets the room the
+	// sentry needs at that cap (pkg/gvisorpids).
 	SandboxPidsLimit int
 	// SandboxInterconnect lets sandboxes on one node connect to each other
 	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
