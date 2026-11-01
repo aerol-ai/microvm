@@ -111,6 +111,20 @@ type SelectPlacementResponse struct {
 	// Recipients is the bounded answer: owner first, then the chosen backups.
 	Recipients []string `json:"recipients,omitempty"`
 	Error      string   `json:"error,omitempty"`
+	// AtCapacity marks a placement refused because every worker that can run
+	// the request is full (ErrClusterAtCapacity). Error then carries exactly
+	// ErrNoPlacementTarget's text, which is all an agent on the previous
+	// build matches — it keeps answering a 503 during a rolling upgrade —
+	// while a current agent restores ErrClusterAtCapacity from this flag.
+	AtCapacity bool `json:"at_capacity,omitempty"`
+}
+
+// SelectPlacementErrorResponse renders a placement failure for an agent.
+func SelectPlacementErrorResponse(err error) SelectPlacementResponse {
+	if errors.Is(err, ErrClusterAtCapacity) {
+		return SelectPlacementResponse{Error: ErrNoPlacementTarget.Error(), AtCapacity: true}
+	}
+	return SelectPlacementResponse{Error: err.Error()}
 }
 
 type DrainStateResponse struct {
@@ -428,6 +442,9 @@ func (a *Agent) selectPlacement(body SelectPlacementRequest) (PlacementTarget, [
 		return PlacementTarget{}, nil, nil, err
 	}
 	if resp.Error != "" {
+		if resp.AtCapacity {
+			return PlacementTarget{}, nil, nil, ErrClusterAtCapacity
+		}
 		if resp.Error == ErrNoPlacementTarget.Error() {
 			return PlacementTarget{}, nil, nil, ErrNoPlacementTarget
 		}

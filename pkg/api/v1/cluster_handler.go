@@ -1684,7 +1684,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if sandboxID := strings.TrimSpace(req.SandboxID); sandboxID != "" {
 		target, recipients, err := c.SelectPlacementForCreate(req.Request, sandboxID, req.RecipientBackups)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Recipients: recipients})
@@ -1697,7 +1697,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	if req.TargetOnly {
 		target, err := c.SelectPlacement(req.Request)
 		if err != nil {
-			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+			apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 			return
 		}
 		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target})
@@ -1705,7 +1705,7 @@ func (h *handlers) clusterInternalSelectPlacement(w http.ResponseWriter, r *http
 	}
 	target, candidates, err := c.SelectPlacementWithCandidates(req.Request)
 	if err != nil {
-		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Error: err.Error()})
+		apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementErrorResponse(err))
 		return
 	}
 	apihttp.WriteJSON(w, http.StatusOK, cluster.SelectPlacementResponse{Target: target, Candidates: candidates})
