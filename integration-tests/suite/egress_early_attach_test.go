@@ -53,14 +53,14 @@ wait
 echo done >> /tmp/early-probe.log
 exec sleep 3600`
 
-// UC-340 — a hostname-allowlisted sandbox has no unfiltered egress at any
+// UC-341 — a hostname-allowlisted sandbox has no unfiltered egress at any
 // moment of its create or after: its workload starts already shut (the
 // driver's block-all is on before the workload runs, and lifts only once the
 // gateway enforces for its address), probes started from the workload's
 // first instruction never reach an outside address directly, and after the
 // create only the allowlist is reachable.
 func TestEgressNothingOpenFromTheFirstInstruction(t *testing.T) {
-	harness.Require(t, sc, "UC-340")
+	harness.Require(t, sc, "UC-341")
 	skipPlainDocker(t)
 	c := client(t)
 	runtimes := []string{""}
@@ -229,12 +229,12 @@ func requireNoNewEgressState(t *testing.T, before map[string]egressNodeState, d 
 	}
 }
 
-// UC-341 — a hostname-filtered create that fails after the runtime built
+// UC-342 — a hostname-filtered create that fails after the runtime built
 // the sandbox (and the early attach ran) leaves no gateway element and no
 // firewall rule for the address on any node, and the next sandboxes, which
 // get freed addresses, get only their own policy.
 func TestEgressFailedCreateLeavesNoGatewayState(t *testing.T) {
-	harness.Require(t, sc, "UC-341")
+	harness.Require(t, sc, "UC-342")
 	c := client(t)
 	before := snapshotEgressNodes(t)
 	// 1 MiB of memory: the container exists and the address was reported,
@@ -272,11 +272,11 @@ func TestEgressFailedCreateLeavesNoGatewayState(t *testing.T) {
 	}
 }
 
-// UC-342 — churn of hostname-rule sandboxes (create, use, destroy, N
+// UC-343 — churn of hostname-rule sandboxes (create, use, destroy, N
 // times; AEROL_EGRESS_CHURN, default 20) leaves the gateway's sets and the
 // host firewall's per-address rules on every node where they were.
 func TestEgressChurnLeavesStateFlat(t *testing.T) {
-	harness.Require(t, sc, "UC-342")
+	harness.Require(t, sc, "UC-343")
 	c := client(t)
 	n := benchEnvInt("AEROL_EGRESS_CHURN", 20)
 	before := snapshotEgressNodes(t)
