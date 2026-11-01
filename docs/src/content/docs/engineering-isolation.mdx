@@ -252,7 +252,7 @@ Each sandbox gets 1 CPU, 1 GB of memory and 10 GB of disk, unless you ask for mo
 |---|---|---|---|---|
 | Docker | Enforced | Enforced, with no extra swap | Enforced when the server's storage supports it; otherwise stopped past its size | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
 | containerd | Enforced | Enforced | Stopped past its size | 4096 by default (`SB_SANDBOX_PIDS_LIMIT`) |
-| gVisor | Enforced | Enforced | Stopped past its size | Inside gVisor's own kernel |
+| gVisor | Enforced | Enforced | Stopped past its size | Inside gVisor's own kernel: 4096 (`SB_SANDBOX_PIDS_LIMIT`), or one per MB of memory if lower (1024 by default) |
 | Firecracker | The virtual machine's CPUs | The virtual machine's memory | The size of its disk | Inside its own kernel |
 | WebAssembly | Each call stops after 5 minutes | Up to 256 MB | Not enforced | No processes |
 | V8 isolate | The jail's cgroup | The jail's cgroup | No file system | Up to 512 |
