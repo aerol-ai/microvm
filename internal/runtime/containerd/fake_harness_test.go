@@ -211,6 +211,10 @@ type fakeContainer struct {
 	newTaskErr   error
 	specOverride *oci.Spec
 	setLabelsErr error
+	// attaches counts Task calls that carried an IO attach; attachFIFOs,
+	// when set, is handed to that attach as containerd would.
+	attaches    int
+	attachFIFOs *cio.FIFOSet
 }
 
 func (c *fakeContainer) ID() string { return c.id }
@@ -261,13 +265,21 @@ func (c *fakeContainer) Spec(context.Context) (*oci.Spec, error) {
 	}
 	return &oci.Spec{}, nil
 }
-func (c *fakeContainer) Task(context.Context, cio.Attach) (cntr.Task, error) {
+func (c *fakeContainer) Task(_ context.Context, attach cio.Attach) (cntr.Task, error) {
 	if c.taskErr != nil {
 		return nil, c.taskErr
 	}
 	if c.task == nil {
 		// containerd's loadTask wraps the task service's NotFound this way.
 		return nil, fmt.Errorf("no running task found: %w", errdefs.ErrNotFound)
+	}
+	if attach != nil {
+		c.attaches++
+		if c.attachFIFOs != nil {
+			if _, err := attach(c.attachFIFOs); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return c.task, nil
 }

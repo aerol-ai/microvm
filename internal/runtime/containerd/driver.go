@@ -105,6 +105,11 @@ type Driver struct {
 
 	warmPool WarmPool
 	netns    NetnsHandoff
+
+	// drainedTasks maps a container ID to the *taskLog this process drains
+	// its output into (logio.go). A running task missing from it gets
+	// re-attached by ListManaged.
+	drainedTasks sync.Map
 }
 
 // New constructs a Driver. The containerd connection is lazy — Ping and
