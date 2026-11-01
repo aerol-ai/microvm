@@ -1513,6 +1513,11 @@ type Config struct {
 	// PATScopeHost: every request on it is public, so a PAT there is
 	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
 	PublicAPISocket string
+	// LivenessSocket is the Unix socket sandboxd answers liveness on from
+	// the first moment of its boot, for the install.sh watchdog. It does no
+	// I/O and takes no lock, so a daemon busy serving the API still answers
+	// it. Empty means off. SB_LIVENESS_SOCKET.
+	LivenessSocket string
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -2889,6 +2894,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadPATScopeConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadLivenessConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {
