@@ -970,6 +970,16 @@ install_caddy_package() {
 # install_packages (and its apt-get update) does not run.
 APT_UPDATED="false"
 
+# rpcbind_on_host is true when the rpcbind package is installed, or a unit
+# of an rpcbind installed some other way is enabled.
+rpcbind_on_host() {
+	if [[ "$(dpkg-query -W -f='${Status}' rpcbind 2>/dev/null || true)" == "install ok installed" ]]; then
+		return 0
+	fi
+	command -v systemctl >/dev/null 2>&1 || return 1
+	systemctl is-enabled --quiet rpcbind.socket 2>/dev/null || systemctl is-enabled --quiet rpcbind.service 2>/dev/null
+}
+
 # install_mount_tools installs the programs that mount external storage and
 # platform volumes. The mount runs on the host, not in the sandbox, so
 # sandboxd needs them on its own PATH. Both Linux install paths call it:
@@ -993,10 +1003,29 @@ install_mount_tools() {
 			echo "Warning: apt-get update failed; installing the mount tools from the existing package index" >&2
 		fi
 	fi
+	# nfs-common depends on rpcbind (the RPC portmapper), whose package
+	# enables and starts it on port 111 on every address: a finding in any
+	# port scan. The NFS client needs it only for an NFSv3 mount that locks,
+	# and then mount.nfs starts rpc-statd.service, which Requires=
+	# rpcbind.socket and so starts it on demand. So it is disabled, not
+	# masked: a mask fails that start, and with it every such mount. A host
+	# that had rpcbind before this run keeps it as it was; it may be in use.
+	local rpcbind_before="false"
+	if rpcbind_on_host; then
+		rpcbind_before="true"
+	fi
 	# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
 	# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
 	# we attempt an apt install first and fall back to the AWS download.
 	apt-get install -y fuse3 sshfs nfs-common rclone || true
+	if [[ "$rpcbind_before" == "true" ]]; then
+		echo "rpcbind was on this host before this run; leaving it as it is" >&2
+	elif ! command -v systemctl >/dev/null 2>&1; then
+		echo "Skipping the rpcbind disable: no systemctl on this host" >&2
+	elif rpcbind_on_host; then
+		systemctl disable --now rpcbind.socket rpcbind.service || \
+			echo "Warning: could not disable rpcbind, so it may listen on port 111; run: systemctl disable --now rpcbind.socket rpcbind.service" >&2
+	fi
 	if ! command -v mount-s3 >/dev/null 2>&1; then
 		local arch_suffix
 		case "$(uname -m)" in
