@@ -63,6 +63,11 @@ func TestEarlyAttachOrder(t *testing.T) {
 			if !ok || early <= 0 {
 				t.Fatalf("svc_egress_early = %v (present %v), want the overlap reported", early, ok)
 			}
+			// Every runtime reports the same egress stages (UC-185 reads
+			// them per runtime).
+			if _, ok := stageMS(timing, "svc_egress_prepare"); !ok {
+				t.Fatal("svc_egress_prepare missing")
+			}
 			join, ok := stageMS(timing, "svc_egress_join")
 			if !ok {
 				t.Fatal("svc_egress_join missing")

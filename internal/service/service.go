@@ -2636,6 +2636,7 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 	// Hostname entries, profiles and learn mode go through the egress
 	// gateway, as on the container runtimes: the driver gets a block-all
 	// copy, so the guest boots shut, and the attach lifts it (§5.7).
+	prepareStart := time.Now()
 	egressPol, err := compileCreateEgressEffective(&req)
 	if err != nil {
 		return nil, err
@@ -2648,6 +2649,9 @@ func (s *Service) createFirecrackerSandbox(ctx context.Context, req models.Creat
 		}
 		driverReq.NetworkBlockAll = true
 		driverReq.NetworkAllowOut, driverReq.NetworkDenyOut = nil, nil
+		// The same stage as the container path, so a Firecracker create's
+		// Server-Timing splits its egress work the same way (UC-185).
+		createtiming.From(ctx).RecordStage("svc_egress_prepare", time.Since(prepareStart))
 	}
 	if req.NetworkBytesInLimit > 0 || req.NetworkBytesOutLimit > 0 {
 		return nil, unsupportedFirecrackerOption("network byte limits")
