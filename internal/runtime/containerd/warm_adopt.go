@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -155,6 +153,12 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if err := pl.Adopt(adoptCtx, sandboxID, toolboxToken, adoptNonce); err != nil {
 		return nil, err
 	}
+	// The park's listener has done its one job: the toolbox holds the
+	// sandbox's identity and has hung up. Closing it unlinks the park socket
+	// and frees its fd; each later start listens on that path afresh
+	// (startTask), and the old listener can no longer unlink the new one's
+	// socket out from under a start.
+	_ = slot.Handle.Close()
 
 	delete(labels, poolParkLabelKey)
 	labels[sandboxIDLabelKey] = sandboxID
@@ -168,7 +172,9 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if d.netns != nil && slot.ID != "" && slot.ID != sandboxID {
 		_ = d.netns.ReassignOwner(ctx, slot.ID, sandboxID)
 	}
-	d.adoptParkHostFiles(slot.ID, sandboxID)
+	// The park's host files stay where they are: the container's spec
+	// mounts them from the slot id's path, and the container keeps that id
+	// (see sandboxHostFiles). Destroy removes them by the container id.
 
 	if err := d.applyAdoptNetworkPolicy(slot.ContainerIP, req); err != nil {
 		return nil, err
@@ -217,31 +223,18 @@ func (d *Driver) findContainerBySandboxID(ctx context.Context, client *Client, s
 	return containers[0], nil
 }
 
-// adoptParkHostFiles renames the park slot's host files to the sandbox id so
-// Destroy cleans them up. The container's bind mount follows the file's
-// inode, not its path, so the rename is invisible inside the sandbox.
-func (d *Driver) adoptParkHostFiles(slotID, sandboxID string) {
-	if slotID == "" || slotID == sandboxID {
-		return
-	}
-	from := filepath.Join(d.cfg.RunDir, "hosts", slotID)
-	to := filepath.Join(d.cfg.RunDir, "hosts", sandboxID)
-	if _, err := os.Stat(from); err != nil {
-		return
-	}
-	_ = os.RemoveAll(to)
-	if err := os.Rename(from, to); err != nil && d.logger != nil {
-		d.logger.Warn("containerd: adopt park host files", "slot_id", slotID, "sandbox_id", sandboxID, "error", err)
-	}
-}
-
 func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedSlot) error {
 	if slot == nil {
 		return nil
 	}
-	if slot.ID != "" {
-		_ = d.removeHostFiles(slot.ID)
+	// The slot id and the container id are the same string (parkContainer);
+	// the boot purge knows only the container id. Every file the park keyed
+	// by it goes with the container: host files, task log, park socket.
+	parkKey := strings.TrimSpace(slot.ID)
+	if parkKey == "" {
+		parkKey = strings.TrimSpace(slot.ContainerID)
 	}
+	d.removeContainerFiles(parkKey)
 	if slot.ContainerIP != "" {
 		_ = d.ClearNetworkRules(slot.ContainerIP)
 	}
@@ -259,14 +252,8 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	// exhausts and cold creates fail with "provision netns: no free slot".
 	// Release is idempotent and a no-op if the slot was already reassigned to an
 	// adopting sandbox.
-	if d.netns != nil {
-		parkKey := strings.TrimSpace(slot.ID)
-		if parkKey == "" {
-			parkKey = strings.TrimSpace(slot.ContainerID)
-		}
-		if parkKey != "" {
-			_ = d.netns.Release(ctx, parkKey)
-		}
+	if d.netns != nil && parkKey != "" {
+		_ = d.netns.Release(ctx, parkKey)
 	}
 	if slot.ContainerID != "" {
 		client, err := d.ensureClient()
