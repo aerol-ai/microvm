@@ -202,6 +202,13 @@ type Snapshot struct {
 	// and canary nodes compare engines like-for-like. Deliberately NOT a
 	// placement attribute — see plans/containerd-engine.md §2 D18.
 	ContainerEngine string `json:"container_engine,omitempty"`
+	// SlotPools reports this host's bounded per-sandbox slot pools (slots.go)
+	// and how many slots each has free. Placement skips a peer whose pool for
+	// the request's runtime has no free slot once its in-flight reservations
+	// are counted. The admitter does not fill it: the service overlays it on
+	// /v1/capacity and on its own lease, from a short cache. Omitted by a peer
+	// that predates the field, which placement reads as "no slot limit".
+	SlotPools []SlotPool `json:"slot_pools,omitempty"`
 	// LocalTemplateInventoryKnown distinguishes an authoritative empty
 	// Firecracker template inventory from a legacy/unknown peer. When
 	// false, placement treats LocalTemplateIDs as "unknown, allow" for

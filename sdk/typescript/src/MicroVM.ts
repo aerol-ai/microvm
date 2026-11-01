@@ -94,9 +94,18 @@ export interface MicroVMConfig {
    * retries up to 3 times with exponential backoff by default. `exec` retries
    * only failures that prove the command never reached the server
    * (connection refused, connect timeout, DNS) and HTTP 429/503, so a command
-   * never runs twice. Pass `{ maxRetries: 0 }` to disable.
+   * never runs twice. Pass `{ maxRetries: 0 }` to disable. A 429 or 503
+   * waits as long as the server's `Retry-After` asks, up to
+   * `retry.maxRetryAfterMs` (30 s by default).
    */
   retry?: RetryConfig;
+  /**
+   * Cancels the client's HTTP requests: aborting it ends the request in
+   * flight and any retry wait, so a call never sits out a long
+   * `Retry-After` once aborted. Pass `AbortSignal.timeout(ms)` to bound
+   * how long the client may run. WebSocket streams are not affected.
+   */
+  signal?: AbortSignal;
 }
 
 export class MicroVM {
@@ -126,6 +135,7 @@ export class MicroVM {
       fetch: config.fetch,
       apiVersion: config.apiVersion,
       retry: config.retry,
+      signal: config.signal,
     });
   }
 

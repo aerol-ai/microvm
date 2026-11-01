@@ -1341,10 +1341,12 @@ public class MicroVMClient {
         int maxRetries = retryConfig.maxRetries != null ? retryConfig.maxRetries : 3;
         int baseDelay = retryConfig.baseDelayMs != null ? retryConfig.baseDelayMs : 200;
         int maxDelay = retryConfig.maxDelayMs != null ? retryConfig.maxDelayMs : 5000;
+        int maxRetryAfter = retryConfig.maxRetryAfterMs != null ? retryConfig.maxRetryAfterMs : RetryAfter.DEFAULT_MAX_RETRY_AFTER_MS;
 
         Exception lastException = null;
 
         for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            String retryAfter = null;
             HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path)).method(method, bodyPublisher);
             if (contentType != null) {
                 builder.header("Content-Type", contentType);
@@ -1363,6 +1365,7 @@ public class MicroVMClient {
                 HttpResponse<byte[]> response = httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
                 if (attempt < maxRetries && retryMode.retriesStatus(response.statusCode())) {
                     // Fall through to retry logic
+                    retryAfter = RetryAfter.hint(response);
                 } else {
                     return response;
                 }
@@ -1379,10 +1382,12 @@ public class MicroVMClient {
                 }
             }
 
-            int delayMs = Math.min(baseDelay * (1 << attempt), maxDelay);
-            double jitter = 1.0 + (Math.random() - 0.5) * 0.5;
+            // A 429 or 503 waits as long as its Retry-After asks, within
+            // maxRetryAfterMs. An interrupt (Future.cancel(true), executor
+            // shutdown) ends the wait at once.
+            long waitMs = RetryAfter.waitMillis(baseDelay, maxDelay, maxRetryAfter, attempt, retryAfter, java.time.Instant.now(), Math.random());
             try {
-                Thread.sleep((long) (delayMs * jitter));
+                Thread.sleep(waitMs);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new MicroVMException("request interrupted during backoff", e);
