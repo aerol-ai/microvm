@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -73,6 +74,22 @@ func ipv6TestHost(t *testing.T, runner cni.Runner, deleted *[]string) *Host {
 		addNetns:   func(context.Context, string) error { return nil },
 		delNetns:   func(_ context.Context, name string) error { *deleted = append(*deleted, name); return nil },
 		loopbackUp: func(context.Context, string) error { return nil },
+		readIPv4:   runnerAddrs(runner),
+	}
+}
+
+// runnerAddrs reads a slot's netns the way the kernel would answer for a
+// fake CNI runner: it holds the address ADD gave its id until a DEL.
+func runnerAddrs(runner cni.Runner) func(path string) ([]string, error) {
+	r, ok := runner.(interface{ IPOf(string) (string, bool) })
+	if !ok {
+		return nil
+	}
+	return func(path string) ([]string, error) {
+		if ip, ok := r.IPOf(filepath.Base(path)); ok {
+			return []string{ip}, nil
+		}
+		return nil, nil
 	}
 }
 
