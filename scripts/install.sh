@@ -38,6 +38,11 @@ WITH_ISOLATE="false"
 # route responder via systemd-resolved.
 INGRESS_PROXY_ROUTING="false"
 ROUTE_DNS_ADDR="127.0.0.1:53053"
+# The aerolvm-rt link's own address. systemd-resolved sends *.rt.internal
+# here, not to ROUTE_DNS_ADDR (write_route_dns_resolver says why), and
+# sandboxd listens here too (SB_ROUTE_DNS_LINK_ADDR).
+ROUTE_DNS_LINK_IP="169.254.53.53"
+ROUTE_DNS_LINK_ADDR="${ROUTE_DNS_LINK_IP}:53053"
 WORKERD_PATH=""
 # Version-pinned workerd release for --with-isolate (plans/isolate-runtime.md
 # Phase 1). Upstream ships gzipped standalone binaries with no checksum
@@ -1284,6 +1289,10 @@ install_binaries() {
 write_environment() {
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	local route_dns_link_addr=""
+	if [[ "$INGRESS_PROXY_ROUTING" == "true" ]]; then
+		route_dns_link_addr="$ROUTE_DNS_LINK_ADDR"
+	fi
 	cat > /etc/sandboxd/sandboxd.env <<EOF
 SB_PAT_TOKEN=$PAT_TOKEN
 SB_NODE_NAME=$NODE_NAME
@@ -1317,6 +1326,7 @@ SB_L4_PORT_RANGE_END=23000
 SB_L4_TLS_LISTEN=$L4_TLS_LISTEN_DEFAULT
 SB_INGRESS_PROXY_ROUTING=$INGRESS_PROXY_ROUTING
 SB_ROUTE_DNS_ADDR=$ROUTE_DNS_ADDR
+SB_ROUTE_DNS_LINK_ADDR=$route_dns_link_addr
 SB_L4_TLS_FALLBACK=127.0.0.1:8443
 EOF
 	# The custom-domain certificate policy sandboxd installs follows the
@@ -1688,6 +1698,35 @@ write_caddy_env() {
 # The link needs an address and no IPv6 autoconf, or networkd leaves it in
 # "configuring" and resolved ignores its DNS settings. Requires
 # systemd-networkd and systemd >= 249 (ActivationPolicy, DNS=ip:port).
+#
+# WHY the DNS server is the link's own address, not the loopback responder:
+# resolved pins its socket for a link's DNS server to that link
+# (IP_UNICAST_IF), so a UDP query to 127.0.0.1 leaves through the dummy link
+# and is dropped. resolved then stalls every lookup for about 20s while it
+# falls back to TCP, and it re-probes UDP every few minutes and stalls again.
+# Each stall failed new connections through the ingress with EOF
+# (cluster-bank-flagship UC-171, 2026-11-01). A query to the link's own
+# address is delivered locally, and sandboxd answers there.
+route_dns_network_unit() {
+	cat <<EOF
+[Match]
+Name=aerolvm-rt
+
+[Link]
+RequiredForOnline=no
+ActivationPolicy=always-up
+
+[Network]
+ConfigureWithoutCarrier=yes
+DNS=$ROUTE_DNS_LINK_ADDR
+Domains=~rt.internal
+DNSDefaultRoute=false
+Address=$ROUTE_DNS_LINK_IP/32
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+EOF
+}
+
 write_route_dns_resolver() {
 	if [[ "$INGRESS_PROXY_ROUTING" != "true" ]]; then
 		return
@@ -1707,23 +1746,7 @@ write_route_dns_resolver() {
 Name=aerolvm-rt
 Kind=dummy
 EOF
-	cat > /etc/systemd/network/10-aerolvm-rt.network <<EOF
-[Match]
-Name=aerolvm-rt
-
-[Link]
-RequiredForOnline=no
-ActivationPolicy=always-up
-
-[Network]
-ConfigureWithoutCarrier=yes
-DNS=$ROUTE_DNS_ADDR
-Domains=~rt.internal
-DNSDefaultRoute=false
-Address=169.254.53.53/32
-LinkLocalAddressing=no
-IPv6AcceptRA=no
-EOF
+	route_dns_network_unit > /etc/systemd/network/10-aerolvm-rt.network
 	systemctl restart systemd-networkd
 	systemctl restart systemd-resolved
 	local i
