@@ -105,6 +105,7 @@ The installer puts two programs on your computer: `sandboxd`, the AerolVM server
 - Registers a systemd service (a Linux background service) named `sandboxd`. If the server crashes, systemd restarts it after 5 seconds.
 - Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds.
 - Adds the `aerolvm-egress-gateway` service, which handles sandboxes' outbound traffic.
+- Installs the tools for [cloud storage](/external-storage/) and [platform volumes](/platform-volumes/): `fuse3`, `sshfs`, `nfs-common`, `rclone` and `mount-s3`. It turns off `rpcbind`, which comes with `nfs-common`, so nothing listens on port `111`.
 
 ## Next steps
 

@@ -145,7 +145,8 @@ What the installer does:
 
 1. Installs Docker, fuse3 / sshfs / nfs-common / rclone / mountpoint-s3 (for
    external-storage mounts), and a custom Caddy build with the
-   `caddy-l4` and `caddy-dns/cloudflare` plugins.
+   `caddy-l4` and `caddy-dns/cloudflare` plugins. It disables the `rpcbind`
+   that nfs-common brings in, so nothing listens on port 111.
 2. Downloads `sandboxd` + `toolboxd` binaries.
 3. Writes `/etc/sandboxd/sandboxd.env` and `/etc/caddy/Caddyfile`.
 4. Registers `sandboxd.service` (always-restart, 5s backoff) and

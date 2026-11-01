@@ -78,8 +78,11 @@ What the installer does on **Linux**:
 1. Downloads `sandboxd` and `toolboxd` to `/usr/local/bin`.
 2. Writes `/etc/sandboxd/sandboxd.env` with `SB_API_HOST=127.0.0.1`,
    `SB_ENABLE_CADDY=false`, and `SB_ENABLE_NETWORK_RULES=false`.
-3. Registers the systemd unit `sandboxd.service` (no Caddy dependency).
-4. Starts the daemon. The API is immediately reachable on `localhost:21212`.
+3. Installs the mount tools (fuse3 / sshfs / nfs-common / rclone /
+   mountpoint-s3) for external storage and platform volumes, and disables
+   the `rpcbind` that nfs-common brings in, so nothing listens on port 111.
+4. Registers the systemd unit `sandboxd.service` (no Caddy dependency).
+5. Starts the daemon. The API is immediately reachable on `localhost:21212`.
 
 Verify:
 
