@@ -175,6 +175,16 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 	// exits. The ingress proxy's IsSandboxStarted hot path will fall
 	// through to SQLite from here on for this id.
 	s.invalidateWarm(sandbox.ID)
+	// End the toolbox requests waiting on it now, before the route and
+	// rule teardown below: a killed gVisor sandbox never closes their
+	// connections. An "oom" event is not an exit: a process in the sandbox
+	// was OOM-killed, which the sandbox may survive, so its requests run on
+	// (a die event follows when it did not).
+	endCalls := event.Action != "oom"
+	detail := stopDetail(event.Action, event.ExitCode)
+	if endCalls {
+		s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
+	}
 	mode := s.classifyDockerStopEvent(sandbox.ID, event)
 	arm := s.shouldArmWake(sandbox, mode)
 
@@ -221,7 +231,13 @@ func (s *Service) markSandboxStopped(ctx context.Context, sandbox *models.Sandbo
 		sandbox.LastError = fmt.Sprintf("container exited with code %d", event.ExitCode)
 	}
 
-	if err := s.store.Upsert(ctx, sandbox); err != nil {
+	err := s.store.Upsert(ctx, sandbox)
+	if endCalls {
+		// Again for a request that read the row while it still said
+		// started (toolbox_calls.go).
+		s.endToolboxCalls(sandbox.ID, toolboxEndStopped, detail)
+	}
+	if err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
 
@@ -252,6 +268,10 @@ func (s *Service) handleDestroyEvent(ctx context.Context, sandbox *models.Sandbo
 	// so the ingress proxy stops treating this id as Started.
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
+	// The container is gone: end its toolbox requests now, and again on
+	// the way out for one that read the row meanwhile.
+	s.endToolboxCalls(sandbox.ID, toolboxEndDestroyed, "destroyed")
+	defer s.endToolboxCalls(sandbox.ID, toolboxEndDestroyed, "destroyed")
 
 	// Best-effort teardown. Order matches DestroySandbox (caddy → mounts →
 	// store.Delete → admitter → schedulePendingImageGC); container destroy

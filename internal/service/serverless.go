@@ -168,6 +168,14 @@ func (s *Service) stopSandboxInternal(ctx context.Context, id string, mode stopM
 		s.consumeExpectedStop(id)
 		return nil, err
 	}
+	// The sandbox is down: its toolbox requests will never be answered.
+	// End them now, and again once the row says stopped (toolbox_calls.go).
+	detail := "stopped"
+	if mode == stopModeLifecycle {
+		detail = "stopped by its lifecycle"
+	}
+	s.endToolboxCalls(id, toolboxEndStopped, detail)
+	defer s.endToolboxCalls(id, toolboxEndStopped, detail)
 
 	// Release the admitter slot now that the container is no longer running.
 	// A stopped sandbox holds no CPU/RAM on the host; keeping the reservation
