@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,7 +81,9 @@ type LiveSandbox func(ctx context.Context, sandboxID string) bool
 type NetnsExists func(path string) bool
 
 // Reconcile tears down orphaned reserved/realized/pooled/adopted rows after a
-// crash or daemon restart, and retries slots parked as releasing.
+// crash or daemon restart, and retries slots parked as releasing. A warm
+// (pooled) slot survives only when its netns is there AND holds the address
+// the row records; otherwise it is rebuilt, never handed out.
 // live==nil treats every adopted/reserved owner as dead, so production wiring
 // must pass a callback that answers "dead" only when the owner's container is
 // confirmed gone: reaping a live owner runs CNI DEL inside its netns and
@@ -125,6 +128,11 @@ func (p *Pool) Reconcile(ctx context.Context, host HostManager, live LiveSandbox
 		default:
 			continue
 		}
+		if !orphan && slot.State == store.NetnsSlotStatePooled && !p.warmSlotHoldsItsAddress(ctx, host, slot) {
+			// The netns at the recorded path is not the one the row
+			// describes: rebuild the slot rather than hand it out.
+			orphan = true
+		}
 		if !orphan && !p.disableSurvivorIPv6(ctx, host, slot) {
 			// A warm slot whose IPv6 cannot be turned off is rebuilt, not
 			// handed to a sandbox.
@@ -145,6 +153,42 @@ func (p *Pool) Reconcile(ctx context.Context, host HostManager, live LiveSandbox
 		unlock()
 	}
 	return reaped, nil
+}
+
+// addressReader is the optional HostManager step Reconcile runs on every
+// surviving warm slot (*Host implements it).
+type addressReader interface {
+	IPv4Addrs(ctx context.Context, slot Slot) ([]string, error)
+}
+
+// warmSlotHoldsItsAddress reports whether a pooled slot's netns holds the
+// address its row records. A path that exists is not enough: slot names
+// are fixed (aerol-netns-<i>), so it shows only that SOME netns of that
+// name is there. After a backup is restored onto a fresh machine, the
+// fresh install's own daemon has already prewarmed aerol-netns-0.. at the
+// addresses its host-local IPAM gave out (10.88.0.2, …), while the
+// restored rows still name the old machine's (10.88.2.111). A create
+// handed such a slot put its rules on the recorded address before its
+// task started, and the task came up at the other one (UC-316: the
+// containerd driver refused it, "came up at 10.88.0.2, not at its prepaid
+// address 10.88.2.111"). Also false when the address cannot be read: a
+// warm slot is cheap to rebuild, and one the pool cannot vouch for is
+// never handed out. A slot with an owner is never asked: its task may
+// have moved the address out of the netns (gVisor), and it is not the
+// pool's to rebuild.
+func (p *Pool) warmSlotHoldsItsAddress(ctx context.Context, host HostManager, slot *Slot) bool {
+	r, ok := host.(addressReader)
+	if !ok {
+		return true
+	}
+	want := strings.TrimSpace(slot.ContainerIP)
+	addrs, err := r.IPv4Addrs(ctx, *slot)
+	if err == nil && want != "" && slices.Contains(addrs, want) {
+		return true
+	}
+	p.log().Warn("containerd netns reconcile: a warm slot's namespace does not hold the address its row records; rebuilding it",
+		"slot_id", slot.SlotID, "netns", slot.NetnsPath, "recorded_ip", want, "found_ips", addrs, "error", err)
+	return false
 }
 
 // ipv6Disabler is the optional HostManager step Reconcile runs on every
