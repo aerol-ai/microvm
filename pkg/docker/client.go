@@ -24,6 +24,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/pool/dockerpool"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
@@ -445,7 +446,16 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		poolParkedEnv+"=",
 	)
 	for key, value := range req.Env {
+		if key == gvisorpids.EnvVar {
+			// The driver sets the gVisor task cap; a create's env must not
+			// shadow it (toolboxd reads the first value of a key).
+			continue
+		}
 		envValues = append(envValues, key+"="+value)
+	}
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, c.pidsLimit, req.MemoryMB)
+	if !c.resourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
 	}
 	sort.Strings(envValues)
 
@@ -587,9 +597,11 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			resources["Memory"] = int64(req.MemoryMB) * 1024 * 1024
 			resources["MemorySwap"] = int64(req.MemoryMB) * 1024 * 1024
 		}
-		if c.pidsLimit > 0 {
-			// A fork bomb stops here instead of exhausting the node.
-			resources["PidsLimit"] = c.pidsLimit
+		if hostPids > 0 {
+			// A fork bomb stops here instead of exhausting the node. For
+			// gVisor this is the sentry's host budget; the sandbox's own
+			// cap is the env toolboxd applies (pkg/gvisorpids).
+			resources["PidsLimit"] = hostPids
 		}
 		if req.DiskGB > 0 {
 			// gVisor does not honor StorageOpt size — silently applying it
