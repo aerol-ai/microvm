@@ -3,10 +3,12 @@ package runloop
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,16 +24,29 @@ func TestExecSubmitEndsWhenDevboxStops(t *testing.T) {
 	env := newTestEnv(t)
 	devbox := env.mustCreate(t, "")
 	ctx := context.Background()
+	// The toolbox takes the command, then the sandbox dies: from that
+	// moment no request is answered, ever (a real dead sandbox's address
+	// goes silent). Without this the fake would keep answering, and the
+	// facade's lost-reply check (getSession) could find the command and
+	// rightly report the submit as done.
 	submitted := make(chan struct{})
+	var dead atomic.Bool
 	var once sync.Once
 	env.toolbox.setBeforeServe(func(r *http.Request) {
+		if dead.Load() {
+			// Consume the body so the client hanging up ends r.Context().
+			_, _ = io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
+			// The fake serves the request after this hook; nothing may run.
+			env.toolbox.setFailNext(r.URL.Path, http.StatusServiceUnavailable)
+			return
+		}
 		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/exec") {
 			once.Do(func() {
 				env.toolbox.serveSession(httptest.NewRecorder(), r, strings.TrimPrefix(r.URL.Path, "/process/session/"))
+				dead.Store(true)
 				close(submitted)
-				<-r.Context().Done() // the sandbox is gone: no answer comes
-				// The fake serves the request after this hook; the command
-				// already ran above, so it must not run again.
+				<-r.Context().Done()
 				env.toolbox.setFailNext(r.URL.Path, http.StatusServiceUnavailable)
 			})
 		}

@@ -3,6 +3,7 @@ package e2b
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +22,8 @@ import (
 func TestRuntimeProxyEndsWhenSandboxStops(t *testing.T) {
 	arrived := make(chan struct{}, 1)
 	envd := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Consume the body so the client hanging up ends r.Context().
+		_, _ = io.Copy(io.Discard, r.Body)
 		arrived <- struct{}{}
 		<-r.Context().Done() // a command that is still running
 	}))

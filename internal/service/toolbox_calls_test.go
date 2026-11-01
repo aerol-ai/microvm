@@ -33,6 +33,8 @@ func newHangingToolbox(t *testing.T) *hangingToolbox {
 	t.Helper()
 	h := &hangingToolbox{arrived: make(chan string, 16), answer: make(chan struct{})}
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Consume the body so a client hanging up ends r.Context().
+		_, _ = io.Copy(io.Discard, r.Body)
 		if r.URL.Path == "/partial" {
 			// Headers and some output, then the command keeps running.
 			w.WriteHeader(http.StatusOK)
@@ -438,13 +440,18 @@ func TestRoundTripToolboxEndsWhenSandboxStops(t *testing.T) {
 		if n := svc.toolboxCalls.inFlight(id); n != 1 {
 			t.Fatalf("a streaming response is not registered: in flight = %d", n)
 		}
-		go func() {
-			time.Sleep(50 * time.Millisecond)
-			_ = svc.handleDockerEvent(ctx, dockerEvent(id, "die"))
-		}()
-		body, err := io.ReadAll(resp.Body)
-		if !errors.Is(err, ErrSandboxStoppedMidRequest) || string(body) != "first line\n" {
-			t.Fatalf("read = %q, %v; want the first line, then the sandbox-stopped error", body, err)
+		// Read what the command printed so far, then stop the sandbox:
+		// the rest of the read reports the stop.
+		first := make([]byte, len("first line\n"))
+		if _, err := io.ReadFull(resp.Body, first); err != nil || string(first) != "first line\n" {
+			t.Fatalf("first read = %q, %v", first, err)
+		}
+		if err := svc.handleDockerEvent(ctx, dockerEvent(id, "die")); err != nil {
+			t.Fatal(err)
+		}
+		rest, err := io.ReadAll(resp.Body)
+		if !errors.Is(err, ErrSandboxStoppedMidRequest) || len(rest) != 0 {
+			t.Fatalf("read after the stop = %q, %v; want the sandbox-stopped error", rest, err)
 		}
 		if err := resp.Body.Close(); err != nil {
 			t.Fatal(err)
@@ -680,17 +687,18 @@ func TestToolboxCallEndRace(t *testing.T) {
 
 // TestToolboxProxyCompletionRacesStop: an exec that finishes just as its
 // sandbox stops either answers normally or reports the stop, never both,
-// never neither (run with -race). Odd iterations answer after 20ms, so the
-// stop lands first; even ones answer at once and race it.
+// never neither (run with -race). Odd iterations never get an answer, so
+// the stop always ends them; even ones are answered at once and race it.
 func TestToolboxProxyCompletionRacesStop(t *testing.T) {
 	const id = "sb-race"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/slow" {
-			select {
-			case <-time.After(20 * time.Millisecond):
-			case <-r.Context().Done():
-				return
-			}
+			// A command still running when the sandbox stops. The body is
+			// read first: Go's server notices a client hanging up only once
+			// the request body is consumed, and the handler must end then.
+			_, _ = io.Copy(io.Discard, r.Body)
+			<-r.Context().Done()
+			return
 		}
 		_, _ = io.WriteString(w, "done")
 	}))
@@ -706,24 +714,29 @@ func TestToolboxProxyCompletionRacesStop(t *testing.T) {
 			path = "/slow"
 		}
 		done := serveInBackground(svc, id, path)
+		// This iteration's stop, bound to it: it waits for the request to
+		// register (or this iteration to finish), so it can neither spin
+		// on after a fast answer nor end a later iteration's request.
+		finished, enderDone := make(chan struct{}), make(chan struct{})
 		go func(i int) {
+			defer close(enderDone)
 			for svc.toolboxCalls.inFlight(id) == 0 {
 				select {
-				case <-time.After(10 * time.Microsecond):
-				case <-time.After(time.Second):
+				case <-finished:
 					return
+				case <-time.After(10 * time.Microsecond):
 				}
 			}
 			// Even: 0-3ms, about one local round trip, so it lands before,
-			// during or after the answer. Odd: well inside the 20ms wait.
-			delay := time.Duration(i%8/2) * time.Millisecond
-			if i%2 == 1 {
-				delay = 5 * time.Millisecond
+			// during or after the answer. Odd: no answer is coming.
+			if i%2 == 0 {
+				time.Sleep(time.Duration(i%8/2) * time.Millisecond)
 			}
-			time.Sleep(delay)
 			svc.endToolboxCalls(id, toolboxEndStopped, "race")
 		}(i)
 		res := waitProxy(t, done)
+		close(finished)
+		<-enderDone
 		switch {
 		case res.err == nil && res.rec.Code == http.StatusOK && res.rec.Body.String() == "done":
 			answered++
@@ -740,7 +753,7 @@ func TestToolboxProxyCompletionRacesStop(t *testing.T) {
 	}
 	t.Logf("answered %d, stopped %d", answered, stopped)
 	if stopped < 30 {
-		t.Fatalf("only %d of the 30 slow execs were ended by the stop", stopped)
+		t.Fatalf("only %d of the 30 unanswered execs were ended by the stop", stopped)
 	}
 	if n := svc.toolboxCalls.inFlight(id); n != 0 {
 		t.Fatalf("%d requests left registered", n)
