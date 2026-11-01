@@ -105,6 +105,10 @@ SECRET_PROVIDER_ENV=""
 NO_START="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
+# --lb-health-port: a plain-HTTP /health listener for a load balancer's
+# health check (Terraform api_load_balancer = "nlb"). Empty writes none, so
+# a default install opens no new port.
+LB_HEALTH_PORT=""
 
 # A re-run restarts a running sandboxd when it changed the daemon's settings
 # file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
@@ -287,6 +291,14 @@ Options:
                                outside" alert see it instead of 127.0.0.1.
                                Writes the Caddy listener wrapper and
                                SB_L4_FALLBACK_PROXY_PROTOCOL=true together.
+  --lb-health-port <port>      Domain mode: serve GET /health in plain HTTP
+                               on <port> for a load balancer's health check.
+                               It answers 200 only when the whole path a
+                               client takes works (caddy-l4 on :443, the
+                               HTTPS site and sandboxd), and 502 otherwise,
+                               so the balancer drops this node while its
+                               daemon is down. Open the port to the load
+                               balancer only.
   --local                     Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. No domain name required.
@@ -679,6 +691,10 @@ while [[ $# -gt 0 ]]; do
 			L4_PROXY_PROTOCOL="true"
 			shift
 			;;
+		--lb-health-port)
+			LB_HEALTH_PORT="$2"
+			shift 2
+			;;
 		--key-custody)
 			KEY_CUSTODY="$2"
 			shift 2
@@ -843,6 +859,29 @@ esac
 if [[ "$L4_PROXY_PROTOCOL" == "true" && -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
 	echo "--l4-proxy-protocol requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
 	exit 1
+fi
+# The load-balancer health listener probes through caddy-l4 on :443, which
+# only exists in domain mode. Its port must not be one this node already
+# listens on, or Caddy fails to start and takes the API down with it.
+if [[ -n "$LB_HEALTH_PORT" ]]; then
+	if [[ -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+		echo "--lb-health-port requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+		exit 1
+	fi
+	if ! [[ "$LB_HEALTH_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || ((LB_HEALTH_PORT > 65535)); then
+		echo "--lb-health-port must be a port from 1024 to 65535, got '$LB_HEALTH_PORT'." >&2
+		exit 1
+	fi
+	case "$LB_HEALTH_PORT" in
+	2019 | 2220 | 7000 | 7001 | 7002 | 8443 | 21212 | 21215 | 53053)
+		echo "--lb-health-port $LB_HEALTH_PORT is already used on this node (Caddy admin, SSH gateway, cluster, HTTPS site, API, host-port redirect or route DNS)." >&2
+		exit 1
+		;;
+	esac
+	if ((LB_HEALTH_PORT >= 22000 && LB_HEALTH_PORT <= 23000)); then
+		echo "--lb-health-port $LB_HEALTH_PORT is inside the raw-TCP port pool (22000-23000)." >&2
+		exit 1
+	fi
 fi
 
 # Shared cert storage validation. The feature only makes sense alongside
@@ -1493,6 +1532,40 @@ ${tls_block}
 	}
 }
 EOF
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		cat >> /etc/caddy/Caddyfile <<EOF
+
+# Load-balancer health listener (--lb-health-port). Plain HTTP, so keep the
+# port closed to everything but the balancer (Terraform opens it to the
+# balancer's security group only). GET /health walks the path a client
+# takes: caddy-l4 on :443, its SNI fallback, the HTTPS API site and
+# sandboxd. Any of them down answers 502, and the balancer stops sending
+# this node new connections. Bound to every address: Caddy numbers its
+# servers by sorted listen address, so ":${LB_HEALTH_PORT}" sorts after
+# "127.0.0.1:8443" and the API site stays srv0, where sandboxd writes routes.
+http://:${LB_HEALTH_PORT} {
+	handle /health {
+		reverse_proxy https://127.0.0.1:443 {
+			# The balancer's probe carries its own address as Host and no
+			# SNI. Send the API site's name in both, or the probe matches
+			# no site and Caddy answers an empty 200 with sandboxd down.
+			header_up Host ${DOMAIN}
+			# Required on every reverse_proxy here; the probe holds no stream.
+			stream_close_delay 10m
+			transport http {
+				tls_server_name ${DOMAIN}
+				# A loopback hop to this same Caddy: the probe checks that
+				# the handshake works (certificate loaded), not who answers.
+				tls_insecure_skip_verify
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+	fi
 }
 
 write_caddy_env() {
@@ -2567,6 +2640,9 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
 	echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
 	echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		echo "Load-balancer health check: http://<this node>:${LB_HEALTH_PORT}/health (open it to the balancer only)"
+	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"
