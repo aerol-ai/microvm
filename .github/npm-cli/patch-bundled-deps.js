@@ -16,9 +16,9 @@ const root = __dirname;
 const pins = {
   'brace-expansion': '5.0.12',
   'http-cache-semantics': '4.2.1',
-  'ip-address': '10.7.3',
+  'ip-address': '10.7.5',
   'postcss-selector-parser': '7.1.6',
-  undici: '6.28.1',
+  undici: '6.29.1',
 };
 
 const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
