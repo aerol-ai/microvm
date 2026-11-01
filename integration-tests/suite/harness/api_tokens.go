@@ -36,12 +36,14 @@ type APIClient struct {
 	// Headers are sent on every request (a facade's own credential header,
 	// a forged client-address header).
 	Headers map[string]string
-	HTTP    *http.Client
+	// HTTP defaults to a client on SharedTransport; a replacement should
+	// keep that transport or a node a case took down stays in its pool.
+	HTTP *http.Client
 }
 
 // NewAPIClient is an APIClient for base with bearer.
 func NewAPIClient(base, bearer string) *APIClient {
-	return &APIClient{Base: strings.TrimRight(base, "/"), Bearer: bearer, HTTP: &http.Client{Timeout: 2 * time.Minute}}
+	return &APIClient{Base: strings.TrimRight(base, "/"), Bearer: bearer, HTTP: HTTPClient(2 * time.Minute)}
 }
 
 // As returns a copy of c that presents bearer instead.
@@ -131,7 +133,7 @@ func (c *APIClient) Do(ctx context.Context, method, path string, body any) (*API
 	}
 	hc := c.HTTP
 	if hc == nil {
-		hc = http.DefaultClient
+		hc = apiHTTPClient
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -185,24 +186,35 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		"SB_TOOLBOX_TOKEN=" + bootstrapToken,
 	}
 	envValues = append(envValues, pl.EnvVars()...)
+	parkReq := parkDefaultCreateRequest()
+	// A parked toolboxd caps a gVisor sentry at park time, sized for the
+	// park's default memory: the adopt handshake does not restart it.
+	hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, d.cfg.PidsLimit, parkReq.MemoryMB)
+	if !d.cfg.ResourceLimitsOff {
+		envValues = append(envValues, pidsEnv...)
+	}
 	sort.Strings(envValues)
 
+	parkMounts := []specs.Mount{
+		{Type: "bind", Source: d.cfg.ToolboxBinaryPath, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
+		{Type: "bind", Source: pl.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
+		{Type: "bind", Source: hostFiles.ResolvConf, Destination: "/etc/resolv.conf", Options: []string{"rbind", "ro"}},
+	}
+	if ociRuntime == "runsc" {
+		parkMounts = append(parkMounts, runscCgroupMount())
+	}
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
 		oci.WithProcessArgs(append([]string{d.cfg.ToolboxMountPath}, userCommand...)...),
 		oci.WithHostname(slotID),
 		oci.WithEnv(envValues),
-		oci.WithMounts([]specs.Mount{
-			{Type: "bind", Source: d.cfg.ToolboxBinaryPath, Destination: d.cfg.ToolboxMountPath, Options: []string{"rbind", "ro"}},
-			{Type: "bind", Source: pl.HostSocketPath(), Destination: dockerpkg.GuestReadySocketPath, Options: []string{"rbind"}},
-			{Type: "bind", Source: hostFiles.ResolvConf, Destination: "/etc/resolv.conf", Options: []string{"rbind", "ro"}},
-		}),
+		oci.WithMounts(parkMounts),
 	}
 	if !d.cfg.Privileged {
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(parkDefaultCreateRequest(), d.cfg.PidsLimit)...)
+		specOpts = append(specOpts, resourceSpecOpts(parkReq, hostPids)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))

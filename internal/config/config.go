@@ -148,7 +148,10 @@ type Config struct {
 	ResourceLimitsOff           bool
 	// SandboxPidsLimit caps the processes and threads of each container
 	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
-	// it one sandbox's fork bomb exhausts the node for every tenant.
+	// it one sandbox's fork bomb exhausts the node for every tenant. A gVisor
+	// sandbox is capped inside its own kernel instead, at this or one task
+	// per MiB of its memory if lower, and its host cgroup gets the room the
+	// sentry needs at that cap (pkg/gvisorpids).
 	SandboxPidsLimit int
 	// SandboxInterconnect lets sandboxes on one node connect to each other
 	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
@@ -1129,6 +1132,16 @@ type Config struct {
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
 	IngressAdvertiseHost string
+	// L4PublicHost is the host name clients dial for a raw-TCP exposure
+	// (the L4 host-port pool). Empty keeps the old target: SB_DOMAIN, else
+	// the public host. It exists for a domain that points at a load
+	// balancer which cannot carry the pool: an AWS Network Load Balancer
+	// has at most 50 listeners and the pool is 1,001 ports, so with
+	// Terraform's api_load_balancer = "nlb" the domain reaches the
+	// balancer and raw TCP keeps reaching the ingress nodes directly under
+	// tcp.<domain>. Only the advertised URL and host change; the pool, the
+	// allocator and the routes do not. SB_L4_PUBLIC_HOST.
+	L4PublicHost string
 	// ClusterShardAwareIngress confirms that the public ingress router is
 	// shard-aware when the live ingress tier is larger than
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
@@ -2090,6 +2103,7 @@ func load(keyTool bool) (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),

@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
 	integration-cluster-hetero-obs integration-cluster-hetero-obs-only integration-obs-snapshot \
@@ -292,6 +292,12 @@ integration-single-isolate-jail:
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
+
+# cluster-3-mixed behind a health-checked AWS Network Load Balancer
+# (api_load_balancer = "nlb"). UC-356 stops one node's daemon and asserts
+# the balancer drops it with no failed call and brings it back.
+integration-cluster-mixed-lb:
+	integration-tests/run.sh cluster-3-mixed-lb $(RUN_FLAGS)
 
 # 3× mixed cluster for docker-only benchmarks — same topology as
 # integration-cluster-mixed but advertises `benchmark` and names artifacts

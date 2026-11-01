@@ -48,7 +48,7 @@ func fcDo(t *testing.T, ctx context.Context, method, baseURL, path string, body 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		t.Fatalf("%s %s: %v", method, path, err)
 	}

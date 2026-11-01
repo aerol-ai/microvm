@@ -244,6 +244,14 @@ const (
 	// CapKeyCustodySingleWrapped: one node installed with
 	// install.sh --key-custody wrapped on a real AWS KMS key.
 	CapKeyCustodySingleWrapped Capability = "key-custody-single-wrapped"
+	// CapAPILoadBalancer: the domain fronts a health-checked AWS Network Load
+	// Balancer (Terraform api_load_balancer = "nlb"; run.sh derives that
+	// variable from this capability, the way deploy_obs follows
+	// observability). Every ingress node runs install.sh --lb-health-port and
+	// every node SB_L4_PUBLIC_HOST=tcp.<domain>. Gates UC-356; the other
+	// cases run unchanged and so cover the balancer's path (and raw TCP on
+	// tcp.<domain>) too.
+	CapAPILoadBalancer Capability = "api-load-balancer"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -295,6 +303,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
+	CapAPILoadBalancer: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -890,6 +899,8 @@ var Registry = []UseCase{
 	// Restricted Docker creates start their own pause (fix/egress-docker-pause-on-demand).
 	{ID: "UC-346", Title: "Egress (Docker engine): a create with network rules (block-all, CIDR allow, CIDR deny, hostname allowlist) runs in a pause container named for it with or without the pause pool, probes from its workload's first instruction never reach an outside address directly, and its destroy leaves no pause, firewall rule or gateway entry", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-347", Title: "Egress (Docker engine): a create without network rules keeps Docker's own path: no docker_pause stage, and no pause container without the pause pool", Requires: []Capability{CapDocker}, Implemented: true},
+	// Ingress high availability behind the load balancer (api_lb_test.go).
+	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
