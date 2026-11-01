@@ -112,6 +112,11 @@ type Driver struct {
 	// the one task. Entries live only while a start holds or waits on them.
 	startMu    sync.Mutex
 	startLocks map[string]*startLock
+
+	// drainedTasks maps a container ID to the *taskLog this process drains
+	// its output into (logio.go). A running task missing from it gets
+	// re-attached by ListManaged.
+	drainedTasks sync.Map
 }
 
 type startLock struct {

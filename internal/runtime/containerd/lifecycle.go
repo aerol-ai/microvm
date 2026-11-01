@@ -293,7 +293,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, err
 	}
-	logIO, closeLog, err := taskLogIO(logPath)
+	logIO, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}
@@ -437,9 +437,10 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	}
 	// Use the size-capped writer, not cio.LogFile: containerd never rotates task
 	// IO, so an uncapped resume log grows for the life of the task and can fill
-	// the host disk — the exact hazard Create's taskLogIO guards against. Closed
-	// on return, mirroring Create's logCloser handling.
-	logIO, closeLog, err := taskLogIO(logPath)
+	// the host disk — the exact hazard Create's taskLogIO guards against.
+	// Released on return like Create's: once the task's IO exists, its copy
+	// goroutines keep the file and close it when the task goes.
+	logIO, closeLog, err := d.taskLogIO(logPath)
 	if err != nil {
 		return nil, err
 	}
@@ -753,6 +754,11 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 		}
 		if state.SandboxID == "" || IsParkedSandboxID(state.SandboxID) {
 			continue
+		}
+		if state.Status == models.SandboxStatusStarted {
+			// The boot reconcile lists every sandbox, so after a restart
+			// this is where a running task gets a reader again.
+			d.ensureTaskDrain(ctx, container)
 		}
 		out[state.SandboxID] = state
 	}
