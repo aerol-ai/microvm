@@ -197,6 +197,7 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   close with zero bytes: the old http server's graceful shutdown closing
   connections that have not sent a request yet. The T19 notes are in
   `plans/integration-test-security.md` §7.12.
+- **Resolver stalls under the flag (fixed, 2026-11-01):** the first flagship run with the flag failed UC-171 with 6 fresh HTTPS dials ending in EOF. caddy-l4's dial of `{sni}.rt.internal` timed out in systemd-resolved: resolved pins its socket for the `aerolvm-rt` link's DNS server to that dummy link, so UDP to the loopback responder was dropped, and every time it re-probed UDP (about 7, 19 and 70 minutes apart on the flagship) lookups stalled for about 20 s. Zero Caddy loads happened on any node in the suite. Fix: the link's DNS server is the link's own address (`SB_ROUTE_DNS_LINK_ADDR`), and the responder echoes EDNS0.
 - **Established WebSockets too (#712):** each reload also closed every
   WebSocket a `reverse_proxy` carried (exec streams, `aerolvm shell`, session
   attach) with code 1001 (UC-68 on `cluster-hetero-lite-secrets`,
