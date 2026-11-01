@@ -336,6 +336,9 @@ type Service struct {
 	localReadyWasmModuleIDsCache   []string
 	localReadyWasmModuleIDsKnown   bool
 	localReadyWasmModuleIDsExpires time.Time
+	// slotPools caches LocalSlotPools (slot_pools.go) for the capacity
+	// heartbeat, so placement's per-create self refresh does not read SQLite.
+	slotPools slotPoolCache
 	// Reserved standard-module aliases that actually resolve on this host,
 	// computed once: each resolve hashes a staged file up to 256MiB, so it must
 	// not run on every 5s inventory refresh (hard rule 2). Staged modules are
@@ -5596,6 +5599,9 @@ func (s *Service) Capacity() capacity.Snapshot {
 		snap.LocalWasmModuleIDs = refs
 	}
 	snap.EgressGatewayReady = s.EgressGatewayReady()
+	// Network-slot pools: a peer with CPU and memory to spare can still be
+	// full for a runtime, and placement can only skip it if we say so.
+	snap.SlotPools = s.LocalSlotPools(context.Background())
 	// Observability-only engine tag (not a placement attribute).
 	if s.cfg.ContainerEngine != "" {
 		snap.ContainerEngine = s.cfg.ContainerEngine
