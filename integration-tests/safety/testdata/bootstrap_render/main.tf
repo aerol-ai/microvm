@@ -38,6 +38,8 @@ locals {
     idle_timeout_min = 30
     pat_scope = "any"
     l4_proxy_protocol = false
+    lb_health_port = 0
+    l4_public_host = ""
     firecracker_binary_url = "x"
     firecracker_jailer_url = "x"
     firecracker_kernel_url = "x"
@@ -268,5 +270,23 @@ output "joiner_kms" {
       # EnvironmentFile takes the last assignment.
       SB_SECRET_PROVIDER_STRICT_BOOT = "false"
     }
+  }))
+}
+
+# Behind the load balancer (Terraform api_load_balancer = "nlb"): an ingress
+# node gets the health listener, every node the raw-TCP host. A worker gets
+# the host only.
+output "joiner_api_lb" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    lb_health_port = 21280
+    l4_public_host = "tcp.x.example.com"
+  }))
+}
+
+output "joiner_api_lb_worker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    l4_public_host = "tcp.x.example.com"
   }))
 }

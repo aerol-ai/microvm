@@ -198,6 +198,13 @@ INSTALL_ARGS+=(--pat-scope host)
 %{ if l4_proxy_protocol ~}
 INSTALL_ARGS+=(--l4-proxy-protocol)
 %{ endif ~}
+%{ if lb_health_port > 0 ~}
+# A health-checked load balancer fronts this ingress node (Terraform
+# api_load_balancer; lb_health_port is 0 otherwise, and this renders
+# nothing). Its probe hits this plain-HTTP /health listener, which walks
+# caddy-l4 on :443 to sandboxd.
+INSTALL_ARGS+=(--lb-health-port '${lb_health_port}')
+%{ endif ~}
 %{ if caddy_storage_s3_enabled ~}
 # Shared S3-backed Caddy cert storage. Every node points at the same
 # bucket; certmagic-s3 holds a distributed lock during ACME so only the
@@ -1039,6 +1046,14 @@ SB_AUDIT_WITNESS_S3_PREFIX=${audit_witness_s3_prefix}
 SB_AUDIT_WITNESS_S3_REGION=${aws_region}
 %{ endif ~}
 
+%{ if l4_public_host != "" ~}
+# Managed by Terraform bootstrap: the domain points at the load balancer
+# (api_load_balancer; l4_public_host is "" otherwise, and this renders
+# nothing). An NLB cannot carry the raw-TCP port pool, so raw-TCP exposures
+# are advertised under a name with one A record per ingress node.
+SB_L4_PUBLIC_HOST=${l4_public_host}
+
+%{ endif ~}
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
 # wins over anything above it, and written BEFORE the final
