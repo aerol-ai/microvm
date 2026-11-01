@@ -64,3 +64,25 @@ func TestSandboxIDsClaimingContainerIP(t *testing.T) {
 		t.Fatal("want error on closed store")
 	}
 }
+
+// TestHasSandbox answers from the row's id alone (no sealed column), and
+// reports a store it can't read.
+func TestHasSandbox(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	if err := st.Upsert(ctx, &models.Sandbox{ID: "sb-here", Image: "img", Status: models.SandboxStatusStarted,
+		CreatedAt: now, UpdatedAt: now, LastActiveAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]bool{"sb-here": true, "sb-gone": false} {
+		got, err := st.HasSandbox(ctx, id)
+		if err != nil || got != want {
+			t.Fatalf("HasSandbox(%s) = %v, %v; want %v", id, got, err, want)
+		}
+	}
+	_ = st.Close()
+	if _, err := st.HasSandbox(ctx, "sb-here"); err == nil {
+		t.Fatal("want error on closed store")
+	}
+}

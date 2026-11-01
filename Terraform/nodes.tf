@@ -30,10 +30,14 @@ resource "aws_instance" "seed" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
@@ -85,6 +89,8 @@ resource "aws_instance" "seed" {
     idle_timeout_min                         = local.seed_node.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, local.seed_name) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
@@ -148,6 +154,7 @@ resource "aws_instance" "seed" {
     joiner_role_unique_id                    = aws_iam_role.joiner.unique_id
     secret_kms_key_arn                       = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot                   = var.secret_kms_strict_boot
+    key_custody                              = var.key_custody
     audit_export_backend                     = var.audit_export_backend
     audit_export_file_path                   = var.audit_export_file_path
     audit_export_s3_bucket                   = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""
@@ -236,6 +243,13 @@ resource "aws_instance" "seed" {
     # shard-aware router with shard_aware_ingress. Failing here is cheaper
     # than provisioning 100 nodes the daemon rejects. Mirrored in
     # Terraform/validate/ingress.go.
+    # Wrapped custody needs a key store to wrap with; the only one this
+    # module provisions is the AWS KMS key behind secret_kms_enabled.
+    precondition {
+      condition     = var.key_custody == "file" || var.secret_kms_enabled
+      error_message = "key_custody = \"wrapped\" needs secret_kms_enabled = true: the server key is wrapped by that KMS key."
+    }
+
     precondition {
       condition     = length(local.ingress_node_names) <= 10 || var.shard_aware_ingress
       error_message = "More than 10 ingress-capable nodes (ingress, a hybrid containing it, or mixed) need a shard-aware router in front of the tier (GET /v1/cluster/ingress-route/{id}); set shard_aware_ingress = true only once that router is in place. See setup/runbooks/cluster-ingress-topology.md."
@@ -263,10 +277,14 @@ resource "aws_instance" "joiner" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # See the seed resource for the rationale: zero blocks when spot=false keeps
@@ -311,6 +329,8 @@ resource "aws_instance" "joiner" {
     idle_timeout_min                         = each.value.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, each.key) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
@@ -375,6 +395,7 @@ resource "aws_instance" "joiner" {
     joiner_role_unique_id        = aws_iam_role.joiner.unique_id
     secret_kms_key_arn           = var.secret_kms_enabled ? aws_kms_key.secrets[0].arn : ""
     secret_kms_strict_boot       = var.secret_kms_strict_boot
+    key_custody                  = var.key_custody
     audit_export_backend         = var.audit_export_backend
     audit_export_file_path       = var.audit_export_file_path
     audit_export_s3_bucket       = var.audit_export_enabled ? aws_s3_bucket.audit[0].bucket : ""

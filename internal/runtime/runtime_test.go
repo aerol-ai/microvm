@@ -24,13 +24,21 @@ func TestDockerClientSatisfiesContainerRuntime(t *testing.T) {
 // Docker's start must re-adopt a warm-pool container with the sandbox's
 // identity, so the service has to find StartWithIdentity on the client it
 // was given; the other drivers start without it.
-func TestOnlyDockerStartsWithIdentity(t *testing.T) {
+// Docker re-adopts a warm-pool container on start; Firecracker re-adopts a
+// guest restored from its stopped snapshot (its agent serves nothing without
+// the sandbox's token).
+func TestDockerAndFirecrackerStartWithIdentity(t *testing.T) {
 	var _ runtime.IdentityStarter = (*docker.Client)(nil)
-	if _, ok := runtime.AsIdentityStarter((*docker.Client)(nil)); !ok {
-		t.Fatal("the Docker client must start with the sandbox's identity")
+	var _ runtime.IdentityStarter = (*firecracker.Driver)(nil)
+	for name, rt := range map[string]runtime.Runtime{
+		"docker": (*docker.Client)(nil), "firecracker": (*firecracker.Driver)(nil),
+	} {
+		if _, ok := runtime.AsIdentityStarter(rt); !ok {
+			t.Fatalf("%s must start with the sandbox's identity", name)
+		}
 	}
 	for name, rt := range map[string]runtime.Runtime{
-		"containerd": (*containerdruntime.Driver)(nil), "firecracker": (*firecracker.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
+		"containerd": (*containerdruntime.Driver)(nil), "wasm": (*wasmruntime.Driver)(nil),
 	} {
 		if _, ok := runtime.AsIdentityStarter(rt); ok {
 			t.Errorf("%s unexpectedly starts with an identity", name)

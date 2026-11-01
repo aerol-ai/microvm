@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 )
 
@@ -148,10 +149,79 @@ func TestSetEgressFloorUsesTheCNISubnet(t *testing.T) {
 	if err := d.SetEgressFloor(context.Background(), []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
 		t.Fatal(err)
 	}
-	if len(be.rules) != 1 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") {
+	// The operator's range, and the CNI subnet to itself (sandboxes are
+	// isolated from each other by default).
+	if len(be.rules) != 2 || !strings.Contains(be.rules[0], "10.88.0.0/16|-d|10.20.0.0/16") || !strings.Contains(be.rules[1], "10.88.0.0/16|-d|10.88.0.0/16") {
 		t.Fatalf("floor rules = %v", be.rules)
 	}
 	if err := New(Config{}, nil, nil).SetEgressFloor(context.Background(), nil); err != nil {
 		t.Fatal("no rules manager is a no-op")
 	}
+}
+
+// NetRulesEnabled is what the service asks before it accepts network policy
+// for a containerd sandbox: true only over a live manager.
+func TestDriverNetRulesEnabled(t *testing.T) {
+	disabled, err := netrules.NewWithOptions(false, netrules.BackendExec, netrules.ChainAerolvmUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if New(Config{}, nil, nil).NetRulesEnabled() {
+		t.Fatal("nil manager reported enabled")
+	}
+	if New(Config{}, disabled, nil).NetRulesEnabled() {
+		t.Fatal("disabled manager reported enabled")
+	}
+	if !New(Config{}, netrules.NewWithBackend(&netrulesFailInsertBackend{}), nil).NetRulesEnabled() {
+		t.Fatal("live manager reported disabled")
+	}
+}
+
+// TestDriverNodeGuardUsesTheCNISubnet: the node guard covers the CNI
+// bridge's subnet; a driver without a firewall reports the guard as
+// unavailable rather than pretending it is in place.
+func TestDriverNodeGuardUsesTheCNISubnet(t *testing.T) {
+	ctx := context.Background()
+	if err := New(Config{}, nil, nil).SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("no rules manager: %v", err)
+	}
+	off, err := netrules.New(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := New(Config{}, off, nil).SetNodeGuard(ctx, nil); !errors.Is(err, sbruntime.ErrNodeGuardUnavailable) {
+		t.Fatalf("rules disabled: %v", err)
+	}
+	if repaired, err := New(Config{}, nil, nil).ReassertNodeGuard(ctx); repaired || err != nil {
+		t.Fatal("no rules manager: nothing to re-assert")
+	}
+	be := &nodeMemBackend{}
+	mgr := netrules.NewWithBackend(be)
+	mgr.SetBridgeSubnet("10.88.0.0/16")
+	d := New(Config{}, mgr, nil)
+	if err := d.SetNodeGuard(ctx, []netrules.NodePort{{Proto: "udp", Port: 53054}}); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(be.rules, "\n")
+	if !strings.Contains(joined, "-s|10.88.0.0/16|-p|udp|--dport|53054") || !strings.Contains(joined, "-s|10.88.0.0/16|-m|comment|--comment|sbx-node-guard|-j|DROP") {
+		t.Fatalf("node guard rules = %v", be.rules)
+	}
+	if _, err := d.ReassertNodeGuard(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// nodeMemBackend flushes one chain at a time, as the kernel does.
+type nodeMemBackend struct{ netrulesMemBackend }
+
+func (n *nodeMemBackend) EnsureJumpChain(string, string) error { return nil }
+func (n *nodeMemBackend) FlushChain(chain string) error {
+	kept := n.rules[:0]
+	for _, r := range n.rules {
+		if !strings.HasPrefix(r, "filter|"+chain+"|") {
+			kept = append(kept, r)
+		}
+	}
+	n.rules = kept
+	return nil
 }

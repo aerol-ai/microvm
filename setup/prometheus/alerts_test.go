@@ -141,3 +141,86 @@ func goMetricLiterals(t *testing.T, root string) map[string]bool {
 	}
 	return out
 }
+
+// TestKeyCustodyAlertRules lints the key-custody alert group
+// (plans/customer-key-custody.md Section 8): the four alerts exist with
+// their severities, every rule is complete, every metric it queries is
+// registered in the Go tree, labels are the positional key/key2/key3 an
+// expvar map exports, and every runbook_url lands on a heading of
+// setup/runbooks/secrets-and-audit.md.
+func TestKeyCustodyAlertRules(t *testing.T) {
+	root := repoRoot(t)
+	raw, err := os.ReadFile(filepath.Join(root, "setup", "prometheus", "sandboxd-alerts.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rules ruleFile
+	if err := yaml.Unmarshal(raw, &rules); err != nil {
+		t.Fatalf("sandboxd-alerts.yml does not parse: %v", err)
+	}
+	runbook, err := os.ReadFile(filepath.Join(root, "setup", "runbooks", "secrets-and-audit.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchors := map[string]bool{}
+	for _, line := range strings.Split(string(runbook), "\n") {
+		for _, prefix := range []string{"## ", "### "} {
+			if strings.HasPrefix(line, prefix) {
+				anchors[strings.ToLower(strings.ReplaceAll(strings.TrimPrefix(line, prefix), " ", "-"))] = true
+			}
+		}
+	}
+	registered := goMetricLiterals(t, root)
+	metricRE := regexp.MustCompile(`aerolvm_[a-z0-9_]+`)
+	labelRE := regexp.MustCompile(`([a-z_0-9]+)(=~|!=|=)"`)
+	const runbookURL = "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#"
+
+	want := map[string]string{
+		"SandboxdServerKeyPlaintext":     "warning",
+		"SandboxdKeyRevoked":             "critical",
+		"SandboxdKeyVersionRetiredInUse": "warning",
+		"SandboxdKeyStoreThrottling":     "warning",
+	}
+	seen := map[string]bool{}
+	for _, g := range rules.Groups {
+		if g.Name != "sandboxd.key-custody" {
+			continue
+		}
+		for _, r := range g.Rules {
+			seen[r.Alert] = true
+			if sev, ok := want[r.Alert]; !ok {
+				t.Errorf("unexpected alert %q in the key-custody group", r.Alert)
+			} else if r.Labels["severity"] != sev {
+				t.Errorf("%s: severity %q, want %q", r.Alert, r.Labels["severity"], sev)
+			}
+			if r.Expr == "" || r.For == "" || r.Labels["component"] != "key-custody" ||
+				r.Annotations["summary"] == "" || r.Annotations["description"] == "" {
+				t.Errorf("%s: incomplete rule %+v", r.Alert, r)
+			}
+			anchor, ok := strings.CutPrefix(r.Annotations["runbook_url"], runbookURL)
+			if !ok || !anchors[anchor] {
+				t.Errorf("%s: runbook_url %q is not a heading of secrets-and-audit.md", r.Alert, r.Annotations["runbook_url"])
+			}
+			for _, name := range metricRE.FindAllString(r.Expr, -1) {
+				if !registered[name] {
+					t.Errorf("%s queries %s, which no Go file registers", r.Alert, name)
+				}
+			}
+			for _, m := range labelRE.FindAllStringSubmatch(r.Expr, -1) {
+				if m[1] != "key" && m[1] != "key2" && m[1] != "key3" {
+					t.Errorf("%s uses label %q; sandboxd exports key/key2/key3 only", r.Alert, m[1])
+				}
+			}
+		}
+	}
+	var missing []string
+	for name := range want {
+		if !seen[name] {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("key-custody alerts missing: %v", missing)
+	}
+}

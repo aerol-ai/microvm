@@ -18,7 +18,7 @@ import (
 
 func TestEnvdFilesystemRoutes(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 	root := t.TempDir()
 	createdDir := filepath.Join(root, "subdir")
 	movedDir := filepath.Join(root, "moved")
@@ -141,7 +141,7 @@ func TestEnvdFilesystemRoutes(t *testing.T) {
 
 func TestEnvdProcessRoutes(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	h := srv.routes()
+	h := authedRoutes(srv)
 
 	startBody := map[string]any{
 		"process": map[string]any{

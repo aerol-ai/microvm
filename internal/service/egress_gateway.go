@@ -71,6 +71,11 @@ const (
 	EgressStatusActive      = "active"
 	EgressStatusHeld        = "held"
 	EgressStatusUnavailable = "unavailable"
+	// EgressStatusUnenforced: the sandbox's runtime enforces its policy with
+	// the host firewall, which is off on this node, so nothing filters its
+	// traffic. Only a sandbox accepted under SB_ALLOW_UNENFORCED_NETWORK_POLICY,
+	// or created before the firewall was turned off, shows it.
+	EgressStatusUnenforced = "unenforced"
 )
 
 // egressAttachTimeout bounds one UDS round trip on the create path.
@@ -477,23 +482,39 @@ func (s *Service) egressSpecFor(sb *models.Sandbox, held bool) (egress.Spec, boo
 func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime) (err error) {
 	ctx, span := observability.StartSpan(ctx, "egress.attach", attribute.String("sandbox_id", sb.ID))
 	defer func() { observability.EndSpan(span, err) }()
+	stages := s.newAttachStages(ctx, span)
 	ctx, cancel := context.WithTimeout(ctx, egressAttachTimeout)
 	defer cancel()
+	attached, held, err := s.attachGateway(ctx, sb, stages)
+	if err != nil || !attached {
+		return err
+	}
+	return s.liftDriverBlock(ctx, sb, cr, held, stages)
+}
+
+// attachGateway is the gateway half of an attach: the spec, the bootstrap
+// latch and the Attach itself. attached is false (with no error) for a
+// sandbox that isn't in gateway mode; held reports the hold the spec was
+// built with. Nothing here touches the host firewall, so the sandbox stays
+// behind the driver's block-all whatever happens.
+func (s *Service) attachGateway(ctx context.Context, sb *models.Sandbox, stages *attachStages) (attached, held bool, err error) {
 	// A held sandbox attaches shut, whatever the hold's class: only the
 	// release that resolves it lifts the gateway's block. An unreadable
 	// record counts as held.
-	held, _ := s.egressHeld(ctx, sb)
+	held, _ = s.egressHeld(ctx, sb)
 	spec, ok := s.egressSpecFor(sb, held)
 	if !ok {
-		return nil
+		return false, held, nil
 	}
 	spec.Secrets = s.egressSecrets(ctx, sb)
 	spec.Pid = s.egressPid(ctx, sb)
+	stages.mark(attachStageLookup)
 	if err := s.EnsureEgressGatewayReady(ctx); err != nil {
 		s.egressStats.recordAttachFailed()
-		return err
+		return false, held, err
 	}
 	s.kickEgressSelfTest()
+	stages.mark(attachStageReady)
 	s.egressSyncMu.RLock()
 	err = s.egressGateway().Attach(ctx, spec)
 	if err == nil {
@@ -501,16 +522,32 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 		s.noteAttached(sb.ID)
 	}
 	s.egressSyncMu.RUnlock()
+	stages.mark(attachStageRPC)
 	if err != nil {
 		s.egressStats.recordAttachFailed()
 		if errors.Is(err, egress.ErrUnavailable) || errors.Is(err, egress.ErrVersionMismatch) {
 			s.egressReady.Store(false)
 		}
-		return err
+		return false, held, err
 	}
-	if err := s.releaseEgressHold(ctx, sb, cr, gatewayHolds...); err != nil {
-		return err
+	return true, held, nil
+}
+
+// liftDriverBlock is the host-firewall half of an attach, run once the
+// gateway enforces for sb's address: the gateway-hold release and the lift
+// of the driver's block-all.
+func (s *Service) liftDriverBlock(ctx context.Context, sb *models.Sandbox, cr runtime.ContainerRuntime, held bool, stages *attachStages) error {
+	// Only a hold seen above can need lifting. One recorded since is left
+	// in place, which is fail-closed and is what its own retry lifts
+	// (retryEgressHolds re-attaches held sandboxes); a create therefore
+	// skips this second read of the store, which on the single SQLite
+	// connection queues behind the create's own row persist.
+	if held {
+		if err := s.releaseEgressHold(ctx, sb, cr, gatewayHolds...); err != nil {
+			return err
+		}
 	}
+	stages.mark(attachStageRelease)
 	// The driver's block-all DROP has done its job; quota and real block-all
 	// keep their own DROPs (applyNetworkQuotaState, NetworkBlockAll).
 	if !sb.NetworkBlockAll && !sb.NetworkQuotaExceeded {
@@ -518,6 +555,7 @@ func (s *Service) attachSandboxEgress(ctx context.Context, sb *models.Sandbox, c
 			return fmt.Errorf("lift driver block after egress attach: %w", err)
 		}
 	}
+	stages.mark(attachStageUnblock)
 	return nil
 }
 
@@ -920,10 +958,15 @@ func (s *Service) setEgressQuotaBlock(ctx context.Context, sb *models.Sandbox, o
 // EgressStatus reports a sandbox's egress status for GET: "" for a sandbox
 // outside gateway mode and not held, otherwise active, held or unavailable.
 // A hold shows on every runtime: a policy that failed to apply, or profiles
-// that can't be resolved, hold WASM, isolate and CIDR sandboxes too.
+// that can't be resolved, hold WASM, isolate and CIDR sandboxes too. A policy
+// on a runtime whose host firewall is off is unenforced, ahead of all of
+// those: neither an attach nor a hold filters anything there.
 func (s *Service) EgressStatus(ctx context.Context, sb *models.Sandbox) string {
 	if sb == nil || !hasEgressConfig(sb) {
 		return ""
+	}
+	if s.sandboxNetRulesOff(sb) {
+		return EgressStatusUnenforced
 	}
 	gw := models.RuntimeUsesEgressGateway(sb.Runtime) && isGatewayMode(sb)
 	if st, err := s.store.GetEgressState(ctx, sb.ID); err == nil && st.HoldReason != "" {

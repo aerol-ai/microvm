@@ -5,6 +5,7 @@ import (
 	"errors"
 	"expvar"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/runtime"
@@ -66,8 +67,20 @@ var (
 	secretDeleteOutboxRetiredStandalone = expvar.NewInt("aerolvm_secret_delete_outbox_retired_standalone_total")
 	secretPutOutboxRetiredStandalone    = expvar.NewInt("aerolvm_secret_put_outbox_retired_standalone_total")
 	secretCiphertextRetiredTotal        = expvar.NewInt("aerolvm_secret_ciphertext_retired_total")
-	// secretProviderCanaryOK is 1 after a successful awskms boot canary, 0 after failure.
+	// secretProviderCanaryOK is 1 after a successful external provider boot
+	// canary, 0 after failure.
 	secretProviderCanaryOK = expvar.NewInt("aerolvm_secret_provider_canary_ok")
+	// keyStoreLimiterWait is how long key-store calls waited for a slot, per
+	// limiter budget (foreground, create, background). A rising foreground
+	// tail means SB_SECRET_PROVIDER_MAX_INFLIGHT is below what restarts need.
+	keyStoreLimiterWait = scaleobs.NewNestedDurationBuckets("aerolvm_key_store_limiter_wait_seconds_bucket")
+	// keyStoreCalls counts key-store calls by backend, op and outcome class
+	// (aerolvm_key_store_calls_total{key=backend,key2=op,key3=class});
+	// SandboxdKeyStoreThrottling watches the throttled class.
+	keyStoreCalls = expvar.NewMap("aerolvm_key_store_calls_total")
+	// keyStoreCallSeconds is each call's latency, keyed "<backend>_<op>".
+	keyStoreCallSeconds = scaleobs.NewNestedDurationBuckets("aerolvm_key_store_call_seconds_bucket")
+	keyStoreCallsMu     sync.Mutex
 	// Best-effort local seal failures (ownership replay backfill).
 	// Promote-retract counter for overlapped reserved-path create
 	// (plans/warm-create-latency-tier1.5-seal-promote-overlap.md). Keyed by
@@ -92,6 +105,16 @@ var (
 	// is currently un-isolated, which is page-worthy.
 	networkBlockReapplyTotal  = expvar.NewInt("aerolvm_network_block_reapply_total")
 	networkBlockReapplyErrors = expvar.NewInt("aerolvm_network_block_reapply_errors_total")
+
+	// Reconcile asked a runtime about a sandbox missing from its listing and
+	// got no answer (reconcile_unknown.go). The row is kept, never deleted.
+	// unknown_total is keyed by runtime (docker, containerd, firecracker,
+	// wasm, isolate); unknown_sandboxes is how many are unanswered now;
+	// marked_error_total counts sandboxes recorded as status=error after
+	// staying unanswered past reconcileUnknownMarkAfter.
+	reconcileRuntimeUnknownTotal       = expvar.NewMap("aerolvm_reconcile_runtime_unknown_total")
+	reconcileRuntimeUnknownSandboxes   = expvar.NewInt("aerolvm_reconcile_runtime_unknown_sandboxes")
+	reconcileRuntimeUnknownMarkedTotal = expvar.NewInt("aerolvm_reconcile_runtime_unknown_marked_error_total")
 
 	wakeRequestsTotal   = expvar.NewInt("aerolvm_wake_requests_total")
 	wakeColdStartsTotal = expvar.NewInt("aerolvm_wake_cold_starts_total")
@@ -200,6 +223,28 @@ func recordSecretFanoutFailure() {
 
 func recordSecretPutOutboxFailure() {
 	secretPutOutboxFailuresTotal.Add(1)
+}
+
+func recordKeyStoreLimiterWait(budget string, wait time.Duration) {
+	keyStoreLimiterWait.Observe(budget, wait)
+}
+
+// recordKeyStoreCall is the router's CallObserver.
+func recordKeyStoreCall(backend, op, class string, took time.Duration) {
+	keyStoreCallsMu.Lock()
+	byOp, _ := keyStoreCalls.Get(backend).(*expvar.Map)
+	if byOp == nil {
+		byOp = new(expvar.Map).Init()
+		keyStoreCalls.Set(backend, byOp)
+	}
+	byClass, _ := byOp.Get(op).(*expvar.Map)
+	if byClass == nil {
+		byClass = new(expvar.Map).Init()
+		byOp.Set(op, byClass)
+	}
+	keyStoreCallsMu.Unlock()
+	byClass.Add(class, 1)
+	keyStoreCallSeconds.Observe(backend+"_"+op, took)
 }
 
 func recordSecretProviderCanary(ok bool) {
@@ -311,6 +356,10 @@ func classifySecretMetricError(err error) string {
 		return "ref_not_found"
 	case errors.Is(err, secrets.ErrDecryptFailed):
 		return "decrypt_failed"
+	case errors.Is(err, secrets.ErrKeyRevoked):
+		return "key_revoked"
+	case errors.Is(err, secrets.ErrKeyVersionRetired):
+		return "key_version_retired"
 	case errors.Is(err, secrets.ErrProviderUnavailable):
 		return "provider_unavailable"
 	case errors.Is(err, secrets.ErrProviderThrottled):

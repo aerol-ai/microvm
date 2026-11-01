@@ -133,6 +133,13 @@ sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager | grep -E 'egres
   policy for very broad wildcards.
 - Anything else from `nft`: capture `sudo nft list table inet aerolvm_egress`
   and the gateway log, then restart the gateway.
+- `pause container for the sandbox's network rules` (Docker engine, no
+  pause pool slot): a create with rules starts a pause container of its own
+  and fails closed when it can't. `pull pause image` means the node can't
+  reach `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE`; point it at a mirror. A leftover
+  `aerolvm-netns-sb-<id>` whose sandbox is gone is removed at the next
+  sandboxd start; `sudo docker rm -f` it sooner if it holds an address you
+  need.
 
 ## SandboxesHeld
 
@@ -276,10 +283,13 @@ reads it for the internal zone, its copy of the floor and the proxy.
 - **Built-in profiles (`builtin_profiles`, on by default).** `false` refuses
   new `builtin:` references with 400; sandboxes already using one keep it.
 - **Deny floor (`deny_cidrs`).** Dropped for every sandbox in every mode, in
-  three places: the host firewall chain `AEROLVM-FLOOR` (jumped from the top
-  of `DOCKER-USER` or `AEROLVM-USER`, rewritten by sandboxd when the file
+  three places: the host firewall, one chain per sandbox subnet named
+  `AEROLVM-FLOOR-<8 hex>` (jumped from the top of `DOCKER-USER`,
+  `AEROLVM-USER` or `AEROLVM-FC`, rewritten by sandboxd when the file
   changes), the gateway's `deny_floor` set, and the WASM and isolate dial
-  guards. Check the host copy with `sudo iptables -S AEROLVM-FLOOR`.
+  guards. Check the host copies with `sudo iptables -S | grep AEROLVM-FLOOR-`:
+  a node running containers and Firecracker guests has one chain for each.
+  A plain `AEROLVM-FLOOR` chain is an older daemon's, emptied at boot.
 - **Control-port guard (`node_control_port_guard`, on by default when a file
   is present).** Sandboxes cannot open TCP connections to any cluster
   member's API, SSH gateway, Raft, gossip or cluster mTLS port, including
@@ -287,6 +297,19 @@ reads it for the internal zone, its copy of the floor and the proxy.
   list to the gateway (`node_control` set) and refreshes it as membership
   changes. A tool inside a sandbox that called a node's `:21212` directly
   now times out; point it at the ingress URL, or set the guard to `false`.
+  Setting it to `false` never opens the sandbox's own node: the node guard
+  below holds that.
+- **Node guard (always on, no file needed).** Sandboxes are default-denied
+  from the node they run on: every new connection from a sandbox subnet to
+  any node address is dropped by `AEROLVM-NODE` (the first rule of `INPUT`,
+  one `AEROLVM-NODE-<8 hex>-A|B` chain per sandbox subnet), except the
+  gateway's DNS and proxy ports, DNS on a node address the sandboxes'
+  resolver names, 80/443 on an ingress node, and `SB_SANDBOX_NODE_PORTS_ALLOW`.
+  WASM and isolate get the same rule in their dial guard. Check it with
+  `sudo iptables -S AEROLVM-NODE` and the chain it jumps to; the
+  `aerolvm_node_guard_ready` expvar is 1 per runtime that has it. sandboxd
+  re-asserts it every 30 s; a runtime where it cannot be installed refuses
+  creates with 503 `node_guard_not_ready` and logs why.
 
 ## Inspection
 

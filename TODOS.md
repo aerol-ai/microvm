@@ -50,29 +50,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
   the Caddy upstream health config in `pkg/caddy` / `packaging/`, and the
   PR #522 design.
 
-## Reconcile still reaps a healthy sandbox on a transient Inspect error (UC-20 residual, unconfirmed)
-
-- **What:** decide whether `reconcileGoneContainerConfirmed`
-  (`internal/service/service.go:4800`) should reap only on a definite
-  not-found, rather than on any `Inspect` error.
-- **Why:** UC-20 (reconcile deleted a freshly created owned sandbox ~200ms
-  after create; a cross-node snapshot then 404'd) was fixed in PR #360
-  (`dd06a979`). Reconcile now re-Inspects a container missing from the bulk
-  `ListManaged` snapshot before reaping it. But the root cause in that commit
-  is containerd's `ListManaged` skipping a container whose `Inspect` errors
-  mid-adopt or mid-start. The re-check treats **any** `Inspect` error as
-  "gone" (`:4808-4811`), so the same transient error on the targeted call
-  still deletes the row and the cluster placement of a healthy sandbox.
-- **Caveat (why it is a TODO, not a bug):** unreproduced. Whether the
-  targeted `Inspect` can fail transiently in the same window is unknown.
-  Narrowing to not-found also has a cost: a container whose `Inspect` keeps
-  erroring would never be reaped. Get a reproduction first.
-- **Start:** `reconcileGoneContainerConfirmed`;
-  `TestReconcileReInspectsBeforeReap`
-  (`internal/service/reconcile_destroy_test.go:692`); the containerd
-  driver's `ListManaged` skip. UC-20 itself is implemented and not skipped
-  (`integration-tests/suite/lifecycle_more_test.go:176`).
-
 ## Destroy events WARN about an already-deleted placement (cluster)
 
 - **What:** stop `handle docker event failed … cluster: unknown sandbox
@@ -592,6 +569,51 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 - **Effort / priority:** M, P3.
 - **Depends on:** open audit witness v1 (Phases 1–5 of
   `plans/open-audit-witness.md`) shipped.
+
+---
+
+## GCP Cloud KMS and Azure Key Vault key providers (security, key custody)
+
+- **What:** add `gcpkms` and `azurekv` providers on the `DataKeyWrapper`
+  seam (`pkg/secrets/kms.go:16-19`), next to `awskms`, `vault` and `pkcs11`.
+- **Why:** customers on Google Cloud or Azure keep their keys in those
+  clouds' key services. Deferred at CEO review 2026-10-20
+  (`plans/customer-key-custody.md`, CEO-E5): no GCP or Azure customer has
+  asked, and the live test harness only knows AWS.
+- **Pros:** native key custody on every major cloud; Cloud KMS is what a GKE
+  Marketplace listing would expect.
+- **Cons:** each needs its own cloud account, credentials and harness
+  support before the docs can say "tested".
+- **Start:** copy `pkg/secrets/awskms.go` (narrow client interface plus
+  error mapping) and run `testProviderContract`
+  (`pkg/secrets/provider_contract_test.go:17`) over the new wrapper. Bind the
+  encryption context as AAD (Cloud KMS `additionalAuthenticatedData`).
+- **Trigger:** the GKE phase of `plans/kubernetes-deployment.md` for Cloud
+  KMS; a named Azure customer for Key Vault.
+- **Effort / priority:** M each (L with test accounts), P3.
+- **Depends on:** `plans/customer-key-custody.md` Phase 1 (seam split and
+  provider tags).
+
+---
+
+## HSM signing of audit chain heads (security, audit witness)
+
+- **What:** sign each witnessed audit chain head with a PKCS#11 key the
+  daemon cannot read, and have `aerolvm audit verify` (`cmd/aerolvm/audit.go`)
+  check the signatures, with a dual-read for old unsigned heads.
+- **Why:** a compromised node can still write a new head that matches a
+  rewritten chain; a signature from a key it cannot read stops that. This is
+  the second follow-up in `plans/secrets-hardening.md:1014` and a non-goal of
+  `plans/open-audit-witness.md`. Deferred at CEO review 2026-10-20
+  (`plans/customer-key-custody.md`, CEO-E6) so the key-custody stack does not
+  change a just-shipped evidence format.
+- **Pros:** forged heads fail the verifier even after a full node compromise.
+- **Cons:** a new signed-head format and verifier dual-read; needs its own
+  plan and eng review.
+- **Start:** reuse the PKCS#11 session pool from `plans/customer-key-custody.md`
+  Phase 3; the witness writer is `internal/service/secret_audit_witness.go`.
+- **Effort / priority:** L, P3.
+- **Depends on:** `plans/customer-key-custody.md` Phase 3 merged.
 
 ---
 

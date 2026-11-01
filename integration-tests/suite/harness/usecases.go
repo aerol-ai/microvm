@@ -83,6 +83,11 @@ const (
 	// scenario configured S3 or NFS. Where the feature is off, the UCs skip
 	// (not-applicable) rather than fail against a 412.
 	CapPlatformVolumes Capability = "platform-volumes"
+	// CapNoHostFirewall marks a deployment with no host firewall (local
+	// mode: SB_ENABLE_NETWORK_RULES=false). A container sandbox there is
+	// refused network policy (501 network_policy_unenforced) rather than
+	// given policy it cannot enforce, so the egress cases assert that refusal.
+	CapNoHostFirewall Capability = "no-host-firewall"
 	// CapBenchmark gates the create-benchmark UCs (UC-94/UC-95). It is
 	// deliberately separate from the runtime capabilities: the benchmark is
 	// slow and provisions many sandboxes (the density probe runs until the
@@ -217,6 +222,36 @@ const (
 	// restarts each one twice. Opt-in for its cost, like CapBenchmark: on an
 	// 8-node hetero cluster that is two rolling restarts of the fleet.
 	CapPATRotation Capability = "pat-rotation"
+	// Customer key custody (plans/customer-key-custody.md Phase 6). Each
+	// scenario boots on the default local provider; the suite installs the
+	// key store over SSH, switches to it the two-step way and wraps the
+	// server key, so the migration a customer runs is what is tested.
+	//
+	// CapKeyCustodyVault: an OpenBao dev server (TLS) on the seed and an
+	// OpenBao Proxy on every node; sandboxd holds no Vault token.
+	CapKeyCustodyVault Capability = "key-custody-vault"
+	// CapKeyCustodyPKCS11: SoftHSM2 on every node with the SAME imported
+	// keys. It proves the PKCS#11 code path, not a network HSM.
+	CapKeyCustodyPKCS11 Capability = "key-custody-pkcs11"
+	// CapKeyCustodyKMSWrapped: a fresh cluster built with Terraform
+	// key_custody = "wrapped" on a real AWS KMS key, so no plaintext server
+	// key is ever written.
+	CapKeyCustodyKMSWrapped Capability = "key-custody-kms-wrapped"
+	// CapKeyCustodyKMSSwitch: a fresh cluster installed on a real AWS KMS
+	// key with custody file, so a case can step it back to local sealing and
+	// run the two-step switch to AWS KMS (eng D22).
+	CapKeyCustodyKMSSwitch Capability = "key-custody-kms-switch"
+	// CapKeyCustodySingleWrapped: one node installed with
+	// install.sh --key-custody wrapped on a real AWS KMS key.
+	CapKeyCustodySingleWrapped Capability = "key-custody-single-wrapped"
+	// CapAPILoadBalancer: the domain fronts a health-checked AWS Network Load
+	// Balancer (Terraform api_load_balancer = "nlb"; run.sh derives that
+	// variable from this capability, the way deploy_obs follows
+	// observability). Every ingress node runs install.sh --lb-health-port and
+	// every node SB_L4_PUBLIC_HOST=tcp.<domain>. Gates UC-356; the other
+	// cases run unchanged and so cover the balancer's path (and raw TCP on
+	// tcp.<domain>) too.
+	CapAPILoadBalancer Capability = "api-load-balancer"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -257,7 +292,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapDocker: true, CapFirecracker: true, CapGvisor: true, CapWasm: true,
 	CapIsolate: true, CapIsolateJail: true, CapGPU: true, CapDomain: true, CapIngressProxyRouting: true,
 	CapCluster: true, CapCustomDomains: true, CapExternalDNSZone: true,
-	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true,
+	CapMixedArchNegative: true, CapPlatformVolumes: true, CapBenchmark: true, CapNoHostFirewall: true,
 	CapDockerPool: true, CapDockerNetnsPool: true, CapDockerEngine: true,
 	CapContainerdEngine: true, CapObservability: true, CapSimulations: true,
 	CapSecrets: true, CapSecretsKMS: true, CapEnterprise: true,
@@ -266,6 +301,9 @@ var KnownCapabilities = map[Capability]bool{
 	CapIdentity: true, CapIdentityOIDC: true, CapTokenMirror: true,
 	CapAuditExportS3: true, CapRollingUpgrade: true, CapPATScopeHost: true,
 	CapL4ProxyProtocol: true, CapPATRotation: true,
+	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
+	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
+	CapAPILoadBalancer: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -797,6 +835,72 @@ var Registry = []UseCase{
 	{ID: "UC-294", Title: "Two teams register the same WASM bytes with no id: each gets its own row, neither sees or deletes the other's, no conflict; a boot by id resolves the caller's row", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
 	{ID: "UC-295", Title: "A team token cannot register a WASM module from a raw host path (absolute or file://): refused with the same not-found whether the path exists or not (no host-file oracle); the reserved keyword still resolves (#537)", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
 	{ID: "UC-296", Title: "A team token's WASM module delete never removes a shared standard module: after a runner registers and deletes the reserved keyword row, the operator can still register it (the staged file survived) (#537)", Requires: []Capability{CapWasm, CapIdentity}, Implemented: true},
+
+	// Customer key custody (plans/customer-key-custody.md Phase 6).
+	{ID: "UC-297", Title: "Key custody: a running local cluster switches to Vault the two-step way (settings everywhere, then the sealing provider); a sandbox sealed before the switch fails over and opens before and after the sweep converts it, and the stale-rows gauge reaches 0 on every node", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-298", Title: "Key custody: the server key is wrapped on every node (migration): `sandboxd key status --check` passes, no plaintext key in the key file or env files, the custody gauge says wrapped, the canary is ok, and an HA sandbox fails over and opens", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-299", Title: "Key custody: a Vault 403 alone never revokes: with the decrypt grant removed for several re-checks every node counts denied, none stops, and restoring the grant changes nothing else", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-300", Title: "Key custody: deleting the Transit key stops every node within the re-check bound (key_revoked gauge, health, 503 key_revoked on a create, key_revoked audit record); restoring it from a backup brings every node back without a restart (key_recovered)", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-301", Title: "Key custody: with wrapped custody and the key store unreachable, a restarted node refuses to start; it starts on its own once the key store is back", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-302", Title: "Key custody: a node set to wrapped custody without the wrapped server-key file refuses to start (a joiner never mints its own key)", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-303", Title: "Key custody: after a Transit rotation the sweep moves every row and the server-key file to the new version (stale 0 on every node); with the old version retired a sandbox sealed before the rotation fails over and opens; `sandboxd key rewrap` follows a second rotation", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-304", Title: "Key custody: server-key rotation (stage, promote, retire) across the cluster with a failover between every step; afterwards no row is on the old key and sandboxes still open", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-305", Title: "Key custody: a node restarted while it owns many secret-bearing sandboxes opens all of them through the key store without a throttled or failed open", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-306", Title: "Key custody: a backup of a wrapped node holds the wrapped file and no plaintext key line or key file; the restored wrapped file verifies through the key store", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-307", Title: "Key custody, PKCS#11: switch to SoftHSM2 the two-step way and wrap the server key; the canary is ok, the vendor library is mapped only in the helper process, and an HA sandbox fails over and opens", Requires: []Capability{CapKeyCustodyPKCS11, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-308", Title: "Key custody, PKCS#11: the four-step label rotation (decrypt label everywhere, switch the key label, sweep to 0, retire the old label) with a failover between every step", Requires: []Capability{CapKeyCustodyPKCS11, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-309", Title: "Key custody, PKCS#11: destroying the key on one node's token stops that node (key_revoked) and only that node; re-importing the same key brings it back", Requires: []Capability{CapKeyCustodyPKCS11, CapCluster}, Implemented: true},
+	{ID: "UC-310", Title: "Key custody, AWS KMS: a cluster built with key_custody = wrapped never writes a plaintext server key (key file, env files, the seed's cred bundle, the S3 bundle object), and an HA sandbox fails over and opens", Requires: []Capability{CapKeyCustodyKMSWrapped, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-311", Title: "Key custody, AWS KMS: the customer disables the key; every node stops within the bound (key_revoked gauge, health, key_revoked audit record, an exec stream open across it closes, 503 key_revoked on a create); enabling it brings every node back (key_recovered) and a sandbox sealed before fails over and opens", Requires: []Capability{CapKeyCustodyKMSWrapped, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-312", Title: "Key custody, AWS KMS: the two-step switch from local (eng D22) with a failover in the middle of step 2: a sandbox sealed by a switched node fails over to a node that still seals locally and opens; after the switch nothing is stale and sandboxes from before and during it fail over and open", Requires: []Capability{CapKeyCustodyKMSSwitch, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-313", Title: "Key custody: env, registry and mount secrets all come back after a failover: the new owner pulls a private image with the opened registry credentials and remounts an SSHFS share with the opened key", Requires: []Capability{CapKeyCustodyVault, CapCluster, CapSecrets}, Implemented: true},
+	{ID: "UC-314", Title: "Key custody: a backup of a wrapped node restored onto the wiped node boots through the key store and rejoins; the restored node's next backup holds no plaintext key", Requires: []Capability{CapKeyCustodyVault, CapCluster}, Implemented: true},
+	{ID: "UC-315", Title: "Key custody, AWS KMS: a single node installed with install.sh --key-custody wrapped holds no plaintext server key, and after a restart reopens its sealed values through the key store", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
+	{ID: "UC-316", Title: "Key custody, AWS KMS: restore onto a fresh machine: the node's root disk is replaced from its launch image (a fresh install with a key of its own), a backup taken before is restored, and the node boots through the key store with the backup's key and opens values sealed before the swap", Requires: []Capability{CapKeyCustodySingleWrapped, CapSecrets}, Implemented: true},
+	// Bank-readiness security boundary (bank_security_test.go): each case
+	// runs on every shell runtime the scenario has (runc, gVisor, Firecracker).
+	{ID: "UC-317", Title: "Security: cloud instance metadata (169.254.169.254, ECS/EKS credential endpoints) is unreachable from every sandbox, even when its own allowlist names it", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-318", Title: "Security: one sandbox cannot connect to another sandbox's listener on the same node (no lateral movement on open egress)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-319", Title: "Security: a sandbox is default-denied from its own node: every TCP port the node listens on, and DNS over UDP, is unreachable on the gateway and private addresses except the node guard's documented allowlist (ingress 80/443, the egress gateway's DNS/proxy for gateway-mode sandboxes)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-320", Title: "Security: a fork bomb stops at the sandbox's process limit; the sandbox, a neighbour and the node stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-321", Title: "Security: a memory bomb is killed inside the sandbox at its requested limit; the sandbox and a neighbour stay responsive", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-322", Title: "Security: a disk fill stops at the sandbox's disk size; the node keeps its free space", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-323", Title: "Security: a CPU hog is held to its CPU limit; a neighbour's exec latency stays within bounds", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-324", Title: "Security: container privilege boundary: no dangerous capability, seccomp on, no mounts, sysctls, sysrq, /sys writes, kernel memory, kernel log, modules or host devices", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-325", Title: "Security: kernel boundary per runtime: gVisor and Firecracker sandboxes run on a kernel other than the node's (runc shares it; reported)", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-326", Title: "Security: filesystem isolation: no node config, state, engine socket or another sandbox's files are visible in a sandbox", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-327", Title: "Security: process isolation: a sandbox sees neither the node's daemons nor another sandbox's processes", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-328", Title: "Security: public attack surface: a full TCP scan of every node finds only web, the SSH gateway, the L4 pool and admin-scoped ports; the security group opens no admin port to the internet", Requires: []Capability{CapDomain}, Implemented: true},
+	{ID: "UC-329", Title: "Security: TLS posture: TLS 1.0/1.1 and non-forward-secret or CBC suites refused, TLS 1.3 offered, plain HTTP redirected", Requires: []Capability{CapDomain}, Implemented: true},
+	{ID: "UC-330", Title: "Security: unauthenticated surface: every /v1 route, the facades and debug paths refuse without (or with a wrong) token, with no 5xx and no stack trace or source path in any body", Implemented: true},
+	{ID: "UC-331", Title: "Security: a sandbox's secret appears in no journal, process command line or /var/log on any node", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-332", Title: "Security: a block-all sandbox has no way out: TCP, UDP DNS to public resolvers, ICMP, HTTP by name and DNS through its own resolver all fail", Requires: []Capability{CapDocker}, Implemented: true},
+	// Bank-readiness scale and stability (bank_scale_test.go): sizes come
+	// from AEROL_BANK_* so they run small everywhere and large on the
+	// flagship; numbers land in <reports>/<scenario>-bank.json.
+	{ID: "UC-333", Title: "Scale: a burst of concurrent creates per runtime: each starts or is refused for capacity, none fails otherwise, all are destroyed", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-334", Title: "Scale: API read throughput: concurrent clients list sandboxes and read health with no 5xx and no transport error", Implemented: true},
+	{ID: "UC-335", Title: "Scale: exec latency (sequential) and concurrent execs into one sandbox per runtime all succeed", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-336", Title: "Stability: churn soak (create, exec, destroy on every runtime) under 0.5% failures; daemon memory and descriptors level off; no leaked veth, TAP, firewall rule or sandbox", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-337", Title: "Stability: the daemon on a worker restarted under load serves again within two minutes; nothing leaks", Requires: []Capability{CapCluster, CapDocker}, Implemented: true},
+	{ID: "UC-338", Title: "Scale: density per runtime: small sandboxes created 8 at a time until a clean capacity refusal or the cap; every created sandbox runs and the API still answers", Requires: []Capability{CapBenchmark, CapDocker}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go).
+	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-340", Title: "Compatibility: IPv6 off inside sandboxes breaks no listener: on every runtime an AF_INET6 socket binds [::], and a listener on [::] accepts an IPv4 connection", Requires: []Capability{CapDocker}, Implemented: true},
+	// Early gateway attach (perf/egress-attach-early): the attach overlaps the
+	// runtime create, and must never open a sandbox or leave state behind.
+	{ID: "UC-341", Title: "Egress: a hostname-allowlisted sandbox has no unfiltered egress from its workload's first instruction (probes started at workload start never reach an outside address directly, during or after the create), and after the create only its allowlist is reachable", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-342", Title: "Egress: a hostname-filtered create that fails after the runtime built the sandbox leaves no gateway set element and no firewall rule per address on any node, and the next sandboxes get only their own policy", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-343", Title: "Egress: churn of hostname-rule sandboxes (create, fetch the allowed name, destroy; AEROL_EGRESS_CHURN times) leaves the gateway's sets and the host firewall's per-address rules flat on every node", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	// Bank-readiness stability, continued (bank_scale_test.go).
+	{ID: "UC-344", Title: "Stability: an exec in flight when its sandbox's runtime process is killed (runc init, gVisor sentry, Firecracker VMM) fails within 45 s, with 409 where the runtime reports the exit (502 allowed for Firecracker, which has no exit event); a healthy exec silent for 75 s first completes", Requires: []Capability{CapDocker}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go).
+	{ID: "UC-345", Title: "Security: a process OOM-killed inside a block-all sandbox (256 MiB, the UC-321 doubling bomb) neither stops the sandbox nor opens its egress, on every shell runtime: it still runs and answers exec, TCP to 1.1.1.1:443 still fails, and every host rule for its address is still on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// Restricted Docker creates start their own pause (fix/egress-docker-pause-on-demand).
+	{ID: "UC-346", Title: "Egress (Docker engine): a create with network rules (block-all, CIDR allow, CIDR deny, hostname allowlist) runs in a pause container named for it with or without the pause pool, probes from its workload's first instruction never reach an outside address directly, and its destroy leaves no pause, firewall rule or gateway entry", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-347", Title: "Egress (Docker engine): a create without network rules keeps Docker's own path: no docker_pause stage, and no pause container without the pause pool", Requires: []Capability{CapDocker}, Implemented: true},
+	// Ingress high availability behind the load balancer (api_lb_test.go).
+	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

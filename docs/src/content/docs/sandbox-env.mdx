@@ -18,7 +18,7 @@ flowchart TB
     Store -- "3. opened when the sandbox starts" --> Box["Sandbox<br/>programs read the variables"]
     Server -- "4. every open is recorded" --> Audit["Audit log<br/>hash-chained"]
     Server -- "5. sealed copy, failover sandboxes only" --> Backups["Backup nodes<br/>the copy is addressed to them"]
-    KMS["AWS KMS (optional)<br/>holds the keys for sealed copies"] -.-> Backups
+    KMS["Your key store (optional)<br/>AWS KMS, Vault, OpenBao or an HSM"] -.-> Backups
     Server -. "6. get and list: hidden<br/>unless you ask" .-> App
 ```
 
@@ -269,13 +269,14 @@ A cluster is a group of AerolVM servers that work as one. Every node keeps a sha
 
 - **By default, the variables stay on one node.** They are sealed (encrypted for chosen nodes) on the node that runs the sandbox, and nowhere else.
 - **Sandboxes with failover get backup copies.** Create a sandbox with `failover: { policy: "recreate" }` and a sealed copy also goes to backup nodes (two by default). The copy is addressed to those nodes. With the default key, every node shares one key, so the address is checked in software, not by the encryption. The create waits until at least one backup confirms its copy. If the sandbox's node dies, a backup rebuilds it with the same variables. See [Durability and failover](/durability/).
-- **AWS KMS can hold the keys.** Then AWS permissions decide which nodes may open a sealed copy, and AWS logs every use of the key. See [Secrets providers](/cluster-secrets/).
+- **Your key store can hold the keys.** With AWS KMS, Vault, OpenBao or an HSM, its permissions decide which nodes may open a sealed copy, and it logs every use of the key. See [Use your own key store](/enterprise/key-custody/).
 - **Nodes prove who they are** before they exchange sealed copies, over mutual TLS.
 
 ## Good to know
 
 - **Inside the sandbox, the values are plain.** That is how programs read them. Any code you run in the sandbox can read every variable, so only pass secrets that code is allowed to see.
 - **The node's container engine holds them too.** AerolVM hands the values to Docker or containerd on the node that runs the sandbox. Someone with admin access to that machine can see them there. Protect the machines that run your sandboxes.
+- **Firecracker keeps them off the disk.** A [Firecracker sandbox](/firecracker-sandbox/) has no container engine. The server sends the values straight to the agent inside the VM, over the VM's private channel to the server rather than the network, and the agent keeps them in memory. They are not written to the VM's disk image. Stopping the sandbox saves the VM's memory, so the saved copy holds them until you delete the sandbox.
 - **Snapshots copy them.** Saving a sandbox as a [snapshot](/images-and-snapshots/#snapshots) also saves its variables. Do not snapshot a sandbox whose secrets you would not share with every user of the snapshot.
 - **They cannot change after create.** To use a new value, create a new sandbox.
 
@@ -299,7 +300,8 @@ A client you cannot upgrade yet needs a code change before the server upgrade. T
 
 ## Next steps
 
-- [Secrets providers](/cluster-secrets/): how a cluster seals and copies secrets, and how to use AWS KMS.
+- [Secrets providers](/cluster-secrets/): how a cluster seals and copies secrets.
+- [Use your own key store](/enterprise/key-custody/): keep the keys in AWS KMS, Vault, OpenBao or an HSM, and revoke them.
 - [Durability and failover](/durability/): rebuild a sandbox, with its variables, when its node dies.
 - [Run commands](/exec-streaming/): pass a variable to one command with `env`.
 - [Tags](/sandbox-tags/): filter lists of sandboxes by label.

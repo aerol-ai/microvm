@@ -23,9 +23,10 @@ feature is still mid-rollout.
 |---|---|
 | `SB_AUTO_RECONCILE` | true |
 | `SB_ENABLE_CADDY` | true |
-| `SB_ENABLE_NETWORK_RULES` | true |
+| `SB_ENABLE_NETWORK_RULES` | true. Off (and on any non-Linux host) the docker, containerd and Firecracker runtimes have no firewall, so creates, starts and updates that ask for network policy are refused with `501 network_policy_unenforced`; WASM and isolate filter egress themselves and are unaffected. |
 | `SB_NETRULES_BACKEND` | `netlink` (in-process nftables; `exec` = go-iptables fallback) |
-| `SB_ENABLE_EVENT_MONITOR` | true |
+| `SB_ENABLE_EVENT_MONITOR` | true. Also what ends a toolbox request (an exec, a file transfer, a session) the moment its container sandbox dies: the die/destroy event answers it 409 instead of leaving it to the connection timeout below. |
+| `SB_TOOLBOX_DEAD_PEER_TIMEOUT` | `30s` — how long a toolbox connection (exec, file transfer, session, SSH-gateway shell) lives on once its sandbox stops answering without closing it, as a killed gVisor sandbox or Firecracker VM does. Keepalive probes start after 15s idle, every 5s, and the third unanswered one ends it; `TCP_USER_TIMEOUT` (Linux) 30s also bounds data the sandbox never acknowledges. A live sandbox's kernel answers the probes, so a command that runs for hours with no output is never cut. What it does cut is a sandbox that answers nothing for the whole bound while still existing: raise it if your sandboxes are paused (a gVisor or Firecracker snapshot) for longer. `0` = off (Go's default keepalive, about 2.5 minutes; about 15 minutes for unacknowledged data); otherwise at least `6s`, or the boot is refused. |
 | `SB_ENABLE_SSH_GATEWAY` | true |
 | `SB_ENABLE_SERVERLESS` | true — wake path on out of the box |
 | `SB_DOCKER_READY_SOCKET_ENABLED` | true |
@@ -42,6 +43,7 @@ feature is still mid-rollout.
 | `SB_EGRESS_FQDN_ENABLED` | true — hostname entries in `network_allow_out` (plans/egress-domain-filtering.md, CEO D25). Inert until a sandbox uses one: no per-sandbox state otherwise. Needs the `aerolvm-egress-gateway` unit for container runtimes; without it (or on a privileged node) hostname creates get 501. `false` refuses them everywhere. |
 | `SB_EGRESS_PROCID_SOCKET` / `SB_EGRESS_GATEWAY_USER` | `/run/aerolvm/egress-procid.sock` / `aerolvm-egress` — sandboxd answers the gateway's executable lookups for per-binary rules on this socket, group-owned by and answering only the gateway's user (the gateway can't read sandbox `/proc` itself). The gateway reads the same `SB_EGRESS_PROCID_SOCKET`. Empty turns lookups off: covered flows are refused. |
 | `SB_EGRESS_GATEWAY_SOCKET` | `/run/aerolvm/egress-gateway.sock` — sandboxd ↔ egress-gateway UDS, created root-owned 0600 by `aerolvm-egress-gateway.socket`. |
+| `SB_EGRESS_DNS_PORT` / `SB_EGRESS_PROXY_PORT` (sandboxd) | 53054 / 15080 — the gateway's listener ports as sandboxd's node guard opens them to sandboxes. Set them in `sandboxd.env` too when `egress-gateway.env` changes them; until then the guard follows the ports the gateway reports it listens on (and logs the mismatch). 1-65535 and different, or the boot is refused. |
 | `SB_TLS_ACME_CA` / `SB_TLS_ACME_CA_ROOT` | unset — ACME directory (https) and its root PEM for custom-domain certificates on a network with no route to Let's Encrypt (plans/egress-domain-filtering.md §5.10 PC-5). install.sh `--acme-ca` / `--acme-ca-root` set these and the Caddyfile's `acme_ca` / `acme_ca_root` for the wildcard certs. Re-read at every start; unset goes back to public ACME. |
 | `SB_TLS_ISSUER` | `acme` — `internal` makes Caddy's own CA issue custom-domain certificates (labs); install.sh `--tls-issuer internal` also switches the wildcard sites to `tls internal`, with no DNS provider. |
 | `SB_EGRESS_OPERATOR_FILE` | unset — the private-cloud operator file (default policy, ceiling, deny floor, internal zone, upstream proxy, control-port guard, org profiles, built-in profile switch); see `setup/runbooks/egress-gateway.md`. Unset keeps every default. An invalid file at boot refuses creates (503) until fixed. |
@@ -51,19 +53,43 @@ feature is still mid-rollout.
 ## 🔴 Must stay off — security / safety
 | Env var | Why off is correct |
 |---|---|
-| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. |
+| `SB_ENTERPRISE_MODE` | Opt-in fail-fast profile; local development keeps its lightweight defaults. Production deployments should enable it. Requires an `SB_PAT_TOKEN` of at least 32 bytes, and named credentials for people (`plans/identity-and-access.md` §5.12): `SB_IDENTITY_ENABLED=true` (tokens-only is enough; an identity file is optional, so air-gapped installs work), `SB_PAT_SCOPE=host`, an `SB_TOKEN_MAX_TTL` of at most 90 days, `SB_AUDIT_API_RECORDS` not `off`, and `SB_AUDIT_API_DURABLE` not `false`. With an external `SB_SECRET_PROVIDER` it also requires `SB_SECRET_PROVIDER_STRICT_BOOT=true` and a hardware PKCS#11 slot, and warns at boot (and fires `SandboxdServerKeyPlaintext`) while `SB_CREDENTIAL_KEY_CUSTODY=file`; the next release refuses that (plans/customer-key-custody.md §7, F2). |
 | `SB_CONTAINER_PRIVILEGED` | Privileged containers = sandbox escape. |
 | `SB_CLUSTER_INSECURE_GOSSIP` | Disables gossip encryption. |
 | `SB_CLUSTER_INSECURE_CREDENTIALS` | Disables credential protection. |
 | `SB_RESOURCE_LIMITS_DISABLED` | *Disables* cgroup limits; `false` already = limits ON. |
+| `SB_SANDBOX_PIDS_LIMIT` | Processes and threads per container sandbox; default `4096`, `0` = unlimited (refused in enterprise mode). A gVisor sandbox gets the cap inside gVisor, lowered to one per MiB of its memory (1024 for the default 1 GB), and a host cgroup limit of twice that plus 1024 for gVisor's own threads. |
+| `SB_SANDBOX_INTERCONNECT` | `true` lets sandboxes on one server reach each other; default `false` (isolated, refused in enterprise mode). |
+| `SB_SANDBOX_NODE_PORTS_ALLOW` | Extra ports of the server itself every sandbox on it may reach, such as `8080,5353/udp` (tcp when bare). Default empty: sandboxes are default-denied from their own server (the node guard, `AEROLVM-NODE` in INPUT), except the egress gateway's DNS and proxy ports (when the gateway runs), DNS on a server address the sandboxes' resolver names, and 80/443 on a server that serves ingress. No ranges. A control or host-service port (API, SSH gateway, Raft, gossip, cluster mTLS, host-port redirect, 22, 111) or the gateway's own port refuses the boot; any entry refuses it in enterprise mode. Logged at every boot. |
+| `SB_DISK_LIMIT_CHECK_INTERVAL` | How often a container sandbox's writable layer is checked against its disk size; one past it is stopped. Default `15s`, `0` = off. |
+| `SB_ALLOW_UNENFORCED_NETWORK_POLICY` | With the host firewall off, accepts network policy (block-all, address lists, hostname rules, byte caps) that nothing enforces: the sandbox runs unfiltered while GET shows the policy (with `egress_status: "unenforced"`). Local development only; boot logs a warning and every accepted sandbox logs one. Refused when `SB_ENTERPRISE_MODE=true`. `install.sh --local` does not set it. |
 
 ## Secret provider (SB_SECRET_PROVIDER)
 
 | Env var | Default | Notes |
 |---|---|---|
-| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault`. Off-state is `local` — never contacts AWS/Vault unless explicitly set. See `docs/.../cluster-secrets.mdx`. |
-| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. |
-| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start on awskms boot-canary failure. Default fail-open with a warning. |
+| `SB_SECRET_PROVIDER` | `local` | `local` \| `awskms` \| `vault` \| `pkcs11`. Off-state is `local` — never contacts a key store unless explicitly set. See `docs/.../cluster-secrets.mdx` and `docs/.../enterprise/key-custody.mdx`. |
+| `SB_SECRET_AWS_KMS_KEY_ID` | (empty) | Required when `SB_SECRET_PROVIDER=awskms`. Set with another provider, the node still opens AWS KMS rows (step 1 of a provider switch). |
+| `SB_SECRET_VAULT_ADDR` | (empty) | Vault or OpenBao URL. Required when `SB_SECRET_PROVIDER=vault`. `https`, or `http` only to loopback (a local `vault proxy`). Set with another provider, the node already opens vault rows. |
+| `SB_SECRET_VAULT_KEY_NAME` | (empty) | Transit key name. Required with `SB_SECRET_VAULT_ADDR`. |
+| `SB_SECRET_VAULT_TRANSIT_MOUNT` | `transit` | Transit mount path. |
+| `SB_SECRET_VAULT_TOKEN_FILE` | (empty) | Token file written by Vault Agent auto-auth; re-read when it changes and once more after a 403. Empty means `SB_SECRET_VAULT_ADDR` is a local `vault proxy` that adds the token, so sandboxd holds none. `VAULT_TOKEN` is never read. The token may hold only `update` on the encrypt and decrypt paths: a token with `create`, `sudo` or `root` there stops the boot, because Transit would recreate a deleted key and undo a revoke. The hourly rewrap sweep also needs `read` on `<mount>/keys/<key>` to learn the latest version. |
+| `SB_SECRET_VAULT_NAMESPACE` | (empty) | Vault Enterprise namespace (`X-Vault-Namespace`). |
+| `SB_SECRET_VAULT_CACERT` | (empty) | PEM CA bundle for a private PKI. |
+| `SB_SECRET_PKCS11_MODULE` | (empty) | Path to the HSM vendor's PKCS#11 `.so`. Required when `SB_SECRET_PROVIDER=pkcs11`. It loads only in the `sandboxd --pkcs11-helper` child process, never in sandboxd. Set with another provider, the node already opens p11 rows. |
+| `SB_SECRET_PKCS11_TOKEN_LABEL` | (empty) | Token (partition) label; must match exactly one slot. |
+| `SB_SECRET_PKCS11_PIN_FILE` | (empty) | User PIN file; refused if it has group or other permission bits (0400 or 0600 pass). |
+| `SB_SECRET_PKCS11_KEY_LABEL` | (empty) | Label of the AES-256 key used for new wraps. |
+| `SB_SECRET_PKCS11_DECRYPT_KEY_LABELS` | (empty) | Comma-separated older labels still allowed for unwrap during a rotation. |
+| `SB_SECRET_PKCS11_GCM_IV` | `auto` | Who picks the AES-GCM IV: `auto` probes at helper start on a throwaway session key, `hsm` (the token writes it, e.g. AWS CloudHSM) or `caller` (sandboxd picks a random IV, e.g. SoftHSM2). An all-zero IV is always refused. |
+| `SB_SECRET_PKCS11_RUN_DIR` | `/run/sandboxd/pkcs11` | Directory (made 0700) for the helper's 0600 Unix socket. |
+| `SB_SECRET_PROVIDER_STRICT_BOOT` | `false` | Fail daemon start when the boot canary of any external provider fails. Default fail-open with a warning. Required for every external provider in enterprise mode. |
+| `SB_SECRET_PROVIDER_MAX_INFLIGHT` | `8` | Foreground key-store calls in flight per node (1–256). One slot is kept for creates; background work has 2 more slots of its own. Lower it to fit an HSM partition's session limit or one Vault active node's capacity. Throttled calls back off inside the caller's deadline, then fail 503 `key_store_throttled`. |
+| `SB_CREDENTIAL_KEY_CUSTODY` | `file` | `file` \| `wrapped`. `file` keeps the server key in the env or `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` (today's behavior). `wrapped` keeps only a copy wrapped by the external provider at `SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH`, unwrapped at boot (one try, 10 s; systemd restarts on failure). Boot refuses if a plaintext key is set or its file exists; a fresh single node generates the key, cluster nodes never do (copy the seed's wrapped file). Manage it with `sandboxd key` (status, verify, wrap, rewrap, unwrap, ack-migration, rotate); `install.sh` and `cluster-init.sh` take `--key-custody wrapped`. Default stays `file`: wrapped custody needs a customer key store. |
+| `SB_SECRET_PROVIDER_RECHECK_INTERVAL` | `5m` | With wrapped custody, how often each node unwraps its server-key file again (±10% jitter) to notice a revoke. Minimum 10s. One key-store call per node per interval, on the background budget. The same tick re-reads the server-key ring with either custody, so a `sandboxd key rotate` step reaches a node without a restart, and while a rotation is in progress it reseals rows onto the current key (local AES work, no key-store call). |
+| `SB_SECRET_PROVIDER_REVOKE_AFTER` | `3` | Consecutive "key revoked" re-check results that stop the node: the server key leaves memory (every sealed read fails 503 `key_revoked`), the egress CA and injection secrets leave the gateway, SSH sessions and proxied toolbox streams end, health reports `key_custody: revoked`. A 403, an outage or a retired key version never count. The first good re-check brings the node back. 5m × 3 ≈ 15 minutes. |
+| `SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH` | `/var/lib/sandboxd/credential_encryption.key.wrapped` | The wrapped server key used with `SB_CREDENTIAL_KEY_CUSTODY=wrapped`. In cluster mode it is what the shared-key check looks for instead of the plaintext key. After `sandboxd key rotate --stage` it holds the server-key ring (format 2), which older builds refuse to read. |
+| `SB_CREDENTIAL_KEY_RING_PATH` | `SB_CREDENTIAL_ENCRYPTION_KEY_PATH` + `.ring` | With `SB_CREDENTIAL_KEY_CUSTODY=file`, the server-key ring that `sandboxd key rotate` writes (plaintext, 0600). Once it exists it holds every live server key; a key in `SB_CREDENTIAL_ENCRYPTION_KEY` or the key file must match its key 0 until key 0 is retired, after which it should be removed. In cluster mode it satisfies the shared-key check. Unused until the first rotation. |
 | `SB_SECRET_RECIPIENT_BACKUP_COUNT` | `2` | Non-owner seal recipients for HA creates. |
 | `SB_SECRET_FANOUT_MIN_ACK_WAIT` | `2s` | Bounded sync wait for ≥1 backup ACK on HA create. Cluster mode requires `>0`; zero ACKs retract the secret and fail the create. |
 | `SB_SECRET_AUDIT_RETENTION_DAYS` | `30` | Local `{Dir(DBPath)}/audit/secrets.jsonl` and `sandbox_audit_acl` retention. Appends are fsynced at least once per second and at shutdown; pruned daily (and on sink start). **`0` means retain nothing beyond the crash buffer** — post-delete ACL rows go at the next sweep and the JSONL keeps one day for the export tailer. It never means forever. Removal is by record time anywhere in the file: the expired prefix is dropped; an expired record that landed behind a newer one (spill drain, worker ingest) becomes a hash-only `retention_redacted` stub so the chain still verifies (runbook: secrets-and-audit). |
@@ -139,8 +165,11 @@ exec body's SHA-256, and the object a non-sandbox route acts on. Only the node
 that runs the handler records; a forwarded call is recorded by its owner with
 the edge as `caller.via`. Refused calls are records too: a 403 is an `api`
 record with `result: denied`; a refused credential (401) is an `auth_denied`
-record, at most one per source address per minute, its `dropped` counting the
-401s folded into it. SSH session opens and the daemon's own destructive work
+record, at most one per source address per minute: the first 401 is written at
+once, and the 401s folded after it are written as one record when the minute
+closes (within about 70 s of the first, even if the address goes quiet), its
+`dropped` counting them. A graceful shutdown writes the counts still owed; a
+crash loses the folded 401s of each address's open minute. SSH session opens and the daemon's own destructive work
 (lifecycle auto-stop and auto-delete, the reconcile reap, the orphan delete)
 write `api` records with `caller: sandbox_key` and `caller: system:<subsystem>`.
 Records are buffered (no fsync on the request path) and, like every new
@@ -189,7 +218,8 @@ Terraform creates one with `audit_witness_enabled = true` (lock mode
 ## 🟡 Opt-in — needs external config/hardware, would break or no-op if forced on
 | Env var | Blocker |
 |---|---|
-| `SB_SECRET_PROVIDER=awskms` | Needs `SB_SECRET_AWS_KMS_KEY_ID` + AWS credentials / IAM. Default remains `local`. |
+| `SB_SECRET_PROVIDER=awskms` \| `vault` \| `pkcs11` | Needs a customer key store: an AWS KMS key + IAM, a Vault/OpenBao Transit key + Vault Agent or Proxy, or an HSM + its PKCS#11 library. Default remains `local`. |
+| `SB_CREDENTIAL_KEY_CUSTODY=wrapped` | Needs an external `SB_SECRET_PROVIDER` to wrap the server key; cluster nodes need the seed's wrapped file. Default remains `file`. |
 | `SB_ENABLE_FIRECRACKER` | Needs KVM/metal host; rejects create otherwise. |
 | `SB_ENABLE_WASM` | Needs a provisioned wasm modules dir. |
 | `SB_CONTAINER_ENGINE` | Code fallback is `docker` (empty/unknown → docker, so a bare host or the local `install.sh` stays dockerd). **Server deployments now default to `containerd`**: the shipped `config/cluster.yml`, Terraform, and Ansible all set `containerd` — set `container_engine: docker` there to keep a legacy dockerd host. This is the docker→containerd migration target; per-sandbox rows record their owning engine so a flip never strands existing sandboxes. containerd is live-validated on the t3 cluster topology (`cluster-3-mixed-containerd`); metal/arm64 provisioning is not yet live-proven (`plans/containerd-engine.md`). |
@@ -229,7 +259,7 @@ via Terraform/Ansible — do not flip the code default on.
 | Env var | Status |
 |---|---|
 | `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. |
-| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. |
+| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. With it off (or empty), a Docker create with network rules starts a pause container of its own so its rules are on before its workload runs (`docker_pause` stage); `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (default `registry.k8s.io/pause:3.10`) is that container's image too, pulled in the background at boot, so an air-gapped node must point it at a mirror. |
 
 ## 🟠 Mid-rollout / not soaked — flip only with soak data
 | Env var | Status |

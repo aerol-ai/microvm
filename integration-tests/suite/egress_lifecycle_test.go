@@ -204,6 +204,9 @@ func TestEgressHostnamePolicySurvivesStopStart(t *testing.T) {
 // list at the address it gets, leaving nothing at the old one.
 func TestEgressCIDRStopStartLeavesNoRulesBehind(t *testing.T) {
 	harness.Require(t, sc, "UC-206")
+	if refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{cloudflareDNS + "/32"}}) {
+		return
+	}
 	c := client(t)
 	sb := newEgressSandbox(t, c, []string{cloudflareDNS + "/32"}, nil)
 	node := sandboxNode(t, c, sb)
@@ -241,6 +244,9 @@ func TestEgressCIDRStopStartLeavesNoRulesBehind(t *testing.T) {
 // gone by the time the start reports success.
 func TestEgressPolicyChangedWhileStoppedIsWhatStartEnforces(t *testing.T) {
 	harness.Require(t, sc, "UC-207")
+	if refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{cloudflareDNS + "/32"}}) {
+		return
+	}
 	c := client(t)
 	sb := newEgressSandbox(t, c, []string{cloudflareDNS + "/32"}, nil)
 	stopSandbox(t, sb)

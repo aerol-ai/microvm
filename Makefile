@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR ?= bin
 
 .PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
-	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
+	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
 	integration-cluster-hetero-obs integration-cluster-hetero-obs-only integration-obs-snapshot \
@@ -21,6 +21,8 @@ BIN_DIR ?= bin
 	integration-secrets-enterprise integration-secrets-enterprise-single integration-secrets-hetero integration-secrets-hetero-kms \
 	integration-secrets-gate integration-secrets-flagship integration-secrets-only \
 	integration-secrets-hetero-lite integration-secrets-hetero-lite-kms integration-secrets-hetero-lite-pair \
+	integration-key-custody-vault integration-key-custody-pkcs11 integration-key-custody-kms \
+	integration-key-custody-kms-switch integration-key-custody-single \
 	integration-routing integration-routing-hetero-lite \
 	integration-bench-cluster integration-identity-gate integration-identity-only
 
@@ -140,6 +142,26 @@ integration-secrets-cluster:
 
 integration-secrets-kms:
 	integration-tests/run.sh cluster-3-mixed-secrets-kms $(RUN_FLAGS)
+
+# Customer key custody (plans/customer-key-custody.md Phase 6). Real AWS,
+# costs money like every scenario here. vault and pkcs11 install their key
+# store over SSH; kms is built with Terraform key_custody = "wrapped";
+# kms-switch runs the two-step switch from local to AWS KMS; single is one
+# node installed with install.sh --key-custody wrapped.
+integration-key-custody-vault:
+	integration-tests/run.sh cluster-3-mixed-secrets-vault $(RUN_FLAGS)
+
+integration-key-custody-pkcs11:
+	integration-tests/run.sh cluster-3-mixed-secrets-pkcs11 $(RUN_FLAGS)
+
+integration-key-custody-kms:
+	integration-tests/run.sh cluster-3-mixed-wrapped-kms $(RUN_FLAGS)
+
+integration-key-custody-kms-switch:
+	integration-tests/run.sh cluster-3-mixed-kms-switch $(RUN_FLAGS)
+
+integration-key-custody-single:
+	integration-tests/run.sh single-node-wrapped-kms $(RUN_FLAGS)
 
 integration-secrets-enterprise:
 	integration-tests/run.sh cluster-3-mixed-secrets-enterprise $(RUN_FLAGS)
@@ -270,6 +292,12 @@ integration-single-isolate-jail:
 
 integration-cluster-mixed:
 	integration-tests/run.sh cluster-3-mixed $(RUN_FLAGS)
+
+# cluster-3-mixed behind a health-checked AWS Network Load Balancer
+# (api_load_balancer = "nlb"). UC-356 stops one node's daemon and asserts
+# the balancer drops it with no failed call and brings it back.
+integration-cluster-mixed-lb:
+	integration-tests/run.sh cluster-3-mixed-lb $(RUN_FLAGS)
 
 # 3× mixed cluster for docker-only benchmarks — same topology as
 # integration-cluster-mixed but advertises `benchmark` and names artifacts

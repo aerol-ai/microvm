@@ -152,6 +152,9 @@ type HASandboxSpec struct {
 	// Mounts is for the scenarios that can satisfy a real external backend;
 	// MountSpec.Credentials is sealed alongside Env.
 	Mounts []models.MountSpec
+	// Registry is the pull credential for a private Image; sealed alongside
+	// Env, and opened again by the node a failover recreates the sandbox on.
+	Registry *sdktypes.RegistryAuth
 	// Image defaults to DefaultImage.
 	Image string
 }
@@ -175,6 +178,7 @@ func CreateHASandbox(t *testing.T, c *Client, spec HASandboxSpec) *microvm.Sandb
 		AllowPublicTraffic: &public,
 		Env:                spec.Env,
 		Mounts:             spec.Mounts,
+		Registry:           spec.Registry,
 		Failover:           &sdktypes.Failover{Policy: sdktypes.FailoverPolicyRecreate},
 	}
 
@@ -496,6 +500,12 @@ const (
 // SSH, which is what makes the restore reliable — and a restore that works
 // is worth more here than fidelity to a power cut, because a node this
 // suite cannot bring back poisons every case after it.
+//
+// The node leaves the API pool once its daemon is stopped (MarkNodeDown),
+// as it would leave a health-checked load balancer's pool, so the case's own
+// polls reach a surviving node instead of 502ing through the victim's Caddy
+// for the whole outage. It rejoins the pool only after the restart AND the
+// rejoin check succeed; a node that did not come back stays out of it.
 func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 	t.Helper()
 	RequireNodeSSH(t, node)
@@ -504,6 +514,7 @@ func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 	if out, err := SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", node.Name, err, out)
 	}
+	MarkNodeDown(node.PublicIP)
 	restored := false
 	return func() {
 		if restored {
@@ -517,8 +528,10 @@ func KillNodeDaemon(t *testing.T, node IntegrationNode) func() {
 		if NodeRejoinCheck != nil {
 			if err := NodeRejoinCheck(t, node); err != nil {
 				t.Errorf("RESTORE FAILED on %s — restarted but did not rejoin: %v", node.Name, err)
+				return
 			}
 		}
+		MarkNodeUp(node.PublicIP)
 	}
 }
 
@@ -628,6 +641,10 @@ func (r NodeBootResult) RefusedWith(substr string) bool {
 //
 // Setting no variables is allowed and means "restart the node unchanged",
 // which is how UC-159 checks that a node rejoins cleanly.
+//
+// The node is out of the API pool (MarkNodeDown) from each restart until it
+// is active and has rejoined, so a refused boot is invisible to fn's API
+// requests the way it would be behind a health-checked load balancer.
 func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn func(NodeBootResult)) {
 	t.Helper()
 	// Before the mutation, not after: an unreachable node must skip cleanly
@@ -654,6 +671,11 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 		// then asked a start-limited unit to start.
 		out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
 			" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
+		// Out of the API pool until it is back. Marked whatever the command
+		// returned: a restore that failed partway leaves the node in a state
+		// nobody checked, and an unchecked node stays out of rotation the
+		// way it would fail a load balancer's health check.
+		MarkNodeDown(node.PublicIP)
 		if err != nil {
 			t.Errorf("RESTORE FAILED on %s — the node may be left down and the rest of this run is suspect: %v\n%s", node.Name, err, out)
 			return
@@ -668,8 +690,10 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 		if NodeRejoinCheck != nil {
 			if err := NodeRejoinCheck(t, node); err != nil {
 				t.Errorf("RESTORE FAILED on %s — the unit is active but the node has not rejoined: %v. Every later case in this run is suspect.", node.Name, err)
+				return
 			}
 		}
+		MarkNodeUp(node.PublicIP)
 	}
 	defer restore()
 
@@ -681,13 +705,24 @@ func WithNodeEnv(t *testing.T, node IntegrationNode, kv map[string]string, fn fu
 	// status is information, not an error. systemctl restart blocks until the
 	// unit settles either way.
 	_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
+	// A refused boot leaves the node down for all of fn, and even a good one
+	// is down until it has rejoined: out of the API pool meanwhile, so fn's
+	// requests are not 502s from this node's Caddy.
+	MarkNodeDown(node.PublicIP)
 	res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
 	// When the node came up, wait for it to be usable before fn runs — a
 	// case that asserts against a node still outside the cluster measures
 	// the rejoin window, not what it set out to test.
-	if res.Started && NodeRejoinCheck != nil {
-		if err := NodeRejoinCheck(t, node); err != nil {
-			t.Logf("node %s is active but not yet fully rejoined under the override: %v", node.Name, err)
+	if res.Started {
+		rejoined := true
+		if NodeRejoinCheck != nil {
+			if err := NodeRejoinCheck(t, node); err != nil {
+				t.Logf("node %s is active but not yet fully rejoined under the override, so it stays out of the API pool: %v", node.Name, err)
+				rejoined = false
+			}
+		}
+		if rejoined {
+			MarkNodeUp(node.PublicIP)
 		}
 	}
 	status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
@@ -712,7 +747,7 @@ func awaitUnitActive(t *testing.T, target, unit string, timeout time.Duration) b
 		// reporting a healthy node as failed to start.
 		switch lastNonEmptyLine(out) {
 		case "active":
-			return true
+			return unitStaysActive(t, target, unit, unitStableWindow)
 		case "failed":
 			// Terminal: systemd has given up. Polling on would just burn the
 			// remaining timeout for an answer that cannot change.
@@ -724,6 +759,33 @@ func awaitUnitActive(t *testing.T, target, unit string, timeout time.Duration) b
 		time.Sleep(2 * time.Second)
 	}
 	return false
+}
+
+// unitStableWindow is how long a unit must stay up to count as started.
+// A variable so the harness's own tests need not wait it out.
+var unitStableWindow = 20 * time.Second
+
+// unitStaysActive reports whether unit stays active, with no new restarts,
+// for window. sandboxd is Type=simple with Restart=always: a daemon its boot
+// gate refuses is "active" for the moment between each restart and its exit,
+// and reading that one moment as a start made a held gate look like it
+// failed OPEN (UC-265 on single-node-secrets-enterprise, where the journal
+// showed "sandboxd exited with error: secret audit witness mismatch" on
+// every restart).
+func unitStaysActive(t *testing.T, target, unit string, window time.Duration) bool {
+	t.Helper()
+	restarts := func() string {
+		out, _ := SSHRun(t, target, "systemctl show -p NRestarts --value "+unit+" || true")
+		return lastNonEmptyLine(out)
+	}
+	before := restarts()
+	for deadline := time.Now().Add(window); time.Now().Before(deadline); time.Sleep(2 * time.Second) {
+		out, _ := SSHRun(t, target, "sudo systemctl is-active "+unit+" || true")
+		if lastNonEmptyLine(out) != "active" {
+			return false
+		}
+	}
+	return restarts() == before
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -951,7 +1013,8 @@ func probeMarkerInt(out, marker string) (int, bool) {
 // first means every joiner always has a live rendezvous to rejoin.
 //
 // fn runs once, after every node has been restarted, and receives the per-node
-// boot outcomes keyed by node name.
+// boot outcomes keyed by node name. A node whose boot was refused stays out
+// of the API pool (MarkNodeDown) while fn runs.
 func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]string, fn func(map[string]NodeBootResult)) {
 	t.Helper()
 	if targets == nil {
@@ -988,6 +1051,7 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 			}
 			out, err := SSHRun(t, target, "sudo rm -f "+itestEnvDropIn+" "+itestEnvOverrideFile+
 				" && sudo systemctl daemon-reload && sudo systemctl reset-failed sandboxd && sudo systemctl restart sandboxd")
+			MarkNodeDown(n.PublicIP)
 			if err != nil {
 				t.Errorf("RESTORE FAILED on %s — the rest of this run is suspect: %v\n%s", n.Name, err, out)
 				continue
@@ -999,8 +1063,10 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 			if NodeRejoinCheck != nil {
 				if err := NodeRejoinCheck(t, n); err != nil {
 					t.Errorf("RESTORE FAILED on %s — active but not rejoined: %v", n.Name, err)
+					continue
 				}
 			}
+			MarkNodeUp(n.PublicIP)
 		}
 	}
 	defer restoreAll()
@@ -1014,7 +1080,15 @@ func WithClusterEnv(t *testing.T, targets *IntegrationTargets, kv map[string]str
 			t.Fatalf("apply env override on %s: %v", n.Name, err)
 		}
 		_, _ = SSHRun(t, target, "sudo systemctl restart sandboxd")
+		MarkNodeDown(n.PublicIP)
 		res := NodeBootResult{Started: awaitUnitActive(t, target, "sandboxd", 90*time.Second)}
+		// Back in the API pool once the unit holds active, which is when a
+		// /health check would pass. There is deliberately no rejoin wait
+		// here: the fleet restarts back to back, as it always has, and a
+		// rejoin wait per node would turn this into a rolling restart.
+		if res.Started {
+			MarkNodeUp(n.PublicIP)
+		}
 		status, _ := SSHRun(t, target, "sudo systemctl is-active sandboxd || true")
 		res.Status = lastNonEmptyLine(status)
 		journal, _ := SSHRun(t, target, "sudo journalctl -u sandboxd --no-pager -n 120 || true")

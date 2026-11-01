@@ -37,6 +37,10 @@ const (
 	opNodeCtl    = "node_control"
 	opInspectCA  = "set_inspect_ca"
 	opBlockGen   = "block_gen"
+	// opClearCA drops the inspection CA, every sandbox's injection secrets
+	// and the established inspected connections: sandboxd sends it when the
+	// customer revoked the key (plans/customer-key-custody.md §10, eng D21).
+	opClearCA = "clear_inspect_ca"
 )
 
 // syncPayload is a full Sync: the specs, and the token of the block writes
@@ -85,6 +89,12 @@ const (
 type InspectCA struct {
 	CertPEM []byte `json:"cert_pem"`
 	KeyPEM  []byte `json:"key_pem"`
+	// DropAfterSeconds, when set, makes the gateway drop the CA once
+	// sandboxd has been silent that long: a sandboxd that can no longer boot
+	// (its key was revoked) cannot leave the key behind, while an ordinary
+	// restart of a few seconds keeps inspected egress working. An older
+	// gateway ignores the field.
+	DropAfterSeconds int64 `json:"drop_after_seconds,omitempty"`
 }
 
 type detachPayload struct {

@@ -188,9 +188,16 @@ func TestExprsEqualAndExprEqualBranches(t *testing.T) {
 		},
 		{
 			name: "unknown_type",
+			x:    &expr.Log{Key: 1},
+			y:    &expr.Log{Key: 1},
+			want: false,
+		},
+		{
+			// meta l4proto is a known shape since the node guard's port rules.
+			name: "meta_equal",
 			x:    &expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
 			y:    &expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-			want: false,
+			want: true,
 		},
 		{
 			name: "type_mismatch",

@@ -871,9 +871,11 @@ type Sandbox struct {
 	// EgressStatus is the hostname-egress state on GET for a sandbox whose
 	// policy needs the egress gateway: "active", "held" (attach failed or the
 	// stored policy is invalid; no egress until it attaches) or
-	// "unavailable" (the gateway is down or lost its table). Empty for every
-	// other sandbox, and on list responses (plans/egress-domain-filtering.md
-	// D16). Response-only: never stored.
+	// "unavailable" (the gateway is down or lost its table). "unenforced" is
+	// any egress policy on a runtime whose host firewall is off on this node
+	// (SB_ENABLE_NETWORK_RULES=false): nothing filters the sandbox's traffic.
+	// Empty for every other sandbox, and on list responses
+	// (plans/egress-domain-filtering.md D16). Response-only: never stored.
 	EgressStatus string `json:"egress_status,omitempty"`
 	// AllowPublicTraffic is whether the sandbox currently has a public route:
 	// only true is public. It starts as the create-time flag and the first
@@ -1006,7 +1008,8 @@ type NetworkPolicyRequest struct {
 // NetworkPolicy is the effective egress policy a PUT leaves in force. A 2xx
 // means it is stored, replicated in a cluster, and live on a running
 // sandbox. EgressStatus is set for a container sandbox in gateway mode, as
-// on GET.
+// on GET; "unenforced" there means the node's host firewall is off and the
+// policy was accepted only under SB_ALLOW_UNENFORCED_NETWORK_POLICY.
 type NetworkPolicy struct {
 	NetworkBlockAll bool     `json:"network_block_all"`
 	NetworkAllowOut []string `json:"network_allow_out"`
@@ -1334,7 +1337,11 @@ type HealthStatus struct {
 	SSHGateway      string `json:"ssh_gateway"`
 	ClusterTopology string `json:"cluster_topology,omitempty"`
 	ClusterNodes    int    `json:"cluster_nodes,omitempty"`
-	Version         string `json:"version"`
+	// KeyCustody is "revoked" while the customer's key store has revoked
+	// the server key and the node has stopped processing their data;
+	// otherwise empty (plans/customer-key-custody.md §10).
+	KeyCustody string `json:"key_custody,omitempty"`
+	Version    string `json:"version"`
 }
 
 type ExecRequest struct {
@@ -1424,6 +1431,57 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // deployment's default egress policy is unknown, so creates fail closed
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
+
+// ErrorCodeIPv6FenceNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's IPv6 fence, which keeps
+// IPv6 off the sandbox bridges and TAPs, is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
+
+// ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
+// policy update or byte-cap update that needs the host firewall on a node
+// where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the
+// docker, containerd and Firecracker runtimes enforce block-all, address
+// lists, hostname rules and byte caps with it. Retrying won't help; the
+// operator turns the firewall on, or the caller drops the policy or picks a
+// runtime that filters egress itself (wasm, isolate).
+const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
+
+// ErrorCodeMountToolUnavailable is returned (501) for a create or start whose
+// external-storage or platform-volume mount needs a mount tool (mount-s3,
+// sshfs, rclone, mount) that is not installed on this node, as on a local
+// install. Retrying won't help, so it is not a 503 (every SDK retries those);
+// the operator installs the tool (the server installer does), or the caller
+// creates the sandbox without the mount.
+const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
+
+// ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's guard that keeps
+// sandboxes off the node's own services is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
+
+// Key-store error codes, each returned with 503 when the key store that wraps
+// sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
+// classes (plans/customer-key-custody.md, eng review Section 2). The response
+// message is fixed text, never the key store's own response.
+const (
+	// ErrorCodeKeyStoreUnavailable: the key store could not be reached.
+	// Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreUnavailable = "key_store_unavailable"
+	// ErrorCodeKeyStoreThrottled: the key store, or this node's cap on calls
+	// to it, is saturated. Retrying after Retry-After is the recovery.
+	ErrorCodeKeyStoreThrottled = "key_store_throttled"
+	// ErrorCodeKeyStoreDenied: the key store refused this node's credentials
+	// or policy. An operator has to fix the grant.
+	ErrorCodeKeyStoreDenied = "key_store_denied"
+	// ErrorCodeKeyRevoked: the key was disabled or deleted in the key store,
+	// so secrets stay sealed until the key owner restores it.
+	ErrorCodeKeyRevoked = "key_revoked"
+	// ErrorCodeKeyVersionRetired: the secret was wrapped under a key version
+	// the key store no longer allows.
+	ErrorCodeKeyVersionRetired = "key_version_retired"
+)
 
 // Facade names used by sandbox_compat_state, snapshot_aliases, and
 // request_idempotency. The string is the only thing persisted, so renaming

@@ -622,8 +622,11 @@ func TestExpandResealErrorWindowsAndAuditInitFail(t *testing.T) {
 	st := openSealTestStore(t)
 	cl := &stubMembersCluster{
 		Noop: cluster.NewNoop("node-a", "http://a", ""),
+		// node-b is the live replacement. Without one the reseal stops at the
+		// durability floor before it reaches the provider and ciphertext reads.
 		members: []cluster.Member{
 			{NodeID: "node-a", Alive: true},
+			{NodeID: "node-b", Alive: true},
 		},
 		placement: cluster.Placement{
 			SandboxID: "sb-reseal31", OwnerNodeID: "node-a", IncarnationID: "inc-a",

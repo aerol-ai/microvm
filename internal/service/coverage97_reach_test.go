@@ -129,13 +129,18 @@ func TestCoverage97ReconcileDriverGaps(t *testing.T) {
 		t.Fatal("reconcile ignored an isolate list failure")
 	}
 
+	// No wasm driver on this node: nothing can say whether the sandbox
+	// exists, so the row is kept rather than reaped (reconcile_unknown.go).
 	svc2, st2, _ := newServiceRuntimeHarness(t, &recordingRuntime{})
 	cov97Seed(t, st2, &models.Sandbox{
 		ID: "sb-wasm-gone", Image: "mod.wasm", Status: models.SandboxStatusStarted,
 		Runtime: models.RuntimeWasm, Durability: models.DurabilityEphemeral,
 	})
-	if err := svc2.Reconcile(ctx); err == nil {
-		t.Fatal("reconcile ignored a wasm row with no driver")
+	if err := svc2.Reconcile(ctx); err != nil {
+		t.Fatalf("reconcile of a wasm row with no driver = %v", err)
+	}
+	if _, err := st2.Get(ctx, "sb-wasm-gone"); err != nil {
+		t.Fatalf("wasm row with no driver was reaped: %v", err)
 	}
 }
 

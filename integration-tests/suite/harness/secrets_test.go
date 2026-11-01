@@ -468,11 +468,17 @@ type fakeSSH struct {
 	mu     sync.Mutex
 	runs   []string
 	active string // what is-active reports; "" means alternate per activeSeq
+	// restarting makes NRestarts climb on every read: a unit Restart=always
+	// keeps bringing back after its boot gate refuses it.
+	restarting   bool
+	restartReads int
 }
 
 func (f *fakeSSH) install(t *testing.T) {
 	t.Helper()
 	prev := sshRunner
+	prevWindow := unitStableWindow
+	unitStableWindow = 10 * time.Millisecond
 	sshRunner = func(_ *testing.T, _, script string) (string, error) {
 		// The reachability probe must answer, or RequireNodeSSH skips every
 		// test that uses this fake — the fake stands in for a node we CAN
@@ -486,6 +492,13 @@ func (f *fakeSSH) install(t *testing.T) {
 		if strings.Contains(script, "is-active") {
 			return f.active + "\n", nil
 		}
+		if strings.Contains(script, "NRestarts") {
+			f.restartReads++
+			if f.restarting {
+				return fmt.Sprintf("%d\n", f.restartReads), nil
+			}
+			return "0\n", nil
+		}
 		return "", nil
 	}
 	// The probe result is cached per target for the whole run, so a test that
@@ -494,6 +507,7 @@ func (f *fakeSSH) install(t *testing.T) {
 	resetSSHReachability()
 	t.Cleanup(func() {
 		sshRunner = prev
+		unitStableWindow = prevWindow
 		resetSSHReachability()
 	})
 }
@@ -1222,4 +1236,20 @@ func TestPeerProbeScriptCarriesBothCredentialsAndResolvesTheCertName(t *testing.
 	if strings.Contains(internalCurlPrefix, " -k ") || strings.Contains(internalCurlPrefix, "--insecure") {
 		t.Fatal("the peer probe disables TLS verification; UC-151/153 assert that verification works, so this would make them vacuous")
 	}
+}
+
+// A daemon its boot gate refuses is "active" between each restart and its
+// exit. Read as a start, a held gate looked like it failed OPEN (UC-265).
+func TestWithNodeEnvRestartLoopIsNotAStart(t *testing.T) {
+	fake := &fakeSSH{active: "active", restarting: true}
+	fake.install(t)
+	WithNodeEnv(t, testNode(), map[string]string{"SB_SECRET_AUDIT_STRICT_BOOT": "true"}, func(res NodeBootResult) {
+		if res.Started {
+			t.Fatal("a unit systemd keeps restarting was read as started")
+		}
+		// The override comes off next; the node boots for real then.
+		fake.mu.Lock()
+		fake.restarting = false
+		fake.mu.Unlock()
+	})
 }

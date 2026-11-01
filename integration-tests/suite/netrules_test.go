@@ -51,6 +51,9 @@ func tcpProbe(t *testing.T, sb *microvm.Sandbox, ip string, port int) bool {
 // destination, 8.8.8.8:53/tcp (Google DNS) as proof the deny is targeted.
 func TestEgressDenyRuleDropsTraffic(t *testing.T) {
 	harness.Require(t, sc, "UC-98")
+	if refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkDenyOut: []string{"1.1.1.1/32"}}) {
+		return
+	}
 	c := client(t)
 
 	const deniedIP = "1.1.1.1"

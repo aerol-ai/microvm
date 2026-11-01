@@ -46,6 +46,12 @@ func WrapSnapshot(svc *service.Service, name func(*http.Request) string, write E
 			write(w, http.StatusServiceUnavailable, "cluster: snapshot home lookup: "+err.Error())
 			return
 		}
+		if !ok && !cluster.CaughtUp(c) {
+			// No entry in a view still catching up after a restart is not
+			// "no such snapshot": its registration may not be applied yet.
+			WriteNotCaughtUp(w, write)
+			return
+		}
 		if !ok || node == c.SelfNodeID() {
 			// No entry (single-node, pre-index, or node gone) or we hold it:
 			// serve locally. The local handler decides 404 vs a local row.

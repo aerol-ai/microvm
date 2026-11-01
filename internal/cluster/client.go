@@ -128,6 +128,17 @@ type Cluster struct {
 	// forever on a permanent local failure (image gone, runtime missing,
 	// disk full). Initialized in startOwnerWatcher.
 	recreateFailures *recreateFailureTracker
+
+	// catchingUp is true from New until this process's FSM has applied the
+	// leader's read index (catch_up.go). While it is set, a placement missing
+	// from the FSM is not evidence of absence. Zero value = caught up.
+	catchingUp  atomic.Bool
+	catchUpStop context.CancelFunc
+	// readIndexHook stands in for the leader read-index round trip in tests.
+	// Always nil in production.
+	readIndexHook func(context.Context) (uint64, error)
+	// catchUpLogEvery overrides catchUpStillWaitingLogEvery in tests.
+	catchUpLogEvery time.Duration
 }
 
 // New constructs the server-role Cluster for cfg.EnableCluster=true. Caller
@@ -199,6 +210,9 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 		deadOwners:    newDeadOwnerTracker(),
 		tls:           clusterTLS,
 	}
+	// Not caught up from the first instant anything can read the FSM; the
+	// loop that clears it starts at the end of New (startCatchUpWatch).
+	c.catchingUp.Store(true)
 	fsm.recoveryResolver = c.fetchRecoveryBlob
 
 	// Build the cluster-internal HTTPS client + listener when TLS is loaded.
@@ -216,6 +230,7 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 			_ = rn.Close()
 			return nil, fmt.Errorf("cluster.New: internal server: %w", err)
 		}
+		is.SetReadIndexHandler(c.LeaderReadIndex)
 		c.internalServer = is
 		c.internalURL = deriveInternalAdvertiseURL(cfg.ClusterInternalAdvertiseURL, cfg.ClusterInternalListenAddr, is.Addr())
 	}
@@ -305,6 +320,11 @@ func New(cfg config.Config, logger *slog.Logger, admitter *capacity.Admitter) (*
 	// service recreate hook. This is the consume side of the spec-replication
 	// pipeline written by RecordPlacement / UpsertSpec.
 	c.startOwnerWatcher()
+
+	// Restart catch-up: until the FSM has applied the leader's read index,
+	// a placement missing from it may still exist (catch_up.go). Armed last
+	// so the loop's first read index finds gossip and the internal client.
+	c.startCatchUpWatch()
 
 	return c, nil
 }
@@ -1549,6 +1569,15 @@ func (c *Cluster) doLeaderApply(ctx context.Context, client *http.Client, endpoi
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// The node this one took for the leader did not answer: it stopped,
+		// or lost the leadership along with its listener. That is a leader
+		// change in progress, which callers retry (IsLeaderUnavailable). It
+		// used to surface as an unclassified error, a 400 on the public API,
+		// so an SDK gave up on a write a retry seconds later would have
+		// committed. The caller's own cancellation stays what it is.
+		if ctx.Err() == nil {
+			return fmt.Errorf("%w: leader-forward apply: %v", ErrNotLeader, err)
+		}
 		return fmt.Errorf("cluster: leader-forward apply: %w", err)
 	}
 	defer resp.Body.Close()
@@ -1677,6 +1706,12 @@ func (c *Cluster) PlacementsForShards(filter PlacementShardFilter) []Placement {
 
 func (c *Cluster) PlacementPage(req PlacementPageRequest) PlacementPageResponse {
 	if c.fsm == nil {
+		return PlacementPageResponse{}
+	}
+	if !c.PlacementViewCaughtUp() {
+		// A page of a view that is still catching up is short of rows the
+		// cluster holds. Non-authoritative is the existing "do not read
+		// absence into this" answer: list fans out or 503s, reconcile skips.
 		return PlacementPageResponse{}
 	}
 	return c.fsm.placementPage(req)
@@ -1849,6 +1884,9 @@ func (c *Cluster) Close() error {
 	if c.ownerWatcherStop != nil {
 		c.ownerWatcherStop()
 	}
+	if c.catchUpStop != nil {
+		c.catchUpStop()
+	}
 	if c.gossip != nil {
 		if err := c.gossip.Close(); err != nil {
 			firstErr = fmt.Errorf("cluster: gossip close: %w", err)
@@ -1947,9 +1985,8 @@ func isUnspecifiedHost(host string) bool {
 	return false
 }
 
-// HealthyForReads is true once the FSM has caught up to the leader's last
-// log index — i.e. our local OwnerOf reads are not stale by more than a
-// single round trip. Used by EnsureClusterReady.
+// HealthyForReads is true once a leader is known. It does NOT mean the FSM
+// has caught up with the leader; PlacementViewCaughtUp is that property.
 func (c *Cluster) HealthyForReads() bool {
 	if c.raft == nil {
 		return false

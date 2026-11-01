@@ -434,7 +434,7 @@ type bearerRoundTripper struct{ token string }
 func (b bearerRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
 	r.Header.Set("Authorization", "Bearer "+b.token)
-	return http.DefaultTransport.RoundTrip(r)
+	return harness.SharedTransport().RoundTrip(r)
 }
 
 // UC-178 — the remote endpoint: no install, just a URL and a token.

@@ -621,9 +621,9 @@ func runGitNoRepo(args ...string) (string, error) {
 
 func runGitNoRepoWithEnv(extraEnv []string, args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
-	if len(extraEnv) > 0 {
-		cmd.Env = append(os.Environ(), extraEnv...)
-	}
+	// Always set: git runs for the user, so it sees the sandbox env (proxy,
+	// GIT_* settings) a container's git would inherit.
+	cmd.Env = append(childEnviron(), extraEnv...)
 	output, err := trackedCombinedOutput(cmd)
 	if err != nil {
 		message := strings.TrimSpace(string(output))

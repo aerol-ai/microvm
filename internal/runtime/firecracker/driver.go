@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -455,6 +456,10 @@ func methodNotImplemented(method string) error {
 // 6 HTTP-over-UDS calls, and 1 Firecracker vsock proxy dial. The OCI pipeline
 // is the only stage with multi-second worst-case latency; per the plan, Phase
 // 2 caches the rootfs and skips this stage when a template hit lands.
+// A request with an env adds one more vsock round trip (set_env, recorded
+// as the fc_env stage) on every path; an env-less request adds nothing.
+// Every create adds one vsock round trip, adopt (the fc_adopt stage), which
+// hands the guest its sandbox ID and toolbox token; see guest_identity.go.
 func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, toolboxToken string, binds []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	// All seams are required for a real Create. Distinct error messages
 	// per missing seam so the operator can localize the wiring bug from
@@ -521,6 +526,16 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if req.OverlaySizeGB > 0 && !d.cfg.OverlayEnabled {
 		return nil, fmt.Errorf("firecracker runtime: overlay drive disabled on this daemon (SB_FIRECRACKER_OVERLAY_ENABLED=false)")
 	}
+	// The env is delivered to the guest after boot (deliverGuestEnv); an
+	// env the guest agent would refuse fails here, before a VM exists.
+	if err := validateGuestEnv(req.Env); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: %w", err)
+	}
+	// The guest is adopted with this token after boot (adoptGuest); without
+	// one it would serve nothing, so refuse before a VM exists.
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: %w", errGuestTokenMissing)
+	}
 
 	// Step 1: Phase 4 warm-VMM pool fast path. Resolve the template
 	// early (before cold-spawn) so a pool hit avoids spending the
@@ -544,7 +559,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	}
 	warmStart := time.Now()
-	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, earlySnap, nil, ""); err != nil {
+	if state, hit, err := d.tryAcquireWarm(ctx, req, allocID, toolboxToken, earlySnap, nil, ""); err != nil {
 		return nil, err
 	} else if hit {
 		// UC-98's warm-hit marker: fc_warm carries both the acquire
@@ -562,11 +577,32 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: tap allocate: %w", err)
 	}
 	released := false
+	// egressApplied: the guest IP may carry the request's rules;
+	// addressReported: the create was told the guest IP
+	// (runtime.AddressObserver).
+	var egressApplied, addressReported bool
 	defer func() {
 		if !released {
+			// Last of the failure cleanups: the VM is down and its TAP gone,
+			// so nothing sends from the address; the create lets go of what
+			// it keyed by it before the slot can go to another sandbox.
+			if addressReported {
+				sbruntime.NotifyReleasingAddress(ctx, slot.GuestIP)
+			}
 			if relErr := d.pool.Release(ctx, allocID); relErr != nil {
 				d.logger.Warn("firecracker: pool release after error failed",
 					"sandbox_id", allocID, "tap", slot.TapName, "error", relErr)
+			}
+		}
+	}()
+	defer func() {
+		// Runs after the VMM cleanup and the TAP removal below (defers
+		// unwind in reverse), so a guest that had booted is down before its
+		// rules lift; the slot is still held, so the rules are still its.
+		if !released && egressApplied {
+			if cErr := d.clearGuestRules(slot.GuestIP, req.NetworkAllowOut, req.NetworkDenyOut); cErr != nil {
+				d.logger.Warn("firecracker: clear egress rules after error failed",
+					"sandbox_id", allocID, "guest_ip", slot.GuestIP, "error", cErr)
 			}
 		}
 	}()
@@ -741,18 +777,15 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}()
 	// Egress policy on the guest IP before the VM runs (Phase 4): it never
 	// runs unfiltered, and a failed create leaves no rule for the next
-	// sandbox on this slot.
+	// sandbox on this slot (a partial install included).
+	egressApplied = true
 	if err := d.applyCreateEgress(slot.GuestIP, req); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: egress policy: %w", err)
 	}
-	defer func() {
-		if !released {
-			if cErr := d.clearGuestRules(slot.GuestIP, req.NetworkAllowOut, req.NetworkDenyOut); cErr != nil {
-				d.logger.Warn("firecracker: clear egress rules after error failed",
-					"sandbox_id", allocID, "guest_ip", slot.GuestIP, "error", cErr)
-			}
-		}
-	}()
+	// The guest IP is fixed and shut, and the VM hasn't started: report it,
+	// so the create's egress gateway attach overlaps the boot.
+	addressReported = true
+	sbruntime.NotifyAddressKnown(ctx, slot.GuestIP)
 
 	// Step 5: start the VMM process and wait for the API socket.
 	spawnStart := time.Now()
@@ -890,6 +923,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			"guest_ip", slot.GuestIP,
 			"gateway_ip", slot.HostIP,
 			"tap", slot.TapName)
+	}
+	// Step 8c: the sandbox env. Neither the rootfs nor a template snapshot
+	// carries it, so the agent gets it now, before Create returns and any
+	// exec can reach the guest. Mandatory when the request has an env: a
+	// failure unwinds the VM through the deferred cleanups above.
+	if err := d.deliverGuestEnv(ctx, vsockPath, handshakeCID, allocID, req.Env); err != nil {
+		return nil, err
+	}
+	// Step 8d: the sandbox's identity, last, so the agent starts serving
+	// only once everything it needs is in place. A template rootfs or
+	// snapshot carries no token and its agent serves nothing until now; a
+	// cold-booted agent already holds this token and the op converges.
+	if err := d.adoptGuest(ctx, vsockPath, handshakeCID, allocID, toolboxToken, adoptRemedyCreate); err != nil {
+		return nil, err
 	}
 	d.scheduleToolboxTCPProbe("create", allocID, slot, snapshotLoadPath)
 
@@ -1381,8 +1428,26 @@ func ociImageRefFor(ref string) string {
 // The VMM process itself does not survive Stop; the stable contract is
 // snapshot-on-stop, destroy host resources, then LoadSnapshot+PATCH+Resume
 // on Start.
+//
+// Start has no toolbox token, so it only reports a VMM that is already
+// running; a restore needs StartWithIdentity, which the service always uses
+// (runtime.IdentityStarter).
 func (d *Driver) Start(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
-	return d.startFromSandboxSnapshot(ctx, sandboxID)
+	return d.startFromSandboxSnapshot(ctx, sandboxID, "")
+}
+
+// StartWithIdentity implements runtime.IdentityStarter: Start, then adopt the
+// restored guest with the sandbox's token. An agent restored from a snapshot
+// taken after its create already holds that token and the adopt converges;
+// one restored without it (a guest stopped while it ran a toolboxd from before
+// identity delivery, or one built by an older daemon) gets it now or, if it
+// cannot take it, is not started. For Firecracker containerRef is the
+// sandbox ID (Service.runtimeRef).
+func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+	if containerRef != sandboxID {
+		return nil, fmt.Errorf("firecracker runtime: start %q: runtime reference does not name sandbox %q", containerRef, sandboxID)
+	}
+	return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
 }
 
 // Stop captures a full per-sandbox snapshot, persists the root/overlay disk
@@ -1436,11 +1501,13 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 	}
 
+	vmDown := true
 	if hasHandle {
 		if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
 			d.logger.Warn("firecracker destroy: shutdown failed",
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
+			vmDown = false
 		}
 	}
 
@@ -1470,6 +1537,14 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 					"sandbox_id", sandboxID, "tap", slot.TapName, "error", err)
 				rememberErr(err)
 			}
+		}
+		// The VM is down (or there never was one): whatever the destroy
+		// keyed by the guest IP (the egress gateway attach) lets go before
+		// the slot can go to another sandbox. A VM whose shutdown failed may
+		// still send, so it keeps its attach; the error makes the caller
+		// keep its row for the retry.
+		if slot != nil && vmDown {
+			sbruntime.NotifyReleasingAddress(ctx, slot.GuestIP)
 		}
 		if err := d.pool.Release(ctx, sandboxID); err != nil {
 			d.logger.Warn("firecracker destroy: pool release failed",

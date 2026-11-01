@@ -3,6 +3,7 @@ package daytona
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -507,6 +508,13 @@ func TestWriteToolboxError(t *testing.T) {
 	h.writeToolboxError(rr2, io.EOF)
 	if rr2.Code != http.StatusBadGateway {
 		t.Fatalf("generic err status = %d, want 502", rr2.Code)
+	}
+
+	// The sandbox stopped under the request: 409, as on /v1.
+	rr3 := httptest.NewRecorder()
+	h.writeToolboxError(rr3, fmt.Errorf("exec: %w", service.ErrSandboxStoppedMidRequest))
+	if rr3.Code != http.StatusConflict || !strings.Contains(rr3.Body.String(), "stopped while the request was in flight") {
+		t.Fatalf("stopped-sandbox status = %d %s, want 409", rr3.Code, rr3.Body.String())
 	}
 }
 

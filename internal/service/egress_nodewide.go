@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
-	"strconv"
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/egress"
@@ -60,21 +59,11 @@ func (s *Service) nodeControlEndpoints() []netip.AddrPort {
 	return egress.SortedControl(out)
 }
 
-// controlPorts are this node's control listeners: API, SSH gateway, Raft,
-// gossip and the cluster mTLS listener.
+// controlPorts are this node's control listeners and host services
+// (config.NodeControlPorts, which SB_SANDBOX_NODE_PORTS_ALLOW may never
+// open, so the two guards agree).
 func (s *Service) controlPorts() []uint16 {
-	var out []uint16
-	if s.cfg.APIPort > 0 && s.cfg.APIPort < 65536 {
-		out = append(out, uint16(s.cfg.APIPort))
-	}
-	for _, addr := range []string{s.cfg.SSHListenAddr, s.cfg.RaftBindAddr, s.cfg.GossipBindAddr, s.cfg.ClusterInternalListenAddr} {
-		if _, p, err := net.SplitHostPort(strings.TrimSpace(addr)); err == nil {
-			if n, err := strconv.ParseUint(p, 10, 16); err == nil && n > 0 {
-				out = append(out, uint16(n))
-			}
-		}
-	}
-	return out
+	return s.cfg.NodeControlPorts()
 }
 
 // endpointOf parses host:port or a URL with an explicit IPv4 host and port.
@@ -119,25 +108,19 @@ var localIPv4s = func() []netip.Addr {
 
 // syncNodeControl pushes the control endpoints when they changed (cluster
 // membership moves, or a gateway restart cleared the record). The guard is
-// part of the operator file (§5.10): without one, or with
-// node_control_port_guard: false, the list is empty, which clears anything
-// pushed earlier.
+// on without an operator file; only node_control_port_guard: false in one
+// turns it off, which clears anything pushed earlier.
 func (s *Service) syncNodeControl(ctx context.Context) {
 	if !s.egressEnabled() || !s.egressReady.Load() {
 		return
 	}
 	op := s.egressOperator()
 	var eps []netip.AddrPort
-	if op != nil && op.NodeControlPortGuard() {
+	if op.NodeControlPortGuard() {
 		eps = s.nodeControlEndpoints()
 	}
 	key := controlKey(eps)
 	if prev := s.egressControlPushed.Load(); prev != nil && *prev == key {
-		return
-	}
-	if op == nil && s.egressControlPushed.Load() == nil {
-		// Never pushed and no operator file: leave the gateway's set as the
-		// kernel has it (empty on a fresh table).
 		return
 	}
 	if err := s.egressGateway().SetNodeControl(ctx, eps); err != nil {

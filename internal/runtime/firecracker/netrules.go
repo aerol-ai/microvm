@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/netip"
 
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -29,6 +31,8 @@ type NetRules interface {
 	HoldEgress(ip string) error
 	ClearHoldEgress(ip string) error
 	SetFloor(subnet netip.Prefix, cidrs []netip.Prefix) error
+	SetNodeGuard(subnet netip.Prefix, allow []netrules.NodePort) error
+	ReassertNodeGuard() (bool, error)
 }
 
 // SetNetRules wires the host firewall; without one, every network-rule
@@ -38,6 +42,8 @@ func (d *Driver) SetNetRules(r NetRules) { d.netRules = r }
 // SetTapSubnet records the TAP pool's base CIDR, which the node-wide deny
 // floor is scoped to.
 func (d *Driver) SetTapSubnet(p netip.Prefix) { d.tapSubnet = p }
+
+var _ sbruntime.NetRulesReporter = (*Driver)(nil)
 
 // NetRulesEnabled reports whether the driver can enforce egress policies.
 func (d *Driver) NetRulesEnabled() bool { return d.netRules != nil }
@@ -181,6 +187,29 @@ func (d *Driver) SetEgressFloor(_ context.Context, cidrs []netip.Prefix) error {
 		return nil
 	}
 	return r.SetFloor(d.tapSubnet, cidrs)
+}
+
+var _ sbruntime.NodeGuardSetter = (*Driver)(nil)
+
+// SetNodeGuard default-denies the TAP subnet from the node itself, except
+// allow (netrules ChainAerolvmNode): a guest reaches the host's address on
+// its TAP, and through it every other address of the node.
+func (d *Driver) SetNodeGuard(_ context.Context, allow []netrules.NodePort) error {
+	if d.netRules == nil {
+		return sbruntime.ErrNodeGuardUnavailable
+	}
+	if !d.tapSubnet.IsValid() {
+		return errors.New("firecracker: node guard needs the TAP subnet")
+	}
+	return d.netRules.SetNodeGuard(d.tapSubnet, allow)
+}
+
+// ReassertNodeGuard puts the guard back if something removed it.
+func (d *Driver) ReassertNodeGuard(context.Context) (bool, error) {
+	if d.netRules == nil {
+		return false, nil
+	}
+	return d.netRules.ReassertNodeGuard()
 }
 
 // firewallLists reports whether allow/deny is a CIDR policy, the kind the

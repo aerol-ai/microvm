@@ -20,7 +20,7 @@ import (
 
 func TestEnvdFilesystemRoundTrip(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	handler := srv.routes()
+	handler := authedRoutes(srv)
 	root := t.TempDir()
 	targetPath := filepath.Join(root, "notes.txt")
 
@@ -108,7 +108,7 @@ func TestListEnvdEntriesFollowsSymlinkRoot(t *testing.T) {
 
 func TestEnvdProcessStartStreamsConnectJSON(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	handler := srv.routes()
+	handler := authedRoutes(srv)
 
 	payload, err := json.Marshal(envdStartRequest{
 		Process: envdProcessConfig{
@@ -178,7 +178,7 @@ func TestEnvdProcessStartStreamsConnectJSON(t *testing.T) {
 
 func TestEnvdRejectsUnsupportedRequestedUser(t *testing.T) {
 	srv := newEnvdTestServer(t)
-	handler := srv.routes()
+	handler := authedRoutes(srv)
 
 	req := httptest.NewRequest(http.MethodGet, envdPrefix+"/files?path=/tmp/missing", nil)
 	req.Header.Set("Authorization", "Bearer toolbox-token")

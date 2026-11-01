@@ -145,7 +145,8 @@ What the installer does:
 
 1. Installs Docker, fuse3 / sshfs / nfs-common / rclone / mountpoint-s3 (for
    external-storage mounts), and a custom Caddy build with the
-   `caddy-l4` and `caddy-dns/cloudflare` plugins.
+   `caddy-l4` and `caddy-dns/cloudflare` plugins. It disables the `rpcbind`
+   that nfs-common brings in, so nothing listens on port 111.
 2. Downloads `sandboxd` + `toolboxd` binaries.
 3. Writes `/etc/sandboxd/sandboxd.env` and `/etc/caddy/Caddyfile`.
 4. Registers `sandboxd.service` (always-restart, 5s backoff) and
@@ -194,7 +195,9 @@ languages.
 
 The systemd watchdog (`sandboxd-healthcheck.timer`) restarts the daemon if
 `/health` fails. The daemon itself restarts on any non-zero exit
-(`Restart=always`, max 10 restarts per 5 min).
+(`Restart=always`, max 10 restarts per 5 min); once systemd stops after
+those 10, the watchdog resets the failed unit and starts it again every 30 s.
+A unit you stopped with `systemctl stop` is not failed and stays stopped.
 
 **Switching the netrules backend** (`SB_NETRULES_BACKEND=exec|netlink` in
 `/etc/sandboxd/sandboxd.env`): check `iptables -V` first. On iptables-nft

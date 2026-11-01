@@ -1373,7 +1373,7 @@ func TestConnectUnsupportedVersion(t *testing.T) {
 }
 
 func TestResourceSpecOptsFractionalCPU(t *testing.T) {
-	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.25, MemoryMB: 64})
+	opts := resourceSpecOpts(models.CreateSandboxRequest{CPU: 0.25, MemoryMB: 64}, 0)
 	if len(opts) != 2 {
 		t.Fatalf("opts=%d", len(opts))
 	}

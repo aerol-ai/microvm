@@ -100,8 +100,15 @@ CADDY_STORAGE_S3_ENCRYPTION_KEY=""
 #                        written in this one step: the flag without the
 #                        wrapper breaks every HTTPS handshake.
 PAT_SCOPE="any"
+KEY_CUSTODY="file"
+SECRET_PROVIDER_ENV=""
+NO_START="false"
 PUBLIC_API_SOCKET="/run/sandboxd-public/api.sock"
 L4_PROXY_PROTOCOL="false"
+# --lb-health-port: a plain-HTTP /health listener for a load balancer's
+# health check (Terraform api_load_balancer = "nlb"). Empty writes none, so
+# a default install opens no new port.
+LB_HEALTH_PORT=""
 
 # A re-run restarts a running sandboxd when it changed the daemon's settings
 # file or unit (see restart_sandboxd_if_reconfigured). record_sandboxd_state
@@ -263,6 +270,20 @@ Options:
                                /run/sandboxd-public/api.sock. Enterprise
                                mode requires "host". Turn it on only after
                                every node runs a release that has it.
+  --no-start                   Install and enable everything but leave sandboxd
+                               stopped, for a node cluster-join.sh will start
+                               once it has the cluster's config and server key.
+                               Booting it before that, as a lone node, would
+                               make a server key of its own. Not with --local.
+  --key-custody <file|wrapped> "wrapped" keeps the server key only wrapped by
+                               the customer's key store (AWS KMS, Vault or an
+                               HSM): the first boot generates it and writes no
+                               plaintext copy; a re-run over a plaintext key
+                               wraps it. Needs --secret-provider-env.
+                               (plans/customer-key-custody.md)
+  --secret-provider-env <file> SB_SECRET_* lines naming the key store
+                               (SB_SECRET_PROVIDER=awskms|vault|pkcs11 and its
+                               settings), appended to sandboxd.env.
   --l4-proxy-protocol          Domain mode: send the real client address
                                from caddy-l4 to the HTTPS site (PROXY
                                protocol v2) and on to sandboxd, so audit
@@ -270,6 +291,14 @@ Options:
                                outside" alert see it instead of 127.0.0.1.
                                Writes the Caddy listener wrapper and
                                SB_L4_FALLBACK_PROXY_PROTOCOL=true together.
+  --lb-health-port <port>      Domain mode: serve GET /health in plain HTTP
+                               on <port> for a load balancer's health check.
+                               It answers 200 only when the whole path a
+                               client takes works (caddy-l4 on :443, the
+                               HTTPS site and sandboxd), and 502 otherwise,
+                               so the balancer drops this node while its
+                               daemon is down. Open the port to the load
+                               balancer only.
   --local                     Local development mode. The server binds to
                                127.0.0.1:21212 with no Caddy or TLS. Supported
                                on both macOS and Linux. No domain name required.
@@ -662,6 +691,22 @@ while [[ $# -gt 0 ]]; do
 			L4_PROXY_PROTOCOL="true"
 			shift
 			;;
+		--lb-health-port)
+			LB_HEALTH_PORT="$2"
+			shift 2
+			;;
+		--key-custody)
+			KEY_CUSTODY="$2"
+			shift 2
+			;;
+		--no-start)
+			NO_START="true"
+			shift
+			;;
+		--secret-provider-env)
+			SECRET_PROVIDER_ENV="$2"
+			shift 2
+			;;
 		--help)
 			usage
 			exit 0
@@ -678,6 +723,33 @@ if [[ "$CLI_ONLY" == "true" ]]; then
 	install_cli
 	exit 0
 fi
+
+if [[ "$NO_START" == "true" && "$LOCAL_MODE" == "true" ]]; then
+	echo "--no-start is for a node cluster-join.sh will start; --local never joins a cluster" >&2
+	exit 1
+fi
+
+case "$KEY_CUSTODY" in
+	file) ;;
+	wrapped)
+		if [[ "$LOCAL_MODE" == "true" ]]; then
+			echo "--key-custody wrapped is not supported with --local" >&2
+			exit 1
+		fi
+		if [[ -z "$SECRET_PROVIDER_ENV" || ! -f "$SECRET_PROVIDER_ENV" ]]; then
+			echo "--key-custody wrapped needs --secret-provider-env <file> with SB_SECRET_PROVIDER and its settings" >&2
+			exit 1
+		fi
+		if ! grep -Eq '^SB_SECRET_PROVIDER=(awskms|vault|pkcs11)$' "$SECRET_PROVIDER_ENV"; then
+			echo "$SECRET_PROVIDER_ENV must set SB_SECRET_PROVIDER to awskms, vault or pkcs11" >&2
+			exit 1
+		fi
+		;;
+	*)
+		echo "--key-custody must be file or wrapped (got $KEY_CUSTODY)" >&2
+		exit 1
+		;;
+esac
 
 if [[ -z "$PAT_TOKEN" ]]; then
 	if command -v openssl >/dev/null 2>&1; then
@@ -787,6 +859,29 @@ esac
 if [[ "$L4_PROXY_PROTOCOL" == "true" && -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
 	echo "--l4-proxy-protocol requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
 	exit 1
+fi
+# The load-balancer health listener probes through caddy-l4 on :443, which
+# only exists in domain mode. Its port must not be one this node already
+# listens on, or Caddy fails to start and takes the API down with it.
+if [[ -n "$LB_HEALTH_PORT" ]]; then
+	if [[ -z "$L4_TLS_LISTEN_DEFAULT" ]]; then
+		echo "--lb-health-port requires domain mode (--domain with --dns-provider, or --tls-issuer internal)." >&2
+		exit 1
+	fi
+	if ! [[ "$LB_HEALTH_PORT" =~ ^[1-9][0-9]{3,4}$ ]] || ((LB_HEALTH_PORT > 65535)); then
+		echo "--lb-health-port must be a port from 1024 to 65535, got '$LB_HEALTH_PORT'." >&2
+		exit 1
+	fi
+	case "$LB_HEALTH_PORT" in
+	2019 | 2220 | 7000 | 7001 | 7002 | 8443 | 21212 | 21215 | 53053)
+		echo "--lb-health-port $LB_HEALTH_PORT is already used on this node (Caddy admin, SSH gateway, cluster, HTTPS site, API, host-port redirect or route DNS)." >&2
+		exit 1
+		;;
+	esac
+	if ((LB_HEALTH_PORT >= 22000 && LB_HEALTH_PORT <= 23000)); then
+		echo "--lb-health-port $LB_HEALTH_PORT is inside the raw-TCP port pool (22000-23000)." >&2
+		exit 1
+	fi
 fi
 
 # Shared cert storage validation. The feature only makes sense alongside
@@ -909,35 +1004,96 @@ install_caddy_package() {
 	rm -rf "$tmp_dir"
 }
 
+# APT_UPDATED is "true" once this run has refreshed the apt package index,
+# so install_mount_tools refreshes it only on the --local path, where
+# install_packages (and its apt-get update) does not run.
+APT_UPDATED="false"
+
+# rpcbind_on_host is true when the rpcbind package is installed, or a unit
+# of an rpcbind installed some other way is enabled.
+rpcbind_on_host() {
+	if [[ "$(dpkg-query -W -f='${Status}' rpcbind 2>/dev/null || true)" == "install ok installed" ]]; then
+		return 0
+	fi
+	command -v systemctl >/dev/null 2>&1 || return 1
+	systemctl is-enabled --quiet rpcbind.socket 2>/dev/null || systemctl is-enabled --quiet rpcbind.service 2>/dev/null
+}
+
+# install_mount_tools installs the programs that mount external storage and
+# platform volumes. The mount runs on the host, not in the sandbox, so
+# sandboxd needs them on its own PATH. Both Linux install paths call it:
+# --local skips install_packages, and a local server used to fail every
+# volume create with `exec: "mount-s3": executable file not found`. A tool
+# that will not install costs only its own mount type, so nothing here fails
+# the install.
+install_mount_tools() {
+	if [[ "$(uname -s)" != "Linux" ]]; then
+		echo "Skipping the mount tools (fuse3, sshfs, nfs-common, rclone, mount-s3): Linux only" >&2
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		echo "Warning: only apt-based distributions get the mount tools from this installer; install fuse3, sshfs, nfs-common, rclone and mount-s3 by hand for external storage and platform volumes" >&2
+		return 0
+	fi
+	if [[ "${APT_UPDATED:-false}" != "true" ]]; then
+		if apt-get update; then
+			APT_UPDATED="true"
+		else
+			echo "Warning: apt-get update failed; installing the mount tools from the existing package index" >&2
+		fi
+	fi
+	# nfs-common depends on rpcbind (the RPC portmapper), whose package
+	# enables and starts it on port 111 on every address: a finding in any
+	# port scan. The NFS client needs it only for an NFSv3 mount that locks,
+	# and then mount.nfs starts rpc-statd.service, which Requires=
+	# rpcbind.socket and so starts it on demand. So it is disabled, not
+	# masked: a mask fails that start, and with it every such mount. A host
+	# that had rpcbind before this run keeps it as it was; it may be in use.
+	local rpcbind_before="false"
+	if rpcbind_on_host; then
+		rpcbind_before="true"
+	fi
+	# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
+	# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
+	# we attempt an apt install first and fall back to the AWS download.
+	apt-get install -y fuse3 sshfs nfs-common rclone || true
+	if [[ "$rpcbind_before" == "true" ]]; then
+		echo "rpcbind was on this host before this run; leaving it as it is" >&2
+	elif ! command -v systemctl >/dev/null 2>&1; then
+		echo "Skipping the rpcbind disable: no systemctl on this host" >&2
+	elif rpcbind_on_host; then
+		systemctl disable --now rpcbind.socket rpcbind.service || \
+			echo "Warning: could not disable rpcbind, so it may listen on port 111; run: systemctl disable --now rpcbind.socket rpcbind.service" >&2
+	fi
+	if ! command -v mount-s3 >/dev/null 2>&1; then
+		local arch_suffix
+		case "$(uname -m)" in
+			x86_64|amd64) arch_suffix="x86_64" ;;
+			aarch64|arm64) arch_suffix="arm64" ;;
+			*) arch_suffix="" ;;
+		esac
+		if [[ -n "$arch_suffix" ]]; then
+			local tmp_deb
+			tmp_deb="$(mktemp --suffix=.deb)"
+			if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
+				apt-get install -y "$tmp_deb" || \
+					echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
+			else
+				echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
+			fi
+			rm -f "$tmp_deb"
+		fi
+	fi
+}
+
 install_packages() {
 	if command -v apt-get >/dev/null 2>&1; then
 		drop_caddy_apt_source
 		apt-get update
+		APT_UPDATED="true"
 		apt-get install -y build-essential ca-certificates curl gnupg lsb-release software-properties-common
 		# Mount tooling for the host-managed external storage feature.
-		# fuse3 is required by mountpoint-s3, sshfs, and rclone mount.
-		# nfs-common provides mount.nfs. mountpoint-s3 ships as a .deb from AWS;
-		# we attempt an apt install first and fall back to the AWS download.
-		apt-get install -y fuse3 sshfs nfs-common rclone || true
-		if ! command -v mount-s3 >/dev/null 2>&1; then
-			local arch_suffix
-			case "$(uname -m)" in
-				x86_64|amd64) arch_suffix="x86_64" ;;
-				aarch64|arm64) arch_suffix="arm64" ;;
-				*) arch_suffix="" ;;
-			esac
-			if [[ -n "$arch_suffix" ]]; then
-				local tmp_deb
-				tmp_deb="$(mktemp --suffix=.deb)"
-				if curl_download "https://s3.amazonaws.com/mountpoint-s3-release/latest/${arch_suffix}/mount-s3.deb" -o "$tmp_deb"; then
-					apt-get install -y "$tmp_deb" || \
-						echo "Warning: mountpoint-s3 install failed; s3 mounts will be unavailable until installed manually" >&2
-				else
-					echo "Warning: failed to download mountpoint-s3; s3 mounts will be unavailable until installed manually" >&2
-				fi
-				rm -f "$tmp_deb"
-			fi
-		fi
+		install_mount_tools
 		ensure_docker
 		if ! command -v caddy >/dev/null 2>&1; then
 			install_caddy_package
@@ -1260,7 +1416,37 @@ EOF
 #SB_AUDIT_WITNESS_S3_ENDPOINT=
 #SB_AUDIT_WITNESS_S3_PATH_STYLE=false
 EOF
+	if [[ "$KEY_CUSTODY" == "wrapped" ]]; then
+		{
+			echo "# Key custody (plans/customer-key-custody.md): the server key exists"
+			echo "# only wrapped by the key store below; see sandboxd key status."
+			# AWS_REGION too: the AWS KMS client needs it, and the SDK's
+			# IMDS fallback turns a missing region into an opaque timeout.
+			grep -E '^(SB_SECRET_[A-Z0-9_]+|AWS_REGION)=' "$SECRET_PROVIDER_ENV"
+			echo "SB_CREDENTIAL_KEY_CUSTODY=wrapped"
+		} >> /etc/sandboxd/sandboxd.env
+	fi
 	chmod 0600 /etc/sandboxd/sandboxd.env
+}
+
+# prepare_key_custody wraps a plaintext server key left by an earlier
+# install, so the daemon (which refuses wrapped custody while a plaintext
+# key file exists) starts. A fresh install has no key: the first boot
+# generates it and writes only the wrapped file.
+prepare_key_custody() {
+	[[ "$KEY_CUSTODY" == "wrapped" ]] || return 0
+	local plain=/var/lib/sandboxd/credential_encryption.key
+	local wrapped=/var/lib/sandboxd/credential_encryption.key.wrapped
+	if [[ -f "$plain" && ! -f "$wrapped" ]]; then
+		echo "Wrapping the existing server key at $plain"
+		"$INSTALL_PREFIX/sandboxd" key wrap --env-file /etc/sandboxd/sandboxd.env
+		# Not a secure delete; `sandboxd key status` reports the migration
+		# until `sandboxd key ack-migration`.
+		rm -f "$plain"
+	elif [[ -f "$plain" && -f "$wrapped" ]]; then
+		"$INSTALL_PREFIX/sandboxd" key verify --env-file /etc/sandboxd/sandboxd.env
+		rm -f "$plain"
+	fi
 }
 
 write_caddyfile() {
@@ -1407,6 +1593,40 @@ ${tls_block}
 	}
 }
 EOF
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		cat >> /etc/caddy/Caddyfile <<EOF
+
+# Load-balancer health listener (--lb-health-port). Plain HTTP, so keep the
+# port closed to everything but the balancer (Terraform opens it to the
+# balancer's security group only). GET /health walks the path a client
+# takes: caddy-l4 on :443, its SNI fallback, the HTTPS API site and
+# sandboxd. Any of them down answers 502, and the balancer stops sending
+# this node new connections. Bound to every address: Caddy numbers its
+# servers by sorted listen address, so ":${LB_HEALTH_PORT}" sorts after
+# "127.0.0.1:8443" and the API site stays srv0, where sandboxd writes routes.
+http://:${LB_HEALTH_PORT} {
+	handle /health {
+		reverse_proxy https://127.0.0.1:443 {
+			# The balancer's probe carries its own address as Host and no
+			# SNI. Send the API site's name in both, or the probe matches
+			# no site and Caddy answers an empty 200 with sandboxd down.
+			header_up Host ${DOMAIN}
+			# Required on every reverse_proxy here; the probe holds no stream.
+			stream_close_delay 10m
+			transport http {
+				tls_server_name ${DOMAIN}
+				# A loopback hop to this same Caddy: the probe checks that
+				# the handshake works (certificate loaded), not who answers.
+				tls_insecure_skip_verify
+			}
+		}
+	}
+	handle {
+		respond 404
+	}
+}
+EOF
+	fi
 }
 
 write_caddy_env() {
@@ -1625,6 +1845,19 @@ ENV_FILE="/etc/sandboxd/sandboxd.env"
 if [[ -f "$ENV_FILE" ]]; then
 	# shellcheck disable=SC1091
 	source "$ENV_FILE"
+fi
+
+# systemd stops restarting a unit that failed StartLimitBurst times within
+# StartLimitIntervalSec. A node whose key store was unreachable at boot
+# (wrapped server-key custody) fails that way and would stay down after the
+# key store came back, so a failed unit is reset and started again here,
+# every run of this timer. A unit an operator stopped is inactive, not
+# failed, and is left alone.
+if systemctl is-failed --quiet sandboxd.service; then
+	logger -t sandboxd-healthcheck "sandboxd.service is failed; resetting it and starting it again"
+	systemctl reset-failed sandboxd.service
+	systemctl start sandboxd.service || true
+	exit 0
 fi
 
 if ! systemctl is-active --quiet sandboxd.service; then
@@ -2063,6 +2296,11 @@ SB_TOOLBOX_MOUNT_PATH=/usr/local/bin/toolboxd
 SB_TOOLBOX_PORT=2280
 SB_IDLE_TIMEOUT_MIN=$IDLE_TIMEOUT_MIN
 SB_ENABLE_CADDY=false
+# No per-sandbox firewall in local mode: a create or update that asks for
+# network policy (block-all, address lists, hostname rules, byte caps) is
+# refused with 501 network_policy_unenforced instead of being accepted and not
+# enforced. SB_ALLOW_UNENFORCED_NETWORK_POLICY=true accepts it unenforced
+# (development only); SB_ENABLE_NETWORK_RULES=true enforces it.
 SB_ENABLE_NETWORK_RULES=false
 SB_MOUNTS_ROOT=/var/lib/sandboxd/mounts
 SB_MOUNTS_CRED_DIR=/run/sandboxd
@@ -2374,6 +2612,10 @@ if [[ "$LOCAL_MODE" == "true" ]]; then
 	install_binaries
 	record_sandboxd_state
 	write_local_environment
+	# This branch skips install_packages, so it installs the two parts of it
+	# a local server still needs, in the same order: the mount tools (platform
+	# volumes and external storage are mounted on the host), then Docker.
+	install_mount_tools
 	# The local unit hard-Requires docker.service; on Linux we must install
 	# the engine here since this branch skips install_packages.
 	ensure_docker
@@ -2424,6 +2666,7 @@ install_custom_caddy "$DNS_PROVIDER"
 install_binaries
 record_sandboxd_state
 write_environment
+prepare_key_custody
 write_caddy_env
 write_caddy_systemd_dropin
 write_route_dns_resolver
@@ -2435,13 +2678,23 @@ write_healthcheck_units
 
 systemctl daemon-reload
 systemctl enable --now aerolvm-egress-gateway.socket aerolvm-egress-gateway.service
-# Before Caddy: a re-run that changed sandboxd's settings restarts it and
-# waits for it, so Caddy starts in front of a sandboxd (and, under
-# --pat-scope host, a public socket) that is already there.
-restart_sandboxd_if_reconfigured
-systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+if [[ "$NO_START" == "true" ]]; then
+	# A joiner: cluster-join.sh starts sandboxd once cluster.env and the
+	# cluster's server key are in place (see --no-start).
+	systemctl enable caddy sandboxd sandboxd-healthcheck.timer
+	systemctl start caddy sandboxd-healthcheck.timer
+else
+	# Before Caddy: a re-run that changed sandboxd's settings restarts it and
+	# waits for it, so Caddy starts in front of a sandboxd (and, under
+	# --pat-scope host, a public socket) that is already there.
+	restart_sandboxd_if_reconfigured
+	systemctl enable --now caddy sandboxd sandboxd-healthcheck.timer
+fi
 
 echo "AerolVM installed"
+if [[ "$NO_START" == "true" ]]; then
+	echo "sandboxd: enabled, not started (--no-start); cluster-join.sh starts it"
+fi
 echo "PAT token: $PAT_TOKEN"
 echo "Use header: Authorization: Bearer <PAT token>"
 if [[ -n "$DOMAIN" ]]; then
@@ -2452,6 +2705,9 @@ if [[ -n "$DOMAIN" ]]; then
 	echo "TLS-SNI multiplexing: ENABLED on :443 (caddy-l4 routes by SNI)"
 	echo "  Regular HTTPS sites moved to 127.0.0.1:8443; caddy-l4 forwards"
 	echo "  unmatched SNI to that listener. exposeTLSPort() works out of the box."
+	if [[ -n "$LB_HEALTH_PORT" ]]; then
+		echo "Load-balancer health check: http://<this node>:${LB_HEALTH_PORT}/health (open it to the balancer only)"
+	fi
 else
 	echo "API URL: http://$PUBLIC_HOST:21212"
 	echo "Health URL: http://$PUBLIC_HOST:21212/health"

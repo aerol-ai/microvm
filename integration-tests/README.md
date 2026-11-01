@@ -143,6 +143,77 @@ integration-tests/run.sh cluster-hetero --upgrade-from v0.6.7  # full gate
 [`SNAPSHOT-MIGRATION-UPGRADE.md`](./SNAPSHOT-MIGRATION-UPGRADE.md) is the manual
 runbook the automation mirrors (use it to debug a failed gate).
 
+## Key custody scenarios
+
+Customer key custody (`plans/customer-key-custody.md` Phase 6) has five
+scenarios. Each costs what any scenario of its size costs; none adds an AWS
+service except the KMS key of the last three.
+
+| Scenario | Make target | Key store |
+|---|---|---|
+| `cluster-3-mixed-secrets-vault` | `make integration-key-custody-vault` | OpenBao 2.1.1 dev server (TLS) on the seed, OpenBao Proxy on every node |
+| `cluster-3-mixed-secrets-pkcs11` | `make integration-key-custody-pkcs11` | SoftHSM2 on every node, the same keys imported into each token |
+| `cluster-3-mixed-wrapped-kms` | `make integration-key-custody-kms` | A real AWS KMS key, with Terraform `key_custody = "wrapped"`; UC-311 disables and re-enables it |
+| `cluster-3-mixed-kms-switch` | `make integration-key-custody-kms-switch` | A real AWS KMS key with custody `file`; UC-312 runs the two-step switch from local to it |
+| `single-node-wrapped-kms` | `make integration-key-custody-single` | A real AWS KMS key, one node with `install.sh --key-custody wrapped`; UC-316 replaces its root disk and restores a backup onto the fresh install |
+
+The vault and pkcs11 scenarios boot a plain local cluster. The cases
+(`suite/z_keycustody_*_test.go`, helpers in
+`suite/keycustody_support_test.go`) install the key store over SSH, switch
+to it the two-step way and wrap the server key, which is the migration a
+customer runs. Each step leaves a marker in `/var/lib/itest-keycustody` on
+the node, so a case run alone (`-run`) brings the cluster to the state it
+needs first. Settings go into `/etc/sandboxd/itest-keycustody.env` under a
+drop-in that sorts before the suite's transient override, so a boot-gate
+case can still override them for one restart.
+
+Fixture notes:
+
+- The OpenBao dev store is in memory: it lives as long as the
+  `itest-openbao` unit on the seed. The Transit key is exportable with
+  plaintext backup allowed, only so UC-300 can restore it after deleting it.
+- `softhsm2-util --import` skips whitespace bytes in a key file, so the
+  fixture's AES keys are 32 alphanumeric bytes.
+- UC-313's private registry (`registry:2.8.3` in Docker on the seed, TLS from
+  a per-cluster CA, htpasswd auth) and SSHFS share (user `itestshare`, key
+  login, `restrict`) live on the seed; the vault scenario opens ports 5000
+  and 22 between nodes for them. Every node trusts the registry's CA and
+  restarts once, because sandboxd reads the system roots once per process.
+- UC-311 disables the scenario's own KMS key with the AWS CLI from the
+  machine running the suite, and re-enables it in cleanup; teardown
+  schedules the key for deletion either way.
+- SoftHSM2 keeps keys on the node's disk: the pkcs11 scenario proves the
+  code path, not a network HSM. The one AWS CloudHSM run is operator-gated
+  and not a scenario here (CloudHSM bills hourly per HSM).
+
+## Ingress load balancer (UC-356)
+
+`cluster-3-mixed-lb` (`make integration-cluster-mixed-lb`) is cluster-3-mixed
+with a health-checked AWS Network Load Balancer in front of the ingress
+nodes. Its `api-load-balancer` capability is the switch: run.sh applies and
+destroys with `api_load_balancer = "nlb"` for it and `"none"` for every other
+scenario, whatever `config/terraform.tfvars` says. The domain then resolves to
+the balancer's Elastic IP, and raw TCP ports to `tcp.<domain>` (one record
+per node), so the whole suite also runs through the balancer.
+
+UC-356 (`suite/api_lb_test.go`) checks the domain resolves to the balancer
+only, stops sandboxd on one non-seed node, and reads the balancer's own view
+(`aws elbv2 describe-target-health` on the 443 target group): the node must
+leave rotation within `AEROL_LB_OUT_OF_ROTATION_MAX` (default 20s), 60
+fresh-connection calls through the domain must then all succeed, and after
+the daemon restarts the node must be healthy again within
+`AEROL_LB_BACK_IN_ROTATION_MAX` (default 90s). Each call opens its own TCP
+and TLS connection on a transport of its own, so neither keep-alive nor the
+suite's shared client can hide a 502. The numbers land in
+`<reports>/cluster-3-mixed-lb-bank.json` under
+`api_load_balancer_daemon_outage`.
+
+The scenario needs the default local build, or a release that has
+`install.sh --lb-health-port` and `SB_L4_PUBLIC_HOST`. The reaper
+(`scripts/integration-reap.sh`) terminates instances only, so a scenario
+whose teardown failed keeps its balancer and Elastic IP until
+`integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
