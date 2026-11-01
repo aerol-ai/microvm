@@ -192,8 +192,8 @@ jobs:
           # Node 22 ships npm older than 11.5.1, the first release that
           # exchanges ACTIONS_ID_TOKEN_REQUEST_*. Install 11.21.0 from the
           # lockfile in .github/npm-cli. `npm ci` checks those integrity hashes
-          # and its postinstall replaces the vulnerable bundled copies of
-          # brace-expansion, http-cache-semantics, ip-address, and undici.
+          # and its postinstall replaces the vulnerable copies npm bundles;
+          # .github/npm-cli/package.json lists them.
           #
           # Refuse to publish if a classic token is still configured. Any
           # _authToken entry, including one that expands empty, makes npm
