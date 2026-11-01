@@ -877,6 +877,7 @@ var Registry = []UseCase{
 	{ID: "UC-338", Title: "Scale: density per runtime: small sandboxes created 8 at a time until a clean capacity refusal or the cap; every created sandbox runs and the API still answers", Requires: []Capability{CapBenchmark, CapDocker}, Implemented: true},
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-340", Title: "Compatibility: IPv6 off inside sandboxes breaks no listener: on every runtime an AF_INET6 socket binds [::], and a listener on [::] accepts an IPv4 connection", Requires: []Capability{CapDocker}, Implemented: true},
 	// Early gateway attach (perf/egress-attach-early): the attach overlaps the
 	// runtime create, and must never open a sandbox or leave state behind.
 	{ID: "UC-341", Title: "Egress: a hostname-allowlisted sandbox has no unfiltered egress from its workload's first instruction (probes started at workload start never reach an outside address directly, during or after the create), and after the create only its allowlist is reachable", Requires: []Capability{CapEgressFQDN}, Implemented: true},

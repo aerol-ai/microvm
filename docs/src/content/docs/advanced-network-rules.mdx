@@ -1517,7 +1517,7 @@ One case reads more strictly here than on E2B. `allowOut` with no `denyOut` is a
 
 ## Limits
 
-- **IPv4 only.** None of these rules filter IPv6 traffic.
+- **IPv4 only.** None of these rules filter IPv6 traffic. Container, gVisor and Firecracker sandboxes have none: see [No IPv6 in a sandbox](/engineering-network-defenses/#no-ipv6-in-a-sandbox).
 - **The server's firewall is required.** On Docker, containerd and Firecracker sandboxes, every policy on this page relies on the server's firewall, names too: the sandbox starts shut until the filter service takes it, and is shut again if the filter fails. A server without the firewall refuses them with `501` and the code `network_policy_unenforced`. That covers a create, a `setNetworkPolicy` that adds a policy, and starting a stopped sandbox that has one. Clearing a policy always works. WASM and V8 isolate sandboxes filter their own traffic and are not affected.
 - **Names, not paths.** The filter decides by site name. It does not read inside HTTPS, so on its own it cannot allow one path or method and refuse another. [Rules and inspection](#allow-only-some-requests) adds that, for plain HTTP and for HTTPS sites you choose to inspect.
 - **Firecracker** supports everything on this page: names, address lists and `networkBlockAll`, at create and with `setNetworkPolicy`. Each VM has its own network device, so another VM cannot pretend to be it. [Rules and inspection](#allow-only-some-requests) is not supported there (`501`).
