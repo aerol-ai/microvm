@@ -13,6 +13,7 @@ package suite
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"regexp"
 	"sort"
@@ -63,6 +64,12 @@ exec sleep 3600`
 // gateway enforces for its address), probes started from the workload's
 // first instruction never reach an outside address directly, and after the
 // create only the allowlist is reachable.
+//
+// A Firecracker guest runs no workload command: its PID 1 is toolboxd, and
+// the create's ContainerCommand is not run (the driver boots the agent
+// only). No user code runs there before the create returns, so the subtest
+// checks exactly that, then starts the probes with the first exec, the
+// guest's first user instruction.
 func TestEgressNothingOpenFromTheFirstInstruction(t *testing.T) {
 	harness.Require(t, sc, "UC-341")
 	c := client(t)
@@ -91,6 +98,14 @@ func TestEgressNothingOpenFromTheFirstInstruction(t *testing.T) {
 			tRet, err := strconv.ParseFloat(strings.TrimSpace(returned), 64)
 			if err != nil {
 				t.Fatalf("uptime after create: %q", returned)
+			}
+			if rt == "firecracker" && !strings.Contains(egressExec(t, sb, "cat /tmp/early-probe.log 2>/dev/null; true"), "probe") {
+				if init := egressExec(t, sb, "tr '\\0' ' ' < /proc/1/cmdline"); !strings.Contains(init, "toolboxd") {
+					t.Fatalf("the guest ran no probe and its PID 1 is %q, not the agent: something else ran before the create returned", init)
+				}
+				t.Log("Firecracker ran no workload command (PID 1 is toolboxd): starting the probes with the first exec")
+				script := base64.StdEncoding.EncodeToString([]byte(earlyProbeScript))
+				egressExec(t, sb, "echo "+script+" | base64 -d > /tmp/early-probe.sh && (nohup sh /tmp/early-probe.sh >/dev/null 2>&1 &); true")
 			}
 			var log string
 			if !eventually(30*time.Second, func() bool {
