@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -620,6 +621,8 @@ func TestCreate_HappyPath(t *testing.T) {
 	}
 	if f.client.bs == nil || f.client.bs.KernelImagePath != f.kernel {
 		t.Errorf("BootSource wrong: %+v", f.client.bs)
+	} else if !strings.Contains(f.client.bs.BootArgs, guestNoIPv6Arg) {
+		t.Errorf("cold-boot args must turn guest IPv6 off: %q", f.client.bs.BootArgs)
 	}
 	if d, ok := f.client.drives[rootDriveID]; !ok || !d.IsRootDevice {
 		t.Errorf("root drive wrong: %+v", d)

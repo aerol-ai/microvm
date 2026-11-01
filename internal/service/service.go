@@ -121,6 +121,10 @@ type Service struct {
 	// SetIsolateRuntime when cfg.EnableIsolate is true. Host-mediated like
 	// wasm: satisfies Runtime only, never ContainerRuntime.
 	isolate runtime.Runtime
+	// ipv6Fence answers the create gate: whether the node's IPv6 fence
+	// covers a runtime's sandboxes (ipv6_fence.go). Nil until pkg/daemon
+	// wires it (tests, non-Linux, nodes that own no sandboxes).
+	ipv6Fence IPv6Fence
 	// isolateBundles is the content-addressed JS/TS bundle store behind
 	// POST /v1/js-bundles and the owner-scoped name→digest resolution on an
 	// isolate create. Nil unless pkg/daemon wired it (EnableIsolate).
@@ -1965,6 +1969,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 		return nil, err
 	}
 	req.Durability = durability
+	// Fail closed: no container or Firecracker sandbox while the node's
+	// IPv6 fence is not installed for its runtime. One atomic map read
+	// (ipv6_fence.go).
+	if err := s.requireIPv6Fence(chosenRuntime); err != nil {
+		return nil, err
+	}
 	if err := validateMaskRequestHost(req.MaskRequestHost); err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/store"
@@ -124,6 +125,11 @@ func (p *Pool) Reconcile(ctx context.Context, host HostManager, live LiveSandbox
 		default:
 			continue
 		}
+		if !orphan && !p.disableSurvivorIPv6(ctx, host, slot) {
+			// A warm slot whose IPv6 cannot be turned off is rebuilt, not
+			// handed to a sandbox.
+			orphan = slot.State == store.NetnsSlotStatePooled
+		}
 		if !orphan {
 			continue
 		}
@@ -139,6 +145,29 @@ func (p *Pool) Reconcile(ctx context.Context, host HostManager, live LiveSandbox
 		unlock()
 	}
 	return reaped, nil
+}
+
+// ipv6Disabler is the optional HostManager step Reconcile runs on every
+// surviving slot (*Host implements it).
+type ipv6Disabler interface {
+	DisableIPv6(ctx context.Context, slot Slot) error
+}
+
+// disableSurvivorIPv6 turns IPv6 off in a slot that outlived a restart:
+// slots realized before Realize did it themselves still have it on. It
+// reports false only when the host could not; a live sandbox's slot is then
+// kept (the node's IPv6 fence still drops what it sends) and logged.
+func (p *Pool) disableSurvivorIPv6(ctx context.Context, host HostManager, slot *Slot) bool {
+	d, ok := host.(ipv6Disabler)
+	if !ok || strings.TrimSpace(slot.NetnsPath) == "" {
+		return true
+	}
+	if err := d.DisableIPv6(ctx, *slot); err != nil {
+		p.log().Warn("containerd netns reconcile: could not turn IPv6 off in a surviving slot",
+			"slot_id", slot.SlotID, "sandbox_id", slot.SandboxID, "state", slot.State, "error", err)
+		return false
+	}
+	return true
 }
 
 // RetryReleasing re-runs the host teardown for every slot parked as releasing

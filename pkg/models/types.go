@@ -1432,6 +1432,12 @@ const ErrorCodeEgressGatewayUnavailable = "egress_gateway_unavailable"
 // (plans/egress-domain-filtering.md §5.10).
 const ErrorCodeEgressOperatorConfigInvalid = "egress_operator_config_invalid"
 
+// ErrorCodeIPv6FenceNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's IPv6 fence, which keeps
+// IPv6 off the sandbox bridges and TAPs, is not installed for that runtime;
+// the node retries it every few seconds.
+const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
+
 // ErrorCodeNetworkPolicyUnenforced is returned (501) for a create, start,
 // policy update or byte-cap update that needs the host firewall on a node
 // where it is off (SB_ENABLE_NETWORK_RULES=false, or not a Linux host): the

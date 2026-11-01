@@ -154,7 +154,10 @@ func (p *NetnsPool) reconcile(ctx context.Context) {
 		case strings.HasPrefix(name, netnsFreePrefix):
 			inspect, err := p.client.inspectContainer(ctx, s.ID)
 			ip := getContainerIP(inspect, p.client.network)
-			if err != nil || inspect.State == nil || !inspect.State.Running || ip == "" {
+			// A free pause an older daemon started has IPv6 on in its
+			// netns; a sandbox must never join it. Replace it instead.
+			if err != nil || inspect.State == nil || !inspect.State.Running || ip == "" ||
+				(p.client.network != "host" && !hasSandboxIPv6Off(inspect.HostConfig.Sysctls)) {
 				_ = p.client.removeContainer(ctx, s.ID, true)
 				continue
 			}
@@ -220,6 +223,9 @@ func (p *NetnsPool) spawnPause(ctx context.Context) (netnsSlot, error) {
 	if p.client.network != "" && p.client.network != "bridge" {
 		hostConfig["NetworkMode"] = p.client.network
 	}
+	// The pause owns the netns every adopting sandbox joins, so IPv6 goes
+	// off here, once, for all of them.
+	setSandboxIPv6Off(hostConfig, p.client.network)
 	createRequest["HostConfig"] = hostConfig
 
 	var created struct {
