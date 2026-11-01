@@ -3,6 +3,7 @@ package mounts
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
@@ -50,6 +51,25 @@ func (c *capturedOutput) String() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return strings.TrimSpace(string(c.buf))
+}
+
+// ErrMountToolUnavailable is a mount whose tool (mount-s3, sshfs, rclone,
+// mount) is not installed on this node, as on a local install, which skips
+// them. It is the node's configuration, never the request: the adapters fix
+// argv[0], so no mount spec can name a missing program. The API answers it
+// with 501 mount_tool_unavailable instead of the catch-all 400.
+var ErrMountToolUnavailable = errors.New("mount tool is not installed on this node")
+
+// toolStartError marks a failure to start a mount tool as
+// ErrMountToolUnavailable when the program is missing: exec.ErrNotFound from
+// the $PATH lookup, or ENOENT starting an absolute path (or the interpreter
+// its #! line names). The exec error, which names the tool, stays wrapped.
+// Any other start failure is returned unchanged.
+func toolStartError(tool string, err error) error {
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: %s: %w", ErrMountToolUnavailable, tool, err)
+	}
+	return err
 }
 
 // procExit reports a mount tool's exit. One goroutine reaps the process

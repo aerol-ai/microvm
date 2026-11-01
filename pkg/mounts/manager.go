@@ -385,7 +385,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 		out, runErr := cmd.CombinedOutput()
 		if runErr != nil {
 			m.cleanupCred(plan)
-			return nil, ContainerBind{}, fmt.Errorf("kernel mount failed: %w (%s)", runErr, string(out))
+			return nil, ContainerBind{}, fmt.Errorf("kernel mount failed: %w (%s)", toolStartError(plan.Argv[0], runErr), string(out))
 		}
 		// Done; nothing to supervise.
 		bind := ContainerBind{HostPath: hostPath, ContainerPath: spec.Target, ReadOnly: spec.ReadOnly}
@@ -398,7 +398,7 @@ func (m *Manager) mountOne(ctx context.Context, sandboxID string, index int, spe
 	cmd, out, exit, err := spawnMountProcess(plan)
 	if err != nil {
 		m.cleanupCred(plan)
-		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", err)
+		return nil, ContainerBind{}, fmt.Errorf("spawn mount tool: %w", toolStartError(plan.Argv[0], err))
 	}
 	state.cmd = cmd
 	state.output = out

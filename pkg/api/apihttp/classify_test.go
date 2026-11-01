@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -14,8 +15,14 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 )
+
+// missingMountS3 is the create error from a node without mount-s3, as the
+// service wraps it (the local-mode run on main f34b607e answered it 400).
+var missingMountS3 = fmt.Errorf("mount external storage: mount 0 (s3): spawn mount tool: %w: mount-s3: %w",
+	mounts.ErrMountToolUnavailable, &exec.Error{Name: "mount-s3", Err: exec.ErrNotFound})
 
 // Classify is the single table every surface shares. These are the cases the
 // E2B and Runloop copies used to miss (defaulting them to 400) or map with a
@@ -42,6 +49,10 @@ func TestClassify(t *testing.T) {
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
 		// The service's refusal matches both sentinels; it keeps its code.
 		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
+		{"mount tool unavailable", missingMountS3, http.StatusNotImplemented, 0, models.ErrorCodeMountToolUnavailable, ErrKindOther},
+		// A mount tool that ran and failed (bad bucket, bad credentials) is
+		// the caller's to fix: it stays the 400.
+		{"mount tool failed", errors.New("mount 0 (s3): mount tool exited before the mount was ready: exit status 2 (mount tool output: bucket does not exist)"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 		{"build timeout", service.ErrBuildTimeout, http.StatusGatewayTimeout, 0, "", ErrKindOther},
 		{"build failed", service.ErrBuildFailed, http.StatusBadGateway, 0, "", ErrKindOther},
 		{"builder unavailable", service.ErrBuilderUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
@@ -136,5 +147,29 @@ func TestWriteStoreAwareErrorNetworkPolicyUnenforced(t *testing.T) {
 	}
 	if rec.Header().Get("Retry-After") != "" {
 		t.Fatal("retrying cannot help: no Retry-After")
+	}
+}
+
+// A mount tool missing on the node reaches the client as 501 with its code
+// and the message naming the tool, without Retry-After (installing a program
+// is not something a retry waits out), and is logged for the operator.
+func TestWriteStoreAwareErrorMountToolUnavailable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteStoreAwareError(nil, rec, fmt.Errorf("create sandbox: %w", missingMountS3))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", rec.Code)
+	}
+	var body models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != models.ErrorCodeMountToolUnavailable || !strings.Contains(body.Error, `"mount-s3": executable file not found`) {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("retrying cannot help: no Retry-After")
+	}
+	if c := Classify(missingMountS3); !c.Log {
+		t.Fatal("the missing tool must reach the node's log")
 	}
 }
