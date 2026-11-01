@@ -535,3 +535,39 @@ func TestBlockSetsConcurrentAddressesAndReassert(t *testing.T) {
 		t.Fatalf("left in the kernel: %v %v", b, r)
 	}
 }
+
+// TestClearAddressForgetsTheSets: clearing an address (its holder is gone)
+// takes it out of both block sets too, release first, with its rules.
+func TestClearAddressForgetsTheSets(t *testing.T) {
+	f := newFakeSets()
+	m := setsManager(t, f)
+	const ip = "10.88.3.2"
+	if err := m.BlockAllEgress(ip); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.LiftBlockAllEgress(ip); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Insert("filter", ChainAerolvmUser, 1, holdSpec(ip)...)
+	if err := m.ClearAddress(ip); err != nil {
+		t.Fatal(err)
+	}
+	if f.has(BlockedSet, ip) || f.has(ReleasedSet, ip) || len(f.rules) != 0 {
+		t.Fatalf("left: sets %v rules %v", f.sets, f.rules)
+	}
+	if got := f.lastTx(); !slices.Equal(got, []blockSetOp{{Set: ReleasedSet, IP: ip}, {Set: BlockedSet, IP: ip}}) {
+		t.Fatalf("tx %v", got)
+	}
+	f.applyErr = errors.New("apply boom")
+	if err := m.BlockAllEgress("10.88.3.3"); err == nil {
+		t.Fatal("block succeeded")
+	}
+	f.applyErr = nil
+	if err := m.BlockAllEgress("10.88.3.4"); err != nil {
+		t.Fatal(err)
+	}
+	f.applyErr = errors.New("apply boom")
+	if err := m.ClearAddress("10.88.3.4"); err == nil {
+		t.Fatal("a failed set delete hidden")
+	}
+}

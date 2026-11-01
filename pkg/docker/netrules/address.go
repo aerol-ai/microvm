@@ -41,6 +41,13 @@ func (m *Manager) ClearAddress(ip string) error {
 	}
 	unlock := m.lockIP(ip)
 	defer unlock()
+	// The block sets hold the address's block-all (blockset.go): it goes
+	// too, release first.
+	if b := m.setsFor(ip); b != nil {
+		if err := m.forgetElements(b, ip); err != nil {
+			return fmt.Errorf("netrules: clear address %s: %w", ip, err)
+		}
+	}
 	chains := []string{m.filterChain()}
 	if m.ensureInputChain() == nil {
 		chains = append(chains, ChainAerolvmInput)
