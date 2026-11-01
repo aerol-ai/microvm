@@ -26,6 +26,7 @@ curl -fsSL https://aerolvm.aerol.ai | bash -s -- --help
 | `--version <tag>` | The release to install, such as `v0.6.4`. | `latest` |
 | `--idle-timeout-min <minutes>` | Stops running sandboxes after this many idle minutes. It skips sandboxes that set their own lifecycle. | `0` (off) |
 | `--node-name <name>` | A friendly name for this server, shown in the cluster table of the [dashboard](/dashboard/). | Empty |
+| `--no-start` | Installs and enables everything but leaves the server stopped. Use it on a server that will join a cluster: `cluster-join.sh` starts it once it has the cluster's settings and key. Not with `--local`. | Off: the server starts |
 
 ## Change or upgrade an install
 
@@ -118,9 +119,10 @@ IP mode has no HTTPS. Your token and data cross the network unencrypted. Use it 
 - Keeps state in `/var/lib/sandboxd`.
 - Installs a custom Caddy build with TCP routing (`caddy-l4`) and the Cloudflare DNS plugin. Caddy is the web server that gets the certificates and sends each link to the right sandbox. Its config is `/etc/caddy/Caddyfile`. The Cloudflare token goes in `/etc/default/caddy`.
 - Registers the systemd services `sandboxd`, `caddy` and `aerolvm-egress-gateway`, which handles sandboxes' outbound traffic. If `sandboxd` crashes, systemd restarts it after 5 seconds, up to 10 times in 5 minutes.
-- Adds `sandboxd-healthcheck.timer`, which checks the server's health every 30 seconds.
+- Adds `sandboxd-healthcheck.timer`, which checks every 30 seconds that the server still answers. It restarts a server only after it has stopped answering for 3 checks in a row over at least 90 seconds, so a server that is just busy keeps running. It also starts again a server that systemd gave up on after 10 failed starts. A server you stopped yourself is left alone.
 - Starts an SSH gateway, so you can [log in to sandboxes over SSH](/ssh-access/).
 - Installs the tools for [cloud storage](/external-storage/): `fuse3`, `sshfs`, `nfs-common`, `rclone` and `mount-s3`.
+- Turns off `rpcbind`, which comes with `nfs-common`, so nothing listens on port `111`. If `rpcbind` was already on the server, the installer leaves it as it is.
 
 In domain mode, `caddy-l4` holds port `443`. It reads the hostname that each client sends at the start of a TLS connection (SNI) and routes on it. Normal HTTPS sites run on `127.0.0.1:8443` behind it. This is why [TLS ports](/tcp-vs-tls-ports/) work without extra setup.
 
@@ -132,6 +134,7 @@ Caddy gets exactly two certificates from Let's Encrypt: one for `sandbox.example
 |---|---|
 | `21212` | The AerolVM API. In domain mode, Caddy forwards HTTPS traffic to it, so keep it closed. |
 | `2019` | Caddy's admin API. It listens on `127.0.0.1` only. Never open it. |
+| `111` | `rpcbind`. The installer turns it off. Mounting an NFS version 3 share that locks files starts it again, on every address, until the server restarts. A server set up by an older installer may still run it. Turn it off with `sudo systemctl disable --now rpcbind.socket rpcbind.service`. |
 
 The SSH gateway listens on `0.0.0.0:2220`. Change it with `SB_SSH_LISTEN_ADDR`.
 
@@ -166,6 +169,7 @@ Add `SB_ENABLE_WASM=true` to `/etc/sandboxd/sandboxd.env` and restart `sandboxd`
 | `--ingress-proxy-routing` | Route sandbox links without writing a Caddy route for each sandbox. Off by default. |
 | `--pat-scope <any\|host>` | Where the server's token (`--pat-token`) works. `any`, the default, keeps today's behavior. `host` accepts it only on the server itself (`127.0.0.1:21212`) and from other cluster servers. Everyone else must sign in with SSO or use a named API token. Caddy then talks to the server through a private socket. [Enterprise mode](/enterprise/enterprise-mode/) requires `host`. Turn it on only after every server runs a release that has it, and see the caution above about settings you added by hand. See [SSO](/enterprise/sso/#step-5-limit-the-server-token-to-the-server). |
 | `--l4-proxy-protocol` | Domain mode only. Passes each caller's real address through Caddy to the server, so audit records and alerts show it instead of `127.0.0.1`. Off by default. |
+| `--lb-health-port <port>` | Domain mode only. For a server behind a load balancer: serves `/health` on this port over plain HTTP for the balancer's health check. It answers `200` only when the whole path a user takes works (Caddy, its port 443 and the AerolVM server), so the balancer stops sending users to this server while any part is down. Open the port to the load balancer only. Off by default. See [Put a load balancer in front](/cluster-setup/#put-a-load-balancer-in-front). |
 | `--build-from-source` | Build `sandboxd` and `toolboxd` from the current checkout instead of downloading them. |
 
 ## Next steps

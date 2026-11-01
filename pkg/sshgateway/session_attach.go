@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/ssh"
 )
@@ -38,12 +39,15 @@ const (
 // baseURL is the http(s) /sessions root (no trailing slash); wsURL is the
 // matching ws(s) root; auth is the full Authorization header value or "".
 // forwardID, when set, is echoed as a correlation header on every call so a
-// cross-node SSH session can be traced from the edge to the owner.
+// cross-node SSH session can be traced from the edge to the owner. bridge,
+// set only on the remote path, attests every call as this gateway acting
+// for the sandbox's key (attest.go).
 type sessionEndpoint struct {
 	baseURL   string
 	wsURL     string
 	auth      string
 	forwardID string
+	bridge    *bridgedSession
 }
 
 // forwardIDHeader is the correlation header carried on cross-node SSH calls.
@@ -57,6 +61,9 @@ func (ep sessionEndpoint) applyHeaders(h http.Header) {
 	}
 	if ep.forwardID != "" {
 		h.Set(forwardIDHeader, ep.forwardID)
+	}
+	if ep.bridge != nil {
+		ep.bridge.attest(h)
 	}
 }
 
@@ -132,6 +139,10 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, ep s
 	header := http.Header{}
 	ep.applyHeaders(header)
 	dialer := *websocket.DefaultDialer
+	// The toolbox dialer's dead-peer bound: a killed gVisor sandbox or
+	// Firecracker VM never closes this socket, and without the bound an
+	// attached shell would hang for minutes.
+	dialer.NetDialContext = toolboxhttp.DialContext
 	// The remote path dials this node's own v1 API over loopback (ws://), so
 	// TLS is normally unused. Tolerate wss:// for completeness.
 	if strings.HasPrefix(ep.wsURL, "wss://") {
@@ -241,7 +252,7 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, ep s
 // findOrCreateSession looks up the named session via toolboxd's HTTP API and
 // returns its ID, creating it if absent. Synchronous; uses small timeouts.
 func (g *Gateway) findOrCreateSession(ctx context.Context, ep sessionEndpoint, name string, state *sessionState) (string, error) {
-	httpClient := &http.Client{Timeout: 5 * time.Second}
+	httpClient := toolboxhttp.Client(5 * time.Second)
 
 	create := models.CreateSessionRequest{
 		Name: name,

@@ -75,9 +75,19 @@ variable "availability_zone" {
 }
 
 variable "admin_allowed_cidrs" {
-  description = "CIDRs allowed to reach SSH (22) and the operator/SDK API (21212)."
+  description = "IPv4 CIDRs allowed to reach SSH (22), the operator/SDK API (21212) and the observability node from outside the VPC. Required: set your office or VPN ranges, e.g. [\"203.0.113.0/24\"]. A world-open range (any /0, such as 0.0.0.0/0) is refused unless allow_admin_from_anywhere = true. Inside the VPC the API is always reachable (monitoring, peers)."
   type        = list(string)
-  default     = ["0.0.0.0/0"]
+
+  validation {
+    condition     = length(var.admin_allowed_cidrs) > 0 && alltrue([for c in var.admin_allowed_cidrs : try(cidrsubnet(c, 0, 0) == c && cidrnetmask(c) != "", false)])
+    error_message = "admin_allowed_cidrs must list at least one IPv4 CIDR written as its network address (your office or VPN range, e.g. \"203.0.113.0/24\")."
+  }
+}
+
+variable "allow_admin_from_anywhere" {
+  description = "Accept a world-open admin_allowed_cidrs (0.0.0.0/0), opening SSH and the daemon API to the whole internet. Off by default."
+  type        = bool
+  default     = false
 }
 
 variable "public_http_ports" {
@@ -102,6 +112,50 @@ variable "ssh_gateway_port" {
   description = "Public TCP port for the per-sandbox SSH gateway. Must match SB_SSH_LISTEN_ADDR on the daemon (default 0.0.0.0:2220). Opened on ingress-bearing nodes."
   type        = number
   default     = 2220
+}
+
+variable "api_load_balancer" {
+  description = <<-EOT
+    What sits in front of the ingress nodes. "none" (the default) is DNS
+    round-robin: <domain> and *.<domain> get one A record per ingress node,
+    exactly as before. A client that DNS sends to a node whose sandboxd is
+    down gets 502 until it is back, because the TCP and TLS handshakes with
+    that node's Caddy still succeed and nothing makes the client try the next
+    record.
+
+    "nlb" creates an internet-facing AWS Network Load Balancer (TCP
+    passthrough, so Caddy keeps terminating TLS and caddy-l4 keeps routing by
+    SNI) on public_http_ports and ssh_gateway_port, with the client address
+    preserved. Its health check probes each ingress node's Caddy
+    (install.sh --lb-health-port), which walks caddy-l4 on :443 to sandboxd,
+    so a node leaves rotation about 10 s after its daemon stops. <domain> and
+    *.<domain> then point at the balancer's Elastic IP. The raw-TCP port
+    pool cannot ride an NLB (at most 50 listeners), so raw TCP moves to
+    tcp.<domain>, which keeps one A record per ingress node, and every node
+    gets SB_L4_PUBLIC_HOST.
+
+    Recommended for production. Changing it on a running cluster changes
+    every node's bootstrap, so Terraform replaces the nodes: choose it when
+    you create the cluster.
+  EOT
+  type        = string
+  default     = "none"
+
+  validation {
+    condition     = contains(["none", "nlb"], var.api_load_balancer)
+    error_message = "api_load_balancer must be \"none\" or \"nlb\"."
+  }
+}
+
+variable "api_lb_health_check_port" {
+  description = "Port of the plain-HTTP /health listener each ingress node opens for the load balancer's health check (install.sh --lb-health-port) when api_load_balancer = \"nlb\". Only the balancer's security group may reach it. It must be a port the node does not otherwise use."
+  type        = number
+  default     = 21280
+
+  validation {
+    condition     = var.api_lb_health_check_port >= 1024 && var.api_lb_health_check_port <= 65535 && floor(var.api_lb_health_check_port) == var.api_lb_health_check_port
+    error_message = "api_lb_health_check_port must be a port number from 1024 to 65535."
+  }
 }
 
 variable "ssh_host_key_pem" {
@@ -595,6 +649,23 @@ variable "secret_kms_enabled" {
 # SB_ENTERPRISE_MODE is true, so defaulting it on keeps an enterprise scenario
 # from failing at daemon start with a config error. A scenario can still turn
 # it off through extra_sandboxd_env, which is rendered after this block.
+# Server-key custody (plans/customer-key-custody.md §3). "wrapped" keeps the
+# server key that seals env, registry, mount and toolbox secrets only wrapped
+# by the KMS key above: install.sh and cluster-init.sh never write it in
+# plaintext, and the S3 cred bundle object then holds only the wrapped file.
+# Needs secret_kms_enabled (this module provisions only AWS KMS; Vault and
+# HSM key stores are the customer's own).
+variable "key_custody" {
+  description = "Server-key custody: \"file\" (default, plaintext key) or \"wrapped\" (wrapped by the secret_kms_enabled key; needs a release whose scripts have --key-custody)."
+  type        = string
+  default     = "file"
+
+  validation {
+    condition     = contains(["file", "wrapped"], var.key_custody)
+    error_message = "key_custody must be \"file\" or \"wrapped\"."
+  }
+}
+
 variable "secret_kms_strict_boot" {
   description = "Set SB_SECRET_PROVIDER_STRICT_BOOT when secret_kms_enabled. Required by config.go for awskms + enterprise mode."
   type        = bool

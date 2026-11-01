@@ -128,7 +128,10 @@ func TestSetEgressFloorUsesTheSandboxSubnet(t *testing.T) {
 	if err := c.SetEgressFloor(context.Background(), []netip.Prefix{netip.MustParsePrefix("10.20.0.0/16")}); err != nil {
 		t.Fatal(err)
 	}
-	if be.flushed != 1 || len(be.rules) != 1 || !strings.Contains(be.rules[0], "-s 172.17.0.0/16 -d 10.20.0.0/16 -j DROP") {
+	// The operator's range, and the subnet to itself (sandboxes isolated
+	// from each other).
+	// Its own floor chain flushed, and the legacy shared one emptied once.
+	if be.flushed != 2 || len(be.rules) != 2 || !strings.HasPrefix(be.rules[0], netrules.FloorChainFor(netip.MustParsePrefix("172.17.0.0/16"))+" ") || !strings.Contains(be.rules[0], "-s 172.17.0.0/16 -d 10.20.0.0/16 -j DROP") || !strings.Contains(be.rules[1], "-s 172.17.0.0/16 -d 172.17.0.0/16 -j DROP") {
 		t.Fatalf("floor = %v", be.rules)
 	}
 	failing := &Client{networkRules: netrules.NewWithBackend(be), httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
@@ -136,5 +139,24 @@ func TestSetEgressFloorUsesTheSandboxSubnet(t *testing.T) {
 	})}}
 	if err := failing.SetEgressFloor(context.Background(), nil); err == nil {
 		t.Fatal("bridge discovery errors surface")
+	}
+}
+
+// NetRulesEnabled is what the service asks before it accepts network policy
+// for a docker sandbox: false for a disabled manager (network rules off, or
+// not Linux) and for none at all.
+func TestClientNetRulesEnabled(t *testing.T) {
+	cases := map[string]struct {
+		c    *Client
+		want bool
+	}{
+		"rules on":       {&Client{networkRules: netrules.NewWithBackend(&memRuleBackend{})}, true},
+		"rules disabled": {&Client{networkRules: disabledRules(t)}, false},
+		"no manager":     {&Client{}, false},
+	}
+	for name, tc := range cases {
+		if got := tc.c.NetRulesEnabled(); got != tc.want {
+			t.Errorf("%s: NetRulesEnabled = %v, want %v", name, got, tc.want)
+		}
 	}
 }

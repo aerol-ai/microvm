@@ -67,12 +67,23 @@ func TestDashboardMetricsExistInFixture(t *testing.T) {
 // Go tree, as the string literal an expvar.New*/Publish call names. A metric
 // renamed or removed in code fails here, not on an empty production panel.
 func TestIdentityRowMetricsAreRegistered(t *testing.T) {
+	rowMetricsRegistered(t, "d9-security-isolation.json", "Identity and access")
+}
+
+// TestKeyCustodyRowMetricsAreRegistered is the same check for the "Key
+// custody" row (plans/customer-key-custody.md Section 8).
+func TestKeyCustodyRowMetricsAreRegistered(t *testing.T) {
+	rowMetricsRegistered(t, "d9-security-isolation.json", "Key custody")
+}
+
+func rowMetricsRegistered(t *testing.T, dashboard, row string) {
+	t.Helper()
 	_, filename, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
 	}
 	root := filepath.Join(filepath.Dir(filename), "..", "..")
-	raw, err := os.ReadFile(filepath.Join(root, "setup", "grafana", "d9-security-isolation.json"))
+	raw, err := os.ReadFile(filepath.Join(root, "setup", "grafana", dashboard))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +104,7 @@ func TestIdentityRowMetricsAreRegistered(t *testing.T) {
 	inRow, sawRow, panels := false, false, 0
 	for _, p := range dash.Panels {
 		if p.Type == "row" {
-			inRow = p.Title == "Identity and access"
+			inRow = p.Title == row
 			sawRow = sawRow || inRow
 			continue
 		}
@@ -106,7 +117,7 @@ func TestIdentityRowMetricsAreRegistered(t *testing.T) {
 		}
 	}
 	if !sawRow || panels == 0 {
-		t.Fatal(`d9-security-isolation.json has no "Identity and access" row with panels; the check would pass vacuously`)
+		t.Fatalf("%s has no %q row with panels; the check would pass vacuously", dashboard, row)
 	}
 	registered := map[string]bool{}
 	literalRE := regexp.MustCompile(`"(aerolvm_[a-z0-9_]+)"`)
@@ -136,7 +147,7 @@ func TestIdentityRowMetricsAreRegistered(t *testing.T) {
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		t.Fatalf("Identity and access panels query metrics no Go file registers:\n%s", strings.Join(missing, "\n"))
+		t.Fatalf("%s panels query metrics no Go file registers:\n%s", row, strings.Join(missing, "\n"))
 	}
 }
 

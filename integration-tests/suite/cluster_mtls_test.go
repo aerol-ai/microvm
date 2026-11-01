@@ -196,7 +196,7 @@ func TestOperatorRoutesAcceptThePATAndInternalRoutesDoNot(t *testing.T) {
 			t.Fatal(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+tenantToken)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := harness.HTTPClient(0).Do(req)
 		if err != nil {
 			t.Fatalf("tenant-token request to %s: %v", p, err)
 		}

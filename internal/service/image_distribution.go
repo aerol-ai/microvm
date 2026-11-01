@@ -251,6 +251,20 @@ func (s *Service) snapshotCommittedAs(ctx context.Context, images []string) (*mo
 	return nil, nil
 }
 
+// HoldsCommittedSnapshotImage reports whether this node's catalogue holds the
+// snapshot committed under image (a docker.SnapshotImageTag, any spelling). It
+// answers for the node, not the caller: whether the caller may start that
+// snapshot is still NormalizeCreateImageDistribution's call. The cluster
+// create router asks it first so a create for a snapshot this node holds stays
+// here, exactly as before, whatever the cluster's snapshot-home index says.
+func (s *Service) HoldsCommittedSnapshotImage(ctx context.Context, image string) (bool, error) {
+	if s == nil || s.store == nil || !docker.IsSnapshotImageRef(image) {
+		return false, nil
+	}
+	snapshot, err := s.snapshotCommittedAs(ctx, docker.EquivalentImageNames(image))
+	return snapshot != nil, err
+}
+
 // NormalizeCreateImageDistribution resolves snapshot aliases and fills the
 // create request's image-distribution metadata before placement decisions are
 // made. The method is intentionally side-effect free: it does not pull, push,

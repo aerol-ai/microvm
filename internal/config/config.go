@@ -19,6 +19,8 @@ import (
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -144,6 +146,28 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the processes and threads of each container
+	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
+	// it one sandbox's fork bomb exhausts the node for every tenant. A gVisor
+	// sandbox is capped inside its own kernel instead, at this or one task
+	// per MiB of its memory if lower, and its host cgroup gets the room the
+	// sentry needs at that cap (pkg/gvisorpids).
+	SandboxPidsLimit int
+	// SandboxInterconnect lets sandboxes on one node connect to each other
+	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
+	// tenant's sandbox cannot reach another's listeners.
+	SandboxInterconnect bool
+	// SandboxNodePortsAllow are node ports every sandbox on this node may
+	// reach on top of the node guard's own allowlist
+	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
+	// mode). Sandboxes are default-denied from the node they run on.
+	SandboxNodePortsAllow []SandboxNodePort
+	// DiskLimitCheckInterval is how often the disk watchdog checks each
+	// container sandbox's writable layer against its DiskGB
+	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
+	// engines do not enforce DiskGB on a stock root filesystem, so without
+	// it one sandbox can fill the node's disk for every tenant.
+	DiskLimitCheckInterval time.Duration
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -211,6 +235,14 @@ type Config struct {
 	AutoReconcile                bool
 	EnableCaddy                  bool
 	EnableNetworkRules           bool
+	// AllowUnenforcedNetworkPolicy lets a container sandbox keep a network
+	// policy (block-all, address lists, hostname rules, byte caps) on a node
+	// whose host firewall is off (SB_ENABLE_NETWORK_RULES=false, or not a
+	// Linux host), where nothing enforces it. Off, those creates and updates
+	// are refused (501): a control the API accepts but does not enforce is
+	// worse than one it refuses. For local development only; enterprise mode
+	// refuses it. SB_ALLOW_UNENFORCED_NETWORK_POLICY.
+	AllowUnenforcedNetworkPolicy bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
@@ -236,8 +268,15 @@ type Config struct {
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
 	EgressProfileApplyQPS int
-	EnableEventMonitor    bool
-	EnableSSHGateway      bool
+	// EgressDNSPort and EgressProxyPort are the egress gateway's listener
+	// ports (SB_EGRESS_DNS_PORT, SB_EGRESS_PROXY_PORT, the same names and
+	// defaults the gateway reads from egress-gateway.env). The node guard
+	// opens them to sandboxes when the gateway runs here, until the gateway
+	// reports the ports it really listens on.
+	EgressDNSPort      int
+	EgressProxyPort    int
+	EnableEventMonitor bool
+	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
 	// of the box; flip to false on a per-host basis to opt that host out of
@@ -418,6 +457,19 @@ type Config struct {
 	SSHHostKeyPath              string
 	CredentialEncryptionKey     string
 	CredentialEncryptionKeyPath string
+	// CredentialKeyCustody is how the server key is kept at rest: "file"
+	// (default; plaintext in the env or the key file, today's behavior) or
+	// "wrapped" (wrapped by SB_SECRET_PROVIDER and unwrapped at boot, so no
+	// plaintext copy lives on disk; plans/customer-key-custody.md §3).
+	// SB_CREDENTIAL_KEY_CUSTODY.
+	CredentialKeyCustody string
+	// CredentialKeyWrappedPath is the wrapped server-key file used when
+	// CredentialKeyCustody=wrapped. SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH.
+	CredentialKeyWrappedPath string
+	// CredentialKeyRingPath is custody=file's server-key ring, written by
+	// `sandboxd key rotate` (plans/customer-key-custody.md §13).
+	// SB_CREDENTIAL_KEY_RING_PATH; empty means KeyRingPath's default.
+	CredentialKeyRingPath       string
 	MountsRootPath              string
 	MountsCredentialsRuntimeDir string
 	MountWaitTimeout            time.Duration
@@ -473,6 +525,13 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
+	// a file transfer, a session) lives on once its sandbox stops answering
+	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
+	// A live sandbox's kernel answers the keepalive probes, so a long command
+	// with no output is never cut. SB_TOOLBOX_DEAD_PEER_TIMEOUT, default 30s;
+	// 0 = off (Go's keepalive, about 2.5 minutes); otherwise at least 6s.
+	ToolboxDeadPeerTimeout time.Duration
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1073,6 +1132,16 @@ type Config struct {
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
 	IngressAdvertiseHost string
+	// L4PublicHost is the host name clients dial for a raw-TCP exposure
+	// (the L4 host-port pool). Empty keeps the old target: SB_DOMAIN, else
+	// the public host. It exists for a domain that points at a load
+	// balancer which cannot carry the pool: an AWS Network Load Balancer
+	// has at most 50 listeners and the pool is 1,001 ports, so with
+	// Terraform's api_load_balancer = "nlb" the domain reaches the
+	// balancer and raw TCP keeps reaching the ingress nodes directly under
+	// tcp.<domain>. Only the advertised URL and host change; the pool, the
+	// allocator and the routes do not. SB_L4_PUBLIC_HOST.
+	L4PublicHost string
 	// ClusterShardAwareIngress confirms that the public ingress router is
 	// shard-aware when the live ingress tier is larger than
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
@@ -1090,6 +1159,15 @@ type Config struct {
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
 	RouteDNSAddr string
+	// RouteDNSLinkAddr is a second responder listener, on the address of the
+	// node's aerolvm-rt link, where the system resolver sends *.rt.internal.
+	// systemd-resolved pins its socket for a link's DNS server to that link,
+	// so a UDP query to the loopback address goes out the dummy link and is
+	// dropped; resolved then stalls every lookup for about 20s while it falls
+	// back to TCP, and does it again each time it re-probes. install.sh sets
+	// it with --ingress-proxy-routing. Empty: no second listener.
+	// SB_ROUTE_DNS_LINK_ADDR.
+	RouteDNSLinkAddr string
 	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
 	// are REDIRECTed to under ingress proxy routing when the kernel can't
 	// DNAT them straight to the sandbox (stopped serverless sandboxes to
@@ -1151,16 +1229,60 @@ type Config struct {
 	SecretRecipientBackupCount int
 
 	// SecretProvider selects the secrets.Provider backend: "local" (default —
-	// node-local AES key, never contacts AWS/Vault), "awskms", or "vault".
-	// The off-state is local, not "no provider". SB_SECRET_PROVIDER.
+	// node-local AES key, never contacts a key store), "awskms", "vault" or
+	// "pkcs11". The off-state is local, not "no provider". SB_SECRET_PROVIDER.
 	SecretProvider string
 	// SecretAWSkmsKeyID is the CMK id/arn/alias used when SecretProvider=awskms.
+	// Set with another provider, the node still opens AWS KMS rows (step 1 of
+	// a provider switch, plans/customer-key-custody.md §12).
 	// SB_SECRET_AWS_KMS_KEY_ID.
 	SecretAWSkmsKeyID string
-	// SecretProviderStrictBoot fails daemon start when the awskms boot canary
-	// (wrap/unwrap) fails. Default false = fail-open with a warning (E4 lite).
-	// SB_SECRET_PROVIDER_STRICT_BOOT.
+	// Vault Transit / OpenBao settings for SecretProvider=vault
+	// (plans/customer-key-custody.md §1). Set with another provider, the node
+	// already opens vault rows. No Vault login code: TokenFile is written by
+	// Vault Agent, or Addr points at Agent's local API proxy.
+	// SB_SECRET_VAULT_ADDR, SB_SECRET_VAULT_TRANSIT_MOUNT (default transit),
+	// SB_SECRET_VAULT_KEY_NAME, SB_SECRET_VAULT_TOKEN_FILE,
+	// SB_SECRET_VAULT_NAMESPACE, SB_SECRET_VAULT_CACERT.
+	SecretVaultAddr      string
+	SecretVaultMount     string
+	SecretVaultKeyName   string
+	SecretVaultTokenFile string
+	SecretVaultNamespace string
+	SecretVaultCACert    string
+
+	// PKCS#11 (HSM) settings for SecretProvider=pkcs11
+	// (plans/customer-key-custody.md §2). The vendor module loads only in
+	// the `sandboxd --pkcs11-helper` process. Set with another provider, the
+	// node already opens p11 rows. SB_SECRET_PKCS11_MODULE,
+	// SB_SECRET_PKCS11_TOKEN_LABEL, SB_SECRET_PKCS11_PIN_FILE (owner-only
+	// mode), SB_SECRET_PKCS11_KEY_LABEL, SB_SECRET_PKCS11_DECRYPT_KEY_LABELS
+	// (comma-separated, for rotation), SB_SECRET_PKCS11_GCM_IV
+	// (auto|hsm|caller), SB_SECRET_PKCS11_RUN_DIR (the helper's socket).
+	SecretPKCS11Module        string
+	SecretPKCS11TokenLabel    string
+	SecretPKCS11PINFile       string
+	SecretPKCS11KeyLabel      string
+	SecretPKCS11DecryptLabels []string
+	SecretPKCS11GCMIV         string
+	SecretPKCS11RunDir        string
+	// SecretProviderStrictBoot fails daemon start when the boot canary
+	// (wrap/unwrap) of any external provider fails. Default false = fail-open
+	// with a warning (E4 lite). SB_SECRET_PROVIDER_STRICT_BOOT.
 	SecretProviderStrictBoot bool
+	// SecretProviderMaxInFlight caps foreground key-store calls per node, so
+	// a restart storm cannot exceed what the customer's key store (an HSM
+	// partition's session limit, one Vault active node) can take. One slot is
+	// kept for creates and background work has its own 2 slots on top (eng
+	// D13). Default 8, range 1-256. SB_SECRET_PROVIDER_MAX_INFLIGHT.
+	SecretProviderMaxInFlight int
+	// SecretProviderRecheckInterval is how often a node with wrapped
+	// custody unwraps its server-key file again to notice a revoke, with
+	// jitter; SecretProviderRevokeAfter consecutive revoked results stop the
+	// node (about 15 minutes by default, eng D18).
+	// SB_SECRET_PROVIDER_RECHECK_INTERVAL, SB_SECRET_PROVIDER_REVOKE_AFTER.
+	SecretProviderRecheckInterval time.Duration
+	SecretProviderRevokeAfter     int
 	// SecretAuditRetentionDays is how long local secrets.jsonl events are kept
 	// before PruneSecretAudit drops them. Default 30. SB_SECRET_AUDIT_RETENTION_DAYS.
 	SecretAuditRetentionDays int
@@ -1391,6 +1513,18 @@ type Config struct {
 	// PATScopeHost: every request on it is public, so a PAT there is
 	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
 	PublicAPISocket string
+	// LivenessSocket is the Unix socket sandboxd answers liveness on from
+	// the first moment of its boot, for the install.sh watchdog. It does no
+	// I/O and takes no lock, so a daemon busy serving the API still answers
+	// it. Empty means off. SB_LIVENESS_SOCKET.
+	LivenessSocket string
+	// APIListMaxInflight bounds the cluster-wide sandbox lists (v1 and the
+	// Daytona, E2B and Runloop facades) this node runs at once; past it a
+	// list waits at most APIListQueueWait for a slot and is otherwise
+	// answered 503 + Retry-After. 0 = no limit. SB_API_LIST_MAX_INFLIGHT,
+	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
+	APIListMaxInflight int
+	APIListQueueWait   time.Duration
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -1800,6 +1934,17 @@ func validateIdentityFile(cfg Config) error {
 }
 
 func Load() (Config, error) {
+	return load(false)
+}
+
+// LoadForKeyTool is Load for `sandboxd key`, minus the cluster-mode check
+// that the shared server key already exists: `sandboxd key wrap --generate`
+// is what creates it on the seed.
+func LoadForKeyTool() (Config, error) {
+	return load(true)
+}
+
+func load(keyTool bool) (Config, error) {
 	exe, _ := os.Executable()
 	defaultToolboxPath := filepath.Join(filepath.Dir(exe), "toolboxd")
 
@@ -1817,10 +1962,14 @@ func Load() (Config, error) {
 		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
 		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
+		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -1843,6 +1992,7 @@ func Load() (Config, error) {
 		AutoReconcile:                     getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		AllowUnenforcedNetworkPolicy:      getEnvBool("SB_ALLOW_UNENFORCED_NETWORK_POLICY", false),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
 		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
 		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
@@ -1850,6 +2000,8 @@ func Load() (Config, error) {
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
+		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
+		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
@@ -1887,6 +2039,9 @@ func Load() (Config, error) {
 		SSHHostKeyPath:                    getEnv("SB_SSH_HOST_KEY_PATH", "/var/lib/sandboxd/ssh_host_ed25519_key"),
 		CredentialEncryptionKey:           strings.TrimSpace(os.Getenv("SB_CREDENTIAL_ENCRYPTION_KEY")),
 		CredentialEncryptionKeyPath:       getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", "/var/lib/sandboxd/credential_encryption.key"),
+		CredentialKeyCustody:              strings.ToLower(strings.TrimSpace(getEnv("SB_CREDENTIAL_KEY_CUSTODY", "file"))),
+		CredentialKeyWrappedPath:          getEnv("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", "/var/lib/sandboxd/credential_encryption.key.wrapped"),
+		CredentialKeyRingPath:             strings.TrimSpace(os.Getenv("SB_CREDENTIAL_KEY_RING_PATH")),
 		MountsRootPath:                    getEnv("SB_MOUNTS_ROOT", "/var/lib/sandboxd/mounts"),
 		MountsCredentialsRuntimeDir:       getEnv("SB_MOUNTS_CRED_DIR", "/run/sandboxd"),
 		MountWaitTimeout:                  getEnvDuration("SB_MOUNT_WAIT_TIMEOUT", 30*time.Second),
@@ -1969,9 +2124,11 @@ func Load() (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
@@ -1987,7 +2144,23 @@ func Load() (Config, error) {
 		SecretRecipientBackupCount:    getEnvInt("SB_SECRET_RECIPIENT_BACKUP_COUNT", 2),
 		SecretProvider:                strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PROVIDER", "local"))),
 		SecretAWSkmsKeyID:             strings.TrimSpace(os.Getenv("SB_SECRET_AWS_KMS_KEY_ID")),
+		SecretVaultAddr:               strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_ADDR")),
+		SecretVaultMount:              getEnv("SB_SECRET_VAULT_TRANSIT_MOUNT", "transit"),
+		SecretVaultKeyName:            strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_KEY_NAME")),
+		SecretVaultTokenFile:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_TOKEN_FILE")),
+		SecretVaultNamespace:          strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_NAMESPACE")),
+		SecretVaultCACert:             strings.TrimSpace(os.Getenv("SB_SECRET_VAULT_CACERT")),
+		SecretPKCS11Module:            strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_MODULE")),
+		SecretPKCS11TokenLabel:        os.Getenv("SB_SECRET_PKCS11_TOKEN_LABEL"),
+		SecretPKCS11PINFile:           strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_PIN_FILE")),
+		SecretPKCS11KeyLabel:          strings.TrimSpace(os.Getenv("SB_SECRET_PKCS11_KEY_LABEL")),
+		SecretPKCS11DecryptLabels:     splitEnvList("SB_SECRET_PKCS11_DECRYPT_KEY_LABELS"),
+		SecretPKCS11GCMIV:             strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_PKCS11_GCM_IV", "auto"))),
+		SecretPKCS11RunDir:            getEnv("SB_SECRET_PKCS11_RUN_DIR", "/run/sandboxd/pkcs11"),
 		SecretProviderStrictBoot:      getEnvBool("SB_SECRET_PROVIDER_STRICT_BOOT", false),
+		SecretProviderMaxInFlight:     getEnvInt("SB_SECRET_PROVIDER_MAX_INFLIGHT", 8),
+		SecretProviderRecheckInterval: getEnvDuration("SB_SECRET_PROVIDER_RECHECK_INTERVAL", 5*time.Minute),
+		SecretProviderRevokeAfter:     getEnvInt("SB_SECRET_PROVIDER_REVOKE_AFTER", 3),
 		SecretAuditRetentionDays:      getEnvInt("SB_SECRET_AUDIT_RETENTION_DAYS", 30),
 		SecretAuditStrictBoot:         getEnvBool("SB_SECRET_AUDIT_STRICT_BOOT", true),
 		SecretAuditBootVerify:         strings.ToLower(strings.TrimSpace(getEnv("SB_SECRET_AUDIT_BOOT_VERIFY", "full"))),
@@ -2215,6 +2388,9 @@ func Load() (Config, error) {
 	}
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
+	}
+	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
+		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
@@ -2480,6 +2656,28 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	if cfg.RouteDNSLinkAddr != "" {
+		host, port, err := net.SplitHostPort(cfg.RouteDNSLinkAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || ip.IsUnspecified() || port == "" || port == "0" {
+			// An address, not a wildcard: the responder answers a non-loopback
+			// client only when it is the listener's own address.
+			return Config{}, fmt.Errorf("invalid SB_ROUTE_DNS_LINK_ADDR %q: require ip:port with a specific IP", cfg.RouteDNSLinkAddr)
+		}
+	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
+	}
+	nodePorts, perr := ParseSandboxNodePorts(os.Getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
+	if perr != nil {
+		return Config{}, perr
+	}
+	cfg.SandboxNodePortsAllow = nodePorts
+	if err := validEgressGatewayPorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
@@ -2567,15 +2765,11 @@ func Load() (Config, error) {
 		// Sealed registry/mount credentials use this node-local AES key. A
 		// shared key is necessary but not sufficient for HA failover: the
 		// sealed row must also be fanned out to recipient peers (or a KMS
-		// provider used). Accept
-		// either an explicit env var or an already-distributed key file;
-		// refuse boot otherwise unless the operator opts out.
-		if cfg.CredentialEncryptionKey == "" && !cfg.ClusterInsecureCredentials {
-			if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
-				if os.IsNotExist(err) {
-					return Config{}, fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
-				}
-				return Config{}, fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+		// provider used). Refuse boot without a shared key unless the
+		// operator opts out.
+		if !cfg.ClusterInsecureCredentials && !keyTool {
+			if err := checkClusterCredentialKey(cfg); err != nil {
+				return Config{}, err
 			}
 		}
 		if cfg.ClusterTLSDir == "" {
@@ -2597,11 +2791,44 @@ func Load() (Config, error) {
 			return Config{}, errors.New("SB_SECRET_AWS_KMS_KEY_ID is required when SB_SECRET_PROVIDER=awskms")
 		}
 	case "vault":
-		// Honest reject: vault is a reserved value on the same Provider seam
-		// but is not implemented. Never silently fall back to local.
-		return Config{}, errors.New("SB_SECRET_PROVIDER=vault is not implemented yet; use local or awskms")
+		// NewVault below checks the settings.
+	case "pkcs11":
+		// checkPKCS11Settings below checks the settings.
 	default:
-		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, or vault (got %q)", cfg.SecretProvider)
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER must be local, awskms, vault, or pkcs11 (got %q)", cfg.SecretProvider)
+	}
+	if vault := cfg.SecretVaultOptions(); cfg.SecretProvider == "vault" || vault.Configured() {
+		// The daemon's own validator: address scheme, key and mount names,
+		// CA bundle. It makes no call to Vault.
+		if _, err := secrets.NewVault(vault); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProvider == "pkcs11" || cfg.PKCS11Configured() {
+		if err := checkPKCS11Settings(cfg); err != nil {
+			return Config{}, err
+		}
+	}
+	if cfg.SecretProviderMaxInFlight < 1 || cfg.SecretProviderMaxInFlight > 256 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_MAX_INFLIGHT must be between 1 and 256 (got %d)", cfg.SecretProviderMaxInFlight)
+	}
+	if cfg.SecretProviderRecheckInterval < 10*time.Second {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_RECHECK_INTERVAL must be at least 10s (got %s)", cfg.SecretProviderRecheckInterval)
+	}
+	if cfg.SecretProviderRevokeAfter < 1 {
+		return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_REVOKE_AFTER must be at least 1 (got %d)", cfg.SecretProviderRevokeAfter)
+	}
+	switch cfg.CredentialKeyCustody {
+	case "", "file":
+		cfg.CredentialKeyCustody = "file"
+	case "wrapped":
+		// The server key is wrapped by the same key store that wraps row DEKs:
+		// one key store, one set of permissions, one log.
+		if cfg.SecretProvider == "local" {
+			return Config{}, errors.New("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs an external SB_SECRET_PROVIDER (awskms, vault or pkcs11) to wrap the server key")
+		}
+	default:
+		return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be file or wrapped (got %q)", cfg.CredentialKeyCustody)
 	}
 	if cfg.SecretAuditRetentionDays < 0 {
 		return Config{}, errors.New("SB_SECRET_AUDIT_RETENTION_DAYS must be >= 0")
@@ -2676,6 +2903,12 @@ func Load() (Config, error) {
 	if err := cfg.loadPATScopeConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadLivenessConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -2703,11 +2936,22 @@ func Load() (Config, error) {
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
 		}
+		if cfg.SandboxPidsLimit == 0 {
+			return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be above 0 when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxInterconnect {
+			return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.AllowUnenforcedNetworkPolicy {
+			return Config{}, errors.New("SB_ALLOW_UNENFORCED_NETWORK_POLICY must be false when SB_ENTERPRISE_MODE=true (it accepts network policy the node does not enforce)")
+		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")
 		}
-		if cfg.SecretProvider == "awskms" && !cfg.SecretProviderStrictBoot {
-			return Config{}, errors.New("SB_SECRET_PROVIDER_STRICT_BOOT must be true for awskms when SB_ENTERPRISE_MODE=true")
+		// A key store this node cannot reach must stop the boot, whichever
+		// one it is (plans/customer-key-custody.md §7).
+		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
+			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
@@ -2863,6 +3107,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// KeyRingPath is custody=file's server-key ring: SB_CREDENTIAL_KEY_RING_PATH,
+// else the key file's path plus ".ring".
+func (c Config) KeyRingPath() string {
+	if c.CredentialKeyRingPath != "" {
+		return c.CredentialKeyRingPath
+	}
+	return c.CredentialEncryptionKeyPath + ".ring"
 }
 
 func (c Config) ListenAddr() string {
@@ -3043,6 +3296,37 @@ func getEnv(key, fallback string) string {
 		return ""
 	}
 	return value
+}
+
+// checkClusterCredentialKey refuses cluster mode without a server key every
+// node can share. With custody=file that is the env var or an already
+// distributed key file. With custody=wrapped it is the wrapped file only: a
+// plaintext copy is exactly what wrapped custody removes, so it does not
+// count here.
+func checkClusterCredentialKey(cfg Config) error {
+	if cfg.CredentialKeyCustody == "wrapped" {
+		if _, err := os.Stat(cfg.CredentialKeyWrappedPath); err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY=wrapped needs the wrapped server key at %s when SB_ENABLE_CLUSTER=true (wrap it on the first node and copy the wrapped file to every node; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out)", cfg.CredentialKeyWrappedPath)
+			}
+			return fmt.Errorf("stat %s: %w", cfg.CredentialKeyWrappedPath, err)
+		}
+		return nil
+	}
+	if cfg.CredentialEncryptionKey != "" {
+		return nil
+	}
+	if _, err := os.Stat(cfg.KeyRingPath()); err == nil {
+		// A rotated key: the ring holds every live key (§13).
+		return nil
+	}
+	if _, err := os.Stat(cfg.CredentialEncryptionKeyPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("SB_CREDENTIAL_ENCRYPTION_KEY is required when SB_ENABLE_CLUSTER=true (or place a shared key at %s; set SB_CLUSTER_INSECURE_CREDENTIALS=true to opt out — a shared key alone does not make sealed creds survive failover; recipient-set sealing + async fan-out, or a KMS provider, is also required)", cfg.CredentialEncryptionKeyPath)
+		}
+		return fmt.Errorf("stat %s: %w", cfg.CredentialEncryptionKeyPath, err)
+	}
+	return nil
 }
 
 func getEnvInt(key string, fallback int) int {
@@ -3260,6 +3544,49 @@ func (c Config) validateAuditWitness() error {
 		return fmt.Errorf("SB_NODE_ID must be set, and not to %q, when SB_AUDIT_WITNESS_BACKEND is set: witness heads are stored per node id, so every server sharing the bucket needs its own", auditwitness.StandaloneNodeID)
 	}
 	return nil
+}
+
+// PKCS11Configured reports whether any PKCS#11 setting is present, which
+// makes the node start the helper even when it seals with another provider.
+func (c Config) PKCS11Configured() bool {
+	return c.SecretPKCS11Module != "" || c.SecretPKCS11KeyLabel != ""
+}
+
+// checkPKCS11Settings fails boot on settings the helper would refuse anyway,
+// so the error names the setting instead of a helper that will not start.
+func checkPKCS11Settings(c Config) error {
+	for _, s := range []struct{ name, value string }{
+		{"SB_SECRET_PKCS11_MODULE", c.SecretPKCS11Module},
+		{"SB_SECRET_PKCS11_TOKEN_LABEL", c.SecretPKCS11TokenLabel},
+		{"SB_SECRET_PKCS11_PIN_FILE", c.SecretPKCS11PINFile},
+		{"SB_SECRET_PKCS11_KEY_LABEL", c.SecretPKCS11KeyLabel},
+	} {
+		if strings.TrimSpace(s.value) == "" {
+			return fmt.Errorf("%s is required for the pkcs11 provider", s.name)
+		}
+	}
+	switch c.SecretPKCS11GCMIV {
+	case "auto", "hsm", "caller":
+	default:
+		return fmt.Errorf("SB_SECRET_PKCS11_GCM_IV must be auto, hsm or caller (got %q)", c.SecretPKCS11GCMIV)
+	}
+	if err := secrets.RefuseGroupOtherBits(c.SecretPKCS11PINFile); err != nil {
+		return fmt.Errorf("SB_SECRET_PKCS11_PIN_FILE: %w", err)
+	}
+	return nil
+}
+
+// SecretVaultOptions projects the Vault settings into the shape pkg/secrets
+// opens. NodeID is filled in by the service, which knows the cluster id.
+func (c Config) SecretVaultOptions() secrets.VaultOptions {
+	return secrets.VaultOptions{
+		Addr:      c.SecretVaultAddr,
+		Mount:     c.SecretVaultMount,
+		KeyName:   c.SecretVaultKeyName,
+		TokenFile: c.SecretVaultTokenFile,
+		Namespace: c.SecretVaultNamespace,
+		CACert:    c.SecretVaultCACert,
+	}
 }
 
 // AuditWitnessConfig projects the witness settings into the shape

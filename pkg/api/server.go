@@ -13,8 +13,10 @@
 package api
 
 import (
+	"expvar"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -30,6 +32,14 @@ import (
 	"github.com/aerol-ai/microvm/pkg/identitywire"
 )
 
+// listGateMetrics are the cluster-list gate's counters on /v1/metrics: lists
+// holding a slot now, lists admitted, and lists shed with 503.
+var listGateMetrics = apihttp.GateMetrics{
+	InFlight: expvar.NewInt("aerolvm_api_list_inflight"),
+	Admitted: expvar.NewInt("aerolvm_api_list_admitted_total"),
+	Shed:     expvar.NewInt("aerolvm_api_list_shed_total"),
+}
+
 type Server struct {
 	logger          *slog.Logger
 	service         *service.Service
@@ -37,10 +47,13 @@ type Server struct {
 	patToken        string
 	validator       controlplane.Validator
 	auditLimiter    *apiv1.AuditRateLimiter
-	clusterEnabled  bool
-	mux             *http.ServeMux
-	root            http.Handler
-	mcp             *remotemcp.Handler
+	// listGate sheds cluster-wide lists past SB_API_LIST_MAX_INFLIGHT
+	// (apihttp.Gate); nil with no limit.
+	listGate       *apihttp.Gate
+	clusterEnabled bool
+	mux            *http.ServeMux
+	root           http.Handler
+	mcp            *remotemcp.Handler
 
 	// authChain is the ordered authenticator list authenticate() tries
 	// (auth.go). NewServer builds it; a bare &Server{} falls back to the
@@ -73,6 +86,12 @@ type Server struct {
 	// authDenied rate-limits auth_denied records to one per source address
 	// per minute (auth_denied.go).
 	authDenied *authDeniedLimiter
+	// The background work StartBackground runs and StopBackground ends
+	// (auth_denied.go): bgStop and bgDone are nil until it starts.
+	bgMu      sync.Mutex
+	bgStop    chan struct{}
+	bgDone    chan struct{}
+	bgStopped bool
 
 	// Facade config, read once from config.Config (not per request in the
 	// facades). Each facade parses its own format.
@@ -137,6 +156,7 @@ func NewServer(logger *slog.Logger, service *service.Service, dockerClient *dock
 			OperatorRate: cfg.AuditRateLimitOperator,
 			NodeRate:     cfg.AuditRateLimitNode,
 		}),
+		listGate:                apihttp.NewGate(cfg.APIListMaxInflight, cfg.APIListQueueWait, listGateMetrics),
 		daytonaDefaultImage:     cfg.DaytonaDefaultImage,
 		e2bTemplateMapJSON:      cfg.E2BTemplateMapJSON,
 		e2bClientID:             cfg.E2BClientID,
@@ -200,6 +220,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		ContainerEngine: s.containerEngine,
 		DefaultImage:    s.daytonaDefaultImage,
+		ListGate:        s.listGate,
 	})
 
 	e2b.RegisterRoutes(mux, e2b.Deps{
@@ -209,6 +230,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		TemplateMapJSON: s.e2bTemplateMapJSON,
 		ClientID:        s.e2bClientID,
+		ListGate:        s.listGate,
 	})
 
 	runloop.RegisterRoutes(mux, runloop.Deps{
@@ -217,6 +239,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Auth:             s.requireRunloopAuth,
 		Audit:            s.audit,
 		BlueprintMapJSON: s.runloopBlueprintMapJSON,
+		ListGate:         s.listGate,
 	})
 
 	apiv1.RegisterRoutes(mux, apiv1.Deps{
@@ -226,6 +249,7 @@ func (s *Server) registerRoutes(mux apihttp.Mux) {
 		Audit:           s.audit,
 		AuditLimiter:    s.auditLimiter,
 		ContainerEngine: s.containerEngine,
+		ListGate:        s.listGate,
 	})
 
 	// Remote MCP (opt-in, SB_MCP_ENABLED). /mcp needs only a valid principal

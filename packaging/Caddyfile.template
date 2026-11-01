@@ -44,6 +44,36 @@
 #     public:
 #         reverse_proxy unix//run/sandboxd-public/api.sock {
 #     Any other reverse proxy on the host must use the socket too.
+#
+# One more opt-in variant, for a node behind a health-checked load balancer
+# (Terraform api_load_balancer = "nlb"):
+#
+#   --lb-health-port <port>: a plain-HTTP site the balancer's health check
+#     probes. GET /health walks the path a client takes (caddy-l4 on :443,
+#     its SNI fallback, the HTTPS API site, sandboxd), so it answers 502
+#     while any of them is down and the balancer stops sending the node new
+#     connections. The probe carries neither SNI nor the domain as Host, so
+#     the site supplies both; without the Host header the probe matches no
+#     site and Caddy answers an empty 200 even with sandboxd down.
+#         http://:<port> {
+#             handle /health {
+#                 reverse_proxy https://127.0.0.1:443 {
+#                     header_up Host {{ROOT_SITE_ADDRESS}}
+#                     stream_close_delay 10m
+#                     transport http {
+#                         tls_server_name {{ROOT_SITE_ADDRESS}}
+#                         tls_insecure_skip_verify
+#                     }
+#                 }
+#             }
+#             handle {
+#                 respond 404
+#             }
+#         }
+#     Keep it unbound (":<port>", not "<ip>:<port>"): Caddy names servers in
+#     sorted listen-address order, and the API site must stay srv0, the
+#     server sandboxd writes its routes into. Open the port to the balancer
+#     only.
 
 {
     admin localhost:2019

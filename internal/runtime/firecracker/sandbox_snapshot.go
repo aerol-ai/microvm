@@ -293,7 +293,7 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 	return nil
 }
 
-func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
+func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start: %w", err)
 	}
@@ -327,6 +327,10 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 		}, nil
 	}
 	d.mu.Unlock()
+	// A restore must be able to adopt the guest it boots (see below).
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)
+	}
 
 	manifest, err := d.readSandboxSnapshotManifest(sandboxID)
 	if err != nil {
@@ -441,6 +445,14 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID string)
 			"tap", slot.TapName)
 	}
 	cancel()
+	// The restored agent's identity. It normally holds this token already
+	// (it was adopted at create, and Stop snapshotted its memory) and the op
+	// converges. One that holds none gets it now; one that cannot take it is
+	// an agent from before identity delivery that serves without a token, so
+	// it is shut down again with the snapshot left on disk.
+	if err := d.adoptGuest(ctx, vsockPath, manifest.VsockCID, sandboxID, toolboxToken, adoptRemedyStart); err != nil {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
 	d.probeToolboxTCP(ctx, "start", sandboxID, slot, true)
 
 	d.mu.Lock()

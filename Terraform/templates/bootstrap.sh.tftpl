@@ -36,6 +36,7 @@
 #   sandboxd_url, toolboxd_url, checksums_url,
 #   joiner_role_unique_id, sandboxd_env (map),
 #   secret_kms_key_arn ("" = disabled), secret_kms_strict_boot (bool),
+#   key_custody ("file" | "wrapped"),
 #   audit_export_backend ("" = daemon default), audit_export_file_path,
 #   audit_export_s3_bucket ("" = no bucket provisioned), audit_export_s3_prefix,
 #   audit_receiver_url, audit_receiver_port, audit_receiver_token,
@@ -197,6 +198,13 @@ INSTALL_ARGS+=(--pat-scope host)
 %{ if l4_proxy_protocol ~}
 INSTALL_ARGS+=(--l4-proxy-protocol)
 %{ endif ~}
+%{ if lb_health_port > 0 ~}
+# A health-checked load balancer fronts this ingress node (Terraform
+# api_load_balancer; lb_health_port is 0 otherwise, and this renders
+# nothing). Its probe hits this plain-HTTP /health listener, which walks
+# caddy-l4 on :443 to sandboxd.
+INSTALL_ARGS+=(--lb-health-port '${lb_health_port}')
+%{ endif ~}
 %{ if caddy_storage_s3_enabled ~}
 # Shared S3-backed Caddy cert storage. Every node points at the same
 # bucket; certmagic-s3 holds a distributed lock during ACME so only the
@@ -221,6 +229,25 @@ INSTALL_ARGS+=(
 %{ endif ~}
 %{ endif ~}
 
+%{ if key_custody == "wrapped" ~}
+# Wrapped server-key custody (plans/customer-key-custody.md §3): install.sh
+# writes the key-store settings into sandboxd.env before the first boot, so
+# the first boot (and cluster-init.sh / cluster-join.sh) can reach the KMS
+# key and no plaintext server key is ever written.
+cat > /tmp/aerolvm-secret-provider.env <<'EOF'
+SB_SECRET_PROVIDER=awskms
+SB_SECRET_AWS_KMS_KEY_ID=${secret_kms_key_arn}
+SB_SECRET_PROVIDER_STRICT_BOOT=${secret_kms_strict_boot}
+AWS_REGION=${aws_region}
+EOF
+INSTALL_ARGS+=(--key-custody wrapped --secret-provider-env /tmp/aerolvm-secret-provider.env)
+%{ endif ~}
+%{ if !is_seed ~}
+# A joiner: cluster-join.sh starts sandboxd once it has the cluster's config
+# and server key. Booted before that, as a lone node, it would begin making a
+# server key of its own (with wrapped custody, a wrap through the key store).
+INSTALL_ARGS+=(--no-start)
+%{ endif ~}
 sudo /tmp/install.sh "$${INSTALL_ARGS[@]}"
 
 %{ if is_seed ~}
@@ -240,13 +267,20 @@ chmod +x /tmp/cluster-init.sh
 # of the EC2 hostname. The signing rendezvous below needs an id BOTH sides can
 # agree on without trusting the joiner, and only Terraform knows one; it also
 # makes /v1/cluster/members readable (node names, not ip-10-42-1-43).
-sudo /tmp/cluster-init.sh \
-  --role '${role}' \
-  --node-id '${node_name}' \
-  --ingress-advertise-host '${domain}' \
-  --gossip-key "$GOSSIP_KEY" \
-  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz \
+INIT_ARGS=(
+  --role '${role}'
+  --node-id '${node_name}'
+  --ingress-advertise-host '${domain}'
+  --gossip-key "$GOSSIP_KEY"
+  --tls-bundle-out /tmp/aerolvm-tls-bundle.tar.gz
   --cred-bundle-out /tmp/aerolvm-cred-bundle.tar.gz
+)
+%{ if key_custody == "wrapped" ~}
+# Only when asked: a cluster-init.sh from before the flag rejects it, and the
+# default custody needs nothing new.
+INIT_ARGS+=(--key-custody wrapped)
+%{ endif ~}
+sudo /tmp/cluster-init.sh "$${INIT_ARGS[@]}"
 
 # Publish artifacts joiners need. Bucket is private + SSE-encrypted.
 printf '%s' "$GOSSIP_KEY" > /tmp/gossip-key.txt
@@ -1012,6 +1046,14 @@ SB_AUDIT_WITNESS_S3_PREFIX=${audit_witness_s3_prefix}
 SB_AUDIT_WITNESS_S3_REGION=${aws_region}
 %{ endif ~}
 
+%{ if l4_public_host != "" ~}
+# Managed by Terraform bootstrap: the domain points at the load balancer
+# (api_load_balancer; l4_public_host is "" otherwise, and this renders
+# nothing). An NLB cannot carry the raw-TCP port pool, so raw-TCP exposures
+# are advertised under a name with one A record per ingress node.
+SB_L4_PUBLIC_HOST=${l4_public_host}
+
+%{ endif ~}
 # Managed by Terraform bootstrap: extra_sandboxd_env (global) merged under this
 # node's own sandboxd_env. Rendered LAST inside this block so a per-node entry
 # wins over anything above it, and written BEFORE the final

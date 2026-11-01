@@ -322,7 +322,7 @@ func TestHeadroomScoreSymmetricNeutral(t *testing.T) {
 func TestAdmitReservationCommandsRejectsMissingCapacityHeartbeat(t *testing.T) {
 	err := admitReservationCommands([]Member{
 		{NodeID: "worker-a", APIURL: "http://worker-a", Alive: true, Role: "worker"},
-	}, nil, nil, 32, []reservationCommand{
+	}, nil, nil, nil, 32, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 	})
 	if !errors.Is(err, ErrNoPlacementTarget) {
@@ -336,7 +336,7 @@ func TestAdmitReservationCommandsAppliesPerWorkerBackpressure(t *testing.T) {
 			HostCPUCores: 16, HostMemoryTotalMB: 32000,
 			CPUBudget: 16, MemoryBudgetMB: 32000,
 		}},
-	}, nil, map[string]int{"worker-a": 2}, 2, []reservationCommand{
+	}, nil, nil, map[string]int{"worker-a": 2}, 2, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 	})
 	if !errors.Is(err, ErrCreateBackpressure) {
@@ -350,7 +350,7 @@ func TestAdmitReservationCommandsAccountsForBatchCapacity(t *testing.T) {
 			HostCPUCores: 4, HostMemoryTotalMB: 4096,
 			CPUBudget: 2, MemoryBudgetMB: 4096,
 		}},
-	}, nil, nil, 32, []reservationCommand{
+	}, nil, nil, nil, 32, []reservationCommand{
 		{SandboxID: "sb1", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1, MemoryMB: 128}},
 		{SandboxID: "sb2", OwnerNodeID: "worker-a", Spec: &models.CreateSandboxRequest{CPU: 1.5, MemoryMB: 128}},
 	})
@@ -746,10 +746,10 @@ func TestCatalogueTemplateHolderPassesTheTemplateFilter(t *testing.T) {
 	// catalogue applied, the reservation placement picked must be admitted.
 	spec := &models.CreateSandboxRequest{CPU: 1, MemoryMB: 100, TemplateID: "tpl-fresh"}
 	res := []reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "fc-1", Spec: spec}}
-	if err := admitReservationCommands(members, nil, map[string]int{}, 0, res); err == nil {
+	if err := admitReservationCommands(members, nil, nil, map[string]int{}, 0, res); err == nil {
 		t.Fatal("precondition: admission on gossip alone must reject fc-1")
 	}
-	if err := admitReservationCommands(got, nil, map[string]int{}, 0, res); err != nil {
+	if err := admitReservationCommands(got, nil, nil, map[string]int{}, 0, res); err != nil {
 		t.Fatalf("admission with the catalogue applied rejected the holder: %v", err)
 	}
 
@@ -803,7 +803,7 @@ func TestNodeFitsTreatsParkedWarmSlotsAsFree(t *testing.T) {
 	// The leader's reservation check (run before the Raft propose, never in
 	// FSM apply) reads the same fit, so a reservation against the node is
 	// admitted rather than refused with ErrCapacityExceeded.
-	err := admitReservationCommands([]Member{warmFilledWorker(8, 8192, 80)}, nil, nil, 0,
+	err := admitReservationCommands([]Member{warmFilledWorker(8, 8192, 80)}, nil, nil, nil, 0,
 		[]reservationCommand{{SandboxID: "sb-1", OwnerNodeID: "w1"}})
 	if err != nil {
 		t.Fatalf("reservation against a warm-filled worker = %v, want admitted", err)

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -81,6 +82,12 @@ type Daemon struct {
 	// after the latest one acknowledges it (layoutSynced).
 	lossGen      uint64
 	seenRejected map[egress.Elem]time.Time
+
+	// lastContact is when sandboxd last sent a request (unix nanoseconds);
+	// caDropAfter is the silence after which the CA is dropped (0: never),
+	// as sandboxd set it with the CA.
+	lastContact atomic.Int64
+	caDropAfter atomic.Int64
 }
 
 // New builds a gateway from cfg and deps. It creates (or confirms) the nft
@@ -127,17 +134,19 @@ func New(cfg Config, deps Deps, log *slog.Logger) (*Daemon, error) {
 	})
 	d.lns = newBridgeListeners(cfg.DNSPort, cfg.ProxyPort, dns.HandlerFunc(d.serveDNS), d.serveProxy, deps.Listen, log)
 	d.srv = egress.NewServer(d.gw, egress.ServerHooks{
-		SetBridges:    d.setBridges,
-		Probe:         d.probe,
-		Listeners:     d.lns.Addrs,
-		Learned:       d.learned,
-		ForgetLearned: d.forgetLearned,
-		RetainLearned: d.retainLearned,
-		Changed:       d.markDirty,
-		NodeControl:   d.setNodeControl,
-		LossGen:       d.layoutLossGen,
-		Synced:        d.layoutSynced,
-		InspectCA:     d.setInspectCA,
+		SetBridges:     d.setBridges,
+		Probe:          d.probe,
+		Listeners:      d.lns.Addrs,
+		Learned:        d.learned,
+		ForgetLearned:  d.forgetLearned,
+		RetainLearned:  d.retainLearned,
+		Changed:        d.markDirty,
+		NodeControl:    d.setNodeControl,
+		LossGen:        d.layoutLossGen,
+		Synced:         d.layoutSynced,
+		InspectCA:      d.setInspectCA,
+		ClearInspectCA: d.clearInspectCA,
+		Contact:        d.contact,
 	}, deps.Peer, d.hub, log)
 	if err := d.restore(); err != nil {
 		log.Warn("egress: snapshot not restored; waiting for sandboxd sync", "error", err)
@@ -154,7 +163,51 @@ func (d *Daemon) setInspectCA(ca egress.InspectCA) error {
 		return err
 	}
 	d.px.SetInspector(a)
+	d.caDropAfter.Store(int64(time.Duration(ca.DropAfterSeconds) * time.Second))
 	return nil
+}
+
+// clearInspectCA is the gateway's part of a key revoke (eng D21): the CA,
+// every sandbox's injection secrets and the established inspected
+// connections all go. Go cannot promise the key bytes are zeroed.
+func (d *Daemon) clearInspectCA() error {
+	d.px.SetInspector(nil)
+	d.caDropAfter.Store(0)
+	d.gw.DropSecrets()
+	n := d.gw.CloseInspected()
+	d.log.Warn("egress: inspection CA and injection secrets dropped", "closed_inspected_connections", n)
+	return nil
+}
+
+func (d *Daemon) contact() { d.lastContact.Store(time.Now().UnixNano()) }
+
+// caDropCheck drops the CA when sandboxd has been silent past the bound it
+// sent: a sandboxd that cannot boot because its key was revoked must not
+// leave the key here (§10).
+func (d *Daemon) caDropCheck(now time.Time) {
+	after := time.Duration(d.caDropAfter.Load())
+	last := d.lastContact.Load()
+	if after <= 0 || last == 0 || now.Sub(time.Unix(0, last)) <= after {
+		return
+	}
+	d.log.Warn("egress: sandboxd silent past the bound it set; dropping the inspection CA", "silent_for", now.Sub(time.Unix(0, last)).Round(time.Second))
+	_ = d.clearInspectCA()
+}
+
+// caDropInterval is how often caDropCheck runs.
+const caDropInterval = 30 * time.Second
+
+func (d *Daemon) caDropLoop(ctx context.Context) {
+	t := time.NewTicker(caDropInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			d.caDropCheck(now)
+		}
+	}
 }
 
 // Gateway exposes the core (tests, metrics).
@@ -241,11 +294,12 @@ func (d *Daemon) OperatorHash() string {
 	return d.opHash
 }
 
-// setNodeControl replaces the control endpoints the node-wide guard drops
-// (sandboxd sends them from cluster membership, §5.10 PC-2).
-func (d *Daemon) setNodeControl(eps []netip.AddrPort) error {
+// setNodeControl replaces the control endpoints and pools the node-wide
+// guard drops (sandboxd sends them from cluster membership and its address
+// pools, §5.10 PC-2).
+func (d *Daemon) setNodeControl(nc egress.NodeControl) error {
 	nw := d.gw.NodeWideState()
-	nw.Control, nw.ControlKnown = eps, true
+	nw.Control, nw.ControlPools, nw.ControlKnown = nc.Endpoints, nc.Pools, true
 	nw.Floor = d.denyFloor()
 	return d.gw.SetNodeWide(nw)
 }
@@ -266,7 +320,7 @@ func (d *Daemon) Serve(ctx context.Context, ln net.Listener) error {
 	loopCtx, stopLoops := context.WithCancel(ctx)
 	defer stopLoops()
 	var wg sync.WaitGroup
-	loops := []func(context.Context){d.heartbeatLoop, d.flowLoop, d.snapshotLoop}
+	loops := []func(context.Context){d.heartbeatLoop, d.flowLoop, d.snapshotLoop, d.caDropLoop}
 	for _, loop := range loops {
 		wg.Add(1)
 		go func(f func(context.Context)) { defer wg.Done(); f(loopCtx) }(loop)

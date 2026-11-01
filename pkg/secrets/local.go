@@ -13,6 +13,11 @@ import (
 type LocalProvider struct {
 	cipher *Cipher
 	store  BlobStore
+	// keyStore opens rows on a node that seals with the server key but
+	// holds a key store's settings: step 1 of the two-step switch (§12,
+	// eng D8), when switched peers already seal their failover copies with
+	// the key store. Nil on a node with no key-store settings.
+	keyStore *KMSProvider
 }
 
 // NewLocalProvider returns a Provider backed by cipher + store.
@@ -81,6 +86,9 @@ func (p *LocalProvider) Put(ctx context.Context, sandboxID string, s Secrets, re
 // Open resolves h to plaintext for nodeID. sandboxID is verified against the
 // v4 envelope binding so ciphertext cannot be relabeled across sandboxes.
 func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, nodeID string) (Secrets, error) {
+	if p != nil && p.keyStore != nil {
+		return p.keyStore.Open(ctx, sandboxID, h, nodeID)
+	}
 	sandboxID = strings.TrimSpace(sandboxID)
 	if h.Ref == "" {
 		return Secrets{}, nil
@@ -127,6 +135,13 @@ func (p *LocalProvider) Open(ctx context.Context, sandboxID string, h Handle, no
 		Ref:           rec.Ref,
 		Version:       rec.Version,
 		Generation:    rec.SealGeneration,
+	}
+	if env, perr := parseEnvelope(rec.SealedPayload); perr == nil {
+		if backend := WrappedKeyBackend(env.WrappedKey); backend != "" {
+			// A peer that already switched sealed it, and this node has
+			// none of that key store's settings yet (step 1 of §12 skipped).
+			return Secrets{}, fmt.Errorf("%w: row wrapped by %s; node configured for %s and has no %s settings", ErrProviderUnavailable, backend, ProviderLocal, backend)
+		}
 	}
 	bag, err := OpenEnvelopeBound(p.cipher, rec.SealedPayload, nodeID, binding)
 	if err != nil {

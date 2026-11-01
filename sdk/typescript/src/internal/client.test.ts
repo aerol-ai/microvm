@@ -3,7 +3,7 @@ import { createServer, type RequestListener } from "node:http";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { APIClient, SandboxResource } from "./client.js";
+import { APIClient, SandboxResource, parseRetryAfter, retryDelayMs } from "./client.js";
 import { Image } from "../Image.js";
 import type { CreateOptions, Sandbox } from "../types.js";
 
@@ -1893,4 +1893,205 @@ test("egress rules: binaries go out and come back as written", async () => {
   assert.deepEqual(bodies[1].network_egress_rules, [git, { host: "pypi.org" }]);
   assert.deepEqual(pol.networkEgressRules, [git, pip]);
   assert.deepEqual(sandbox.networkEgressRules, [git, pip]);
+});
+
+test("parseRetryAfter reads delta-seconds and HTTP dates", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const cases: Array<[string | null, number | undefined]> = [
+    [null, undefined],
+    ["", undefined],
+    ["   ", undefined],
+    ["3", 3000],
+    [" 3 ", 3000],
+    ["0", 0],
+    ["-1", undefined],
+    ["+3", undefined],
+    ["1.5", undefined],
+    ["soon", undefined],
+    ["Mon, 02 Nov 2026 12:00:07 GMT", 7000],
+    ["Mon, 02 Nov 2026 11:59:00 GMT", 0],
+    ["Mon, 32 Nov 2026 12:00:07 GMT", undefined],
+    // No zone: Date.parse would read it in local time, so it is refused.
+    ["Mon Nov  2 12:00:07 2026", undefined],
+  ];
+  for (const [value, want] of cases) {
+    assert.equal(parseRetryAfter(value, now), want, String(value));
+  }
+  assert.ok(parseRetryAfter("99999999999999999999", now)! > 1e20);
+});
+
+test("retryDelayMs honours Retry-After between the backoff and the cap", () => {
+  const now = Date.parse("2026-11-02T12:00:00Z");
+  const config = (maxRetryAfterMs: number) => ({ maxRetries: 3, baseDelayMs: 100, maxDelayMs: 1000, maxRetryAfterMs });
+  const cases: Array<{ name: string; limit: number; attempt: number; header: string | null; random: number; want: number }> = [
+    { name: "no header: backoff minus a quarter", limit: 2000, attempt: 0, header: null, random: 0, want: 75 },
+    { name: "no header: backoff plus a quarter", limit: 2000, attempt: 0, header: null, random: 1, want: 125 },
+    { name: "no header: doubles per attempt", limit: 2000, attempt: 2, header: null, random: 0.5, want: 400 },
+    { name: "no header: capped by maxDelayMs", limit: 2000, attempt: 5, header: null, random: 0.5, want: 1000 },
+    { name: "malformed header falls back", limit: 2000, attempt: 0, header: "soon", random: 0, want: 75 },
+    { name: "seconds: never sooner than asked", limit: 2000, attempt: 0, header: "1", random: 0, want: 1000 },
+    { name: "seconds: at most a fifth later", limit: 2000, attempt: 0, header: "1", random: 1, want: 1200 },
+    { name: "HTTP date", limit: 2000, attempt: 0, header: "Mon, 02 Nov 2026 12:00:01 GMT", random: 0, want: 1000 },
+    { name: "backoff is the floor", limit: 2000, attempt: 2, header: "0", random: 0, want: 400 },
+    { name: "spread stops at the cap", limit: 1100, attempt: 0, header: "1", random: 1, want: 1100 },
+    { name: "long ask is cut to the cap", limit: 2000, attempt: 0, header: "120", random: 0, want: 2000 },
+    { name: "long ask spreads below the cap", limit: 2000, attempt: 0, header: "120", random: 1, want: 1600 },
+    { name: "cap 0 ignores the header", limit: 0, attempt: 0, header: "120", random: 0, want: 75 },
+  ];
+  for (const tc of cases) {
+    assert.ok(Math.abs(retryDelayMs(config(tc.limit), tc.attempt, tc.header, now, tc.random) - tc.want) < 1e-9, tc.name);
+  }
+});
+
+/**
+ * A fetch that answers the first `refusals` calls with `status` and the
+ * Retry-After `header()` returns, then a sandbox (or an exec result). It
+ * records when each call arrived.
+ */
+function pacedFetch(status: number, refusals: number, header: () => string | null) {
+  const arrivals: number[] = [];
+  const signals: Array<AbortSignal | null | undefined> = [];
+  const fetchFn = async (input: RequestInfo | URL, init?: RequestInit) => {
+    arrivals.push(performance.now());
+    signals.push(init?.signal);
+    if (arrivals.length <= refusals) {
+      const value = header();
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (value !== null) headers["retry-after"] = value;
+      return new Response(JSON.stringify({ error: "busy", code: "overloaded" }), { status, headers });
+    }
+    if (String(input).endsWith("/toolbox/process/execute")) {
+      return jsonResponse({ stdout: "ok\n", stderr: "", exit_code: 0, duration_ms: 1 });
+    }
+    return jsonResponse(apiSandbox("sb-paced"));
+  };
+  const gap = () => {
+    assert.ok(arrivals.length >= 2, `saw ${arrivals.length} calls, want a retry`);
+    return arrivals[1] - arrivals[0];
+  };
+  return { fetchFn, arrivals, signals, gap };
+}
+
+function pacedClient(fetchFn: ReturnType<typeof pacedFetch>["fetchFn"], extra: { maxRetryAfterMs?: number; signal?: AbortSignal } = {}) {
+  return new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1, maxRetryAfterMs: extra.maxRetryAfterMs },
+    signal: extra.signal,
+    fetch: fetchFn,
+  });
+}
+
+// Get is idempotent; exec is re-sent only after a refusal. Both honour it.
+const callBoth: Array<[string, (client: APIClient) => Promise<unknown>]> = [
+  ["get", (client) => client.get("sb-paced")],
+  ["exec", (client) => client.exec("sb-paced", { command: "true" })],
+];
+
+// With a 1 ms backoff, only the server's Retry-After explains a 1 s gap.
+test("internal client waits out Retry-After on 429 and 503", async () => {
+  const inTwoSeconds = () => new Date(Date.now() + 2000).toUTCString();
+  const cases: Array<{ name: string; status: number; header: () => string; min: number; max: number }> = [
+    { name: "429 seconds", status: 429, header: () => "1", min: 1000, max: 2000 },
+    { name: "503 seconds", status: 503, header: () => "1", min: 1000, max: 2000 },
+    // Whole-second precision: the date asks for 1-2 s.
+    { name: "503 HTTP date", status: 503, header: inTwoSeconds, min: 1000, max: 3000 },
+  ];
+  await Promise.all(cases.flatMap((tc) => callBoth.map(async ([callName, call]) => {
+    const paced = pacedFetch(tc.status, 1, tc.header);
+    await call(pacedClient(paced.fetchFn));
+    const gap = paced.gap();
+    // setTimeout may fire up to a millisecond early.
+    assert.ok(gap >= tc.min - 2 && gap <= tc.max, `${tc.name}/${callName}: retried after ${gap} ms`);
+  })));
+});
+
+test("internal client caps Retry-After at maxRetryAfterMs", async () => {
+  const paced = pacedFetch(503, 1, () => "120");
+  await pacedClient(paced.fetchFn, { maxRetryAfterMs: 100 }).get("sb-paced");
+  const gap = paced.gap();
+  assert.ok(gap >= 78 && gap <= 1000, `retried after ${gap} ms`);
+});
+
+// A missing or malformed header, or one on a status that is a hop's rather
+// than the server's pacing (421/502/504), leaves the 1 ms backoff in charge.
+test("internal client falls back to backoff without a usable Retry-After", async () => {
+  const cases: Array<[number, string | null]> = [
+    [503, null],
+    [429, "soon"],
+    [503, "-1"],
+    [421, "120"],
+    [502, "120"],
+    [504, "120"],
+  ];
+  for (const [status, header] of cases) {
+    const paced = pacedFetch(status, 1, () => header);
+    await pacedClient(paced.fetchFn).get("sb-paced");
+    assert.ok(paced.gap() < 500, `${status} ${header}: retried after ${paced.gap()} ms`);
+  }
+});
+
+test("internal client keeps its retry budget and statuses with Retry-After", async () => {
+  const exhausted = pacedFetch(503, 100, () => "0");
+  await assert.rejects(pacedClient(exhausted.fetchFn).get("sb-paced"), { message: "busy" });
+  assert.equal(exhausted.arrivals.length, 4, "1 + 3 retries");
+
+  for (const status of [400, 404, 500]) {
+    const paced = pacedFetch(status, 100, () => "1");
+    await assert.rejects(pacedClient(paced.fetchFn).get("sb-paced"));
+    assert.equal(paced.arrivals.length, 1, `${status} is not retried`);
+  }
+  const exec502 = pacedFetch(502, 100, () => "1");
+  await assert.rejects(pacedClient(exec502.fetchFn).exec("sb-paced", { command: "true" }));
+  assert.equal(exec502.arrivals.length, 1, "exec does not re-send a 502");
+});
+
+test("internal client signal ends a Retry-After wait", async () => {
+  const cases: Array<{ name: string; signal: () => AbortSignal; error: (err: unknown) => boolean }> = [
+    {
+      name: "abort",
+      signal: () => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new Error("caller gave up")), 100);
+        return controller.signal;
+      },
+      error: (err) => err instanceof Error && err.message === "caller gave up",
+    },
+    {
+      name: "timeout",
+      signal: () => AbortSignal.timeout(100),
+      error: (err) => err instanceof DOMException && err.name === "TimeoutError",
+    },
+  ];
+  for (const tc of cases) {
+    for (const [callName, call] of callBoth) {
+      const paced = pacedFetch(503, 100, () => "30");
+      const signal = tc.signal();
+      const start = performance.now();
+      await assert.rejects(call(pacedClient(paced.fetchFn, { signal })), tc.error, `${tc.name}/${callName}`);
+      const elapsed = performance.now() - start;
+      assert.ok(elapsed < 2000, `${tc.name}/${callName}: returned after ${elapsed} ms`);
+      assert.equal(paced.arrivals.length, 1, `${tc.name}/${callName}`);
+      assert.equal(paced.signals[0], signal, "fetch gets the client's signal");
+    }
+  }
+});
+
+test("internal client does not retry once its signal has aborted", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const client = new APIClient({
+    baseURL: "https://api.example.com",
+    patToken: "pat-token",
+    retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 },
+    signal: controller.signal,
+    fetch: async () => {
+      attempts++;
+      controller.abort();
+      // A transport error that would otherwise be retried.
+      throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) });
+    },
+  });
+  await assert.rejects(client.get("sb-paced"), TypeError);
+  assert.equal(attempts, 1);
 });

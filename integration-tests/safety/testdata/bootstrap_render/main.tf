@@ -38,6 +38,8 @@ locals {
     idle_timeout_min = 30
     pat_scope = "any"
     l4_proxy_protocol = false
+    lb_health_port = 0
+    l4_public_host = ""
     firecracker_binary_url = "x"
     firecracker_jailer_url = "x"
     firecracker_kernel_url = "x"
@@ -112,6 +114,7 @@ locals {
     sandboxd_env           = { SB_ENTERPRISE_MODE = "true", SB_AUDIT_EXPORT_MODE = "file" }
     secret_kms_key_arn     = ""
     secret_kms_strict_boot = true
+    key_custody            = "file"
     audit_export_backend   = ""
     audit_export_file_path = "/var/log/aerol-audit-export.jsonl"
     audit_export_s3_bucket = ""
@@ -245,6 +248,17 @@ output "joiner_receiver" {
   }))
 }
 
+# Wrapped server-key custody (plans/customer-key-custody.md §3): install.sh
+# gets the key-store env and --key-custody, and the seed's cluster-init.sh
+# gets --key-custody too.
+output "seed_wrapped" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed            = true
+    key_custody        = "wrapped"
+    secret_kms_key_arn = "arn:aws:kms:us-east-1:111122223333:key/abcd-1234"
+  }))
+}
+
 output "joiner_kms" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
     is_seed            = false
@@ -256,5 +270,23 @@ output "joiner_kms" {
       # EnvironmentFile takes the last assignment.
       SB_SECRET_PROVIDER_STRICT_BOOT = "false"
     }
+  }))
+}
+
+# Behind the load balancer (Terraform api_load_balancer = "nlb"): an ingress
+# node gets the health listener, every node the raw-TCP host. A worker gets
+# the host only.
+output "joiner_api_lb" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    lb_health_port = 21280
+    l4_public_host = "tcp.x.example.com"
+  }))
+}
+
+output "joiner_api_lb_worker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    l4_public_host = "tcp.x.example.com"
   }))
 }

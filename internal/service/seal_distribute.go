@@ -340,8 +340,10 @@ func pruneDeadSecretHolders(sandboxID, incarnationID string, alive map[string]st
 // HA creates: local seal + optional bounded sync wait for ≥1 peer ACK
 // (SB_SECRET_FANOUT_MIN_ACK_WAIT, default 2s) to shrink GAP-1; remaining
 // peers / retries continue asynchronously. A zero-ACK HA create is retracted.
+// Every caller is a create, so the seal may take the key-store slot kept for
+// creates: a restart storm of opens cannot queue it.
 func (s *Service) SealAndDistribute(ctx context.Context, sandboxID string, req models.CreateSandboxRequest, recipients []string) (cluster.PlacementSecrets, error) {
-	return s.sealAndDistributeForIncarnation(ctx, sandboxID, req, recipients, "")
+	return s.sealAndDistributeForIncarnation(secrets.ContextForCreate(ctx), sandboxID, req, recipients, "")
 }
 
 // ReservedSecretBinding returns the one leader-confirmed identity used by both

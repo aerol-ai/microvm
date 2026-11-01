@@ -44,6 +44,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/oci"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/sshgateway"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 	"github.com/aerol-ai/microvm/pkg/volumes"
 )
 
@@ -78,11 +79,21 @@ type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Pro
 // makeProvider supplies the control-plane capabilities. nil (the open-source
 // default) means controlplane.Noop(): every non-PAT token rejected, every usage
 // report a no-op, every create admitted, no enforcement loop.
-func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) error {
+func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) (err error) {
+	// stop is the caller's context: cancelled only when the daemon is asked
+	// to stop (SIGTERM/SIGINT in the standard wrapper). Run derives its own
+	// cancellable child below, which a failed listener also cancels.
+	stop := ctx
+	defer func() { err = bootStopped(stop, err, logger) }()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// First, before any slow boot step: the watchdog reads "booting" from
+	// here on instead of "connection refused" (liveness.go).
+	live := startLiveness(cfg.LivenessSocket, logger)
+	defer live.stop()
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -108,6 +119,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
+	configureHostMediatedNodeGuard(cfg, logger)
+	// Before anything dials a toolbox: every toolbox connection is
+	// dialed with this bound.
+	toolboxhttp.SetDeadPeerTimeout(cfg.ToolboxDeadPeerTimeout)
 
 	otelTracesShutdown, err := observability.StartOTELTraces(ctx, logger, observability.OTELTracesConfig{
 		Enabled:     cfg.OTELTracesEnabled,
@@ -152,7 +167,15 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// Initialize the cipher before opening the database. Store startup may need
 	// it to transactionally seal plaintext env/toolbox values left by a
 	// pre-hardening release before any service begins reading the database.
-	cipher, err := secrets.NewCipher(cfg.CredentialEncryptionKey, cfg.CredentialEncryptionKeyPath)
+	// With wrapped custody the server key comes from the customer's key
+	// store, so its client (and the PKCS#11 helper) start first
+	// (plans/customer-key-custody.md §3).
+	keys, err := startKeyStore(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer keys.stop()
+	cipher, err := openServerKey(ctx, cfg, keys.wrapper, logger)
 	if err != nil {
 		return fmt.Errorf("initialize credential cipher: %w", err)
 	}
@@ -175,6 +198,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 	if rules.Enabled() {
 		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
+	}
+	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled())
+	if prepareBlockSets(rules, netrules.ChainDockerUser, logger) {
+		defer startBlockSetReassert(ctx, rules, logger)()
 	}
 
 	dockerClient, err := docker.New(logger, cfg, rules)
@@ -311,9 +338,12 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if cfg.SecretAuditExternalWitness && !cp.HasExternalWitness() {
 		return errors.New("SB_SECRET_AUDIT_EXTERNAL_WITNESS=true requires a non-noop controlplane.Witness (tamper-evidence cannot be claimed from local JSONL alone)")
 	}
+	keys.handTo(svc)
 	if err := svc.ConfigureSecretProvider(ctx); err != nil {
 		return fmt.Errorf("configure secret provider: %w", err)
 	}
+	svc.RecordKeyCustody()
+	service.PublishKeyCustody(cfg, keys.custodyFacts())
 	svc.SetDockerAuxClient(dockerClient)
 	var ctdWiring *containerdEngineWiring
 	if ctd, err := wireContainerEngine(ctx, cfg, logger, svc, db, dockerClient, rules, admitter); err != nil {
@@ -355,9 +385,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
 	}
-	if netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient); netnsPool != nil {
+	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
+	if netnsPool != nil {
 		defer netnsPool.Stop(context.WithoutCancel(ctx))
 	}
+	wireDockerOwnPause(ctx, cfg, dockerClient, rules.Enabled(), netnsPool != nil, time.Now())
 	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
 	// to the service as its FleetController; under Noop() the factory yields a
 	// no-op whose Start does nothing. Runs on the daemon's cancellable ctx so it
@@ -634,6 +666,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}); ok {
 			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
 		}
+		registerSlotPoolsProvider(cfg, clusterClient, svc.LocalSlotPools)
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
@@ -653,6 +686,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			"peers", cfg.BootstrapPeers,
 		)
 	}
+
+	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
+	// the API serves, so no container or Firecracker sandbox is created
+	// without it; while it is not installed those creates are refused.
+	wireIPv6Fence(ctx, cfg, svc, dockerClient, logger)
 
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
@@ -681,6 +719,8 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	routingBoot := startIngressRouting(ctx, cfg, svc, hostPortForwarder, logger)
 	wireEgressOperator(ctx, cfg, svc, logger)
 	wireEgressGateway(ctx, cfg, svc, dockerClient, logger)
+	// After the gateway is wired: whether its ports are open depends on it.
+	wireNodeGuard(ctx, cfg, svc)
 	wireEgressProfiles(ctx, cfg, svc)
 	ownerReasserted := !cfg.IsWorker()
 	// Bootstrap the netstats poller at boot so the first /network/usage call
@@ -820,6 +860,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			svc.StartReconcileLoop(ctx)
 		}
 		svc.StartLifecycleSweep(ctx)
+		svc.StartDiskLimitWatch(ctx)
 		svc.StartEventMonitor(ctx)
 		svc.StartBuiltImageGC(ctx)
 		// Opt-in live CPU/memory sampler. No-op unless a usage reporter is wired
@@ -926,6 +967,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		if err != nil {
 			return fmt.Errorf("create ssh gateway: %w", err)
 		}
+		// A key revoke ends every SSH session: each holds a toolbox token
+		// opened before it (plans/customer-key-custody.md §10).
+		svc.OnKeyRevoked(gw.CloseAll)
 		go func() {
 			if err := gw.Start(ctx); err != nil {
 				logger.Warn("ssh gateway stopped", "error", err)
@@ -999,12 +1043,20 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		Protocols:   apiListenerProtocols(),
 	}
 
+	// The API server's own background work (the auth_denied flush) runs
+	// from here to StopBackground at shutdown; nothing when api records
+	// are off.
+	server.StartBackground(ctx)
 	go func() {
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("sandboxd stopped unexpectedly", "error", err)
 			cancel()
 		}
 	}()
+	// The revoke re-check (wrapped custody only) starts once the API is up;
+	// it runs on the key store's background budget, never a create's.
+	svc.StartKeyCustody(ctx)
+	live.setPhase(livenessPhaseServing)
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {
@@ -1123,6 +1175,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	<-ctx.Done()
+	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -1145,6 +1198,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 			logger.Warn("ingress proxy graceful shutdown failed", "error", err)
 		}
 	}
+	// The API listeners are drained: write the auth_denied records still
+	// owed for folded 401s (those of the drain included) before the audit
+	// writer closes.
+	server.StopBackground()
 	// Drain any pending Caddy admin writes before the process exits so
 	// the last batch of route changes is not silently dropped. No-op on
 	// nodes that never started the coalescer.
@@ -1830,6 +1887,27 @@ func shouldStartSSHGateway(cfg config.Config) bool {
 	return cfg.RunsSSHGateway()
 }
 
+// registerSlotPoolsProvider overlays this node's network-slot pools
+// (containerd netns, Firecracker TAP, capped WASM instances) onto its own
+// capacity lease, matching what peers read from /v1/capacity, so placement
+// skips the node for a runtime whose pool is full. Only a node that can own
+// sandboxes has pools; a client without the hook (the Agent, Noop) is left
+// alone.
+func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context.Context) []capacity.SlotPool) {
+	if !cfg.IsWorker() || pools == nil {
+		return
+	}
+	withSlots, ok := client.(interface {
+		SetLocalSlotPoolsProvider(func() []capacity.SlotPool)
+	})
+	if !ok {
+		return
+	}
+	withSlots.SetLocalSlotPoolsProvider(func() []capacity.SlotPool {
+		return pools(context.Background())
+	})
+}
+
 func supportedRuntimesForConfig(cfg config.Config) []string {
 	runtimes := cfg.HostSupportedRuntimes
 	if len(runtimes) == 0 {
@@ -2011,6 +2089,9 @@ type templateBuilderAdapter struct {
 
 func (a *templateBuilderAdapter) Build(ctx context.Context, req service.TemplateBuildRequest) (*service.TemplateBuildResult, error) {
 	var inject []oci.InjectFile
+	// No token, on purpose: the template's disk and snapshot are shared by
+	// every sandbox booted from it, so its agent boots token-less, serves
+	// nothing, and is adopted per sandbox over vsock (the driver's adopt op).
 	for _, f := range fcruntime.ColdBootInjectFiles(a.toolboxBinaryPath, "", nil) {
 		inject = append(inject, oci.InjectFile{
 			HostPath:  f.HostPath,

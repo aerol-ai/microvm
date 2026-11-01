@@ -97,6 +97,37 @@ func TestColdBootArgs(t *testing.T) {
 	}
 }
 
+// TestColdBootArgsDisableGuestIPv6 is the regression test for the guest
+// side of the IPv6 hole: every boot the driver makes (cold creates and
+// template snapshots both build their command line here) starts every
+// guest interface with IPv6 off, with or without a slot or an injected
+// agent. And never ipv6.disable=1: that removes the IPv6 stack, so a
+// workload that opens an AF_INET6 socket (a listener on [::]) fails in a VM
+// while it works in a container.
+func TestColdBootArgsDisableGuestIPv6(t *testing.T) {
+	slot := &TapSlot{GuestIP: "172.16.0.2", HostIP: "172.16.0.1", CIDR: "172.16.0.0/30"}
+	for _, args := range []string{coldBootArgs(slot, true), coldBootArgs(slot, false), coldBootArgs(nil, true), coldBootArgs(nil, false)} {
+		n := 0
+		for _, f := range strings.Fields(args) {
+			if f == "ipv6.disable_ipv6=1" {
+				n++
+			}
+			if strings.HasPrefix(f, "ipv6.disable=") {
+				t.Fatalf("%q removes the guest's IPv6 stack (AF_INET6 sockets fail): %q", f, args)
+			}
+			if strings.HasPrefix(f, "ipv6.disable_ipv6=") && f != "ipv6.disable_ipv6=1" {
+				t.Fatalf("conflicting ipv6 arg %q in %q", f, args)
+			}
+		}
+		if n != 1 {
+			t.Fatalf("ipv6.disable_ipv6=1 appears %d times in %q, want once", n, args)
+		}
+	}
+	if guestNoIPv6Arg != "ipv6.disable_ipv6=1" {
+		t.Fatalf("guestNoIPv6Arg = %q", guestNoIPv6Arg)
+	}
+}
+
 func TestNetmaskFromCIDR(t *testing.T) {
 	for _, tc := range []struct{ cidr, want string }{
 		{"172.16.0.0/30", "255.255.255.252"},

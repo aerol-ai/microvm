@@ -1,9 +1,14 @@
 package apihttp
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
@@ -11,7 +16,14 @@ import (
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
+
+// missingMountS3 is the create error from a node without mount-s3, as the
+// service wraps it (the local-mode run on main f34b607e answered it 400).
+var missingMountS3 = fmt.Errorf("mount external storage: mount 0 (s3): spawn mount tool: %w: mount-s3: %w",
+	mounts.ErrMountToolUnavailable, &exec.Error{Name: "mount-s3", Err: exec.ErrNotFound})
 
 // Classify is the single table every surface shares. These are the cases the
 // E2B and Runloop copies used to miss (defaulting them to 400) or map with a
@@ -27,6 +39,9 @@ func TestClassify(t *testing.T) {
 		kind       ErrKind
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, 0, "", ErrKindNotFound},
+		// Load shedding: a fast retryable 503, never the 400 catch-all.
+		{"overloaded", ErrOverloaded, http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
+		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"admission denied", controlplane.ErrAdmissionDenied, http.StatusForbidden, 0, "", ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
@@ -34,8 +49,17 @@ func TestClassify(t *testing.T) {
 		{"wake circuit open", service.ErrWakeCircuitOpen, http.StatusServiceUnavailable, 60, "", ErrKindOther},
 		{"manually stopped", service.ErrSandboxManuallyStopped, http.StatusConflict, 0, "", ErrKindOther},
 		{"not running", service.ErrSandboxNotRunning, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
+		// A toolbox request whose sandbox stopped under it: 409, never a
+		// retryable 5xx (an SDK must not resend an exec that may have run).
+		{"stopped mid request", service.ErrSandboxStoppedMidRequest, http.StatusConflict, 0, "", ErrKindSandboxNotRunning},
 		{"not resumable", service.ErrSandboxNotResumable, http.StatusConflict, 0, "", ErrKindSandboxNotResumable},
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
+		// The service's refusal matches both sentinels; it keeps its code.
+		{"network policy unenforced", errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented), http.StatusNotImplemented, 0, models.ErrorCodeNetworkPolicyUnenforced, ErrKindOther},
+		{"mount tool unavailable", missingMountS3, http.StatusNotImplemented, 0, models.ErrorCodeMountToolUnavailable, ErrKindOther},
+		// A mount tool that ran and failed (bad bucket, bad credentials) is
+		// the caller's to fix: it stays the 400.
+		{"mount tool failed", errors.New("mount 0 (s3): mount tool exited before the mount was ready: exit status 2 (mount tool output: bucket does not exist)"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 		{"build timeout", service.ErrBuildTimeout, http.StatusGatewayTimeout, 0, "", ErrKindOther},
 		{"build failed", service.ErrBuildFailed, http.StatusBadGateway, 0, "", ErrKindOther},
 		{"builder unavailable", service.ErrBuilderUnavailable, http.StatusServiceUnavailable, 0, "", ErrKindOther},
@@ -45,12 +69,21 @@ func TestClassify(t *testing.T) {
 		{"egress inspect recreate", service.ErrEgressInspectRecreate, http.StatusConflict, 0, "", ErrKindOther},
 		{"capacity", cluster.ErrCapacityExceeded, http.StatusServiceUnavailable, cluster.CapacityRetryAfterSeconds, "", ErrKindOther},
 		{"backpressure", cluster.ErrCreateBackpressure, http.StatusTooManyRequests, cluster.CreateBackpressureRetryAfterSeconds, "", ErrKindOther},
+		{"not leader", cluster.ErrNotLeader, http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		{"no leader", fmt.Errorf("storage retirement: %w", cluster.ErrNoLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		{"leader gone mid-forward", fmt.Errorf("%w: leader-forward apply: dial tcp 10.42.1.198:7002: connect: connection refused", cluster.ErrNotLeader), http.StatusServiceUnavailable, cluster.LeaderChangeRetryAfterSeconds, "", ErrKindOther},
+		{"placement view catching up", fmt.Errorf("destroy: %w", cluster.ErrNotCaughtUp), http.StatusServiceUnavailable, cluster.CatchUpRetryAfterSeconds, "", ErrKindOther},
 		{"snapshot name conflict", store.ErrSnapshotNameConflict, http.StatusConflict, 0, "", ErrKindSnapshotNameConflict},
 		{"sandbox exists", models.ErrSandboxExists, http.StatusConflict, 0, "", ErrKindSandboxExists},
 		{"token request invalid", service.ErrAPITokenInvalid, http.StatusBadRequest, 0, "", ErrKindOther},
 		{"token name taken", service.ErrAPITokenNameTaken, http.StatusConflict, 0, "", ErrKindOther},
 		{"token ops not on every server", service.ErrAPITokenClusterVersion, http.StatusConflict, 0, "", ErrKindOther},
 		{"token store unavailable", service.ErrAPITokensUnavailable, http.StatusServiceUnavailable, 5, "", ErrKindOther},
+		{"key revoked", secrets.ErrKeyRevoked, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyRevoked, ErrKindOther},
+		{"key version retired", secrets.ErrKeyVersionRetired, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyVersionRetired, ErrKindOther},
+		{"key store denied", secrets.ErrProviderDenied, http.StatusServiceUnavailable, 0, models.ErrorCodeKeyStoreDenied, ErrKindOther},
+		{"key store throttled", secrets.ErrProviderThrottled, http.StatusServiceUnavailable, keyStoreThrottledRetryAfterSeconds, models.ErrorCodeKeyStoreThrottled, ErrKindOther},
+		{"key store unavailable", secrets.ErrProviderUnavailable, http.StatusServiceUnavailable, keyStoreUnavailableRetryAfterSeconds, models.ErrorCodeKeyStoreUnavailable, ErrKindOther},
 		{"unclassified", errors.New("boom"), http.StatusBadRequest, 0, "", ErrKindUnclassified},
 	}
 	for _, tc := range cases {
@@ -62,5 +95,88 @@ func TestClassify(t *testing.T) {
 					c.Status, c.RetryAfter, c.Code, c.Kind, tc.status, tc.retryAfter, tc.code, tc.kind)
 			}
 		})
+	}
+}
+
+// A key-store error reaches the client as fixed text with its code: the key
+// store's own error text (here a stand-in for a provider message) stays in
+// the server log.
+func TestWriteStoreAwareErrorKeyStoreClasses(t *testing.T) {
+	for _, class := range []error{secrets.ErrKeyRevoked, secrets.ErrKeyVersionRetired, secrets.ErrProviderDenied, secrets.ErrProviderThrottled, secrets.ErrProviderUnavailable} {
+		rec := httptest.NewRecorder()
+		WriteStoreAwareError(nil, rec, fmt.Errorf("open: %w: provider said key arn:aws:kms:secret-detail", class))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%v: status %d", class, rec.Code)
+		}
+		var body models.ErrorResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.Code == "" || strings.Contains(rec.Body.String(), "secret-detail") {
+			t.Fatalf("%v: body %s", class, rec.Body.String())
+		}
+		wantRetry := errors.Is(class, secrets.ErrProviderThrottled) || errors.Is(class, secrets.ErrProviderUnavailable)
+		if got := rec.Header().Get("Retry-After") != ""; got != wantRetry {
+			t.Fatalf("%v: Retry-After %q", class, rec.Header().Get("Retry-After"))
+		}
+	}
+}
+
+// A leader change is answered in fixed words: the forward's error names the
+// old leader's internal address, which is not the caller's business.
+func TestClassifyLeaderChangeHidesTheInternalAddress(t *testing.T) {
+	err := fmt.Errorf("%w: leader-forward apply: Post \"https://10.42.1.198:7002/internal/apply\": dial tcp 10.42.1.198:7002: connect: connection refused", cluster.ErrNotLeader)
+	c := Classify(err)
+	if c.Status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", c.Status)
+	}
+	if strings.Contains(c.Message, "10.42.1.198") || strings.Contains(c.Message, "7002") {
+		t.Fatalf("message leaks the internal address: %q", c.Message)
+	}
+}
+
+// A network policy the node's firewall can't enforce reaches the client as
+// 501 with its stable code and the service's message, which names the
+// refused field and the flag that fixes the node.
+func TestWriteStoreAwareErrorNetworkPolicyUnenforced(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteStoreAwareError(nil, rec, fmt.Errorf("network_block_all refused, see SB_ENABLE_NETWORK_RULES: %w",
+		errors.Join(service.ErrNetworkPolicyUnenforced, models.ErrRuntimeNotImplemented)))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", rec.Code)
+	}
+	var body models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != models.ErrorCodeNetworkPolicyUnenforced || !strings.Contains(body.Error, "SB_ENABLE_NETWORK_RULES") {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("retrying cannot help: no Retry-After")
+	}
+}
+
+// A mount tool missing on the node reaches the client as 501 with its code
+// and the message naming the tool, without Retry-After (installing a program
+// is not something a retry waits out), and is logged for the operator.
+func TestWriteStoreAwareErrorMountToolUnavailable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	WriteStoreAwareError(nil, rec, fmt.Errorf("create sandbox: %w", missingMountS3))
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status %d, want 501", rec.Code)
+	}
+	var body models.ErrorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Code != models.ErrorCodeMountToolUnavailable || !strings.Contains(body.Error, `"mount-s3": executable file not found`) {
+		t.Fatalf("body %s", rec.Body.String())
+	}
+	if rec.Header().Get("Retry-After") != "" {
+		t.Fatal("retrying cannot help: no Retry-After")
+	}
+	if c := Classify(missingMountS3); !c.Log {
+		t.Fatal("the missing tool must reach the node's log")
 	}
 }

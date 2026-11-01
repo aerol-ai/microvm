@@ -1,0 +1,33 @@
+# cluster-3-mixed behind a health-checked AWS Network Load Balancer
+# (cluster-3-mixed-lb.tfvars). api-load-balancer makes run.sh apply with
+# api_load_balancer = "nlb" and gates UC-356, which stops one node's daemon
+# and asserts the balancer drops and restores it with no failed call. That
+# is a node kill, hence disruptive: true, which also runs the other
+# disruptive cluster cases through the balancer.
+name: cluster-3-mixed-lb
+capabilities:
+  - api-load-balancer
+  - docker
+  - platform-volumes
+  - domain
+  - cluster
+  # SB_MCP_ENABLED=true on every node (tfvars extra_sandboxd_env); gates UC-178.
+  - remote-mcp
+  # Hostname egress filtering: install.sh starts the egress gateway on every
+  # node and SB_EGRESS_FQDN_ENABLED defaults on, so the egress use cases run
+  # here, each on whichever node owns its sandbox (UC-216 needs two).
+  - egress-fqdn
+  # Identity and access (T12): avm_ tokens and the test issuer on every node.
+  - identity
+  - identity-oidc
+  # Every node exports audit records to the scenario's S3 bucket (UC-279).
+  - audit-export-s3
+  # No rolling-upgrade: a fleet provisioned from an older release (--version)
+  # has an install.sh without --lb-health-port and a daemon without
+  # SB_L4_PUBLIC_HOST, so this scenario needs the default local build (or a
+  # release that has both).
+
+# Expected gossiped member count (read by run.sh → AEROL_EXPECTED_MEMBERS).
+expected_members: 3
+
+disruptive: true

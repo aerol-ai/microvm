@@ -14,6 +14,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -130,7 +131,8 @@ func (r *recordingRuntime) Inspect(_ context.Context, ref string) (*models.Sandb
 			return &copy, nil
 		}
 	}
-	return &models.SandboxRuntimeState{}, nil
+	// What a real driver answers for a container it has never heard of.
+	return nil, fmt.Errorf("container %s: %w", ref, runtime.ErrInstanceNotFound)
 }
 
 func (r *recordingRuntime) ListManaged(_ context.Context) (map[string]*models.SandboxRuntimeState, error) {

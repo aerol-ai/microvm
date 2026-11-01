@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/aerol-ai/microvm/pkg/capacity"
 )
 
 // Container netns pool lifecycle states. Stored as TEXT; queries use literals.
@@ -16,6 +18,14 @@ const (
 	NetnsSlotStateRealized = "realized"
 	NetnsSlotStatePooled   = "pooled"
 	NetnsSlotStateAdopted  = "adopted"
+	// NetnsSlotStateReleasing holds a slot whose host teardown (CNI DEL, NAT
+	// chain, netns delete) failed. The row has no owner, so no sandbox can find
+	// or claim it, but it keeps netns_path + container_ip: they are the
+	// identity the retry needs to delete exactly what CNI ADD created. Freeing
+	// such a slot instead would hand a new sandbox a slot whose lease and
+	// masquerade chain still exist (host-local then refuses the slot's next
+	// ADD as a duplicate, and the leftover rules pile up).
+	NetnsSlotStateReleasing = "releasing"
 )
 
 // ContainerNetnsSlot is one row of container_netns_slots.
@@ -30,7 +40,10 @@ type ContainerNetnsSlot struct {
 }
 
 // ErrNoFreeContainerNetnsSlot is returned when the netns pool is exhausted.
-var ErrNoFreeContainerNetnsSlot = errors.New("container netns pool: no free slot")
+// It is a capacity refusal (errors.Is matches capacity.ErrCapacityExceeded),
+// so the API answers 503 + Retry-After and placement can try another node,
+// instead of the catch-all 400 a full node used to look like.
+var ErrNoFreeContainerNetnsSlot error = capacity.NewSlotPoolExhausted("container netns pool")
 
 // SeedContainerNetnsSlot inserts one free pool row. Idempotent on slot_id PK.
 func (s *Store) SeedContainerNetnsSlot(ctx context.Context, slotID string, now time.Time) error {
@@ -289,6 +302,55 @@ func (s *Store) ResetContainerNetnsSlotToFree(ctx context.Context, slotID string
 	return nil
 }
 
+// MarkContainerNetnsSlotReleasing parks a slot whose host teardown failed:
+// owner cleared, state releasing, netns_path / container_ip set to the
+// identity the teardown used so a retry deletes the same CNI state. owner is
+// the sandbox_id the caller saw ("" for a row with no owner); the update only
+// applies while the row still has that owner, so a stale caller can never
+// park a slot that was meanwhile freed and handed to another sandbox.
+// Returns ErrNotFound when the row no longer matches.
+func (s *Store) MarkContainerNetnsSlotReleasing(ctx context.Context, slotID, owner, netnsPath, containerIP string, now time.Time) error {
+	slotID = strings.TrimSpace(slotID)
+	if slotID == "" {
+		return errors.New("mark container netns releasing: slot_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE container_netns_slots
+		SET sandbox_id = NULL, netns_path = ?, container_ip = ?, state = ?, updated_at = ?
+		WHERE slot_id = ? AND COALESCE(sandbox_id, '') = ? AND state != ?
+	`, strings.TrimSpace(netnsPath), strings.TrimSpace(containerIP), NetnsSlotStateReleasing, now.UTC(),
+		slotID, strings.TrimSpace(owner), NetnsSlotStateFree)
+	if err != nil {
+		return fmt.Errorf("mark container netns releasing: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark container netns releasing (affected): %w", err)
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// FreeReleasingContainerNetnsSlot returns a releasing slot to the free pool
+// once its host teardown has finally succeeded. A no-op for any other state.
+func (s *Store) FreeReleasingContainerNetnsSlot(ctx context.Context, slotID string, now time.Time) error {
+	slotID = strings.TrimSpace(slotID)
+	if slotID == "" {
+		return errors.New("free releasing netns slot: slot_id is required")
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE container_netns_slots
+		SET sandbox_id = NULL, netns_path = '', container_ip = '', state = ?, updated_at = ?
+		WHERE slot_id = ? AND state = ?
+	`, NetnsSlotStateFree, now.UTC(), slotID, NetnsSlotStateReleasing)
+	if err != nil {
+		return fmt.Errorf("free releasing netns slot: %w", err)
+	}
+	return nil
+}
+
 // MarkContainerNetnsSlotRealized records CNI ADD output for a reserved slot.
 // Idempotent when already realized or adopted with the same paths.
 func (s *Store) MarkContainerNetnsSlotRealized(ctx context.Context, sandboxID, netnsPath, containerIP string, now time.Time) (*ContainerNetnsSlot, error) {
@@ -467,6 +529,9 @@ type ContainerNetnsPoolStats struct {
 	Realized int
 	Pooled   int
 	Adopted  int
+	// Releasing counts slots parked after a failed host teardown. A count that
+	// stays above zero means CNI DEL keeps failing on this node.
+	Releasing int
 }
 
 func (s *Store) GetContainerNetnsPoolStats(ctx context.Context) (ContainerNetnsPoolStats, error) {
@@ -478,10 +543,11 @@ func (s *Store) GetContainerNetnsPoolStats(ctx context.Context) (ContainerNetnsP
 			COALESCE(SUM(CASE WHEN state = 'reserved' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN state = 'realized' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN state = 'pooled' THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN state = 'adopted' THEN 1 ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN state = 'adopted' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN state = 'releasing' THEN 1 ELSE 0 END), 0)
 		FROM container_netns_slots
 	`)
-	if err := row.Scan(&stats.Total, &stats.Free, &stats.Reserved, &stats.Realized, &stats.Pooled, &stats.Adopted); err != nil {
+	if err := row.Scan(&stats.Total, &stats.Free, &stats.Reserved, &stats.Realized, &stats.Pooled, &stats.Adopted, &stats.Releasing); err != nil {
 		return stats, fmt.Errorf("container netns pool stats: %w", err)
 	}
 	return stats, nil

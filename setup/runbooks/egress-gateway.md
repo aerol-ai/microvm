@@ -133,6 +133,13 @@ sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager | grep -E 'egres
   policy for very broad wildcards.
 - Anything else from `nft`: capture `sudo nft list table inet aerolvm_egress`
   and the gateway log, then restart the gateway.
+- `pause container for the sandbox's network rules` (Docker engine, no
+  pause pool slot): a create with rules starts a pause container of its own
+  and fails closed when it can't. `pull pause image` means the node can't
+  reach `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE`; point it at a mirror. A leftover
+  `aerolvm-netns-sb-<id>` whose sandbox is gone is removed at the next
+  sandboxd start; `sudo docker rm -f` it sooner if it holds an address you
+  need.
 
 ## SandboxesHeld
 
@@ -229,7 +236,7 @@ guard to the guests.
   another guest's address, so the source IP the gateway keys on can't be
   forged.
 - **Stopped guests** keep their slot and IP, so a gateway-mode guest is shut
-  (block-all on its IP in `AEROLVM-FC`) when it stops, and Start re-attaches
+  (block-all on its IP, in the block sets: see BlockSets) when it stops, and Start re-attaches
   it before lifting that. A gateway restart while it is stopped can't leave a
   resumed guest unfiltered.
 - **No self-test for the TAPs:** there is no bridge to join a probe to. Guest
@@ -276,10 +283,13 @@ reads it for the internal zone, its copy of the floor and the proxy.
 - **Built-in profiles (`builtin_profiles`, on by default).** `false` refuses
   new `builtin:` references with 400; sandboxes already using one keep it.
 - **Deny floor (`deny_cidrs`).** Dropped for every sandbox in every mode, in
-  three places: the host firewall chain `AEROLVM-FLOOR` (jumped from the top
-  of `DOCKER-USER` or `AEROLVM-USER`, rewritten by sandboxd when the file
+  three places: the host firewall, one chain per sandbox subnet named
+  `AEROLVM-FLOOR-<8 hex>` (jumped from the top of `DOCKER-USER`,
+  `AEROLVM-USER` or `AEROLVM-FC`, rewritten by sandboxd when the file
   changes), the gateway's `deny_floor` set, and the WASM and isolate dial
-  guards. Check the host copy with `sudo iptables -S AEROLVM-FLOOR`.
+  guards. Check the host copies with `sudo iptables -S | grep AEROLVM-FLOOR-`:
+  a node running containers and Firecracker guests has one chain for each.
+  A plain `AEROLVM-FLOOR` chain is an older daemon's, emptied at boot.
 - **Control-port guard (`node_control_port_guard`, on by default when a file
   is present).** Sandboxes cannot open TCP connections to any cluster
   member's API, SSH gateway, Raft, gossip or cluster mTLS port, including
@@ -287,6 +297,73 @@ reads it for the internal zone, its copy of the floor and the proxy.
   list to the gateway (`node_control` set) and refreshes it as membership
   changes. A tool inside a sandbox that called a node's `:21212` directly
   now times out; point it at the ingress URL, or set the guard to `false`.
+  Setting it to `false` never opens the sandbox's own node: the node guard
+  below holds that.
+  - The Firecracker TAP subnet is guarded whole: one `node_control` entry
+    per control port whose destination is the whole TAP subnet, so every
+    guest's TAP address (the host side of its `/30`) is covered from boot
+    and guests starting and stopping never rewrite the set. Each rewrite
+    replaced the whole set and held the node's nftables commit mutex for
+    about 25 ms on a 48-vCPU host, so creates waited behind it.
+  - A gateway older than sandboxd answers the pools push with
+    `unknown op "node_control_pools"`; sandboxd then lists every TAP
+    address one by one, as before, until the gateway restarts on the new
+    binary.
+- **Node guard (always on, no file needed).** Sandboxes are default-denied
+  from the node they run on: every new connection from a sandbox subnet to
+  any node address is dropped by `AEROLVM-NODE` (the first rule of `INPUT`,
+  one `AEROLVM-NODE-<8 hex>-A|B` chain per sandbox subnet), except the
+  gateway's DNS and proxy ports, DNS on a node address the sandboxes'
+  resolver names, 80/443 on an ingress node, and `SB_SANDBOX_NODE_PORTS_ALLOW`.
+  WASM and isolate get the same rule in their dial guard. Check it with
+  `sudo iptables -S AEROLVM-NODE` and the chain it jumps to; the
+  `aerolvm_node_guard_ready` expvar is 1 per runtime that has it. sandboxd
+  re-asserts it every 30 s; a runtime where it cannot be installed refuses
+  creates with 503 `node_guard_not_ready` and logs why.
+
+## BlockSets
+
+A sandbox's block-all is its address in the sets of the nftables table
+`ip aerolvm_block`. This covers a block-all policy, a quota block, the
+block a hostname-filtered create starts behind, and a parked warm slot.
+The table drops forwarded and host-bound packets whose source is in
+`blocked` and not in `released`. Established and related replies to the
+host still pass.
+
+```bash
+sudo nft list table ip aerolvm_block
+```
+
+- **What the sets mean:**
+  - An address only in `blocked` is shut.
+  - An address in both sets is open. Its gateway attach lifted the block,
+    and the gateway filters it.
+  - An address in neither set has no block.
+  - An address should never be in `released` alone. ReassertBlockSets
+    deletes a release that sandboxd didn't make.
+- **A create killed mid-way** (a sandboxd crash between the block and the
+  lift) leaves its address only in `blocked`. It stays shut through the
+  restart until reconcile removes the orphan, and then the address leaves
+  both sets.
+- **A flush** of the table (`nft flush ruleset`, an operator) opens every
+  blocked sandbox until sandboxd puts it back. That happens on the next
+  block operation, or within 30 s on the re-assert tick, with every
+  element sandboxd knows of. The log line is `block sets repaired`.
+- **The re-assert only reads** while the table is as sandboxd made it: it
+  writes only what is missing or changed. sandboxd keeps one netlink
+  socket open for the sets. Closing a netfilter socket makes the kernel
+  take the commit mutex and wait an RCU grace period for anything an
+  earlier commit left to free (5 to 10 ms on a 48-vCPU host), and every
+  create's lift waits behind that.
+- **Per-address rules** are the old form of the block: a `-s IP -j DROP`
+  in `DOCKER-USER`/`AEROLVM-USER`/`AEROLVM-FC` and an `sbx-input-block`
+  drop in `AEROLVM-INPUT`. sandboxd converts them into set elements at
+  start. The exec backend (`SB_NETRULES_BACKEND=exec`) and IPv6 addresses
+  keep using them.
+- **Downgrading** to a sandboxd without the block sets leaves every
+  address in `blocked` shut, because the older daemon never removes set
+  elements. After the downgrade, once its sandboxes are recreated, run
+  `sudo nft delete table ip aerolvm_block`.
 
 ## Inspection
 

@@ -5,6 +5,7 @@ import (
 
 	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -40,4 +41,30 @@ func withNetworkNamespace(path string) oci.SpecOpts {
 		})
 		return nil
 	}
+}
+
+// SandboxContainerExists reports whether sandboxID still has a containerd
+// container on this node, running or stopped. It is the netns pool's
+// ownership test at boot: a slot belongs to its sandbox for as long as the
+// container exists, because the container's spec pins the slot's netns path
+// and a later Start rejoins it. Unlike Inspect it never fails on a healthy
+// sandbox: Inspect also reads the IP out of the netns, which a gVisor sandbox
+// does not expose there. A warm-adopted sandbox keeps its park container id,
+// so a miss by id falls back to the sandbox-id label. Any error other than
+// NotFound is returned, and the caller must treat it as "still owned".
+func (d *Driver) SandboxContainerExists(ctx context.Context, sandboxID string) (bool, error) {
+	client, err := d.ensureClient()
+	if err != nil {
+		return false, err
+	}
+	if _, err := client.LoadContainer(ctx, sandboxID); err == nil {
+		return true, nil
+	} else if !errdefs.IsNotFound(err) {
+		return false, err
+	}
+	c, err := d.findContainerBySandboxID(ctx, client, sandboxID)
+	if err != nil {
+		return false, err
+	}
+	return c != nil, nil
 }

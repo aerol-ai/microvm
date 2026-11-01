@@ -125,7 +125,7 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// arrive between gossip ticks both pick the same "best" node and double-
 	// book it. The FSM serializes opReserve through raft, so the second
 	// SelectPlacement on the same leader sees the first reservation here.
-	pending := c.fsm.pendingReservationsByNode(time.Now().Unix())
+	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(time.Now().Unix())
 	// Drained nodes are excluded from the candidate set entirely. Cheaper and
 	// clearer than threading the flag through nodeFits — drain is a hard
 	// admission rule (operator says "don't put more work here"), not a
@@ -138,6 +138,11 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	// no candidate, the failure is ordinary (capacity, drain); if it was not,
 	// the artifact itself is out of reach and the client must re-create it.
 	requiredReachable := false
+	// full records that a live, eligible worker able to run the request was
+	// turned away only for room (CPU, memory, disk, live memory, or a full
+	// network-slot pool). An empty candidate set with one is a cluster at
+	// capacity — ErrClusterAtCapacity — not an unexplained "no target".
+	full := false
 	for _, m := range all {
 		if !m.Alive {
 			rejects["dead"]++
@@ -178,8 +183,21 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 			rejects["mediated_egress"]++
 			continue
 		}
-		if !nodeFits(m, req, pending[m.NodeID]) {
+		switch nodeFitVerdict(m, req, pending[m.NodeID]) {
+		case fitIncompatible:
 			rejects["capacity"]++
+			continue
+		case fitNoRoom:
+			rejects["capacity"]++
+			full = true
+			continue
+		}
+		// A node with CPU and memory to spare is still full for this
+		// runtime when its network-slot pool is: the create would fail
+		// there with "no free slot" (bank density run, 2026-11-01).
+		if !slotsFit(m, req, pendingRuntimes[m.NodeID]) {
+			rejects["network_slots"]++
+			full = true
 			continue
 		}
 		candidates = append(candidates, m)
@@ -188,13 +206,13 @@ func (c *Cluster) SelectPlacementWithCandidates(req capacity.Request) (Placement
 	self := PlacementTarget{NodeID: c.nodeID, APIURL: c.apiURL, DataPlaneHost: c.dataPlaneHost, InternalURL: c.internalURL, IsSelf: true}
 	if len(candidates) == 0 {
 		recordSchedulerDecision("no_target", 0, rejects)
-		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0)
+		return PlacementTarget{}, nil, noPlacementTargetError(req, requiredReachable, rejects["egress_gateway"] > 0, full)
 	}
 
 	// Power-of-two-choices.
 	a, b := pickTwo(candidates)
 	winner := a
-	if !sameNode(a, b) && headroomScore(b, req, pending[b.NodeID]) > headroomScore(a, req, pending[a.NodeID]) {
+	if !sameNode(a, b) && placementScore(b, req, pending[b.NodeID], pendingRuntimes[b.NodeID]) > placementScore(a, req, pending[a.NodeID], pendingRuntimes[a.NodeID]) {
 		winner = b
 	}
 
@@ -315,6 +333,20 @@ func secretRecipientScore(sandboxID, nodeID string) uint64 {
 	return x
 }
 
+// fitVerdict is nodeFitVerdict's answer. The two refusals are told apart so
+// an empty candidate set can say "at capacity" only when some worker that can
+// run the request is merely full, never when none can run it at all.
+type fitVerdict int
+
+const (
+	fitOK fitVerdict = iota
+	// fitIncompatible: the peer can never run req (runtime, GPU inventory,
+	// template or module not here), or has no fresh heartbeat.
+	fitIncompatible
+	// fitNoRoom: the peer can run req but its budgets are spent right now.
+	fitNoRoom
+)
+
 // nodeFits returns true if the member could plausibly accept req based on its
 // latest capacity heartbeat. We use the budget numbers (post-overcommit)
 // because that's what the remote admitter will check. extraReserved is the sum
@@ -327,25 +359,19 @@ func secretRecipientScore(sandboxID, nodeID string) uint64 {
 // does not report Parked* reads as zero, which is the old accounting.
 // headroomScore still counts them, so a node with genuinely free room wins
 // before warm slots are given up.
+//
+// Network slots are a separate check (slotsFit): they are counted per pool,
+// not as one aggregate, so they need the per-runtime pending counts.
 func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bool {
+	return nodeFitVerdict(m, req, extraReserved) == fitOK
+}
+
+// nodeFitVerdict is nodeFits with the reason. The static checks run first, so
+// a peer that cannot run req reads as incompatible even when it is also full.
+func nodeFitVerdict(m Member, req capacity.Request, extraReserved capacity.Request) fitVerdict {
 	cap := m.Capacity
 	if m.CapacityStale || !hasCapacitySnapshot(cap) {
-		return false
-	}
-	if !cap.CanAdmit && len(cap.Reasons) > 0 {
-		return false
-	}
-	reservedCPU := max(cap.ReservedCPU-cap.ParkedCPU, 0)
-	reservedMemMB := max(cap.ReservedMemoryMB-cap.ParkedMemoryMB, 0)
-	reservedDiskGB := max(cap.ReservedDiskGB-cap.ParkedDiskGB, 0)
-	if cap.CPUBudget > 0 && reservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
-		return false
-	}
-	if cap.MemoryBudgetMB > 0 && reservedMemMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
-		return false
-	}
-	if cap.DiskBudgetGB > 0 && reservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
-		return false
+		return fitIncompatible
 	}
 	// GPU and runtime are physical attributes — a peer that lacks them can
 	// never satisfy the request, so we don't even forward. We only enforce
@@ -354,10 +380,10 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 	// the rolling-upgrade behaviour the admitter uses on its own host.
 	if req.GPUs > 0 {
 		if cap.GPUCount < req.GPUs {
-			return false
+			return fitIncompatible
 		}
 		if req.GPUVendor != "" && cap.GPUVendor != "" && req.GPUVendor != cap.GPUVendor {
-			return false
+			return fitIncompatible
 		}
 	}
 	if req.Runtime != "" && len(cap.SupportedRuntimes) > 0 {
@@ -369,7 +395,7 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 			}
 		}
 		if !supported {
-			return false
+			return fitIncompatible
 		}
 	}
 	// Phase 6 PR-D template-aware placement. A create that names a
@@ -393,7 +419,7 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 			}
 		}
 		if !hit {
-			return false
+			return fitIncompatible
 		}
 	}
 	if req.Runtime == models.RuntimeWasm && req.ModuleRef != "" && cap.LocalWasmModuleInventoryKnown {
@@ -405,10 +431,57 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 			}
 		}
 		if !hit {
-			return false
+			return fitIncompatible
 		}
 	}
-	return true
+	if !cap.CanAdmit && len(cap.Reasons) > 0 {
+		return fitNoRoom
+	}
+	reservedCPU := max(cap.ReservedCPU-cap.ParkedCPU, 0)
+	reservedMemMB := max(cap.ReservedMemoryMB-cap.ParkedMemoryMB, 0)
+	reservedDiskGB := max(cap.ReservedDiskGB-cap.ParkedDiskGB, 0)
+	if cap.CPUBudget > 0 && reservedCPU+extraReserved.CPU+req.CPU > cap.CPUBudget {
+		return fitNoRoom
+	}
+	if cap.MemoryBudgetMB > 0 && reservedMemMB+extraReserved.MemoryMB+req.MemoryMB > cap.MemoryBudgetMB {
+		return fitNoRoom
+	}
+	if cap.DiskBudgetGB > 0 && reservedDiskGB+extraReserved.DiskGB+req.DiskGB > cap.DiskBudgetGB {
+		return fitNoRoom
+	}
+	return fitOK
+}
+
+// freeSlotsAfterPending returns how many slots m's pool for req.Runtime has
+// left once the reservations in flight to m are counted, and the pool's size.
+// Every runtime the pool serves counts: on a containerd node a pending gVisor
+// create takes a netns a docker create could have had. ok=false when m reports
+// no pool for the runtime.
+func freeSlotsAfterPending(m Member, req capacity.Request, pendingByRuntime map[string]int) (free, total int, ok bool) {
+	pool, ok := m.Capacity.SlotPoolFor(req.Runtime)
+	if !ok {
+		return 0, 0, false
+	}
+	free = pool.Free
+	for _, rt := range pool.Runtimes {
+		free -= pendingByRuntime[rt]
+	}
+	return free, pool.Total, true
+}
+
+// slotsFit reports whether m has a network slot for req after its in-flight
+// reservations. A peer that reports no pool for the runtime — an older build,
+// or a runtime with no bounded pool — is not gated ("unknown, allow", like an
+// empty SupportedRuntimes), so a rolling upgrade places exactly as before.
+//
+// The heartbeat can lag a create that has already been promoted (the pending
+// claim is gone, the next pull has not run): within one capacity interval a
+// node can still be picked for its last slots. The worker then refuses with
+// its pool's capacity error (503 + Retry-After) and the retry is placed again;
+// that is the same window CPU and memory accounting have.
+func slotsFit(m Member, req capacity.Request, pendingByRuntime map[string]int) bool {
+	free, _, ok := freeSlotsAfterPending(m, req, pendingByRuntime)
+	return !ok || free >= 1
 }
 
 // headroomScore is the metric power-of-two-choices compares. Larger is better.
@@ -418,11 +491,21 @@ func nodeFits(m Member, req capacity.Request, extraReserved capacity.Request) bo
 // the peer advertises a budget so single-axis (CPU/memory) clusters keep their
 // existing scoring behaviour.
 func headroomScore(m Member, req capacity.Request, extraReserved capacity.Request) float64 {
-	cap := m.Capacity
-	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
+	sum, axes, known := headroomAxes(m, req, extraReserved)
+	if !known {
 		// Unknown capacity — neutral score so it ties with peers that have
 		// reported, slightly preferred over fully-loaded ones.
 		return 0.5
+	}
+	return sum / float64(axes)
+}
+
+// headroomAxes returns the sum of headroomScore's per-axis fractions and how
+// many axes it summed; known=false for a peer that reported no host size.
+func headroomAxes(m Member, req capacity.Request, extraReserved capacity.Request) (sum float64, axes int, known bool) {
+	cap := m.Capacity
+	if cap.HostCPUCores == 0 && cap.HostMemoryTotalMB == 0 {
+		return 0, 0, false
 	}
 	cpuScore := 1.0
 	if cap.CPUBudget > 0 {
@@ -432,11 +515,29 @@ func headroomScore(m Member, req capacity.Request, extraReserved capacity.Reques
 	if cap.MemoryBudgetMB > 0 {
 		memScore = float64(cap.MemoryBudgetMB-cap.ReservedMemoryMB-extraReserved.MemoryMB-req.MemoryMB) / float64(cap.MemoryBudgetMB)
 	}
+	sum, axes = cpuScore+memScore, 2
 	if cap.DiskBudgetGB > 0 {
-		diskScore := float64(cap.DiskBudgetGB-cap.ReservedDiskGB-extraReserved.DiskGB-req.DiskGB) / float64(cap.DiskBudgetGB)
-		return (cpuScore + memScore + diskScore) / 3
+		sum += float64(cap.DiskBudgetGB-cap.ReservedDiskGB-extraReserved.DiskGB-req.DiskGB) / float64(cap.DiskBudgetGB)
+		axes++
 	}
-	return (cpuScore + memScore) / 2
+	return sum, axes, true
+}
+
+// placementScore is headroomScore with the request's network-slot pool as one
+// more equal axis when the peer reports one. Without it a big host keeps
+// winning on CPU and memory until its pool is empty, and the fleet's last
+// slots are all spent on the node whose heartbeat is most likely to lag; with
+// it, a host whose pool is nearly spent gives way to one with slots left.
+func placementScore(m Member, req capacity.Request, extraReserved capacity.Request, pendingByRuntime map[string]int) float64 {
+	sum, axes, known := headroomAxes(m, req, extraReserved)
+	if !known {
+		return headroomScore(m, req, extraReserved)
+	}
+	if free, total, ok := freeSlotsAfterPending(m, req, pendingByRuntime); ok && total > 0 {
+		sum += float64(free-1) / float64(total)
+		axes++
+	}
+	return sum / float64(axes)
 }
 
 // pickTwo returns two distinct candidates if possible, else duplicates the
@@ -462,7 +563,7 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 		return nil
 	}
 	now := time.Now().Unix()
-	pending := c.fsm.pendingReservationsByNode(now)
+	pending, pendingRuntimes := c.fsm.pendingReservationLoadByNode(now)
 	pendingCounts := make(map[string]int, len(reservations))
 	for _, r := range reservations {
 		if _, ok := pendingCounts[r.OwnerNodeID]; !ok {
@@ -476,7 +577,7 @@ func (c *Cluster) admitReservationCommand(cmd command) error {
 		}
 	}
 	members := c.withCatalogueTemplateHolders(c.membersWithCapacity(), templateIDs...)
-	return admitReservationCommands(members, pending, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
+	return admitReservationCommands(members, pending, pendingRuntimes, pendingCounts, c.cfg.ClusterCreateMaxPendingPerWorker, reservations)
 }
 
 // withCatalogueTemplateHolders adds each templateID to the ready-template
@@ -538,7 +639,11 @@ func (c *Cluster) withCatalogueTemplateHolders(members []Member, templateIDs ...
 	return out
 }
 
-func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
+// admitReservationCommands re-checks each reservation in a command against
+// its owner's fresh heartbeat plus everything already pending there,
+// including earlier reservations in the same batch. pendingRuntimes is the
+// FSM's per-owner, per-runtime pending count (network slots are per pool).
+func admitReservationCommands(members []Member, pending map[string]capacity.Request, pendingRuntimes map[string]map[string]int, pendingCounts map[string]int, maxPendingPerWorker int, reservations []reservationCommand) error {
 	byID := make(map[string]Member, len(members))
 	for _, m := range members {
 		if m.NodeID != "" {
@@ -547,6 +652,7 @@ func admitReservationCommands(members []Member, pending map[string]capacity.Requ
 	}
 	batchPending := make(map[string]capacity.Request)
 	batchCounts := make(map[string]int)
+	batchRuntimes := make(map[string]map[string]int)
 	for _, r := range reservations {
 		if r.SandboxID == "" || r.OwnerNodeID == "" {
 			return fmt.Errorf("%w: reservation missing sandbox_id or owner_node_id", ErrReservationConflict)
@@ -572,6 +678,18 @@ func admitReservationCommands(members []Member, pending map[string]capacity.Requ
 		if !nodeFits(m, req, extra) {
 			return fmt.Errorf("%w: worker %s cannot fit sandbox %s", ErrCapacityExceeded, r.OwnerNodeID, r.SandboxID)
 		}
+		byRuntime := batchRuntimes[r.OwnerNodeID]
+		if byRuntime == nil {
+			byRuntime = make(map[string]int)
+			for rt, n := range pendingRuntimes[r.OwnerNodeID] {
+				byRuntime[rt] = n
+			}
+			batchRuntimes[r.OwnerNodeID] = byRuntime
+		}
+		if !slotsFit(m, req, byRuntime) {
+			return fmt.Errorf("%w: worker %s has no free network slot for %s sandbox %s", ErrCapacityExceeded, r.OwnerNodeID, req.Runtime, r.SandboxID)
+		}
+		byRuntime[req.Runtime]++
 		batchExtra.CPU += req.CPU
 		batchExtra.MemoryMB += req.MemoryMB
 		batchExtra.DiskGB += req.DiskGB
@@ -653,12 +771,19 @@ var _ = func() error {
 // A gateway-mode create that lost at least one peer only to the gateway rule
 // fails as ErrNoEgressGatewayTarget so the client is told why: some node may
 // have had room, none could filter hostnames.
-func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected bool) error {
+//
+// Otherwise, when a worker that could run the request was turned away only
+// for room (full), the cluster is at capacity: ErrClusterAtCapacity says so,
+// and stays an ErrNoPlacementTarget for every existing 503 mapping.
+func noPlacementTargetError(req capacity.Request, requiredReachable, gatewayRejected, full bool) error {
 	if req.RequiredNodeID != "" && !requiredReachable {
 		return fmt.Errorf("%w (node %q)", ErrArtifactNodeUnavailable, req.RequiredNodeID)
 	}
 	if req.NeedsEgressGateway && gatewayRejected {
 		return ErrNoEgressGatewayTarget
+	}
+	if full {
+		return ErrClusterAtCapacity
 	}
 	return ErrNoPlacementTarget
 }

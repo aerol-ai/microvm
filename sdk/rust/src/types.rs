@@ -565,7 +565,8 @@ pub struct Sandbox {
     #[serde(rename = "network_block_all")]
     pub network_block_all: bool,
     /// Hostname-egress state on get (container runtimes): "active", "held"
-    /// or "unavailable". `None` otherwise, and on list results.
+    /// or "unavailable"; "unenforced" when the server's firewall is off and
+    /// nothing filters the sandbox. `None` otherwise, and on list results.
     #[serde(default, rename = "egress_status", skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
     /// Egress profiles this sandbox references.
@@ -881,7 +882,8 @@ pub struct NetworkPolicy {
     /// Hostname entries in force: inline plus every profile's (at most 1024).
     #[serde(default)]
     pub effective_hostname_count: usize,
-    /// "active", "held" or "unavailable" for hostname rules on a container.
+    /// "active", "held" or "unavailable" for hostname rules on a container;
+    /// "unenforced" when the server's firewall is off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_status: Option<String>,
 }
@@ -1315,6 +1317,16 @@ pub struct RetryConfig {
     pub max_retries: Option<i32>,
     pub base_delay_ms: Option<u64>,
     pub max_delay_ms: Option<u64>,
+    /// Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    /// client waits as long as the server's `Retry-After` header asks
+    /// (seconds or an HTTP date), never less than its own backoff, plus up
+    /// to a fifth more so clients told the same value spread out; a longer
+    /// ask is cut to this. A missing or malformed header uses the backoff.
+    /// `None` means 30000; `Some(0)` ignores `Retry-After`. The client is
+    /// blocking, so the wait holds the calling thread: lower this to bound
+    /// how long a call can take under load.
+    #[serde(default)]
+    pub max_retry_after_ms: Option<u64>,
 }
 
 impl Default for RetryConfig {
@@ -1323,6 +1335,7 @@ impl Default for RetryConfig {
             max_retries: Some(3),
             base_delay_ms: Some(200),
             max_delay_ms: Some(5000),
+            max_retry_after_ms: Some(30_000),
         }
     }
 }

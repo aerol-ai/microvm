@@ -13,11 +13,29 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
+
+// ErrInstanceNotFound is a runtime's definitive "no such instance": Docker
+// answered 404, containerd answered NotFound. Drivers wrap it so callers can
+// tell it from a runtime that could not answer at all.
+var ErrInstanceNotFound = errors.New("runtime: instance not found")
+
+// InstanceGone reports whether an Inspect result proves the instance does not
+// exist. Only that may justify deleting a sandbox's row: an unknown answer (a
+// timeout, an unreadable netns, a shim that did not reply) once did, and
+// reconcile deleted live sandboxes on it.
+func InstanceGone(state *models.SandboxRuntimeState, err error) bool {
+	if err != nil {
+		return errors.Is(err, ErrInstanceNotFound)
+	}
+	return state == nil
+}
 
 // Runtime is the core contract the service layer requires of any sandbox
 // runtime driver. Implementations must be safe for concurrent use; the
@@ -57,6 +75,16 @@ type Runtime interface {
 	Resize(ctx context.Context, containerRef string, req models.ResizeSandboxRequest) error
 
 	// Inspect returns the current runtime state for a single container.
+	//
+	// A result says one of three things, and callers that delete anything
+	// must tell them apart (see InstanceGone):
+	//   - a state: the instance exists. An instance whose address could not
+	//     be read this time is still a state (Started, empty ContainerIP);
+	//   - gone: an error wrapping ErrInstanceNotFound, or (nil, nil) from a
+	//     driver whose registry is in-process memory (firecracker, wasm,
+	//     isolate), where a registry miss is the definitive answer;
+	//   - unknown: any other error. The runtime could not answer; the
+	//     instance may well be running.
 	Inspect(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error)
 
 	// ListManaged returns the runtime state of every container managed by
@@ -94,12 +122,49 @@ type EgressHolder interface {
 	ClearEgressHold(containerIP string) error
 }
 
+// NetRulesReporter is implemented by drivers that enforce a sandbox's network
+// policy (block-all, CIDR allow/deny lists, byte-cap blocks, the egress
+// gateway's fail-closed hold) with host firewall rules: docker, containerd and
+// Firecracker. NetRulesEnabled is false when that firewall is off
+// (SB_ENABLE_NETWORK_RULES=false, or a non-Linux host such as macOS local
+// mode). Every rule call is then a silent no-op, so the service refuses those
+// policies instead of storing one nothing enforces.
+type NetRulesReporter interface {
+	NetRulesEnabled() bool
+}
+
 // EgressFloorSetter is implemented by container runtimes that can install
 // the operator's node-wide deny floor for every sandbox on their bridge
 // (plans/egress-domain-filtering.md §5.10 PC-2). It works without the
 // egress gateway, which carries its own copy of the floor.
 type EgressFloorSetter interface {
 	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
+}
+
+// NodeGuardSetter is implemented by runtimes whose sandboxes reach the node
+// over a host bridge or TAP subnet (containers, gVisor, Firecracker): it
+// default-denies every sandbox on that subnet from the node itself, except
+// allow (pkg/docker/netrules ChainAerolvmNode). WASM and isolate sandboxes
+// dial from host processes and are held off the node by the dial guard
+// instead (egresspolicy.CheckNode).
+type NodeGuardSetter interface {
+	SetNodeGuard(ctx context.Context, allow []netrules.NodePort) error
+	// ReassertNodeGuard puts back a guard something removed; repaired
+	// reports that it had to.
+	ReassertNodeGuard(ctx context.Context) (repaired bool, err error)
+}
+
+// ErrNodeGuardUnavailable means the runtime has no host firewall (network
+// rules are off), so nothing keeps its sandboxes off the node's services.
+var ErrNodeGuardUnavailable = errors.New("runtime: the host firewall is off; sandboxes can reach every service on this node")
+
+// WritableLayerSizer is a container engine that can say how much a
+// sandbox has written to its writable layer. Neither containerd's overlay
+// snapshotter nor Docker's overlay2 on a stock ext4 root enforces a size,
+// so the disk watchdog (Service.runDiskLimitWatch) stops a sandbox that has
+// written past its DiskGB.
+type WritableLayerSizer interface {
+	WritableLayerBytes(ctx context.Context, containerRef string) (int64, error)
 }
 
 type ContainerRuntime interface {
@@ -198,10 +263,13 @@ func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
 }
 
 // IdentityStarter is a Runtime whose start must hand the container its
-// sandbox identity again. A Docker container adopted from the warm pool keeps
-// the pool's parked env for life (Docker can't change a container's env), so
-// after every stop its toolboxd boots parked and serves nothing until it is
-// adopted again with the sandbox's ID and toolbox token.
+// sandbox identity again. A Docker or containerd container adopted from the
+// warm pool keeps the pool's parked env for life (Docker can't change a
+// container's env; containerd adoption relabels the container and leaves
+// its spec alone), so after every stop its toolboxd boots parked and serves
+// nothing until it is adopted again with the sandbox's ID and toolbox token. A Firecracker guest
+// restored from its stopped snapshot is adopted again over vsock: its
+// toolboxd serves nothing without the token.
 type IdentityStarter interface {
 	StartWithIdentity(ctx context.Context, containerRef, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error)
 }

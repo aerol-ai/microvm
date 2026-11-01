@@ -8,12 +8,19 @@ import (
 
 // FakeRunner is an in-memory CNI backend for unit tests.
 type FakeRunner struct {
-	mu     sync.Mutex
-	adds   []call
-	dels   []call
-	ips    map[string]string // containerID -> ip
-	addErr error
-	delErr error
+	mu      sync.Mutex
+	adds    []call
+	dels    []call
+	masq    []MasqCall
+	ips     map[string]string // containerID -> ip
+	addErr  error
+	delErr  error
+	masqErr error
+}
+
+// MasqCall records one TeardownIPMasq call.
+type MasqCall struct {
+	ContainerID, ContainerIP string
 }
 
 type call struct {
@@ -26,6 +33,32 @@ func NewFakeRunner() *FakeRunner {
 
 func (f *FakeRunner) SetAddError(err error) { f.addErr = err }
 func (f *FakeRunner) SetDelError(err error) { f.delErr = err }
+
+// SetMasqError makes TeardownIPMasq fail with err (nil clears it).
+func (f *FakeRunner) SetMasqError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.masqErr = err
+}
+
+// TeardownIPMasq records the call; it implements IPMasqTeardown.
+func (f *FakeRunner) TeardownIPMasq(ctx context.Context, containerID, containerIP string) error {
+	_ = ctx
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.masqErr != nil {
+		return f.masqErr
+	}
+	f.masq = append(f.masq, MasqCall{ContainerID: containerID, ContainerIP: containerIP})
+	return nil
+}
+
+// MasqTeardowns returns the recorded TeardownIPMasq calls.
+func (f *FakeRunner) MasqTeardowns() []MasqCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]MasqCall(nil), f.masq...)
+}
 
 func (f *FakeRunner) Add(ctx context.Context, netnsPath, containerID string) (Result, error) {
 	_ = ctx
@@ -53,6 +86,15 @@ func (f *FakeRunner) Del(ctx context.Context, netnsPath, containerID string) err
 	f.dels = append(f.dels, call{netnsPath, containerID})
 	delete(f.ips, containerID)
 	return nil
+}
+
+// IPOf returns the address ADD gave containerID that no DEL has released:
+// what a real netns realized under that id would hold.
+func (f *FakeRunner) IPOf(containerID string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ip, ok := f.ips[containerID]
+	return ip, ok
 }
 
 func (f *FakeRunner) Adds() []call {

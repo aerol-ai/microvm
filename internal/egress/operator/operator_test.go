@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -62,7 +63,9 @@ func TestParseFull(t *testing.T) {
 	if entries, desc, ok := op.OrgProfileEntries("org:baseline"); !ok || len(entries) != 2 || entries[1] != "git.corp.bank.internal:22" || desc != "internal git" {
 		t.Fatalf("org profile entries = %v %q %v", entries, desc, ok)
 	}
-	if op.Ceiling() == nil || op.InternalZone() == nil || len(op.DenyFloor()) != 1 {
+	// The file's deny_cidrs, plus the cloud metadata endpoints every floor
+	// carries.
+	if op.Ceiling() == nil || op.InternalZone() == nil || len(op.DenyFloor()) != 1+len(egresspolicy.MetadataPrefixes) {
 		t.Fatal("ceiling, zone and floor must be set")
 	}
 	up := op.Upstream()
@@ -70,7 +73,7 @@ func TestParseFull(t *testing.T) {
 		t.Fatalf("upstream = %+v", up)
 	}
 	g := op.Guard()
-	if g.Zone == nil || len(g.DenyFloor) != 1 || g.Strict {
+	if g.Zone == nil || len(g.DenyFloor) != 1+len(egresspolicy.MetadataPrefixes) || g.Strict {
 		t.Fatalf("guard = %+v", g)
 	}
 	ig := op.IsolateGuard()
@@ -91,8 +94,12 @@ func TestNilOperatorDefaults(t *testing.T) {
 	if op.DefaultMode() != ModeOpen || !op.NodeControlPortGuard() || !op.BuiltinProfiles() {
 		t.Fatal("nil operator must mean today's behavior")
 	}
-	if op.Ceiling() != nil || op.Upstream() != nil || op.InternalZone() != nil || op.DenyFloor() != nil || op.DefaultAllowOut() != nil || op.OrgProfileNames() != nil {
+	if op.Ceiling() != nil || op.Upstream() != nil || op.InternalZone() != nil || op.DefaultAllowOut() != nil || op.OrgProfileNames() != nil {
 		t.Fatal("nil operator accessors")
+	}
+	// No file still keeps the cloud metadata endpoints out of reach.
+	if !slices.Equal(op.DenyFloor(), egresspolicy.MetadataPrefixes) || !slices.Equal(op.Guard().DenyFloor, egresspolicy.MetadataPrefixes) || !slices.Equal(op.IsolateGuard().DenyFloor, egresspolicy.MetadataPrefixes) {
+		t.Fatal("nil operator floor must be the metadata endpoints")
 	}
 	if _, ok := op.OrgProfile("org:x"); ok {
 		t.Fatal("nil operator has no profiles")

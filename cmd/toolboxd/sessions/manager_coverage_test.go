@@ -34,7 +34,7 @@ func TestManagerCreateDefaultNameGetOrCreateErrorAndMergeEnv(t *testing.T) {
 		t.Fatal("expected GetOrCreate Create failure")
 	}
 
-	merged := mergeEnv(map[string]string{"COV95": "1"})
+	merged := mergeEnvOnto(os.Environ(), map[string]string{"COV95": "1"})
 	found := false
 	for _, e := range merged {
 		if e == "COV95=1" {

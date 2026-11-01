@@ -116,6 +116,29 @@ func (l *ParkedListener) EnvVars() []string {
 	}
 }
 
+// ParkedEnvCredentials reads back what EnvVars and the park's bootstrap token
+// put in a container's env. A container adopted from a warm pool keeps that
+// env for life, so each time it starts again its toolboxd boots parked and
+// sends its hello with these, and the host must listen for exactly them to
+// adopt it again. parked is false for any container that was never parked.
+func ParkedEnvCredentials(env []string) (bootstrapToken, parkNonce string, parked bool) {
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case poolParkedEnv:
+			parked = strings.TrimSpace(v) == "1"
+		case "SB_TOOLBOX_TOKEN":
+			bootstrapToken = strings.TrimSpace(v)
+		case readyNonceEnv:
+			parkNonce = strings.TrimSpace(v)
+		}
+	}
+	return bootstrapToken, parkNonce, parked
+}
+
 // WaitParked accepts one valid parked hello and retains the connection.
 func (l *ParkedListener) WaitParked(ctx context.Context) error {
 	if l == nil || l.listener == nil {

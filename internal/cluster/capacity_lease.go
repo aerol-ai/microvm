@@ -121,6 +121,10 @@ type capacityLeaseCache struct {
 	// lease, which local SelectPlacement reads instead of /v1/capacity.
 	// nil = the node runs no egress gateway, so it never advertises one.
 	localEgressGatewayReady func() bool
+	// localSlotPools overlays SlotPools (this node's network-slot pools and
+	// their free counts) onto our own lease, as /v1/capacity does for peers.
+	// nil = no bounded pool here, which placement reads as "no slot limit".
+	localSlotPools func() []capacity.SlotPool
 }
 
 func newCapacityLeaseCache(selfID string, admitter *capacity.Admitter, interval time.Duration, logger *slog.Logger) *capacityLeaseCache {
@@ -199,6 +203,7 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	templateCatalog := c.localTemplateCatalog
 	wasmModuleInventory := c.localWasmModuleInventory
 	egressGatewayReady := c.localEgressGatewayReady
+	slotPools := c.localSlotPools
 	c.mu.RUnlock()
 	if admitter == nil {
 		return
@@ -228,6 +233,9 @@ func (c *capacityLeaseCache) refreshLocal(now time.Time) {
 	}
 	if egressGatewayReady != nil {
 		snap.EgressGatewayReady = egressGatewayReady()
+	}
+	if slotPools != nil {
+		snap.SlotPools = slotPools()
 	}
 	c.set(c.selfID, snap, now)
 }
@@ -276,6 +284,18 @@ func (c *capacityLeaseCache) SetEgressGatewayReadyProvider(fn func() bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.localEgressGatewayReady = fn
+}
+
+// SetLocalSlotPoolsProvider installs the network-slot pool callback. It runs
+// on every refreshLocal, which placement calls per create on a mixed node, so
+// it must answer from a cache (Service.LocalSlotPools does).
+func (c *capacityLeaseCache) SetLocalSlotPoolsProvider(fn func() []capacity.SlotPool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.localSlotPools = fn
 }
 
 func (c *capacityLeaseCache) set(nodeID string, snap capacity.Snapshot, updated time.Time) {

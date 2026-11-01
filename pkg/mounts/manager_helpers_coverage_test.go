@@ -38,7 +38,7 @@ func TestWriteCredFileAndCleanup(t *testing.T) {
 func TestWaitForMountTimesOut(t *testing.T) {
 	dir := t.TempDir()
 	// A path that never becomes a distinct mount point times out quickly.
-	if err := waitForMount(filepath.Join(dir, "never"), 250*time.Millisecond); err == nil {
+	if err := waitForMount(filepath.Join(dir, "never"), 250*time.Millisecond, nil); err == nil {
 		t.Fatal("waitForMount should time out for a non-mount path")
 	}
 }

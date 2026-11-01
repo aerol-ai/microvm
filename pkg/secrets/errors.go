@@ -14,4 +14,13 @@ var (
 	ErrProviderUnavailable = errors.New("secret provider unavailable")
 	ErrProviderThrottled   = errors.New("secret provider throttled")
 	ErrProviderDenied      = errors.New("secret provider denied")
+
+	// ErrKeyRevoked means the key store deliberately refused the key: it was
+	// disabled, deleted or scheduled for deletion. Only these signals may trip a
+	// revoke (plans/customer-key-custody.md §10); a permission error or an outage
+	// never does.
+	ErrKeyRevoked = errors.New("key revoked by the key store")
+	// ErrKeyVersionRetired means the row was wrapped under a key version the
+	// key store no longer decrypts. It marks a stale row, never a revoke.
+	ErrKeyVersionRetired = errors.New("key version retired by the key store")
 )

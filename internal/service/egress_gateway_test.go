@@ -34,13 +34,21 @@ type fakeGateway struct {
 	probeErr     error
 	control      []netip.AddrPort
 	controlCalls int
+	// pools is the last pools push; poolsUnknown answers it as a gateway
+	// from before the op, and listCalls counts the list pushes.
+	pools        []egress.ControlPool
+	poolsUnknown bool
+	listCalls    int
 	learned      map[string]json.RawMessage
 	learnedErr   error
 	forgotten    []string
 	inspectCA    []egress.InspectCA
-	inspectErr   error
-	retained     []string
-	retains      int
+	// cleared counts ClearInspectCA calls; clearErr is what they return.
+	cleared    int
+	clearErr   error
+	inspectErr error
+	retained   []string
+	retains    int
 }
 
 func newFakeGateway() *fakeGateway {
@@ -131,6 +139,13 @@ func (f *fakeGateway) RetainLearned(_ context.Context, ids []string) error {
 	f.retains++
 	return nil
 }
+func (f *fakeGateway) ClearInspectCA(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cleared++
+	return f.clearErr
+}
+
 func (f *fakeGateway) SetInspectCA(_ context.Context, ca egress.InspectCA) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -144,6 +159,22 @@ func (f *fakeGateway) SetNodeControl(_ context.Context, eps []netip.AddrPort) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.control = append([]netip.AddrPort(nil), eps...)
+	f.pools = nil
+	f.controlCalls++
+	f.listCalls++
+	return nil
+}
+
+// SetNodeControlPools records like SetNodeControl; poolsUnknown makes it a
+// gateway from before the op.
+func (f *fakeGateway) SetNodeControlPools(_ context.Context, nc egress.NodeControl) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.poolsUnknown {
+		return errors.New(`unknown op "node_control_pools"`)
+	}
+	f.control = append([]netip.AddrPort(nil), nc.Endpoints...)
+	f.pools = append([]egress.ControlPool(nil), nc.Pools...)
 	f.controlCalls++
 	return nil
 }
