@@ -257,6 +257,7 @@ func TestBankNoLateralMovement(t *testing.T) {
 		if out, _ := bankRun(t, a, fmt.Sprintf("ping -c 2 -W 2 %s >/dev/null 2>&1; echo rc=$?", bIP), time.Minute); strings.Contains(out, "rc=0") {
 			t.Errorf("sandbox %s gets ICMP echo replies from sandbox %s at %s (interconnect is off by default: no protocol may pass)", a.ID, b.ID, bIP)
 		}
+		bankNoIPv6Path(t, rt, a, b)
 	})
 }
 
@@ -1305,4 +1306,139 @@ func TestBankToolboxAgentUnreachable(t *testing.T) {
 			}
 		})
 	}
+}
+
+// bankNoIPv6Path is UC-318 over IPv6. Every host rule between sandboxes is
+// IPv4, and on cluster-3-mixed-routing a sandbox reached its neighbour at
+// fe80::…%eth0 while the neighbour's IPv4 address timed out. Now neither
+// sandbox may have IPv6 up, a link-local connection from the neighbour to a
+// listener on [::] in the victim must fail, and the node must hold the
+// IPv6 fence (internal/network/ipv6fence) that drops whatever a sandbox
+// still sends.
+func bankNoIPv6Path(t *testing.T, rt bankRuntime, a, b *microvm.Sandbox) {
+	t.Helper()
+	for _, sb := range []*microvm.Sandbox{a, b} {
+		disable, addrs := bankIPv6State(t, sb)
+		t.Logf("%s sandbox %s: net.ipv6.conf.all.disable_ipv6=%q, IPv6 addresses %v", rt.name, sb.ID, disable, addrs)
+		if disable != "1" && len(addrs) > 0 {
+			t.Errorf("sandbox %s (%s) has IPv6 up: disable_ipv6=%q, addresses %v", sb.ID, rt.name, disable, addrs)
+		}
+	}
+	// The victim listens on [::] where it can open an IPv6 socket (busybox
+	// nc binds dual-stack), else on IPv4 only.
+	bankRun(t, b, "nohup sh -c 'while true; do echo v6victim | nc -l -p 8081; done' >/dev/null 2>&1 & sleep 1; echo started", time.Minute)
+	dev := bankDefaultDev(t, b)
+	targets := map[string]bool{}
+	for _, a := range bankLinkLocals(t, b, dev) {
+		targets[a] = true
+	}
+	// The address the kernel would give the victim's interface with IPv6
+	// up: probed even when it has none, so a regression that brings IPv6
+	// back is caught here and not only by the state check above.
+	out, _ := bankRun(t, b, "ip link show "+dev+" | awk '/link\\/ether/ {print $2; exit}'", time.Minute)
+	if ll, ok := bankEUI64LinkLocal(strings.TrimSpace(out)); ok {
+		targets[ll] = true
+	}
+	if len(targets) == 0 {
+		t.Fatalf("no link-local address to probe for sandbox %s (%s has no MAC?)", b.ID, dev)
+	}
+	adev := bankDefaultDev(t, a)
+	for ll := range targets {
+		out, _ := bankRun(t, a, fmt.Sprintf("nc -z -w 3 %s%%%s 8081; echo rc=$?", ll, adev), time.Minute)
+		if strings.Contains(out, "rc=0") {
+			t.Errorf("sandbox %s reached sandbox %s's listener over IPv6 link-local at %s%%%s:8081", a.ID, b.ID, ll, adev)
+		}
+	}
+	bankNodeHoldsIPv6Fence(t, b)
+}
+
+// bankIPv6State is what a sandbox shows of its own IPv6: the
+// all.disable_ipv6 sysctl ("" where the kernel has none, a Firecracker
+// guest booted with ipv6.disable=1, or gVisor not exposing it) and every
+// IPv6 address on any interface.
+func bankIPv6State(t *testing.T, sb *microvm.Sandbox) (string, []string) {
+	t.Helper()
+	out, _ := bankRun(t, sb, `echo "disable=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"; ip -6 -o addr 2>/dev/null | awk '{print "addr=" $2 " " $4}'; awk '{print "addr=" $6 " " $1}' /proc/net/if_inet6 2>/dev/null; true`, time.Minute)
+	disable := ""
+	seen := map[string]bool{}
+	var addrs []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "disable="):
+			disable = strings.TrimPrefix(line, "disable=")
+		case strings.HasPrefix(line, "addr="):
+			if a := strings.TrimPrefix(line, "addr="); !seen[a] {
+				seen[a] = true
+				addrs = append(addrs, a)
+			}
+		}
+	}
+	sort.Strings(addrs)
+	return disable, addrs
+}
+
+// bankDefaultDev is the interface of sb's default route (eth0 on every
+// runtime today).
+func bankDefaultDev(t *testing.T, sb *microvm.Sandbox) string {
+	t.Helper()
+	out, _ := bankRun(t, sb, "ip route | awk '/^default/ {print $5; exit}'", time.Minute)
+	if dev := strings.TrimSpace(out); dev != "" {
+		return dev
+	}
+	return "eth0"
+}
+
+// bankLinkLocals is every fe80 address on dev in sb.
+func bankLinkLocals(t *testing.T, sb *microvm.Sandbox, dev string) []string {
+	t.Helper()
+	out, _ := bankRun(t, sb, "ip -6 -o addr show dev "+dev+" scope link 2>/dev/null | awk '{print $4}' | cut -d/ -f1", time.Minute)
+	var lls []string
+	for _, f := range strings.Fields(out) {
+		if ip := net.ParseIP(f); ip != nil && ip.IsLinkLocalUnicast() && ip.To4() == nil {
+			lls = append(lls, f)
+		}
+	}
+	return lls
+}
+
+// bankEUI64LinkLocal is the fe80 address the kernel derives from a MAC
+// (EUI-64: flip the universal/local bit, insert ff:fe).
+func bankEUI64LinkLocal(mac string) (string, bool) {
+	hw, err := net.ParseMAC(mac)
+	if err != nil || len(hw) != 6 {
+		return "", false
+	}
+	ip := make(net.IP, net.IPv6len)
+	ip[0], ip[1] = 0xfe, 0x80
+	copy(ip[8:], []byte{hw[0] ^ 0x02, hw[1], hw[2], 0xff, 0xfe, hw[3], hw[4], hw[5]})
+	return ip.String(), true
+}
+
+// bankNodeHoldsIPv6Fence checks the node that runs sb over SSH: the ip6
+// table drops IPv6 on the sandbox interfaces, and either the bridge-family
+// table drops it between bridge ports or br_netfilter hands bridged frames
+// to the ip6 table. Skipped (logged) without SSH targets.
+func bankNodeHoldsIPv6Fence(t *testing.T, sb *microvm.Sandbox) {
+	t.Helper()
+	targets := harness.LoadIntegrationTargets()
+	if targets == nil || len(targets.Nodes) == 0 {
+		t.Log("no AEROL_INTEGRATION_TARGETS: the node's IPv6 fence is not checked over SSH")
+		return
+	}
+	node := bankSandboxNode(t, targets, sb)
+	if _, ok := harness.SSHTarget(node); !ok {
+		t.Logf("node %s has no SSH address: the IPv6 fence is not checked", node.Name)
+		return
+	}
+	out := nodeSSH(t, node, "sudo nft list table ip6 aerolvm_ipv6 2>&1; echo '#bridge'; sudo nft list table bridge aerolvm_ipv6 2>&1; echo '#brnf'; cat /proc/sys/net/bridge/bridge-nf-call-ip6tables 2>&1")
+	ip6, rest, _ := strings.Cut(out, "#bridge")
+	bridge, brnf, _ := strings.Cut(rest, "#brnf")
+	if !strings.Contains(ip6, "aerolvm ipv6 fence") || !strings.Contains(ip6, "drop") {
+		t.Errorf("node %s has no IPv6 fence (ip6 table aerolvm_ipv6):\n%s", node.Name, ip6)
+	}
+	if !strings.Contains(bridge, "drop") && strings.TrimSpace(brnf) != "1" {
+		t.Errorf("node %s: no bridge-family IPv6 fence and bridge-nf-call-ip6tables=%q, so bridged IPv6 passes the ip6 table:\n%s", node.Name, strings.TrimSpace(brnf), bridge)
+	}
+	t.Logf("node %s IPv6 fence: bridge table present=%v, bridge-nf-call-ip6tables=%s", node.Name, strings.Contains(bridge, "drop"), strings.TrimSpace(brnf))
 }
