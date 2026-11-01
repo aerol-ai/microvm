@@ -198,7 +198,10 @@ func bankWaitStarted(c *harness.Client, id string, timeout time.Duration) bool {
 }
 
 // UC-334 — API read throughput: concurrent clients list sandboxes and read
-// health for a fixed time; no server error, no transport error.
+// health for a fixed time; no server error, no transport error. A refusal
+// that says when to come back (429, or the 503 a node sheds a list with past
+// SB_API_LIST_MAX_INFLIGHT, both with Retry-After) is load shedding, counted
+// apart; UC-361 drives the cluster past that point on purpose.
 func TestBankAPIThroughput(t *testing.T) {
 	harness.Require(t, sc, "UC-334")
 	workers := benchEnvInt("AEROL_BANK_API_CONCURRENCY", 16)
@@ -222,7 +225,7 @@ func TestBankAPIThroughput(t *testing.T) {
 					switch {
 					case err != nil:
 						netErr.Add(1)
-					case resp.Status == http.StatusTooManyRequests:
+					case (resp.Status == http.StatusTooManyRequests || resp.Status == http.StatusServiceUnavailable) && resp.Header.Get("Retry-After") != "":
 						limited.Add(1)
 					case resp.Status >= 500:
 						srvErr.Add(1)
