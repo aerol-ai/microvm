@@ -83,7 +83,9 @@ func TestLinkOrCopyRootfs(t *testing.T) {
 
 func TestNonLinuxStubsAndWarmDestroyHandle(t *testing.T) {
 	t.Run("rss_sampler_stub", func(t *testing.T) {
-		pages, err := readRSSPagesForPID(123)
+		// Above Linux's pid_max ceiling (4194304), so no process can hold it;
+		// pid 123 was often a live kernel thread on CI runners.
+		pages, err := readRSSPagesForPID(1 << 30)
 		if pages != 0 {
 			t.Fatalf("readRSSPagesForPID() pages = %d, want 0", pages)
 		}
