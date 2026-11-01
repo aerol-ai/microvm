@@ -12,7 +12,8 @@ Spawns a complete AerolVM cluster on EC2 in one `scripts/terraform.sh apply`:
 - an S3 bucket the seed uses to hand its gossip key + TLS bundle to joiners,
 - IAM instance profiles that grant only what each role needs on that bucket,
 - Cloudflare `A` + wildcard `A` records pointing at every ingress-bearing
-  node's public IP.
+  node's public IP, or, with `api_load_balancer = "nlb"`, at a health-checked
+  Network Load Balancer in front of them (see "Load balancer" below).
 
 ## Prereqs
 
@@ -284,6 +285,31 @@ For each ingress-bearing node, two records are created:
 Set `cloudflare_proxied = true` to orange-cloud them. Note: Cloudflare only
 proxies HTTP(S); leave it `false` for raw TCP ingress.
 
+## Load balancer
+
+`api_load_balancer = "nlb"` (default `"none"`) puts an internet-facing AWS
+Network Load Balancer in front of the ingress nodes (`load_balancer.tf`).
+DNS round-robin cannot route around a node whose sandboxd is down while its
+Caddy is up: the handshakes succeed, so its share of clients get 502 until
+the daemon is back. The balancer health-checks every ingress node through
+Caddy to sandboxd and drops a failing one in about 10 s.
+
+- TCP passthrough on `public_http_ports` and `ssh_gateway_port`, instance
+  targets, client IP preserved: Caddy keeps TLS, caddy-l4 keeps SNI routing,
+  and sandboxd's audit records see the real caller.
+- Health check: HTTP `GET /health` on `api_lb_health_check_port` (21280),
+  served by `install.sh --lb-health-port`, open to the balancer's security
+  group only. Every 5 s; out after 2 failures, back after 2 passes.
+- `<domain_name>` and `*.<domain_name>` become one A record to the
+  balancer's Elastic IP. The raw-TCP pool (`l4_port_range`) cannot ride an
+  NLB (50 listeners at most), so `tcp.<domain_name>` keeps one A record per
+  ingress node and every node gets `SB_L4_PUBLIC_HOST=tcp.<domain_name>`.
+- Choose it when the cluster is created: it changes every node's user data,
+  so on a running cluster Terraform replaces the nodes.
+
+`terraform output api_load_balancer` shows the balancer's IP, DNS name,
+target groups and the raw-TCP host.
+
 ## Files
 
 | File                        | Purpose                                   |
@@ -296,6 +322,7 @@ proxies HTTP(S); leave it `false` for raw TCP ingress.
 | `iam.tf`                    | Bundle S3 bucket + seed/joiner profiles   |
 | `nodes.tf`                  | Seed `aws_instance` + joiner `for_each`   |
 | `dns.tf`                    | Cloudflare A + wildcard records           |
+| `load_balancer.tf`          | Optional NLB in front of ingress (`api_load_balancer`) |
 | `outputs.tf`                | Node summary, ingress IPs, SSH help       |
 | `templates/bootstrap.sh.tftpl` | Single user_data template (seed/joiner) |
 | `../config/terraform.tfvars.example` | Drop-in starter for `config/terraform.tfvars` (gitignored sibling) |
