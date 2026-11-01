@@ -32,6 +32,7 @@
 #            cluster-3-mixed-secrets-pkcs11 | cluster-3-mixed-wrapped-kms |
 #            cluster-3-mixed-kms-switch | single-node-wrapped-kms
 # Ingress proxy routing gate: cluster-3-mixed-routing | cluster-hetero-lite-routing
+# Ingress load balancer (UC-356): cluster-3-mixed-lb
 #
 # Safety: every dangerous input is gated by provision.sh check-safety BEFORE any
 # apply. Teardown runs on EXIT/INT/TERM (trap) so a crash can't leak EC2; the
@@ -237,6 +238,20 @@ deploy_obs_tfvar() {
   fi
 }
 
+# api_lb_tfvar mirrors the scenario api-load-balancer capability into
+# Terraform's api_load_balancer var, so the capability that gates UC-356 and
+# the balancer it needs cannot disagree. Passed on every apply AND destroy,
+# like deploy_obs: an operator's terraform.tfvars cannot put a balancer under
+# scenarios that do not ask for one, or leave one out of the scenario that does.
+api_lb_tfvar() {
+  local caps_file="$1"
+  if yq -r '.capabilities | contains(["api-load-balancer"])' "$caps_file" | grep -q true; then
+    echo "nlb"
+  else
+    echo "none"
+  fi
+}
+
 # T7 resolved 2026-07-19: 5×c5.metal workers + 2×m6i.large ingress + 3×t3.medium
 # servers + m6i.large obs (~$21/hr). Kept as a cost acknowledgement gate — set
 # AEROL_HETERO_OBS_T7_OK=1 (Makefile does) to proceed; unset still warns loudly.
@@ -415,7 +430,8 @@ destroy_scenario() {
     $(tf_varfile_args "$scenario") ${admin[@]+"${admin[@]}"} \
     -var="config_dir=${REPO_ROOT}/integration-tests/.tf/${scenario}/config" \
     -var="force_on_demand=$(on_demand_tfvar)" \
-    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
+    -var="deploy_obs=$(deploy_obs_tfvar "${HERE}/scenarios/${scenario}.caps.yml")" \
+    -var="api_load_balancer=$(api_lb_tfvar "${HERE}/scenarios/${scenario}.caps.yml")"
 }
 
 teardown() {
@@ -1279,7 +1295,8 @@ run_one() {
     $(tf_varfile_args "$scenario") \
     -var="config_dir=${overlay}" \
     -var="force_on_demand=$(on_demand_tfvar)" \
-    -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")"
+    -var="deploy_obs=$(deploy_obs_tfvar "$caps_file")" \
+    -var="api_load_balancer=$(api_lb_tfvar "$caps_file")"
 
   # Discover endpoint.
   local targets base_url pat grafana_url pushgateway_url

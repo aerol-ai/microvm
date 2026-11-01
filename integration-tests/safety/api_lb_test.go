@@ -59,3 +59,28 @@ func TestAPILoadBalancerKeepsItsGuarantees(t *testing.T) {
 		t.Errorf("tcp.<domain> must never be proxied: Cloudflare's proxy does not carry raw TCP:\n%s", direct)
 	}
 }
+
+// run.sh turns the api-load-balancer capability into Terraform's
+// api_load_balancer on the apply AND the destroy, as it does deploy_obs for
+// observability. The capability is the one switch: a scenario that gates
+// UC-356 gets the balancer, and an operator's terraform.tfvars cannot put one
+// under the other scenarios.
+func TestHarnessDerivesTheLoadBalancerFromTheCapability(t *testing.T) {
+	run := readRepoFile(t, "integration-tests", "run.sh")
+	fn := hclBlock(run, "api_lb_tfvar() {")
+	if !strings.Contains(fn, `contains(["api-load-balancer"])`) || !strings.Contains(fn, `echo "nlb"`) || !strings.Contains(fn, `echo "none"`) {
+		t.Fatalf("api_lb_tfvar must map the api-load-balancer capability to nlb, else none:\n%s", fn)
+	}
+	if n := strings.Count(run, `-var="api_load_balancer=$(api_lb_tfvar `); n != 2 {
+		t.Fatalf("api_load_balancer is passed %d times; want the apply and the destroy", n)
+	}
+	if !strings.Contains(hclBlock(run, "destroy_scenario() {"), "api_load_balancer=") {
+		t.Fatal("destroy_scenario does not pass api_load_balancer")
+	}
+	caps := readRepoFile(t, "integration-tests", "scenarios", "cluster-3-mixed-lb.caps.yml")
+	for _, want := range []string{"- api-load-balancer", "- domain", "- cluster", "disruptive: true"} {
+		if !strings.Contains(caps, want) {
+			t.Errorf("cluster-3-mixed-lb.caps.yml lacks %q; UC-356 would skip there", want)
+		}
+	}
+}

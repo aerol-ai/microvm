@@ -186,6 +186,34 @@ Fixture notes:
   code path, not a network HSM. The one AWS CloudHSM run is operator-gated
   and not a scenario here (CloudHSM bills hourly per HSM).
 
+## Ingress load balancer (UC-356)
+
+`cluster-3-mixed-lb` (`make integration-cluster-mixed-lb`) is cluster-3-mixed
+with a health-checked AWS Network Load Balancer in front of the ingress
+nodes. Its `api-load-balancer` capability is the switch: run.sh applies and
+destroys with `api_load_balancer = "nlb"` for it and `"none"` for every other
+scenario, whatever `config/terraform.tfvars` says. The domain then resolves to
+the balancer's Elastic IP, and raw TCP ports to `tcp.<domain>` (one record
+per node), so the whole suite also runs through the balancer.
+
+UC-356 (`suite/api_lb_test.go`) checks the domain resolves to the balancer
+only, stops sandboxd on one non-seed node, and reads the balancer's own view
+(`aws elbv2 describe-target-health` on the 443 target group): the node must
+leave rotation within `AEROL_LB_OUT_OF_ROTATION_MAX` (default 20s), 60
+fresh-connection calls through the domain must then all succeed, and after
+the daemon restarts the node must be healthy again within
+`AEROL_LB_BACK_IN_ROTATION_MAX` (default 90s). Each call opens its own TCP
+and TLS connection on a transport of its own, so neither keep-alive nor the
+suite's shared client can hide a 502. The numbers land in
+`<reports>/cluster-3-mixed-lb-bank.json` under
+`api_load_balancer_daemon_outage`.
+
+The scenario needs the default local build, or a release that has
+`install.sh --lb-health-port` and `SB_L4_PUBLIC_HOST`. The reaper
+(`scripts/integration-reap.sh`) terminates instances only, so a scenario
+whose teardown failed keeps its balancer and Elastic IP until
+`integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an
