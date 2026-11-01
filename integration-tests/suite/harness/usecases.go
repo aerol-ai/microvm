@@ -907,6 +907,9 @@ var Registry = []UseCase{
 	// exec-stream churn gate for the cluster-bank-flagship UC-230/UC-266
 	// "unexpected EOF" dials.
 	{ID: "UC-357", Title: "Churn gate for new connections: through every ingress node, fresh TLS to the API and to a sandbox, and new exec streams, never reset or EOF while sandboxes are created and destroyed across the cluster", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	// Bank-readiness stability, continued (bank_scale_test.go): containerd
+	// task output kept draining after create (the UC-171 flagship stall).
+	{ID: "UC-360", Title: "Stability: a sandbox whose main process writes 3 MiB to stdout and 3 MiB to stderr after create keeps running and finishes, on every container runtime (output is drained past the pipe buffers and the task-log cap)", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

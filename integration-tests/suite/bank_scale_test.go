@@ -877,3 +877,34 @@ if [ -z "$pids" ] || [ "$pids" = 0 ]; then echo "no %s process for $id (containe
 sudo kill -9 $pids && echo "killed %s process(es) $pids (container $cid)"
 `, shellQuote(id), kind, kind, kind)
 }
+
+// UC-360 — a sandbox that writes a lot to stdout and stderr keeps running.
+// On containerd, sandboxd stopped draining a task's output when the create
+// returned, so the task's next write blocked forever once ~128 KiB had piled
+// up: a web server froze after a few thousand access-log lines
+// (cluster-bank-flagship UC-171, 2026-11-01; the main process stopped at 127
+// KiB). Here the main process writes 3 MiB to each stream after the create,
+// past the stall and past the 4 MiB task-log cap, and must finish. VM guests
+// write to their console instead, so only container runtimes run it.
+func TestBankChattySandboxKeepsRunning(t *testing.T) {
+	harness.Require(t, sc, "UC-360")
+	const chunks = 48 // 64 KiB each, per stream
+	script := `i=0; while [ $i -lt ` + strconv.Itoa(chunks) + ` ]; do head -c 65535 /dev/zero | tr '\0' o; echo; head -c 65535 /dev/zero | tr '\0' e >&2; echo >&2; i=$((i+1)); echo $i > /tmp/progress; done; echo done > /tmp/done; exec sleep 600`
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		if rt.vm {
+			t.Skip("a VM guest's output goes to its console, not a task FIFO")
+		}
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{ContainerCommand: []string{"sh", "-c", script}})
+		deadline := time.Now().Add(2 * time.Minute)
+		for {
+			out, _ := bankRun(t, sb, "cat /tmp/done 2>/dev/null; cat /tmp/progress 2>/dev/null", time.Minute)
+			if strings.Contains(out, "done") {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("the main process stopped after %s of %d 64 KiB chunks per stream: its output is not drained (a task blocks after ~128 KiB)", strings.TrimSpace(out), chunks)
+			}
+			time.Sleep(2 * time.Second)
+		}
+	})
+}
