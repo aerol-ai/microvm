@@ -213,19 +213,36 @@ func (p *NetnsPool) spawnPause(ctx context.Context) (netnsSlot, error) {
 	if _, err := rand.Read(suffix); err != nil {
 		return netnsSlot{}, err
 	}
-	name := netnsFreePrefix + hex.EncodeToString(suffix)
+	return p.client.startNetnsPause(ctx, p.pauseImage, netnsFreePrefix+hex.EncodeToString(suffix))
+}
 
+// startNetnsPause starts a pause container named name on the sandbox
+// network and returns it with its address. The pool's refill and a
+// restricted create's own pause (netns_pause_on_demand.go) both start
+// theirs here, so an address is held the same way whichever started it.
+// On failure nothing is left behind.
+func (c *Client) startNetnsPause(ctx context.Context, image, name string) (netnsSlot, error) {
+	id, err := c.createNetnsPause(ctx, image, name)
+	if err != nil {
+		return netnsSlot{}, err
+	}
+	return c.runNetnsPause(ctx, id)
+}
+
+// createNetnsPause creates (does not start) a pause container named name.
+func (c *Client) createNetnsPause(ctx context.Context, image, name string) (string, error) {
 	createRequest := map[string]any{
-		"Image":  p.pauseImage,
+		"Image":  image,
 		"Labels": map[string]string{netnsPauseLabelKey: "true"},
 	}
 	hostConfig := map[string]any{}
-	if p.client.network != "" && p.client.network != "bridge" {
-		hostConfig["NetworkMode"] = p.client.network
+	if c.network != "" && c.network != "bridge" {
+		hostConfig["NetworkMode"] = c.network
 	}
-	// The pause owns the netns every adopting sandbox joins, so IPv6 goes
-	// off here, once, for all of them.
-	setSandboxIPv6Off(hostConfig, p.client.network)
+	// The pause owns the netns its sandbox joins (a pool slot's adopter, or
+	// the restricted create that started it), so IPv6 goes off here, once,
+	// for both.
+	setSandboxIPv6Off(hostConfig, c.network)
 	createRequest["HostConfig"] = hostConfig
 
 	var created struct {
@@ -233,23 +250,37 @@ func (p *NetnsPool) spawnPause(ctx context.Context) (netnsSlot, error) {
 	}
 	q := url.Values{}
 	q.Set("name", name)
-	if err := p.client.doJSON(ctx, http.MethodPost, "/containers/create", q, createRequest, nil, &created); err != nil {
-		return netnsSlot{}, fmt.Errorf("create pause container: %w", err)
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/create", q, createRequest, nil, &created); err != nil {
+		return "", fmt.Errorf("create pause container: %w", err)
 	}
-	if err := p.client.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
-		_ = p.client.removeContainer(ctx, created.ID, true)
+	return created.ID, nil
+}
+
+// runNetnsPause starts a created pause container and reads its address,
+// removing it if either fails.
+func (c *Client) runNetnsPause(ctx context.Context, id string) (netnsSlot, error) {
+	slot, err := c.bootNetnsPause(ctx, id)
+	if err != nil {
+		_ = c.removeContainer(context.WithoutCancel(ctx), id, true)
+	}
+	return slot, err
+}
+
+// bootNetnsPause starts a created pause container and reads its address.
+// On failure the container is the caller's to remove.
+func (c *Client) bootNetnsPause(ctx context.Context, id string) (netnsSlot, error) {
+	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(id)+"/start", nil, nil, nil, nil); err != nil {
 		return netnsSlot{}, fmt.Errorf("start pause container: %w", err)
 	}
-	inspect, err := p.client.inspectContainer(ctx, created.ID)
-	ip := getContainerIP(inspect, p.client.network)
+	inspect, err := c.inspectContainer(ctx, id)
+	ip := getContainerIP(inspect, c.network)
 	if err != nil || ip == "" {
-		_ = p.client.removeContainer(ctx, created.ID, true)
 		if err == nil {
-			err = fmt.Errorf("pause container %s has no IP", created.ID)
+			err = fmt.Errorf("pause container %s has no IP", id)
 		}
 		return netnsSlot{}, err
 	}
-	return netnsSlot{containerID: created.ID, ip: ip}, nil
+	return netnsSlot{containerID: id, ip: ip}, nil
 }
 
 // Adopt pops a warm slot and renames it to the sandbox's adopted name.
@@ -278,14 +309,6 @@ func (p *NetnsPool) Adopt(ctx context.Context, sandboxID string) (netnsSlot, boo
 		netnsPoolHits.Add(1)
 		return slot, true
 	}
-}
-
-// ReleaseAdopted removes an adopted pause container after the sandbox
-// create failed downstream of Adopt. The slot can't be returned to the
-// pool: it already carries the sandbox's adopted name, and a rename
-// back would race a concurrent duplicate create for the same ID.
-func (p *NetnsPool) ReleaseAdopted(ctx context.Context, slot netnsSlot) {
-	_ = p.client.removeContainer(ctx, slot.containerID, true)
 }
 
 // removeNetnsPauseForSandbox is the destroy-path cleanup: best-effort

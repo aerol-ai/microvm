@@ -78,8 +78,12 @@ type Client struct {
 	pullFailures       map[string]imagePullFailure
 	warmPool           *dockerpool.Pool
 	netnsPool          *NetnsPool
-	parkDiskGB         int
-	imageIDs           *imageIDCache
+	// pauseImage is the image of the pause container a restricted create
+	// starts for itself when the pool has no slot for it
+	// (netns_pause_on_demand.go).
+	pauseImage string
+	parkDiskGB int
+	imageIDs   *imageIDCache
 	// Mirror configuration: zero value disables rewriting and the pull
 	// path behaves exactly as it did before AOCR mirror support landed.
 	// Set via ConfigureMirror after construction; main() is responsible
@@ -572,6 +576,20 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// put there before the workload started; addressReported: the create
 	// was told that address (runtime.AddressObserver).
 	var earlyRules, addressReported bool
+	// workloadLeft: a failed create's workload container could not be
+	// removed and may run. What keeps it shut then stays: its rules, its
+	// pause and the address the create was told. The orphan sweep destroys
+	// it later, in Destroy's order.
+	var workloadLeft bool
+	removeWorkload := func(id string) {
+		// Not the create's context: a cancelled create must still take its
+		// workload down before anything that keeps it shut goes.
+		if err := c.removeContainer(context.WithoutCancel(ctx), id, true); err != nil {
+			workloadLeft = true
+			c.logger.Warn("failed create: workload container not removed; its rules and pause stay until it is",
+				"sandbox_id", sandboxID, "container_id", id, "error", err)
+		}
+	}
 	if c.netnsPool != nil && effectiveRuntime == models.RuntimeDocker {
 		netnsStart := time.Now()
 		adoptedNetns, netnsAdopted = c.netnsPool.Adopt(ctx, sandboxID)
@@ -581,11 +599,35 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		CreateTimingFrom(ctx).RecordStageDesc("docker_netns", time.Since(netnsStart), desc)
 	}
+	// No slot for a create with network rules: it starts a pause container
+	// of its own and goes on as with a slot, so its rules are on before its
+	// workload runs (netns_pause_on_demand.go). Without rules, Docker's own
+	// path, unchanged.
+	var own *ownPause
+	var ownCreate time.Duration
+	ownDesc := "on_demand"
+	if !netnsAdopted && c.needsOwnPause(req, effectiveRuntime) {
+		pauseStart := time.Now()
+		p, pulled, err := c.startSandboxPause(ctx, sandboxID)
+		if pulled {
+			ownDesc = "on_demand_pulled"
+		}
+		ownCreate = time.Since(pauseStart)
+		if err != nil {
+			CreateTimingFrom(ctx).RecordStageDesc("docker_pause", ownCreate, ownDesc)
+			return nil, fmt.Errorf("pause container for the sandbox's network rules: %w", err)
+		}
+		// Its address is read once it runs, after the workload's create.
+		own, adoptedNetns, netnsAdopted = p, netnsSlot{containerID: p.id}, true
+	}
 	defer func() {
-		// The adopted slot already carries this sandbox's name, so on any
-		// failure below it must be removed, not returned to the pool — a
-		// rename back would race a concurrent duplicate create.
-		if netnsAdopted && !keepNetnsPause {
+		// The slot (adopted, or the create's own pause) carries this
+		// sandbox's name, so on any failure below it must be removed, not
+		// returned to the pool: a rename back would race a concurrent
+		// duplicate create.
+		if netnsAdopted && !keepNetnsPause && !workloadLeft {
+			// A pause still starting is not removed under its start.
+			_, _ = own.wait()
 			// Every failure below has removed the workload container by
 			// now, so nothing sends from the address: the create lets go of
 			// what it keyed by it, then its rules go while the pause
@@ -596,7 +638,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			if earlyRules {
 				c.clearCreateNetRules(adoptedNetns.ip, req)
 			}
-			c.netnsPool.ReleaseAdopted(context.WithoutCancel(ctx), adoptedNetns)
+			c.releaseSandboxPause(ctx, adoptedNetns)
 		}
 	}()
 
@@ -711,6 +753,18 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if err != nil {
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	if own != nil {
+		// The pause started alongside the workload's create; only what that
+		// didn't cover is the create's cost (docker_pause).
+		joinStart := time.Now()
+		slot, err := own.wait()
+		CreateTimingFrom(ctx).RecordStageDesc("docker_pause", ownCreate+time.Since(joinStart), ownDesc)
+		if err != nil {
+			removeWorkload(created.ID)
+			return nil, fmt.Errorf("pause container for the sandbox's network rules: %w", err)
+		}
+		adoptedNetns = slot
+	}
 	// The pause slot fixed the address before the workload exists, and a
 	// duplicate create stopped at the name conflict above: put the
 	// request's rules on the address before the workload starts, so it
@@ -721,7 +775,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		earlyRules = true
 		netrulesStart := time.Now()
 		if err := c.applyCreateNetRules(ip, req); err != nil {
-			_ = c.removeContainer(ctx, created.ID, true)
+			removeWorkload(created.ID)
 			return nil, err
 		}
 		if hasCreateNetRules(req) {
@@ -733,7 +787,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	startStart := time.Now()
 	if err := c.doJSON(ctx, http.MethodPost, "/containers/"+url.PathEscape(created.ID)+"/start", nil, nil, nil, nil); err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 	CreateTimingFrom(ctx).RecordStage("docker_start", time.Since(startStart))
@@ -742,13 +796,13 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	containerIP, inspect, err := c.waitForContainerRunning(ctx, created.ID)
 	runtimeWait := time.Since(runtimeWaitStart)
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 
 	toolboxAddr, err := c.toolboxAddr(inspect, containerIP)
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 	toolboxWaitStart := time.Now()
@@ -758,7 +812,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		timing.RecordDockerWaits(runtimeWait, toolboxWait, toolboxSource)
 	}
 	if err != nil {
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, err
 	}
 	if readyListener != nil {
@@ -780,7 +834,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if earlyRules && runtime.ContainerIP != strings.TrimSpace(adoptedNetns.ip) {
 		// The rules, and any attach the create started, are on the pause
 		// slot's address: a workload at another one would run without them.
-		_ = c.removeContainer(ctx, created.ID, true)
+		removeWorkload(created.ID)
 		return nil, fmt.Errorf("docker: sandbox came up at %q, not at its pause slot's address %q", runtime.ContainerIP, adoptedNetns.ip)
 	}
 	netrulesStart := time.Now()
@@ -791,7 +845,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			// Clear any partial state and tear the container down before
 			// returning the error.
 			_ = c.networkRules.ClearBlockAllEgress(runtime.ContainerIP)
-			_ = c.removeContainer(ctx, created.ID, true)
+			removeWorkload(created.ID)
 			return nil, fmt.Errorf("apply network block: %w", err)
 		}
 	}
@@ -803,7 +857,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 			// only a partial rule set must not be left running. Roll the
 			// partial policy back and tear the container down.
 			_ = c.networkRules.ClearEgressPolicy(runtime.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut)
-			_ = c.removeContainer(ctx, created.ID, true)
+			removeWorkload(created.ID)
 			return nil, fmt.Errorf("apply egress policy: %w", err)
 		}
 	}
@@ -904,7 +958,7 @@ func (c *Client) Stop(ctx context.Context, containerRef string) error {
 }
 
 func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
-	if sandbox != nil && c.netnsPool != nil {
+	if sandbox != nil && c.pausesPossible() {
 		if onPause, err := c.hasNetnsPause(ctx, sandbox.ID); err == nil && onPause {
 			return c.destroyOnPause(ctx, sandbox)
 		}
@@ -933,8 +987,8 @@ func (c *Client) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	return c.removeContainer(ctx, containerRef, true)
 }
 
-// hasNetnsPause reports whether the sandbox runs on an adopted pause
-// container (the pause-netns pool).
+// hasNetnsPause reports whether the sandbox runs in a pause container's
+// network namespace (a pool slot, or its own).
 func (c *Client) hasNetnsPause(ctx context.Context, sandboxID string) (bool, error) {
 	if _, err := c.inspectContainer(ctx, netnsAdoptedName(sandboxID)); err != nil {
 		if isContainerNotFoundError(err) {
@@ -1914,6 +1968,8 @@ type containerSummary struct {
 	ID     string            `json:"Id"`
 	Names  []string          `json:"Names"`
 	Labels map[string]string `json:"Labels"`
+	// Created is the container's creation time, Unix seconds.
+	Created int64 `json:"Created"`
 }
 
 func splitSnapshotImageRef(imageRef string) (repo, tag string, err error) {
