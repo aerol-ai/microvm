@@ -191,6 +191,9 @@ func TestSandboxHasNoNetRaw(t *testing.T) {
 // (this exec proves it).
 func TestBlockAllGuardsHostServices(t *testing.T) {
 	harness.Require(t, sc, "UC-184")
+	if refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkBlockAll: true}) {
+		return
+	}
 	c := client(t)
 	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Name: harness.UniqueName(sc, t), NetworkBlockAll: true})
 	waitRunning(t, sb)
