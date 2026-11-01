@@ -256,6 +256,9 @@ func TestAPILoadBalancerRidesOutADaemonOutage(t *testing.T) {
 	if !ok {
 		t.Fatal("no ingress node reachable over SSH to stop")
 	}
+	// lbVictim prefers a non-seed ingress; a topology whose only ingress is
+	// the seed cannot lose it without losing the cluster.
+	requireNonSeedVictim(t, victim)
 	probe := newLBProber(sc.Domain, sc.PAT)
 
 	// 2. Before: the victim is in rotation and every call succeeds.
