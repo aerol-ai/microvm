@@ -299,6 +299,16 @@ reads it for the internal zone, its copy of the floor and the proxy.
   now times out; point it at the ingress URL, or set the guard to `false`.
   Setting it to `false` never opens the sandbox's own node: the node guard
   below holds that.
+  - The Firecracker TAP subnet is guarded whole: one `node_control` entry
+    per control port whose destination is the whole TAP subnet, so every
+    guest's TAP address (the host side of its `/30`) is covered from boot
+    and guests starting and stopping never rewrite the set. Each rewrite
+    replaced the whole set and held the node's nftables commit mutex for
+    about 25 ms on a 48-vCPU host, so creates waited behind it.
+  - A gateway older than sandboxd answers the pools push with
+    `unknown op "node_control_pools"`; sandboxd then lists every TAP
+    address one by one, as before, until the gateway restarts on the new
+    binary.
 - **Node guard (always on, no file needed).** Sandboxes are default-denied
   from the node they run on: every new connection from a sandbox subnet to
   any node address is dropped by `AEROLVM-NODE` (the first rule of `INPUT`,
@@ -339,6 +349,12 @@ sudo nft list table ip aerolvm_block
   blocked sandbox until sandboxd puts it back. That happens on the next
   block operation, or within 30 s on the re-assert tick, with every
   element sandboxd knows of. The log line is `block sets repaired`.
+- **The re-assert only reads** while the table is as sandboxd made it: it
+  writes only what is missing or changed. sandboxd keeps one netlink
+  socket open for the sets. Closing a netfilter socket makes the kernel
+  take the commit mutex and wait an RCU grace period for anything an
+  earlier commit left to free (5 to 10 ms on a 48-vCPU host), and every
+  create's lift waits behind that.
 - **Per-address rules** are the old form of the block: a `-s IP -j DROP`
   in `DOCKER-USER`/`AEROLVM-USER`/`AEROLVM-FC` and an `sbx-input-block`
   drop in `AEROLVM-INPUT`. sandboxd converts them into set elements at

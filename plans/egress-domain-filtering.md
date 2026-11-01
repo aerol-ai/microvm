@@ -1278,6 +1278,13 @@ upstream_proxy:
     (`7002`) and Raft ports.
   - It is filled from gossip membership (debounced; up to 2000 members × 4
     ports) and dropped in forward for every sandbox.
+  - The Firecracker TAP subnet is a control pool: one entry per control
+    port with the whole subnet as the destination, not one per guest TAP
+    address. Per-address listing rewrote the whole set at every guest start
+    and stop, a 25 ms hold of the node's commit mutex on a 48-vCPU host
+    that a create's lift waited behind (UC-185 Firecracker p99 20 ms on the
+    bank flagship). An older gateway answers the pools op "unknown op" and
+    gets the per-address list.
   - It extends P0-5, which only protects the local host, to every node.
     Ingress `80`/`443` stays reachable, so agents keep using the API's
     load-balanced URL.
