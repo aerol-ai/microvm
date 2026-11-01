@@ -1786,6 +1786,17 @@ Phase 3 starts.
        on purpose: a sandboxd crash mid-create then leaves an orphan behind
        its block-all, never open. Every path that frees an address detaches
        the gateway first.
+     - **Amendment 2026-11-01 (fix/egress-docker-pause-on-demand).** Docker
+       without a pause slot (pool off, or empty) gave a sandbox its address
+       only when it started the workload, so a restricted create's rules
+       went on a few milliseconds after the workload ran. Such a create
+       (block-all, a CIDR list, or a hostname allowlist) now starts a pause
+       container of its own through the pool's code and follows the slot
+       contract above; a create without rules keeps Docker's own path. The
+       cost is the `docker_pause` stage. gVisor on the Docker engine is the
+       one create left whose block-all goes on after the workload starts
+       (runsc doesn't join a pause's namespace; on the containerd engine it
+       uses the netns pool and is covered).
    - **Measured, not estimated.**
      - `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` (the
        time the create actually waited) are recorded through
