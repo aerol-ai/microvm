@@ -399,6 +399,10 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 	if err != nil {
 		return nil, err
 	}
+	// A duplicate concurrent start waits here, then finds the task running
+	// and returns its state.
+	unlock := d.lockStart(containerRef)
+	defer unlock()
 	container, err := client.LoadContainer(ctx, containerRef)
 	if err != nil {
 		return nil, fmt.Errorf("load container: %w", err)

@@ -678,3 +678,44 @@ func TestWarmPoolChurnLeavesNoContainerFiles(t *testing.T) {
 		t.Fatalf("%d containers left", n)
 	}
 }
+
+// Two starts of one stopped pool sandbox at once (a retried SDK call, the
+// CLI's exec-starts-it racing a start): both succeed with the same state,
+// and the agent is adopted once, not raced over one socket path.
+func TestConcurrentStartsOfOneSandbox(t *testing.T) {
+	r := newRestartRig(t)
+	ctx := context.Background()
+	r.adopt("park-cc", "sb-cc", "tok")
+	if err := r.d.Stop(ctx, "park-cc"); err != nil {
+		t.Fatal(err)
+	}
+	const n = 4
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	states := make([]*models.SandboxRuntimeState, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			states[i], errs[i] = r.d.StartWithIdentity(ctx, "park-cc", "sb-cc", "tok")
+		}()
+	}
+	wg.Wait()
+	for i := range n {
+		if errs[i] != nil || states[i].Status != models.SandboxStatusStarted || states[i].ContainerID != "park-cc" {
+			t.Fatalf("start %d = %+v, %v", i, states[i], errs[i])
+		}
+	}
+	r.mu.Lock()
+	adopts := len(r.adopted)
+	r.mu.Unlock()
+	if adopts != 2 { // the create's, and one start's
+		t.Fatalf("the agent was adopted %d times, want 2", adopts)
+	}
+	r.d.startMu.Lock()
+	left := len(r.d.startLocks)
+	r.d.startMu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d start locks outlived their starts", left)
+	}
+}
