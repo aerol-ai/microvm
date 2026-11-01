@@ -117,6 +117,12 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrWakeCircuitOpen):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 60, Message: err.Error()}
 
+	// Load shedding (admission.go): this node runs as many requests of an
+	// expensive kind as it is configured to. Retryable at once, no log line
+	// (a storm would otherwise write one per refused request).
+	case errors.Is(err, ErrOverloaded):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: OverloadedRetryAfterSeconds, Code: models.ErrorCodeOverloaded, Message: ErrOverloaded.Error()}
+
 	case errors.Is(err, service.ErrSecretAuditBusy):
 		return Classification{Status: http.StatusTooManyRequests, RetryAfter: 1, Message: service.ErrSecretAuditBusy.Error()}
 	case errors.Is(err, service.ErrSecretAuditChainBroken):

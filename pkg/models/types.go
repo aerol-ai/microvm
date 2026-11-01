@@ -1455,6 +1455,12 @@ const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
 // creates the sandbox without the mount.
 const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
 
+// ErrorCodeOverloaded is returned (503, with Retry-After) when the node shed
+// the request: it already runs as many requests of that kind (cluster-wide
+// sandbox lists) as it is configured to. Retrying after Retry-After is the
+// recovery; nothing is wrong with the request.
+const ErrorCodeOverloaded = "overloaded"
+
 // ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
 // container or Firecracker create while this node's guard that keeps
 // sandboxes off the node's own services is not installed for that runtime;

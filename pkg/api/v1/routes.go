@@ -31,6 +31,10 @@ type Deps struct {
 	// ContainerEngine is the host engine (docker|containerd). Used for
 	// Server-Timing engine tags and BuildKit-absent clear errors.
 	ContainerEngine string
+	// ListGate bounds the cluster-wide lists this node runs at once
+	// (clusterlist.Admit); nil admits every list. One gate is shared by v1
+	// and every facade: they cost the same fan-out.
+	ListGate *apihttp.Gate
 }
 
 // Route returns h behind authenticate → authorize(perm) → audit seam

@@ -1518,6 +1518,13 @@ type Config struct {
 	// I/O and takes no lock, so a daemon busy serving the API still answers
 	// it. Empty means off. SB_LIVENESS_SOCKET.
 	LivenessSocket string
+	// APIListMaxInflight bounds the cluster-wide sandbox lists (v1 and the
+	// Daytona, E2B and Runloop facades) this node runs at once; past it a
+	// list waits at most APIListQueueWait for a slot and is otherwise
+	// answered 503 + Retry-After. 0 = no limit. SB_API_LIST_MAX_INFLIGHT,
+	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
+	APIListMaxInflight int
+	APIListQueueWait   time.Duration
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -2897,6 +2904,9 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, err
 	}
 	if err := cfg.loadLivenessConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAPIAdmissionConfig(); err != nil {
 		return Config{}, err
 	}
 	if err := validateIdentity(&cfg); err != nil {

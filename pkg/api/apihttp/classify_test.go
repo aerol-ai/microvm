@@ -1,6 +1,7 @@
 package apihttp
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,9 @@ func TestClassify(t *testing.T) {
 		kind       ErrKind
 	}{
 		{"not found", store.ErrNotFound, http.StatusNotFound, 0, "", ErrKindNotFound},
+		// Load shedding: a fast retryable 503, never the 400 catch-all.
+		{"overloaded", ErrOverloaded, http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
+		{"overloaded while the caller left", fmt.Errorf("%w: %w", ErrOverloaded, context.Canceled), http.StatusServiceUnavailable, OverloadedRetryAfterSeconds, models.ErrorCodeOverloaded, ErrKindOther},
 		{"admission denied", controlplane.ErrAdmissionDenied, http.StatusForbidden, 0, "", ErrKindOther},
 		{"admission unavailable", controlplane.ErrAdmissionUnavailable, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
 		{"engine not registered", models.ErrContainerEngineNotRegistered, http.StatusServiceUnavailable, admissionRetryAfterSeconds, "", ErrKindOther},
