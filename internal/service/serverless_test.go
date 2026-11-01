@@ -239,9 +239,11 @@ func TestDockerEventManualStopDoesNotArmWake(t *testing.T) {
 
 // TestDockerEventOOMAlwaysInvoluntary: even when sandboxd had recorded
 // an expected stop (e.g. operator issued StopSandbox), an OOM kill
-// reaping the container before the stop completed must still classify
-// as involuntary so a serverless sandbox can recover on the next
-// request. The kernel killed the container, not the operator.
+// reaping the container before the stop completed (an oom event, then
+// the init's die) must still classify as involuntary so a serverless
+// sandbox can recover on the next request. The kernel killed the
+// container, not the operator. The oom event alone stops nothing and
+// arms nothing.
 func TestDockerEventOOMAlwaysInvoluntary(t *testing.T) {
 	ctx := context.Background()
 	svc, st := newServerlessHarness(t, &fakeCapacityRuntime{})
@@ -249,15 +251,21 @@ func TestDockerEventOOMAlwaysInvoluntary(t *testing.T) {
 
 	svc.recordExpectedStop(sb.ID, stopModeManual)
 
-	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{
-		SandboxID: sb.ID,
-		Action:    "oom",
-		Time:      time.Now().UTC(),
-	}); err != nil {
+	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: sb.ID, Action: "oom", Time: time.Now().UTC()}); err != nil {
 		t.Fatalf("handleDockerEvent oom: %v", err)
 	}
-
 	got, err := st.Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.WakeArmed || got.Status != models.SandboxStatusStarted {
+		t.Fatalf("an oom event alone armed wake (%v) or stopped the sandbox (%q)", got.WakeArmed, got.Status)
+	}
+
+	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: sb.ID, Action: "die", ExitCode: 137, Time: time.Now().UTC()}); err != nil {
+		t.Fatalf("handleDockerEvent die: %v", err)
+	}
+	got, err = st.Get(ctx, sb.ID)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}

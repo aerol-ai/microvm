@@ -619,6 +619,11 @@ type Service struct {
 	// of leaving them to wait on a sandbox that is gone (toolbox_calls.go).
 	toolboxCalls toolboxCallRegistry
 
+	// sandboxOOMs remembers recent oom events, so the die that follows an
+	// init's OOM kill is recorded as one (sandbox_oom.go). An oom event is
+	// not a stop.
+	sandboxOOMs sandboxOOMTracker
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE

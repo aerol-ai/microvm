@@ -2,8 +2,8 @@
 
 package suite
 
-// Security boundary cases for running untrusted code (UC-317..UC-332 and
-// UC-339): what
+// Security boundary cases for running untrusted code (UC-317..UC-332,
+// UC-339, UC-340 and UC-345): what
 // a regulated buyer asks of a platform that executes code it did not write.
 // Every case attacks the boundary from inside a sandbox, or from the
 // internet, and asserts it holds on each shell runtime the scenario has:
@@ -535,13 +535,11 @@ func TestBankMemoryBombContained(t *testing.T) {
 			t.Errorf("a 1 TiB string was allocated in a %d MiB sandbox: %s", memMB, out)
 		}
 		t.Logf("%s: memory bomb ended with %q", rt.name, strings.TrimSpace(out))
-		// The bomb's own sandbox may be stopped by its OOM (a group kill
-		// takes its init): containment either way, reported for the record.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		if res, err := sb.ExecCommand(ctx, "echo alive"); err != nil || !strings.Contains(res.Stdout, "alive") {
-			t.Logf("FINDING: %s: the memory bomb's sandbox stopped answering after its OOM (%v)", rt.name, err)
-		}
-		cancel()
+		// The kernel killed the bomb, not its sandbox: the sandbox keeps
+		// answering. The daemon used to read the container engine's oom
+		// event as the sandbox's exit and answer "sandbox is not running"
+		// from here on (UC-345).
+		bankStillAnswers(t, sb, time.Minute)
 		for _, s := range []*microvm.Sandbox{neighbour} {
 			deadline := time.Now().Add(3 * time.Minute)
 			for {
@@ -1492,4 +1490,116 @@ func bankNodeHoldsIPv6Fence(t *testing.T, sb *microvm.Sandbox) {
 		t.Errorf("node %s: no bridge-family IPv6 fence and bridge-nf-call-ip6tables=%q, so bridged IPv6 passes the ip6 table:\n%s", node.Name, strings.TrimSpace(brnf), bridge)
 	}
 	t.Logf("node %s IPv6 fence: bridge table present=%v, bridge-nf-call-ip6tables=%s", node.Name, strings.Contains(bridge, "drop"), strings.TrimSpace(brnf))
+}
+
+// bankStillAnswers asserts sb is running and answers an exec within wait.
+func bankStillAnswers(t *testing.T, sb *microvm.Sandbox, wait time.Duration) {
+	t.Helper()
+	var last string
+	for deadline := time.Now().Add(wait); ; time.Sleep(5 * time.Second) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		res, err := sb.ExecCommand(ctx, "echo alive")
+		cancel()
+		if err == nil && res.ExitCode == 0 && strings.Contains(res.Stdout, "alive") {
+			break
+		}
+		last = fmt.Sprintf("%v %q", err, res.Stdout+res.Stderr)
+		if time.Now().After(deadline) {
+			t.Fatalf("sandbox %s stopped answering after an OOM kill inside it: %s", sb.ID, last)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := client(t).SDK().Get(ctx, sb.ID)
+	if err != nil {
+		t.Fatalf("get %s: %v", sb.ID, err)
+	}
+	if string(got.Status) != "started" {
+		t.Fatalf("sandbox %s answers but reads %q (last error %q) after an OOM kill inside it", sb.ID, got.Status, got.LastError)
+	}
+}
+
+// bankAddressRules is the node's host firewall lines that name ip (iptables,
+// legacy iptables and nftables, whichever the node uses), normalized so two
+// snapshots compare: nft counters are dropped, and a set's element list is
+// reduced to "holds ip".
+func bankAddressRules(t *testing.T, node harness.IntegrationNode, ip string) []string {
+	t.Helper()
+	out := nodeSSH(t, node, "sudo iptables-save 2>/dev/null; sudo iptables-legacy-save 2>/dev/null; sudo nft list ruleset 2>/dev/null; true")
+	re := ipOnLine(ip)
+	counters := regexp.MustCompile(`counter packets \d+ bytes \d+ ?`)
+	var rules []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if !re.MatchString(line) {
+			continue
+		}
+		if strings.Contains(line, "elements = {") {
+			line = "a set holds " + ip
+		}
+		rules = append(rules, counters.ReplaceAllString(line, ""))
+	}
+	sort.Strings(rules)
+	return rules
+}
+
+// UC-345 — a process OOM-killed inside a sandbox neither stops the sandbox
+// nor opens its egress. Docker's "oom" and containerd's /tasks/oom fire when
+// the kernel OOM-kills ANY process in the container's cgroup. The daemon used
+// to run its stop path on that event: the sandbox read as stopped while it
+// kept running, and its block-all, CIDR and hostname-allowlist rules were
+// removed from the node, so a tenant could open its own internet egress with
+// a memory spike (the subnet floor still blocked metadata and other
+// sandboxes). Now the event is only recorded; only the sandbox's exit stops
+// it.
+func TestBankOOMKeepsSandboxAndEgress(t *testing.T) {
+	harness.Require(t, sc, "UC-345")
+	targets := bankTargets(t)
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		if !rt.vm && refusedForNoHostFirewall(t, sdktypes.CreateSandboxOptions{NetworkBlockAll: true, Runtime: rt.runtime, Image: bankImage(rt)}) {
+			return
+		}
+		const memMB = 256
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{MemoryMB: memMB, NetworkBlockAll: true})
+		node := bankSandboxNode(t, targets, sb)
+		ip := containerIP(t, client(t), sb)
+		before := bankAddressRules(t, node, ip)
+		t.Logf("%s %s at %s on %s: %d host rule lines before", rt.name, sb.ID, ip, node.Name, len(before))
+		if len(before) == 0 && !rt.vm {
+			t.Fatalf("no host rule on %s names the block-all sandbox's address %s", node.Name, ip)
+		}
+		if bankTCPOpen(t, sb, "1.1.1.1", 443) {
+			t.Fatalf("%s: a block-all sandbox reached 1.1.1.1:443 before the OOM", rt.name)
+		}
+
+		// The doubling bomb from UC-321: the kernel kills awk, a child of
+		// toolboxd, at the sandbox's memory limit.
+		out, _ := bankRun(t, sb, `awk 'BEGIN{s="x"; for(i=0;i<40;i++){s=s s}; print length(s)}'; echo rc=$?`, 5*time.Minute)
+		t.Logf("%s: memory bomb ended with %q", rt.name, strings.TrimSpace(out))
+		if regexp.MustCompile(`rc=0\b`).MatchString(out) {
+			t.Fatalf("a 1 TiB string was allocated in a %d MiB sandbox: %s", memMB, out)
+		}
+		time.Sleep(5 * time.Second) // the oom event reaches the daemon in well under a second
+
+		bankStillAnswers(t, sb, time.Minute)
+		if bankTCPOpen(t, sb, "1.1.1.1", 443) {
+			t.Errorf("%s: block-all egress was open after an OOM kill inside the sandbox (TCP to 1.1.1.1:443 connected)", rt.name)
+		}
+		after := bankAddressRules(t, node, ip)
+		have := map[string]int{}
+		for _, r := range after {
+			have[r]++
+		}
+		var gone []string
+		for _, r := range before {
+			if have[r] == 0 {
+				gone = append(gone, r)
+				continue
+			}
+			have[r]--
+		}
+		if len(gone) > 0 {
+			t.Errorf("%s: %d host rule lines for %s were removed by an OOM kill inside the sandbox: %v", rt.name, len(gone), ip, gone)
+		}
+	})
 }
