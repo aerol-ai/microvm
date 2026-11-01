@@ -30,6 +30,19 @@ type netnsFakeDaemon struct {
 	// created keeps every create, including containers a failed create
 	// removed again, so a test can read what was sent.
 	created []netnsFakeContainer
+	// missing holds images the engine doesn't have until a pull of them
+	// lands (a create of one answers 404 No such image, as Docker does).
+	missing map[string]bool
+	// now stamps each new container (Docker's Created, Unix seconds).
+	now int64
+	// Injection points and hooks for the ordering tests. The hooks run with
+	// d.mu held: they may read containers through byRef, nothing else here.
+	createResp func(name, image string) *http.Response
+	startResp  func(c *netnsFakeContainer) *http.Response
+	pullResp   func(image string) *http.Response
+	removeResp func(c *netnsFakeContainer) *http.Response
+	onStart    func(c *netnsFakeContainer)
+	onRemove   func(c *netnsFakeContainer)
 }
 
 type netnsFakeContainer struct {
@@ -40,6 +53,7 @@ type netnsFakeContainer struct {
 	ip      string
 	netMode string
 	sysctls map[string]string
+	created int64
 }
 
 func newNetnsFakeDaemon() *netnsFakeDaemon {
@@ -77,22 +91,37 @@ func (d *netnsFakeDaemon) inspectJSON(c *netnsFakeContainer) string {
 
 func (d *netnsFakeDaemon) transport() roundTripFunc {
 	return func(r *http.Request) (*http.Response, error) {
+		// As a real transport: a request on an ended context never lands.
+		if err := r.Context().Err(); err != nil {
+			return nil, err
+		}
 		d.mu.Lock()
 		defer d.mu.Unlock()
 		p := r.URL.Path
 		d.requests = append(d.requests, r.Method+" "+p)
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(p, "/images/"):
-			if d.imageMissing {
+			if d.imageMissing || d.missing[strings.TrimSuffix(strings.TrimPrefix(p, "/images/"), "/json")] {
 				return textResponse(http.StatusNotFound, `{"message":"No such image"}`), nil
 			}
 			return jsonResponse(http.StatusOK, map[string]any{"Id": "pauseimg"}), nil
 		case r.Method == http.MethodPost && p == "/images/create":
 			d.pullCalls++
+			image := r.URL.Query().Get("fromImage")
+			if tag := r.URL.Query().Get("tag"); tag != "" {
+				image += ":" + tag
+			}
+			if d.pullResp != nil {
+				if resp := d.pullResp(image); resp != nil {
+					return resp, nil
+				}
+			}
 			d.imageMissing = false
+			delete(d.missing, image)
 			return textResponse(http.StatusOK, "{}"), nil
 		case r.Method == http.MethodPost && p == "/containers/create":
 			var body struct {
+				Image      string            `json:"Image"`
 				Labels     map[string]string `json:"Labels"`
 				HostConfig struct {
 					NetworkMode string            `json:"NetworkMode"`
@@ -100,6 +129,18 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 				} `json:"HostConfig"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
+			name := r.URL.Query().Get("name")
+			if d.createResp != nil {
+				if resp := d.createResp(name, body.Image); resp != nil {
+					return resp, nil
+				}
+			}
+			if d.missing[body.Image] {
+				return textResponse(http.StatusNotFound, fmt.Sprintf(`{"message":"No such image: %s"}`, body.Image)), nil
+			}
+			if name != "" && d.byRef(name) != nil {
+				return textResponse(http.StatusConflict, fmt.Sprintf(`{"message":"Conflict. The container name \"/%s\" is already in use"}`, name)), nil
+			}
 			d.nextID++
 			id := fmt.Sprintf("pause-%d", d.nextID)
 			ip := fmt.Sprintf("172.30.0.%d", d.nextID)
@@ -113,11 +154,12 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			}
 			d.containers[id] = &netnsFakeContainer{
 				id:      id,
-				name:    r.URL.Query().Get("name"),
+				name:    name,
 				labels:  body.Labels,
 				ip:      ip,
 				netMode: body.HostConfig.NetworkMode,
 				sysctls: body.HostConfig.Sysctls,
+				created: d.now,
 			}
 			d.created = append(d.created, *d.containers[id])
 			return jsonResponse(http.StatusCreated, map[string]string{"Id": id}), nil
@@ -127,6 +169,14 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			}
 			ref := strings.TrimSuffix(strings.TrimPrefix(p, "/containers/"), "/start")
 			if c := d.byRef(ref); c != nil {
+				if d.startResp != nil {
+					if resp := d.startResp(c); resp != nil {
+						return resp, nil
+					}
+				}
+				if d.onStart != nil {
+					d.onStart(c)
+				}
 				c.running = true
 			}
 			return textResponse(http.StatusNoContent, ""), nil
@@ -145,7 +195,7 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			out := make([]map[string]any, 0, len(d.containers))
 			for _, c := range d.containers {
 				out = append(out, map[string]any{
-					"Id": c.id, "Names": []string{"/" + c.name}, "Labels": c.labels,
+					"Id": c.id, "Names": []string{"/" + c.name}, "Labels": c.labels, "Created": c.created,
 				})
 			}
 			return jsonResponse(http.StatusOK, out), nil
@@ -161,6 +211,14 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			c := d.byRef(ref)
 			if c == nil {
 				return textResponse(http.StatusNotFound, "no such container"), nil
+			}
+			if d.removeResp != nil {
+				if resp := d.removeResp(c); resp != nil {
+					return resp, nil
+				}
+			}
+			if d.onRemove != nil {
+				d.onRemove(c)
 			}
 			delete(d.containers, c.id)
 			return textResponse(http.StatusNoContent, ""), nil

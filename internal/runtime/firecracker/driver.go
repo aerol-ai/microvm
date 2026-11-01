@@ -46,6 +46,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	"github.com/aerol-ai/microvm/pkg/firecracker"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -576,11 +577,32 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, fmt.Errorf("firecracker runtime: tap allocate: %w", err)
 	}
 	released := false
+	// egressApplied: the guest IP may carry the request's rules;
+	// addressReported: the create was told the guest IP
+	// (runtime.AddressObserver).
+	var egressApplied, addressReported bool
 	defer func() {
 		if !released {
+			// Last of the failure cleanups: the VM is down and its TAP gone,
+			// so nothing sends from the address; the create lets go of what
+			// it keyed by it before the slot can go to another sandbox.
+			if addressReported {
+				sbruntime.NotifyReleasingAddress(ctx, slot.GuestIP)
+			}
 			if relErr := d.pool.Release(ctx, allocID); relErr != nil {
 				d.logger.Warn("firecracker: pool release after error failed",
 					"sandbox_id", allocID, "tap", slot.TapName, "error", relErr)
+			}
+		}
+	}()
+	defer func() {
+		// Runs after the VMM cleanup and the TAP removal below (defers
+		// unwind in reverse), so a guest that had booted is down before its
+		// rules lift; the slot is still held, so the rules are still its.
+		if !released && egressApplied {
+			if cErr := d.clearGuestRules(slot.GuestIP, req.NetworkAllowOut, req.NetworkDenyOut); cErr != nil {
+				d.logger.Warn("firecracker: clear egress rules after error failed",
+					"sandbox_id", allocID, "guest_ip", slot.GuestIP, "error", cErr)
 			}
 		}
 	}()
@@ -755,18 +777,15 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}()
 	// Egress policy on the guest IP before the VM runs (Phase 4): it never
 	// runs unfiltered, and a failed create leaves no rule for the next
-	// sandbox on this slot.
+	// sandbox on this slot (a partial install included).
+	egressApplied = true
 	if err := d.applyCreateEgress(slot.GuestIP, req); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: egress policy: %w", err)
 	}
-	defer func() {
-		if !released {
-			if cErr := d.clearGuestRules(slot.GuestIP, req.NetworkAllowOut, req.NetworkDenyOut); cErr != nil {
-				d.logger.Warn("firecracker: clear egress rules after error failed",
-					"sandbox_id", allocID, "guest_ip", slot.GuestIP, "error", cErr)
-			}
-		}
-	}()
+	// The guest IP is fixed and shut, and the VM hasn't started: report it,
+	// so the create's egress gateway attach overlaps the boot.
+	addressReported = true
+	sbruntime.NotifyAddressKnown(ctx, slot.GuestIP)
 
 	// Step 5: start the VMM process and wait for the API socket.
 	spawnStart := time.Now()
@@ -1482,11 +1501,13 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		}
 	}
 
+	vmDown := true
 	if hasHandle {
 		if err := handle.Shutdown(ctx, 3*time.Second); err != nil {
 			d.logger.Warn("firecracker destroy: shutdown failed",
 				"sandbox_id", sandboxID, "error", err)
 			rememberErr(err)
+			vmDown = false
 		}
 	}
 
@@ -1516,6 +1537,14 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 					"sandbox_id", sandboxID, "tap", slot.TapName, "error", err)
 				rememberErr(err)
 			}
+		}
+		// The VM is down (or there never was one): whatever the destroy
+		// keyed by the guest IP (the egress gateway attach) lets go before
+		// the slot can go to another sandbox. A VM whose shutdown failed may
+		// still send, so it keeps its attach; the error makes the caller
+		// keep its row for the retry.
+		if slot != nil && vmDown {
+			sbruntime.NotifyReleasingAddress(ctx, slot.GuestIP)
 		}
 		if err := d.pool.Release(ctx, sandboxID); err != nil {
 			d.logger.Warn("firecracker destroy: pool release failed",

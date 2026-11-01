@@ -29,6 +29,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/egress"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	storepkg "github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -51,6 +52,11 @@ type attachBenchRules interface {
 type benchRuntime struct {
 	*recordingRuntime
 	rules attachBenchRules
+	// early reports the address before the build (as containerd's netns
+	// pool, Docker's pause netns and Firecracker's TAP slot do); build is
+	// how long the runtime create takes after that.
+	early bool
+	build time.Duration
 
 	mu   sync.Mutex
 	next uint32
@@ -68,13 +74,17 @@ func (r *benchRuntime) nextIP() string {
 	return netip.AddrFrom4([4]byte{10, 99, byte(n >> 8), byte(n)}).String()
 }
 
-func (r *benchRuntime) Create(_ context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
+func (r *benchRuntime) Create(ctx context.Context, req models.CreateSandboxRequest, sandboxID, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	ip := r.nextIP()
 	if req.NetworkBlockAll {
 		if err := r.ApplyNetworkBlockAll(ip); err != nil {
 			return nil, err
 		}
 	}
+	if r.early {
+		runtime.NotifyAddressKnown(ctx, ip)
+	}
+	time.Sleep(r.build)
 	return &models.SandboxRuntimeState{SandboxID: sandboxID, ContainerID: "ctr-" + sandboxID, ContainerIP: ip, Status: models.SandboxStatusStarted}, nil
 }
 
@@ -287,10 +297,17 @@ func BenchmarkEgressAttach(b *testing.B) {
 
 // BenchmarkEgressCreate times a whole hostname-rule CreateSandbox and reports
 // the createtiming stages the live UC-185 reads: the attach, and how long
-// the create actually waited for it (svc_egress_join).
+// the create actually waited for it (svc_egress_join), for a runtime that
+// reports the address only on return (late) and one that reports it before
+// a 5 ms build (early).
 func BenchmarkEgressCreate(b *testing.B) {
-	a := newAttachBench(b, egress.NewMemBackend(), nil)
-	benchCreates(b, a)
+	for _, early := range []bool{false, true} {
+		b.Run(map[bool]string{false: "late", true: "early"}[early], func(b *testing.B) {
+			a := newAttachBench(b, egress.NewMemBackend(), nil)
+			a.rt.early, a.rt.build = early, 5*time.Millisecond
+			benchCreates(b, a)
+		})
+	}
 }
 
 func benchCreates(b *testing.B, a *attachBench) {

@@ -368,9 +368,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	if dockerWarmPool != nil {
 		defer func() { drainDockerWarmPool(dockerWarmPool, logger) }()
 	}
-	if netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient); netnsPool != nil {
+	netnsPool := wireDockerNetnsPool(ctx, cfg, logger, dockerClient)
+	if netnsPool != nil {
 		defer netnsPool.Stop(context.WithoutCancel(ctx))
 	}
+	wireDockerOwnPause(ctx, cfg, dockerClient, rules.Enabled(), netnsPool != nil, time.Now())
 	// Start the standing-driven enforcement loop. EnforcementFor binds the loop
 	// to the service as its FleetController; under Noop() the factory yields a
 	// no-op whose Start does nothing. Runs on the daemon's cancellable ctx so it

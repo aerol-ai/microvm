@@ -1771,6 +1771,32 @@ Phase 3 starts.
        nft transaction. That bounds the interval-set (`allow_cidr`) commit
        cost when many sandboxes start at once on a dense node. It is not
        built unless the measurement asks for it.
+     - **Amendment 2026-11-01 (perf/egress-attach-cheap,
+       perf/egress-attach-early).** Measured, the attach's cost was the host
+       firewall lift of the driver's block-all (six chain listings, growing
+       with every restricted neighbour), not the gateway round trip
+       (~0.25 ms); the lift is now one listing per chain and one commit, and
+       the attach reports `svc_egress_attach_<stage>`. Where the runtime
+       fixes the address before the workload (containerd's netns pool,
+       Docker's pause netns, Firecracker's TAP slot) the driver installs the
+       block-all before the workload starts and reports the address
+       (`runtime.AddressObserver`); the gateway Attach then runs during the
+       runtime create (`svc_egress_early`) and only the lift remains after
+       it, alongside the persist. The lift stays after the runtime create
+       on purpose: a sandboxd crash mid-create then leaves an orphan behind
+       its block-all, never open. Every path that frees an address detaches
+       the gateway first.
+     - **Amendment 2026-11-01 (fix/egress-docker-pause-on-demand).** Docker
+       without a pause slot (pool off, or empty) gave a sandbox its address
+       only when it started the workload, so a restricted create's rules
+       went on a few milliseconds after the workload ran. Such a create
+       (block-all, a CIDR list, or a hostname allowlist) now starts a pause
+       container of its own through the pool's code and follows the slot
+       contract above; a create without rules keeps Docker's own path. The
+       cost is the `docker_pause` stage. gVisor on the Docker engine is the
+       one create left whose block-all goes on after the workload starts
+       (runsc doesn't join a pause's namespace; on the containerd engine it
+       uses the netns pool and is covered).
    - **Measured, not estimated.**
      - `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` (the
        time the create actually waited) are recorded through
