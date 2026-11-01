@@ -4,11 +4,11 @@ package suite
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/models"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -35,8 +35,9 @@ func refusedForNoHostFirewall(t *testing.T, opts sdktypes.CreateSandboxOptions) 
 		t.Fatalf("a node with no host firewall accepted network policy it cannot enforce (block_all=%v allow=%v deny=%v)",
 			opts.NetworkBlockAll, opts.NetworkAllowOut, opts.NetworkDenyOut)
 	}
-	if msg := err.Error(); !strings.Contains(msg, "network_policy_unenforced") && !strings.Contains(msg, "501") {
-		t.Fatalf("network policy refused on a node with no host firewall, but not as unenforced: %v", err)
+	if !harness.IsUnenforcedPolicyRefusal(err) {
+		t.Fatalf("network policy refused on a node with no host firewall, but not as unenforced (want 501 %s): %s",
+			models.ErrorCodeNetworkPolicyUnenforced, harness.DescribeAPIError(err))
 	}
 	t.Logf("no host firewall on this node: network policy refused, fail closed (%v)", err)
 	return true
