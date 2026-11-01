@@ -1525,6 +1525,14 @@ type Config struct {
 	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
 	APIListMaxInflight int
 	APIListQueueWait   time.Duration
+	// APIListMaxInflightPerTenant is how many of those slots one tenant (the
+	// owner a credential acts for; every unscoped caller is the one
+	// "operator" tenant) may hold; past it the tenant's lists wait their
+	// turn and are otherwise answered 429 + Retry-After. Resolved at load:
+	// a quarter of APIListMaxInflight (at least 1) when unset, and
+	// APIListMaxInflight itself (no share) for an explicit 0.
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT.
+	APIListMaxInflightPerTenant int
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.

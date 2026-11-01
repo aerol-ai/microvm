@@ -135,13 +135,35 @@ a 37 s p99 and 5,081 `502`s from a node the watchdog restarted). A single node
 identical placement-page reads on a node share one control-plane request, and
 each still comes from a read that began after its caller asked.
 
+The slots are shared fairly between tenants. A tenant is the owner a
+credential acts for (a team for `avm_` team tokens and OIDC identities, the
+account for a managed identity), never the token, so minting more tokens buys
+no more share; every unscoped caller (the PAT, fleet-wide tokens) is the one
+`operator` tenant. A tenant may hold at most its share of a node's slots.
+When lists must wait, freed slots go to waiting tenants in turn (round-robin),
+not first come first served, so a quiet tenant waits at most one turn of each
+other waiting tenant, not behind a noisy tenant's hundreds of lists. A list refused
+because its own tenant holds its share gets `429` + `Retry-After: 1` with
+code `rate_limited`; a list refused because the node is full while its tenant
+is within its share keeps `503` `overloaded`. Either refusal comes only after
+the queue wait, so a client that ignores `Retry-After` still makes at most two
+requests a second per connection.
+
 | Env var | Default | Notes |
 |---|---|---|
 | `SB_API_LIST_MAX_INFLIGHT` | `16` | Cluster-wide lists this node runs at once. Matches the cluster transport's 16 pooled connections per peer, so list fan-out reuses mTLS connections rather than opening new ones. A healthy list holds its slot for milliseconds, so 16 slots serve thousands of lists a second and fill only when owners or the control plane slow down. Raise it on nodes with more CPU. `0` = no limit (the behaviour before this setting). Anything but a whole number refuses the boot. |
-| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is shed. Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
+| `SB_API_LIST_MAX_INFLIGHT_PER_TENANT` | a quarter of `SB_API_LIST_MAX_INFLIGHT`, at least 1 (`4` by default) | How many of a node's list slots one tenant may hold. With the default, one tenant's burst runs 4 lists at once and three quarters of the node stay free for everyone else. Raise it for few tenants with bursty but legitimate list traffic; the node limit still applies. `0` = no per-tenant share (one tenant may take every slot; turns stay round-robin). More than `SB_API_LIST_MAX_INFLIGHT`, or anything but a whole number, refuses the boot; ignored when `SB_API_LIST_MAX_INFLIGHT=0`. |
+| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is refused (`503`, or `429` when its tenant holds its share). Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
 
-Metrics: `aerolvm_api_list_inflight`, `aerolvm_api_list_admitted_total`,
-`aerolvm_api_list_shed_total` (alert `SandboxdAPIListShedding`).
+Metrics (none labelled by tenant): `aerolvm_api_list_inflight`,
+`aerolvm_api_list_queued`, `aerolvm_api_list_tenants` (tenants with a list in
+flight or queued), `aerolvm_api_list_admitted_total`,
+`aerolvm_api_list_shed_total` (`503`, alert `SandboxdAPIListShedding`),
+`aerolvm_api_list_rate_limited_total` (`429`, alert
+`SandboxdAPIListTenantRateLimited`), and the configured
+`aerolvm_api_list_max_inflight` and `aerolvm_api_list_max_inflight_per_tenant`.
+Which tenants: `GET /debug/vars` (fleet admin only) has `api_list_gate`, the
+gate's totals and its 10 busiest tenants by name, most refused first.
 
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
