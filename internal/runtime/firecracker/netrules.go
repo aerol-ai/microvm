@@ -24,6 +24,7 @@ import (
 type NetRules interface {
 	BlockAllEgress(ip string) error
 	ClearBlockAllEgress(ip string) error
+	LiftBlockAllEgress(ip string) error
 	ApplyEgressPolicy(ip string, allow, deny []string) error
 	ClearEgressPolicy(ip string, allow, deny []string) error
 	BlockAllIngress(ip string) error
@@ -154,7 +155,8 @@ func (d *Driver) ClearNetworkBlockEgress(ip string) error {
 	if err != nil {
 		return err
 	}
-	return r.ClearBlockAllEgress(ip)
+	// The guest keeps its address: lift, don't forget.
+	return r.LiftBlockAllEgress(ip)
 }
 
 // ApplyEgressHold implements runtime.EgressHolder: the fail-closed hold

@@ -28,10 +28,18 @@ import (
 //     for it and its rules are gone (the next sandbox there gets only its
 //     own policy).
 //
+// The block-all is the host firewall's two sets (pkg/docker/netrules
+// blockset.go): an address is shut while it is in blocked and not in
+// released. A block puts it in blocked and takes it out of released (a
+// release left by the address's last owner must never open the next one);
+// a lift, the create path's unblock, puts it in released; a forget, when
+// the address is let go, takes it out of both.
+//
 // A violation is recorded with the event history that led to it.
 type netModel struct {
 	mu         sync.Mutex
 	blocked    map[string]bool
+	released   map[string]bool
 	attached   map[string]string // address -> sandbox the gateway enforces for
 	running    map[string]bool
 	claimed    map[string]string // address -> sandbox holding the slot
@@ -46,7 +54,7 @@ type netModel struct {
 }
 
 func newNetModel() *netModel {
-	return &netModel{blocked: map[string]bool{}, attached: map[string]string{}, running: map[string]bool{}, claimed: map[string]string{}, unrestricted: map[string]bool{}}
+	return &netModel{blocked: map[string]bool{}, released: map[string]bool{}, attached: map[string]string{}, running: map[string]bool{}, claimed: map[string]string{}, unrestricted: map[string]bool{}}
 }
 
 func (m *netModel) eventLocked(format string, args ...any) {
@@ -58,7 +66,12 @@ func (m *netModel) violateLocked(format string, args ...any) {
 }
 
 func (m *netModel) openLocked(ip string) bool {
-	return m.running[ip] && !m.blocked[ip] && m.attached[ip] == "" && !m.unrestricted[ip]
+	return m.running[ip] && m.unshutLocked(ip) && m.attached[ip] == "" && !m.unrestricted[ip]
+}
+
+// unshutLocked: the host firewall lets ip's traffic through.
+func (m *netModel) unshutLocked(ip string) bool {
+	return !m.blocked[ip] || m.released[ip]
 }
 
 // unrestrict marks ip as an unrestricted sandbox's until it is freed.
@@ -98,25 +111,55 @@ func (m *netModel) free(id, ip string) {
 	if m.blocked[ip] {
 		m.violateLocked("address %s freed with its block-all still on (the next owner would inherit it)", ip)
 	}
+	if m.released[ip] {
+		m.violateLocked("address %s freed with a release still in the set (it would open the next owner's block)", ip)
+	}
 	delete(m.claimed, ip)
 	delete(m.unrestricted, ip)
 }
 
+// block is the driver's block-all: in blocked, out of released.
 func (m *netModel) block(ip string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.eventLocked("block %s", ip)
 	m.blocked[ip] = true
+	m.released[ip] = false
 }
 
+// unblock is the lift: the address joins released and stays in blocked.
 func (m *netModel) unblock(ip string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.eventLocked("unblock %s", ip)
-	m.blocked[ip] = false
+	if m.blocked[ip] {
+		m.released[ip] = true
+	}
 	if m.openLocked(ip) {
 		m.violateLocked("block-all lifted at %s while its workload runs and the gateway doesn't enforce there", ip)
 	}
+}
+
+// forget lets the address go in both sets, released first.
+func (m *netModel) forget(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventLocked("forget %s", ip)
+	m.released[ip] = false
+	m.blocked[ip] = false
+	if m.openLocked(ip) {
+		m.violateLocked("block-all forgotten at %s while its workload runs and the gateway doesn't enforce there", ip)
+	}
+}
+
+// staleRelease puts a release in the set for ip with nobody holding it:
+// a sandboxd killed after a lift, before the address was let go.
+func (m *netModel) staleRelease(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventLocked("stale-release %s", ip)
+	m.blocked[ip] = true
+	m.released[ip] = true
 }
 
 func (m *netModel) start(ip string) {
@@ -214,6 +257,11 @@ func (m *netModel) assertNothingLeft(t *testing.T) {
 	for ip, on := range m.blocked {
 		if on {
 			t.Errorf("block-all left on %s", ip)
+		}
+	}
+	for ip, on := range m.released {
+		if on {
+			t.Errorf("release left in the set for %s", ip)
 		}
 	}
 	if t.Failed() {
@@ -414,7 +462,7 @@ func (r *modelRuntime) Create(ctx context.Context, req models.CreateSandboxReque
 		if reported {
 			runtime.NotifyReleasingAddress(ctx, ip)
 		}
-		r.m.unblock(ip)
+		r.m.forget(ip)
 		r.dropContainer(id)
 		r.release(id, ip)
 	}
@@ -493,7 +541,7 @@ func (r *modelRuntime) Destroy(ctx context.Context, sb *models.Sandbox) error {
 		return nil
 	}
 	if plain {
-		r.m.unblock(ip)
+		r.m.forget(ip)
 		r.m.stop(ip)
 		r.dropContainer(sb.ID)
 		r.release(sb.ID, ip)
@@ -501,9 +549,9 @@ func (r *modelRuntime) Destroy(ctx context.Context, sb *models.Sandbox) error {
 	}
 	r.m.stop(ip)
 	runtime.NotifyReleasingAddress(ctx, ip)
-	r.m.unblock(ip)
+	r.m.forget(ip)
 	if sb.ContainerIP != "" && sb.ContainerIP != ip {
-		r.m.unblock(sb.ContainerIP) // the drivers clear the row's address too
+		r.m.forget(sb.ContainerIP) // the drivers clear the row's address too
 	}
 	r.dropContainer(sb.ID)
 	r.release(sb.ID, ip)
@@ -512,7 +560,7 @@ func (r *modelRuntime) Destroy(ctx context.Context, sb *models.Sandbox) error {
 
 func (r *modelRuntime) ApplyNetworkBlockAll(ip string) error    { r.m.block(ip); return nil }
 func (r *modelRuntime) ClearNetworkBlockEgress(ip string) error { r.m.unblock(ip); return nil }
-func (r *modelRuntime) ClearNetworkRules(ip string) error       { r.m.unblock(ip); return nil }
+func (r *modelRuntime) ClearNetworkRules(ip string) error       { r.m.forget(ip); return nil }
 func (r *modelRuntime) ApplyEgressHold(ip string) error         { r.m.event("hold %s", ip); return nil }
 func (r *modelRuntime) ClearEgressHold(ip string) error         { r.m.event("unhold %s", ip); return nil }
 func (r *modelRuntime) NetRulesEnabled() bool                   { return true }

@@ -480,6 +480,24 @@ func TestDaemonNodeWide(t *testing.T) {
 	if err := r.client.SetNodeControl(ctx, nil); err != nil || be.Len(egress.SetNodeControl) != 0 {
 		t.Fatalf("an empty list clears the guard: %v %d", err, be.Len(egress.SetNodeControl))
 	}
+	// A pool is guarded whole: one element per port, whatever addresses
+	// in it come and go; the floor is rewritten with it, unchanged.
+	pool := egress.ControlPool{Prefix: netip.MustParsePrefix("127.16.0.0/16"), Ports: []uint16{21212, 22}}
+	if err := r.client.SetNodeControlPools(ctx, egress.NodeControl{Endpoints: eps, Pools: []egress.ControlPool{pool}}); err != nil {
+		t.Fatal(err)
+	}
+	whole := egress.Elem{Src: netip.MustParseAddr("127.0.0.0"), SrcEnd: netip.MustParseAddr("127.255.255.255"),
+		Dst: netip.MustParseAddr("127.16.0.0"), DstEnd: netip.MustParseAddr("127.16.255.255"), Port: 22}
+	if be.Len(egress.SetNodeControl) != 4 || !be.Has(egress.SetNodeControl, whole) || be.Len(egress.SetDenyFloor) != 1 {
+		t.Fatalf("pools: control %d floor %d", be.Len(egress.SetNodeControl), be.Len(egress.SetDenyFloor))
+	}
+	if nw := r.d.Gateway().NodeWideState(); len(nw.ControlPools) != 1 || !nw.ControlKnown {
+		t.Fatalf("pools not remembered: %+v", nw)
+	}
+	// An older sandboxd's push (no pools) drops them.
+	if err := r.client.SetNodeControl(ctx, eps); err != nil || be.Len(egress.SetNodeControl) != 2 || be.Has(egress.SetNodeControl, whole) {
+		t.Fatalf("legacy push: %v %d", err, be.Len(egress.SetNodeControl))
+	}
 }
 
 // TestDaemonLayoutMigrationKeepsSandboxesShut (review finding 11): a gateway
