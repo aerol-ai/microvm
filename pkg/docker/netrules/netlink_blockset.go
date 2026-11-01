@@ -15,6 +15,9 @@ import (
 // nftSetAPI is the Conn surface the block sets need; *nftables.Conn has it,
 // and tests inject a fake.
 type nftSetAPI interface {
+	ListTableOfFamily(name string, family nftables.TableFamily) (*nftables.Table, error)
+	GetSetByName(t *nftables.Table, name string) (*nftables.Set, error)
+	ListChain(t *nftables.Table, chain string) (*nftables.Chain, error)
 	AddTable(t *nftables.Table) *nftables.Table
 	AddSet(s *nftables.Set, vals []nftables.SetElement) error
 	AddChain(c *nftables.Chain) *nftables.Chain
@@ -29,11 +32,44 @@ type nftSetAPI interface {
 
 var errNoSetConn = errors.New("netrules: backend has no nftables set connection")
 
-func (b *netlinkBackend) setConn() (nftSetAPI, error) {
+// lastingConn is a set conn that keeps its netlink socket open across
+// operations (*nftables.Conn made AsLasting).
+type lastingConn interface{ CloseLasting() error }
+
+// withSetConn runs fn on the backend's set conn, one socket kept open.
+//
+// Closing a netfilter netlink socket is not free. The kernel's release
+// notifier (nft_rcv_nl_event) takes the nftables commit mutex and, when an
+// earlier commit anywhere on the node left transactions to free (a delete,
+// a chain update), waits an RCU grace period for them before it lets go:
+// 5 to 10 ms on a 48-vCPU host, measured on kernel 6.8, and no commit on the
+// node (another create's lift) runs meanwhile. A socket per operation paid
+// that at its close after any delete on the node and held every other
+// writer behind it. A socket that stays open never closes on these paths.
+//
+// fn's error drops the conn (it may hold queued messages or replies not
+// read); the next operation dials a new one.
+func (b *netlinkBackend) withSetConn(fn func(nftSetAPI) error) error {
 	if b.newSetConn == nil {
-		return nil, errNoSetConn
+		return errNoSetConn
 	}
-	return b.newSetConn()
+	b.setMu.Lock()
+	defer b.setMu.Unlock()
+	if b.setC == nil {
+		c, err := b.newSetConn()
+		if err != nil {
+			return err
+		}
+		b.setC = c
+	}
+	err := fn(b.setC)
+	if err != nil {
+		if l, ok := b.setC.(lastingConn); ok {
+			_ = l.CloseLasting()
+		}
+		b.setC = nil
+	}
+	return err
 }
 
 func blockTableRef() *nftables.Table {
@@ -103,24 +139,30 @@ func rulesMatch(rules []*nftables.Rule, want ...[]expr.Any) bool {
 // EnsureBlockTable implements blockSetBackend: the table, both sets and the
 // base chains in one transaction (each an idempotent create, so existing
 // elements stay), then each chain's rules, rewritten in one transaction
-// only if they aren't exactly the expected ones.
+// only if they aren't exactly the expected ones. It reads first and writes
+// only what is missing or wrong: the re-assert runs it every interval, and
+// even an idempotent create of a chain that is already there commits a
+// chain update the kernel frees after an RCU grace period, which the next
+// netfilter socket closed on the node waits for under the commit mutex.
 func (b *netlinkBackend) EnsureBlockTable() error {
-	conn, err := b.setConn()
-	if err != nil {
-		return err
-	}
+	return b.withSetConn(ensureBlockTable)
+}
+
+func ensureBlockTable(conn nftSetAPI) error {
 	t := blockTableRef()
-	conn.AddTable(t)
-	for _, name := range []string{BlockedSet, ReleasedSet} {
-		if err := conn.AddSet(blockSetRef(t, name), nil); err != nil {
-			return fmt.Errorf("nft add set %s: %w", name, err)
-		}
-	}
 	fwd, in := blockChains(t)
-	conn.AddChain(fwd)
-	conn.AddChain(in)
-	if err := conn.Flush(); err != nil {
-		return fmt.Errorf("nft add %s table: %w", BlockTable, err)
+	if !blockTableInPlace(conn, t, fwd, in) {
+		conn.AddTable(t)
+		for _, name := range []string{BlockedSet, ReleasedSet} {
+			if err := conn.AddSet(blockSetRef(t, name), nil); err != nil {
+				return fmt.Errorf("nft add set %s: %w", name, err)
+			}
+		}
+		conn.AddChain(fwd)
+		conn.AddChain(in)
+		if err := conn.Flush(); err != nil {
+			return fmt.Errorf("nft add %s table: %w", BlockTable, err)
+		}
 	}
 	type chainRules struct {
 		ch   *nftables.Chain
@@ -155,12 +197,42 @@ func (b *netlinkBackend) EnsureBlockTable() error {
 	return nil
 }
 
+// blockTableInPlace reports whether the table, both address sets and both
+// base chains (hook, priority, type, accept policy) are there as
+// EnsureBlockTable makes them. Any read error counts as not in place: the
+// idempotent create that follows is always safe.
+func blockTableInPlace(conn nftSetAPI, t *nftables.Table, chains ...*nftables.Chain) bool {
+	if _, err := conn.ListTableOfFamily(t.Name, t.Family); err != nil {
+		return false
+	}
+	for _, name := range []string{BlockedSet, ReleasedSet} {
+		s, err := conn.GetSetByName(t, name)
+		if err != nil || s == nil || s.KeyType.Name != nftables.TypeIPAddr.Name {
+			return false
+		}
+	}
+	for _, want := range chains {
+		got, err := conn.ListChain(t, want.Name)
+		if err != nil || got == nil || got.Type != want.Type ||
+			got.Hooknum == nil || *got.Hooknum != *want.Hooknum ||
+			got.Priority == nil || *got.Priority != *want.Priority ||
+			got.Policy == nil || *got.Policy != *want.Policy {
+			return false
+		}
+	}
+	return true
+}
+
 // BlockSetElements implements blockSetBackend.
 func (b *netlinkBackend) BlockSetElements() (blocked, released []string, err error) {
-	conn, err := b.setConn()
-	if err != nil {
-		return nil, nil, err
-	}
+	err = b.withSetConn(func(conn nftSetAPI) error {
+		blocked, released, err = blockSetElements(conn)
+		return err
+	})
+	return blocked, released, err
+}
+
+func blockSetElements(conn nftSetAPI) (blocked, released []string, err error) {
 	t := blockTableRef()
 	read := func(name string) ([]string, error) {
 		els, err := conn.GetSetElements(blockSetRef(t, name))
@@ -192,10 +264,10 @@ func (b *netlinkBackend) ApplyBlockSetOps(ops []blockSetOp) error {
 	if len(ops) == 0 {
 		return nil
 	}
-	conn, err := b.setConn()
-	if err != nil {
-		return err
-	}
+	return b.withSetConn(func(conn nftSetAPI) error { return applyBlockSetOps(conn, ops) })
+}
+
+func applyBlockSetOps(conn nftSetAPI, ops []blockSetOp) (err error) {
 	t := blockTableRef()
 	for _, op := range ops {
 		ip := net.ParseIP(op.IP).To4()

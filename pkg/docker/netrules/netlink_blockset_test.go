@@ -4,6 +4,7 @@ package netrules
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"slices"
 	"strings"
@@ -22,14 +23,17 @@ type setKernel struct {
 	exists  bool
 	sets    map[string]map[string]bool
 	rules   map[string][]*nftables.Rule
+	chains  map[string]nftables.Chain
 	flushes int
+	// dials and closes count the conns the backend opened and dropped.
+	dials, closes int
 	// injected failures
-	addSetErr, getRulesErr, getElemsErr error
-	flushErrs                           []error // consumed one per Flush
+	addSetErr, getRulesErr, getElemsErr, dialErr error
+	flushErrs                                    []error // consumed one per Flush
 }
 
 func newSetKernel() *setKernel {
-	return &setKernel{sets: map[string]map[string]bool{}, rules: map[string][]*nftables.Rule{}}
+	return &setKernel{sets: map[string]map[string]bool{}, rules: map[string][]*nftables.Rule{}, chains: map[string]nftables.Chain{}}
 }
 
 type setConn struct {
@@ -55,7 +59,45 @@ func (c *setConn) AddSet(s *nftables.Set, _ []nftables.SetElement) error {
 	return nil
 }
 
-func (c *setConn) AddChain(ch *nftables.Chain) *nftables.Chain { return ch }
+func (c *setConn) AddChain(ch *nftables.Chain) *nftables.Chain {
+	c.queue = append(c.queue, func(k *setKernel) error { k.chains[ch.Name] = *ch; return nil })
+	return ch
+}
+
+func (c *setConn) ListTableOfFamily(name string, _ nftables.TableFamily) (*nftables.Table, error) {
+	c.k.mu.Lock()
+	defer c.k.mu.Unlock()
+	if !c.k.exists {
+		return nil, syscall.ENOENT
+	}
+	return blockTableRef(), nil
+}
+
+func (c *setConn) GetSetByName(t *nftables.Table, name string) (*nftables.Set, error) {
+	c.k.mu.Lock()
+	defer c.k.mu.Unlock()
+	if !c.k.exists || c.k.sets[name] == nil {
+		return nil, syscall.ENOENT
+	}
+	return blockSetRef(t, name), nil
+}
+
+func (c *setConn) ListChain(_ *nftables.Table, name string) (*nftables.Chain, error) {
+	c.k.mu.Lock()
+	defer c.k.mu.Unlock()
+	ch, ok := c.k.chains[name]
+	if !c.k.exists || !ok {
+		return nil, syscall.ENOENT
+	}
+	return &ch, nil
+}
+
+func (c *setConn) CloseLasting() error {
+	c.k.mu.Lock()
+	defer c.k.mu.Unlock()
+	c.k.closes++
+	return nil
+}
 
 func (c *setConn) GetRules(_ *nftables.Table, ch *nftables.Chain) ([]*nftables.Rule, error) {
 	c.k.mu.Lock()
@@ -141,7 +183,10 @@ func (c *setConn) Flush() error {
 		}
 	}
 	// All or nothing: apply on a copy.
-	snap := &setKernel{exists: k.exists, sets: map[string]map[string]bool{}, rules: map[string][]*nftables.Rule{}}
+	snap := &setKernel{exists: k.exists, sets: map[string]map[string]bool{}, rules: map[string][]*nftables.Rule{}, chains: map[string]nftables.Chain{}}
+	for n, ch := range k.chains {
+		snap.chains[n] = ch
+	}
 	for n, s := range k.sets {
 		snap.sets[n] = map[string]bool{}
 		for ip := range s {
@@ -158,12 +203,20 @@ func (c *setConn) Flush() error {
 		}
 	}
 	c.queue = nil
-	k.exists, k.sets, k.rules = snap.exists, snap.sets, snap.rules
+	k.exists, k.sets, k.rules, k.chains = snap.exists, snap.sets, snap.rules, snap.chains
 	return nil
 }
 
 func setBackend(k *setKernel, rules *chainNFT) *netlinkBackend {
-	b := &netlinkBackend{newSetConn: func() (nftSetAPI, error) { return &setConn{k: k}, nil }}
+	b := &netlinkBackend{newSetConn: func() (nftSetAPI, error) {
+		k.mu.Lock()
+		defer k.mu.Unlock()
+		if k.dialErr != nil {
+			return nil, k.dialErr
+		}
+		k.dials++
+		return &setConn{k: k}, nil
+	}}
 	if rules != nil {
 		b.newConn = func() (nftAPI, error) { return rules, nil }
 	}
@@ -182,15 +235,47 @@ func TestNetlinkEnsureBlockTable(t *testing.T) {
 	if !rulesMatch(k.rules["forward"], blockDropExprs()) || !rulesMatch(k.rules["input"], blockEstablishedExprs(), blockDropExprs()) {
 		t.Fatalf("rules %v", k.rules)
 	}
-	// In place: nothing rewritten.
+	// In place: read only, no commit at all (the re-assert runs this every
+	// interval, and even an idempotent chain create commits an update).
 	n := k.flushes
-	if err := b.EnsureBlockTable(); err != nil || k.flushes != n+1 {
-		t.Fatalf("second ensure: err=%v flushes %d → %d (want only the idempotent create)", err, n, k.flushes)
+	if err := b.EnsureBlockTable(); err != nil || k.flushes != n {
+		t.Fatalf("second ensure: err=%v flushes %d → %d (want none)", err, n, k.flushes)
 	}
 	// A rule changed under us: the chain is rewritten in one transaction.
 	k.rules["input"] = k.rules["input"][1:]
-	if err := b.EnsureBlockTable(); err != nil || !rulesMatch(k.rules["input"], blockEstablishedExprs(), blockDropExprs()) {
-		t.Fatalf("repair: err=%v rules %v", err, k.rules["input"])
+	if err := b.EnsureBlockTable(); err != nil || !rulesMatch(k.rules["input"], blockEstablishedExprs(), blockDropExprs()) || k.flushes != n+1 {
+		t.Fatalf("repair: err=%v rules %v flushes %d", err, k.rules["input"], k.flushes-n)
+	}
+	// Anything about the table, a set or a base chain not as made: the
+	// idempotent create runs again and puts it back.
+	_, wantIn := blockChains(blockTableRef())
+	for name, mutate := range map[string]func(){
+		"set gone":   func() { delete(k.sets, ReleasedSet) },
+		"chain gone": func() { delete(k.chains, "forward") },
+		"priority":   func() { ch := k.chains["input"]; ch.Priority = nftables.ChainPriorityFilter; k.chains["input"] = ch },
+		"policy": func() {
+			ch := k.chains["input"]
+			drop := nftables.ChainPolicyDrop
+			ch.Policy = &drop
+			k.chains["input"] = ch
+		},
+		"hook": func() { ch := k.chains["input"]; ch.Hooknum = nftables.ChainHookOutput; k.chains["input"] = ch },
+		"type": func() { ch := k.chains["input"]; ch.Type = nftables.ChainTypeNAT; k.chains["input"] = ch },
+		"no hook at all": func() {
+			ch := k.chains["input"]
+			ch.Hooknum, ch.Priority, ch.Policy = nil, nil, nil
+			k.chains["input"] = ch
+		},
+		"table gone too": func() { k.exists = false },
+	} {
+		mutate()
+		before := k.flushes
+		if err := b.EnsureBlockTable(); err != nil || k.flushes == before {
+			t.Fatalf("%s: err=%v, no create ran", name, err)
+		}
+		if ch := k.chains["input"]; ch.Type != wantIn.Type || *ch.Hooknum != *wantIn.Hooknum || *ch.Priority != *wantIn.Priority || *ch.Policy != *wantIn.Policy || k.sets[ReleasedSet] == nil {
+			t.Fatalf("%s: not put back: %+v", name, ch)
+		}
 	}
 	// Elements survive an ensure.
 	k.sets[BlockedSet]["10.1.0.2"] = true
@@ -347,5 +432,66 @@ func TestNetlinkBlockSetsThroughTheManager(t *testing.T) {
 	}
 	if err := m.ClearBlockAllEgress("10.1.2.2"); err != nil || k.sets[ReleasedSet]["10.1.2.2"] || k.sets[BlockedSet]["10.1.2.2"] {
 		t.Fatalf("let-go: %v %v", err, k.sets)
+	}
+}
+
+// TestNetlinkBlockSetConnKeptOpen: every block-set operation shares one
+// kept-open conn (closing a netfilter socket waits out the kernel's pending
+// frees under the commit mutex); a failed operation drops it, closed, and
+// the next one dials afresh.
+func TestNetlinkBlockSetConnKeptOpen(t *testing.T) {
+	k := newSetKernel()
+	b := setBackend(k, nil)
+	if err := b.EnsureBlockTable(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		ip := fmt.Sprintf("10.1.3.%d", i+2)
+		if err := b.ApplyBlockSetOps([]blockSetOp{{Set: BlockedSet, Add: true, IP: ip}, {Set: ReleasedSet, Add: true, IP: ip}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := b.BlockSetElements(); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.EnsureBlockTable(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if k.dials != 1 || k.closes != 0 {
+		t.Fatalf("dials %d closes %d, want one conn kept open", k.dials, k.closes)
+	}
+	// A failure drops the conn, closed; the next operation dials again.
+	k.flushErrs = []error{errors.New("enobufs")}
+	if err := b.ApplyBlockSetOps([]blockSetOp{{Set: BlockedSet, Add: true, IP: "10.1.3.9"}}); err == nil {
+		t.Fatal("flush error hidden")
+	}
+	if k.closes != 1 || b.setC != nil {
+		t.Fatalf("closes %d conn kept %v after a failure", k.closes, b.setC != nil)
+	}
+	if err := b.ApplyBlockSetOps([]blockSetOp{{Set: BlockedSet, Add: true, IP: "10.1.3.9"}}); err != nil || k.dials != 2 || !k.sets[BlockedSet]["10.1.3.9"] {
+		t.Fatalf("after redial: err=%v dials %d", err, k.dials)
+	}
+	// A dial failure is returned and nothing is kept.
+	b.setC = nil
+	k.dialErr = errors.New("dial boom")
+	if err := b.EnsureBlockTable(); err == nil || b.setC != nil {
+		t.Fatalf("dial error: %v kept %v", err, b.setC != nil)
+	}
+	// Concurrent operations share the conn safely (one at a time).
+	k.dialErr = nil
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ip := fmt.Sprintf("10.1.4.%d", i+2)
+			if err := b.ApplyBlockSetOps([]blockSetOp{{Set: BlockedSet, Add: true, IP: ip}}); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if len(k.sets[BlockedSet]) != 6+16 || k.dials != 3 {
+		t.Fatalf("concurrent: %d elements, dials %d", len(k.sets[BlockedSet]), k.dials)
 	}
 }

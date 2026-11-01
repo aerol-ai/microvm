@@ -4,6 +4,7 @@ package netrules
 
 import (
 	"fmt"
+	"sync"
 	"syscall"
 
 	"github.com/google/nftables"
@@ -37,9 +38,14 @@ type nftAPI interface {
 // is already the Manager's job via lockIP.
 type netlinkBackend struct {
 	newConn func() (nftAPI, error)
-	// newSetConn serves the block sets (netlink_blockset.go). Nil keeps the
-	// manager on the per-address block rules.
+	// newSetConn dials the block sets' conn (netlink_blockset.go). Nil keeps
+	// the manager on the per-address block rules.
 	newSetConn func() (nftSetAPI, error)
+	// setMu guards setC, the one block-set conn kept open between
+	// operations (withSetConn). Every block-set write is a commit, and
+	// commits on a node run one at a time in the kernel anyway.
+	setMu sync.Mutex
+	setC  nftSetAPI
 }
 
 // NewNetlinkBackend wires the per-operation nftables connection factory.
@@ -54,7 +60,7 @@ func NewNetlinkBackend() (RuleBackend, error) {
 			return c, nil
 		},
 		newSetConn: func() (nftSetAPI, error) {
-			c, err := nftables.New()
+			c, err := nftables.New(nftables.AsLasting())
 			if err != nil {
 				return nil, fmt.Errorf("nftables conn: %w", err)
 			}

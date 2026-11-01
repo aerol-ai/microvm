@@ -16,6 +16,7 @@ package netrules
 
 import (
 	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -29,6 +30,10 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/google/nftables"
+	"github.com/mdlayher/netlink"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -404,6 +409,88 @@ func TestKernelBlockSetsFlushRebuilt(t *testing.T) {
 		t.Fatal(err)
 	}
 	ktExpect(t, "after the next block", false)
+}
+
+// ktGen is the node's nftables generation: every commit bumps it.
+func ktGen(tb testing.TB) uint32 {
+	tb.Helper()
+	c, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer c.Close()
+	msgs, err := c.Execute(netlink.Message{
+		Header: netlink.Header{Type: netlink.HeaderType(unix.NFNL_SUBSYS_NFTABLES<<8 | unix.NFT_MSG_GETGEN), Flags: netlink.Request},
+		Data:   []byte{unix.AF_UNSPEC, 0, 0, 0},
+	})
+	if err != nil || len(msgs) != 1 || len(msgs[0].Data) < 4 {
+		tb.Fatalf("getgen: %v %d", err, len(msgs))
+	}
+	ad, err := netlink.NewAttributeDecoder(msgs[0].Data[4:])
+	if err != nil {
+		tb.Fatal(err)
+	}
+	ad.ByteOrder = binary.BigEndian
+	for ad.Next() {
+		if ad.Type() == unix.NFTA_GEN_ID {
+			return ad.Uint32()
+		}
+	}
+	tb.Fatal("getgen: no generation id")
+	return 0
+}
+
+// TestKernelBlockSetsSteadyReassertCommitsNothing: with the table as made,
+// the re-assert only reads. It used to re-create the table, the sets and
+// the chains every interval; the chain updates that commits made were freed
+// after an RCU grace period, which the next netfilter socket closed on the
+// node (the re-assert's own) waited for under the commit mutex, holding up
+// every create's lift for 5 to 10 ms on a 48-vCPU host. The block-set
+// operations also share one kept-open socket.
+func TestKernelBlockSetsSteadyReassertCommitsNothing(t *testing.T) {
+	ktTopology(t)
+	m := ktManager(t, true)
+	if err := m.BlockAllEgress(ktSandboxIP); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.LiftBlockAllEgress(ktSandboxIP); err != nil {
+		t.Fatal(err)
+	}
+	// What the kernel reports reads back as made, on a fresh socket.
+	c, err := nftables.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := blockTableRef()
+	fwd, in := blockChains(tbl)
+	if !blockTableInPlace(c, tbl, fwd, in) {
+		t.Fatal("the table as EnsureBlockTable made it does not read back in place")
+	}
+	blockReassertMinGap = 0
+	defer func() { blockReassertMinGap = 10 * time.Second }()
+	nb := m.ipt.(*netlinkBackend)
+	conn := nb.setC
+	gen := ktGen(t)
+	for i := 0; i < 3; i++ {
+		if repaired, err := m.ReassertBlockSets(); err != nil || repaired {
+			t.Fatalf("reassert %d: repaired=%v err=%v", i, repaired, err)
+		}
+	}
+	if got := ktGen(t); got != gen {
+		t.Fatalf("a steady re-assert committed: generation %d → %d", gen, got)
+	}
+	if nb.setC == nil || nb.setC != conn {
+		t.Fatal("the block-set socket was not kept open across operations")
+	}
+	ktExpect(t, "after the re-asserts (lifted)", true)
+	// A chain policy changed under us is put back by the next re-assert.
+	ktRun(t, "nft", "chain", "ip", BlockTable, "input", "{", "policy", "drop", ";", "}")
+	if _, err := m.ReassertBlockSets(); err != nil {
+		t.Fatal(err)
+	}
+	if !blockTableInPlace(c, tbl, fwd, in) {
+		t.Fatal("the re-assert did not put the chain policy back")
+	}
 }
 
 func ktPct(v []time.Duration, p int) time.Duration {
