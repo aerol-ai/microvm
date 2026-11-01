@@ -22,11 +22,12 @@ We fixed two things. A busy server now answers "busy, retry in 1 second" instead
 
 This section describes the test cluster and the load we sent it.
 
-We ran an 11-server test cluster on AWS. Each server in a cluster is a **node**, and each node has a role. These are the roles that matter here:
+We ran an 11-server test cluster on AWS. Each server in a cluster is a **node**, and each node has a role. These are the roles:
 
 - **3 control-plane servers.** They agree on shared state, such as which worker owns which sandbox.
 - **2 ingress nodes.** They take requests from clients and pass them on. Each was an m6i.large with 2 vCPUs.
 - **5 workers.** They run the sandboxes. 2 of them were bare-metal servers.
+- **1 metrics node.** It collects logs and numbers from the others. It does not serve requests.
 
 Every node runs `sandboxd`, the AerolVM server program. In front of it on each node sits Caddy, the web server that takes incoming connections.
 
