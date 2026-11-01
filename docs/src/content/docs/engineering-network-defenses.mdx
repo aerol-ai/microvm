@@ -177,13 +177,14 @@ For an entry with another port, such as `github.com:22`, the proxy cannot read a
 
 Container, gVisor and Firecracker sandboxes use IPv4 only. Every rule on this page that keeps sandboxes apart, and away from the server, is written for IPv4. So IPv6 is shut off twice, and either one alone is enough:
 
-- **IPv6 is off inside the sandbox from the start.** A container or gVisor sandbox starts with IPv6 turned off in its own network, before your code runs. A Firecracker sandbox's kernel boots with IPv6 disabled (`ipv6.disable=1`). The sandbox has no IPv6 address at all, not even `::1`.
+- **IPv6 is off inside the sandbox from the start.** A container or gVisor sandbox starts with IPv6 turned off in its own network, before your code runs. A Firecracker sandbox's kernel boots with IPv6 off on every network device (`ipv6.disable_ipv6=1`). The sandbox has no IPv6 address at all, not even `::1`.
 - **The server drops IPv6 on every sandbox network.** Even if code inside a sandbox turns IPv6 back on, as root in a Firecracker guest can, the server drops every IPv6 packet between two sandboxes on the same network, from a sandbox to the server, and from the server to a sandbox. The server's own end of each Firecracker network device has IPv6 off as well.
 
 What this means for you:
 
 - **There is no IPv6 internet access from a sandbox.** Sandboxes reach the internet over IPv4.
-- **Listen on `0.0.0.0` or `127.0.0.1`.** A program that listens only on `::1` fails to start. Listening on `::` still takes IPv4 connections in a container, but fails in a Firecracker sandbox, whose kernel has no IPv6 at all. Most servers fall back to IPv4 on their own.
+- **Listening on `::` still works.** IPv6 sockets can still be opened, so a server that listens on `::`, such as nginx's default `listen [::]:80` or `python3 -m http.server`, starts as usual and takes IPv4 connections, on every runtime.
+- **Do not listen on `::1` alone.** There is no `::1`, so a program that listens only there fails to start. Listen on `127.0.0.1` instead.
 
 For operators:
 
