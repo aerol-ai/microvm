@@ -37,8 +37,12 @@ type Manager struct {
 	waitTimeout time.Duration
 	adapters    map[models.MountType]adapters.Adapter
 
-	mu    sync.Mutex
-	state map[string][]*mountState // sandboxID -> per-index states
+	// mu guards state, mounting and sweeping, which together say who owns
+	// rootDir/<id>; see claimOrphan for the rule.
+	mu       sync.Mutex
+	state    map[string][]*mountState // sandboxID -> per-index states
+	mounting map[string]int           // sandboxID -> MountAll calls in flight
+	sweeping map[string]chan struct{} // sandboxID -> closed when Sweep is done with it
 
 	closeCh chan struct{}
 }
@@ -88,6 +92,8 @@ func New(logger *slog.Logger, cfg Config) (*Manager, error) {
 		waitTimeout: cfg.WaitTimeout,
 		adapters:    adapters.Adapters(),
 		state:       make(map[string][]*mountState),
+		mounting:    make(map[string]int),
+		sweeping:    make(map[string]chan struct{}),
 		closeCh:     make(chan struct{}),
 	}, nil
 }
@@ -115,6 +121,14 @@ func (m *Manager) MountAll(ctx context.Context, sandboxID string, mounts []model
 	if err := models.ValidateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("mount: %w", err)
 	}
+	// Own rootDir/<id> before creating it, and until state holds the mounts
+	// (the deferred release runs after the store below), so Sweep never sees
+	// this directory unowned.
+	release, err := m.beginMount(ctx, sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("mount: %w", err)
+	}
+	defer release()
 	if err := os.MkdirAll(filepath.Join(m.rootDir, sandboxID), 0o700); err != nil {
 		return nil, fmt.Errorf("create sandbox mount dir: %w", err)
 	}
@@ -184,10 +198,12 @@ func (m *Manager) HostBindsFor(sandboxID string) []ContainerBind {
 //   - umount(s) every mountpoint under the orphan dir, lazily if needed
 //   - removes the orphan directory tree
 //
-// Intended for sandboxd startup, after the reconciler has computed the set of
-// sandboxes that should still exist. A crash mid-MountAll can leave a FUSE
-// process attached to a directory whose sandbox row is gone or whose container
-// never came up; without this sweep those mounts pile up forever.
+// Called at the end of every reconcile pass (at startup and on the periodic
+// ticker), after the reconciler has computed the set of sandboxes that should
+// still exist. A crash mid-MountAll can leave a FUSE process attached to a
+// directory whose sandbox row is gone or whose container never came up;
+// without this sweep those mounts pile up forever. Directories the manager
+// owns in-process (tracked, or with a MountAll in flight) are never swept.
 func (m *Manager) Sweep(keep map[string]struct{}) {
 	entries, err := os.ReadDir(m.rootDir)
 	if err != nil {
@@ -197,13 +213,6 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 		return
 	}
 
-	m.mu.Lock()
-	tracked := make(map[string]struct{}, len(m.state))
-	for id := range m.state {
-		tracked[id] = struct{}{}
-	}
-	m.mu.Unlock()
-
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -212,14 +221,94 @@ func (m *Manager) Sweep(keep map[string]struct{}) {
 		if _, ok := keep[id]; ok {
 			continue
 		}
-		if _, ok := tracked[id]; ok {
-			// We're already managing it in-process; never sweep an active mount.
+		done, mountInFlight := m.claimOrphan(id)
+		if done == nil {
+			if mountInFlight {
+				m.logger.Info("mounts sweep: skipping, mount in progress", "sandbox_id", id)
+			}
 			continue
 		}
 		path := filepath.Join(m.rootDir, id)
 		m.logger.Info("mounts sweep: removing orphan", "sandbox_id", id, "path", path)
 		m.cleanupOrphanDir(path)
+		m.releaseOrphan(id, done)
 	}
+}
+
+// claimOrphan claims rootDir/<id> for Sweep to remove. It returns nil when
+// someone else owns the directory; mountInFlight then says whether that owner
+// is a MountAll still running.
+//
+// Ownership rule: rootDir/<id>, and every mount tool whose argv names a path
+// in it, belongs to exactly one of
+//   - the MountAll calls in flight for id (mounting), from before the first
+//     one creates the directory until the last one returns;
+//   - the tracked mounts (state), from MountAll's success until UnmountAll;
+//   - a Sweep that claimed id (sweeping), until the directory is gone.
+//
+// Each is checked and taken under mu, and Sweep claims one id right before
+// cleaning it, not from a snapshot taken earlier. So a sweep that finds a
+// mount in flight skips it, and a mount that finds a sweep in progress waits
+// for it (beginMount) instead of building a directory the sweep then deletes.
+// Before this, the claim was a tracked-only snapshot and state was written
+// only once every mount was ready, so the periodic reconcile sweep took a
+// mount still waiting for mount-s3 for an orphan: it SIGKILLed the tool,
+// removed the directory, and the create waited out the full 30s mount
+// timeout (UC-84).
+func (m *Manager) claimOrphan(id string) (done chan struct{}, mountInFlight bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mounting[id] > 0 {
+		return nil, true
+	}
+	if _, tracked := m.state[id]; tracked {
+		return nil, false
+	}
+	if _, swept := m.sweeping[id]; swept {
+		return nil, false // a concurrent Sweep already has it
+	}
+	done = make(chan struct{})
+	m.sweeping[id] = done
+	return done, false
+}
+
+// releaseOrphan ends Sweep's claim on id and wakes any MountAll waiting for it.
+func (m *Manager) releaseOrphan(id string, done chan struct{}) {
+	m.mu.Lock()
+	delete(m.sweeping, id)
+	m.mu.Unlock()
+	close(done)
+}
+
+// beginMount marks a MountAll of id as in flight until the returned release
+// is called. If Sweep is removing id's directory it waits for that to finish
+// first: a create retried with the id of a genuine orphan then mounts into a
+// clean directory rather than one the sweep is still deleting. The wait is
+// one directory's cleanup, and it ends early if ctx is cancelled.
+func (m *Manager) beginMount(ctx context.Context, id string) (release func(), err error) {
+	m.mu.Lock()
+	for {
+		done, swept := m.sweeping[id]
+		if !swept {
+			break
+		}
+		m.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		m.mu.Lock()
+	}
+	m.mounting[id]++
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.mounting[id]--; m.mounting[id] <= 0 {
+			delete(m.mounting, id)
+		}
+	}, nil
 }
 
 // cleanupOrphanDir kills FUSE processes attached to anything under dir,
@@ -233,7 +322,8 @@ func (m *Manager) cleanupOrphanDir(dir string) {
 }
 
 // Reestablish ensures a sandbox's mounts are running, mounting any that are
-// missing. Called by the reconciler at startup and periodically.
+// missing. Called by the reconciler at startup and periodically. It mounts
+// only through MountAll, so its mounts are owned against Sweep the same way.
 func (m *Manager) Reestablish(ctx context.Context, sandboxID string, mounts []models.MountSpec) error {
 	m.mu.Lock()
 	already, present := m.state[sandboxID]
