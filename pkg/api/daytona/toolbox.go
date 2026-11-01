@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/apihttp"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -418,6 +419,12 @@ func (h *handlers) writeToolboxError(w http.ResponseWriter, err error) {
 	var httpErr *toolboxHTTPError
 	if errors.As(err, &httpErr) {
 		apihttp.WriteError(w, httpErr.StatusCode, httpErr.Error())
+		return
+	}
+	// The sandbox stopped while the request waited on it: 409, as on /v1,
+	// not a gateway error.
+	if errors.Is(err, service.ErrSandboxStoppedMidRequest) {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 	if h.deps.Logger != nil {

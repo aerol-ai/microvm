@@ -887,8 +887,11 @@ var Registry = []UseCase{
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-339", Title: "Security: no sandbox reaches another sandbox's toolbox agent (port 2280) on any pair of runtimes; a Firecracker guest's agent, cold-booted or cloned from a template, refuses exec, files and sessions without its sandbox's token even from the node", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-340", Title: "Compatibility: IPv6 off inside sandboxes breaks no listener: on every runtime an AF_INET6 socket binds [::], and a listener on [::] accepts an IPv4 connection", Requires: []Capability{CapDocker}, Implemented: true},
+	// Bank-readiness stability, continued (bank_scale_test.go).
+	{ID: "UC-344", Title: "Stability: an exec in flight when its sandbox's runtime process is killed (runc init, gVisor sentry, Firecracker VMM) fails within 45 s, with 409 where the runtime reports the exit (502 allowed for Firecracker, which has no exit event); a healthy exec silent for 75 s first completes", Requires: []Capability{CapDocker}, Implemented: true},
+	// Bank-readiness security, continued (bank_security_test.go).
+	{ID: "UC-345", Title: "Security: a process OOM-killed inside a block-all sandbox (256 MiB, the UC-321 doubling bomb) neither stops the sandbox nor opens its egress, on every shell runtime: it still runs and answers exec, TCP to 1.1.1.1:443 still fails, and every host rule for its address is still on the node", Requires: []Capability{CapDocker}, Implemented: true},
 	// Ingress high availability behind the load balancer (api_lb_test.go).
-	// UC-341..355 are taken by other open branches.
 	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
 }
 

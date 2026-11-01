@@ -344,6 +344,9 @@ func TestHandleDockerEventErrorBranches(t *testing.T) {
 		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-oom", Action: "oom", Time: time.Now().UTC()}); err != nil {
 			t.Fatalf("oom event: %v", err)
 		}
+		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-oom", Action: "die", ExitCode: 137, Time: time.Now().UTC()}); err != nil {
+			t.Fatalf("die event: %v", err)
+		}
 		got, err := st.Get(ctx, "sb-oom")
 		if err != nil {
 			t.Fatalf("store.Get: %v", err)

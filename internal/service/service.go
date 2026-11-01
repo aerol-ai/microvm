@@ -614,6 +614,16 @@ type Service struct {
 	warmCacheMu sync.RWMutex
 	warmCache   map[string]int64
 
+	// toolboxCalls holds every in-flight network toolbox request by
+	// sandbox, so the stop and destroy paths can end them at once instead
+	// of leaving them to wait on a sandbox that is gone (toolbox_calls.go).
+	toolboxCalls toolboxCallRegistry
+
+	// sandboxOOMs remembers recent oom events, so the die that follows an
+	// init's OOM kill is recorded as one (sandbox_oom.go). An oom event is
+	// not a stop.
+	sandboxOOMs sandboxOOMTracker
+
 	// touchCoalescer debounces last_active_at flushes per sandbox so a
 	// burst of HTTP requests (wake-aware ingress proxy, toolbox/session/
 	// runtime proxies, SSH gateway) does not become one SQLite UPDATE
@@ -1445,6 +1455,9 @@ func (s *Service) finalizeStaleLocalSandbox(ctx context.Context, sandbox *models
 			return err
 		}
 	}
+	// This node's copy is gone (the row first, then the runtime): its
+	// toolbox requests end; a retry is routed to the owner.
+	s.endToolboxCalls(sandbox.ID, toolboxEndMoved, "moved to another node")
 	s.forgetWakeFlight(sandbox.ID)
 	s.invalidateWarm(sandbox.ID)
 	s.forgetNetstatsActivity(sandbox.ID)
@@ -3525,6 +3538,10 @@ func (s *Service) DestroySandbox(ctx context.Context, id string) error {
 	if err := rt.Destroy(ctx, sandbox); err != nil {
 		return err
 	}
+	// The runtime is gone: end its toolbox requests now, and again on the
+	// way out for one that read the row meanwhile (toolbox_calls.go).
+	s.endToolboxCalls(id, toolboxEndDestroyed, "destroyed")
+	defer s.endToolboxCalls(id, toolboxEndDestroyed, "destroyed")
 	// Everything the installed record names goes: a transition that didn't
 	// finish may have left a gateway attachment and CIDR rules at once. The
 	// row is the retry anchor until those are recorded against the address
@@ -5841,6 +5858,9 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			if !s.reconcileGoneContainerConfirmed(ctx, sandbox) {
 				continue
 			}
+			// Definitively gone: its toolbox requests will never be
+			// answered. (An unknown answer above ends nothing.)
+			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
 			// The reap's record (caller system:reconcile) is written once the
 			// row is gone; the identity is resolved now, while it exists.
 			reaped := s.beginSystemAction(ctx, sandbox.ID, systemActionReap)
@@ -5938,6 +5958,8 @@ func (s *Service) Reconcile(ctx context.Context) error {
 			s.forgetWakeFlight(sandbox.ID)
 			s.invalidateWarm(sandbox.ID)
 			s.forgetNetstatsActivity(sandbox.ID)
+			// Again for a request that read the row before it went.
+			s.endToolboxCalls(sandbox.ID, toolboxEndGone, "runtime gone")
 			if s.admitter != nil {
 				s.admitter.Release(sandbox.ID)
 			}
