@@ -37,18 +37,30 @@ type nftAPI interface {
 // is already the Manager's job via lockIP.
 type netlinkBackend struct {
 	newConn func() (nftAPI, error)
+	// newSetConn serves the block sets (netlink_blockset.go). Nil keeps the
+	// manager on the per-address block rules.
+	newSetConn func() (nftSetAPI, error)
 }
 
 // NewNetlinkBackend wires the per-operation nftables connection factory.
 // Callers must be on linux; non-linux builds use the stub that always errors.
 func NewNetlinkBackend() (RuleBackend, error) {
-	return &netlinkBackend{newConn: func() (nftAPI, error) {
-		c, err := nftables.New()
-		if err != nil {
-			return nil, fmt.Errorf("nftables conn: %w", err)
-		}
-		return c, nil
-	}}, nil
+	return &netlinkBackend{
+		newConn: func() (nftAPI, error) {
+			c, err := nftables.New()
+			if err != nil {
+				return nil, fmt.Errorf("nftables conn: %w", err)
+			}
+			return c, nil
+		},
+		newSetConn: func() (nftSetAPI, error) {
+			c, err := nftables.New()
+			if err != nil {
+				return nil, fmt.Errorf("nftables conn: %w", err)
+			}
+			return c, nil
+		},
+	}, nil
 }
 
 func (b *netlinkBackend) Exists(table, chain string, rulespec ...string) (bool, error) {
