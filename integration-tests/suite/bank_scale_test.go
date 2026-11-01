@@ -693,8 +693,11 @@ func TestBankRecoveryUnderLoad(t *testing.T) {
 
 // UC-338 — density per runtime: small sandboxes are created, 8 at a time,
 // until the cluster refuses for capacity or AEROL_BANK_DENSITY_MAX is
-// reached. The refusal is a clean capacity error, every created sandbox
-// runs, and the nodes stay healthy.
+// reached. The refusal is a clean capacity error — a 503 with Retry-After,
+// whichever limit ran out first (CPU, memory, or a node's network-slot pool:
+// the 2026-11-01 flagship ramp stopped on full netns and TAP pools that
+// answered as the catch-all 400) — every created sandbox runs, and the nodes
+// stay healthy.
 func TestBankDensity(t *testing.T) {
 	harness.Require(t, sc, "UC-338")
 	max := benchEnvInt("AEROL_BANK_DENSITY_MAX", 40)
@@ -705,6 +708,7 @@ func TestBankDensity(t *testing.T) {
 			var created []string
 			var failures []string
 			capacityHit := false
+			var refusal error
 			var lat []time.Duration
 			t.Cleanup(func() {
 				var wg sync.WaitGroup
@@ -735,6 +739,9 @@ func TestBankDensity(t *testing.T) {
 							created = append(created, sb.ID)
 							lat = append(lat, time.Since(t0))
 						case bankIsCapacity(err):
+							if !capacityHit {
+								refusal = err
+							}
 							capacityHit = true
 						default:
 							failures = append(failures, err.Error())
@@ -742,6 +749,15 @@ func TestBankDensity(t *testing.T) {
 					}(i)
 				}
 				wg.Wait()
+			}
+			if capacityHit {
+				// Full must be distinguishable from broken: the status and
+				// the retry hint, not only words in the message.
+				var apiErr *microvm.APIError
+				if !errors.As(refusal, &apiErr) || apiErr.StatusCode != http.StatusServiceUnavailable || apiErr.RetryAfter <= 0 {
+					t.Errorf("the capacity refusal is not a 503 with Retry-After: %v", refusal)
+				}
+				t.Logf("%s density stopped on: %v", rt.name, refusal)
 			}
 			running := 0
 			for _, id := range created {
