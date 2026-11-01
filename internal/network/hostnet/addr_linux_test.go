@@ -80,3 +80,22 @@ func TestNetnsIPv4AddrsMissingPath(t *testing.T) {
 		t.Fatal("a netns path that does not exist must fail")
 	}
 }
+
+// The real dump, in the caller's own namespace (netns.None() asks for no
+// setns, so it needs no privilege): it returns raw addresses, loopback
+// included, which netnsIPv4Addrs then filters out.
+func TestIPv4AddrsInOwnNamespace(t *testing.T) {
+	addrs, err := ipv4AddrsIn(netns.None())
+	if err != nil {
+		t.Fatalf("netlink dump in the caller's namespace: %v", err)
+	}
+	for _, a := range addrs {
+		if a.IPNet != nil && a.IP.To4() == nil {
+			t.Fatalf("an IPv4 dump returned %s", a.IP)
+		}
+		if a.IPNet != nil && a.IP.IsLoopback() {
+			return
+		}
+	}
+	t.Skipf("no IPv4 loopback in this namespace (%d addresses)", len(addrs))
+}
