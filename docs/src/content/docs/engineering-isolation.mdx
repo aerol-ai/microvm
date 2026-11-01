@@ -232,6 +232,8 @@ flowchart TB
 
 What `toolboxd` can do is what the API offers: run commands and code, open terminal sessions, read and write files, and run Git.
 
+[How the in-sandbox agent knows who is calling](/toolbox-agent-authentication/) explains the token check and how a cloned VM gets its token.
+
 ## Who the code runs as
 
 A sandbox runs as its image's default user. For most images, that is root. Setting a user when you create the sandbox does not change this yet.
