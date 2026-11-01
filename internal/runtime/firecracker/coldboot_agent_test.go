@@ -97,6 +97,29 @@ func TestColdBootArgs(t *testing.T) {
 	}
 }
 
+// TestColdBootArgsDisableGuestIPv6 is the regression test for the guest
+// side of the IPv6 hole: every boot the driver makes (cold creates and
+// template snapshots both build their command line here) turns IPv6 off in
+// the guest kernel, with or without a slot or an injected agent.
+func TestColdBootArgsDisableGuestIPv6(t *testing.T) {
+	slot := &TapSlot{GuestIP: "172.16.0.2", HostIP: "172.16.0.1", CIDR: "172.16.0.0/30"}
+	for _, args := range []string{coldBootArgs(slot, true), coldBootArgs(slot, false), coldBootArgs(nil, true), coldBootArgs(nil, false)} {
+		fields := strings.Fields(args)
+		n := 0
+		for _, f := range fields {
+			if f == "ipv6.disable=1" {
+				n++
+			}
+			if strings.HasPrefix(f, "ipv6.disable=") && f != "ipv6.disable=1" {
+				t.Fatalf("conflicting ipv6 arg %q in %q", f, args)
+			}
+		}
+		if n != 1 {
+			t.Fatalf("ipv6.disable=1 appears %d times in %q, want once", n, args)
+		}
+	}
+}
+
 func TestNetmaskFromCIDR(t *testing.T) {
 	for _, tc := range []struct{ cidr, want string }{
 		{"172.16.0.0/30", "255.255.255.252"},
