@@ -40,8 +40,12 @@ type API interface {
 	// ForgetLearned never arrived is collected eventually.
 	RetainLearned(ctx context.Context, ids []string) error
 	// SetNodeControl replaces the node-wide control-port guard's endpoints
-	// (§5.10 PC-2).
+	// (§5.10 PC-2), and drops any pools.
 	SetNodeControl(ctx context.Context, endpoints []netip.AddrPort) error
+	// SetNodeControlPools replaces the guard's endpoints and pools
+	// (ControlPool). A gateway from before the op answers with an error
+	// that IsUnknownOp reports.
+	SetNodeControlPools(ctx context.Context, nc NodeControl) error
 	// SetInspectCA hands the gateway the node's inspection CA (P3-1).
 	SetInspectCA(ctx context.Context, ca InspectCA) error
 	// ClearInspectCA drops the CA, the injection secrets and the inspected
@@ -86,6 +90,9 @@ func (Noop) Probe(context.Context, ProbeRequest) (ProbeResult, error) {
 
 // SetNodeControl is a no-op: without a gateway there is no table to guard.
 func (Noop) SetNodeControl(context.Context, []netip.AddrPort) error { return nil }
+
+// SetNodeControlPools is a no-op, as SetNodeControl.
+func (Noop) SetNodeControlPools(context.Context, NodeControl) error { return nil }
 
 func (Noop) Learned(context.Context, string) (json.RawMessage, error) {
 	return nil, fmt.Errorf("%w: gateway disabled", ErrUnavailable)
@@ -285,6 +292,13 @@ func (c *Client) SetNodeControl(ctx context.Context, endpoints []netip.AddrPort)
 		endpoints = []netip.AddrPort{}
 	}
 	return c.call(ctx, opNodeCtl, endpoints, nil)
+}
+
+func (c *Client) SetNodeControlPools(ctx context.Context, nc NodeControl) error {
+	if nc.Endpoints == nil {
+		nc.Endpoints = []netip.AddrPort{}
+	}
+	return c.call(ctx, opNodeCtlPools, nc, nil)
 }
 
 func (c *Client) SetBridges(ctx context.Context, bridges []Bridge) error {

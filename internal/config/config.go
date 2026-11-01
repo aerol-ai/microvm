@@ -20,6 +20,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -145,6 +146,28 @@ type Config struct {
 	CreateSandboxTimeoutSeconds int
 	ContainerPrivileged         bool
 	ResourceLimitsOff           bool
+	// SandboxPidsLimit caps the processes and threads of each container
+	// sandbox (SB_SANDBOX_PIDS_LIMIT, default 4096; 0 is unlimited). Without
+	// it one sandbox's fork bomb exhausts the node for every tenant. A gVisor
+	// sandbox is capped inside its own kernel instead, at this or one task
+	// per MiB of its memory if lower, and its host cgroup gets the room the
+	// sentry needs at that cap (pkg/gvisorpids).
+	SandboxPidsLimit int
+	// SandboxInterconnect lets sandboxes on one node connect to each other
+	// (SB_SANDBOX_INTERCONNECT, default false). Isolated by default: one
+	// tenant's sandbox cannot reach another's listeners.
+	SandboxInterconnect bool
+	// SandboxNodePortsAllow are node ports every sandbox on this node may
+	// reach on top of the node guard's own allowlist
+	// (SB_SANDBOX_NODE_PORTS_ALLOW, default empty; refused in enterprise
+	// mode). Sandboxes are default-denied from the node they run on.
+	SandboxNodePortsAllow []SandboxNodePort
+	// DiskLimitCheckInterval is how often the disk watchdog checks each
+	// container sandbox's writable layer against its DiskGB
+	// (SB_DISK_LIMIT_CHECK_INTERVAL, default 15s; 0 turns it off). The
+	// engines do not enforce DiskGB on a stock root filesystem, so without
+	// it one sandbox can fill the node's disk for every tenant.
+	DiskLimitCheckInterval time.Duration
 	// Runtime is the host default container runtime for new sandboxes.
 	// Per-sandbox CreateSandboxRequest.Runtime overrides it. Allowed values
 	// are "docker" (default), "gvisor", or "kata"; validation lives in Load().
@@ -212,6 +235,14 @@ type Config struct {
 	AutoReconcile                bool
 	EnableCaddy                  bool
 	EnableNetworkRules           bool
+	// AllowUnenforcedNetworkPolicy lets a container sandbox keep a network
+	// policy (block-all, address lists, hostname rules, byte caps) on a node
+	// whose host firewall is off (SB_ENABLE_NETWORK_RULES=false, or not a
+	// Linux host), where nothing enforces it. Off, those creates and updates
+	// are refused (501): a control the API accepts but does not enforce is
+	// worse than one it refuses. For local development only; enterprise mode
+	// refuses it. SB_ALLOW_UNENFORCED_NETWORK_POLICY.
+	AllowUnenforcedNetworkPolicy bool
 	// NetrulesBackend selects the RuleBackend for DOCKER-USER rules:
 	// "netlink" (default, google/nftables) or "exec" (go-iptables). See
 	// plans/warm-create-latency-tier1.md Phase 1. SB_NETRULES_BACKEND.
@@ -237,8 +268,15 @@ type Config struct {
 	// re-applies after an egress profile changes, so one profile edit can't
 	// flood the gateway and firewall (SB_EGRESS_PROFILE_APPLY_QPS, D21).
 	EgressProfileApplyQPS int
-	EnableEventMonitor    bool
-	EnableSSHGateway      bool
+	// EgressDNSPort and EgressProxyPort are the egress gateway's listener
+	// ports (SB_EGRESS_DNS_PORT, SB_EGRESS_PROXY_PORT, the same names and
+	// defaults the gateway reads from egress-gateway.env). The node guard
+	// opens them to sandboxes when the gateway runs here, until the gateway
+	// reports the ports it really listens on.
+	EgressDNSPort      int
+	EgressProxyPort    int
+	EnableEventMonitor bool
+	EnableSSHGateway   bool
 	// EnableServerless gates wake behavior for sandboxes created with
 	// Lifecycle.Serverless=true. Defaults to true so the wake path is on out
 	// of the box; flip to false on a per-host basis to opt that host out of
@@ -487,6 +525,13 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
+	// a file transfer, a session) lives on once its sandbox stops answering
+	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
+	// A live sandbox's kernel answers the keepalive probes, so a long command
+	// with no output is never cut. SB_TOOLBOX_DEAD_PEER_TIMEOUT, default 30s;
+	// 0 = off (Go's keepalive, about 2.5 minutes); otherwise at least 6s.
+	ToolboxDeadPeerTimeout time.Duration
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1087,6 +1132,16 @@ type Config struct {
 	// See plans/data-plane-load-balancer.md.
 	// SB_INGRESS_ADVERTISE_HOST.
 	IngressAdvertiseHost string
+	// L4PublicHost is the host name clients dial for a raw-TCP exposure
+	// (the L4 host-port pool). Empty keeps the old target: SB_DOMAIN, else
+	// the public host. It exists for a domain that points at a load
+	// balancer which cannot carry the pool: an AWS Network Load Balancer
+	// has at most 50 listeners and the pool is 1,001 ports, so with
+	// Terraform's api_load_balancer = "nlb" the domain reaches the
+	// balancer and raw TCP keeps reaching the ingress nodes directly under
+	// tcp.<domain>. Only the advertised URL and host change; the pool, the
+	// allocator and the routes do not. SB_L4_PUBLIC_HOST.
+	L4PublicHost string
 	// ClusterShardAwareIngress confirms that the public ingress router is
 	// shard-aware when the live ingress tier is larger than
 	// cluster.MaxReplicatedIngressRouteNodes. Above that size, each ingress
@@ -1104,6 +1159,15 @@ type Config struct {
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
 	RouteDNSAddr string
+	// RouteDNSLinkAddr is a second responder listener, on the address of the
+	// node's aerolvm-rt link, where the system resolver sends *.rt.internal.
+	// systemd-resolved pins its socket for a link's DNS server to that link,
+	// so a UDP query to the loopback address goes out the dummy link and is
+	// dropped; resolved then stalls every lookup for about 20s while it falls
+	// back to TCP, and does it again each time it re-probes. install.sh sets
+	// it with --ingress-proxy-routing. Empty: no second listener.
+	// SB_ROUTE_DNS_LINK_ADDR.
+	RouteDNSLinkAddr string
 	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
 	// are REDIRECTed to under ingress proxy routing when the kernel can't
 	// DNAT them straight to the sandbox (stopped serverless sandboxes to
@@ -1449,6 +1513,18 @@ type Config struct {
 	// PATScopeHost: every request on it is public, so a PAT there is
 	// refused. Unused under PATScopeAny. SB_PUBLIC_API_SOCKET.
 	PublicAPISocket string
+	// LivenessSocket is the Unix socket sandboxd answers liveness on from
+	// the first moment of its boot, for the install.sh watchdog. It does no
+	// I/O and takes no lock, so a daemon busy serving the API still answers
+	// it. Empty means off. SB_LIVENESS_SOCKET.
+	LivenessSocket string
+	// APIListMaxInflight bounds the cluster-wide sandbox lists (v1 and the
+	// Daytona, E2B and Runloop facades) this node runs at once; past it a
+	// list waits at most APIListQueueWait for a slot and is otherwise
+	// answered 503 + Retry-After. 0 = no limit. SB_API_LIST_MAX_INFLIGHT,
+	// SB_API_LIST_QUEUE_WAIT (api_admission.go).
+	APIListMaxInflight int
+	APIListQueueWait   time.Duration
 	// OperatorVolumeScope pins the scope segment of the operator's platform
 	// volumes. Empty keeps the legacy op-<hash(PAT)>, which a PAT rotation
 	// would move (H2). SB_OPERATOR_VOLUME_SCOPE.
@@ -1886,10 +1962,14 @@ func load(keyTool bool) (Config, error) {
 		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
 		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
 		ResourceLimitsOff:                 getEnvBool("SB_RESOURCE_LIMITS_DISABLED", false),
+		SandboxPidsLimit:                  getEnvInt("SB_SANDBOX_PIDS_LIMIT", 4096),
+		SandboxInterconnect:               getEnvBool("SB_SANDBOX_INTERCONNECT", false),
+		DiskLimitCheckInterval:            getEnvDuration("SB_DISK_LIMIT_CHECK_INTERVAL", 15*time.Second),
 		Runtime:                           getEnv("SB_CONTAINER_RUNTIME", models.RuntimeDocker),
 		ContainerEngine:                   getEnv("SB_CONTAINER_ENGINE", models.ContainerEngineDocker),
 		ContainerdSocket:                  getEnv("SB_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"),
@@ -1912,6 +1992,7 @@ func load(keyTool bool) (Config, error) {
 		AutoReconcile:                     getEnvBool("SB_AUTO_RECONCILE", true),
 		EnableCaddy:                       getEnvBool("SB_ENABLE_CADDY", true),
 		EnableNetworkRules:                getEnvBool("SB_ENABLE_NETWORK_RULES", true),
+		AllowUnenforcedNetworkPolicy:      getEnvBool("SB_ALLOW_UNENFORCED_NETWORK_POLICY", false),
 		NetrulesBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_NETRULES_BACKEND", "netlink"))),
 		EgressFQDNEnabled:                 getEnvBool("SB_EGRESS_FQDN_ENABLED", true),
 		EgressGatewaySocket:               strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_SOCKET", "/run/aerolvm/egress-gateway.sock")),
@@ -1919,6 +2000,8 @@ func load(keyTool bool) (Config, error) {
 		EgressGatewayUser:                 strings.TrimSpace(getEnv("SB_EGRESS_GATEWAY_USER", "aerolvm-egress")),
 		EgressOperatorFile:                strings.TrimSpace(getEnv("SB_EGRESS_OPERATOR_FILE", "")),
 		EgressProfileApplyQPS:             getEnvInt("SB_EGRESS_PROFILE_APPLY_QPS", 50),
+		EgressDNSPort:                     getEnvInt("SB_EGRESS_DNS_PORT", 53054),
+		EgressProxyPort:                   getEnvInt("SB_EGRESS_PROXY_PORT", 15080),
 		EnableEventMonitor:                getEnvBool("SB_ENABLE_EVENT_MONITOR", true),
 		EnableSSHGateway:                  getEnvBool("SB_ENABLE_SSH_GATEWAY", true),
 		EnableServerless:                  getEnvBool("SB_ENABLE_SERVERLESS", true),
@@ -2041,9 +2124,11 @@ func load(keyTool bool) (Config, error) {
 		SelfAPIAdvertiseURL:              strings.TrimSpace(os.Getenv("SB_API_ADVERTISE_URL")),
 		DataPlaneAdvertiseHost:           normalizeAdvertiseHost(os.Getenv("SB_DATA_PLANE_ADVERTISE_HOST")),
 		IngressAdvertiseHost:             normalizeAdvertiseHost(os.Getenv("SB_INGRESS_ADVERTISE_HOST")),
+		L4PublicHost:                     normalizeAdvertiseHost(os.Getenv("SB_L4_PUBLIC_HOST")),
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
@@ -2303,6 +2388,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
+	}
+	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
+		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")
@@ -2568,6 +2656,28 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
+	if cfg.RouteDNSLinkAddr != "" {
+		host, port, err := net.SplitHostPort(cfg.RouteDNSLinkAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || ip.IsUnspecified() || port == "" || port == "0" {
+			// An address, not a wildcard: the responder answers a non-loopback
+			// client only when it is the listener's own address.
+			return Config{}, fmt.Errorf("invalid SB_ROUTE_DNS_LINK_ADDR %q: require ip:port with a specific IP", cfg.RouteDNSLinkAddr)
+		}
+	}
+	if cfg.SandboxPidsLimit < 0 {
+		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)
+	}
+	nodePorts, perr := ParseSandboxNodePorts(os.Getenv("SB_SANDBOX_NODE_PORTS_ALLOW"))
+	if perr != nil {
+		return Config{}, perr
+	}
+	cfg.SandboxNodePortsAllow = nodePorts
+	if err := validEgressGatewayPorts(cfg); err != nil {
+		return Config{}, err
+	}
+	if err := validateSandboxNodePorts(cfg); err != nil {
+		return Config{}, err
+	}
 	if cfg.L4PortRangeStart < 1024 || cfg.L4PortRangeEnd > 65535 || cfg.L4PortRangeStart >= cfg.L4PortRangeEnd {
 		return Config{}, fmt.Errorf("invalid SB_L4_PORT_RANGE_START/END (%d-%d): require 1024 <= start < end <= 65535",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
@@ -2793,6 +2903,12 @@ func load(keyTool bool) (Config, error) {
 	if err := cfg.loadPATScopeConfig(); err != nil {
 		return Config{}, err
 	}
+	if err := cfg.loadLivenessConfig(); err != nil {
+		return Config{}, err
+	}
+	if err := cfg.loadAPIAdmissionConfig(); err != nil {
+		return Config{}, err
+	}
 	if err := validateIdentity(&cfg); err != nil {
 		return Config{}, err
 	}
@@ -2819,6 +2935,15 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ResourceLimitsOff {
 			return Config{}, errors.New("SB_RESOURCE_LIMITS_DISABLED must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxPidsLimit == 0 {
+			return Config{}, errors.New("SB_SANDBOX_PIDS_LIMIT must be above 0 when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.SandboxInterconnect {
+			return Config{}, errors.New("SB_SANDBOX_INTERCONNECT must be false when SB_ENTERPRISE_MODE=true")
+		}
+		if cfg.AllowUnenforcedNetworkPolicy {
+			return Config{}, errors.New("SB_ALLOW_UNENFORCED_NETWORK_POLICY must be false when SB_ENTERPRISE_MODE=true (it accepts network policy the node does not enforce)")
 		}
 		if !cfg.SecretAuditStrictBoot {
 			return Config{}, errors.New("SB_SECRET_AUDIT_STRICT_BOOT must be true when SB_ENTERPRISE_MODE=true")

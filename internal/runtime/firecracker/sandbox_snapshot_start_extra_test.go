@@ -28,7 +28,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	os.MkdirAll(dir, 0755)
 
 	// Manifest missing
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "read sandbox snapshot manifest") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "read sandbox snapshot manifest") {
 		t.Errorf("expected manifest missing error, got %v", err)
 	}
 
@@ -44,7 +44,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	os.WriteFile(manifestPath, b, 0644)
 
 	// Verify fail (missing mem/state)
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot integrity") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "snapshot integrity") {
 		t.Errorf("expected verify fail error, got %v", err)
 	}
 
@@ -58,21 +58,21 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	os.WriteFile(manifestPath, b, 0644)
 
 	// Rootfs missing
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot rootfs missing") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "snapshot rootfs missing") {
 		t.Errorf("expected rootfs missing error, got %v", err)
 	}
 
 	os.WriteFile(rootfsPath, []byte("rootfs"), 0644)
 
 	// Overlay missing
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "snapshot overlay missing") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "snapshot overlay missing") {
 		t.Errorf("expected overlay missing error, got %v", err)
 	}
 
 	os.WriteFile(overlayPath, []byte("overlay"), 0644)
 
 	// Tap slot missing (fakePool doesn't have it allocated)
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "tap slot missing") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "tap slot missing") {
 		t.Errorf("expected tap slot missing error, got %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	d.SetSpawner(func(cfg Config, sandboxID string) (VMMHandle, error) {
 		return nil, errors.New("spawn error")
 	})
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "spawn error") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "spawn error") {
 		t.Errorf("expected spawn error, got %v", err)
 	}
 
@@ -94,7 +94,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	fakeTap := &fakeTapHost{ensureErr: errors.New("ensure error")}
 	d.tapHost = fakeTap
 
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "tap host ensure") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "tap host ensure") {
 		t.Errorf("expected tap ensure error, got %v", err)
 	}
 
@@ -105,7 +105,7 @@ func TestStartFromSandboxSnapshot_ExtraCoverage(t *testing.T) {
 	d.SetClientFactory(func(socketPath string) VMMClient {
 		return client
 	})
-	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID); err == nil || !strings.Contains(err.Error(), "patch VM Resumed") {
+	if _, err := d.startFromSandboxSnapshot(context.Background(), sbID, "tok"); err == nil || !strings.Contains(err.Error(), "patch VM Resumed") {
 		t.Errorf("expected patch VM Resumed error, got %v", err)
 	}
 }

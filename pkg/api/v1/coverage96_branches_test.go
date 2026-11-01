@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -820,6 +821,38 @@ func TestC96bClusterListSweepSkipsBlankKeysAndCountsLocalFailure(t *testing.T) {
 	}
 	if got.failedPeers != 1 {
 		t.Fatalf("failedPeers = %d, want 1 for the failed local list", got.failedPeers)
+	}
+}
+
+// The aggregating node not running the runtime is not a missing peer. Found
+// live on a heterogeneous cluster: a server without isolate answered every
+// js-bundle list with X-Aerol-Missing-Js-Bundle-Peers: 1 (UC-168).
+func TestClusterListSweepSelfWithoutTheRuntimeIsNotAMissingPeer(t *testing.T) {
+	c := cluster.NewNoop("self", "http://self", "")
+	notHere := fmt.Errorf("js-bundles require the isolate runtime: %w", models.ErrRuntimeNotImplemented)
+	tests := []struct {
+		name     string
+		catalog  []string
+		wantRows []string
+	}{
+		{name: "rows from the catalogue", catalog: []string{"a", "b"}, wantRows: []string{"a", "b"}},
+		{name: "no rows anywhere", catalog: nil, wantRows: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			catalog := func(*http.Request) ([]string, []string, bool) { return tc.catalog, []string{"w1"}, true }
+			got, err := clusterListSweep[string](httptest.NewRequest(http.MethodGet, "/v1/js-bundles", nil), c, models.RuntimeIsolate, "X-Test",
+				nil, notHere, func(s string) string { return s }, c96bLogger(), "js-bundles", nil, catalog)
+			if err != nil {
+				t.Fatalf("sweep: %v (a node without the runtime must not fail the list)", err)
+			}
+			if got.failedPeers != 0 {
+				t.Fatalf("failedPeers = %d, want 0: this node not running isolate is not a peer that failed", got.failedPeers)
+			}
+			if len(got.rows) != len(tc.wantRows) {
+				t.Fatalf("rows = %v, want %v", got.rows, tc.wantRows)
+			}
+		})
 	}
 }
 

@@ -30,10 +30,14 @@ resource "aws_instance" "seed" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # Spot is opt-in per node. The dynamic block emits ZERO blocks when spot is
@@ -85,6 +89,8 @@ resource "aws_instance" "seed" {
     idle_timeout_min                         = local.seed_node.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, local.seed_name) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
@@ -271,10 +277,14 @@ resource "aws_instance" "joiner" {
     encrypted             = true
   }
 
+  # Hop limit 1: IMDSv2 answers the node itself (sandboxd, KMS, S3) and not
+  # a sandbox one NAT hop away, which could otherwise read the node's
+  # instance-role credentials. sandboxd also drops the metadata endpoints on
+  # every sandbox network (egresspolicy.MetadataPrefixes).
   metadata_options {
     http_endpoint               = "enabled"
     http_tokens                 = "required"
-    http_put_response_hop_limit = 2
+    http_put_response_hop_limit = 1
   }
 
   # See the seed resource for the rationale: zero blocks when spot=false keeps
@@ -319,6 +329,8 @@ resource "aws_instance" "joiner" {
     idle_timeout_min                         = each.value.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, each.key) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url

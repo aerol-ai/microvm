@@ -296,7 +296,7 @@ func burstAuditReads(t *testing.T, c *harness.Client, sandboxID string, n int) (
 			t.Fatalf("build request: %v", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+sc.PAT)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := harness.HTTPClient(0).Do(req)
 		if err != nil {
 			t.Fatalf("audit read %d: %v", i, err)
 		}

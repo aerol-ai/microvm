@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/caddy"
 	"github.com/aerol-ai/microvm/pkg/capacity"
@@ -55,7 +57,8 @@ func (f *fakeCapacityRuntime) Inspect(_ context.Context, ref string) (*models.Sa
 	if state, ok := f.inspect[ref]; ok {
 		return state, nil
 	}
-	return &models.SandboxRuntimeState{}, nil
+	// What a real driver answers for a container it has never heard of.
+	return nil, fmt.Errorf("container %s: %w", ref, runtime.ErrInstanceNotFound)
 }
 
 func (f *fakeCapacityRuntime) Create(context.Context, models.CreateSandboxRequest, string, string, []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
@@ -1442,11 +1445,10 @@ func TestUnknownSandboxEventIsNoOp(t *testing.T) {
 	}
 }
 
-// TestOOMEventReleasesAdmitter: oom is grouped with die/stop in
-// markSandboxStopped — the container is dead, the host slot is freed, and
-// the row is preserved with a LastError that names OOM so users can see why
-// their container died on next list.
-func TestOOMEventReleasesAdmitter(t *testing.T) {
+// TestOOMEventAloneKeepsTheSandbox: an oom event means a process in the
+// container was OOM-killed, which the sandbox survives unless its init was
+// the one killed. The slot stays held and the row stays started.
+func TestOOMEventAloneKeepsTheSandbox(t *testing.T) {
 	ctx := context.Background()
 	svc, admitter, st := newCapacityHarness(t, nil, nil)
 
@@ -1454,30 +1456,54 @@ func TestOOMEventReleasesAdmitter(t *testing.T) {
 	seedSandbox(t, st, id, models.SandboxStatusStarted, 1, 1024)
 	admitter.Reserve(id, capacity.Request{CPU: 1, MemoryMB: 1024})
 
-	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{
-		SandboxID: id,
-		Action:    "oom",
-		Time:      time.Now().UTC(),
-	}); err != nil {
+	if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: id, Action: "oom", Time: time.Now().UTC()}); err != nil {
 		t.Fatalf("oom event: %v", err)
 	}
-	if snap := admitter.Snapshot(); snap.SandboxesActive != 0 {
-		t.Fatalf("oom did not release admitter: %+v", snap)
+	if snap := admitter.Snapshot(); snap.SandboxesActive != 1 {
+		t.Fatalf("an oom event released the slot of a running sandbox: %+v", snap)
 	}
 	got, err := st.Get(ctx, id)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if got.Status != models.SandboxStatusStopped {
-		t.Fatalf("status after oom: %q, want stopped", got.Status)
-	}
-	if got.LastError == "" {
-		t.Fatalf("oom event must set LastError so the cause shows in /v1/sandboxes")
+	if got.Status != models.SandboxStatusStarted || got.LastError != "" {
+		t.Fatalf("after an oom event: status %q last error %q, want started and none", got.Status, got.LastError)
 	}
 }
 
-// TestStopEventActionReleasesAdmitter: covers the third action that funnels
-// through markSandboxStopped — "stop" — separately from die/oom. Belt-and-
+// TestOOMThenDieReleasesAdmitter: when the init is the process killed, the
+// die that follows the oom event releases the slot and leaves the row
+// stopped with a LastError that names OOM, so users see why it died.
+func TestOOMThenDieReleasesAdmitter(t *testing.T) {
+	ctx := context.Background()
+	svc, admitter, st := newCapacityHarness(t, nil, nil)
+
+	const id = "sb-oom-die"
+	seedSandbox(t, st, id, models.SandboxStatusStarted, 1, 1024)
+	admitter.Reserve(id, capacity.Request{CPU: 1, MemoryMB: 1024})
+
+	for _, ev := range []docker.DockerEvent{
+		{SandboxID: id, Action: "oom", Time: time.Now().UTC()},
+		{SandboxID: id, Action: "die", ExitCode: 137, Time: time.Now().UTC()},
+	} {
+		if err := svc.handleDockerEvent(ctx, ev); err != nil {
+			t.Fatalf("%s event: %v", ev.Action, err)
+		}
+	}
+	if snap := admitter.Snapshot(); snap.SandboxesActive != 0 {
+		t.Fatalf("oom then die did not release the slot: %+v", snap)
+	}
+	got, err := st.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != models.SandboxStatusStopped || got.LastError != "container killed by OOM" {
+		t.Fatalf("after oom then die: status %q last error %q", got.Status, got.LastError)
+	}
+}
+
+// TestStopEventActionReleasesAdmitter: covers the second action that funnels
+// through markSandboxStopped — "stop" — separately from die. Belt-and-
 // braces against a future refactor that splits the switch.
 func TestStopEventActionReleasesAdmitter(t *testing.T) {
 	ctx := context.Background()

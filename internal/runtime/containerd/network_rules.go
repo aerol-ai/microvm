@@ -2,9 +2,12 @@ package containerd
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
+	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func (d *Driver) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken string, ports []int) error {
@@ -21,6 +24,40 @@ func (d *Driver) ClearNetworkRules(containerIP string) error {
 	}
 	_ = d.networkRules.ClearBlockAllEgress(containerIP)
 	return d.networkRules.ClearBlockAllIngress(containerIP)
+}
+
+// hasCreateNetRules reports whether a create asks for host firewall rules.
+func hasCreateNetRules(req models.CreateSandboxRequest) bool {
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+}
+
+// applyCreateNetRules installs a create's rules on ip: block-all (which a
+// hostname-filtered create arrives as, the gateway attach lifting it), or
+// the CIDR lists. A create without either installs nothing.
+func (d *Driver) applyCreateNetRules(ip string, req models.CreateSandboxRequest) error {
+	if req.NetworkBlockAll {
+		if err := d.ApplyNetworkBlockAll(ip); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		if err := d.ApplyEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+			return fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// clearCreateNetRules removes what applyCreateNetRules may have installed
+// on ip, a partial install included. Best effort, as Destroy's clears are.
+func (d *Driver) clearCreateNetRules(ip string, req models.CreateSandboxRequest) {
+	if !hasCreateNetRules(req) {
+		return
+	}
+	_ = d.ClearNetworkRules(ip)
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		_ = d.ClearEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut)
+	}
 }
 
 func (d *Driver) ApplyNetworkBlockAll(containerIP string) error {
@@ -55,7 +92,9 @@ func (d *Driver) ClearNetworkBlockEgress(containerIP string) error {
 	if d.networkRules == nil {
 		return nil
 	}
-	return d.networkRules.ClearBlockAllEgress(containerIP)
+	// The sandbox keeps its address: lift, don't forget (netrules
+	// LiftBlockAllEgress; on the block sets, one element add).
+	return d.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 func (d *Driver) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error {
@@ -72,7 +111,15 @@ func (d *Driver) ClearEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []s
 	return d.networkRules.ClearEgressPolicy(containerIP, allowCIDRs, denyCIDRs)
 }
 
-var _ sbruntime.EgressHolder = (*Driver)(nil)
+var (
+	_ sbruntime.EgressHolder     = (*Driver)(nil)
+	_ sbruntime.NetRulesReporter = (*Driver)(nil)
+)
+
+// NetRulesEnabled reports whether the AEROLVM-USER rules are live. A nil or
+// disabled manager (network rules off, or not Linux) makes every rule method
+// here a no-op.
+func (d *Driver) NetRulesEnabled() bool { return d.networkRules.Enabled() }
 
 // ApplyEgressHold installs the fail-closed hold DROP (CEO D16).
 func (d *Driver) ApplyEgressHold(containerIP string) error {
@@ -88,6 +135,25 @@ func (d *Driver) ClearEgressHold(containerIP string) error {
 		return nil
 	}
 	return d.networkRules.ClearHoldEgress(containerIP)
+}
+
+var _ sbruntime.NodeGuardSetter = (*Driver)(nil)
+
+// SetNodeGuard default-denies the CNI bridge subnet from the node itself,
+// except allow (netrules ChainAerolvmNode).
+func (d *Driver) SetNodeGuard(_ context.Context, allow []netrules.NodePort) error {
+	if d.networkRules == nil || !d.networkRules.Enabled() {
+		return sbruntime.ErrNodeGuardUnavailable
+	}
+	return d.networkRules.SetNodeGuard(d.networkRules.BridgeSubnet(), allow)
+}
+
+// ReassertNodeGuard puts the guard back if something removed it.
+func (d *Driver) ReassertNodeGuard(context.Context) (bool, error) {
+	if d.networkRules == nil {
+		return false, nil
+	}
+	return d.networkRules.ReassertNodeGuard()
 }
 
 // SetEgressFloor installs the operator's node-wide deny floor for the CNI

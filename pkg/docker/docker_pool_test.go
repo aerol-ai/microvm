@@ -94,9 +94,15 @@ func TestIsDockerNameConflict(t *testing.T) {
 }
 
 func TestParkDefaultResources(t *testing.T) {
-	res := parkDefaultResources(&Client{})
+	res := parkDefaultResources(0)
 	if res["CpuQuota"] == nil || res["Memory"] == nil {
 		t.Fatalf("resources = %#v", res)
+	}
+	if _, ok := res["PidsLimit"]; ok {
+		t.Fatalf("an unlimited node must not set PidsLimit: %#v", res)
+	}
+	if got := parkDefaultResources(3072)["PidsLimit"]; got != int64(3072) {
+		t.Fatalf("PidsLimit = %v, want 3072", got)
 	}
 }
 

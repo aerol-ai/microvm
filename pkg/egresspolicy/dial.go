@@ -128,6 +128,11 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	case ip.IsMulticast() || ip == broadcast:
 		return refuse(DialReasonMulticast, "")
 	}
+	// The node itself, whatever a policy CIDR or the internal zone opens:
+	// one of its addresses can sit inside an allowed private range.
+	if err := CheckNode(t.Addr); err != nil {
+		return err
+	}
 	if err := g.CheckFloor(t.Addr); err != nil {
 		return err
 	}
@@ -153,12 +158,16 @@ func (g DialGuard) Check(p *Policy, t DialTarget) error {
 	return nil
 }
 
-// CheckFloor applies only the operator deny floor. The floor is the one guard
+// CheckFloor applies only the deny floor: the cloud metadata endpoints, then
+// the operator's deny_cidrs. The floor is the one guard
 // rule that binds a sandbox with no policy of its own (§5.10 PC-2: it drops
 // matching traffic from every sandbox in every mode); the private-range rule
 // and the internal zone only narrow what a policy's allow rules open.
 func (g DialGuard) CheckFloor(addr netip.AddrPort) error {
 	ip := addr.Addr().Unmap()
+	if pfx, ok := firstContaining(MetadataPrefixes, ip); ok {
+		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
+	}
 	if pfx, ok := firstContaining(g.DenyFloor, ip); ok {
 		return &DialError{Addr: ip.String(), Reason: DialReasonDenyFloor, Rule: pfx.String()}
 	}

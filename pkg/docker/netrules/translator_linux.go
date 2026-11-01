@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/nftables/expr"
 	"github.com/google/nftables/xt"
+	"golang.org/x/sys/unix"
 )
 
 // exprsFromRulespec builds the nft expression list for a Manager rule shape.
@@ -31,6 +32,9 @@ func exprsFromRulespec(rulespec ...string) ([]expr.Any, error) {
 	if parsed.dst != nil {
 		exprs = append(exprs, ipv4MatchExprs(16, parsed.dst)...)
 	}
+	if parsed.proto != "" {
+		exprs = append(exprs, protoMatchExprs(parsed.proto, parsed.dport)...)
+	}
 	if parsed.comment != "" {
 		cmt := xt.Comment(parsed.comment)
 		exprs = append(exprs, &expr.Match{
@@ -47,11 +51,40 @@ func exprsFromRulespec(rulespec ...string) ([]expr.Any, error) {
 		kind = expr.VerdictAccept
 	case verdictReturn:
 		kind = expr.VerdictReturn
+	case verdictJump:
+		exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictJump, Chain: parsed.jump})
+		return exprs, nil
 	default:
 		return nil, fmt.Errorf("netrules: internal: unset verdict after parse")
 	}
 	exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: kind})
 	return exprs, nil
+}
+
+// protoMatchExprs is `-p tcp|udp [--dport N]` in the shape iptables-nft
+// 1.8.7 (Ubuntu 22.04) writes it: meta l4proto, then the xt tcp/udp match
+// for the port. The xt match, not a native transport-header payload, so
+// every iptables-nft version can still list the chain (one that cannot
+// render a rule breaks `iptables -S` for the whole chain); the kernel
+// already needs nft_compat for the conntrack match the input chains use.
+func protoMatchExprs(proto string, dport uint16) []expr.Any {
+	num := byte(unix.IPPROTO_TCP)
+	if proto == "udp" {
+		num = unix.IPPROTO_UDP
+	}
+	out := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{num}},
+	}
+	if dport == 0 {
+		return out
+	}
+	ports := [2]uint16{dport, dport}
+	var info xt.InfoAny = &xt.Tcp{SrcPorts: [2]uint16{0, 0xffff}, DstPorts: ports}
+	if proto == "udp" {
+		info = &xt.Udp{SrcPorts: [2]uint16{0, 0xffff}, DstPorts: ports}
+	}
+	return append(out, &expr.Match{Name: proto, Rev: 0, Info: info})
 }
 
 // ipv4MatchExprs matches an IPv4 address/CIDR at the given network-header
@@ -154,21 +187,49 @@ func exprEqual(a, b expr.Any) bool {
 		return ok && x.SourceRegister == y.SourceRegister && x.DestRegister == y.DestRegister &&
 			x.Len == y.Len && bytesEqual(x.Mask, y.Mask) && bytesEqual(x.Xor, y.Xor)
 	case *expr.Verdict:
+		// A jump's identity includes where it goes: otherwise a check for
+		// the jump to one chain would find the jump to another.
 		y, ok := b.(*expr.Verdict)
-		return ok && x.Kind == y.Kind
+		return ok && x.Kind == y.Kind && x.Chain == y.Chain
+	case *expr.Meta:
+		y, ok := b.(*expr.Meta)
+		return ok && x.Key == y.Key && x.Register == y.Register && x.SourceRegister == y.SourceRegister
 	case *expr.Match:
 		y, ok := b.(*expr.Match)
 		if !ok || x.Name != y.Name || x.Rev != y.Rev {
 			return false
 		}
-		xc, xok := x.Info.(*xt.Comment)
-		yc, yok := y.Info.(*xt.Comment)
-		return xok && yok && *xc == *yc
+		return matchInfoEqual(x.Info, y.Info)
+	case *expr.Lookup:
+		// The set's ID is per transaction; its name is what the rule means.
+		y, ok := b.(*expr.Lookup)
+		return ok && x.SourceRegister == y.SourceRegister && x.SetName == y.SetName && x.Invert == y.Invert &&
+			x.DestRegister == y.DestRegister && x.IsDestRegSet == y.IsDestRegSet
+	case *expr.Ct:
+		y, ok := b.(*expr.Ct)
+		return ok && x.Key == y.Key && x.Register == y.Register && x.SourceRegister == y.SourceRegister && x.Direction == y.Direction
 	case *expr.Counter:
 		// Counters are runtime state (packet/byte totals), not identity —
 		// two counter exprs always match regardless of what they've counted.
 		_, ok := b.(*expr.Counter)
 		return ok
+	default:
+		return false
+	}
+}
+
+// matchInfoEqual compares the xt match payloads Manager rules carry.
+func matchInfoEqual(a, b xt.InfoAny) bool {
+	switch x := a.(type) {
+	case *xt.Comment:
+		y, ok := b.(*xt.Comment)
+		return ok && *x == *y
+	case *xt.Tcp:
+		y, ok := b.(*xt.Tcp)
+		return ok && *x == *y
+	case *xt.Udp:
+		y, ok := b.(*xt.Udp)
+		return ok && *x == *y
 	default:
 		return false
 	}

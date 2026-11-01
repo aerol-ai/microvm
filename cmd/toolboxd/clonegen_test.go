@@ -22,7 +22,7 @@ func TestCloneGenerationRoute_ReturnsToken(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	s.routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/clone-generation", nil))
+	authedRoutes(s).ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/clone-generation", nil))
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (unauthenticated)", rr.Code)
 	}

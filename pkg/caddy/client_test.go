@@ -1109,6 +1109,25 @@ func TestPublicEndpointHelpers(t *testing.T) {
 			t.Fatalf("TCPPublicEndpoint() = %q", got)
 		}
 	})
+	// SB_L4_PUBLIC_HOST: the domain fronts a load balancer that cannot carry
+	// the host-port pool, so raw TCP is advertised under its own name. The
+	// URL and the Host field come from one function and must agree.
+	t.Run("tcp_endpoint_uses_l4_public_host_over_domain", func(t *testing.T) {
+		client := New(config.Config{Domain: "sandbox.example.com", PublicHost: "203.0.113.10", L4PublicHost: "tcp.sandbox.example.com"})
+		if got := client.TCPPublicEndpoint(22017); got != "tcp://tcp.sandbox.example.com:22017" {
+			t.Fatalf("TCPPublicEndpoint() = %q", got)
+		}
+		if got := client.PublicHost(); got != "tcp.sandbox.example.com" {
+			t.Fatalf("PublicHost() = %q", got)
+		}
+		// Everything else the domain names is unchanged.
+		if got := client.PortPublicURL("abc", 3000); got != "https://abc-3000.sandbox.example.com" {
+			t.Fatalf("PortPublicURL() = %q", got)
+		}
+		if got := client.TLSPublicEndpoint("abc", 5432, ":443"); got != "tls://abc-5432.sandbox.example.com:443" {
+			t.Fatalf("TLSPublicEndpoint() = %q", got)
+		}
+	})
 	t.Run("tls_endpoint_requires_domain_and_listen", func(t *testing.T) {
 		client := &Client{domain: "sandbox.example.com", publicHost: "203.0.113.10"}
 		if got := client.TLSPublicEndpoint("abc", 5432, ":443"); got != "tls://abc-5432.sandbox.example.com:443" {

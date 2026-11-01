@@ -186,6 +186,53 @@ Fixture notes:
   code path, not a network HSM. The one AWS CloudHSM run is operator-gated
   and not a scenario here (CloudHSM bills hourly per HSM).
 
+## Ingress load balancer (UC-356)
+
+`cluster-3-mixed-lb` (`make integration-cluster-mixed-lb`) is cluster-3-mixed
+with a health-checked AWS Network Load Balancer in front of the ingress
+nodes. Its `api-load-balancer` capability is the switch: run.sh applies and
+destroys with `api_load_balancer = "nlb"` for it and `"none"` for every other
+scenario, whatever `config/terraform.tfvars` says. The domain then resolves to
+the balancer's Elastic IP, and raw TCP ports to `tcp.<domain>` (one record
+per node), so the whole suite also runs through the balancer.
+
+UC-356 (`suite/api_lb_test.go`) checks the domain resolves to the balancer
+only, stops sandboxd on one non-seed node, and reads the balancer's own view
+(`aws elbv2 describe-target-health` on the 443 target group): the node must
+leave rotation within `AEROL_LB_OUT_OF_ROTATION_MAX` (default 20s), 60
+fresh-connection calls through the domain must then all succeed, and after
+the daemon restarts the node must be healthy again within
+`AEROL_LB_BACK_IN_ROTATION_MAX` (default 90s). Each call opens its own TCP
+and TLS connection on a transport of its own, so neither keep-alive nor the
+suite's shared client can hide a 502. The numbers land in
+`<reports>/cluster-3-mixed-lb-bank.json` under
+`api_load_balancer_daemon_outage`.
+
+The scenario needs the default local build, or a release that has
+`install.sh --lb-health-port` and `SB_L4_PUBLIC_HOST`. The reaper
+(`scripts/integration-reap.sh`) terminates instances only, so a scenario
+whose teardown failed keeps its balancer and Elastic IP until
+`integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
+
+## Overload is shed, not restarted (UC-361)
+
+UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,
+`domain` and `disruptive: true`. It drives `AEROL_OVERLOAD_CONCURRENCY`
+clients (default 1024, the step that broke the bank flagship) at
+`GET /v1/sandboxes` through the domain for `AEROL_OVERLOAD_SECONDS` (default
+60) with a client that never retries. Every answer must be 200 or a refusal
+with `Retry-After` (503 or 429); a 502, any other 5xx, a refused or reset
+connection, or a request hung past 30 s fails it. Over SSH it then checks
+that no sandboxd restarted on any node: the unit's `InvocationID` and
+`NRestarts` are unchanged (a watchdog restart does not raise `NRestarts`),
+and neither `journalctl -u sandboxd` nor `journalctl -t sandboxd-healthcheck`
+shows a start or a restart since the load began. Last, the list must be back
+to its baseline latency (the median of 5 in a row within 2x the idle p50, or
+the p50 plus 250 ms) within 60 s of the load stopping. The numbers, and each
+node's `aerolvm_api_list_shed_total`, land in `<reports>/<scenario>-bank.json`
+under `overload_shed_v1_sandboxes`; a run that shed nothing says so in the
+test log, since it never reached the shedding point.
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an

@@ -1299,6 +1299,29 @@ func TestNodeRoleCases(t *testing.T) {
 		}
 	})
 
+	// SB_L4_PUBLIC_HOST is a host name, whatever form the operator wrote it
+	// in: tcp://tcp.example.com:22000 would otherwise land in every raw-TCP
+	// URL as tcp://tcp://tcp.example.com:22000:22017.
+	t.Run("l4_public_host_is_normalized_from_env", func(t *testing.T) {
+		for raw, want := range map[string]string{
+			"":                             "",
+			"tcp.example.com":              "tcp.example.com",
+			" tcp.example.com ":            "tcp.example.com",
+			"tcp.example.com:22000":        "tcp.example.com",
+			"tcp://tcp.example.com:22000/": "tcp.example.com",
+		} {
+			setClusterDefaults(t)
+			t.Setenv("SB_L4_PUBLIC_HOST", raw)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() with SB_L4_PUBLIC_HOST=%q: %v", raw, err)
+			}
+			if cfg.L4PublicHost != want {
+				t.Errorf("SB_L4_PUBLIC_HOST=%q loads as %q, want %q", raw, cfg.L4PublicHost, want)
+			}
+		}
+	})
+
 	t.Run("cluster_shard_aware_ingress_opt_in_loads", func(t *testing.T) {
 		setClusterDefaults(t)
 		t.Setenv("SB_CLUSTER_SHARD_AWARE_INGRESS", "true")

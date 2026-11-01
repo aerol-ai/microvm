@@ -21,14 +21,14 @@
     "astro-mermaid": "^2.1.0",
     "http-cache-semantics": "file:../third_party/http-cache-semantics",
     "mermaid": "^11.17.2",
-    "sass": "^1.105.1",
+    "sass": "^1.107.0",
     "tailwindcss": "^4.3.3",
     "typescript": "^7.0.2"
   },
   "devDependencies": {
     "prettier": "^3.9.10",
     "prettier-plugin-astro": "^1.1.1",
-    "wrangler": "4.151.0"
+    "wrangler": "4.156.0"
   },
   "optionalDependencies": {
     "@emnapi/core": "1.11.3",

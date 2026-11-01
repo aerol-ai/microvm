@@ -542,8 +542,9 @@ export interface Sandbox {
   networkBlockAll: boolean;
   /**
    * Hostname-egress state on `get` for a sandbox whose allow list names
-   * hosts (container runtimes): "active", "held" or "unavailable". Absent
-   * otherwise, and on list results.
+   * hosts (container runtimes): "active", "held" or "unavailable";
+   * "unenforced" when the server's firewall is off and nothing filters the
+   * sandbox. Absent otherwise, and on list results.
    */
   egressStatus?: string;
   /** Egress profiles this sandbox references. */
@@ -693,7 +694,10 @@ export interface NetworkPolicy {
   networkEgressRules: EgressRule[];
   /** Hostname entries in force: inline plus every profile's (at most 1024). */
   effectiveHostnameCount: number;
-  /** "active", "held" or "unavailable" for hostname rules on a container. */
+  /**
+   * "active", "held" or "unavailable" for hostname rules on a container;
+   * "unenforced" when the server's firewall is off.
+   */
   egressStatus?: string;
 }
 

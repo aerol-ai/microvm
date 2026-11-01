@@ -808,7 +808,7 @@ The scrape token is **read-only, not metrics-only**. It cannot create, run or de
 With SSO on or off, every call that changes something writes an audit record. The record names the caller.
 
 - **Every call except plain reads.** That covers create, delete, start, stop, ports, snapshots, tokens, and every command or file call inside a sandbox. File reads count too, since files can hold secrets. With `SB_AUDIT_API_RECORDS=all`, plain reads are recorded too.
-- **Refused calls.** A `403` is a record with `result: denied`. A refused credential (`401`) is an `auth_denied` record, at most one per address per minute.
+- **Refused calls.** A `403` is a record with `result: denied`. A refused credential (`401`) is an `auth_denied` record, at most one per address per minute. Together, those records count every refused call.
 - **The server's own work.** For example, a lifecycle timer may delete a sandbox. The record names the part of the server that did it, such as `system:lifecycle`.
 - **Commands are not stored by default.** A record holds a fingerprint of the command. The fingerprint proves what ran without keeping any secrets the command held.
 

@@ -276,6 +276,7 @@ A cluster is a group of AerolVM servers that work as one. Every node keeps a sha
 
 - **Inside the sandbox, the values are plain.** That is how programs read them. Any code you run in the sandbox can read every variable, so only pass secrets that code is allowed to see.
 - **The node's container engine holds them too.** AerolVM hands the values to Docker or containerd on the node that runs the sandbox. Someone with admin access to that machine can see them there. Protect the machines that run your sandboxes.
+- **Firecracker keeps them off the disk.** A [Firecracker sandbox](/firecracker-sandbox/) has no container engine. The server sends the values straight to the agent inside the VM, over the VM's private channel to the server rather than the network, and the agent keeps them in memory. They are not written to the VM's disk image. Stopping the sandbox saves the VM's memory, so the saved copy holds them until you delete the sandbox.
 - **Snapshots copy them.** Saving a sandbox as a [snapshot](/images-and-snapshots/#snapshots) also saves its variables. Do not snapshot a sandbox whose secrets you would not share with every user of the snapshot.
 - **They cannot change after create.** To use a new value, create a new sandbox.
 

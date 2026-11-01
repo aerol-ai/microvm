@@ -452,28 +452,42 @@ func sameEventIDs(a, b []auditlog.Event) bool {
 const auditLogScript = sqliteSourceEnv +
 	`db="${SB_DB_PATH:-/var/lib/sandboxd/state.db}"; dir="$(dirname "$db")/audit"; log="$dir/secrets.jsonl"; `
 
-// tamperMiddleAuditLineScript edits a line in the MIDDLE of the chain and
-// keeps a pristine copy alongside.
+// tamperMiddleAuditLineScript changes one byte of a record in the MIDDLE of
+// the chain, in place, and records where so it can be put back.
 //
 // The middle matters. A tail edit is indistinguishable from a torn write
-// after a crash — which the product deliberately tolerates and records as a
-// gap — so tampering with the tail would assert nothing about tamper
+// after a crash, which the product deliberately tolerates and records as a
+// gap, so tampering with the tail would assert nothing about tamper
 // detection.
+//
+// The byte is the first character of the record's "result" value, a field
+// every record carries (an edit keyed on an optional field left most logs
+// untouched, and the verifier rightly passed them). It is written in place
+// (dd conv=notrunc): rewriting the file from a copy would drop whatever the
+// daemon appended meanwhile and break the chain for the wrong reason.
 const tamperMiddleAuditLineScript = `sudo bash -c '` + auditLogScript +
 	`[ -f "$log" ] || { echo "NOLOG $log"; exit 0; }; ` +
 	`n=$(wc -l < "$log" 2>/dev/null || echo 0); ` +
 	`[ "$n" -ge 4 ] || { echo TOOSHORT; exit 0; }; ` +
 	`cp -a "$log" "$log.itest-backup"; ` +
 	`mid=$(( n / 2 )); ` +
-	`awk -v m="$mid" '"'"'NR==m { sub(/"reason":"/, "\"reason\":\"tampered-"); } { print }'"'"' "$log.itest-backup" > "$log.tmp" && ` +
-	`cat "$log.tmp" > "$log" && rm -f "$log.tmp" && echo TAMPERED'`
+	`off=$(head -n $(( mid - 1 )) "$log" | wc -c); ` +
+	`k=$(sed -n "${mid}p" "$log" | grep -bo "\"result\":\"" | head -1 | cut -d: -f1); ` +
+	`[ -n "$k" ] || { echo "NORESULT line $mid"; exit 1; }; ` +
+	`pos=$(( off + k + 10 )); ` +
+	`orig=$(dd if="$log" bs=1 skip=$pos count=1 2>/dev/null); ` +
+	`new=X; [ "$orig" = X ] && new=Y; ` +
+	`printf %s "$new" | dd of="$log" bs=1 seek=$pos conv=notrunc 2>/dev/null; ` +
+	`[ "$(dd if="$log" bs=1 skip=$pos count=1 2>/dev/null)" = "$new" ] || { echo NOCHANGE; exit 1; }; ` +
+	`echo "$pos $orig" > "$log.itest-byte"; echo TAMPERED'`
 
-// restoreTamperedAuditLogScript puts the pristine copy back. Writing through
-// the existing inode (cat >, not mv) because the daemon holds the file open:
-// a rename would leave it appending to an unlinked inode.
+// restoreTamperedAuditLogScript writes the original byte back in place, so
+// every record appended since the tamper stays.
 const restoreTamperedAuditLogScript = `sudo bash -c '` + auditLogScript +
-	`[ -f "$log.itest-backup" ] || { echo NOBACKUP; exit 0; }; ` +
-	`cat "$log.itest-backup" > "$log" && rm -f "$log.itest-backup" && echo RESTORED'`
+	`[ -f "$log.itest-byte" ] || { echo NOBACKUP; exit 0; }; ` +
+	`read pos orig < "$log.itest-byte"; ` +
+	`printf %s "$orig" | dd of="$log" bs=1 seek=$pos conv=notrunc 2>/dev/null && ` +
+	`rm -f "$log.itest-byte" "$log.itest-backup" && echo RESTORED'`
 
 // auditDirSnapshotScript copies the whole audit directory aside with cp -a
 // (owner, mode, timestamps and every sidecar), for a case about to tamper with
@@ -809,7 +823,7 @@ func getWithHeaders(ctx context.Context, c *harness.Client, path string) (string
 		return "", nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+sc.PAT)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		return "", nil, err
 	}
@@ -985,7 +999,12 @@ func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string
 	}
 	if err := waitNodeRejoined(t, node); err != nil {
 		t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+		return
 	}
+	// Back in the API pool for a case that took it out (harness.MarkNodeDown);
+	// a no-op for one that did not. Only now, as for KillNodeDaemon: a node
+	// that has not rejoined stays out of rotation.
+	harness.MarkNodeUp(node.PublicIP)
 }
 
 func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {

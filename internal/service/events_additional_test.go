@@ -344,6 +344,9 @@ func TestHandleDockerEventErrorBranches(t *testing.T) {
 		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-oom", Action: "oom", Time: time.Now().UTC()}); err != nil {
 			t.Fatalf("oom event: %v", err)
 		}
+		if err := svc.handleDockerEvent(ctx, docker.DockerEvent{SandboxID: "sb-oom", Action: "die", ExitCode: 137, Time: time.Now().UTC()}); err != nil {
+			t.Fatalf("die event: %v", err)
+		}
 		got, err := st.Get(ctx, "sb-oom")
 		if err != nil {
 			t.Fatalf("store.Get: %v", err)
@@ -485,9 +488,11 @@ func TestHandleDockerEventAdditionalBranches(t *testing.T) {
 
 	t.Run("start empty IP returns nil", func(t *testing.T) {
 		svc, _, st := newCapacityHarness(t, nil, map[string]*models.SandboxRuntimeState{
-			"ctr-start-empty": {
+			// seedSandbox records ContainerID "ctr-<id>"; the start event
+			// inspects that.
+			"ctr-sb-start-empty": {
 				SandboxID:   "sb-start-empty",
-				ContainerID: "ctr-start-empty",
+				ContainerID: "ctr-sb-start-empty",
 				ContainerIP: "",
 				Status:      models.SandboxStatusStarted,
 			},

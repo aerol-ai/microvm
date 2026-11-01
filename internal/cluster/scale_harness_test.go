@@ -105,7 +105,7 @@ func TestScaleGateEnterpriseTopologyCreateSealDeletePlanes(t *testing.T) {
 			defer func() { <-sem }()
 			// Every batch targets a distinct owner, so admission and encoding can run
 			// concurrently. Only Raft FSM Apply is serialized, matching production.
-			if err := admitReservationCommands(members, nil, map[string]int{job.owner: 0}, len(job.batch), job.batch); err != nil {
+			if err := admitReservationCommands(members, nil, nil, map[string]int{job.owner: 0}, len(job.batch), job.batch); err != nil {
 				admitFail.Add(1)
 				return
 			}

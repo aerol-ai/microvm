@@ -294,11 +294,12 @@ func (d *Daemon) OperatorHash() string {
 	return d.opHash
 }
 
-// setNodeControl replaces the control endpoints the node-wide guard drops
-// (sandboxd sends them from cluster membership, §5.10 PC-2).
-func (d *Daemon) setNodeControl(eps []netip.AddrPort) error {
+// setNodeControl replaces the control endpoints and pools the node-wide
+// guard drops (sandboxd sends them from cluster membership and its address
+// pools, §5.10 PC-2).
+func (d *Daemon) setNodeControl(nc egress.NodeControl) error {
 	nw := d.gw.NodeWideState()
-	nw.Control, nw.ControlKnown = eps, true
+	nw.Control, nw.ControlPools, nw.ControlKnown = nc.Endpoints, nc.Pools, true
 	nw.Floor = d.denyFloor()
 	return d.gw.SetNodeWide(nw)
 }

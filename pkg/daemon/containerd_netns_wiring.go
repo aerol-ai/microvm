@@ -15,6 +15,11 @@ import (
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
+// maxBridgePorts is how many interfaces one Linux bridge can hold: the
+// kernel numbers bridge ports with 10 bits (BR_MAX_PORTS = 1024) and never
+// hands out port 0. Each containerd netns slot uses one.
+const maxBridgePorts = 1023
+
 type containerdNetnsPool struct {
 	refiller *netns.Refiller
 	pool     *netns.Pool
@@ -32,6 +37,37 @@ func (p *containerdNetnsPool) Stop() {
 	}
 }
 
+// netnsOwnerProber is the slice of the containerd driver the boot reconcile
+// needs to decide whether a slot's owner is gone.
+type netnsOwnerProber interface {
+	SandboxContainerExists(ctx context.Context, sandboxID string) (bool, error)
+}
+
+// netnsSlotOwnerLive answers "does this slot still belong to its sandbox?"
+// for the boot reconcile. Only a confirmed-missing container means no: the
+// reconcile then runs CNI DEL in the slot's netns and deletes it, so a false
+// "dead" cuts a running sandbox off the network and lets the slot (and, for
+// a stopped sandbox, the netns path its spec still pins) go to someone else.
+// It used to be "Inspect succeeded and the task is running", which also said
+// dead for every stopped sandbox, for every gVisor sandbox (Inspect fails to
+// read their IP from the netns), and on any transient containerd error.
+func netnsSlotOwnerLive(prober netnsOwnerProber, logger *slog.Logger) netns.LiveSandbox {
+	return func(ctx context.Context, sandboxID string) bool {
+		if prober == nil {
+			return false
+		}
+		exists, err := prober.SandboxContainerExists(ctx, sandboxID)
+		if err != nil {
+			if logger != nil {
+				logger.Warn("containerd netns reconcile: owner check failed; keeping its slot",
+					"sandbox_id", sandboxID, "error", err)
+			}
+			return true
+		}
+		return exists
+	}
+}
+
 // wireContainerdNativeNetnsPool seeds the SQLite-backed netns pool, runs boot
 // reconcile, starts the refill ticker, and wires the driver handoff.
 func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logger *slog.Logger, st *store.Store, driver *cntr.Driver) (*containerdNetnsPool, error) {
@@ -42,6 +78,7 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 		return nil, fmt.Errorf("containerd native netns pool: driver and store are required")
 	}
 	pool := netns.New(st)
+	pool.SetLogger(logger)
 	now := time.Now()
 	// Total capacity is decoupled from the warm depth (mirrors the firecracker
 	// TAP pool). Seeding only `depth` slots — as this once did — hard-capped every
@@ -52,6 +89,15 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 	poolSize := cfg.ContainerdNetnsPoolSize
 	if poolSize < cfg.ContainerdNetnsPoolDepth {
 		poolSize = cfg.ContainerdNetnsPoolDepth
+	}
+	if poolSize > maxBridgePorts {
+		// Every realized slot attaches one veth to the aerolvm0 bridge, and
+		// a Linux bridge takes at most 1023 ports. Slots past that fail CNI
+		// ADD with "exchange full" instead of refusing cleanly for capacity,
+		// so an operator raising the size must know where the wall is.
+		logger.Warn("containerd netns pool is larger than one bridge can hold; slots past the bridge limit cannot be realized",
+			"pool_size", poolSize, "bridge_port_limit", maxBridgePorts,
+			"hint", "keep SB_CONTAINERD_NETNS_POOL_SIZE at or below the bridge limit (setup/config-defaults.md)")
 	}
 	if err := pool.Seed(ctx, netns.SeedConfig{PoolSize: poolSize}, now); err != nil {
 		return nil, fmt.Errorf("seed containerd netns pool: %w", err)
@@ -78,17 +124,7 @@ func wireContainerdNativeNetnsPool(ctx context.Context, cfg config.Config, logge
 		return nil, fmt.Errorf("host forwarding sysctls: %w", err)
 	}
 	host := &netns.Host{Runner: runner}
-	live := func(ctx context.Context, sandboxID string) bool {
-		if driver == nil {
-			return false
-		}
-		state, err := driver.Inspect(ctx, sandboxID)
-		if err != nil || state == nil {
-			return false
-		}
-		return state.Status == models.SandboxStatusStarted
-	}
-	if reaped, err := pool.Reconcile(ctx, host, live, nil, now); err != nil {
+	if reaped, err := pool.Reconcile(ctx, host, netnsSlotOwnerLive(driver, logger), nil, now); err != nil {
 		return nil, fmt.Errorf("reconcile containerd netns pool: %w", err)
 	} else if reaped > 0 {
 		logger.Warn("containerd netns pool reconcile reaped orphans", "count", reaped)
