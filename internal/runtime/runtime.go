@@ -263,10 +263,11 @@ func AsToolboxAddresser(rt Runtime) (ToolboxAddresser, bool) {
 }
 
 // IdentityStarter is a Runtime whose start must hand the container its
-// sandbox identity again. A Docker container adopted from the warm pool keeps
-// the pool's parked env for life (Docker can't change a container's env), so
-// after every stop its toolboxd boots parked and serves nothing until it is
-// adopted again with the sandbox's ID and toolbox token. A Firecracker guest
+// sandbox identity again. A Docker or containerd container adopted from the
+// warm pool keeps the pool's parked env for life (Docker can't change a
+// container's env; containerd adoption relabels the container and leaves
+// its spec alone), so after every stop its toolboxd boots parked and serves
+// nothing until it is adopted again with the sandbox's ID and toolbox token. A Firecracker guest
 // restored from its stopped snapshot is adopted again over vsock: its
 // toolboxd serves nothing without the token.
 type IdentityStarter interface {
