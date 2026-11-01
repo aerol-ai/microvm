@@ -731,6 +731,13 @@ class RetryConfig(TypedDict, total=False):
     maxRetries: int
     baseDelayMs: int
     maxDelayMs: int
+    # Cap in milliseconds on the wait before re-sending a 429 or 503. The
+    # client waits as long as the server's Retry-After header asks (seconds
+    # or an HTTP date), never less than its own backoff, plus up to a fifth
+    # more so clients told the same value spread out; a longer ask is cut to
+    # this. A missing or malformed header uses the backoff. Defaults to
+    # 30000; 0 ignores Retry-After.
+    maxRetryAfterMs: int
 
 
 class MicroVMConfig(TypedDict, total=False):
