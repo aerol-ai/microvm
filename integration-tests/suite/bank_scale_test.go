@@ -2,11 +2,12 @@
 
 package suite
 
-// Scale and stability cases (UC-333..UC-338): concurrent create bursts, API
-// and exec throughput, a churn soak that watches the daemon and the node for
-// leaks, recovery under load, and density per runtime. Sizes come from the
-// environment so the same cases run small on every scenario and large on
-// the flagship; each writes its numbers to <reports>/<scenario>-bank.json.
+// Scale and stability cases (UC-333..UC-338, UC-344): concurrent create
+// bursts, API and exec throughput, a churn soak that watches the daemon and
+// the node for leaks, recovery under load, density per runtime, and an exec
+// whose sandbox dies under it. Sizes come from the environment so the same
+// cases run small on every scenario and large on the flagship; each writes
+// its numbers to <reports>/<scenario>-bank.json.
 
 import (
 	"context"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
@@ -764,4 +766,114 @@ func TestBankDensity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// UC-344 — an exec in flight when its sandbox dies fails fast. A bank run
+// killed a gVisor sandbox (fork bomb) under an exec, and the exec answered
+// 502 after 3m18s: nothing was left to close its connection, so it waited
+// for the kernel to give up. Now the runtime's exit event ends it with 409
+// within seconds, and where no event comes (a Firecracker VMM has none) the
+// toolbox dialer's dead-peer bound ends it within 30 s. First a healthy exec
+// that prints nothing for 75 s, past that bound, must still complete: a live
+// sandbox answers the keepalive probes.
+func TestBankExecEndsWhenSandboxDies(t *testing.T) {
+	harness.Require(t, sc, "UC-344")
+	targets := bankTargets(t)
+	const bound = 45 * time.Second
+	results := map[string]any{}
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
+		silentStart := time.Now()
+		if out, rc := bankRun(t, sb, "sleep 75; echo alive", 3*time.Minute); rc != 0 || !strings.Contains(out, "alive") {
+			t.Fatalf("a healthy exec silent for 75 s did not complete: rc=%d %q", rc, out)
+		}
+		silent := time.Since(silentStart)
+		node := bankSandboxNode(t, targets, sb)
+
+		errc := make(chan error, 1)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			_, err := sb.ExecCommand(ctx, "sleep 600; echo never")
+			errc <- err
+		}()
+		time.Sleep(5 * time.Second) // the exec is in flight
+		select {
+		case err := <-errc:
+			t.Fatalf("the exec ended before its sandbox was killed: %v", err)
+		default:
+		}
+		killed := time.Now()
+		t.Logf("%s on %s: %s", sb.ID, node.Name, strings.TrimSpace(nodeSSH(t, node, bankKillRuntimeScript(rt, sb.ID))))
+
+		var err error
+		select {
+		case err = <-errc:
+		case <-time.After(4 * time.Minute):
+			t.Fatalf("the exec was still waiting 4 minutes after its sandbox's runtime was killed")
+		}
+		took := time.Since(killed)
+		status := 0
+		var apiErr *microvm.APIError
+		if errors.As(err, &apiErr) {
+			status = apiErr.StatusCode
+		}
+		t.Logf("exec ended %v after the kill: status %d, %v", took.Round(100*time.Millisecond), status, err)
+		bankRecord(t, "exec_dead_sandbox_"+rt.name, map[string]any{
+			"ended_after_ms": took.Milliseconds(), "status": status, "silent_exec_ms": silent.Milliseconds(),
+		})
+		results[rt.name] = status
+		if err == nil {
+			t.Fatal("the exec succeeded after its sandbox was killed")
+		}
+		if took > bound {
+			t.Errorf("the exec ended %v after the kill, want within %v", took.Round(time.Second), bound)
+		}
+		switch {
+		case status == http.StatusConflict:
+		case rt.vm && status == http.StatusBadGateway:
+			// No exit event for a Firecracker VMM: the dead-peer bound ended
+			// it, as a gateway error, until reconcile notices the VM.
+		default:
+			want := "409 (the sandbox stopped)"
+			if rt.vm {
+				want += " or 502"
+			}
+			t.Errorf("status %d, want %s", status, want)
+		}
+	})
+	t.Logf("statuses by runtime: %v", results)
+}
+
+// bankKillRuntimeScript kills sandbox id's runtime process on its node the
+// way a crash does, with SIGKILL and no shutdown: the container's init for
+// runc (the kernel then kills its PID namespace and closes its sockets), the
+// gVisor sentry (runsc-sandbox; its network stack dies with it, so nothing
+// closes the connection), the Firecracker VMM (likewise). A warm-adopted
+// container keeps its park-* id, so the container is found by the sandbox
+// label first. The pgrep patterns start with a bracket expression so they do
+// not match the remote shell running this script, whose command line holds
+// them.
+func bankKillRuntimeScript(rt bankRuntime, id string) string {
+	kind := "runc"
+	switch {
+	case rt.vm:
+		kind = "firecracker"
+	case rt.gvisor:
+		kind = "gvisor"
+	}
+	return fmt.Sprintf(`set -u
+id=%s
+cid=$(sudo ctr -n aerolvm containers ls -q "labels.\"aerolvm.sandbox_id\"==$id" 2>/dev/null | head -1)
+[ -n "$cid" ] || cid=$(sudo docker inspect -f '{{.Id}}' "$id" 2>/dev/null || true)
+[ -n "$cid" ] || cid=$id
+case %s in
+firecracker) pids=$(pgrep -f -- "[f]irecracker.*--id $id" || true) ;;
+gvisor) pids=$(pgrep -f -- "[r]unsc-sandbox.*$cid" || true) ;;
+*) pids=$(sudo ctr -n aerolvm task ls 2>/dev/null | awk -v c="$cid" '$1==c {print $2}')
+   [ -n "$pids" ] && [ "$pids" != 0 ] || pids=$(sudo docker inspect -f '{{.State.Pid}}' "$cid" 2>/dev/null || true) ;;
+esac
+if [ -z "$pids" ] || [ "$pids" = 0 ]; then echo "no %s process for $id (container $cid)"; exit 1; fi
+sudo kill -9 $pids && echo "killed %s process(es) $pids (container $cid)"
+`, shellQuote(id), kind, kind, kind)
 }
