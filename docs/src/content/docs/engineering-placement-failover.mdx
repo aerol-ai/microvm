@@ -576,3 +576,4 @@ The same create call works on one node, on three nodes, and in the middle of a f
 - [Cluster setup](/cluster-setup/): how to deploy a cluster, and the quorum rules.
 - [Safe retries (idempotency)](/engineering-idempotency/): the single-node rules (name uniqueness, partial unique indexes) that the FSM mirrors across the cluster.
 - [Secrets providers](/cluster-secrets/): how sealed secrets are copied to the nodes that may need them.
+- [Staying up under overload](/overload-protection-architecture/): how a node protects itself when too many cluster-wide lists read the placement table at once.
