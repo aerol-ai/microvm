@@ -27,7 +27,7 @@
   },
   "devDependencies": {
     "prettier": "^3.9.10",
-    "prettier-plugin-astro": "^1.1.1",
+    "prettier-plugin-astro": "^1.1.2",
     "wrangler": "4.156.0"
   },
   "optionalDependencies": {
