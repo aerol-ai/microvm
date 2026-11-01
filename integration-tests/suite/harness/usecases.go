@@ -910,6 +910,9 @@ var Registry = []UseCase{
 	// Bank-readiness stability, continued (bank_scale_test.go): containerd
 	// task output kept draining after create (the UC-171 flagship stall).
 	{ID: "UC-360", Title: "Stability: a sandbox whose main process writes 3 MiB to stdout and 3 MiB to stderr after create keeps running and finishes, on every container runtime (output is drained past the pipe buffers and the task-log cap)", Requires: []Capability{CapDocker}, Implemented: true},
+	// Overload is shed, never turned into an outage (overload_shed_test.go):
+	// the bank-flagship ramp's 1024-client list collapse and watchdog restart.
+	{ID: "UC-361", Title: "Overload: N concurrent clients (default 1024) listing sandboxes through the domain for 60 s get 200 or a refusal with Retry-After (503/429), never 502, another 5xx, a refused or reset connection or a request hung past 30 s; no sandboxd on any node restarts (InvocationID, NRestarts and the journal unchanged); and the list is back to its baseline latency within 60 s of the load stopping", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

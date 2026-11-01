@@ -79,11 +79,21 @@ type ProviderFactory func(ctx context.Context, fc FleetConfig) (controlplane.Pro
 // makeProvider supplies the control-plane capabilities. nil (the open-source
 // default) means controlplane.Noop(): every non-PAT token rejected, every usage
 // report a no-op, every create admitted, no enforcement loop.
-func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) error {
+func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory) (err error) {
+	// stop is the caller's context: cancelled only when the daemon is asked
+	// to stop (SIGTERM/SIGINT in the standard wrapper). Run derives its own
+	// cancellable child below, which a failed listener also cancels.
+	stop := ctx
+	defer func() { err = bootStopped(stop, err, logger) }()
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// First, before any slow boot step: the watchdog reads "booting" from
+	// here on instead of "connection refused" (liveness.go).
+	live := startLiveness(cfg.LivenessSocket, logger)
+	defer live.stop()
 
 	cp := controlplane.Noop()
 	if makeProvider != nil {
@@ -1045,6 +1055,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// The revoke re-check (wrapped custody only) starts once the API is up;
 	// it runs on the key store's background budget, never a create's.
 	svc.StartKeyCustody(ctx)
+	live.setPhase(livenessPhaseServing)
 	if publicServer != nil {
 		logger.Info("public API socket listening", "path", cfg.PublicAPISocket)
 		go func() {
@@ -1163,6 +1174,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	}
 
 	<-ctx.Done()
+	live.setPhase(livenessPhaseStopping)
 	logger.Info("shutting down sandboxd")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)

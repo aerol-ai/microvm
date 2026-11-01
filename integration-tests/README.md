@@ -214,6 +214,25 @@ The scenario needs the default local build, or a release that has
 whose teardown failed keeps its balancer and Elastic IP until
 `integration-tests/run.sh cluster-3-mixed-lb --destroy-only`.
 
+## Overload is shed, not restarted (UC-361)
+
+UC-361 (`suite/overload_shed_test.go`) runs on any scenario with `cluster`,
+`domain` and `disruptive: true`. It drives `AEROL_OVERLOAD_CONCURRENCY`
+clients (default 1024, the step that broke the bank flagship) at
+`GET /v1/sandboxes` through the domain for `AEROL_OVERLOAD_SECONDS` (default
+60) with a client that never retries. Every answer must be 200 or a refusal
+with `Retry-After` (503 or 429); a 502, any other 5xx, a refused or reset
+connection, or a request hung past 30 s fails it. Over SSH it then checks
+that no sandboxd restarted on any node: the unit's `InvocationID` and
+`NRestarts` are unchanged (a watchdog restart does not raise `NRestarts`),
+and neither `journalctl -u sandboxd` nor `journalctl -t sandboxd-healthcheck`
+shows a start or a restart since the load began. Last, the list must be back
+to its baseline latency (the median of 5 in a row within 2x the idle p50, or
+the p50 plus 250 ms) within 60 s of the load stopping. The numbers, and each
+node's `aerolvm_api_list_shed_total`, land in `<reports>/<scenario>-bank.json`
+under `overload_shed_v1_sandboxes`; a run that shed nothing says so in the
+test log, since it never reached the shedding point.
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an

@@ -52,6 +52,7 @@ image-pull storm if the signals point there.
 | `SandboxdCaddyAdminErrors` | Check Caddy service and admin endpoint. | public URLs fail or route lag grows. |
 | `SandboxdOwnerForwardErrors` | Check owner node health and advertise URLs. | many sandboxes fail cross-node operations. |
 | `SandboxdSecretDecryptErrors` | Check credential encryption key consistency. | failover/recreate workloads cannot start. |
+| `SandboxdAPIListShedding` | Find who polls lists; check owner list latency. | the shed rate keeps rising, or other routes slow down too. |
 
 ## Control Plane Checks
 
@@ -124,6 +125,17 @@ Mitigation:
 - Reduce create/expose churn if route lag grows faster than it drains.
 - Check `SB_DATA_PLANE_ADVERTISE_HOST` and `SB_CLUSTER_INTERNAL_ADVERTISE`
   when owner-forward errors or route misses appear after topology changes.
+
+List overload (`SandboxdAPIListShedding`, clients seeing `503` with code
+`overloaded`): the node is protecting itself, not failing. Each node runs at
+most `SB_API_LIST_MAX_INFLIGHT` cluster-wide lists at once
+(`aerolvm_api_list_inflight`) and answers the rest `503` + `Retry-After: 1`.
+Do not restart sandboxd for it: a restart drops every request in flight and
+the load comes straight back. The watchdog does not restart a busy daemon
+either: `journalctl -t sandboxd-healthcheck` shows a restart only after 3
+failed liveness probes in a row over 90 s. Spread the clients across more
+ingress nodes, slow the pollers down, or raise the limit on nodes with more
+CPU.
 
 ## Secret Failure Checks
 

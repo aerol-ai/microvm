@@ -28,6 +28,7 @@ feature is still mid-rollout.
 | `SB_ENABLE_EVENT_MONITOR` | true. Also what ends a toolbox request (an exec, a file transfer, a session) the moment its container sandbox dies: the die/destroy event answers it 409 instead of leaving it to the connection timeout below. |
 | `SB_TOOLBOX_DEAD_PEER_TIMEOUT` | `30s` — how long a toolbox connection (exec, file transfer, session, SSH-gateway shell) lives on once its sandbox stops answering without closing it, as a killed gVisor sandbox or Firecracker VM does. Keepalive probes start after 15s idle, every 5s, and the third unanswered one ends it; `TCP_USER_TIMEOUT` (Linux) 30s also bounds data the sandbox never acknowledges. A live sandbox's kernel answers the probes, so a command that runs for hours with no output is never cut. What it does cut is a sandbox that answers nothing for the whole bound while still existing: raise it if your sandboxes are paused (a gVisor or Firecracker snapshot) for longer. `0` = off (Go's default keepalive, about 2.5 minutes; about 15 minutes for unacknowledged data); otherwise at least `6s`, or the boot is refused. |
 | `SB_ENABLE_SSH_GATEWAY` | true |
+| `SB_LIVENESS_SOCKET` | `/run/sandboxd/live.sock` — the Unix socket (root `0600`) the install.sh watchdog (`sandboxd-healthcheck`) probes: `GET /livez` answers `200` with the phase (`booting`, `serving`, `stopping`) from its own listener, with no I/O and no lock, from the first moment of the boot. It is liveness only; `/health` stays the readiness check (store, engines, Caddy). The watchdog restarts sandboxd only after 3 failed liveness probes in a row of one daemon run over at least 90 s, never in the daemon's first 120 s and never while a start, stop or restart is under way. `off` closes the socket, and the watchdog then probes `/health` with the same rule. Must be absolute. |
 | `SB_ENABLE_SERVERLESS` | true — wake path on out of the box |
 | `SB_DOCKER_READY_SOCKET_ENABLED` | true |
 | `SB_IMAGE_BUILD_GC_ENABLED` | true — both image janitors |
@@ -120,6 +121,27 @@ The cluster-internal per-sandbox audit endpoint that ingress fan-out hits has it
 Whole-chain verification no longer runs on every page read. It runs at boot, before every retention sweep, incrementally as records are indexed (a break disables the index and withholds reads with `503` until an operator repairs the log), and on demand via `POST /v1/audit/verify` (operator PAT; O(file); one at a time per node; `aerolvm_audit_chain_verify_ok`).
 
 `vault` is accepted as a known name but **fails boot** with a not-implemented error (no silent fallback to local).
+
+## API overload protection (SB_API_LIST_*)
+
+A cluster-wide sandbox list (`GET /v1/sandboxes`, and the Daytona, E2B and
+Runloop lists) fans out: a placement-page read from the control plane and one
+request per owner node. Each node runs only so many at once; past that a list
+waits briefly for a slot and is otherwise answered `503` + `Retry-After: 1`
+with code `overloaded`, instead of queueing until it takes 30 s and the node
+falls over (bank flagship ramp, 2026-11-01: 1024 concurrent list clients gave
+a 37 s p99 and 5,081 `502`s from a node the watchdog restarted). A single node
+(cluster off) and a peer's forwarded list hop are never gated. Concurrent
+identical placement-page reads on a node share one control-plane request, and
+each still comes from a read that began after its caller asked.
+
+| Env var | Default | Notes |
+|---|---|---|
+| `SB_API_LIST_MAX_INFLIGHT` | `16` | Cluster-wide lists this node runs at once. Matches the cluster transport's 16 pooled connections per peer, so list fan-out reuses mTLS connections rather than opening new ones. A healthy list holds its slot for milliseconds, so 16 slots serve thousands of lists a second and fill only when owners or the control plane slow down. Raise it on nodes with more CPU. `0` = no limit (the behaviour before this setting). Anything but a whole number refuses the boot. |
+| `SB_API_LIST_QUEUE_WAIT` | `500ms` | How long a list waits for a free slot before it is shed. Short on purpose: inside every SDK's own retry backoff (they retry `503` up to 3 times, about 1-1.75 s in all). `0` = refuse at once. |
+
+Metrics: `aerolvm_api_list_inflight`, `aerolvm_api_list_admitted_total`,
+`aerolvm_api_list_shed_total` (alert `SandboxdAPIListShedding`).
 
 ## Audit export connectors (SB_AUDIT_EXPORT_BACKEND)
 
