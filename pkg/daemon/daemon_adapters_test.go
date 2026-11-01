@@ -495,3 +495,32 @@ func TestVMMTemplateListerAdapter_TypeUses(t *testing.T) {
 	var _ vmmpool.TemplateWarmInput
 	var _ = fcruntime.TemplateResolution{}
 }
+
+// TestWireDockerOwnPause: the image is always set; the background pull and
+// sweep run only on a docker-engine node with the host firewall on and no
+// pool (whose loop does both itself).
+func TestWireDockerOwnPause(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "unix:///tmp/daemon-own-pause-test.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the background work finds nothing to talk to and returns
+	cfg := config.Config{DockerNetnsPoolPauseImage: "registry.k8s.io/pause:3.10", ContainerEngine: models.ContainerEngineDocker}
+	cases := []struct {
+		name          string
+		cfg           config.Config
+		rulesOn, pool bool
+		want          bool
+	}{
+		{"docker, rules on, no pool", cfg, true, false, true},
+		{"rules off", cfg, false, false, false},
+		{"pool on", cfg, true, true, false},
+		{"containerd engine", config.Config{DockerNetnsPoolPauseImage: cfg.DockerNetnsPoolPauseImage, ContainerEngine: models.ContainerEngineContainerd}, true, false, false},
+	}
+	for _, tc := range cases {
+		// A client per case: the daemon wires one once, and the background
+		// work of one case must not see the next case's wiring.
+		c := newTestDockerClient(t)
+		if got := wireDockerOwnPause(ctx, tc.cfg, c, tc.rulesOn, tc.pool, time.Now()); got != tc.want {
+			t.Errorf("%s: started = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

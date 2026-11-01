@@ -212,24 +212,6 @@ func TestDestroyOnPauseKeepsEverythingWhenTheWorkloadStays(t *testing.T) {
 	}
 }
 
-// TestPlainDockerReportsNothing: without the pause pool Docker learns the
-// address only from the running container; Create reports nothing and
-// keeps its late rules.
-func TestPlainDockerReportsNothing(t *testing.T) {
-	c, d, rs := pauseCreateClient(t)
-	c.netnsPool = nil
-	d.mu.Lock()
-	d.noIP = false
-	d.mu.Unlock()
-	obs := &dockerAddrObserver{}
-	c.toolboxWaitTimeout = 50_000_000
-	_, _ = c.Create(sbruntime.WithAddressObserver(context.Background(), obs), models.CreateSandboxRequest{Image: "img", NetworkBlockAll: true}, "sb-plain", "tok", nil)
-	if len(obs.known) != 0 {
-		t.Fatalf("plain Docker reported %v", obs.known)
-	}
-	_ = rs
-}
-
 // TestCreatePauseSlotCIDRPolicy: a CIDR policy goes on the pause slot's
 // address before the workload starts; one that fails to go on fails the
 // create and is cleared.

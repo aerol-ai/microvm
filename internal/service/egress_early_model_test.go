@@ -37,17 +37,16 @@ type netModel struct {
 	claimed    map[string]string // address -> sandbox holding the slot
 	events     []string
 	violations []string
-	// lateBlock allows a workload to start before its block-all: plain
-	// Docker learns the address from the started container, the window
-	// this change leaves as it was (the path is unchanged).
+	// lateBlock allows a workload to start before its block-all (a driver
+	// that broke the contract, which the service must then shut).
 	lateBlock bool
-	// lateRelease allows an address to be freed before the gateway lets
-	// go: Docker's IPAM frees it with the container, and the detach follows.
-	lateRelease bool
+	// unrestricted are the addresses of sandboxes created without rules,
+	// which run open by design (the contract is for restricted ones).
+	unrestricted map[string]bool
 }
 
 func newNetModel() *netModel {
-	return &netModel{blocked: map[string]bool{}, attached: map[string]string{}, running: map[string]bool{}, claimed: map[string]string{}}
+	return &netModel{blocked: map[string]bool{}, attached: map[string]string{}, running: map[string]bool{}, claimed: map[string]string{}, unrestricted: map[string]bool{}}
 }
 
 func (m *netModel) eventLocked(format string, args ...any) {
@@ -59,7 +58,15 @@ func (m *netModel) violateLocked(format string, args ...any) {
 }
 
 func (m *netModel) openLocked(ip string) bool {
-	return m.running[ip] && !m.blocked[ip] && m.attached[ip] == ""
+	return m.running[ip] && !m.blocked[ip] && m.attached[ip] == "" && !m.unrestricted[ip]
+}
+
+// unrestrict marks ip as an unrestricted sandbox's until it is freed.
+func (m *netModel) unrestrict(ip string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventLocked("unrestricted %s", ip)
+	m.unrestricted[ip] = true
 }
 
 func (m *netModel) event(format string, args ...any) {
@@ -85,13 +92,14 @@ func (m *netModel) free(id, ip string) {
 	if m.claimed[ip] != id {
 		m.violateLocked("address %s freed by %s, held by %q", ip, id, m.claimed[ip])
 	}
-	if who := m.attached[ip]; who != "" && !m.lateRelease {
+	if who := m.attached[ip]; who != "" {
 		m.violateLocked("address %s freed while the gateway still enforces for %s there", ip, who)
 	}
 	if m.blocked[ip] {
 		m.violateLocked("address %s freed with its block-all still on (the next owner would inherit it)", ip)
 	}
 	delete(m.claimed, ip)
+	delete(m.unrestricted, ip)
 }
 
 func (m *netModel) block(ip string) {
@@ -279,11 +287,15 @@ func (g *modelGateway) attachCount(id string) int {
 	return g.m.count("attach " + id + " ")
 }
 
-// Runtime shapes. The three early ones are the drivers this change wires
-// (containerd's prepaid netns, Docker's pause netns, a Firecracker TAP slot):
-// for the service they are one contract, so one fake plays them all, the
-// Firecracker one through the Firecracker create path. dockerPlain is
-// Docker's own IPAM: no address until the container runs.
+// Runtime shapes. The early ones are the drivers that know a sandbox's
+// address before its workload runs (containerd's prepaid netns, Docker's
+// pause netns, a Firecracker TAP slot): for the service they are one
+// contract, so one fake plays them all, the Firecracker one through the
+// Firecracker create path. dockerPlain is Docker without the pause pool: a
+// create with rules starts a pause container of its own (pkg/docker
+// netns_pause_on_demand.go) and so is early too, which can fail before
+// anything is claimed; a create without rules keeps Docker's own IPAM (no
+// address until the container runs, which goes with the container).
 const (
 	shapeContainerd  = "containerd-netns"
 	shapeDockerPause = "docker-pause"
@@ -291,7 +303,13 @@ const (
 	shapeDockerPlain = "docker-plain"
 )
 
-var earlyShapes = []string{shapeContainerd, shapeDockerPause, shapeFirecracker}
+var earlyShapes = []string{shapeContainerd, shapeDockerPause, shapeFirecracker, shapeDockerPlain}
+
+// hasRules is the driver's test for a create that must be shut before its
+// workload runs (a hostname allowlist reaches it as block-all).
+func hasRules(req models.CreateSandboxRequest) bool {
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+}
 
 // modelRuntime follows the driver contract runtime.AddressObserver states,
 // in the shape it is told, and reports every transition to the model. A
@@ -303,11 +321,13 @@ type modelRuntime struct {
 
 	mu         sync.Mutex
 	slots      map[string]string // sandbox id -> address
+	plain      map[string]bool   // sandbox id -> on Docker's own IPAM
 	pool       []string          // free addresses, reused last-freed first
 	next       int
 	containers map[string]*models.SandboxRuntimeState
 	destroyed  []string
-	// fail injects a failure at a point of Create: "before-report",
+	// fail injects a failure at a point of Create: "pause" (plain Docker's
+	// own pause container can't be started), "before-report",
 	// "after-report", "after-start".
 	fail map[string]error
 	// afterReport runs right after the address is reported (a context
@@ -321,7 +341,7 @@ type modelRuntime struct {
 }
 
 func newModelRuntime(m *netModel, shape string) *modelRuntime {
-	return &modelRuntime{m: m, shape: shape, slots: map[string]string{}, containers: map[string]*models.SandboxRuntimeState{}, fail: map[string]error{}}
+	return &modelRuntime{m: m, shape: shape, slots: map[string]string{}, plain: map[string]bool{}, containers: map[string]*models.SandboxRuntimeState{}, fail: map[string]error{}}
 }
 
 func (r *modelRuntime) claim(id string) string {
@@ -372,7 +392,14 @@ func (r *modelRuntime) dropContainer(id string) {
 
 func (r *modelRuntime) Create(ctx context.Context, req models.CreateSandboxRequest, id, _ string, _ []mounts.ContainerBind) (*models.SandboxRuntimeState, error) {
 	if r.shape == shapeDockerPlain {
-		return r.createPlain(ctx, req, id)
+		if !hasRules(req) {
+			return r.createPlain(ctx, req, id)
+		}
+		// The pause container is the slot: if it can't start, nothing is
+		// claimed and nothing ran.
+		if err := r.fail["pause"]; err != nil {
+			return nil, err
+		}
 	}
 	ip := r.claim(id)
 	if !r.newContainer(id) {
@@ -433,37 +460,39 @@ func (r *modelRuntime) Create(ctx context.Context, req models.CreateSandboxReque
 	return &models.SandboxRuntimeState{SandboxID: id, ContainerID: "ctr-" + id, ContainerIP: final, Status: models.SandboxStatusStarted}, nil
 }
 
-// createPlain is Docker without the pause pool: the address exists only
-// once the container runs, and the block-all goes on then (unchanged).
-func (r *modelRuntime) createPlain(_ context.Context, req models.CreateSandboxRequest, id string) (*models.SandboxRuntimeState, error) {
+// createPlain is Docker's own path, for a create without rules: the
+// address exists only once the container runs.
+func (r *modelRuntime) createPlain(_ context.Context, _ models.CreateSandboxRequest, id string) (*models.SandboxRuntimeState, error) {
 	if !r.newContainer(id) {
 		return nil, docker.ErrSandboxContainerExists
 	}
 	ip := r.claim(id)
+	r.mu.Lock()
+	r.plain[id] = true
+	r.mu.Unlock()
+	r.m.unrestrict(ip)
 	r.m.start(ip)
-	if req.NetworkBlockAll {
-		r.m.block(ip)
-	}
 	r.m.event("returned %s", ip)
 	return &models.SandboxRuntimeState{SandboxID: id, ContainerID: "ctr-" + id, ContainerIP: ip, Status: models.SandboxStatusStarted}, nil
 }
 
 // Destroy follows the drivers: the workload goes first, the observer is
-// told, the rules go while the slot is held, the slot goes last. Plain
-// Docker's address goes with its container (rules first, then the
-// container and its address; the service detaches after).
+// told, the rules go while the slot is held, the slot goes last. A sandbox
+// on Docker's own IPAM (no rules) has its address go with its container.
 func (r *modelRuntime) Destroy(ctx context.Context, sb *models.Sandbox) error {
 	if sb == nil {
 		return nil
 	}
 	r.mu.Lock()
 	ip, held := r.slots[sb.ID]
+	plain := r.plain[sb.ID]
+	delete(r.plain, sb.ID)
 	r.mu.Unlock()
 	if !held {
 		r.dropContainer(sb.ID)
 		return nil
 	}
-	if r.shape == shapeDockerPlain {
+	if plain {
 		r.m.unblock(ip)
 		r.m.stop(ip)
 		r.dropContainer(sb.ID)
@@ -544,9 +573,6 @@ type earlyHarness struct {
 func newEarlyHarness(t *testing.T, shape string) *earlyHarness {
 	t.Helper()
 	m := newNetModel()
-	if shape == shapeDockerPlain {
-		m.lateBlock, m.lateRelease = true, true
-	}
 	rt := newModelRuntime(m, shape)
 	svc, _, _ := newServiceRuntimeHarnessAtPath(t, filepath.Join(t.TempDir(), "state.db"), rt)
 	svc.cfg.EgressFQDNEnabled = true

@@ -80,14 +80,16 @@ func TestEarlyAttachOrder(t *testing.T) {
 	}
 }
 
-// TestPlainDockerKeepsLateAttach: Docker without the pause pool reports no
-// address before the container runs, so its create attaches after the
-// runtime create as before, and waits for the Attach (the join this change
-// removes elsewhere).
-func TestPlainDockerKeepsLateAttach(t *testing.T) {
+// TestPlainDockerRestrictedCreateIsShutFromTheStart: Docker without the
+// pause pool used to learn a restricted sandbox's address only from its
+// started container, so the workload ran before its block-all. It now
+// starts a pause container of its own: the address is reported with the
+// block-all on and before the workload starts, the attach overlaps the
+// build, and the model's "never runs unblocked" check holds with no
+// exception (the plain shape no longer gets lateBlock).
+func TestPlainDockerRestrictedCreateIsShutFromTheStart(t *testing.T) {
 	h := newEarlyHarness(t, shapeDockerPlain)
-	// Long enough that no row persist on a slow disk hides it.
-	h.gw.attachDelay = 300 * time.Millisecond
+	h.rt.waitAttach = h.gw.attachedCh
 	ctx, timing := createtiming.With(context.Background())
 	resp, err := h.svc.CreateSandbox(ctx, h.request())
 	if err != nil {
@@ -95,18 +97,50 @@ func TestPlainDockerKeepsLateAttach(t *testing.T) {
 	}
 	h.m.assertClean(t)
 	ip := resp.ContainerIP
-	if r, a := h.m.index("returned "+ip), h.m.index("attach "+resp.ID); a < r {
-		t.Fatalf("plain Docker attached (%d) before its runtime create returned (%d)", a, r)
+	block, rep, start := h.m.index("block "+ip), h.m.index("reported "+ip), h.m.index("start "+ip)
+	if !(block >= 0 && block < rep && rep < start) {
+		t.Fatalf("want block < reported < start, got %d %d %d: %v", block, rep, start, h.m.events)
 	}
-	if h.m.index("reported") >= 0 {
-		t.Fatal("plain Docker must not report an address early")
+	if a, r := h.m.index("attach "+resp.ID), h.m.index("returned "+ip); a < 0 || a > r {
+		t.Fatalf("attach %d, runtime returned %d: the attach must overlap the build", a, r)
 	}
-	if _, ok := stageMS(timing, "svc_egress_early"); ok {
-		t.Fatal("svc_egress_early on a late attach")
+	if _, ok := stageMS(timing, "svc_egress_early"); !ok {
+		t.Fatal("svc_egress_early missing")
 	}
-	if join, _ := stageMS(timing, "svc_egress_join"); join < h.gw.attachDelay/2 {
-		t.Fatalf("svc_egress_join %v: a late attach is joined after the persist", join)
+}
+
+// TestPlainDockerPauseFailureFailsClosed: a restricted create whose own
+// pause container can't start fails, with nothing claimed, run or attached.
+func TestPlainDockerPauseFailureFailsClosed(t *testing.T) {
+	h := newEarlyHarness(t, shapeDockerPlain)
+	boom := errors.New("pause container for the sandbox's network rules: start pause container: boom")
+	h.rt.fail["pause"] = boom
+	if _, err := h.svc.CreateSandbox(context.Background(), h.request()); !errors.Is(err, boom) {
+		t.Fatalf("err = %v", err)
 	}
+	h.m.assertClean(t)
+	h.m.assertNothingLeft(t)
+	if h.m.index("start ") >= 0 || h.m.index("claim ") >= 0 || h.m.index("attach ") >= 0 {
+		t.Fatalf("events %v: nothing may have run", h.m.events)
+	}
+}
+
+// TestPlainDockerWithoutRulesKeepsItsPath: a create without rules keeps
+// Docker's own path: no pause, no early report, no gateway attach.
+func TestPlainDockerWithoutRulesKeepsItsPath(t *testing.T) {
+	h := newEarlyHarness(t, shapeDockerPlain)
+	resp, err := h.svc.CreateSandbox(context.Background(), models.CreateSandboxRequest{Image: "alpine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.m.index("reported") >= 0 || h.gw.attachCount(resp.ID) != 0 {
+		t.Fatalf("events %v", h.m.events)
+	}
+	if err := h.svc.DestroySandbox(context.Background(), resp.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.m.assertClean(t)
+	h.m.assertNothingLeft(t)
 }
 
 // TestEarlyAttachFailureLeavesNoGatewayState: whatever step of an early
@@ -400,11 +434,10 @@ func TestEarlyAttachGatewayDownFailsClean(t *testing.T) {
 
 // TestDestroyLetsTheGatewayGoBeforeTheAddress: destroying a sandbox the
 // gateway enforces for detaches it after the workload stopped and before
-// the runtime frees the address, on every runtime that holds its address
-// apart from the workload; plain Docker's address goes with its container
-// and the detach follows (unchanged).
+// the runtime frees the address, on every runtime (plain Docker's
+// restricted sandboxes hold their address in a pause container too).
 func TestDestroyLetsTheGatewayGoBeforeTheAddress(t *testing.T) {
-	for _, shape := range append(slices.Clone(earlyShapes), shapeDockerPlain) {
+	for _, shape := range earlyShapes {
 		t.Run(shape, func(t *testing.T) {
 			h := newEarlyHarness(t, shape)
 			ctx := context.Background()
@@ -420,12 +453,6 @@ func TestDestroyLetsTheGatewayGoBeforeTheAddress(t *testing.T) {
 			stop, det, free := h.m.index("stop "), h.m.index("detach "+resp.ID), h.m.index("free "+resp.ID)
 			if stop < 0 || det < 0 || free < 0 {
 				t.Fatalf("stop %d detach %d free %d: %v", stop, det, free, h.m.events)
-			}
-			if shape == shapeDockerPlain {
-				if free > det {
-					t.Fatalf("plain Docker: free %d before detach %d expected (the address goes with the container)", free, det)
-				}
-				return
 			}
 			if !(stop < det && det < free) {
 				t.Fatalf("want stop < detach < free, got %d %d %d: %v", stop, det, free, h.m.events)

@@ -245,9 +245,11 @@ func TestBenchEgressCreateStages(t *testing.T) {
 }
 
 // egressStageNames are the gateway-mode create stages UC-185 reports, the
-// attach's sub-stages included.
+// attach's sub-stages included, and docker_pause: the pause container a
+// restricted Docker create starts when the pool has no slot for it.
 var egressStageNames = []string{"svc_egress_prepare", "svc_egress_attach", "svc_egress_join", "svc_egress_early",
-	"svc_egress_attach_lookup", "svc_egress_attach_ready", "svc_egress_attach_rpc", "svc_egress_attach_release", "svc_egress_attach_unblock"}
+	"svc_egress_attach_lookup", "svc_egress_attach_ready", "svc_egress_attach_rpc", "svc_egress_attach_release", "svc_egress_attach_unblock",
+	"docker_pause"}
 
 // egressCreateStageSamples creates samples+1 hostname-rule sandboxes on rt
 // (the first may pay the one-time gateway connect and is dropped) and
