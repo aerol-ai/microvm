@@ -823,7 +823,7 @@ func getWithHeaders(ctx context.Context, c *harness.Client, path string) (string
 		return "", nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+sc.PAT)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := harness.HTTPClient(0).Do(req)
 	if err != nil {
 		return "", nil, err
 	}
