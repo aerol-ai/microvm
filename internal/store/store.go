@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -8107,10 +8108,10 @@ func (s *Store) GetFirecrackerTapPoolStats(ctx context.Context) (FirecrackerTapP
 }
 
 // ErrNoFreeFirecrackerTapSlot is returned by AllocateFirecrackerTapSlot
-// when every slot is claimed. The Firecracker create path translates
-// this into a 503-ish admission error upstream — operators see "pool
-// exhausted" before the customer sees a confusing timeout.
-var ErrNoFreeFirecrackerTapSlot = errors.New("firecracker tap pool: no free slot")
+// when every slot is claimed. It is a capacity refusal (errors.Is matches
+// capacity.ErrCapacityExceeded), so a full pool answers 503 + Retry-After
+// like any other admission refusal rather than a catch-all 400.
+var ErrNoFreeFirecrackerTapSlot error = capacity.NewSlotPoolExhausted("firecracker tap pool")
 
 // Firecracker warm-VMM pool status constants. Kept as bare strings
 // rather than a typed enum because SQLite stores them as TEXT and the

@@ -666,6 +666,7 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		}); ok {
 			withEgress.SetEgressGatewayReadyProvider(svc.EgressGatewayReady)
 		}
+		registerSlotPoolsProvider(cfg, clusterClient, svc.LocalSlotPools)
 		if cfg.EnableWasm && cfg.IsWorker() {
 			if withModules, ok := clusterClient.(interface {
 				SetLocalWasmModuleIDsProvider(func() ([]string, bool))
@@ -1884,6 +1885,27 @@ func readBypassMarker(path string) bool {
 // the gateway on exactly the nodes that start it.
 func shouldStartSSHGateway(cfg config.Config) bool {
 	return cfg.RunsSSHGateway()
+}
+
+// registerSlotPoolsProvider overlays this node's network-slot pools
+// (containerd netns, Firecracker TAP, capped WASM instances) onto its own
+// capacity lease, matching what peers read from /v1/capacity, so placement
+// skips the node for a runtime whose pool is full. Only a node that can own
+// sandboxes has pools; a client without the hook (the Agent, Noop) is left
+// alone.
+func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context.Context) []capacity.SlotPool) {
+	if !cfg.IsWorker() || pools == nil {
+		return
+	}
+	withSlots, ok := client.(interface {
+		SetLocalSlotPoolsProvider(func() []capacity.SlotPool)
+	})
+	if !ok {
+		return
+	}
+	withSlots.SetLocalSlotPoolsProvider(func() []capacity.SlotPool {
+		return pools(context.Background())
+	})
 }
 
 func supportedRuntimesForConfig(cfg config.Config) []string {
