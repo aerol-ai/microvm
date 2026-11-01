@@ -190,6 +190,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		netrules.WarnIfLegacyIptables(cfg.NetrulesBackend, logger)
 	}
 	logNetworkPolicyEnforcement(logger, cfg, rules.Enabled())
+	if prepareBlockSets(rules, netrules.ChainDockerUser, logger) {
+		defer startBlockSetReassert(ctx, rules, logger)()
+	}
 
 	dockerClient, err := docker.New(logger, cfg, rules)
 	if err != nil {

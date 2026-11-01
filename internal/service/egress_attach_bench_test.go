@@ -44,6 +44,7 @@ import (
 type attachBenchRules interface {
 	BlockAllEgress(ip string) error
 	ClearBlockAllEgress(ip string) error
+	LiftBlockAllEgress(ip string) error
 }
 
 // benchRuntime is a concurrency-safe container runtime: creates hand out
@@ -101,7 +102,8 @@ func (r *benchRuntime) ClearNetworkBlockEgress(ip string) error {
 	if r.rules == nil {
 		return nil
 	}
-	return r.rules.ClearBlockAllEgress(ip)
+	// As the drivers: the sandbox keeps its address, so this is the lift.
+	return r.rules.LiftBlockAllEgress(ip)
 }
 
 // attachBench is one service wired to one in-process gateway.
@@ -109,6 +111,9 @@ type attachBench struct {
 	svc *Service
 	gw  *egress.Gateway
 	rt  *benchRuntime
+	// tolerate counts failed creates instead of failing the benchmark
+	// (the per-address path under heavy churn, kept for comparison).
+	tolerate bool
 
 	mu     sync.Mutex
 	stages map[string][]time.Duration
@@ -312,11 +317,16 @@ func BenchmarkEgressCreate(b *testing.B) {
 
 func benchCreates(b *testing.B, a *attachBench) {
 	stages := map[string][]time.Duration{}
+	failed := 0
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx, timing := createtiming.With(context.Background())
 		if _, err := a.svc.CreateSandbox(ctx, models.CreateSandboxRequest{Image: "alpine", NetworkAllowOut: []string{"pypi.org"}}); err != nil {
-			b.Fatal(err)
+			if !a.tolerate {
+				b.Fatal(err)
+			}
+			failed++
+			continue
 		}
 		for _, st := range timing.Stages() {
 			if strings.HasPrefix(st.Name, "svc_egress") || st.Name == "svc_persist" {
@@ -325,6 +335,9 @@ func benchCreates(b *testing.B, a *attachBench) {
 		}
 	}
 	b.StopTimer()
+	if a.tolerate {
+		b.ReportMetric(float64(failed), "creates_failed")
+	}
 	names := make([]string, 0, len(stages))
 	for n := range stages {
 		names = append(names, n)

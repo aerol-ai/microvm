@@ -112,9 +112,38 @@ func (c *Client) startSandboxPause(ctx context.Context, sandboxID string) (p *ow
 // releaseSandboxPause removes a create's pause container, a pool slot or
 // its own, once nothing runs in its network namespace.
 func (c *Client) releaseSandboxPause(ctx context.Context, slot netnsSlot) {
-	if err := c.removeContainer(context.WithoutCancel(ctx), slot.containerID, true); err != nil {
+	if err := c.removePause(ctx, slot.containerID, slot.ip); err != nil {
 		c.logger.Warn("remove pause container failed; the boot sweep removes it", "container_id", slot.containerID, "error", err)
 	}
+}
+
+// removePause lets a pause container go with everything keyed by its
+// address (netrules ClearAddress): the address's rules first, while the
+// pause still holds it and nothing runs in it, the pause last, so the
+// address's next owner starts with only its own rules. ip is the address
+// when the caller knows it; otherwise the pause is inspected. A pause whose
+// address can't be read, or whose rules can't be cleared, is kept: its
+// rules stay with their owner, and the next sweep or destroy tries again.
+// A pause already gone is a no-op. Not the caller's context: a cancelled
+// create still lets its pause go.
+func (c *Client) removePause(ctx context.Context, ref, ip string) error {
+	ctx = context.WithoutCancel(ctx)
+	if ip == "" {
+		inspect, err := c.inspectContainer(ctx, ref)
+		if err != nil {
+			if isContainerNotFoundError(err) {
+				return nil
+			}
+			return fmt.Errorf("read pause %s's address: %w", ref, err)
+		}
+		ip = getContainerIP(inspect, c.network)
+	}
+	if ip != "" {
+		if err := c.networkRules.ClearAddress(ip); err != nil {
+			return fmt.Errorf("clear pause %s's address %s: %w", ref, ip, err)
+		}
+	}
+	return c.removeContainer(ctx, ref, true)
 }
 
 // pausesPossible reports whether a sandbox here may run in a pause's
@@ -154,7 +183,7 @@ func (c *Client) PrepareNetnsPause(ctx context.Context, before time.Time) {
 			continue // its workload exists (or the engine didn't say): keep it
 		}
 		netnsPoolOrphansReaped.Add(1)
-		if err := c.removeContainer(ctx, s.ID, true); err != nil {
+		if err := c.removePause(ctx, s.ID, ""); err != nil {
 			c.logger.Warn("pause container sweep: remove failed", "container_id", s.ID, "error", err)
 		}
 	}

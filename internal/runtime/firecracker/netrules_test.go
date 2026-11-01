@@ -34,6 +34,7 @@ func (f *fakeNetRules) rec(op, ip string, extra ...[]string) error {
 
 func (f *fakeNetRules) BlockAllEgress(ip string) error       { return f.rec("block-egress", ip) }
 func (f *fakeNetRules) ClearBlockAllEgress(ip string) error  { return f.rec("clear-egress", ip) }
+func (f *fakeNetRules) LiftBlockAllEgress(ip string) error   { return f.rec("lift-egress", ip) }
 func (f *fakeNetRules) BlockAllIngress(ip string) error      { return f.rec("block-ingress", ip) }
 func (f *fakeNetRules) ClearBlockAllIngress(ip string) error { return f.rec("clear-ingress", ip) }
 func (f *fakeNetRules) HoldEgress(ip string) error           { return f.rec("hold", ip) }
@@ -152,7 +153,7 @@ func TestNetRuleMethods(t *testing.T) {
 			t.Fatalf("call %d: %v", i, err)
 		}
 	}
-	for _, want := range []string{"clear-egress", "clear-ingress", "block-egress", "policy", "clear-policy", "block-ingress", "hold", "clear-hold", "floor 172.16.0.0/16"} {
+	for _, want := range []string{"clear-egress", "lift-egress 10.0.0.2", "clear-ingress", "block-egress", "policy", "clear-policy", "block-ingress", "hold", "clear-hold", "floor 172.16.0.0/16"} {
 		if !rules.has(want) {
 			t.Fatalf("missing %q in %v", want, rules.calls)
 		}

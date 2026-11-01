@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/netip"
 	"sync"
 	"time"
 )
@@ -30,8 +29,9 @@ type ServerHooks struct {
 	RetainLearned func(ids []string) error
 	// Changed is called after any state change so the snapshot can be saved.
 	Changed func()
-	// NodeControl replaces the control endpoints of the node-wide guard.
-	NodeControl func([]netip.AddrPort) error
+	// NodeControl replaces the control endpoints and pools of the
+	// node-wide guard.
+	NodeControl func(NodeControl) error
 	// InspectCA installs the inspection CA (P3-1), memory only.
 	InspectCA func(InspectCA) error
 	// ClearInspectCA drops the CA, the injection secrets and the inspected
@@ -260,15 +260,22 @@ func (s *Server) dispatch(req request) (json.RawMessage, error) {
 		if s.hooks.RetainLearned != nil {
 			err = s.hooks.RetainLearned(ids)
 		}
-	case opNodeCtl:
-		var eps []netip.AddrPort
-		if err = json.Unmarshal(req.Payload, &eps); err != nil {
+	case opNodeCtl, opNodeCtlPools:
+		// The older op is a bare endpoint list: a sandboxd from before
+		// pools lists every address itself, so its push carries none.
+		var nc NodeControl
+		if req.Op == opNodeCtl {
+			err = json.Unmarshal(req.Payload, &nc.Endpoints)
+		} else {
+			err = json.Unmarshal(req.Payload, &nc)
+		}
+		if err != nil {
 			return nil, err
 		}
 		if s.hooks.NodeControl == nil {
 			return nil, fmt.Errorf("%w: node control guard not supported", ErrUnavailable)
 		}
-		err = s.hooks.NodeControl(eps)
+		err = s.hooks.NodeControl(nc)
 	case opInspectCA:
 		var ca InspectCA
 		if err = json.Unmarshal(req.Payload, &ca); err != nil {
