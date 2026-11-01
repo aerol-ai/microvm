@@ -13,6 +13,7 @@ import (
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/secrets"
 	"github.com/aerol-ai/microvm/pkg/wasmmod"
 )
@@ -128,6 +129,14 @@ func Classify(err error) Classification {
 	// its code.
 	case errors.Is(err, service.ErrNetworkPolicyUnenforced):
 		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeNetworkPolicyUnenforced, Message: err.Error()}
+
+	// A mount whose tool is not installed on this node (a local install
+	// skips them): the node's configuration, not the request, so not the
+	// catch-all 400. 501 like the policy refusal above, not 503: every SDK
+	// retries 503, and a missing program will not appear between retries.
+	// Logged, so the node's journal names the missing tool.
+	case errors.Is(err, mounts.ErrMountToolUnavailable):
+		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeMountToolUnavailable, Message: err.Error(), Log: true, LogLevel: slog.LevelWarn}
 
 	// The node cannot keep IPv6 off its sandbox networks right now. The
 	// cause (a netlink error) is for the node's log, not the caller.

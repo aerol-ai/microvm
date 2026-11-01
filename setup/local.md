@@ -168,6 +168,11 @@ docker ps -a --filter 'label=aerolvm.managed=true' -q | xargs -r docker rm -f
   anyway, set `SB_ALLOW_UNENFORCED_NETWORK_POLICY=true`: the policy is stored
   but nothing filters the traffic. To have it enforced, run on Linux with
   `SB_ENABLE_NETWORK_RULES=true`.
+- **No external-storage mount tools.** `--local` skips the package step that
+  installs `fuse3`, `sshfs`, `nfs-common`, `rclone` and `mount-s3`, so a create
+  or start with an S3, SSHFS or rclone mount (including a platform volume on an
+  S3 store) is refused with `501 mount_tool_unavailable`, naming the missing
+  program. Install the tools by hand to try mounts locally.
 - **No automatic restarts on host reboot if you uninstall Docker.** The
   daemon depends on Docker running first.
 

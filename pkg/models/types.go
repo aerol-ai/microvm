@@ -1447,6 +1447,14 @@ const ErrorCodeIPv6FenceNotReady = "ipv6_fence_not_ready"
 // runtime that filters egress itself (wasm, isolate).
 const ErrorCodeNetworkPolicyUnenforced = "network_policy_unenforced"
 
+// ErrorCodeMountToolUnavailable is returned (501) for a create or start whose
+// external-storage or platform-volume mount needs a mount tool (mount-s3,
+// sshfs, rclone, mount) that is not installed on this node, as on a local
+// install. Retrying won't help, so it is not a 503 (every SDK retries those);
+// the operator installs the tool (the server installer does), or the caller
+// creates the sandbox without the mount.
+const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
+
 // ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
 // container or Firecracker create while this node's guard that keeps
 // sandboxes off the node's own services is not installed for that runtime;
