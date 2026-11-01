@@ -1797,6 +1797,22 @@ Phase 3 starts.
        one create left whose block-all goes on after the workload starts
        (runsc doesn't join a pause's namespace; on the containerd engine it
        uses the netns pool and is covered).
+     - **Amendment 2026-11-01 (perf/egress-lift-is-an-add).** Measured on
+       the bank flagship (kernel 6.8), the lift still cost about one RCU
+       grace period (every nf_tables commit that deletes waits one, 5.7 ms)
+       plus the chain listings (6 ms at 300 neighbours): 12 ms p50. The
+       block-all is now membership in two sets of the table
+       `ip aerolvm_block` (forward and input base chains drop
+       `ip saddr @blocked ip saddr != @released`): a block is an add to
+       @blocked (and deletes a release left at the address), the lift an
+       add to @released, and only letting an address go deletes (release
+       first), off the create path. Sets are read back at sandboxd start,
+       so a create killed between block and lift stays shut until reconcile
+       removes the orphan, and a stale release never opens a new owner.
+       In the kernel container: svc_egress_attach_unblock p50 72-74 us and
+       svc_egress_join p50 0 (p99 61-196 us) at 300 and 1000 neighbours
+       with churn, against 5.4 ms and 5.3 ms (and failed creates at 1000)
+       on the per-address rules.
    - **Measured, not estimated.**
      - `svc_egress_prepare`, `svc_egress_attach` and `svc_egress_join` (the
        time the create actually waited) are recorded through
