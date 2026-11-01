@@ -1,7 +1,7 @@
 GO ?= go
 BIN_DIR ?= bin
 
-.PHONY: fmt install-git-hooks test test-acme-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
+.PHONY: fmt install-git-hooks test test-acme-e2e test-ingress-reload-e2e build build-sandboxd build-toolboxd docs-install docs-dev docs-build clean \
 	integration-local integration-single integration-single-containerd integration-single-wasm integration-single-isolate integration-single-private-cloud integration-cluster-mixed integration-cluster-mixed-lb integration-cluster-mixed-docker integration-cluster-mixed-containerd integration-cluster-mixed-wasm \
 	integration-cluster-mixed-fc integration-cluster-mixed-gvisor integration-cluster-hetero integration-cluster-hetero-safe \
 	integration-cluster-mixed-obs integration-cluster-mixed-obs-only \
@@ -42,6 +42,22 @@ test:
 # Not wired into CI — gated by the e2e build tag.
 test-acme-e2e:
 	$(GO) test -tags=e2e -count=1 -timeout=10m ./internal/service -run TestACME
+
+# Operator-runnable reproduction of new connections dropped by Caddy config
+# reloads under sandbox churn, and the gate that the static routes of
+# SB_INGRESS_PROXY_ROUTING drop none (pkg/caddy TestE2EIngressReloadChurn).
+# Needs a Caddy with caddy-l4: AEROL_E2E_CADDY_BIN, or this builds the
+# release combination (.github/workflows/release.yml) with xcaddy. Linux
+# only (the test is build-tagged linux): on macOS run it in a Linux container.
+CADDY_E2E_VERSION ?= v2.11.7
+CADDY_E2E_BIN ?= $(BIN_DIR)/caddy-l4-e2e
+test-ingress-reload-e2e:
+	@if [ -z "$$AEROL_E2E_CADDY_BIN" ] && [ ! -x "$(CADDY_E2E_BIN)" ]; then \
+		mkdir -p $(BIN_DIR) && CGO_ENABLED=0 $(GO) run github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.6 build $(CADDY_E2E_VERSION) \
+			--output $(CADDY_E2E_BIN) --with github.com/mholt/caddy-l4@v0.1.2; \
+	fi
+	AEROL_E2E_CADDY_BIN="$${AEROL_E2E_CADDY_BIN:-$(abspath $(CADDY_E2E_BIN))}" \
+		$(GO) test -tags=e2e -count=1 -timeout=10m -v ./pkg/caddy -run TestE2EIngressReloadChurn
 
 build: build-sandboxd build-toolboxd
 
@@ -202,8 +218,10 @@ integration-secrets-hetero-lite-kms:
 # Ingress proxy routing gate (plans/ingress-proxy-routing.md T10): the same
 # topologies with SB_INGRESS_PROXY_ROUTING on every node. UC-171 (churn: 0
 # failed fresh HTTP/TCP connections), UC-172 (sessions survive a sandboxd
-# restart), UC-173 (no per-sandbox Caddy routes). Run the cheap 3-mixed pair
-# first, then hetero-lite, which covers the ingress-only → worker path.
+# restart), UC-173 (no per-sandbox Caddy routes), UC-357 (fresh TLS and exec
+# streams through every ingress node: 0 resets or EOFs under churn). Run the
+# cheap 3-mixed pair first, then hetero-lite, which covers the ingress-only →
+# worker path. cluster-bank-flagship runs the same gate on the metal shape.
 integration-routing:
 	integration-tests/run.sh cluster-3-mixed-routing $(RUN_FLAGS)
 
