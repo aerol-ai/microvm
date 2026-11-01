@@ -1028,13 +1028,14 @@ func TestBankTLSPosture(t *testing.T) {
 	} else {
 		t.Logf("TLS 1.3: %s", tls.CipherSuiteName(st.CipherSuite))
 	}
-	resp, err := (&http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}).Get("https://" + host + "/health")
+	insecure := harness.NewTransport(func(tr *http.Transport) { tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} })
+	resp, err := (&http.Client{Timeout: 15 * time.Second, Transport: insecure}).Get("https://" + host + "/health")
 	if err == nil {
 		resp.Body.Close()
 		t.Logf("security headers on /health: Strict-Transport-Security=%q X-Content-Type-Options=%q Server=%q",
 			resp.Header.Get("Strict-Transport-Security"), resp.Header.Get("X-Content-Type-Options"), resp.Header.Get("Server"))
 	}
-	plain, err := (&http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get("http://" + strings.Split(host, ":")[0] + "/v1/sandboxes")
+	plain, err := (&http.Client{Timeout: 15 * time.Second, Transport: harness.SharedTransport(), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Get("http://" + strings.Split(host, ":")[0] + "/v1/sandboxes")
 	if err == nil {
 		plain.Body.Close()
 		if plain.StatusCode < 300 || plain.StatusCode >= 400 {

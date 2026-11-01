@@ -185,6 +185,14 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 	if out, err := harness.SSHRun(t, target, "sudo systemctl stop sandboxd"); err != nil {
 		t.Fatalf("stop sandboxd on %s: %v\n%s", victim.Name, err, out)
 	}
+	// Out of the client's rotation, as a health-checked load balancer would
+	// take it out. This hides nothing from the assertion: coverage is
+	// computed by the node that serves the read, which still has to ask the
+	// victim and fail. Without it a client whose keep-alive connection is to
+	// the victim's Caddy (every node is an ingress on cluster-3-mixed) reads
+	// 502 for the whole poll and the case fails for the wrong reason.
+	// restoreNodeDaemon puts it back once it has rejoined.
+	harness.MarkNodeDown(victim.PublicIP)
 	t.Cleanup(func() { restoreNodeDaemon(t, victim, target) })
 
 	// Give gossip a moment, then read again.
@@ -193,9 +201,9 @@ func TestAuditCoverageReportsUnreachableNodes(t *testing.T) {
 	for time.Now().Before(deadline) {
 		page, err := harness.TryAuditEvents(c, sb.ID, harness.AuditQuery{Limit: 100})
 		if err != nil {
-			// We just stopped a node. A gateway that still holds a route to
-			// it answers 502 for a few seconds; that is the fault we
-			// injected talking, not the audit read. Keep polling — if it
+			// We just stopped a node. A gateway or peer that has not noticed
+			// yet can still fail a read for a few seconds; that is the fault
+			// we injected talking, not the audit read. Keep polling — if it
 			// never clears, the deadline below fails with this error.
 			lastErr = err
 			time.Sleep(10 * time.Second)
