@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/models"
 	microvm "github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
@@ -346,6 +347,10 @@ func TestNetworkUsageCounters(t *testing.T) {
 }
 
 // UC-38 — Patching network limits is enforced (reflected back in usage).
+//
+// With no host firewall (local mode) nothing can enforce a cap, so setting
+// one must be refused as unenforced (#846), and lifting one (0) must still
+// work, as the network-usage docs promise.
 func TestNetworkLimitsPatch(t *testing.T) {
 	harness.Require(t, sc, "UC-38")
 	c := client(t)
@@ -358,6 +363,25 @@ func TestNetworkLimitsPatch(t *testing.T) {
 	usage, err := c.SDK().SetNetworkLimits(ctx, sb.ID, sdktypes.SetNetworkLimitsOptions{
 		NetworkBytesInLimit: &limit,
 	})
+	if sc.Has(harness.CapNoHostFirewall) {
+		if err == nil {
+			t.Fatalf("a node with no host firewall accepted a %d-byte receive cap it cannot enforce (usage %+v)", limit, usage)
+		}
+		if !harness.IsUnenforcedPolicyRefusal(err) {
+			t.Fatalf("a byte cap was refused on a node with no host firewall, but not as unenforced (want 501 %s): %s",
+				models.ErrorCodeNetworkPolicyUnenforced, harness.DescribeAPIError(err))
+		}
+		zero := int64(0)
+		usage, err = c.SDK().SetNetworkLimits(ctx, sb.ID, sdktypes.SetNetworkLimitsOptions{NetworkBytesInLimit: &zero})
+		if err != nil {
+			t.Fatalf("lifting a cap (0) must always work, also with no host firewall: %s", harness.DescribeAPIError(err))
+		}
+		if usage.BytesInLimit != 0 {
+			t.Fatalf("bytes_in_limit=%d after lifting the cap, want 0", usage.BytesInLimit)
+		}
+		t.Logf("no host firewall on this node: a byte cap is refused (fail closed) and lifting one works")
+		return
+	}
 	if err != nil {
 		t.Fatalf("set network limits: %v", err)
 	}
