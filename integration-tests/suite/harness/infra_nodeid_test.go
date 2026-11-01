@@ -21,3 +21,24 @@ func TestIntegrationNodeForClusterID(t *testing.T) {
 		t.Error("nil targets matched")
 	}
 }
+
+// Terraform's integration_targets carries api_load_balancer as an object, or
+// null when the scenario has no balancer. UC-356 reads the balancer's IP and
+// the 443 target group from it; null must load as nil, not as a zero value
+// whose empty IP a case could mistake for "resolves to nothing".
+func TestLoadIntegrationTargetsReadsTheLoadBalancer(t *testing.T) {
+	t.Setenv("AEROL_INTEGRATION_TARGETS", `{"domain":"lb.itest.example.com","api_load_balancer":{"ip":"198.51.100.7","dns_name":"x.elb.us-east-1.amazonaws.com","l4_host":"tcp.lb.itest.example.com","health_check_port":21280,"target_group_arns":{"443":"arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/x/abc","80":"arn:80","2220":"arn:2220"}},"nodes":[]}`)
+	got := LoadIntegrationTargets()
+	if got == nil || got.APILoadBalancer == nil {
+		t.Fatalf("api_load_balancer not loaded: %+v", got)
+	}
+	lb := got.APILoadBalancer
+	if lb.IP != "198.51.100.7" || lb.L4Host != "tcp.lb.itest.example.com" || lb.HealthCheckPort != 21280 || lb.TargetGroupARNs["443"] != "arn:aws:elasticloadbalancing:us-east-1:111122223333:targetgroup/x/abc" {
+		t.Fatalf("api_load_balancer = %+v", lb)
+	}
+
+	t.Setenv("AEROL_INTEGRATION_TARGETS", `{"domain":"x.example.com","api_load_balancer":null,"nodes":[]}`)
+	if got := LoadIntegrationTargets(); got == nil || got.APILoadBalancer != nil {
+		t.Fatalf("a scenario without a balancer must load api_load_balancer as nil: %+v", got)
+	}
+}

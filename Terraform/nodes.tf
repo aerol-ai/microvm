@@ -89,6 +89,8 @@ resource "aws_instance" "seed" {
     idle_timeout_min                         = local.seed_node.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, local.seed_name) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url
@@ -327,6 +329,8 @@ resource "aws_instance" "joiner" {
     idle_timeout_min                         = each.value.idle_timeout_min
     pat_scope                                = var.pat_scope
     l4_proxy_protocol                        = var.l4_proxy_protocol
+    lb_health_port                           = local.api_lb_enabled && contains(local.ingress_node_names, each.key) ? var.api_lb_health_check_port : 0
+    l4_public_host                           = local.l4_direct_host
     firecracker_binary_url                   = var.firecracker.binary_url
     firecracker_jailer_url                   = var.firecracker.jailer_url
     firecracker_kernel_url                   = var.firecracker.kernel_url

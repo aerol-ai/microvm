@@ -31,6 +31,24 @@ type IntegrationTargets struct {
 	PushgatewayURL string            `json:"pushgateway_url"`
 	ObsPublicIP    string            `json:"obs_public_ip"`
 	ObsPrivateIP   string            `json:"obs_private_ip"`
+	// APILoadBalancer is Terraform's api_load_balancer summary: nil unless
+	// the scenario was applied with api_load_balancer = "nlb" (run.sh does
+	// that for the api-load-balancer capability).
+	APILoadBalancer *IntegrationLoadBalancer `json:"api_load_balancer"`
+}
+
+// IntegrationLoadBalancer mirrors Terraform's api_load_balancer output.
+type IntegrationLoadBalancer struct {
+	// IP is the balancer's Elastic IP: the one address the domain and its
+	// wildcard resolve to.
+	IP      string `json:"ip"`
+	DNSName string `json:"dns_name"`
+	// L4Host is the name raw-TCP exposures are advertised under
+	// (tcp.<domain>), which still resolves to every ingress node.
+	L4Host          string `json:"l4_host"`
+	HealthCheckPort int    `json:"health_check_port"`
+	// TargetGroupARNs is keyed by listener port ("80", "443", "2220").
+	TargetGroupARNs map[string]string `json:"target_group_arns"`
 }
 
 // LoadIntegrationTargets parses AEROL_INTEGRATION_TARGETS (JSON from run.sh).

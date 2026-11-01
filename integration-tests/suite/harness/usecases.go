@@ -244,6 +244,14 @@ const (
 	// CapKeyCustodySingleWrapped: one node installed with
 	// install.sh --key-custody wrapped on a real AWS KMS key.
 	CapKeyCustodySingleWrapped Capability = "key-custody-single-wrapped"
+	// CapAPILoadBalancer: the domain fronts a health-checked AWS Network Load
+	// Balancer (Terraform api_load_balancer = "nlb"; run.sh derives that
+	// variable from this capability, the way deploy_obs follows
+	// observability). Every ingress node runs install.sh --lb-health-port and
+	// every node SB_L4_PUBLIC_HOST=tcp.<domain>. Gates UC-356; the other
+	// cases run unchanged and so cover the balancer's path (and raw TCP on
+	// tcp.<domain>) too.
+	CapAPILoadBalancer Capability = "api-load-balancer"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -295,6 +303,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
+	CapAPILoadBalancer: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -882,6 +891,8 @@ var Registry = []UseCase{
 	{ID: "UC-344", Title: "Stability: an exec in flight when its sandbox's runtime process is killed (runc init, gVisor sentry, Firecracker VMM) fails within 45 s, with 409 where the runtime reports the exit (502 allowed for Firecracker, which has no exit event); a healthy exec silent for 75 s first completes", Requires: []Capability{CapDocker}, Implemented: true},
 	// Bank-readiness security, continued (bank_security_test.go).
 	{ID: "UC-345", Title: "Security: a process OOM-killed inside a block-all sandbox (256 MiB, the UC-321 doubling bomb) neither stops the sandbox nor opens its egress, on every shell runtime: it still runs and answers exec, TCP to 1.1.1.1:443 still fails, and every host rule for its address is still on the node", Requires: []Capability{CapDocker}, Implemented: true},
+	// Ingress high availability behind the load balancer (api_lb_test.go).
+	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
