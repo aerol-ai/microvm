@@ -38,6 +38,10 @@ type Host struct {
 	// addNetns/delNetns; production leaves it nil and execs `ip -n <name> link
 	// set lo up`.
 	loopbackUp func(ctx context.Context, name string) error
+	// readIPv4 lists the IPv4 addresses inside the netns at a path. Test
+	// seam like addNetns; production leaves it nil and reads them over
+	// netlink (hostnet.NetnsIPv4Addrs).
+	readIPv4 func(path string) ([]string, error)
 }
 
 func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
@@ -113,6 +117,21 @@ func (h *Host) DisableIPv6(_ context.Context, slot Slot) error {
 		return errors.New("netns host: slot has no netns path")
 	}
 	return disableIPv6InNetns(path)
+}
+
+// IPv4Addrs lists the IPv4 addresses inside an already-realized slot's
+// netns: the address a task started there comes up at. Reconcile compares
+// it with the address the slot's row records before a warm slot that
+// outlived a restart is handed out again.
+func (h *Host) IPv4Addrs(_ context.Context, slot Slot) ([]string, error) {
+	path := strings.TrimSpace(slot.NetnsPath)
+	if path == "" {
+		return nil, errors.New("netns host: slot has no netns path")
+	}
+	if h.readIPv4 != nil {
+		return h.readIPv4(path)
+	}
+	return hostnet.NetnsIPv4Addrs(path)
 }
 
 // createNetns creates a persistent named netns (bind-mounted at

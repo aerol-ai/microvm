@@ -141,6 +141,21 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "invalid SB_HOSTPORT_REDIRECT_PORT 0",
 		},
 		{
+			name: "route dns link addr is not an ip:port",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "aerolvm-rt:53053"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
+		},
+		{
+			name: "route dns link addr is a wildcard",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "0.0.0.0:53053"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
+		},
+		{
+			name: "route dns link addr has no port",
+			env:  map[string]string{"SB_ROUTE_DNS_LINK_ADDR": "169.254.53.53"},
+			want: "invalid SB_ROUTE_DNS_LINK_ADDR",
+		},
+		{
 			name: "node role without cluster",
 			env:  map[string]string{"SB_NODE_ROLE": "worker"},
 			want: "requires SB_ENABLE_CLUSTER=true",
@@ -569,5 +584,19 @@ func TestLoad_ComprehensiveEnabledConfig(t *testing.T) {
 	}
 	if len(cfg.ImageGCWhitelist) != 2 || len(cfg.HostSupportedRuntimes) != 2 {
 		t.Fatalf("unexpected list parsing: whitelist=%v runtimes=%v", cfg.ImageGCWhitelist, cfg.HostSupportedRuntimes)
+	}
+}
+
+// SB_ROUTE_DNS_LINK_ADDR is empty unless set (no second responder listener),
+// and a link address loads as given.
+func TestLoad_RouteDNSLinkAddr(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	cfg, err := Load()
+	if err != nil || cfg.RouteDNSLinkAddr != "" {
+		t.Fatalf("default: RouteDNSLinkAddr = %q, err = %v; want empty", cfg.RouteDNSLinkAddr, err)
+	}
+	t.Setenv("SB_ROUTE_DNS_LINK_ADDR", "169.254.53.53:53053")
+	if cfg, err = Load(); err != nil || cfg.RouteDNSLinkAddr != "169.254.53.53:53053" {
+		t.Fatalf("set: RouteDNSLinkAddr = %q, err = %v", cfg.RouteDNSLinkAddr, err)
 	}
 }

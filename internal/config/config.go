@@ -1159,6 +1159,15 @@ type Config struct {
 	// §3.2). On ingress nodes the resolver routes *.rt.internal here.
 	// SB_ROUTE_DNS_ADDR.
 	RouteDNSAddr string
+	// RouteDNSLinkAddr is a second responder listener, on the address of the
+	// node's aerolvm-rt link, where the system resolver sends *.rt.internal.
+	// systemd-resolved pins its socket for a link's DNS server to that link,
+	// so a UDP query to the loopback address goes out the dummy link and is
+	// dropped; resolved then stalls every lookup for about 20s while it falls
+	// back to TCP, and does it again each time it re-probes. install.sh sets
+	// it with --ingress-proxy-routing. Empty: no second listener.
+	// SB_ROUTE_DNS_LINK_ADDR.
+	RouteDNSLinkAddr string
 	// HostPortRedirectPort is the sandboxd listener that raw-TCP host ports
 	// are REDIRECTed to under ingress proxy routing when the kernel can't
 	// DNAT them straight to the sandbox (stopped serverless sandboxes to
@@ -2107,6 +2116,7 @@ func load(keyTool bool) (Config, error) {
 		ClusterShardAwareIngress:         getEnvBool("SB_CLUSTER_SHARD_AWARE_INGRESS", false),
 		IngressProxyRouting:              getEnvBool("SB_INGRESS_PROXY_ROUTING", false),
 		RouteDNSAddr:                     getEnv("SB_ROUTE_DNS_ADDR", "127.0.0.1:53053"),
+		RouteDNSLinkAddr:                 getEnv("SB_ROUTE_DNS_LINK_ADDR", ""),
 		HostPortRedirectPort:             getEnvInt("SB_HOSTPORT_REDIRECT_PORT", 21215),
 		ClusterRaftCommitTimeout:         getEnvDuration("SB_RAFT_COMMIT_TIMEOUT", 5*time.Second),
 		ClusterCapacityGossipInterval:    getEnvDuration("SB_CAPACITY_GOSSIP_INTERVAL", 5*time.Second),
@@ -2633,6 +2643,14 @@ func load(keyTool bool) (Config, error) {
 		(cfg.HostPortRedirectPort >= cfg.L4PortRangeStart && cfg.HostPortRedirectPort <= cfg.L4PortRangeEnd)) {
 		return Config{}, fmt.Errorf("invalid SB_HOSTPORT_REDIRECT_PORT %d: require 1-65535 outside SB_L4_PORT_RANGE_START/END (%d-%d)",
 			cfg.HostPortRedirectPort, cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
+	if cfg.RouteDNSLinkAddr != "" {
+		host, port, err := net.SplitHostPort(cfg.RouteDNSLinkAddr)
+		if ip := net.ParseIP(host); err != nil || ip == nil || ip.IsUnspecified() || port == "" || port == "0" {
+			// An address, not a wildcard: the responder answers a non-loopback
+			// client only when it is the listener's own address.
+			return Config{}, fmt.Errorf("invalid SB_ROUTE_DNS_LINK_ADDR %q: require ip:port with a specific IP", cfg.RouteDNSLinkAddr)
+		}
 	}
 	if cfg.SandboxPidsLimit < 0 {
 		return Config{}, fmt.Errorf("invalid SB_SANDBOX_PIDS_LIMIT %d: require 0 (unlimited) or more", cfg.SandboxPidsLimit)

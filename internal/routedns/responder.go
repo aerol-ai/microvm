@@ -96,6 +96,10 @@ func (r *Responder) clock() time.Time {
 	return time.Now()
 }
 
+// ednsUDPSize is the payload size this responder advertises when a query
+// carries EDNS0. Answers are one record, far below it.
+const ednsUDPSize = 1232
+
 // ServeDNS implements dns.Handler. Every answer is authoritative and nothing
 // recurses: a query about a sandbox hostname never leaves this node.
 func (r *Responder) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
@@ -103,6 +107,20 @@ func (r *Responder) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	m.SetReply(req)
 	m.Authoritative = true
 	m.RecursionAvailable = false
+	// Echo EDNS0 when the query has it (RFC 6891 §7). systemd-resolved
+	// probes its servers with EDNS0 first; a reply without OPT tells it the
+	// server is broken, and it starts walking down its feature levels.
+	if req.IsEdns0() != nil {
+		m.SetEdns0(ednsUDPSize, false)
+	}
+	// The link listener (SB_ROUTE_DNS_LINK_ADDR) is not on loopback, so a
+	// sandbox routed through this host could reach it. Placements are not
+	// for tenants: answer only this node.
+	if !localSource(w) {
+		m.Rcode = dns.RcodeRefused
+		_ = w.WriteMsg(m)
+		return
+	}
 	if len(req.Question) != 1 {
 		m.Rcode = dns.RcodeFormatError
 		_ = w.WriteMsg(m)
@@ -125,6 +143,32 @@ func (r *Responder) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		m.Ns = append(m.Ns, r.soa())
 	}
 	_ = w.WriteMsg(m)
+}
+
+// localSource reports whether a query came from this node: from loopback,
+// or from the very address it arrived on. systemd-resolved's socket for a
+// link-scoped server sends from the link's own address (169.254.53.53 to
+// 169.254.53.53), while a sandbox's query carries the sandbox's address.
+func localSource(w dns.ResponseWriter) bool {
+	remote := addrIP(w.RemoteAddr())
+	if remote == nil {
+		return false
+	}
+	if remote.IsLoopback() {
+		return true
+	}
+	local := addrIP(w.LocalAddr())
+	return local != nil && !local.IsUnspecified() && local.Equal(remote)
+}
+
+func addrIP(a net.Addr) net.IP {
+	switch v := a.(type) {
+	case *net.UDPAddr:
+		return v.IP
+	case *net.TCPAddr:
+		return v.IP
+	}
+	return nil
 }
 
 // answer returns one record, or nil plus NXDOMAIN (unknown / fall back) or
