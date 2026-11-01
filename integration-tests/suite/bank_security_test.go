@@ -1308,6 +1308,56 @@ func TestBankToolboxAgentUnreachable(t *testing.T) {
 	}
 }
 
+// UC-340 — IPv6 off inside a sandbox (UC-318) must not break a workload
+// that listens on [::]: nginx's stock listen [::]:80, python3 -m
+// http.server (it picks AF_INET6 when getaddrinfo lists :: first), many
+// language servers. On every runtime an AF_INET6 socket must open and bind
+// [::], and a listener on [::] must accept an IPv4 connection. This is why a
+// Firecracker guest boots with ipv6.disable_ipv6=1 (no addresses) and not
+// ipv6.disable=1, which removes the stack and fails every AF_INET6 socket
+// with EAFNOSUPPORT.
+func TestBankIPv6SocketsStillWork(t *testing.T) {
+	harness.Require(t, sc, "UC-340")
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		image := bankPythonImage(rt)
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{Image: image})
+		if out, _ := bankRun(t, sb, "command -v python3 >/dev/null 2>&1 && echo present || echo missing", time.Minute); !strings.Contains(out, "present") {
+			t.Skipf("python3 is missing in %s on %s, so the AF_INET6 checks cannot run here", image, rt.name)
+		}
+		out, rc := bankRun(t, sb, `python3 -c "import socket; s=socket.socket(socket.AF_INET6); s.bind(('::', 18080)); s.listen(); print('ok')"`, time.Minute)
+		if rc != 0 || strings.TrimSpace(out) != "ok" {
+			t.Errorf("%s sandbox %s cannot bind an AF_INET6 socket to [::] (exit %d): %s", rt.name, sb.ID, rc, strings.TrimSpace(out))
+		}
+		// A dual-stack listener, as most servers open one: IPv4 clients
+		// arrive as ::ffff:a.b.c.d.
+		out, rc = bankRun(t, sb, `python3 -c '
+import socket
+srv = socket.socket(socket.AF_INET6)
+srv.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("::", 18081))
+srv.listen()
+cli = socket.create_connection(("127.0.0.1", 18081), timeout=5)
+conn, peer = srv.accept()
+conn.sendall(b"v4ok")
+print(cli.recv(4).decode(), peer[0])
+'`, time.Minute)
+		if rc != 0 || !strings.Contains(out, "v4ok") {
+			t.Errorf("%s sandbox %s: a listener on [::] did not accept an IPv4 connection (exit %d): %s", rt.name, sb.ID, rc, strings.TrimSpace(out))
+		}
+		t.Logf("%s: AF_INET6 bind on [::] ok; IPv4 client to the [::] listener: %s", rt.name, strings.TrimSpace(out))
+	})
+}
+
+// bankPythonImage is an image with python3 for rt (ECR Public for a
+// Firecracker cold boot, as bankImage).
+func bankPythonImage(rt bankRuntime) string {
+	if rt.vm {
+		return "public.ecr.aws/docker/library/python:3.12-alpine"
+	}
+	return "python:3.12-alpine"
+}
+
 // bankNoIPv6Path is UC-318 over IPv6. Every host rule between sandboxes is
 // IPv4, and on cluster-3-mixed-routing a sandbox reached its neighbour at
 // fe80::…%eth0 while the neighbour's IPv4 address timed out. Now neither
@@ -1353,9 +1403,10 @@ func bankNoIPv6Path(t *testing.T, rt bankRuntime, a, b *microvm.Sandbox) {
 }
 
 // bankIPv6State is what a sandbox shows of its own IPv6: the
-// all.disable_ipv6 sysctl ("" where the kernel has none, a Firecracker
-// guest booted with ipv6.disable=1, or gVisor not exposing it) and every
-// IPv6 address on any interface.
+// all.disable_ipv6 sysctl ("" where gVisor does not expose it; a
+// Firecracker guest booted with ipv6.disable_ipv6=1 reads 0 there, with
+// default and every interface at 1) and every IPv6 address on any
+// interface.
 func bankIPv6State(t *testing.T, sb *microvm.Sandbox) (string, []string) {
 	t.Helper()
 	out, _ := bankRun(t, sb, `echo "disable=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)"; ip -6 -o addr 2>/dev/null | awk '{print "addr=" $2 " " $4}'; awk '{print "addr=" $6 " " $1}' /proc/net/if_inet6 2>/dev/null; true`, time.Minute)
