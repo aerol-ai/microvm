@@ -492,8 +492,11 @@ func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot)
 	if slot == nil {
 		return nil
 	}
+	// The slot holds its address until it is removed: everything keyed by
+	// the address goes first (the park block, and anything an adopt
+	// that failed half way put there).
 	if slot.ContainerIP != "" {
-		_ = c.ClearNetworkRules(slot.ContainerIP)
+		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {
 		_ = slot.Handle.Close()

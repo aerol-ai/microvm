@@ -43,6 +43,11 @@ type netnsFakeDaemon struct {
 	removeResp func(c *netnsFakeContainer) *http.Response
 	onStart    func(c *netnsFakeContainer)
 	onRemove   func(c *netnsFakeContainer)
+	// reuseIPs hands a removed container's address to the next container
+	// first, as Docker's IPAM can: what is left at an address meets its
+	// next owner.
+	reuseIPs bool
+	freeIPs  []string
 }
 
 type netnsFakeContainer struct {
@@ -148,6 +153,8 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			// NetworkSettings of its own — the IP belongs to the owner.
 			if strings.HasPrefix(body.HostConfig.NetworkMode, "container:") {
 				ip = ""
+			} else if n := len(d.freeIPs); d.reuseIPs && n > 0 {
+				ip, d.freeIPs = d.freeIPs[n-1], d.freeIPs[:n-1]
 			}
 			if d.noIP {
 				ip = ""
@@ -219,6 +226,9 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			}
 			if d.onRemove != nil {
 				d.onRemove(c)
+			}
+			if c.ip != "" {
+				d.freeIPs = append(d.freeIPs, c.ip)
 			}
 			delete(d.containers, c.id)
 			return textResponse(http.StatusNoContent, ""), nil
