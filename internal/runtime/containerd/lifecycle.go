@@ -192,6 +192,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	specOpts = append(specOpts, withSandboxIPv6Off())
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 	}
@@ -227,7 +228,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(sandboxID, image),
-		cntr.WithNewSpec(specOpts...),
+		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(containerLabels),
 	}
 	if ociRuntime != "" {

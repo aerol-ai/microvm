@@ -7,6 +7,10 @@ import (
 	"path/filepath"
 )
 
+// DefaultBridgeName is the bridge the generated conflist attaches sandboxes
+// to.
+const DefaultBridgeName = "aerolvm0"
+
 // DefaultBridgeSubnet is the host-local IPAM subnet for the aerolvm0 bridge.
 // Shared so the netrules FORWARD-accept rules target the same CIDR the conflist
 // hands out.
@@ -57,7 +61,7 @@ func RenderBridgeConflist(opts ConflistOptions) ([]byte, error) {
 		opts.Name = "aerolvm"
 	}
 	if opts.Bridge == "" {
-		opts.Bridge = "aerolvm0"
+		opts.Bridge = DefaultBridgeName
 	}
 	if opts.Subnet == "" {
 		opts.Subnet = DefaultBridgeSubnet
@@ -94,4 +98,38 @@ func RenderBridgeConflist(opts ConflistOptions) ([]byte, error) {
 		return nil, fmt.Errorf("render cni conflist: %w", err)
 	}
 	return append(body, '\n'), nil
+}
+
+// DefaultPluginBridge is the bridge the CNI bridge plugin creates when its
+// config names none (containerd's stock conflist relies on it).
+const DefaultPluginBridge = "cni0"
+
+// BridgeName is the Linux bridge the conflist at path attaches sandboxes to:
+// the "bridge" field of the plugin the runner invokes (plugins[0], see
+// singlePluginNetconf), or the plugin's own default when it names none. The
+// node's IPv6 fence drops IPv6 on that bridge by name, so it must be the one
+// CNI really uses, which an operator-provided conflist may call anything.
+func BridgeName(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read cni conf %q: %w", path, err)
+	}
+	conf, err := singlePluginNetconf(raw)
+	if err != nil {
+		return "", err
+	}
+	var plugin struct {
+		Type   string `json:"type"`
+		Bridge string `json:"bridge"`
+	}
+	if err := json.Unmarshal(conf, &plugin); err != nil {
+		return "", fmt.Errorf("parse cni plugin: %w", err)
+	}
+	if plugin.Type != "bridge" {
+		return "", fmt.Errorf("cni conf %q: plugin type %q is not bridge", path, plugin.Type)
+	}
+	if plugin.Bridge == "" {
+		return DefaultPluginBridge, nil
+	}
+	return plugin.Bridge, nil
 }

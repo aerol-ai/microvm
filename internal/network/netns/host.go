@@ -73,12 +73,46 @@ func (h *Host) Realize(ctx context.Context, slot Slot) (string, string, error) {
 		return "", "", fmt.Errorf("netns host: loopback up %s: %w", name, err)
 	}
 	path := filepath.Join(root, name)
+	// IPv6 off before the sandbox's interface exists: "default" is what the
+	// veth CNI ADD creates in here starts with, so it never gets a
+	// link-local address a neighbour on the bridge could reach (every host
+	// rule between sandboxes is IPv4). Prewarmed slots come through here
+	// too.
+	if err := disableIPv6InNetns(path); err != nil {
+		_ = h.deleteNetns(ctx, name)
+		return "", "", fmt.Errorf("netns host: disable ipv6 in %s: %w", name, err)
+	}
 	res, err := h.Runner.Add(ctx, path, name)
 	if err != nil {
 		_ = h.deleteNetns(ctx, name)
 		return "", "", fmt.Errorf("netns host: cni add: %w", err)
 	}
+	// And again after: IPAM turns IPv6 back on for an interface it gives an
+	// IPv6 address (an operator conflist with a v6 range). "all" switches
+	// it off on every interface there. The ADD succeeded, so a failure
+	// here undoes all of it, as Remove would.
+	if err := disableIPv6InNetns(path); err != nil {
+		rmErr := h.Remove(ctx, Slot{SlotID: slot.SlotID, SandboxID: slot.SandboxID, NetnsPath: path, ContainerIP: res.IP4})
+		return "", "", errors.Join(fmt.Errorf("netns host: disable ipv6 in %s after cni add: %w", name, err), rmErr)
+	}
 	return path, res.IP4, nil
+}
+
+// disableIPv6InNetns turns IPv6 off inside a sandbox netns. A var because
+// unit tests have no real netns to enter (TestMain stands in a no-op; the
+// IPv6 tests record calls).
+var disableIPv6InNetns = hostnet.DisableIPv6InNetns
+
+// DisableIPv6 turns IPv6 off in an already-realized slot's netns.
+// Reconcile runs it on every slot that survives a restart, so a warm slot
+// an older daemon realized is not handed out with IPv6 on, and a running
+// sandbox loses the link-local address it booted with. Idempotent.
+func (h *Host) DisableIPv6(_ context.Context, slot Slot) error {
+	path := strings.TrimSpace(slot.NetnsPath)
+	if path == "" {
+		return errors.New("netns host: slot has no netns path")
+	}
+	return disableIPv6InNetns(path)
 }
 
 // createNetns creates a persistent named netns (bind-mounted at
