@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -44,7 +42,8 @@ type APIError struct {
 	Code string
 	// Message is models.ErrorResponse.Error, or a status-based fallback.
 	Message string
-	// RetryAfter is the server's Retry-After hint in seconds form, if any.
+	// RetryAfter is how long the server's Retry-After asked the caller to
+	// wait (delta-seconds or HTTP-date form), or zero without one.
 	RetryAfter time.Duration
 	// Reason says why the server refused an avm_ API token or an OIDC
 	// token. On a 401: expired, not_yet_valid, unknown_issuer,
@@ -90,8 +89,8 @@ func decodeError(response *http.Response) error {
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("request failed with status %d", response.StatusCode),
 	}
-	if secs, err := strconv.Atoi(strings.TrimSpace(response.Header.Get("Retry-After"))); err == nil && secs > 0 {
-		apiErr.RetryAfter = time.Duration(secs) * time.Second
+	if after, ok := parseRetryAfter(response.Header.Get("Retry-After"), time.Now()); ok {
+		apiErr.RetryAfter = after
 	}
 	var payload models.ErrorResponse
 	if err := json.NewDecoder(response.Body).Decode(&payload); err == nil && payload.Error != "" {
