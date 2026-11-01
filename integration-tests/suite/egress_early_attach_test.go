@@ -182,6 +182,10 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 	}
 	// A sandbox's pause is named for it (the pool's free slots are not).
 	script.WriteString("echo '## pause'; command -v docker >/dev/null && sudo docker ps -a --filter label=aerolvm.netns-pause=true --format '{{.Names}}' 2>/dev/null | grep '^aerolvm-netns-sb-'; ")
+	// Parked warm-pool containers hold their own addresses, with the park
+	// block on them by design (pkg/docker parkContainer): a refill during a
+	// test parks a new one, which is not something left behind.
+	script.WriteString("echo '## park'; command -v docker >/dev/null && for id in $(sudo docker ps -q --filter label=aerol.pool=park 2>/dev/null); do sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' \"$id\" 2>/dev/null; done; ")
 	script.WriteString("true")
 	out := nodeSSH(t, node, script.String())
 	st := egressNodeState{}
@@ -203,6 +207,10 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 		case section == "pause":
 			if name := strings.TrimSpace(line); name != "" {
 				st["pause "+name] = true
+			}
+		case section == "park":
+			for _, ip := range strings.Fields(line) {
+				st[heldPrefix+ip] = true
 			}
 		}
 	}
@@ -234,9 +242,10 @@ func newEgressEntries(before, after map[string]egressNodeState) []string {
 	var added []string
 	for node, st := range after {
 		for k := range st {
-			if !before[node][k] {
-				added = append(added, node+": "+k)
+			if before[node][k] || strings.HasPrefix(k, heldPrefix) || parkBlock(st, k) {
+				continue
 			}
+			added = append(added, node+": "+k)
 		}
 	}
 	sort.Strings(added)
@@ -438,4 +447,24 @@ func TestDockerOpenCreateKeepsDockersPath(t *testing.T) {
 	if !sc.Has(harness.CapDockerNetnsPool) && onSomeNode(snapshotEgressNodes(t), pauseFor(sb.ID)) {
 		t.Fatalf("an open create on a node without the pool got a pause container")
 	}
+}
+
+// heldPrefix marks an address a parked warm-pool container holds; such
+// keys describe the node, they are never "left behind".
+const heldPrefix = "held-by-park "
+
+// parkBlock reports whether k is the park block (the block-all pair) of an
+// address a parked warm-pool container holds: the park's own rules, which
+// go when the park does.
+func parkBlock(st egressNodeState, k string) bool {
+	rule, ok := strings.CutPrefix(k, "rule ")
+	if !ok {
+		return false
+	}
+	m := ruleIPRe.FindStringSubmatch(rule)
+	if m == nil || !st[heldPrefix+m[1]] {
+		return false
+	}
+	return strings.HasSuffix(rule, "-s "+m[1]+"/32 -j DROP") ||
+		strings.HasSuffix(rule, "-s "+m[1]+"/32 -m comment --comment sbx-input-block -j DROP")
 }
