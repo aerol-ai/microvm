@@ -272,6 +272,7 @@ func (c *Client) parkContainer(ctx context.Context, slotID string, key dockerpoo
 	if c.network != "" && c.network != "bridge" {
 		hostConfig["NetworkMode"] = c.network
 	}
+	setSandboxIPv6Off(hostConfig, c.network)
 	if ociRuntime != "" {
 		hostConfig["Runtime"] = ociRuntime
 	}

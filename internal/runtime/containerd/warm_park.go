@@ -207,6 +207,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
+	specOpts = append(specOpts, withSandboxIPv6Off())
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 	}
@@ -228,7 +229,7 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 	containerOpts := []cntr.NewContainerOpts{
 		cntr.WithImage(image),
 		cntr.WithNewSnapshot(slotID, image),
-		cntr.WithNewSpec(specOpts...),
+		withNewSpec(specOpts...),
 		cntr.WithContainerLabels(labels),
 	}
 	if ociRuntime != "" {

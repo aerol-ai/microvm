@@ -563,6 +563,7 @@ func (c *Client) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if !netnsAdopted {
 		c.publishToolboxLoopback(createRequest, hostConfig)
+		setSandboxIPv6Off(hostConfig, c.network)
 	}
 
 	// Only set HostConfig.Runtime when we actually need to override the
@@ -1783,8 +1784,9 @@ type containerInspect struct {
 		Ports map[string][]portBinding `json:"Ports"`
 	} `json:"NetworkSettings"`
 	HostConfig struct {
-		Binds       []string `json:"Binds"`
-		NetworkMode string   `json:"NetworkMode"`
+		Binds       []string          `json:"Binds"`
+		NetworkMode string            `json:"NetworkMode"`
+		Sysctls     map[string]string `json:"Sysctls"`
 	} `json:"HostConfig"`
 	Mounts []struct {
 		Source      string `json:"Source"`
