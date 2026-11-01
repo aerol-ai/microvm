@@ -259,7 +259,7 @@ via Terraform/Ansible — do not flip the code default on.
 | Env var | Status |
 |---|---|
 | `SB_DOCKER_POOL_ENABLED` | SHIPPED & VERIFIED v0.5.33 (2026-07-11): warm-hit p50 **43ms**, beats the ≤100ms gate. Holds pre-started containers resident; enabling also widens `DockerReadySocketEffective`. See `plans/docker-warm-pool.md` §12. |
-| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. |
+| `SB_DOCKER_NETNS_POOL_ENABLED` | Companion pause-netns pool shipped/deployed (PR #300, v0.5.30–32). Terraform plumbs it per-node. With it off (or empty), a Docker create with network rules starts a pause container of its own so its rules are on before its workload runs (`docker_pause` stage); `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE` (default `registry.k8s.io/pause:3.10`) is that container's image too, pulled in the background at boot, so an air-gapped node must point it at a mirror. |
 
 ## 🟠 Mid-rollout / not soaked — flip only with soak data
 | Env var | Status |

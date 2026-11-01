@@ -206,6 +206,12 @@ func TestBlockAllGuardsHostServices(t *testing.T) {
 // UC-185 (EF-78) — gateway-mode creates carry the svc_egress_* stages and
 // stay inside the §8.2 budgets: join (what the create actually waited for
 // the gateway) ≤2 ms p50, attach ≤10 ms p99. AEROL_BENCH=1 only.
+//
+// Measured per runtime the scenario runs (the default engine, gVisor,
+// Firecracker; AEROL_BENCH_RUNTIMES narrows it), each with the attach's
+// sub-stages (lookup, ready, rpc, release, unblock) so a miss names where
+// the time went, and svc_egress_early, present when the runtime reported
+// the address early and the attach overlapped its create.
 func TestBenchEgressCreateStages(t *testing.T) {
 	harness.Require(t, sc, "UC-185")
 	requireBenchEnabled(t)
@@ -213,12 +219,53 @@ func TestBenchEgressCreateStages(t *testing.T) {
 	samples := benchEnvInt("AEROL_BENCH_SAMPLES", 20)
 	joinBudget := time.Duration(benchEnvInt("AEROL_EGRESS_JOIN_P50_MS", 2)) * time.Millisecond
 	attachBudget := time.Duration(benchEnvInt("AEROL_EGRESS_ATTACH_P99_MS", 10)) * time.Millisecond
+	runtimes := []struct{ label, runtime string }{{"default", ""}}
+	if sc.Has(harness.CapGvisor) && benchRuntimeAllowed("gvisor") {
+		runtimes = append(runtimes, struct{ label, runtime string }{"gvisor", "gvisor"})
+	}
+	if sc.Has(harness.CapFirecracker) && benchRuntimeAllowed("firecracker") {
+		runtimes = append(runtimes, struct{ label, runtime string }{"firecracker", "firecracker"})
+	}
+	for _, rt := range runtimes {
+		t.Run(rt.label, func(t *testing.T) {
+			stages := egressCreateStageSamples(t, c, rt.runtime, samples)
+			for _, name := range []string{"svc_egress_prepare", "svc_egress_attach", "svc_egress_join"} {
+				if len(stages[name]) == 0 {
+					t.Fatalf("no create reported %s in Server-Timing", name)
+				}
+			}
+			t.Log(egressStageTable(rt.label, stages))
+			join50 := percentile(stages["svc_egress_join"], 50)
+			attach99 := percentile(stages["svc_egress_attach"], 99)
+			if join50 > joinBudget {
+				t.Errorf("%s: svc_egress_join p50 %v over the %v budget", rt.label, join50, joinBudget)
+			}
+			if attach99 > attachBudget {
+				t.Errorf("%s: svc_egress_attach p99 %v over the %v budget", rt.label, attach99, attachBudget)
+			}
+		})
+	}
+}
+
+// egressStageNames are the gateway-mode create stages UC-185 reports, the
+// attach's sub-stages included, and docker_pause: the pause container a
+// restricted Docker create starts when the pool has no slot for it.
+var egressStageNames = []string{"svc_egress_prepare", "svc_egress_attach", "svc_egress_join", "svc_egress_early",
+	"svc_egress_attach_lookup", "svc_egress_attach_ready", "svc_egress_attach_rpc", "svc_egress_attach_release", "svc_egress_attach_unblock",
+	"docker_pause"}
+
+// egressCreateStageSamples creates samples+1 hostname-rule sandboxes on rt
+// (the first may pay the one-time gateway connect and is dropped) and
+// returns each svc_egress_* stage's samples.
+func egressCreateStageSamples(t *testing.T, c *harness.Client, rt string, samples int) map[string][]time.Duration {
+	t.Helper()
 	stages := map[string][]time.Duration{}
 	for i := 0; i < samples+1; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
 			Image:           harness.DefaultImage,
 			Name:            harness.UniqueName(sc, t),
+			Runtime:         rt,
 			NetworkAllowOut: []string{"pypi.org"},
 		})
 		cancel()
@@ -228,28 +275,25 @@ func TestBenchEgressCreateStages(t *testing.T) {
 		got, ok := c.LastServerCreateStages()
 		destroyBest(c, sb.ID)
 		if i == 0 || !ok {
-			continue // the first create may pay the one-time gateway connect
+			continue
 		}
-		for _, name := range []string{"svc_egress_prepare", "svc_egress_attach", "svc_egress_join"} {
+		for _, name := range egressStageNames {
 			if ms, present := got[name]; present {
 				stages[name] = append(stages[name], time.Duration(ms*float64(time.Millisecond)))
 			}
 		}
 	}
-	for _, name := range []string{"svc_egress_prepare", "svc_egress_attach", "svc_egress_join"} {
-		if len(stages[name]) == 0 {
-			t.Fatalf("no create reported %s in Server-Timing", name)
+	return stages
+}
+
+// egressStageTable renders p50/p99 and the sample count of every stage seen.
+func egressStageTable(label string, stages map[string][]time.Duration) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "egress create stages, runtime %s:\n", label)
+	for _, name := range egressStageNames {
+		if v := stages[name]; len(v) > 0 {
+			fmt.Fprintf(&sb, "  %-28s p50 %10v  p99 %10v  n=%d\n", name, percentile(v, 50), percentile(v, 99), len(v))
 		}
 	}
-	join50 := percentile(stages["svc_egress_join"], 50)
-	attach99 := percentile(stages["svc_egress_attach"], 99)
-	t.Logf("egress stages over %d creates: prepare p50=%v attach p50=%v p99=%v join p50=%v",
-		len(stages["svc_egress_join"]), percentile(stages["svc_egress_prepare"], 50),
-		percentile(stages["svc_egress_attach"], 50), attach99, join50)
-	if join50 > joinBudget {
-		t.Errorf("svc_egress_join p50 %v over the %v budget", join50, joinBudget)
-	}
-	if attach99 > attachBudget {
-		t.Errorf("svc_egress_attach p99 %v over the %v budget", attach99, attachBudget)
-	}
+	return sb.String()
 }

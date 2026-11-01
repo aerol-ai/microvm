@@ -133,6 +133,13 @@ sudo journalctl -u sandboxd --since "30 minutes ago" --no-pager | grep -E 'egres
   policy for very broad wildcards.
 - Anything else from `nft`: capture `sudo nft list table inet aerolvm_egress`
   and the gateway log, then restart the gateway.
+- `pause container for the sandbox's network rules` (Docker engine, no
+  pause pool slot): a create with rules starts a pause container of its own
+  and fails closed when it can't. `pull pause image` means the node can't
+  reach `SB_DOCKER_NETNS_POOL_PAUSE_IMAGE`; point it at a mirror. A leftover
+  `aerolvm-netns-sb-<id>` whose sandbox is gone is removed at the next
+  sandboxd start; `sudo docker rm -f` it sooner if it holds an address you
+  need.
 
 ## SandboxesHeld
 

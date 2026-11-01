@@ -2,10 +2,12 @@ package containerd
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/docker/netrules"
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 func (d *Driver) PushAllowedPorts(ctx context.Context, containerIP, toolboxToken string, ports []int) error {
@@ -22,6 +24,40 @@ func (d *Driver) ClearNetworkRules(containerIP string) error {
 	}
 	_ = d.networkRules.ClearBlockAllEgress(containerIP)
 	return d.networkRules.ClearBlockAllIngress(containerIP)
+}
+
+// hasCreateNetRules reports whether a create asks for host firewall rules.
+func hasCreateNetRules(req models.CreateSandboxRequest) bool {
+	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0
+}
+
+// applyCreateNetRules installs a create's rules on ip: block-all (which a
+// hostname-filtered create arrives as, the gateway attach lifting it), or
+// the CIDR lists. A create without either installs nothing.
+func (d *Driver) applyCreateNetRules(ip string, req models.CreateSandboxRequest) error {
+	if req.NetworkBlockAll {
+		if err := d.ApplyNetworkBlockAll(ip); err != nil {
+			return fmt.Errorf("apply network block: %w", err)
+		}
+	}
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		if err := d.ApplyEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+			return fmt.Errorf("apply egress policy: %w", err)
+		}
+	}
+	return nil
+}
+
+// clearCreateNetRules removes what applyCreateNetRules may have installed
+// on ip, a partial install included. Best effort, as Destroy's clears are.
+func (d *Driver) clearCreateNetRules(ip string, req models.CreateSandboxRequest) {
+	if !hasCreateNetRules(req) {
+		return
+	}
+	_ = d.ClearNetworkRules(ip)
+	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+		_ = d.ClearEgressPolicy(ip, req.NetworkAllowOut, req.NetworkDenyOut)
+	}
 }
 
 func (d *Driver) ApplyNetworkBlockAll(containerIP string) error {

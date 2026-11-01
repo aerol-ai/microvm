@@ -80,6 +80,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		netnsPath        string
 		prepaidIP        string
 		netnsProvisioned bool
+		// earlyRules: the request's network rules may be on prepaidIP, put
+		// there before the workload started; addressReported: the create
+		// was told prepaidIP (runtime.AddressObserver). Both drive the
+		// failure cleanup below.
+		earlyRules, addressReported bool
 	)
 	if d.cfg.NativeNetnsPool && d.netns != nil {
 		netnsPath, prepaidIP, err = d.netns.Provision(ctx, sandboxID)
@@ -116,11 +121,21 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if committed || lostRace {
 			return
 		}
+		// Undo in the order that keeps the sandbox shut and its address
+		// clean: the workload dies first; then whatever the create keyed by
+		// the address (the egress gateway attach) is told and lets go; then
+		// the address's rules go, while this call still holds the slot (a
+		// rule cleared after the slot is free could be the next owner's);
+		// and the slot goes back to the pool last.
 		d.lifoTeardown(ctx, client, container, task, logPath, hostFiles)
-	}()
-	defer func() {
-		if committed || lostRace || !netnsProvisioned || d.netns == nil {
+		if !netnsProvisioned || d.netns == nil {
 			return
+		}
+		if addressReported {
+			sbruntime.NotifyReleasingAddress(ctx, prepaidIP)
+		}
+		if earlyRules {
+			d.clearCreateNetRules(prepaidIP, req)
 		}
 		_ = d.netns.Release(ctx, sandboxID)
 	}()
@@ -254,6 +269,25 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 		return nil, fmt.Errorf("create container: %w", err)
 	}
+	// The prepaid address is this sandbox's from here (a duplicate create
+	// stopped at NewContainer above), and the workload hasn't started: put
+	// the request's rules on it now, so the workload never runs without
+	// them (a hostname-filtered create's block-all included), and report
+	// it, so the create's egress gateway attach overlaps the task start and
+	// the readiness wait. The container exists, so a crash from here leaves
+	// an orphan whose Destroy clears these rules.
+	if ip := strings.TrimSpace(prepaidIP); ip != "" {
+		earlyRules = true
+		netrulesStart := time.Now()
+		if err := d.applyCreateNetRules(ip, req); err != nil {
+			return nil, err
+		}
+		if hasCreateNetRules(req) {
+			createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
+		}
+		addressReported = true
+		sbruntime.NotifyAddressKnown(ctx, ip)
+	}
 
 	logPath, err = d.taskLogPath(sandboxID)
 	if err != nil {
@@ -299,16 +333,26 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	createtiming.From(ctx).RecordReadinessWaits(0, time.Since(readyStart), readinessSource)
 
-	if req.NetworkBlockAll && state.ContainerIP != "" {
-		netrulesStart := time.Now()
-		if err := d.ApplyNetworkBlockAll(state.ContainerIP); err != nil {
-			return nil, fmt.Errorf("apply network block: %w", err)
+	switch {
+	case earlyRules && state.ContainerIP != strings.TrimSpace(prepaidIP):
+		// The rules, and any attach the create started, are on the prepaid
+		// address: a sandbox at another one would run without them.
+		return nil, fmt.Errorf("containerd: sandbox came up at %q, not at its prepaid address %q", state.ContainerIP, prepaidIP)
+	case earlyRules:
+	default:
+		// No address before the workload (no netns pool): the rules go on
+		// the one the started task reports.
+		if req.NetworkBlockAll && state.ContainerIP != "" {
+			netrulesStart := time.Now()
+			if err := d.ApplyNetworkBlockAll(state.ContainerIP); err != nil {
+				return nil, fmt.Errorf("apply network block: %w", err)
+			}
+			createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
 		}
-		createtiming.From(ctx).RecordStage("containerd_netrules", time.Since(netrulesStart))
-	}
-	if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
-		if err := d.ApplyEgressPolicy(state.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
-			return nil, fmt.Errorf("apply egress policy: %w", err)
+		if len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0 {
+			if err := d.ApplyEgressPolicy(state.ContainerIP, req.NetworkAllowOut, req.NetworkDenyOut); err != nil {
+				return nil, fmt.Errorf("apply egress policy: %w", err)
+			}
 		}
 	}
 
@@ -406,21 +450,36 @@ func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	return err
 }
 
+// Destroy removes the sandbox in the order that keeps it shut and its
+// address clean: the workload is killed first; then the destroy's
+// runtime.AddressObserver (the egress gateway detach) is told; then the
+// address's rules are cleared, while the netns slot is still held (a rule
+// cleared after the slot is free could be the next owner's); and the slot
+// goes back to the pool last. It used to clear the rules and free the slot
+// first and kill the task last, so a destroyed sandbox briefly ran without
+// its rules and its address could be handed on while the gateway still held
+// state for it. A failed container removal still lets the address go (the
+// netns teardown cuts the workload's network) and is returned.
 func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
-	if sandbox != nil {
-		_ = d.ClearNetworkRules(sandbox.ContainerIP)
-		_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
-	}
 	if sandbox == nil {
 		return nil
 	}
+	destroyErr := d.destroyContainer(ctx, sandbox)
+	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
+	_ = d.ClearNetworkRules(sandbox.ContainerIP)
+	_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
 	if d.netns != nil {
 		_ = d.netns.Release(ctx, sandbox.ID)
 	}
 	dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandbox.ID)
 	_ = d.removeHostFiles(sandbox.ID)
 	_ = d.removeTaskLog(sandbox.ID)
+	return destroyErr
+}
 
+// destroyContainer kills the sandbox's task and deletes its container; a
+// container containerd doesn't have is already gone.
+func (d *Driver) destroyContainer(ctx context.Context, sandbox *models.Sandbox) error {
 	client, err := d.ensureClient()
 	if err != nil {
 		return err
