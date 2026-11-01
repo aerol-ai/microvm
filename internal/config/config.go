@@ -20,6 +20,7 @@ import (
 
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/secrets"
+	"github.com/aerol-ai/microvm/pkg/toolboxhttp"
 )
 
 // snapshotRetentionSuffixPattern validates SB_SNAPSHOT_PUSH_TAG_SUFFIX. It
@@ -521,6 +522,13 @@ type Config struct {
 	ReconcileInterval     time.Duration
 	NetstatsPollInterval  time.Duration
 	UploadMaxBytes        int64
+	// ToolboxDeadPeerTimeout bounds how long a toolbox connection (an exec,
+	// a file transfer, a session) lives on once its sandbox stops answering
+	// without closing it, as a killed gVisor sandbox or Firecracker VM does.
+	// A live sandbox's kernel answers the keepalive probes, so a long command
+	// with no output is never cut. SB_TOOLBOX_DEAD_PEER_TIMEOUT, default 30s;
+	// 0 = off (Go's keepalive, about 2.5 minutes); otherwise at least 6s.
+	ToolboxDeadPeerTimeout time.Duration
 	// OTELMetricsEnabled starts a native OTLP/HTTP metric exporter that bridges
 	// the daemon's aerolvm_* expvars into OpenTelemetry observations. It is
 	// also enabled automatically when SB_OTEL_METRICS_ENDPOINT is set.
@@ -1920,6 +1928,7 @@ func load(keyTool bool) (Config, error) {
 		ToolboxBinaryPath:                 getEnv("SB_TOOLBOX_BINARY_PATH", defaultToolboxPath),
 		ToolboxMountPath:                  getEnv("SB_TOOLBOX_MOUNT_PATH", "/usr/local/bin/toolboxd"),
 		ToolboxPort:                       getEnvInt("SB_TOOLBOX_PORT", defaultToolboxPort),
+		ToolboxDeadPeerTimeout:            getEnvDuration("SB_TOOLBOX_DEAD_PEER_TIMEOUT", toolboxhttp.DefaultDeadPeerTimeout),
 		IdleTimeoutMinutes:                getEnvInt("SB_IDLE_TIMEOUT_MIN", 0),
 		CreateSandboxTimeoutSeconds:       getEnvInt("SB_CREATE_TIMEOUT_SEC", 600),
 		ContainerPrivileged:               getEnvBool("SB_CONTAINER_PRIVILEGED", false),
@@ -2343,6 +2352,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.OTELTracesEnabled && (cfg.OTELTracesSampleRatio < 0 || cfg.OTELTracesSampleRatio > 1) {
 		return Config{}, errors.New("SB_OTEL_TRACES_SAMPLE_RATIO must be between 0 and 1 when OTEL traces are enabled")
+	}
+	if cfg.ToolboxDeadPeerTimeout < 0 || (cfg.ToolboxDeadPeerTimeout > 0 && cfg.ToolboxDeadPeerTimeout < toolboxhttp.MinDeadPeerTimeout) {
+		return Config{}, fmt.Errorf("SB_TOOLBOX_DEAD_PEER_TIMEOUT must be 0 (off) or at least %s", toolboxhttp.MinDeadPeerTimeout)
 	}
 	if cfg.ImagePullMaxConcurrent < 0 {
 		return Config{}, errors.New("SB_IMAGE_PULL_MAX_CONCURRENT must be >= 0")

@@ -139,6 +139,10 @@ func (g *Gateway) attachToSession(ctx context.Context, channel ssh.Channel, ep s
 	header := http.Header{}
 	ep.applyHeaders(header)
 	dialer := *websocket.DefaultDialer
+	// The toolbox dialer's dead-peer bound: a killed gVisor sandbox or
+	// Firecracker VM never closes this socket, and without the bound an
+	// attached shell would hang for minutes.
+	dialer.NetDialContext = toolboxhttp.DialContext
 	// The remote path dials this node's own v1 API over loopback (ws://), so
 	// TLS is normally unused. Tolerate wss:// for completeness.
 	if strings.HasPrefix(ep.wsURL, "wss://") {
