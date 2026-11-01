@@ -129,6 +129,21 @@ groups:
   - name: sandboxd.ingress-and-data-plane
     interval: 30s
     rules:
+      # Cluster-wide lists are being shed. A list holds its slot for
+      # milliseconds when owners and the control plane answer quickly, so
+      # sustained shedding means list traffic beyond what the node is sized
+      # for, or slow owners holding slots.
+      - alert: SandboxdAPIListShedding
+        expr: sum by (instance) (increase(aerolvm_api_list_shed_total[10m])) > 100
+        for: 10m
+        labels:
+          severity: warning
+          component: api
+        annotations:
+          summary: "sandboxd is shedding cluster-wide list requests (503)"
+          description: "aerolvm_api_list_shed_total is rising: GET /v1/sandboxes (and the Daytona, E2B and Runloop lists) found all SB_API_LIST_MAX_INFLIGHT slots taken for SB_API_LIST_QUEUE_WAIT and were answered 503 + Retry-After. The node itself is fine. Check aerolvm_api_list_inflight, peer list latency, and which clients poll lists; add ingress nodes or raise the limit on bigger nodes."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/slo-breach.md"
+
       - alert: SandboxdIngressRouteLag
         expr: max(aerolvm_ingress_route_lag_versions) > 100
         for: 5m

@@ -334,6 +334,14 @@ func (h *handlers) clusterListWrap(w http.ResponseWriter, r *http.Request) {
 		h.listSandboxesLocalPage(w, r)
 		return
 	}
+	// A list that fans out takes one of this node's list slots, or is
+	// answered 503 + Retry-After at once when they are all taken.
+	release, err := clusterlist.Admit(h.deps.ListGate, c, r)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	defer release()
 
 	ownerRef := clusterlist.OwnerRefFromContext(r.Context())
 	limit, pageToken := clusterlist.ParsePageParams(r.URL)
