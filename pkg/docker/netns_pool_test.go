@@ -27,6 +27,9 @@ type netnsFakeDaemon struct {
 	noIP         bool // created containers report no IP
 	pullCalls    int
 	requests     []string
+	// created keeps every create, including containers a failed create
+	// removed again, so a test can read what was sent.
+	created []netnsFakeContainer
 }
 
 type netnsFakeContainer struct {
@@ -36,6 +39,7 @@ type netnsFakeContainer struct {
 	running bool
 	ip      string
 	netMode string
+	sysctls map[string]string
 }
 
 func newNetnsFakeDaemon() *netnsFakeDaemon {
@@ -62,12 +66,13 @@ func (d *netnsFakeDaemon) inspectJSON(c *netnsFakeContainer) string {
 	if c.ip != "" {
 		networks = fmt.Sprintf(`{"bridge":{"IPAddress":%q}}`, c.ip)
 	}
+	sysctls, _ := json.Marshal(c.sysctls)
 	return fmt.Sprintf(`{
 		"Id": %q, "Name": %q,
 		"State": {"Running": %v, "Status": "running", "Pid": 7},
 		"NetworkSettings": {"Networks": %s},
-		"HostConfig": {"NetworkMode": %q}
-	}`, c.id, "/"+c.name, c.running, networks, c.netMode)
+		"HostConfig": {"NetworkMode": %q, "Sysctls": %s}
+	}`, c.id, "/"+c.name, c.running, networks, c.netMode, sysctls)
 }
 
 func (d *netnsFakeDaemon) transport() roundTripFunc {
@@ -90,7 +95,8 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 			var body struct {
 				Labels     map[string]string `json:"Labels"`
 				HostConfig struct {
-					NetworkMode string `json:"NetworkMode"`
+					NetworkMode string            `json:"NetworkMode"`
+					Sysctls     map[string]string `json:"Sysctls"`
 				} `json:"HostConfig"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&body)
@@ -111,7 +117,9 @@ func (d *netnsFakeDaemon) transport() roundTripFunc {
 				labels:  body.Labels,
 				ip:      ip,
 				netMode: body.HostConfig.NetworkMode,
+				sysctls: body.HostConfig.Sysctls,
 			}
+			d.created = append(d.created, *d.containers[id])
 			return jsonResponse(http.StatusCreated, map[string]string{"Id": id}), nil
 		case r.Method == http.MethodPost && strings.HasSuffix(p, "/start"):
 			if d.startErr {
@@ -271,7 +279,7 @@ func TestNetnsPoolReconcileAdoptsSurvivorsAndReapsOrphans(t *testing.T) {
 	// Survivor free slot from a previous run.
 	d.add(&netnsFakeContainer{
 		id: "old-free", name: netnsFreePrefix + "aaaa", running: true, ip: "172.30.9.1",
-		labels: map[string]string{netnsPauseLabelKey: "true"},
+		labels: map[string]string{netnsPauseLabelKey: "true"}, sysctls: sandboxIPv6Sysctls(),
 	})
 	// Adopted pause whose sandbox is gone — the crash window artifact.
 	d.add(&netnsFakeContainer{

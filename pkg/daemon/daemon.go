@@ -667,6 +667,11 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		)
 	}
 
+	// The IPv6 fence (internal/network/ipv6fence): synced once here, before
+	// the API serves, so no container or Firecracker sandbox is created
+	// without it; while it is not installed those creates are refused.
+	wireIPv6Fence(ctx, cfg, svc, dockerClient, logger)
+
 	// Bootstrap caddy-l4 at boot so the first L4 exposure isn't paying for
 	// it. Best-effort by design: a cold-started caddy may still be coming
 	// up, in which case the next ExposePort(tcp|tls) will retry under the

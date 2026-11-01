@@ -129,6 +129,11 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrNetworkPolicyUnenforced):
 		return Classification{Status: http.StatusNotImplemented, Code: models.ErrorCodeNetworkPolicyUnenforced, Message: err.Error()}
 
+	// The node cannot keep IPv6 off its sandbox networks right now. The
+	// cause (a netlink error) is for the node's log, not the caller.
+	case errors.Is(err, service.ErrIPv6FenceNotReady):
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeIPv6FenceNotReady, Message: service.ErrIPv6FenceNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+
 	// An option this runtime/build can't honor is 501, not 400.
 	case errors.Is(err, models.ErrRuntimeNotImplemented):
 		return Classification{Status: http.StatusNotImplemented, Message: err.Error()}
