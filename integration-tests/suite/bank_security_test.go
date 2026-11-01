@@ -479,6 +479,15 @@ func TestBankForkBombContained(t *testing.T) {
 		neighbour := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
 		limit, _ := bankRun(t, sb, "cat /sys/fs/cgroup/pids.max 2>/dev/null || cat /sys/fs/cgroup/pids/pids.max 2>/dev/null || echo none", time.Minute)
+		if rt.gvisor {
+			// runsc puts the spec's pids limit on the host cgroup only, where
+			// a bomb panics the sentry; the sandbox's own cap is the one
+			// toolboxd sets inside it (pkg/gvisorpids). "max" or "none" here
+			// means it was not set and the bomb below ends the sandbox.
+			if n, err := strconv.Atoi(strings.TrimSpace(limit)); err != nil || n <= 0 {
+				t.Errorf("gvisor sandbox has no task cap inside the sandbox: pids.max=%q", strings.TrimSpace(limit))
+			}
+		}
 		const tries = 20000
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		res, err := sb.ExecCommand(ctx, fmt.Sprintf(`i=0; while [ $i -lt %d ]; do sleep 120 >/dev/null 2>&1 & [ $? -eq 0 ] || break; i=$((i+1)); done 2>/dev/null; echo spawned=$i`, tries))

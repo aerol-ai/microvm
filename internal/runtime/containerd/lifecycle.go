@@ -22,6 +22,7 @@ import (
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
+	"github.com/aerol-ai/microvm/pkg/gvisorpids"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
 )
@@ -187,16 +188,19 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, securitySpecOpts()...)
 	}
 	if !d.cfg.ResourceLimitsOff {
-		specOpts = append(specOpts, resourceSpecOpts(req, d.cfg.PidsLimit)...)
+		hostPids, pidsEnv := gvisorpids.ForRuntime(ociRuntime, d.cfg.PidsLimit, req.MemoryMB)
+		envValues = append(envValues, pidsEnv...)
+		specOpts = append(specOpts, resourceSpecOpts(req, hostPids)...)
 	}
 	if netnsPath != "" {
 		specOpts = append(specOpts, withNetworkNamespace(netnsPath))
 	}
 	specOpts = append(specOpts, withSandboxIPv6Off())
+	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 	if ociRuntime == "runsc" {
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
+		mountSpecs = append(mountSpecs, runscCgroupMount())
 	}
-	mountSpecs := buildMounts(d.cfg, hostFiles, hostMounts)
 
 	if d.cfg.ReadyEnabled {
 		readyListener, err = d.setupReadySocket(&envValues, &mountSpecs, sandboxID, toolboxToken)
@@ -698,6 +702,11 @@ func buildEnv(req models.CreateSandboxRequest, sandboxID, toolboxToken string, t
 		"SB_POOL_PARKED=",
 	}
 	for key, value := range req.Env {
+		if key == gvisorpids.EnvVar {
+			// The driver sets the gVisor task cap; a create's env must not
+			// shadow it (toolboxd reads the first value of a key).
+			continue
+		}
 		envValues = append(envValues, key+"="+value)
 	}
 	sort.Strings(envValues)
