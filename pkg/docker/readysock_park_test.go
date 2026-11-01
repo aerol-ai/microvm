@@ -201,3 +201,28 @@ func TestRemoveParkSocketSkipsActive(t *testing.T) {
 	_ = pl.Close()
 	RemoveParkSocket(path)
 }
+
+// ParkedEnvCredentials reads back exactly what a park writes: the parked
+// flag and nonce from EnvVars, plus the bootstrap token. A container that was
+// never parked (no SB_POOL_PARKED=1) is not parked, whatever else it carries.
+func TestParkedEnvCredentialsReadsWhatTheParkWrote(t *testing.T) {
+	pl, err := NewParkedListener(shortParkTestDir(t), "park-env", "boot-tok", "boot-nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pl.Close() })
+	env := append([]string{"PATH=/bin", "SB_TOOLBOX_TOKEN=boot-tok", "MALFORMED"}, pl.EnvVars()...)
+	token, nonce, parked := ParkedEnvCredentials(env)
+	if !parked || token != "boot-tok" || nonce != "boot-nonce" {
+		t.Fatalf("ParkedEnvCredentials(park env) = %q, %q, %v", token, nonce, parked)
+	}
+	for name, env := range map[string][]string{
+		"cold create": {"SB_TOOLBOX_TOKEN=sandbox-tok", readyNonceEnv + "=n"},
+		"flag off":    {poolParkedEnv + "=0", "SB_TOOLBOX_TOKEN=t"},
+		"empty":       nil,
+	} {
+		if _, _, parked := ParkedEnvCredentials(env); parked {
+			t.Errorf("%s: reported parked", name)
+		}
+	}
+}
