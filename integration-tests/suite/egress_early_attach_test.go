@@ -25,14 +25,18 @@ import (
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
 
-// skipPlainDocker skips where the engine is Docker without the pause-netns
-// pool: Docker learns that sandbox's address only from the started
-// container, so its block-all goes on a few milliseconds after the workload
-// starts (unchanged by the early attach, a known gap).
-func skipPlainDocker(t *testing.T) {
+// skipGvisorOnDocker skips gVisor on the Docker engine, the one runtime
+// that still learns a restricted sandbox's address only from its started
+// container: runsc builds its own network stack and doesn't join a pause
+// container's namespace, so its block-all goes on a few milliseconds after
+// the workload starts (plans/egress-domain-filtering.md §8.2 amendment).
+// runc on the Docker engine is asserted with or without the pause pool: a
+// restricted create gets a pause container of its own when the pool has no
+// slot for it.
+func skipGvisorOnDocker(t *testing.T, runtime string) {
 	t.Helper()
-	if sc.Has(harness.CapDockerEngine) && !sc.Has(harness.CapDockerNetnsPool) {
-		t.Skip("Docker without the pause-netns pool installs the block-all after the workload starts (known gap, see plans/egress-domain-filtering.md §8.2 amendment)")
+	if runtime == "gvisor" && sc.Has(harness.CapDockerEngine) {
+		t.Skip("gVisor on the Docker engine installs the block-all after the workload starts (known gap, see plans/egress-domain-filtering.md §8.2 amendment)")
 	}
 }
 
@@ -61,7 +65,6 @@ exec sleep 3600`
 // create only the allowlist is reachable.
 func TestEgressNothingOpenFromTheFirstInstruction(t *testing.T) {
 	harness.Require(t, sc, "UC-341")
-	skipPlainDocker(t)
 	c := client(t)
 	runtimes := []string{""}
 	if sc.Has(harness.CapGvisor) {
@@ -76,6 +79,7 @@ func TestEgressNothingOpenFromTheFirstInstruction(t *testing.T) {
 			name = "default"
 		}
 		t.Run(name, func(t *testing.T) {
+			skipGvisorOnDocker(t, rt)
 			sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{
 				Image:            harness.DefaultImage,
 				Name:             harness.UniqueName(sc, t),
@@ -136,7 +140,8 @@ func lastLines(s string, n int) string {
 }
 
 // egressNodeState is what a node holds per sandbox address: the gateway's
-// set elements and the host firewall's per-IP rules.
+// set elements, the host firewall's per-IP rules and, on the Docker engine,
+// the pause containers that hold restricted sandboxes' addresses.
 type egressNodeState map[string]bool
 
 var (
@@ -148,8 +153,9 @@ var (
 var gatewaySets = []string{"fqdn_src", "src_deny_default", "src_accept", "learn_src", "blocked_src"}
 
 // snapshotEgressNode reads every per-address entry a node holds: each
-// gateway set's elements ("set fqdn_src 10.88.0.5") and each per-IP rule of
-// the sandbox chains ("rule AEROLVM-USER -s 10.88.0.5/32 -j DROP").
+// gateway set's elements ("set fqdn_src 10.88.0.5"), each per-IP rule of
+// the sandbox chains ("rule AEROLVM-USER -s 10.88.0.5/32 -j DROP") and each
+// sandbox's pause container ("pause aerolvm-netns-sb-<id>").
 func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeState {
 	t.Helper()
 	var script strings.Builder
@@ -159,6 +165,8 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 	for _, ch := range []string{"AEROLVM-USER", "AEROLVM-INPUT", "DOCKER-USER", "AEROLVM-FC"} {
 		fmt.Fprintf(&script, "echo '## chain %s'; sudo iptables -w -S %s 2>/dev/null; ", ch, ch)
 	}
+	// A sandbox's pause is named for it (the pool's free slots are not).
+	script.WriteString("echo '## pause'; command -v docker >/dev/null && sudo docker ps -a --filter label=aerolvm.netns-pause=true --format '{{.Names}}' 2>/dev/null | grep '^aerolvm-netns-sb-'; ")
 	script.WriteString("true")
 	out := nodeSSH(t, node, script.String())
 	st := egressNodeState{}
@@ -176,6 +184,10 @@ func snapshotEgressNode(t *testing.T, node harness.IntegrationNode) egressNodeSt
 		case strings.HasPrefix(section, "chain "):
 			if ruleIPRe.MatchString(line) {
 				st["rule "+strings.TrimSpace(line)] = true
+			}
+		case section == "pause":
+			if name := strings.TrimSpace(line); name != "" {
+				st["pause "+name] = true
 			}
 		}
 	}
@@ -240,7 +252,8 @@ func TestEgressFailedCreateLeavesNoGatewayState(t *testing.T) {
 	// 1 MiB of memory: the container exists and the address was reported,
 	// then the task can't start (runc: "container init was OOM-killed";
 	// Firecracker refuses the machine config). Docker refuses it at the
-	// container create, before any report, which is still a no-state check.
+	// workload's container create, after the sandbox's pause started and
+	// before any report: the pause must be gone afterwards too.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	sb, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{
 		Image:           harness.DefaultImage,
@@ -303,4 +316,98 @@ func TestEgressChurnLeavesStateFlat(t *testing.T) {
 		}
 	}
 	requireNoNewEgressState(t, before, 90*time.Second)
+}
+
+// pauseFor is the name of the pause container that holds a Docker
+// sandbox's address (pkg/docker netnsAdoptedName).
+func pauseFor(id string) string { return "pause aerolvm-netns-sb-" + id }
+
+// onSomeNode reports whether any node's snapshot holds key.
+func onSomeNode(nodes map[string]egressNodeState, key string) bool {
+	for _, st := range nodes {
+		if st[key] {
+			return true
+		}
+	}
+	return false
+}
+
+// UC-346 — on the Docker engine, a create with network rules (block-all, a
+// CIDR allow list, a CIDR deny list, and a hostname allowlist where the
+// gateway runs) runs in a pause container named for it, whether the pause
+// pool had a slot or not; probes its workload starts from its first
+// instruction never reach an outside address directly; and its destroy
+// leaves no pause, firewall rule or gateway entry behind.
+func TestDockerRestrictedCreateRunsInItsPause(t *testing.T) {
+	harness.Require(t, sc, "UC-346")
+	if !sc.Has(harness.CapDockerEngine) {
+		t.Skip("the Docker engine's create path; this scenario runs containerd")
+	}
+	c := client(t)
+	before := snapshotEgressNodes(t)
+	kinds := []struct {
+		name string
+		opts sdktypes.CreateSandboxOptions
+	}{
+		{"block-all", sdktypes.CreateSandboxOptions{NetworkBlockAll: true}},
+		{"allow-out", sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{"9.9.9.9/32"}}},
+		{"deny-out", sdktypes.CreateSandboxOptions{NetworkDenyOut: []string{"1.1.1.1/32"}}},
+	}
+	if sc.Has(harness.CapEgressFQDN) {
+		kinds = append(kinds, struct {
+			name string
+			opts sdktypes.CreateSandboxOptions
+		}{"hostname", sdktypes.CreateSandboxOptions{NetworkAllowOut: []string{"pypi.org"}}})
+	}
+	for _, k := range kinds {
+		t.Run(k.name, func(t *testing.T) {
+			opts := k.opts
+			opts.Image = harness.DefaultImage
+			opts.Name = harness.UniqueName(sc, t)
+			opts.ContainerCommand = []string{"sh", "-c", earlyProbeScript}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+			sb, err := c.SDK().Create(ctx, opts)
+			cancel()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer destroyBest(c, sb.ID)
+			if !onSomeNode(snapshotEgressNodes(t), pauseFor(sb.ID)) {
+				t.Fatalf("no pause container holds sandbox %s's address", sb.ID)
+			}
+			var log string
+			if !eventually(30*time.Second, func() bool {
+				log = egressExec(t, sb, "cat /tmp/early-probe.log 2>/dev/null")
+				return strings.Contains(log, "done")
+			}) {
+				t.Fatalf("probes did not finish:\n%s", lastLines(log, 20))
+			}
+			for _, line := range strings.Split(log, "\n") {
+				if strings.Contains(line, "fl=") || strings.Contains(line, "visit_scheme=") {
+					t.Fatalf("a probe reached 1.1.1.1 directly (unfiltered egress):\n%s", line)
+				}
+			}
+		})
+	}
+	requireNoNewEgressState(t, before, 60*time.Second)
+}
+
+// UC-347 — on the Docker engine, a create without network rules keeps
+// Docker's own path: it pays no docker_pause stage and, without the pause
+// pool, gets no pause container.
+func TestDockerOpenCreateKeepsDockersPath(t *testing.T) {
+	harness.Require(t, sc, "UC-347")
+	if !sc.Has(harness.CapDockerEngine) {
+		t.Skip("the Docker engine's create path; this scenario runs containerd")
+	}
+	c := client(t)
+	sb := c.NewSandbox(t, sdktypes.CreateSandboxOptions{Image: harness.DefaultImage, Name: harness.UniqueName(sc, t)})
+	if stages, ok := c.LastServerCreateStages(); ok {
+		if ms, present := stages["docker_pause"]; present {
+			t.Fatalf("an open create paid docker_pause (%.1f ms)", ms)
+		}
+	}
+	if !sc.Has(harness.CapDockerNetnsPool) && onSomeNode(snapshotEgressNodes(t), pauseFor(sb.ID)) {
+		t.Fatalf("an open create on a node without the pool got a pause container")
+	}
 }
