@@ -166,12 +166,31 @@ No sandbox can reach the server it runs on, whatever its policy allows. See [The
 | **Hard-coded addresses**: connecting to an address directly, with no name | With no site name, the connection is refused unless an address range allows it. |
 | **A false site name**: sending an allowed name to a different address | The proxy looks the name up itself and connects there, not where the program wanted. |
 | **Going around the filter**: outside DNS, DNS over TLS, QUIC | Refused. |
-| **IPv6 and encrypted client hello** | IPv6 and HTTPS record lookups get empty answers, so programs use IPv4 and a visible site name. |
+| **IPv6 and encrypted client hello** | IPv6 and HTTPS record lookups get empty answers, so programs use IPv4 and a visible site name. A sandbox has no IPv6 to use anyway: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox). |
 | **Domain fronting**: a request for one site, sent inside a connection to another on the same CDN | Stopped on inspected HTTPS, where every request's `Host` must match the site name (`421` otherwise). Not checked without inspection. |
 
 ## Ports other than 80 and 443
 
 For an entry with another port, such as `github.com:22`, the proxy cannot read a site name. The server opens the addresses that name looked up to, on that port only. Any other site at the same address and port can then be reached too.
+
+## No IPv6 in a sandbox
+
+Container, gVisor and Firecracker sandboxes use IPv4 only. Every rule on this page that keeps sandboxes apart, and away from the server, is written for IPv4. So IPv6 is shut off twice, and either one alone is enough:
+
+- **IPv6 is off inside the sandbox from the start.** A container or gVisor sandbox starts with IPv6 turned off in its own network, before your code runs. A Firecracker sandbox's kernel boots with IPv6 disabled (`ipv6.disable=1`). The sandbox has no IPv6 address at all, not even `::1`.
+- **The server drops IPv6 on every sandbox network.** Even if code inside a sandbox turns IPv6 back on, as root in a Firecracker guest can, the server drops every IPv6 packet between two sandboxes on the same network, from a sandbox to the server, and from the server to a sandbox. The server's own end of each Firecracker network device has IPv6 off as well.
+
+What this means for you:
+
+- **There is no IPv6 internet access from a sandbox.** Sandboxes reach the internet over IPv4.
+- **Listen on `0.0.0.0` or `127.0.0.1`.** A program that listens only on `::1` fails to start. Listening on `::` still takes IPv4 connections in a container, but fails in a Firecracker sandbox, whose kernel has no IPv6 at all. Most servers fall back to IPv4 on their own.
+
+For operators:
+
+- **The rules are two `nftables` tables named `aerolvm_ipv6`:** `nft list table ip6 aerolvm_ipv6` and `nft list table bridge aerolvm_ipv6`. Each rule counts the packets it dropped. They do not depend on the policy file or on `SB_ENABLE_NETWORK_RULES`.
+- **A kernel without nftables bridge support** gets only the `ip6` table. The server then turns on `br_netfilter` so traffic inside a bridge still goes through that table, and checks that it stays on.
+- **The server checks the tables every 30 seconds** and puts them back if a firewall reload removed them. If it cannot install them, it refuses new container, gVisor and Firecracker sandboxes with `503` and the code `ipv6_fence_not_ready` until it can.
+- **A server with `SB_ENABLE_NETWORK_RULES=false`** (local mode) has no host firewall, so it installs no IPv6 tables either. IPv6 is still off inside its sandboxes. Enterprise mode always installs them.
 
 ## Between sandboxes
 
@@ -194,7 +213,7 @@ A server runs more than AerolVM: an EDR agent, a log shipper, a metrics exporter
 
 - **Replies still flow.** When the server opens a connection into a sandbox (AerolVM's agent, health checks), the sandbox's replies get through.
 - **No policy opens the server.** An allow list that names the server's address range still cannot reach it.
-- **Containers, gVisor and Firecracker** are held back by the server's firewall: a chain named `AEROLVM-NODE` runs first in its `INPUT` chain, with one chain per sandbox network. The server checks every 30 seconds that it is still in place and puts it back if a firewall reload removed it. If it cannot be put in place, the server refuses new sandboxes on that runtime (503, `node_guard_not_ready`) until it can.
+- **Containers, gVisor and Firecracker** are held back by the server's firewall: a chain named `AEROLVM-NODE` runs first in its `INPUT` chain, with one chain per sandbox network. The server checks every 30 seconds that it is still in place and puts it back if a firewall reload removed it. If it cannot be put in place, the server refuses new sandboxes on that runtime (503, `node_guard_not_ready`) until it can. Over IPv6, a sandbox cannot reach the server at all: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox).
 - **WebAssembly and V8 isolate** sandboxes connect out through AerolVM itself, so the same rule sits in its connection check instead: loopback and every server address are refused.
 - **Other servers in a cluster:** their AerolVM ports (API, Raft, gossip, cluster, SSH gateway) and their SSH and rpcbind are closed to every sandbox, through the egress gateway. Their other ports are not: block your private ranges with `deny_cidrs`.
 - **The server's public address through NAT** (a cloud public IP that is not bound to the server) is reached the way any internet client reaches it. What answers there is up to the cloud firewall.
@@ -245,7 +264,7 @@ If the server allows privileged containers, name allow lists are turned off. Kee
 - **What an allowed site does with your data.** The filter controls where traffic goes, not what the far side does with it.
 - **Traffic inside an allowed HTTPS connection** is not read unless you turn on inspection for that site.
 - **Name filtering works on IPv4.** IPv6 lookups get empty answers.
-- **The server guard works on IPv4,** like the rest of the sandbox network.
+- **The server guard works on IPv4,** like the rest of the sandbox network. Over IPv6 nothing gets through at all: see [No IPv6 in a sandbox](#no-ipv6-in-a-sandbox).
 
 ## Next steps
 
