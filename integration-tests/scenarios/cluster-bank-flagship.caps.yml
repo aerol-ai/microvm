@@ -18,6 +18,10 @@ capabilities:
   - egress-fqdn
   - benchmark
   - observability
+  # Every node routes without per-sandbox Caddy writes (the tfvars'
+  # default_ingress_proxy_routing), so no create or destroy reloads an
+  # ingress. Runs the routing gate: UC-171..173 and UC-357.
+  - ingress-proxy-routing
 
 expected_members: 10
 

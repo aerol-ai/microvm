@@ -903,6 +903,10 @@ var Registry = []UseCase{
 	{ID: "UC-359", Title: "Egress: destroying a hostname-filtered sandbox removes its address from both block sets (no release left behind), and a block-all sandbox that gets the address next is shut from its first instruction", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	// Ingress high availability behind the load balancer (api_lb_test.go).
 	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
+	// Ingress proxy routing, continued (ingress_routing_test.go): the
+	// exec-stream churn gate for the cluster-bank-flagship UC-230/UC-266
+	// "unexpected EOF" dials.
+	{ID: "UC-357", Title: "Churn gate for new connections: through every ingress node, fresh TLS to the API and to a sandbox, and new exec streams, never reset or EOF while sandboxes are created and destroyed across the cluster", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.
