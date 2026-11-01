@@ -999,7 +999,12 @@ func restoreNodeDaemon(t *testing.T, node harness.IntegrationNode, target string
 	}
 	if err := waitNodeRejoined(t, node); err != nil {
 		t.Errorf("RESTORE INCOMPLETE: sandboxd was restarted on %s but it did not rejoin the cluster: %v; every later case in this run is against a smaller fleet", node.Name, err)
+		return
 	}
+	// Back in the API pool for a case that took it out (harness.MarkNodeDown);
+	// a no-op for one that did not. Only now, as for KillNodeDaemon: a node
+	// that has not rejoined stays out of rotation.
+	harness.MarkNodeUp(node.PublicIP)
 }
 
 func waitNodeRejoined(t *testing.T, node harness.IntegrationNode) error {
