@@ -251,18 +251,22 @@ Network rules and traffic counters run on the host, out of the sandbox's reach. 
 
 Docker accepts its own bridge traffic early, which would skip any rule simply added to the `FORWARD` chain. `DOCKER-USER` is jumped to from `FORWARD` before `DOCKER-FORWARD`, so AerolVM's rules run first. That holds on older iptables and on Docker 28 and later alike. The rules run on the host, before packets leave its network card. They live in the host's network namespace (its own view of network devices and routes).
 
+A "block everything" for one sandbox is not a rule in those chains. It is the sandbox's address in a set. This covers a block-all policy, a byte-limit block, and the short block a sandbox is created behind while its hostname filter is set up. AerolVM keeps its own nftables table, `ip aerolvm_block`, with two sets: `blocked` and `released`. The table drops any packet whose source is in `blocked` and not in `released`, both forwarded packets and packets to the host itself. Replies to connections the host opened still get through. Blocking a sandbox adds its address to `blocked`. Lifting the block, once the egress gateway filters the sandbox, adds the address to `released`. Removing the sandbox takes the address out of both sets. The add steps are fast because the kernel doesn't wait on them. Only the remove step waits, and it runs when a sandbox goes away, not while one is being created (`pkg/docker/netrules/blockset.go`).
+
 This is the order in which a packet from a container sandbox meets the host's firewall.
 
 ```mermaid
 flowchart TB
     P["A packet leaves a sandbox"] --> FWD["Host firewall<br/>FORWARD chain"]
+    P --> B["aerolvm_block table:<br/>address in blocked, not in released?"]
+    B -- "yes" --> X
     FWD -- "jumps first to" --> U["DOCKER-USER, or<br/>AEROLVM-USER under containerd"]
     U -- "matches a drop rule" --> X["Dropped"]
     U -- "no drop rule matched" --> N["Normal forwarding rules"]
     N --> Out["Leaves through the<br/>host's network card"]
 ```
 
-**The byte counters.** `pkg/docker/netstats` polls each sandbox's counters for incoming and outgoing traffic from `/proc/<container_pid>/net/dev`. It reads them from the host, by entering the container's network namespace (netns). When a sandbox hits a limit, `sandboxd` installs a DROP rule for that direction on the container IP.
+**The byte counters.** `pkg/docker/netstats` polls each sandbox's counters for incoming and outgoing traffic from `/proc/<container_pid>/net/dev`. It reads them from the host, by entering the container's network namespace (netns). When a sandbox hits a limit, `sandboxd` blocks that direction on the container IP. Outgoing traffic is blocked through the block sets above. Incoming traffic is blocked with a DROP rule.
 
 It also saves a quota-exceeded flag on the sandbox (`MarkNetworkQuotaExceeded`, called from `internal/service/netstats.go`). So reconcile, the repair loop, re-applies the block after a restart. The metrics are published through expvar, Go's built-in metrics endpoint. They include `aerolvm_netstats_poll_total`, `aerolvm_netstats_samples_total` and counters for dropped samples (`pkg/docker/netstats/metrics.go`).
 

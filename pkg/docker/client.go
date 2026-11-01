@@ -291,7 +291,9 @@ func (c *Client) ClearNetworkBlockEgress(containerIP string) error {
 	if containerIP == "" {
 		return nil
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	// The sandbox keeps its address: lift, don't forget (netrules
+	// LiftBlockAllEgress; on the block sets, one element add).
+	return c.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 // hasCreateNetRules reports whether a create asks for host firewall rules.

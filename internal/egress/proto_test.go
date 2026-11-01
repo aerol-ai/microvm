@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -107,11 +108,12 @@ func TestClientServerRoundTrip(t *testing.T) {
 func TestClientAndNoopCoverTheLaterOps(t *testing.T) {
 	var forgotten, retained string
 	var controlled []netip.AddrPort
+	var pools []ControlPool
 	var inspected bool
 	c, _, _, _ := startServer(t, ServerHooks{
 		ForgetLearned: func(id string) error { forgotten = id; return nil },
 		RetainLearned: func(ids []string) error { retained = strings.Join(ids, ","); return nil },
-		NodeControl:   func(eps []netip.AddrPort) error { controlled = eps; return nil },
+		NodeControl:   func(nc NodeControl) error { controlled, pools = nc.Endpoints, nc.Pools; return nil },
 		InspectCA:     func(ca InspectCA) error { inspected = ca.CertPEM != nil; return nil },
 	}, nil)
 	ctx := context.Background()
@@ -131,6 +133,25 @@ func TestClientAndNoopCoverTheLaterOps(t *testing.T) {
 	if err := c.SetNodeControl(ctx, nil); err != nil || len(controlled) != 0 {
 		t.Fatalf("SetNodeControl nil: %v %v", err, controlled)
 	}
+	pool := ControlPool{Prefix: netip.MustParsePrefix("172.16.0.0/16"), Ports: []uint16{22, 21212}}
+	if err := c.SetNodeControlPools(ctx, NodeControl{Endpoints: []netip.AddrPort{ep}, Pools: []ControlPool{pool}}); err != nil ||
+		len(controlled) != 1 || len(pools) != 1 || pools[0].Prefix != pool.Prefix || !slices.Equal(pools[0].Ports, pool.Ports) {
+		t.Fatalf("SetNodeControlPools: %v %v %v", err, controlled, pools)
+	}
+	if err := c.SetNodeControlPools(ctx, NodeControl{}); err != nil || controlled == nil || len(controlled) != 0 || len(pools) != 0 {
+		t.Fatalf("SetNodeControlPools empty: %v %v %v", err, controlled, pools)
+	}
+	// The older op carries no pools: a sandboxd from before them lists
+	// every address itself, so its push drops any pools set earlier.
+	_ = c.SetNodeControlPools(ctx, NodeControl{Pools: []ControlPool{pool}})
+	if err := c.SetNodeControl(ctx, []netip.AddrPort{ep}); err != nil || len(pools) != 0 {
+		t.Fatalf("legacy push kept pools: %v %v", err, pools)
+	}
+	// A gateway from before the op: the client sees an unknown op.
+	old, _, _, _ := startServer(t, ServerHooks{}, nil)
+	if err := old.call(ctx, "no_such_op", nil, nil); !IsUnknownOp(err) {
+		t.Fatalf("unknown op error = %v", err)
+	}
 	if err := c.SetInspectCA(ctx, InspectCA{CertPEM: []byte("cert")}); err != nil || !inspected {
 		t.Fatalf("SetInspectCA: %v", err)
 	}
@@ -140,6 +161,9 @@ func TestClientAndNoopCoverTheLaterOps(t *testing.T) {
 		t.Fatalf("Noop.SyncToken: %v", err)
 	}
 	if err := noop.SetNodeControl(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := noop.SetNodeControlPools(ctx, NodeControl{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := noop.ForgetLearned(ctx, "sb"); err != nil {

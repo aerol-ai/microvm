@@ -24,6 +24,13 @@ The layer4 `tls-mux` in front of :443 adds resets on top.
   churn, ~2.6% of new connections fail under route churn.**
 - **No built-in fix:** `grace_period=10s` plus `shutdown_delay=2s` measured
   2.6%, unchanged.
+- **Why (confirmed 2026-11-01, `pkg/caddy` `TestE2EIngressReloadChurn`,
+  Linux):** a reload stops every Caddy app. The old HTTPS server's
+  `Shutdown` makes Go's `net/http` drop the first request it reads on an
+  already-accepted connection (zero bytes back), and the old
+  `SO_REUSEPORT` listening socket is closed with connections still queued on
+  it (reset). caddy-l4 does not cut connections it has accepted. Neither is a
+  Caddy setting, which is why the two knobs above changed nothing.
 - **Seen live:** T19 S6 UC-09, where the TLS dial was reset 0.41 s after
   another test's route DELETE, and hetero-lite UC-31, where an `expose_port`
   POST got EOF during a burst of 3 reloads.

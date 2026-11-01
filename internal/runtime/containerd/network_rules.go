@@ -92,7 +92,9 @@ func (d *Driver) ClearNetworkBlockEgress(containerIP string) error {
 	if d.networkRules == nil {
 		return nil
 	}
-	return d.networkRules.ClearBlockAllEgress(containerIP)
+	// The sandbox keeps its address: lift, don't forget (netrules
+	// LiftBlockAllEgress; on the block sets, one element add).
+	return d.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 func (d *Driver) ApplyEgressPolicy(containerIP string, allowCIDRs, denyCIDRs []string) error {

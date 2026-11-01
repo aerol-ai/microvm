@@ -899,8 +899,17 @@ var Registry = []UseCase{
 	// Restricted Docker creates start their own pause (fix/egress-docker-pause-on-demand).
 	{ID: "UC-346", Title: "Egress (Docker engine): a create with network rules (block-all, CIDR allow, CIDR deny, hostname allowlist) runs in a pause container named for it with or without the pause pool, probes from its workload's first instruction never reach an outside address directly, and its destroy leaves no pause, firewall rule or gateway entry", Requires: []Capability{CapDocker}, Implemented: true},
 	{ID: "UC-347", Title: "Egress (Docker engine): a create without network rules keeps Docker's own path: no docker_pause stage, and no pause container without the pause pool", Requires: []Capability{CapDocker}, Implemented: true},
+	{ID: "UC-358", Title: "Egress: a sandboxd killed (SIGKILL) between a hostname-filtered create's block and its lift leaves the address blocked (in @blocked, never in @released) through the restart until the orphan's removal lets it go", Requires: []Capability{CapEgressFQDN}, Implemented: true},
+	{ID: "UC-359", Title: "Egress: destroying a hostname-filtered sandbox removes its address from both block sets (no release left behind), and a block-all sandbox that gets the address next is shut from its first instruction", Requires: []Capability{CapEgressFQDN}, Implemented: true},
 	// Ingress high availability behind the load balancer (api_lb_test.go).
 	{ID: "UC-356", Title: "Ingress HA: with sandboxd stopped on one ingress node behind the health-checked load balancer, the node leaves rotation within the health-check window, API calls through the domain on fresh connections then see no 502 and no failure, and the node returns to rotation once its daemon is back", Requires: []Capability{CapAPILoadBalancer, CapDomain, CapCluster}, Implemented: true},
+	// Ingress proxy routing, continued (ingress_routing_test.go): the
+	// exec-stream churn gate for the cluster-bank-flagship UC-230/UC-266
+	// "unexpected EOF" dials.
+	{ID: "UC-357", Title: "Churn gate for new connections: through every ingress node, fresh TLS to the API and to a sandbox, and new exec streams, never reset or EOF while sandboxes are created and destroyed across the cluster", Requires: []Capability{CapIngressProxyRouting, CapCluster, CapDomain}, Implemented: true},
+	// Bank-readiness stability, continued (bank_scale_test.go): containerd
+	// task output kept draining after create (the UC-171 flagship stall).
+	{ID: "UC-360", Title: "Stability: a sandbox whose main process writes 3 MiB to stdout and 3 MiB to stderr after create keeps running and finishes, on every container runtime (output is drained past the pipe buffers and the task-log cap)", Requires: []Capability{CapDocker}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

@@ -96,6 +96,12 @@ type Manager struct {
 	// nodeGuard is the subnet and allowlist SetNodeGuard last installed,
 	// which ReassertNodeGuard restores.
 	nodeGuard atomic.Pointer[nodeGuardState]
+	// setsReady: PrepareBlockSets succeeded, so block-alls are membership in
+	// the block sets (blockset.go) rather than per-address rules.
+	setsReady atomic.Bool
+	// legacyConverted: PrepareBlockSets turned the per-address block rules
+	// of an older daemon into set elements, so Lift needn't look for them.
+	legacyConverted atomic.Bool
 }
 
 // topPos is the position of a rule that belongs at the top of the user
@@ -243,6 +249,9 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	if b := m.setsFor(containerIP); b != nil {
+		return m.blockInSets(b, containerIP)
+	}
 	if b, ok := m.ipt.(batchBackend); ok {
 		return m.blockAllEgressBatch(b, containerIP)
 	}
@@ -269,12 +278,20 @@ func (m *Manager) BlockAllEgressReport(containerIP string) (bool, error) {
 	return inserted || inputInserted, nil
 }
 
+// ClearBlockAllEgress removes containerIP's block-all for good, when the
+// address is let go or about to be (destroy, a failed create, a stop): on
+// the block sets it is Forget (the delete that pays the grace period); a
+// sandbox that keeps its address and only stops being blocked is lifted
+// instead (LiftBlockAllEgress).
 func (m *Manager) ClearBlockAllEgress(containerIP string) error {
 	if !m.Enabled() || containerIP == "" {
 		return nil
 	}
 	unlock := m.lockIP(containerIP)
 	defer unlock()
+	if b := m.setsFor(containerIP); b != nil {
+		return m.forgetInSets(b, containerIP)
+	}
 	if b, ok := m.ipt.(batchBackend); ok {
 		return m.clearBlockAllEgressBatch(b, containerIP)
 	}

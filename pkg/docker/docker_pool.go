@@ -485,15 +485,19 @@ func (c *Client) applyAdoptNetworkPolicy(containerIP string, req models.CreateSa
 		// idempotent and re-asserts it in case it was lost.
 		return c.networkRules.BlockAllEgress(containerIP)
 	}
-	return c.networkRules.ClearBlockAllEgress(containerIP)
+	// The adopted sandbox keeps the slot's address: lift the park block.
+	return c.networkRules.LiftBlockAllEgress(containerIP)
 }
 
 func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot) error {
 	if slot == nil {
 		return nil
 	}
+	// The slot holds its address until it is removed: everything keyed by
+	// the address goes first (the park block, and anything an adopt
+	// that failed half way put there).
 	if slot.ContainerIP != "" {
-		_ = c.ClearNetworkRules(slot.ContainerIP)
+		_ = c.networkRules.ClearAddress(slot.ContainerIP)
 	}
 	if slot.Handle != nil {
 		_ = slot.Handle.Close()
