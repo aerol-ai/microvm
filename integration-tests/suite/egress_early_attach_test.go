@@ -495,21 +495,55 @@ func blockSetsOn(t *testing.T, node harness.IntegrationNode) (blocked, released 
 }
 
 // crashWatchScript polls a node's block sets every few milliseconds and,
-// at the first address that joins @blocked without being in @released,
-// kills sandboxd with SIGKILL (systemd starts it again) and prints it.
+// at the first address shut by a block (in @blocked, not in @released)
+// that wasn't shut when it started, kills sandboxd's main process with
+// SIGKILL (systemd starts it again) and prints it.
+//
+// The baseline is the addresses shut at the start, not every address in
+// @blocked: a node reuses a guest address as soon as it is free (every
+// sequential Firecracker create gets 172.16.0.2), so the earlier test's
+// sandbox, open (in both sets) or still being destroyed when the watcher
+// started, must not hide the next create's block of the same address.
+//
+// On a Firecracker node it also holds the create deterministically: the
+// block goes in before the guest's VMM starts, and the lift waits for the
+// guest's toolbox, so the first VMM started after the watcher is stopped
+// (SIGSTOP) until sandboxd is killed, then let go (SIGCONT). A VMM that
+// never shows a block within 20 s is not this create's and is let go.
+//
+// Only sandboxd's main process is killed: the egress gateway and the WASM
+// hosts run the same binary and stay up, as they do when sandboxd crashes.
 const crashWatchScript = `snap() { sudo nft list set ip aerolvm_block "$1" 2>/dev/null | sed -n '/elements/,$p' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u; }
-before=$(snap blocked)
+fcs() { pgrep -x firecracker | sort; }
+rel0=$(snap released)
+shut0=$(for ip in $(snap blocked); do printf '%%s\n' "$rel0" | grep -qx "$ip" || echo "$ip"; done)
+fc0=$(fcs)
+held=""; held_at=0; n=0
 end=$(( $(date +%%s) + %d ))
 while [ "$(date +%%s)" -lt "$end" ]; do
+  n=$((n+1))
+  if [ -z "$held" ]; then
+    for pid in $(fcs); do
+      if ! printf '%%s\n' "$fc0" | grep -qx "$pid"; then
+        sudo kill -STOP "$pid" && held=$pid && held_at=$(date +%%s); break
+      fi
+    done
+  elif [ $(( $(date +%%s) - held_at )) -gt 20 ]; then
+    sudo kill -CONT "$held"; fc0=$(printf '%%s\n%%s' "$fc0" "$held"); held=""
+  fi
   rel=$(snap released)
   for ip in $(snap blocked); do
-    if ! printf '%%s\n' "$before" | grep -qx "$ip" && ! printf '%%s\n' "$rel" | grep -qx "$ip"; then
-      sudo kill -9 $(pidof sandboxd) && echo "KILLED $ip"; exit 0
+    if ! printf '%%s\n' "$shut0" | grep -qx "$ip" && ! printf '%%s\n' "$rel" | grep -qx "$ip"; then
+      pid=$(systemctl show -p MainPID --value sandboxd)
+      [ "${pid:-0}" -gt 0 ] && sudo kill -9 "$pid" && echo "KILLED $ip held=${held:-none}"
+      [ -n "$held" ] && sudo kill -CONT "$held"
+      exit 0
     fi
   done
   sleep 0.003
 done
-echo NONE`
+[ -n "$held" ] && sudo kill -CONT "$held"
+echo "NONE polls=$n held=${held:-none} shut0=$(echo $shut0 | tr ' ' ,) blocked=$(snap blocked | tr '\n' ,) released=$(snap released | tr '\n' ,)"`
 
 // UC-358 — a sandboxd killed (SIGKILL) between a hostname-filtered create's
 // block and its lift leaves the address blocked: in @blocked and never in
@@ -557,17 +591,27 @@ func TestEgressSandboxdKilledBetweenBlockAndLift(t *testing.T) {
 		defer destroyBest(c, sb.ID)
 	}
 	var victim harness.IntegrationNode
-	var ip string
+	var ip, held string
+	var none []string
 	for range watchers {
 		h := <-hits
-		if f := strings.Fields(strings.TrimSpace(h.out)); len(f) == 2 && f[0] == "KILLED" {
-			victim, ip = h.node, f[1]
+		for _, line := range strings.Split(h.out, "\n") {
+			f := strings.Fields(line)
+			switch {
+			case len(f) >= 2 && f[0] == "KILLED":
+				victim, ip = h.node, f[1]
+				if len(f) == 3 {
+					held = f[2]
+				}
+			case len(f) >= 1 && f[0] == "NONE":
+				none = append(none, h.node.Name+": "+line)
+			}
 		}
 	}
 	if ip == "" {
-		t.Skip("no watcher caught a create between its block and its lift (the window was too short on this run)")
+		t.Skipf("no watcher caught a create between its block and its lift:\n%s", strings.Join(none, "\n"))
 	}
-	t.Logf("killed sandboxd on %s with %s blocked and not released (create err: %v)", victim.Name, ip, createErr)
+	t.Logf("killed sandboxd on %s with %s blocked and not released, %s (create err: %v)", victim.Name, ip, held, createErr)
 	blocked, released := blockSetsOn(t, victim)
 	if !blocked[ip] || released[ip] {
 		t.Fatalf("right after the kill: blocked=%v released=%v, want blocked only", blocked[ip], released[ip])
