@@ -24,7 +24,7 @@ func newTestGateMetrics() GateMetrics {
 // ErrOverloaded; a slot that frees inside the wait is taken.
 func TestGateShedsWhenFullAndAdmitsWhenASlotFrees(t *testing.T) {
 	m := newTestGateMetrics()
-	g := NewGate(2, 0, m)
+	g := NewGate(2, 0, 0, m)
 	if g.Limit() != 2 {
 		t.Fatalf("Limit = %d, want 2", g.Limit())
 	}
@@ -67,7 +67,7 @@ func TestGateShedsWhenFullAndAdmitsWhenASlotFrees(t *testing.T) {
 
 func TestGateQueueWait(t *testing.T) {
 	m := newTestGateMetrics()
-	g := NewGate(1, 200*time.Millisecond, m)
+	g := NewGate(1, 0, 200*time.Millisecond, m)
 	release, err := g.Acquire(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -103,11 +103,11 @@ func TestGateQueueWait(t *testing.T) {
 
 // No gate admits everything; a non-positive limit means no gate.
 func TestNilGateAdmitsEverything(t *testing.T) {
-	if NewGate(0, time.Second, GateMetrics{}) != nil || NewGate(-1, 0, GateMetrics{}) != nil {
+	if NewGate(0, 0, time.Second, GateMetrics{}) != nil || NewGate(-1, 0, 0, GateMetrics{}) != nil {
 		t.Fatal("a non-positive limit must mean no gate")
 	}
 	var g *Gate
-	if g.Limit() != 0 {
+	if g.Limit() != 0 || g.PerFlowLimit() != 0 {
 		t.Fatal("nil gate limit")
 	}
 	var wg sync.WaitGroup
@@ -125,7 +125,7 @@ func TestNilGateAdmitsEverything(t *testing.T) {
 	}
 	wg.Wait()
 	// A negative wait is treated as none, and nil metrics are fine.
-	g = NewGate(1, -time.Second, GateMetrics{})
+	g = NewGate(1, 0, -time.Second, GateMetrics{})
 	release, _ := g.Acquire(context.Background())
 	if _, err := g.Acquire(context.Background()); !errors.Is(err, ErrOverloaded) {
 		t.Fatalf("err = %v", err)

@@ -252,6 +252,14 @@ const (
 	// cases run unchanged and so cover the balancer's path (and raw TCP on
 	// tcp.<domain>) too.
 	CapAPILoadBalancer Capability = "api-load-balancer"
+	// CapAPIListFairness: every node runs a list gate small enough that one
+	// tenant's list storm fills its per-tenant share (the scenario's
+	// extra_sandboxd_env sets SB_API_LIST_MAX_INFLIGHT and
+	// SB_API_LIST_MAX_INFLIGHT_PER_TENANT). A healthy list holds its slot for
+	// milliseconds, so the default 16 slots with 4 per tenant may never fill
+	// under the suite's client; gates UC-362, which asserts the noisy tenant
+	// is told 429.
+	CapAPIListFairness Capability = "api-list-fairness"
 )
 
 // UseCase is one row of the coverage matrix.
@@ -303,7 +311,7 @@ var KnownCapabilities = map[Capability]bool{
 	CapL4ProxyProtocol: true, CapPATRotation: true,
 	CapKeyCustodyVault: true, CapKeyCustodyPKCS11: true, CapKeyCustodyKMSWrapped: true,
 	CapKeyCustodyKMSSwitch: true, CapKeyCustodySingleWrapped: true,
-	CapAPILoadBalancer: true,
+	CapAPILoadBalancer: true, CapAPIListFairness: true,
 }
 
 // Registry is the full use-case catalogue. Order is the matrix row order.
@@ -913,6 +921,9 @@ var Registry = []UseCase{
 	// Overload is shed, never turned into an outage (overload_shed_test.go):
 	// the bank-flagship ramp's 1024-client list collapse and watchdog restart.
 	{ID: "UC-361", Title: "Overload: N concurrent clients (default 1024) listing sandboxes through the domain for 60 s get 200 or a refusal with Retry-After (503/429), never 502, another 5xx, a refused or reset connection or a request hung past 30 s; no sandboxd on any node restarts (InvocationID, NRestarts and the journal unchanged); and the list is back to its baseline latency within 60 s of the load stopping", Requires: []Capability{CapCluster, CapDomain}, Implemented: true},
+	// Per-tenant fairness for the list gate (list_fairness_test.go): one
+	// tenant's list storm must not degrade another tenant's lists.
+	{ID: "UC-362", Title: "Fairness: two teams list sandboxes through every ingress node at once for 60 s, a noisy one with N clients (default 1024) and a quiet one with 4: the quiet team's lists succeed at least 99% of the time with a p99 within the stated bound (default 2 s), the noisy team is told 429 rate_limited with Retry-After and never sees a 502, another 5xx, a transport error or a request hung past 30 s, and no sandboxd restarts", Requires: []Capability{CapCluster, CapDomain, CapIdentity, CapDocker, CapAPIListFairness}, Implemented: true},
 }
 
 // byID is a lookup built once for the report generator.

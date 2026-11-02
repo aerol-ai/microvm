@@ -122,6 +122,10 @@ func Classify(err error) Classification {
 	// (a storm would otherwise write one per refused request).
 	case errors.Is(err, ErrOverloaded):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: OverloadedRetryAfterSeconds, Code: models.ErrorCodeOverloaded, Message: ErrOverloaded.Error()}
+	// The caller's own tenant holds its share of those slots: 429, so the
+	// noisy tenant (not the node) is named as the one to slow down.
+	case errors.Is(err, ErrRateLimited):
+		return Classification{Status: http.StatusTooManyRequests, RetryAfter: RateLimitedRetryAfterSeconds, Code: models.ErrorCodeRateLimited, Message: ErrRateLimited.Error()}
 
 	case errors.Is(err, service.ErrSecretAuditBusy):
 		return Classification{Status: http.StatusTooManyRequests, RetryAfter: 1, Message: service.ErrSecretAuditBusy.Error()}

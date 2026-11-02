@@ -233,6 +233,33 @@ node's `aerolvm_api_list_shed_total`, land in `<reports>/<scenario>-bank.json`
 under `overload_shed_v1_sandboxes`; a run that shed nothing says so in the
 test log, since it never reached the shedding point.
 
+## One tenant's list storm does not degrade another (UC-362)
+
+UC-362 (`suite/list_fairness_test.go`) runs on a scenario with `cluster`,
+`domain`, `identity`, `docker`, `api-list-fairness` and `disruptive: true`:
+today `cluster-3-mixed-lb`, whose tfvars run the list gate at 8 slots with 2
+per tenant (`SB_API_LIST_MAX_INFLIGHT`, `SB_API_LIST_MAX_INFLIGHT_PER_TENANT`).
+That is on purpose: a healthy list holds its slot for milliseconds, so with
+the default 16 slots and 4 per tenant the suite's client may never fill a
+tenant's share, and the case is about what happens when it is full.
+
+It mints runner tokens for two teams (`payments`, noisy; `checkout`, quiet),
+gives each `AEROL_FAIRNESS_SANDBOXES` sandboxes (default 3) so every list
+fans out to owner nodes, then lists as both at once for
+`AEROL_FAIRNESS_SECONDS` (default 60): `AEROL_FAIRNESS_NOISY` clients
+(default 1024) and `AEROL_FAIRNESS_QUIET` (default 4), each pinned to one
+ingress node round-robin on its own tenant's connection, so every node serves
+both. It first reads each node's gate size from `/v1/metrics` and refuses to
+run when the quiet tenant's clients would not fit inside its own share on a
+node. It passes when the quiet team's lists succeed at least 99% of the time
+with a p99 within `AEROL_FAIRNESS_QUIET_P99_MS` (default 2000), the noisy
+team got at least one `429` with code `rate_limited` and `Retry-After` and no
+`502`, other 5xx, refusal without `Retry-After`, transport error or request
+over 30 s, and no sandboxd restarted (UC-361's checks). The numbers land in
+`<reports>/<scenario>-bank.json` under `list_fairness_v1_sandboxes`, with
+each node's `429`/`503` counts. A run whose noisy team never got a `429`
+fails and says to raise `AEROL_FAIRNESS_NOISY`.
+
 ## Enterprise scenarios and the audit witness
 
 Enterprise mode (`SB_ENTERPRISE_MODE=true`) refuses to boot without an

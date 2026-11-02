@@ -1461,6 +1461,13 @@ const ErrorCodeMountToolUnavailable = "mount_tool_unavailable"
 // recovery; nothing is wrong with the request.
 const ErrorCodeOverloaded = "overloaded"
 
+// ErrorCodeRateLimited is returned (429, with Retry-After) when the caller's
+// own tenant already runs its share of the node's requests of that kind
+// (cluster-wide sandbox lists): the node has room, but not for one more from
+// this tenant. Other tenants are unaffected. Retrying after Retry-After is
+// the recovery; slowing down is the cure.
+const ErrorCodeRateLimited = "rate_limited"
+
 // ErrorCodeNodeGuardNotReady is returned (503, with Retry-After) for a
 // container or Firecracker create while this node's guard that keeps
 // sandboxes off the node's own services is not installed for that runtime;

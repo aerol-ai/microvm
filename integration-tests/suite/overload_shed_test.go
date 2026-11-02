@@ -27,7 +27,8 @@ package suite
 //   - within 60 s of the load stopping, the list is back to its baseline
 //     latency.
 //
-// It reports each node's aerolvm_api_list_shed_total so a run that never
+// It reports each node's list refusals (aerolvm_api_list_shed_total, 503,
+// and aerolvm_api_list_rate_limited_total, 429) so a run that never
 // reached the shedding point says so instead of passing quietly.
 
 import (
@@ -107,19 +108,38 @@ sudo journalctl -t sandboxd-healthcheck --since @%d --no-pager | grep -c 'restar
 	return counts[0], counts[1], nil
 }
 
-// overloadShedTotal reads aerolvm_api_list_shed_total on a node (the PAT
-// goes over stdin, never onto a command line). Informational only.
-func overloadShedTotal(t *testing.T, node harness.IntegrationNode) string {
+// apiListMetrics reads a node's aerolvm_api_list_* series (the list gate's
+// counters and size) over SSH; the PAT goes over stdin, never onto a command
+// line. A series the node does not publish is absent from the map.
+func apiListMetrics(t *testing.T, node harness.IntegrationNode) (map[string]float64, error) {
 	t.Helper()
 	target, _ := harness.SSHTarget(node)
-	out, err := harness.SSHRunStdin(t, target, `read -r pat; curl -s -m 10 -H "Authorization: Bearer $pat" http://127.0.0.1:21212/v1/metrics | grep -E '^aerolvm_api_list_shed_total ' | awk '{print $2}'`, sc.PAT+"\n")
+	out, err := harness.SSHRunStdin(t, target, `read -r pat; curl -s -m 10 -H "Authorization: Bearer $pat" http://127.0.0.1:21212/v1/metrics | grep -E '^aerolvm_api_list_' || true`, sc.PAT+"\n")
+	if err != nil {
+		return nil, fmt.Errorf("%v: %s", err, out)
+	}
+	m := map[string]float64{}
+	for _, line := range strings.Split(out, "\n") {
+		name, value, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		if v, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			m[name] = v
+		}
+	}
+	return m, nil
+}
+
+// overloadShedTotal reads a node's list refusals: aerolvm_api_list_shed_total
+// (503) and aerolvm_api_list_rate_limited_total (429). Informational only.
+func overloadShedTotal(t *testing.T, node harness.IntegrationNode) string {
+	t.Helper()
+	m, err := apiListMetrics(t, node)
 	if err != nil {
 		return "?"
 	}
-	if v := strings.TrimSpace(out); v != "" {
-		return v
-	}
-	return "0"
+	return fmt.Sprintf("503:%g 429:%g", m["aerolvm_api_list_shed_total"], m["aerolvm_api_list_rate_limited_total"])
 }
 
 // overloadClip keeps a failure sample short enough to group by.

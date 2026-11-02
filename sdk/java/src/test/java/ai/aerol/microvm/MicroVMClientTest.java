@@ -2570,6 +2570,197 @@ class MicroVMClientTest {
         }
     }
 
+    // With a 1 ms backoff, only the server's Retry-After explains a 1 s wait.
+    // The cases run side by side so the test takes about 2 s.
+    @Test
+    void retryWaitsOutRetryAfterOn429And503() throws Exception {
+        java.time.format.DateTimeFormatter imfFixdate =
+            java.time.format.DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss 'GMT'", java.util.Locale.US);
+        String inTwoSeconds = imfFixdate.format(java.time.ZonedDateTime.now(java.time.ZoneOffset.UTC).plusSeconds(2));
+        // {name, status, header, min ms, max ms}; the date has whole-second
+        // precision, so it asks for 1-2 s.
+        Object[][] cases = {
+            {"429 seconds", 429, "1", 1000L, 2000L},
+            {"503 seconds", 503, "1", 1000L, 2000L},
+            {"503 HTTP date", 503, inTwoSeconds, 1000L, 3000L},
+        };
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(cases.length * 2);
+        try {
+            List<java.util.concurrent.Future<?>> runs = new ArrayList<>();
+            for (Object[] c : cases) {
+                for (boolean exec : new boolean[] {false, true}) {
+                    runs.add(pool.submit(() -> {
+                        AtomicInteger hits = new AtomicInteger();
+                        HttpServer server = pacedServer((Integer) c[1], 1, () -> (String) c[2], hits);
+                        try {
+                            long start = System.nanoTime();
+                            getOrExec(clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()), exec);
+                            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                            String name = c[0] + (exec ? "/exec" : "/get");
+                            assertEquals(2, hits.get(), name);
+                            assertTrue(elapsedMs >= (Long) c[3] && elapsedMs <= (Long) c[4], name + ": retried after " + elapsedMs + " ms");
+                        } finally {
+                            server.stop(0);
+                        }
+                        return null;
+                    }));
+                }
+            }
+            for (java.util.concurrent.Future<?> run : runs) {
+                run.get();
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    @Test
+    void retryAfterIsCappedByMaxRetryAfterMs() throws Exception {
+        AtomicInteger hits = new AtomicInteger();
+        HttpServer server = pacedServer(503, 1, () -> "120", hits);
+        try {
+            MicroVMClient client = clientFor(serverUrl(server), fastRetry().setMaxRetryAfterMs(100), HttpClient.newHttpClient());
+            long start = System.nanoTime();
+            client.get("sb-1");
+            long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+            assertEquals(2, hits.get());
+            assertTrue(elapsedMs >= 80 && elapsedMs <= 1000, "Retry-After: 120 with a 100 ms cap waited " + elapsedMs + " ms");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    // A missing or malformed header, or one on a status that is a hop's rather
+    // than the server's pacing (421/502/504), keeps the 1 ms backoff.
+    @Test
+    void retryWithoutUsableRetryAfterUsesBackoff() throws Exception {
+        Object[][] cases = {{503, null}, {429, "soon"}, {503, "-1"}, {421, "120"}, {502, "120"}, {504, "120"}};
+        for (Object[] c : cases) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer server = pacedServer((Integer) c[0], 1, () -> (String) c[1], hits);
+            try {
+                long start = System.nanoTime();
+                clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()).get("sb-1");
+                long elapsedMs = (System.nanoTime() - start) / 1_000_000;
+                assertEquals(2, hits.get(), c[0] + " " + c[1]);
+                assertTrue(elapsedMs < 500, c[0] + " " + c[1] + ": retried after " + elapsedMs + " ms");
+            } finally {
+                server.stop(0);
+            }
+        }
+    }
+
+    @Test
+    void retryAfterKeepsRetryBudgetAndStatuses() throws Exception {
+        AtomicInteger exhausted = new AtomicInteger();
+        HttpServer server = pacedServer(503, 100, () -> "0", exhausted);
+        try {
+            MicroVMException ex = assertThrows(MicroVMException.class,
+                () -> clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient()).get("sb-1"));
+            assertEquals("busy", ex.getMessage());
+            assertEquals(4, exhausted.get(), "1 + 3 retries");
+        } finally {
+            server.stop(0);
+        }
+
+        for (int status : new int[] {400, 404, 500}) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer refusing = pacedServer(status, 100, () -> "1", hits);
+            try {
+                assertThrows(MicroVMException.class,
+                    () -> clientFor(serverUrl(refusing), fastRetry(), HttpClient.newHttpClient()).get("sb-1"));
+                assertEquals(1, hits.get(), status + " is not retried");
+            } finally {
+                refusing.stop(0);
+            }
+        }
+
+        AtomicInteger execHits = new AtomicInteger();
+        HttpServer gateway = pacedServer(502, 100, () -> "1", execHits);
+        try {
+            assertThrows(MicroVMException.class,
+                () -> getOrExec(clientFor(serverUrl(gateway), fastRetry(), HttpClient.newHttpClient()), true));
+            assertEquals(1, execHits.get(), "exec does not re-send a 502");
+        } finally {
+            gateway.stop(0);
+        }
+    }
+
+    // Future.cancel(true) interrupts the calling thread; the call must end
+    // then, not after a 30 s Retry-After, and keep the interrupt flag set.
+    @Test
+    void cancelEndsRetryAfterWait() throws Exception {
+        for (boolean exec : new boolean[] {false, true}) {
+            AtomicInteger hits = new AtomicInteger();
+            HttpServer server = pacedServer(503, 100, () -> "30", hits);
+            java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newSingleThreadExecutor();
+            try {
+                MicroVMClient client = clientFor(serverUrl(server), fastRetry(), HttpClient.newHttpClient());
+                AtomicReference<Throwable> outcome = new AtomicReference<>();
+                java.util.concurrent.atomic.AtomicBoolean interrupted = new java.util.concurrent.atomic.AtomicBoolean();
+                java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(1);
+                java.util.concurrent.Future<?> call = pool.submit(() -> {
+                    try {
+                        getOrExec(client, exec);
+                    } catch (Throwable t) {
+                        outcome.set(t);
+                        interrupted.set(Thread.currentThread().isInterrupted());
+                    } finally {
+                        done.countDown();
+                    }
+                });
+                Thread.sleep(200);
+                call.cancel(true);
+                assertTrue(done.await(2, java.util.concurrent.TimeUnit.SECONDS), "the wait ignored the interrupt");
+                assertTrue(outcome.get() instanceof MicroVMException, String.valueOf(outcome.get()));
+                assertEquals("request interrupted during backoff", outcome.get().getMessage());
+                assertTrue(interrupted.get(), "the interrupt flag is restored");
+                assertEquals(1, hits.get());
+            } finally {
+                pool.shutdownNow();
+                server.stop(0);
+            }
+        }
+    }
+
+    /**
+     * Answers the first {@code refusals} requests with {@code status} and the
+     * Retry-After {@code retryAfter} supplies (none for null), then 200.
+     */
+    private static HttpServer pacedServer(int status, int refusals, java.util.function.Supplier<String> retryAfter, AtomicInteger hits) throws IOException {
+        return startServer(exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            if (hits.incrementAndGet() <= refusals) {
+                String value = retryAfter.get();
+                if (value != null) {
+                    exchange.getResponseHeaders().set("Retry-After", value);
+                }
+                writeJson(exchange, status, mapOf("error", "busy", "code", "overloaded"));
+                return;
+            }
+            if (exchange.getRequestURI().getPath().endsWith("/toolbox/process/execute")) {
+                writeJson(exchange, 200, mapOf("stdout", "", "stderr", "", "exit_code", 0, "duration_ms", 1));
+                return;
+            }
+            writeJson(exchange, 200, mapOf(
+                "id", "sb-1",
+                "image", "ubuntu:22.04",
+                "status", "started",
+                "created_at", "2026-05-07T10:00:00Z",
+                "updated_at", "2026-05-07T10:00:00Z"
+            ));
+        });
+    }
+
+    /** Get is idempotent; exec is re-sent only after a refusal. */
+    private static void getOrExec(MicroVMClient client, boolean exec) {
+        if (exec) {
+            client.exec("sb-1", new ExecRequest().setCommand("true"));
+        } else {
+            client.get("sb-1");
+        }
+    }
+
     private static MicroVMClient clientFor(HttpServer server) {
         return new MicroVMClient(
             new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat-token"),
