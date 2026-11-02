@@ -282,7 +282,7 @@ Not every error has a code. Many errors are only meant for a person to read. An 
 | TypeScript | `MicroVMApiError` | `status` | `code` (`undefined`) | `retryAfterMs` |
 | Python | `MicroVMHTTPError` | `status_code` | `code` (`""`) | `retry_after`, in seconds |
 | Go | `*microvm.APIError` | `StatusCode` | `Code` (`""`) | `RetryAfter` |
-| Rust | `Error::Status(ApiError)` | `status()` | `code()` (`None`) | `retry_after()` |
+| Rust | `Error::Api(ApiError)` | `status()` | `code()` (`None`) | `retry_after()` |
 | Java | `MicroVMApiException` | `getStatusCode()` | `getCode()` (`null`) | `getRetryAfter()` |
 
 <Tabs syncKey="lang">
@@ -347,7 +347,7 @@ Not every error has a code. Many errors are only meant for a person to read. An 
         ..Default::default()
     }) {
         Ok(sandbox) => println!("Created {}", sandbox.data.id),
-        Err(Error::Status(err)) => {
+        Err(Error::Api(err)) => {
             eprintln!("status {}, code {:?}: {}", err.status(), err.code(), err.message());
             if let Some(wait) = err.retry_after() {
                 eprintln!("The server asked to wait {:?}.", wait);
@@ -391,7 +391,7 @@ Some codes you may see:
 | `key_revoked` | `503` | The key that protects sandbox secrets was turned off or deleted in the key store. | Ask the key's owner to restore it. |
 | `network_policy_unenforced` | `501` | This node cannot enforce the network rules you asked for. | Drop the rules, or ask the operator to turn on the host firewall. |
 
-The Rust `Error::Status` variant is new in Rust SDK 0.8.0. Before it, an HTTP error was an `Error::Api` holding the text `"<status>: <message>"`. `Error::Api` now holds only errors the SDK finds itself, such as a missing argument.
+In Rust SDK 0.8.0, `Error::Api` holds an `ApiError` instead of the text `"<status>: <message>"`. Errors the SDK finds itself, such as a missing argument, moved to `Error::Client`. Code that read the old text as a `String` no longer compiles, so the compiler shows each place to update.
 
 ## Next steps
 

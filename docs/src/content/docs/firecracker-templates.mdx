@@ -167,7 +167,7 @@ The build takes a while. There is no callback when it finishes, so check the sta
             match tpl.status {
                 TemplateStatus::Ready | TemplateStatus::ReadyNoSnapshot => return Ok(tpl),
                 TemplateStatus::Failed => {
-                    return Err(aerolvm_sdk::Error::Api(format!(
+                    return Err(aerolvm_sdk::Error::Client(format!(
                         "build failed: {}",
                         tpl.last_error.unwrap_or_default()
                     )));

@@ -92,15 +92,16 @@ pub struct SessionAttachOptions {
 pub enum Error {
     Reqwest(reqwest::Error),
     MissingToken,
-    /// A failure the SDK found itself, before or after talking to the
-    /// server: a missing argument, an Image build the daemon does not
-    /// support, an incomplete cluster list, a WebSocket handshake or stream
-    /// failure. An HTTP error response from the server is [`Error::Status`].
-    Api(String),
     /// The server, or a proxy in front of it, answered with an HTTP error
     /// status. [`ApiError`] carries the status, the server's stable error
     /// code and its `Retry-After`.
-    Status(ApiError),
+    Api(ApiError),
+    /// A failure the SDK client found itself rather than an HTTP error
+    /// response: a missing or invalid argument, a server that lacks a
+    /// feature (Image builds, name lookup), an incomplete cluster list, or a
+    /// WebSocket handshake or stream failure. Before 0.8.0 these were
+    /// `Error::Api(String)`.
+    Client(String),
     WebSocket(WebSocketError),
     Http(http::Error),
     SerdeJson(serde_json::Error),
@@ -116,8 +117,9 @@ impl fmt::Display for Error {
                 f,
                 "PAT token is required. Set SB_PAT_TOKEN or SB_API_TOKEN, or pass pat_token."
             ),
-            Error::Api(message) => write!(f, "API error: {}", message),
-            Error::Status(err) => write!(f, "API error: {}", err),
+            Error::Api(err) => write!(f, "API error: {}", err),
+            // The text these errors had as Error::Api(String) before 0.8.0.
+            Error::Client(message) => write!(f, "API error: {}", message),
             Error::WebSocket(err) => write!(f, "WebSocket error: {}", err),
             Error::Http(err) => write!(f, "HTTP request build error: {}", err),
             Error::SerdeJson(err) => write!(f, "JSON error: {}", err),
@@ -130,13 +132,13 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// An HTTP error response from the AerolVM server, returned as
-/// [`Error::Status`].
+/// [`Error::Api`].
 ///
 /// Branch on [`ApiError::code`], not on the message: the code is a stable
 /// identifier such as `"idempotency_key_reused"` or `"overloaded"`, the
 /// message is wording for a person. It displays as
-/// `"<status>: <message>"`, the text `Error::Api` carried for these errors
-/// before this type existed.
+/// `"<status>: <message>"`, the same text `Error::Api(String)` carried for
+/// these errors before 0.8.0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApiError {
     status: reqwest::StatusCode,
@@ -308,13 +310,13 @@ fn websocket_request(
     request.headers_mut().insert(
         http::header::AUTHORIZATION,
         http::HeaderValue::from_str(&format!("Bearer {}", pat_token))
-            .map_err(|err| Error::Api(format!("invalid auth header: {}", err)))?,
+            .map_err(|err| Error::Client(format!("invalid auth header: {}", err)))?,
     );
     if let Some(team) = team {
         request.headers_mut().insert(
             TEAM_HEADER,
             http::HeaderValue::from_str(team)
-                .map_err(|err| Error::Api(format!("invalid {} header: {}", TEAM_HEADER, err)))?,
+                .map_err(|err| Error::Client(format!("invalid {} header: {}", TEAM_HEADER, err)))?,
         );
     }
     Ok(request)
@@ -352,7 +354,7 @@ impl Tokens<'_> {
     pub fn revoke(&self, id: &str) -> Result<(), Error> {
         let id = id.trim();
         if id.is_empty() {
-            return Err(Error::Api("token id is required".to_string()));
+            return Err(Error::Client("token id is required".to_string()));
         }
         let path = self.path(&format!("/{}", urlencoding::encode(id)));
         self.client.do_json::<(), ()>(Method::DELETE, &path, None)
@@ -990,18 +992,18 @@ impl Client {
         }
 
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
 
         let push_body = if let Some(push) = options.push.as_ref() {
             let registry = push.registry.trim();
             if registry.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.registry is required when push is set".to_string(),
                 ));
             }
             if push.username.is_empty() || push.password.is_empty() {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "push.username and push.password are required when push is set".to_string(),
                 ));
             }
@@ -1028,7 +1030,7 @@ impl Client {
             .send()?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             let _ = response.text();
-            return Err(Error::Api(format!(
+            return Err(Error::Client(format!(
                 "this daemon does not support Image builds (POST {} is not registered) — pass a string image reference (e.g. \"ubuntu:22.04\") instead, or upgrade the daemon",
                 path,
             )));
@@ -1086,7 +1088,7 @@ impl Client {
                 None => return Ok(items),
             }
         }
-        Err(Error::Api(
+        Err(Error::Client(
             "incomplete cluster list: exceeded max pages".into(),
         ))
     }
@@ -1112,7 +1114,7 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if partial == "true" || ready == "false" {
-            return Err(Error::Api("incomplete cluster list".into()));
+            return Err(Error::Client("incomplete cluster list".into()));
         }
         let next = headers
             .get("X-Cluster-List-Next-Page-Token")
@@ -1146,7 +1148,7 @@ impl Client {
     ) -> Result<Option<Sandbox>, Error> {
         let wanted = name.trim();
         if wanted.is_empty() {
-            return Err(Error::Api("sandbox name is required".into()));
+            return Err(Error::Client("sandbox name is required".into()));
         }
         let mut path = format!("{}/sandboxes", self.version_prefix());
         path.push_str(&build_sandbox_query(
@@ -1159,7 +1161,7 @@ impl Client {
             return Ok(None);
         }
         if raw.len() > 1 || raw[0].name.as_deref() != Some(wanted) {
-            return Err(Error::Api(format!(
+            return Err(Error::Client(format!(
                 "{} does not support sandbox name lookup; use the sandbox ID or upgrade the server",
                 self.api_url
             )));
@@ -1242,7 +1244,7 @@ impl Client {
 
         let name = opts.name.trim();
         if name.is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
 
         let image = opts
@@ -1255,12 +1257,12 @@ impl Client {
             .filter(|value| !value.is_empty());
         match (&image, &dockerfile_content) {
             (None, None) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image or dockerfile_content is required".to_string(),
                 ))
             }
             (Some(_), Some(_)) => {
-                return Err(Error::Api(
+                return Err(Error::Client(
                     "image and dockerfile_content are mutually exclusive".to_string(),
                 ))
             }
@@ -1305,7 +1307,7 @@ impl Client {
         mut opts: RegisterSnapshotOptions,
     ) -> Result<SandboxSnapshot, Error> {
         if let Some(message) = image.validation_error() {
-            return Err(Error::Api(message.to_string()));
+            return Err(Error::Client(message.to_string()));
         }
         opts.name = name.to_string();
         opts.image = None;
@@ -1315,7 +1317,7 @@ impl Client {
 
     /// Look a snapshot up by name. In a cluster the request is routed to the
     /// node holding the image. A missing snapshot surfaces as an
-    /// [`Error::Status`] carrying the server's 404.
+    /// [`Error::Api`] carrying the server's 404.
     pub fn get_snapshot(&self, name: &str) -> Result<SandboxSnapshot, Error> {
         self.do_json::<(), SandboxSnapshot>(
             Method::GET,
@@ -1374,7 +1376,7 @@ impl Client {
     /// template.
     pub fn create_template(&self, opts: CreateTemplateOptions) -> Result<Template, Error> {
         if opts.image.trim().is_empty() {
-            return Err(Error::Api("image is required".to_string()));
+            return Err(Error::Client("image is required".to_string()));
         }
         self.do_json::<CreateTemplateOptions, Template>(
             Method::POST,
@@ -1411,7 +1413,7 @@ impl Client {
     /// the returned row is typically already `WasmModuleStatus::Ready`.
     pub fn create_wasm_module(&self, opts: CreateWasmModuleOptions) -> Result<WasmModule, Error> {
         if opts.module_ref.trim().is_empty() {
-            return Err(Error::Api("module_ref is required".to_string()));
+            return Err(Error::Client("module_ref is required".to_string()));
         }
         self.do_json::<CreateWasmModuleOptions, WasmModule>(
             Method::POST,
@@ -1453,10 +1455,10 @@ impl Client {
         opts: PushWasmModuleOptions,
     ) -> Result<PushWasmModuleResponse, Error> {
         if opts.name.trim().is_empty() {
-            return Err(Error::Api("name is required".to_string()));
+            return Err(Error::Client("name is required".to_string()));
         }
         if opts.registry_token.trim().is_empty() {
-            return Err(Error::Api("registry_token is required".to_string()));
+            return Err(Error::Client("registry_token is required".to_string()));
         }
         let tag = if opts.tag.trim().is_empty() {
             "latest"
@@ -1490,7 +1492,7 @@ impl Client {
     /// in its post-transition state (typically `Unhealthy`); poll
     /// [`Client::get_template`] to observe the transition back to `Ready`.
     ///
-    /// Returns an [`Error::Status`] wrapping a 412 response when the template
+    /// Returns an [`Error::Api`] wrapping a 412 response when the template
     /// is in a state where rebuild is unsafe (build in flight) or
     /// unsupported (`ReadyNoSnapshot`, `Failed` — those need
     /// delete+recreate today).
@@ -1860,7 +1862,7 @@ impl Client {
         options: ExecStreamOptions,
     ) -> Result<ExecStreamHandle, Error> {
         if options.command.trim().is_empty() {
-            return Err(Error::Api("command is required".to_string()));
+            return Err(Error::Client("command is required".to_string()));
         }
 
         let (control_tx, control_rx) = unbounded_channel();
@@ -1965,7 +1967,7 @@ impl Client {
             "http" | "" => Ok(ExposeResult::Http {
                 url: wire.public_url,
             }),
-            other => Err(Error::Api(format!("unknown expose protocol: {}", other))),
+            other => Err(Error::Client(format!("unknown expose protocol: {}", other))),
         }
     }
 
@@ -2185,7 +2187,7 @@ impl Client {
                 .and_then(|value| value.to_str().ok())
                 .map(String::from);
             let body = response.text().unwrap_or_default();
-            Err(Error::Status(ApiError::from_response(
+            Err(Error::Api(ApiError::from_response(
                 status,
                 retry_after.as_deref(),
                 &body,
@@ -2273,10 +2275,10 @@ async fn run_exec_stream(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -2370,10 +2372,10 @@ async fn run_session_attach(
                             if let Some(callback) = &options.on_error {
                                 callback(message.clone());
                             }
-                            return Err(Error::Api(message));
+                            return Err(Error::Client(message));
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None => return Err(Error::Api("session stream closed before exit".to_string())),
+                    Some(Ok(Message::Close(_))) | None => return Err(Error::Client("session stream closed before exit".to_string())),
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(Error::WebSocket(err)),
                 }
@@ -2440,12 +2442,12 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
             let body_str = String::from_utf8_lossy(&body);
             let trimmed = body_str.trim();
             if trimmed.is_empty() {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}",
                     label, status
                 ))
             } else {
-                Error::Api(format!(
+                Error::Client(format!(
                     "{} websocket handshake failed: status={}, body={:?}",
                     label, status, trimmed
                 ))
@@ -2457,7 +2459,7 @@ fn decorate_ws_handshake(label: &str, err: WebSocketError) -> Error {
 
 fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
     let mut parsed = reqwest::Url::parse(&format!("{}{}", base_url.trim_end_matches('/'), path))
-        .map_err(|err| Error::Api(format!("invalid API URL: {}", err)))?;
+        .map_err(|err| Error::Client(format!("invalid API URL: {}", err)))?;
     match parsed.scheme() {
         "http" => {
             let _ = parsed.set_scheme("ws");
@@ -2466,7 +2468,7 @@ fn websocket_url(base_url: &str, path: &str) -> Result<String, Error> {
             let _ = parsed.set_scheme("wss");
         }
         "ws" | "wss" => {}
-        other => return Err(Error::Api(format!("unsupported API URL scheme: {}", other))),
+        other => return Err(Error::Client(format!("unsupported API URL scheme: {}", other))),
     }
     Ok(parsed.to_string())
 }
@@ -4892,13 +4894,13 @@ mod tests {
             let (url, _rx) = spawn_json_server(reply.to_string());
             let client = Client::new(Some(&url), Some("pat-token")).expect("client should build");
             match client.get_by_name("agent") {
-                Err(Error::Api(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
+                Err(Error::Client(msg)) => assert!(msg.contains("does not support sandbox name lookup"), "{}", msg),
                 other => panic!("expected unsupported error, got {:?}", other.map(|s| s.map(|s| s.data.id))),
             }
         }
 
         let client = Client::new(Some("http://127.0.0.1:1"), Some("pat-token")).expect("client should build");
-        assert!(matches!(client.get_by_name("  "), Err(Error::Api(_))));
+        assert!(matches!(client.get_by_name("  "), Err(Error::Client(_))));
     }
 
     #[test]
@@ -5083,7 +5085,7 @@ mod tests {
             Client::new(Some(&format!("http://{}", addr)), Some("pat-token")).expect("client");
         let err = client.list().expect_err("partial list must fail");
         match err {
-            Error::Api(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
+            Error::Client(msg) => assert!(msg.contains("incomplete cluster list"), "msg={msg}"),
             other => panic!("unexpected error: {other:?}"),
         }
     }
@@ -5471,7 +5473,7 @@ mod tests {
             .create_template(CreateTemplateOptions::default())
             .expect_err("empty image must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("image is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5529,7 +5531,7 @@ mod tests {
             })
             .expect_err("empty module_ref must be rejected");
         match err {
-            Error::Api(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
+            Error::Client(msg) => assert!(msg.contains("module_ref is required"), "msg = {}", msg),
             other => panic!("unexpected error: {:?}", other),
         }
     }
@@ -5560,7 +5562,7 @@ mod tests {
             .rebuild_template("tpl-pending")
             .expect_err("412 must surface as error");
         match err {
-            Error::Status(api) => {
+            Error::Api(api) => {
                 assert_eq!(api.status(), 412);
                 assert!(api.message().contains("not eligible"), "msg = {}", api.message());
             }
@@ -5876,9 +5878,9 @@ mod tests {
         .expect("client should build")
     }
 
-    // Every HTTP error response is Error::Status carrying the status, the
-    // server's stable code and its Retry-After; Display keeps the
-    // "API error: <status>: <message>" text Error::Api carried before.
+    // Every HTTP error response is Error::Api(ApiError) carrying the status,
+    // the server's stable code and its Retry-After; Display keeps the
+    // "API error: <status>: <message>" text of the old Error::Api(String).
     #[test]
     fn http_errors_carry_status_code_and_retry_after() {
         struct Case {
@@ -5941,8 +5943,8 @@ mod tests {
                 })
                 .expect_err(case.name);
             let display = err.to_string();
-            let Error::Status(api) = err else {
-                panic!("{}: want Error::Status, got {:?}", case.name, err);
+            let Error::Api(api) = err else {
+                panic!("{}: want Error::Api, got {:?}", case.name, err);
             };
             assert_eq!(api.status(), case.status, "{}", case.name);
             assert_eq!(api.code(), case.code, "{}", case.name);
@@ -5971,7 +5973,7 @@ mod tests {
             })
             .expect_err("a reused key is refused");
         assert!(
-            matches!(&err, Error::Status(api) if api.code() == Some("idempotency_key_reused")),
+            matches!(&err, Error::Api(api) if api.code() == Some("idempotency_key_reused")),
             "unexpected error: {:?}",
             err
         );
