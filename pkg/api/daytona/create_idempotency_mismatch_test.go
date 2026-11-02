@@ -1,6 +1,7 @@
 package daytona
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -10,8 +11,11 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func daytonaPost(t *testing.T, h *handlers, key, body string) *httptest.ResponseRecorder {
@@ -127,5 +131,21 @@ func TestDaytonaForwardedRetryWithAReusedKey(t *testing.T) {
 	}
 	if n := countSandboxes(t, env); n != 1 {
 		t.Fatalf("sandbox count = %d, want 1", n)
+	}
+}
+
+// With the server key revoked a keyed Daytona create fails instead of going
+// ahead unchecked.
+func TestDaytonaCreateSandbox_IdempotencyKeyWithTheServerKeyRevoked(t *testing.T) {
+	ciph, err := secrets.NewCipherRing([]secrets.RingKey{{ID: 0, Key: bytes.Repeat([]byte{1}, 32), Current: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciph.Revoke()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &handlers{deps: Deps{Service: service.New(config.Config{}, logger, nil, nil, nil, nil, ciph, nil, nil), Logger: logger}}
+	rr := daytonaPost(t, h, "job-1", `{"snapshot":"alpine:3.20"}`)
+	if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), models.ErrorCodeKeyRevoked) {
+		t.Fatalf("keyed create with the key revoked = %d %s; want 503", rr.Code, rr.Body.String())
 	}
 }

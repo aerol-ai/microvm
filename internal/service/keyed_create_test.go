@@ -314,6 +314,9 @@ func TestBeginKeyedCreate(t *testing.T) {
 }
 
 func TestKeyReusedErrorWithoutAKey(t *testing.T) {
+	if withCreateRequestDigests(t.Context(), nil) != t.Context() {
+		t.Fatal("an empty digest list was recorded")
+	}
 	err := keyReusedError(t.Context())
 	if !errors.Is(err, models.ErrIdempotencyKeyReused) || err.Error() != "Idempotency-Key was already used with a different request" {
 		t.Fatalf("error = %v", err)

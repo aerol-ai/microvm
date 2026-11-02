@@ -1,16 +1,21 @@
 package v1
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
 	"github.com/aerol-ai/microvm/pkg/api/clustercreate"
 	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/secrets"
 )
 
 func postCreate(t *testing.T, h *handlers, key, body string) *httptest.ResponseRecorder {
@@ -193,5 +198,32 @@ func TestClusterCreateWrap_ForwardedRetryWithAReusedKey(t *testing.T) {
 	}
 	if rt.createCalls != 1 {
 		t.Fatalf("runtime creates = %d, want 1", rt.createCalls)
+	}
+}
+
+// With the server key revoked a keyed create cannot be digested, so it fails
+// (503 key_revoked) rather than go ahead unchecked; an unkeyed create never
+// needs a digest.
+func TestCreateSandbox_IdempotencyKeyWithTheServerKeyRevoked(t *testing.T) {
+	ciph, err := secrets.NewCipherRing([]secrets.RingKey{{ID: 0, Key: bytes.Repeat([]byte{1}, 32), Current: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciph.Revoke()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := &handlers{deps: Deps{Service: service.New(config.Config{}, logger, nil, nil, nil, nil, ciph, nil, nil), Logger: logger}}
+	for name, call := range map[string]http.HandlerFunc{
+		"single node": h.createSandbox,
+		"cluster":     h.clusterCreateWrap,
+	} {
+		t.Run(name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/sandboxes", strings.NewReader(`{"image":"alpine:3.20"}`))
+			req.Header.Set("Idempotency-Key", "job-1")
+			call(rr, req)
+			if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), models.ErrorCodeKeyRevoked) {
+				t.Fatalf("keyed create with the key revoked = %d %s; want 503 %s", rr.Code, rr.Body.String(), models.ErrorCodeKeyRevoked)
+			}
+		})
 	}
 }
