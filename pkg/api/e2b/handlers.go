@@ -150,15 +150,21 @@ func (h *handlers) createSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A replay (Replayed) answers with the sandbox an earlier create of the
+	// id made; a failure below must not roll that sandbox back.
 	if err := h.persistSandboxMeta(r.Context(), response.ID, meta); err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
 
 	if err := h.deps.Service.CompleteIdempotentRequest(r.Context(), idempotencyScopeCreate, fingerprint, response.ID, time.Now().UTC(), e2bCreateReplayWindow); err != nil {
-		clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		if !response.Replayed {
+			clustercreate.RollbackLocalCreate(context.Background(), h.deps.Service, h.deps.Logger, response.ID)
+		}
 		cleanupReservation()
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return

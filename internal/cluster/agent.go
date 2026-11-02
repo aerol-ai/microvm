@@ -1667,6 +1667,12 @@ func (a *Agent) doHTTPRequest(ctx context.Context, client *http.Client, endpoint
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrNameConflict.Error()) {
 			return fmt.Errorf("%w: %s", ErrNameConflict, message)
 		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrIncarnationConflict.Error()) {
+			// The same hop for the incarnation fence (ApplyErrorStatus): an
+			// Idempotency-Key retry's re-reserve that hits it is routed to
+			// the reservation's owner, which keys off errors.Is.
+			return fmt.Errorf("%w: %s", ErrIncarnationConflict, message)
+		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(message, ErrMemberStillAlive.Error()) {
 			return ErrMemberStillAlive
 		}

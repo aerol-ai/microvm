@@ -482,7 +482,29 @@ func DetectHost() (HostInfo, error) {
 // against a pool that keeps re-parking. It fires only when the host is
 // otherwise full, so a create that fits pays nothing for it.
 func (a *Admitter) Admit(sandboxID string, req Request) error {
-	slots, err := a.admitOnce(sandboxID, req)
+	return a.admit(sandboxID, req, false)
+}
+
+// errReservationHeld is admitOnce's refusal, for AdmitOwned, of an ID that
+// already holds a reservation.
+var errReservationHeld = errors.New("capacity: sandbox id already holds a reservation")
+
+// AdmitOwned is Admit for a create, which must know whether the reservation
+// is its own to release. An ID that already holds a reservation (its live
+// sandbox, or another create of the same ID) keeps it untouched — no
+// overwrite, no budget check, since that capacity is already counted — and
+// owned is false: the caller did not make it, and its rollback must not
+// Release it. Otherwise it is Admit, and owned is true once admitted.
+func (a *Admitter) AdmitOwned(sandboxID string, req Request) (owned bool, err error) {
+	err = a.admit(sandboxID, req, true)
+	if errors.Is(err, errReservationHeld) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (a *Admitter) admit(sandboxID string, req Request, onlyNew bool) error {
+	slots, err := a.admitOnce(sandboxID, req, onlyNew)
 	for round := 0; err != nil && slots > 0 && round < 2; round++ {
 		a.mu.Lock()
 		reclaimers := append([]ParkReclaimer(nil), a.reclaimers...)
@@ -497,20 +519,25 @@ func (a *Admitter) Admit(sandboxID string, req Request) error {
 		if freed == 0 {
 			return err
 		}
-		slots, err = a.admitOnce(sandboxID, req)
+		slots, err = a.admitOnce(sandboxID, req, onlyNew)
 	}
 	return err
 }
 
 // admitOnce is one locked admission pass. On a budget-only failure it also
 // returns how many parked slots would cover the shortfall (0 when parked
-// capacity cannot, or the failure is not a budget one).
-func (a *Admitter) admitOnce(sandboxID string, req Request) (int, error) {
+// capacity cannot, or the failure is not a budget one). onlyNew refuses an ID
+// that already holds a reservation with errReservationHeld, under the same
+// lock as the check, so two AdmitOwned calls for one ID cannot both own it.
+func (a *Admitter) admitOnce(sandboxID string, req Request, onlyNew bool) (int, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	// Reservation check — what the future state would be if we accept.
 	prior, exists := a.reservations[sandboxID]
+	if exists && onlyNew {
+		return 0, errReservationHeld
+	}
 	projectedCPU := a.totalCPU + req.CPU
 	projectedMem := a.totalMemMB + req.MemoryMB
 	projectedDisk := a.totalDiskGB + req.DiskGB

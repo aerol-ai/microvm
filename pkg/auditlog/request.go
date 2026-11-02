@@ -78,8 +78,12 @@ type Request struct {
 	// Status is the response status; 101 for a WebSocket upgrade, recorded
 	// at the upgrade.
 	Status int `json:"status,omitempty"`
-	// Digest is the hex SHA-256 of an exec request body, hashed as it
-	// streamed. It proves which command ran without recording it.
+	// Digest is a keyed digest of an exec request body, "hmac:<key id>:<hex>":
+	// an HMAC under a key derived from the server key, of the body's SHA-256
+	// as it streamed. It proves which command ran without recording it, and
+	// without letting a reader of the log test a guessed secret. Records from
+	// older releases hold the body's plain hex SHA-256; empty when the body
+	// was not read or no server key was usable.
 	Digest string `json:"digest,omitempty"`
 	// Count is how many identical calls one coalesced record stands for.
 	// Absent means one.

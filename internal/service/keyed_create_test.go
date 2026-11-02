@@ -70,35 +70,6 @@ func TestCreateDigestsMatch(t *testing.T) {
 	}
 }
 
-func TestKeyedCreateClaims(t *testing.T) {
-	var k keyedCreateClaims
-	r1, ok := k.claim("sb-1", []string{"hmac:0:aa"})
-	if !ok {
-		t.Fatal("first claim refused")
-	}
-	if _, ok := k.claim("sb-1", []string{"hmac:0:bb"}); ok {
-		t.Fatal("a different request joined a running create")
-	}
-	r2, ok := k.claim("sb-1", []string{"hmac:0:aa"})
-	if !ok {
-		t.Fatal("the same request could not join its running create")
-	}
-	if _, ok := k.claim("sb-2", []string{"hmac:0:bb"}); !ok {
-		t.Fatal("another id was refused")
-	}
-	r1()
-	r1() // a release runs once
-	if _, ok := k.claim("sb-1", []string{"hmac:0:bb"}); ok {
-		t.Fatal("the claim ended while a joined create still runs")
-	}
-	r2()
-	r3, ok := k.claim("sb-1", []string{"hmac:0:bb"})
-	if !ok {
-		t.Fatal("a claim outlived every create of its id")
-	}
-	r3()
-}
-
 func keyedCtx(key string) context.Context {
 	return WithIdempotencyKey(userCtx("tenant-a"), key)
 }
@@ -271,29 +242,50 @@ func TestDuplicateCreateReplaysCheckTheDigest(t *testing.T) {
 	}
 }
 
-func TestBeginKeyedCreate(t *testing.T) {
+func TestBeginSandboxCreate(t *testing.T) {
 	rt := &recordingRuntime{}
 	svc, st, _ := newServiceRuntimeHarnessAllowStoreClose(t, rt)
 
-	// No digests: admitted, nothing held.
-	ctx, release, err := svc.BeginKeyedCreate(t.Context(), "sb-x", nil)
-	if err != nil || createRequestDigestsFrom(ctx) != nil {
-		t.Fatalf("unkeyed = %v, digests %q", err, createRequestDigestsFrom(ctx))
+	// No id (a generated one): nothing to hold.
+	ctx, release, err := svc.BeginSandboxCreate(t.Context(), "", []string{"hmac:0:aa"})
+	if err != nil || ctx != t.Context() {
+		t.Fatalf("no id = %v", err)
 	}
 	release()
 
-	// An outer claim and the inner create of the same request share one claim.
-	outer, releaseOuter, err := svc.BeginKeyedCreate(keyedCtx("k"), "sb-x", []string{"hmac:0:aa"})
+	// No digests: the lease is held, unchecked.
+	ctx, release, err = svc.BeginSandboxCreate(t.Context(), "sb-x", nil)
+	if err != nil || createRequestDigestsFrom(ctx) != nil || !svc.createLeases.held("sb-x") {
+		t.Fatalf("unkeyed = %v, digests %q, held %v", err, createRequestDigestsFrom(ctx), svc.createLeases.held("sb-x"))
+	}
+	release()
+	if svc.createLeases.held("sb-x") {
+		t.Fatal("the lease outlived its release")
+	}
+
+	// An outer take and the inner create of the same request share one lease.
+	outer, releaseOuter, err := svc.BeginSandboxCreate(keyedCtx("k"), "sb-x", []string{"hmac:0:aa"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, releaseInner, err := svc.BeginKeyedCreate(outer, "sb-x", []string{"hmac:0:aa"}); err != nil {
-		t.Fatalf("inner claim = %v", err)
+	if got := createRequestDigestsFrom(outer); len(got) != 1 || got[0] != "hmac:0:aa" {
+		t.Fatalf("outer digests = %q", got)
+	}
+	if _, releaseInner, err := svc.BeginSandboxCreate(outer, "sb-x", []string{"hmac:0:aa"}); err != nil {
+		t.Fatalf("inner take = %v", err)
 	} else {
 		releaseInner()
 	}
-	if _, _, err := svc.BeginKeyedCreate(keyedCtx("k"), "sb-x", []string{"hmac:0:bb"}); !errors.Is(err, models.ErrIdempotencyKeyReused) {
-		t.Fatalf("a different request during the outer claim = %v", err)
+	if _, releaseInner, err := svc.beginCreateLease(outer, "sb-x", []string{"hmac:0:aa"}); err != nil {
+		t.Fatalf("inner lease = %v", err)
+	} else {
+		releaseInner()
+	}
+	if !svc.createLeases.held("sb-x") {
+		t.Fatal("an inner release gave the outer lease back")
+	}
+	if _, _, err := svc.BeginSandboxCreate(keyedCtx("k"), "sb-x", []string{"hmac:0:bb"}); !errors.Is(err, models.ErrIdempotencyKeyReused) {
+		t.Fatalf("a different request during the outer lease = %v", err)
 	}
 	releaseOuter()
 
@@ -301,15 +293,15 @@ func TestBeginKeyedCreate(t *testing.T) {
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := svc.BeginKeyedCreate(keyedCtx("k"), "sb-y", []string{"hmac:0:aa"}); err == nil {
+	if _, _, err := svc.BeginSandboxCreate(keyedCtx("k"), "sb-y", []string{"hmac:0:aa"}); err == nil {
 		t.Fatal("a create was admitted without reading the stored digest")
 	}
 	if err := svc.checkStoredCreateDigest(withCreateRequestDigests(t.Context(), []string{"hmac:0:aa"}), "sb-y"); err == nil {
 		t.Fatal("a duplicate replay was admitted without reading the stored digest")
 	}
-	// The failed read released its claim.
-	if _, ok := svc.keyedCreates.claim("sb-y", []string{"hmac:0:bb"}); !ok {
-		t.Fatal("a failed admission kept its claim")
+	// The failed read gave its lease back.
+	if svc.createLeases.held("sb-y") {
+		t.Fatal("a failed admission kept its lease")
 	}
 }
 

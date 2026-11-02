@@ -813,6 +813,12 @@ Useful gauges, all per node:
 
 `SandboxdServerKeyPlaintext`: an enterprise node keeps its server key in a
 file or the environment, so "the customer holds the keys" is not true on it.
+With a key store configured an enterprise node no longer starts like this:
+it exits naming `SB_CREDENTIAL_KEY_CUSTODY`, and `sandboxd key` still runs
+on it, so the steps below work with the daemon stopped. The alert itself is
+left for an enterprise node with no key store (`SB_SECRET_PROVIDER=local`):
+give it one first, the two-step way (settings on every node, then the
+provider), then wrap.
 
 1. On one node, with the key store reachable: `sandboxd key wrap`. It writes
    `credential_encryption.key.wrapped` and reads it back through the key store.

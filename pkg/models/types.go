@@ -1208,9 +1208,15 @@ type UpdateNetworkLimitsRequest struct {
 // — it is never persisted and never returned again. The corresponding public
 // key is stored on the sandbox record and is the only key authorized to SSH
 // into that sandbox.
+//
+// Replayed is server-side only: the create found a sandbox an earlier create
+// of the same ID made and answered with it. A caller that rolls a failed
+// create back must not roll back a replay — the sandbox is the earlier
+// create's, not this request's.
 type CreateSandboxResponse struct {
 	Sandbox
 	SSHPrivateKey string `json:"ssh_private_key,omitempty"`
+	Replayed      bool   `json:"-"`
 }
 
 // CreateSandboxSnapshotRequest creates a reusable local image snapshot from an
@@ -1517,6 +1523,12 @@ const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
 // Idempotency-Key was already used with a different request. Retrying the
 // same request cannot succeed: send the original request, or a new key.
 const ErrorCodeIdempotencyKeyReused = "idempotency_key_reused"
+
+// ErrorCodeCreateInProgress is returned (503, with Retry-After) for a create
+// that waited past its bound for another create of the same sandbox ID (the
+// same Idempotency-Key) running on the node. Nothing was created; the same
+// request retried later gets that create's sandbox.
+const ErrorCodeCreateInProgress = "create_in_progress"
 
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error

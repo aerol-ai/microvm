@@ -8,7 +8,6 @@ import (
 	"errors"
 	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -368,7 +367,7 @@ func createRequestFingerprints(d requestDigester, ownerRef, templateID string, s
 	}
 	var out createFingerprints
 	for i, digest := range digests {
-		fp := "hmac:" + strconv.FormatUint(uint64(digest.KeyID), 10) + ":" + hex.EncodeToString(digest.Sum)
+		fp := digest.String()
 		if i == 0 {
 			out.current = fp
 			continue

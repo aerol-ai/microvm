@@ -21,7 +21,7 @@ func (s *Service) returnExistingSandboxResponse(ctx context.Context, sandboxID s
 	if err != nil || existing == nil {
 		return nil, false
 	}
-	return &models.CreateSandboxResponse{Sandbox: *existing}, true
+	return &models.CreateSandboxResponse{Sandbox: *existing, Replayed: true}, true
 }
 
 func (s *Service) handleDuplicateCreateAfterRuntime(ctx context.Context, sandboxID string, err error) (*models.CreateSandboxResponse, error) {

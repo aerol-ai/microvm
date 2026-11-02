@@ -179,15 +179,9 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	// per-group RAM is not modeled here (surfaced via expvar, per the capacity
 	// decision); each sandbox is admitted at its declared footprint —
 	// conservative, never over-books.
-	if s.admitter != nil {
-		if err := s.admitter.Admit(sandboxID, capacityRequestFromCreate(req)); err != nil {
-			return nil, err
-		}
-	}
-	releaseAdmission := func() {
-		if s.admitter != nil {
-			s.admitter.Release(sandboxID)
-		}
+	releaseAdmission, err := s.admitCreate(sandboxID, req)
+	if err != nil {
+		return nil, err
 	}
 
 	// Cold path: resolve bundle → group router → load. The driver reaps a
@@ -242,19 +236,24 @@ func (s *Service) createIsolateSandbox(ctx context.Context, req models.CreateSan
 	sandbox.ContainerIP = "127.0.0.1"
 	if err := s.persistSandboxCreate(ctx, sandbox); err != nil {
 		if errors.Is(err, models.ErrSandboxExists) {
-			// A concurrent create with the same id won the INSERT. Both callers
-			// ran the full driver create for the SAME id — host.Load, the group
-			// member set, and admission are all keyed by id and idempotent, so
-			// the winner's driver state and reservation are shared and already
-			// correct. Rolling back here (Destroy + Release) would tear down the
-			// winner's live sandbox and free its reservation (pr-review.md §4:
-			// never delete state another caller installed). Return the committed
-			// row instead — idempotent success.
+			// Another writer of the id won the INSERT. The create lease
+			// (create_lease.go) keeps a second create of one id off this node,
+			// so this is the defence behind it. host.Load and the group member
+			// set are keyed by id and idempotent, so the winner's driver state
+			// is shared: rolling back here (Destroy) would tear down the
+			// winner's live sandbox (pr-review.md §4: never delete state
+			// another caller installed). releaseAdmission frees only a
+			// reservation this create made (admitCreate), never the winner's.
+			// Return the committed row instead — idempotent success.
+			releaseAdmission()
 			stored, getErr := s.store.Get(ctx, sandbox.ID)
 			if getErr != nil {
 				return nil, getErr
 			}
-			return &models.CreateSandboxResponse{Sandbox: *stored}, nil
+			if err := s.checkStoredCreateDigest(ctx, sandbox.ID); err != nil {
+				return nil, err
+			}
+			return &models.CreateSandboxResponse{Sandbox: *stored, Replayed: true}, nil
 		}
 		_ = s.isolate.Destroy(ctx, sandbox)
 		releaseAdmission()

@@ -1473,7 +1473,8 @@ type Config struct {
 	AuditAPIRate  float64
 	AuditAPIBurst int
 	// AuditExecCommand is what an exec record says about the command:
-	// "digest" (default) is the SHA-256 of the request body only, because
+	// "digest" (default) is a keyed digest of the request body only (an HMAC
+	// under the server key, so a log reader cannot test guesses), because
 	// commands carry secrets; "full" also records the argv, never the
 	// environment. SB_AUDIT_EXEC_COMMAND.
 	AuditExecCommand string
@@ -2973,6 +2974,13 @@ func load(keyTool bool) (Config, error) {
 		// one it is (plans/customer-key-custody.md §7).
 		if secrets.IsExternalProvider(cfg.SecretProvider) && !cfg.SecretProviderStrictBoot {
 			return Config{}, fmt.Errorf("SB_SECRET_PROVIDER_STRICT_BOOT must be true for %s when SB_ENTERPRISE_MODE=true", secrets.NormalizeProviderName(cfg.SecretProvider))
+		}
+		// With a customer key store the server key must be wrapped by it: a
+		// plaintext key file would make the custody claim false (F2, Phase
+		// 7; the release before warned). `sandboxd key` still loads, since
+		// `sandboxd key wrap` is how a node gets there.
+		if secrets.IsExternalProvider(cfg.SecretProvider) && cfg.CredentialKeyCustody != secrets.CustodyWrapped && !keyTool {
+			return Config{}, fmt.Errorf("SB_CREDENTIAL_KEY_CUSTODY must be wrapped for %s when SB_ENTERPRISE_MODE=true: run `sandboxd key wrap`, set SB_CREDENTIAL_KEY_CUSTODY=wrapped and delete the plaintext key (plans/customer-key-custody.md §7)", secrets.NormalizeProviderName(cfg.SecretProvider))
 		}
 		if cfg.SecretAuditRetentionDays == 0 || cfg.SecretTombRetentionDays == 0 {
 			return Config{}, errors.New("secret audit and tomb retention must be non-zero when SB_ENTERPRISE_MODE=true")
