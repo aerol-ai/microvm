@@ -14,12 +14,12 @@ timeline
     July 2026 : 1 release : v0.5.5
     September 2026 : 3 releases : v0.5.6 to v0.6.0
     October 2026 : 8 releases : v0.6.1 to v0.6.8
-    November 2026 : 1 release : v0.6.9
+    November 2026 : 2 releases : v0.6.9 to v0.6.10
 ```
 
 | Release line | Releases | Dates | Latest |
 |---|---|---|---|
-| [0.6](#06-release-line) | 10 | Sep 28, 2026 to Nov 2, 2026 | [v0.6.9](#v069-your-own-key-store-and-sandboxes-fenced-off-by-default) |
+| [0.6](#06-release-line) | 11 | Sep 28, 2026 to Nov 2, 2026 | [v0.6.10](#v0610-key-custody-enforced-and-safe-create-retries) |
 | [0.5](#05-release-line) | 7 | Jun 1, 2026 to Sep 28, 2026 | [v0.5.7](#v057-dependency-updates) |
 | [0.4](#04-release-line) | 1 | May 28, 2026 | [v0.4.1](#v041-firecracker-runtime-wiring) |
 | [0.3](#03-release-line) | 1 | May 24, 2026 | [v0.3.1](#v031-custom-domains-and-image-garbage-collection) |
@@ -27,6 +27,36 @@ timeline
 | [0.1](#01-release-line) | 8 | May 8, 2026 to May 16, 2026 | [v0.1.7](#v017-daytona-and-e2b-compatibility-snapshots-image-builds) |
 
 ## 0.6 release line
+
+### v0.6.10: Key custody enforced, and safe create retries
+
+*November 2, 2026* · [Full notes](https://github.com/aerol-ai/microvm/releases/tag/v0.6.10)
+
+This release finishes the work v0.6.9 started. Enterprise servers that use your own key store now refuse to run with a plain server key. A create retried while the first attempt is still running gets the same sandbox. The last two plain hashes over request bodies that can hold secrets are now keyed with the server key. The SDKs, published as 0.8.0 alongside this release, send a retry-safe key on every create and expose the server's error code.
+
+> **Enterprise servers with a key store must wrap the server key before they upgrade.** With `SB_ENTERPRISE_MODE=true` and `SB_SECRET_PROVIDER` set to `vault`, `pkcs11` or `awskms`, v0.6.10 refuses to start while `SB_CREDENTIAL_KEY_CUSTODY` is still `file`. v0.6.9 warned about this at start and with the `SandboxdServerKeyPlaintext` alert. Wrap the key on v0.6.9 first (see the upgrade notes).
+
+- **A key store means a wrapped server key.** An enterprise server with a customer key store will not start while its server key is a plain file. `sandboxd key` still runs on such a server, so `sandboxd key wrap` is always available to fix it.
+- **Retrying a create is safe, even while the first attempt runs.** A v1 or Daytona create retried with the same `Idempotency-Key` and the same request now waits for the create already running and returns its sandbox. Before, the retry started a second create of the same sandbox, and when that failed it could take away the first create's capacity reservation and mounts.
+- **The SDKs send a key on every create.** Each SDK generates an `Idempotency-Key` once per create call and sends the same key on its own automatic retries, so a create retried after a timeout or a dropped connection no longer makes a second sandbox. Pass your own key to make your own retries of the whole call safe too.
+- **Every SDK exposes the server's error code.** TypeScript, Python, Go, Rust and Java errors carry the HTTP status, the server's `code` (such as `idempotency_key_reused` or `overloaded`) and the `Retry-After` wait.
+- **No plain hashes over secret-bearing bodies are left.** The Runloop devbox ID and the exec audit record's digest are now HMACs under a key derived from the server key, like the E2B fingerprint in v0.6.9. A guessed env value can no longer be checked offline against either.
+
+**Before you upgrade:**
+
+- **Enterprise servers with a key store: wrap first.** On v0.6.9, run `sandboxd key wrap` on one server, copy `credential_encryption.key.wrapped` to every server, set `SB_CREDENTIAL_KEY_CUSTODY=wrapped`, remove `SB_CREDENTIAL_ENCRYPTION_KEY` from the env files, run `sandboxd key verify`, delete the old key file, and restart one server at a time. Then upgrade. A server upgraded first refuses to start, and `sandboxd key wrap` still works on it. Terraform users set `key_custody = "wrapped"`. Servers without enterprise mode, or without a key store, are unaffected.
+- **New answers on create.**
+
+  | Status | Code | `Retry-After` | When |
+  |---|---|---|---|
+  | 503 | `create_in_progress` | 5 | A keyed retry waited the whole create timeout for the create it repeats. Nothing was changed. |
+  | 503 | none | 1 | In a cluster, a keyed retry whose create settled while the retry was being routed, or whose reservation is gone. Was a `409` in one case. |
+
+- **Exec audit digests change format.** Anything that reads the `digest` field of exec audit records, such as a SIEM rule, must accept `hmac:<key id>:<hex>` as well as the old 64-character hex. Digests change again when the server key is rotated.
+- **Runloop devbox IDs change for new creates.** Existing devboxes keep their IDs. A Runloop create retried across nodes while they disagree on the current server key (during a rotation) or run different releases (during a rolling upgrade) can still make a second devbox.
+- **SDK 0.8.0 is a breaking release for Rust.** HTTP errors are `Error::Api(ApiError)` instead of `Error::Api(String)`, and the SDK's own errors moved to a new `Error::Client(String)`. `Error` is `#[non_exhaustive]`, so a `match` on it needs a `_` arm. `CreateOptions` gains `idempotency_key`, so a struct literal without `..Default::default()` must add it. The other SDKs only add to their APIs.
+- **Every SDK create is now a keyed create.** On the server, each one costs one HMAC at the API edge, one extra database read and one small row (`sandbox_create_digests`), a few microseconds in all.
+- **Rolling upgrades.** Old and new servers work together in a cluster. The incarnation conflict travels as `409` only between upgraded nodes; an older node still sees a `500` and answers that create's retry with a `503` the SDKs retry.
 
 ### v0.6.9: Your own key store, and sandboxes fenced off by default
 
