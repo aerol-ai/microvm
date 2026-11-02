@@ -1474,6 +1474,13 @@ const ErrorCodeRateLimited = "rate_limited"
 // the node retries it every few seconds.
 const ErrorCodeNodeGuardNotReady = "node_guard_not_ready"
 
+// ErrorCodeEgressFloorNotReady is returned (503, with Retry-After) for a
+// container or Firecracker create while this node's egress deny floor, which
+// keeps sandboxes off the cloud metadata endpoints and the operator's
+// deny_cidrs, is not installed for that runtime; the node retries it every
+// few seconds.
+const ErrorCodeEgressFloorNotReady = "egress_floor_not_ready"
+
 // Key-store error codes, each returned with 503 when the key store that wraps
 // sandbox secrets (SB_SECRET_PROVIDER) answers with one of its five error
 // classes (plans/customer-key-custody.md, eng review Section 2). The response

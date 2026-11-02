@@ -305,6 +305,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 		"memory_overprovision_factor", cfg.MemoryOverProvisionFactor,
 		"rss_watermark_ratio", cfg.FirecrackerRSSWatermarkRatio,
 	)
+	// The docker engine's sandbox bridge holds 1,023 ports; count them as a
+	// slot pool before any create or reservation replay can fill it.
+	wireDockerBridgeSlots(ctx, cfg, logger, dockerClient, admitter)
 
 	// dockerClient is passed twice: as the runtime.Runtime driver (the
 	// abstraction service uses for sandbox lifecycle) and as the concrete
@@ -1888,11 +1891,11 @@ func shouldStartSSHGateway(cfg config.Config) bool {
 }
 
 // registerSlotPoolsProvider overlays this node's network-slot pools
-// (containerd netns, Firecracker TAP, capped WASM instances) onto its own
-// capacity lease, matching what peers read from /v1/capacity, so placement
-// skips the node for a runtime whose pool is full. Only a node that can own
-// sandboxes has pools; a client without the hook (the Agent, Noop) is left
-// alone.
+// (containerd netns, docker bridge, Firecracker TAP, capped WASM instances)
+// onto its own capacity lease, matching what peers read from /v1/capacity,
+// so placement skips the node for a runtime whose pool is full. Only a node
+// that can own sandboxes has pools; a client without the hook (the Agent,
+// Noop) is left alone.
 func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context.Context) []capacity.SlotPool) {
 	if !cfg.IsWorker() || pools == nil {
 		return

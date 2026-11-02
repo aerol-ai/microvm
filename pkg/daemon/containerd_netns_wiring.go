@@ -12,13 +12,13 @@ import (
 	"github.com/aerol-ai/microvm/internal/network/netns"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/store"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
-// maxBridgePorts is how many interfaces one Linux bridge can hold: the
-// kernel numbers bridge ports with 10 bits (BR_MAX_PORTS = 1024) and never
-// hands out port 0. Each containerd netns slot uses one.
-const maxBridgePorts = 1023
+// maxBridgePorts is how many interfaces one Linux bridge can hold
+// (capacity.BridgeMaxPorts). Each containerd netns slot uses one.
+const maxBridgePorts = capacity.BridgeMaxPorts
 
 type containerdNetnsPool struct {
 	refiller *netns.Refiller

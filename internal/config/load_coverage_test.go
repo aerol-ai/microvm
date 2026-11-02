@@ -85,6 +85,11 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			want: "SB_IMAGE_PULL_FAILURE_BACKOFF must be >= 0",
 		},
 		{
+			name: "docker bridge slots negative",
+			env:  map[string]string{"SB_DOCKER_BRIDGE_SLOTS": "-1"},
+			want: "SB_DOCKER_BRIDGE_SLOTS must be >= 0",
+		},
+		{
 			name: "auto import without hooks url",
 			env:  map[string]string{"SB_AUTO_IMPORT_ENABLED": "true"},
 			want: "SB_AUTO_IMPORT_HOOKS_URL",

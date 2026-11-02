@@ -163,6 +163,10 @@ func Classify(err error) Classification {
 	case errors.Is(err, service.ErrNodeGuardNotReady):
 		// The cause (an iptables error) is for the node's log, not the caller.
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeNodeGuardNotReady, Message: service.ErrNodeGuardNotReady.Error(), Log: true, LogLevel: slog.LevelError}
+	case errors.Is(err, service.ErrEgressFloorNotReady):
+		// The cause (an iptables or netlink error) is for the node's log,
+		// not the caller.
+		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressFloorNotReady, Message: service.ErrEgressFloorNotReady.Error(), Log: true, LogLevel: slog.LevelError}
 	case errors.Is(err, service.ErrEgressGatewayUnavailable), errors.Is(err, cluster.ErrNoEgressGatewayTarget):
 		return Classification{Status: http.StatusServiceUnavailable, RetryAfter: 5, Code: models.ErrorCodeEgressGatewayUnavailable, Message: err.Error()}
 	case errors.Is(err, service.ErrEgressSpecCommitFailed):

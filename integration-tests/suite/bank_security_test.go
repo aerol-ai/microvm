@@ -3,7 +3,7 @@
 package suite
 
 // Security boundary cases for running untrusted code (UC-317..UC-332,
-// UC-339, UC-340 and UC-345): what
+// UC-339, UC-340, UC-345 and UC-363): what
 // a regulated buyer asks of a platform that executes code it did not write.
 // Every case attacks the boundary from inside a sandbox, or from the
 // internet, and asserts it holds on each shell runtime the scenario has:
@@ -15,10 +15,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +29,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/integration-tests/suite/harness"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/sdk/go/pkg/microvm"
 	sdktypes "github.com/aerol-ai/microvm/sdk/go/pkg/types"
 )
@@ -203,7 +206,7 @@ func TestBankCloudMetadataUnreachable(t *testing.T) {
 	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
 		probe := func(sb *microvm.Sandbox, why string) {
 			t.Helper()
-			for _, ep := range []string{"169.254.169.254 80", "169.254.170.2 80", "169.254.170.23 80", "100.100.100.200 80"} {
+			for _, ep := range bankMetadataEndpoints {
 				f := strings.Fields(ep)
 				port, _ := strconv.Atoi(f[1])
 				if bankTCPOpen(t, sb, f[0], port) {
@@ -229,6 +232,246 @@ func TestBankCloudMetadataUnreachable(t *testing.T) {
 		waitRunning(t, sb)
 		probe(sb, "metadata endpoint in the sandbox's own allowlist")
 	})
+}
+
+// bankMetadataEndpoints are the cloud metadata and credential endpoints a
+// sandbox probes on TCP 80: instance metadata (AWS, GCP, Azure, OpenStack,
+// Oracle), ECS task credentials, EKS Pod Identity and Alibaba's metadata.
+var bankMetadataEndpoints = []string{"169.254.169.254 80", "169.254.170.2 80", "169.254.170.23 80", "100.100.100.200 80"}
+
+// bankMetadataOpen lists the metadata endpoints sb opens a TCP connection to.
+func bankMetadataOpen(t *testing.T, sb *microvm.Sandbox) []string {
+	t.Helper()
+	var open []string
+	for _, ep := range bankMetadataEndpoints {
+		f := strings.Fields(ep)
+		port, _ := strconv.Atoi(f[1])
+		if bankTCPOpen(t, sb, f[0], port) {
+			open = append(open, f[0]+":"+f[1])
+		}
+	}
+	return open
+}
+
+// bankFloorRuntime is the runtime whose floor a user chain jumps to, by the
+// key sandboxd publishes it under in aerolvm_egress_floor_ready.
+var bankFloorRuntime = map[string]string{"DOCKER-USER": "docker", "AEROLVM-USER": "containerd", "AEROLVM-FC": "firecracker"}
+
+// UC-363 — the egress deny floor fails closed and heals. For a container,
+// gVisor or Firecracker sandbox whose traffic does not pass the egress
+// gateway, the floor (one AEROLVM-FLOOR-<hash> chain per sandbox subnet,
+// jumped from the top of its runtime's user chain) is all that stands
+// between it and the cloud metadata endpoints, which hand out the node's own
+// cloud credentials. Here that chain is removed over SSH, as a host firewall
+// reload would remove it. sandboxd re-asserts the floor every 30 s, so it
+// must be back, jumped first and dropping 169.254.169.254, within 45 s;
+// aerolvm_egress_floor_ready must then read 1 for that runtime, the journal
+// must name the repair, and the metadata endpoints must stay unreachable
+// from the sandbox that was running and from a new one on the same node.
+//
+// Creates on that runtime keep going while the floor is out. The create gate
+// reads what the last check recorded (no firewall call per create), and the
+// re-assert that finds the chain gone puts it back in the same pass, so a
+// create is refused (503 egress_floor_not_ready) only while putting it back
+// keeps failing. Each create in the window must succeed or get exactly that
+// refusal; how many were refused is reported, not required.
+func TestBankEgressFloorFailsClosedAndHeals(t *testing.T) {
+	harness.Require(t, sc, "UC-363")
+	if sc.Has(harness.CapNoHostFirewall) {
+		t.Skip("no host firewall on this deployment (local mode): there is no deny floor to remove")
+	}
+	if !harness.DisruptiveAllowed() {
+		t.Skip("removes a node's egress deny floor; set disruptive: true in the scenario caps")
+	}
+	targets := bankTargets(t)
+	metadata := netip.MustParseAddr("169.254.169.254")
+	bankEachRuntime(t, func(t *testing.T, rt bankRuntime) {
+		c := client(t)
+		sb := bankSandbox(t, rt, sdktypes.CreateSandboxOptions{})
+		node := bankSandboxNode(t, targets, sb)
+		ip, err := netip.ParseAddr(containerIP(t, c, sb))
+		if err != nil {
+			t.Fatalf("sandbox %s: %v", sb.ID, err)
+		}
+		floor, ok := harness.FloorFor(bankFloorChains(t, node), ip)
+		if !ok || !floor.Drops(metadata) {
+			t.Fatalf("node %s has no floor for %s's subnet (%s) that drops %s: %+v", node.Name, sb.ID, ip, metadata, floor)
+		}
+		parent, key := "", ""
+		for _, p := range floor.TopOf {
+			if k, ok := bankFloorRuntime[p]; ok {
+				parent, key = p, k
+				break
+			}
+		}
+		if parent == "" {
+			t.Fatalf("node %s: floor %s for %s is the first rule of no runtime's user chain (first in %v)", node.Name, floor.Name, floor.Src, floor.TopOf)
+		}
+		if open := bankMetadataOpen(t, sb); len(open) > 0 {
+			t.Fatalf("%s reaches %v with the floor in place; UC-317 covers this, and the heal below would prove nothing", sb.ID, open)
+		}
+
+		out := nodeSSH(t, node, "sudo bash -c "+shellQuote(bankRemoveFloorScript(floor.Name)))
+		removed := time.Now()
+		var at, left int64
+		if m := regexp.MustCompile(`at=(\d+)`).FindStringSubmatch(out); m != nil {
+			at, _ = strconv.ParseInt(m[1], 10, 64)
+		}
+		m := regexp.MustCompile(`metadata_drops_after=(\d+)`).FindStringSubmatch(out)
+		if m == nil || at == 0 {
+			t.Fatalf("the removal script on %s did not report: %s", node.Name, out)
+		}
+		left, _ = strconv.ParseInt(m[1], 10, 64)
+		if left != 0 {
+			t.Fatalf("could not remove floor %s on %s (%d metadata drops left): %s", floor.Name, node.Name, left, out)
+		}
+		healed := false
+		t.Cleanup(func() {
+			if !healed {
+				// Never leave a node without its floor for the cases after
+				// this one: a restart installs it at boot.
+				t.Logf("floor %s on %s was not put back; restarting sandboxd there: %s", floor.Name, node.Name,
+					nodeSSH(t, node, "sudo systemctl restart sandboxd && echo restarted"))
+			}
+		})
+		t.Logf("removed %s (the %s floor for %s, first in %s) on %s: %s", floor.Name, key, floor.Src, parent, node.Name, strings.TrimSpace(out))
+
+		// Creates on this runtime while the floor is out. They are not
+		// pinned to the node, so one placed elsewhere only shows that no
+		// other answer comes back.
+		base := harness.UniqueName(sc, t)
+		stop := make(chan struct{})
+		var (
+			wg               sync.WaitGroup
+			mu               sync.Mutex
+			created, refused int
+			others           []string
+		)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 8; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+				got, err := c.SDK().Create(ctx, sdktypes.CreateSandboxOptions{Image: bankImage(rt), Runtime: rt.runtime, Name: fmt.Sprintf("%s-w%d", base, i)})
+				cancel()
+				if err == nil {
+					destroyBest(c, got.ID)
+				}
+				mu.Lock()
+				switch {
+				case err == nil:
+					created++
+				case harness.IsEgressFloorNotReady(err):
+					refused++
+				default:
+					others = append(others, harness.DescribeAPIError(err))
+				}
+				mu.Unlock()
+				select {
+				case <-stop:
+					return
+				case <-time.After(5 * time.Second):
+				}
+			}
+		}()
+		for deadline := removed.Add(45 * time.Second); ; time.Sleep(2 * time.Second) {
+			if f, ok := harness.FloorFor(bankFloorChains(t, node), ip); ok && f.Drops(metadata) && slices.Contains(f.TopOf, parent) {
+				healed = true
+				break
+			}
+			if time.Now().After(deadline) {
+				break
+			}
+		}
+		took := time.Since(removed)
+		close(stop)
+		wg.Wait()
+		t.Logf("%s: creates while the floor was out: %d created, %d refused with %s", rt.name, created, refused, models.ErrorCodeEgressFloorNotReady)
+		bankRecord(t, "egress_floor_heal_"+rt.name, map[string]any{
+			"healed": healed, "heal_ms": took.Milliseconds(), "creates_ok": created, "creates_refused": refused, "creates_other": len(others),
+		})
+		for _, o := range others {
+			t.Errorf("a create while the floor was out failed with something other than 503 %s: %s", models.ErrorCodeEgressFloorNotReady, o)
+		}
+		if !healed {
+			t.Fatalf("floor %s on %s was not back (jumped first from %s, dropping %s) %v after it was removed; the re-assert runs every 30 s", floor.Name, node.Name, parent, metadata, took.Round(time.Second))
+		}
+		t.Logf("floor %s back on %s %v after it was removed", floor.Name, node.Name, took.Round(time.Second))
+
+		nb := nodeBase(t, node)
+		var ready float64
+		var seen bool
+		for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(time.Second) {
+			ready, seen = harness.MetricValue(nodeMetrics(t, nb), "aerolvm_egress_floor_ready", map[string]string{"key": key})
+			if (seen && ready == 1) || time.Now().After(deadline) {
+				break
+			}
+		}
+		if !seen || ready != 1 {
+			t.Errorf("node %s: aerolvm_egress_floor_ready{key=%q} = %v (present %v) after the floor is back, want 1", node.Name, key, ready, seen)
+		}
+		journal := nodeSSH(t, node, fmt.Sprintf("sudo journalctl -u sandboxd --since @%d --no-pager | grep 'egress floor was missing' || true", at))
+		if !strings.Contains(journal, key) {
+			t.Errorf("node %s: the journal since the removal has no repair line for runtime %s:\n%s", node.Name, key, journal)
+		}
+
+		if open := bankMetadataOpen(t, sb); len(open) > 0 {
+			t.Errorf("after the floor was put back, %s on %s reaches %v", sb.ID, node.Name, open)
+		}
+		if fresh, ok := bankNeighbour(t, rt, sb); ok {
+			if open := bankMetadataOpen(t, fresh); len(open) > 0 {
+				t.Errorf("a %s sandbox created on %s after the floor was put back reaches %v", rt.name, node.Name, open)
+			}
+		} else {
+			t.Logf("no new %s sandbox landed on %s; only the running one was probed after the heal", rt.name, node.Name)
+		}
+	})
+}
+
+// bankFloorChains is every egress deny floor chain in node's host firewall,
+// whichever tool holds it.
+func bankFloorChains(t *testing.T, node harness.IntegrationNode) map[string]*harness.FloorChain {
+	t.Helper()
+	return harness.ParseFloorChains(bankRuleDump(t, node))
+}
+
+// bankRuleDump is node's whole host firewall: iptables (nft-backed and
+// legacy) and nftables.
+func bankRuleDump(t *testing.T, node harness.IntegrationNode) string {
+	t.Helper()
+	return nodeSSH(t, node, "sudo iptables-save 2>/dev/null; sudo iptables-legacy-save 2>/dev/null; sudo nft list ruleset 2>/dev/null; true")
+}
+
+// bankRemoveFloorScript removes one floor chain the way a host firewall
+// reload would: every user chain's jump to it, its rules, and the chain. It
+// covers the netlink backend (native nftables) and the exec backend
+// (iptables, nft-backed or legacy), and prints the node's clock at the start
+// (for the journal) and how many metadata drops the chain still holds.
+func bankRemoveFloorScript(chain string) string {
+	return fmt.Sprintf(`C=%s
+echo "at=$(date +%%s)"
+removed=none
+if nft list chain ip filter "$C" >/dev/null 2>&1; then
+  for P in DOCKER-USER AEROLVM-USER AEROLVM-FC; do
+    for h in $(nft -a list chain ip filter "$P" 2>/dev/null | awk -v c="$C" '$0 ~ ("jump " c "( |$)") {print $NF}'); do
+      nft delete rule ip filter "$P" handle "$h" && removed=jump
+    done
+  done
+  nft flush chain ip filter "$C" && removed=flushed
+  nft delete chain ip filter "$C" 2>/dev/null && removed=deleted
+fi
+for IPT in iptables iptables-legacy; do
+  command -v "$IPT" >/dev/null 2>&1 || continue
+  "$IPT" -w -S "$C" >/dev/null 2>&1 || continue
+  for P in DOCKER-USER AEROLVM-USER AEROLVM-FC; do
+    while "$IPT" -w -D "$P" -j "$C" 2>/dev/null; do removed=jump; done
+  done
+  "$IPT" -w -F "$C" && removed=flushed
+  "$IPT" -w -X "$C" 2>/dev/null && removed=deleted
+done
+left=$( { nft list chain ip filter "$C" 2>/dev/null; iptables -w -S "$C" 2>/dev/null; iptables-legacy -w -S "$C" 2>/dev/null; } | grep -c '169\.254\.169\.254' )
+echo "removed=$removed metadata_drops_after=${left:-0}"
+`, chain)
 }
 
 // UC-318 — one tenant's sandbox cannot connect to another's: a listener in
@@ -1557,7 +1800,7 @@ func bankStillAnswers(t *testing.T, sb *microvm.Sandbox, wait time.Duration) {
 // reduced to "holds ip".
 func bankAddressRules(t *testing.T, node harness.IntegrationNode, ip string) []string {
 	t.Helper()
-	out := nodeSSH(t, node, "sudo iptables-save 2>/dev/null; sudo iptables-legacy-save 2>/dev/null; sudo nft list ruleset 2>/dev/null; true")
+	out := bankRuleDump(t, node)
 	re := ipOnLine(ip)
 	counters := regexp.MustCompile(`counter packets \d+ bytes \d+ ?`)
 	var rules []string

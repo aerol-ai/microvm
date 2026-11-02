@@ -43,7 +43,8 @@ func TestConfigureHostMediatedNodeGuard(t *testing.T) {
 }
 
 // TestWireNodeGuard: only nodes that own sandboxes run it; a worker starts
-// the supervisor, which stops with the context.
+// the node guard's and the egress floor's supervisors, which stop with the
+// context.
 func TestWireNodeGuard(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

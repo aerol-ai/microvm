@@ -139,7 +139,15 @@ type NetRulesReporter interface {
 // egress gateway, which carries its own copy of the floor.
 type EgressFloorSetter interface {
 	SetEgressFloor(ctx context.Context, cidrs []netip.Prefix) error
+	// ReassertEgressFloor puts back a floor something removed; repaired
+	// reports that it had to.
+	ReassertEgressFloor(ctx context.Context) (repaired bool, err error)
 }
+
+// ErrEgressFloorUnavailable means the runtime has no host firewall (network
+// rules are off), so nothing on the host keeps its sandboxes off the cloud
+// metadata endpoints.
+var ErrEgressFloorUnavailable = errors.New("runtime: the host firewall is off; sandboxes can reach the cloud metadata endpoints")
 
 // NodeGuardSetter is implemented by runtimes whose sandboxes reach the node
 // over a host bridge or TAP subnet (containers, gVisor, Firecracker): it
